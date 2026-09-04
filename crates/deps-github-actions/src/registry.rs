@@ -534,6 +534,8 @@ impl deps_core::Registry for GithubActionsRegistry {
 mod tests {
     use super::*;
 
+    use std::assert_matches;
+
     #[test]
     fn test_parse_tags_response() {
         let sha1 = "a".repeat(40);
@@ -789,7 +791,7 @@ mod tests {
 
         let registry = mock_registry(&server.url(), false);
         let err = registry.get_versions("owner/missing").await.unwrap_err();
-        assert!(matches!(err, DepsError::PackageNotFound { .. }));
+        assert_matches!(err, DepsError::PackageNotFound { .. });
     }
 
     #[tokio::test]
@@ -829,10 +831,10 @@ mod tests {
         // `generate_diagnostics_from_cache`.
         let fetch_failed: HashMap<String, deps_core::error::FetchFailure> =
             HashMap::from([("owner/repo".to_string(), failure)]);
-        assert!(matches!(
+        assert_matches!(
             fetch_failed.get("owner/repo"),
             Some(deps_core::error::FetchFailure::Actionable(_))
-        ));
+        );
     }
 
     #[tokio::test]
@@ -968,7 +970,7 @@ mod tests {
             .get_versions("owner/private-repo")
             .await
             .unwrap_err();
-        assert!(matches!(err, DepsError::HttpStatus { status: 403, .. }));
+        assert_matches!(err, DepsError::HttpStatus { status: 403, .. });
         assert!(!registry.rate_limit.is_tripped());
     }
 
@@ -976,7 +978,7 @@ mod tests {
     async fn test_get_versions_rejects_invalid_owner_repo_with_zero_requests() {
         let registry = mock_registry("http://127.0.0.1:1", false);
         let err = registry.get_versions("../../etc/passwd").await.unwrap_err();
-        assert!(matches!(err, DepsError::InvalidUri(_)));
+        assert_matches!(err, DepsError::InvalidUri(_));
     }
 
     #[tokio::test]

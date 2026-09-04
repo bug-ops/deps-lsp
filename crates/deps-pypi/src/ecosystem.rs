@@ -21,6 +21,7 @@ use crate::registry::PypiRegistry;
 /// The source(s) a `CompletionContext::Version`'s bare `package_name` joins back to within a
 /// manifest's already-parsed dependencies (validator finding #1 — mirrors
 /// `deps_npm::ecosystem`'s identical type).
+#[derive(Debug)]
 enum CompletionSource {
     /// No dependency in the manifest has this exact name yet — most commonly because the
     /// user is still typing a brand-new dependency line. Callers fall back to the
@@ -485,6 +486,7 @@ fn is_safe_document_link_target(target: &str) -> bool {
 mod tests {
     use super::*;
     use deps_core::{EcosystemConfig, VersionData};
+    use std::assert_matches;
     use std::collections::HashMap;
 
     fn pkg(s: &str) -> deps_core::PackageName {
@@ -691,10 +693,10 @@ mod tests {
         let Err(err) = result else {
             panic!("expected a parse error");
         };
-        assert!(matches!(
+        assert_matches!(
             err,
             deps_core::DepsError::ParseError { file_type, .. } if file_type == "pyproject.toml"
-        ));
+        );
     }
 
     #[test]
@@ -1178,16 +1180,16 @@ mod tests {
     #[test]
     fn test_resolve_completion_source_classification() {
         let not_in_manifest = empty_parse_result();
-        assert!(matches!(
+        assert_matches!(
             resolve_completion_source(&not_in_manifest, &pkg("mypkg")),
             CompletionSource::NotInManifest
-        ));
+        );
 
         let resolved = parse_result_with_dependency("mypkg", DependencySource::Registry);
-        assert!(matches!(
+        assert_matches!(
             resolve_completion_source(&resolved, &pkg("mypkg")),
             CompletionSource::Resolved(DependencySource::Registry)
-        ));
+        );
 
         let ambiguous = crate::parser::ParseResult {
             dependencies: vec![
@@ -1208,10 +1210,10 @@ mod tests {
             document_links: Vec::new(),
             resolved_chains: Vec::new(),
         };
-        assert!(matches!(
+        assert_matches!(
             resolve_completion_source(&ambiguous, &pkg("mypkg")),
             CompletionSource::Ambiguous
-        ));
+        );
     }
 
     #[tokio::test]

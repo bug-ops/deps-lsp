@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-nuget**: a NuGet source that fails closed on credential binding now logs the source key, reason, and specific cause (debounced per config state, debug/warn severity matching the existing convention), instead of silently dropping the dependency with no observability (resolves #576) (#578)
 
 ### Changed
+- **MSRV bumped to 1.98** — unlocks `assert_matches!` (replacing `assert!(matches!(...))` in tests) and `str::strip_circumfix` (replacing chained `strip_prefix`/`strip_suffix` in `deps-core`, `deps-gradle`, `deps-pypi`) (resolves #549) (#594)
 - **deps-nuget**: `NuGetSourceChain.hops`/`NuGetRegistry::with_base` now carry per-hop credential/slot data (`ResolvedHop`) instead of a bare feed URL; `deps_lsp::register_ecosystems` now takes an `&EcosystemRuntime` instead of a bare `Arc<RegistryAccessPolicy>` — both breaking, pre-1.0, no alias (#572)
 - **deps-core, deps-cargo, deps-nuget**: consolidated four independently hand-implemented "redact this secret from `Debug`/`Display`" wrapper types into a single `deps_core::secret::Redacted<T>` newtype (resolves #573) (#577)
 - **deps-core, deps-cargo, deps-nuget**: renamed the secret-exposing `as_str()` accessor on `Redacted<T>` and its delegating wrapper types (`AuthToken`, `RedactedSecret`) to `expose_secret()`, so it can no longer be confused with an ordinary string conversion in a grep or code review (resolves #581) (#582)

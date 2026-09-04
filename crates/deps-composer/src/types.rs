@@ -260,6 +260,7 @@ deps_core::impl_metadata!(ComposerPackage {
 mod tests {
     use super::*;
     use deps_core::{Metadata, Version};
+    use std::assert_matches;
     use tower_lsp_server::ls_types::Position;
 
     #[test]
@@ -274,16 +275,13 @@ mod tests {
 
         assert_eq!(dep.name, "symfony/console");
         assert_eq!(dep.version_req, Some("^6.0".into()));
-        assert!(matches!(dep.section, ComposerSection::Require));
+        assert_matches!(dep.section, ComposerSection::Require);
     }
 
     #[test]
     fn test_composer_section_variants() {
-        assert!(matches!(ComposerSection::Require, ComposerSection::Require));
-        assert!(matches!(
-            ComposerSection::RequireDev,
-            ComposerSection::RequireDev
-        ));
+        assert_matches!(ComposerSection::Require, ComposerSection::Require);
+        assert_matches!(ComposerSection::RequireDev, ComposerSection::RequireDev);
     }
 
     #[test]

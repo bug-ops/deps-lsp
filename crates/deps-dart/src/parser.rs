@@ -253,6 +253,8 @@ impl deps_core::ParseResult for DartParseResult {
 mod tests {
     use super::*;
 
+    use std::assert_matches;
+
     fn test_uri() -> Uri {
         #[cfg(windows)]
         let path = "C:/test/pubspec.yaml";
@@ -287,14 +289,11 @@ dev_dependencies:
 ";
         let result = parse_pubspec_yaml(yaml, &test_uri()).unwrap();
         assert_eq!(result.dependencies.len(), 2);
-        assert!(matches!(
+        assert_matches!(
             result.dependencies[0].section,
             DependencySection::DevDependencies
-        ));
-        assert!(matches!(
-            result.dependencies[0].source,
-            DependencySource::Sdk { .. }
-        ));
+        );
+        assert_matches!(result.dependencies[0].source, DependencySource::Sdk { .. });
     }
 
     #[test]
@@ -332,10 +331,7 @@ dependencies:
     path: ../local_pkg
 ";
         let result = parse_pubspec_yaml(yaml, &test_uri()).unwrap();
-        assert!(matches!(
-            result.dependencies[0].source,
-            DependencySource::Path { .. }
-        ));
+        assert_matches!(result.dependencies[0].source, DependencySource::Path { .. });
     }
 
     #[test]
@@ -368,10 +364,10 @@ dependency_overrides:
 ";
         let result = parse_pubspec_yaml(yaml, &test_uri()).unwrap();
         assert_eq!(result.dependencies.len(), 1);
-        assert!(matches!(
+        assert_matches!(
             result.dependencies[0].section,
             DependencySection::DependencyOverrides
-        ));
+        );
     }
 
     #[test]
@@ -490,10 +486,10 @@ dependencies:
     fn test_invalid_yaml() {
         let yaml = "{{invalid yaml";
         let result = parse_pubspec_yaml(yaml, &test_uri());
-        assert!(matches!(
+        assert_matches!(
             result,
             Err(DepsError::ParseError { file_type, .. }) if file_type == "pubspec.yaml"
-        ));
+        );
     }
 
     #[test]

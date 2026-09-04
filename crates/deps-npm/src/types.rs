@@ -198,6 +198,7 @@ deps_core::impl_metadata!(NpmPackage {
 mod tests {
     use super::*;
     use deps_core::{Metadata, Version};
+    use std::assert_matches;
     use tower_lsp_server::ls_types::Position;
 
     #[test]
@@ -223,13 +224,10 @@ mod tests {
         let peer_deps = NpmDependencySection::PeerDependencies;
         let opt_deps = NpmDependencySection::OptionalDependencies;
 
-        assert!(matches!(deps, NpmDependencySection::Dependencies));
-        assert!(matches!(dev_deps, NpmDependencySection::DevDependencies));
-        assert!(matches!(peer_deps, NpmDependencySection::PeerDependencies));
-        assert!(matches!(
-            opt_deps,
-            NpmDependencySection::OptionalDependencies
-        ));
+        assert_matches!(deps, NpmDependencySection::Dependencies);
+        assert_matches!(dev_deps, NpmDependencySection::DevDependencies);
+        assert_matches!(peer_deps, NpmDependencySection::PeerDependencies);
+        assert_matches!(opt_deps, NpmDependencySection::OptionalDependencies);
     }
 
     #[test]

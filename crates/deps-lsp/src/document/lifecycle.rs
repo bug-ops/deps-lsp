@@ -2684,6 +2684,7 @@ pub async fn ensure_document_loaded(
 mod tests {
     use super::*;
     use deps_core::parser::DependencySource;
+    use std::assert_matches;
 
     /// Pairs every name with the plain `Registry` source — the shape every pre-existing
     /// `fetch_latest_versions_parallel` test used before that function became source-aware
@@ -6065,10 +6066,7 @@ time = "0.1.43"
             state.update_document(uri.clone(), doc_state2);
 
             let doc = state.get_document(&uri).unwrap();
-            assert!(matches!(
-                doc.vulnerabilities.get("time"),
-                Some(ScanOutcome::Clean)
-            ));
+            assert_matches!(doc.vulnerabilities.get("time"), Some(ScanOutcome::Clean));
         }
 
         #[tokio::test]
@@ -7546,10 +7544,10 @@ tokio = "1.0"
             let (targets, skipped) =
                 build_scan_targets(&parse_result, &resolved, &MockFormatter, EcosystemId::Cargo);
             assert!(targets.is_empty());
-            assert!(matches!(
+            assert_matches!(
                 skipped.get("time"),
                 Some(ScanOutcome::Skipped(SkipReason::NonRegistrySource))
-            ));
+            );
         }
 
         #[test]
@@ -7791,10 +7789,10 @@ tokio = "1.0"
             let (targets, skipped) =
                 build_scan_targets(&parse_result, &resolved, &MockFormatter, EcosystemId::Cargo);
             assert!(targets.is_empty());
-            assert!(matches!(
+            assert_matches!(
                 skipped.get("serde"),
                 Some(ScanOutcome::Skipped(SkipReason::NoConcreteVersion))
-            ));
+            );
         }
 
         #[test]
@@ -7811,10 +7809,10 @@ tokio = "1.0"
             let (targets, skipped) =
                 build_scan_targets(&parse_result, &resolved, &MockFormatter, EcosystemId::Cargo);
             assert!(targets.is_empty());
-            assert!(matches!(
+            assert_matches!(
                 skipped.get("serde"),
                 Some(ScanOutcome::Skipped(SkipReason::NoConcreteVersion))
-            ));
+            );
         }
 
         #[test]
@@ -7853,10 +7851,10 @@ tokio = "1.0"
                     EcosystemId::Cargo,
                 );
                 assert!(targets.is_empty(), "{source:?} must be skipped (step 0)");
-                assert!(matches!(
+                assert_matches!(
                     skipped.get("pkg"),
                     Some(ScanOutcome::Skipped(SkipReason::NonRegistrySource))
-                ));
+                );
             }
         }
 
@@ -7894,14 +7892,14 @@ tokio = "1.0"
             assert_eq!(targets.len(), 1);
             assert_eq!(targets[0].key, "concrete");
             assert_eq!(skipped.len(), 2);
-            assert!(matches!(
+            assert_matches!(
                 skipped.get("range-only"),
                 Some(ScanOutcome::Skipped(SkipReason::NoConcreteVersion))
-            ));
-            assert!(matches!(
+            );
+            assert_matches!(
                 skipped.get("git-dep"),
                 Some(ScanOutcome::Skipped(SkipReason::NonRegistrySource))
-            ));
+            );
         }
 
         // `collect_in_use_versions` (§4.6) reuses the same `in_use_version`

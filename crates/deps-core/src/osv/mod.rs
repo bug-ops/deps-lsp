@@ -704,6 +704,7 @@ fn log_scan_summary(outcomes: &HashMap<String, ScanOutcome>) {
 mod tests {
     use super::*;
     use crate::EcosystemId;
+    use std::assert_matches;
 
     fn client() -> OsvClient {
         OsvClient::new(Arc::new(HttpCache::new()))
@@ -768,7 +769,7 @@ mod tests {
         let outcomes = client.scan(EcosystemId::Npm, &targets, TEST_TIMEOUT).await;
 
         assert_eq!(outcomes.len(), 1);
-        assert!(matches!(outcomes.get("left-pad"), Some(ScanOutcome::Clean)));
+        assert_matches!(outcomes.get("left-pad"), Some(ScanOutcome::Clean));
     }
 
     #[tokio::test]
@@ -786,10 +787,10 @@ mod tests {
 
         assert_eq!(outcomes.len(), 2);
         for key in ["a", "b"] {
-            assert!(matches!(
+            assert_matches!(
                 outcomes.get(key),
                 Some(ScanOutcome::Skipped(SkipReason::QueryFailed))
-            ));
+            );
         }
     }
 
@@ -806,10 +807,10 @@ mod tests {
         let targets = vec![target("a", "1.0.0")];
         let outcomes = client.scan(EcosystemId::Npm, &targets, TEST_TIMEOUT).await;
 
-        assert!(matches!(
+        assert_matches!(
             outcomes.get("a"),
             Some(ScanOutcome::Skipped(SkipReason::QueryFailed))
-        ));
+        );
     }
 
     #[tokio::test]
@@ -837,10 +838,10 @@ mod tests {
         let targets = vec![target("pkg", "1.0.0")];
         let outcomes = client.scan(EcosystemId::Npm, &targets, TEST_TIMEOUT).await;
 
-        assert!(matches!(
+        assert_matches!(
             outcomes.get("pkg"),
             Some(ScanOutcome::Skipped(SkipReason::QueryFailed))
-        ));
+        );
     }
 
     #[tokio::test]
@@ -858,10 +859,10 @@ mod tests {
         let outcomes = client.scan(EcosystemId::Npm, &targets, TEST_TIMEOUT).await;
 
         for key in ["a", "b"] {
-            assert!(matches!(
+            assert_matches!(
                 outcomes.get(key),
                 Some(ScanOutcome::Skipped(SkipReason::QueryFailed))
-            ));
+            );
         }
     }
 
@@ -920,10 +921,10 @@ mod tests {
             .await;
 
         for key in ["a", "b"] {
-            assert!(matches!(
+            assert_matches!(
                 outcomes.get(key),
                 Some(ScanOutcome::Skipped(SkipReason::QueryFailed))
-            ));
+            );
         }
     }
 
@@ -1025,10 +1026,10 @@ mod tests {
         let targets = vec![target("linux", "5.10.1")];
         let outcomes = client.scan(EcosystemId::Go, &targets, TEST_TIMEOUT).await;
 
-        assert!(matches!(
+        assert_matches!(
             outcomes.get("linux"),
             Some(ScanOutcome::Skipped(SkipReason::Truncated))
-        ));
+        );
     }
 
     #[tokio::test]
@@ -1152,7 +1153,7 @@ mod tests {
             !matches!(outcome, ScanOutcome::Clean),
             "a truncated batch result must never render as clean"
         );
-        assert!(matches!(outcome, ScanOutcome::Vulnerable(_)));
+        assert_matches!(outcome, ScanOutcome::Vulnerable(_));
     }
 
     #[tokio::test]
@@ -1236,17 +1237,17 @@ mod tests {
             .check_candidates(EcosystemId::Npm, &candidates, TEST_TIMEOUT)
             .await;
 
-        assert!(matches!(
+        assert_matches!(
             statuses.get("clean-pkg"),
             Some(UpgradeStatus::CandidateClean { version }) if version == "2.0.0"
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             statuses.get("bad-pkg"),
             Some(UpgradeStatus::CandidateVulnerable { version, advisory_ids })
                 if version == "2.0.0"
                     && advisory_ids.items() == ["ADV-1".to_string()]
                     && advisory_ids.total() == 1
-        ));
+        );
     }
 
     #[tokio::test]
@@ -1274,10 +1275,10 @@ mod tests {
             .check_candidates(EcosystemId::Go, &[candidate], TEST_TIMEOUT)
             .await;
 
-        assert!(matches!(
+        assert_matches!(
             statuses.get("golang.org/x/text"),
             Some(UpgradeStatus::CandidateClean { version }) if version == "v0.4.0"
-        ));
+        );
     }
 
     #[test]

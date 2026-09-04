@@ -772,6 +772,7 @@ mod tests {
     use super::super::{MAX_MARKER_LEN, marker_too_deep};
     use super::*;
     use crate::error::PypiError;
+    use std::assert_matches;
     use tower_lsp_server::ls_types::{Position, Range};
 
     fn test_uri() -> Uri {
@@ -786,7 +787,7 @@ mod tests {
         let content = format!("a = {}1{}", "[".repeat(300), "]".repeat(300));
         let parser = PypiParser::new();
         let result = parser.parse_content(&content, &test_uri());
-        assert!(matches!(result, Err(PypiError::TomlParseError { .. })));
+        assert_matches!(result, Err(PypiError::TomlParseError { .. }));
     }
 
     #[test]
@@ -812,10 +813,7 @@ dependencies = [
                 .map(deps_core::VersionReq::as_str),
             Some(">=2.28.0")
         );
-        assert!(matches!(
-            deps[0].section,
-            PypiDependencySection::Dependencies
-        ));
+        assert_matches!(deps[0].section, PypiDependencySection::Dependencies);
 
         assert_eq!(deps[1].name, "flask");
         assert_eq!(deps[1].extras, vec!["async"]);
@@ -861,10 +859,7 @@ requests = "^2.28.0"
         // Should skip "python"
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].name, "requests");
-        assert!(matches!(
-            deps[0].section,
-            PypiDependencySection::PoetryDependencies
-        ));
+        assert_matches!(deps[0].section, PypiDependencySection::PoetryDependencies);
     }
 
     #[test]
@@ -1030,10 +1025,7 @@ flask = "^3.0"
         let result = parser.parse_content(content, &test_uri());
 
         assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            PypiError::TomlParseError { .. }
-        ));
+        assert_matches!(result.unwrap_err(), PypiError::TomlParseError { .. });
     }
 
     #[test]
@@ -1249,7 +1241,7 @@ dependencies = [
         let deps = &result.dependencies;
         assert_eq!(deps.len(), 2);
         assert_eq!(deps[0].name, "mylib");
-        assert!(matches!(deps[0].source, PypiDependencySource::Git { .. }));
+        assert_matches!(deps[0].source, PypiDependencySource::Git { .. });
         assert_eq!(deps[1].name, "django");
     }
 
@@ -2391,10 +2383,7 @@ requests = "^2.28.0"
             .iter()
             .find(|d| d.name == "requests")
             .unwrap();
-        assert!(matches!(
-            dep.source,
-            PypiDependencySource::AlternateRegistry { .. }
-        ));
+        assert_matches!(dep.source, PypiDependencySource::AlternateRegistry { .. });
     }
 
     /// Validator finding S3: two primary-priority Poetry sources must not silently pick an
@@ -2499,10 +2488,10 @@ requests = "^2.28.0"
         let result = parse_with_all_policy(content);
         // No primary declared, but a supplemental source exists -> case (b): still routes
         // through an AlternateRegistry chain (extras + implicit public), not plain Registry.
-        assert!(matches!(
+        assert_matches!(
             result.dependencies[0].source,
             PypiDependencySource::AlternateRegistry { .. }
-        ));
+        );
     }
 
     // --- T005: uv [tool.uv.index] + [tool.uv.sources] (FR-013) ---
@@ -2518,10 +2507,10 @@ url = "https://extra.example/simple"
 dependencies = ["requests>=2.28.0"]
 "#;
         let result = parse_with_all_policy(content);
-        assert!(matches!(
+        assert_matches!(
             result.dependencies[0].source,
             PypiDependencySource::AlternateRegistry { .. }
-        ));
+        );
     }
 
     /// FR-013's corrected mapping: `default = true` is uv's lowest-priority, last-resort
@@ -2549,10 +2538,10 @@ dependencies = ["requests>=2.28.0"]
         // Both entries route through the same case-(b)-shaped chain (AlternateRegistry, not
         // CustomRegistry) — proving `default = true` did not populate `primary` (which would
         // make an invalid primary fail closed instead, a structurally different source).
-        assert!(matches!(
+        assert_matches!(
             result.dependencies[0].source,
             PypiDependencySource::AlternateRegistry { .. }
-        ));
+        );
     }
 
     #[test]

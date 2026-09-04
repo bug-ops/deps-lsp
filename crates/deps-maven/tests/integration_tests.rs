@@ -1,6 +1,7 @@
 //! Integration tests using fixture files.
 
 use deps_maven::parse_pom_xml;
+use std::assert_matches;
 use tower_lsp_server::ls_types::Uri;
 
 fn fixture_uri(name: &str) -> Uri {
@@ -92,14 +93,11 @@ fn test_fixture_scoped_deps() {
         .map(|d| (d.artifact_id.clone(), &d.scope))
         .collect();
 
-    assert!(matches!(by_scope["commons-lang3"], MavenScope::Compile));
-    assert!(matches!(by_scope["junit"], MavenScope::Test));
-    assert!(matches!(by_scope["logback-classic"], MavenScope::Runtime));
-    assert!(matches!(
-        by_scope["javax.servlet-api"],
-        MavenScope::Provided
-    ));
-    assert!(matches!(by_scope["tools"], MavenScope::System));
+    assert_matches!(by_scope["commons-lang3"], MavenScope::Compile);
+    assert_matches!(by_scope["junit"], MavenScope::Test);
+    assert_matches!(by_scope["logback-classic"], MavenScope::Runtime);
+    assert_matches!(by_scope["javax.servlet-api"], MavenScope::Provided);
+    assert_matches!(by_scope["tools"], MavenScope::System);
 }
 
 #[test]

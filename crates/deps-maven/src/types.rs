@@ -148,6 +148,7 @@ impl deps_core::Metadata for ArtifactInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
     use tower_lsp_server::ls_types::Position;
 
     fn test_dep() -> MavenDependency {
@@ -165,40 +166,31 @@ mod tests {
     #[test]
     fn test_scope_variants() {
         use std::str::FromStr;
-        assert!(matches!(
-            "test".parse::<MavenScope>().unwrap(),
-            MavenScope::Test
-        ));
-        assert!(matches!(
+        assert_matches!("test".parse::<MavenScope>().unwrap(), MavenScope::Test);
+        assert_matches!(
             "runtime".parse::<MavenScope>().unwrap(),
             MavenScope::Runtime
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             "provided".parse::<MavenScope>().unwrap(),
             MavenScope::Provided
-        ));
-        assert!(matches!(
-            "system".parse::<MavenScope>().unwrap(),
-            MavenScope::System
-        ));
-        assert!(matches!(
-            "import".parse::<MavenScope>().unwrap(),
-            MavenScope::Import
-        ));
-        assert!(matches!(
+        );
+        assert_matches!("system".parse::<MavenScope>().unwrap(), MavenScope::System);
+        assert_matches!("import".parse::<MavenScope>().unwrap(), MavenScope::Import);
+        assert_matches!(
             "compile".parse::<MavenScope>().unwrap(),
             MavenScope::Compile
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             "unknown".parse::<MavenScope>().unwrap(),
             MavenScope::Compile
-        ));
+        );
         let _ = MavenScope::from_str; // ensure trait is accessible
     }
 
     #[test]
     fn test_scope_default() {
-        assert!(matches!(MavenScope::default(), MavenScope::Compile));
+        assert_matches!(MavenScope::default(), MavenScope::Compile);
     }
 
     #[test]
@@ -213,10 +205,7 @@ mod tests {
         );
         assert!(dep.features().is_empty());
         assert!(dep.as_any().is::<MavenDependency>());
-        assert!(matches!(
-            dep.source(),
-            deps_core::parser::DependencySource::Registry
-        ));
+        assert_matches!(dep.source(), deps_core::parser::DependencySource::Registry);
     }
 
     #[test]
@@ -226,10 +215,7 @@ mod tests {
         let dep = test_dep();
         assert_eq!(dep.name(), "org.apache.commons:commons-lang3");
         assert!(dep.version_range().is_some());
-        assert!(matches!(
-            dep.source(),
-            deps_core::parser::DependencySource::Registry
-        ));
+        assert_matches!(dep.source(), deps_core::parser::DependencySource::Registry);
     }
 
     #[test]

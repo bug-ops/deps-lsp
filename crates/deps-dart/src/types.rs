@@ -84,6 +84,7 @@ impl deps_core::Dependency for DartDependency {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
     use tower_lsp_server::ls_types::Position;
 
     fn test_dep(source: DependencySource) -> DartDependency {
@@ -100,35 +101,32 @@ mod tests {
 
     #[test]
     fn test_dependency_source_variants() {
-        assert!(matches!(
-            DependencySource::Registry,
-            DependencySource::Registry
-        ));
-        assert!(matches!(
+        assert_matches!(DependencySource::Registry, DependencySource::Registry);
+        assert_matches!(
             DependencySource::Git {
                 url: "u".into(),
                 rev: None
             },
             DependencySource::Git { .. }
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             DependencySource::Path { path: "p".into() },
             DependencySource::Path { .. }
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             DependencySource::Sdk {
                 sdk: "flutter".into()
             },
             DependencySource::Sdk { .. }
-        ));
+        );
     }
 
     #[test]
     fn test_dependency_section_default() {
-        assert!(matches!(
+        assert_matches!(
             DependencySection::default(),
             DependencySection::Dependencies
-        ));
+        );
     }
 
     #[test]
@@ -158,7 +156,7 @@ mod tests {
             sdk: "flutter".into(),
         });
         assert!(!dep.source().is_registry());
-        assert!(matches!(dep.source(), DependencySource::Sdk { sdk } if sdk == "flutter"));
+        assert_matches!(dep.source(), DependencySource::Sdk { sdk } if sdk == "flutter");
     }
 
     #[test]

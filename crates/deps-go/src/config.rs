@@ -935,6 +935,7 @@ fn resolve_at(
 mod tests {
     use super::*;
     use deps_core::net_policy::WorkspaceRegistryAccess;
+    use std::assert_matches;
 
     fn all_policy() -> RegistryAccessPolicy {
         RegistryAccessPolicy::new(WorkspaceRegistryAccess::All)
@@ -953,45 +954,45 @@ mod tests {
 
     #[test]
     fn test_proxy_url_rejects_http() {
-        assert!(matches!(
+        assert_matches!(
             GoProxyUrl::new("http://goproxy.mycorp.example", &all_policy()),
             Err(GoProxyUrlError::NotHttps(_))
-        ));
+        );
     }
 
     #[test]
     fn test_proxy_url_rejects_userinfo() {
-        assert!(matches!(
+        assert_matches!(
             GoProxyUrl::new("https://user:pass@goproxy.mycorp.example", &all_policy()),
             Err(GoProxyUrlError::UserInfoPresent)
-        ));
+        );
     }
 
     #[test]
     fn test_proxy_url_rejects_invalid() {
-        assert!(matches!(
+        assert_matches!(
             GoProxyUrl::new("not-a-valid-url", &all_policy()),
             Err(GoProxyUrlError::InvalidUrl(_))
-        ));
+        );
     }
 
     /// F3: a query string breaks the `{base}/{module}/@v/...` path-join convention every
     /// request URL builder relies on — rejected rather than silently mis-joined.
     #[test]
     fn test_proxy_url_rejects_query_string() {
-        assert!(matches!(
+        assert_matches!(
             GoProxyUrl::new("https://goproxy.mycorp.example/?tok=abc", &all_policy()),
             Err(GoProxyUrlError::InvalidUrl(_))
-        ));
+        );
     }
 
     /// F3: a fragment is rejected for the same path-join reason as a query string.
     #[test]
     fn test_proxy_url_rejects_fragment() {
-        assert!(matches!(
+        assert_matches!(
             GoProxyUrl::new("https://goproxy.mycorp.example/#frag", &all_policy()),
             Err(GoProxyUrlError::InvalidUrl(_))
-        ));
+        );
     }
 
     #[test]
@@ -1344,8 +1345,8 @@ mod tests {
         let chain = config.goproxy_chain().unwrap();
         assert_eq!(chain.key, index);
         assert_eq!(chain.hops.len(), 2);
-        assert!(matches!(chain.hops[0], GoProxyHop::Url(_)));
-        assert!(matches!(chain.hops[1], GoProxyHop::Direct));
+        assert_matches!(chain.hops[0], GoProxyHop::Url(_));
+        assert_matches!(chain.hops[1], GoProxyHop::Direct);
     }
 
     /// US-004: `GOPROXY=off` as sole entry.
@@ -1379,17 +1380,17 @@ mod tests {
         );
         let chain = config.goproxy_chain().unwrap();
         assert_eq!(chain.hops.len(), 1);
-        assert!(matches!(chain.hops[0], GoProxyHop::Url(_)));
+        assert_matches!(chain.hops[0], GoProxyHop::Url(_));
     }
 
     /// FR-011: a policy-blocked hop is treated the same as an invalid one.
     #[test]
     fn test_goproxy_policy_blocked_hop_fails_closed() {
         let config = GoEnvConfig::parse("GOPROXY=https://goproxy.mycorp.example", &off_policy());
-        assert!(matches!(
+        assert_matches!(
             config.resolve_source_for("github.com/gin-gonic/gin"),
             DependencySource::CustomRegistry { .. }
-        ));
+        );
     }
 
     /// FR-002: everything declared after a terminal `direct`/`off` hop is unreachable and
@@ -1402,7 +1403,7 @@ mod tests {
         );
         let chain = config.goproxy_chain().unwrap();
         assert_eq!(chain.hops.len(), 2);
-        assert!(matches!(chain.hops[1], GoProxyHop::Direct));
+        assert_matches!(chain.hops[1], GoProxyHop::Direct);
     }
 
     /// FR-002: pipe-separated entries parse the same as comma-separated ones.
@@ -1462,10 +1463,7 @@ mod tests {
         );
 
         let public_source = config.resolve_source_for("github.com/gin-gonic/gin");
-        assert!(matches!(
-            public_source,
-            DependencySource::AlternateRegistry { .. }
-        ));
+        assert_matches!(public_source, DependencySource::AlternateRegistry { .. });
         assert_ne!(private_source, public_source);
         assert!(config.has_goprivate());
     }
@@ -1541,7 +1539,7 @@ mod tests {
         );
         let chain = config.goproxy_chain().unwrap();
         assert_eq!(chain.hops.len(), 3);
-        assert!(matches!(chain.hops[2], GoProxyHop::Direct));
+        assert_matches!(chain.hops[2], GoProxyHop::Direct);
         assert_eq!(
             chain.separators,
             vec![ChainSeparator::AnyError, ChainSeparator::NotFoundOnly]

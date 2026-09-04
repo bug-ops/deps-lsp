@@ -168,6 +168,7 @@ impl LockFileProvider for SwiftLockParser {
 mod tests {
     use super::*;
     use deps_core::lockfile::LockFileProvider;
+    use std::assert_matches;
 
     #[tokio::test]
     async fn test_parse_v1() {
@@ -273,7 +274,7 @@ mod tests {
         let resolved = parser.parse_lockfile(&path).await.unwrap();
         assert_eq!(resolved.len(), 1);
         let pkg = resolved.get("local-pkg").unwrap();
-        assert!(matches!(pkg.source, ResolvedSource::Path { .. }));
+        assert_matches!(pkg.source, ResolvedSource::Path { .. });
     }
 
     #[tokio::test]

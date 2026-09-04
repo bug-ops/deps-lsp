@@ -16,6 +16,7 @@ use tower_lsp_server::ls_types::{Position, Range, Uri};
 
 pub use deps_core::lsp_helpers::LineOffsetTable;
 
+#[derive(Debug)]
 pub struct GradleParseResult {
     pub dependencies: Vec<GradleDependency>,
     pub uri: Uri,
@@ -39,7 +40,7 @@ pub fn resolve_variables(deps: &mut [GradleDependency], properties: &HashMap<Str
 /// Returns the resolved value if `value` is a `$name` or `${name}` reference. Returns `None` otherwise.
 fn resolve_variable_ref(value: &str, properties: &HashMap<String, String>) -> Option<String> {
     let trimmed = value.trim();
-    if let Some(name) = trimmed.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
+    if let Some(name) = trimmed.strip_circumfix("${", '}') {
         properties.get(name).cloned()
     } else if let Some(name) = trimmed.strip_prefix('$') {
         properties.get(name).cloned()

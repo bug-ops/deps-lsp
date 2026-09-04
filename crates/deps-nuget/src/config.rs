@@ -1909,6 +1909,7 @@ fn expand_env_vars_with(
 mod tests {
     use super::*;
     use deps_core::net_policy::WorkspaceRegistryAccess;
+    use std::assert_matches;
 
     fn all_policy() -> RegistryAccessPolicy {
         RegistryAccessPolicy::new(WorkspaceRegistryAccess::All)
@@ -1933,10 +1934,10 @@ mod tests {
     #[test]
     fn test_feed_url_rejects_userinfo() {
         let policy = all_policy();
-        assert!(matches!(
+        assert_matches!(
             NuGetFeedUrl::new("https://user:pass@feed.example/v3/index.json", &policy),
             Err(NuGetFeedUrlError::UserInfoPresent)
-        ));
+        );
     }
 
     #[test]
@@ -2048,7 +2049,7 @@ mod tests {
         let config = resolve(dir.path(), &cache, &policy);
 
         let source = config.resolve_source_for(&pkg("Any.Package"));
-        assert!(matches!(source, DependencySource::AlternateRegistry { .. }));
+        assert_matches!(source, DependencySource::AlternateRegistry { .. });
         let chains = config.resolved_chains();
         assert_eq!(chains.len(), 1);
         assert_eq!(chains[0].hops.len(), 1);
@@ -2335,10 +2336,10 @@ mod tests {
         let policy = all_policy();
         let config = resolve(dir.path(), &cache, &policy);
 
-        assert!(matches!(
+        assert_matches!(
             config.resolve_source_for(&pkg("Newtonsoft.Json")),
             DependencySource::AlternateRegistry { .. }
-        ));
+        );
     }
 
     /// R1 counterexample from the critic review: a root mapping `{CorpFeed: MyCompany.*,
@@ -2634,10 +2635,10 @@ mod tests {
             DependencySource::Registry
         );
         // The private pattern must still route to CorpFeed, unaffected.
-        assert!(matches!(
+        assert_matches!(
             config.resolve_source_for(&pkg("MyCompany.Internal")),
             DependencySource::AlternateRegistry { .. }
-        ));
+        );
     }
 
     #[test]
@@ -2757,10 +2758,10 @@ mod tests {
         let config = resolve(dir.path(), &cache, &policy);
 
         assert!(config.resolved_chains().is_empty());
-        assert!(matches!(
+        assert_matches!(
             config.resolve_source_for(&pkg("Any.Package")),
             DependencySource::CustomRegistry { .. }
-        ));
+        );
     }
 
     // --- M2: plain-chain path treats a public-only hop like the mapping path does ---
@@ -3060,7 +3061,7 @@ mod tests {
         assert_eq!(set.unwrap().as_str(), "secret-pat");
 
         let unset = expand_env_vars_with("%CORP_FEED_PAT%", |_| None);
-        assert!(matches!(unset, Err(NuGetFeedUrlError::HasCredentials)));
+        assert_matches!(unset, Err(NuGetFeedUrlError::HasCredentials));
     }
 
     /// Regression coverage for the `&str`-slice rewrite of `expand_env_vars_with` (it no
@@ -3098,10 +3099,10 @@ mod tests {
             "abc%A"
         );
         assert_eq!(expand_env_vars_with("%%", lookup).unwrap().as_str(), "%%");
-        assert!(matches!(
+        assert_matches!(
             expand_env_vars_with("pre-%UNSET%-post", lookup),
             Err(NuGetFeedUrlError::HasCredentials)
-        ));
+        );
     }
 
     /// SC-002 end-to-end: the same expansion wired through `resolve`'s credential-binding
@@ -3116,10 +3117,10 @@ mod tests {
             password: None,
             encrypted: false,
         };
-        assert!(matches!(
+        assert_matches!(
             expand_credential(&credential),
             Err(NuGetFeedUrlError::HasCredentials)
-        ));
+        );
     }
 
     /// SC-002/NFR-001: `Debug`/`Display` on the credential-holding types never leak the
@@ -3189,10 +3190,10 @@ mod tests {
             password: None,
             encrypted: true,
         };
-        assert!(matches!(
+        assert_matches!(
             expand_credential(&credential),
             Err(NuGetFeedUrlError::EncryptedPasswordUnsupported)
-        ));
+        );
     }
 
     /// FR-004/SC-010: repo-tier `<packageSourceCredentials>` fails closed unconditionally,
@@ -3609,10 +3610,10 @@ mod tests {
         assert!(flag_off.resolved_chains().is_empty());
 
         let flag_on = resolve_ctx(&repo, &cache, &policy, Some(&user_profile), true);
-        assert!(matches!(
+        assert_matches!(
             flag_on.resolve_source_for(&pkg("Any.Package")),
             DependencySource::AlternateRegistry { .. }
-        ));
+        );
     }
 
     /// FR-009: the non-transitive key-aliasing counterexample from the critic review —

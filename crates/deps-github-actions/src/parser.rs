@@ -616,6 +616,7 @@ pub fn parse_workflow_yaml(content: &str, uri: &Uri) -> Result<GithubActionsPars
 mod tests {
     use super::*;
     use deps_core::Dependency;
+    use std::assert_matches;
 
     fn test_uri() -> Uri {
         deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml")
@@ -838,7 +839,7 @@ mod tests {
         let dep = &result.dependencies[0];
         assert!(dep.version_range().is_none());
         assert!(dep.version_requirement().is_none());
-        assert!(matches!(dep.source(), DependencySource::Path { .. }));
+        assert_matches!(dep.source(), DependencySource::Path { .. });
     }
 
     #[test]
@@ -847,7 +848,7 @@ mod tests {
         let result = parse_workflow_yaml(content, &test_uri()).unwrap();
         let dep = &result.dependencies[0];
         assert!(dep.version_range().is_none());
-        assert!(matches!(dep.source(), DependencySource::Url { .. }));
+        assert_matches!(dep.source(), DependencySource::Url { .. });
     }
 
     #[test]
@@ -870,7 +871,7 @@ mod tests {
             dep.version_requirement().map(deps_core::VersionReq::as_str),
             Some("v3")
         );
-        assert!(matches!(dep.source(), DependencySource::Registry));
+        assert_matches!(dep.source(), DependencySource::Registry);
         // Critic S1 regression: `version_range` must span the ref (`v3`), not a
         // substring of the truncated subpath (`in`, from `codeql-action/**in**it@v3`)
         // — the bug the range assertion here is specifically for.
@@ -901,7 +902,7 @@ mod tests {
         assert_eq!(dep.name(), "octo-org/repo");
         assert!(dep.version_range().is_none());
         assert!(dep.version_requirement().is_none());
-        assert!(matches!(dep.source(), DependencySource::Url { .. }));
+        assert_matches!(dep.source(), DependencySource::Url { .. });
     }
 
     #[test]
@@ -1060,7 +1061,7 @@ mod tests {
         // `deps_core::parser`'s own gate tests.
         let payload = format!("{}1", "- ".repeat(deps_core::MAX_YAML_NESTING_DEPTH + 1));
         let result = parse_workflow_yaml(&payload, &test_uri());
-        assert!(matches!(result, Err(DepsError::ParseError { .. })));
+        assert_matches!(result, Err(DepsError::ParseError { .. }));
     }
 
     // --- classify_uses_value / ref classification unit coverage ---

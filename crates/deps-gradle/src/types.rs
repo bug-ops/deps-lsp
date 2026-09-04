@@ -51,6 +51,7 @@ impl deps_core::Dependency for GradleDependency {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
     use tower_lsp_server::ls_types::Position;
 
     fn test_dep() -> GradleDependency {
@@ -77,10 +78,7 @@ mod tests {
         );
         assert!(dep.features().is_empty());
         assert!(dep.as_any().is::<GradleDependency>());
-        assert!(matches!(
-            dep.source(),
-            deps_core::parser::DependencySource::Registry
-        ));
+        assert_matches!(dep.source(), deps_core::parser::DependencySource::Registry);
     }
 
     #[test]
@@ -90,10 +88,7 @@ mod tests {
         let dep = test_dep();
         assert_eq!(dep.name(), "org.springframework.boot:spring-boot-starter");
         assert!(dep.version_range().is_some());
-        assert!(matches!(
-            dep.source(),
-            deps_core::parser::DependencySource::Registry
-        ));
+        assert_matches!(dep.source(), deps_core::parser::DependencySource::Registry);
     }
 
     #[test]

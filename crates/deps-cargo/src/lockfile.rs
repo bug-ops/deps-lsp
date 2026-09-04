@@ -229,6 +229,8 @@ fn parse_cargo_dependencies_from_table(table: &toml_span::value::Table<'_>) -> V
 mod tests {
     use super::*;
 
+    use std::assert_matches;
+
     #[test]
     fn test_parse_cargo_source_registry() {
         let source = parse_cargo_source(Some(
@@ -294,10 +296,10 @@ mod tests {
 
         let parser = CargoLockParser;
         let result = parser.parse_lockfile(&lockfile_path).await;
-        assert!(matches!(
+        assert_matches!(
             result,
             Err(DepsError::ParseError { file_type, .. }) if file_type == "Cargo.lock"
-        ));
+        );
     }
 
     #[tokio::test]
@@ -322,10 +324,10 @@ mod tests {
 
         let parser = CargoLockParser;
         let result = parser.parse_lockfile(&lockfile_path).await;
-        assert!(matches!(
+        assert_matches!(
             result,
             Err(DepsError::ParseError { file_type, .. }) if file_type == "Cargo.lock"
-        ));
+        );
     }
 
     #[tokio::test]
@@ -348,10 +350,10 @@ mod tests {
 
         let parser = CargoLockParser;
         let result = parser.parse_lockfile(&lockfile_path).await;
-        assert!(matches!(
+        assert_matches!(
             result,
             Err(DepsError::ParseError { file_type, .. }) if file_type == "Cargo.lock"
-        ));
+        );
     }
 
     #[tokio::test]

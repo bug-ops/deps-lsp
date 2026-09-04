@@ -509,6 +509,7 @@ pub fn parse_package_swift(content: &str, uri: &Uri) -> Result<SwiftParseResult>
 mod tests {
     use super::*;
     use deps_core::Dependency;
+    use std::assert_matches;
 
     fn test_uri() -> Uri {
         deps_core::test_util::test_uri("/test/Package.swift")
@@ -633,7 +634,7 @@ let package = Package(
         assert_eq!(result.dependencies.len(), 1);
         let dep = &result.dependencies[0];
         assert_eq!(dep.version_requirement(), None);
-        assert!(matches!(dep.source(), DependencySource::Git { .. }));
+        assert_matches!(dep.source(), DependencySource::Git { .. });
     }
 
     #[test]
@@ -641,10 +642,10 @@ let package = Package(
         let content = r#".package(url: "https://github.com/dev/debug", .revision("abc123"))"#;
         let result = parse_package_swift(content, &test_uri()).unwrap();
         assert_eq!(result.dependencies.len(), 1);
-        assert!(matches!(
+        assert_matches!(
             result.dependencies[0].source(),
             DependencySource::Git { .. }
-        ));
+        );
     }
 
     #[test]
@@ -652,10 +653,10 @@ let package = Package(
         let content = r#".package(path: "../LocalPackage")"#;
         let result = parse_package_swift(content, &test_uri()).unwrap();
         assert_eq!(result.dependencies.len(), 1);
-        assert!(matches!(
+        assert_matches!(
             result.dependencies[0].source(),
             DependencySource::Path { .. }
-        ));
+        );
         assert_eq!(result.dependencies[0].name(), "LocalPackage");
     }
 

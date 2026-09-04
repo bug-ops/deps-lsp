@@ -1822,6 +1822,8 @@ impl Default for HttpCache {
 mod tests {
     use super::*;
 
+    use std::assert_matches;
+
     // Guards the non-loopback path of `ensure_https`: every other test in this
     // module reaches it only through loopback `mockito` URLs, so without this
     // test the "reject any other HTTP host" branch would never run.
@@ -1891,10 +1893,10 @@ mod tests {
     #[test]
     fn test_validate_resolved_addrs_blocks_cloud_metadata() {
         let addrs = vec!["169.254.169.254:0".parse().unwrap()];
-        assert!(matches!(
+        assert_matches!(
             validate_resolved_addrs("evil.example", addrs, AddrGuard::Baseline),
             Err(ResolveGuardError::Blocked { .. })
-        ));
+        );
     }
 
     // FR-003: an attacker's public A record alongside a blocked one must not keep the probe
@@ -1905,10 +1907,10 @@ mod tests {
             "1.1.1.1:0".parse().unwrap(),
             "169.254.169.254:0".parse().unwrap(),
         ];
-        assert!(matches!(
+        assert_matches!(
             validate_resolved_addrs("evil.example", addrs, AddrGuard::Baseline),
             Err(ResolveGuardError::Blocked { .. })
-        ));
+        );
     }
 
     #[test]
@@ -1924,19 +1926,19 @@ mod tests {
     // resolved" as "nothing to block".
     #[test]
     fn test_validate_resolved_addrs_fails_closed_on_empty() {
-        assert!(matches!(
+        assert_matches!(
             validate_resolved_addrs("evil.example", vec![], AddrGuard::Baseline),
             Err(ResolveGuardError::NoAddresses { .. })
-        ));
+        );
     }
 
     #[test]
     fn test_validate_resolved_addrs_unwraps_mapped_v4() {
         let addrs = vec!["[::ffff:169.254.169.254]:0".parse().unwrap()];
-        assert!(matches!(
+        assert_matches!(
             validate_resolved_addrs("evil.example", addrs, AddrGuard::Baseline),
             Err(ResolveGuardError::Blocked { .. })
-        ));
+        );
     }
 
     // Issue #455, test-plan item 1: under `Baseline`, an RFC1918/CGNAT/unique-local address is
@@ -1985,10 +1987,10 @@ mod tests {
     fn test_validate_resolved_addrs_workspace_off_rejects_global() {
         let guard = AddrGuard::WorkspaceDeclared(WorkspaceRegistryAccess::Off);
         let addrs = vec!["1.1.1.1:0".parse().unwrap()];
-        assert!(matches!(
+        assert_matches!(
             validate_resolved_addrs("index.crates.io", addrs, guard),
             Err(ResolveGuardError::Blocked { .. })
-        ));
+        );
     }
 
     // Test-plan item 3: `build_guarded_client_with_lookup` shares `build_client_inner` with the
@@ -3359,7 +3361,7 @@ mod tests {
 
         let body = serde_json::json!({ "queries": [] });
         let result: Result<Bytes> = cache.post_json(&url, &body).await;
-        assert!(matches!(result, Err(DepsError::Offline { .. })));
+        assert_matches!(result, Err(DepsError::Offline { .. }));
         mock.assert_async().await;
     }
 
@@ -3378,7 +3380,7 @@ mod tests {
         cache.set_offline(true);
 
         let result: Result<Bytes> = cache.get_transport_only(&url).await;
-        assert!(matches!(result, Err(DepsError::Offline { .. })));
+        assert_matches!(result, Err(DepsError::Offline { .. }));
         mock.assert_async().await;
     }
 
@@ -3458,7 +3460,7 @@ mod tests {
         cache.set_offline(true);
 
         let result: Result<Bytes> = cache.get_cached(&url).await;
-        assert!(matches!(result, Err(DepsError::Offline { .. })));
+        assert_matches!(result, Err(DepsError::Offline { .. }));
         mock.assert_async().await;
     }
 

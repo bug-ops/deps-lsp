@@ -150,6 +150,7 @@ mod tests {
     use super::*;
     use deps_core::ecosystem::Dependency;
     use deps_core::registry::{Metadata, Version};
+    use std::assert_matches;
     use tower_lsp_server::ls_types::Position;
 
     #[test]
@@ -169,7 +170,7 @@ mod tests {
             dep.version_requirement().map(deps_core::VersionReq::as_str),
             Some("v1.9.1")
         );
-        assert!(matches!(dep.source(), DependencySource::Registry));
+        assert_matches!(dep.source(), DependencySource::Registry);
         assert_eq!(dep.features().len(), 0);
     }
 

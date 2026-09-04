@@ -923,6 +923,7 @@ pub async fn complete_versions_generic(
 mod tests {
     use super::*;
     use std::any::Any;
+    use std::assert_matches;
 
     fn pkg(s: &str) -> PackageName {
         PackageName::new(s)
@@ -1765,10 +1766,7 @@ mod tests {
         assert_eq!(item.label, "serde");
         assert_eq!(item.kind, Some(CompletionItemKind::MODULE));
         assert_eq!(item.detail, Some("v1.0.214".to_string()));
-        assert!(matches!(
-            item.documentation,
-            Some(Documentation::MarkupContent(_))
-        ));
+        assert_matches!(item.documentation, Some(Documentation::MarkupContent(_)));
 
         if let Some(Documentation::MarkupContent(content)) = item.documentation {
             assert!(content.value.contains("**serde** v1\\.0\\.214"));

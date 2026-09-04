@@ -615,6 +615,8 @@ pub fn validate_index_url(
 mod tests {
     use super::*;
 
+    use std::assert_matches;
+
     fn host_class(url: &str) -> HostClass {
         classify_host(&url::Url::parse(url).unwrap())
     }
@@ -876,7 +878,7 @@ mod tests {
             )
             .is_ok()
         );
-        assert!(matches!(
+        assert_matches!(
             validate_index_url(
                 "https://169.254.169.254/",
                 "https://169.254.169.254/",
@@ -884,7 +886,7 @@ mod tests {
                 PolicyGate::Enforce(&policy)
             ),
             Err(IndexUrlError::BlockedHost { .. })
-        ));
+        );
     }
 
     #[test]

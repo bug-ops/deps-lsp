@@ -323,6 +323,8 @@ fn parse_pypi_dependencies(table: &Table<'_>) -> Vec<String> {
 mod tests {
     use super::*;
 
+    use std::assert_matches;
+
     #[tokio::test]
     async fn test_parse_lockfile_rejects_excessive_nesting() {
         // Well past MAX_TOML_NESTING_DEPTH (64) but far below the depth
@@ -336,10 +338,10 @@ mod tests {
 
         let parser = PypiLockParser;
         let result = parser.parse_lockfile(&lockfile_path).await;
-        assert!(matches!(
+        assert_matches!(
             result,
             Err(DepsError::ParseError { file_type, .. }) if file_type == "Python lock file"
-        ));
+        );
     }
 
     #[tokio::test]

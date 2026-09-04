@@ -1130,6 +1130,7 @@ mod tests {
     use super::*;
 
     use deps_core::test_util::{capture_tracing_output, capture_tracing_output_async};
+    use std::assert_matches;
 
     #[test]
     fn test_package_url() {
@@ -1735,11 +1736,11 @@ mod tests {
             status: 404,
         };
         let result = not_found_or(err, "flask");
-        assert!(matches!(
+        assert_matches!(
             result,
             DepsError::PackageNotFound { package, registry }
                 if package == "flask" && registry == REGISTRY
-        ));
+        );
     }
 
     #[test]
@@ -1753,7 +1754,7 @@ mod tests {
             status: 500,
         };
         let result = not_found_or(err, "pytest-404");
-        assert!(matches!(result, DepsError::HttpStatus { status: 500, .. }));
+        assert_matches!(result, DepsError::HttpStatus { status: 500, .. });
     }
 
     #[test]
@@ -1787,11 +1788,11 @@ mod tests {
         let cache = std::sync::Arc::new(deps_core::HttpCache::new());
         let registry = PypiRegistry::new(cache);
         let err = registry.get_versions("---").await.unwrap_err();
-        assert!(matches!(
+        assert_matches!(
             err,
             DepsError::PackageNotFound { package, registry }
                 if package == "---" && registry == REGISTRY
-        ));
+        );
     }
 
     #[tokio::test]
@@ -1799,7 +1800,7 @@ mod tests {
         let cache = std::sync::Arc::new(deps_core::HttpCache::new());
         let registry = PypiRegistry::new(cache);
         let err = registry.get_package_metadata("...").await.unwrap_err();
-        assert!(matches!(err, DepsError::PackageNotFound { .. }));
+        assert_matches!(err, DepsError::PackageNotFound { .. });
     }
 
     #[tokio::test]
@@ -2722,7 +2723,7 @@ mod tests {
             deps_core::FreshnessSettings::default(),
         )
         .await;
-        assert!(matches!(result, Err(DepsError::PackageNotFound { .. })));
+        assert_matches!(result.err(), Some(DepsError::PackageNotFound { .. }));
 
         let result = deps_core::Registry::get_latest_matching_from(
             &registry,
@@ -2732,7 +2733,7 @@ mod tests {
             None,
         )
         .await;
-        assert!(matches!(result, Err(DepsError::PackageNotFound { .. })));
+        assert_matches!(result.err(), Some(DepsError::PackageNotFound { .. }));
     }
 
     // --- T008: tier guard on search/warm_search_index/get_package_metadata ---
@@ -2789,7 +2790,7 @@ mod tests {
         let client = PypiRegistry::with_base(Arc::clone(&cache), &base, Vec::new());
 
         let err = client.get_package_metadata("flask").await.unwrap_err();
-        assert!(matches!(err, DepsError::PackageNotFound { .. }));
+        assert_matches!(err, DepsError::PackageNotFound { .. });
         mock.assert_async().await;
     }
 }

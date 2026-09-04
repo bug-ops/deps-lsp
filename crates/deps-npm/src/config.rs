@@ -530,6 +530,7 @@ fn resolve_with_home(
 mod tests {
     use super::*;
     use deps_core::net_policy::WorkspaceRegistryAccess;
+    use std::assert_matches;
     use std::time::SystemTime;
 
     fn public_only_policy() -> RegistryAccessPolicy {
@@ -559,10 +560,10 @@ mod tests {
     #[test]
     fn test_npm_registry_index_rejects_http_non_loopback() {
         let policy = all_policy();
-        assert!(matches!(
+        assert_matches!(
             NpmRegistryIndex::new("http://registry.example.com", &policy),
             Err(NpmRegistryIndexError::NotHttps(_))
-        ));
+        );
     }
 
     /// N-C1: even under the `cfg(test)`/`test-util` carve-out, a *non-loopback* `http` host
@@ -570,10 +571,10 @@ mod tests {
     #[test]
     fn test_npm_registry_index_rejects_http_near_miss_loopback() {
         let policy = all_policy();
-        assert!(matches!(
+        assert_matches!(
             NpmRegistryIndex::new("http://localhost.evil.com", &policy),
             Err(NpmRegistryIndexError::NotHttps(_))
-        ));
+        );
     }
 
     #[test]
@@ -586,19 +587,19 @@ mod tests {
     #[test]
     fn test_npm_registry_index_rejects_userinfo() {
         let policy = all_policy();
-        assert!(matches!(
+        assert_matches!(
             NpmRegistryIndex::new("https://user:pass@npm.example", &policy),
             Err(NpmRegistryIndexError::UserInfoPresent)
-        ));
+        );
     }
 
     #[test]
     fn test_npm_registry_index_rejects_invalid_url() {
         let policy = all_policy();
-        assert!(matches!(
+        assert_matches!(
             NpmRegistryIndex::new("not-a-valid-url", &policy),
             Err(NpmRegistryIndexError::InvalidUrl(_))
-        ));
+        );
     }
 
     /// S5: `https://x/` and `https://x` normalize to one index, and neither carries a
@@ -618,14 +619,14 @@ mod tests {
     #[test]
     fn test_npm_registry_index_policy_matrix() {
         assert!(NpmRegistryIndex::new("https://127.0.0.1:4873", &all_policy()).is_ok());
-        assert!(matches!(
+        assert_matches!(
             NpmRegistryIndex::new("https://127.0.0.1:4873", &public_only_policy()),
             Err(NpmRegistryIndexError::BlockedHost { .. })
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             NpmRegistryIndex::new("https://127.0.0.1:4873", &off_policy()),
             Err(NpmRegistryIndexError::BlockedHost { .. })
-        ));
+        );
     }
 
     #[test]
@@ -750,13 +751,13 @@ mod tests {
     fn test_resolve_entry_undefined_var_is_invalid() {
         let policy = all_policy();
         let result = resolve_entry("${UNDEFINED_VAR}", &policy);
-        assert!(matches!(
+        assert_matches!(
             result,
             Err(InvalidEntry {
                 reason: NpmRegistryIndexError::UndefinedEnvVar(_),
                 ..
             })
-        ));
+        );
         assert_eq!(result.unwrap_err().raw, "${UNDEFINED_VAR}");
     }
 
@@ -782,7 +783,7 @@ mod tests {
         let log = deps_core::test_util::capture_tracing_output(|| {
             let err = NpmRegistryIndex::new_for_log(expanded_secret, raw_placeholder, &policy)
                 .unwrap_err();
-            assert!(matches!(err, NpmRegistryIndexError::BlockedHost { .. }));
+            assert_matches!(err, NpmRegistryIndexError::BlockedHost { .. });
         });
 
         assert!(
@@ -819,10 +820,7 @@ mod tests {
         let policy = all_policy();
         let log = deps_core::test_util::capture_tracing_output(|| {
             let invalid = resolve_entry("https://user:hunter2@npm.example/", &policy).unwrap_err();
-            assert!(matches!(
-                invalid.reason,
-                NpmRegistryIndexError::UserInfoPresent
-            ));
+            assert_matches!(invalid.reason, NpmRegistryIndexError::UserInfoPresent);
             assert!(
                 !invalid.raw.contains("hunter2"),
                 "InvalidEntry::raw leaked the credential: {}",
@@ -855,10 +853,7 @@ mod tests {
         let log = deps_core::test_util::capture_tracing_output(|| {
             let invalid =
                 resolve_entry("https://user:hunter2@npm.example:99999/", &policy).unwrap_err();
-            assert!(matches!(
-                invalid.reason,
-                NpmRegistryIndexError::InvalidUrl(_)
-            ));
+            assert_matches!(invalid.reason, NpmRegistryIndexError::InvalidUrl(_));
             assert!(
                 !invalid.raw.contains("hunter2"),
                 "InvalidEntry::raw leaked the credential: {}",

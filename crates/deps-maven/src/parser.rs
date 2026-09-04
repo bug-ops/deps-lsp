@@ -12,6 +12,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use tower_lsp_server::ls_types::{Range, Uri};
 
+#[derive(Debug)]
 pub struct MavenParseResult {
     pub dependencies: Vec<MavenDependency>,
     pub properties: HashMap<String, String>,
@@ -330,6 +331,8 @@ impl deps_core::ParseResult for MavenParseResult {
 mod tests {
     use super::*;
 
+    use std::assert_matches;
+
     fn test_uri() -> Uri {
         #[cfg(windows)]
         let path = "C:/test/pom.xml";
@@ -358,7 +361,7 @@ mod tests {
         assert_eq!(dep.artifact_id, "commons-lang3");
         assert_eq!(dep.name, "org.apache.commons:commons-lang3");
         assert_eq!(dep.version_req, Some("3.14.0".into()));
-        assert!(matches!(dep.scope, MavenScope::Compile));
+        assert_matches!(dep.scope, MavenScope::Compile);
     }
 
     #[test]
@@ -383,7 +386,7 @@ mod tests {
         assert_eq!(result.dependencies.len(), 2);
         assert_eq!(result.dependencies[0].name, "com.google.guava:guava");
         assert_eq!(result.dependencies[1].name, "junit:junit");
-        assert!(matches!(result.dependencies[1].scope, MavenScope::Test));
+        assert_matches!(result.dependencies[1].scope, MavenScope::Test);
     }
 
     #[test]
@@ -408,7 +411,7 @@ mod tests {
             result.dependencies[0].name,
             "org.springframework.boot:spring-boot-dependencies"
         );
-        assert!(matches!(result.dependencies[0].scope, MavenScope::Import));
+        assert_matches!(result.dependencies[0].scope, MavenScope::Import);
     }
 
     #[test]
@@ -451,8 +454,8 @@ mod tests {
 </project>";
 
         let result = parse_pom_xml(xml, &test_uri()).unwrap();
-        assert!(matches!(result.dependencies[0].scope, MavenScope::Runtime));
-        assert!(matches!(result.dependencies[1].scope, MavenScope::Provided));
+        assert_matches!(result.dependencies[0].scope, MavenScope::Runtime);
+        assert_matches!(result.dependencies[1].scope, MavenScope::Provided);
     }
 
     #[test]
@@ -567,10 +570,10 @@ mod tests {
         // Malformed attribute triggers a hard error
         let xml2 = r#"<project attr="unclosed></project>"#;
         let result2 = parse_pom_xml(xml2, &test_uri());
-        assert!(matches!(
+        assert_matches!(
             result2,
             Err(DepsError::ParseError { file_type, .. }) if file_type == "pom.xml"
-        ));
+        );
     }
 
     #[test]

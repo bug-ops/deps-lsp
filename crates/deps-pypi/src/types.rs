@@ -311,6 +311,7 @@ impl deps_core::Metadata for PypiPackage {
 mod tests {
     use super::*;
     use deps_core::{Metadata, Version};
+    use std::assert_matches;
     use tower_lsp_server::ls_types::Position;
 
     #[test]
@@ -370,23 +371,11 @@ mod tests {
             group: "test".into(),
         };
 
-        assert!(matches!(deps, PypiDependencySection::Dependencies));
-        assert!(matches!(
-            opt_deps,
-            PypiDependencySection::OptionalDependencies { .. }
-        ));
-        assert!(matches!(
-            dep_group,
-            PypiDependencySection::DependencyGroup { .. }
-        ));
-        assert!(matches!(
-            poetry_deps,
-            PypiDependencySection::PoetryDependencies
-        ));
-        assert!(matches!(
-            poetry_group,
-            PypiDependencySection::PoetryGroup { .. }
-        ));
+        assert_matches!(deps, PypiDependencySection::Dependencies);
+        assert_matches!(opt_deps, PypiDependencySection::OptionalDependencies { .. });
+        assert_matches!(dep_group, PypiDependencySection::DependencyGroup { .. });
+        assert_matches!(poetry_deps, PypiDependencySection::PoetryDependencies);
+        assert_matches!(poetry_group, PypiDependencySection::PoetryGroup { .. });
     }
 
     #[test]
@@ -404,8 +393,8 @@ mod tests {
         };
 
         assert!(registry.is_registry());
-        assert!(matches!(git, PypiDependencySource::Git { .. }));
-        assert!(matches!(path, PypiDependencySource::Path { .. }));
+        assert_matches!(git, PypiDependencySource::Git { .. });
+        assert_matches!(path, PypiDependencySource::Path { .. });
         assert!(!url.is_registry());
     }
 

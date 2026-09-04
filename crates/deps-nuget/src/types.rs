@@ -131,6 +131,7 @@ deps_core::impl_metadata!(PackageInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
     use tower_lsp_server::ls_types::Position;
 
     fn test_dep() -> NuGetDependency {
@@ -155,10 +156,7 @@ mod tests {
         );
         assert!(dep.features().is_empty());
         assert!(dep.as_any().is::<NuGetDependency>());
-        assert!(matches!(
-            dep.source(),
-            deps_core::parser::DependencySource::Registry
-        ));
+        assert_matches!(dep.source(), deps_core::parser::DependencySource::Registry);
     }
 
     #[test]
