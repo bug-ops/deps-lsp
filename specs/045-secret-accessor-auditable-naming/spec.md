@@ -10,7 +10,7 @@ tags:
   - deps-cargo
   - deps-nuget
 created: 2026-09-04
-status: draft
+status: specified
 related:
   - "[[constitution]]"
   - "[[041-credential-redaction-hardening/spec|Redact user:pass@ credentials from registry-index logs and errors]]"
@@ -200,26 +200,21 @@ shape changes.
 
 ## 9. Open Questions
 
-- [NEEDS CLARIFICATION: exact chosen accessor name — `expose_secret()` (mirrors `secrecy`'s
-  `ExposeSecret` trait method, most discoverable to anyone familiar with that ecosystem
-  convention), or a shorter in-house alternative (`reveal()`, `secret_str()`, `expose()`).
-  `expose_secret()` is the more obviously "borrowed convention, not reinvented" choice, but
-  final naming is a maintainer call.]
-- [NEEDS CLARIFICATION: rename all four in-scope sites atomically in one PR (simplest,
-  smallest possible diff, no risk of half-migrated state) versus spreading across
-  incremental PRs per crate (`deps-core` first, then `deps-cargo`, then `deps-nuget`). Given
-  the total blast radius is four accessor definitions plus a small, grep-countable set of
-  call sites, an atomic single-PR rename appears low-risk and is the tentative default absent
-  a reason to split it.]
-- [NEEDS CLARIFICATION: should `NuGetAuth::header_value()` also be renamed to the chosen
-  name for full consistency (FR-005), or is a domain-specific name like `header_value()`
-  preferable there since it additionally documents *how* the value must be used (as a header),
-  not just that it is secret? Both are defensible; no strong signal either way from the
-  existing codebase.]
-- No tracking GitHub issue filed yet for this finding — file one if/when this spec is picked
-  up for implementation, per this project's `research/parity` convention (see
-  `specs/044-precommit-hooks-ecosystem/spec.md` for the analogous "no tracking issue filed
-  yet" pattern).
+All three clarification items are resolved:
+
+- **Exact chosen accessor name**: `expose_secret()`. Mirrors `secrecy`'s `ExposeSecret` trait
+  method — the more obviously "borrowed convention, not reinvented" choice, and the most
+  discoverable to anyone already familiar with that ecosystem convention.
+- **Rollout**: atomic, single PR covering all four in-scope sites. The total blast radius
+  (four accessor definitions plus a small, grep-countable set of call sites) is small enough
+  that an atomic rename carries no meaningful risk of a half-migrated state, and avoids the
+  coordination overhead of splitting per crate.
+- **`NuGetAuth::header_value()`**: left as-is, not renamed. It already sits outside the
+  naming-collision problem this spec addresses, and its current name additionally documents
+  *how* the value must be used (as a pre-formatted header value) — a more specific and useful
+  name than a generic secret-exposure accessor would be at that call site.
+
+Tracking issue: `#581`.
 
 ## 10. See Also
 
