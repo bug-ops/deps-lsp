@@ -9,7 +9,7 @@ deps-lsp provides comprehensive LSP support for 13 package ecosystems:
 | Ecosystem | Language | Manifest File(s) | Lock File(s) | Features |
 |-----------|----------|-----------------|--------------|----------|
 | **Cargo** | Rust | `Cargo.toml` | `Cargo.lock` | Hover, inlay hints, completion, code actions, diagnostics, code lens, feature flag completion, alternate/private registry resolution via `.cargo/config.toml` (see below) |
-| **npm** | JavaScript/TypeScript | `package.json` | `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml` | Hover, inlay hints, completion, code actions, diagnostics, code lens, custom/private registry resolution via `.npmrc` (see below) |
+| **npm** | JavaScript/TypeScript | `package.json` | `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml` | Hover, inlay hints, completion, code actions, diagnostics, code lens, custom/private registry resolution via `.npmrc`, pnpm workspace catalog (`catalog:`/`catalog:<name>`) resolution via `pnpm-workspace.yaml` (see below) |
 | **PyPI** | Python | `pyproject.toml`, `requirements.txt`, `constraints.txt` (also recognized under a `requirements/` directory, e.g. `requirements/base.txt`) | `poetry.lock`, `uv.lock` | Hover with PEP 508 environment marker display ("Active when: `<marker>`"), inlay hints, completion, code actions, diagnostics, code lens, document links for `-r`/`-c`/`--requirement`/`--constraint` file references, private/custom index resolution via `--index-url`/`--extra-index-url`, Poetry `[[tool.poetry.source]]`, and uv `[tool.uv.index]`/`[tool.uv.sources]` (see below) |
 | **Go** | Go | `go.mod` | `go.sum` | Hover, inlay hints, completion, code actions, diagnostics, code lens, pseudo-version support, `$GOENV` `GOPROXY`/`GOPRIVATE` proxy-chain resolution (see below) |
 | **Bundler** | Ruby | `Gemfile` | `Gemfile.lock` | Hover, inlay hints, completion, code actions, diagnostics, code lens |
@@ -167,9 +167,58 @@ setting's own doc above.
   scanning and loses its npmjs.com hover link (an advisory or link keyed to the
   public package name does not apply to a same-named private package) and its
   relative-age ("published N days ago") hover suffix.
-- `.yarnrc`/`.yarnrc.yml` (Yarn Berry's own config format) and pnpm-specific
-  extensions to `.npmrc` are not read; a standard `.npmrc` present in the
-  workspace is still honored either way.
+- `.yarnrc`/`.yarnrc.yml` (Yarn Berry's own config format) are not read; a
+  standard `.npmrc` present in the workspace is still honored either way.
+  pnpm's own `pnpm-workspace.yaml` catalog extension *is* read — see below.
+
+### npm pnpm Catalogs
+
+A `package.json` dependency declared as `"catalog:"` (the default catalog) or
+`"catalog:<name>"` (a named catalog) resolves against the nearest-ancestor
+`pnpm-workspace.yaml`'s `catalog:`/`catalogs.<name>:` map — the same
+hover/diagnostic/completion/inlay-hint experience a literal semver range gets,
+instead of an unresolvable raw string.
+
+**Resolution**: the nearest `pnpm-workspace.yaml` found walking up from the
+`package.json`'s directory wins (matching pnpm's own `find-workspace-dir`
+single-root-per-tree behavior — nested/multiple workspace roots are not
+searched further). `catalog:` and `catalog:default` are equivalent references
+to the default catalog, which may be defined either as a top-level `catalog:`
+block or a `catalogs.default:` section (but never both — see below).
+
+**Fail-closed, never destructive**: whenever a `catalog:` specifier does not
+resolve to a parseable semver range — no `pnpm-workspace.yaml` found, the file
+is malformed, the referenced catalog or entry doesn't exist, or the entry's
+value isn't a semver range (`workspace:*`, a git URL) — the dependency's
+version *requirement* is left unset while hover still renders an explanatory
+message. This is a deliberate correctness guarantee, not a missing feature: an
+unresolved catalog specifier must never be treated as a valid semver range,
+since that would let the "Update all outdated dependencies" quick-fix silently
+overwrite `"react": "catalog:"` with a literal version, destroying the catalog
+reference.
+
+**Both a top-level `catalog:` block and a `catalogs.default:` section present**
+is treated as unresolvable for *every* `catalog:` specifier in the workspace
+(not only default-catalog references) — matching pnpm's own
+`checkDefaultCatalogIsDefinedOnce`, which rejects the whole workspace manifest
+in this situation before returning any catalog map at all; this deliberately
+never per-key-merges the two sections.
+
+**Known limitations**:
+- Editing `pnpm-workspace.yaml` does not proactively refresh an already-open
+  `package.json`'s pushed diagnostics — the cached catalog map is refreshed on
+  that document's *next* reparse (open/edit/save, or any hover/completion/
+  inlay-hint pull request), matching `.npmrc`'s identical existing refresh
+  contract exactly; there is no dedicated file watcher for
+  `pnpm-workspace.yaml` (`deps-lsp`'s watcher only covers lockfile patterns).
+- `pnpm-lock.yaml` is not read for in-use/resolved-version detection (no
+  `deps-npm` lockfile support for it yet — see the lock-file column above);
+  this is a pre-existing gap shared with every other npm dependency in a pnpm
+  workspace, not specific to catalogs.
+- The `npm:<pkg>@catalog:<name>` alias form is not detected.
+- A catalog entry whose value isn't a scalar string (e.g. a nested mapping)
+  gets its own distinct "not a version string" message rather than being
+  validated against pnpm's own schema further.
 
 ### PyPI Custom/Private Indexes
 

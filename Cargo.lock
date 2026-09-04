@@ -680,6 +680,7 @@ dependencies = [
  "tracing",
  "url",
  "urlencoding",
+ "yaml-rust2",
 ]
 
 [[package]]

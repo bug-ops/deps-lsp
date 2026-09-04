@@ -5,16 +5,21 @@
 
 use std::any::Any;
 use std::sync::Arc;
-use tower_lsp_server::ls_types::{CompletionItem, Position, Range, Uri};
+use tower_lsp_server::ls_types::{
+    CompletionItem, Diagnostic, DiagnosticSeverity, Hover, HoverContents, Position, Range, Uri,
+};
 
 use deps_core::{
-    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, completion::Completions,
-    lsp_helpers::EcosystemFormatter, parser::DependencySource,
+    Ecosystem, ParseResult as ParseResultTrait, Registry, Result,
+    completion::Completions,
+    lsp_helpers::{DiagnosticSeverities, EcosystemFormatter},
+    parser::DependencySource,
 };
 
 use crate::config::NpmParseContext;
 use crate::formatter::NpmFormatter;
 use crate::registry::NpmRegistry;
+use crate::types::NpmDependency;
 
 /// The source(s) a `CompletionContext::Version`'s bare `package_name` joins back to within a
 /// manifest's already-parsed dependencies (spec FR-017).
@@ -259,9 +264,127 @@ impl Ecosystem for NpmEcosystem {
         })
     }
 
+    /// Appends a `**Catalog**` line (spec 046) to the shared default's hover output for a
+    /// `catalog:`/`catalog:<name>`-referencing dependency — the base hover already renders
+    /// everything else identically to a literal-range dependency (FR-004), since a resolved
+    /// catalog entry rewrites `version_req` in place before hover ever runs.
+    fn generate_hover<'a>(
+        &'a self,
+        parse_result: &'a dyn ParseResultTrait,
+        position: Position,
+        versions: deps_core::VersionData<'a>,
+        freshness: deps_core::FreshnessSettings,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Option<Hover>> {
+        Box::pin(async move {
+            let mut hover = deps_core::lsp_generate_hover(
+                parse_result,
+                position,
+                versions,
+                self.registry.as_ref(),
+                self.formatter(),
+                freshness,
+                deps_core::PublishTime::now(),
+            )
+            .await?;
+
+            let catalog_line = parse_result
+                .dependencies()
+                .into_iter()
+                .find(|dep| {
+                    deps_core::position_in_range(position, dep.name_range())
+                        || dep
+                            .version_range()
+                            .is_some_and(|r| deps_core::position_in_range(position, r))
+                })
+                .and_then(|dep| dep.as_any().downcast_ref::<NpmDependency>())
+                .and_then(catalog_hover_line);
+
+            if let Some(catalog_line) = catalog_line
+                && let HoverContents::Markup(content) = &mut hover.contents
+            {
+                content.value.push_str(&catalog_line);
+            }
+
+            Some(hover)
+        })
+    }
+
+    /// Appends one diagnostic per unresolved `catalog:`-referencing dependency (spec 046
+    /// FR-005/FR-006) to the shared default's output — additive, since the base pass never
+    /// evaluates a catalog dependency's outdated/unsatisfiable/yanked status once
+    /// `version_req` is `None` (the module's totality invariant closes that off structurally).
+    fn generate_diagnostics<'a>(
+        &'a self,
+        parse_result: &'a dyn ParseResultTrait,
+        versions: deps_core::VersionData<'a>,
+        uri: &'a Uri,
+        freshness: deps_core::FreshnessSettings,
+        severities: DiagnosticSeverities,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Vec<Diagnostic>> {
+        Box::pin(async move {
+            let mut diagnostics = deps_core::lsp_helpers::generate_diagnostics_from_cache(
+                parse_result,
+                versions,
+                self.formatter(),
+                uri,
+                freshness,
+                severities,
+                deps_core::PublishTime::now(),
+            );
+            diagnostics.extend(catalog_diagnostics(parse_result, severities.unknown));
+            diagnostics
+        })
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
+}
+
+/// Renders the `**Catalog**` hover line for `dep`, or `None` for a non-catalog dependency.
+///
+/// `` `catalog:react17` → `^17.0.2` `` when resolved; the outcome's own message otherwise
+/// (including [`crate::catalog::CatalogOutcome::NonSemverEntry`], which gets no diagnostic but
+/// still deserves a hover explanation of why no version comparison ran).
+fn catalog_hover_line(dep: &NpmDependency) -> Option<String> {
+    let origin = dep.catalog.as_ref()?;
+    Some(format!(
+        "\n**Catalog**: {}\n",
+        origin.hover_detail(dep.name.as_str())
+    ))
+}
+
+/// One diagnostic per catalog-referencing dependency whose outcome carries a message (spec 046
+/// FR-005/FR-006) — `None` from [`crate::catalog::CatalogOrigin::diagnostic_message`] (resolved,
+/// or a non-semver entry) contributes nothing.
+///
+/// The `npm_dep.version_range?` skip is not a catalog-specific gap in FR-005's "no silent
+/// omission" guarantee: every diagnostic rule in this codebase anchors on `version_range` and
+/// skips the same way when it's absent (`crates/deps-core/src/lsp_helpers/diagnostics.rs`'s
+/// own `let Some(version_range) = dep.version_range() else { continue };` gate) — there is
+/// simply nowhere in the document to place a diagnostic squiggle without a span, catalog or
+/// otherwise.
+fn catalog_diagnostics(
+    parse_result: &dyn ParseResultTrait,
+    severity: DiagnosticSeverity,
+) -> Vec<Diagnostic> {
+    parse_result
+        .dependencies()
+        .into_iter()
+        .filter_map(|dep| {
+            let npm_dep = dep.as_any().downcast_ref::<NpmDependency>()?;
+            let origin = npm_dep.catalog.as_ref()?;
+            let range = npm_dep.version_range?;
+            let message = origin.diagnostic_message(npm_dep.name.as_str())?;
+            Some(Diagnostic {
+                range,
+                severity: Some(severity),
+                message,
+                source: Some("deps-lsp".into()),
+                ..Default::default()
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -853,6 +976,7 @@ mod tests {
             version_range: None,
             section: crate::types::NpmDependencySection::Dependencies,
             source,
+            catalog: None,
         }
     }
 
@@ -1051,5 +1175,92 @@ mod tests {
             )
             .await;
         assert!(!results.is_empty());
+    }
+
+    // --- pnpm catalogs (spec 046): generate_hover/generate_diagnostics overrides ---
+
+    #[tokio::test]
+    async fn test_generate_hover_appends_catalog_line_for_resolved_dependency() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("pnpm-workspace.yaml"),
+            "catalog:\n  react: ^18.3.0\n",
+        )
+        .unwrap();
+        let manifest_path = root.path().join("package.json");
+        let uri = Uri::from_file_path(&manifest_path).unwrap();
+
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = NpmEcosystem::new(cache);
+        let content = r#"{"dependencies": {"react": "catalog:"}}"#;
+        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+
+        let position = Position::new(0, 20); // inside "react"'s name
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+        let hover = ecosystem
+            .generate_hover(
+                parse_result.as_ref(),
+                position,
+                VersionData::new(&cached_versions, &resolved_versions),
+                deps_core::FreshnessSettings::default(),
+            )
+            .await
+            .expect("hover must fire for a catalog-resolved dependency");
+
+        let tower_lsp_server::ls_types::HoverContents::Markup(content) = &hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            content.value.contains("**Requirement**"),
+            "{}",
+            content.value
+        );
+        assert!(content.value.contains("^18.3.0"), "{}", content.value);
+        assert!(content.value.contains("**Catalog**"), "{}", content.value);
+        assert!(content.value.contains("catalog:"), "{}", content.value);
+    }
+
+    #[tokio::test]
+    async fn test_generate_diagnostics_reports_missing_catalog_entry() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("pnpm-workspace.yaml"),
+            "catalog:\n  react: ^18.3.0\n",
+        )
+        .unwrap();
+        let manifest_path = root.path().join("package.json");
+        let uri = Uri::from_file_path(&manifest_path).unwrap();
+
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = NpmEcosystem::new(cache);
+        let content = r#"{"dependencies": {"left-pad": "catalog:"}}"#;
+        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+
+        // A cached entry for "left-pad" so the base diagnostics pass doesn't separately fire
+        // its own "unknown package" rule (which reads whether *any* registry data was ever
+        // cached, independent of the catalog outcome under test here).
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            pkg("left-pad"),
+            deps_core::lsp_helpers::PackageVersions::latest_only("1.3.0"),
+        );
+        let resolved_versions = HashMap::new();
+        let diagnostics = ecosystem
+            .generate_diagnostics(
+                parse_result.as_ref(),
+                VersionData::new(&cached_versions, &resolved_versions),
+                &uri,
+                deps_core::FreshnessSettings::default(),
+                deps_core::DiagnosticSeverities::default(),
+            )
+            .await;
+
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].message.contains("left-pad"));
+        assert_eq!(
+            diagnostics[0].severity,
+            Some(tower_lsp_server::ls_types::DiagnosticSeverity::WARNING)
+        );
     }
 }

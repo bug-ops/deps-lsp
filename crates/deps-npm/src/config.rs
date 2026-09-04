@@ -376,8 +376,9 @@ fn resolve_entry(
 }
 
 /// Upper bound on the project-tier ancestor walk depth, matching `deps-cargo`'s
-/// `MAX_CONFIG_ANCESTOR_DEPTH`.
-const MAX_CONFIG_ANCESTOR_DEPTH: usize = 64;
+/// `MAX_CONFIG_ANCESTOR_DEPTH`. `pub(crate)` so `crate::catalog::find_workspace_file` can
+/// reuse the same bound for its own ancestor walk.
+pub(crate) const MAX_CONFIG_ANCESTOR_DEPTH: usize = 64;
 
 /// Per-`.npmrc`-file-path memoization (FR-012), mirroring `deps-cargo::config::ConfigFileCache`
 /// exactly in shape.
@@ -426,6 +427,9 @@ pub struct NpmParseContext {
     /// Memoizes each distinct `.npmrc` file's raw, unvalidated contents across every parse
     /// that reads it.
     pub config_cache: Arc<NpmConfigCache>,
+    /// Memoizes each distinct `pnpm-workspace.yaml` file's parsed catalogs across every parse
+    /// that reads it (spec 046, NFR-001).
+    pub workspace_cache: Arc<crate::catalog::PnpmWorkspaceCache>,
 }
 
 /// Resolves `manifest_dir`'s `.npmrc` hierarchy (project tier, ancestor-walked, plus the
