@@ -20,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-go**: `$GOENV` `GOPROXY`/`GOPRIVATE` follow-up hardening — test-injectable `$GOENV` path, oversized-`GOPRIVATE`-pattern warning, expanded edge-case/integration test coverage, and `GOPROXY` `,`/`|` separator docs (#563)
 
 ### Fixed
-- **deps-composer**: a `require`/`require-dev` entry whose value isn't a string (e.g. an object) is now skipped instead of producing a dependency entry queried against Packagist (resolves #621)
+- **deps-composer**: a `require`/`require-dev` entry whose value isn't a string (e.g. an object) is now skipped instead of producing a dependency entry queried against Packagist (resolves #621) (#623)
 - **deps-cargo, deps-npm, deps-nuget**: ancestor-walk depth cap now imports `deps-core`'s canonical `MAX_CONFIG_ANCESTOR_DEPTH` instead of each declaring its own duplicate copy (resolves #611) (#616)
 - **deps-core**: `MtimeFileCache` enforces an 8 MiB size cap (checked via `fs::metadata`) before reading a config file's content, instead of always reading the full file before any safety guard runs (resolves #591) (#595)
 - **deps-go**: oversized-`GOPRIVATE`-pattern warning now logs once per distinct `$GOENV` file content instead of once per LSP re-parse (resolves #565) (#567)
