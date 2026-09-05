@@ -519,8 +519,16 @@ pub struct ServerState {
     pub(crate) workspace_registry_ecosystems: Vec<&'static str>,
     /// Cold start rate limiter
     pub cold_start_limiter: ColdStartLimiter,
-    /// Background task handles
-    tasks: tokio::sync::RwLock<HashMap<Uri, JoinHandle<()>>>,
+    /// Background task handles, keyed by URI.
+    ///
+    /// Stores each task's [`tokio::task::Id`] alongside its [`tokio::task::AbortHandle`]
+    /// rather than its `JoinHandle`: the supervisor task [`Self::spawn_background_task`]
+    /// spawns alongside it owns the actual `JoinHandle` for the task's whole lifetime (to
+    /// detect a panic — issue #632), so the registry only needs enough to cancel, plus the
+    /// id so a belated supervisor can tell whether it is still the current task for its URI
+    /// before acting on a panic (issue #632 critic S3 — see
+    /// [`Self::is_current_background_task`]).
+    tasks: tokio::sync::RwLock<HashMap<Uri, (tokio::task::Id, tokio::task::AbortHandle)>>,
     /// Whether the client advertised `window.workDoneProgress` support during
     /// `initialize`. Set once, read from spawned lifecycle tasks that have no
     /// direct access to `ClientCapabilities` (see `RegistryProgress::start` call
@@ -880,23 +888,135 @@ impl ServerState {
         self.documents.remove(uri)
     }
 
-    /// Spawns a background task for a document.
+    /// Spawns a background task for a document, supervising it for panics.
     ///
-    /// If a task already exists for the given URI, it is aborted before
-    /// the new task is registered. This ensures only one background task
-    /// runs per document.
+    /// If a task already exists for the given URI, it is aborted before the new task is
+    /// registered. This ensures only one background task runs per document.
     ///
-    /// Typical use case: fetching version data asynchronously after
-    /// document open or change.
-    pub async fn spawn_background_task(&self, uri: Uri, task: JoinHandle<()>) {
-        let mut tasks = self.tasks.write().await;
+    /// Typical use case: fetching version data asynchronously after document open or
+    /// change.
+    ///
+    /// Takes `self: &Arc<Self>` (rather than `&self`) because this also spawns a
+    /// supervisor task that awaits `task` for its whole lifetime (issue #632): if the
+    /// background fetch task panics instead of reaching `DocumentState::set_loaded`/
+    /// `set_failed`, the document's `loading_state` would otherwise stay `Loading`
+    /// forever, permanently suppressing diagnostics for it. The supervisor forces
+    /// `loading_state` to `Failed` only on a genuine panic — never when `task` is
+    /// cancelled (a newer call to this method, or [`Self::cancel_background_task`]
+    /// superseding it), since an intentionally aborted task's document state is already
+    /// owned by whatever superseded it. It additionally re-checks whether it is still the
+    /// current task for its URI right before writing (issue #632 critic S3): a task that
+    /// already panicked (finished, not cancelled) before a newer task was registered for
+    /// the same URI must not have its belated supervisor clobber that newer task's
+    /// in-flight load.
+    pub async fn spawn_background_task(self: &Arc<Self>, uri: Uri, task: JoinHandle<()>) {
+        let task_id = task.id();
+        let abort_handle = task.abort_handle();
 
-        // Cancel existing task if any
-        if let Some(old_task) = tasks.remove(&uri) {
-            old_task.abort();
+        {
+            let mut tasks = self.tasks.write().await;
+            // Cancel existing task if any
+            if let Some((_, old_task)) = tasks.insert(uri.clone(), (task_id, abort_handle)) {
+                old_task.abort();
+            }
         }
 
-        tasks.insert(uri, task);
+        let state = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Err(join_error) = task.await
+                && !join_error.is_cancelled()
+            {
+                if !state.is_current_background_task(&uri, task_id).await {
+                    tracing::debug!(
+                        "background task for {:?} panicked ({}) after being superseded; \
+                         ignoring stale panic",
+                        uri,
+                        join_error
+                    );
+                    return;
+                }
+                tracing::error!(
+                    "background task for {:?} panicked ({}); forcing loading_state to Failed",
+                    uri,
+                    join_error
+                );
+                state.force_document_failed_with_not_attempted(&uri);
+            }
+        });
+    }
+
+    /// Whether `task_id` is still the background task currently registered for `uri`
+    /// (issue #632 critic S3).
+    ///
+    /// A background task's own supervisor (see [`Self::spawn_background_task`]) checks
+    /// this immediately before forcing a panicked task's document to `Failed`: by the
+    /// time a supervisor observes a panic, a newer [`Self::spawn_background_task`] call
+    /// may already have superseded it (aborting an already-finished — and thus
+    /// unabortable — handle is a documented no-op), and that newer task now owns the
+    /// document's `loading_state`.
+    async fn is_current_background_task(&self, uri: &Uri, task_id: tokio::task::Id) -> bool {
+        self.tasks
+            .read()
+            .await
+            .get(uri)
+            .is_some_and(|(current_id, _)| *current_id == task_id)
+    }
+
+    /// Forces `uri`'s document out of `Loading` into `Failed`, seeding a
+    /// [`deps_core::FetchFailure::NotAttempted`] finding for every dependency that has
+    /// neither a cached registry version nor a lockfile-resolved one (issue #632 critic
+    /// S2).
+    ///
+    /// Without the seeding, `generate_diagnostics_from_cache`'s unknown-package rule would
+    /// render every such dependency as "Unknown package" — a registry lookup that was
+    /// never actually attempted looks identical to one that came back empty — instead of
+    /// "lookup could not be determined", turning a silently suppressed diagnostic into a
+    /// misleading one. `set_fetch_failure_if_absent` (already used for a similar
+    /// never-queried case, source collisions — see `document::lifecycle`) never clobbers a
+    /// genuine `Actionable`/`Transient` finding a partial fetch may have already recorded
+    /// for the same dependency.
+    ///
+    /// A no-op if the document is missing, or (issue #632 critic M3) if it isn't currently
+    /// `Loading` — this must never clobber a document that a newer background task has
+    /// already taken past `Loading`, or one that panicked before ever reaching
+    /// `DocumentState::set_loading`.
+    pub(crate) fn force_document_failed_with_not_attempted(&self, uri: &Uri) {
+        let Some(mut doc) = self.documents.get_mut(uri) else {
+            return;
+        };
+        if doc.loading_state != LoadingState::Loading {
+            return;
+        }
+
+        let not_attempted: Vec<String> = self
+            .ecosystem_registry
+            .get(doc.ecosystem_id())
+            .zip(doc.parse_result())
+            .map(|(ecosystem, parse_result)| {
+                let formatter = ecosystem.formatter();
+                parse_result
+                    .dependencies()
+                    .into_iter()
+                    .filter(|dep| formatter.can_resolve_source(&dep.source()))
+                    .map(|dep| dep.name().clone())
+                    .filter(|name| {
+                        !doc.cached_versions.contains_key(name)
+                            && !doc.resolved_versions.contains_key(name)
+                    })
+                    .map(|name| formatter.normalize_package_name(&name))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if !not_attempted.is_empty() {
+            let mut outcomes = doc.outcomes.clone();
+            for name in not_attempted {
+                outcomes.set_fetch_failure_if_absent(name, deps_core::FetchFailure::NotAttempted);
+            }
+            doc.replace_outcomes(outcomes);
+        }
+
+        doc.set_failed();
     }
 
     /// Cancels the background task for a document.
@@ -904,7 +1024,7 @@ impl ServerState {
     /// If no task exists, this is a no-op.
     pub async fn cancel_background_task(&self, uri: &Uri) {
         let mut tasks = self.tasks.write().await;
-        if let Some(task) = tasks.remove(uri) {
+        if let Some((_, task)) = tasks.remove(uri) {
             task.abort();
         }
     }
@@ -1433,7 +1553,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_server_state_background_tasks() {
-        let state = ServerState::new();
+        let state = Arc::new(ServerState::new());
         let uri = deps_core::test_util::test_uri("/test.toml");
 
         let task = tokio::spawn(async {
@@ -1446,7 +1566,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_spawn_background_task_cancels_previous() {
-        let state = ServerState::new();
+        let state = Arc::new(ServerState::new());
         let uri = deps_core::test_util::test_uri("/test.toml");
 
         let task1 = tokio::spawn(async {
@@ -1463,8 +1583,162 @@ mod tests {
 
     #[tokio::test]
     async fn test_cancel_background_task_nonexistent() {
-        let state = ServerState::new();
+        let state = Arc::new(ServerState::new());
         let uri = deps_core::test_util::test_uri("/test.toml");
+        state.cancel_background_task(&uri).await;
+    }
+
+    /// Polls every 5ms until `condition` returns true or `timeout` elapses (issue #632
+    /// critic M4): avoids racing a fixed `sleep` against the supervisor's real
+    /// `JoinHandle::await`, which is slower and more variable under load than a plain
+    /// timer, so a fixed-sleep assertion can flake on a busy CI runner.
+    async fn poll_until(timeout: std::time::Duration, mut condition: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if condition() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Issue #632: a background task that panics (rather than cleanly completing or
+    /// being aborted) must not leave the document stuck in `LoadingState::Loading`
+    /// forever — the supervisor spawned by `spawn_background_task` must force it to
+    /// `Failed`.
+    #[tokio::test]
+    async fn test_spawn_background_task_panic_marks_document_failed() {
+        let state = Arc::new(ServerState::new());
+        let uri = deps_core::test_util::test_uri("/test.toml");
+
+        let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
+        doc.set_loading();
+        state.update_document(uri.clone(), doc);
+
+        let task = tokio::spawn(async {
+            panic!("simulated background task panic");
+        });
+        state.spawn_background_task(uri.clone(), task).await;
+
+        let reached_failed = poll_until(std::time::Duration::from_secs(1), || {
+            state
+                .get_document(&uri)
+                .is_some_and(|d| d.loading_state == LoadingState::Failed)
+        })
+        .await;
+        assert!(
+            reached_failed,
+            "supervisor did not force loading_state to Failed within 1s"
+        );
+    }
+
+    /// Issue #632 critic M3: a task that panics *before* the document ever reaches
+    /// `Loading` (e.g. a panic during setup, prior to the first `set_loading` call) must
+    /// not force it into `Failed` — there is no in-flight load to fail, and doing so
+    /// would misrepresent an `Idle` document as a failed fetch attempt.
+    #[tokio::test]
+    async fn test_spawn_background_task_panic_does_not_mark_idle_document_failed() {
+        let state = Arc::new(ServerState::new());
+        let uri = deps_core::test_util::test_uri("/test.toml");
+
+        let doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
+        assert_eq!(doc.loading_state, LoadingState::Idle);
+        state.update_document(uri.clone(), doc);
+
+        let task = tokio::spawn(async {
+            panic!("simulated pre-loading panic");
+        });
+        state.spawn_background_task(uri.clone(), task).await;
+
+        // Give the supervisor ample time to (incorrectly, pre-fix) act.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let doc = state.get_document(&uri).unwrap();
+        assert_eq!(
+            doc.loading_state,
+            LoadingState::Idle,
+            "a panic before the document ever reached Loading must not force it to Failed"
+        );
+    }
+
+    /// Issue #632 companion: an intentionally aborted task (superseded by a newer
+    /// `spawn_background_task` call) must NOT be treated as a failure — the new task
+    /// owns the document state from this point on.
+    #[tokio::test]
+    async fn test_spawn_background_task_abort_does_not_mark_document_failed() {
+        let state = Arc::new(ServerState::new());
+        let uri = deps_core::test_util::test_uri("/test.toml");
+
+        let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
+        doc.set_loading();
+        state.update_document(uri.clone(), doc);
+
+        let task1 = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        });
+        state.spawn_background_task(uri.clone(), task1).await;
+
+        // Superseding the task aborts it — this must not be mistaken for a panic.
+        let task2_done = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&task2_done);
+        let task2 = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            flag.store(true, Ordering::SeqCst);
+        });
+        state.spawn_background_task(uri.clone(), task2).await;
+
+        poll_until(std::time::Duration::from_secs(1), || {
+            task2_done.load(Ordering::SeqCst)
+        })
+        .await;
+        // Give task1's supervisor a further moment to (incorrectly, pre-fix) act on the
+        // cancellation it observes.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let doc = state.get_document(&uri).unwrap();
+        assert_eq!(
+            doc.loading_state,
+            LoadingState::Loading,
+            "an aborted (superseded) task must not force the document to Failed"
+        );
+    }
+
+    /// Issue #632 critic S3: a supervisor for a task that has already been superseded by
+    /// a newer `spawn_background_task` call for the same URI must recognize it is no
+    /// longer current. Tests `ServerState::is_current_background_task` directly rather
+    /// than racing a real panic against a real re-registration — that race's winner
+    /// depends on scheduler timing, but the identity check must be correct regardless of
+    /// who wins it.
+    #[tokio::test]
+    async fn test_is_current_background_task_detects_supersession() {
+        let state = Arc::new(ServerState::new());
+        let uri = deps_core::test_util::test_uri("/test.toml");
+
+        let task_a = tokio::spawn(std::future::pending::<()>());
+        let id_a = task_a.id();
+        state.spawn_background_task(uri.clone(), task_a).await;
+        assert!(
+            state.is_current_background_task(&uri, id_a).await,
+            "A must be current right after being registered"
+        );
+
+        let task_b = tokio::spawn(std::future::pending::<()>());
+        let id_b = task_b.id();
+        state.spawn_background_task(uri.clone(), task_b).await;
+
+        assert!(
+            !state.is_current_background_task(&uri, id_a).await,
+            "A's id must no longer be current once B supersedes it — a belated \
+             supervisor for A must not force-fail B's in-flight load"
+        );
+        assert!(
+            state.is_current_background_task(&uri, id_b).await,
+            "B must be the current task after superseding A"
+        );
+
         state.cancel_background_task(&uri).await;
     }
 

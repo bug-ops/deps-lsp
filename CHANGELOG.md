@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-go**: `$GOENV` `GOPROXY`/`GOPRIVATE` follow-up hardening — test-injectable `$GOENV` path, oversized-`GOPRIVATE`-pattern warning, expanded edge-case/integration test coverage, and `GOPROXY` `,`/`|` separator docs (#563)
 
 ### Fixed
+- **deps-lsp**: diagnostics no longer stay stuck forever for a document that never leaves `LoadingState::Loading` (e.g. a background fetch task panic) — a fetch-timeout-derived ceiling now forces it to `Failed`, and a panicking background task is now supervised instead of silently discarding its result (resolves #632)
 - **deps-gradle**: recognize modern/variant configuration names (`androidTestImplementation`, `debugImplementation`, `compileOnlyApi`, `kaptAndroidTest`, etc.) instead of a fixed literal whitelist (resolves #627) (#631)
 - **deps-gradle**: fix mis-attributed name/version ranges for same-line dependencies sharing an identical coordinate or version (resolves #628) (#631)
 - **deps-gradle**: fix `dependencies { }` block guard false-positiving on unrelated blocks like `dependenciesInfo { }` (resolves #629) (#631)
