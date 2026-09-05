@@ -15,7 +15,9 @@ use crate::specifier::parse_specifier;
 use crate::types::{DenoDependency, DenoDependencySection};
 use deps_core::json_ast::find_last_prop;
 use deps_core::lsp_helpers::LineOffsetTable;
-use deps_core::{DepsError, PackageName, Result, VersionReq};
+use deps_core::{
+    DepsError, MAX_JSON_NESTING_DEPTH, PackageName, Result, VersionReq, json_depth_error_message,
+};
 use jsonc_parser::ast::{Object, StringLit, Value};
 use jsonc_parser::{CollectOptions, ParseOptions, parse_to_ast};
 use std::borrow::Cow;
@@ -45,8 +47,10 @@ deps_core::impl_parse_result!(
 /// # Errors
 ///
 /// Returns an error if the content is not valid JSON/JSONC (malformed syntax, unclosed
-/// block comment, stray brace) — the file is then not recognized as a Deno manifest and
-/// degrades gracefully (spec §6), matching every other ecosystem's parse-failure behavior.
+/// block comment, stray brace), or if the parsed AST nests deeper than
+/// [`deps_core::MAX_JSON_NESTING_DEPTH`] — the file is then not recognized as a Deno
+/// manifest and degrades gracefully (spec §6), matching every other ecosystem's
+/// parse-failure behavior.
 ///
 /// # Examples
 ///
@@ -76,6 +80,15 @@ pub fn parse_deno_json(content: &str, uri: &Uri) -> Result<DenoParseResult> {
         source: e.to_string().into(),
     })?;
 
+    if let Some(value) = &ast.value
+        && let Err(depth) = check_ast_nesting_depth(value, MAX_JSON_NESTING_DEPTH)
+    {
+        return Err(DepsError::ParseError {
+            file_type: "deno.json".into(),
+            source: json_depth_error_message(depth).into(),
+        });
+    }
+
     let line_table = LineOffsetTable::new(content);
     let mut dependencies = Vec::new();
 
@@ -90,6 +103,52 @@ pub fn parse_deno_json(content: &str, uri: &Uri) -> Result<DenoParseResult> {
         dependencies,
         uri: uri.clone(),
     })
+}
+
+/// Computes `value`'s real nesting depth (`value` itself counts as depth 1, each further
+/// `Object`/`Array` descent adds one), rejecting once it exceeds `max_depth`.
+///
+/// Unlike a raw byte scan over the source text (`deps_core::check_json_nesting_depth`, the
+/// pattern `deps-npm`/`deps-composer` use ahead of their own strict-JSON `serde_json` parse),
+/// walking the already-parsed AST is immune to JSONC comment characters (`//`, `/* */`)
+/// miscounting as structural nesting — a comment's bracket characters never become AST nodes
+/// at all, so they cannot be mistaken for real nesting the way a text scanner would (impl-critic
+/// #618 S1). `jsonc-parser`'s own hardcoded 512-deep recursion cap already bounded
+/// `parse_to_ast` itself before this ever runs, so this walk exists to align `deno.json`
+/// parsing with `deps_core::MAX_JSON_NESTING_DEPTH` — the same, tighter bound every other
+/// workspace JSON call site enforces — not because `parse_to_ast`'s result is unsafe to walk.
+/// An explicit stack (rather than recursive descent) keeps the walk itself non-recursive
+/// regardless.
+///
+/// # Errors
+///
+/// Returns `Err(depth)` with the depth reached the instant nesting exceeds `max_depth`.
+fn check_ast_nesting_depth(root: &Value<'_>, max_depth: usize) -> std::result::Result<(), usize> {
+    let mut stack = vec![(root, 1_usize)];
+    while let Some((value, depth)) = stack.pop() {
+        // Only `Object`/`Array` nodes open a nesting level; a leaf (string/number/bool/null)
+        // is never itself checked or descended into, so it can never inflate the depth of the
+        // container that holds it.
+        match value {
+            Value::Object(obj) => {
+                if depth > max_depth {
+                    return Err(depth);
+                }
+                stack.extend(obj.properties.iter().map(|prop| (&prop.value, depth + 1)));
+            }
+            Value::Array(arr) => {
+                if depth > max_depth {
+                    return Err(depth);
+                }
+                stack.extend(arr.elements.iter().map(|elem| (elem, depth + 1)));
+            }
+            Value::StringLit(_)
+            | Value::NumberLit(_)
+            | Value::BooleanLit(_)
+            | Value::NullKeyword(_) => {}
+        }
+    }
+    Ok(())
 }
 
 /// Builds a [`DenoDependency`] for every entry in the `imports` object, applying
@@ -512,6 +571,54 @@ mod tests {
                 other => panic!("value {value}: expected PackageName context, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn test_parse_deeply_nested_json_rejected_after_ast_parse() {
+        // #618: a deeply nested deno.json must be rejected by the explicit AST nesting-depth
+        // guard (deps_core::MAX_JSON_NESTING_DEPTH, tighter than jsonc-parser's own
+        // internal 512-deep recursion cap) once it's been safely parsed, matching
+        // deps-npm/deps-composer's own JSON depth bound (#617/#430) even though those two
+        // apply it to raw text ahead of a strict-JSON `serde_json` parse, not JSONC.
+        let depth = deps_core::MAX_JSON_NESTING_DEPTH + 1;
+        let json = format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
+        let result = parse_deno_json(&json, &test_uri());
+        assert_matches!(
+            result,
+            Err(DepsError::ParseError { file_type, .. }) if file_type == "deno.json"
+        );
+    }
+
+    #[test]
+    fn test_parse_nesting_at_max_depth_accepted() {
+        let depth = deps_core::MAX_JSON_NESTING_DEPTH;
+        let json = format!(
+            r#"{{"imports": {{}}, "extra": {}1{}}}"#,
+            "[".repeat(depth - 1),
+            "]".repeat(depth - 1)
+        );
+        let result = parse_deno_json(&json, &test_uri());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_comment_brackets_not_miscounted_as_nesting() {
+        // impl-critic #618 S1: a byte-level scanner over raw source text would miscount
+        // comment bracket characters as structural nesting; the AST-based check must ignore
+        // them entirely, since a comment never produces an AST node.
+        let over_max_bracket_count = deps_core::MAX_JSON_NESTING_DEPTH + 5;
+        let comment_brackets = "[".repeat(over_max_bracket_count);
+        let json = format!(
+            r#"{{
+  // {comment_brackets}
+  "imports": {{
+    "@std/fs": "jsr:@std/fs@^1.0"
+  }}
+}}"#
+        );
+        let result = parse_deno_json(&json, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "jsr:@std/fs");
     }
 
     #[test]
