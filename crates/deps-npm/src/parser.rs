@@ -103,41 +103,39 @@ pub fn parse_package_json_with_context(
 
     let mut dependencies = Vec::new();
 
-    // Parse each dependency section
-    if let Some(deps) = root.get("dependencies").and_then(|v| v.as_object()) {
-        dependencies.extend(parse_dependency_section(
-            content,
-            deps,
-            NpmDependencySection::Dependencies,
-            &line_table,
-        ));
-    }
-
-    if let Some(deps) = root.get("devDependencies").and_then(|v| v.as_object()) {
-        dependencies.extend(parse_dependency_section(
-            content,
-            deps,
-            NpmDependencySection::DevDependencies,
-            &line_table,
-        ));
-    }
-
-    if let Some(deps) = root.get("peerDependencies").and_then(|v| v.as_object()) {
-        dependencies.extend(parse_dependency_section(
-            content,
-            deps,
-            NpmDependencySection::PeerDependencies,
-            &line_table,
-        ));
-    }
-
-    if let Some(deps) = root.get("optionalDependencies").and_then(|v| v.as_object()) {
-        dependencies.extend(parse_dependency_section(
-            content,
-            deps,
+    // Parse each dependency section, scoping position search to that section's own byte
+    // range (see `find_section_byte_range`) so a name repeated across sections (e.g. also
+    // present in `devDependencies`) does not have both occurrences resolve to the first
+    // match in the file.
+    const SECTIONS: [(&str, NpmDependencySection); 4] = [
+        ("dependencies", NpmDependencySection::Dependencies),
+        ("devDependencies", NpmDependencySection::DevDependencies),
+        ("peerDependencies", NpmDependencySection::PeerDependencies),
+        (
+            "optionalDependencies",
             NpmDependencySection::OptionalDependencies,
-            &line_table,
-        ));
+        ),
+    ];
+
+    for (key, section) in SECTIONS {
+        if let Some(deps) = root.get(key).and_then(|v| v.as_object()) {
+            // Fall back to the whole-file range (pre-fix behavior) if the section's own
+            // bounds cannot be located — never drop a section's dependencies over this.
+            let section_range = find_section_byte_range(content, key).unwrap_or_else(|| {
+                tracing::debug!(
+                    section = key,
+                    "section byte range not found, falling back to whole-file position search"
+                );
+                (0, content.len())
+            });
+            dependencies.extend(parse_dependency_section(
+                content,
+                deps,
+                section,
+                section_range,
+                &line_table,
+            ));
+        }
     }
 
     // FR-002: a non-`file:` URI (or one `Uri::to_file_path` cannot resolve) has no directory to
@@ -195,10 +193,15 @@ pub fn parse_package_json_with_context(
 }
 
 /// Parses a single dependency section and extracts positions.
+///
+/// `section_range` bounds the search performed by `find_dependency_positions` to this
+/// section's own `{...}` byte range, so a name that also appears in another section does
+/// not resolve to that other section's occurrence.
 fn parse_dependency_section(
     content: &str,
     deps: &serde_json::Map<String, Value>,
     section: NpmDependencySection,
+    section_range: (usize, usize),
     line_table: &LineOffsetTable,
 ) -> Vec<NpmDependency> {
     let mut result = Vec::new();
@@ -207,8 +210,13 @@ fn parse_dependency_section(
         let version_req = value.as_str().map(String::from);
 
         // Calculate positions for name and version
-        let (name_range, version_range) =
-            find_dependency_positions(content, name, version_req.as_ref(), line_table);
+        let (name_range, version_range) = find_dependency_positions(
+            content,
+            name,
+            version_req.as_ref(),
+            section_range,
+            line_table,
+        );
 
         result.push(NpmDependency {
             name: name.clone().into(),
@@ -233,30 +241,35 @@ fn parse_dependency_section(
 
 /// Finds the position of a dependency name and version in the source text.
 ///
-/// Searches for the dependency as a JSON key-value pair to avoid false matches
-/// when the name appears elsewhere in the file (e.g., in scripts).
+/// Searches for the dependency as a JSON key-value pair within `section_range` (the
+/// enclosing section's own `{...}` byte range) to avoid false matches both from unrelated
+/// text elsewhere in the file (e.g., in `scripts`) and from the same name declared in a
+/// *different* dependency section.
 fn find_dependency_positions(
     content: &str,
     name: &str,
     version_req: Option<&String>,
+    section_range: (usize, usize),
     line_table: &LineOffsetTable,
 ) -> (Range, Option<Range>) {
     let mut name_range = Range::default();
     let mut version_range = None;
 
     let name_pattern = format!("\"{name}\"");
+    let (range_start, range_end) = section_range;
+    let section_content = &content[range_start..range_end];
 
     // Find all occurrences of the name pattern and check which one is a dependency key
     let mut search_start = 0;
-    while let Some(rel_idx) = content[search_start..].find(&name_pattern) {
-        let name_start_idx = search_start + rel_idx;
-        let after_name = &content[name_start_idx + name_pattern.len()..];
+    while let Some(rel_idx) = section_content[search_start..].find(&name_pattern) {
+        let name_start_idx = range_start + search_start + rel_idx;
+        let after_name = &content[name_start_idx + name_pattern.len()..range_end];
 
         // Check if this is a JSON key (followed by optional whitespace and colon)
         let trimmed = after_name.trim_start();
         if !trimmed.starts_with(':') {
             // Not a key, continue searching
-            search_start = name_start_idx + name_pattern.len();
+            search_start = (name_start_idx + name_pattern.len()) - range_start;
             continue;
         }
 
@@ -273,11 +286,17 @@ fn find_dependency_positions(
                 name_start_idx + name_pattern.len() + (after_name.len() - trimmed.len());
             let after_colon = &content[colon_offset..];
 
-            // Limit search to the next 100 chars to stay within this key-value pair.
+            // Limit search to the next 100 chars to stay within this key-value pair, and
+            // never past the enclosing section's own end — otherwise a version search
+            // starting near a section boundary could bleed into the next section's text.
             // Round down to a char boundary since `version.len()` is a byte count that
             // can land mid-character when the source contains multi-byte UTF-8.
-            let search_limit =
-                after_colon.floor_char_boundary(after_colon.len().min(100 + version.len()));
+            let search_limit = after_colon.floor_char_boundary(
+                after_colon
+                    .len()
+                    .min(100 + version.len())
+                    .min(range_end.saturating_sub(colon_offset)),
+            );
             let search_area = &after_colon[..search_limit];
 
             if let Some(ver_rel_idx) = search_area.find(&version_search) {
@@ -294,6 +313,113 @@ fn find_dependency_positions(
     }
 
     (name_range, version_range)
+}
+
+/// Finds the byte range of a top-level dependency section's object value — e.g. the
+/// `{...}` following `"dependencies":` — so per-dependency position search
+/// (`find_dependency_positions`) can be scoped to just that section instead of the whole
+/// file. This is what lets a name repeated across sections (e.g. also present in
+/// `devDependencies`) resolve to the correct occurrence.
+///
+/// Runs a single forward pass tracking brace depth with the same string/escape-aware
+/// state machine as [`find_matching_brace_end`], and only accepts a `"<key>":` match at
+/// depth 1 (i.e. a direct child of the root object) — a `dependencies`/`devDependencies`
+/// key nested inside another section's value (e.g. pnpm's `packageExtensions`, npm's
+/// `overrides`) sits at a deeper depth and is skipped, so it can no longer be mistaken
+/// for the real top-level section.
+///
+/// Returns `None` if `section_key` cannot be located as a top-level JSON object value
+/// (e.g. malformed JSON) — the caller falls back to whole-file search for that section
+/// rather than dropping its dependencies.
+fn find_section_byte_range(content: &str, section_key: &str) -> Option<(usize, usize)> {
+    let key_pattern = format!("\"{section_key}\"");
+    let mut depth = 0u32;
+    let mut in_string = false;
+    let mut escape = false;
+    let mut idx = 0;
+
+    while idx < content.len() {
+        let rest = &content[idx..];
+        let ch = rest.chars().next().unwrap_or_default();
+        let ch_len = ch.len_utf8();
+
+        if in_string {
+            match ch {
+                _ if escape => escape = false,
+                '\\' => escape = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            idx += ch_len;
+            continue;
+        }
+
+        if ch == '"' {
+            if depth == 1 && rest.starts_with(&key_pattern) {
+                let after_key = &content[idx + key_pattern.len()..];
+                let trimmed = after_key.trim_start();
+                if let Some(after_colon) = trimmed.strip_prefix(':') {
+                    let value = after_colon.trim_start();
+                    if let Some(object_body) = value.strip_prefix('{') {
+                        let open_brace_idx = content.len() - value.len();
+                        if let Some(end) = find_matching_brace_end(object_body) {
+                            return Some((open_brace_idx, open_brace_idx + 1 + end));
+                        }
+                        // Unbalanced braces — malformed JSON for this candidate; keep
+                        // scanning rather than giving up on the whole search.
+                    }
+                }
+            }
+            in_string = true;
+            idx += ch_len;
+            continue;
+        }
+
+        match ch {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        idx += ch_len;
+    }
+
+    None
+}
+
+/// Given the text right after an opening `{`, finds the byte offset (relative to that
+/// text) of the matching closing `}`, skipping over brace characters that appear inside
+/// string literals (so a `{`/`}` in a version string, e.g. a git URL, is not miscounted).
+/// Returns the offset just past the matching `}`.
+fn find_matching_brace_end(object_body: &str) -> Option<usize> {
+    let mut depth = 1u32;
+    let mut in_string = false;
+    let mut escape = false;
+
+    for (offset, ch) in object_body.char_indices() {
+        if in_string {
+            match ch {
+                _ if escape => escape = false,
+                '\\' => escape = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(offset + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -672,8 +798,13 @@ mod tests {
         let content = format!("\"{name}\":{padding}é more text \"{version}\" end");
 
         let line_table = LineOffsetTable::new(&content);
-        let (name_range, version_range) =
-            find_dependency_positions(&content, name, Some(&version), &line_table);
+        let (name_range, version_range) = find_dependency_positions(
+            &content,
+            name,
+            Some(&version),
+            (0, content.len()),
+            &line_table,
+        );
 
         assert_eq!(name_range.start.line, 0);
         // The multibyte character falls right at the truncated search boundary, so the
@@ -694,8 +825,13 @@ mod tests {
         let content = format!("\"{name}\": {quoted_version}{padding}é end");
 
         let line_table = LineOffsetTable::new(&content);
-        let (name_range, version_range) =
-            find_dependency_positions(&content, name, Some(&version), &line_table);
+        let (name_range, version_range) = find_dependency_positions(
+            &content,
+            name,
+            Some(&version),
+            (0, content.len()),
+            &line_table,
+        );
 
         assert_eq!(name_range.start.line, 0);
         let version_range = version_range.expect("version should still be found after truncation");
@@ -1014,5 +1150,240 @@ mod tests {
 
         assert_eq!(result.dependencies[0].version_req, Some("^4.18.2".into()));
         assert!(result.dependencies[0].catalog.is_none());
+    }
+
+    // --- #605: duplicate dependency names across sections ---
+
+    #[test]
+    fn test_duplicate_name_across_two_sections_with_intervening_entries() {
+        // #605: "lodash" appears in both `dependencies` and `devDependencies`, separated by
+        // several intervening `devDependencies` entries — each occurrence must resolve to its
+        // own section's position, not both collapsing onto the first match in the file.
+        let json = r#"{
+  "dependencies": {
+    "lodash": "^4.17.21"
+  },
+  "devDependencies": {
+    "aaa": "^1.0.0",
+    "bbb": "^1.0.0",
+    "ccc": "^1.0.0",
+    "lodash": "^4.17.0"
+  }
+}"#;
+
+        let result = parse_package_json(json, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 5);
+
+        let deps_lodash = result
+            .dependencies
+            .iter()
+            .find(|d| d.name == "lodash" && matches!(d.section, NpmDependencySection::Dependencies))
+            .expect("lodash in dependencies");
+        let dev_lodash = result
+            .dependencies
+            .iter()
+            .find(|d| {
+                d.name == "lodash" && matches!(d.section, NpmDependencySection::DevDependencies)
+            })
+            .expect("lodash in devDependencies");
+
+        assert_eq!(deps_lodash.version_req, Some("^4.17.21".into()));
+        assert_eq!(dev_lodash.version_req, Some("^4.17.0".into()));
+
+        assert_eq!(deps_lodash.name_range.start.line, 2);
+        assert_eq!(dev_lodash.name_range.start.line, 8);
+
+        let deps_version = deps_lodash
+            .version_range
+            .expect("dependencies lodash version_range");
+        let dev_version = dev_lodash
+            .version_range
+            .expect("devDependencies lodash version_range");
+        assert_eq!(deps_version.start.line, 2);
+        assert_eq!(dev_version.start.line, 8);
+    }
+
+    #[test]
+    fn test_duplicate_name_across_three_sections() {
+        let json = r#"{
+  "dependencies": {
+    "shared-lib": "^1.0.0"
+  },
+  "devDependencies": {
+    "shared-lib": "^2.0.0"
+  },
+  "optionalDependencies": {
+    "shared-lib": "^3.0.0"
+  }
+}"#;
+
+        let result = parse_package_json(json, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 3);
+
+        let dep = result
+            .dependencies
+            .iter()
+            .find(|d| matches!(d.section, NpmDependencySection::Dependencies))
+            .expect("shared-lib in dependencies");
+        let dev = result
+            .dependencies
+            .iter()
+            .find(|d| matches!(d.section, NpmDependencySection::DevDependencies))
+            .expect("shared-lib in devDependencies");
+        let opt = result
+            .dependencies
+            .iter()
+            .find(|d| matches!(d.section, NpmDependencySection::OptionalDependencies))
+            .expect("shared-lib in optionalDependencies");
+
+        assert_eq!(dep.version_req, Some("^1.0.0".into()));
+        assert_eq!(dev.version_req, Some("^2.0.0".into()));
+        assert_eq!(opt.version_req, Some("^3.0.0".into()));
+
+        assert_eq!(dep.name_range.start.line, 2);
+        assert_eq!(dev.name_range.start.line, 5);
+        assert_eq!(opt.name_range.start.line, 8);
+    }
+
+    #[test]
+    fn test_section_range_unaffected_by_unbalanced_brace_inside_version_string() {
+        // The section's own byte range is located by depth-scanning `{`/`}`, skipping string
+        // contents (`find_matching_brace_end`). An unbalanced `{` inside a version string must
+        // not miscount that depth and truncate (or overextend) the section's own range.
+        let json = r#"{
+  "dependencies": {
+    "weird": "pkg@file:../{unbalanced",
+    "after-weird": "^1.0.0"
+  },
+  "devDependencies": {
+    "weird": "^2.0.0"
+  }
+}"#;
+
+        let result = parse_package_json(json, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 3);
+
+        let deps_weird = result
+            .dependencies
+            .iter()
+            .find(|d| d.name == "weird" && matches!(d.section, NpmDependencySection::Dependencies))
+            .expect("weird in dependencies");
+        let dev_weird = result
+            .dependencies
+            .iter()
+            .find(|d| {
+                d.name == "weird" && matches!(d.section, NpmDependencySection::DevDependencies)
+            })
+            .expect("weird in devDependencies");
+        let after_weird = result
+            .dependencies
+            .iter()
+            .find(|d| d.name == "after-weird")
+            .expect("after-weird");
+
+        assert_eq!(
+            deps_weird.version_req,
+            Some("pkg@file:../{unbalanced".into())
+        );
+        assert_eq!(dev_weird.version_req, Some("^2.0.0".into()));
+        assert!(matches!(
+            after_weird.section,
+            NpmDependencySection::Dependencies
+        ));
+        assert_eq!(after_weird.version_req, Some("^1.0.0".into()));
+        assert!(after_weird.version_range.is_some());
+
+        assert_eq!(deps_weird.name_range.start.line, 2);
+        assert_eq!(dev_weird.name_range.start.line, 6);
+    }
+
+    #[test]
+    fn test_section_key_nested_under_package_extensions_not_mistaken_for_top_level() {
+        // impl-critic C1: pnpm's `packageExtensions` can declare a nested `dependencies`
+        // object before the manifest's real top-level `dependencies`. The nested key must
+        // not be mistaken for the section start — depth 1 is required.
+        let json = r#"{
+  "packageExtensions": {
+    "some-pkg": {
+      "dependencies": {
+        "nested-only": "^9.9.9"
+      }
+    }
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}"#;
+
+        let result = parse_package_json(json, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+
+        let express = &result.dependencies[0];
+        assert_eq!(express.name, "express");
+        assert_eq!(express.version_req, Some("^4.18.2".into()));
+        assert!(matches!(
+            express.section,
+            NpmDependencySection::Dependencies
+        ));
+        assert_ne!(express.name_range, Range::default());
+        assert!(express.version_range.is_some());
+    }
+
+    #[test]
+    fn test_section_key_nested_under_overrides_not_mistaken_for_top_level() {
+        // impl-critic C1: npm's `overrides` can likewise nest a `dependencies` key (e.g.
+        // for a package-specific override) before the real top-level `dependencies`.
+        let json = r#"{
+  "overrides": {
+    "some-pkg": {
+      "dependencies": {
+        "nested-only": "^9.9.9"
+      }
+    }
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}"#;
+
+        let result = parse_package_json(json, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+
+        let express = &result.dependencies[0];
+        assert_eq!(express.name, "express");
+        assert_eq!(express.version_req, Some("^4.18.2".into()));
+        assert!(matches!(
+            express.section,
+            NpmDependencySection::Dependencies
+        ));
+        assert_ne!(express.name_range, Range::default());
+        assert!(express.version_range.is_some());
+    }
+
+    #[test]
+    fn test_dependencies_section_not_matched_by_run_dependencies_script_key() {
+        // `find_section_byte_range` matches the exact quoted key `"dependencies"`; a script
+        // literally named "run-dependencies" must not be mistaken for the real section start.
+        let json = r#"{
+  "scripts": {
+    "run-dependencies": "some-cli-tool"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}"#;
+
+        let result = parse_package_json(json, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+
+        let express = &result.dependencies[0];
+        assert_eq!(express.name, "express");
+        assert_eq!(express.version_req, Some("^4.18.2".into()));
+        assert!(matches!(
+            express.section,
+            NpmDependencySection::Dependencies
+        ));
+        assert_eq!(express.name_range.start.line, 5);
+        assert!(express.version_range.is_some());
     }
 }
