@@ -1,0 +1,110 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Manifest edits bringing every safely-editable outdated dependency to `latest`."><title>collect_update_all_edits in deps_core::lsp_helpers - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="deps_core" data-themes="" data-resource-suffix="" data-rustdoc-version="1.98.1 (48a229cea 2026-09-01)" data-channel="1.98.1" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc fn"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">collect_update_all_edits</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../deps_core/index.html">deps_<wbr>core</a><span class="version">0.12.1</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">collect_<wbr>update_<wbr>all_<wbr>edits</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#examples" title="Examples">Examples</a></li></ul></section><div id="rustdoc-modnav"><h2><a href="index.html">In deps_<wbr>core::<wbr>lsp_<wbr>helpers</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">deps_core</a>::<wbr><a href="index.html">lsp_helpers</a></div><h1>Function <span class="fn">collect_<wbr>update_<wbr>all_<wbr>edits</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/deps_core/lsp_helpers/code_lenses.rs.html#122-202">Source</a> </span></div><pre class="rust item-decl"><code>pub fn collect_update_all_edits(
+    parse_result: &amp;dyn <a class="trait" href="../ecosystem/trait.ParseResult.html" title="trait deps_core::ecosystem::ParseResult">ParseResult</a>,
+    content: &amp;<a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>,
+    versions: <a class="struct" href="struct.VersionData.html" title="struct deps_core::lsp_helpers::VersionData">VersionData</a>&lt;'_&gt;,
+    formatter: &amp;dyn <a class="trait" href="trait.EcosystemFormatter.html" title="trait deps_core::lsp_helpers::EcosystemFormatter">EcosystemFormatter</a>,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;TextEdit&gt;</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Manifest edits bringing every safely-editable outdated dependency to <code>latest</code>.</p>
+<p>A dependency is included when all of the following hold:</p>
+<ul>
+<li>it declares a <code>version_range</code> (a span to rewrite exists);</li>
+<li>a <code>latest</code> version is known in <code>versions.cached</code> (normalized name first, then raw —
+mirroring <a href="fn.generate_diagnostics_from_cache.html" title="fn deps_core::lsp_helpers::generate_diagnostics_from_cache"><code>crate::lsp_helpers::generate_diagnostics_from_cache</code></a>);</li>
+<li><code>formatter.is_requirement_up_to_date</code> reports the declared requirement as <em>not</em>
+satisfying <code>latest</code> — the same predicate diagnostics use, so on a fixture where the
+guard below is a no-op, <code>collect_update_all_edits(..).len()</code> equals the number of
+<code>generate_diagnostics_from_cache</code> “Newer version available” diagnostics;</li>
+<li>the <strong>literal-span guard</strong> (<code>literal_span_matches</code>): <code>content</code> sliced over
+<code>version_range</code> must still be (up to whitespace and NuGet’s bracket wrap) the
+literal text — <a href="../ecosystem/trait.Dependency.html#method.version_literal" title="method deps_core::ecosystem::Dependency::version_literal"><code>Dependency::version_literal</code></a>
+when the ecosystem provides one (e.g. <code>deps-swift</code>, whose synthesized comparator
+requirement string diverges from the bare literal <code>version_range</code> spans), falling
+back to the declared requirement text otherwise. Some ecosystems point
+<code>version_range</code> at something that is not a version literal at all — a Maven
+<code>${property}</code> reference or a Gradle DSL variable/version-catalog alias — and
+rewriting those spans would corrupt the manifest instead of fixing it. A dependency
+that fails the guard is skipped entirely: neither counted nor edited.</li>
+</ul>
+<p>Accepted edits are sorted by start position; a later edit whose start falls before the
+previous edit’s end (an overlap — a <code>WorkspaceEdit</code> protocol violation) is dropped with
+a <code>tracing::warn!</code>. No current parser produces overlapping <code>version_range</code>s, so this is
+a guard against future parser changes, not an expected code path.</p>
+<p><code>content</code> is the manifest source, needed for the literal-span guard above — the same
+parameter <a href="../ecosystem/trait.Ecosystem.html#tymethod.generate_completions" title="method deps_core::ecosystem::Ecosystem::generate_completions"><code>Ecosystem::generate_completions</code></a>
+already threads through for a similar reason.</p>
+<h2 id="examples"><a class="doc-anchor" href="#examples">§</a>Examples</h2>
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>deps_core::lsp_helpers::{
+    collect_update_all_edits, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
+    PackageRendering, PackageVersions, RequirementResolution, SourcePolicy, VersionData,
+};
+<span class="kw">use </span>deps_core::{ConcreteVersion, Dependency, ParseResult, PackageName, VersionReq};
+<span class="kw">use </span>std::any::Any;
+<span class="kw">use </span>std::collections::HashMap;
+<span class="kw">use </span>tower_lsp_server::ls_types::{Position, Range, Uri};
+
+<span class="kw">struct </span>MockFormatter;
+<span class="kw">impl </span>PackageNaming <span class="kw">for </span>MockFormatter {}
+<span class="kw">impl </span>PackageRendering <span class="kw">for </span>MockFormatter {
+    <span class="kw">fn </span>format_version_for_text_edit(<span class="kw-2">&amp;</span><span class="self">self</span>, version: <span class="kw-2">&amp;</span>ConcreteVersion) -&gt; String {
+        version.to_string()
+    }
+    <span class="kw">fn </span>package_url(<span class="kw-2">&amp;</span><span class="self">self</span>, name: <span class="kw-2">&amp;</span>PackageName) -&gt; String {
+        <span class="macro">format!</span>(<span class="string">"https://example.com/{name}"</span>)
+    }
+}
+<span class="kw">impl </span>RequirementResolution <span class="kw">for </span>MockFormatter {}
+<span class="kw">impl </span>DiagnosticMessages <span class="kw">for </span>MockFormatter {}
+<span class="kw">impl </span>DiagnosticPolicy <span class="kw">for </span>MockFormatter {}
+<span class="kw">impl </span>SourcePolicy <span class="kw">for </span>MockFormatter {}
+<span class="kw">impl </span>OsvNaming <span class="kw">for </span>MockFormatter {}
+
+<span class="kw">struct </span>MockDep {
+    name: PackageName,
+    version_req: VersionReq,
+    version_range: Range,
+    name_range: Range,
+}
+<span class="kw">impl </span>Dependency <span class="kw">for </span>MockDep {
+    <span class="kw">fn </span>name(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="kw-2">&amp;</span>PackageName { <span class="kw-2">&amp;</span><span class="self">self</span>.name }
+    <span class="kw">fn </span>name_range(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; Range { <span class="self">self</span>.name_range }
+    <span class="kw">fn </span>version_requirement(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="prelude-ty">Option</span>&lt;<span class="kw-2">&amp;</span>VersionReq&gt; { <span class="prelude-val">Some</span>(<span class="kw-2">&amp;</span><span class="self">self</span>.version_req) }
+    <span class="kw">fn </span>version_range(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="prelude-ty">Option</span>&lt;Range&gt; { <span class="prelude-val">Some</span>(<span class="self">self</span>.version_range) }
+    <span class="kw">fn </span>source(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; deps_core::parser::DependencySource {
+        deps_core::parser::DependencySource::Registry
+    }
+    <span class="kw">fn </span>as_any(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="kw-2">&amp;</span><span class="kw">dyn </span>Any { <span class="self">self </span>}
+}
+
+<span class="kw">struct </span>MockParseResult { deps: Vec&lt;MockDep&gt;, uri: Uri }
+<span class="kw">impl </span>ParseResult <span class="kw">for </span>MockParseResult {
+    <span class="kw">fn </span>dependencies(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; Vec&lt;<span class="kw-2">&amp;</span><span class="kw">dyn </span>Dependency&gt; {
+        <span class="self">self</span>.deps.iter().map(|d| d <span class="kw">as </span><span class="kw-2">&amp;</span><span class="kw">dyn </span>Dependency).collect()
+    }
+    <span class="kw">fn </span>workspace_root(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="prelude-ty">Option</span>&lt;<span class="kw-2">&amp;</span>std::path::Path&gt; { <span class="prelude-val">None </span>}
+    <span class="kw">fn </span>uri(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="kw-2">&amp;</span>Uri { <span class="kw-2">&amp;</span><span class="self">self</span>.uri }
+    <span class="kw">fn </span>as_any(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="kw-2">&amp;</span><span class="kw">dyn </span>Any { <span class="self">self </span>}
+}
+
+<span class="kw">let </span>content = <span class="string">r#"serde = "1.0.0""#</span>;
+<span class="kw">let </span>parse_result = MockParseResult {
+    deps: <span class="macro">vec!</span>[MockDep {
+        name: PackageName::new(<span class="string">"serde"</span>),
+        version_req: VersionReq::new(<span class="string">"1.0.0"</span>),
+        version_range: Range::new(Position::new(<span class="number">0</span>, <span class="number">9</span>), Position::new(<span class="number">0</span>, <span class="number">14</span>)),
+        name_range: Range::new(Position::new(<span class="number">0</span>, <span class="number">0</span>), Position::new(<span class="number">0</span>, <span class="number">5</span>)),
+    }],
+    uri: deps_core::test_util::test_uri(<span class="string">"/test/Cargo.toml"</span>),
+};
+
+<span class="kw">let </span><span class="kw-2">mut </span>cached = HashMap::new();
+cached.insert(<span class="string">"serde"</span>.into(), PackageVersions::latest_only(<span class="string">"1.2.0"</span>));
+<span class="kw">let </span>resolved = HashMap::new();
+
+<span class="kw">let </span>edits = collect_update_all_edits(
+    <span class="kw-2">&amp;</span>parse_result,
+    content,
+    VersionData::new(<span class="kw-2">&amp;</span>cached, <span class="kw-2">&amp;</span>resolved),
+    <span class="kw-2">&amp;</span>MockFormatter,
+);
+
+<span class="macro">assert_eq!</span>(edits.len(), <span class="number">1</span>);
+<span class="macro">assert_eq!</span>(edits[<span class="number">0</span>].new_text, <span class="string">"1.2.0"</span>);</code></pre></div></div></details></section></div></main></body></html>

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["IndexTrust","Provenance","RegistryIndexError","SourceReplacement"],"fn":["cargo_home_config_path","referenced_aliases","resolve"],"struct":["AuthToken","CargoConfig","ConfigFileCache","RegistryIndex","ResolvedRegistryEntry"]};

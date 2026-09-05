@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["manifest_pattern_matches"],"struct":["EcosystemRegistry"]};

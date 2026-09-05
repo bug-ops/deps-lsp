@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["MAX_LOCKFILE_BYTES"],"enum":["ResolvedSource"],"fn":["locate_lockfile_for_manifest","read_lockfile_content"],"struct":["LockFileCache","ResolvedPackage","ResolvedPackages"],"trait":["LockFileProvider"]};

@@ -1,0 +1,50 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Index of the version an existence check should report as “latest”, ignoring `req` entirely."><title>select_latest_for_existence in deps_core::registry - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="deps_core" data-themes="" data-resource-suffix="" data-rustdoc-version="1.98.1 (48a229cea 2026-09-01)" data-channel="1.98.1" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc fn"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">select_latest_for_existence</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../deps_core/index.html">deps_<wbr>core</a><span class="version">0.12.1</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">select_<wbr>latest_<wbr>for_<wbr>existence</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#requirement-blindness-is-deliberate-and-dangerous" title="Requirement-blindness is deliberate and dangerous">Requirement-blindness is deliberate and dangerous</a></li><li><a href="#examples" title="Examples">Examples</a></li></ul></section><div id="rustdoc-modnav"><h2><a href="index.html">In deps_<wbr>core::<wbr>registry</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">deps_core</a>::<wbr><a href="index.html">registry</a></div><h1>Function <span class="fn">select_<wbr>latest_<wbr>for_<wbr>existence</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/deps_core/registry.rs.html#742-763">Source</a> </span></div><pre class="rust item-decl"><code>pub fn select_latest_for_existence&lt;T&gt;(
+    versions: &amp;<a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.slice.html">[T]</a>,
+    as_version: impl <a class="trait" href="https://doc.rust-lang.org/1.98.1/core/ops/function/trait.Fn.html" title="trait core::ops::function::Fn">Fn</a>(<a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.reference.html">&amp;T</a>) -&gt; &amp;dyn <a class="trait" href="trait.Version.html" title="trait deps_core::registry::Version">Version</a>,
+) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.98.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.usize.html">usize</a>&gt;</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Index of the version an <em>existence</em> check should report as “latest”, ignoring <code>req</code>
+entirely.</p>
+<p>This is the shared 3-rung fallback ladder used under a wildcard/empty requirement, where
+every version satisfies by definition and the question is only which one to prefer for
+display:</p>
+<ol>
+<li>The newest version that is neither flagged
+(<a href="enum.RemovalStatus.html#method.is_flagged" title="method deps_core::registry::RemovalStatus::is_flagged"><code>RemovalStatus::is_flagged</code></a>) nor a pre-release (<a href="trait.Version.html#method.is_prerelease" title="method deps_core::registry::Version::is_prerelease"><code>Version::is_prerelease</code></a>).</li>
+<li>Else, the newest version that does not block resolution
+(<a href="enum.RemovalStatus.html#method.blocks_resolution" title="method deps_core::registry::RemovalStatus::blocks_resolution"><code>RemovalStatus::blocks_resolution</code></a>) — an <code>AdvisoryDeprecated</code> version counts here.</li>
+<li>Else, index <code>0</code> unconditionally — the newest version overall, however it is flagged.
+A yanked-or-prerelease-only package still exists; this rung is what turns that case
+into “here is its newest version” instead of a false “Unknown package” (#347, #364).</li>
+</ol>
+<p><code>versions</code> must be sorted newest-first, as returned by <a href="trait.Registry.html#tymethod.get_versions" title="method deps_core::registry::Registry::get_versions"><code>Registry::get_versions</code></a>. Returns
+<code>None</code> only when <code>versions</code> is empty.</p>
+<h2 id="requirement-blindness-is-deliberate-and-dangerous"><a class="doc-anchor" href="#requirement-blindness-is-deliberate-and-dangerous">§</a>Requirement-blindness is deliberate and dangerous</h2>
+<p>This function takes no <code>req</code> parameter and does not check whether the caller is under a
+wildcard requirement — it always returns rung 3 as a last resort, regardless of what a
+concrete requirement might demand. It is <strong>only correct once the caller has already
+confirmed the requirement is a wildcard</strong> via <a href="fn.is_existence_wildcard.html" title="fn deps_core::registry::is_existence_wildcard"><code>is_existence_wildcard</code></a>. Calling it
+ungated — e.g. under a concrete <code>^1.2</code> requirement — can return a version that does not
+satisfy that requirement at all, silently corrupting upgrade resolution.</p>
+<h2 id="examples"><a class="doc-anchor" href="#examples">§</a>Examples</h2>
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>deps_core::registry::{RemovalStatus, Version, select_latest_for_existence};
+<span class="kw">use </span>deps_core::ConcreteVersion;
+<span class="kw">use </span>std::any::Any;
+
+<span class="kw">struct </span>MyVersion { version: ConcreteVersion, status: RemovalStatus, prerelease: bool }
+
+<span class="kw">impl </span>Version <span class="kw">for </span>MyVersion {
+    <span class="kw">fn </span>version_string(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="kw-2">&amp;</span>ConcreteVersion { <span class="kw-2">&amp;</span><span class="self">self</span>.version }
+    <span class="kw">fn </span>removal_status(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; RemovalStatus { <span class="self">self</span>.status }
+    <span class="kw">fn </span>is_prerelease(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; bool { <span class="self">self</span>.prerelease }
+    <span class="kw">fn </span>as_any(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="kw-2">&amp;</span><span class="kw">dyn </span>Any { <span class="self">self </span>}
+}
+
+<span class="comment">// Newest version is yanked; rung 3 still returns it rather than `None`.
+</span><span class="kw">let </span>versions = <span class="macro">vec!</span>[
+    MyVersion { version: <span class="string">"2.0.0"</span>.into(), status: RemovalStatus::Yanked, prerelease: <span class="bool-val">false </span>},
+    MyVersion { version: <span class="string">"1.5.0"</span>.into(), status: RemovalStatus::Yanked, prerelease: <span class="bool-val">false </span>},
+];
+
+<span class="kw">let </span>idx = select_latest_for_existence(<span class="kw-2">&amp;</span>versions, |v| v <span class="kw">as </span><span class="kw-2">&amp;</span><span class="kw">dyn </span>Version);
+<span class="macro">assert_eq!</span>(idx, <span class="prelude-val">Some</span>(<span class="number">0</span>));
+
+<span class="macro">assert_eq!</span>(select_latest_for_existence::&lt;MyVersion&gt;(<span class="kw-2">&amp;</span>[], |v| v <span class="kw">as </span><span class="kw-2">&amp;</span><span class="kw">dyn </span>Version), <span class="prelude-val">None</span>);</code></pre></div></div></details></section></div></main></body></html>

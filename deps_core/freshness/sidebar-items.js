@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["DEFAULT_COOLDOWN_SECS"],"fn":["format_relative_age","is_within_cooldown"],"struct":["FreshnessSettings","PublishTime"]};

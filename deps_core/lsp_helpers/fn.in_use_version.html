@@ -1,0 +1,85 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="The version of `dep` this project treats as actually in use."><title>in_use_version in deps_core::lsp_helpers - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="deps_core" data-themes="" data-resource-suffix="" data-rustdoc-version="1.98.1 (48a229cea 2026-09-01)" data-channel="1.98.1" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc fn"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">in_use_version</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../deps_core/index.html">deps_<wbr>core</a><span class="version">0.12.1</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">in_<wbr>use_<wbr>version</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#examples" title="Examples">Examples</a></li></ul></section><div id="rustdoc-modnav"><h2><a href="index.html">In deps_<wbr>core::<wbr>lsp_<wbr>helpers</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">deps_core</a>::<wbr><a href="index.html">lsp_helpers</a></div><h1>Function <span class="fn">in_<wbr>use_<wbr>version</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/deps_core/lsp_helpers/in_use_version.rs.html#304-326">Source</a> </span></div><pre class="rust item-decl"><code>pub fn in_use_version(
+    dep: &amp;dyn <a class="trait" href="../ecosystem/trait.Dependency.html" title="trait deps_core::ecosystem::Dependency">Dependency</a>,
+    normalized_name: &amp;<a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>,
+    resolved_versions: &amp;<a class="struct" href="https://doc.rust-lang.org/1.98.1/std/collections/hash/map/struct.HashMap.html" title="struct std::collections::hash::map::HashMap">HashMap</a>&lt;<a class="struct" href="../package/struct.PackageName.html" title="struct deps_core::package::PackageName">PackageName</a>, <a class="struct" href="../package/struct.ConcreteVersion.html" title="struct deps_core::package::ConcreteVersion">ConcreteVersion</a>&gt;,
+    formatter: &amp;dyn <a class="trait" href="trait.EcosystemFormatter.html" title="trait deps_core::lsp_helpers::EcosystemFormatter">EcosystemFormatter</a>,
+    ecosystem: <a class="enum" href="../ecosystem/enum.EcosystemId.html" title="enum deps_core::ecosystem::EcosystemId">EcosystemId</a>,
+) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.98.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>&gt;</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>The version of <code>dep</code> this project treats as actually in use.</p>
+<p>The lock-file-resolved version, else the declared requirement when it is
+already concrete (<a href="fn.concrete_pin_version.html" title="fn deps_core::lsp_helpers::concrete_pin_version"><code>concrete_pin_version</code></a>). <code>None</code> when neither applies.</p>
+<p>A dependency whose manifest requirement is itself the resolved version
+(<a href="trait.RequirementResolution.html#method.manifest_requirement_is_resolved_version" title="method deps_core::lsp_helpers::RequirementResolution::manifest_requirement_is_resolved_version"><code>crate::lsp_helpers::RequirementResolution::manifest_requirement_is_resolved_version</code></a> — a Go
+<code>require</code>-directive dependency) skips the lockfile step entirely, going
+straight to the declared requirement (go.sum is unreliable there — a
+checksum ledger that <code>go get</code>/<code>go build</code> only ever append to, so its
+last-occurrence-wins parse can surface a version still recorded in the
+file but no longer selected by Go’s MVS). Shared by <code>deps-lsp</code>’s OSV
+target selection, its yanked-version check, and the yanked-diagnostic
+consistency check in <a href="fn.generate_diagnostics_from_cache.html" title="fn deps_core::lsp_helpers::generate_diagnostics_from_cache"><code>super::diagnostics::generate_diagnostics_from_cache</code></a>
+(#394 S1) — all three need “what version does the user actually have”
+for the same reason: querying a fabricated version produces a silent
+false negative.</p>
+<h2 id="examples"><a class="doc-anchor" href="#examples">§</a>Examples</h2>
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>deps_core::lsp_helpers::{
+    DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
+    RequirementResolution, SourcePolicy, in_use_version,
+};
+<span class="kw">use </span>deps_core::{ConcreteVersion, Dependency, EcosystemId, PackageName, VersionReq};
+<span class="kw">use </span>std::any::Any;
+<span class="kw">use </span>std::collections::HashMap;
+<span class="kw">use </span>tower_lsp_server::ls_types::Range;
+
+<span class="kw">struct </span>SimpleDep {
+    name: PackageName,
+    version_req: <span class="prelude-ty">Option</span>&lt;VersionReq&gt;,
+}
+
+<span class="kw">impl </span>Dependency <span class="kw">for </span>SimpleDep {
+    <span class="kw">fn </span>name(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="kw-2">&amp;</span>PackageName {
+        <span class="kw-2">&amp;</span><span class="self">self</span>.name
+    }
+    <span class="kw">fn </span>name_range(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; Range {
+        Range::default()
+    }
+    <span class="kw">fn </span>version_requirement(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="prelude-ty">Option</span>&lt;<span class="kw-2">&amp;</span>VersionReq&gt; {
+        <span class="self">self</span>.version_req.as_ref()
+    }
+    <span class="kw">fn </span>version_range(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="prelude-ty">Option</span>&lt;Range&gt; {
+        <span class="prelude-val">None
+    </span>}
+    <span class="kw">fn </span>source(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; deps_core::parser::DependencySource {
+        deps_core::parser::DependencySource::Registry
+    }
+    <span class="kw">fn </span>as_any(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="kw-2">&amp;</span><span class="kw">dyn </span>Any {
+        <span class="self">self
+    </span>}
+}
+
+<span class="kw">struct </span>SimpleFormatter;
+<span class="kw">impl </span>PackageNaming <span class="kw">for </span>SimpleFormatter {}
+<span class="kw">impl </span>PackageRendering <span class="kw">for </span>SimpleFormatter {
+    <span class="kw">fn </span>format_version_for_text_edit(<span class="kw-2">&amp;</span><span class="self">self</span>, version: <span class="kw-2">&amp;</span>ConcreteVersion) -&gt; String {
+        version.to_string()
+    }
+    <span class="kw">fn </span>package_url(<span class="kw-2">&amp;</span><span class="self">self</span>, name: <span class="kw-2">&amp;</span>PackageName) -&gt; String {
+        name.to_string()
+    }
+}
+<span class="kw">impl </span>RequirementResolution <span class="kw">for </span>SimpleFormatter {}
+<span class="kw">impl </span>DiagnosticMessages <span class="kw">for </span>SimpleFormatter {}
+<span class="kw">impl </span>DiagnosticPolicy <span class="kw">for </span>SimpleFormatter {}
+<span class="kw">impl </span>SourcePolicy <span class="kw">for </span>SimpleFormatter {}
+<span class="kw">impl </span>OsvNaming <span class="kw">for </span>SimpleFormatter {}
+
+<span class="kw">let </span>dep = SimpleDep {
+    name: PackageName::new(<span class="string">"time"</span>),
+    version_req: <span class="prelude-val">Some</span>(VersionReq::new(<span class="string">"=0.1.43"</span>)),
+};
+<span class="kw">let </span>resolved_versions: HashMap&lt;PackageName, ConcreteVersion&gt; = HashMap::new();
+
+<span class="comment">// No lock file, but the requirement is already an exact pin — falls
+// back to it, stripped of its `=` marker.
+</span><span class="macro">assert_eq!</span>(
+    in_use_version(<span class="kw-2">&amp;</span>dep, <span class="string">"time"</span>, <span class="kw-2">&amp;</span>resolved_versions, <span class="kw-2">&amp;</span>SimpleFormatter, EcosystemId::Cargo),
+    <span class="prelude-val">Some</span>(<span class="string">"0.1.43"</span>.to_string())
+);</code></pre></div></div></details></section></div></main></body></html>

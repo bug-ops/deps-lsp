@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["DependencyGroup","DependencySource"],"struct":["BundlerDependency","BundlerVersion","GemInfo"]};

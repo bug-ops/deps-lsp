@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["REGISTRY"],"fn":["package_url"],"struct":["PubDevRegistry"]};

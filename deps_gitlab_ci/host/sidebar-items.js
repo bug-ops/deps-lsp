@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["GITLAB_COM","GITLAB_COM_ORIGIN"],"fn":["is_valid_gitlab_coordinate","token_host_origin"],"struct":["GitlabHost","GitlabInstanceHost"]};

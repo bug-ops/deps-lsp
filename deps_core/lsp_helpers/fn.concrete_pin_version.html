@@ -1,0 +1,39 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Returns the concrete version text `requirement` denotes, or `None` if `requirement` is not the shape of a single concrete version."><title>concrete_pin_version in deps_core::lsp_helpers - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="deps_core" data-themes="" data-resource-suffix="" data-rustdoc-version="1.98.1 (48a229cea 2026-09-01)" data-channel="1.98.1" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc fn"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">concrete_pin_version</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../deps_core/index.html">deps_<wbr>core</a><span class="version">0.12.1</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">concrete_<wbr>pin_<wbr>version</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#examples" title="Examples">Examples</a></li></ul></section><div id="rustdoc-modnav"><h2><a href="index.html">In deps_<wbr>core::<wbr>lsp_<wbr>helpers</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">deps_core</a>::<wbr><a href="index.html">lsp_helpers</a></div><h1>Function <span class="fn">concrete_<wbr>pin_<wbr>version</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/deps_core/lsp_helpers/in_use_version.rs.html#183-208">Source</a> </span></div><pre class="rust item-decl"><code>pub fn concrete_pin_version(
+    requirement: &amp;<a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>,
+    ecosystem: <a class="enum" href="../ecosystem/enum.EcosystemId.html" title="enum deps_core::ecosystem::EcosystemId">EcosystemId</a>,
+) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.98.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;<a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>&gt;</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Returns the concrete version text <code>requirement</code> denotes, or <code>None</code> if
+<code>requirement</code> is not the shape of a single concrete version.</p>
+<p>Any pin marker (<code>=</code>/<code>==</code>, or a single-value bracket wrap like NuGet’s
+<code>[1.0.0]</code>) is stripped off. The only shape safe to query OSV with
+directly, and, for #233, the only shape safe to compare against a real
+registry version string in the yanked-version probe. A wrong answer here
+is invisible in testing (OSV silently returns <code>{}</code> for a fabricated
+version; the yanked probe silently finds no match), so getting this
+right matters more than covering every ecosystem’s full range grammar.</p>
+<p>An explicit pin marker is always accepted, and its marker is stripped
+from the returned text — required because PyPI’s parser retains the
+pep440 comparator in <code>Dependency::version_requirement()</code> (an exact pin
+parses to <code>"==4.9.0"</code>, not <code>"4.9.0"</code>; confirmed by
+<code>deps-pypi</code>’s <code>test_basic_pinned</code>), so comparing the <em>unstripped</em> text
+against a real registry version string (<code>"4.9.0"</code>) would never match. A
+<em>bare</em> requirement (no marker) is returned verbatim, and is accepted only
+for ecosystems where a bare version is not itself a range by default
+(critique C2) — see <code>bare_version_is_a_range</code>.</p>
+<h2 id="examples"><a class="doc-anchor" href="#examples">§</a>Examples</h2>
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>deps_core::EcosystemId;
+<span class="kw">use </span>deps_core::lsp_helpers::concrete_pin_version;
+
+<span class="comment">// An explicit pin marker is stripped, for any ecosystem.
+</span><span class="macro">assert_eq!</span>(
+    concrete_pin_version(<span class="string">"=1.2.3"</span>, EcosystemId::Cargo),
+    <span class="prelude-val">Some</span>(<span class="string">"1.2.3"</span>)
+);
+
+<span class="comment">// Cargo's bare version is a caret range by default, not a pin.
+</span><span class="macro">assert_eq!</span>(concrete_pin_version(<span class="string">"1.2.3"</span>, EcosystemId::Cargo), <span class="prelude-val">None</span>);
+
+<span class="comment">// Maven has no implicit range operator, so a bare version is exact.
+</span><span class="macro">assert_eq!</span>(
+    concrete_pin_version(<span class="string">"2.14.1"</span>, EcosystemId::Maven),
+    <span class="prelude-val">Some</span>(<span class="string">"2.14.1"</span>)
+);</code></pre></div></div></details></section></div></main></body></html>

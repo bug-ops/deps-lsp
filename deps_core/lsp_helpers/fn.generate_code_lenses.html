@@ -1,0 +1,51 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Zero or one lens for the document, bound to `command_id`."><title>generate_code_lenses in deps_core::lsp_helpers - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="deps_core" data-themes="" data-resource-suffix="" data-rustdoc-version="1.98.1 (48a229cea 2026-09-01)" data-channel="1.98.1" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc fn"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">generate_code_lenses</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../deps_core/index.html">deps_<wbr>core</a><span class="version">0.12.1</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">generate_<wbr>code_<wbr>lenses</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#examples" title="Examples">Examples</a></li></ul></section><div id="rustdoc-modnav"><h2><a href="index.html">In deps_<wbr>core::<wbr>lsp_<wbr>helpers</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">deps_core</a>::<wbr><a href="index.html">lsp_helpers</a></div><h1>Function <span class="fn">generate_<wbr>code_<wbr>lenses</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/deps_core/lsp_helpers/code_lenses.rs.html#297-326">Source</a> </span></div><pre class="rust item-decl"><code>pub fn generate_code_lenses(
+    parse_result: &amp;dyn <a class="trait" href="../ecosystem/trait.ParseResult.html" title="trait deps_core::ecosystem::ParseResult">ParseResult</a>,
+    content: &amp;<a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>,
+    versions: <a class="struct" href="struct.VersionData.html" title="struct deps_core::lsp_helpers::VersionData">VersionData</a>&lt;'_&gt;,
+    formatter: &amp;dyn <a class="trait" href="trait.EcosystemFormatter.html" title="trait deps_core::lsp_helpers::EcosystemFormatter">EcosystemFormatter</a>,
+    uri: &amp;Uri,
+    command_id: &amp;<a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;CodeLens&gt;</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Zero or one lens for the document, bound to <code>command_id</code>.</p>
+<p>Delegates to <a href="fn.collect_update_all_edits.html" title="fn deps_core::lsp_helpers::collect_update_all_edits"><code>collect_update_all_edits</code></a> for the count in the lens title — the same
+call the command handler makes to produce the edits it applies, so <code>title N == edits applied</code> holds by construction rather than by two implementations agreeing. Returns no
+lens when there is nothing to update: a permanent line-0 annotation on every
+up-to-date manifest would be noise.</p>
+<h2 id="examples"><a class="doc-anchor" href="#examples">§</a>Examples</h2>
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>deps_core::lsp_helpers::{
+    generate_code_lenses, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
+    PackageRendering, RequirementResolution, SourcePolicy, VersionData,
+};
+<span class="kw">use </span>deps_core::{ConcreteVersion, PackageName, ParseResult};
+<span class="kw">use </span>std::collections::HashMap;
+
+<span class="kw">struct </span>MockFormatter;
+<span class="kw">impl </span>PackageNaming <span class="kw">for </span>MockFormatter {}
+<span class="kw">impl </span>PackageRendering <span class="kw">for </span>MockFormatter {
+    <span class="kw">fn </span>format_version_for_text_edit(<span class="kw-2">&amp;</span><span class="self">self</span>, version: <span class="kw-2">&amp;</span>ConcreteVersion) -&gt; String {
+        version.to_string()
+    }
+    <span class="kw">fn </span>package_url(<span class="kw-2">&amp;</span><span class="self">self</span>, name: <span class="kw-2">&amp;</span>PackageName) -&gt; String {
+        <span class="macro">format!</span>(<span class="string">"https://example.com/{name}"</span>)
+    }
+}
+<span class="kw">impl </span>RequirementResolution <span class="kw">for </span>MockFormatter {}
+<span class="kw">impl </span>DiagnosticMessages <span class="kw">for </span>MockFormatter {}
+<span class="kw">impl </span>DiagnosticPolicy <span class="kw">for </span>MockFormatter {}
+<span class="kw">impl </span>SourcePolicy <span class="kw">for </span>MockFormatter {}
+<span class="kw">impl </span>OsvNaming <span class="kw">for </span>MockFormatter {}
+
+<span class="comment">// An empty parse result yields no outdated dependencies, so no lens is generated.
+</span><span class="kw">let </span>parse_result = EmptyParseResult { uri: deps_core::test_util::test_uri(<span class="string">"/test/Cargo.toml"</span>) };
+<span class="kw">let </span>cached = HashMap::new();
+<span class="kw">let </span>resolved = HashMap::new();
+
+<span class="kw">let </span>lenses = generate_code_lenses(
+    <span class="kw-2">&amp;</span>parse_result,
+    <span class="string">""</span>,
+    VersionData::new(<span class="kw-2">&amp;</span>cached, <span class="kw-2">&amp;</span>resolved),
+    <span class="kw-2">&amp;</span>MockFormatter,
+    parse_result.uri(),
+    <span class="string">"deps-lsp.updateAllOutdated"</span>,
+);
+
+<span class="macro">assert!</span>(lenses.is_empty());</code></pre></div></div></details></section></div></main></body></html>

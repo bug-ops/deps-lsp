@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["EndpointKind","HostRef","IncludeKind","PinStyle"],"struct":["GitlabCiDependency","GitlabCiParseResult","GitlabCiVersion","GitlabRoute"]};

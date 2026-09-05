@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["PypiDependencySource"],"mod":["config","ecosystem","error","formatter","lockfile","name","parser","registry","types"]};

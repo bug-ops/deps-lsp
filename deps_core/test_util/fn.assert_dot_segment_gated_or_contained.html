@@ -1,0 +1,53 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Exercises one ecosystem’s identifier-to-URL sink against every `ADVERSARIAL_URL_SEGMENTS` entry."><title>assert_dot_segment_gated_or_contained in deps_core::test_util - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="deps_core" data-themes="" data-resource-suffix="" data-rustdoc-version="1.98.1 (48a229cea 2026-09-01)" data-channel="1.98.1" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc fn"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">assert_dot_segment_gated_or_contained</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../deps_core/index.html">deps_<wbr>core</a><span class="version">0.12.1</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">assert_<wbr>dot_<wbr>segment_<wbr>gated_<wbr>or_<wbr>contained</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#panics" title="Panics">Panics</a></li><li><a href="#examples" title="Examples">Examples</a></li></ul></section><div id="rustdoc-modnav"><h2><a href="index.html">In deps_<wbr>core::<wbr>test_<wbr>util</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">deps_core</a>::<wbr><a href="index.html">test_util</a></div><h1>Function <span class="fn">assert_<wbr>dot_<wbr>segment_<wbr>gated_<wbr>or_<wbr>contained</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/deps_core/test_util.rs.html#130-141">Source</a> </span></div><pre class="rust item-decl"><code>pub fn assert_dot_segment_gated_or_contained(
+    resolve: impl <a class="trait" href="https://doc.rust-lang.org/1.98.1/core/ops/function/trait.Fn.html" title="trait core::ops::function::Fn">Fn</a>(&amp;<a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.98.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>&gt;,
+    expected_host: &amp;<a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>,
+    expected_path_prefix: &amp;<a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>,
+)</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Exercises one ecosystem’s identifier-to-URL sink against every
+<a href="constant.ADVERSARIAL_URL_SEGMENTS.html" title="constant deps_core::test_util::ADVERSARIAL_URL_SEGMENTS"><code>ADVERSARIAL_URL_SEGMENTS</code></a> entry.</p>
+<p><code>resolve</code> should mirror the real request path: apply whatever validation gate
+(<code>is_dot_segment</code>, <code>is_safe_package_name</code>, <code>is_safe_maven_coordinate_segment</code>, …) the
+production code runs before building the request, returning <code>None</code> when the gate would
+reject the identifier (the request is never built, so there is nothing to check), or
+<code>Some(url)</code> with the URL the identifier resolves to when it reaches the real
+fetch-URL-builder function directly.</p>
+<p>For every input that reaches <code>Some(url)</code>, asserts <code>url</code> parses, stays under
+<code>expected_host</code>/<code>expected_path_prefix</code>, and that <code>segment</code> itself survives the round
+trip. That last check is the one that actually catches a missing/deleted gate: for an
+ecosystem whose identifier is the <em>first</em> path component (no fixed sub-path to nest
+under, e.g. <code>deps-cargo</code>’s sparse-index path or <code>deps-npm</code>’s bare
+<code>registry.npmjs.org/{name}</code>), <code>expected_path_prefix</code> can only ever be <code>"/"</code> — trivially
+satisfied by any path — so the prefix check alone is a tautology there. Deleting the
+real gate collapses <code>..</code>/<code>.</code> via dot-segment normalization, which removes it from the
+path entirely; the survival check catches that regardless of how trivial
+<code>expected_path_prefix</code> is, so passing <code>"/"</code> is fine as long as this check is also in
+effect.</p>
+<p>The survival check itself takes one of two forms depending on <code>segment</code>:</p>
+<ul>
+<li>For a bare <code>.</code>/<code>..</code> (the only values <code>url</code>’s dot-segment normalization treats
+specially): some path segment, once percent-decoded, must <em>start with</em> that value.
+A whole-path substring search would be too weak here — a coincidental <code>.</code> baked into
+a static suffix the sink always appends (e.g. <code>.json</code>) would satisfy <code>contains</code> even
+if the real <code>.</code>/<code>..</code> segment was silently removed, leaving no trace of it anywhere.
+<code>starts_with</code> (not exact equality) still accommodates a sink that glues the
+identifier directly onto a static suffix with no separator (e.g. <code>deps-bundler</code>’s
+<code>versions_url</code>, which decodes a <code>..</code> identifier to the segment <code>"..json"</code>).</li>
+<li>For every other adversarial entry: the percent-decoded <em>whole path</em> must contain
+<code>segment</code> (or <code>transform(segment)</code>) as a substring — safe here since none of those
+entries collides with a static suffix the way a bare <code>.</code> does.</li>
+</ul>
+<h2 id="panics"><a class="doc-anchor" href="#panics">§</a>Panics</h2>
+<p>Panics if a returned URL fails to parse, escapes <code>expected_host</code> or
+<code>expected_path_prefix</code>, if the (possibly transformed) segment is empty despite
+<code>resolve</code> returning <code>Some</code>, or if the segment does not survive per the rules above.</p>
+<h2 id="examples"><a class="doc-anchor" href="#examples">§</a>Examples</h2>
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>deps_core::test_util::assert_dot_segment_gated_or_contained;
+
+<span class="kw">fn </span>build(name: <span class="kw-2">&amp;</span>str) -&gt; String {
+    <span class="macro">format!</span>(<span class="string">"https://example.com/api/{}"</span>, urlencoding::encode(name))
+}
+
+<span class="kw">fn </span>resolve(name: <span class="kw-2">&amp;</span>str) -&gt; <span class="prelude-ty">Option</span>&lt;String&gt; {
+    (name != <span class="string">"." </span>&amp;&amp; name != <span class="string">".."</span>).then(|| build(name))
+}
+
+assert_dot_segment_gated_or_contained(resolve, <span class="string">"example.com"</span>, <span class="string">"/api/"</span>);</code></pre></div></div></details></section></div></main></body></html>

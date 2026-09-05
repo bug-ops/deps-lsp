@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["MAX_GITLAB_PAGES"],"fn":["gitlab_rate_limit_error","parse_releases_page","parse_tags_page"],"struct":["GitlabApiClient","GitlabCommit","GitlabRelease","GitlabTag"]};

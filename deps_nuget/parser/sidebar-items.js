@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["parse_directory_packages_props","parse_packages_config","parse_project_file"]};

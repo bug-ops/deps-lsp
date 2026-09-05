@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["REGISTRY"],"struct":["GithubActionsRegistry","TagIndex"]};

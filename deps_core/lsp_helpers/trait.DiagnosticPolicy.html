@@ -1,0 +1,90 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Per-ecosystem opt-outs for which diagnostics apply to which dependency/requirement shapes."><title>DiagnosticPolicy in deps_core::lsp_helpers - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="deps_core" data-themes="" data-resource-suffix="" data-rustdoc-version="1.98.1 (48a229cea 2026-09-01)" data-channel="1.98.1" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc trait"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">DiagnosticPolicy</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../deps_core/index.html">deps_<wbr>core</a><span class="version">0.12.1</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Diagnostic<wbr>Policy</a></h2><h3><a href="#provided-methods">Provided Methods</a></h3><ul class="block"><li><a href="#method.strict_semver_prerelease_exclusion" title="strict_semver_prerelease_exclusion">strict_semver_prerelease_exclusion</a></li><li><a href="#method.supports_package_rename" title="supports_package_rename">supports_package_rename</a></li><li><a href="#method.yanked_diagnostic_applies_to" title="yanked_diagnostic_applies_to">yanked_diagnostic_applies_to</a></li></ul><h3><a href="#implementors">Implementors</a></h3></section><div id="rustdoc-modnav"><h2><a href="index.html">In deps_<wbr>core::<wbr>lsp_<wbr>helpers</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">deps_core</a>::<wbr><a href="index.html">lsp_helpers</a></div><h1>Trait <span class="trait">Diagnostic<wbr>Policy</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/deps_core/lsp_helpers/formatter.rs.html#486-609">Source</a> </span></div><pre class="rust item-decl"><code>pub trait DiagnosticPolicy: <a class="trait" href="https://doc.rust-lang.org/1.98.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + <a class="trait" href="https://doc.rust-lang.org/1.98.1/core/marker/trait.Sync.html" title="trait core::marker::Sync">Sync</a> {
+    // Provided methods
+    fn <a href="#method.strict_semver_prerelease_exclusion" class="fn">strict_semver_prerelease_exclusion</a>(&amp;self) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.bool.html">bool</a> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.supports_package_rename" class="fn">supports_package_rename</a>(&amp;self) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.bool.html">bool</a> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.yanked_diagnostic_applies_to" class="fn">yanked_diagnostic_applies_to</a>(
+        &amp;self,
+        _dep: &amp;dyn <a class="trait" href="../ecosystem/trait.Dependency.html" title="trait deps_core::ecosystem::Dependency">Dependency</a>,
+        _requirement: &amp;<a class="struct" href="../package/struct.VersionReq.html" title="struct deps_core::package::VersionReq">VersionReq</a>,
+    ) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.bool.html">bool</a> { ... }
+}</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Per-ecosystem opt-outs for which diagnostics apply to which dependency/requirement shapes.</p>
+<p>Implementors guarantee these hooks only ever narrow or disable a diagnostic a shared,
+ecosystem-agnostic pass would otherwise emit unconditionally — never widen or fabricate one.
+An override does not always mean “this ecosystem is broken”: <code>NpmFormatter</code> returns <code>false</code>
+from <a href="trait.DiagnosticPolicy.html#method.yanked_diagnostic_applies_to" title="method deps_core::lsp_helpers::DiagnosticPolicy::yanked_diagnostic_applies_to"><code>yanked_diagnostic_applies_to</code></a> unconditionally not
+because the underlying signal is wrong, but to avoid duplicating the separate #205
+package-level deprecation diagnostic that would otherwise fire alongside it.</p>
+</div></details><h2 id="provided-methods" class="section-header">Provided Methods<a href="#provided-methods" class="anchor">§</a></h2><div class="methods"><details class="toggle method-toggle" open><summary><section id="method.strict_semver_prerelease_exclusion" class="method"><a class="src rightside" href="../../src/deps_core/lsp_helpers/formatter.rs.html#513-515">Source</a><h4 class="code-header">fn <a href="#method.strict_semver_prerelease_exclusion" class="fn">strict_semver_prerelease_exclusion</a>(&amp;self) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.bool.html">bool</a></h4></section></summary><div class="docblock"><p>Whether this ecosystem’s requirement/version syntax follows strict SemVer 2.0.0
+pre-release semantics: a pre-release version (<code>X.Y.Z-pre</code>) is excluded from matching
+<code>requirement</code> unless <code>requirement</code> itself pins to the same <code>X.Y.Z</code> tuple with a
+pre-release tag — the rule Cargo’s <code>semver</code> crate and npm’s <code>node-semver</code> both
+implement, and that <code>compile_requirement</code>’s matcher inherits from its underlying
+comparator.</p>
+<p>Used by <a href="fn.requirement_is_unsatisfiable.html" title="fn deps_core::lsp_helpers::requirement_is_unsatisfiable"><code>crate::lsp_helpers::requirement_is_unsatisfiable</code></a>’s caller in <code>generate_diagnostics_from_cache</code>
+to decide whether the unsatisfiable-requirement WARNING should be enriched with a
+mention of a published pre-release that would satisfy <code>requirement</code> if pre-release
+exclusion were relaxed (#299). Maven/NuGet/Composer/Gradle use non-strict,
+ecosystem-specific range models where this premise does not hold — they must not
+override this.</p>
+<p>Default <code>false</code>. <code>deps-cargo</code>, <code>deps-npm</code>, and <code>deps-swift</code> override this to <code>true</code>.</p>
+<h5 id="examples"><a class="doc-anchor" href="#examples">§</a>Examples</h5>
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>deps_core::lsp_helpers::DiagnosticPolicy;
+
+<span class="kw">struct </span>DefaultFormatter;
+<span class="kw">impl </span>DiagnosticPolicy <span class="kw">for </span>DefaultFormatter {}
+
+<span class="macro">assert!</span>(!DefaultFormatter.strict_semver_prerelease_exclusion());</code></pre></div></div></details><details class="toggle method-toggle" open><summary><section id="method.supports_package_rename" class="method"><a class="src rightside" href="../../src/deps_core/lsp_helpers/formatter.rs.html#526-528">Source</a><h4 class="code-header">fn <a href="#method.supports_package_rename" class="fn">supports_package_rename</a>(&amp;self) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.bool.html">bool</a></h4></section></summary><div class="docblock"><p>Whether this ecosystem’s deprecation payload (<a href="../registry/struct.Deprecation.html#structfield.replacement" title="field deps_core::registry::Deprecation::replacement"><code>crate::Deprecation::replacement</code></a>)
+is safe to offer as a “Replace with X” rename quickfix.</p>
+<p>Default <code>false</code>. Only an ecosystem whose replacement name comes from a
+<strong>structured, registry-validated</strong> field may override this to <code>true</code> — never one
+synthesized by parsing free text, which is a typosquatting vector (npm’s
+<code>deprecated</code> message names a successor only in prose). <code>ComposerFormatter</code>
+overrides this to <code>true</code>: Packagist’s <code>abandoned</code> replacement is a real package
+name field, not extracted text.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.yanked_diagnostic_applies_to" class="method"><a class="src rightside" href="../../src/deps_core/lsp_helpers/formatter.rs.html#602-608">Source</a><h4 class="code-header">fn <a href="#method.yanked_diagnostic_applies_to" class="fn">yanked_diagnostic_applies_to</a>(
+    &amp;self,
+    _dep: &amp;dyn <a class="trait" href="../ecosystem/trait.Dependency.html" title="trait deps_core::ecosystem::Dependency">Dependency</a>,
+    _requirement: &amp;<a class="struct" href="../package/struct.VersionReq.html" title="struct deps_core::package::VersionReq">VersionReq</a>,
+) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.bool.html">bool</a></h4></section></summary><div class="docblock"><p>Whether the “requirement satisfiable only by a yanked version” diagnostic
+(<code>crate::lsp_helpers::requirement_matches_only_yanked</code>) should evaluate <code>requirement</code>
+at all for this ecosystem.</p>
+<p>Default <code>true</code> — no restriction, every requirement shape is checked. Override to
+<code>false</code> for a requirement shape (or, returning <code>false</code> unconditionally, for every
+requirement) where this diagnostic would duplicate a more specific one, or where this
+ecosystem’s <code>Version::removal_status()</code> is not a reliable enough per-version signal.
+This is independent of
+<a href="../registry/trait.Registry.html#method.reports_yanked" title="method deps_core::registry::Registry::reports_yanked"><code>Registry::reports_yanked</code></a>: that flag gates whether
+<code>removal_status()</code> data is trusted at all (and thus whether the separate #263
+in-use-version yanked check runs), while this hook only narrows <em>this</em> diagnostic.</p>
+<p><code>dep</code> is passed alongside <code>requirement</code> (rather than <code>requirement</code> alone) so an
+implementor can key its decision off the dependency’s package name — needed by
+<code>DenoFormatter</code> (#448) to tell its <code>jsr:</code>- and <code>npm:</code>-scheme specifiers apart, since
+the scheme lives in the name, not in the requirement text. At the sole call site
+(<code>crate::lsp_helpers::diagnostics::generate_diagnostics_from_cache</code>), <code>requirement</code>
+is always <code>dep.version_requirement().unwrap()</code> for the same <code>dep</code> — the two are
+never independent, though an implementor is free to key off either or both.</p>
+<p><code>DenoFormatter</code> returns <code>false</code> unconditionally for <code>npm:</code> specifiers, mirroring
+<code>NpmFormatter</code> (#448), and applies unconditionally (<code>true</code>, the same as leaving this
+hook at its default) for <code>jsr:</code> specifiers, for any requirement shape (#454): unlike
+npm’s <code>deprecated</code>, JSR’s <code>yanked</code> flag is a genuine per-version signal with no
+package-level deprecation diagnostic to conflate with, so <code>jsr:</code> needs no restriction
+here at all — see that formatter’s docs. <code>NpmFormatter</code> returns <code>false</code>
+unconditionally (#436): npm’s <code>AdvisoryDeprecated</code> is genuinely per-version but
+commonly applied package-wide, so even an exact pin would often just duplicate the
+dedicated package-level deprecation diagnostic (<a href="trait.DiagnosticMessages.html#method.deprecated_message" title="method deps_core::lsp_helpers::DiagnosticMessages::deprecated_message"><code>DiagnosticMessages::deprecated_message</code></a>,
+issue #205); npm keeps <code>reports_yanked() == true</code>; so the #263 in-use-version check
+stays live. <code>ComposerFormatter</code> does not override this hook at all — it opts out at
+the registry level instead
+(<a href="../registry/trait.Registry.html#method.reports_yanked" title="method deps_core::registry::Registry::reports_yanked"><code>Registry::reports_yanked</code></a> <code>== false</code>, pre-dating
+#436, independently justified by #233 R2): Packagist’s <code>abandoned</code> is package-level via
+p2 minified inheritance, so its yanked map is never populated and this hook has nothing
+to restrict.</p>
+<h5 id="examples-1"><a class="doc-anchor" href="#examples-1">§</a>Examples</h5>
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>deps_core::lsp_helpers::DiagnosticPolicy;
+<span class="kw">use </span>deps_core::{Dependency, PackageName, VersionReq};
+
+<span class="kw">struct </span>DefaultFormatter;
+<span class="kw">impl </span>DiagnosticPolicy <span class="kw">for </span>DefaultFormatter {}
+
+<span class="kw">let </span>dep = FakeDep(PackageName::new(<span class="string">"example"</span>));
+<span class="macro">assert!</span>(DefaultFormatter.yanked_diagnostic_applies_to(<span class="kw-2">&amp;</span>dep, <span class="kw-2">&amp;</span>VersionReq::new(<span class="string">"^1.2"</span>)));</code></pre></div></div></details></div><h2 id="dyn-compatibility" class="section-header">Dyn Compatibility<a href="#dyn-compatibility" class="anchor">§</a></h2><div class="dyn-compatibility-info"><p>This trait <b>is</b> <a href="https://doc.rust-lang.org/1.98.1/reference/items/traits.html#dyn-compatibility">dyn compatible</a>.</p><p><i>In older versions of Rust, dyn compatibility was called "object safety".</i></p></div><h2 id="implementors" class="section-header">Implementors<a href="#implementors" class="anchor">§</a></h2><div id="implementors-list"></div><script src="../../trait.impl/deps_core/lsp_helpers/formatter/trait.DiagnosticPolicy.js" async></script></section></div></main></body></html>

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["page_has_more","paginate_pages","warn_if_pagination_truncated"]};

@@ -1,0 +1,213 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Requirement parsing, matching, and up-to-date status."><title>RequirementResolution in deps_core::lsp_helpers - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="deps_core" data-themes="" data-resource-suffix="" data-rustdoc-version="1.98.1 (48a229cea 2026-09-01)" data-channel="1.98.1" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc trait"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">RequirementResolution</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../deps_core/index.html">deps_<wbr>core</a><span class="version">0.12.1</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Requirement<wbr>Resolution</a></h2><h3><a href="#provided-methods">Provided Methods</a></h3><ul class="block"><li><a href="#method.compile_requirement" title="compile_requirement">compile_requirement</a></li><li><a href="#method.is_requirement_up_to_date" title="is_requirement_up_to_date">is_requirement_up_to_date</a></li><li><a href="#method.manifest_requirement_is_resolved_version" title="manifest_requirement_is_resolved_version">manifest_requirement_is_resolved_version</a></li><li><a href="#method.requirement_is_undecidable_given_available" title="requirement_is_undecidable_given_available">requirement_is_undecidable_given_available</a></li><li><a href="#method.requirement_is_unresolved" title="requirement_is_unresolved">requirement_is_unresolved</a></li><li><a href="#method.requirement_status" title="requirement_status">requirement_status</a></li><li><a href="#method.requirement_status_for" title="requirement_status_for">requirement_status_for</a></li><li><a href="#method.version_satisfies_requirement" title="version_satisfies_requirement">version_satisfies_requirement</a></li></ul><h3><a href="#implementors">Implementors</a></h3></section><div id="rustdoc-modnav"><h2><a href="index.html">In deps_<wbr>core::<wbr>lsp_<wbr>helpers</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">deps_core</a>::<wbr><a href="index.html">lsp_helpers</a></div><h1>Trait <span class="trait">Requirement<wbr>Resolution</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/deps_core/lsp_helpers/formatter.rs.html#173-443">Source</a> </span></div><pre class="rust item-decl"><code>pub trait RequirementResolution: <a class="trait" href="https://doc.rust-lang.org/1.98.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + <a class="trait" href="https://doc.rust-lang.org/1.98.1/core/marker/trait.Sync.html" title="trait core::marker::Sync">Sync</a> {
+    // Provided methods
+    fn <a href="#method.version_satisfies_requirement" class="fn">version_satisfies_requirement</a>(
+        &amp;self,
+        version: &amp;<a class="struct" href="../package/struct.ConcreteVersion.html" title="struct deps_core::package::ConcreteVersion">ConcreteVersion</a>,
+        requirement: &amp;<a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>,
+    ) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.bool.html">bool</a> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.is_requirement_up_to_date" class="fn">is_requirement_up_to_date</a>(
+        &amp;self,
+        requirement: &amp;<a class="struct" href="../package/struct.VersionReq.html" title="struct deps_core::package::VersionReq">VersionReq</a>,
+        latest: &amp;<a class="struct" href="../package/struct.ConcreteVersion.html" title="struct deps_core::package::ConcreteVersion">ConcreteVersion</a>,
+    ) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.bool.html">bool</a> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.requirement_is_unresolved" class="fn">requirement_is_unresolved</a>(&amp;self, _requirement: &amp;<a class="struct" href="../package/struct.VersionReq.html" title="struct deps_core::package::VersionReq">VersionReq</a>) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.bool.html">bool</a> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.requirement_status" class="fn">requirement_status</a>(
+        &amp;self,
+        requirement: &amp;<a class="struct" href="../package/struct.VersionReq.html" title="struct deps_core::package::VersionReq">VersionReq</a>,
+        latest: &amp;<a class="struct" href="../package/struct.ConcreteVersion.html" title="struct deps_core::package::ConcreteVersion">ConcreteVersion</a>,
+    ) -&gt; <a class="enum" href="enum.RequirementStatus.html" title="enum deps_core::lsp_helpers::RequirementStatus">RequirementStatus</a> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.requirement_status_for" class="fn">requirement_status_for</a>(
+        &amp;self,
+        dep: &amp;dyn <a class="trait" href="../ecosystem/trait.Dependency.html" title="trait deps_core::ecosystem::Dependency">Dependency</a>,
+        requirement: &amp;<a class="struct" href="../package/struct.VersionReq.html" title="struct deps_core::package::VersionReq">VersionReq</a>,
+        latest: &amp;<a class="struct" href="../package/struct.ConcreteVersion.html" title="struct deps_core::package::ConcreteVersion">ConcreteVersion</a>,
+    ) -&gt; <a class="enum" href="enum.RequirementStatus.html" title="enum deps_core::lsp_helpers::RequirementStatus">RequirementStatus</a> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.compile_requirement" class="fn">compile_requirement</a>(
+        &amp;self,
+        _requirement: &amp;<a class="struct" href="../package/struct.VersionReq.html" title="struct deps_core::package::VersionReq">VersionReq</a>,
+    ) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.98.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="trait.RequirementMatcher.html" title="trait deps_core::lsp_helpers::RequirementMatcher">RequirementMatcher</a>&gt;&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.requirement_is_undecidable_given_available" class="fn">requirement_is_undecidable_given_available</a>(
+        &amp;self,
+        _requirement: &amp;<a class="struct" href="../package/struct.VersionReq.html" title="struct deps_core::package::VersionReq">VersionReq</a>,
+        _available: &amp;[<a class="struct" href="../package/struct.ConcreteVersion.html" title="struct deps_core::package::ConcreteVersion">ConcreteVersion</a>],
+    ) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.bool.html">bool</a> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.manifest_requirement_is_resolved_version" class="fn">manifest_requirement_is_resolved_version</a>(
+        &amp;self,
+        dep: &amp;dyn <a class="trait" href="../ecosystem/trait.Dependency.html" title="trait deps_core::ecosystem::Dependency">Dependency</a>,
+    ) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.bool.html">bool</a> { ... }
+}</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Requirement parsing, matching, and up-to-date status.</p>
+<p>Implementors guarantee every method here is a pure function of its arguments — no network
+or filesystem access — since these run on the hot hover/diagnostic path. The default
+<a href="trait.RequirementResolution.html#method.requirement_status" title="method deps_core::lsp_helpers::RequirementResolution::requirement_status"><code>requirement_status</code></a> maps
+<a href="trait.RequirementResolution.html#method.requirement_is_unresolved" title="method deps_core::lsp_helpers::RequirementResolution::requirement_is_unresolved"><code>requirement_is_unresolved</code></a> to its <code>Unresolved</code> variant
+and otherwise defers to <a href="trait.RequirementResolution.html#method.is_requirement_up_to_date" title="method deps_core::lsp_helpers::RequirementResolution::is_requirement_up_to_date"><code>is_requirement_up_to_date</code></a> — but
+an override of one without the other is not a contract violation: an ecosystem whose
+requirement syntax can be unresolved (Maven, Gradle, NuGet, <code>deps-github-actions</code>) overrides
+<code>requirement_is_unresolved</code> precisely so <code>requirement_status</code> can distinguish “not yet
+decidable” from “decided outdated”, a distinction the boolean method has no variant for.
+Callers needing that distinction use <code>requirement_status</code>, not the boolean method.</p>
+</div></details><h2 id="provided-methods" class="section-header">Provided Methods<a href="#provided-methods" class="anchor">§</a></h2><div class="methods"><details class="toggle method-toggle" open><summary><section id="method.version_satisfies_requirement" class="method"><a class="src rightside" href="../../src/deps_core/lsp_helpers/formatter.rs.html#181-220">Source</a><h4 class="code-header">fn <a href="#method.version_satisfies_requirement" class="fn">version_satisfies_requirement</a>(
+    &amp;self,
+    version: &amp;<a class="struct" href="../package/struct.ConcreteVersion.html" title="struct deps_core::package::ConcreteVersion">ConcreteVersion</a>,
+    requirement: &amp;<a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>,
+) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.bool.html">bool</a></h4></section></summary><div class="docblock"><p>Check if a version satisfies a requirement string.</p>
+<p>General constraint check (e.g. for completion/candidate filtering) — not the
+“is this dependency up to date” hook. That is <code>is_requirement_up_to_date</code> below,
+which has its own default and its own override points; an ecosystem whose bare
+requirement is a floor rather than an auto-following range (see <code>deps-nuget</code>)
+overrides that method, not this one.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.is_requirement_up_to_date" class="method"><a class="src rightside" href="../../src/deps_core/lsp_helpers/formatter.rs.html#232-238">Source</a><h4 class="code-header">fn <a href="#method.is_requirement_up_to_date" class="fn">is_requirement_up_to_date</a>(
+    &amp;self,
+    requirement: &amp;<a class="struct" href="../package/struct.VersionReq.html" title="struct deps_core::package::VersionReq">VersionReq</a>,
+    latest: &amp;<a class="struct" href="../package/struct.ConcreteVersion.html" title="struct deps_core::package::ConcreteVersion">ConcreteVersion</a>,
+) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.bool.html">bool</a></h4></section></summary><div class="docblock"><p>Whether an unresolved dependency (no lock-file version) should be reported as
+up to date against <code>latest</code>, given its declared <code>requirement</code>.</p>
+<p>Default: <code>latest</code> satisfies <code>requirement</code> — correct for range-based ecosystems
+(Cargo’s <code>^1.2</code>, npm’s <code>~1.2</code>, …) where the declared requirement already
+expresses forward compatibility, so a <code>latest</code> it accepts is not “newer” in any
+actionable sense. Ecosystems where a bare requirement is a minimum floor rather
+than an auto-following range (NuGet’s bare <code>Version="1.0.0"</code>) must override this,
+since “does the floor accept <code>latest</code>” and “is the pin already <code>latest</code>” are
+different questions there.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.requirement_is_unresolved" class="method"><a class="src rightside" href="../../src/deps_core/lsp_helpers/formatter.rs.html#260-262">Source</a><h4 class="code-header">fn <a href="#method.requirement_is_unresolved" class="fn">requirement_is_unresolved</a>(&amp;self, _requirement: &amp;<a class="struct" href="../package/struct.VersionReq.html" title="struct deps_core::package::VersionReq">VersionReq</a>) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.bool.html">bool</a></h4></section></summary><div class="docblock"><p>Whether <code>requirement</code> could not be resolved to a concrete version constraint (e.g. an
+unexpanded property/variable placeholder rather than a real version or range).</p>
+<p>Default: always resolvable. Ecosystems whose requirement syntax can contain
+unresolved placeholders (Maven’s <code>${property}</code>, Gradle’s <code>$var</code>/<code>${var}</code>) override
+this single predicate; both <code>version_satisfies_requirement</code>’s “treat as satisfied”
+short-circuit and <code>requirement_status</code>’s <code>Unresolved</code> variant are derived from it, so
+the two can’t drift out of sync with each other.</p>
+<h5 id="examples"><a class="doc-anchor" href="#examples">§</a>Examples</h5>
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>deps_core::lsp_helpers::RequirementResolution;
+<span class="kw">use </span>deps_core::VersionReq;
+
+<span class="kw">struct </span>DefaultFormatter;
+<span class="kw">impl </span>RequirementResolution <span class="kw">for </span>DefaultFormatter {}
+
+<span class="macro">assert!</span>(!DefaultFormatter.requirement_is_unresolved(<span class="kw-2">&amp;</span>VersionReq::new(<span class="string">"^1.2"</span>)));</code></pre></div></div></details><details class="toggle method-toggle" open><summary><section id="method.requirement_status" class="method"><a class="src rightside" href="../../src/deps_core/lsp_helpers/formatter.rs.html#291-304">Source</a><h4 class="code-header">fn <a href="#method.requirement_status" class="fn">requirement_status</a>(
+    &amp;self,
+    requirement: &amp;<a class="struct" href="../package/struct.VersionReq.html" title="struct deps_core::package::VersionReq">VersionReq</a>,
+    latest: &amp;<a class="struct" href="../package/struct.ConcreteVersion.html" title="struct deps_core::package::ConcreteVersion">ConcreteVersion</a>,
+) -&gt; <a class="enum" href="enum.RequirementStatus.html" title="enum deps_core::lsp_helpers::RequirementStatus">RequirementStatus</a></h4></section></summary><div class="docblock"><p>Tri-state variant of <code>is_requirement_up_to_date</code> that distinguishes “confirmed up to
+date” from “could not be resolved, so we don’t know.”</p>
+<p>Default: <code>Unresolved</code> when <code>requirement_is_unresolved</code> says so, otherwise maps the
+boolean result of <code>is_requirement_up_to_date</code> to <code>UpToDate</code>/<code>Outdated</code>. Callers
+needing the distinction — inlay hints, in particular — use this instead of
+<code>is_requirement_up_to_date</code> so they can tell “verified up to date” apart from
+“resolution failed.”</p>
+<h5 id="examples-1"><a class="doc-anchor" href="#examples-1">§</a>Examples</h5>
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>deps_core::lsp_helpers::{RequirementResolution, RequirementStatus};
+<span class="kw">use </span>deps_core::{ConcreteVersion, VersionReq};
+
+<span class="kw">struct </span>DefaultFormatter;
+<span class="kw">impl </span>RequirementResolution <span class="kw">for </span>DefaultFormatter {}
+
+<span class="macro">assert_eq!</span>(
+    DefaultFormatter.requirement_status(<span class="kw-2">&amp;</span>VersionReq::new(<span class="string">"^1.2"</span>), <span class="kw-2">&amp;</span>ConcreteVersion::new(<span class="string">"1.5.0"</span>)),
+    RequirementStatus::UpToDate
+);
+<span class="macro">assert_eq!</span>(
+    DefaultFormatter.requirement_status(<span class="kw-2">&amp;</span>VersionReq::new(<span class="string">"^1.2"</span>), <span class="kw-2">&amp;</span>ConcreteVersion::new(<span class="string">"2.0.0"</span>)),
+    RequirementStatus::Outdated
+);</code></pre></div></div></details><details class="toggle method-toggle" open><summary><section id="method.requirement_status_for" class="method"><a class="src rightside" href="../../src/deps_core/lsp_helpers/formatter.rs.html#319-327">Source</a><h4 class="code-header">fn <a href="#method.requirement_status_for" class="fn">requirement_status_for</a>(
+    &amp;self,
+    dep: &amp;dyn <a class="trait" href="../ecosystem/trait.Dependency.html" title="trait deps_core::ecosystem::Dependency">Dependency</a>,
+    requirement: &amp;<a class="struct" href="../package/struct.VersionReq.html" title="struct deps_core::package::VersionReq">VersionReq</a>,
+    latest: &amp;<a class="struct" href="../package/struct.ConcreteVersion.html" title="struct deps_core::package::ConcreteVersion">ConcreteVersion</a>,
+) -&gt; <a class="enum" href="enum.RequirementStatus.html" title="enum deps_core::lsp_helpers::RequirementStatus">RequirementStatus</a></h4></section></summary><div class="docblock"><p>Like <a href="trait.RequirementResolution.html#method.requirement_status" title="method deps_core::lsp_helpers::RequirementResolution::requirement_status"><code>requirement_status</code></a>, but also hands the ecosystem
+the dependency itself — for an ecosystem whose requirement <em>text</em> alone is ambiguous
+between two shapes with different resolution rules, and which already computed the
+disambiguating classification once, at parse time, onto the dependency (<code>deps-gitlab-ci</code>’s
+<code>PinStyle</code>, #466 review M-c: a bare <code>"1.2"</code> is <code>Partial</code> under its <code>component:</code> pin
+grammar but <code>Branch</code> under its simpler <code>project:</code> ref grammar — indistinguishable from
+the text alone).</p>
+<p>Default: forwards to <a href="trait.RequirementResolution.html#method.requirement_status" title="method deps_core::lsp_helpers::RequirementResolution::requirement_status"><code>requirement_status</code></a>, ignoring <code>dep</code>
+— every other ecosystem’s requirement text alone is unambiguous, so this is a no-op
+for them. Callers that already have <code>dep</code> in hand (the diagnostic pipeline’s outdated
+rule) call this instead of <code>requirement_status</code> directly, mirroring
+<code>Registry::select_latest_matching_with_context</code>’s identical additive-default pattern.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.compile_requirement" class="method"><a class="src rightside" href="../../src/deps_core/lsp_helpers/formatter.rs.html#374-379">Source</a><h4 class="code-header">fn <a href="#method.compile_requirement" class="fn">compile_requirement</a>(
+    &amp;self,
+    _requirement: &amp;<a class="struct" href="../package/struct.VersionReq.html" title="struct deps_core::package::VersionReq">VersionReq</a>,
+) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.98.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="trait.RequirementMatcher.html" title="trait deps_core::lsp_helpers::RequirementMatcher">RequirementMatcher</a>&gt;&gt;</h4></section></summary><div class="docblock"><p>Compiles <code>requirement</code> into a matcher for precise membership testing against a list
+of candidate version strings, or <code>None</code> when this ecosystem cannot parse or cannot
+model this requirement form — in which case no unsatisfiable-requirement diagnostic
+is produced for it.</p>
+<p>Distinct from <code>version_satisfies_requirement</code>, which answers the looser “treat as up
+to date” question and is deliberately permissive (see that method’s docs). This one
+gates a WARNING diagnostic claiming “no published version satisfies this
+requirement”, so it must never guess: an ecosystem that has not opted in by
+overriding this method emits no such diagnostic at all, rather than one derived from
+a loose heuristic.</p>
+<p><code>None</code> has two distinct causes, both correct to suppress the diagnostic for: the
+requirement string fails to parse under this ecosystem’s own comparator (<code>deps-cargo</code>,
+<code>deps-npm</code>, <code>deps-pypi</code>, <code>deps-swift</code> — <code>.ok()</code> on a fallible parse), or the
+requirement parses fine but names a version-space region the fetched <code>available</code> list
+structurally cannot contain regardless — a Go pseudo-version, a Composer
+dev-branch/<code>@dev</code> flag, a RubyGems exact pin indistinguishable from one that matches
+only a yanked release, a malformed Maven/Gradle/NuGet range. Scanning either case would
+always decide <code>Some(false)</code> for every candidate, producing a false “no published
+version satisfies” verdict instead of correctly suppressing the check. Implementors of
+the second (predicate-guard) shape should use
+<a href="fn.compile_requirement_unless.html" title="fn deps_core::lsp_helpers::compile_requirement_unless"><code>crate::lsp_helpers::compile_requirement_unless</code></a>, which
+centralizes this contract instead of re-deriving it per ecosystem. <code>deps-dart</code> is the
+only ecosystem with neither cause: every requirement string is a valid Dart constraint
+by construction, so its override is always <code>Some</code>.</p>
+<p>Default: <code>None</code> — an ecosystem that has not opted in emits no unsatisfiable-requirement
+diagnostics.</p>
+<h5 id="examples-2"><a class="doc-anchor" href="#examples-2">§</a>Examples</h5>
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>deps_core::lsp_helpers::RequirementResolution;
+<span class="kw">use </span>deps_core::VersionReq;
+
+<span class="kw">struct </span>DefaultFormatter;
+<span class="kw">impl </span>RequirementResolution <span class="kw">for </span>DefaultFormatter {}
+
+<span class="macro">assert!</span>(
+    DefaultFormatter
+        .compile_requirement(<span class="kw-2">&amp;</span>VersionReq::new(<span class="string">"^1.2"</span>))
+        .is_none()
+);</code></pre></div></div></details><details class="toggle method-toggle" open><summary><section id="method.requirement_is_undecidable_given_available" class="method"><a class="src rightside" href="../../src/deps_core/lsp_helpers/formatter.rs.html#410-416">Source</a><h4 class="code-header">fn <a href="#method.requirement_is_undecidable_given_available" class="fn">requirement_is_undecidable_given_available</a>(
+    &amp;self,
+    _requirement: &amp;<a class="struct" href="../package/struct.VersionReq.html" title="struct deps_core::package::VersionReq">VersionReq</a>,
+    _available: &amp;[<a class="struct" href="../package/struct.ConcreteVersion.html" title="struct deps_core::package::ConcreteVersion">ConcreteVersion</a>],
+) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.bool.html">bool</a></h4></section></summary><div class="docblock"><p>Whether this ecosystem’s registry can silently omit a <em>published</em> version from
+<code>available</code> in a way indistinguishable from “never published” — and, if so, whether
+<code>requirement</code> names a version-space region that specific omission could explain, given
+the versions actually observed in <code>available</code>.</p>
+<p>Called by <a href="fn.requirement_is_unsatisfiable.html" title="fn deps_core::lsp_helpers::requirement_is_unsatisfiable"><code>crate::lsp_helpers::requirement_is_unsatisfiable</code></a> before compiling <code>requirement</code>; returning
+<code>true</code> suppresses the “no published version satisfies this requirement” diagnostic for
+this dependency, the same as <a href="trait.RequirementResolution.html#method.compile_requirement" title="method deps_core::lsp_helpers::RequirementResolution::compile_requirement"><code>Self::compile_requirement</code></a> returning <code>None</code> — but,
+unlike that method, this one sees <code>available</code> and can therefore narrow the suppression
+instead of disabling it for every requirement of a given shape.</p>
+<p>Default <code>false</code> — no ecosystem has this problem unless it opts in. <code>deps-bundler</code>
+overrides it (see <code>BundlerFormatter::requirement_is_undecidable_given_available</code> and
+its helper for the RubyGems-specific rationale and heuristic).</p>
+<h5 id="examples-3"><a class="doc-anchor" href="#examples-3">§</a>Examples</h5>
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>deps_core::lsp_helpers::RequirementResolution;
+<span class="kw">use </span>deps_core::{ConcreteVersion, VersionReq};
+
+<span class="kw">struct </span>DefaultFormatter;
+<span class="kw">impl </span>RequirementResolution <span class="kw">for </span>DefaultFormatter {}
+
+<span class="macro">assert!</span>(!DefaultFormatter.requirement_is_undecidable_given_available(
+    <span class="kw-2">&amp;</span>VersionReq::new(<span class="string">"1.6.13"</span>),
+    <span class="kw-2">&amp;</span>[ConcreteVersion::new(<span class="string">"1.6.9"</span>), ConcreteVersion::new(<span class="string">"1.6.14"</span>)],
+));</code></pre></div></div></details><details class="toggle method-toggle" open><summary><section id="method.manifest_requirement_is_resolved_version" class="method"><a class="src rightside" href="../../src/deps_core/lsp_helpers/formatter.rs.html#439-442">Source</a><h4 class="code-header">fn <a href="#method.manifest_requirement_is_resolved_version" class="fn">manifest_requirement_is_resolved_version</a>(&amp;self, dep: &amp;dyn <a class="trait" href="../ecosystem/trait.Dependency.html" title="trait deps_core::ecosystem::Dependency">Dependency</a>) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.bool.html">bool</a></h4></section></summary><div class="docblock"><p>Whether <code>dep</code>’s manifest version-requirement line is itself the exact
+version already selected — never a range.</p>
+<p>True only for a Go <code>require</code>-directive dependency: <code>go.mod</code>’s
+<code>require</code> line already holds the module version selected by Go’s
+MVS, unlike Cargo/npm where the manifest holds a range and the lock
+file holds the pin. When true, hover and inlay hints prefer
+<a href="../ecosystem/trait.Dependency.html#tymethod.version_requirement" title="method deps_core::ecosystem::Dependency::version_requirement"><code>Dependency::version_requirement</code></a> over the lock-file-derived entry
+in <a href="struct.VersionData.html#structfield.resolved" title="field deps_core::lsp_helpers::VersionData::resolved"><code>crate::lsp_helpers::VersionData::resolved</code></a>, because <code>go.sum</code> is a checksum ledger
+that <code>go get</code>/<code>go build</code> only ever append to (only <code>go mod tidy</code>
+prunes it) — a stale, no-longer-selected higher version can remain
+recorded there after a downgrade and, since go.sum is written sorted
+ascending by semver, always sorts last and wins naive
+last-occurrence-wins parsing (overridden in <code>deps-go</code>; see <code>#235</code>).</p>
+<p>Takes <code>dep</code> (precedent: <a href="trait.OsvNaming.html#method.osv_package_name" title="method deps_core::lsp_helpers::OsvNaming::osv_package_name"><code>OsvNaming::osv_package_name</code></a>) because Go’s
+<code>exclude</code>/<code>replace</code> directives are also surfaced as dependencies
+whose <code>version_requirement()</code> is <em>not</em> an in-use version (the
+excluded version, or the replaced-from version) — the <code>deps-go</code>
+override inspects the directive kind and returns <code>true</code> only for
+<code>require</code>.</p>
+</div></details></div><h2 id="dyn-compatibility" class="section-header">Dyn Compatibility<a href="#dyn-compatibility" class="anchor">§</a></h2><div class="dyn-compatibility-info"><p>This trait <b>is</b> <a href="https://doc.rust-lang.org/1.98.1/reference/items/traits.html#dyn-compatibility">dyn compatible</a>.</p><p><i>In older versions of Rust, dyn compatibility was called "object safety".</i></p></div><h2 id="implementors" class="section-header">Implementors<a href="#implementors" class="anchor">§</a></h2><div id="implementors-list"></div><script src="../../trait.impl/deps_core/lsp_helpers/formatter/trait.RequirementResolution.js" async></script></section></div></main></body></html>

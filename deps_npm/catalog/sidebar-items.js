@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["CatalogOutcome","ConfigDefect"],"fn":["apply","load"],"struct":["CatalogOrigin","PnpmWorkspaceCache","PnpmWorkspaceConfig"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["PYPI_URL","REGISTRY"],"fn":["package_url"],"struct":["PypiRegistry"]};

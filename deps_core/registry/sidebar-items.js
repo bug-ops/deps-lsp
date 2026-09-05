@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["RemovalStatus"],"fn":["find_latest_stable","has_default_prerelease_marker","hash_routing_key","is_existence_wildcard","is_existence_wildcard_str","select_latest_for_existence"],"struct":["Deprecation"],"trait":["Metadata","Registry","Version"]};

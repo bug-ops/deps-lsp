@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["HostClass","IndexUrlError","PolicyGate","WorkspaceRegistryAccess"],"fn":["classify_addr","classify_host","redact_userinfo","validate_index_url"],"struct":["RegistryAccessPolicy"]};

@@ -1,0 +1,45 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Validates a candidate registry/index URL: `https` scheme, no userinfo, and — when `gate` is `PolicyGate::Enforce` — a host the live `RegistryAccessPolicy` allows."><title>validate_index_url in deps_core::net_policy - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="deps_core" data-themes="" data-resource-suffix="" data-rustdoc-version="1.98.1 (48a229cea 2026-09-01)" data-channel="1.98.1" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc fn"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">validate_index_url</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../deps_core/index.html">deps_<wbr>core</a><span class="version">0.12.1</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">validate_<wbr>index_<wbr>url</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#errors" title="Errors">Errors</a></li><li><a href="#examples" title="Examples">Examples</a></li></ul></section><div id="rustdoc-modnav"><h2><a href="index.html">In deps_<wbr>core::<wbr>net_<wbr>policy</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">deps_core</a>::<wbr><a href="index.html">net_policy</a></div><h1>Function <span class="fn">validate_<wbr>index_<wbr>url</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/deps_core/net_policy.rs.html#582-612">Source</a> </span></div><pre class="rust item-decl"><code>pub fn validate_index_url(
+    candidate: &amp;<a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>,
+    raw_for_log: &amp;<a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>,
+    ecosystem: &amp;'static <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>,
+    gate: <a class="enum" href="enum.PolicyGate.html" title="enum deps_core::net_policy::PolicyGate">PolicyGate</a>&lt;'_&gt;,
+) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.98.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="struct" href="https://docs.rs/url/2.5.7/url/struct.Url.html" title="struct url::Url">Url</a>, <a class="enum" href="enum.IndexUrlError.html" title="enum deps_core::net_policy::IndexUrlError">IndexUrlError</a>&gt;</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Validates a candidate registry/index URL: <code>https</code> scheme, no userinfo, and — when <code>gate</code>
+is <a href="enum.PolicyGate.html#variant.Enforce" title="variant deps_core::net_policy::PolicyGate::Enforce"><code>PolicyGate::Enforce</code></a> — a host the live <a href="struct.RegistryAccessPolicy.html" title="struct deps_core::net_policy::RegistryAccessPolicy"><code>RegistryAccessPolicy</code></a> allows.</p>
+<p><code>candidate</code> is the string actually parsed (e.g. <code>deps-npm</code>’s already <code>${VAR}</code>-expanded
+value); <code>raw_for_log</code> is what an error payload and the blocked-host <code>tracing::warn!</code>
+name instead — the pre-expansion <code>.npmrc</code> value for <code>deps-npm</code>, or the same string as
+<code>candidate</code> for <code>deps-cargo</code>/<code>deps-pypi</code> (neither has an expansion step). This split
+keeps an environment variable’s expanded value out of any log line or error a caller
+might surface in a diagnostic. <code>ecosystem</code> is carried on the blocked-host warning only,
+to tell <code>deps-cargo</code>/<code>deps-npm</code>/<code>deps-pypi</code> call sites apart in the logs.</p>
+<p>The check order — parse, then https, then userinfo, then the policy gate — is
+load-bearing: userinfo is rejected <em>before</em> the policy gate runs, which is what lets a
+caller safely log <code>raw_for_log</code> unredacted on a <a href="enum.IndexUrlError.html#variant.BlockedHost" title="variant deps_core::net_policy::IndexUrlError::BlockedHost"><code>IndexUrlError::BlockedHost</code></a> warning,
+since a userinfo-bearing candidate can never reach that point. Do not reorder.</p>
+<p><a href="enum.IndexUrlError.html#variant.InvalidUrl" title="variant deps_core::net_policy::IndexUrlError::InvalidUrl"><code>IndexUrlError::InvalidUrl</code></a> is the one variant this invariant can’t cover — <code>candidate</code>
+failed to parse <em>before</em> any userinfo check could run, so <code>raw_for_log</code> might still carry
+one (S1 finding: an otherwise-valid <code>user:pass@host</code> URL can fail to parse for an unrelated
+reason, e.g. an invalid port). <a href="fn.redact_userinfo.html" title="fn deps_core::net_policy::redact_userinfo"><code>redact_userinfo</code></a> is applied to <code>raw_for_log</code> before it is
+wrapped in <a href="enum.IndexUrlError.html#variant.InvalidUrl" title="variant deps_core::net_policy::IndexUrlError::InvalidUrl"><code>IndexUrlError::InvalidUrl</code></a>, so every caller — <code>deps-cargo</code>, <code>deps-npm</code>,
+<code>deps-pypi</code> — gets this for free, whether or not it separately redacts its own <code>raw</code> before
+logging.</p>
+<h2 id="errors"><a class="doc-anchor" href="#errors">§</a>Errors</h2>
+<p>Returns <a href="enum.IndexUrlError.html" title="enum deps_core::net_policy::IndexUrlError"><code>IndexUrlError</code></a> if <code>candidate</code> does not parse as a URL, is not <code>https</code> (outside
+the <code>cfg(test)</code>/<code>test-util</code> loopback carve-out), carries a userinfo component, or (under
+<a href="enum.PolicyGate.html#variant.Enforce" title="variant deps_core::net_policy::PolicyGate::Enforce"><code>PolicyGate::Enforce</code></a>) resolves to a host class the current policy blocks.</p>
+<h2 id="examples"><a class="doc-anchor" href="#examples">§</a>Examples</h2>
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>deps_core::net_policy::{PolicyGate, validate_index_url};
+
+<span class="kw">let </span>url = validate_index_url(
+    <span class="string">"https://index.mycorp.dev"</span>,
+    <span class="string">"https://index.mycorp.dev"</span>,
+    <span class="string">"cargo"</span>,
+    PolicyGate::Skip,
+)
+.unwrap();
+<span class="macro">assert_eq!</span>(url.as_str(), <span class="string">"https://index.mycorp.dev/"</span>);
+
+<span class="macro">assert!</span>(
+    validate_index_url(<span class="string">"http://example.com"</span>, <span class="string">"http://example.com"</span>, <span class="string">"cargo"</span>, PolicyGate::Skip)
+        .is_err()
+);</code></pre></div></div></details></section></div></main></body></html>

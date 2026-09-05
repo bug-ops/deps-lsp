@@ -1,0 +1,2 @@
+window.ALL_CRATES = ["deps_bundler","deps_cargo","deps_composer","deps_core","deps_dart","deps_deno","deps_github_actions","deps_gitlab_ci","deps_go","deps_gradle","deps_lsp","deps_maven","deps_npm","deps_nuget","deps_pypi","deps_swift"];
+//{"start":21,"fragment_lengths":[14,13,16,12,12,12,22,17,10,14,11,13,11,13,12,13]}

@@ -1,0 +1,97 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="How a package/version renders into manifest text edits and hover content."><title>PackageRendering in deps_core::lsp_helpers - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="deps_core" data-themes="" data-resource-suffix="" data-rustdoc-version="1.98.1 (48a229cea 2026-09-01)" data-channel="1.98.1" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc trait"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">PackageRendering</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../deps_core/index.html">deps_<wbr>core</a><span class="version">0.12.1</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Package<wbr>Rendering</a></h2><h3><a href="#required-methods">Required Methods</a></h3><ul class="block"><li><a href="#tymethod.format_version_for_text_edit" title="format_version_for_text_edit">format_version_for_text_edit</a></li><li><a href="#tymethod.package_url" title="package_url">package_url</a></li></ul><h3><a href="#provided-methods">Provided Methods</a></h3><ul class="block"><li><a href="#method.format_version_replacing" title="format_version_replacing">format_version_replacing</a></li><li><a href="#method.format_version_replacing_for" title="format_version_replacing_for">format_version_replacing_for</a></li><li><a href="#method.is_position_on_dependency" title="is_position_on_dependency">is_position_on_dependency</a></li><li><a href="#method.suppress_package_url" title="suppress_package_url">suppress_package_url</a></li></ul><h3><a href="#implementors">Implementors</a></h3></section><div id="rustdoc-modnav"><h2><a href="index.html">In deps_<wbr>core::<wbr>lsp_<wbr>helpers</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">deps_core</a>::<wbr><a href="index.html">lsp_helpers</a></div><h1>Trait <span class="trait">Package<wbr>Rendering</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/deps_core/lsp_helpers/formatter.rs.html#71-159">Source</a> </span></div><pre class="rust item-decl"><code>pub trait PackageRendering: <a class="trait" href="https://doc.rust-lang.org/1.98.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + <a class="trait" href="https://doc.rust-lang.org/1.98.1/core/marker/trait.Sync.html" title="trait core::marker::Sync">Sync</a> {
+    // Required methods
+    fn <a href="#tymethod.format_version_for_text_edit" class="fn">format_version_for_text_edit</a>(&amp;self, version: &amp;<a class="struct" href="../package/struct.ConcreteVersion.html" title="struct deps_core::package::ConcreteVersion">ConcreteVersion</a>) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>;
+<span class="item-spacer"></span>    fn <a href="#tymethod.package_url" class="fn">package_url</a>(&amp;self, name: &amp;<a class="struct" href="../package/struct.PackageName.html" title="struct deps_core::package::PackageName">PackageName</a>) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>;
+
+    // Provided methods
+    fn <a href="#method.format_version_replacing" class="fn">format_version_replacing</a>(
+        &amp;self,
+        version: &amp;<a class="struct" href="../package/struct.ConcreteVersion.html" title="struct deps_core::package::ConcreteVersion">ConcreteVersion</a>,
+        _current: &amp;<a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/string/struct.String.html" title="struct alloc::string::String">String</a> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.format_version_replacing_for" class="fn">format_version_replacing_for</a>(
+        &amp;self,
+        _dep: &amp;dyn <a class="trait" href="../ecosystem/trait.Dependency.html" title="trait deps_core::ecosystem::Dependency">Dependency</a>,
+        version: &amp;<a class="struct" href="../package/struct.ConcreteVersion.html" title="struct deps_core::package::ConcreteVersion">ConcreteVersion</a>,
+        current: &amp;<a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/string/struct.String.html" title="struct alloc::string::String">String</a> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.suppress_package_url" class="fn">suppress_package_url</a>(&amp;self, source: &amp;<a class="enum" href="../parser/enum.DependencySource.html" title="enum deps_core::parser::DependencySource">DependencySource</a>) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.bool.html">bool</a> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.is_position_on_dependency" class="fn">is_position_on_dependency</a>(
+        &amp;self,
+        dep: &amp;dyn <a class="trait" href="../ecosystem/trait.Dependency.html" title="trait deps_core::ecosystem::Dependency">Dependency</a>,
+        position: Position,
+    ) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.bool.html">bool</a> { ... }
+}</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>How a package/version renders into manifest text edits and hover content.</p>
+<p>Implementors guarantee that <a href="trait.PackageRendering.html#tymethod.format_version_for_text_edit" title="method deps_core::lsp_helpers::PackageRendering::format_version_for_text_edit"><code>format_version_for_text_edit</code></a>
+and <a href="trait.PackageRendering.html#tymethod.package_url" title="method deps_core::lsp_helpers::PackageRendering::package_url"><code>package_url</code></a> — the trait’s only two required methods — produce
+text safe to embed directly in a manifest or hover response for any version/name that has
+already passed the workspace’s shared safety gates
+(<a href="fn.is_safe_version_string.html" title="fn deps_core::lsp_helpers::is_safe_version_string"><code>crate::is_safe_version_string</code></a>, <a href="fn.is_safe_package_name.html" title="fn deps_core::lsp_helpers::is_safe_package_name"><code>crate::is_safe_package_name</code></a>). Callers may assume the
+replacement-preserving methods (<a href="trait.PackageRendering.html#method.format_version_replacing" title="method deps_core::lsp_helpers::PackageRendering::format_version_replacing"><code>format_version_replacing</code></a>,
+<a href="trait.PackageRendering.html#method.format_version_replacing_for" title="method deps_core::lsp_helpers::PackageRendering::format_version_replacing_for"><code>format_version_replacing_for</code></a>) never change a
+requirement’s semantics unless the ecosystem has explicitly opted in to that transformation.</p>
+</div></details><h2 id="required-methods" class="section-header">Required Methods<a href="#required-methods" class="anchor">§</a></h2><div class="methods"><details class="toggle method-toggle" open><summary><section id="tymethod.format_version_for_text_edit" class="method"><a class="src rightside" href="../../src/deps_core/lsp_helpers/formatter.rs.html#73">Source</a><h4 class="code-header">fn <a href="#tymethod.format_version_for_text_edit" class="fn">format_version_for_text_edit</a>(&amp;self, version: &amp;<a class="struct" href="../package/struct.ConcreteVersion.html" title="struct deps_core::package::ConcreteVersion">ConcreteVersion</a>) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/string/struct.String.html" title="struct alloc::string::String">String</a></h4></section></summary><div class="docblock"><p>Format version string for code action text edit.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.package_url" class="method"><a class="src rightside" href="../../src/deps_core/lsp_helpers/formatter.rs.html#115">Source</a><h4 class="code-header">fn <a href="#tymethod.package_url" class="fn">package_url</a>(&amp;self, name: &amp;<a class="struct" href="../package/struct.PackageName.html" title="struct deps_core::package::PackageName">PackageName</a>) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/string/struct.String.html" title="struct alloc::string::String">String</a></h4></section></summary><div class="docblock"><p>Get package URL for hover markdown.</p>
+</div></details></div><h2 id="provided-methods" class="section-header">Provided Methods<a href="#provided-methods" class="anchor">§</a></h2><div class="methods"><details class="toggle method-toggle" open><summary><section id="method.format_version_replacing" class="method"><a class="src rightside" href="../../src/deps_core/lsp_helpers/formatter.rs.html#85-87">Source</a><h4 class="code-header">fn <a href="#method.format_version_replacing" class="fn">format_version_replacing</a>(
+    &amp;self,
+    version: &amp;<a class="struct" href="../package/struct.ConcreteVersion.html" title="struct deps_core::package::ConcreteVersion">ConcreteVersion</a>,
+    _current: &amp;<a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/string/struct.String.html" title="struct alloc::string::String">String</a></h4></section></summary><div class="docblock"><p>Format <code>version</code> as a replacement for the existing requirement text
+<code>current</code>, preserving <code>current</code>’s operator/pin style where the
+ecosystem supports more than one.</p>
+<p>Default: ignores <code>current</code>, delegating to
+<a href="trait.PackageRendering.html#tymethod.format_version_for_text_edit" title="method deps_core::lsp_helpers::PackageRendering::format_version_for_text_edit"><code>format_version_for_text_edit</code></a>.
+Override when a bare <code>format_version_for_text_edit</code> replacement would
+silently change the requirement’s semantics — e.g. PyPI’s <code>==1.0.1</code>
+pin becoming <code>&gt;=1.0.1,&lt;2</code> on “update version” would defeat the point
+of pinning.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.format_version_replacing_for" class="method"><a class="src rightside" href="../../src/deps_core/lsp_helpers/formatter.rs.html#105-112">Source</a><h4 class="code-header">fn <a href="#method.format_version_replacing_for" class="fn">format_version_replacing_for</a>(
+    &amp;self,
+    _dep: &amp;dyn <a class="trait" href="../ecosystem/trait.Dependency.html" title="trait deps_core::ecosystem::Dependency">Dependency</a>,
+    version: &amp;<a class="struct" href="../package/struct.ConcreteVersion.html" title="struct deps_core::package::ConcreteVersion">ConcreteVersion</a>,
+    current: &amp;<a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/string/struct.String.html" title="struct alloc::string::String">String</a></h4></section></summary><div class="docblock"><p>Like <a href="trait.PackageRendering.html#method.format_version_replacing" title="method deps_core::lsp_helpers::PackageRendering::format_version_replacing"><code>format_version_replacing</code></a>, but also
+carries the dependency identity <code>version</code>/<code>current</code> apply to.</p>
+<p>Default: ignores <code>dep</code>, delegating to
+<a href="trait.PackageRendering.html#method.format_version_replacing" title="method deps_core::lsp_helpers::PackageRendering::format_version_replacing"><code>format_version_replacing</code></a>. Override when the
+replacement text cannot be derived from <code>version</code>/<code>current</code> alone — e.g.
+<code>deps-github-actions</code>’s SHA-pinned <code>uses: owner/repo@&lt;sha&gt; # vX.Y.Z</code> form, where
+the new SHA for a given tag is looked up per <code>dep.name()</code> (a tag’s commit SHA is
+per-repository, unknowable from the tag string alone) in a registry-populated
+index the formatter holds a shared handle to.</p>
+<p>Every shared call site that builds a version-update edit (the vulnerability and
+unsatisfiable-requirement quickfixes, the REFACTOR-loop “update to X” actions, and
+the “Update N outdated dependencies” code lens) already has <code>dep</code> in scope and
+calls this method instead of <a href="trait.PackageRendering.html#method.format_version_replacing" title="method deps_core::lsp_helpers::PackageRendering::format_version_replacing"><code>format_version_replacing</code></a>
+directly, so an override here is picked up on every edit path at once.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.suppress_package_url" class="method"><a class="src rightside" href="../../src/deps_core/lsp_helpers/formatter.rs.html#149-152">Source</a><h4 class="code-header">fn <a href="#method.suppress_package_url" class="fn">suppress_package_url</a>(&amp;self, source: &amp;<a class="enum" href="../parser/enum.DependencySource.html" title="enum deps_core::parser::DependencySource">DependencySource</a>) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.bool.html">bool</a></h4></section></summary><div class="docblock"><p>Whether hover should omit <a href="trait.PackageRendering.html#tymethod.package_url" title="method deps_core::lsp_helpers::PackageRendering::package_url"><code>Self::package_url</code></a>’s heading link for a dependency
+resolved against <code>source</code>.</p>
+<p><a href="trait.PackageRendering.html#tymethod.package_url" title="method deps_core::lsp_helpers::PackageRendering::package_url"><code>Self::package_url</code></a> always names the ecosystem’s <em>default</em> public registry (e.g.
+crates.io) — correct for a plain <a href="../parser/enum.DependencySource.html#variant.Registry" title="variant deps_core::parser::DependencySource::Registry"><code>DependencySource::Registry</code></a>
+dependency, but wrong for one resolved against a different registry entirely (e.g.
+<code>deps-cargo</code>’s resolved <code>AlternateRegistry</code>): once live version data from that other
+registry renders alongside the link, an unrelated crates.io link reads as
+confirmation the link is real, which is worse than showing no link at all.</p>
+<p>Default <code>false</code> — every ecosystem with only one registry concept keeps its existing
+hover heading unchanged; only <code>deps-cargo</code>’s <code>CargoFormatter</code> overrides this.</p>
+<h5 id="examples"><a class="doc-anchor" href="#examples">§</a>Examples</h5>
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>deps_core::lsp_helpers::PackageRendering;
+<span class="kw">use </span>deps_core::parser::DependencySource;
+<span class="kw">use </span>deps_core::{ConcreteVersion, PackageName};
+
+<span class="kw">struct </span>DefaultFormatter;
+<span class="kw">impl </span>PackageRendering <span class="kw">for </span>DefaultFormatter {
+    <span class="kw">fn </span>format_version_for_text_edit(<span class="kw-2">&amp;</span><span class="self">self</span>, version: <span class="kw-2">&amp;</span>ConcreteVersion) -&gt; String {
+        version.to_string()
+    }
+    <span class="kw">fn </span>package_url(<span class="kw-2">&amp;</span><span class="self">self</span>, name: <span class="kw-2">&amp;</span>PackageName) -&gt; String {
+        name.to_string()
+    }
+}
+
+<span class="macro">assert!</span>(!DefaultFormatter.suppress_package_url(<span class="kw-2">&amp;</span>DependencySource::Registry));</code></pre></div></div></details><details class="toggle method-toggle" open><summary><section id="method.is_position_on_dependency" class="method"><a class="src rightside" href="../../src/deps_core/lsp_helpers/formatter.rs.html#155-158">Source</a><h4 class="code-header">fn <a href="#method.is_position_on_dependency" class="fn">is_position_on_dependency</a>(
+    &amp;self,
+    dep: &amp;dyn <a class="trait" href="../ecosystem/trait.Dependency.html" title="trait deps_core::ecosystem::Dependency">Dependency</a>,
+    position: Position,
+) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.bool.html">bool</a></h4></section></summary><div class="docblock"><p>Detect if cursor position is on a dependency for code actions.</p>
+</div></details></div><h2 id="dyn-compatibility" class="section-header">Dyn Compatibility<a href="#dyn-compatibility" class="anchor">§</a></h2><div class="dyn-compatibility-info"><p>This trait <b>is</b> <a href="https://doc.rust-lang.org/1.98.1/reference/items/traits.html#dyn-compatibility">dyn compatible</a>.</p><p><i>In older versions of Rust, dyn compatibility was called "object safety".</i></p></div><h2 id="implementors" class="section-header">Implementors<a href="#implementors" class="anchor">§</a></h2><div id="implementors-list"></div><script src="../../trait.impl/deps_core/lsp_helpers/formatter/trait.PackageRendering.js" async></script></section></div></main></body></html>

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["WorkspaceRegistriesSetting"],"struct":["CacheConfig","CodeLensConfig","ColdStartConfig","DepsConfig","DiagnosticsConfig","FreshnessConfig","InlayHintsConfig","LoadingIndicatorConfig","NetworkConfig","RegistriesConfig","SupplyChainConfig"]};

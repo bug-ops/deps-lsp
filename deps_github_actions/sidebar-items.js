@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["MUTABLE_REF_PIN_DIAGNOSTIC_CODE","PIN_ALL_TO_SHA_COMMAND_ID"],"fn":["is_valid_github_identity"],"mod":["ecosystem","formatter","parser","registry","types"]};

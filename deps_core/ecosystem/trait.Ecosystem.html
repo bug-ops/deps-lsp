@@ -1,0 +1,332 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Main trait that all ecosystem implementations must implement."><title>Ecosystem in deps_core::ecosystem - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="deps_core" data-themes="" data-resource-suffix="" data-rustdoc-version="1.98.1 (48a229cea 2026-09-01)" data-channel="1.98.1" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc trait"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Ecosystem</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../deps_core/index.html">deps_<wbr>core</a><span class="version">0.12.1</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Ecosystem</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#type-erasure" title="Type Erasure">Type Erasure</a></li><li><a href="#examples" title="Examples">Examples</a></li></ul><h3><a href="#required-methods">Required Methods</a></h3><ul class="block"><li><a href="#tymethod.as_any" title="as_any">as_any</a></li><li><a href="#tymethod.display_name" title="display_name">display_name</a></li><li><a href="#tymethod.formatter" title="formatter">formatter</a></li><li><a href="#tymethod.generate_completions" title="generate_completions">generate_completions</a></li><li><a href="#tymethod.id" title="id">id</a></li><li><a href="#tymethod.manifest_filenames" title="manifest_filenames">manifest_filenames</a></li><li><a href="#tymethod.parse_manifest" title="parse_manifest">parse_manifest</a></li><li><a href="#tymethod.registry" title="registry">registry</a></li></ul><h3><a href="#provided-methods">Provided Methods</a></h3><ul class="block"><li><a href="#method.generate_code_actions" title="generate_code_actions">generate_code_actions</a></li><li><a href="#method.generate_code_lenses" title="generate_code_lenses">generate_code_lenses</a></li><li><a href="#method.generate_diagnostics" title="generate_diagnostics">generate_diagnostics</a></li><li><a href="#method.generate_document_links" title="generate_document_links">generate_document_links</a></li><li><a href="#method.generate_hover" title="generate_hover">generate_hover</a></li><li><a href="#method.generate_inlay_hints" title="generate_inlay_hints">generate_inlay_hints</a></li><li><a href="#method.lockfile_filenames" title="lockfile_filenames">lockfile_filenames</a></li><li><a href="#method.lockfile_provider" title="lockfile_provider">lockfile_provider</a></li><li><a href="#method.manifest_directory_patterns" title="manifest_directory_patterns">manifest_directory_patterns</a></li><li><a href="#method.manifest_extensions" title="manifest_extensions">manifest_extensions</a></li><li><a href="#method.manifest_patterns" title="manifest_patterns">manifest_patterns</a></li><li><a href="#method.package_search_is_incomplete" title="package_search_is_incomplete">package_search_is_incomplete</a></li><li><a href="#method.watched_config_filenames" title="watched_config_filenames">watched_config_filenames</a></li></ul><h3><a href="#implementors">Implementors</a></h3></section><div id="rustdoc-modnav"><h2><a href="index.html">In deps_<wbr>core::<wbr>ecosystem</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">deps_core</a>::<wbr><a href="index.html">ecosystem</a></div><h1>Trait <span class="trait">Ecosystem</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/deps_core/ecosystem.rs.html#391-728">Source</a> </span></div><pre class="rust item-decl"><code>pub trait Ecosystem:
+    <a class="trait" href="https://doc.rust-lang.org/1.98.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a>
+    + <a class="trait" href="https://doc.rust-lang.org/1.98.1/core/marker/trait.Sync.html" title="trait core::marker::Sync">Sync</a>
+    + <a class="trait" href="private/trait.Sealed.html" title="trait deps_core::ecosystem::private::Sealed">Sealed</a> {
+<details class="toggle type-contents-toggle"><summary class="hideme"><span>Show 21 methods</span></summary>    // Required methods
+    fn <a href="#tymethod.id" class="fn">id</a>(&amp;self) -&gt; &amp;'static <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>;
+<span class="item-spacer"></span>    fn <a href="#tymethod.display_name" class="fn">display_name</a>(&amp;self) -&gt; &amp;'static <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>;
+<span class="item-spacer"></span>    fn <a href="#tymethod.manifest_filenames" class="fn">manifest_filenames</a>(&amp;self) -&gt; &amp;[&amp;'static <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>];
+<span class="item-spacer"></span>    fn <a href="#tymethod.parse_manifest" class="fn">parse_manifest</a>&lt;'a&gt;(
+        &amp;'a self,
+        content: &amp;'a <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>,
+        uri: &amp;'a Uri,
+    ) -&gt; <a class="type" href="type.BoxFuture.html" title="type deps_core::ecosystem::BoxFuture">BoxFuture</a>&lt;'a, <a class="type" href="../error/type.Result.html" title="type deps_core::error::Result">Result</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="trait.ParseResult.html" title="trait deps_core::ecosystem::ParseResult">ParseResult</a>&gt;&gt;&gt;;
+<span class="item-spacer"></span>    fn <a href="#tymethod.registry" class="fn">registry</a>(&amp;self) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/sync/struct.Arc.html" title="struct alloc::sync::Arc">Arc</a>&lt;dyn <a class="trait" href="../registry/trait.Registry.html" title="trait deps_core::registry::Registry">Registry</a>&gt;;
+<span class="item-spacer"></span>    fn <a href="#tymethod.formatter" class="fn">formatter</a>(&amp;self) -&gt; &amp;dyn <a class="trait" href="../lsp_helpers/trait.EcosystemFormatter.html" title="trait deps_core::lsp_helpers::EcosystemFormatter">EcosystemFormatter</a>;
+<span class="item-spacer"></span>    fn <a href="#tymethod.generate_completions" class="fn">generate_completions</a>&lt;'a&gt;(
+        &amp;'a self,
+        parse_result: &amp;'a dyn <a class="trait" href="trait.ParseResult.html" title="trait deps_core::ecosystem::ParseResult">ParseResult</a>,
+        position: Position,
+        content: &amp;'a <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>,
+        freshness: <a class="struct" href="../freshness/struct.FreshnessSettings.html" title="struct deps_core::freshness::FreshnessSettings">FreshnessSettings</a>,
+    ) -&gt; <a class="type" href="type.BoxFuture.html" title="type deps_core::ecosystem::BoxFuture">BoxFuture</a>&lt;'a, <a class="struct" href="../completion/struct.Completions.html" title="struct deps_core::completion::Completions">Completions</a>&gt;;
+<span class="item-spacer"></span>    fn <a href="#tymethod.as_any" class="fn">as_any</a>(&amp;self) -&gt; &amp;dyn <a class="trait" href="https://doc.rust-lang.org/1.98.1/core/any/trait.Any.html" title="trait core::any::Any">Any</a>;
+
+    // Provided methods
+    fn <a href="#method.manifest_extensions" class="fn">manifest_extensions</a>(&amp;self) -&gt; &amp;[&amp;'static <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>] { ... }
+<span class="item-spacer"></span>    fn <a href="#method.manifest_patterns" class="fn">manifest_patterns</a>(&amp;self) -&gt; &amp;[&amp;'static <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>] { ... }
+<span class="item-spacer"></span>    fn <a href="#method.manifest_directory_patterns" class="fn">manifest_directory_patterns</a>(&amp;self) -&gt; &amp;[(&amp;'static <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>, &amp;'static <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>)] { ... }
+<span class="item-spacer"></span>    fn <a href="#method.lockfile_filenames" class="fn">lockfile_filenames</a>(&amp;self) -&gt; &amp;[&amp;'static <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>] { ... }
+<span class="item-spacer"></span>    fn <a href="#method.watched_config_filenames" class="fn">watched_config_filenames</a>(&amp;self) -&gt; &amp;[&amp;'static <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>] { ... }
+<span class="item-spacer"></span>    fn <a href="#method.lockfile_provider" class="fn">lockfile_provider</a>(&amp;self) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.98.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/sync/struct.Arc.html" title="struct alloc::sync::Arc">Arc</a>&lt;dyn <a class="trait" href="../lockfile/trait.LockFileProvider.html" title="trait deps_core::lockfile::LockFileProvider">LockFileProvider</a>&gt;&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.generate_inlay_hints" class="fn">generate_inlay_hints</a>&lt;'a&gt;(
+        &amp;'a self,
+        parse_result: &amp;'a dyn <a class="trait" href="trait.ParseResult.html" title="trait deps_core::ecosystem::ParseResult">ParseResult</a>,
+        versions: <a class="struct" href="../lsp_helpers/struct.VersionData.html" title="struct deps_core::lsp_helpers::VersionData">VersionData</a>&lt;'a&gt;,
+        loading_state: <a class="enum" href="../parser/enum.LoadingState.html" title="enum deps_core::parser::LoadingState">LoadingState</a>,
+        config: &amp;'a <a class="struct" href="struct.EcosystemConfig.html" title="struct deps_core::ecosystem::EcosystemConfig">EcosystemConfig</a>,
+    ) -&gt; <a class="type" href="type.BoxFuture.html" title="type deps_core::ecosystem::BoxFuture">BoxFuture</a>&lt;'a, <a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;InlayHint&gt;&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.generate_hover" class="fn">generate_hover</a>&lt;'a&gt;(
+        &amp;'a self,
+        parse_result: &amp;'a dyn <a class="trait" href="trait.ParseResult.html" title="trait deps_core::ecosystem::ParseResult">ParseResult</a>,
+        position: Position,
+        versions: <a class="struct" href="../lsp_helpers/struct.VersionData.html" title="struct deps_core::lsp_helpers::VersionData">VersionData</a>&lt;'a&gt;,
+        freshness: <a class="struct" href="../freshness/struct.FreshnessSettings.html" title="struct deps_core::freshness::FreshnessSettings">FreshnessSettings</a>,
+    ) -&gt; <a class="type" href="type.BoxFuture.html" title="type deps_core::ecosystem::BoxFuture">BoxFuture</a>&lt;'a, <a class="enum" href="https://doc.rust-lang.org/1.98.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;Hover&gt;&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.generate_code_actions" class="fn">generate_code_actions</a>&lt;'a&gt;(
+        &amp;'a self,
+        parse_result: &amp;'a dyn <a class="trait" href="trait.ParseResult.html" title="trait deps_core::ecosystem::ParseResult">ParseResult</a>,
+        position: Position,
+        uri: &amp;'a Uri,
+        versions: <a class="struct" href="../lsp_helpers/struct.VersionData.html" title="struct deps_core::lsp_helpers::VersionData">VersionData</a>&lt;'a&gt;,
+        content: &amp;'a <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>,
+    ) -&gt; <a class="type" href="type.BoxFuture.html" title="type deps_core::ecosystem::BoxFuture">BoxFuture</a>&lt;'a, <a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;CodeAction&gt;&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.generate_diagnostics" class="fn">generate_diagnostics</a>&lt;'a&gt;(
+        &amp;'a self,
+        parse_result: &amp;'a dyn <a class="trait" href="trait.ParseResult.html" title="trait deps_core::ecosystem::ParseResult">ParseResult</a>,
+        versions: <a class="struct" href="../lsp_helpers/struct.VersionData.html" title="struct deps_core::lsp_helpers::VersionData">VersionData</a>&lt;'a&gt;,
+        uri: &amp;'a Uri,
+        freshness: <a class="struct" href="../freshness/struct.FreshnessSettings.html" title="struct deps_core::freshness::FreshnessSettings">FreshnessSettings</a>,
+        severities: <a class="struct" href="../lsp_helpers/struct.DiagnosticSeverities.html" title="struct deps_core::lsp_helpers::DiagnosticSeverities">DiagnosticSeverities</a>,
+    ) -&gt; <a class="type" href="type.BoxFuture.html" title="type deps_core::ecosystem::BoxFuture">BoxFuture</a>&lt;'a, <a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;Diagnostic&gt;&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.generate_document_links" class="fn">generate_document_links</a>(
+        &amp;self,
+        _parse_result: &amp;dyn <a class="trait" href="trait.ParseResult.html" title="trait deps_core::ecosystem::ParseResult">ParseResult</a>,
+        _uri: &amp;Uri,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;DocumentLink&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.generate_code_lenses" class="fn">generate_code_lenses</a>&lt;'a&gt;(
+        &amp;'a self,
+        parse_result: &amp;'a dyn <a class="trait" href="trait.ParseResult.html" title="trait deps_core::ecosystem::ParseResult">ParseResult</a>,
+        content: &amp;'a <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>,
+        versions: <a class="struct" href="../lsp_helpers/struct.VersionData.html" title="struct deps_core::lsp_helpers::VersionData">VersionData</a>&lt;'a&gt;,
+        uri: &amp;'a Uri,
+        command_id: &amp;'a <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>,
+        _severities: <a class="struct" href="../lsp_helpers/struct.DiagnosticSeverities.html" title="struct deps_core::lsp_helpers::DiagnosticSeverities">DiagnosticSeverities</a>,
+    ) -&gt; <a class="type" href="type.BoxFuture.html" title="type deps_core::ecosystem::BoxFuture">BoxFuture</a>&lt;'a, <a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;CodeLens&gt;&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.package_search_is_incomplete" class="fn">package_search_is_incomplete</a>(&amp;self) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.bool.html">bool</a> { ... }
+</details>}</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Main trait that all ecosystem implementations must implement.</p>
+<p>Each ecosystem (Cargo, npm, PyPI, etc.) provides its own implementation.
+This trait defines the contract for parsing manifests, fetching registry data,
+and generating LSP responses.</p>
+<h2 id="type-erasure"><a class="doc-anchor" href="#type-erasure">§</a>Type Erasure</h2>
+<p>This trait uses <code>Box&lt;dyn Trait&gt;</code> instead of associated types to allow
+runtime polymorphism and dynamic ecosystem registration.</p>
+<h2 id="examples"><a class="doc-anchor" href="#examples">§</a>Examples</h2>
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>deps_core::{Ecosystem, ParseResult, Registry, EcosystemConfig, PackageName, ConcreteVersion};
+<span class="kw">use </span>deps_core::completion::Completions;
+<span class="kw">use </span>deps_core::lsp_helpers::{
+    DiagnosticMessages, DiagnosticPolicy, EcosystemFormatter, OsvNaming, PackageNaming,
+    PackageRendering, RequirementResolution, SourcePolicy,
+};
+<span class="kw">use </span>std::sync::Arc;
+<span class="kw">use </span>std::any::Any;
+<span class="kw">use </span>tower_lsp_server::ls_types::{Uri, CompletionItem, Position};
+
+<span class="kw">struct </span>MyFormatter;
+<span class="kw">impl </span>PackageNaming <span class="kw">for </span>MyFormatter {}
+<span class="kw">impl </span>PackageRendering <span class="kw">for </span>MyFormatter {
+    <span class="kw">fn </span>format_version_for_text_edit(<span class="kw-2">&amp;</span><span class="self">self</span>, version: <span class="kw-2">&amp;</span>ConcreteVersion) -&gt; String { version.to_string() }
+    <span class="kw">fn </span>package_url(<span class="kw-2">&amp;</span><span class="self">self</span>, name: <span class="kw-2">&amp;</span>PackageName) -&gt; String { <span class="macro">format!</span>(<span class="string">"https://example.com/{name}"</span>) }
+}
+<span class="kw">impl </span>RequirementResolution <span class="kw">for </span>MyFormatter {}
+<span class="kw">impl </span>DiagnosticMessages <span class="kw">for </span>MyFormatter {}
+<span class="kw">impl </span>DiagnosticPolicy <span class="kw">for </span>MyFormatter {}
+<span class="kw">impl </span>SourcePolicy <span class="kw">for </span>MyFormatter {}
+<span class="kw">impl </span>OsvNaming <span class="kw">for </span>MyFormatter {}
+
+<span class="kw">struct </span>MyEcosystem {
+    registry: Arc&lt;<span class="kw">dyn </span>Registry&gt;,
+    formatter: MyFormatter,
+}
+
+<span class="kw">impl </span>deps_core::ecosystem::private::Sealed <span class="kw">for </span>MyEcosystem {}
+
+<span class="kw">impl </span>Ecosystem <span class="kw">for </span>MyEcosystem {
+    <span class="kw">fn </span>id(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="kw-2">&amp;</span><span class="lifetime">'static </span>str { <span class="string">"my-ecosystem" </span>}
+    <span class="kw">fn </span>display_name(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="kw-2">&amp;</span><span class="lifetime">'static </span>str { <span class="string">"My Ecosystem" </span>}
+    <span class="kw">fn </span>manifest_filenames(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="kw-2">&amp;</span>[<span class="kw-2">&amp;</span><span class="lifetime">'static </span>str] { <span class="kw-2">&amp;</span>[<span class="string">"my-manifest.toml"</span>] }
+
+    <span class="kw">fn </span>parse_manifest&lt;<span class="lifetime">'a</span>&gt;(
+        <span class="kw-2">&amp;</span><span class="lifetime">'a </span><span class="self">self</span>,
+        _content: <span class="kw-2">&amp;</span><span class="lifetime">'a </span>str,
+        _uri: <span class="kw-2">&amp;</span><span class="lifetime">'a </span>Uri,
+    ) -&gt; deps_core::ecosystem::BoxFuture&lt;<span class="lifetime">'a</span>, deps_core::error::Result&lt;Box&lt;<span class="kw">dyn </span>ParseResult&gt;&gt;&gt; {
+        Box::pin(<span class="kw">async move </span>{ <span class="macro">todo!</span>() })
+    }
+
+    <span class="kw">fn </span>registry(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; Arc&lt;<span class="kw">dyn </span>Registry&gt; { <span class="self">self</span>.registry.clone() }
+
+    <span class="kw">fn </span>formatter(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="kw-2">&amp;</span><span class="kw">dyn </span>EcosystemFormatter { <span class="kw-2">&amp;</span><span class="self">self</span>.formatter }
+
+    <span class="kw">fn </span>generate_completions&lt;<span class="lifetime">'a</span>&gt;(
+        <span class="kw-2">&amp;</span><span class="lifetime">'a </span><span class="self">self</span>,
+        _parse_result: <span class="kw-2">&amp;</span><span class="lifetime">'a </span><span class="kw">dyn </span>ParseResult,
+        _position: Position,
+        _content: <span class="kw-2">&amp;</span><span class="lifetime">'a </span>str,
+        _freshness: deps_core::FreshnessSettings,
+    ) -&gt; deps_core::ecosystem::BoxFuture&lt;<span class="lifetime">'a</span>, Completions&gt; {
+        Box::pin(<span class="kw">async move </span>{ Completions::default() })
+    }
+
+    <span class="kw">fn </span>as_any(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="kw-2">&amp;</span><span class="kw">dyn </span>Any { <span class="self">self </span>}
+}</code></pre></div></div></details><h2 id="required-methods" class="section-header">Required Methods<a href="#required-methods" class="anchor">§</a></h2><div class="methods"><details class="toggle method-toggle" open><summary><section id="tymethod.id" class="method"><a class="src rightside" href="../../src/deps_core/ecosystem.rs.html#395">Source</a><h4 class="code-header">fn <a href="#tymethod.id" class="fn">id</a>(&amp;self) -&gt; &amp;'static <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a></h4></section></summary><div class="docblock"><p>Unique identifier (e.g., “cargo”, “npm”, “pypi”)</p>
+<p>This identifier is used for ecosystem registration and routing.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.display_name" class="method"><a class="src rightside" href="../../src/deps_core/ecosystem.rs.html#400">Source</a><h4 class="code-header">fn <a href="#tymethod.display_name" class="fn">display_name</a>(&amp;self) -&gt; &amp;'static <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a></h4></section></summary><div class="docblock"><p>Human-readable name (e.g., “Cargo (Rust)”, “npm (JavaScript)”)</p>
+<p>This name is displayed in diagnostic messages and logs.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.manifest_filenames" class="method"><a class="src rightside" href="../../src/deps_core/ecosystem.rs.html#406">Source</a><h4 class="code-header">fn <a href="#tymethod.manifest_filenames" class="fn">manifest_filenames</a>(&amp;self) -&gt; &amp;[&amp;'static <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>]</h4></section></summary><div class="docblock"><p>Manifest filenames this ecosystem handles (e.g., [“Cargo.toml”])</p>
+<p>The ecosystem registry uses these filenames to route file URIs
+to the appropriate ecosystem implementation.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.parse_manifest" class="method"><a class="src rightside" href="../../src/deps_core/ecosystem.rs.html#493-497">Source</a><h4 class="code-header">fn <a href="#tymethod.parse_manifest" class="fn">parse_manifest</a>&lt;'a&gt;(
+    &amp;'a self,
+    content: &amp;'a <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>,
+    uri: &amp;'a Uri,
+) -&gt; <a class="type" href="type.BoxFuture.html" title="type deps_core::ecosystem::BoxFuture">BoxFuture</a>&lt;'a, <a class="type" href="../error/type.Result.html" title="type deps_core::error::Result">Result</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="trait.ParseResult.html" title="trait deps_core::ecosystem::ParseResult">ParseResult</a>&gt;&gt;&gt;</h4></section></summary><div class="docblock"><p>Parse a manifest file and return parsed result</p>
+<h5 id="arguments"><a class="doc-anchor" href="#arguments">§</a>Arguments</h5>
+<ul>
+<li><code>content</code> - Raw file content</li>
+<li><code>uri</code> - Document URI for position tracking</li>
+</ul>
+<h5 id="errors"><a class="doc-anchor" href="#errors">§</a>Errors</h5>
+<p>Returns error if manifest cannot be parsed</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.registry" class="method"><a class="src rightside" href="../../src/deps_core/ecosystem.rs.html#502">Source</a><h4 class="code-header">fn <a href="#tymethod.registry" class="fn">registry</a>(&amp;self) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/sync/struct.Arc.html" title="struct alloc::sync::Arc">Arc</a>&lt;dyn <a class="trait" href="../registry/trait.Registry.html" title="trait deps_core::registry::Registry">Registry</a>&gt;</h4></section></summary><div class="docblock"><p>Get the registry client for this ecosystem</p>
+<p>The registry provides version lookup and package search capabilities.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.formatter" class="method"><a class="src rightside" href="../../src/deps_core/ecosystem.rs.html#516">Source</a><h4 class="code-header">fn <a href="#tymethod.formatter" class="fn">formatter</a>(&amp;self) -&gt; &amp;dyn <a class="trait" href="../lsp_helpers/trait.EcosystemFormatter.html" title="trait deps_core::lsp_helpers::EcosystemFormatter">EcosystemFormatter</a></h4></section></summary><div class="docblock"><p>Get the ecosystem-specific formatter for LSP response generation.</p>
+<p>The formatter handles version comparison, package URLs, and text formatting.
+Override this to customize LSP response generation.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.generate_completions" class="method"><a class="src rightside" href="../../src/deps_core/ecosystem.rs.html#692-698">Source</a><h4 class="code-header">fn <a href="#tymethod.generate_completions" class="fn">generate_completions</a>&lt;'a&gt;(
+    &amp;'a self,
+    parse_result: &amp;'a dyn <a class="trait" href="trait.ParseResult.html" title="trait deps_core::ecosystem::ParseResult">ParseResult</a>,
+    position: Position,
+    content: &amp;'a <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>,
+    freshness: <a class="struct" href="../freshness/struct.FreshnessSettings.html" title="struct deps_core::freshness::FreshnessSettings">FreshnessSettings</a>,
+) -&gt; <a class="type" href="type.BoxFuture.html" title="type deps_core::ecosystem::BoxFuture">BoxFuture</a>&lt;'a, <a class="struct" href="../completion/struct.Completions.html" title="struct deps_core::completion::Completions">Completions</a>&gt;</h4></section></summary><div class="docblock"><p>Generate completions for a position.</p>
+<p>Provides autocomplete suggestions for package names and versions.</p>
+<p><code>freshness.enabled</code> gates whether version completion items carry a
+relative-age <code>label_details</code> suffix (issue #145); implementations that
+delegate to <a href="../completion/fn.complete_versions_generic.html" title="fn deps_core::completion::complete_versions_generic"><code>crate::completion::complete_versions_generic</code></a> get this for
+free by threading <code>freshness</code> through.</p>
+<p>The returned <a href="../completion/struct.Completions.html#structfield.is_incomplete" title="field deps_core::completion::Completions::is_incomplete"><code>Completions::is_incomplete</code></a> must reflect <em>this specific call</em>
+(the completion context actually served), not a static worst case for the
+ecosystem as a whole (#427): a package-name search over an unranked,
+truncated index should report <code>true</code>, while a version completion or any
+other exhaustive context in the same manifest must report <code>false</code>, even for
+an ecosystem where some contexts are incomplete and others are not.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.as_any" class="method"><a class="src rightside" href="../../src/deps_core/ecosystem.rs.html#727">Source</a><h4 class="code-header">fn <a href="#tymethod.as_any" class="fn">as_any</a>(&amp;self) -&gt; &amp;dyn <a class="trait" href="https://doc.rust-lang.org/1.98.1/core/any/trait.Any.html" title="trait core::any::Any">Any</a></h4></section></summary><div class="docblock"><p>Support for downcasting to concrete ecosystem type</p>
+<p>This allows ecosystem-specific operations when needed.</p>
+</div></details></div><h2 id="provided-methods" class="section-header">Provided Methods<a href="#provided-methods" class="anchor">§</a></h2><div class="methods"><details class="toggle method-toggle" open><summary><section id="method.manifest_extensions" class="method"><a class="src rightside" href="../../src/deps_core/ecosystem.rs.html#415-417">Source</a><h4 class="code-header">fn <a href="#method.manifest_extensions" class="fn">manifest_extensions</a>(&amp;self) -&gt; &amp;[&amp;'static <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>]</h4></section></summary><div class="docblock"><p>File extensions this ecosystem handles when the manifest basename is
+not fixed (e.g. <code>[".csproj", ".fsproj"]</code> for NuGet project files).</p>
+<p>Consulted by <a href="../ecosystem_registry/struct.EcosystemRegistry.html#method.get_for_filename" title="method deps_core::ecosystem_registry::EcosystemRegistry::get_for_filename"><code>crate::EcosystemRegistry::get_for_filename</code></a> only after
+an exact <a href="trait.Ecosystem.html#tymethod.manifest_filenames" title="method deps_core::ecosystem::Ecosystem::manifest_filenames"><code>manifest_filenames</code></a> match
+fails. Empty by default, indicating this ecosystem is routed solely by
+exact filename.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.manifest_patterns" class="method"><a class="src rightside" href="../../src/deps_core/ecosystem.rs.html#433-435">Source</a><h4 class="code-header">fn <a href="#method.manifest_patterns" class="fn">manifest_patterns</a>(&amp;self) -&gt; &amp;[&amp;'static <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>]</h4></section></summary><div class="docblock"><p>Basename glob patterns this ecosystem handles, each containing exactly
+one <code>*</code> wildcard (e.g. <code>["requirements*.txt"]</code>).</p>
+<p>Consulted by <a href="../ecosystem_registry/struct.EcosystemRegistry.html#method.get_for_filename" title="method deps_core::ecosystem_registry::EcosystemRegistry::get_for_filename"><code>crate::EcosystemRegistry::get_for_filename</code></a> as a third
+routing stage, tried after an exact
+<a href="trait.Ecosystem.html#tymethod.manifest_filenames" title="method deps_core::ecosystem::Ecosystem::manifest_filenames"><code>manifest_filenames</code></a> match fails and
+before <a href="trait.Ecosystem.html#method.manifest_extensions" title="method deps_core::ecosystem::Ecosystem::manifest_extensions"><code>manifest_extensions</code></a> — for
+basenames that are neither fixed nor identified by extension alone
+(e.g. <code>requirements.txt</code>, <code>requirements-dev.txt</code>). Empty by default.
+Matching is case-sensitive, unlike the extension stage: these patterns
+target canonically-lowercase filenames (pip, Renovate and Dependabot
+all treat <code>requirements.txt</code> as lowercase), whereas the extension
+stage exists specifically for Windows/MSBuild project files whose
+case genuinely varies.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.manifest_directory_patterns" class="method"><a class="src rightside" href="../../src/deps_core/ecosystem.rs.html#453-455">Source</a><h4 class="code-header">fn <a href="#method.manifest_directory_patterns" class="fn">manifest_directory_patterns</a>(&amp;self) -&gt; &amp;[(&amp;'static <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>, &amp;'static <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>)]</h4></section></summary><div class="docblock"><p><code>(directory_path, file_suffix)</code> pairs identifying a file solely by its
+containing directory path and suffix. <code>directory_path</code> may be a single
+segment (e.g. <code>[("requirements", ".txt")]</code> for Python’s
+<code>requirements/base.txt</code> split-file layout) or multiple <code>/</code>-joined
+segments (e.g. <code>[(".github/workflows", ".yml")]</code> for GitHub Actions
+workflow files) — either way it is matched against the <em>tail</em> of the
+file’s directory path on segment boundaries, not just the immediate
+parent, so a multi-segment pattern matches regardless of how many
+ancestor directories precede it. Used when the basename alone carries
+no ecosystem signal.</p>
+<p>Consulted by <a href="../ecosystem_registry/struct.EcosystemRegistry.html#method.get_for_uri" title="method deps_core::ecosystem_registry::EcosystemRegistry::get_for_uri"><code>crate::EcosystemRegistry::get_for_uri</code></a> only, after both
+<a href="trait.Ecosystem.html#method.manifest_patterns" title="method deps_core::ecosystem::Ecosystem::manifest_patterns"><code>manifest_patterns</code></a> and
+<a href="trait.Ecosystem.html#method.manifest_extensions" title="method deps_core::ecosystem::Ecosystem::manifest_extensions"><code>manifest_extensions</code></a> miss on the
+basename — it needs the full path, so it is never reachable from
+<a href="../ecosystem_registry/struct.EcosystemRegistry.html#method.get_for_filename" title="method deps_core::ecosystem_registry::EcosystemRegistry::get_for_filename"><code>crate::EcosystemRegistry::get_for_filename</code></a>. Empty by default.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.lockfile_filenames" class="method"><a class="src rightside" href="../../src/deps_core/ecosystem.rs.html#466-468">Source</a><h4 class="code-header">fn <a href="#method.lockfile_filenames" class="fn">lockfile_filenames</a>(&amp;self) -&gt; &amp;[&amp;'static <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>]</h4></section></summary><div class="docblock"><p>Lock file filenames this ecosystem uses (e.g., [“Cargo.lock”])</p>
+<p>Used for file watching - LSP will monitor changes to these files
+and refresh UI when they change. Returns empty slice if ecosystem
+doesn’t use lock files.</p>
+<h5 id="default-implementation"><a class="doc-anchor" href="#default-implementation">§</a>Default Implementation</h5>
+<p>Returns empty slice by default, indicating no lock files are used.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.watched_config_filenames" class="method"><a class="src rightside" href="../../src/deps_core/ecosystem.rs.html#479-481">Source</a><h4 class="code-header">fn <a href="#method.watched_config_filenames" class="fn">watched_config_filenames</a>(&amp;self) -&gt; &amp;[&amp;'static <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>]</h4></section></summary><div class="docblock"><p>Non-lockfile config filenames this ecosystem resolves <em>during</em> <a href="trait.Ecosystem.html#tymethod.parse_manifest" title="method deps_core::ecosystem::Ecosystem::parse_manifest"><code>Self::parse_manifest</code></a>
+(e.g. <code>["pnpm-workspace.yaml", ".npmrc"]</code> for npm’s catalog and registry resolution),
+whose values end up baked into a manifest’s <code>ParseResult</code> rather than looked up
+separately the way a <a href="trait.Ecosystem.html#method.lockfile_provider" title="method deps_core::ecosystem::Ecosystem::lockfile_provider"><code>Self::lockfile_provider</code></a> is.</p>
+<p>Used for file watching alongside <a href="trait.Ecosystem.html#method.lockfile_filenames" title="method deps_core::ecosystem::Ecosystem::lockfile_filenames"><code>Self::lockfile_filenames</code></a> — LSP monitors changes
+to these files too, but reacts by fully re-parsing every open document of this
+ecosystem (not merely refreshing cached resolved versions, since the value isn’t kept
+separately from the parse result to refresh in place). Returns empty slice by default.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.lockfile_provider" class="method"><a class="src rightside" href="../../src/deps_core/ecosystem.rs.html#508-510">Source</a><h4 class="code-header">fn <a href="#method.lockfile_provider" class="fn">lockfile_provider</a>(&amp;self) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.98.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/sync/struct.Arc.html" title="struct alloc::sync::Arc">Arc</a>&lt;dyn <a class="trait" href="../lockfile/trait.LockFileProvider.html" title="trait deps_core::lockfile::LockFileProvider">LockFileProvider</a>&gt;&gt;</h4></section></summary><div class="docblock"><p>Get the lock file provider for this ecosystem.</p>
+<p>Returns <code>None</code> if the ecosystem doesn’t support lock files.
+Lock files provide resolved dependency versions without network requests.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.generate_inlay_hints" class="method"><a class="src rightside" href="../../src/deps_core/ecosystem.rs.html#522-538">Source</a><h4 class="code-header">fn <a href="#method.generate_inlay_hints" class="fn">generate_inlay_hints</a>&lt;'a&gt;(
+    &amp;'a self,
+    parse_result: &amp;'a dyn <a class="trait" href="trait.ParseResult.html" title="trait deps_core::ecosystem::ParseResult">ParseResult</a>,
+    versions: <a class="struct" href="../lsp_helpers/struct.VersionData.html" title="struct deps_core::lsp_helpers::VersionData">VersionData</a>&lt;'a&gt;,
+    loading_state: <a class="enum" href="../parser/enum.LoadingState.html" title="enum deps_core::parser::LoadingState">LoadingState</a>,
+    config: &amp;'a <a class="struct" href="struct.EcosystemConfig.html" title="struct deps_core::ecosystem::EcosystemConfig">EcosystemConfig</a>,
+) -&gt; <a class="type" href="type.BoxFuture.html" title="type deps_core::ecosystem::BoxFuture">BoxFuture</a>&lt;'a, <a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;InlayHint&gt;&gt;</h4></section></summary><div class="docblock"><p>Generate inlay hints for the document.</p>
+<p>Default implementation delegates to <code>lsp_helpers::generate_inlay_hints</code>
+using <code>self.formatter()</code>. Override only if custom behavior is needed.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.generate_hover" class="method"><a class="src rightside" href="../../src/deps_core/ecosystem.rs.html#544-564">Source</a><h4 class="code-header">fn <a href="#method.generate_hover" class="fn">generate_hover</a>&lt;'a&gt;(
+    &amp;'a self,
+    parse_result: &amp;'a dyn <a class="trait" href="trait.ParseResult.html" title="trait deps_core::ecosystem::ParseResult">ParseResult</a>,
+    position: Position,
+    versions: <a class="struct" href="../lsp_helpers/struct.VersionData.html" title="struct deps_core::lsp_helpers::VersionData">VersionData</a>&lt;'a&gt;,
+    freshness: <a class="struct" href="../freshness/struct.FreshnessSettings.html" title="struct deps_core::freshness::FreshnessSettings">FreshnessSettings</a>,
+) -&gt; <a class="type" href="type.BoxFuture.html" title="type deps_core::ecosystem::BoxFuture">BoxFuture</a>&lt;'a, <a class="enum" href="https://doc.rust-lang.org/1.98.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;Hover&gt;&gt;</h4></section></summary><div class="docblock"><p>Generate hover information for a position.</p>
+<p>Default implementation delegates to <code>lsp_helpers::generate_hover</code>
+using <code>self.formatter()</code> and <code>self.registry()</code>.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.generate_code_actions" class="method"><a class="src rightside" href="../../src/deps_core/ecosystem.rs.html#576-597">Source</a><h4 class="code-header">fn <a href="#method.generate_code_actions" class="fn">generate_code_actions</a>&lt;'a&gt;(
+    &amp;'a self,
+    parse_result: &amp;'a dyn <a class="trait" href="trait.ParseResult.html" title="trait deps_core::ecosystem::ParseResult">ParseResult</a>,
+    position: Position,
+    uri: &amp;'a Uri,
+    versions: <a class="struct" href="../lsp_helpers/struct.VersionData.html" title="struct deps_core::lsp_helpers::VersionData">VersionData</a>&lt;'a&gt;,
+    content: &amp;'a <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>,
+) -&gt; <a class="type" href="type.BoxFuture.html" title="type deps_core::ecosystem::BoxFuture">BoxFuture</a>&lt;'a, <a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;CodeAction&gt;&gt;</h4></section></summary><div class="docblock"><p>Generate code actions for a position.</p>
+<p>Default implementation delegates to <code>lsp_helpers::generate_code_actions</code>
+using <code>self.formatter()</code> and <code>self.registry()</code>. <code>versions</code> carries the
+same OSV scan results <code>generate_hover</code> and <code>generate_diagnostics</code> use,
+so a vulnerable dependency at <code>position</code> gets a “fix vulnerability”
+quickfix alongside the plain version-update actions. <code>content</code> is the
+manifest source, needed to guard against rewriting a <code>version_range</code>
+that no longer slices to its declared requirement text (see
+<code>lsp_helpers::literal_span_matches</code>).</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.generate_diagnostics" class="method"><a class="src rightside" href="../../src/deps_core/ecosystem.rs.html#603-622">Source</a><h4 class="code-header">fn <a href="#method.generate_diagnostics" class="fn">generate_diagnostics</a>&lt;'a&gt;(
+    &amp;'a self,
+    parse_result: &amp;'a dyn <a class="trait" href="trait.ParseResult.html" title="trait deps_core::ecosystem::ParseResult">ParseResult</a>,
+    versions: <a class="struct" href="../lsp_helpers/struct.VersionData.html" title="struct deps_core::lsp_helpers::VersionData">VersionData</a>&lt;'a&gt;,
+    uri: &amp;'a Uri,
+    freshness: <a class="struct" href="../freshness/struct.FreshnessSettings.html" title="struct deps_core::freshness::FreshnessSettings">FreshnessSettings</a>,
+    severities: <a class="struct" href="../lsp_helpers/struct.DiagnosticSeverities.html" title="struct deps_core::lsp_helpers::DiagnosticSeverities">DiagnosticSeverities</a>,
+) -&gt; <a class="type" href="type.BoxFuture.html" title="type deps_core::ecosystem::BoxFuture">BoxFuture</a>&lt;'a, <a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;Diagnostic&gt;&gt;</h4></section></summary><div class="docblock"><p>Generate diagnostics for the document.</p>
+<p>Default implementation delegates to <code>lsp_helpers::generate_diagnostics_from_cache</code>
+using <code>self.formatter()</code>.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.generate_document_links" class="method"><a class="src rightside" href="../../src/deps_core/ecosystem.rs.html#633-639">Source</a><h4 class="code-header">fn <a href="#method.generate_document_links" class="fn">generate_document_links</a>(
+    &amp;self,
+    _parse_result: &amp;dyn <a class="trait" href="trait.ParseResult.html" title="trait deps_core::ecosystem::ParseResult">ParseResult</a>,
+    _uri: &amp;Uri,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;DocumentLink&gt;</h4></section></summary><div class="docblock"><p>Generate <code>textDocument/documentLink</code> targets for the document.</p>
+<p>A document link is a clickable reference from a byte range in this
+manifest to another resource — e.g. a <code>-r other.txt</code> / <code>-c constraints.txt</code> reference inside a pip requirements file, resolved
+to the absolute file it points at. Purely local (no registry access),
+so unlike the other <code>generate_*</code> methods this is synchronous rather
+than a <a href="type.BoxFuture.html" title="type deps_core::ecosystem::BoxFuture"><code>BoxFuture</code></a>. Empty by default: most ecosystems’ manifest
+formats have no such intra-file-graph references.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.generate_code_lenses" class="method"><a class="src rightside" href="../../src/deps_core/ecosystem.rs.html#656-675">Source</a><h4 class="code-header">fn <a href="#method.generate_code_lenses" class="fn">generate_code_lenses</a>&lt;'a&gt;(
+    &amp;'a self,
+    parse_result: &amp;'a dyn <a class="trait" href="trait.ParseResult.html" title="trait deps_core::ecosystem::ParseResult">ParseResult</a>,
+    content: &amp;'a <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>,
+    versions: <a class="struct" href="../lsp_helpers/struct.VersionData.html" title="struct deps_core::lsp_helpers::VersionData">VersionData</a>&lt;'a&gt;,
+    uri: &amp;'a Uri,
+    command_id: &amp;'a <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>,
+    _severities: <a class="struct" href="../lsp_helpers/struct.DiagnosticSeverities.html" title="struct deps_core::lsp_helpers::DiagnosticSeverities">DiagnosticSeverities</a>,
+) -&gt; <a class="type" href="type.BoxFuture.html" title="type deps_core::ecosystem::BoxFuture">BoxFuture</a>&lt;'a, <a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;CodeLens&gt;&gt;</h4></section></summary><div class="docblock"><p>Generate the “Update N outdated dependencies” code lens for the document.</p>
+<p><code>severities</code> is unused by the default implementation (the shared “update all
+outdated” lens has no enable/disable toggle of its own — that’s <code>code_lens.enabled</code>
+in <code>deps-lsp</code>’s config, gating the whole handler before this method is ever
+called) but is threaded through so an override can gate an <em>additional</em>,
+ecosystem-specific lens on a <code>DiagnosticSeverities</code> flag the way
+<code>generate_diagnostics</code>’s <code>severities</code> parameter already does — see
+<code>deps_github_actions::GithubActionsEcosystem</code>’s override, which gates its bulk
+“Pin N actions to commit SHA” lens on <code>severities.mutable_ref_pin_enabled</code> so
+disabling that flag suppresses the lens the same way it suppresses the
+diagnostic (issue #633).</p>
+<p>Default implementation delegates to <code>lsp_helpers::generate_code_lenses</code> using
+<code>self.formatter()</code>. Override only if custom behavior is needed.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.package_search_is_incomplete" class="method"><a class="src rightside" href="../../src/deps_core/ecosystem.rs.html#720-722">Source</a><h4 class="code-header">fn <a href="#method.package_search_is_incomplete" class="fn">package_search_is_incomplete</a>(&amp;self) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.bool.html">bool</a></h4></section></summary><div class="docblock"><p>Whether this ecosystem’s package-name search may return a truncated view of
+a larger candidate set (see e.g. <code>PypiRegistry::search</code>’s doc comment).</p>
+<p><a href="trait.Ecosystem.html#tymethod.generate_completions" title="method deps_core::ecosystem::Ecosystem::generate_completions"><code>generate_completions</code></a> already reports
+this precisely per call via <a href="../completion/struct.Completions.html#structfield.is_incomplete" title="field deps_core::completion::Completions::is_incomplete"><code>Completions::is_incomplete</code></a> whenever a real
+completion context is available. This method exists only for the two
+<code>deps-lsp</code> code paths that cannot compute that precise per-call signal
+because no context has been resolved yet:</p>
+<ul>
+<li>the raw-text fallback search (<code>fallback_completion</code>), which always
+performs a package-name lookup via <a href="../registry/trait.Registry.html#tymethod.search" title="method deps_core::registry::Registry::search"><code>crate::Registry::search</code></a> regardless
+of what completion context (or lack thereof) triggered it;</li>
+<li>the document-not-loaded early return, before any <code>ParseResult</code> — and so
+any completion context — exists to call <code>generate_completions</code> with.</li>
+</ul>
+<p>Unlike the ecosystem-wide <code>completions_are_incomplete()</code> flag this method
+superseded (#419, removed in #427), it never gates the <em>primary</em>
+<code>generate_completions</code> response — only these two context-less fallbacks.
+Default <code>false</code> preserves existing behavior for every ecosystem whose
+package-name search is always exhaustive.</p>
+</div></details></div><h2 id="dyn-compatibility" class="section-header">Dyn Compatibility<a href="#dyn-compatibility" class="anchor">§</a></h2><div class="dyn-compatibility-info"><p>This trait <b>is</b> <a href="https://doc.rust-lang.org/1.98.1/reference/items/traits.html#dyn-compatibility">dyn compatible</a>.</p><p><i>In older versions of Rust, dyn compatibility was called "object safety".</i></p></div><h2 id="implementors" class="section-header">Implementors<a href="#implementors" class="anchor">§</a></h2><div id="implementors-list"></div><script src="../../trait.impl/deps_core/ecosystem/trait.Ecosystem.js" async></script></section></div></main></body></html>

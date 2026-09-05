@@ -1,0 +1,78 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Returns `true` when no published version satisfies `requirement`."><title>requirement_is_unsatisfiable in deps_core::lsp_helpers - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="deps_core" data-themes="" data-resource-suffix="" data-rustdoc-version="1.98.1 (48a229cea 2026-09-01)" data-channel="1.98.1" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc fn"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">requirement_is_unsatisfiable</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../deps_core/index.html">deps_<wbr>core</a><span class="version">0.12.1</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">requirement_<wbr>is_<wbr>unsatisfiable</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#examples" title="Examples">Examples</a></li></ul></section><div id="rustdoc-modnav"><h2><a href="index.html">In deps_<wbr>core::<wbr>lsp_<wbr>helpers</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">deps_core</a>::<wbr><a href="index.html">lsp_helpers</a></div><h1>Function <span class="fn">requirement_<wbr>is_<wbr>unsatisfiable</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/deps_core/lsp_helpers/diagnostics.rs.html#287-317">Source</a> </span></div><pre class="rust item-decl"><code>pub fn requirement_is_unsatisfiable(
+    formatter: &amp;dyn <a class="trait" href="trait.EcosystemFormatter.html" title="trait deps_core::lsp_helpers::EcosystemFormatter">EcosystemFormatter</a>,
+    requirement: &amp;<a class="struct" href="../package/struct.VersionReq.html" title="struct deps_core::package::VersionReq">VersionReq</a>,
+    available: &amp;[<a class="struct" href="../package/struct.ConcreteVersion.html" title="struct deps_core::package::ConcreteVersion">ConcreteVersion</a>],
+) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.bool.html">bool</a></code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Returns <code>true</code> when no published version satisfies <code>requirement</code>.</p>
+<p><code>available</code> must be non-empty, <code>requirement</code> must be a concrete (non-empty, resolved,
+not implausibly long) constraint, and no entry in <code>available</code> — of any kind: stable,
+prerelease, or yanked — may satisfy it. All of the following must hold for <code>true</code>:</p>
+<ol>
+<li><code>!available.is_empty()</code> — an empty or not-yet-loaded list means “unknown”, not
+“unsatisfiable” (FR-004: no diagnostic while loading or offline).</li>
+<li><code>!requirement.as_str().trim().is_empty()</code>.</li>
+<li><code>requirement.as_str().len() &lt;= MAX_REQUIREMENT_LEN</code> — see that constant’s docs; an
+oversized requirement is treated the same as “unmodellable” (suppressed, not warned).</li>
+<li><code>!formatter.requirement_is_unresolved(requirement)</code> (FR-005) — an unresolved
+placeholder requirement was never actually checked against anything.</li>
+<li><code>!formatter.requirement_is_undecidable_given_available(requirement, available)</code> — this
+ecosystem’s registry can hide a published version that would have decided the match.</li>
+<li><code>formatter.compile_requirement(requirement)</code> returns <code>Some(matcher)</code> — this
+ecosystem opted in and the requirement string itself parses.</li>
+<li>Scanning <code>available</code> with <code>matcher.matches</code>: <strong>at least one</strong> candidate returned
+<code>Some(false)</code>, and <strong>none</strong> returned <code>Some(true)</code>. Candidates returning <code>None</code>
+(unparseable candidate strings) are skipped and count toward neither side —
+condition 7’s “at least one <code>Some(false)</code>” is load-bearing: if every candidate is
+unparseable, nothing was decided, so the verdict is <code>false</code> (no diagnostic) rather
+than a vacuous <code>true</code>.</li>
+</ol>
+<p>The scan short-circuits on the first <code>Some(true)</code> — O(N) worst case, and the newest-first
+ordering of <code>available</code> means a satisfiable requirement typically exits within the first
+few entries.</p>
+<h2 id="examples"><a class="doc-anchor" href="#examples">§</a>Examples</h2>
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>deps_core::lsp_helpers::{
+    requirement_is_unsatisfiable, DiagnosticMessages, DiagnosticPolicy, OsvNaming,
+    PackageNaming, PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy,
+};
+<span class="kw">use </span>deps_core::{ConcreteVersion, PackageName, VersionReq};
+
+<span class="kw">struct </span>ExactMatcher(String);
+<span class="kw">impl </span>RequirementMatcher <span class="kw">for </span>ExactMatcher {
+    <span class="kw">fn </span>matches(<span class="kw-2">&amp;</span><span class="self">self</span>, version: <span class="kw-2">&amp;</span>ConcreteVersion) -&gt; <span class="prelude-ty">Option</span>&lt;bool&gt; {
+        <span class="prelude-val">Some</span>(version.as_str() == <span class="self">self</span>.<span class="number">0</span>)
+    }
+}
+
+<span class="kw">struct </span>ExactFormatter;
+<span class="kw">impl </span>PackageNaming <span class="kw">for </span>ExactFormatter {}
+<span class="kw">impl </span>PackageRendering <span class="kw">for </span>ExactFormatter {
+    <span class="kw">fn </span>format_version_for_text_edit(<span class="kw-2">&amp;</span><span class="self">self</span>, version: <span class="kw-2">&amp;</span>ConcreteVersion) -&gt; String {
+        version.to_string()
+    }
+    <span class="kw">fn </span>package_url(<span class="kw-2">&amp;</span><span class="self">self</span>, name: <span class="kw-2">&amp;</span>PackageName) -&gt; String {
+        name.to_string()
+    }
+}
+<span class="kw">impl </span>RequirementResolution <span class="kw">for </span>ExactFormatter {
+    <span class="kw">fn </span>compile_requirement(
+        <span class="kw-2">&amp;</span><span class="self">self</span>,
+        requirement: <span class="kw-2">&amp;</span>VersionReq,
+    ) -&gt; <span class="prelude-ty">Option</span>&lt;Box&lt;<span class="kw">dyn </span>RequirementMatcher&gt;&gt; {
+        <span class="prelude-val">Some</span>(Box::new(ExactMatcher(requirement.as_str().to_string())))
+    }
+}
+<span class="kw">impl </span>DiagnosticMessages <span class="kw">for </span>ExactFormatter {}
+<span class="kw">impl </span>DiagnosticPolicy <span class="kw">for </span>ExactFormatter {}
+<span class="kw">impl </span>SourcePolicy <span class="kw">for </span>ExactFormatter {}
+<span class="kw">impl </span>OsvNaming <span class="kw">for </span>ExactFormatter {}
+
+<span class="kw">let </span>available = <span class="macro">vec!</span>[ConcreteVersion::new(<span class="string">"1.0.0"</span>), ConcreteVersion::new(<span class="string">"0.9.0"</span>)];
+<span class="macro">assert!</span>(requirement_is_unsatisfiable(
+    <span class="kw-2">&amp;</span>ExactFormatter,
+    <span class="kw-2">&amp;</span>VersionReq::new(<span class="string">"2.0.0"</span>),
+    <span class="kw-2">&amp;</span>available,
+));
+<span class="macro">assert!</span>(!requirement_is_unsatisfiable(
+    <span class="kw-2">&amp;</span>ExactFormatter,
+    <span class="kw-2">&amp;</span>VersionReq::new(<span class="string">"1.0.0"</span>),
+    <span class="kw-2">&amp;</span>available,
+));</code></pre></div></div></details></section></div></main></body></html>

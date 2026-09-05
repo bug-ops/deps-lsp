@@ -1,0 +1,285 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Generic package registry interface."><title>Registry in deps_core::registry - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="deps_core" data-themes="" data-resource-suffix="" data-rustdoc-version="1.98.1 (48a229cea 2026-09-01)" data-channel="1.98.1" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc trait"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Registry</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../deps_core/index.html">deps_<wbr>core</a><span class="version">0.12.1</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Registry</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#type-erasure" title="Type Erasure">Type Erasure</a></li><li><a href="#examples" title="Examples">Examples</a></li></ul><h3><a href="#required-methods">Required Methods</a></h3><ul class="block"><li><a href="#tymethod.as_any" title="as_any">as_any</a></li><li><a href="#tymethod.get_latest_matching" title="get_latest_matching">get_latest_matching</a></li><li><a href="#tymethod.get_versions" title="get_versions">get_versions</a></li><li><a href="#tymethod.search" title="search">search</a></li></ul><h3><a href="#provided-methods">Provided Methods</a></h3><ul class="block"><li><a href="#method.get_latest_matching_from" title="get_latest_matching_from">get_latest_matching_from</a></li><li><a href="#method.get_latest_matching_with_context" title="get_latest_matching_with_context">get_latest_matching_with_context</a></li><li><a href="#method.get_versions_from" title="get_versions_from">get_versions_from</a></li><li><a href="#method.get_versions_with" title="get_versions_with">get_versions_with</a></li><li><a href="#method.reports_yanked" title="reports_yanked">reports_yanked</a></li><li><a href="#method.select_latest_matching" title="select_latest_matching">select_latest_matching</a></li><li><a href="#method.select_latest_matching_with_context" title="select_latest_matching_with_context">select_latest_matching_with_context</a></li></ul><h3><a href="#implementors">Implementors</a></h3></section><div id="rustdoc-modnav"><h2><a href="index.html">In deps_<wbr>core::<wbr>registry</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">deps_core</a>::<wbr><a href="index.html">registry</a></div><h1>Trait <span class="trait">Registry</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/deps_core/registry.rs.html#73-305">Source</a> </span></div><pre class="rust item-decl"><code>pub trait Registry: <a class="trait" href="https://doc.rust-lang.org/1.98.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + <a class="trait" href="https://doc.rust-lang.org/1.98.1/core/marker/trait.Sync.html" title="trait core::marker::Sync">Sync</a> {
+    // Required methods
+    fn <a href="#tymethod.get_versions" class="fn">get_versions</a>&lt;'a&gt;(
+        &amp;'a self,
+        name: &amp;'a <a class="struct" href="../package/struct.PackageName.html" title="struct deps_core::package::PackageName">PackageName</a>,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.98.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.98.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="../error/type.Result.html" title="type deps_core::error::Result">Result</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="trait.Version.html" title="trait deps_core::registry::Version">Version</a>&gt;&gt;&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.98.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'a&gt;&gt;;
+<span class="item-spacer"></span>    fn <a href="#tymethod.get_latest_matching" class="fn">get_latest_matching</a>&lt;'a&gt;(
+        &amp;'a self,
+        name: &amp;'a <a class="struct" href="../package/struct.PackageName.html" title="struct deps_core::package::PackageName">PackageName</a>,
+        req: &amp;'a <a class="struct" href="../package/struct.VersionReq.html" title="struct deps_core::package::VersionReq">VersionReq</a>,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.98.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.98.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="../error/type.Result.html" title="type deps_core::error::Result">Result</a>&lt;<a class="enum" href="https://doc.rust-lang.org/1.98.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="trait.Version.html" title="trait deps_core::registry::Version">Version</a>&gt;&gt;&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.98.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'a&gt;&gt;;
+<span class="item-spacer"></span>    fn <a href="#tymethod.search" class="fn">search</a>&lt;'a&gt;(
+        &amp;'a self,
+        query: &amp;'a <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>,
+        limit: <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.usize.html">usize</a>,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.98.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.98.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="../error/type.Result.html" title="type deps_core::error::Result">Result</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="trait.Metadata.html" title="trait deps_core::registry::Metadata">Metadata</a>&gt;&gt;&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.98.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'a&gt;&gt;;
+<span class="item-spacer"></span>    fn <a href="#tymethod.as_any" class="fn">as_any</a>(&amp;self) -&gt; &amp;dyn <a class="trait" href="https://doc.rust-lang.org/1.98.1/core/any/trait.Any.html" title="trait core::any::Any">Any</a>;
+
+    // Provided methods
+    fn <a href="#method.get_versions_with" class="fn">get_versions_with</a>&lt;'a&gt;(
+        &amp;'a self,
+        name: &amp;'a <a class="struct" href="../package/struct.PackageName.html" title="struct deps_core::package::PackageName">PackageName</a>,
+        freshness: <a class="struct" href="../freshness/struct.FreshnessSettings.html" title="struct deps_core::freshness::FreshnessSettings">FreshnessSettings</a>,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.98.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.98.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="../error/type.Result.html" title="type deps_core::error::Result">Result</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="trait.Version.html" title="trait deps_core::registry::Version">Version</a>&gt;&gt;&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.98.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'a&gt;&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.get_versions_from" class="fn">get_versions_from</a>&lt;'a&gt;(
+        &amp;'a self,
+        name: &amp;'a <a class="struct" href="../package/struct.PackageName.html" title="struct deps_core::package::PackageName">PackageName</a>,
+        source: &amp;'a <a class="enum" href="../parser/enum.DependencySource.html" title="enum deps_core::parser::DependencySource">DependencySource</a>,
+        freshness: <a class="struct" href="../freshness/struct.FreshnessSettings.html" title="struct deps_core::freshness::FreshnessSettings">FreshnessSettings</a>,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.98.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.98.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="../error/type.Result.html" title="type deps_core::error::Result">Result</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="trait.Version.html" title="trait deps_core::registry::Version">Version</a>&gt;&gt;&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.98.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'a&gt;&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.get_latest_matching_with_context" class="fn">get_latest_matching_with_context</a>&lt;'a&gt;(
+        &amp;'a self,
+        name: &amp;'a <a class="struct" href="../package/struct.PackageName.html" title="struct deps_core::package::PackageName">PackageName</a>,
+        req: &amp;'a <a class="struct" href="../package/struct.VersionReq.html" title="struct deps_core::package::VersionReq">VersionReq</a>,
+        minimum_stability: <a class="enum" href="https://doc.rust-lang.org/1.98.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'a <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>&gt;,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.98.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.98.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="../error/type.Result.html" title="type deps_core::error::Result">Result</a>&lt;<a class="enum" href="https://doc.rust-lang.org/1.98.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="trait.Version.html" title="trait deps_core::registry::Version">Version</a>&gt;&gt;&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.98.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'a&gt;&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.get_latest_matching_from" class="fn">get_latest_matching_from</a>&lt;'a&gt;(
+        &amp;'a self,
+        name: &amp;'a <a class="struct" href="../package/struct.PackageName.html" title="struct deps_core::package::PackageName">PackageName</a>,
+        source: &amp;'a <a class="enum" href="../parser/enum.DependencySource.html" title="enum deps_core::parser::DependencySource">DependencySource</a>,
+        req: &amp;'a <a class="struct" href="../package/struct.VersionReq.html" title="struct deps_core::package::VersionReq">VersionReq</a>,
+        minimum_stability: <a class="enum" href="https://doc.rust-lang.org/1.98.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'a <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>&gt;,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.98.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.98.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="../error/type.Result.html" title="type deps_core::error::Result">Result</a>&lt;<a class="enum" href="https://doc.rust-lang.org/1.98.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="trait.Version.html" title="trait deps_core::registry::Version">Version</a>&gt;&gt;&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.98.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'a&gt;&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.select_latest_matching" class="fn">select_latest_matching</a>(
+        &amp;self,
+        _versions: &amp;[<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="trait.Version.html" title="trait deps_core::registry::Version">Version</a>&gt;],
+        _req: &amp;<a class="struct" href="../package/struct.VersionReq.html" title="struct deps_core::package::VersionReq">VersionReq</a>,
+    ) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.98.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.usize.html">usize</a>&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.select_latest_matching_with_context" class="fn">select_latest_matching_with_context</a>(
+        &amp;self,
+        versions: &amp;[<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="trait.Version.html" title="trait deps_core::registry::Version">Version</a>&gt;],
+        req: &amp;<a class="struct" href="../package/struct.VersionReq.html" title="struct deps_core::package::VersionReq">VersionReq</a>,
+        minimum_stability: <a class="enum" href="https://doc.rust-lang.org/1.98.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;<a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>&gt;,
+    ) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.98.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.usize.html">usize</a>&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.reports_yanked" class="fn">reports_yanked</a>(&amp;self) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.bool.html">bool</a> { ... }
+}</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Generic package registry interface.</p>
+<p>Implementors provide access to a package registry (crates.io, npm, PyPI, etc.)
+with version lookup, search, and metadata retrieval capabilities.</p>
+<p>All methods return <code>Result&lt;T&gt;</code> to allow graceful error handling.
+LSP handlers must never panic on registry errors.</p>
+<h2 id="type-erasure"><a class="doc-anchor" href="#type-erasure">§</a>Type Erasure</h2>
+<p>This trait uses <code>Box&lt;dyn Trait&gt;</code> return types instead of associated types
+to allow runtime polymorphism and dynamic ecosystem registration.</p>
+<h2 id="examples"><a class="doc-anchor" href="#examples">§</a>Examples</h2>
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>deps_core::{Registry, Version, Metadata, PackageName, ConcreteVersion};
+<span class="kw">use </span>std::any::Any;
+<span class="kw">use </span>std::pin::Pin;
+
+<span class="kw">struct </span>MyRegistry;
+
+<span class="attr">#[derive(Clone)]
+</span><span class="kw">struct </span>MyVersion { version: ConcreteVersion }
+
+<span class="kw">impl </span>Version <span class="kw">for </span>MyVersion {
+    <span class="kw">fn </span>version_string(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="kw-2">&amp;</span>ConcreteVersion { <span class="kw-2">&amp;</span><span class="self">self</span>.version }
+    <span class="kw">fn </span>as_any(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="kw-2">&amp;</span><span class="kw">dyn </span>Any { <span class="self">self </span>}
+}
+
+<span class="attr">#[derive(Clone)]
+</span><span class="kw">struct </span>MyMetadata { name: PackageName, latest: ConcreteVersion }
+
+<span class="kw">impl </span>Metadata <span class="kw">for </span>MyMetadata {
+    <span class="kw">fn </span>name(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="kw-2">&amp;</span>PackageName { <span class="kw-2">&amp;</span><span class="self">self</span>.name }
+    <span class="kw">fn </span>description(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="prelude-ty">Option</span>&lt;<span class="kw-2">&amp;</span>str&gt; { <span class="prelude-val">None </span>}
+    <span class="kw">fn </span>repository(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="prelude-ty">Option</span>&lt;<span class="kw-2">&amp;</span>str&gt; { <span class="prelude-val">None </span>}
+    <span class="kw">fn </span>documentation(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="prelude-ty">Option</span>&lt;<span class="kw-2">&amp;</span>str&gt; { <span class="prelude-val">None </span>}
+    <span class="kw">fn </span>latest_version(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="kw-2">&amp;</span>ConcreteVersion { <span class="kw-2">&amp;</span><span class="self">self</span>.latest }
+    <span class="kw">fn </span>as_any(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="kw-2">&amp;</span><span class="kw">dyn </span>Any { <span class="self">self </span>}
+}
+
+<span class="kw">impl </span>Registry <span class="kw">for </span>MyRegistry {
+    <span class="kw">fn </span>get_versions&lt;<span class="lifetime">'a</span>&gt;(<span class="kw-2">&amp;</span><span class="lifetime">'a </span><span class="self">self</span>, _name: <span class="kw-2">&amp;</span><span class="lifetime">'a </span>PackageName)
+        -&gt; Pin&lt;Box&lt;<span class="kw">dyn </span>std::future::Future&lt;Output = deps_core::error::Result&lt;Vec&lt;Box&lt;<span class="kw">dyn </span>Version&gt;&gt;&gt;&gt; + Send + <span class="lifetime">'a</span>&gt;&gt;
+    {
+        Box::pin(<span class="kw">async move </span>{ <span class="prelude-val">Ok</span>(<span class="macro">vec!</span>[Box::new(MyVersion { version: <span class="string">"1.0.0"</span>.into() }) <span class="kw">as </span>Box&lt;<span class="kw">dyn </span>Version&gt;]) })
+    }
+
+    <span class="kw">fn </span>get_latest_matching&lt;<span class="lifetime">'a</span>&gt;(<span class="kw-2">&amp;</span><span class="lifetime">'a </span><span class="self">self</span>, _name: <span class="kw-2">&amp;</span><span class="lifetime">'a </span>PackageName, _req: <span class="kw-2">&amp;</span><span class="lifetime">'a </span>deps_core::VersionReq)
+        -&gt; Pin&lt;Box&lt;<span class="kw">dyn </span>std::future::Future&lt;Output = deps_core::error::Result&lt;<span class="prelude-ty">Option</span>&lt;Box&lt;<span class="kw">dyn </span>Version&gt;&gt;&gt;&gt; + Send + <span class="lifetime">'a</span>&gt;&gt;
+    {
+        Box::pin(<span class="kw">async move </span>{ <span class="prelude-val">Ok</span>(<span class="prelude-val">None</span>) })
+    }
+
+    <span class="kw">fn </span>search&lt;<span class="lifetime">'a</span>&gt;(<span class="kw-2">&amp;</span><span class="lifetime">'a </span><span class="self">self</span>, _query: <span class="kw-2">&amp;</span><span class="lifetime">'a </span>str, _limit: usize)
+        -&gt; Pin&lt;Box&lt;<span class="kw">dyn </span>std::future::Future&lt;Output = deps_core::error::Result&lt;Vec&lt;Box&lt;<span class="kw">dyn </span>Metadata&gt;&gt;&gt;&gt; + Send + <span class="lifetime">'a</span>&gt;&gt;
+    {
+        Box::pin(<span class="kw">async move </span>{ <span class="prelude-val">Ok</span>(<span class="macro">vec!</span>[]) })
+    }
+
+    <span class="kw">fn </span>as_any(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="kw-2">&amp;</span><span class="kw">dyn </span>Any { <span class="self">self </span>}
+}</code></pre></div></div></details><h2 id="required-methods" class="section-header">Required Methods<a href="#required-methods" class="anchor">§</a></h2><div class="methods"><details class="toggle method-toggle" open><summary><section id="tymethod.get_versions" class="method"><a class="src rightside" href="../../src/deps_core/registry.rs.html#84-87">Source</a><h4 class="code-header">fn <a href="#tymethod.get_versions" class="fn">get_versions</a>&lt;'a&gt;(
+    &amp;'a self,
+    name: &amp;'a <a class="struct" href="../package/struct.PackageName.html" title="struct deps_core::package::PackageName">PackageName</a>,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.98.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.98.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="../error/type.Result.html" title="type deps_core::error::Result">Result</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="trait.Version.html" title="trait deps_core::registry::Version">Version</a>&gt;&gt;&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.98.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'a&gt;&gt;</h4></section></summary><div class="docblock"><p>Fetches all available versions for a package.</p>
+<p>Returns versions sorted newest-first. May include yanked/deprecated versions.</p>
+<h5 id="errors"><a class="doc-anchor" href="#errors">§</a>Errors</h5>
+<p>Returns error if:</p>
+<ul>
+<li>Package does not exist</li>
+<li>Network request fails</li>
+<li>Response parsing fails</li>
+</ul>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.get_latest_matching" class="method"><a class="src rightside" href="../../src/deps_core/registry.rs.html#168-172">Source</a><h4 class="code-header">fn <a href="#tymethod.get_latest_matching" class="fn">get_latest_matching</a>&lt;'a&gt;(
+    &amp;'a self,
+    name: &amp;'a <a class="struct" href="../package/struct.PackageName.html" title="struct deps_core::package::PackageName">PackageName</a>,
+    req: &amp;'a <a class="struct" href="../package/struct.VersionReq.html" title="struct deps_core::package::VersionReq">VersionReq</a>,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.98.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.98.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="../error/type.Result.html" title="type deps_core::error::Result">Result</a>&lt;<a class="enum" href="https://doc.rust-lang.org/1.98.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="trait.Version.html" title="trait deps_core::registry::Version">Version</a>&gt;&gt;&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.98.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'a&gt;&gt;</h4></section></summary><div class="docblock"><p>Finds the latest version matching a version requirement.</p>
+<p>Filter with <a href="enum.RemovalStatus.html#method.blocks_resolution" title="method deps_core::registry::RemovalStatus::blocks_resolution"><code>RemovalStatus::blocks_resolution</code></a>, never with
+<a href="enum.RemovalStatus.html#method.is_flagged" title="method deps_core::registry::RemovalStatus::is_flagged"><code>RemovalStatus::is_flagged</code></a>. An <code>AdvisoryDeprecated</code> version is fully
+installable — excluding it turns an existing package into a false
+“Unknown package” (#347). Under a wildcard/empty requirement
+(<code>"*"</code>/<code>""</code>, see <a href="fn.is_existence_wildcard.html" title="fn deps_core::registry::is_existence_wildcard"><code>is_existence_wildcard</code></a>) this is an <em>existence</em> check (“does this
+package exist / what is its newest version for display purposes”), not an upgrade
+recommendation: an implementation may prefer a non-yanked version but fall back to a
+yanked one rather than returning <code>None</code> when no non-yanked version exists — a yanked
+package still exists. <code>deps-npm</code> implements this fallback (mirrored by
+<a href="trait.Registry.html#method.select_latest_matching" title="method deps_core::registry::Registry::select_latest_matching"><code>select_latest_matching</code></a>’s wildcard branch on the
+same registry, which every caller reaching this trait method through the shared
+fetch loop actually goes through first); the exception never applies to a concrete
+requirement.</p>
+<h5 id="arguments"><a class="doc-anchor" href="#arguments">§</a>Arguments</h5>
+<ul>
+<li><code>name</code> - Package name</li>
+<li><code>req</code> - Version requirement string (e.g., “^1.0”, “&gt;=2.0”)</li>
+</ul>
+<h5 id="returns"><a class="doc-anchor" href="#returns">§</a>Returns</h5>
+<ul>
+<li><code>Ok(Some(version))</code> - Latest matching version found</li>
+<li><code>Ok(None)</code> - No matching version found</li>
+<li><code>Err(_)</code> - Network or parsing error</li>
+</ul>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.search" class="method"><a class="src rightside" href="../../src/deps_core/registry.rs.html#230-234">Source</a><h4 class="code-header">fn <a href="#tymethod.search" class="fn">search</a>&lt;'a&gt;(
+    &amp;'a self,
+    query: &amp;'a <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>,
+    limit: <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.usize.html">usize</a>,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.98.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.98.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="../error/type.Result.html" title="type deps_core::error::Result">Result</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="trait.Metadata.html" title="trait deps_core::registry::Metadata">Metadata</a>&gt;&gt;&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.98.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'a&gt;&gt;</h4></section></summary><div class="docblock"><p>Searches for packages by name or keywords.</p>
+<p>Returns up to <code>limit</code> results sorted by relevance/popularity.</p>
+<h5 id="errors-1"><a class="doc-anchor" href="#errors-1">§</a>Errors</h5>
+<p>Returns error if network request or parsing fails.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.as_any" class="method"><a class="src rightside" href="../../src/deps_core/registry.rs.html#304">Source</a><h4 class="code-header">fn <a href="#tymethod.as_any" class="fn">as_any</a>(&amp;self) -&gt; &amp;dyn <a class="trait" href="https://doc.rust-lang.org/1.98.1/core/any/trait.Any.html" title="trait core::any::Any">Any</a></h4></section></summary><div class="docblock"><p>Downcast to concrete registry type for ecosystem-specific operations</p>
+</div></details></div><h2 id="provided-methods" class="section-header">Provided Methods<a href="#provided-methods" class="anchor">§</a></h2><div class="methods"><details class="toggle method-toggle" open><summary><section id="method.get_versions_with" class="method"><a class="src rightside" href="../../src/deps_core/registry.rs.html#107-114">Source</a><h4 class="code-header">fn <a href="#method.get_versions_with" class="fn">get_versions_with</a>&lt;'a&gt;(
+    &amp;'a self,
+    name: &amp;'a <a class="struct" href="../package/struct.PackageName.html" title="struct deps_core::package::PackageName">PackageName</a>,
+    freshness: <a class="struct" href="../freshness/struct.FreshnessSettings.html" title="struct deps_core::freshness::FreshnessSettings">FreshnessSettings</a>,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.98.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.98.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="../error/type.Result.html" title="type deps_core::error::Result">Result</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="trait.Version.html" title="trait deps_core::registry::Version">Version</a>&gt;&gt;&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.98.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'a&gt;&gt;</h4></section></summary><div class="docblock"><p>Like <a href="trait.Registry.html#tymethod.get_versions" title="method deps_core::registry::Registry::get_versions"><code>get_versions</code></a>, but lets a registry that can obtain
+<a href="trait.Version.html#method.published_at" title="method deps_core::registry::Version::published_at"><code>Version::published_at</code></a> only through an <em>extra</em> request gate that request behind
+<code>freshness.enabled</code> instead of always paying for it.</p>
+<p>Implementors overriding this method MUST keep every other aspect of
+<a href="trait.Registry.html#tymethod.get_versions" title="method deps_core::registry::Registry::get_versions"><code>get_versions</code></a>’s behavior — set, order, and content of the
+returned versions — identical; the only difference the override may introduce is
+populating <a href="trait.Version.html#method.published_at" title="method deps_core::registry::Version::published_at"><code>Version::published_at</code></a>. Callers that render publish ages MUST call this
+method rather than <a href="trait.Registry.html#tymethod.get_versions" title="method deps_core::registry::Registry::get_versions"><code>get_versions</code></a>: the default implementation
+below simply forwards to <code>get_versions</code> and ignores <code>freshness</code>, so a caller that
+keeps calling <code>get_versions</code> silently gets no freshness signal even from a registry
+that implements this override.</p>
+<p>Default: forwards to <a href="trait.Registry.html#tymethod.get_versions" title="method deps_core::registry::Registry::get_versions"><code>get_versions</code></a>, ignoring <code>freshness</code>. This
+keeps the ten registries with no extra publish-time source unchanged, and keeps
+<a href="../freshness/struct.FreshnessSettings.html" title="struct deps_core::freshness::FreshnessSettings"><code>FreshnessSettings</code></a> — a <code>Copy + 'static</code> DTO —
+out of every <code>Registry::new</code> signature and the <code>register!</code> ecosystem-registration
+macro.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.get_versions_from" class="method"><a class="src rightside" href="../../src/deps_core/registry.rs.html#132-140">Source</a><h4 class="code-header">fn <a href="#method.get_versions_from" class="fn">get_versions_from</a>&lt;'a&gt;(
+    &amp;'a self,
+    name: &amp;'a <a class="struct" href="../package/struct.PackageName.html" title="struct deps_core::package::PackageName">PackageName</a>,
+    source: &amp;'a <a class="enum" href="../parser/enum.DependencySource.html" title="enum deps_core::parser::DependencySource">DependencySource</a>,
+    freshness: <a class="struct" href="../freshness/struct.FreshnessSettings.html" title="struct deps_core::freshness::FreshnessSettings">FreshnessSettings</a>,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.98.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.98.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="../error/type.Result.html" title="type deps_core::error::Result">Result</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="trait.Version.html" title="trait deps_core::registry::Version">Version</a>&gt;&gt;&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.98.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'a&gt;&gt;</h4></section></summary><div class="docblock"><p>Like <a href="trait.Registry.html#method.get_versions_with" title="method deps_core::registry::Registry::get_versions_with"><code>get_versions_with</code></a>, but additionally carries the
+dependency’s resolved <a href="../parser/enum.DependencySource.html" title="enum deps_core::parser::DependencySource"><code>DependencySource</code></a>, for a registry that routes a single
+fetch across more than one underlying index (e.g. <code>deps-cargo</code>’s <code>CargoRegistry</code>,
+which dispatches a <code>DependencySource::AlternateRegistry</code> to a private sparse index
+instead of crates.io).</p>
+<p>Default: forwards to <a href="trait.Registry.html#method.get_versions_with" title="method deps_core::registry::Registry::get_versions_with"><code>get_versions_with</code></a>, ignoring
+<code>source</code> entirely. This keeps every registry with no per-dependency routing concept
+— every ecosystem except Cargo today — bit-identical: <code>source</code> is accepted and
+dropped, so a caller migrating to this method from <code>get_versions_with</code> changes no
+observable behavior for them.</p>
+<p>Callers that know which source a dependency resolved to should call this rather
+than <a href="trait.Registry.html#method.get_versions_with" title="method deps_core::registry::Registry::get_versions_with"><code>get_versions_with</code></a>, even against a registry with no
+override — the whole point is that call sites don’t need to know which registries
+route on source and which don’t.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.get_latest_matching_with_context" class="method"><a class="src rightside" href="../../src/deps_core/registry.rs.html#189-197">Source</a><h4 class="code-header">fn <a href="#method.get_latest_matching_with_context" class="fn">get_latest_matching_with_context</a>&lt;'a&gt;(
+    &amp;'a self,
+    name: &amp;'a <a class="struct" href="../package/struct.PackageName.html" title="struct deps_core::package::PackageName">PackageName</a>,
+    req: &amp;'a <a class="struct" href="../package/struct.VersionReq.html" title="struct deps_core::package::VersionReq">VersionReq</a>,
+    minimum_stability: <a class="enum" href="https://doc.rust-lang.org/1.98.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'a <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>&gt;,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.98.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.98.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="../error/type.Result.html" title="type deps_core::error::Result">Result</a>&lt;<a class="enum" href="https://doc.rust-lang.org/1.98.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="trait.Version.html" title="trait deps_core::registry::Version">Version</a>&gt;&gt;&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.98.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'a&gt;&gt;</h4></section></summary><div class="docblock"><p>Like <a href="trait.Registry.html#tymethod.get_latest_matching" title="method deps_core::registry::Registry::get_latest_matching"><code>get_latest_matching</code></a>, but lets a registry whose
+“latest matching” selection can be refined by ecosystem-specific manifest state (e.g.
+Composer’s <code>minimum-stability</code> field, #424) read it, alongside <code>req</code>.</p>
+<p><code>minimum_stability</code> is an opaque, ecosystem-defined string (Composer’s own stability
+keyword: <code>"dev"</code>, <code>"alpha"</code>, <code>"beta"</code>, <code>"RC"</code>, or <code>"stable"</code>) rather than a shared type,
+mirroring <a href="trait.Registry.html#method.get_versions_with" title="method deps_core::registry::Registry::get_versions_with"><code>get_versions_with</code></a>’s
+<a href="../freshness/struct.FreshnessSettings.html" title="struct deps_core::freshness::FreshnessSettings"><code>FreshnessSettings</code></a> precedent for “an optional
+extra parameter most registries ignore” — except here even the <em>shape</em> of the extra
+context is ecosystem-specific, so no shared DTO is introduced for it; only the one
+registry that understands the string overrides this method.</p>
+<p>Default: forwards to <a href="trait.Registry.html#tymethod.get_latest_matching" title="method deps_core::registry::Registry::get_latest_matching"><code>get_latest_matching</code></a>, ignoring
+<code>minimum_stability</code>. This keeps every registry with no manifest-level stability
+concept unchanged.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.get_latest_matching_from" class="method"><a class="src rightside" href="../../src/deps_core/registry.rs.html#212-221">Source</a><h4 class="code-header">fn <a href="#method.get_latest_matching_from" class="fn">get_latest_matching_from</a>&lt;'a&gt;(
+    &amp;'a self,
+    name: &amp;'a <a class="struct" href="../package/struct.PackageName.html" title="struct deps_core::package::PackageName">PackageName</a>,
+    source: &amp;'a <a class="enum" href="../parser/enum.DependencySource.html" title="enum deps_core::parser::DependencySource">DependencySource</a>,
+    req: &amp;'a <a class="struct" href="../package/struct.VersionReq.html" title="struct deps_core::package::VersionReq">VersionReq</a>,
+    minimum_stability: <a class="enum" href="https://doc.rust-lang.org/1.98.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'a <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>&gt;,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.98.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.98.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="../error/type.Result.html" title="type deps_core::error::Result">Result</a>&lt;<a class="enum" href="https://doc.rust-lang.org/1.98.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="trait.Version.html" title="trait deps_core::registry::Version">Version</a>&gt;&gt;&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.98.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'a&gt;&gt;</h4></section></summary><div class="docblock"><p>Like <a href="trait.Registry.html#method.get_latest_matching_with_context" title="method deps_core::registry::Registry::get_latest_matching_with_context"><code>get_latest_matching_with_context</code></a>,
+but additionally carries the dependency’s resolved <a href="../parser/enum.DependencySource.html" title="enum deps_core::parser::DependencySource"><code>DependencySource</code></a> — the
+<code>get_latest_matching</code>-shaped counterpart to
+<a href="trait.Registry.html#method.get_versions_from" title="method deps_core::registry::Registry::get_versions_from"><code>get_versions_from</code></a>, covering the fallback path a caller
+takes when the list-based pick fails on a non-empty <a href="trait.Registry.html#method.get_versions_from" title="method deps_core::registry::Registry::get_versions_from"><code>get_versions_from</code></a>
+result (see <code>deps_core::lsp_helpers::hover</code>’s <code>list_fallback_latest</code> and
+<code>deps-lsp</code>’s background-fetch fallback for the two call sites this exists for).</p>
+<p>Default: forwards to
+<a href="trait.Registry.html#method.get_latest_matching_with_context" title="method deps_core::registry::Registry::get_latest_matching_with_context"><code>get_latest_matching_with_context</code></a>,
+ignoring <code>source</code> — every registry with no per-dependency routing concept stays
+bit-identical, exactly as <a href="trait.Registry.html#method.get_versions_from" title="method deps_core::registry::Registry::get_versions_from"><code>get_versions_from</code></a> does for the
+list-fetching side.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.select_latest_matching" class="method"><a class="src rightside" href="../../src/deps_core/registry.rs.html#257-263">Source</a><h4 class="code-header">fn <a href="#method.select_latest_matching" class="fn">select_latest_matching</a>(
+    &amp;self,
+    _versions: &amp;[<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="trait.Version.html" title="trait deps_core::registry::Version">Version</a>&gt;],
+    _req: &amp;<a class="struct" href="../package/struct.VersionReq.html" title="struct deps_core::package::VersionReq">VersionReq</a>,
+) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.98.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.usize.html">usize</a>&gt;</h4></section></summary><div class="docblock"><p>Index of the latest version in <code>versions</code> satisfying <code>req</code>, with no I/O.</p>
+<p>Filter with <a href="enum.RemovalStatus.html#method.blocks_resolution" title="method deps_core::registry::RemovalStatus::blocks_resolution"><code>RemovalStatus::blocks_resolution</code></a>, never with
+<a href="enum.RemovalStatus.html#method.is_flagged" title="method deps_core::registry::RemovalStatus::is_flagged"><code>RemovalStatus::is_flagged</code></a>. An <code>AdvisoryDeprecated</code> version is fully
+installable — excluding it turns an existing package into a false
+“Unknown package” (#347). Under a wildcard/empty requirement (see
+<a href="fn.is_existence_wildcard.html" title="fn deps_core::registry::is_existence_wildcard"><code>is_existence_wildcard</code></a>) this is an <em>existence</em> check, not an upgrade
+recommendation: Cargo, PyPI, Dart, npm, and Deno implement it by gating on
+<a href="fn.is_existence_wildcard.html" title="fn deps_core::registry::is_existence_wildcard"><code>is_existence_wildcard</code></a> and delegating to <a href="fn.select_latest_for_existence.html" title="fn deps_core::registry::select_latest_for_existence"><code>select_latest_for_existence</code></a>.</p>
+<p><code>versions</code> must be a newest-first list as returned by this registry’s
+<a href="trait.Registry.html#tymethod.get_versions" title="method deps_core::registry::Registry::get_versions"><code>get_versions</code></a>. Returns an index rather than a reference so
+callers holding an owned <code>Vec</code> can move the chosen element out
+(<code>versions.into_iter().nth(i)</code>) — a borrow into the list would keep it frozen while
+<a href="trait.Registry.html#tymethod.get_latest_matching" title="method deps_core::registry::Registry::get_latest_matching"><code>get_latest_matching</code></a> needs to return an owned
+<code>Box&lt;dyn Version&gt;</code>, and <code>Version</code> has no <code>clone_box</code>.</p>
+<p>Default: <code>None</code>. Every registry reachable from the LSP fetch path overrides this so
+the fetch loop can obtain both “latest” and the full version list from one round
+trip; the default exists so test doubles that never resolve a “latest” compile
+unchanged.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.select_latest_matching_with_context" class="method"><a class="src rightside" href="../../src/deps_core/registry.rs.html#274-282">Source</a><h4 class="code-header">fn <a href="#method.select_latest_matching_with_context" class="fn">select_latest_matching_with_context</a>(
+    &amp;self,
+    versions: &amp;[<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="trait.Version.html" title="trait deps_core::registry::Version">Version</a>&gt;],
+    req: &amp;<a class="struct" href="../package/struct.VersionReq.html" title="struct deps_core::package::VersionReq">VersionReq</a>,
+    minimum_stability: <a class="enum" href="https://doc.rust-lang.org/1.98.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;<a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>&gt;,
+) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.98.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.usize.html">usize</a>&gt;</h4></section></summary><div class="docblock"><p>Like <a href="trait.Registry.html#method.select_latest_matching" title="method deps_core::registry::Registry::select_latest_matching"><code>select_latest_matching</code></a>, but lets a registry
+whose selection can be refined by ecosystem-specific manifest state (e.g. Composer’s
+<code>minimum-stability</code> field, #424) read it, alongside <code>versions</code> and <code>req</code>. See
+<a href="trait.Registry.html#method.get_latest_matching_with_context" title="method deps_core::registry::Registry::get_latest_matching_with_context"><code>get_latest_matching_with_context</code></a> for why
+<code>minimum_stability</code> is an opaque per-ecosystem string rather than a shared type.</p>
+<p>Default: forwards to <a href="trait.Registry.html#method.select_latest_matching" title="method deps_core::registry::Registry::select_latest_matching"><code>select_latest_matching</code></a>, ignoring
+<code>minimum_stability</code>. This keeps every registry with no manifest-level stability concept
+unchanged.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.reports_yanked" class="method"><a class="src rightside" href="../../src/deps_core/registry.rs.html#299-301">Source</a><h4 class="code-header">fn <a href="#method.reports_yanked" class="fn">reports_yanked</a>(&amp;self) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.bool.html">bool</a></h4></section></summary><div class="docblock"><p>Whether <a href="trait.Registry.html#tymethod.get_versions" title="method deps_core::registry::Registry::get_versions"><code>get_versions</code></a> results carry meaningful
+per-version yank/deprecation data via <a href="trait.Version.html#method.removal_status" title="method deps_core::registry::Version::removal_status"><code>Version::removal_status</code></a>.</p>
+<p>Default <code>true</code>: a registry is opted into the yanked-version diagnostic
+unless it explicitly says it cannot answer. This fails toward
+correctness — a registry whose <code>removal_status</code> later becomes real
+data starts participating automatically, by deleting its opt-out
+rather than by someone remembering to add an opt-in. Return <code>false</code>
+only when <code>removal_status()</code> is hardcoded (e.g. always
+<code>RemovalStatus::Available</code>) or otherwise cannot reflect real registry
+data; a <code>true</code> return authorizes callers to trust <code>removal_status()</code>
+on versions from this registry’s normal
+<a href="trait.Registry.html#tymethod.get_versions" title="method deps_core::registry::Registry::get_versions"><code>get_versions</code></a>/
+<a href="trait.Registry.html#tymethod.get_latest_matching" title="method deps_core::registry::Registry::get_latest_matching"><code>get_latest_matching</code></a> results — it does
+not trigger any additional network request.</p>
+</div></details></div><h2 id="dyn-compatibility" class="section-header">Dyn Compatibility<a href="#dyn-compatibility" class="anchor">§</a></h2><div class="dyn-compatibility-info"><p>This trait <b>is</b> <a href="https://doc.rust-lang.org/1.98.1/reference/items/traits.html#dyn-compatibility">dyn compatible</a>.</p><p><i>In older versions of Rust, dyn compatibility was called "object safety".</i></p></div><h2 id="implementors" class="section-header">Implementors<a href="#implementors" class="anchor">§</a></h2><div id="implementors-list"></div><script src="../../trait.impl/deps_core/registry/trait.Registry.js" async></script></section></div></main></body></html>

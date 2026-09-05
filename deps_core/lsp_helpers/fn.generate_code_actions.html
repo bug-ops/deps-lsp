@@ -1,0 +1,95 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Generates the code actions offered for the dependency at `position`."><title>generate_code_actions in deps_core::lsp_helpers - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="deps_core" data-themes="" data-resource-suffix="" data-rustdoc-version="1.98.1 (48a229cea 2026-09-01)" data-channel="1.98.1" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc fn"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">generate_code_actions</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../deps_core/index.html">deps_<wbr>core</a><span class="version">0.12.1</span></h2></div><div class="sidebar-elems"><div id="rustdoc-modnav"><h2><a href="index.html">In deps_<wbr>core::<wbr>lsp_<wbr>helpers</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">deps_core</a>::<wbr><a href="index.html">lsp_helpers</a></div><h1>Function <span class="fn">generate_<wbr>code_<wbr>actions</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/deps_core/lsp_helpers/code_actions.rs.html#497-715">Source</a> </span></div><pre class="rust item-decl"><code>pub async fn generate_code_actions&lt;R: <a class="trait" href="../registry/trait.Registry.html" title="trait deps_core::registry::Registry">Registry</a> + ?<a class="trait" href="https://doc.rust-lang.org/1.98.1/core/marker/trait.Sized.html" title="trait core::marker::Sized">Sized</a>&gt;(
+    parse_result: &amp;dyn <a class="trait" href="../ecosystem/trait.ParseResult.html" title="trait deps_core::ecosystem::ParseResult">ParseResult</a>,
+    position: Position,
+    uri: &amp;Uri,
+    versions: <a class="struct" href="struct.VersionData.html" title="struct deps_core::lsp_helpers::VersionData">VersionData</a>&lt;'_&gt;,
+    content: &amp;<a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>,
+    registry: <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.reference.html">&amp;R</a>,
+    formatter: &amp;dyn <a class="trait" href="trait.EcosystemFormatter.html" title="trait deps_core::lsp_helpers::EcosystemFormatter">EcosystemFormatter</a>,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;CodeAction&gt;</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Generates the code actions offered for the dependency at <code>position</code>.</p>
+<p>Finds the dependency whose declared version <code>position</code> falls on
+(<code>formatter.is_position_on_dependency</code>). Returns an empty <code>Vec</code>
+immediately if no dependency is at <code>position</code>, it has no <code>version_range</code>
+to edit, it has no declared (or an empty) <code>version_requirement</code>, or the
+<strong>literal-span guard</strong> rejects it — <code>content</code> sliced over <code>version_range</code>
+no longer holds the literal text (see <code>literal_span_matches</code>, compared
+against <a href="../ecosystem/trait.Dependency.html#method.version_literal" title="method deps_core::ecosystem::Dependency::version_literal"><code>Dependency::version_literal</code></a> when the ecosystem provides one,
+falling back to <code>version_requirement</code> otherwise — e.g. a Maven
+<code>${property}</code> reference or a Gradle DSL variable/alias). Writing a
+<code>TextEdit</code> at that range would corrupt the manifest instead of fixing it,
+so this mirrors the guard <code>collect_update_all_edits</code> already applies on
+the bulk-edit path, and gates every kind of action below since any of
+them could write there.</p>
+<p>Otherwise returns up to three kinds of action, in this order:</p>
+<ol>
+<li>At most one <code>QUICKFIX</code> “fix vulnerability” action, if <code>versions</code>
+carries an OSV scan result flagging this dependency,
+<a href="../osv/struct.DependencyVulnerabilities.html#method.recommended_fix" title="method deps_core::osv::DependencyVulnerabilities::recommended_fix"><code>crate::osv::DependencyVulnerabilities::recommended_fix</code></a> has a
+claimable target F, and F’s own <code>fix_target_status</code> (populated by
+<code>deps-lsp</code>’s phase B, #462) clears it as a verified fix — see the
+private <code>build_vulnerability_fix_action</code> helper just above. This action
+is computed entirely from <code>versions</code> and the dependency’s declared
+requirement, deliberately <em>before</em> the <code>registry.get_versions</code> call
+below — a <em>registry</em> outage must never hide a known-vulnerable
+dependency’s fix (FR-007), so this action is still returned even when
+the registry fetch that produces the plain list below fails. This does
+not extend to an <em>OSV</em> outage or unavailability: F’s verification is an
+OSV-derived precondition (<code>fix_target_status</code>), not a registry one, so
+an OSV outage — or a code-action request racing ahead of phase B
+completing — degrades to omitting this action entirely rather than
+presenting an unverified F as verified (FR-004, fail-safe). When the
+registry fetch does succeed, a fix target the registry reports as
+yanked is dropped rather than offered.</li>
+<li>At most one <code>QUICKFIX</code> “fix unsatisfiable requirement” action, computed the same
+registry-independent way (see the private <code>build_unsatisfiable_fix_action</code> helper
+just above) for the same FR-007 reason. If its rewritten text collides with the
+vulnerability fix’s (both yank-filtered first), it is dropped in favor of the
+vulnerability fix, whose title is the more informative of the two.</li>
+<li>Up to five plain <code>REFACTOR</code> “update to <code>&lt;version&gt;</code>” actions, one per
+non-yanked version <a href="../completion/fn.prepare_version_display_items.html" title="fn deps_core::completion::prepare_version_display_items"><code>crate::completion::prepare_version_display_items</code></a>
+selects from the registry response. Each action’s edit text
+comes from <a href="trait.PackageRendering.html#method.format_version_replacing" title="method deps_core::lsp_helpers::PackageRendering::format_version_replacing"><code>crate::lsp_helpers::PackageRendering::format_version_replacing</code></a>, which
+preserves the manifest’s existing pin/operator style where an
+ecosystem overrides it (e.g. PyPI’s <code>==1.0.1</code> stays <code>==1.0.2</code> rather
+than expanding to a <code>&gt;=,&lt;</code> range). Every entry’s formatted edit text is
+checked against a running set seeded with the declared requirement and
+the two fix actions’ own formatted text (whitespace-insensitive); an entry
+is skipped, and never added to the set, when its text is already
+present. This is the common case, not a rare edge case:
+<a href="../completion/fn.prepare_version_display_items.html" title="fn deps_core::completion::prepare_version_display_items"><code>crate::completion::prepare_version_display_items</code></a> lists the top 5
+non-yanked registry versions newest-first, so whenever the declared
+version is already within 5 releases of latest, it is itself one of
+the display items being offered as an “update”. The same set also
+catches two display items whose formatted text coincides — e.g. an
+ecosystem formatter that truncates precision (PyPI’s
+<code>truncate_release_to_match</code>) can map several distinct registry
+versions to the same rewritten text — and a display item matching a
+fix action’s target even when their <em>raw</em> versions differ (formatting
+can normalize two distinct inputs to the same text). Textual (not
+semantic) equality is deliberate: <code>formatter.is_requirement_up_to_date</code>
+answers “does <code>latest</code> already satisfy this requirement”, which is
+true for e.g. <code>is_requirement_up_to_date("^1.0", "1.2.0")</code> and would
+wrongly suppress every explicit-bump action for a range-style
+requirement; it also can’t detect a pinned no-op like <code>==1.0.0</code> -&gt;
+<code>==1.0.0</code>, since it never compares the formatted edit text at all.</li>
+</ol>
+<p>Every action above is built with <code>is_preferred: None</code>; exactly one is promoted to
+<code>Some(true)</code> in a single post-pass once all three kinds have been considered, in
+priority order: the vulnerability fix, then the unsatisfiable fix, then the REFACTOR
+item whose <code>item.is_latest</code> is set. LSP’s <code>isPreferred</code> is a flat per-response boolean
+with no per-diagnostic scoping, so “at most one preferred action” must hold across all
+producers, not per producer — building every action with <code>None</code> and resolving the flag
+once here, rather than at each construction site, is what keeps that invariant
+structural (checkable with one <code>filter().count() &lt;= 1</code> assertion) instead of something
+every future producer has to remember to uphold by hand. A vulnerability is silent and
+security-relevant; an unsatisfiable requirement is loud (the package manager already
+fails the build) but merely inconvenient; both outrank a routine “update to latest”.
+This resolution runs on every return path below that can carry a fix action, including
+the registry-outage path, so an outage never silently drops <code>isPreferred</code> from an
+already-built fix.</p>
+<p>Returns an empty <code>Vec</code> also when no fix action applies and the registry fetch fails.</p>
+<p>No <code># Examples</code> here: exercising this meaningfully needs a <code>Registry</code>
+impl plus <code>ParseResult</code>/<code>Dependency</code> mocks, which live as private test
+fixtures in the sibling <code>test_support</code> module rather than as public
+API — see the <code>generate_code_actions_*</code> tests here for realistic calls.</p>
+</div></details></section></div></main></body></html>

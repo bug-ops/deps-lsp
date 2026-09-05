@@ -1,0 +1,28 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Maximum allowed nesting depth for TOML table/array recursion before `check_toml_nesting_depth` rejects the input."><title>MAX_TOML_NESTING_DEPTH in deps_core::parser - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="deps_core" data-themes="" data-resource-suffix="" data-rustdoc-version="1.98.1 (48a229cea 2026-09-01)" data-channel="1.98.1" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc constant"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">MAX_TOML_NESTING_DEPTH</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../deps_core/index.html">deps_<wbr>core</a><span class="version">0.12.1</span></h2></div><div class="sidebar-elems"><div id="rustdoc-modnav"><h2><a href="index.html">In deps_<wbr>core::<wbr>parser</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">deps_core</a>::<wbr><a href="index.html">parser</a></div><h1>Constant <span class="constant">MAX_<wbr>TOML_<wbr>NESTING_<wbr>DEPTH</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/deps_core/parser.rs.html#36">Source</a> </span></div><pre class="rust item-decl"><code>pub const MAX_TOML_NESTING_DEPTH: <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.usize.html">usize</a> = 64;</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Maximum allowed nesting depth for TOML table/array recursion before
+<a href="fn.check_toml_nesting_depth.html" title="fn deps_core::parser::check_toml_nesting_depth"><code>check_toml_nesting_depth</code></a> rejects the input.</p>
+<p>Counts both <code>[</code>/<code>{</code> bracket depth and dotted-key/table-header segment
+count (e.g. <code>a.b.c</code> or <code>[a.b.c]</code>), since both drive <code>toml-span</code>’s
+recursive descent.</p>
+<p><code>toml-span</code> 0.7.1’s recursive-descent parser has no recursion limit, so
+either a deeply nested <code>[[[...]]]</code> array/<code>{{{...}}}</code> inline-table
+literal, or a dotted key/header with many <code>.</code>-separated segments, can
+overflow the native thread stack and abort the whole process (SIGABRT)
+before <code>toml_span::parse</code> ever returns an error. As a library, <code>deps-core</code>
+cannot rely on its consumers raising their stack size, so this constant
+deliberately assumes the smallest stack any caller is likely to run on: a
+<code>tokio</code> worker thread’s 2 MiB default (relevant since lock file parsing
+runs inside <code>tokio::spawn</code>), not the platform’s larger 8 MiB main-thread
+default. <code>deps-lsp</code>, the one consumer in this workspace, additionally
+raises its <code>tokio</code> worker stacks to 8 MiB as defense-in-depth on top of
+this guard (see <code>WORKER_THREAD_STACK_SIZE</code> in <code>deps-lsp</code>’s <code>main.rs</code>), but
+the constant itself stays sized for the 2 MiB floor. Stack cost per level
+is also shape-dependent: nested inline tables (<code>{a={a=...}}</code>) cost
+noticeably more per level than nested arrays in a debug build.</p>
+<p>Bisected against the real <code>toml_span</code> 0.7.1 recursion on a 2 MiB stack:
+a debug build survives depth 220 for inline tables / 305 for arrays; a
+release build survives roughly 2485 / 1805. 64 leaves a &gt;3x margin under
+the tightest of these (debug inline tables, 220) while still being far
+deeper than any real manifest needs — across a corpus of thousands of
+real-world <code>.toml</code> files, the deepest observed bracket nesting was 5 and
+the deepest dotted-key path was 6 segments.</p>
+</div></details></section></div></main></body></html>
