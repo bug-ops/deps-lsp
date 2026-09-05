@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **deps-core**: OSV malicious-package advisories (`MAL-*` id or alias) now classify as a distinct `VulnSeverity::Malicious` instead of falling through to "unknown severity" in hover/diagnostics (resolves #646) (PR link pending)
+
 ### Fixed
 - **deps-cargo**: an explicit `package = "..."` rename now resolves hover/diagnostics/completion/code actions/code lenses/inlay hints against the real crate name instead of the local TOML alias (resolves #648)
 

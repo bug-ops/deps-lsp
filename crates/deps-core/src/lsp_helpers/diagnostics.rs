@@ -1339,6 +1339,17 @@ fn push_deprecation_diagnostic(
 /// `N` is derived from [`crate::osv::Capped::remaining`] — the batch result's reported count,
 /// never from `dv.advisories.items().len()`, since invariant 3 (`architecture.md` §8)
 /// caps the record *fetch* independently of the render cap.
+///
+/// A [`crate::osv::VulnSeverity::Malicious`] advisory's message is prefixed with the
+/// `"[MALWARE]"` tag (SC-002) — deliberately not the word "malicious" again: OSV's own
+/// `summary` text for these records routinely already starts with "Malicious code in ..."
+/// (impl-critic M3), and prefixing with "Malicious package" produced a redundant
+/// "Malicious package — Malicious code in ..." read. `code` is still `advisory.id` like
+/// every other advisory (a `MAL-*` id can never collide with a `RUSTSEC-`/`GHSA-`/`CVE-`
+/// one), but the message tag means a reader scanning the Problems panel does not need to
+/// recognize the `MAL-` id convention (or an alias to one — see `severity::classify`) to
+/// tell the two apart. `severity` itself stays capped at `WARNING` either way
+/// (`diagnostic_severity_for`).
 fn push_vulnerability_diagnostics(
     diagnostics: &mut Vec<Diagnostic>,
     dep: &dyn Dependency,
@@ -1353,17 +1364,20 @@ fn push_vulnerability_diagnostics(
             .ok()
             .map(|href| CodeDescription { href });
 
+        let summary = advisory
+            .summary
+            .as_deref()
+            .unwrap_or("(no summary provided)");
+        let message = if advisory.severity == crate::osv::VulnSeverity::Malicious {
+            format!("{}: [MALWARE] {summary}", advisory.id)
+        } else {
+            format!("{}: {summary}", advisory.id)
+        };
+
         diagnostics.push(Diagnostic {
             range,
             severity: Some(diagnostic_severity_for(advisory.severity)),
-            message: format!(
-                "{}: {}",
-                advisory.id,
-                advisory
-                    .summary
-                    .as_deref()
-                    .unwrap_or("(no summary provided)")
-            ),
+            message,
             code: Some(NumberOrString::String(advisory.id.clone())),
             code_description,
             source: Some("deps-lsp".into()),
@@ -3752,6 +3766,131 @@ mod tests {
         assert_eq!(
             vuln_diag.code,
             Some(NumberOrString::String("RUSTSEC-2020-0071".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_generate_diagnostics_malicious_advisory_is_distinguishable_from_unknown() {
+        // SC-002: a MAL-* advisory and an ordinary Unknown-severity advisory on
+        // the same dependency must be distinguishable without opening hover.
+        use crate::osv::{
+            Capped, DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity,
+            VulnerabilityMap,
+        };
+
+        let formatter = MockFormatter;
+        let parse_result = MockParseResult {
+            deps: vec![dep_at("vulnerable-pkg")],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+
+        let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
+        vulns.insert(
+            "vulnerable-pkg".to_string(),
+            ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                advisories: Capped::new(
+                    vec![
+                        sample_advisory("MAL-2025-47141", VulnSeverity::Malicious),
+                        sample_advisory("RUSTSEC-2020-0071", VulnSeverity::Unknown),
+                    ],
+                    2,
+                ),
+                fix_target_status: UpgradeStatus::NotChecked,
+                upgrade_status: UpgradeStatus::NotChecked,
+            }),
+        );
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
+            &formatter,
+            parse_result.uri(),
+            crate::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        let malicious_diag = diagnostics
+            .iter()
+            .find(|d| d.message.contains("MAL-2025-47141"))
+            .expect("malicious advisory diagnostic must be emitted");
+        let unknown_diag = diagnostics
+            .iter()
+            .find(|d| d.message.contains("RUSTSEC-2020-0071"))
+            .expect("unknown-severity advisory diagnostic must be emitted");
+
+        assert_ne!(malicious_diag.message, unknown_diag.message);
+        assert_ne!(malicious_diag.code, unknown_diag.code);
+        assert!(malicious_diag.message.contains("[MALWARE]"));
+        assert!(!unknown_diag.message.contains("[MALWARE]"));
+    }
+
+    #[test]
+    fn test_generate_diagnostics_malicious_message_does_not_repeat_the_word_malicious() {
+        // M3 (impl-critic): OSV's own summary for MAL-* records routinely
+        // already starts with "Malicious code in ..." — the message must not
+        // also prefix "Malicious package", which read redundantly.
+        use crate::osv::{
+            Advisory, Capped, DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity,
+            VulnerabilityMap,
+        };
+        use std::sync::Arc;
+
+        let formatter = MockFormatter;
+        let parse_result = MockParseResult {
+            deps: vec![dep_at("bad-pkg")],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+
+        let advisory = Arc::new(Advisory {
+            id: "MAL-2025-47141".to_string(),
+            modified: "2025-09-17T06:23:36Z".to_string(),
+            summary: Some("Malicious code in @ctrl/tinycolor (npm)".to_string()),
+            aliases: vec!["GHSA-qjqf-7j6f-82c4".to_string()],
+            severity: VulnSeverity::Malicious,
+            cvss_vector: None,
+            fixed_versions: vec![],
+            url: "https://osv.dev/vulnerability/MAL-2025-47141".to_string(),
+        });
+
+        let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
+        vulns.insert(
+            "bad-pkg".to_string(),
+            ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                advisories: Capped::new(vec![advisory], 1),
+                fix_target_status: UpgradeStatus::NotChecked,
+                upgrade_status: UpgradeStatus::NotChecked,
+            }),
+        );
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
+            &formatter,
+            parse_result.uri(),
+            crate::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        let diag = diagnostics
+            .iter()
+            .find(|d| d.message.contains("MAL-2025-47141"))
+            .expect("malicious advisory diagnostic must be emitted");
+        assert!(
+            diag.message.contains("[MALWARE]"),
+            "message must carry the distinguishing [MALWARE] tag, got: {}",
+            diag.message
+        );
+        assert!(
+            !diag.message.contains("Malicious package"),
+            "message must not also prefix the redundant 'Malicious package' wording \
+             on top of OSV's own \"Malicious ...\" summary text, got: {}",
+            diag.message
         );
     }
 

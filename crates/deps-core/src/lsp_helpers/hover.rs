@@ -641,6 +641,12 @@ fn push_offline_footer_hover_section(markdown: &mut String, resolvable: bool, of
 }
 
 /// Lowercase display label for a [`crate::osv::VulnSeverity`], used only in hover text.
+///
+/// `Malicious` renders as `"confirmed malicious package"` — deliberately
+/// distinct from both `"unknown severity"` (a record this could not grade,
+/// carrying no urgency signal of its own) and every graded label
+/// (`critical`/`high`/`medium`/`low`), since a confirmed-malicious-package
+/// finding is categorically different from a graded-but-uncertain risk.
 const fn severity_label(severity: crate::osv::VulnSeverity) -> &'static str {
     match severity {
         crate::osv::VulnSeverity::Critical => "critical",
@@ -648,6 +654,7 @@ const fn severity_label(severity: crate::osv::VulnSeverity) -> &'static str {
         crate::osv::VulnSeverity::Medium => "medium",
         crate::osv::VulnSeverity::Low => "low",
         crate::osv::VulnSeverity::Unknown => "unknown severity",
+        crate::osv::VulnSeverity::Malicious => "confirmed malicious package",
     }
 }
 
@@ -826,6 +833,20 @@ mod tests {
 
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    #[test]
+    fn severity_label_for_malicious_is_distinct_from_unknown_and_every_graded_label() {
+        let malicious = severity_label(crate::osv::VulnSeverity::Malicious);
+        assert_ne!(malicious, "unknown severity");
+        for graded in [
+            crate::osv::VulnSeverity::Critical,
+            crate::osv::VulnSeverity::High,
+            crate::osv::VulnSeverity::Medium,
+            crate::osv::VulnSeverity::Low,
+        ] {
+            assert_ne!(malicious, severity_label(graded));
+        }
+    }
 
     #[tokio::test]
     async fn test_generate_hover_recent_versions_shows_age_when_known() {
@@ -2471,6 +2492,55 @@ mod tests {
         );
         assert!(content.value.contains("+2 more advisories"));
         assert!(content.value.contains("also affected"));
+    }
+
+    #[tokio::test]
+    async fn test_generate_hover_malicious_advisory_never_renders_unknown_severity() {
+        // SC-001: a MAL-* advisory (e.g. the live MAL-2025-47141 record for
+        // npm `@ctrl/tinycolor`) must never render as "unknown severity".
+        use crate::osv::{
+            Capped, DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity,
+            VulnerabilityMap,
+        };
+
+        let parse_result = MockParseResult {
+            deps: vec![dep_at("bad-pkg")],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+
+        let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
+        vulns.insert(
+            "bad-pkg".to_string(),
+            ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                advisories: Capped::new(
+                    vec![sample_advisory("MAL-2025-47141", VulnSeverity::Malicious)],
+                    1,
+                ),
+                fix_target_status: UpgradeStatus::NotChecked,
+                upgrade_status: UpgradeStatus::NotChecked,
+            }),
+        );
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
+            &MockRegistry,
+            &MockFormatter,
+            crate::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(content.value.contains("MAL-2025-47141"));
+        assert!(content.value.contains("confirmed malicious package"));
+        assert!(!content.value.contains("unknown severity"));
     }
 
     #[tokio::test]
