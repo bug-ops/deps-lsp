@@ -2,8 +2,7 @@
 //!
 //! Regex-based extraction of dependency declarations from dependencies { } blocks.
 
-use crate::parser::{GradleParseResult, find_name_range, find_version_range};
-use crate::types::GradleDependency;
+use crate::parser::{CONFIGURATIONS, GradleParseResult, build_dependency};
 use deps_core::Result;
 use regex::Regex;
 use std::sync::LazyLock;
@@ -31,20 +30,6 @@ static RE_PLATFORM_NO_VERSION: LazyLock<Regex> = LazyLock::new(|| {
     )
     .expect("RE_PLATFORM_NO_VERSION")
 });
-
-const CONFIGURATIONS: &[&str] = &[
-    "implementation",
-    "api",
-    "compileOnly",
-    "runtimeOnly",
-    "testImplementation",
-    "testRuntimeOnly",
-    "annotationProcessor",
-    "kapt",
-    "classpath",
-    "ksp",
-    "testCompileOnly",
-];
 
 pub fn parse_kotlin_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
     let mut dependencies = Vec::new();
@@ -91,25 +76,7 @@ pub fn parse_kotlin_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
             if !CONFIGURATIONS.contains(&config) {
                 continue;
             }
-
-            let group_id = caps.get(2).map_or("", |m| m.as_str()).to_string();
-            let artifact_id = caps.get(3).map_or("", |m| m.as_str()).to_string();
-            let version = caps.get(4).map_or("", |m| m.as_str()).trim().to_string();
-            let name = format!("{group_id}:{artifact_id}");
-
-            // name_range covers the full "group:artifact" portion of the string
-            let name_range = find_name_range(line, line_u32, &group_id, &artifact_id);
-            let version_range = find_version_range(line, line_u32, &version);
-
-            dependencies.push(GradleDependency {
-                group_id,
-                artifact_id,
-                name: name.into(),
-                name_range,
-                version_req: Some(version.into()),
-                version_range: Some(version_range),
-                configuration: config.to_string(),
-            });
+            dependencies.push(build_dependency(&caps, line, line_u32, true, config));
         }
 
         // Try pattern without version (only if no versioned match on this line)
@@ -134,21 +101,7 @@ pub fn parse_kotlin_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
             if already_matched.contains(&match_start) {
                 continue;
             }
-
-            let group_id = caps.get(2).map_or("", |m| m.as_str()).to_string();
-            let artifact_id = caps.get(3).map_or("", |m| m.as_str()).to_string();
-            let name = format!("{group_id}:{artifact_id}");
-            let name_range = find_name_range(line, line_u32, &group_id, &artifact_id);
-
-            dependencies.push(GradleDependency {
-                group_id,
-                artifact_id,
-                name: name.into(),
-                name_range,
-                version_req: None,
-                version_range: None,
-                configuration: config.to_string(),
-            });
+            dependencies.push(build_dependency(&caps, line, line_u32, false, config));
         }
 
         // Same as above, for platform()/enforcedPlatform()-wrapped BOM coordinates
@@ -167,24 +120,7 @@ pub fn parse_kotlin_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
             if !CONFIGURATIONS.contains(&config) {
                 continue;
             }
-
-            let group_id = caps.get(2).map_or("", |m| m.as_str()).to_string();
-            let artifact_id = caps.get(3).map_or("", |m| m.as_str()).to_string();
-            let version = caps.get(4).map_or("", |m| m.as_str()).trim().to_string();
-            let name = format!("{group_id}:{artifact_id}");
-
-            let name_range = find_name_range(line, line_u32, &group_id, &artifact_id);
-            let version_range = find_version_range(line, line_u32, &version);
-
-            dependencies.push(GradleDependency {
-                group_id,
-                artifact_id,
-                name: name.into(),
-                name_range,
-                version_req: Some(version.into()),
-                version_range: Some(version_range),
-                configuration: config.to_string(),
-            });
+            dependencies.push(build_dependency(&caps, line, line_u32, true, config));
         }
 
         for caps in RE_PLATFORM_NO_VERSION.captures_iter(line) {
@@ -196,21 +132,7 @@ pub fn parse_kotlin_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
             if already_matched_platform.contains(&match_start) {
                 continue;
             }
-
-            let group_id = caps.get(2).map_or("", |m| m.as_str()).to_string();
-            let artifact_id = caps.get(3).map_or("", |m| m.as_str()).to_string();
-            let name = format!("{group_id}:{artifact_id}");
-            let name_range = find_name_range(line, line_u32, &group_id, &artifact_id);
-
-            dependencies.push(GradleDependency {
-                group_id,
-                artifact_id,
-                name: name.into(),
-                name_range,
-                version_req: None,
-                version_range: None,
-                configuration: config.to_string(),
-            });
+            dependencies.push(build_dependency(&caps, line, line_u32, false, config));
         }
     }
 
@@ -286,6 +208,47 @@ mod tests {
         assert_eq!(result.dependencies[1].configuration, "compileOnly");
         assert_eq!(result.dependencies[2].configuration, "runtimeOnly");
         assert_eq!(result.dependencies[3].configuration, "kapt");
+    }
+
+    #[test]
+    fn test_parse_legacy_configurations() {
+        // Kotlin DSL scripts migrated from (or targeting) pre-Gradle-7 builds
+        // can still use the legacy `compile`/`testCompile`/`provided` words —
+        // Gradle parses them regardless of DSL, so they must be recognized
+        // here just as they are in groovy.rs.
+        let content = r#"dependencies {
+    compile("org.springframework.boot:spring-boot-starter:3.2.0")
+    testCompile("junit:junit:4.13.2")
+    provided("javax.servlet:javax.servlet-api:4.0.1")
+}
+"#;
+        let result = parse_kotlin_dsl(content, &make_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 3);
+        assert_eq!(result.dependencies[0].configuration, "compile");
+        assert_eq!(result.dependencies[1].configuration, "testCompile");
+        assert_eq!(result.dependencies[2].configuration, "provided");
+    }
+
+    #[test]
+    fn test_parse_legacy_configuration_no_version() {
+        let content = "dependencies {\n    provided(\"javax.servlet:javax.servlet-api\")\n}\n";
+        let result = parse_kotlin_dsl(content, &make_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].configuration, "provided");
+        assert!(result.dependencies[0].version_req.is_none());
+    }
+
+    #[test]
+    fn test_parse_legacy_configuration_platform() {
+        let content = "dependencies {\n    compile(platform(\"org.springframework.boot:spring-boot-dependencies:3.2.0\"))\n}\n";
+        let result = parse_kotlin_dsl(content, &make_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].configuration, "compile");
+        assert_eq!(
+            result.dependencies[0].name,
+            "org.springframework.boot:spring-boot-dependencies"
+        );
+        assert_eq!(result.dependencies[0].version_req, Some("3.2.0".into()));
     }
 
     #[test]
