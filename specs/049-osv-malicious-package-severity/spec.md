@@ -160,7 +160,7 @@ Use EARS notation. Prefix with FR-NNN.
 
 | ID | Requirement | Priority |
 |----|------------|----------|
-| FR-001 | WHEN an OSV record's advisory `id` has the `MAL-` prefix THE SYSTEM SHALL classify that advisory as confirmed-malicious rather than falling through to `VulnSeverity::Unknown` (resolved: id-prefix detection only — no live-observed OSV record pairs `CWE-506` with a non-`MAL-` id, so the CWE check is dropped as unnecessary complexity per NFR-001) | must |
+| FR-001 | WHEN an OSV record's advisory `id`, OR any entry in its `aliases[]`, has the `MAL-` prefix THE SYSTEM SHALL classify that advisory as confirmed-malicious rather than falling through to `VulnSeverity::Unknown` (resolved: id-prefix detection, extended to `aliases[]` after live verification found the same malicious-package event served under three cross-aliased OSV ids — `GHSA-*`, `MAL-*`, `RUSTSEC-*` — for `rustdecimal`/crates.io, where only the `MAL-*` record's own `id` carries the prefix; checking `id` alone misses the other two records for the identical malware. No `CWE-506` check — dropped as unnecessary complexity per NFR-001, no live-observed record needs it) | must |
 | FR-002 | WHEN an advisory is classified as confirmed-malicious THE SYSTEM SHALL render a hover label distinct from `"unknown severity"` and distinct from every existing graded label (`critical`/`high`/`medium`/`low`) | must |
 | FR-003 | WHEN an advisory is classified as confirmed-malicious THE SYSTEM SHALL produce a diagnostic that is distinguishable from a `VulnSeverity::Unknown` diagnostic for an ordinary CVE via message content and diagnostic code, while remaining at `DiagnosticSeverity::WARNING` (resolved: keeps the existing "ERROR means broken manifest" convention from `architecture.md` §6 intact) | must |
 | FR-004 | WHEN an OSV record has both a graded CVSS-style severity field AND is classified as confirmed-malicious (a record can in principle carry both) THE SYSTEM SHALL still surface the confirmed-malicious classification — a malicious-package finding must never be silently masked by an unrelated graded-severity value taking precedence | must |
@@ -178,15 +178,16 @@ Use EARS notation. Prefix with FR-NNN.
 
 | Entity | Description | Key Attributes |
 |--------|-------------|----------------|
-| `VulnSeverity` (existing, `crates/deps-core/src/osv/types.rs`, line ~70) | Severity bucket enum | Currently `Critical`, `High`, `Medium`, `Low`, `Unknown` — resolved: add a new `Malicious` variant (forces every exhaustive `match` on `VulnSeverity` to be updated, consistent with this project's `EcosystemId` precedent) |
-| `Advisory` (existing, same file, line ~104) | Per-advisory data surfaced to hover/diagnostics | `id`, `summary`, `aliases`, `severity`, `cvss_vector`, `fixed_versions`, `url` — the classification signal (id prefix and/or CWE) must be read at construction time from the raw OSV record, since `Advisory` itself does not currently carry `cwes` |
-| *(new)* Malicious-package classification signal | Where the `MAL-` check reads from | Raw OSV record's `id` field (already available at `classify()`'s call site — no new field needs to be threaded through `OsvVulnRecord`/`Advisory`) |
+| `VulnSeverity` (existing, `crates/deps-core/src/osv/types.rs`, line ~70) | Severity bucket enum | Currently `Critical`, `High`, `Medium`, `Low`, `Unknown` — resolved: add a new `Malicious` variant (forces every exhaustive `match` on `VulnSeverity` to be updated at compile time, consistent with this project's `EcosystemId` precedent) |
+| `Advisory` (existing, same file, line ~104) | Per-advisory data surfaced to hover/diagnostics | `id`, `summary`, `aliases`, `severity`, `cvss_vector`, `fixed_versions`, `url` — `aliases` is already parsed and already reaches `classify()`'s call site, so the `MAL-` check reads `id` and `aliases[]` with no new field needed |
+| *(new)* Malicious-package classification signal | Where the `MAL-` check reads from | Raw OSV record's `id` field and its already-parsed `aliases[]` (both available at `classify()`'s call site) |
 
 ## 6. Edge Cases and Error Handling
 
 | Scenario | Expected Behavior |
 |----------|-------------------|
-| Record has `MAL-` id prefix but also a graded `database_specific.severity` (hypothetical, not observed live) | Per FR-004, confirmed-malicious classification (the new `VulnSeverity::Malicious` variant) still takes precedence and is surfaced — the id-prefix check runs before the existing 3-tier graded-severity fallback |
+| Record has `MAL-` id prefix but also a graded `database_specific.severity` (hypothetical, not observed live) | Per FR-004, confirmed-malicious classification (the new `VulnSeverity::Malicious` variant) still takes precedence and is surfaced — the id/alias `MAL-` check runs before the existing 3-tier graded-severity fallback |
+| Record's own `id` does not have the `MAL-` prefix, but one of its `aliases[]` does (live-observed: `GHSA-7pwq-f4pq-78gm` and `RUSTSEC-2022-0042` both alias `MAL-2022-1` for the same `rustdecimal`/crates.io malicious-package event) | Classified as confirmed-malicious — FR-001 checks `id` OR any `aliases[]` entry for the `MAL-` prefix specifically to cover this case |
 | Record has `MAL-` id prefix but the CWE data is entirely absent (matches the live `@ctrl/tinycolor` `MAL-2025-47141` case) | Classified as confirmed-malicious — the id prefix alone is sufficient (resolved: no CWE-506 check, see FR-001) |
 | A dependency has both a confirmed-malicious advisory and one or more ordinary graded/unscored advisories | Each advisory keeps its own independent classification; the malicious one must not be diluted or hidden by unrelated advisories on the same dependency |
 | `Capped` truncation (`ADVISORY_DISPLAY_CAP`) causes a confirmed-malicious advisory to fall outside the displayed slice | Out of scope for this spec (resolved: no reordering — pre-existing truncation/ordering behavior is unchanged; a dedicated "sort malicious first" enhancement is deferred to a follow-up if truncation drops turn out to matter in practice) |
@@ -210,8 +211,8 @@ Use EARS notation. Prefix with FR-NNN.
   citations) that must not be silently dropped
 - Preserve existing graded-severity precedence and existing `Unknown`
   behavior for genuinely non-malicious unscored records (FR-005, NFR-003)
-- Add/update unit tests in `severity.rs` for both detection signals
-  (`MAL-` prefix, `CWE-506`) and for the FR-004 both-signals-present case
+- Add/update unit tests in `severity.rs` for the `MAL-` prefix check on both
+  `id` and `aliases[]`, and for the FR-004 both-signals-present case
 - Run full CI checks (`cargo +nightly fmt --check`, clippy, nextest, rustdoc
   gate) per project convention before any PR
 - Live-verify against the real `@ctrl/tinycolor` / `MAL-2025-47141` OSV
@@ -238,12 +239,14 @@ Use EARS notation. Prefix with FR-NNN.
 
 ## 9. Resolved Decisions
 
-All open questions were resolved with the user before implementation:
+All open questions were resolved with the user before implementation. One
+resolution was subsequently refined during implementation review after new
+live evidence (see the FR-001 amendment below):
 
 - **Data model**: add a new `VulnSeverity::Malicious` variant (not an orthogonal flag). Forces every exhaustive `match` on `VulnSeverity` to be updated at compile time, consistent with this project's `EcosystemId` precedent.
-- **Detection signal**: `MAL-` id-prefix only. No live-observed OSV record pairs `CWE-506` with a non-`MAL-` id, so the CWE check is dropped as unnecessary complexity (NFR-001).
+- **Detection signal**: `MAL-` prefix on the advisory's own `id` OR any entry in its `aliases[]` (no `CWE-506` check). Originally scoped to `id` only; the implementation's adversarial critique re-queried OSV live and found the same malicious-package event served as three cross-aliased records for `rustdecimal`/crates.io (`GHSA-7pwq-f4pq-78gm`, `MAL-2022-1`, `RUSTSEC-2022-0042`) — only the `MAL-2022-1` record's own `id` carries the prefix, so an `id`-only check would still render `"unknown severity"` for the `RUSTSEC-2022-0042` record of the identical malware, reproducing the exact bug this spec exists to fix. `aliases[]` is already parsed and already reaches `classify()`'s call site, so the fix needs no new fetch.
 - **Diagnostic severity**: stays `DiagnosticSeverity::WARNING`, distinguished via message content and diagnostic code — keeps the existing "ERROR means broken manifest" convention (`architecture.md` §6) intact.
-- **Ordering**: no change to advisory/diagnostic ordering or `ADVISORY_DISPLAY_CAP` truncation behavior in this spec — deferred to a follow-up if it turns out to matter in practice.
+- **Ordering**: no change to advisory/diagnostic ordering or `ADVISORY_DISPLAY_CAP` truncation behavior in this spec — deferred to a follow-up if it turns out to matter in practice. (`recommended_fix()`'s internal `severity_rank` helper, used only to order `FixRecommendation::advisory_ids` among advisories that already have a known fix, does rank `Malicious` above `Critical`; this is a documented, near-inert side effect — confirmed-malicious records observed live carry no `fixed_versions` — not a change to the diagnostic/hover ordering this bullet covers.)
 - **Scope**: hover + diagnostics only, matching US-001/US-002. Inlay hints / code lens treatment is deferred to a follow-up.
 - **GitHub issue**: filed as #646 (`enhancement`, `P2`, `research`), referencing this spec.
 
@@ -262,3 +265,4 @@ All open questions were resolved with the user before implementation:
 - [JetBrains Package Checker](https://www.jetbrains.com/help/idea/package-checker.html) — reference-project precedent for headline malicious-package detection separate from vulnerability severity
 - `.local/testing/playbooks/competitive-parity.md`, "Scan Notes (2026-08-23...)" — the original deferred note that this spec follows through on
 - Live OSV.dev evidence: `POST https://api.osv.dev/v1/query {"package":{"name":"@ctrl/tinycolor","ecosystem":"npm"}}` returning `MAL-2025-47141` with no severity fields anywhere in the response
+- Live OSV.dev evidence (implementation review): `POST https://api.osv.dev/v1/query {"package":{"name":"rustdecimal","ecosystem":"crates.io"}}` returning three mutually-aliased records for one malware event (`GHSA-7pwq-f4pq-78gm` graded `HIGH`, `MAL-2022-1` with no severity fields, `RUSTSEC-2022-0042` with no severity fields) — the motivating case for the FR-001 `aliases[]` amendment

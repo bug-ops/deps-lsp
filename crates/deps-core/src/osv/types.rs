@@ -78,6 +78,24 @@ pub enum VulnSeverity {
     Low,
     /// No severity field was present or recognized on the record.
     Unknown,
+    /// The advisory's `id`, or any entry in its `aliases`, carries OSV's
+    /// `MAL-` prefix, identifying a confirmed-malicious-package record
+    /// ingested from the OpenSSF `malicious-packages` feed: this exact
+    /// published version is known malware (typically "fully compromised,
+    /// rotate all secrets"), not a graded-but-uncertain risk. `MAL-*`
+    /// records carry no CVSS-style severity field at all, so without this
+    /// variant they would collapse into [`Self::Unknown`] and render
+    /// identically to a merely unscored, low-confidence CVE — see the
+    /// `MAL-` prefix check (on both `id` and `aliases`) this crate's OSV
+    /// severity classification runs before its graded-severity fallback,
+    /// and `architecture.md` §6. The `aliases` check matters because OSV
+    /// can serve one confirmed-malicious-package event under a non-`MAL-`
+    /// primary id, cross-referencing the canonical `MAL-*` id only via
+    /// `aliases`. Deliberately not folded into [`Self::Critical`] either: a
+    /// confirmed compromise is categorically different from a graded
+    /// CVSS-CRITICAL score, and collapsing the two would make them
+    /// indistinguishable to a reader.
+    Malicious,
 }
 
 /// A single vulnerability advisory, converted from OSV's wire format at the
@@ -311,8 +329,15 @@ pub struct FixRecommendation {
 
 /// Numeric ranking used only to sort [`FixRecommendation::advisory_ids`],
 /// worst severity first.
+///
+/// `Malicious` ranks above `Critical`: a confirmed-malicious-package finding
+/// is more urgent than any graded CVSS score. In practice a `Malicious`
+/// advisory rarely reaches this ranking at all, since `recommended_fix` only
+/// considers advisories with a known fix and a malicious-package record
+/// typically has none.
 const fn severity_rank(severity: VulnSeverity) -> u8 {
     match severity {
+        VulnSeverity::Malicious => 5,
         VulnSeverity::Critical => 4,
         VulnSeverity::High => 3,
         VulnSeverity::Medium => 2,
@@ -852,7 +877,12 @@ impl OsvVulnRecord {
             relevant
         };
 
-        let severity = super::severity::classify(self.database_specific.as_ref(), &relevant);
+        let severity = super::severity::classify(
+            &self.id,
+            &self.aliases,
+            self.database_specific.as_ref(),
+            &relevant,
+        );
         let cvss_vector = self
             .severity
             .iter()
