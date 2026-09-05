@@ -13,57 +13,12 @@ use deps_core::{
     Ecosystem, ParseResult as ParseResultTrait, Registry, Result,
     completion::Completions,
     lsp_helpers::{DiagnosticSeverities, EcosystemFormatter},
-    parser::DependencySource,
 };
 
 use crate::config::NpmParseContext;
 use crate::formatter::NpmFormatter;
 use crate::registry::NpmRegistry;
 use crate::types::NpmDependency;
-
-/// The source(s) a `CompletionContext::Version`'s bare `package_name` joins back to within a
-/// manifest's already-parsed dependencies (spec FR-017).
-#[derive(Debug)]
-enum CompletionSource {
-    /// No dependency in the manifest has this exact name yet — most commonly because the
-    /// user is still typing a brand-new dependency line. Callers fall back to the
-    /// pre-existing public-registry-only behavior, unchanged.
-    NotInManifest,
-    /// Every occurrence of this name in the manifest agrees on one resolved source.
-    Resolved(DependencySource),
-    /// Two or more occurrences of this name resolve to different sources — callers must
-    /// offer no completions at all rather than picking one arbitrarily.
-    Ambiguous,
-}
-
-/// Joins `package_name` back to `parse_result.dependencies()` by name (spec FR-017).
-///
-/// Mirrors `deps_cargo::ecosystem`'s identical helper, adapted to npm's scope-keyed (rather
-/// than alias-keyed) resolution: the source itself is already resolved by the parser from
-/// the `@scope/` name prefix, so this is purely a name join, no `.npmrc` re-resolution.
-fn resolve_completion_source(
-    parse_result: &dyn ParseResultTrait,
-    package_name: &deps_core::PackageName,
-) -> CompletionSource {
-    let mut sources = parse_result
-        .dependencies()
-        .into_iter()
-        .filter(|d| d.name() == package_name)
-        .map(deps_core::Dependency::source);
-
-    let Some(first) = sources.next() else {
-        return CompletionSource::NotInManifest;
-    };
-    if sources.all(|s| s == first) {
-        CompletionSource::Resolved(first)
-    } else {
-        tracing::warn!(
-            package = %package_name,
-            "ambiguous dependency source for version completion; offering none"
-        );
-        CompletionSource::Ambiguous
-    }
-}
 
 /// npm ecosystem implementation.
 ///
@@ -140,48 +95,39 @@ impl NpmEcosystem {
         .await
     }
 
-    /// Completes version requirements for `package_name`, routed by the source that name
-    /// resolves to in `parse_result` (spec FR-017). An ambiguous, unresolved, or
-    /// unregistered-alternate source offers no completions rather than risking a private
-    /// package name lookup against `registry.npmjs.org` — the same leak class FR-006 closes
-    /// for hover/diagnostics/code-actions.
+    /// Completes version requirements for the dependency at `position`, resolved by cursor
+    /// position rather than by name (issue #599, mirroring `deps_cargo::ecosystem`'s
+    /// identical migration for issue #593) — delegates to
+    /// [`deps_core::completion::complete_versions_at_position`]. This fixes the residual gap
+    /// in the old name-based `resolve_completion_source` routing: two dependencies sharing
+    /// one `PackageName` but resolving to different sources (e.g. two npm workspace scopes,
+    /// or a `.npmrc` scope override) used to collapse into an `Ambiguous` result and offer no
+    /// completions for either occurrence, even though the cursor position unambiguously
+    /// identifies which one the user is editing.
+    ///
+    /// The shared helper's `can_resolve_source` gate keeps `NpmRegistry::get_versions_from`'s
+    /// permissive catch-all from leaking a private/non-registry dependency's name to
+    /// `registry.npmjs.org` on every keystroke (the same leak class FR-006 closes for
+    /// hover/diagnostics/code-actions); `AlternateRegistry` routing through
+    /// `self.registry.alternate_client` is unchanged — it already lives inside
+    /// `NpmRegistry::get_versions_from` itself, which the shared helper calls into.
     async fn complete_versions(
         &self,
         parse_result: &dyn ParseResultTrait,
-        package_name: &deps_core::PackageName,
+        position: Position,
         prefix: &str,
         freshness: deps_core::FreshnessSettings,
     ) -> Vec<CompletionItem> {
-        match resolve_completion_source(parse_result, package_name) {
-            CompletionSource::Ambiguous => vec![],
-            CompletionSource::NotInManifest
-            | CompletionSource::Resolved(DependencySource::Registry) => {
-                deps_core::completion::complete_versions_generic(
-                    self.registry.as_ref(),
-                    package_name,
-                    prefix,
-                    &['^', '~', '=', '<', '>', '*'],
-                    freshness,
-                )
-                .await
-            }
-            CompletionSource::Resolved(DependencySource::AlternateRegistry { index, .. }) => {
-                match self.registry.alternate_client(&index) {
-                    Some(client) => {
-                        deps_core::completion::complete_versions_generic(
-                            client.as_ref(),
-                            package_name,
-                            prefix,
-                            &['^', '~', '=', '<', '>', '*'],
-                            freshness,
-                        )
-                        .await
-                    }
-                    None => vec![],
-                }
-            }
-            CompletionSource::Resolved(_) => vec![],
-        }
+        deps_core::completion::complete_versions_at_position(
+            self.registry.as_ref(),
+            &self.formatter,
+            parse_result,
+            position,
+            prefix,
+            &['^', '~', '=', '<', '>', '*'],
+            freshness,
+        )
+        .await
     }
 }
 
@@ -255,11 +201,8 @@ impl Ecosystem for NpmEcosystem {
                 CompletionContext::PackageName { prefix, range } => {
                     self.complete_package_names(&prefix, range).await
                 }
-                CompletionContext::Version {
-                    package_name,
-                    prefix,
-                } => {
-                    self.complete_versions(parse_result, &package_name, &prefix, freshness)
+                CompletionContext::Version { prefix, .. } => {
+                    self.complete_versions(parse_result, position, &prefix, freshness)
                         .await
                 }
                 CompletionContext::Feature { .. } => vec![],
@@ -395,8 +338,8 @@ fn catalog_diagnostics(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::parser::DependencySource;
     use deps_core::{EcosystemConfig, VersionData};
-    use std::assert_matches;
     use std::collections::HashMap;
 
     fn pkg(s: &str) -> deps_core::PackageName {
@@ -430,14 +373,21 @@ mod tests {
         }
     }
 
-    /// A `MockParseResult` with no dependencies — `resolve_completion_source` reports
-    /// `NotInManifest` for any name against it, so `complete_versions` falls back to its
-    /// pre-existing public-registry-only behavior (M4/SC-002: this is the mechanical,
-    /// behavior-preserving fixture change FR-017 forces on every pre-existing
-    /// `complete_versions` test below).
-    fn empty_parse_result() -> MockParseResult {
-        MockParseResult {
-            dependencies: vec![],
+    /// Builds an `NpmDependency` with a `version_range` at `line`, whose start position is
+    /// what `complete_versions` (position-based, issue #599) looks up `parse_result` by.
+    fn dep_with_source(
+        name: &str,
+        source: DependencySource,
+        line: u32,
+    ) -> crate::types::NpmDependency {
+        crate::types::NpmDependency {
+            name: pkg(name),
+            name_range: Range::default(),
+            version_req: None,
+            version_range: Some(Range::new(Position::new(line, 0), Position::new(line, 10))),
+            section: crate::types::NpmDependencySection::Dependencies,
+            source,
+            catalog: None,
         }
     }
 
@@ -580,11 +530,16 @@ mod tests {
     async fn test_complete_versions_real() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = NpmEcosystem::new(cache);
+        let dep = dep_with_source("express", DependencySource::Registry, 0);
+        let position = dep.version_range.unwrap().start;
+        let parse_result = MockParseResult {
+            dependencies: vec![dep],
+        };
 
         let results = ecosystem
             .complete_versions(
-                &empty_parse_result(),
-                &pkg("express"),
+                &parse_result,
+                position,
                 "4.",
                 deps_core::FreshnessSettings::default(),
             )
@@ -598,11 +553,16 @@ mod tests {
     async fn test_complete_versions_with_operator() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = NpmEcosystem::new(cache);
+        let dep = dep_with_source("express", DependencySource::Registry, 0);
+        let position = dep.version_range.unwrap().start;
+        let parse_result = MockParseResult {
+            dependencies: vec![dep],
+        };
 
         let results = ecosystem
             .complete_versions(
-                &empty_parse_result(),
-                &pkg("express"),
+                &parse_result,
+                position,
                 "^4.",
                 deps_core::FreshnessSettings::default(),
             )
@@ -615,12 +575,21 @@ mod tests {
     async fn test_complete_versions_unknown_package() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = NpmEcosystem::new(cache);
+        let dep = dep_with_source(
+            "this-package-does-not-exist-12345",
+            DependencySource::Registry,
+            0,
+        );
+        let position = dep.version_range.unwrap().start;
+        let parse_result = MockParseResult {
+            dependencies: vec![dep],
+        };
 
         // Unknown package should return empty (graceful degradation)
         let results = ecosystem
             .complete_versions(
-                &empty_parse_result(),
-                &pkg("this-package-does-not-exist-12345"),
+                &parse_result,
+                position,
                 "1.0",
                 deps_core::FreshnessSettings::default(),
             )
@@ -667,12 +636,17 @@ mod tests {
     async fn test_complete_versions_limit_20() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = NpmEcosystem::new(cache);
+        let dep = dep_with_source("express", DependencySource::Registry, 0);
+        let position = dep.version_range.unwrap().start;
+        let parse_result = MockParseResult {
+            dependencies: vec![dep],
+        };
 
         // Test that we respect the 20 result limit
         let results = ecosystem
             .complete_versions(
-                &empty_parse_result(),
-                &pkg("express"),
+                &parse_result,
+                position,
                 "4",
                 deps_core::FreshnessSettings::default(),
             )
@@ -917,12 +891,21 @@ mod tests {
     async fn test_complete_versions_empty_prefix() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = NpmEcosystem::new(cache);
+        let dep = dep_with_source(
+            "this-package-does-not-exist-12345",
+            DependencySource::Registry,
+            0,
+        );
+        let position = dep.version_range.unwrap().start;
+        let parse_result = MockParseResult {
+            dependencies: vec![dep],
+        };
 
         // Empty prefix should show non-deprecated versions (up to 20)
         let results = ecosystem
             .complete_versions(
-                &empty_parse_result(),
-                &pkg("this-package-does-not-exist-12345"),
+                &parse_result,
+                position,
                 "",
                 deps_core::FreshnessSettings::default(),
             )
@@ -935,12 +918,21 @@ mod tests {
     async fn test_complete_versions_with_tilde_operator() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = NpmEcosystem::new(cache);
+        let dep = dep_with_source(
+            "this-package-does-not-exist-12345",
+            DependencySource::Registry,
+            0,
+        );
+        let position = dep.version_range.unwrap().start;
+        let parse_result = MockParseResult {
+            dependencies: vec![dep],
+        };
 
         // Test ~ operator stripping
         let results = ecosystem
             .complete_versions(
-                &empty_parse_result(),
-                &pkg("this-package-does-not-exist-12345"),
+                &parse_result,
+                position,
                 "~4.0",
                 deps_core::FreshnessSettings::default(),
             )
@@ -952,12 +944,21 @@ mod tests {
     async fn test_complete_versions_with_wildcard() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = NpmEcosystem::new(cache);
+        let dep = dep_with_source(
+            "this-package-does-not-exist-12345",
+            DependencySource::Registry,
+            0,
+        );
+        let position = dep.version_range.unwrap().start;
+        let parse_result = MockParseResult {
+            dependencies: vec![dep],
+        };
 
         // Test * wildcard stripping
         let results = ecosystem
             .complete_versions(
-                &empty_parse_result(),
-                &pkg("this-package-does-not-exist-12345"),
+                &parse_result,
+                position,
                 "*",
                 deps_core::FreshnessSettings::default(),
             )
@@ -969,12 +970,21 @@ mod tests {
     async fn test_complete_versions_with_less_than_operator() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = NpmEcosystem::new(cache);
+        let dep = dep_with_source(
+            "this-package-does-not-exist-12345",
+            DependencySource::Registry,
+            0,
+        );
+        let position = dep.version_range.unwrap().start;
+        let parse_result = MockParseResult {
+            dependencies: vec![dep],
+        };
 
         // Test < and > operator stripping
         let results = ecosystem
             .complete_versions(
-                &empty_parse_result(),
-                &pkg("this-package-does-not-exist-12345"),
+                &parse_result,
+                position,
                 "<2.0",
                 deps_core::FreshnessSettings::default(),
             )
@@ -982,87 +992,84 @@ mod tests {
         assert!(results.is_empty());
     }
 
-    // --- FR-017: version-completion source routing ---
+    // --- issue #599: position-based version-completion source routing ---
 
-    fn dep_with_source(name: &str, source: DependencySource) -> crate::types::NpmDependency {
-        crate::types::NpmDependency {
-            name: pkg(name),
-            name_range: Range::default(),
-            version_req: None,
-            version_range: None,
-            section: crate::types::NpmDependencySection::Dependencies,
-            source,
-            catalog: None,
-        }
-    }
-
-    #[test]
-    fn test_resolve_completion_source_not_in_manifest() {
-        let parse_result = empty_parse_result();
-        assert_matches!(
-            resolve_completion_source(&parse_result, &pkg("express")),
-            CompletionSource::NotInManifest
-        );
-    }
-
-    #[test]
-    fn test_resolve_completion_source_resolved() {
-        let parse_result = MockParseResult {
-            dependencies: vec![dep_with_source("express", DependencySource::Registry)],
-        };
-        assert_matches!(
-            resolve_completion_source(&parse_result, &pkg("express")),
-            CompletionSource::Resolved(DependencySource::Registry)
-        );
-    }
-
-    /// Two occurrences of the same name resolving to different sources must not pick either
-    /// arbitrarily.
-    #[test]
-    fn test_resolve_completion_source_ambiguous() {
-        let parse_result = MockParseResult {
-            dependencies: vec![
-                dep_with_source("@myorg/pkg", DependencySource::Registry),
-                dep_with_source(
-                    "@myorg/pkg",
-                    DependencySource::AlternateRegistry {
-                        index: "https://npm.pkg.github.com".to_string(),
-                        mirrors_crates_io: false,
-                    },
-                ),
-            ],
-        };
-        assert_matches!(
-            resolve_completion_source(&parse_result, &pkg("@myorg/pkg")),
-            CompletionSource::Ambiguous
-        );
-    }
-
+    /// Issue #599: two dependencies sharing one `PackageName` but resolving to different
+    /// sources no longer collapse into the old name-based "offer nothing for either" result
+    /// — cursor position now identifies exactly one dependency, so each occurrence routes
+    /// independently. Mirrors `deps_cargo::ecosystem`'s identical
+    /// `test_complete_versions_same_name_different_sources_routes_by_position` (issue #593).
+    ///
+    /// Both halves are required to discriminate pre-fix from post-fix behavior (impl-critic
+    /// finding C1): the alternate-occurrence assertion alone is empty under *both* the old
+    /// name-based `Ambiguous` collapse and the new position-based routing (an unregistered
+    /// alternate index fails closed either way), so it cannot fail on unfixed code by itself.
+    /// The registry-occurrence assertion is the discriminating half — pre-fix it also
+    /// collapsed to `Ambiguous` and returned empty; post-fix, cursor position resolves it
+    /// independently of the co-occurring `AlternateRegistry` entry and it reaches the (mocked)
+    /// public registry.
     #[tokio::test]
-    async fn test_complete_versions_ambiguous_source_offers_nothing() {
+    async fn test_complete_versions_same_name_different_sources_routes_by_position() {
+        let mut public_server = mockito::Server::new_async().await;
+        public_server
+            .mock("GET", "/@myorg/pkg")
+            .with_status(200)
+            .with_body(r#"{"versions": {"1.0.0": {}, "1.5.0": {}}}"#)
+            .create_async()
+            .await;
+
         let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = NpmEcosystem::new(cache);
+        let registry = NpmRegistry::with_registry_base(cache, public_server.url());
+        let ecosystem = NpmEcosystem::with_registry(Arc::new(registry));
+
+        let registry_dep = dep_with_source("@myorg/pkg", DependencySource::Registry, 0);
+        let registry_position = registry_dep.version_range.unwrap().start;
+        let alternate_dep = dep_with_source(
+            "@myorg/pkg",
+            DependencySource::AlternateRegistry {
+                index: "https://npm.pkg.github.com".to_string(),
+                mirrors_crates_io: false,
+            },
+            1,
+        );
+        let alternate_position = alternate_dep.version_range.unwrap().start;
         let parse_result = MockParseResult {
-            dependencies: vec![
-                dep_with_source("@myorg/pkg", DependencySource::Registry),
-                dep_with_source(
-                    "@myorg/pkg",
-                    DependencySource::AlternateRegistry {
-                        index: "https://npm.pkg.github.com".to_string(),
-                        mirrors_crates_io: false,
-                    },
-                ),
-            ],
+            dependencies: vec![registry_dep, alternate_dep],
         };
-        let results = ecosystem
+
+        // The alternate occurrence resolves deterministically without network: its index was
+        // never registered, so `NpmRegistry::get_versions_from` fails closed with
+        // `PackageNotFound` before any HTTP call — proving its own source, not the
+        // co-occurring `Registry`-sourced entry, drove the routing.
+        let alternate_results = ecosystem
             .complete_versions(
                 &parse_result,
-                &pkg("@myorg/pkg"),
+                alternate_position,
                 "1.",
                 deps_core::FreshnessSettings::default(),
             )
             .await;
-        assert!(results.is_empty());
+        assert!(
+            alternate_results.is_empty(),
+            "unregistered alternate index must offer no completions"
+        );
+
+        // Discriminating assertion: the co-occurring `Registry`-sourced entry must still
+        // resolve via the mocked public registry, proving position (not the ambiguity the old
+        // name-based join would have detected) drives routing.
+        let registry_results = ecosystem
+            .complete_versions(
+                &parse_result,
+                registry_position,
+                "1.",
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
+        assert!(
+            !registry_results.is_empty(),
+            "the Registry-sourced occurrence must resolve despite a co-occurring, \
+             differently-sourced entry sharing its name"
+        );
     }
 
     /// FR-006 interaction: a `CustomRegistry`-resolved name (the fail-closed state) offers no
@@ -1089,18 +1096,21 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let registry = NpmRegistry::with_registry_base(cache, public_server.url());
         let ecosystem = NpmEcosystem::with_registry(Arc::new(registry));
+        let dep = dep_with_source(
+            "@myorg/pkg",
+            DependencySource::CustomRegistry {
+                url: "not-a-valid-url".to_string(),
+            },
+            0,
+        );
+        let position = dep.version_range.unwrap().start;
         let parse_result = MockParseResult {
-            dependencies: vec![dep_with_source(
-                "@myorg/pkg",
-                DependencySource::CustomRegistry {
-                    url: "not-a-valid-url".to_string(),
-                },
-            )],
+            dependencies: vec![dep],
         };
         let results = ecosystem
             .complete_versions(
                 &parse_result,
-                &pkg("@myorg/pkg"),
+                position,
                 "1.",
                 deps_core::FreshnessSettings::default(),
             )
@@ -1130,19 +1140,22 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let registry = NpmRegistry::with_registry_base(cache, public_server.url());
         let ecosystem = NpmEcosystem::with_registry(Arc::new(registry));
+        let dep = dep_with_source(
+            "@myorg/pkg",
+            DependencySource::AlternateRegistry {
+                index: "https://never-registered.example".to_string(),
+                mirrors_crates_io: false,
+            },
+            0,
+        );
+        let position = dep.version_range.unwrap().start;
         let parse_result = MockParseResult {
-            dependencies: vec![dep_with_source(
-                "@myorg/pkg",
-                DependencySource::AlternateRegistry {
-                    index: "https://never-registered.example".to_string(),
-                    mirrors_crates_io: false,
-                },
-            )],
+            dependencies: vec![dep],
         };
         let results = ecosystem
             .complete_versions(
                 &parse_result,
-                &pkg("@myorg/pkg"),
+                position,
                 "1.",
                 deps_core::FreshnessSettings::default(),
             )
@@ -1151,7 +1164,7 @@ mod tests {
         public_mock.assert_async().await;
     }
 
-    /// FR-017 end-to-end: a registered alternate client's version completion routes there.
+    /// Issue #599 end-to-end: a registered alternate client's version completion routes there.
     #[tokio::test]
     async fn test_complete_versions_routes_to_registered_alternate_client() {
         let mut alt_server = mockito::Server::new_async().await;
@@ -1173,19 +1186,22 @@ mod tests {
         let index = crate::config::NpmRegistryIndex::new(&alt_server.url(), &policy).unwrap();
         registry.register_alternate(index.clone());
 
+        let dep = dep_with_source(
+            "@myorg/pkg",
+            DependencySource::AlternateRegistry {
+                index: index.as_str().to_string(),
+                mirrors_crates_io: false,
+            },
+            0,
+        );
+        let position = dep.version_range.unwrap().start;
         let parse_result = MockParseResult {
-            dependencies: vec![dep_with_source(
-                "@myorg/pkg",
-                DependencySource::AlternateRegistry {
-                    index: index.as_str().to_string(),
-                    mirrors_crates_io: false,
-                },
-            )],
+            dependencies: vec![dep],
         };
         let results = ecosystem
             .complete_versions(
                 &parse_result,
-                &pkg("@myorg/pkg"),
+                position,
                 "1.",
                 deps_core::FreshnessSettings::default(),
             )
