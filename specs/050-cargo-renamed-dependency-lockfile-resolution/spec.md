@@ -10,7 +10,7 @@ tags:
   - deps-cargo
   - lockfile
 created: 2026-09-06
-status: specified
+status: shipped
 related:
   - "[[constitution]]"
   - "[[023-cargo-custom-registries/spec|Cargo custom/private registry & source-replacement resolution]]"
