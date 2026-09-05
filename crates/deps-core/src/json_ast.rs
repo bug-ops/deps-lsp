@@ -157,8 +157,9 @@ impl JsonSection<'_> {
     ///
     /// `version_range` is `Some` only when the property's value is itself a plain string
     /// literal (an object/array/number/bool/null value has no meaningful "version span",
-    /// matching each caller's own `value.as_str()` gate on `version_req`). `None` if `name`
-    /// isn't a direct property of this section.
+    /// matching each caller's own `value.as_str()` gate on whether the entry is a
+    /// dependency declaration at all). `None` if `name` isn't a direct property of this
+    /// section.
     ///
     /// # Examples
     ///
