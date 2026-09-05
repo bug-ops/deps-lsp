@@ -33,9 +33,9 @@ jobs:
       rust: ${{ steps.filter.outputs.rust }}
       workflows: ${{ steps.filter.outputs.workflows }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
 
-      - uses: dorny/paths-filter@v3
+      - uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad  # v3
         id: filter
         with:
           filters: |
@@ -55,9 +55,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
 
-      - uses: moonrepo/setup-rust@v1
+      - uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3  # v1
         with:
           channel: nightly
           components: rustfmt
@@ -75,9 +75,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
 
-      - uses: moonrepo/setup-rust@v1
+      - uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3  # v1
         with:
           components: clippy
         env:
@@ -118,10 +118,10 @@ jobs:
       contents: read
       issues: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
 
       - name: Install cargo-deny
-        uses: taiki-e/install-action@cargo-deny
+        uses: taiki-e/install-action@5724fe4561a201b0d36bddf13177e3557b43787b  # cargo-deny
 
       - name: Run cargo-deny
         run: cargo deny check
@@ -142,15 +142,15 @@ jobs:
             rust: beta
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
 
-      - uses: moonrepo/setup-rust@v1
+      - uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3  # v1
         with:
           channel: ${{ matrix.rust }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@ef6302df50adb496d123b03ae2b53322d688ffa1  # nextest
 
       - name: Run tests
         run: cargo nextest run --workspace --all-features --no-fail-fast --profile ci
@@ -179,9 +179,9 @@ jobs:
             use_cross_tool: true
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
 
-      - uses: moonrepo/setup-rust@v1
+      - uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3  # v1
         with:
           targets: ${{ matrix.target }}
           cache: false
@@ -190,7 +190,7 @@ jobs:
 
       - name: Install cross
         if: matrix.use_cross_tool
-        uses: taiki-e/install-action@cross
+        uses: taiki-e/install-action@a82845735191974ac374fc0472388c6df0a158ca  # cross
 
       - name: Build for cross-compile target
         if: ${{ !matrix.use_cross_tool }}
@@ -207,13 +207,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
 
-      - uses: moonrepo/setup-rust@v1
+      - uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3  # v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@7b8d4719ee4aaa279bdf55df38dacb9ebfe12a6c  # v2
         with:
           tool: cargo-nextest, cargo-llvm-cov
 
@@ -221,7 +221,7 @@ jobs:
         run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info nextest --profile coverage
 
       - name: Upload coverage
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac  # v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: lcov.info
@@ -229,7 +229,7 @@ jobs:
           verbose: true
 
       - name: Archive coverage report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: coverage-report
           path: lcov.info
@@ -242,7 +242,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
 
       - name: Read MSRV from Cargo.toml
         id: msrv
@@ -250,7 +250,7 @@ jobs:
           MSRV=$(grep '^rust-version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
           echo "version=$MSRV" >> $GITHUB_OUTPUT
 
-      - uses: moonrepo/setup-rust@v1
+      - uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3  # v1
         with:
           channel: ${{ steps.msrv.outputs.version }}
         env:
@@ -266,11 +266,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
         with:
           submodules: true
 
-      - uses: moonrepo/setup-rust@v1
+      - uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3  # v1
         with:
           targets: wasm32-wasip1
           cache-target: release
@@ -293,9 +293,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
 
-      - uses: moonrepo/setup-rust@v1
+      - uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3  # v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -309,9 +309,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
 
-      - uses: moonrepo/setup-rust@v1
+      - uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3  # v1
         with:
           cache-target: release
         env:
