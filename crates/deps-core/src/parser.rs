@@ -795,6 +795,30 @@ pub fn check_json_nesting_depth(
     Ok(())
 }
 
+/// Message text for a JSON payload rejected for nesting deeper than [`MAX_JSON_NESTING_DEPTH`].
+///
+/// The single shared wording for every workspace call site that rejects on JSON nesting depth,
+/// whether it reports the rejection via `serde_json::Error` (as `json_depth_error` does, for
+/// [`parse_json_checked`]'s callers) or via its own error type (a caller whose depth check runs
+/// against an already-parsed AST rather than raw bytes, and so cannot route through
+/// `parse_json_checked` itself, e.g. `deps-deno`'s `parse_deno_json`) — kept as one function so
+/// the two paths cannot silently drift apart.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::parser::json_depth_error_message;
+///
+/// assert_eq!(
+///     json_depth_error_message(65),
+///     "JSON nesting depth 65 exceeds maximum of 64"
+/// );
+/// ```
+#[must_use]
+pub fn json_depth_error_message(depth: usize) -> String {
+    format!("JSON nesting depth {depth} exceeds maximum of {MAX_JSON_NESTING_DEPTH}")
+}
+
 /// Builds the `serde_json::Error` reporting a too-deep payload.
 ///
 /// Shared internally by [`parse_json_checked`]'s two failure paths (too-deep vs. genuinely
@@ -803,9 +827,7 @@ pub fn check_json_nesting_depth(
 /// malformed-JSON handling, from an error `serde_json` itself would have produced.
 #[must_use]
 fn json_depth_error(depth: usize) -> serde_json::Error {
-    serde::de::Error::custom(format!(
-        "JSON nesting depth {depth} exceeds maximum of {MAX_JSON_NESTING_DEPTH}"
-    ))
+    serde::de::Error::custom(json_depth_error_message(depth))
 }
 
 /// Deserializes `bytes` into `T`, first rejecting payloads whose JSON nesting exceeds
