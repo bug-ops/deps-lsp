@@ -69,7 +69,7 @@ status: moc
 | 045 | [[045-secret-accessor-auditable-naming/spec\|Rename Redacted<T>/wrapper as_str() secret accessors to an auditable name]] | specify | enhancement/security, P3, ready for implementation (issue #581) |
 | 046 | [[046-pnpm-catalogs/spec\|pnpm catalogs + workspace: protocol resolution support]] | specify | research/enhancement, P3, clarifications resolved 2026-09-04, ready for implementation (issue #587) |
 | 047 | [[047-elixir-hex-ecosystem/spec\|New ecosystem: Elixir Hex (mix.exs dependency version hints)]] | specify | draft — research/new-ecosystem, P4, 6 open `[NEEDS CLARIFICATION]` items, issue #642 |
-| 048 | [[048-gitlab-ci-mutable-pin-message-contradicts-quickfix/spec\|GitLab CI mutable-ref-pin diagnostic wrongly claims no automated fix for component Latest/Partial pins]] | specify | draft — bug, P2, 2 open `[NEEDS CLARIFICATION]` items, no tracking issue filed yet |
+| 048 | [[048-gitlab-ci-mutable-pin-message-contradicts-quickfix/spec\|GitLab CI mutable-ref-pin diagnostic wrongly claims no automated fix for component Latest/Partial pins]] | specify | approved — bug, P2, 0 open `[NEEDS CLARIFICATION]` items, issue #643, in implementation on `feat/640-643-gitlab-ci-pin-parity` |
 
 ## Completed Specs
 

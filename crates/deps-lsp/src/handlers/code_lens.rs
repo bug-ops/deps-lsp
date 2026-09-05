@@ -81,16 +81,35 @@ pub async fn handle_code_lens(
         return vec![];
     };
 
-    ecosystem
+    let versions = VersionData::new(&cached_versions, &resolved_versions).with_offline(offline);
+    let mut lenses = ecosystem
         .generate_code_lenses(
             parse_result.as_ref(),
             &content,
-            VersionData::new(&cached_versions, &resolved_versions).with_offline(offline),
+            versions,
             uri,
             COMMAND_ID,
             severities,
         )
-        .await
+        .await;
+
+    // M4 (#640): the bulk "Pin N {noun} to commit SHA" lens lives here, not as an
+    // ecosystem's own `generate_code_lenses` override, so no override can silently drop
+    // it. Same on/off toggle as the mutable-ref-pin diagnostic (issue #633): a lens is
+    // push-based/permanently rendered, unlike the pull-based per-position quickfix, so
+    // disabling the flag must suppress the lens too, not just the diagnostic.
+    if severities.mutable_ref_pin_enabled {
+        let count = ecosystem
+            .collect_pin_all_to_sha_edits(parse_result.as_ref(), versions)
+            .len();
+        lenses.extend(deps_core::lsp_helpers::build_pin_all_to_sha_lens(
+            count,
+            ecosystem.pin_all_to_sha_noun(),
+            uri,
+        ));
+    }
+
+    lenses
 }
 
 #[cfg(test)]
@@ -876,6 +895,108 @@ let package = Package(
             );
 
             assert_guard_skips(ecosystem.as_ref(), &uri, &content, cached).await;
+        }
+
+        /// (C′) test split, issue #640: migrated from
+        /// `deps_github_actions::ecosystem`'s deleted `generate_code_lenses` override —
+        /// the suppression gate now lives in `handle_code_lens` itself (M4), so its test
+        /// belongs here too. Paired with the enabled-flag test below so the absence
+        /// assertion is non-vacuous (proves the lens genuinely renders when enabled,
+        /// not that this fixture can never produce one at all).
+        #[cfg(feature = "github-actions")]
+        #[tokio::test]
+        async fn test_pin_all_to_sha_lens_present_when_mutable_ref_pin_enabled() {
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let content = "steps:\n  - uses: actions/checkout@v4\n".to_string();
+
+            let ecosystem = state.ecosystem_registry.get("github-actions").unwrap();
+            seed_gha_tag_index(
+                ecosystem.as_ref(),
+                "actions/checkout",
+                "v4",
+                &"a".repeat(40),
+            );
+            let parse_result = ecosystem.parse_manifest(&content, &uri).await.unwrap();
+            let mut doc_state = crate::document::DocumentState::new_from_parse_result(
+                deps_core::EcosystemId::GithubActions,
+                content.clone(),
+                parse_result,
+            );
+            doc_state.set_loaded();
+            doc_state.set_version(Some(1));
+            state.update_document(uri.clone(), doc_state);
+
+            let (client, config) = create_test_client_and_config();
+            let result = handle_code_lens(state, params(uri), true, client, config).await;
+
+            assert!(
+                result.iter().any(|l| l.command.as_ref().is_some_and(
+                    |c| c.command == deps_core::lsp_helpers::PIN_ALL_TO_SHA_COMMAND_ID
+                )),
+                "expected the Pin-all-to-SHA lens when mutable_ref_pin_enabled is true \
+                 (the default): {result:?}"
+            );
+        }
+
+        /// S3 (impl-critic re-review): pairs the suppression assertion with proof the
+        /// sibling `updateAllOutdated` lens is unaffected — the gate this test exercises
+        /// must be scoped to the pin-all lens only, mirroring the GHA
+        /// `test_generate_code_lenses_update_all_outdated_lens_unaffected_by_mutable_ref_pin_flag`
+        /// test that was deleted with the override and not migrated. `actions/checkout` is
+        /// seeded both as outdated (`v3` declared, `v4` cached) and as a resolvable Tag pin
+        /// for `v3` so both lenses have a genuine reason to render absent that assertion.
+        #[cfg(feature = "github-actions")]
+        #[tokio::test]
+        async fn test_pin_all_to_sha_lens_absent_when_mutable_ref_pin_disabled() {
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let content = "steps:\n  - uses: actions/checkout@v3\n".to_string();
+
+            let ecosystem = state.ecosystem_registry.get("github-actions").unwrap();
+            seed_gha_tag_index(
+                ecosystem.as_ref(),
+                "actions/checkout",
+                "v3",
+                &"a".repeat(40),
+            );
+            let parse_result = ecosystem.parse_manifest(&content, &uri).await.unwrap();
+            let mut doc_state = crate::document::DocumentState::new_from_parse_result(
+                deps_core::EcosystemId::GithubActions,
+                content.clone(),
+                parse_result,
+            );
+            let mut cached = std::collections::HashMap::new();
+            cached.insert(
+                deps_core::PackageName::new("actions/checkout"),
+                deps_core::PackageVersions::latest_only("v4"),
+            );
+            doc_state.update_cached_versions(cached);
+            doc_state.set_loaded();
+            doc_state.set_version(Some(1));
+            state.update_document(uri.clone(), doc_state);
+
+            let (client, config) = create_test_client_and_config();
+            // `handle_code_lens` derives severities from `config.diagnostics.to_severities()`,
+            // not a hand-built `DiagnosticSeverities` — drive the flag through the config
+            // the test helper already hands out.
+            config.write().await.diagnostics.mutable_ref_pin_enabled = false;
+            let result = handle_code_lens(state, params(uri), true, client, config).await;
+
+            assert!(
+                !result.iter().any(|l| l.command.as_ref().is_some_and(
+                    |c| c.command == deps_core::lsp_helpers::PIN_ALL_TO_SHA_COMMAND_ID
+                )),
+                "mutable_ref_pin_enabled: false must suppress the Pin-all-to-SHA lens, \
+                 mirroring the diagnostic's own suppression: {result:?}"
+            );
+            assert!(
+                result
+                    .iter()
+                    .any(|l| l.command.as_ref().is_some_and(|c| c.command == COMMAND_ID)),
+                "the sibling updateAllOutdated lens must be unaffected by \
+                 mutable_ref_pin_enabled: {result:?}"
+            );
         }
     }
 }

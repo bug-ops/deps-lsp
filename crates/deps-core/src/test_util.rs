@@ -349,3 +349,35 @@ pub async fn capture_tracing_output_async(fut: impl std::future::Future<Output =
     drop(guard);
     String::from_utf8(writer.0.lock().unwrap().clone()).expect("tracing output is valid utf8")
 }
+
+/// Like [`capture_tracing_output_async`], but capturing every level up to and including
+/// `max_level`.
+///
+/// The async counterpart of [`capture_tracing_output_at`], needed to assert a
+/// `tracing::debug!` emission inside an `async fn`/`.await`ed future.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::test_util::capture_tracing_output_async_at;
+///
+/// # #[tokio::main]
+/// # async fn main() {
+/// let output = capture_tracing_output_async_at(tracing::Level::DEBUG, async {
+///     tracing::debug!("quiet detail");
+/// })
+/// .await;
+/// assert!(output.contains("quiet detail"));
+/// # }
+/// ```
+#[cfg(feature = "test-util")]
+pub async fn capture_tracing_output_async_at(
+    max_level: tracing::Level,
+    fut: impl std::future::Future<Output = ()>,
+) -> String {
+    let (writer, subscriber) = capturing_subscriber_at(max_level);
+    let guard = tracing::subscriber::set_default(subscriber);
+    fut.await;
+    drop(guard);
+    String::from_utf8(writer.0.lock().unwrap().clone()).expect("tracing output is valid utf8")
+}

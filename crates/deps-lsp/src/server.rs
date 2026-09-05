@@ -34,12 +34,13 @@ mod commands {
     /// Command to update every outdated dependency in a document, bound to the code
     /// lens produced by `handlers::code_lens`.
     pub(super) const UPDATE_ALL_OUTDATED: &str = crate::handlers::code_lens::COMMAND_ID;
-    /// Command to pin every mutable-tag GitHub Actions step to a commit SHA, bound to
-    /// the "Pin N actions to commit SHA" lens `deps-github-actions` produces (issue
-    /// #633). GitHub-Actions-specific, so only registered/dispatched when that ecosystem
-    /// feature is enabled.
-    #[cfg(feature = "github-actions")]
-    pub(super) const PIN_ALL_TO_SHA: &str = deps_github_actions::PIN_ALL_TO_SHA_COMMAND_ID;
+    /// Command to pin every mutable-ref dependency an ecosystem can resolve to a commit
+    /// SHA, bound to the bulk "Pin N {noun} to commit SHA" lens (issue #633, generalized
+    /// cross-ecosystem in #640). Registered/dispatched unconditionally for every
+    /// ecosystem through `Ecosystem::collect_pin_all_to_sha_edits` — its trait default
+    /// returns no edits, so the command is simply always a no-op for an ecosystem with
+    /// no mutable-ref pin concept, rather than needing its own feature gate.
+    pub(super) const PIN_ALL_TO_SHA: &str = deps_core::lsp_helpers::PIN_ALL_TO_SHA_COMMAND_ID;
 }
 
 /// Parses a [`DepsConfig`] from a raw JSON settings payload (client
@@ -425,16 +426,11 @@ impl Backend {
                 ..Default::default()
             })),
             execute_command_provider: Some(ExecuteCommandOptions {
-                commands: {
-                    #[allow(unused_mut)]
-                    let mut cmds = vec![
-                        commands::UPDATE_VERSION.into(),
-                        commands::UPDATE_ALL_OUTDATED.into(),
-                    ];
-                    #[cfg(feature = "github-actions")]
-                    cmds.push(commands::PIN_ALL_TO_SHA.into());
-                    cmds
-                },
+                commands: vec![
+                    commands::UPDATE_VERSION.into(),
+                    commands::UPDATE_ALL_OUTDATED.into(),
+                    commands::PIN_ALL_TO_SHA.into(),
+                ],
                 ..Default::default()
             }),
             ..Default::default()
@@ -1009,7 +1005,6 @@ impl LanguageServer for Backend {
             self.execute_update_all_outdated(update_args.uri).await;
         }
 
-        #[cfg(feature = "github-actions")]
         if params.command == commands::PIN_ALL_TO_SHA
             && let Some(args) = params.arguments.first()
             && let Ok(pin_args) = serde_json::from_value::<PinAllToShaArgs>(args.clone())
@@ -1183,14 +1178,14 @@ impl Backend {
     }
 
     /// Recomputes and applies the batch, version-guarded `WorkspaceEdit` for
-    /// `deps-lsp.pinAllToSha` (issue #633) — the GitHub-Actions-specific bulk
-    /// counterpart of [`Self::execute_update_all_outdated`], sharing its readiness
+    /// `deps-lsp.pinAllToSha` (issue #633, generalized cross-ecosystem in #640) — the
+    /// bulk counterpart of [`Self::execute_update_all_outdated`], sharing its readiness
     /// contract (see that method's doc comment) but sourcing edits from
-    /// [`deps_github_actions::GithubActionsEcosystem::collect_pin_all_to_sha_edits`]
-    /// instead of `deps_core::collect_update_all_edits`. Refused (same warning) when the
-    /// document's ecosystem is not GitHub Actions, so a stale or forged command against a
-    /// non-GHA document is a no-op rather than a panic.
-    #[cfg(feature = "github-actions")]
+    /// [`deps_core::Ecosystem::collect_pin_all_to_sha_edits`] instead of
+    /// `deps_core::collect_update_all_edits`. Dispatched through the resolved
+    /// `Arc<dyn Ecosystem>` for every document's own ecosystem — an ecosystem with no
+    /// mutable-ref pin concept simply returns no edits from the trait default, taking
+    /// the same "nothing to pin" INFO path below rather than a distinct refusal.
     #[allow(clippy::await_holding_invalid_type)]
     async fn execute_pin_all_to_sha(&self, uri: Uri) {
         let Some(doc) = self.state.get_document(&uri) else {
@@ -1211,19 +1206,6 @@ impl Backend {
             return;
         };
 
-        let Some(gha_ecosystem) = ecosystem
-            .as_any()
-            .downcast_ref::<deps_github_actions::GithubActionsEcosystem>()
-        else {
-            tracing::warn!(
-                "deps-lsp.pinAllToSha invoked for a non-GitHub-Actions document: {:?}",
-                uri
-            );
-            drop(doc);
-            self.warn_update_all_outdated_not_ready().await;
-            return;
-        };
-
         let Some(parse_result) = doc.parse_result() else {
             tracing::warn!("No parse result for {:?}", uri);
             drop(doc);
@@ -1231,15 +1213,24 @@ impl Backend {
             return;
         };
 
-        let edits = gha_ecosystem.collect_pin_all_to_sha_edits(parse_result);
+        let versions = deps_core::VersionData::new(&doc.cached_versions, &doc.resolved_versions);
+        let edits = ecosystem.collect_pin_all_to_sha_edits(parse_result, versions);
         let version = doc.version;
         drop(doc);
 
         if edits.is_empty() {
+            // M1 (#640): now that this command is advertised and dispatched
+            // unconditionally for every ecosystem, this log line is what still
+            // distinguishes "this document genuinely has nothing to pin" from a
+            // misrouted/stale command — the client-facing message can't say that.
+            tracing::debug!(ecosystem = ecosystem.id(), "pinAllToSha: no edits");
             self.client
                 .show_message(
                     MessageType::INFO,
-                    "deps-lsp: no mutable-tag actions to pin to commit SHA",
+                    format!(
+                        "deps-lsp: no mutable-tag {} to pin to commit SHA",
+                        ecosystem.pin_all_to_sha_noun().plural
+                    ),
                 )
                 .await;
             return;
@@ -1306,7 +1297,6 @@ struct UpdateAllOutdatedArgs {
 /// Arguments for `deps-lsp.pinAllToSha` (issue #633) — the URI only, same shape and
 /// rationale as [`UpdateAllOutdatedArgs`]: edits are recomputed at execution time (see
 /// `Backend::execute_pin_all_to_sha`), never baked into the command arguments.
-#[cfg(feature = "github-actions")]
 #[derive(serde::Deserialize)]
 struct PinAllToShaArgs {
     uri: Uri,
@@ -1766,7 +1756,6 @@ mod tests {
         assert_eq!(commands::UPDATE_ALL_OUTDATED, "deps-lsp.updateAllOutdated");
     }
 
-    #[cfg(feature = "github-actions")]
     #[test]
     fn test_server_capabilities_execute_command_includes_pin_all_to_sha() {
         let caps = Backend::server_capabilities();
@@ -1780,17 +1769,15 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "github-actions")]
     #[test]
     fn test_commands_pin_all_to_sha_matches_ecosystem_command_id() {
         assert_eq!(commands::PIN_ALL_TO_SHA, "deps-lsp.pinAllToSha");
         assert_eq!(
             commands::PIN_ALL_TO_SHA,
-            deps_github_actions::PIN_ALL_TO_SHA_COMMAND_ID
+            deps_core::lsp_helpers::PIN_ALL_TO_SHA_COMMAND_ID
         );
     }
 
-    #[cfg(feature = "github-actions")]
     #[test]
     fn test_pin_all_to_sha_args_deserialization() {
         let json = serde_json::json!({ "uri": "file:///repo/.github/workflows/ci.yml" });
@@ -2662,15 +2649,19 @@ mod tests {
         /// discriminating precondition (issue #633 critic S2: `execute_command` returns
         /// `Ok(None)` on every path, including every refusal branch, so asserting only
         /// `result.is_ok()` cannot tell "applied N edits" apart from "silently refused").
+        /// Calls the trait method directly on `&dyn Ecosystem` (#640) — no downcast, since
+        /// `collect_pin_all_to_sha_edits` is generic across every ecosystem now.
         fn gha_edit_count(
             ecosystem: &dyn deps_core::Ecosystem,
             parse_result: &dyn deps_core::ParseResult,
         ) -> usize {
+            let cached = std::collections::HashMap::new();
+            let resolved = std::collections::HashMap::new();
             ecosystem
-                .as_any()
-                .downcast_ref::<deps_github_actions::GithubActionsEcosystem>()
-                .expect("github-actions ecosystem must back onto a GithubActionsEcosystem")
-                .collect_pin_all_to_sha_edits(parse_result)
+                .collect_pin_all_to_sha_edits(
+                    parse_result,
+                    deps_core::VersionData::new(&cached, &resolved),
+                )
                 .len()
         }
 
@@ -2844,45 +2835,135 @@ mod tests {
             let result = backend.execute_command(command_params(&uri)).await;
             assert!(result.is_ok());
         }
+    }
 
-        #[tokio::test]
-        async fn test_execute_command_pin_all_to_sha_non_gha_document_no_op() {
-            // A stale/forged command against a document whose ecosystem is not GitHub
-            // Actions must be refused, not panic on the downcast.
-            let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
-            let backend = service.inner();
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+    /// #640: a stale/forged `deps-lsp.pinAllToSha` against a document whose ecosystem has
+    /// no mutable-ref pin concept (e.g. Cargo) is a no-op, but — since the command is now
+    /// dispatched through `Ecosystem::collect_pin_all_to_sha_edits`'s trait default rather
+    /// than a GitHub-Actions-specific downcast — it takes the same INFO "nothing to pin"
+    /// path an all-SHA-pinned GitHub Actions workflow would (Risk #2), not a distinct
+    /// refusal. This intentionally supersedes the pre-#640 downcast-refusal test.
+    ///
+    /// S4 (impl-critic re-review): `execute_command` returns `Ok(None)` on every path
+    /// (including every refusal), so asserting only `result.is_ok()` cannot distinguish
+    /// "reached the INFO path" from "was refused earlier for an unrelated reason" — assert
+    /// the M1 `tracing::debug!("pinAllToSha: no edits")` line actually fired instead.
+    #[cfg(feature = "cargo")]
+    #[tokio::test]
+    async fn test_execute_command_pin_all_to_sha_non_pin_ecosystem_document_no_op() {
+        use crate::document::DocumentState;
+        use deps_core::EcosystemId;
 
-            let ecosystem = backend.state.ecosystem_registry.get("cargo").unwrap();
-            // Pin the precondition this test actually depends on: the downcast
-            // `execute_pin_all_to_sha` performs must genuinely fail for this fixture,
-            // not merely "some cargo-flavored content" that happens to also pass.
-            assert!(
-                ecosystem
-                    .as_any()
-                    .downcast_ref::<deps_github_actions::GithubActionsEcosystem>()
-                    .is_none(),
-                "fixture must back onto a non-GitHub-Actions ecosystem for this to test \
-                 the downcast-refusal path"
-            );
-            let content = "[dependencies]\nserde = \"1.0.0\"\n".to_string();
-            let parse_result = ecosystem.parse_manifest(&content, &uri).await.unwrap();
-            let mut doc_state = DocumentState::new_from_parse_result(
-                EcosystemId::Cargo,
-                content.clone(),
-                parse_result,
-            );
-            doc_state.set_version(Some(1));
-            doc_state.set_loaded();
-            backend.state.update_document(uri.clone(), doc_state);
+        let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+        let backend = service.inner();
+        let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
 
-            let result = backend.execute_command(command_params(&uri)).await;
-            assert!(result.is_ok());
-            assert_eq!(
-                backend.state.get_document(&uri).unwrap().content,
-                content,
-                "a refused command must not touch document content"
-            );
-        }
+        let ecosystem = backend.state.ecosystem_registry.get("cargo").unwrap();
+        let content = "[dependencies]\nserde = \"1.0.0\"\n".to_string();
+        let parse_result = ecosystem.parse_manifest(&content, &uri).await.unwrap();
+        let mut doc_state =
+            DocumentState::new_from_parse_result(EcosystemId::Cargo, content.clone(), parse_result);
+        doc_state.set_version(Some(1));
+        doc_state.set_loaded();
+        backend.state.update_document(uri.clone(), doc_state);
+
+        let output =
+            deps_core::test_util::capture_tracing_output_async_at(tracing::Level::DEBUG, async {
+                let result = backend
+                    .execute_command(ExecuteCommandParams {
+                        command: commands::PIN_ALL_TO_SHA.to_string(),
+                        arguments: vec![serde_json::json!({ "uri": uri.as_str() })],
+                        work_done_progress_params: Default::default(),
+                    })
+                    .await;
+                assert!(result.is_ok());
+            })
+            .await;
+
+        assert!(
+            output.contains("pinAllToSha: no edits"),
+            "expected the M1 debug! log confirming the INFO 'nothing to pin' path fired \
+             (proving the generic dispatch reached the empty-edits branch, not some other \
+             refusal): {output}"
+        );
+        assert_eq!(
+            backend.state.get_document(&uri).unwrap().content,
+            content,
+            "a no-op command must not touch document content"
+        );
+    }
+
+    /// #640: end-to-end mirror of
+    /// `pin_all_to_sha_execute_command_tests::test_execute_command_pin_all_to_sha_applies_edit_for_resolvable_steps`
+    /// for GitLab CI — proves the generic `deps-lsp.pinAllToSha` dispatch (no ecosystem
+    /// downcast) reaches a non-GitHub-Actions ecosystem's own
+    /// `collect_pin_all_to_sha_edits` override.
+    #[cfg(feature = "gitlab-ci")]
+    #[tokio::test]
+    async fn test_execute_command_pin_all_to_sha_gitlab_ci_applies_edit_for_resolvable_tag_pin() {
+        use crate::document::DocumentState;
+        use deps_core::EcosystemId;
+        use std::sync::Arc;
+
+        let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+        let backend = service.inner();
+        let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+        let content = "include:\n  - project: org/proj\n    ref: v1.0.0\n";
+
+        let ecosystem = backend.state.ecosystem_registry.get("gitlab-ci").unwrap();
+        let registry = ecosystem.registry();
+        let gitlab_registry = registry
+            .as_any()
+            .downcast_ref::<deps_gitlab_ci::GitlabCiRegistry>()
+            .expect("gitlab-ci ecosystem must back onto a GitlabCiRegistry");
+        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+        let name = deps_core::ParseResult::dependencies(parse_result.as_ref())[0]
+            .name()
+            .clone();
+        let mut index = deps_gitlab_ci::registry::TagIndex::default();
+        index
+            .tag_to_sha
+            .insert("v1.0.0".to_string(), "a".repeat(40));
+        gitlab_registry
+            .tag_index()
+            .insert((deps_gitlab_ci::EndpointKind::Tags, name), Arc::new(index));
+
+        // S4 (impl-critic re-review): pin the precondition this test actually depends on —
+        // an empty-edit run also returns `Ok`, so without this the test cannot prove the
+        // generic dispatch actually reached GitLab CI's `collect_pin_all_to_sha_edits`
+        // override, only that *some* no-op-or-not path completed without erroring.
+        let empty_cached = std::collections::HashMap::new();
+        let empty_resolved = std::collections::HashMap::new();
+        let versions = deps_core::VersionData::new(&empty_cached, &empty_resolved);
+        assert_eq!(
+            ecosystem
+                .collect_pin_all_to_sha_edits(parse_result.as_ref(), versions)
+                .len(),
+            1,
+            "fixture must have exactly one resolvable edit for this to test the \
+             apply-edit path, not an empty-edits no-op"
+        );
+
+        let mut doc_state = DocumentState::new_from_parse_result(
+            EcosystemId::GitlabCi,
+            content.to_string(),
+            parse_result,
+        );
+        doc_state.set_version(Some(1));
+        doc_state.set_loaded();
+        backend.state.update_document(uri.clone(), doc_state);
+
+        // This test `Backend` is never `initialize`d, so `apply_edit` returns `Err`
+        // (documented `apply_edit` behavior) — exercises the same not-a-panic
+        // apply-failure path the GitHub Actions equivalent covers, proving the command
+        // reaches (and survives) the apply step for a non-GitHub-Actions ecosystem too.
+        let result = backend
+            .execute_command(ExecuteCommandParams {
+                command: commands::PIN_ALL_TO_SHA.to_string(),
+                arguments: vec![serde_json::json!({ "uri": uri.as_str() })],
+                work_done_progress_params: Default::default(),
+            })
+            .await;
+        assert!(result.is_ok());
     }
 }
