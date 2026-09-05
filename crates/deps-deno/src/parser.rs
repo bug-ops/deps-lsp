@@ -1,16 +1,22 @@
 //! `deno.json` / `deno.jsonc` parser using `jsonc-parser`'s AST (D6).
 //!
 //! Plain JSON is a strict subset of JSONC, so both `deno.json` and `deno.jsonc` share this
-//! single code path. The AST (rather than `deps-npm`'s `serde_json` + text-search pattern)
-//! is required because Deno import maps routinely point several aliases at the identical
-//! specifier value — a find-first-occurrence text search would hand every such alias the
-//! same source position, corrupting hover/inlay-hint/code-action targeting.
+//! single code path. Reading positions straight off the AST (rather than a text search) is
+//! required here specifically because Deno import maps routinely point several aliases at the
+//! identical specifier value — a find-first-occurrence text search would hand every such alias
+//! the same source position, corrupting hover/inlay-hint/code-action targeting. `deps-npm` and
+//! `deps-composer` since #613 also read positions off this same `jsonc-parser` AST (via
+//! `deps_core::json_ast`), for the equally AST-shaped duplicate-key and nested-value bugs their
+//! own manifests can hit — this module's `find_last_prop` reuse of that shared helper is the
+//! overlap between the two designs; the value-oriented parsing below (specifier scheme
+//! detection, escape guards) is Deno-specific and has no equivalent there.
 
 use crate::specifier::parse_specifier;
 use crate::types::{DenoDependency, DenoDependencySection};
+use deps_core::json_ast::find_last_prop;
 use deps_core::lsp_helpers::LineOffsetTable;
 use deps_core::{DepsError, PackageName, Result, VersionReq};
-use jsonc_parser::ast::{Object, ObjectProp, StringLit, Value};
+use jsonc_parser::ast::{Object, StringLit, Value};
 use jsonc_parser::{CollectOptions, ParseOptions, parse_to_ast};
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -84,18 +90,6 @@ pub fn parse_deno_json(content: &str, uri: &Uri) -> Result<DenoParseResult> {
         dependencies,
         uri: uri.clone(),
     })
-}
-
-/// Finds the property named `key` in `object`, taking the *last* one if `key` occurs more
-/// than once — JSON's last-key-wins semantics (spec §6), which `jsonc-parser`'s
-/// `Vec<ObjectProp>` does not enforce on its own (unlike `serde_json::Map`, which dedupes
-/// during parsing).
-fn find_last_prop<'a, 'b>(object: &'a Object<'b>, key: &str) -> Option<&'a ObjectProp<'b>> {
-    object
-        .properties
-        .iter()
-        .rev()
-        .find(|prop| prop.name.as_str() == key)
 }
 
 /// Builds a [`DenoDependency`] for every entry in the `imports` object, applying

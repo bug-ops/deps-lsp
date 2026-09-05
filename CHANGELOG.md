@@ -38,6 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: `read_lockfile_content` now bounds the read via `fs_probe::read_to_string_capped` (new 32 MiB `MAX_LOCKFILE_BYTES` cap), off the tokio worker thread via `spawn_blocking`, instead of reading a discovered lock file with no size gate at all (resolves #607) (#615)
 - **deps-core**: `locate_lockfile_for_manifest` now gates each candidate on `fs_probe::is_file` instead of `Path::exists`, so a non-regular file (FIFO, socket, directory) at a lock file's conventional name is no longer treated as found (resolves #607) (#615)
 - **deps-gradle**: `load_gradle_properties`'s ancestor walk is now bounded by a 64-directory depth cap and each `gradle.properties` read via `fs_probe::read_to_string_capped` (8 MiB cap), instead of an unbounded walk to the filesystem root with an unbounded read (resolves #608) (#615)
+- **deps-npm, deps-composer, deps-core**: dependency name/version positions are now read directly from a `jsonc-parser` AST (new `deps_core::json_ast` module) instead of substring-scanning manifest text, fixing a nested-object value that shares a dependency's name and a duplicate top-level section key (`require`/`require-dev`, `dependencies`/`devDependencies`) resolving to the wrong or a default `(0,0)` position — also widens hover/diagnostics/inlay-hints/code-actions to dependencies whose key needed a JSON escape, previously left without any position at all; also resolves the O(deps × section length) quadratic scan #609/#612 introduced (resolves #613, #614) (#617)
+
+### Removed
+- **Breaking (pre-1.0, public API)**: **deps-core**: removed `find_json_section_byte_range` from `parser`'s public API, superseded by the AST-based `deps_core::json_ast` module (#613) (#617)
 
 ### Changed
 - **deps-lsp**: the #590 watched-config-file reparse path now also sends `workspace/diagnostic/refresh` (previously only inlay-hint/code-lens refresh), matching #592's config-change reparse — a deliberate improvement, not a side effect (resolves #592) (#600)

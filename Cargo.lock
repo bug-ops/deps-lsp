@@ -488,6 +488,7 @@ dependencies = [
  "dashmap",
  "futures",
  "insta",
+ "jsonc-parser",
  "mockito",
  "reqwest",
  "semver",

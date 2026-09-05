@@ -19,6 +19,7 @@ pub mod error;
 pub mod freshness;
 pub mod fs_probe;
 pub mod github;
+pub mod json_ast;
 pub mod lockfile;
 pub mod lsp_helpers;
 pub mod macros;
@@ -43,6 +44,7 @@ pub use error::{DepsError, FetchFailure, Result};
 pub use freshness::{
     DEFAULT_COOLDOWN_SECS, FreshnessSettings, PublishTime, format_relative_age, is_within_cooldown,
 };
+pub use json_ast::{JsonAst, JsonSection, find_last_prop};
 pub use lockfile::{
     LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource, read_lockfile_content,
 };
@@ -63,8 +65,7 @@ pub use package::{ConcreteVersion, InvalidPackageName, PackageName, VersionReq};
 pub use parser::{
     DependencySource, LoadingState, MAX_JSON_NESTING_DEPTH, MAX_TOML_NESTING_DEPTH,
     MAX_YAML_EXPANDED_BYTES, MAX_YAML_NESTING_DEPTH, check_json_nesting_depth,
-    check_toml_nesting_depth, check_yaml_expansion, check_yaml_nesting_depth,
-    find_json_section_byte_range, parse_json_checked,
+    check_toml_nesting_depth, check_yaml_expansion, check_yaml_nesting_depth, parse_json_checked,
 };
 pub use registry::{
     Deprecation, Metadata, Registry, RemovalStatus, Version, find_latest_stable,

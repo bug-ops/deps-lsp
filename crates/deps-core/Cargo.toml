@@ -34,6 +34,7 @@ test-util = ["dep:tracing-subscriber"]
 bytes = { workspace = true }
 dashmap = { workspace = true }
 futures = { workspace = true }
+jsonc-parser = { workspace = true }
 reqwest = { workspace = true, features = ["json", "gzip"] }
 semver = { workspace = true }
 serde = { workspace = true }
