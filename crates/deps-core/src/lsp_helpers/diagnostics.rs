@@ -100,18 +100,18 @@ pub struct DiagnosticSeverities {
     /// Severity for a dependency on a package the registry reports as
     /// deprecated/abandoned (issue #205).
     pub deprecated: DiagnosticSeverity,
-    /// Severity for a GitHub Actions `uses:` step pinned to a mutable ref (a tag)
-    /// instead of a full commit SHA (issue #473). Unused by every ecosystem except
-    /// `deps-github-actions` today — see that crate's
+    /// Severity for a dependency pinned to a mutable ref (a tag or branch) instead of a
+    /// full commit SHA (issue #473, extended to GitLab CI by issue #634). Unused except by
+    /// `deps-github-actions` and `deps-gitlab-ci` today — see each crate's own
     /// `MUTABLE_REF_PIN_DIAGNOSTIC_CODE` for the diagnostic this severity gates.
     /// Tunes loudness only; see [`Self::mutable_ref_pin_enabled`] for the on/off
     /// toggle.
     pub mutable_ref_pin: DiagnosticSeverity,
-    /// Whether the mutable-ref-pin diagnostic (issue #473) runs at all, unused by
-    /// every ecosystem except `deps-github-actions`. Unlike every other field in
-    /// this struct, `mutable_ref_pin` alone cannot silence the diagnostic —
-    /// `DiagnosticSeverity` has no suppression value, and severity is never treated
-    /// as a suppression input anywhere in this codebase — so this diagnostic
+    /// Whether the mutable-ref-pin diagnostic (issue #473, extended to GitLab CI by issue
+    /// #634) runs at all, unused except by `deps-github-actions` and `deps-gitlab-ci`.
+    /// Unlike every other field in this struct, `mutable_ref_pin` alone cannot silence the
+    /// diagnostic — `DiagnosticSeverity` has no suppression value, and severity is never
+    /// treated as a suppression input anywhere in this codebase — so this diagnostic
     /// additionally needs a real presence toggle, mirroring
     /// `deps_lsp::config::DiagnosticsConfig::vulnerabilities_enabled`'s shape.
     pub mutable_ref_pin_enabled: bool,

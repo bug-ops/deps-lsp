@@ -63,11 +63,18 @@ impl RateLimitGate {
     }
 }
 
-/// Per-`PackageName` tag/release-name -> commit-SHA cross-reference.
+/// Per-`(endpoint, name)` tag/release-name -> commit-SHA cross-reference.
 ///
 /// Mirrors `deps_github_actions::registry::TagIndex` in shape — lets a SHA pin render a
-/// readable `**Resolved**` hover line. Populated from whichever endpoint the route used: tag
+/// readable `**Resolved**` hover line, and lets a `PinStyle::Tag` pin render a "Pin to
+/// commit SHA" quickfix (issue #634). Populated from whichever endpoint the route used: tag
 /// names for `project:`, release names for `component:`.
+///
+/// Keyed by `(EndpointKind, PackageName)`, not `PackageName` alone (validation finding S2,
+/// see [`crate::types::IncludeKind::endpoint`]'s doc): a `component:`'s host-qualified name
+/// can textually collide with an unrelated `project:` include's own name, and a
+/// `PackageName`-only key would let the two share one entry — resolving a quickfix's SHA
+/// from the wrong repository.
 #[derive(Debug, Default)]
 pub struct TagIndex {
     pub tag_to_sha: std::collections::HashMap<String, String>,
@@ -77,7 +84,7 @@ pub struct TagIndex {
 /// Maximum number of [`GitlabCiRegistry::tag_index`] entries.
 const MAX_TAG_INDEX_ENTRIES: usize = 256;
 
-fn evict_if_full<V>(map: &DashMap<PackageName, V>, max_entries: usize) {
+fn evict_if_full<K: std::hash::Hash + Eq + Clone, V>(map: &DashMap<K, V>, max_entries: usize) {
     if map.len() < max_entries {
         return;
     }
@@ -87,26 +94,42 @@ fn evict_if_full<V>(map: &DashMap<PackageName, V>, max_entries: usize) {
     }
 }
 
-fn populate_tag_index(
-    index: &DashMap<PackageName, Arc<TagIndex>>,
-    name: &PackageName,
-    versions: &[GitlabCiVersion],
+/// Populates one `TagIndex` entry from raw `(name, sha)` pairs — independent of whatever
+/// semver filter the caller's own version-list conversion (`tags_to_versions`) applies.
+///
+/// A non-semver-shaped tag (e.g. a literal tool-name tag like `cargo-deny`, or a bare-major
+/// moving tag) would otherwise never reach a `TagIndex` entry for a `project:` include,
+/// since `tags_to_versions` silently drops anything that doesn't parse as a full
+/// `major.minor.patch` semver — making the registry-confirmed-`PinStyle::Branch` diagnostic
+/// path (issue #551's discipline) and any future SHA-pin quickfix widening unreachable in
+/// production for such a tag (validation finding C1). Mirrors
+/// `deps_github_actions::registry::GithubActionsRegistry::populate_tag_index`'s identical
+/// "index straight from the raw response" fix for the same class of bug. Still gated on
+/// [`deps_core::lsp_helpers::is_full_sha`] (security S-3): the SHA is later spliced
+/// verbatim into a manifest text edit and a hover string.
+pub(crate) fn populate_tag_index_entries<'a>(
+    index: &DashMap<(EndpointKind, PackageName), Arc<TagIndex>>,
+    key: (EndpointKind, PackageName),
+    entries: impl Iterator<Item = (&'a str, &'a str)>,
 ) {
     let mut built = TagIndex::default();
-    for v in versions {
+    for (name, sha) in entries {
+        if !deps_core::lsp_helpers::is_full_sha(sha) {
+            continue;
+        }
         built
             .sha_to_tag
-            .entry(v.sha.clone())
-            .or_insert_with(|| v.version.as_str().to_string());
+            .entry(sha.to_string())
+            .or_insert_with(|| name.to_string());
         built
             .tag_to_sha
-            .entry(v.version.as_str().to_string())
-            .or_insert_with(|| v.sha.clone());
+            .entry(name.to_string())
+            .or_insert_with(|| sha.to_string());
     }
-    if !index.contains_key(name) {
+    if !index.contains_key(&key) {
         evict_if_full(index, MAX_TAG_INDEX_ENTRIES);
     }
-    index.insert(name.clone(), Arc::new(built));
+    index.insert(key, Arc::new(built));
 }
 
 /// Converts a fetched tags page into a newest-first, semver-filtered version list.
@@ -205,7 +228,7 @@ pub struct GitlabCiRegistry {
     client: Arc<GitlabApiClient>,
     routes: Arc<DashMap<String, GitlabRoute>>,
     rate_limits: Arc<DashMap<String, Arc<RateLimitGate>>>,
-    tag_index: Arc<DashMap<PackageName, Arc<TagIndex>>>,
+    tag_index: Arc<DashMap<(EndpointKind, PackageName), Arc<TagIndex>>>,
 }
 
 impl GitlabCiRegistry {
@@ -222,7 +245,7 @@ impl GitlabCiRegistry {
 
     /// Shares this registry's [`TagIndex`] map with [`crate::formatter::GitlabCiFormatter`].
     #[must_use]
-    pub fn tag_index(&self) -> Arc<DashMap<PackageName, Arc<TagIndex>>> {
+    pub fn tag_index(&self) -> Arc<DashMap<(EndpointKind, PackageName), Arc<TagIndex>>> {
         Arc::clone(&self.tag_index)
     }
 
@@ -349,6 +372,14 @@ impl GitlabCiRegistry {
                 )
                 .await
                 .map_err(|e| self.map_error(&route.origin, name.as_str(), e))?;
+                // C1 (validation finding): index straight from the raw, unfiltered `tags`
+                // response, not `tags_to_versions`' semver-filtered output — see
+                // `populate_tag_index_entries`'s doc.
+                populate_tag_index_entries(
+                    &self.tag_index,
+                    (EndpointKind::Tags, name.clone()),
+                    tags.iter().map(|t| (t.name.as_str(), t.commit.id.as_str())),
+                );
                 tags_to_versions(tags)
             }
             EndpointKind::Releases => {
@@ -365,11 +396,20 @@ impl GitlabCiRegistry {
                 )
                 .await
                 .map_err(|e| self.map_error(&route.origin, name.as_str(), e))?;
+                // `releases_to_versions` never drops an entry on shape grounds (unlike
+                // `tags_to_versions`), so this is not affected by C1 — kept symmetric with
+                // the Tags arm anyway, and keyed by `EndpointKind::Releases` (S2 fix).
+                populate_tag_index_entries(
+                    &self.tag_index,
+                    (EndpointKind::Releases, name.clone()),
+                    releases
+                        .iter()
+                        .map(|r| (r.tag_name.as_str(), r.commit.id.as_str())),
+                );
                 releases_to_versions(releases)
             }
         };
 
-        populate_tag_index(&self.tag_index, name, &versions);
         Ok(versions)
     }
 
@@ -722,6 +762,115 @@ mod tests {
         assert_eq!(versions.len(), 1);
         tags_mock.assert_async().await;
         releases_mock.assert_async().await;
+    }
+
+    // --- validation finding C1: TagIndex must not lose a non-semver-shaped tag ---
+
+    /// A literal tool-name tag (e.g. `cargo-deny`, the same shape issue #551's own example
+    /// uses) fails `tags_to_versions`' full-semver filter and so never appears in the
+    /// version list `fetch_route` returns — but it must still reach a `TagIndex` entry,
+    /// since that's the only way the registry-confirmed-`PinStyle::Branch` diagnostic path
+    /// (and any future SHA-pin quickfix widening) can ever fire for a `project:` include
+    /// pinned to such a tag. Regression for the bug `populate_tag_index_entries` fixes: the
+    /// previous `populate_tag_index` was fed `tags_to_versions`' already-filtered output,
+    /// making this path unreachable in production.
+    #[tokio::test]
+    async fn test_fetch_route_tags_indexes_non_semver_tag_for_registry_confirmation() {
+        let mut server = mockito::Server::new_async().await;
+        let sha = "a".repeat(40);
+        let _tags_mock = server
+            .mock("GET", "/api/v4/projects/org%2Fproj/repository/tags")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(format!(
+                r#"[{{"name":"cargo-deny","commit":{{"id":"{sha}"}}}}]"#
+            ))
+            .create_async()
+            .await;
+
+        let registry = GitlabCiRegistry::new(test_client());
+        let host_bare = server.url();
+        let gitlab_route = route(&host_bare, EndpointKind::Tags);
+        let name = PackageName::new(format!("{host_bare}/org/proj"));
+
+        let versions = registry.fetch_route(&name, &gitlab_route).await.unwrap();
+        assert!(
+            versions.is_empty(),
+            "a non-semver tag must not appear in the outdated-diagnostic version list"
+        );
+
+        let index = registry
+            .tag_index
+            .get(&(EndpointKind::Tags, name))
+            .expect("expected a TagIndex entry despite the tag failing the semver filter");
+        assert_eq!(index.tag_to_sha.get("cargo-deny"), Some(&sha));
+    }
+
+    // --- validation finding S2: TagIndex must not collide across (endpoint, name) ---
+
+    /// A `project:` include and a `component:` include can produce the identical
+    /// host-qualified `PackageName` text for two entirely unrelated GitLab resources (a
+    /// project literally named `org/proj/comp`, versus a component named `comp` inside
+    /// project `org/proj`) — spec §3.1's documented residual collision covers only the
+    /// same-project case, not this cross-resource one. Without `EndpointKind` in the
+    /// `TagIndex` key, whichever fetch ran last would silently overwrite the other's entry,
+    /// letting a quickfix resolve a SHA from the wrong repository. Regression for the fix:
+    /// both routes populate distinct entries for the same `PackageName`.
+    #[tokio::test]
+    async fn test_tag_index_keyed_by_endpoint_no_cross_kind_collision() {
+        let mut server = mockito::Server::new_async().await;
+        let project_sha = "a".repeat(40);
+        let component_sha = "b".repeat(40);
+        let _tags_mock = server
+            .mock("GET", "/api/v4/projects/org%2Fproj%2Fcomp/repository/tags")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(format!(
+                r#"[{{"name":"v1.0.0","commit":{{"id":"{project_sha}"}}}}]"#
+            ))
+            .create_async()
+            .await;
+        let _releases_mock = server
+            .mock("GET", "/api/v4/projects/org%2Fproj/releases")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(format!(
+                r#"[{{"tag_name":"v1.0.0","commit":{{"id":"{component_sha}"}}}}]"#
+            ))
+            .create_async()
+            .await;
+
+        let registry = GitlabCiRegistry::new(test_client());
+        let host_bare = server.url();
+        // Same `PackageName` text for both: a `project:` include for repo `org/proj/comp`,
+        // and a `component:` include naming component `comp` inside project `org/proj`.
+        let name = PackageName::new(format!("{host_bare}/org/proj/comp"));
+
+        let project_versions = registry
+            .fetch_route(&name, &route(&host_bare, EndpointKind::Tags))
+            .await
+            .unwrap();
+        let component_versions = registry
+            .fetch_route(&name, &route(&host_bare, EndpointKind::Releases))
+            .await
+            .unwrap();
+
+        assert_eq!(project_versions[0].sha, project_sha);
+        assert_eq!(component_versions[0].sha, component_sha);
+
+        let project_index = registry
+            .tag_index
+            .get(&(EndpointKind::Tags, name.clone()))
+            .expect("expected a Tags-endpoint TagIndex entry");
+        let component_index = registry
+            .tag_index
+            .get(&(EndpointKind::Releases, name))
+            .expect("expected a Releases-endpoint TagIndex entry");
+        assert_eq!(project_index.tag_to_sha.get("v1.0.0"), Some(&project_sha));
+        assert_eq!(
+            component_index.tag_to_sha.get("v1.0.0"),
+            Some(&component_sha)
+        );
     }
 
     // --- resolve_component_pin: H1 (#466 review) — FR-007 wired to a real caller ---
