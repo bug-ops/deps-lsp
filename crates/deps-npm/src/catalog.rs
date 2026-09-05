@@ -478,7 +478,7 @@ fn find_workspace_file(manifest_dir: &Path) -> Option<PathBuf> {
     let mut current = Some(manifest_dir);
     let mut depth = 0usize;
     while let Some(dir) = current {
-        if depth >= crate::config::MAX_CONFIG_ANCESTOR_DEPTH {
+        if depth >= deps_core::fs_probe::MAX_CONFIG_ANCESTOR_DEPTH {
             break;
         }
         depth += 1;

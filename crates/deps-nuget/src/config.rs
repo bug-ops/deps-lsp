@@ -47,6 +47,7 @@ use std::sync::atomic::AtomicBool;
 
 use base64::Engine;
 use deps_core::PackageName;
+use deps_core::fs_probe::MAX_CONFIG_ANCESTOR_DEPTH;
 use deps_core::net_policy::{
     IndexUrlError, PolicyGate, RegistryAccessPolicy, redact_userinfo, validate_index_url,
 };
@@ -54,10 +55,6 @@ use deps_core::parser::DependencySource;
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use zeroize::Zeroizing;
-
-/// Upper bound on the in-repo `NuGet.Config` ancestor walk, matching `deps-npm`'s/
-/// `deps-cargo`'s identical `MAX_CONFIG_ANCESTOR_DEPTH`.
-const MAX_CONFIG_ANCESTOR_DEPTH: usize = 64;
 
 /// Candidate filenames checked per directory, in order — real NuGet is case-insensitive on
 /// Linux/macOS and all three spellings occur in the wild. `is_file()` stats, not `read_dir`.
