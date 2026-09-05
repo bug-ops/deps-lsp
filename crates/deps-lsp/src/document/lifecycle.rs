@@ -1959,6 +1959,7 @@ async fn run_document_open_background_task(
         freshness_settings,
         diagnostic_severities,
         offline,
+        diagnostics::loading_ceiling(cache_config.fetch_timeout_secs),
     )
     .await;
 
@@ -2377,6 +2378,7 @@ async fn run_document_change_task(
             config.freshness,
             config.diagnostic_severities,
             config.offline,
+            config.cache.fetch_timeout_secs,
         )
         .await;
         return;
@@ -2465,6 +2467,7 @@ async fn run_document_change_task(
         config.freshness,
         config.diagnostic_severities,
         config.offline,
+        config.cache.fetch_timeout_secs,
     )
     .await;
 }
@@ -2512,6 +2515,7 @@ async fn generate_and_publish_diagnostics(
     freshness_settings: deps_core::FreshnessSettings,
     diagnostic_severities: deps_core::DiagnosticSeverities,
     offline: bool,
+    fetch_timeout_secs: u64,
 ) {
     let diags = diagnostics::generate_diagnostics_internal(
         Arc::clone(state),
@@ -2519,6 +2523,7 @@ async fn generate_and_publish_diagnostics(
         freshness_settings,
         diagnostic_severities,
         offline,
+        diagnostics::loading_ceiling(fetch_timeout_secs),
     )
     .await;
     client.publish_diagnostics(uri.clone(), diags, None).await;
@@ -3119,6 +3124,9 @@ mod tests {
                 deps_core::FreshnessSettings::default(),
                 deps_core::DiagnosticSeverities::default(),
                 false,
+                diagnostics::loading_ceiling(
+                    crate::config::CacheConfig::default().fetch_timeout_secs,
+                ),
             )
             .await;
 
@@ -3211,6 +3219,9 @@ mod tests {
                 deps_core::FreshnessSettings::default(),
                 deps_core::DiagnosticSeverities::default(),
                 false,
+                diagnostics::loading_ceiling(
+                    crate::config::CacheConfig::default().fetch_timeout_secs,
+                ),
             )
             .await;
 

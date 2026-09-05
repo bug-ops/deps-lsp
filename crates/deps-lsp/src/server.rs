@@ -253,12 +253,13 @@ impl Backend {
         // `handle_diagnostics` (which re-reads `self.config` per URI) would hold this
         // guard across a nested read of the same write-preferring `RwLock` — a writer
         // queued in between would then block that nested read forever.
-        let (freshness, severities, offline) = {
+        let (freshness, severities, offline, loading_ceiling) = {
             let config = self.config.read().await;
             (
                 config.freshness.to_settings(),
                 config.diagnostics.to_severities(),
                 config.network.offline,
+                diagnostics::loading_ceiling(config.cache.fetch_timeout_secs),
             )
         };
 
@@ -273,6 +274,7 @@ impl Backend {
                 freshness,
                 severities,
                 offline,
+                loading_ceiling,
             )
             .await;
 

@@ -4,9 +4,38 @@ use crate::config::{DepsConfig, DiagnosticsConfig};
 use crate::document::{ServerState, ensure_document_loaded};
 use deps_core::VersionData;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 use tower_lsp_server::Client;
 use tower_lsp_server::ls_types::{Diagnostic, Uri};
+
+/// How many multiples of `cache.fetch_timeout_secs` a document may stay in
+/// [`deps_core::LoadingState::Loading`] before diagnostics generation gives up waiting
+/// and forces it to `Failed`, falling through to whatever cache is already available
+/// (issue #632).
+///
+/// This alone under-estimates the legitimate (non-stuck) worst case for a large
+/// manifest (issue #632 critic S1): a single package fetch can take up to roughly
+/// `2 * fetch_timeout_secs` (the primary registry call plus its own timeout-bounded
+/// `get_latest_matching_from` fallback — see `document::lifecycle::fetch_and_classify_package`),
+/// run `cache.max_concurrent_fetches`-wide via `buffer_unordered` — so `N` dependencies
+/// take roughly `ceil(N / C) * 2T` even when nothing is wrong. With the defaults
+/// (T=10s, C=20), a 60-dependency manifest alone already reaches ~60s. Combined with
+/// [`MIN_LOADING_CEILING`], the effective ceiling is `max(3T, 120s)` — generous-but-bounded
+/// headroom, not a precise duration model: this exists to recover from a background task
+/// that never reaches `set_loaded`/`set_failed` (a hang the per-package timeout alone
+/// doesn't cover, e.g. a `DashMap` deadlock), not to model the exact fetch duration.
+pub(crate) const LOADING_CEILING_MULTIPLIER: u32 = 3;
+
+/// Floor under the [`LOADING_CEILING_MULTIPLIER`]-scaled ceiling (issue #632 critic S1):
+/// keeps a small `fetch_timeout_secs` from producing an unrealistically tight ceiling.
+pub(crate) const MIN_LOADING_CEILING: Duration = Duration::from_secs(120);
+
+/// Computes the loading ceiling from the configured per-package fetch timeout. See
+/// [`LOADING_CEILING_MULTIPLIER`] and [`MIN_LOADING_CEILING`].
+pub(crate) fn loading_ceiling(fetch_timeout_secs: u64) -> Duration {
+    (Duration::from_secs(fetch_timeout_secs) * LOADING_CEILING_MULTIPLIER).max(MIN_LOADING_CEILING)
+}
 
 /// Handles diagnostic requests using trait-based delegation.
 pub async fn handle_diagnostics(
@@ -23,16 +52,17 @@ pub async fn handle_diagnostics(
     }
 
     // Snapshot before generating diagnostics (Copy value, no lock held across the call)
-    let (freshness, offline) = {
+    let (freshness, offline, ceiling) = {
         let full_config = full_config.read().await;
         (
             full_config.freshness.to_settings(),
             full_config.network.offline,
+            loading_ceiling(full_config.cache.fetch_timeout_secs),
         )
     };
     let severities = config.to_severities();
 
-    generate_diagnostics_internal(state, uri, freshness, severities, offline).await
+    generate_diagnostics_internal(state, uri, freshness, severities, offline, ceiling).await
 }
 
 /// Internal diagnostic generation without cold start support.
@@ -44,7 +74,37 @@ pub(crate) async fn generate_diagnostics_internal(
     freshness: deps_core::FreshnessSettings,
     severities: deps_core::DiagnosticSeverities,
     offline: bool,
+    loading_ceiling: Duration,
 ) -> Vec<Diagnostic> {
+    // Skip diagnostics while versions are still loading to avoid false "Unknown package"
+    // warnings from empty cache — but only up to `loading_ceiling` (issue #632): if the
+    // background fetch task panicked or otherwise never reached `set_loaded`/`set_failed`,
+    // `loading_state` would otherwise stay `Loading` forever and permanently suppress
+    // diagnostics for this document. Past the ceiling, force the document to `Failed`
+    // *before* the extraction below (critic M1/S2) — a bare read-only fallthrough would
+    // leave `loading_state` stuck (re-warning on every request, and leaving inlay
+    // hints/`is_ready_for_batch_update` believing the document is still loading) and would
+    // leave `outcomes` empty, misrendering every unresolved dependency as "Unknown
+    // package" instead of "lookup could not be determined". `unwrap_or(Duration::MAX)`
+    // (critic M2) treats a `Loading` document with no recorded start time — a state the
+    // public API can't actually reach, but the fields are both `pub` — as already past the
+    // ceiling rather than never.
+    let past_ceiling = state
+        .with_document(uri, |doc| {
+            doc.loading_state == deps_core::LoadingState::Loading
+                && doc.loading_duration().unwrap_or(Duration::MAX) >= loading_ceiling
+        })
+        .unwrap_or(false);
+    if past_ceiling {
+        tracing::warn!(
+            "Loading exceeded ceiling ({:?}) for {:?}; forcing Failed and falling through \
+             to diagnostics with available cache",
+            loading_ceiling,
+            uri
+        );
+        state.force_document_failed_with_not_attempted(uri);
+    }
+
     // Own everything `generate_diagnostics` needs and release the DashMap shard `Ref`
     // before awaiting it (#333): `with_document` only ever hands `extract` a borrowed
     // `&DocumentState` synchronously, so the guard can't leak across the `.await` below.
@@ -57,9 +117,8 @@ pub(crate) async fn generate_diagnostics_internal(
             return None;
         };
 
-        // Skip diagnostics while versions are still loading to avoid
-        // false "Unknown package" warnings from empty cache
-        // TODO(critic): bound this skip by loading_started_at.elapsed() — see #592 residual
+        // The ceiling check above already forced a stuck document out of `Loading`, so
+        // this only ever suppresses a document that is genuinely, recently loading.
         if doc.loading_state == deps_core::LoadingState::Loading {
             return None;
         }
@@ -116,6 +175,16 @@ mod tests {
     use deps_core::EcosystemId;
 
     // Generic tests (no feature flag required)
+
+    #[test]
+    fn test_loading_ceiling_scales_with_fetch_timeout() {
+        // Critic S1: the default `fetch_timeout_secs` (10s) scales to 30s, well under
+        // `MIN_LOADING_CEILING` — the floor must win.
+        assert_eq!(loading_ceiling(10), Duration::from_secs(120));
+        assert_eq!(loading_ceiling(1), Duration::from_secs(120));
+        // A large `fetch_timeout_secs` scales past the floor.
+        assert_eq!(loading_ceiling(50), Duration::from_secs(150));
+    }
 
     #[tokio::test]
     async fn test_handle_diagnostics_missing_document() {
@@ -441,6 +510,161 @@ serde = "1.0.0"
             let (client, full_config) = create_test_client_and_config();
             let result = handle_diagnostics(state, &uri, &config, client, full_config).await;
             assert!(result.is_empty());
+        }
+
+        /// Issue #632: a document stuck in `Loading` past `loading_ceiling` must fall
+        /// through to diagnostics generated from whatever cache is already available,
+        /// instead of returning nothing forever (e.g. a background fetch task that
+        /// panicked without reaching `set_loaded`/`set_failed`).
+        #[tokio::test]
+        async fn test_generate_diagnostics_internal_falls_through_after_loading_ceiling_exceeded() {
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+
+            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let content = "[dependencies]\nserde = \"1.0.0\"\n".to_string();
+            let parse_result = ecosystem
+                .parse_manifest(&content, &uri)
+                .await
+                .expect("Failed to parse manifest");
+
+            let mut doc_state =
+                DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+            let mut cached = std::collections::HashMap::new();
+            cached.insert(
+                "serde".into(),
+                deps_core::PackageVersions {
+                    latest: "2.0.0".into(),
+                    available: std::sync::Arc::from(vec!["2.0.0".into(), "1.0.0".into()]),
+                    yanked: std::sync::Arc::from(Vec::new()),
+                    published_at: None,
+                },
+            );
+            doc_state.update_cached_versions(cached);
+            doc_state.set_loading();
+            state.update_document(uri.clone(), doc_state);
+
+            // Let real elapsed time exceed a deliberately tiny ceiling.
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+            let result = generate_diagnostics_internal(
+                Arc::clone(&state),
+                &uri,
+                deps_core::FreshnessSettings::default(),
+                deps_core::DiagnosticSeverities::default(),
+                false,
+                std::time::Duration::from_millis(1),
+            )
+            .await;
+
+            assert_eq!(
+                result.len(),
+                1,
+                "expected the outdated diagnostic to render from cache once the loading \
+                 ceiling is exceeded, got: {result:?}"
+            );
+
+            // Critic M1: the fallthrough must repair `loading_state`, not just read past
+            // it — otherwise inlay hints/code lens keep believing the document is still
+            // loading, and this same warning would refire on every subsequent request.
+            let doc = state.get_document(&uri).unwrap();
+            assert_eq!(doc.loading_state, deps_core::LoadingState::Failed);
+        }
+
+        /// Issue #632 critic S2: forcing a stuck-`Loading` document to `Failed` must seed
+        /// a `NotAttempted` fetch-failure finding for every dependency with neither a
+        /// cached nor a lockfile-resolved version — otherwise the unknown-package rule
+        /// renders it as "Unknown package" (a registry lookup that never happened looks
+        /// identical to one that came back empty), turning a silently suppressed
+        /// diagnostic into a misleading one.
+        #[tokio::test]
+        async fn test_generate_diagnostics_internal_ceiling_exceeded_seeds_not_attempted_instead_of_unknown_package()
+         {
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+
+            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            // No cached_versions/resolved_versions seeded for "serde" at all — the exact
+            // "never actually fetched" shape S2 covers.
+            let content = "[dependencies]\nserde = \"1.0.0\"\n".to_string();
+            let parse_result = ecosystem
+                .parse_manifest(&content, &uri)
+                .await
+                .expect("Failed to parse manifest");
+
+            let mut doc_state =
+                DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+            doc_state.set_loading();
+            state.update_document(uri.clone(), doc_state);
+
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+            let result = generate_diagnostics_internal(
+                Arc::clone(&state),
+                &uri,
+                deps_core::FreshnessSettings::default(),
+                deps_core::DiagnosticSeverities::default(),
+                false,
+                std::time::Duration::from_millis(1),
+            )
+            .await;
+
+            assert_eq!(
+                result.len(),
+                1,
+                "expected exactly one diagnostic, got: {result:?}"
+            );
+            assert!(
+                result[0].message.contains("could not be determined"),
+                "expected the 'lookup could not be determined' message, got: {:?}",
+                result[0].message
+            );
+            assert!(
+                !result[0].message.contains("Unknown package"),
+                "a dependency that was never actually fetched must not render as 'Unknown \
+                 package', got: {:?}",
+                result[0].message
+            );
+
+            let doc = state.get_document(&uri).unwrap();
+            assert_eq!(doc.loading_state, deps_core::LoadingState::Failed);
+        }
+
+        /// Issue #632 companion: within the ceiling, the pre-existing suppression must
+        /// still apply — no diagnostics render for a document that is still legitimately
+        /// loading.
+        #[tokio::test]
+        async fn test_generate_diagnostics_internal_still_suppressed_within_loading_ceiling() {
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+
+            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let content = "[dependencies]\nserde = \"1.0.0\"\n".to_string();
+            let parse_result = ecosystem
+                .parse_manifest(&content, &uri)
+                .await
+                .expect("Failed to parse manifest");
+
+            let mut doc_state =
+                DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+            doc_state.set_loading();
+            state.update_document(uri.clone(), doc_state);
+
+            let result = generate_diagnostics_internal(
+                Arc::clone(&state),
+                &uri,
+                deps_core::FreshnessSettings::default(),
+                deps_core::DiagnosticSeverities::default(),
+                false,
+                std::time::Duration::from_secs(60),
+            )
+            .await;
+
+            assert!(
+                result.is_empty(),
+                "expected diagnostics to stay suppressed within the loading ceiling, got: \
+                 {result:?}"
+            );
         }
 
         /// End-to-end coverage for issue #206's unsatisfiable-requirement diagnostic,
