@@ -300,72 +300,25 @@ impl Backend {
     /// [`deps_core::lockfile::LockFileProvider::locate_lockfile`] is for lock files, and
     /// re-parsing an already-open document is cheap.
     ///
-    /// Each reparse is version-guarded ([`handle_document_change_guarded`]'s
-    /// `expected_version`): the content/version pair is snapshotted once, up front, but the
-    /// actual reparse for a given document is awaited one at a time — a concurrent
-    /// `did_change` for that same document can land and commit newer content while an earlier
-    /// document's reparse in this loop is still in flight. Without the guard, this call's
-    /// (now-stale) commit would silently overwrite that newer edit (impl-critic S1).
-    async fn handle_watched_config_change(&self, ecosystem_id: &str) {
-        let affected: Vec<(Uri, String, Option<i32>)> = self
-            .state
-            .documents
-            .iter()
-            .filter(|entry| entry.value().ecosystem_id() == ecosystem_id)
-            .map(|entry| {
-                (
-                    entry.key().clone(),
-                    entry.value().content.clone(),
-                    entry.value().version,
-                )
-            })
-            .collect();
-
-        if affected.is_empty() {
-            tracing::debug!(
-                "No open {} documents affected by watched config file change",
-                ecosystem_id
-            );
-            return;
-        }
-
-        tracing::info!(
-            "Reparsing {} document(s) affected by watched config file change",
-            affected.len()
-        );
-
-        for (uri, content, version) in affected {
-            match crate::document::handle_document_change_guarded(
-                uri.clone(),
-                content,
-                version,
-                crate::document::CommitGuard::ExpectVersion(version),
-                Arc::clone(&self.state),
-                self.client.clone(),
-                Arc::clone(&self.config),
-            )
-            .await
-            {
-                Ok(Some(task)) => self.state.spawn_background_task(uri, task).await,
-                // A skip (superseded by a concurrent `did_change`) must never touch the task
-                // registry for this URI — `spawn_background_task` unconditionally aborts
-                // whatever task is already registered there, which would cancel the
-                // concurrent edit's own, already-installed background task (impl-critic S3).
-                Ok(None) => tracing::debug!(
-                    "skipped stale reparse for {:?}: superseded by a concurrent edit",
-                    uri
-                ),
-                Err(e) => tracing::error!(
-                    "failed to reparse {:?} after watched config file change: {}",
-                    uri,
-                    e
-                ),
-            }
-        }
-
-        // Detached, capability-gated, timeout-bounded (issue #493): see
-        // `ServerState::spawn_refresh_requests` for rationale.
-        self.state.spawn_refresh_requests(&self.client);
+    /// A thin wrapper around [`crate::document::reparse::reparse_open_documents`] (issue
+    /// #592), the same version-guarded, sequential-await driver a live-reloaded
+    /// `DepsConfig` setting change now also uses — awaited directly here rather than
+    /// spawned, since this is triggered by a `didChangeWatchedFiles` notification handler
+    /// that already returns promptly, unlike `did_change_configuration`'s debounced path.
+    /// `RefetchPolicy::Diff` matches this path's pre-#592 behavior exactly: only
+    /// added/version-changed dependencies are re-fetched, since a watched-config change
+    /// affects how a manifest *parses*, not the routing decisions a forced full refetch
+    /// exists to correct.
+    async fn handle_watched_config_change(&self, ecosystem_id: &'static str) {
+        crate::document::reparse::reparse_open_documents(
+            crate::config::ReparseScope::Ecosystems(vec![ecosystem_id]),
+            crate::document::RefetchPolicy::Diff,
+            "watched config file change",
+            Arc::clone(&self.state),
+            self.client.clone(),
+            Arc::clone(&self.config),
+        )
+        .await;
     }
 
     /// Check if client supports work done progress.
@@ -483,6 +436,12 @@ impl LanguageServer for Backend {
         let code_lens_refresh_supported = self.code_lens_refresh_supported().await;
         self.state
             .set_code_lens_refresh_supported(code_lens_refresh_supported);
+        // Mirrored onto `ServerState` (issue #592) so `document::reparse::reparse_open_documents`
+        // — a free function with no access to `Backend::client_capabilities` — can gate its
+        // post-reparse `workspace/diagnostic/refresh` on it.
+        let diagnostic_refresh_supported = self.diagnostic_refresh_supported().await;
+        self.state
+            .set_diagnostic_refresh_supported(diagnostic_refresh_supported);
         // Note (issue #493 M1): a client that implements refresh but never declares
         // `refreshSupport` is gated off here too, and will not see hints/lenses update
         // after a background fetch until the document is reopened.
@@ -649,6 +608,15 @@ impl LanguageServer for Backend {
     /// no-op. A payload that fails to parse (or has no keys `DepsConfig` recognizes,
     /// C2) keeps the previously stored configuration rather than silently resetting it
     /// to defaults.
+    ///
+    /// Issue #592: beyond applying the new config, a field that affects parse-time
+    /// decisions (currently `registries.workspace_registries`,
+    /// `registries.nuget_user_profile_sources`, `registries.gitlab_instance_host` — see
+    /// `config::reparse_scope`) also
+    /// re-parses every open document its `config::ReparseScope` covers, forcing a full
+    /// re-fetch (`document::RefetchPolicy::AllDependencies`) since the routing changed, not
+    /// the manifest content. A burst of config changes is coalesced into one debounced
+    /// reparse (`ServerState::queue_reparse`) rather than firing once per notification.
     async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
         if params.settings.is_null() {
             tracing::debug!(
@@ -663,15 +631,44 @@ impl LanguageServer for Backend {
         };
 
         tracing::info!("configuration updated via workspace/didChangeConfiguration");
-        self.state
-            .cache
-            .set_registry_policy(config.registries.workspace_registries.to_policy());
-        self.state.nuget_user_profile_sources.store(
-            config.registries.nuget_user_profile_sources,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+
+        // Captured before `config` is moved into the write guard below (`DepsConfig` has
+        // no `Clone`, see revision item 6): these shared-handle updates don't need to be
+        // atomic with the config swap itself (M4) — they're applied *after* `*guard =
+        // config` below, not before, but with no `.await` between the swap and this
+        // update, no other task can observe `self.config` already reflecting the new
+        // value while the policy `Arc` (the thing that actually gates a fetch) still
+        // reflects the old one.
+        let workspace_registries_policy = config.registries.workspace_registries.to_policy();
+        let nuget_user_profile_sources = config.registries.nuget_user_profile_sources;
+        let offline = config.network.offline;
+        let cache_enabled = config.cache.enabled;
+        let cold_start_rate_limit_ms = config.cold_start.rate_limit_ms;
         let gitlab_instance_host = (!config.registries.gitlab_instance_host.is_empty())
             .then(|| config.registries.gitlab_instance_host.clone());
+
+        // Diff the old vs new config for parse-affecting changes (issue #592) and swap in
+        // the new config under one write-guard acquisition — `DepsConfig` has no `Clone`,
+        // so the diff must read the not-yet-overwritten guard before `config` is moved
+        // into it.
+        let scope = {
+            let mut guard = self.config.write().await;
+            let scope = crate::config::reparse_scope(
+                &guard,
+                &config,
+                &self.state.workspace_registry_ecosystems,
+            );
+            *guard = config;
+            scope
+        };
+
+        self.state
+            .cache
+            .set_registry_policy(workspace_registries_policy);
+        self.state.nuget_user_profile_sources.store(
+            nuget_user_profile_sources,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         #[cfg(feature = "gitlab-ci")]
         if let Some(raw) = &gitlab_instance_host {
             warn_if_gitlab_instance_host_invalid(&self.client, raw, &self.state.registry_policy)
@@ -682,32 +679,74 @@ impl LanguageServer for Backend {
             .gitlab_instance_host
             .write()
             .expect("gitlab_instance_host lock poisoned") = gitlab_instance_host;
-        // Must land before `workspace_diagnostic_refresh` below, or the refresh re-renders
+        // Must land before either refresh notification below, or the refresh re-renders
         // diagnostics under the stale flag values (critic M5).
-        self.state.cache.set_offline(config.network.offline);
-        self.state.cache.set_cache_enabled(config.cache.enabled);
+        self.state.cache.set_offline(offline);
+        self.state.cache.set_cache_enabled(cache_enabled);
         self.state
             .cold_start_limiter
-            .set_min_interval(std::time::Duration::from_millis(
-                config.cold_start.rate_limit_ms,
-            ));
-        *self.config.write().await = config;
+            .set_min_interval(std::time::Duration::from_millis(cold_start_rate_limit_ms));
 
-        // Hover/completion/code actions are computed on demand and pick up the new
-        // config for free. Diagnostics are pull-based, so a pull-capable client must be
-        // told to re-request them (push-only clients are a known v1 gap, M2).
-        // Timeout-bounded (issue #493, same class as S1): capability-gated already, but
-        // an unresponsive client would otherwise hang this handler forever.
-        if self.diagnostic_refresh_supported().await {
-            match tokio::time::timeout(
-                CLIENT_REFRESH_TIMEOUT,
-                self.client.workspace_diagnostic_refresh(),
-            )
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => tracing::debug!("workspace/diagnostic/refresh failed: {:?}", e),
-                Err(_) => tracing::debug!("workspace/diagnostic/refresh timed out"),
+        match scope {
+            Some(scope) => {
+                // Coalescing: union into the pending scope and bump the generation before
+                // spawning a debounced worker, so a burst of changes collapses into one
+                // reparse without losing any individual change's scope.
+                let generation = self.state.queue_reparse(scope);
+                let state = Arc::clone(&self.state);
+                let client = self.client.clone();
+                let config = Arc::clone(&self.config);
+                tokio::spawn(async move {
+                    tokio::time::sleep(crate::document::reparse::RECONFIGURE_DEBOUNCE).await;
+                    let superseded = state.config_generation() != generation;
+                    // Security M3: a superseded worker normally defers to the newer one —
+                    // but under a continuous burst arriving faster than the debounce
+                    // window, every worker would see itself superseded forever, leaving a
+                    // security-relevant setting's reparse starved indefinitely while
+                    // `set_registry_policy` has already taken effect. Once the pending
+                    // scope has been waiting at least `MAX_DEBOUNCE_WAIT`, drain it
+                    // regardless of staleness.
+                    if superseded
+                        && !state
+                            .pending_reparse_overdue(crate::document::reparse::MAX_DEBOUNCE_WAIT)
+                    {
+                        return;
+                    }
+                    let Some(scope) = state.take_pending_reparse() else {
+                        return;
+                    };
+                    crate::document::reparse::reparse_open_documents(
+                        scope,
+                        crate::document::RefetchPolicy::AllDependencies,
+                        "workspace/didChangeConfiguration",
+                        state,
+                        client,
+                        config,
+                    )
+                    .await;
+                });
+            }
+            None => {
+                // Nothing parse-affecting changed. Hover/completion/code actions are
+                // computed on demand and pick up the new config for free. Diagnostics are
+                // pull-based, so a pull-capable client must be told to re-request them
+                // (push-only clients are a known v1 gap, M2). Timeout-bounded (issue #493,
+                // same class as S1): capability-gated already, but an unresponsive client
+                // would otherwise hang this handler forever.
+                if self.diagnostic_refresh_supported().await {
+                    match tokio::time::timeout(
+                        CLIENT_REFRESH_TIMEOUT,
+                        self.client.workspace_diagnostic_refresh(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            tracing::debug!("workspace/diagnostic/refresh failed: {:?}", e);
+                        }
+                        Err(_) => tracing::debug!("workspace/diagnostic/refresh timed out"),
+                    }
+                }
             }
         }
     }
@@ -2089,6 +2128,125 @@ mod tests {
             outcome.0.expect("hover task panicked");
             outcome.1.expect("diagnostics task panicked");
             assert_eq!(backend.config.read().await.freshness.cooldown_secs, 42);
+        }
+
+        /// Issue #592 S1 regression: two rapid `didChangeConfiguration` notifications, each
+        /// touching a *different* parse-affecting setting, must coalesce into one reparse
+        /// that covers the union of both scopes — not just the second (narrower) one, which
+        /// a naive "recompute against the immediately-previous config" coalescing scheme
+        /// would lose.
+        ///
+        /// **Security review S5 correction**: the second payload must explicitly repeat
+        /// `"workspace_registries": "off"`. `did_change_configuration` uses
+        /// replace-whole-config semantics, so a payload that omits a `RegistriesConfig`
+        /// field resets it to its type default (`PublicOnly`) — a second payload that only
+        /// sets `nuget_user_profile_sources` would silently flip `workspace_registries` from
+        /// `Off` (set by the first call) back to `PublicOnly`, which is *itself* a change
+        /// and would independently re-trigger the full workspace-ecosystems scope on the
+        /// second call alone. That would make this test pass even if `queue_reparse`
+        /// replaced the pending scope instead of unioning it, since the second call's own
+        /// (accidentally broad) scope would already cover the cargo document. Repeating
+        /// `"off"` holds `workspace_registries` constant across both calls, so the second
+        /// call's own scope is genuinely just `["nuget"]` — only a real union still covers
+        /// cargo.
+        ///
+        /// Observed via `cached_versions` being cleared: `RefetchPolicy::AllDependencies`
+        /// clears it unconditionally before attempting the (network, and in this sandboxed
+        /// test environment expected-to-fail) fetch, so an empty map is proof the document's
+        /// scope was actually reparsed, regardless of whether the fetch itself succeeds.
+        #[cfg(all(feature = "cargo", feature = "nuget"))]
+        #[tokio::test]
+        async fn test_rapid_config_changes_coalesce_into_a_union_scope_reparse() {
+            use crate::document::DocumentState;
+            use deps_core::{EcosystemId, PackageName, PackageVersions};
+
+            let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+            let backend = service.inner();
+
+            // `cargo` is only ever in scope via the `workspace_registries` change (the
+            // first call); `nuget_user_profile_sources` (the second call) never mentions
+            // cargo at all — so cargo's `cached_versions` being cleared is proof the first
+            // call's scope survived the union, not an artifact of the second call's own
+            // (unrelated) scope.
+            let cargo_uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let cargo_ecosystem = backend.state.ecosystem_registry.get("cargo").unwrap();
+            let cargo_content = "[dependencies]\nserde = \"1.0\"\n".to_string();
+            let cargo_parse = cargo_ecosystem
+                .parse_manifest(&cargo_content, &cargo_uri)
+                .await
+                .unwrap();
+            let mut cargo_doc = DocumentState::new_from_parse_result(
+                EcosystemId::Cargo,
+                cargo_content,
+                cargo_parse,
+            );
+            cargo_doc.set_version(Some(1));
+            cargo_doc.update_cached_versions(HashMap::from([(
+                PackageName::new("serde"),
+                PackageVersions::latest_only("1.0.999"),
+            )]));
+            backend.state.update_document(cargo_uri.clone(), cargo_doc);
+
+            let nuget_uri = deps_core::test_util::test_uri("/test/project.csproj");
+            let nuget_ecosystem = backend.state.ecosystem_registry.get("nuget").unwrap();
+            let nuget_content = r#"<Project><ItemGroup><PackageReference Include="Newtonsoft.Json" Version="12.0.3" /></ItemGroup></Project>"#.to_string();
+            let nuget_parse = nuget_ecosystem
+                .parse_manifest(&nuget_content, &nuget_uri)
+                .await
+                .unwrap();
+            let mut nuget_doc = DocumentState::new_from_parse_result(
+                EcosystemId::NuGet,
+                nuget_content,
+                nuget_parse,
+            );
+            nuget_doc.set_version(Some(1));
+            nuget_doc.update_cached_versions(HashMap::from([(
+                PackageName::new("Newtonsoft.Json"),
+                PackageVersions::latest_only("99.0.0"),
+            )]));
+            backend.state.update_document(nuget_uri.clone(), nuget_doc);
+
+            // Fired back-to-back, no `.await`ed sleep in between — the second call's
+            // `queue_reparse` must union onto, not replace, the first's pending scope.
+            backend
+                .did_change_configuration(DidChangeConfigurationParams {
+                    settings: serde_json::json!({ "registries": { "workspace_registries": "off" } }),
+                })
+                .await;
+            backend
+                .did_change_configuration(DidChangeConfigurationParams {
+                    settings: serde_json::json!({
+                        "registries": {
+                            "workspace_registries": "off",
+                            "nuget_user_profile_sources": true
+                        }
+                    }),
+                })
+                .await;
+
+            let both_cleared = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let cargo_cleared = backend
+                        .state
+                        .get_document(&cargo_uri)
+                        .is_some_and(|d| d.cached_versions.is_empty());
+                    let nuget_cleared = backend
+                        .state
+                        .get_document(&nuget_uri)
+                        .is_some_and(|d| d.cached_versions.is_empty());
+                    if cargo_cleared && nuget_cleared {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await;
+
+            assert!(
+                both_cleared.is_ok(),
+                "both documents' stale cached_versions must be dropped by the coalesced \
+                 reparse — a lost scope would leave one of them untouched"
+            );
         }
     }
 

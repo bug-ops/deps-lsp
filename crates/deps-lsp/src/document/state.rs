@@ -29,6 +29,18 @@ use tower_lsp_server::ls_types::Uri;
 /// `tower_lsp_server`'s limited `buffer_unordered` concurrency slots.
 pub(crate) const CLIENT_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Server-wide cap on concurrent registry-fetch *documents* in flight (issue #592 critic
+/// S2/S3) — an axis `cache.max_concurrent_fetches` does not cover, since that bounds
+/// dependencies within one document's fetch, not how many documents fetch at once.
+/// Deliberately an independent constant, not derived from `cache.max_concurrent_fetches`:
+/// the two bound different axes, and coupling them would let one config knob square the
+/// peak concurrent outbound request count. Shared by the open path
+/// (`document::lifecycle::run_document_open_background_task`, including cold-start
+/// documents `ensure_document_loaded` admits) and the change path
+/// (`document::lifecycle::run_document_change_task`), so neither alone can fan out
+/// unbounded registry traffic.
+const FETCH_PERMITS: usize = 4;
+
 // Re-export LoadingState from deps-core for convenience
 pub use deps_core::LoadingState;
 
@@ -499,6 +511,12 @@ pub struct ServerState {
     /// struct's docs for why this is a feature-agnostic `Arc<RwLock<Option<String>>>`
     /// rather than a `deps-gitlab-ci` type.
     pub gitlab_instance_host: Arc<RwLock<Option<String>>>,
+    /// Ecosystem ids `crate::register_ecosystems` actually threaded the live
+    /// `registry_policy` handle into (issue #592 security M1) — the single source of truth
+    /// `config::reparse_scope`'s caller uses to scope a `registries.workspace_registries`
+    /// reparse, returned by that same function so the two facts can never independently
+    /// drift. See [`crate::register_ecosystems`]'s doc.
+    pub(crate) workspace_registry_ecosystems: Vec<&'static str>,
     /// Cold start rate limiter
     pub cold_start_limiter: ColdStartLimiter,
     /// Background task handles
@@ -516,6 +534,35 @@ pub struct ServerState {
     /// Whether the client advertised `workspace.codeLens.refreshSupport` during
     /// `initialize`. See `inlay_hint_refresh_supported` for rationale.
     code_lens_refresh_supported: AtomicBool,
+    /// Whether the client advertised `workspace.diagnostics.refreshSupport` during
+    /// `initialize`. Mirrors `inlay_hint_refresh_supported`'s rationale, but for
+    /// `document::reparse::reparse_open_documents` (issue #592), which — unlike the
+    /// lifecycle tasks the other three mirrors serve — is a free function with no access to
+    /// `Backend::client_capabilities`.
+    diagnostic_refresh_supported: AtomicBool,
+    /// Server-wide bound on concurrent registry-fetch documents in flight. See
+    /// [`FETCH_PERMITS`].
+    pub(crate) fetch_permits: Arc<tokio::sync::Semaphore>,
+    /// Coalesced [`crate::config::ReparseScope`] pending a debounced reparse triggered by
+    /// `workspace/didChangeConfiguration` (issue #592) — unioned (never replaced) by every
+    /// parse-affecting config change in a burst, and drained by whichever debounce worker's
+    /// generation is still current when it wakes, or whichever wakes once
+    /// [`Self::pending_reparse_overdue`] trips. See [`Self::queue_reparse`].
+    pending_reparse: std::sync::Mutex<Option<PendingReparse>>,
+    /// Generation counter bumped by [`Self::queue_reparse`], letting a debounce worker
+    /// detect it was superseded by a newer config change before draining `pending_reparse`.
+    config_generation: AtomicU64,
+}
+
+/// A coalesced, not-yet-drained reparse scope plus when it was first queued (issue #592
+/// security M3): `first_queued_at` is set once, by the change that starts a new pending
+/// entry, and survives every later union — a continuous burst of config changes arriving
+/// faster than the debounce window must not starve the reparse forever, so a debounce
+/// worker forces a drain once this timestamp is old enough, regardless of whether it was
+/// itself superseded by a newer generation.
+struct PendingReparse {
+    scope: crate::config::ReparseScope,
+    first_queued_at: Instant,
 }
 
 impl ServerState {
@@ -535,7 +582,7 @@ impl ServerState {
         let gitlab_instance_host = Arc::new(RwLock::new(None));
 
         // Register ecosystems based on enabled features
-        crate::register_ecosystems(
+        let workspace_registry_ecosystems = crate::register_ecosystems(
             &ecosystem_registry,
             Arc::clone(&cache),
             &crate::EcosystemRuntime {
@@ -563,11 +610,16 @@ impl ServerState {
             registry_policy,
             nuget_user_profile_sources,
             gitlab_instance_host,
+            workspace_registry_ecosystems,
             cold_start_limiter,
             tasks: tokio::sync::RwLock::new(HashMap::new()),
             progress_supported: AtomicBool::new(false),
             inlay_hint_refresh_supported: AtomicBool::new(false),
             code_lens_refresh_supported: AtomicBool::new(false),
+            diagnostic_refresh_supported: AtomicBool::new(false),
+            fetch_permits: Arc::new(tokio::sync::Semaphore::new(FETCH_PERMITS)),
+            pending_reparse: std::sync::Mutex::new(None),
+            config_generation: AtomicU64::new(0),
         }
     }
 
@@ -610,6 +662,89 @@ impl ServerState {
     pub fn set_code_lens_refresh_supported(&self, supported: bool) {
         self.code_lens_refresh_supported
             .store(supported, Ordering::Relaxed);
+    }
+
+    /// Returns whether the client supports `workspace/diagnostic/refresh`.
+    pub fn diagnostic_refresh_supported(&self) -> bool {
+        self.diagnostic_refresh_supported.load(Ordering::Relaxed)
+    }
+
+    /// Records whether the client supports `workspace/diagnostic/refresh`.
+    ///
+    /// Called once from `initialize` with the result of negotiating
+    /// `workspace.diagnostics.refreshSupport` from `ClientCapabilities`.
+    pub fn set_diagnostic_refresh_supported(&self, supported: bool) {
+        self.diagnostic_refresh_supported
+            .store(supported, Ordering::Relaxed);
+    }
+
+    /// Unions `scope` into the pending coalesced reparse and bumps the generation counter
+    /// (issue #592), returning the new generation.
+    ///
+    /// Union happens first, and both operations happen while the same lock is held —
+    /// bumping the generation first would let a debounce worker that wakes between the two
+    /// steps drain a union still missing this call's own scope. `first_queued_at` is set
+    /// only when this call starts a fresh pending entry (`None` -> `Some`); a union onto an
+    /// already-pending entry keeps the original timestamp, so [`Self::pending_reparse_overdue`]
+    /// measures from the *first* unhandled change in a burst, not the latest (security M3:
+    /// otherwise a burst arriving faster than the debounce window could starve the reparse
+    /// indefinitely).
+    pub(crate) fn queue_reparse(&self, scope: crate::config::ReparseScope) -> u64 {
+        {
+            let mut pending = self
+                .pending_reparse
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *pending = Some(match pending.take() {
+                Some(existing) => PendingReparse {
+                    scope: existing.scope.union(scope),
+                    first_queued_at: existing.first_queued_at,
+                },
+                None => PendingReparse {
+                    scope,
+                    first_queued_at: Instant::now(),
+                },
+            });
+        }
+        self.config_generation.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Current reparse-coalescing generation (issue #592), read by a debounce worker to
+    /// detect whether it was superseded by a newer config change before draining
+    /// `pending_reparse`.
+    pub(crate) fn config_generation(&self) -> u64 {
+        self.config_generation.load(Ordering::SeqCst)
+    }
+
+    /// Whether the pending coalesced reparse has been waiting at least `max_wait` since it
+    /// was first queued (issue #592 security M3). A debounce worker that finds itself
+    /// superseded by a newer config generation normally defers to that newer worker — but
+    /// under a continuous burst arriving faster than the debounce window, every worker would
+    /// see itself superseded forever. Once this returns `true`, the worker that observes it
+    /// must drain and reparse regardless of its own generation being stale, capping the
+    /// worst-case staleness a live-reloaded, security-relevant setting can be left
+    /// unapplied to open documents' rendered data.
+    pub(crate) fn pending_reparse_overdue(&self, max_wait: Duration) -> bool {
+        self.pending_reparse
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|pending| pending.first_queued_at.elapsed() >= max_wait)
+    }
+
+    /// Drains the pending coalesced reparse scope, if any (issue #592).
+    ///
+    /// Returns `None` if no config change is pending — reachable even for a worker that
+    /// just passed its own generation check: one that wakes between a newer change's union
+    /// and its generation bump can lose the race to drain first (see
+    /// [`Self::queue_reparse`]'s ordering). Callers must treat `None` as "nothing to do",
+    /// never `unwrap`/`expect` it.
+    pub(crate) fn take_pending_reparse(&self) -> Option<crate::config::ReparseScope> {
+        self.pending_reparse
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .map(|pending| pending.scope)
     }
 
     /// Fires `workspace/inlayHint/refresh` and `workspace/codeLens/refresh` as
@@ -1125,6 +1260,175 @@ mod tests {
 
         state.set_code_lens_refresh_supported(false);
         assert!(!state.code_lens_refresh_supported());
+    }
+
+    #[test]
+    fn test_diagnostic_refresh_supported_defaults_false_and_round_trips() {
+        let state = ServerState::new();
+        assert!(!state.diagnostic_refresh_supported());
+
+        state.set_diagnostic_refresh_supported(true);
+        assert!(state.diagnostic_refresh_supported());
+
+        state.set_diagnostic_refresh_supported(false);
+        assert!(!state.diagnostic_refresh_supported());
+    }
+
+    // =========================================================================
+    // Reparse coalescing tests (issue #592)
+    // =========================================================================
+
+    mod reparse_coalescing_tests {
+        use super::*;
+        use crate::config::ReparseScope;
+
+        #[test]
+        fn test_queue_reparse_bumps_generation() {
+            let state = ServerState::new();
+            assert_eq!(state.config_generation(), 0);
+
+            let gen1 = state.queue_reparse(ReparseScope::Ecosystems(vec!["cargo"]));
+            assert_eq!(gen1, 1);
+            assert_eq!(state.config_generation(), 1);
+
+            let gen2 = state.queue_reparse(ReparseScope::Ecosystems(vec!["npm"]));
+            assert_eq!(gen2, 2);
+        }
+
+        #[test]
+        fn test_queue_reparse_unions_pending_scope_across_calls() {
+            let state = ServerState::new();
+            state.queue_reparse(ReparseScope::Ecosystems(vec!["cargo"]));
+            state.queue_reparse(ReparseScope::Ecosystems(vec!["npm"]));
+
+            let scope = state
+                .take_pending_reparse()
+                .expect("a pending scope must exist after two queue_reparse calls");
+            assert!(
+                scope.matches("cargo"),
+                "earlier change's scope must survive"
+            );
+            assert!(scope.matches("npm"));
+        }
+
+        #[test]
+        fn test_take_pending_reparse_drains_and_returns_none_on_empty() {
+            let state = ServerState::new();
+            assert!(state.take_pending_reparse().is_none(), "nothing queued yet");
+
+            state.queue_reparse(ReparseScope::All);
+            assert!(state.take_pending_reparse().is_some());
+            assert!(
+                state.take_pending_reparse().is_none(),
+                "a second drain must see nothing left (M1: never unwrap this)"
+            );
+        }
+
+        /// Issue #592 security M3: nothing pending must never read as overdue, regardless
+        /// of `max_wait`.
+        #[test]
+        fn test_pending_reparse_overdue_false_when_nothing_queued() {
+            let state = ServerState::new();
+            assert!(!state.pending_reparse_overdue(Duration::ZERO));
+        }
+
+        /// Security M3: a freshly queued change is never immediately overdue, but becomes
+        /// so once real time exceeds `max_wait` — proven with a tiny `max_wait` rather than
+        /// waiting out the real multi-second constant, since the threshold is a parameter.
+        #[tokio::test]
+        async fn test_pending_reparse_overdue_becomes_true_after_max_wait_elapses() {
+            let state = ServerState::new();
+            state.queue_reparse(ReparseScope::Ecosystems(vec!["cargo"]));
+
+            assert!(
+                !state.pending_reparse_overdue(Duration::from_secs(10)),
+                "must not be overdue against a generous max_wait"
+            );
+
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            assert!(
+                state.pending_reparse_overdue(Duration::from_millis(1)),
+                "must be overdue once real elapsed time exceeds max_wait"
+            );
+        }
+
+        /// Security M3's actual safety property: a union onto an already-pending entry must
+        /// NOT reset the queued-at clock to the union's own time — otherwise a burst of
+        /// changes arriving faster than `max_wait` would keep pushing the deadline out
+        /// forever, exactly the starvation this mechanism exists to cap.
+        #[tokio::test]
+        async fn test_queue_reparse_union_preserves_first_queued_at() {
+            let state = ServerState::new();
+            state.queue_reparse(ReparseScope::Ecosystems(vec!["cargo"]));
+
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            // A second change arrives well after the first — if this union reset the
+            // clock, `pending_reparse_overdue` below (checked against the first change's
+            // age) would wrongly read `false`.
+            state.queue_reparse(ReparseScope::Ecosystems(vec!["npm"]));
+
+            assert!(
+                state.pending_reparse_overdue(Duration::from_millis(15)),
+                "overdue must be measured from the first queued change, not the latest union"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_fetch_permits_bounds_concurrency() {
+            let state = Arc::new(ServerState::new());
+            assert_eq!(state.fetch_permits.available_permits(), 4);
+
+            let permit = state.fetch_permits.acquire().await.unwrap();
+            assert_eq!(state.fetch_permits.available_permits(), 3);
+            drop(permit);
+            assert_eq!(state.fetch_permits.available_permits(), 4);
+        }
+
+        /// Issue #592 critic S2/S3: `fetch_permits` must actually bound real concurrent
+        /// contention, not just track a count in isolation. Ten tasks race for the four
+        /// permits `run_document_open_background_task` and `run_document_change_task`
+        /// share; the observed peak concurrency must never exceed `FETCH_PERMITS` (4),
+        /// mirroring the `ConcurrencyTrackingRegistry` pattern `fetch_latest_versions_parallel`'s
+        /// own tests use for the orthogonal per-document axis.
+        #[tokio::test]
+        async fn test_fetch_permits_bounds_real_concurrent_contention() {
+            use std::sync::atomic::AtomicUsize;
+
+            let state = Arc::new(ServerState::new());
+            let current = Arc::new(AtomicUsize::new(0));
+            let max_seen = Arc::new(AtomicUsize::new(0));
+
+            let mut handles = Vec::new();
+            for _ in 0..10 {
+                let state = Arc::clone(&state);
+                let current = Arc::clone(&current);
+                let max_seen = Arc::clone(&max_seen);
+                handles.push(tokio::spawn(async move {
+                    let _permit = state.fetch_permits.acquire().await.unwrap();
+                    let now = current.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_seen.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                    current.fetch_sub(1, Ordering::SeqCst);
+                }));
+            }
+            for handle in handles {
+                handle.await.unwrap();
+            }
+
+            let peak = max_seen.load(Ordering::SeqCst);
+            assert!(
+                peak <= 4,
+                "peak concurrent permit-holders ({peak}) must never exceed FETCH_PERMITS \
+                 (4) — the semaphore failed to bound concurrency"
+            );
+            assert!(
+                peak >= 2,
+                "peak concurrent permit-holders ({peak}) is implausibly low for 10 tasks \
+                 racing for 4 permits — this test isn't exercising real contention (a \
+                 liveness check, not exact equality, since scheduler timing shouldn't pin \
+                 the assertion to exactly 4)"
+            );
+        }
     }
 
     #[tokio::test]
