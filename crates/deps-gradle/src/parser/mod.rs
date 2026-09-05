@@ -10,11 +10,80 @@ pub mod settings;
 
 use crate::types::GradleDependency;
 use deps_core::Result;
+use regex::Captures;
 use std::any::Any;
 use std::collections::HashMap;
 use tower_lsp_server::ls_types::{Position, Range, Uri};
 
 pub use deps_core::lsp_helpers::LineOffsetTable;
+
+/// Configuration words recognized as dependency declarations in both Groovy
+/// and Kotlin Gradle DSLs.
+///
+/// Includes the pre-Gradle-7 legacy configurations `compile`, `testCompile`,
+/// and `provided`: Gradle still parses them regardless of which DSL a build
+/// script uses, so a `build.gradle.kts` migrated from an old `build.gradle`
+/// (or targeting a project not yet updated) can legitimately contain them.
+/// Restricting recognition to one DSL would be silent drift, not an
+/// intentional scoping decision.
+pub(crate) const CONFIGURATIONS: &[&str] = &[
+    "implementation",
+    "api",
+    "compileOnly",
+    "runtimeOnly",
+    "testImplementation",
+    "testRuntimeOnly",
+    "annotationProcessor",
+    "kapt",
+    "classpath",
+    "ksp",
+    "testCompileOnly",
+    "compile",
+    "testCompile",
+    "provided",
+];
+
+/// Builds a [`GradleDependency`] from a regex match's captures.
+///
+/// All Groovy and Kotlin DSL regex variants share identical capture group
+/// indices — 1: configuration, 2: group id, 3: artifact id, 4: version (when
+/// present) — so `has_version` alone distinguishes the two capture shapes.
+pub(crate) fn build_dependency(
+    caps: &Captures<'_>,
+    line: &str,
+    line_idx: u32,
+    has_version: bool,
+    config: &str,
+) -> GradleDependency {
+    debug_assert_eq!(
+        caps.len(),
+        if has_version { 5 } else { 4 },
+        "regex capture count must match has_version so group 4 (version) is only read when present"
+    );
+
+    let group_id = caps.get(2).map_or("", |m| m.as_str()).to_string();
+    let artifact_id = caps.get(3).map_or("", |m| m.as_str()).to_string();
+    let name = format!("{group_id}:{artifact_id}");
+    let name_range = find_name_range(line, line_idx, &group_id, &artifact_id);
+
+    let (version_req, version_range) = if has_version {
+        let version = caps.get(4).map_or("", |m| m.as_str()).trim().to_string();
+        let version_range = find_version_range(line, line_idx, &version);
+        (Some(version.into()), Some(version_range))
+    } else {
+        (None, None)
+    };
+
+    GradleDependency {
+        group_id,
+        artifact_id,
+        name: name.into(),
+        name_range,
+        version_req,
+        version_range,
+        configuration: config.to_string(),
+    }
+}
 
 #[derive(Debug)]
 pub struct GradleParseResult {

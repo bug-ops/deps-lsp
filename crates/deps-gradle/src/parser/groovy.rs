@@ -2,7 +2,7 @@
 //!
 //! Regex-based extraction of dependency declarations from dependencies { } blocks.
 
-use crate::parser::{GradleParseResult, find_name_range, find_version_range};
+use crate::parser::{CONFIGURATIONS, GradleParseResult, build_dependency};
 use crate::types::GradleDependency;
 use deps_core::Result;
 use regex::Regex;
@@ -53,23 +53,6 @@ static RE_PLATFORM_NO_VERSION_WITHOUT_PARENS: LazyLock<Regex> = LazyLock::new(||
         .expect("RE_PLATFORM_NO_VERSION_WITHOUT_PARENS")
 });
 
-const CONFIGURATIONS: &[&str] = &[
-    "implementation",
-    "api",
-    "compileOnly",
-    "runtimeOnly",
-    "testImplementation",
-    "testRuntimeOnly",
-    "annotationProcessor",
-    "kapt",
-    "classpath",
-    "ksp",
-    "testCompileOnly",
-    "compile",
-    "testCompile",
-    "provided",
-];
-
 /// Runs `re` over `line`, filters matches to known `CONFIGURATIONS`, dedups
 /// against `matched_positions` (shared across all patterns tried on this
 /// line), and pushes a [`GradleDependency`] for each surviving match.
@@ -97,28 +80,7 @@ fn extract_matches(
         }
         matched_positions.push(start);
 
-        let group_id = caps.get(2).map_or("", |m| m.as_str()).to_string();
-        let artifact_id = caps.get(3).map_or("", |m| m.as_str()).to_string();
-        let name = format!("{group_id}:{artifact_id}");
-        let name_range = find_name_range(line, line_u32, &group_id, &artifact_id);
-
-        let (version_req, version_range) = if has_version {
-            let version = caps.get(4).map_or("", |m| m.as_str()).trim().to_string();
-            let version_range = find_version_range(line, line_u32, &version);
-            (Some(version.into()), Some(version_range))
-        } else {
-            (None, None)
-        };
-
-        dependencies.push(GradleDependency {
-            group_id,
-            artifact_id,
-            name: name.into(),
-            name_range,
-            version_req,
-            version_range,
-            configuration: config.to_string(),
-        });
+        dependencies.push(build_dependency(&caps, line, line_u32, has_version, config));
     }
 }
 
@@ -294,6 +256,19 @@ mod tests {
         assert_eq!(result.dependencies.len(), 4);
         assert_eq!(result.dependencies[1].configuration, "testImplementation");
         assert_eq!(result.dependencies[2].configuration, "compileOnly");
+    }
+
+    #[test]
+    fn test_parse_legacy_configurations() {
+        // compile/testCompile/provided predate #625's unification but were
+        // never covered by a dedicated test; guard the shared CONFIGURATIONS
+        // list now that both DSLs read from it.
+        let content = "dependencies {\n    compile 'org.springframework.boot:spring-boot-starter:3.2.0'\n    testCompile 'junit:junit:4.13.2'\n    provided 'javax.servlet:javax.servlet-api:4.0.1'\n}\n";
+        let result = parse_groovy_dsl(content, &make_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 3);
+        assert_eq!(result.dependencies[0].configuration, "compile");
+        assert_eq!(result.dependencies[1].configuration, "testCompile");
+        assert_eq!(result.dependencies[2].configuration, "provided");
     }
 
     #[test]
