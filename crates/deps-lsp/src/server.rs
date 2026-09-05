@@ -34,6 +34,12 @@ mod commands {
     /// Command to update every outdated dependency in a document, bound to the code
     /// lens produced by `handlers::code_lens`.
     pub(super) const UPDATE_ALL_OUTDATED: &str = crate::handlers::code_lens::COMMAND_ID;
+    /// Command to pin every mutable-tag GitHub Actions step to a commit SHA, bound to
+    /// the "Pin N actions to commit SHA" lens `deps-github-actions` produces (issue
+    /// #633). GitHub-Actions-specific, so only registered/dispatched when that ecosystem
+    /// feature is enabled.
+    #[cfg(feature = "github-actions")]
+    pub(super) const PIN_ALL_TO_SHA: &str = deps_github_actions::PIN_ALL_TO_SHA_COMMAND_ID;
 }
 
 /// Parses a [`DepsConfig`] from a raw JSON settings payload (client
@@ -419,10 +425,16 @@ impl Backend {
                 ..Default::default()
             })),
             execute_command_provider: Some(ExecuteCommandOptions {
-                commands: vec![
-                    commands::UPDATE_VERSION.into(),
-                    commands::UPDATE_ALL_OUTDATED.into(),
-                ],
+                commands: {
+                    #[allow(unused_mut)]
+                    let mut cmds = vec![
+                        commands::UPDATE_VERSION.into(),
+                        commands::UPDATE_ALL_OUTDATED.into(),
+                    ];
+                    #[cfg(feature = "github-actions")]
+                    cmds.push(commands::PIN_ALL_TO_SHA.into());
+                    cmds
+                },
                 ..Default::default()
             }),
             ..Default::default()
@@ -997,6 +1009,14 @@ impl LanguageServer for Backend {
             self.execute_update_all_outdated(update_args.uri).await;
         }
 
+        #[cfg(feature = "github-actions")]
+        if params.command == commands::PIN_ALL_TO_SHA
+            && let Some(args) = params.arguments.first()
+            && let Ok(pin_args) = serde_json::from_value::<PinAllToShaArgs>(args.clone())
+        {
+            self.execute_pin_all_to_sha(pin_args.uri).await;
+        }
+
         Ok(None)
     }
 }
@@ -1105,8 +1125,22 @@ impl Backend {
             .and_then(|we| we.document_changes)
             .unwrap_or(false);
 
-        let edit = build_update_all_outdated_edit(&uri, version, edits, supports_document_changes);
+        let edit = build_batch_workspace_edit(&uri, version, edits, supports_document_changes);
+        self.apply_batch_edit(&uri, edit, "dependency updates")
+            .await;
+    }
 
+    /// Applies `edit` via `workspace/applyEdit`, warning the client through
+    /// `window/showMessage` on rejection, error, or timeout.
+    ///
+    /// Shared by [`Self::execute_update_all_outdated`] and (when the `github-actions`
+    /// feature is enabled) `execute_pin_all_to_sha` (issue #633): both bulk commands
+    /// recompute their own edits, but converge on identical apply/response handling.
+    /// `what` names the batch's contents for the user-facing failure messages (critic
+    /// M2: the messages must not say "dependency updates" for a command that updates
+    /// nothing, e.g. `deps-lsp.pinAllToSha`) — e.g. `"dependency updates"` or
+    /// `"SHA pins"`.
+    async fn apply_batch_edit(&self, uri: &Uri, edit: WorkspaceEdit, what: &str) {
         match tokio::time::timeout(CLIENT_REFRESH_TIMEOUT, self.client.apply_edit(edit)).await {
             Ok(Ok(response)) if response.applied => {}
             Ok(Ok(response)) => {
@@ -1118,7 +1152,7 @@ impl Backend {
                 self.client
                     .show_message(
                         MessageType::WARNING,
-                        "deps-lsp: failed to apply dependency updates",
+                        format!("deps-lsp: failed to apply {what}"),
                     )
                     .await;
             }
@@ -1127,7 +1161,7 @@ impl Backend {
                 self.client
                     .show_message(
                         MessageType::WARNING,
-                        "deps-lsp: failed to apply dependency updates",
+                        format!("deps-lsp: failed to apply {what}"),
                     )
                     .await;
             }
@@ -1140,12 +1174,89 @@ impl Backend {
                     .show_message(
                         MessageType::WARNING,
                         format!(
-                            "deps-lsp: the editor did not respond to the update within {CLIENT_REFRESH_TIMEOUT:?}"
+                            "deps-lsp: the editor did not respond to the {what} within {CLIENT_REFRESH_TIMEOUT:?}"
                         ),
                     )
                     .await;
             }
         }
+    }
+
+    /// Recomputes and applies the batch, version-guarded `WorkspaceEdit` for
+    /// `deps-lsp.pinAllToSha` (issue #633) — the GitHub-Actions-specific bulk
+    /// counterpart of [`Self::execute_update_all_outdated`], sharing its readiness
+    /// contract (see that method's doc comment) but sourcing edits from
+    /// [`deps_github_actions::GithubActionsEcosystem::collect_pin_all_to_sha_edits`]
+    /// instead of `deps_core::collect_update_all_edits`. Refused (same warning) when the
+    /// document's ecosystem is not GitHub Actions, so a stale or forged command against a
+    /// non-GHA document is a no-op rather than a panic.
+    #[cfg(feature = "github-actions")]
+    #[allow(clippy::await_holding_invalid_type)]
+    async fn execute_pin_all_to_sha(&self, uri: Uri) {
+        let Some(doc) = self.state.get_document(&uri) else {
+            self.warn_update_all_outdated_not_ready().await;
+            return;
+        };
+
+        if !doc.is_ready_for_batch_update() {
+            drop(doc);
+            self.warn_update_all_outdated_not_ready().await;
+            return;
+        }
+
+        let Some(ecosystem) = self.state.ecosystem_registry.get(doc.ecosystem_id()) else {
+            tracing::warn!("Unknown ecosystem for {:?}", uri);
+            drop(doc);
+            self.warn_update_all_outdated_not_ready().await;
+            return;
+        };
+
+        let Some(gha_ecosystem) = ecosystem
+            .as_any()
+            .downcast_ref::<deps_github_actions::GithubActionsEcosystem>()
+        else {
+            tracing::warn!(
+                "deps-lsp.pinAllToSha invoked for a non-GitHub-Actions document: {:?}",
+                uri
+            );
+            drop(doc);
+            self.warn_update_all_outdated_not_ready().await;
+            return;
+        };
+
+        let Some(parse_result) = doc.parse_result() else {
+            tracing::warn!("No parse result for {:?}", uri);
+            drop(doc);
+            self.warn_update_all_outdated_not_ready().await;
+            return;
+        };
+
+        let edits = gha_ecosystem.collect_pin_all_to_sha_edits(parse_result);
+        let version = doc.version;
+        drop(doc);
+
+        if edits.is_empty() {
+            self.client
+                .show_message(
+                    MessageType::INFO,
+                    "deps-lsp: no mutable-tag actions to pin to commit SHA",
+                )
+                .await;
+            return;
+        }
+
+        let supports_document_changes = self
+            .client_capabilities
+            .read()
+            .await
+            .as_ref()
+            .and_then(|c| c.workspace.as_ref())
+            .and_then(|w| w.workspace_edit.as_ref())
+            .and_then(|we| we.document_changes)
+            .unwrap_or(false);
+
+        let edit = build_batch_workspace_edit(&uri, version, edits, supports_document_changes);
+        self.apply_batch_edit(&uri, edit, "SHA pins").await;
     }
 }
 
@@ -1192,13 +1303,23 @@ struct UpdateAllOutdatedArgs {
     uri: Uri,
 }
 
-/// Builds the `WorkspaceEdit` for `deps-lsp.updateAllOutdated`.
+/// Arguments for `deps-lsp.pinAllToSha` (issue #633) — the URI only, same shape and
+/// rationale as [`UpdateAllOutdatedArgs`]: edits are recomputed at execution time (see
+/// `Backend::execute_pin_all_to_sha`), never baked into the command arguments.
+#[cfg(feature = "github-actions")]
+#[derive(serde::Deserialize)]
+struct PinAllToShaArgs {
+    uri: Uri,
+}
+
+/// Builds the `WorkspaceEdit` for a bulk command (`deps-lsp.updateAllOutdated`,
+/// `deps-lsp.pinAllToSha`) from its already-computed `edits`.
 ///
 /// Emits `document_changes` (versioned per `TextDocumentEdit`) when
 /// `supports_document_changes` is `true` — gated on the client's
 /// `workspace.workspaceEdit.documentChanges` capability — and falls back to the untyped
 /// `changes` map otherwise.
-fn build_update_all_outdated_edit(
+fn build_batch_workspace_edit(
     uri: &Uri,
     version: Option<i32>,
     edits: Vec<TextEdit>,
@@ -1645,6 +1766,38 @@ mod tests {
         assert_eq!(commands::UPDATE_ALL_OUTDATED, "deps-lsp.updateAllOutdated");
     }
 
+    #[cfg(feature = "github-actions")]
+    #[test]
+    fn test_server_capabilities_execute_command_includes_pin_all_to_sha() {
+        let caps = Backend::server_capabilities();
+        let execute = caps
+            .execute_command_provider
+            .expect("execute command provider should exist");
+        assert!(
+            execute
+                .commands
+                .contains(&commands::PIN_ALL_TO_SHA.to_string())
+        );
+    }
+
+    #[cfg(feature = "github-actions")]
+    #[test]
+    fn test_commands_pin_all_to_sha_matches_ecosystem_command_id() {
+        assert_eq!(commands::PIN_ALL_TO_SHA, "deps-lsp.pinAllToSha");
+        assert_eq!(
+            commands::PIN_ALL_TO_SHA,
+            deps_github_actions::PIN_ALL_TO_SHA_COMMAND_ID
+        );
+    }
+
+    #[cfg(feature = "github-actions")]
+    #[test]
+    fn test_pin_all_to_sha_args_deserialization() {
+        let json = serde_json::json!({ "uri": "file:///repo/.github/workflows/ci.yml" });
+        let args: PinAllToShaArgs = serde_json::from_value(json).unwrap();
+        assert_eq!(args.uri.as_str(), "file:///repo/.github/workflows/ci.yml");
+    }
+
     #[test]
     fn test_update_all_outdated_args_deserialization() {
         let json = serde_json::json!({ "uri": "file:///test/Cargo.toml" });
@@ -1653,14 +1806,14 @@ mod tests {
     }
 
     #[test]
-    fn test_build_update_all_outdated_edit_uses_document_changes_with_version() {
+    fn test_build_batch_workspace_edit_uses_document_changes_with_version() {
         let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
         let edits = vec![TextEdit {
             range: Range::default(),
             new_text: "1.2.0".into(),
         }];
 
-        let edit = build_update_all_outdated_edit(&uri, Some(7), edits, true);
+        let edit = build_batch_workspace_edit(&uri, Some(7), edits, true);
 
         assert!(edit.changes.is_none());
         let DocumentChanges::Edits(doc_edits) =
@@ -1675,14 +1828,14 @@ mod tests {
     }
 
     #[test]
-    fn test_build_update_all_outdated_edit_falls_back_to_changes_map() {
+    fn test_build_batch_workspace_edit_falls_back_to_changes_map() {
         let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
         let edits = vec![TextEdit {
             range: Range::default(),
             new_text: "1.2.0".into(),
         }];
 
-        let edit = build_update_all_outdated_edit(&uri, Some(7), edits, false);
+        let edit = build_batch_workspace_edit(&uri, Some(7), edits, false);
 
         assert!(edit.document_changes.is_none());
         let changes = edit.changes.expect("changes present");
@@ -2464,6 +2617,272 @@ mod tests {
 
             let result = backend.execute_command(command_params(&uri)).await;
             assert!(result.is_ok());
+        }
+    }
+
+    #[cfg(feature = "github-actions")]
+    mod pin_all_to_sha_execute_command_tests {
+        use super::*;
+        use crate::document::DocumentState;
+        use deps_core::EcosystemId;
+        use std::sync::Arc;
+
+        fn command_params(uri: &Uri) -> ExecuteCommandParams {
+            ExecuteCommandParams {
+                command: commands::PIN_ALL_TO_SHA.to_string(),
+                arguments: vec![serde_json::json!({ "uri": uri.as_str() })],
+                work_done_progress_params: Default::default(),
+            }
+        }
+
+        /// Seeds `ecosystem`'s shared `TagIndex` for `name` with one `tag -> sha` entry —
+        /// same pattern `handlers::code_lens::cross_ecosystem_tests::seed_gha_tag_index`
+        /// uses, downcasting through `Ecosystem::registry()`/`Registry::as_any()` since
+        /// this module never drives a live registry fetch.
+        fn seed_gha_tag_index(
+            ecosystem: &dyn deps_core::Ecosystem,
+            name: &str,
+            tag: &str,
+            sha: &str,
+        ) {
+            let registry = ecosystem.registry();
+            let gha_registry = registry
+                .as_any()
+                .downcast_ref::<deps_github_actions::GithubActionsRegistry>()
+                .expect("github-actions ecosystem must back onto a GithubActionsRegistry");
+            let mut index = deps_github_actions::registry::TagIndex::default();
+            index.tag_to_sha.insert(tag.to_string(), sha.to_string());
+            gha_registry
+                .tag_index()
+                .insert(deps_core::PackageName::new(name), Arc::new(index));
+        }
+
+        /// Recomputes the bulk pin-all-to-SHA edit count directly, the same call
+        /// `Backend::execute_pin_all_to_sha` makes — used to pin each test's actual
+        /// discriminating precondition (issue #633 critic S2: `execute_command` returns
+        /// `Ok(None)` on every path, including every refusal branch, so asserting only
+        /// `result.is_ok()` cannot tell "applied N edits" apart from "silently refused").
+        fn gha_edit_count(
+            ecosystem: &dyn deps_core::Ecosystem,
+            parse_result: &dyn deps_core::ParseResult,
+        ) -> usize {
+            ecosystem
+                .as_any()
+                .downcast_ref::<deps_github_actions::GithubActionsEcosystem>()
+                .expect("github-actions ecosystem must back onto a GithubActionsEcosystem")
+                .collect_pin_all_to_sha_edits(parse_result)
+                .len()
+        }
+
+        #[tokio::test]
+        async fn test_execute_command_pin_all_to_sha_closed_document_no_op() {
+            let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+            let backend = service.inner();
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+
+            assert!(backend.state.get_document(&uri).is_none());
+
+            let result = backend.execute_command(command_params(&uri)).await;
+            assert!(result.is_ok());
+            assert!(
+                backend.state.get_document(&uri).is_none(),
+                "a refused command must not create a document"
+            );
+        }
+
+        /// Mirrors `execute_update_all_outdated`'s own
+        /// `test_execute_command_update_all_outdated_loading_document_no_op`: the
+        /// readiness-gate refusal branch (`!doc.is_ready_for_batch_update()`) had zero
+        /// test coverage for this command before this test (tester finding).
+        #[tokio::test]
+        async fn test_execute_command_pin_all_to_sha_loading_document_no_op() {
+            let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+            let backend = service.inner();
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+
+            let ecosystem = backend
+                .state
+                .ecosystem_registry
+                .get("github-actions")
+                .unwrap();
+            let content = "steps:\n  - uses: actions/checkout@v4\n".to_string();
+            let parse_result = ecosystem.parse_manifest(&content, &uri).await.unwrap();
+            let mut doc_state = DocumentState::new_from_parse_result(
+                EcosystemId::GithubActions,
+                content.clone(),
+                parse_result,
+            );
+            doc_state.set_version(Some(1));
+            doc_state.set_loading();
+            // Pin the precondition directly: this fixture must actually be "not ready"
+            // per the same predicate `execute_command` consults, not just assumed to be.
+            assert!(!doc_state.is_ready_for_batch_update());
+            backend.state.update_document(uri.clone(), doc_state);
+
+            let result = backend.execute_command(command_params(&uri)).await;
+            assert!(result.is_ok());
+            assert_eq!(
+                backend.state.get_document(&uri).unwrap().content,
+                content,
+                "a refused command must not touch document content"
+            );
+        }
+
+        /// Mirrors `execute_update_all_outdated`'s own
+        /// `test_execute_command_update_all_outdated_no_version_no_op` (tester finding).
+        #[tokio::test]
+        async fn test_execute_command_pin_all_to_sha_no_version_no_op() {
+            // `version: None` mirrors a document populated from disk after a missed
+            // didOpen (server restart/crash) — must be refused even though loaded and
+            // not `Loading`.
+            let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+            let backend = service.inner();
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+
+            let ecosystem = backend
+                .state
+                .ecosystem_registry
+                .get("github-actions")
+                .unwrap();
+            let content = "steps:\n  - uses: actions/checkout@v4\n";
+            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let mut doc_state = DocumentState::new_from_parse_result(
+                EcosystemId::GithubActions,
+                content.to_string(),
+                parse_result,
+            );
+            doc_state.set_loaded();
+            // `version` deliberately left as `None`.
+            assert!(!doc_state.is_ready_for_batch_update());
+            backend.state.update_document(uri.clone(), doc_state);
+
+            let result = backend.execute_command(command_params(&uri)).await;
+            assert!(result.is_ok());
+        }
+
+        #[tokio::test]
+        async fn test_execute_command_pin_all_to_sha_no_resolvable_step_shows_info_message() {
+            // No `TagIndex` seeded: the one Tag-pinned step is a cache miss, so
+            // `collect_pin_all_to_sha_edits` returns empty and the command must be a
+            // no-op (informational message, not a warning/panic).
+            let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+            let backend = service.inner();
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let content = "steps:\n  - uses: actions/checkout@v4\n";
+
+            let ecosystem = backend
+                .state
+                .ecosystem_registry
+                .get("github-actions")
+                .unwrap();
+            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            // Pin the precondition the refusal actually depends on: a genuine `TagIndex`
+            // cache miss, not e.g. a wrong downcast or an empty method body.
+            assert_eq!(
+                gha_edit_count(ecosystem.as_ref(), parse_result.as_ref()),
+                0,
+                "fixture must have zero resolvable edits for this to test the no-op path"
+            );
+            let mut doc_state = DocumentState::new_from_parse_result(
+                EcosystemId::GithubActions,
+                content.to_string(),
+                parse_result,
+            );
+            doc_state.set_version(Some(1));
+            doc_state.set_loaded();
+            backend.state.update_document(uri.clone(), doc_state);
+
+            let result = backend.execute_command(command_params(&uri)).await;
+            assert!(result.is_ok());
+        }
+
+        #[tokio::test]
+        async fn test_execute_command_pin_all_to_sha_applies_edit_for_resolvable_steps() {
+            let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+            let backend = service.inner();
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let content = "steps:\n\
+                 \x20 - uses: actions/checkout@v4\n\
+                 \x20 - uses: actions/setup-node@v3\n";
+
+            let ecosystem = backend
+                .state
+                .ecosystem_registry
+                .get("github-actions")
+                .unwrap();
+            seed_gha_tag_index(
+                ecosystem.as_ref(),
+                "actions/checkout",
+                "v4",
+                &"a".repeat(40),
+            );
+            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            // Pin the precondition this test actually exercises: exactly one of the two
+            // steps is resolvable (the other has no seeded `TagIndex` entry) — without
+            // this, the test below cannot distinguish "applied 1 edit" from "refused,
+            // showed an info message" (both return `Ok(None)`, critic S2).
+            assert_eq!(
+                gha_edit_count(ecosystem.as_ref(), parse_result.as_ref()),
+                1,
+                "fixture must have exactly one resolvable edit for this to test the \
+                 apply-edit path, not the no-resolvable-step refusal"
+            );
+            let mut doc_state = DocumentState::new_from_parse_result(
+                EcosystemId::GithubActions,
+                content.to_string(),
+                parse_result,
+            );
+            doc_state.set_version(Some(1));
+            doc_state.set_loaded();
+            backend.state.update_document(uri.clone(), doc_state);
+
+            // This test `Backend` is never `initialize`d, so `apply_edit` returns `Err`
+            // (documented `apply_edit` behavior) — exercises the same not-a-panic
+            // apply-failure path `execute_update_all_outdated`'s own test covers,
+            // proving the command reaches (and survives) the apply step rather than
+            // being refused earlier.
+            let result = backend.execute_command(command_params(&uri)).await;
+            assert!(result.is_ok());
+        }
+
+        #[tokio::test]
+        async fn test_execute_command_pin_all_to_sha_non_gha_document_no_op() {
+            // A stale/forged command against a document whose ecosystem is not GitHub
+            // Actions must be refused, not panic on the downcast.
+            let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+            let backend = service.inner();
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+
+            let ecosystem = backend.state.ecosystem_registry.get("cargo").unwrap();
+            // Pin the precondition this test actually depends on: the downcast
+            // `execute_pin_all_to_sha` performs must genuinely fail for this fixture,
+            // not merely "some cargo-flavored content" that happens to also pass.
+            assert!(
+                ecosystem
+                    .as_any()
+                    .downcast_ref::<deps_github_actions::GithubActionsEcosystem>()
+                    .is_none(),
+                "fixture must back onto a non-GitHub-Actions ecosystem for this to test \
+                 the downcast-refusal path"
+            );
+            let content = "[dependencies]\nserde = \"1.0.0\"\n".to_string();
+            let parse_result = ecosystem.parse_manifest(&content, &uri).await.unwrap();
+            let mut doc_state = DocumentState::new_from_parse_result(
+                EcosystemId::Cargo,
+                content.clone(),
+                parse_result,
+            );
+            doc_state.set_version(Some(1));
+            doc_state.set_loaded();
+            backend.state.update_document(uri.clone(), doc_state);
+
+            let result = backend.execute_command(command_params(&uri)).await;
+            assert!(result.is_ok());
+            assert_eq!(
+                backend.state.get_document(&uri).unwrap().content,
+                content,
+                "a refused command must not touch document content"
+            );
         }
     }
 }

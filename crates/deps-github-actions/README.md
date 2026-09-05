@@ -30,6 +30,9 @@ implements `deps_core::Ecosystem`.
   `@v4`) gets an additive, independent diagnostic recommending SHA pinning, plus a "Pin to
   commit SHA" quick fix rewriting it to `@<sha> # <tag>` when the tag's commit is already
   known; on by default, configurable via `mutable_ref_pin_severity`/`mutable_ref_pin_enabled`
+- **Bulk "Pin all to SHA" code lens** (issue #633) — a "Pin N actions to commit SHA" lens
+  applies the per-step quick fix above to every resolvable mutable-tag step in one edit,
+  reusing the same `TagIndex` lookup at zero additional network cost
 - **Release-freshness signal (partial)** (issue #486) — `GithubActionsRegistry::
   get_versions_with_release_dates`, invoked via `Registry::get_versions_with` when
   freshness rendering is enabled, attaches GitHub Release publish timestamps to
@@ -93,6 +96,10 @@ against the tag with zero SHA-to-tag network resolution.
   (`uses: "actions/checkout@v4"`) — the ref sits inside the quotes there, and appending
   `# <tag>` would corrupt the value instead of adding a YAML comment; the diagnostic still
   fires, just without the automated fix
+- Both the "Pin to commit SHA" quick fix and the bulk "Pin all to SHA" lens are withheld
+  for a `uses:` step written in YAML flow style (`{uses: actions/checkout@v4, with:
+  {node: 20}}`) — appending `# <tag>` would comment out the rest of the flow collection
+  and produce invalid YAML; block-style steps (the common case) are unaffected
 
 ## License
 

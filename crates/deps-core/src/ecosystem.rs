@@ -640,6 +640,17 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
 
     /// Generate the "Update N outdated dependencies" code lens for the document.
     ///
+    /// `severities` is unused by the default implementation (the shared "update all
+    /// outdated" lens has no enable/disable toggle of its own — that's `code_lens.enabled`
+    /// in `deps-lsp`'s config, gating the whole handler before this method is ever
+    /// called) but is threaded through so an override can gate an *additional*,
+    /// ecosystem-specific lens on a `DiagnosticSeverities` flag the way
+    /// `generate_diagnostics`'s `severities` parameter already does — see
+    /// `deps_github_actions::GithubActionsEcosystem`'s override, which gates its bulk
+    /// "Pin N actions to commit SHA" lens on `severities.mutable_ref_pin_enabled` so
+    /// disabling that flag suppresses the lens the same way it suppresses the
+    /// diagnostic (issue #633).
+    ///
     /// Default implementation delegates to `lsp_helpers::generate_code_lenses` using
     /// `self.formatter()`. Override only if custom behavior is needed.
     fn generate_code_lenses<'a>(
@@ -649,6 +660,7 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
         versions: VersionData<'a>,
         uri: &'a Uri,
         command_id: &'a str,
+        _severities: crate::lsp_helpers::DiagnosticSeverities,
     ) -> BoxFuture<'a, Vec<CodeLens>> {
         Box::pin(async move {
             crate::lsp_helpers::generate_code_lenses(

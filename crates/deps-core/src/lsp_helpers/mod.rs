@@ -22,7 +22,7 @@ mod inlay_hints;
 mod test_support;
 
 pub use code_actions::generate_code_actions;
-pub use code_lenses::{collect_update_all_edits, generate_code_lenses};
+pub use code_lenses::{collect_update_all_edits, dedup_overlapping_edits, generate_code_lenses};
 pub use diagnostics::{
     DEPRECATED_DIAGNOSTIC_CODE, DiagnosticSeverities, UNSATISFIABLE_DIAGNOSTIC_CODE,
     compile_requirement_unless, generate_diagnostics_from_cache, requirement_is_unsatisfiable,

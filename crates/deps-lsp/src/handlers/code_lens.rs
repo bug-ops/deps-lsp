@@ -45,7 +45,10 @@ pub async fn handle_code_lens(
         return vec![];
     }
 
-    let offline = { config.read().await.network.offline };
+    let (offline, severities) = {
+        let config = config.read().await;
+        (config.network.offline, config.diagnostics.to_severities())
+    };
 
     // Own everything `generate_code_lenses` needs and release the DashMap shard `Ref`
     // before awaiting it (#333): `with_document` only ever hands `extract` a borrowed
@@ -85,6 +88,7 @@ pub async fn handle_code_lens(
             VersionData::new(&cached_versions, &resolved_versions).with_offline(offline),
             uri,
             COMMAND_ID,
+            severities,
         )
         .await
 }

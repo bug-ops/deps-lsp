@@ -189,6 +189,7 @@ pub(crate) mod blocking_ecosystem {
             _versions: VersionData<'a>,
             _uri: &'a Uri,
             _command_id: &'a str,
+            _severities: DiagnosticSeverities,
         ) -> BoxFuture<'a, Vec<CodeLens>> {
             Box::pin(async move {
                 if matches!(self.hook, BlockingHook::CodeLenses) {

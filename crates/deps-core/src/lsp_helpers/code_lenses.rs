@@ -198,6 +198,23 @@ pub fn collect_update_all_edits(
         });
     }
 
+    dedup_overlapping_edits(edits, "collect_update_all_edits")
+}
+
+/// Sorts `edits` by start position and drops any edit whose start falls before the
+/// previous (surviving) edit's end — a `WorkspaceEdit` protocol violation no LSP client
+/// can apply.
+///
+/// `caller` names the collector in the `tracing::warn!` emitted for each dropped edit, so
+/// a log line is traceable back to which bulk command produced it.
+///
+/// Shared by every "collect edits for a bulk `WorkspaceEdit`" aggregator in the
+/// workspace (issue #633 critic M3: a sibling collector omitting this pass — while every
+/// current parser happens not to produce overlapping spans — is exactly the kind of
+/// divergence the project's cross-ecosystem-consistency rule exists to catch) —
+/// currently [`collect_update_all_edits`] and
+/// `deps_github_actions::ecosystem::collect_pin_all_to_sha_edits`.
+pub fn dedup_overlapping_edits(mut edits: Vec<TextEdit>, caller: &str) -> Vec<TextEdit> {
     edits.sort_by_key(|edit| (edit.range.start.line, edit.range.start.character));
 
     let mut non_overlapping: Vec<TextEdit> = Vec::with_capacity(edits.len());
@@ -209,7 +226,8 @@ pub fn collect_update_all_edits(
         if overlaps_prev {
             tracing::warn!(
                 range = ?edit.range,
-                "collect_update_all_edits: dropping overlapping TextEdit"
+                caller,
+                "dropping overlapping TextEdit"
             );
             continue;
         }

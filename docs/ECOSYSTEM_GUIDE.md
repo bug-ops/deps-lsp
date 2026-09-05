@@ -1132,6 +1132,47 @@ tag-to-SHA-style index exists for branches, and adding one would require a new n
 branch; reusable-workflow calls (`owner/repo/.github/workflows/x.yml@ref`) and `./local`/
 `docker://` references are not resolvable refs and get no diagnostic either.
 
+### Bulk "Pin All to SHA" Code Lens (issue #633)
+
+**GitHub Actions only.** A workflow with at least one mutable-tag `uses:` step resolvable
+to a commit SHA shows a second code lens alongside `Update N outdated dependencies`,
+titled `Pin N actions to commit SHA`. Clicking it rewrites every such step in one batch
+edit — the bulk counterpart of the per-step "Pin `<name>` to commit SHA" quickfix
+documented above, reusing the exact same `TagIndex` lookup (**zero additional network
+calls**: bulk-pinning N actions costs N hashmap lookups, not N registry fetches).
+
+A step is included only when the per-step quickfix would also offer it — the bulk lens is
+never laxer than the single-step fix:
+
+- Only a statically-classified `PinStyle::Tag` step is pinned; a registry-confirmed
+  literal-named tag (the `PinStyle::Branch` case from the diagnostic section above) has no
+  automated fix here either, for the same branch/tag name-collision safety reason.
+- A step whose tag has no resolvable `TagIndex` entry yet (cache miss — e.g. the document
+  was opened before the registry fetch completed) is silently skipped, not blocked on or
+  turned into an extra fetch.
+- A quoted `uses:` scalar (`uses: "actions/checkout@v4"`) is skipped, matching the
+  per-step quickfix's own guard against corrupting the quoted value.
+- A `uses:` step written in YAML **flow** style (`{uses: actions/checkout@v4, with:
+  {node: 20}}`) is skipped: appending `# <tag>` right after the ref would comment out the
+  rest of the flow collection, producing invalid (unterminated) YAML instead of merely
+  leaving the step unpinned. Ordinary block-style steps — the overwhelming majority of
+  real workflows — are unaffected.
+
+The lens itself is omitted entirely — no permanent line-0 annotation — when nothing in the
+document is eligible: an all-SHA-pinned workflow, an empty workflow, or one where every tag
+is still an unresolved cache miss. It is also omitted whenever
+`diagnostics.mutable_ref_pin_enabled` is `false` — the same on/off switch that silences the
+mutable-ref-pin diagnostic above, since a lens is permanently rendered (unlike the pull-based
+per-step quickfix) and must respect the same opt-out.
+
+**Known limitations.** The lens counts only steps resolvable via the live `TagIndex`, while
+the mutable-ref-pin diagnostic flags every `PinStyle::Tag` step regardless of resolvability —
+so a workflow can show more mutable-ref-pin squiggles than the lens's own count, and clicking
+the lens can leave some squiggles in place (the steps it genuinely could not resolve). The
+lens's displayed count can also drift from the number of edits actually applied if a
+background fetch for another open workflow evicts a `TagIndex` entry between render and
+click (the shared index is bounded to 256 repositories).
+
 ### GitHub Actions: Non-Semver Tag Handling (issue #550)
 
 When a GitHub Action repository has only tags that don't parse as full semantic versions — such as

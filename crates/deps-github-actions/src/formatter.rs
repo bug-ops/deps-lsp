@@ -647,6 +647,7 @@ mod tests {
             pin,
             source: DependencySource::Registry,
             is_plain_scalar: true,
+            is_last_on_line: true,
         }
     }
 
