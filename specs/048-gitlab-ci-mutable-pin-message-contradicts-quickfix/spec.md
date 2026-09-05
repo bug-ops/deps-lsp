@@ -7,7 +7,7 @@ tags:
   - bug
   - deps-gitlab-ci
 created: 2026-09-05
-status: draft
+status: approved
 related:
   - "[[constitution]]"
   - "[[030-gitlab-ci-ecosystem/spec]]"
@@ -18,7 +18,7 @@ related:
 
 > [!info] Metadata
 > **Author**: k05h31@gmail.com
-> **Branch**: fix/gitlab-ci-mutable-pin-message-contradicts-quickfix (no issue filed yet)
+> **Branch**: feat/640-643-gitlab-ci-pin-parity (issue #643, implemented alongside #640)
 > **Source**: continuous-improvement cycle-045, live-tested against real `gitlab.com` API data
 
 ## 1. Overview
@@ -142,7 +142,8 @@ THEN the message text is unchanged from current behavior (still states no automa
 
 | ID | Requirement | Priority |
 |----|------------|----------|
-| FR-001 | WHEN `mutable_ref_pin_diagnostics` builds a message for a `component:` include with `PinStyle::Latest` or `PinStyle::Partial` THE SYSTEM SHALL NOT include the literal suffix `"(manual edit — no automated fix available for this ref)"` in that message | must |
+| FR-001 | WHEN `mutable_ref_pin_diagnostics` builds a message for a `component:` include with `PinStyle::Latest` or `PinStyle::Partial` **whose `DependencySource` is `AlternateRegistry` with a route registered in `GitlabCiRegistry::routes`** THE SYSTEM SHALL NOT include the literal suffix `"(manual edit — no automated fix available for this ref)"` in that message | must |
+| FR-001a | WHEN the same include's host is `HostRef::Unresolved` or `HostRef::CapacityRefused` (so its source is `CustomRegistry`, or its route is unregistered, and `build_dynamic_component_pin_action` therefore cannot offer a quickfix) THE SYSTEM SHALL continue to include the existing "no automated fix available for this ref" wording | must |
 | FR-002 | WHEN `mutable_ref_pin_diagnostics` builds a message for a ref-less `project:` include (no `ref:` key) THE SYSTEM SHALL continue to include the existing "no automated fix available" wording unchanged | must |
 | FR-003 | WHEN `mutable_ref_pin_diagnostics` builds a message for the `else` fallback case (`PinStyle::Branch` confirmed via `is_registry_confirmed_tag`, and any other pin style reaching that arm) THE SYSTEM SHALL continue to include the existing "no automated fix available for this ref" wording unchanged | must |
 | FR-004 | WHEN the doc comment above `mutable_ref_pin_diagnostics` describes which pin styles get no quickfix THE SYSTEM's documentation SHALL accurately list only the ref-less `project:` include and the `PinStyle::Branch`/`else`-fallback case — not `Latest`/`Partial` component pins | must |
@@ -165,6 +166,7 @@ or diagnostic codes are introduced. `MUTABLE_REF_PIN_DIAGNOSTIC_CODE` stays the 
 | Scenario | Expected Behavior |
 |----------|-------------------|
 | `component:` pin is `PinStyle::Latest`/`Partial` but `resolve_component_pin` times out or fails at quickfix-request time (after the diagnostic already published a "fix may be available" message) | Diagnostic message must not claim a fix is *guaranteed* — see FR-005; `textDocument/codeAction` legitimately returns zero actions in this case (existing degrade-to-nothing behavior, unchanged) |
+| `component:` pin is `PinStyle::Latest`/`Partial` but its host is `HostRef::Unresolved` (`$CI_SERVER_FQDN`, FR-012) or `HostRef::CapacityRefused`, so it has no registered route | Message keeps the "no automated fix available for this ref" suffix (FR-001a). `build_dynamic_component_pin_action` requires `DependencySource::AlternateRegistry` **and** a registered route, so no quickfix is offered for these includes and the suffix is accurate — this is the one `Latest`/`Partial` case FR-001 does not cover |
 | Ref-less `project:` include | Message unchanged (FR-002) |
 | `PinStyle::Branch` confirmed via `is_registry_confirmed_tag`, reaching the `else` arm | Message unchanged (FR-003) |
 | `PinStyle::Tag` | Message unchanged (already correct, no suffix) |
@@ -205,19 +207,39 @@ or diagnostic codes are introduced. `MUTABLE_REF_PIN_DIAGNOSTIC_CODE` stays the 
 - Port this change to `deps-github-actions` without first confirming (per Out of Scope) that the
   same mismatch actually exists there
 
-## 9. Open Questions
+## 9. Resolved Questions
 
-- [NEEDS CLARIFICATION: Which message-wording option should the implementer choose? Option (a):
-  omit the suffix entirely for `Latest`/`Partial`, matching `PinStyle::Tag`'s phrasing exactly
-  (simplest, but doesn't communicate the small chance the quickfix resolution can miss/timeout at
-  click time). Option (b): phrase it conditionally, e.g. "...guard against ref mutation (an
-  automated fix may be available via a quick-fix)" (more honest about the `COMPONENT_PIN_RESOLUTION_TIMEOUT`
-  degrade-to-nothing path, but introduces wording that doesn't exist elsewhere in this diagnostic
-  family and may need reviewer sign-off on tone/precedent).]
-- [NEEDS CLARIFICATION: No GitHub issue has been filed for this finding yet. File one with labels
-  `bug` + `P2` (per `.claude/rules/continuous-improvement.md`'s severity mapping — "incorrect
-  ...broken hover"-class message inconsistency, not a crash or data-loss issue) before or alongside
-  opening the implementation PR.]
+Both original clarification items are resolved; none remain open. (This section deliberately
+contains no open-clarification marker text, so a grep-based gate over `specs/` reads this spec as
+implementation-ready.)
+
+**Q1 — message wording: resolved as option (a)** (omit the suffix entirely, matching
+`PinStyle::Tag`'s phrasing). Option (b) existed to hedge against `COMPONENT_PIN_RESOLUTION_TIMEOUT`
+returning no action at click time, but `PinStyle::Tag` already has the identical failure mode — its
+quickfix returns `None` on a `TagIndex` cache miss — and its message hedges nothing. Option (a) is
+therefore consistent with the precedent this diagnostic family already set for the same situation,
+and satisfies FR-005 because a message that makes no availability claim cannot overclaim. Option (b)
+would also introduce a third message state, weakening the message/quickfix agreement invariant from
+a binary one to a three-way one.
+
+**Q2 — tracking issue: resolved.** Issue #643 is filed and assigned; implemented on branch
+`feat/640-643-gitlab-ci-pin-parity` alongside #640.
+
+## 9a. Amendments
+
+**2026-09-05 — FR-001 narrowed, FR-001a added.** As originally written, FR-001 was unconditional for
+every `Latest`/`Partial` `component:` include. That conflicted with the spec's own Goal ("the
+diagnostic text and the actual quickfix behavior agree") and with US-001's acceptance criteria: a
+`Latest`/`Partial` component on a `HostRef::Unresolved`/`CapacityRefused` host gets
+`DependencySource::CustomRegistry` and no registered route, so
+`build_dynamic_component_pin_action` (`ecosystem.rs:696-699`) offers **no** quickfix for it — and
+dropping the suffix there would have replaced one message/behavior mismatch with another, in the
+opposite direction.
+
+The original wording was an oversight rather than a scope decision: the finding's live evidence came
+exclusively from a resolved `gitlab.com` host, where the unresolved-host case cannot arise. FR-001
+now carries the source/route condition, FR-001a states the complementary case, and §6 gains the
+corresponding Edge Cases row. No change to the Goal, user stories, or Out of Scope.
 
 ## 10. See Also
 

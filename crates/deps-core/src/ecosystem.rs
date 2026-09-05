@@ -2,7 +2,7 @@ use std::any::Any;
 use std::pin::Pin;
 use std::sync::Arc;
 use tower_lsp_server::ls_types::{
-    CodeAction, CodeLens, Diagnostic, DocumentLink, Hover, InlayHint, Position, Uri,
+    CodeAction, CodeLens, Diagnostic, DocumentLink, Hover, InlayHint, Position, TextEdit, Uri,
 };
 
 use crate::{
@@ -725,6 +725,40 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     ///
     /// This allows ecosystem-specific operations when needed.
     fn as_any(&self) -> &dyn Any;
+
+    /// Builds the edits for this ecosystem's bulk "Pin N {noun} to commit SHA" code lens
+    /// and `deps-lsp.pinAllToSha` command (issue #633, generalized cross-ecosystem in
+    /// #640) — one [`TextEdit`] per mutable-ref pin resolvable to a commit SHA from
+    /// already-in-hand data, mirroring [`crate::collect_update_all_edits`]'s
+    /// recompute-at-click-time contract for the sibling "Update N outdated
+    /// dependencies" lens.
+    ///
+    /// `versions` is threaded through for an ecosystem (e.g. `deps-gitlab-ci`) whose
+    /// dynamic pin forms need the caller's already-fetched version data to resolve
+    /// without an extra network round trip — a lens is push-based and must never block
+    /// on, or trigger, a fetch. Empty by default: most ecosystems have no mutable-ref
+    /// pin concept at all. The lens/command wiring itself lives in `deps-lsp`'s
+    /// `handlers::code_lens` (not a trait default here), so no override of
+    /// [`Self::generate_code_lenses`] can accidentally suppress it.
+    fn collect_pin_all_to_sha_edits(
+        &self,
+        _parse_result: &dyn ParseResult,
+        _versions: VersionData<'_>,
+    ) -> Vec<TextEdit> {
+        Vec::new()
+    }
+
+    /// Singular/plural noun for this ecosystem's bulk "Pin N {noun} to commit SHA" lens
+    /// title (e.g. `{ singular: "action", plural: "actions" }` for GitHub Actions),
+    /// consulted only when [`Self::collect_pin_all_to_sha_edits`] returns at least one
+    /// edit. Default `{ "ref", "refs" }` is a generic fallback; override to match the
+    /// ecosystem's own vocabulary.
+    fn pin_all_to_sha_noun(&self) -> crate::lsp_helpers::PinNoun {
+        crate::lsp_helpers::PinNoun {
+            singular: "ref",
+            plural: "refs",
+        }
+    }
 }
 
 #[cfg(test)]

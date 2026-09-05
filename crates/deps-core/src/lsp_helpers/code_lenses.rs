@@ -9,6 +9,24 @@ use super::{
     slice_for_range, strip_whitespace, warn_rejected_value,
 };
 
+/// `workspace/executeCommand` id for the bulk "Pin N {noun} to commit SHA" code lens.
+///
+/// Issue #633, generalized cross-ecosystem in #640 — shared by every ecosystem that
+/// overrides [`crate::Ecosystem::collect_pin_all_to_sha_edits`], mirroring
+/// `deps-lsp.updateAllOutdated`'s single-command-for-every-ecosystem shape.
+pub const PIN_ALL_TO_SHA_COMMAND_ID: &str = "deps-lsp.pinAllToSha";
+
+/// Singular/plural noun for an ecosystem's bulk "Pin N {noun} to commit SHA" lens title,
+/// consulted by [`build_pin_all_to_sha_lens`] — see
+/// [`crate::Ecosystem::pin_all_to_sha_noun`].
+#[derive(Debug, Clone, Copy)]
+pub struct PinNoun {
+    /// Singular form, e.g. `"action"`.
+    pub singular: &'static str,
+    /// Plural form, e.g. `"actions"`.
+    pub plural: &'static str,
+}
+
 /// Manifest edits bringing every safely-editable outdated dependency to `latest`.
 ///
 /// A dependency is included when all of the following hold:
@@ -323,6 +341,56 @@ pub fn generate_code_lenses(
         }),
         data: None,
     }]
+}
+
+/// Zero or one lens for the bulk "Pin N {noun} to commit SHA" command, from an
+/// already-computed edit `count`.
+///
+/// Issue #633, generalized cross-ecosystem in #640 — the caller (`deps-lsp`'s
+/// `handlers::code_lens`) takes `count = ecosystem.collect_pin_all_to_sha_edits(..).len()`
+/// itself, so the lens title and the edits the `deps-lsp.pinAllToSha` command applies can
+/// never disagree about how many there are. Returns no lens when `count` is zero — a
+/// permanent line-0 annotation on a manifest with nothing to pin would be noise.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::{PinNoun, build_pin_all_to_sha_lens};
+///
+/// let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+/// let noun = PinNoun { singular: "action", plural: "actions" };
+///
+/// assert!(build_pin_all_to_sha_lens(0, noun, &uri).is_none());
+///
+/// let lens = build_pin_all_to_sha_lens(1, noun, &uri).unwrap();
+/// let command = lens.command.unwrap();
+/// assert_eq!(command.title, "Pin 1 action to commit SHA");
+/// assert_eq!(command.command, deps_core::lsp_helpers::PIN_ALL_TO_SHA_COMMAND_ID);
+///
+/// let lens = build_pin_all_to_sha_lens(3, noun, &uri).unwrap();
+/// assert_eq!(lens.command.unwrap().title, "Pin 3 actions to commit SHA");
+/// ```
+#[must_use]
+pub fn build_pin_all_to_sha_lens(count: usize, noun: PinNoun, uri: &Uri) -> Option<CodeLens> {
+    if count == 0 {
+        return None;
+    }
+
+    let title = if count == 1 {
+        format!("Pin 1 {} to commit SHA", noun.singular)
+    } else {
+        format!("Pin {count} {} to commit SHA", noun.plural)
+    };
+
+    Some(CodeLens {
+        range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+        command: Some(Command {
+            title,
+            command: PIN_ALL_TO_SHA_COMMAND_ID.to_string(),
+            arguments: Some(vec![serde_json::json!({ "uri": uri })]),
+        }),
+        data: None,
+    })
 }
 
 #[cfg(test)]
@@ -1016,6 +1084,122 @@ mod tests {
                 &MockFormatter,
             );
             assert_eq!(edits.len(), 1, "the overlapping later edit must be dropped");
+        }
+    }
+
+    mod pin_all_to_sha_lens_tests {
+        use super::*;
+
+        fn noun() -> PinNoun {
+            PinNoun {
+                singular: "action",
+                plural: "actions",
+            }
+        }
+
+        #[test]
+        fn test_zero_count_returns_no_lens() {
+            let uri = crate::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            assert!(build_pin_all_to_sha_lens(0, noun(), &uri).is_none());
+        }
+
+        #[test]
+        fn test_singular_title_for_one() {
+            let uri = crate::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let lens = build_pin_all_to_sha_lens(1, noun(), &uri).unwrap();
+            let command = lens.command.unwrap();
+            assert_eq!(command.title, "Pin 1 action to commit SHA");
+            assert_eq!(command.command, PIN_ALL_TO_SHA_COMMAND_ID);
+        }
+
+        #[test]
+        fn test_plural_title_for_n() {
+            let uri = crate::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let lens = build_pin_all_to_sha_lens(3, noun(), &uri).unwrap();
+            assert_eq!(lens.command.unwrap().title, "Pin 3 actions to commit SHA");
+        }
+
+        #[test]
+        fn test_command_arguments_carry_uri() {
+            let uri = crate::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let lens = build_pin_all_to_sha_lens(1, noun(), &uri).unwrap();
+            let command = lens.command.unwrap();
+            let args = command.arguments.expect("command has arguments");
+            assert_eq!(args[0]["uri"], uri.as_str());
+        }
+
+        #[test]
+        fn test_trait_default_returns_empty() {
+            use crate::Ecosystem as _;
+
+            struct DefaultEcosystem;
+            impl crate::ecosystem::private::Sealed for DefaultEcosystem {}
+            impl crate::Ecosystem for DefaultEcosystem {
+                fn id(&self) -> &'static str {
+                    "default"
+                }
+                fn display_name(&self) -> &'static str {
+                    "Default"
+                }
+                fn manifest_filenames(&self) -> &[&'static str] {
+                    &[]
+                }
+                fn parse_manifest<'a>(
+                    &'a self,
+                    _content: &'a str,
+                    _uri: &'a Uri,
+                ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Box<dyn ParseResult>>>
+                {
+                    unimplemented!()
+                }
+                fn registry(&self) -> std::sync::Arc<dyn crate::Registry> {
+                    unimplemented!()
+                }
+                fn formatter(&self) -> &dyn EcosystemFormatter {
+                    unimplemented!()
+                }
+                fn generate_completions<'a>(
+                    &'a self,
+                    _parse_result: &'a dyn ParseResult,
+                    _position: Position,
+                    _content: &'a str,
+                    _freshness: crate::FreshnessSettings,
+                ) -> crate::ecosystem::BoxFuture<'a, crate::completion::Completions>
+                {
+                    unimplemented!()
+                }
+                fn as_any(&self) -> &dyn std::any::Any {
+                    self
+                }
+            }
+
+            let eco = DefaultEcosystem;
+            let uri = crate::test_util::test_uri("/test/manifest");
+            let cached = std::collections::HashMap::new();
+            let resolved = std::collections::HashMap::new();
+            struct EmptyParseResult {
+                uri: Uri,
+            }
+            impl ParseResult for EmptyParseResult {
+                fn dependencies(&self) -> Vec<&dyn crate::Dependency> {
+                    vec![]
+                }
+                fn workspace_root(&self) -> Option<&std::path::Path> {
+                    None
+                }
+                fn uri(&self) -> &Uri {
+                    &self.uri
+                }
+                fn as_any(&self) -> &dyn std::any::Any {
+                    self
+                }
+            }
+            let pr = EmptyParseResult { uri };
+
+            let edits = eco.collect_pin_all_to_sha_edits(&pr, VersionData::new(&cached, &resolved));
+            assert!(edits.is_empty());
+            assert_eq!(eco.pin_all_to_sha_noun().singular, "ref");
+            assert_eq!(eco.pin_all_to_sha_noun().plural, "refs");
         }
     }
 }
