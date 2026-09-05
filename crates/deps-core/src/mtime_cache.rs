@@ -23,14 +23,17 @@ pub const DEFAULT_MAX_CACHED_FILES: usize = 256;
 
 /// Maximum file size [`MtimeFileCache::get_or_parse`] reads before parsing.
 ///
-/// Checked against [`std::fs::Metadata::len`] *before* `read_to_string`, so an oversized file
-/// (e.g. a crafted `pnpm-workspace.yaml` in a cloned repository) never reaches
-/// `read_to_string`, `YamlLoader`, or any content-based guard like
+/// Enforced twice: a cheap [`std::fs::Metadata::len`] pre-filter rejects an obviously oversized
+/// file before it is even opened, and [`crate::fs_probe::read_to_string_capped`] then bounds
+/// the actual read itself, so an oversized file (e.g. a crafted `pnpm-workspace.yaml` in a
+/// cloned repository) never reaches `YamlLoader` or any content-based guard like
 /// [`crate::check_yaml_nesting_depth`]/[`crate::check_yaml_expansion`] — those guards run on
-/// content already read into memory, so they cannot bound the read itself. 8 MiB matches
-/// [`crate::cache`]'s `MAX_CACHEABLE_ENTRY_BYTES` order of magnitude and is generous for a
-/// real config file (`.cargo/config.toml`, `.npmrc`, `pnpm-workspace.yaml`), which are
-/// typically a few KB.
+/// content already read into memory, so they cannot bound the read itself. The capped read is
+/// what actually closes the gap: the `stat` pre-filter alone would leave a TOCTOU window where
+/// a symlink swap or concurrent growth between the `stat` and the read could let an oversized
+/// file's content through. 8 MiB matches [`crate::cache`]'s `MAX_CACHEABLE_ENTRY_BYTES` order
+/// of magnitude and is generous for a real config file (`.cargo/config.toml`, `.npmrc`,
+/// `pnpm-workspace.yaml`), which are typically a few KB.
 pub const MAX_CACHED_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// One cached file's mtime plus its parsed value. The mtime lives here, not on `T`, so `T`
@@ -84,19 +87,55 @@ impl<T> MtimeFileCache<T> {
         }
     }
 
+    /// Logs the "oversized, not caching" warning at most once per distinct `mtime`, deduping
+    /// via [`Self::oversize_warned`] exactly like the pre-existing stat-based rejection path.
+    /// `len` is the known content length when available (the cheap stat pre-filter has it);
+    /// the capped-read rejection path does not know the exact length without reading the
+    /// whole oversized file, so it passes `None` and the length is simply omitted from the log.
+    fn warn_oversized_once(&self, path: &Path, mtime: Option<SystemTime>, len: Option<u64>) {
+        let already_warned = mtime.is_some_and(|mtime| {
+            self.oversize_warned
+                .get(path)
+                .is_some_and(|warned| *warned == mtime)
+        });
+        if already_warned {
+            return;
+        }
+        tracing::warn!(
+            path = %path.display(),
+            label = self.label,
+            len,
+            cap = MAX_CACHED_FILE_BYTES,
+            "file exceeds mtime file cache size cap; not reading"
+        );
+        if let Some(mtime) = mtime
+            && self.oversize_warned.len() < self.capacity
+        {
+            self.oversize_warned.insert(path.to_path_buf(), mtime);
+        }
+    }
+
     /// Returns `path`'s parsed contents, from cache if `path`'s mtime is unchanged, else
     /// re-reading and re-parsing with `parse`. `None` if `path` does not exist, is not a
     /// regular file, exceeds [`MAX_CACHED_FILE_BYTES`], or cannot be read.
     ///
-    /// Rejects anything but a regular file (a FIFO, socket, character device, or directory)
-    /// before ever attempting to read it — reading one of those can block the calling thread
+    /// Rejects anything but a regular file (a FIFO, socket, character device, or directory) as
+    /// observed at `stat` time — reading one of those can block the calling thread
     /// indefinitely, and [`std::fs::metadata`] follows symlinks, so a symlinked regular file
-    /// still resolves.
+    /// still resolves. This check is necessarily a point-in-time observation, not a guarantee
+    /// about what [`crate::fs_probe::read_to_string_capped`] will see: a symlink that resolved
+    /// to a regular file at `stat` time can still be swapped to a FIFO before the subsequent
+    /// `open` (the same TOCTOU class as the size check below), which would still block on
+    /// open. Fixing that blocking-open race is out of scope here (it needs `O_NONBLOCK` or
+    /// equivalent); this doc only avoids overclaiming that the gate rules it out.
     ///
-    /// Also rejects a file over [`MAX_CACHED_FILE_BYTES`] via the same `stat` result, before
-    /// `read_to_string` ever runs — every content-based safety guard (nesting-depth,
-    /// expansion) only sees content already read into memory, so it cannot bound the read
-    /// itself; this check is what does.
+    /// A file over [`MAX_CACHED_FILE_BYTES`] never reaches `parse` — every content-based
+    /// safety guard (nesting-depth, expansion) only sees content already read into memory, so
+    /// it cannot bound the read itself. This is enforced twice: the `stat` result is checked
+    /// first as a cheap pre-filter (skips opening an obviously huge file), and
+    /// [`crate::fs_probe::read_to_string_capped`] then bounds the read itself regardless of
+    /// what the `stat` reported — so a symlink swap or concurrent growth between the `stat`
+    /// and the read cannot let an oversized file's content slip through (CWE-367).
     ///
     /// Always performs one `stat` (the mtime check) — that cost is unavoidable and paid on
     /// every call, cache hit or not — but reads and parses the file's *content* only on a
@@ -124,26 +163,7 @@ impl<T> MtimeFileCache<T> {
             return None;
         }
         if metadata.len() > MAX_CACHED_FILE_BYTES {
-            let mtime = metadata.modified().ok();
-            let already_warned = mtime.is_some_and(|mtime| {
-                self.oversize_warned
-                    .get(path)
-                    .is_some_and(|warned| *warned == mtime)
-            });
-            if !already_warned {
-                tracing::warn!(
-                    path = %path.display(),
-                    label = self.label,
-                    len = metadata.len(),
-                    cap = MAX_CACHED_FILE_BYTES,
-                    "file exceeds mtime file cache size cap; not reading"
-                );
-                if let Some(mtime) = mtime
-                    && self.oversize_warned.len() < self.capacity
-                {
-                    self.oversize_warned.insert(path.to_path_buf(), mtime);
-                }
-            }
+            self.warn_oversized_once(path, metadata.modified().ok(), Some(metadata.len()));
             return None;
         }
         let mtime = metadata.modified().ok()?;
@@ -154,7 +174,16 @@ impl<T> MtimeFileCache<T> {
             return Some(Arc::clone(&existing.value));
         }
 
-        let content = fs_probe::read_to_string(path).ok()?;
+        let content = match fs_probe::read_to_string_capped(path, MAX_CACHED_FILE_BYTES).ok()? {
+            Some(content) => content,
+            None => {
+                // The stat-based pre-filter above passed, but the read itself still hit the
+                // cap — a symlink swap or concurrent growth between the two calls (CWE-367).
+                // Same outward behavior as the stat-based rejection: not cached, warned once.
+                self.warn_oversized_once(path, Some(mtime), None);
+                return None;
+            }
+        };
         let value = Arc::new(parse(&content));
 
         if !self.files.contains_key(path) && self.files.len() >= self.capacity {
@@ -313,8 +342,10 @@ mod tests {
         assert!(cache.get_or_parse(dir.path(), parse_upper).is_none());
     }
 
-    /// A file over [`MAX_CACHED_FILE_BYTES`] must never reach `read_to_string`/`parse` at
-    /// all — the size check happens on the `stat` result alone, before any content read.
+    /// A file over [`MAX_CACHED_FILE_BYTES`] must never reach `parse` at all — rejected here by
+    /// the cheap `stat` pre-filter. `fs_probe::tests::read_to_string_capped_rejects_content_over_cap`
+    /// proves the same bound holds on the read itself, independent of any `stat` result —
+    /// that is what closes the TOCTOU gap (CWE-367) a stat-only check would leave open.
     #[test]
     fn oversized_file_returns_none_without_reading_content() {
         let dir = tempfile::tempdir().unwrap();
@@ -336,6 +367,22 @@ mod tests {
             0,
             "parse must not run on an oversized file"
         );
+    }
+
+    /// A file exactly at [`MAX_CACHED_FILE_BYTES`] must still be cached — the capped read
+    /// reads one byte past the cap to detect an overage, and an off-by-one there would
+    /// falsely reject a file that lands exactly on the boundary.
+    #[test]
+    fn file_exactly_at_cap_is_still_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("exact.txt");
+        let content = "a".repeat(MAX_CACHED_FILE_BYTES as usize);
+        std::fs::write(&path, &content).unwrap();
+
+        let cache: MtimeFileCache<Parsed> = MtimeFileCache::new(DEFAULT_MAX_CACHED_FILES, "test");
+        let result = cache.get_or_parse(&path, parse_upper);
+
+        assert!(result.is_some(), "a file exactly at the cap must be cached");
     }
 
     /// Impl-critic S2 regression: an oversized file must warn at most once per distinct
