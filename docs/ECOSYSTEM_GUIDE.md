@@ -1132,14 +1132,20 @@ tag-to-SHA-style index exists for branches, and adding one would require a new n
 branch; reusable-workflow calls (`owner/repo/.github/workflows/x.yml@ref`) and `./local`/
 `docker://` references are not resolvable refs and get no diagnostic either.
 
-### Bulk "Pin All to SHA" Code Lens (issue #633)
+### Bulk "Pin All to SHA" Code Lens (issue #633, generalized cross-ecosystem in #640)
 
-**GitHub Actions only.** A workflow with at least one mutable-tag `uses:` step resolvable
-to a commit SHA shows a second code lens alongside `Update N outdated dependencies`,
-titled `Pin N actions to commit SHA`. Clicking it rewrites every such step in one batch
-edit — the bulk counterpart of the per-step "Pin `<name>` to commit SHA" quickfix
-documented above, reusing the exact same `TagIndex` lookup (**zero additional network
-calls**: bulk-pinning N actions costs N hashmap lookups, not N registry fetches).
+A document with at least one mutable-ref pin resolvable to a commit SHA shows a second
+code lens alongside `Update N outdated dependencies`, titled `Pin N {noun} to commit
+SHA` (GitHub Actions: `Pin N actions to commit SHA`; GitLab CI: `Pin N refs to commit
+SHA`). Clicking it rewrites every such pin in one batch edit — the bulk counterpart of
+the per-position "Pin `<name>` to commit SHA" quickfix each ecosystem already offers.
+The lens/command itself is a shared `deps-lsp`/`deps-core` mechanism
+(`Ecosystem::collect_pin_all_to_sha_edits`); an ecosystem with no mutable-ref pin concept
+simply never shows it.
+
+**GitHub Actions:** reuses the exact same `TagIndex` lookup the per-step quickfix uses
+(**zero additional network calls**: bulk-pinning N actions costs N hashmap lookups, not N
+registry fetches).
 
 A step is included only when the per-step quickfix would also offer it — the bulk lens is
 never laxer than the single-step fix:
@@ -1172,6 +1178,15 @@ the lens can leave some squiggles in place (the steps it genuinely could not res
 lens's displayed count can also drift from the number of edits actually applied if a
 background fetch for another open workflow evicts a `TagIndex` entry between render and
 click (the shared index is bounded to 256 repositories).
+
+**GitLab CI:** covers a `project:`/`component:` include pinned via `PinStyle::Tag`
+(resolved synchronously against the shared `TagIndex`, same as GitHub Actions) *and* a
+`component:` include pinned via `~latest`/a partial version (`1.2`), resolved against the
+project's already-fetched release list — the lens never itself performs a network fetch,
+so a `~latest`/partial pin is only counted (and edited) once that data has already been
+loaded for some other reason (e.g. hover, diagnostics). A SHA pin, an unconfirmed branch
+ref, and a ref-less `project:` include are never eligible, matching the per-position
+quickfix's own restrictions.
 
 ### GitHub Actions: Non-Semver Tag Handling (issue #550)
 
