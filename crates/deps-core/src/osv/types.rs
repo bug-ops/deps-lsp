@@ -78,19 +78,23 @@ pub enum VulnSeverity {
     Low,
     /// No severity field was present or recognized on the record.
     Unknown,
-    /// The advisory's `id` carries OSV's `MAL-` prefix, identifying a
-    /// confirmed-malicious-package record ingested from the OpenSSF
-    /// `malicious-packages` feed: this exact published version is known
-    /// malware (typically "fully compromised, rotate all secrets"), not a
-    /// graded-but-uncertain risk. `MAL-*` records carry no CVSS-style
-    /// severity field at all, so without this variant they would collapse
-    /// into [`Self::Unknown`] and render identically to a merely unscored,
-    /// low-confidence CVE — see the `MAL-` prefix check this crate's OSV
+    /// The advisory's `id`, or any entry in its `aliases`, carries OSV's
+    /// `MAL-` prefix, identifying a confirmed-malicious-package record
+    /// ingested from the OpenSSF `malicious-packages` feed: this exact
+    /// published version is known malware (typically "fully compromised,
+    /// rotate all secrets"), not a graded-but-uncertain risk. `MAL-*`
+    /// records carry no CVSS-style severity field at all, so without this
+    /// variant they would collapse into [`Self::Unknown`] and render
+    /// identically to a merely unscored, low-confidence CVE — see the
+    /// `MAL-` prefix check (on both `id` and `aliases`) this crate's OSV
     /// severity classification runs before its graded-severity fallback,
-    /// and `architecture.md` §6. Deliberately not folded into
-    /// [`Self::Critical`] either: a confirmed compromise is categorically
-    /// different from a graded CVSS-CRITICAL score, and collapsing the two
-    /// would make them indistinguishable to a reader.
+    /// and `architecture.md` §6. The `aliases` check matters because OSV
+    /// can serve one confirmed-malicious-package event under a non-`MAL-`
+    /// primary id, cross-referencing the canonical `MAL-*` id only via
+    /// `aliases`. Deliberately not folded into [`Self::Critical`] either: a
+    /// confirmed compromise is categorically different from a graded
+    /// CVSS-CRITICAL score, and collapsing the two would make them
+    /// indistinguishable to a reader.
     Malicious,
 }
 
