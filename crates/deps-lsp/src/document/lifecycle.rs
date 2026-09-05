@@ -1790,7 +1790,8 @@ async fn run_document_open_background_task(
         (dep_sources, in_use, minimum_stability, collided_names)
     };
 
-    tracing::debug!(count = dep_sources.len(), "starting registry fetch");
+    let dep_count = dep_sources.len();
+    tracing::debug!(count = dep_count, "starting registry fetch");
 
     // Bounds total outbound fetch concurrency across every open/changed document
     // server-wide (issue #592 critic S2/M1). Acquired *before* `set_loading()`/
@@ -1959,7 +1960,11 @@ async fn run_document_open_background_task(
         freshness_settings,
         diagnostic_severities,
         offline,
-        diagnostics::loading_ceiling(cache_config.fetch_timeout_secs),
+        diagnostics::loading_ceiling(
+            cache_config.fetch_timeout_secs,
+            dep_count,
+            cache_config.max_concurrent_fetches,
+        ),
     )
     .await;
 
@@ -2371,16 +2376,7 @@ async fn run_document_change_task(
         )
         .await;
 
-        generate_and_publish_diagnostics(
-            &state,
-            &uri,
-            &client,
-            config.freshness,
-            config.diagnostic_severities,
-            config.offline,
-            config.cache.fetch_timeout_secs,
-        )
-        .await;
+        generate_and_publish_diagnostics(&state, &uri, &client, &config, 0).await;
         return;
     }
 
@@ -2395,6 +2391,7 @@ async fn run_document_change_task(
         .await
         .expect("fetch_permits semaphore is never closed");
 
+    let dep_count = deps_to_fetch.len();
     let (progress, fetch_result, attempted_names, collided_names) =
         fetch_registry_versions_for_change(
             &uri,
@@ -2460,16 +2457,7 @@ async fn run_document_change_task(
     )
     .await;
 
-    generate_and_publish_diagnostics(
-        &state,
-        &uri,
-        &client,
-        config.freshness,
-        config.diagnostic_severities,
-        config.offline,
-        config.cache.fetch_timeout_secs,
-    )
-    .await;
+    generate_and_publish_diagnostics(&state, &uri, &client, &config, dep_count).await;
 }
 
 /// Awaits the concurrently-spawned OSV phase-A scan, if one was started, and — when it
@@ -2508,22 +2496,28 @@ async fn await_and_commit_osv_phase_b(
 /// Generates diagnostics from the current document/cache state and publishes them to the
 /// client. Shared by both branches of [`run_document_change_task`], each of which must end
 /// with an up-to-date publish regardless of whether a registry fetch actually ran.
+///
+/// Takes `&ChangeTaskConfig` rather than its individual fields (both call sites already hold
+/// one) plus `dep_count`, the one value that isn't part of that snapshot — a fetch-batch size
+/// only the caller knows.
 async fn generate_and_publish_diagnostics(
     state: &Arc<ServerState>,
     uri: &Uri,
     client: &Client,
-    freshness_settings: deps_core::FreshnessSettings,
-    diagnostic_severities: deps_core::DiagnosticSeverities,
-    offline: bool,
-    fetch_timeout_secs: u64,
+    config: &ChangeTaskConfig,
+    dep_count: usize,
 ) {
     let diags = diagnostics::generate_diagnostics_internal(
         Arc::clone(state),
         uri,
-        freshness_settings,
-        diagnostic_severities,
-        offline,
-        diagnostics::loading_ceiling(fetch_timeout_secs),
+        config.freshness,
+        config.diagnostic_severities,
+        config.offline,
+        diagnostics::loading_ceiling(
+            config.cache.fetch_timeout_secs,
+            dep_count,
+            config.cache.max_concurrent_fetches,
+        ),
     )
     .await;
     client.publish_diagnostics(uri.clone(), diags, None).await;
@@ -3126,6 +3120,8 @@ mod tests {
                 false,
                 diagnostics::loading_ceiling(
                     crate::config::CacheConfig::default().fetch_timeout_secs,
+                    1,
+                    crate::config::CacheConfig::default().max_concurrent_fetches,
                 ),
             )
             .await;
@@ -3221,6 +3217,8 @@ mod tests {
                 false,
                 diagnostics::loading_ceiling(
                     crate::config::CacheConfig::default().fetch_timeout_secs,
+                    1,
+                    crate::config::CacheConfig::default().max_concurrent_fetches,
                 ),
             )
             .await;

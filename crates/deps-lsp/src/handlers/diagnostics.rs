@@ -9,32 +9,75 @@ use tokio::sync::RwLock;
 use tower_lsp_server::Client;
 use tower_lsp_server::ls_types::{Diagnostic, Uri};
 
-/// How many multiples of `cache.fetch_timeout_secs` a document may stay in
-/// [`deps_core::LoadingState::Loading`] before diagnostics generation gives up waiting
-/// and forces it to `Failed`, falling through to whatever cache is already available
-/// (issue #632).
-///
-/// This alone under-estimates the legitimate (non-stuck) worst case for a large
-/// manifest (issue #632 critic S1): a single package fetch can take up to roughly
-/// `2 * fetch_timeout_secs` (the primary registry call plus its own timeout-bounded
-/// `get_latest_matching_from` fallback — see `document::lifecycle::fetch_and_classify_package`),
-/// run `cache.max_concurrent_fetches`-wide via `buffer_unordered` — so `N` dependencies
-/// take roughly `ceil(N / C) * 2T` even when nothing is wrong. With the defaults
-/// (T=10s, C=20), a 60-dependency manifest alone already reaches ~60s. Combined with
-/// [`MIN_LOADING_CEILING`], the effective ceiling is `max(3T, 120s)` — generous-but-bounded
-/// headroom, not a precise duration model: this exists to recover from a background task
-/// that never reaches `set_loaded`/`set_failed` (a hang the per-package timeout alone
-/// doesn't cover, e.g. a `DashMap` deadlock), not to model the exact fetch duration.
-pub(crate) const LOADING_CEILING_MULTIPLIER: u32 = 3;
-
-/// Floor under the [`LOADING_CEILING_MULTIPLIER`]-scaled ceiling (issue #632 critic S1):
-/// keeps a small `fetch_timeout_secs` from producing an unrealistically tight ceiling.
+/// Floor under the dependency/concurrency-scaled ceiling (issue #632 critic S1): keeps a
+/// small `fetch_timeout_secs` or a small manifest from producing an unrealistically tight
+/// ceiling.
 pub(crate) const MIN_LOADING_CEILING: Duration = Duration::from_secs(120);
 
-/// Computes the loading ceiling from the configured per-package fetch timeout. See
-/// [`LOADING_CEILING_MULTIPLIER`] and [`MIN_LOADING_CEILING`].
-pub(crate) fn loading_ceiling(fetch_timeout_secs: u64) -> Duration {
-    (Duration::from_secs(fetch_timeout_secs) * LOADING_CEILING_MULTIPLIER).max(MIN_LOADING_CEILING)
+/// Ceiling on the dependency/concurrency-scaled result (issue #636 critic S1): without this,
+/// a large manifest combined with a low `max_concurrent_fetches` (both user-configurable, down
+/// to `C=1`) produces an unbounded ceiling — e.g. `C=1`, `T=300s`, 300 dependencies scales to a
+/// ~50-hour ceiling. The ceiling is the *only* mechanism that recovers a document from a
+/// background fetch task that hangs without panicking (a panic is already handled by
+/// `spawn_background_task`'s supervisor), so an unbounded value reinstates issue #632's
+/// stuck-forever shape for exactly the manifests this fix targets. 30 minutes is a deliberate
+/// prefer-recovery-over-waiting tradeoff: past this point, forcing `Failed` and falling
+/// through to cached data is judged better than continuing to wait, even though a legitimate
+/// (very large manifest, very low concurrency) fetch could still be in flight — issue #636
+/// itself notes that undershooting the ceiling is low-impact and self-corrects once the
+/// background fetch completes.
+pub(crate) const MAX_LOADING_CEILING: Duration = Duration::from_mins(30);
+
+/// Computes how long a document may stay in [`deps_core::LoadingState::Loading`] before
+/// diagnostics generation gives up waiting and forces it to `Failed`, falling through to
+/// whatever cache is already available (issue #632).
+///
+/// Models the actual worst case: a single package fetch can take up to roughly
+/// `2 * fetch_timeout_secs` (the primary registry call plus its own timeout-bounded
+/// `get_latest_matching_from` fallback — see `document::lifecycle::fetch_and_classify_package`),
+/// run `max_concurrent_fetches`-wide via `buffer_unordered` — so `dep_count` dependencies
+/// take roughly `ceil(dep_count / max_concurrent_fetches) * 2 * fetch_timeout_secs` even when
+/// nothing is wrong (issue #636: a fixed multiplier under-counted this for a low
+/// `max_concurrent_fetches` combined with a non-trivial dependency count — e.g. `C=1`,
+/// `T=10s`, 10 dependencies legitimately needs 200s). The result is clamped between
+/// [`MIN_LOADING_CEILING`] and [`MAX_LOADING_CEILING`], so this exists to recover from a
+/// background task that never reaches `set_loaded`/`set_failed` (a hang the per-package
+/// timeout alone doesn't cover, e.g. a `DashMap` deadlock), not to model the exact fetch
+/// duration.
+///
+/// `dep_count` is an *upper bound* on the number of packages in the in-flight fetch, not
+/// necessarily its exact size: the two call sites that actually drive this check
+/// (`handle_diagnostics` and the lock-file-change refresh in `server.rs`) don't know the
+/// current fetch's real batch size, so they deliberately over-approximate using the
+/// document's full manifest dependency count — a document left `Loading` by e.g. a 1-dependency
+/// incremental fetch on a 300-dependency manifest gets a 300-dependency ceiling. This is
+/// conservative (a looser ceiling), never unsafe.
+pub(crate) fn loading_ceiling(
+    fetch_timeout_secs: u64,
+    dep_count: usize,
+    max_concurrent_fetches: usize,
+) -> Duration {
+    let batches = dep_count.div_ceil(max_concurrent_fetches.max(1));
+    let worst_case_secs = u64::try_from(batches)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(2)
+        .saturating_mul(fetch_timeout_secs);
+    Duration::from_secs(worst_case_secs).clamp(MIN_LOADING_CEILING, MAX_LOADING_CEILING)
+}
+
+/// Returns the number of dependencies declared in `uri`'s currently loaded parse result, or
+/// `0` if the document isn't loaded or has no parse result yet.
+///
+/// Shared by every call site that needs [`loading_ceiling`]'s conservative, manifest-wide
+/// `dep_count` upper bound (see that function's doc comment) rather than a specific fetch
+/// batch's real size — currently [`handle_diagnostics`] and the lock-file-change diagnostics
+/// refresh in `server.rs`.
+pub(crate) fn document_dependency_count(state: &ServerState, uri: &Uri) -> usize {
+    state
+        .with_document(uri, |doc| {
+            doc.parse_result().map_or(0, |p| p.dependencies().len())
+        })
+        .unwrap_or(0)
 }
 
 /// Handles diagnostic requests using trait-based delegation.
@@ -52,14 +95,17 @@ pub async fn handle_diagnostics(
     }
 
     // Snapshot before generating diagnostics (Copy value, no lock held across the call)
-    let (freshness, offline, ceiling) = {
+    let (freshness, offline, fetch_timeout_secs, max_concurrent_fetches) = {
         let full_config = full_config.read().await;
         (
             full_config.freshness.to_settings(),
             full_config.network.offline,
-            loading_ceiling(full_config.cache.fetch_timeout_secs),
+            full_config.cache.fetch_timeout_secs,
+            full_config.cache.max_concurrent_fetches,
         )
     };
+    let dep_count = document_dependency_count(&state, uri);
+    let ceiling = loading_ceiling(fetch_timeout_secs, dep_count, max_concurrent_fetches);
     let severities = config.to_severities();
 
     generate_diagnostics_internal(state, uri, freshness, severities, offline, ceiling).await
@@ -177,13 +223,48 @@ mod tests {
     // Generic tests (no feature flag required)
 
     #[test]
-    fn test_loading_ceiling_scales_with_fetch_timeout() {
-        // Critic S1: the default `fetch_timeout_secs` (10s) scales to 30s, well under
+    fn test_loading_ceiling_small_manifest_hits_floor() {
+        // A small manifest under default concurrency stays well under
         // `MIN_LOADING_CEILING` — the floor must win.
-        assert_eq!(loading_ceiling(10), Duration::from_secs(120));
-        assert_eq!(loading_ceiling(1), Duration::from_secs(120));
-        // A large `fetch_timeout_secs` scales past the floor.
-        assert_eq!(loading_ceiling(50), Duration::from_secs(150));
+        assert_eq!(loading_ceiling(10, 1, 20), Duration::from_secs(120));
+        assert_eq!(loading_ceiling(1, 1, 20), Duration::from_secs(120));
+    }
+
+    #[test]
+    fn test_loading_ceiling_scales_with_dependency_count_and_concurrency() {
+        // Issue #636: a low `max_concurrent_fetches` combined with a non-trivial
+        // dependency count must scale the ceiling past the floor —
+        // ceil(10 / 1) * 2 * 10s = 200s.
+        assert_eq!(loading_ceiling(10, 10, 1), Duration::from_secs(200));
+        // ceil(21 / 20) * 2 * 5s = 20s, still under the floor.
+        assert_eq!(loading_ceiling(5, 21, 20), Duration::from_secs(120));
+        // ceil(41 / 20) * 2 * 5s = 30s, still under the floor.
+        assert_eq!(loading_ceiling(5, 41, 20), Duration::from_secs(120));
+    }
+
+    #[test]
+    fn test_loading_ceiling_zero_dependencies_hits_floor() {
+        assert_eq!(loading_ceiling(50, 0, 20), Duration::from_secs(120));
+    }
+
+    #[test]
+    fn test_loading_ceiling_zero_max_concurrent_fetches_does_not_panic() {
+        // Defensive: `max_concurrent_fetches` is clamped to >= 1 by
+        // `config::deserialize_max_concurrent`, but this free function must not panic
+        // (integer division by zero) if ever called with an un-clamped value directly.
+        assert_eq!(loading_ceiling(10, 10, 0), Duration::from_secs(200));
+    }
+
+    /// Issue #636 critic S1: an unbounded ceiling would reinstate issue #632's
+    /// stuck-forever shape for a large manifest under low concurrency (the ceiling is the
+    /// only mechanism recovering a hung, non-panicking background task) — `MAX_LOADING_CEILING`
+    /// must cap the result regardless of how large `dep_count / max_concurrent_fetches` gets.
+    #[test]
+    fn test_loading_ceiling_caps_at_max_loading_ceiling() {
+        // C=1, T=300s, 300 dependencies -> uncapped would be 300 * 2 * 300s = 50 hours.
+        assert_eq!(loading_ceiling(300, 300, 1), MAX_LOADING_CEILING);
+        // Defaults (C=20, T=10s) with a very large manifest also hits the cap.
+        assert_eq!(loading_ceiling(10, 2000, 20), MAX_LOADING_CEILING);
     }
 
     #[tokio::test]
@@ -470,6 +551,45 @@ serde = "1.0.0"
     mod cargo_tests {
         use super::*;
         use crate::document::DocumentState;
+
+        /// Issue #636 tester finding: `handle_diagnostics`'s existing coverage only ever
+        /// used a single-dependency fixture, so nothing proved `document_dependency_count`
+        /// actually reads the document's real dependency count rather than e.g. always `0`.
+        #[tokio::test]
+        async fn test_document_dependency_count_reflects_real_dependency_count() {
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let content =
+                "[dependencies]\nserde = \"1.0\"\ntokio = \"1.0\"\nanyhow = \"1.0\"\n".to_string();
+            let parse_result = ecosystem
+                .parse_manifest(&content, &uri)
+                .await
+                .expect("Failed to parse manifest");
+            let doc_state =
+                DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+            state.update_document(uri.clone(), doc_state);
+
+            assert_eq!(document_dependency_count(&state, &uri), 3);
+        }
+
+        #[tokio::test]
+        async fn test_document_dependency_count_missing_document_is_zero() {
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            assert_eq!(document_dependency_count(&state, &uri), 0);
+        }
+
+        #[tokio::test]
+        async fn test_document_dependency_count_no_parse_result_is_zero() {
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let doc_state =
+                DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
+            state.update_document(uri.clone(), doc_state);
+
+            assert_eq!(document_dependency_count(&state, &uri), 0);
+        }
 
         #[tokio::test]
         async fn test_handle_diagnostics() {
