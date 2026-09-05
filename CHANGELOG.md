@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- **CI**: pin every third-party `uses:` action across `.github/workflows/*.yml` to a full commit SHA instead of a mutable tag, closing the tag-retargeting supply-chain exposure on this repository's own CI (resolves #641)
+
 ### Changed
 - **deps-core, deps-npm, deps-composer**: `deps-npm` and `deps-composer` now share a single `deps_core::json_helpers::string_valued_entries` helper (and its test coverage) for skipping non-string dependency-map values, instead of each crate carrying its own duplicated guard and tests (resolves #624) (#630)
 
