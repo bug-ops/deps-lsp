@@ -974,6 +974,91 @@ pub async fn complete_versions_generic_from(
         .collect()
 }
 
+/// Version completion resolved by **cursor position**, not by package name (issue #593).
+///
+/// Finds the dependency in `parse_result` whose `version_range` contains `position` — the
+/// same containment check [`detect_completion_context`] used to decide this is a `Version`
+/// context in the first place — then completes through [`complete_versions_generic_from`]
+/// against that dependency's own [`crate::Dependency::source`]. Unlike a name join (the old
+/// per-ecosystem `resolve_completion_source` pattern this replaces), two dependencies sharing
+/// one [`PackageName`] but resolving to different sources never collide: the cursor position
+/// unambiguously identifies which occurrence the user is editing, so each completes against
+/// its own source independently instead of both offering nothing.
+///
+/// Deliberately reuses this module's own (lenient) `position_in_range` rather than
+/// [`crate::lsp_helpers::position_in_range`] (the two differ at the one-past-`range.end`
+/// boundary) — using a different predicate here than the one [`detect_completion_context`]
+/// used to decide `position` is even inside a `Version` context would let this lookup silently
+/// disagree with its own caller and return empty at a boundary the caller already committed to.
+///
+/// # Source-resolvability gate
+///
+/// [`crate::Registry::get_versions_from`]'s default/documented contract does not itself fail
+/// closed for a source an ecosystem's registry does not specifically route (see that method's
+/// docs) — several concrete `Registry` implementations forward an unrecognized source (e.g.
+/// `Git`, `Path`, an unresolved `CustomRegistry`) to their default public-registry client
+/// rather than erroring. Gating on `formatter`'s
+/// [`SourcePolicy::can_resolve_source`](crate::lsp_helpers::SourcePolicy::can_resolve_source)
+/// first — the same check [`crate::lsp_helpers::generate_hover`] and diagnostics/code-actions
+/// already use — is what keeps that permissive default from leaking a private/non-registry
+/// dependency's name to a public registry on every keystroke.
+///
+/// # Examples
+///
+/// ```no_run
+/// use deps_core::completion::complete_versions_at_position;
+/// use deps_core::lsp_helpers::SourcePolicy;
+/// use tower_lsp_server::ls_types::Position;
+///
+/// struct DefaultFormatter;
+/// impl SourcePolicy for DefaultFormatter {}
+///
+/// # async fn example(registry: &dyn deps_core::Registry, parse_result: &dyn deps_core::ParseResult) {
+/// let freshness = deps_core::FreshnessSettings::default();
+/// let position = Position { line: 3, character: 12 };
+/// let items = complete_versions_at_position(
+///     registry,
+///     &DefaultFormatter,
+///     parse_result,
+///     position,
+///     "1.",
+///     &['^', '~'],
+///     freshness,
+/// ).await;
+/// # }
+/// ```
+pub async fn complete_versions_at_position(
+    registry: &dyn crate::Registry,
+    formatter: &dyn crate::lsp_helpers::SourcePolicy,
+    parse_result: &dyn ParseResult,
+    position: Position,
+    prefix: &str,
+    operator_chars: &[char],
+    freshness: FreshnessSettings,
+) -> Vec<CompletionItem> {
+    let Some(dep) = parse_result.dependencies().into_iter().find(|d| {
+        d.version_range()
+            .is_some_and(|r| position_in_range(position, r))
+    }) else {
+        return vec![];
+    };
+
+    let source = dep.source();
+    if !formatter.can_resolve_source(&source) {
+        return vec![];
+    }
+
+    complete_versions_generic_from(
+        registry,
+        dep.name(),
+        &source,
+        prefix,
+        operator_chars,
+        freshness,
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -10,56 +10,12 @@ use tower_lsp_server::ls_types::{CompletionItem, Position, Uri};
 
 use deps_core::{
     Ecosystem, ParseResult as ParseResultTrait, Registry, Result, completion::Completions,
-    lsp_helpers::EcosystemFormatter, parser::DependencySource,
+    lsp_helpers::EcosystemFormatter,
 };
 
 use crate::config::GoParseContext;
 use crate::formatter::GoFormatter;
 use crate::registry::GoRegistry;
-
-/// The source(s) a `CompletionContext::Version`'s bare `package_name` joins back to within a
-/// manifest's already-parsed dependencies (spec 034 F1).
-#[derive(Debug)]
-enum CompletionSource {
-    /// No dependency in the manifest has this exact name yet — most commonly because the
-    /// user is still typing a brand-new dependency line. Callers fall back to the
-    /// pre-existing public-registry-only behavior, unchanged.
-    NotInManifest,
-    /// Every occurrence of this name in the manifest agrees on one resolved source.
-    Resolved(DependencySource),
-    /// Two or more occurrences of this name resolve to different sources — callers must
-    /// offer no completions at all rather than picking one arbitrarily.
-    Ambiguous,
-}
-
-/// Joins `package_name` back to `parse_result.dependencies()` by name (spec 034 F1).
-///
-/// Mirrors `deps_npm::ecosystem`/`deps_pypi::ecosystem`'s identical helper — the resolved
-/// `$GOENV` source is already attached to each dependency by `parser::parse_go_mod_with_context`,
-/// so this is purely a name join, no `$GOENV` re-resolution.
-fn resolve_completion_source(
-    parse_result: &dyn ParseResultTrait,
-    package_name: &deps_core::PackageName,
-) -> CompletionSource {
-    let mut sources = parse_result
-        .dependencies()
-        .into_iter()
-        .filter(|d| d.name() == package_name)
-        .map(deps_core::Dependency::source);
-
-    let Some(first) = sources.next() else {
-        return CompletionSource::NotInManifest;
-    };
-    if sources.all(|s| s == first) {
-        CompletionSource::Resolved(first)
-    } else {
-        tracing::warn!(
-            package = %package_name,
-            "ambiguous dependency source for version completion; offering none"
-        );
-        CompletionSource::Ambiguous
-    }
-}
 
 /// Go modules ecosystem implementation.
 ///
@@ -120,48 +76,38 @@ impl GoEcosystem {
         std::future::ready(vec![])
     }
 
-    /// Completes version requirements for `package_name`, routed by the source that name
-    /// resolves to in `parse_result` (spec 034 F1). An ambiguous, unresolved, or
-    /// unregistered-alternate source offers no completions rather than risking a private
-    /// module path lookup against `proxy.golang.org` — the same leak class `GOPRIVATE`/`GOPROXY`
-    /// close for hover/diagnostics/code-actions.
+    /// Completes version requirements for the dependency at `position`, resolved by cursor
+    /// position rather than by name (issue #593) — delegates to
+    /// [`deps_core::completion::complete_versions_at_position`], which mirrors
+    /// `deps_gitlab_ci::ecosystem::GitLabCiEcosystem::generate_completions`'s reference
+    /// pattern. Position-based lookup also fixes a residual gap in the old name-based
+    /// routing (spec 034 F1): two dependencies sharing one `PackageName` but resolving to
+    /// different sources used to collapse into an ambiguous, empty result for both
+    /// occurrences, even though the cursor position unambiguously identifies which one the
+    /// user is editing.
+    ///
+    /// An unresolvable source still offers no completions rather than risking a private
+    /// module path lookup against `proxy.golang.org` — the shared helper's gate is what keeps
+    /// `Registry::get_versions_from`'s permissive routing of an unrecognized source to the
+    /// default public client (matching hover/diagnostics/code-actions' identical gate) from
+    /// leaking one for completions too.
     async fn complete_versions(
         &self,
         parse_result: &dyn ParseResultTrait,
-        package_name: &deps_core::PackageName,
+        position: Position,
         prefix: &str,
         freshness: deps_core::FreshnessSettings,
     ) -> Vec<CompletionItem> {
-        match resolve_completion_source(parse_result, package_name) {
-            CompletionSource::Ambiguous => vec![],
-            CompletionSource::NotInManifest
-            | CompletionSource::Resolved(DependencySource::Registry) => {
-                deps_core::completion::complete_versions_generic(
-                    self.registry.as_ref(),
-                    package_name,
-                    prefix,
-                    &[],
-                    freshness,
-                )
-                .await
-            }
-            CompletionSource::Resolved(DependencySource::AlternateRegistry { index, .. }) => {
-                match self.registry.alternate_client(&index) {
-                    Some(client) => {
-                        deps_core::completion::complete_versions_generic(
-                            client.as_ref(),
-                            package_name,
-                            prefix,
-                            &[],
-                            freshness,
-                        )
-                        .await
-                    }
-                    None => vec![],
-                }
-            }
-            CompletionSource::Resolved(_) => vec![],
-        }
+        deps_core::completion::complete_versions_at_position(
+            self.registry.as_ref(),
+            &self.formatter,
+            parse_result,
+            position,
+            prefix,
+            &[],
+            freshness,
+        )
+        .await
     }
 
     /// Completes feature flags for a specific package.
@@ -243,11 +189,8 @@ impl Ecosystem for GoEcosystem {
                 CompletionContext::PackageName { prefix, .. } => {
                     self.complete_package_names(&prefix).await
                 }
-                CompletionContext::Version {
-                    package_name,
-                    prefix,
-                } => {
-                    self.complete_versions(parse_result, &package_name, &prefix, freshness)
+                CompletionContext::Version { prefix, .. } => {
+                    self.complete_versions(parse_result, position, &prefix, freshness)
                         .await
                 }
                 CompletionContext::Feature {
@@ -269,8 +212,9 @@ impl Ecosystem for GoEcosystem {
 mod tests {
     use super::*;
     use crate::types::{GoDependency, GoDirective};
-    use deps_core::{Dependency, EcosystemConfig, PackageVersions, VersionData};
-    use std::assert_matches;
+    use deps_core::{
+        Dependency, EcosystemConfig, PackageVersions, VersionData, parser::DependencySource,
+    };
     use std::collections::HashMap;
     use tower_lsp_server::ls_types::{InlayHintLabel, Position, Range};
 
@@ -301,24 +245,14 @@ mod tests {
         uri: Uri,
     }
 
-    /// A `MockParseResult` with no dependencies — `resolve_completion_source` reports
-    /// `NotInManifest` for any name against it, so `complete_versions` falls back to its
-    /// pre-existing public-registry-only behavior (F1: this is the mechanical,
-    /// behavior-preserving fixture change forced on every pre-existing `complete_versions`
-    /// test below).
-    fn empty_parse_result() -> MockParseResult {
-        MockParseResult {
-            dependencies: vec![],
-            uri: deps_core::test_util::test_uri("/test/go.mod"),
-        }
-    }
-
-    fn dep_with_source(name: &str, source: DependencySource) -> GoDependency {
+    /// A dependency on `line`, with a `version_range` there so position-based lookup
+    /// (issue #593) can find it — mirrors `mock_dependency`, but with an explicit `source`.
+    fn dep_with_source(name: &str, source: DependencySource, line: u32) -> GoDependency {
         GoDependency {
             module_path: pkg(name),
-            module_path_range: Range::default(),
+            module_path_range: Range::new(Position::new(line, 0), Position::new(line, 0)),
             version: None,
-            version_range: None,
+            version_range: Some(Range::new(Position::new(line, 0), Position::new(line, 10))),
             directive: GoDirective::Require,
             indirect: false,
             source,
@@ -574,11 +508,17 @@ mod tests {
     async fn test_complete_versions_real() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = GoEcosystem::new(cache);
+        let dep = mock_dependency("github.com/gin-gonic/gin", Some("v1.9"), 0);
+        let position = dep.version_range.unwrap().start;
+        let parse_result = MockParseResult {
+            dependencies: vec![dep],
+            uri: deps_core::test_util::test_uri("/test/go.mod"),
+        };
 
         let results = ecosystem
             .complete_versions(
-                &empty_parse_result(),
-                &pkg("github.com/gin-gonic/gin"),
+                &parse_result,
+                position,
                 "v1.9",
                 deps_core::FreshnessSettings::default(),
             )
@@ -591,12 +531,18 @@ mod tests {
     async fn test_complete_versions_unknown_package() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = GoEcosystem::new(cache);
+        let dep = mock_dependency("github.com/nonexistent/package12345", Some("v1.0"), 0);
+        let position = dep.version_range.unwrap().start;
+        let parse_result = MockParseResult {
+            dependencies: vec![dep],
+            uri: deps_core::test_util::test_uri("/test/go.mod"),
+        };
 
         // Unknown package should return empty (graceful degradation)
         let results = ecosystem
             .complete_versions(
-                &empty_parse_result(),
-                &pkg("github.com/nonexistent/package12345"),
+                &parse_result,
+                position,
                 "v1.0",
                 deps_core::FreshnessSettings::default(),
             )
@@ -623,10 +569,16 @@ mod tests {
         let ecosystem = GoEcosystem::new(cache);
 
         // Test that we respect the 20 result limit
+        let dep = mock_dependency("github.com/gin-gonic/gin", Some("v1.0"), 0);
+        let position = dep.version_range.unwrap().start;
+        let parse_result = MockParseResult {
+            dependencies: vec![dep],
+            uri: deps_core::test_util::test_uri("/test/go.mod"),
+        };
         let results = ecosystem
             .complete_versions(
-                &empty_parse_result(),
-                &pkg("github.com/gin-gonic/gin"),
+                &parse_result,
+                position,
                 "v",
                 deps_core::FreshnessSettings::default(),
             )
@@ -903,81 +855,47 @@ require github.com/gin-gonic/gin v1.9.1
         assert_eq!(dep.name(), "github.com/example/pkg");
     }
 
-    // --- spec 034 F1: completion routes by resolved DependencySource ---
+    // --- issue #593: completion routes by cursor position, not by resolved DependencySource name ---
 
-    #[test]
-    fn test_resolve_completion_source_not_in_manifest() {
-        let parse_result = empty_parse_result();
-        assert_matches!(
-            resolve_completion_source(&parse_result, &pkg("github.com/gin-gonic/gin")),
-            CompletionSource::NotInManifest
-        );
-    }
-
-    #[test]
-    fn test_resolve_completion_source_resolved() {
-        let parse_result = MockParseResult {
-            dependencies: vec![dep_with_source(
-                "github.com/gin-gonic/gin",
-                DependencySource::Registry,
-            )],
-            uri: deps_core::test_util::test_uri("/test/go.mod"),
-        };
-        assert_matches!(
-            resolve_completion_source(&parse_result, &pkg("github.com/gin-gonic/gin")),
-            CompletionSource::Resolved(DependencySource::Registry)
-        );
-    }
-
-    /// Two occurrences of the same name resolving to different sources must not pick either
-    /// arbitrarily.
-    #[test]
-    fn test_resolve_completion_source_ambiguous() {
-        let parse_result = MockParseResult {
-            dependencies: vec![
-                dep_with_source("git.mycorp.example/pkg", DependencySource::Registry),
-                dep_with_source(
-                    "git.mycorp.example/pkg",
-                    DependencySource::AlternateRegistry {
-                        index: "go-private:direct".to_string(),
-                        mirrors_crates_io: false,
-                    },
-                ),
-            ],
-            uri: deps_core::test_util::test_uri("/test/go.mod"),
-        };
-        assert_matches!(
-            resolve_completion_source(&parse_result, &pkg("git.mycorp.example/pkg")),
-            CompletionSource::Ambiguous
-        );
-    }
-
+    /// Two dependencies sharing one `PackageName` but resolving to different sources no
+    /// longer collapse into the old name-based "offer nothing for either" result (spec 034
+    /// F1's `CompletionSource::Ambiguous`) — cursor position now identifies exactly one
+    /// dependency, so each occurrence routes independently through its own source.
     #[tokio::test]
-    async fn test_complete_versions_ambiguous_source_offers_nothing() {
+    async fn test_complete_versions_same_name_different_sources_routes_by_position() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = GoEcosystem::new(cache);
+        let registry_dep = dep_with_source("git.mycorp.example/pkg", DependencySource::Registry, 0);
+        let alternate_dep = dep_with_source(
+            "git.mycorp.example/pkg",
+            DependencySource::AlternateRegistry {
+                index: "go-private:never-registered".to_string(),
+                mirrors_crates_io: false,
+            },
+            1,
+        );
+        let alternate_position = alternate_dep.version_range.unwrap().start;
         let parse_result = MockParseResult {
-            dependencies: vec![
-                dep_with_source("git.mycorp.example/pkg", DependencySource::Registry),
-                dep_with_source(
-                    "git.mycorp.example/pkg",
-                    DependencySource::AlternateRegistry {
-                        index: "go-private:direct".to_string(),
-                        mirrors_crates_io: false,
-                    },
-                ),
-            ],
+            dependencies: vec![registry_dep, alternate_dep],
             uri: deps_core::test_util::test_uri("/test/go.mod"),
         };
+
+        // The alternate occurrence resolves deterministically without network: its index was
+        // never registered, so the fetch fails closed with `PackageNotFound` before any HTTP
+        // call — proving its own source, not the co-occurring `Registry`-sourced entry, drove
+        // the routing.
         let results = ecosystem
             .complete_versions(
                 &parse_result,
-                &pkg("git.mycorp.example/pkg"),
+                alternate_position,
                 "v1.",
                 deps_core::FreshnessSettings::default(),
             )
             .await;
-        assert!(results.is_empty());
+        assert!(
+            results.is_empty(),
+            "unregistered alternate index must offer no completions"
+        );
     }
 
     /// An `AlternateRegistry` source whose index has no registered client offers no
@@ -986,20 +904,23 @@ require github.com/gin-gonic/gin v1.9.1
     async fn test_complete_versions_unregistered_alternate_offers_nothing() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = GoEcosystem::new(cache);
+        let dep = dep_with_source(
+            "git.mycorp.example/internal/auth",
+            DependencySource::AlternateRegistry {
+                index: "never-registered".to_string(),
+                mirrors_crates_io: false,
+            },
+            0,
+        );
+        let position = dep.version_range.unwrap().start;
         let parse_result = MockParseResult {
-            dependencies: vec![dep_with_source(
-                "git.mycorp.example/internal/auth",
-                DependencySource::AlternateRegistry {
-                    index: "never-registered".to_string(),
-                    mirrors_crates_io: false,
-                },
-            )],
+            dependencies: vec![dep],
             uri: deps_core::test_util::test_uri("/test/go.mod"),
         };
         let results = ecosystem
             .complete_versions(
                 &parse_result,
-                &pkg("git.mycorp.example/internal/auth"),
+                position,
                 "v1.",
                 deps_core::FreshnessSettings::default(),
             )
@@ -1038,20 +959,23 @@ require github.com/gin-gonic/gin v1.9.1
         };
         GoRegistry::register_chain(&registry, &chain);
 
+        let dep = dep_with_source(
+            "git.mycorp.example/internal/auth",
+            DependencySource::AlternateRegistry {
+                index: "go-proxy:test".to_string(),
+                mirrors_crates_io: false,
+            },
+            0,
+        );
+        let position = dep.version_range.unwrap().start;
         let parse_result = MockParseResult {
-            dependencies: vec![dep_with_source(
-                "git.mycorp.example/internal/auth",
-                DependencySource::AlternateRegistry {
-                    index: "go-proxy:test".to_string(),
-                    mirrors_crates_io: false,
-                },
-            )],
+            dependencies: vec![dep],
             uri: deps_core::test_util::test_uri("/test/go.mod"),
         };
         let results = ecosystem
             .complete_versions(
                 &parse_result,
-                &pkg("git.mycorp.example/internal/auth"),
+                position,
                 "v1.",
                 deps_core::FreshnessSettings::default(),
             )
