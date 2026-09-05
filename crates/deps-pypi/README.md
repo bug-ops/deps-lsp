@@ -28,7 +28,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 
 ```toml
 [dependencies]
-deps-pypi = "0.12"
+deps-pypi = "0.13"
 ```
 
 > [!IMPORTANT]

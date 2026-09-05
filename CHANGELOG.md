@@ -7,11 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Security
-- **CI**: pin every third-party `uses:` action across `.github/workflows/*.yml` to a full commit SHA instead of a mutable tag, closing the tag-retargeting supply-chain exposure on this repository's own CI (resolves #641) (#644)
-
-### Changed
-- **deps-core, deps-npm, deps-composer**: `deps-npm` and `deps-composer` now share a single `deps_core::json_helpers::string_valued_entries` helper (and its test coverage) for skipping non-string dependency-map values, instead of each crate carrying its own duplicated guard and tests (resolves #624) (#630)
+## [0.13.0] - 2026-09-05
 
 ### Added
 - **deps-core, deps-github-actions, deps-gitlab-ci, deps-lsp**: bulk "Pin N {noun} to commit SHA" code lens generalized cross-ecosystem — GitLab CI `include:` entries now get the same batch quickfix GitHub Actions workflows already had (resolves #640) (#645)
@@ -59,10 +55,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-deno**: `parse_deno_json` now checks the parsed AST's nesting depth against `deps_core::MAX_JSON_NESTING_DEPTH` (64), tightening `jsonc-parser`'s own existing internal recursion cap (512) for consistency with deps-npm/deps-composer's JSON depth guard — hardening, not a vulnerability fix, since `deno.json`/`deno.jsonc` parsing was already bounded (resolves #618) (#620)
 - **deps-npm**: a `dependencies`/`devDependencies`/`peerDependencies`/`optionalDependencies` entry whose value is not a JSON string (e.g. an object) is now skipped instead of being queried against the registry and reported as an unknown package (resolves #619) (#622)
 
-### Removed
-- **Breaking (pre-1.0, public API)**: **deps-core**: removed `find_json_section_byte_range` from `parser`'s public API, superseded by the AST-based `deps_core::json_ast` module (#613) (#617)
-
 ### Changed
+- **deps-core, deps-npm, deps-composer**: `deps-npm` and `deps-composer` now share a single `deps_core::json_helpers::string_valued_entries` helper (and its test coverage) for skipping non-string dependency-map values, instead of each crate carrying its own duplicated guard and tests (resolves #624) (#630)
 - **deps-lsp**: the #590 watched-config-file reparse path now also sends `workspace/diagnostic/refresh` (previously only inlay-hint/code-lens refresh), matching #592's config-change reparse — a deliberate improvement, not a side effect (resolves #592) (#600)
 - **MSRV bumped to 1.98** — unlocks `assert_matches!` (replacing `assert!(matches!(...))` in tests) and `str::strip_circumfix` (replacing chained `strip_prefix`/`strip_suffix` in `deps-core`, `deps-gradle`, `deps-pypi`) (resolves #549) (#594)
 - **deps-nuget**: `NuGetSourceChain.hops`/`NuGetRegistry::with_base` now carry per-hop credential/slot data (`ResolvedHop`) instead of a bare feed URL; `deps_lsp::register_ecosystems` now takes an `&EcosystemRuntime` instead of a bare `Arc<RegistryAccessPolicy>` — both breaking, pre-1.0, no alias (#572)
@@ -72,7 +66,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-pypi, deps-nuget, deps-go**: consolidated three independently hand-rolled "hash an ordered routing chain into an opaque identity key" implementations into a single `deps_core::hash_routing_key` helper; resulting chain-key digest values change (process-local cache keys only, never persisted or compared cross-process, so this is not observable); `deps_go::config::ChainSeparator` no longer derives `Hash` (breaking, pre-1.0, no alias) (resolves #579) (#584)
 - **deps-core, deps-lsp**: decomposed `generate_hover` and `fetch_latest_versions_parallel`/`handle_document_open` into named, independently-testable helpers — pure refactor, no behavior change (resolves #586, #585) (#588)
 
+### Removed
+- **Breaking (pre-1.0, public API)**: **deps-core**: removed `find_json_section_byte_range` from `parser`'s public API, superseded by the AST-based `deps_core::json_ast` module (#613) (#617)
+
 ### Security
+- **CI**: pin every third-party `uses:` action across `.github/workflows/*.yml` to a full commit SHA instead of a mutable tag, closing the tag-retargeting supply-chain exposure on this repository's own CI (resolves #641) (#644)
 - **deps-core, deps-nuget**: credential material and its construction intermediates now zeroize on drop (resolves #574) (#577)
 
 ## [0.12.1] - 2026-09-03
@@ -796,7 +794,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TLS enforced via rustls
 - cargo-deny configured for vulnerability scanning
 
-[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v0.12.1...HEAD
+[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/bug-ops/deps-lsp/compare/v0.12.1...v0.13.0
 [0.12.1]: https://github.com/bug-ops/deps-lsp/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/bug-ops/deps-lsp/compare/v0.11.1...v0.12.0
 [0.11.1]: https://github.com/bug-ops/deps-lsp/compare/v0.11.0...v0.11.1

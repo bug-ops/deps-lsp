@@ -1088,30 +1088,28 @@ message is shown verbatim, which is the useful part), just not an automated rena
 | Composer | Yes, with replace action | `abandoned` (bare `true`, or a string naming a successor package) |
 | Cargo, Go, PyPI, Bundler, Dart, Maven, Gradle, Swift, NuGet, Deno | Not yet | No registry-native package-level deprecation signal wired up yet (tracked as fast-follows; Dart's `isDiscontinued`/`replacedBy` and PyPI's PEP 792 `project-status` already exist on the wire and are the best next targets) |
 
-### Mutable-Ref-Pin Diagnostic (issue #473)
+### Mutable-Ref-Pin Diagnostic (issue #473, #634)
 
-**GitHub Actions only.** A `uses:` step pinned to a mutable ref — a tag (`actions/checkout@v4`)
-or, in a future iteration, a branch — can silently start running different code than the
-workflow file shows: a compromised or republished tag changes what CI executes without a single
-line of the workflow file changing. This is a distinct, additive signal from the outdated-version
-diagnostic above (configurable via `diagnostics.mutable_ref_pin_severity`, default HINT) — a step
-can be up to date on its tag and still vulnerable to tag mutation, so both diagnostics can fire
-independently on the same step with distinct codes:
+**GitHub Actions and GitLab CI/CD.** A dependency or include pinned to a mutable ref can silently
+start running different code than the workflow/manifest file shows: a compromised or republished tag
+changes what CI executes without a single line of the file changing. This is a distinct, additive
+signal from the outdated-version diagnostic above (configurable via
+`diagnostics.mutable_ref_pin_severity`, default HINT) — a pin can be up to date on its tag and
+still vulnerable to tag mutation, so both diagnostics can fire independently on the same target
+with distinct codes:
+
+**GitHub Actions:** A `uses:` step pinned to a mutable ref — a tag (`actions/checkout@v4`)
+or, in a future iteration, a branch — is flagged via this diagnostic:
 
 ```
 actions/checkout is pinned to the mutable tag ref `v4`; pin to a full commit SHA to guard against tag mutation
 ```
 
-The diagnostic fires for two kinds of tags:
+**GitHub Actions:** The diagnostic fires for two kinds of tags:
 - **Semantic-version-shaped tags** (`v1.2.3`, `v4.0`, etc.) — detected by text pattern and confirmed via the registry.
 - **Literal-named tags** (non-version-like names such as `cargo-deny`, `latest-stable`) — these do not look tag-shaped to the parser, but when the registry confirms they are real tags, they become eligible for this diagnostic too (issue #551).
 
-Unlike every other diagnostic in this project, severity alone cannot silence this one —
-`DiagnosticSeverity` has no suppression value. Set `diagnostics.mutable_ref_pin_enabled` to
-`false` in initialization options to turn it off entirely for teams that intentionally accept
-tag pinning.
-
-**"Pin `<name>` to commit SHA" quick fix.** When offered, rewrites the step's ref to
+**"Pin `<name>` to commit SHA" quick fix (GitHub Actions).** When offered, rewrites the step's ref to
 `<sha> # <tag>` — the exact same `{sha} # {tag}` shape the outdated-SHA-update quick fix already
 produces for a SHA-pinned step, reusing the tag/SHA cross-reference already populated by the
 existing outdated-version check (zero new network calls). The quick fix is withheld, not offered
@@ -1127,10 +1125,30 @@ with a wrong or destructive edit, in three cases:
   than starting a YAML comment — a `uses:` value GitHub Actions rejects. Re-pin a quoted step by
   hand, or remove the quotes first.
 
-**Out of scope for this iteration:** branch pins (`@main`) get no diagnostic yet — no
+**Out of scope for GitHub Actions this iteration:** branch pins (`@main`) get no diagnostic yet — no
 tag-to-SHA-style index exists for branches, and adding one would require a new network call per
 branch; reusable-workflow calls (`owner/repo/.github/workflows/x.yml@ref`) and `./local`/
 `docker://` references are not resolvable refs and get no diagnostic either.
+
+**GitLab CI/CD:** The diagnostic fires for:
+- **`include: - project:`** pins to a mutable tag or branch ref — the ref is resolved against the GitLab
+  repository-tags API. The diagnostic fires for tag-shaped refs (semantically-versioned or literal-named
+  tags confirmed as real).
+- **`include: - component:`** pins to `~latest` or a partial-semver version (e.g. `1.2` for a component
+  published via releases) — while not a branch-vs-tag confusion risk like GitHub Actions, these are still
+  mutable in the sense that the pin can resolve to a different release if the GitLab project publishes a
+  new one (resolved against the project-releases API).
+
+**"Pin to commit SHA" quick fix (GitLab CI/CD).** For `project:` includes, rewrites the tag/branch ref to
+its resolved commit SHA; for `component:` includes with `~latest`/partial pins that have already been
+resolved against the releases API, shows the fix was available (resolves #643). The quick fix is withheld in
+the same cases as GitHub Actions: SHA not yet known (still loading), or for literal-named tags (same
+branch/tag ambiguity safety concern).
+
+Unlike every other diagnostic in this project, severity alone cannot silence this one —
+`DiagnosticSeverity` has no suppression value. Set `diagnostics.mutable_ref_pin_enabled` to
+`false` in initialization options to turn it off entirely for teams that intentionally accept
+mutable pins.
 
 ### Bulk "Pin All to SHA" Code Lens (issue #633, generalized cross-ecosystem in #640)
 
