@@ -58,12 +58,14 @@ const LARGE_FILE_THRESHOLD: u64 = 1_000_000; // 1MB
 /// # Returns
 ///
 /// * `Ok(String)` - File content
-/// * `Err(DepsError)` - File not found, permission denied, or not a file URI
+/// * `Err(DepsError)` - File not found, permission denied, not a file URI, or too large/not a
+///   regular file
 ///
 /// # Errors
 ///
 /// - `DepsError::InvalidUri` - URI is not a file:// URI
 /// - `DepsError::Io` - File read error (not found, permission denied, etc.)
+/// - `DepsError::CacheError` - Not a regular file, or exceeds `MAX_FILE_SIZE`
 ///
 /// # Examples
 ///
@@ -79,9 +81,10 @@ const LARGE_FILE_THRESHOLD: u64 = 1_000_000; // 1MB
 /// # }
 /// ```
 pub async fn load_document_from_disk(uri: &Uri) -> Result<String> {
-    // Convert URI to filesystem path
+    // Convert URI to filesystem path. Owned (not `Cow::Borrowed`), since the read below runs
+    // in `spawn_blocking` and needs a `'static` path.
     let path = match uri.to_file_path() {
-        Some(p) => p,
+        Some(p) => p.into_owned(),
         None => {
             tracing::debug!("Cannot load non-file URI: {:?}", uri);
             return Err(DepsError::InvalidUri(format!("{uri:?}")));
@@ -93,6 +96,20 @@ pub async fn load_document_from_disk(uri: &Uri) -> Result<String> {
     // Check file metadata for size limits and warnings
     match tokio::fs::metadata(&path).await {
         Ok(metadata) => {
+            // Reject anything but a regular file (FIFO, socket, character device,
+            // directory) before ever attempting to open it — a FIFO/chardev reports
+            // `len() == 0`, would pass the size gate below, and then block the
+            // `spawn_blocking` thread that opens it indefinitely (mirrors the `is_file`
+            // gate `discover_workspace` applies via `fs_probe::metadata` in
+            // `deps-cargo/src/parser.rs`).
+            if !metadata.is_file() {
+                tracing::warn!("Rejecting non-regular-file document: {:?}", path);
+                return Err(DepsError::CacheError(format!(
+                    "not a regular file: {}",
+                    path.display()
+                )));
+            }
+
             let size = metadata.len();
 
             // Hard limit: reject files over 10MB
@@ -135,8 +152,21 @@ pub async fn load_document_from_disk(uri: &Uri) -> Result<String> {
         }
     }
 
-    // Read file content asynchronously
-    let content = tokio::fs::read_to_string(&path).await.map_err(|e| {
+    // Read file content, bounded by the read itself (not just the metadata pre-filter
+    // above): `read_to_string_capped` opens the file and caps via `Read::take`, so a
+    // symlink swap or concurrent growth between the `metadata` call above and this read
+    // cannot let an oversized file through (CWE-367). Runs in `spawn_blocking` since it is a
+    // synchronous `std::fs` call.
+    let read_path = path.clone();
+    let capped = tokio::task::spawn_blocking(move || {
+        deps_core::fs_probe::read_to_string_capped(&read_path, MAX_FILE_SIZE)
+    })
+    .await
+    .map_err(|e| {
+        tracing::error!("document read task for {:?} panicked: {}", path, e);
+        DepsError::CacheError(format!("document read task failed: {e}"))
+    })?
+    .map_err(|e| {
         // Differentiate permission errors in file read
         match e.kind() {
             std::io::ErrorKind::NotFound => {
@@ -151,6 +181,26 @@ pub async fn load_document_from_disk(uri: &Uri) -> Result<String> {
         }
         DepsError::Io(e)
     })?;
+
+    let content = match capped {
+        Some(content) => content,
+        None => {
+            // Unreachable without a real TOCTOU race (a symlink swap or concurrent growth
+            // between the `metadata` check above and this read): the metadata gate already
+            // rejects anything over `MAX_FILE_SIZE` before the read starts. This is
+            // race-only defense-in-depth, not the primary mitigation — the property that
+            // this branch can even fire is what `fs_probe`'s own
+            // `read_to_string_capped_rejects_content_over_cap` test proves.
+            tracing::error!(
+                "Document exceeds maximum size during read (limit: {} bytes): {:?}",
+                MAX_FILE_SIZE,
+                path
+            );
+            return Err(DepsError::CacheError(format!(
+                "file too large (max: {MAX_FILE_SIZE} bytes)"
+            )));
+        }
+    };
 
     tracing::debug!(
         "Successfully loaded document: {:?} ({} bytes)",
@@ -346,6 +396,40 @@ serde = "1.0"
         assert!(result.is_err(), "Circular symlink should fail");
     }
 
+    /// A FIFO reports `len() == 0` from `metadata`, which would pass the size gate — without
+    /// the `is_file` check, opening it for read blocks the `spawn_blocking` thread
+    /// indefinitely (a writerless FIFO never yields EOF). Wrapped in a timeout so a
+    /// regression fails this test in seconds instead of hanging the whole suite.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_load_fifo_does_not_hang() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let fifo_path = temp_dir.path().join("Cargo.toml");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo_path)
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "mkfifo must succeed for this test to be meaningful"
+        );
+
+        let uri = Uri::from_file_path(&fifo_path).unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            load_document_from_disk(&uri),
+        )
+        .await
+        .expect("a FIFO must be rejected by the is_file gate, not block trying to open it");
+
+        assert!(
+            result.is_err(),
+            "a FIFO must never be treated as a loadable document"
+        );
+    }
+
     #[tokio::test]
     async fn test_load_file_exceeding_max_size() {
         use std::io::Write;
@@ -398,5 +482,44 @@ serde = "1.0"
                 _ => panic!("Expected CacheError for oversized file"),
             }
         }
+    }
+
+    /// A file exactly at `MAX_FILE_SIZE` must still load in full: `read_to_string_capped`
+    /// reads one byte past the cap to detect an overage, and an off-by-one there would
+    /// falsely reject a file that lands exactly on the boundary (mirrors
+    /// `deps_core::mtime_cache::tests::file_exactly_at_cap_is_still_cached`).
+    #[tokio::test]
+    async fn test_load_file_exactly_at_max_size() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("exact.toml");
+        let content = "a".repeat(MAX_FILE_SIZE as usize);
+        std::fs::write(&path, &content).unwrap();
+
+        let uri = Uri::from_file_path(&path).unwrap();
+        let loaded = load_document_from_disk(&uri).await.unwrap();
+
+        assert_eq!(loaded.len(), MAX_FILE_SIZE as usize);
+    }
+
+    /// Proves the read goes through the counted `fs_probe::read_to_string_capped`, not a raw
+    /// `tokio::fs::read_to_string` that would bypass the cap enforced at the read itself —
+    /// the property that closes the TOCTOU gap for #603 the same way #601 closed it for
+    /// `MtimeFileCache`.
+    #[tokio::test]
+    async fn test_load_routes_through_capped_read() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(b"test content").unwrap();
+        temp_file.flush().unwrap();
+
+        let uri = Uri::from_file_path(temp_file.path()).unwrap();
+        let (_, reads_before) = deps_core::fs_probe::snapshot();
+        load_document_from_disk(&uri).await.unwrap();
+        let (_, reads_after) = deps_core::fs_probe::snapshot();
+
+        assert_eq!(
+            reads_after - reads_before,
+            1,
+            "load_document_from_disk must read exactly once through the counted fs_probe path"
+        );
     }
 }
