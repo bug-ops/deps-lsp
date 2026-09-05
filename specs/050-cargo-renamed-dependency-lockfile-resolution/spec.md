@@ -10,7 +10,7 @@ tags:
   - deps-cargo
   - lockfile
 created: 2026-09-06
-status: draft
+status: specified
 related:
   - "[[constitution]]"
   - "[[023-cargo-custom-registries/spec|Cargo custom/private registry & source-replacement resolution]]"
@@ -76,11 +76,11 @@ queried at all — a false negative. Hover/inlay hints report "in use:
 
 PR #650 deliberately left this unresolved (added a regression test pinning
 the current known-limitation behavior rather than fixing it) and filed
-issue #649 for the architectural follow-up this spec covers. `[NEEDS CLARIFICATION:
-should this spec also account for #394's original scenario (duplicate names
-across `[target.'cfg(...)'.dependencies]` blocks in deps-lsp's own manifest-side
-HashMap), or is that a separate, already-closed concern (#394/PR #404) that
-should stay out of scope here? See Open Questions.]`
+issue #649 for the architectural follow-up this spec covers. #394's original
+scenario (duplicate names across `[target.'cfg(...)'.dependencies]` blocks)
+was fixed at the manifest-parsing layer by PR #404 and is a separate,
+already-closed concern — this spec is scoped purely to the lock-file
+resolution layer.
 
 ### Goal
 
@@ -160,7 +160,7 @@ Use EARS notation. Prefix with FR-NNN.
 | FR-003 | WHEN no lock-file entry for a name satisfies an occurrence's `version_requirement()`, THE SYSTEM SHALL return the existing "no concrete version" outcome for that occurrence (matching pre-#648 honest-skip behavior) rather than falling back to an arbitrary non-matching entry | must |
 | FR-004 | WHEN `vulnerability_keys()` computes a per-occurrence OSV cache-key signature, THE SYSTEM SHALL derive it from the per-occurrence resolved version produced by FR-001, so two occurrences of the same name pinned to different satisfying versions receive distinct signatures | must |
 | FR-005 | WHEN only a single manifest occurrence exists for a given resolved package name (the common case, no rename/alias involved), THE SYSTEM SHALL produce identical in-use-version and OSV-signature results to the current behavior — this is a correctness fix for the multi-occurrence case, not a behavior change for the single-occurrence case | must |
-| FR-006 | WHEN a downstream ecosystem/caller still needs "the single best version for this name regardless of any specific occurrence" (e.g. `[NEEDS CLARIFICATION: does any current caller of `ResolvedPackages::get_version`/`into_map` need this collapsed semantics preserved, or can every current caller be migrated to the per-occurrence lookup? see Open Questions]`), THE SYSTEM SHALL continue to expose that collapsed lookup as a distinct, explicitly-named API rather than removing it | should |
+| FR-006 | WHEN a downstream ecosystem/caller still needs "the single best version for this name regardless of any specific occurrence" (resolved: no current caller outside `in_use_version`/`vulnerability_keys` needs migrating — `ResolvedPackages::get`/`get_version`/`into_map` keep their existing collapsed semantics untouched as the fast-path default), THE SYSTEM SHALL continue to expose that collapsed lookup as a distinct, explicitly-named API rather than removing it | should |
 
 ## 4. Non-Functional Requirements
 
@@ -176,7 +176,7 @@ Use EARS notation. Prefix with FR-NNN.
 | Entity | Description | Key Attributes |
 |--------|-------------|----------------|
 | `ResolvedPackages` (existing, `crates/deps-core/src/lockfile.rs:280`) | Per-lockfile collection of resolved packages, already `Vec`-per-name internally | `packages: HashMap<String, Vec<ResolvedPackage>>`; `get_all()` (line 326) already exposes the full per-name `Vec` — likely the primary building block for the fix |
-| `resolved_versions: HashMap<PackageName, ConcreteVersion>` (existing, threaded through `deps-lsp::document::lifecycle` and `deps-core::lsp_helpers::in_use_version`/`deps-core::osv::vulnerability_keys`) | The collapsed one-value-per-name shape causing this bug | `[NEEDS CLARIFICATION: does this type change shape entirely (e.g. `HashMap<PackageName, Vec<ConcreteVersion>>`, or `HashMap<PackageName, ResolvedPackages>`-like), or does `load_resolved_versions()` keep building this exact type for the single-occurrence fast path while a new, separate lookup handles the multi-occurrence/version_req-aware case? See Open Questions — this is the central design decision of this spec.]` |
+| `resolved_versions: HashMap<PackageName, ConcreteVersion>` (existing, threaded through `deps-lsp::document::lifecycle` and `deps-core::lsp_helpers::in_use_version`/`deps-core::osv::vulnerability_keys`) | The collapsed one-value-per-name shape causing this bug | Resolved: `load_resolved_versions()` keeps building this exact type unchanged (fast path, FR-005/NFR-001). A new sibling map, `resolved_version_candidates: HashMap<PackageName, Vec<ConcreteVersion>>` (sourced from `ResolvedPackages::get_all()`), is threaded alongside it; `in_use_version()`/`vulnerability_keys()` consult the candidates map first when more than one entry exists for a name, filtering by the occurrence's `version_requirement()` (FR-001-FR-003), and fall back to the existing collapsed map when only one candidate exists — additive, no existing call site changes shape |
 | `Dependency::version_requirement()` (existing, `crates/deps-core/src/ecosystem.rs` trait method) | Already available per-occurrence, already used elsewhere in `in_use_version()` for the concrete-pin fallback path (line 321-323) | Returns `Option<&VersionReq>` — the natural filter key for FR-001's per-occurrence match |
 
 ## 6. Edge Cases and Error Handling
@@ -184,7 +184,7 @@ Use EARS notation. Prefix with FR-NNN.
 | Scenario | Expected Behavior |
 |----------|-------------------|
 | Two occurrences of the same resolved name, both with a `version_requirement()` satisfied by the same single lock-file entry (i.e. no actual rename scenario, just two manifest sections referencing the same crate at compatible versions — the common/default case) | Both occurrences resolve to that one entry; behavior identical to today (FR-005) |
-| A renamed occurrence's `version_requirement()` is `None` (no version specified, relying on the lock file entirely) | `[NEEDS CLARIFICATION: with no version_requirement to filter by, is falling back to the collapsed highest-semver entry (today's behavior) acceptable here, or does this need its own honest "ambiguous — cannot disambiguate without a stated requirement" skip reason? See Open Questions.]` |
+| A renamed occurrence's `version_requirement()` is `None` (no version specified, relying on the lock file entirely) | Resolved: fall back to the collapsed highest-semver entry (today's behavior) — no new skip-reason variant. This is no worse than pre-#648 (which had no data at all for this alias) and avoids adding diagnostic-surface complexity for a case that has no requirement to disambiguate against in the first place |
 | A workspace-inherited dependency (`workspace = true`) combined with a rename (`package = "..."` is already discarded when `workspace = true` is present per #648's fix) | Not a multi-occurrence-same-name scenario introduced by this bug — `package` is ignored in that case already, so only one occurrence's worth of resolution applies; no special handling needed beyond what #648 already does |
 | Lock file has only one entry for a name, but two manifest occurrences both reference it (no actual version conflict, just aliasing to the same version) | Both occurrences correctly resolve to that single entry — FR-001's per-occurrence filter degenerates to the current single-value lookup when there is nothing to disambiguate |
 | `ResolvedPackages::get_all()` returns entries whose versions fail to parse as semver (non-semver lock-file version string) | Reuse `best_package()`'s existing fallback ordering (lexicographic string compare) for the tiebreak among non-parseable versions — do not introduce a second, divergent version-comparison policy |
@@ -239,36 +239,29 @@ Use EARS notation. Prefix with FR-NNN.
 - Ship this without live-testing the two-major rename reproduction from
   issue #649, per the project's Live Testing Principle
 
-## 9. Open Questions
+## 9. Open Questions (resolved)
 
-- [NEEDS CLARIFICATION: Should the fix change `resolved_versions`'s shape
-  (e.g. `HashMap<PackageName, Vec<ConcreteVersion>>` or storing
-  `ResolvedPackages` itself further downstream instead of pre-collapsing at
-  `load_resolved_versions()`), or add a new, separate version-req-aware
-  lookup function that callers (`in_use_version`, `vulnerability_keys`) opt
-  into, leaving `resolved_versions`'s current shape as a fast-path default
-  for the overwhelmingly common single-occurrence case? The former is more
-  uniform but touches more call sites; the latter is lower-risk but adds a
-  second lookup path callers must remember to use correctly.]
-- [NEEDS CLARIFICATION: Is #394's original scenario (duplicate dependency
-  names across `[target.'cfg(...)'.dependencies]` blocks, fixed in
-  PR #404 at the `deps-lsp` manifest-parsing layer, not the lockfile layer)
-  actually the same underlying limitation this spec should also revisit, or
-  a fully separate, already-closed concern? The issue explicitly calls out
-  "same limitation class as #394" — worth confirming whether #404's fix
-  already solved the manifest side and this spec is purely the lockfile
-  side, or whether there's remaining overlap.]
-- [NEEDS CLARIFICATION: When a renamed occurrence has no `version_requirement()`
-  at all (relying entirely on the lock file), what should the per-occurrence
-  filter do — fall back to the collapsed highest-semver entry (today's
-  behavior, potentially still wrong but no worse than before), or introduce
-  a new explicit "ambiguous, cannot disambiguate" skip outcome distinct from
-  `SkipReason::NoConcreteVersion`?]
-- [NEEDS CLARIFICATION: Should this fix be implemented as a single PR, or
-  does the FR-006/NFR-001 backward-compatibility surface (10 `LockFileProvider`
-  implementations, multiple `deps-core` call sites) warrant splitting into
-  staged PRs the way #023 (Cargo custom registries) or #041 (credential
-  redaction hardening) were staged?]
+- **Data-model shape**: additive — keep `resolved_versions` unchanged and add
+  a sibling `resolved_version_candidates: HashMap<PackageName, Vec<ConcreteVersion>>`
+  that `in_use_version()`/`vulnerability_keys()` consult first, falling back
+  to the collapsed map for the single-occurrence case. Chosen over reshaping
+  `resolved_versions` itself because it satisfies NFR-001/FR-005 (zero
+  behavior change for the dominant single-occurrence path, zero call-site
+  churn outside the two consumers that need per-occurrence data) and matches
+  the project's MVP/minimal-change convention over a more "uniform" but
+  higher-blast-radius rewrite touching all 10 `LockFileProvider` call sites.
+- **#394 overlap**: separate, already-closed concern — #404 fixed the
+  manifest-parsing layer; this spec is scoped purely to lock-file resolution.
+  No overlap requiring revisiting.
+- **No `version_requirement()` case**: fall back to the collapsed
+  highest-semver entry (today's behavior) rather than a new skip-reason
+  variant — no worse than before, avoids new diagnostic-surface complexity.
+- **Single PR vs staged**: single PR. The additive design above keeps the
+  change confined to `deps-core::lockfile`, `deps-core::lsp_helpers::in_use_version`,
+  `deps-core::osv::types`, and `deps-lsp::document::lifecycle`'s
+  `load_resolved_versions()`, with no `LockFileProvider` trait signature
+  change — unlike #023/#041, there is no independently-shippable phase
+  boundary here that would justify staging.
 
 ## 10. References
 
