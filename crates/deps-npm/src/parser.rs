@@ -104,9 +104,9 @@ pub fn parse_package_json_with_context(
     let mut dependencies = Vec::new();
 
     // Parse each dependency section, scoping position search to that section's own byte
-    // range (see `find_section_byte_range`) so a name repeated across sections (e.g. also
-    // present in `devDependencies`) does not have both occurrences resolve to the first
-    // match in the file.
+    // range (see `deps_core::parser::find_json_section_byte_range`) so a name repeated
+    // across sections (e.g. also present in `devDependencies`) does not have both
+    // occurrences resolve to the first match in the file.
     const SECTIONS: [(&str, NpmDependencySection); 4] = [
         ("dependencies", NpmDependencySection::Dependencies),
         ("devDependencies", NpmDependencySection::DevDependencies),
@@ -121,13 +121,14 @@ pub fn parse_package_json_with_context(
         if let Some(deps) = root.get(key).and_then(|v| v.as_object()) {
             // Fall back to the whole-file range (pre-fix behavior) if the section's own
             // bounds cannot be located — never drop a section's dependencies over this.
-            let section_range = find_section_byte_range(content, key).unwrap_or_else(|| {
-                tracing::debug!(
-                    section = key,
-                    "section byte range not found, falling back to whole-file position search"
-                );
-                (0, content.len())
-            });
+            let section_range = deps_core::parser::find_json_section_byte_range(content, key)
+                .unwrap_or_else(|| {
+                    tracing::debug!(
+                        section = key,
+                        "section byte range not found, falling back to whole-file position search"
+                    );
+                    (0, content.len())
+                });
             dependencies.extend(parse_dependency_section(
                 content,
                 deps,
@@ -313,113 +314,6 @@ fn find_dependency_positions(
     }
 
     (name_range, version_range)
-}
-
-/// Finds the byte range of a top-level dependency section's object value — e.g. the
-/// `{...}` following `"dependencies":` — so per-dependency position search
-/// (`find_dependency_positions`) can be scoped to just that section instead of the whole
-/// file. This is what lets a name repeated across sections (e.g. also present in
-/// `devDependencies`) resolve to the correct occurrence.
-///
-/// Runs a single forward pass tracking brace depth with the same string/escape-aware
-/// state machine as [`find_matching_brace_end`], and only accepts a `"<key>":` match at
-/// depth 1 (i.e. a direct child of the root object) — a `dependencies`/`devDependencies`
-/// key nested inside another section's value (e.g. pnpm's `packageExtensions`, npm's
-/// `overrides`) sits at a deeper depth and is skipped, so it can no longer be mistaken
-/// for the real top-level section.
-///
-/// Returns `None` if `section_key` cannot be located as a top-level JSON object value
-/// (e.g. malformed JSON) — the caller falls back to whole-file search for that section
-/// rather than dropping its dependencies.
-fn find_section_byte_range(content: &str, section_key: &str) -> Option<(usize, usize)> {
-    let key_pattern = format!("\"{section_key}\"");
-    let mut depth = 0u32;
-    let mut in_string = false;
-    let mut escape = false;
-    let mut idx = 0;
-
-    while idx < content.len() {
-        let rest = &content[idx..];
-        let ch = rest.chars().next().unwrap_or_default();
-        let ch_len = ch.len_utf8();
-
-        if in_string {
-            match ch {
-                _ if escape => escape = false,
-                '\\' => escape = true,
-                '"' => in_string = false,
-                _ => {}
-            }
-            idx += ch_len;
-            continue;
-        }
-
-        if ch == '"' {
-            if depth == 1 && rest.starts_with(&key_pattern) {
-                let after_key = &content[idx + key_pattern.len()..];
-                let trimmed = after_key.trim_start();
-                if let Some(after_colon) = trimmed.strip_prefix(':') {
-                    let value = after_colon.trim_start();
-                    if let Some(object_body) = value.strip_prefix('{') {
-                        let open_brace_idx = content.len() - value.len();
-                        if let Some(end) = find_matching_brace_end(object_body) {
-                            return Some((open_brace_idx, open_brace_idx + 1 + end));
-                        }
-                        // Unbalanced braces — malformed JSON for this candidate; keep
-                        // scanning rather than giving up on the whole search.
-                    }
-                }
-            }
-            in_string = true;
-            idx += ch_len;
-            continue;
-        }
-
-        match ch {
-            '{' => depth += 1,
-            '}' => depth = depth.saturating_sub(1),
-            _ => {}
-        }
-        idx += ch_len;
-    }
-
-    None
-}
-
-/// Given the text right after an opening `{`, finds the byte offset (relative to that
-/// text) of the matching closing `}`, skipping over brace characters that appear inside
-/// string literals (so a `{`/`}` in a version string, e.g. a git URL, is not miscounted).
-/// Returns the offset just past the matching `}`.
-fn find_matching_brace_end(object_body: &str) -> Option<usize> {
-    let mut depth = 1u32;
-    let mut in_string = false;
-    let mut escape = false;
-
-    for (offset, ch) in object_body.char_indices() {
-        if in_string {
-            match ch {
-                _ if escape => escape = false,
-                '\\' => escape = true,
-                '"' => in_string = false,
-                _ => {}
-            }
-            continue;
-        }
-
-        match ch {
-            '"' => in_string = true,
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(offset + 1);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    None
 }
 
 #[cfg(test)]
@@ -1248,7 +1142,8 @@ mod tests {
     #[test]
     fn test_section_range_unaffected_by_unbalanced_brace_inside_version_string() {
         // The section's own byte range is located by depth-scanning `{`/`}`, skipping string
-        // contents (`find_matching_brace_end`). An unbalanced `{` inside a version string must
+        // contents (`deps_core::parser::find_json_section_byte_range`). An unbalanced `{`
+        // inside a version string must
         // not miscount that depth and truncate (or overextend) the section's own range.
         let json = r#"{
   "dependencies": {
@@ -1362,8 +1257,9 @@ mod tests {
 
     #[test]
     fn test_dependencies_section_not_matched_by_run_dependencies_script_key() {
-        // `find_section_byte_range` matches the exact quoted key `"dependencies"`; a script
-        // literally named "run-dependencies" must not be mistaken for the real section start.
+        // `deps_core::parser::find_json_section_byte_range` matches the exact quoted key
+        // `"dependencies"`; a script literally named "run-dependencies" must not be
+        // mistaken for the real section start.
         let json = r#"{
   "scripts": {
     "run-dependencies": "some-cli-tool"
