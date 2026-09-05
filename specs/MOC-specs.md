@@ -51,7 +51,7 @@ status: moc
 | 027 | [[027-nuget-unlisted-version-and-multiproject-lockfile/spec\|NuGet unlisted-version hover marker and multi-project lock file matching]] | specify | shipped — bug, P2 (PR #458, issue #451) |
 | 028 | [[028-pypi-requirements-documentlinks-and-directory-layout/spec\|PyPI requirements.txt -r/-c documentLinks and requirements/*.txt directory-layout recognition]] | specify | shipped — enhancement/security-hardening, P3 (PR #458, issue #452) |
 | 029 | [[029-deno-jsr-yanked-exact-pin-restriction-drop/spec\|Drop the jsr: exact-pin-only restriction on the Deno yanked diagnostic]] | specify | shipped — bug, P2 (PR #459, issue #454) |
-| 030 | [[030-gitlab-ci-ecosystem/spec\|New ecosystem: GitLab CI/CD include: version pins]] | plan | draft — research/new ecosystem, P4, 0 open `[NEEDS CLARIFICATION]` items; implemented in `crates/deps-gitlab-ci`, PR #596 open for issue #466 — mark shipped once merged |
+| 030 | [[030-gitlab-ci-ecosystem/spec\|New ecosystem: GitLab CI/CD include: version pins]] | plan | shipped — research/new ecosystem, P4 (PR #596, issue #466) |
 | 031 | [[031-github-actions-sha-pin-diagnostic/spec\|GitHub Actions mutable-ref-pin security diagnostic (SHA-pin recommendation)]] | tasks | shipped — research/parity, P2 (PR #477, issue #473) |
 | 032 | [[032-npm-npmrc-registry-support/spec\|npm .npmrc custom/private registry support (scoped registries + top-level registry=)]] | plan | shipped — research/enhancement, P3 (PR #510, issue #502) |
 | 033 | [[033-pypi-private-index-support/spec\|PyPI private/custom index resolution (--index-url / --extra-index-url / Poetry source / uv index)]] | tasks | shipped — research/enhancement, P3 (PR #516, issue #513) |
