@@ -70,6 +70,7 @@ status: moc
 | 046 | [[046-pnpm-catalogs/spec\|pnpm catalogs + workspace: protocol resolution support]] | specify | research/enhancement, P3, clarifications resolved 2026-09-04, ready for implementation (issue #587) |
 | 047 | [[047-elixir-hex-ecosystem/spec\|New ecosystem: Elixir Hex (mix.exs dependency version hints)]] | specify | draft — research/new-ecosystem, P4, 6 open `[NEEDS CLARIFICATION]` items, issue #642 |
 | 048 | [[048-gitlab-ci-mutable-pin-message-contradicts-quickfix/spec\|GitLab CI mutable-ref-pin diagnostic wrongly claims no automated fix for component Latest/Partial pins]] | specify | approved — bug, P2, 0 open `[NEEDS CLARIFICATION]` items, issue #643, in implementation on `feat/640-643-gitlab-ci-pin-parity` |
+| 049 | [[049-osv-malicious-package-severity/spec\|OSV malicious-package (MAL-*) advisory severity distinguishing]] | specify | draft — research/correctness, P2, 6 open `[NEEDS CLARIFICATION]` items |
 
 ## Completed Specs
 
