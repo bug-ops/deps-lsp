@@ -39,22 +39,6 @@ pub fn metadata(path: &Path) -> std::io::Result<std::fs::Metadata> {
     std::fs::metadata(path)
 }
 
-/// Counted wrapper around [`std::fs::read_to_string`].
-///
-/// Unbounded: reads the whole file regardless of size. Prefer [`read_to_string_capped`] for
-/// any path whose size is untrusted or attacker-influenced (e.g. a config file discovered by
-/// walking a cloned repository), since this function has no defense against an oversized file.
-///
-/// # Errors
-///
-/// Returns an error under the same conditions as [`std::fs::read_to_string`] — most
-/// commonly, `path` does not exist, is not accessible, or is not valid UTF-8.
-pub fn read_to_string(path: &Path) -> std::io::Result<String> {
-    #[cfg(any(test, feature = "test-util"))]
-    READ_COUNT.fetch_add(1, Ordering::Relaxed);
-    std::fs::read_to_string(path)
-}
-
 /// Counted, size-bounded wrapper around [`std::fs::File::open`] + [`Read::take`].
 ///
 /// Reads at most `max_bytes + 1` bytes and returns `Ok(None)` if that read produced more than

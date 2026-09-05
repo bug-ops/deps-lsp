@@ -630,23 +630,54 @@ fn discover_workspace(doc_uri: &Uri) -> Result<WorkspaceDiscovery> {
         if workspace_root.is_none() {
             let workspace_toml = dir.join("Cargo.toml");
 
-            if deps_core::fs_probe::is_file(&workspace_toml)
-                && let Ok(content) = deps_core::fs_probe::read_to_string(&workspace_toml)
+            if let Ok(metadata) = deps_core::fs_probe::metadata(&workspace_toml)
+                && metadata.is_file()
             {
-                if deps_core::check_toml_nesting_depth(&content, deps_core::MAX_TOML_NESTING_DEPTH)
-                    .is_err()
-                {
+                if metadata.len() > deps_core::MAX_CACHED_FILE_BYTES {
                     tracing::warn!(
                         path = %workspace_toml.display(),
-                        "skipping ancestor Cargo.toml during workspace root discovery: nesting depth exceeds maximum"
+                        len = metadata.len(),
+                        cap = deps_core::MAX_CACHED_FILE_BYTES,
+                        "skipping ancestor Cargo.toml during workspace root discovery: exceeds size cap"
                     );
-                } else if let Ok(doc) = toml_span::parse(&content)
-                    && doc
-                        .as_table()
-                        .and_then(|t| get_val(t, "workspace"))
-                        .is_some()
-                {
-                    workspace_root = Some(dir.to_path_buf());
+                } else {
+                    match deps_core::fs_probe::read_to_string_capped(
+                        &workspace_toml,
+                        deps_core::MAX_CACHED_FILE_BYTES,
+                    ) {
+                        Ok(Some(content)) => {
+                            if deps_core::check_toml_nesting_depth(
+                                &content,
+                                deps_core::MAX_TOML_NESTING_DEPTH,
+                            )
+                            .is_err()
+                            {
+                                tracing::warn!(
+                                    path = %workspace_toml.display(),
+                                    "skipping ancestor Cargo.toml during workspace root discovery: nesting depth exceeds maximum"
+                                );
+                            } else if let Ok(doc) = toml_span::parse(&content)
+                                && doc
+                                    .as_table()
+                                    .and_then(|t| get_val(t, "workspace"))
+                                    .is_some()
+                            {
+                                workspace_root = Some(dir.to_path_buf());
+                            }
+                        }
+                        Ok(None) => {
+                            // The stat pre-filter above passed, but the read itself still
+                            // hit the cap — a symlink swap or concurrent growth between the
+                            // two calls (CWE-367). Same outward behavior as the stat-based
+                            // rejection above, just observed later: warn, then skip.
+                            tracing::warn!(
+                                path = %workspace_toml.display(),
+                                cap = deps_core::MAX_CACHED_FILE_BYTES,
+                                "skipping ancestor Cargo.toml during workspace root discovery: exceeds size cap on read"
+                            );
+                        }
+                        Err(_) => {}
+                    }
                 }
             }
         }
@@ -1516,6 +1547,63 @@ tokio = "1.0"
         assert_eq!(
             result.workspace_root, None,
             "a workspace root beyond MAX_CONFIG_ANCESTOR_DEPTH must not be found"
+        );
+    }
+
+    /// An ancestor `Cargo.toml` over [`deps_core::MAX_CACHED_FILE_BYTES`] must be skipped
+    /// during workspace-root discovery via the cheap `stat`-based size pre-filter, which
+    /// rejects it before `deps_core::fs_probe::read_to_string_capped` is even called — this
+    /// proves the CWE-400 (uncontrolled resource consumption) rejection path, not the
+    /// TOCTOU-closing property of the capped read itself (both `read_to_string` and
+    /// `read_to_string_capped` would pass this test identically, since the pre-filter is
+    /// what actually stops the read here). The bound on the read call itself is proven
+    /// independently by `deps_core::fs_probe::tests::read_to_string_capped_rejects_content_over_cap`.
+    #[test]
+    fn test_discover_workspace_skips_oversized_ancestor_cargo_toml() {
+        let root = tempfile::tempdir().unwrap();
+
+        // A synthetic chain deeper than MAX_CONFIG_ANCESTOR_DEPTH, so the depth cap always
+        // stops the walk inside this tempdir — it never escapes into the real filesystem's
+        // ancestry above it (which could contain an unrelated, readable Cargo.toml and make
+        // the read-count assertion below flaky).
+        let mut current = root.path().to_path_buf();
+        for i in 0..(MAX_CONFIG_ANCESTOR_DEPTH + 5) {
+            current = current.join(format!("d{i}"));
+        }
+        std::fs::create_dir_all(&current).unwrap();
+
+        // Sparse file, large enough to exceed the cap without allocating real disk space —
+        // content is irrelevant, since the size cap must reject it before any open/read.
+        // Placed two levels up from the opened file, well within the depth budget.
+        let oversized_manifest = current
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("Cargo.toml");
+        let file = std::fs::File::create(&oversized_manifest).unwrap();
+        file.set_len(deps_core::MAX_CACHED_FILE_BYTES + 1).unwrap();
+        drop(file);
+
+        let opened_content = "[dependencies]\nserde = \"1.0\"\n";
+        let opened_path = current.join("Cargo.toml");
+        std::fs::write(&opened_path, opened_content).unwrap();
+        let doc_uri = Uri::from_file_path(&opened_path).unwrap();
+
+        let (_, reads_before) = deps_core::fs_probe::snapshot();
+        let discovery = discover_workspace(&doc_uri).unwrap();
+        let (_, reads_after) = deps_core::fs_probe::snapshot();
+
+        assert_eq!(
+            discovery.workspace_root, None,
+            "an oversized ancestor Cargo.toml must never be treated as the workspace root"
+        );
+        assert_eq!(
+            reads_after - reads_before,
+            1,
+            "expected exactly one read: the opened document's own directory Cargo.toml — the \
+             oversized ancestor two levels up must be rejected by the stat-based pre-filter \
+             without ever being opened for a read"
         );
     }
 
