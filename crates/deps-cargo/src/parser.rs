@@ -33,6 +33,7 @@ use crate::config::{
     AuthToken, ConfigFileCache, IndexTrust, RegistryIndex, RegistryIndexError, SourceReplacement,
 };
 use crate::types::{DependencySection, DependencySource, ParsedDependency};
+use deps_core::fs_probe::MAX_CONFIG_ANCESTOR_DEPTH;
 use deps_core::net_policy::RegistryAccessPolicy;
 use deps_core::{DepsError, Result};
 use std::any::Any;
@@ -567,16 +568,6 @@ fn span_to_range(content: &str, line_table: &LineOffsetTable, span: toml_span::S
     let end = line_table.byte_offset_to_position(content, span.end);
     Range::new(start, end)
 }
-
-/// Upper bound on how many ancestor directories [`discover_workspace`] climbs, independent
-/// of whether the filesystem root has been reached (spec NFR-005, plan-1b §1.5, critic N1).
-///
-/// Caps the previously-unbounded workspace-root search — today's manifest walk is unbounded
-/// and TOML-parses every ancestor `Cargo.toml` — and bounds the merged `.cargo/config.toml`
-/// discovery pass added alongside it. A workspace root or config file more than 64
-/// directories up is not a realistic layout; a hostile deeply-nested tree hits this cap
-/// instead of doing unbounded work per parse.
-pub(crate) const MAX_CONFIG_ANCESTOR_DEPTH: usize = 64;
 
 /// Result of [`discover_workspace`]'s merged ancestor walk.
 struct WorkspaceDiscovery {

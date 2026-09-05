@@ -43,6 +43,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use deps_core::PackageName;
+use deps_core::fs_probe::MAX_CONFIG_ANCESTOR_DEPTH;
 use deps_core::net_policy::{
     HostClass, IndexUrlError, PolicyGate, RegistryAccessPolicy, redact_userinfo, validate_index_url,
 };
@@ -374,11 +375,6 @@ fn resolve_entry(
         }
     }
 }
-
-/// Upper bound on the project-tier ancestor walk depth, matching `deps-cargo`'s
-/// `MAX_CONFIG_ANCESTOR_DEPTH`. `pub(crate)` so `crate::catalog::find_workspace_file` can
-/// reuse the same bound for its own ancestor walk.
-pub(crate) const MAX_CONFIG_ANCESTOR_DEPTH: usize = 64;
 
 /// Per-`.npmrc`-file-path memoization (FR-012), mirroring `deps-cargo::config::ConfigFileCache`
 /// exactly in shape.
