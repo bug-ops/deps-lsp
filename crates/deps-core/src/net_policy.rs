@@ -21,9 +21,12 @@ use std::sync::atomic::{AtomicU8, Ordering};
 /// [`WorkspaceRegistryAccess`].
 ///
 /// Computed from the URL alone (see [`classify_host`]) — never from a DNS resolution, so an
-/// attacker-controlled hostname that merely *resolves* to a blocked range is not caught here
-/// (the residual risk spec NFR-003/§5 of the plan documents; closing it needs a
-/// `reqwest::dns::Resolve` filter, deferred as a follow-up).
+/// attacker-controlled hostname that merely *resolves* to a blocked range is not caught here.
+/// This residual scope is by design, not an open gap: the DNS-rebinding TOCTOU it would
+/// otherwise allow is closed separately, at connect time, by `crate::cache`'s
+/// `BlockedAddrResolver` (a `reqwest::dns::Resolve` implementation, fail-closed on lookup
+/// errors, wired into every client via `build_guarded_client`) — see [`classify_addr`], its
+/// counterpart for already-resolved addresses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostClass {
     /// `127.0.0.0/8`, `::1`, `localhost`, `*.localhost`.
