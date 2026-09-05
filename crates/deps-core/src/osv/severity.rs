@@ -171,6 +171,18 @@ mod tests {
     }
 
     #[test]
+    fn non_mal_aliases_do_not_trigger_malicious_classification() {
+        // N5 (impl-critic): pins the discriminating half of the MAL- alias
+        // predicate — a record with a non-empty, non-MAL-prefixed aliases
+        // list must not be misclassified as Malicious (NFR-001).
+        let aliases = ["GHSA-xxxx-xxxx-xxxx".to_string(), "CVE-2020-1".to_string()];
+        assert_eq!(
+            classify("RUSTSEC-2020-0071", &aliases, None, &[]),
+            VulnSeverity::Unknown
+        );
+    }
+
+    #[test]
     fn mal_prefix_with_no_severity_fields_is_malicious() {
         // Live-verified shape: OSV's MAL-2025-47141 record for npm
         // `@ctrl/tinycolor` has no severity field anywhere.
