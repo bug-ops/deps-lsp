@@ -184,7 +184,13 @@ fn parse_section(
             continue;
         }
 
-        let version_req = value.as_str().map(String::from);
+        // A manifest entry whose value isn't a string (e.g. an object) is not a valid
+        // dependency declaration — skip it rather than fabricating an entry with no
+        // `version_req` that would still be queried against the registry (#621, same bug
+        // class as npm's #619).
+        let Some(version_req) = value.as_str() else {
+            continue;
+        };
         let (name_range, version_range) = positions
             .and_then(|s| s.position(name, content, line_table))
             .unwrap_or_default();
@@ -192,7 +198,7 @@ fn parse_section(
         result.push(ComposerDependency {
             name: name.clone().into(),
             name_range,
-            version_req: version_req.map(Into::into),
+            version_req: Some(version_req.into()),
             version_range,
             section,
         });
@@ -355,6 +361,62 @@ mod tests {
 
         assert_eq!(require_count, 1);
         assert_eq!(dev_count, 1);
+    }
+
+    #[test]
+    fn test_non_string_dependency_value_is_skipped() {
+        // #621, same bug class as npm's #619: an object-valued entry (e.g. accidentally
+        // nested config) is not a valid dependency declaration and must not be surfaced or
+        // queried against the registry.
+        let json = r#"{
+  "require": {
+    "nested-shadow": { "acme/express": "0.0.1" },
+    "symfony/console": "^6.0"
+  }
+}"#;
+
+        let result = parse_composer_json(json, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "symfony/console");
+        assert_eq!(result.dependencies[0].version_req, Some("^6.0".into()));
+    }
+
+    #[test]
+    fn test_various_non_string_dependency_value_kinds_are_skipped() {
+        // #621: `value.as_str()` returns `None` uniformly for every non-string JSON kind, not
+        // just objects — cover number, bool, null and array alongside one valid entry.
+        let json = r#"{
+  "require": {
+    "bad/number": 1,
+    "bad/bool": true,
+    "bad/null": null,
+    "bad/array": ["1.0.0"],
+    "symfony/console": "^6.0"
+  }
+}"#;
+
+        let result = parse_composer_json(json, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "symfony/console");
+        assert_eq!(result.dependencies[0].version_req, Some("^6.0".into()));
+    }
+
+    #[test]
+    fn test_all_invalid_dependency_values_in_section_yields_empty_list() {
+        // #621: a section present in the manifest but whose every entry has a non-string
+        // value must resolve to an empty list, not an error or a panic.
+        let json = r#"{
+  "require": {
+    "bad/object": { "nested": "0.0.1" },
+    "bad/number": 1
+  },
+  "require-dev": {
+    "bad/object-dev": { "nested": "0.0.1" }
+  }
+}"#;
+
+        let result = parse_composer_json(json, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 0);
     }
 
     /// #424: `minimum-stability` is parsed from the manifest root when present.
@@ -581,7 +643,8 @@ mod tests {
     /// name as a real top-level dependency in this section (e.g. a malformed/unusual
     /// manifest). A text-based scanner finds the nested occurrence first; the AST only
     /// ever indexes a section's own *direct* properties, so the real top-level occurrence's
-    /// position is never stolen by one nested inside a sibling's value.
+    /// position is never stolen by one nested inside a sibling's value. `a/b` itself has an
+    /// object value, so it is skipped entirely (#621) — only `c/d` survives.
     #[test]
     fn test_nested_object_value_with_colliding_key_resolves_to_top_level_position() {
         let json = r#"{
@@ -594,7 +657,7 @@ mod tests {
 }"#;
 
         let result = parse_composer_json(json, &test_uri()).unwrap();
-        assert_eq!(result.dependencies.len(), 2);
+        assert_eq!(result.dependencies.len(), 1);
 
         let c_d = result
             .dependencies
