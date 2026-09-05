@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-npm, deps-composer**: `deps-npm` and `deps-composer` now share a single `deps_core::json_helpers::string_valued_entries` helper (and its test coverage) for skipping non-string dependency-map values, instead of each crate carrying its own duplicated guard and tests (resolves #624) (#630)
 
 ### Added
+- **deps-github-actions, deps-lsp**: bulk "Pin N actions to commit SHA" code lens for GitHub Actions workflows, applying every resolvable mutable-tag `uses:` pin in one edit via the existing per-step quickfix's `TagIndex` lookup (resolves #633) (#639)
 - **deps-gitlab-ci**: mutable-ref SHA-pin diagnostic and "Pin to commit SHA" quickfix for `include: - project:`/`component:` entries (resolves #634)
 - **deps-lsp**: `workspace/didChangeConfiguration` now re-parses and forces a full re-fetch for every open document affected by a live-reloaded setting that alters registry routing (`registries.workspace_registries`, `registries.nuget_user_profile_sources`, `registries.gitlab_instance_host`), bounded by a server-wide fetch-concurrency cap shared with cold-start loading (resolves #592) (#600)
 - **deps-npm, deps-lsp**: watch `pnpm-workspace.yaml`/`.npmrc` for external changes and reparse already-open `package.json` documents so catalog/registry-resolved diagnostics stay current (resolves #590) (#595)

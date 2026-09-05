@@ -4,8 +4,8 @@ use dashmap::DashMap;
 use std::any::Any;
 use std::sync::Arc;
 use tower_lsp_server::ls_types::{
-    CodeAction, CodeActionKind, Diagnostic, Hover, HoverContents, NumberOrString, Position,
-    TextEdit, Uri, WorkspaceEdit,
+    CodeAction, CodeActionKind, CodeLens, Command, Diagnostic, Hover, HoverContents,
+    NumberOrString, Position, Range, TextEdit, Uri, WorkspaceEdit,
 };
 
 use deps_core::{
@@ -75,6 +75,24 @@ impl GithubActionsEcosystem {
             registry,
             formatter,
         }
+    }
+
+    /// Builds the bulk "Pin all to SHA" edits for `parse_result` (issue #633), one per
+    /// `PinStyle::Tag` step resolvable via this ecosystem's own `TagIndex`-backed
+    /// formatter — the same edits the "Pin N actions to commit SHA" code lens counts and
+    /// the `deps-lsp.pinAllToSha` command applies.
+    ///
+    /// `pub`, not `pub(crate)`: `deps-lsp`'s command handler recomputes these edits fresh
+    /// at execution time (mirroring `deps_core::collect_update_all_edits`'s recompute-at-
+    /// click-time contract for `deps-lsp.updateAllOutdated`) and needs the concrete
+    /// formatter this method wraps, since `Ecosystem::formatter()` only exposes the
+    /// trait-object view.
+    #[must_use]
+    pub fn collect_pin_all_to_sha_edits(
+        &self,
+        parse_result: &dyn ParseResultTrait,
+    ) -> Vec<TextEdit> {
+        collect_pin_all_to_sha_edits(parse_result, &self.formatter)
     }
 }
 
@@ -223,6 +241,45 @@ impl Ecosystem for GithubActionsEcosystem {
                 &self.formatter,
             ));
             actions
+        })
+    }
+
+    /// Appends the "Pin N actions to commit SHA" bulk code lens (issue #633) to the
+    /// shared default's "Update N outdated dependencies" lens — an independent, additive
+    /// lens bound to its own command, mirroring how [`Self::generate_diagnostics`] and
+    /// [`Self::generate_code_actions`] above append their own GHA-specific signal without
+    /// altering the shared default's output.
+    fn generate_code_lenses<'a>(
+        &'a self,
+        parse_result: &'a dyn ParseResultTrait,
+        content: &'a str,
+        versions: deps_core::VersionData<'a>,
+        uri: &'a Uri,
+        command_id: &'a str,
+        severities: deps_core::lsp_helpers::DiagnosticSeverities,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Vec<CodeLens>> {
+        Box::pin(async move {
+            let mut lenses = deps_core::lsp_helpers::generate_code_lenses(
+                parse_result,
+                content,
+                versions,
+                self.formatter(),
+                uri,
+                command_id,
+            );
+            // Same on/off toggle as `mutable_ref_pin_diagnostics` (issue #633): unlike a
+            // quickfix (pull-based, invoked per-position), a lens is push-based and
+            // permanently rendered, so a user who disables the mutable-ref-pin signal
+            // must not still see a standing "Pin N actions to commit SHA" banner on
+            // every workflow.
+            if severities.mutable_ref_pin_enabled {
+                lenses.extend(build_pin_all_to_sha_lens(
+                    parse_result,
+                    uri,
+                    &self.formatter,
+                ));
+            }
+            lenses
         })
     }
 
@@ -513,30 +570,11 @@ fn build_sha_pin_action(
         .find(|d| formatter.is_position_on_dependency(*d, position))?;
 
     let gha_dep = dep.as_any().downcast_ref::<GithubActionsDependency>()?;
-    if gha_dep.pin != Some(PinStyle::Tag) {
-        return None;
-    }
-    // FR-010: for a quoted `uses:` scalar, `version_range` sits inside the quotes —
-    // writing `{sha} # {tag}` there corrupts the value instead of adding a YAML comment
-    // (security audit finding, spec 031 FR-010). Withhold rather than risk that edit.
-    if !gha_dep.is_plain_scalar {
-        return None;
-    }
-    let version_range = gha_dep.version_range?;
-    let tag = gha_dep
-        .version_req
-        .as_ref()
-        .map(deps_core::VersionReq::as_str)?;
-    let new_text = formatter.sha_pin_replacement_for(&gha_dep.name, tag)?;
+    let text_edit = sha_pin_text_edit_for(dep, formatter)?;
+    let diagnostic_range = text_edit.range;
 
     let mut changes = std::collections::HashMap::new();
-    changes.insert(
-        uri.clone(),
-        vec![TextEdit {
-            range: version_range,
-            new_text,
-        }],
-    );
+    changes.insert(uri.clone(), vec![text_edit]);
 
     Some(CodeAction {
         title: format!("Pin {} to commit SHA", gha_dep.name),
@@ -547,9 +585,99 @@ fn build_sha_pin_action(
         }),
         data: Some(serde_json::json!({
             "diagnostic_codes": [MUTABLE_REF_PIN_DIAGNOSTIC_CODE],
-            "diagnostic_range": version_range,
+            "diagnostic_range": diagnostic_range,
         })),
         ..Default::default()
+    })
+}
+
+/// Builds the `{sha} # {tag}` [`TextEdit`] for a single `PinStyle::Tag` step, shared by
+/// [`build_sha_pin_action`] (wraps it into a per-position quickfix) and
+/// [`collect_pin_all_to_sha_edits`] (the bulk "Pin all to SHA" code lens, issue #633).
+///
+/// `None` for anything but a plain-scalar `PinStyle::Tag` step with a resolvable
+/// `TagIndex` entry — the same withholding guards `build_sha_pin_action`'s doc comment
+/// describes (FR-010's quoted-scalar guard, and a `TagIndex` cache miss).
+fn sha_pin_text_edit_for(
+    dep: &dyn deps_core::Dependency,
+    formatter: &GithubActionsFormatter,
+) -> Option<TextEdit> {
+    let gha_dep = dep.as_any().downcast_ref::<GithubActionsDependency>()?;
+    if gha_dep.pin != Some(PinStyle::Tag) {
+        return None;
+    }
+    // FR-010: for a quoted `uses:` scalar, `version_range` sits inside the quotes —
+    // writing `{sha} # {tag}` there corrupts the value instead of adding a YAML comment
+    // (security audit finding, spec 031 FR-010). Withhold rather than risk that edit.
+    if !gha_dep.is_plain_scalar {
+        return None;
+    }
+    // Security audit finding (issue #633): for a `uses:` step written in YAML flow
+    // style (`{uses: actions/checkout@v4, with: {node: 20}}`), appending `# <tag>`
+    // right after the ref comments out the rest of the flow collection, producing
+    // invalid (unterminated) YAML instead of merely leaving the step unpinned.
+    // Withhold rather than risk corrupting the workflow.
+    if !gha_dep.is_last_on_line {
+        return None;
+    }
+    let version_range = gha_dep.version_range?;
+    let tag = gha_dep
+        .version_req
+        .as_ref()
+        .map(deps_core::VersionReq::as_str)?;
+    let new_text = formatter.sha_pin_replacement_for(&gha_dep.name, tag)?;
+    Some(TextEdit {
+        range: version_range,
+        new_text,
+    })
+}
+
+/// Builds one [`TextEdit`] per `PinStyle::Tag` step in `parse_result` resolvable to a
+/// commit SHA via `formatter`'s `TagIndex` — the bulk counterpart to
+/// [`build_sha_pin_action`]'s single-step quickfix (issue #633). A step with no
+/// resolvable `TagIndex` entry (cache miss) is silently skipped, exactly like that
+/// quickfix's own withholding behavior — never blocking on, or triggering, a fetch.
+fn collect_pin_all_to_sha_edits(
+    parse_result: &dyn ParseResultTrait,
+    formatter: &GithubActionsFormatter,
+) -> Vec<TextEdit> {
+    let edits: Vec<TextEdit> = parse_result
+        .dependencies()
+        .into_iter()
+        .filter_map(|dep| sha_pin_text_edit_for(dep, formatter))
+        .collect();
+    deps_core::lsp_helpers::dedup_overlapping_edits(edits, "collect_pin_all_to_sha_edits")
+}
+
+/// Zero or one lens for "Pin N actions to commit SHA" (issue #633), the bulk counterpart
+/// of [`build_sha_pin_action`]'s per-step quickfix. Mirrors
+/// `deps_core::lsp_helpers::generate_code_lenses`'s shape: no lens when there is nothing
+/// to pin, so an all-SHA-pinned (or empty) workflow gets no permanent line-0 annotation.
+fn build_pin_all_to_sha_lens(
+    parse_result: &dyn ParseResultTrait,
+    uri: &Uri,
+    formatter: &GithubActionsFormatter,
+) -> Option<CodeLens> {
+    let edits = collect_pin_all_to_sha_edits(parse_result, formatter);
+    if edits.is_empty() {
+        return None;
+    }
+
+    let count = edits.len();
+    let title = if count == 1 {
+        "Pin 1 action to commit SHA".to_string()
+    } else {
+        format!("Pin {count} actions to commit SHA")
+    };
+
+    Some(CodeLens {
+        range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+        command: Some(Command {
+            title,
+            command: crate::PIN_ALL_TO_SHA_COMMAND_ID.to_string(),
+            arguments: Some(vec![serde_json::json!({ "uri": uri })]),
+        }),
+        data: None,
     })
 }
 
@@ -1029,6 +1157,39 @@ mod tests {
         );
     }
 
+    /// Security audit finding (issue #633): a `uses:` step written in YAML flow-mapping
+    /// style has real content (`, with: {...}}`) after the ref on the same line — the
+    /// quickfix must withhold itself even on a `TagIndex` hit, since appending `# v4`
+    /// would comment out the rest of the flow mapping and produce invalid, unterminated
+    /// YAML (reproduced live by the security audit against a real `yaml_rust2` re-parse).
+    #[test]
+    fn test_build_sha_pin_action_no_quickfix_for_flow_mapping_step() {
+        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+        let content = "steps:\n  - {uses: actions/checkout@v4, with: {node: 20}}\n";
+        let parse_result = crate::parser::parse_workflow_yaml(content, &uri).unwrap();
+        assert!(!parse_result.dependencies[0].is_last_on_line);
+
+        let formatter = GithubActionsFormatter {
+            tag_index: Arc::new(dashmap::DashMap::new()),
+        };
+        let mut index = crate::registry::TagIndex::default();
+        index.tag_to_sha.insert("v4".to_string(), "a".repeat(40));
+        formatter.tag_index.insert(
+            deps_core::PackageName::new("actions/checkout"),
+            Arc::new(index),
+        );
+
+        let position = deps_core::ParseResult::dependencies(&parse_result)[0]
+            .version_range()
+            .unwrap()
+            .start;
+
+        assert!(
+            build_sha_pin_action(&parse_result, position, &uri, &formatter).is_none(),
+            "a flow-mapping uses: step must withhold the quickfix even on a TagIndex hit"
+        );
+    }
+
     #[test]
     fn test_ecosystem_id_and_display_name() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1301,6 +1462,317 @@ mod tests {
             "a quoted uses: scalar offers no SHA-pin quickfix even on a TagIndex hit, so the \
              footer must not be restored; got: {}",
             content.value
+        );
+    }
+
+    // --- issue #633: bulk "Pin all to SHA" code lens ---
+
+    async fn code_lenses_for(content: &str, eco: &GithubActionsEcosystem) -> Vec<CodeLens> {
+        code_lenses_for_with_severities(
+            content,
+            eco,
+            deps_core::lsp_helpers::DiagnosticSeverities::default(),
+        )
+        .await
+    }
+
+    async fn code_lenses_for_with_severities(
+        content: &str,
+        eco: &GithubActionsEcosystem,
+        severities: deps_core::lsp_helpers::DiagnosticSeverities,
+    ) -> Vec<CodeLens> {
+        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+
+        eco.generate_code_lenses(
+            parse_result.as_ref(),
+            content,
+            deps_core::VersionData::new(&cached, &resolved),
+            &uri,
+            "deps-lsp.updateAllOutdated",
+            severities,
+        )
+        .await
+    }
+
+    fn seed_tag(eco: &GithubActionsEcosystem, name: &str, tag: &str, sha: &str) {
+        let mut index = crate::registry::TagIndex::default();
+        index.tag_to_sha.insert(tag.to_string(), sha.to_string());
+        eco.formatter
+            .tag_index
+            .insert(deps_core::PackageName::new(name), Arc::new(index));
+    }
+
+    #[tokio::test]
+    async fn test_generate_code_lenses_pin_all_lens_present_for_resolvable_tag_pins() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = GithubActionsEcosystem::new(cache);
+        seed_tag(&eco, "actions/checkout", "v4", &"a".repeat(40));
+        seed_tag(&eco, "actions/setup-node", "v3", &"b".repeat(40));
+
+        let content = "steps:\n\
+             \x20 - uses: actions/checkout@v4\n\
+             \x20 - uses: actions/setup-node@v3\n";
+        let lenses = code_lenses_for(content, &eco).await;
+
+        let pin_all = lenses
+            .iter()
+            .find(|l| {
+                l.command
+                    .as_ref()
+                    .is_some_and(|c| c.command == crate::PIN_ALL_TO_SHA_COMMAND_ID)
+            })
+            .expect("expected a Pin-all-to-SHA lens");
+        let command = pin_all.command.as_ref().unwrap();
+        assert_eq!(command.title, "Pin 2 actions to commit SHA");
+        assert_eq!(command.command, crate::PIN_ALL_TO_SHA_COMMAND_ID);
+    }
+
+    /// Issue #633 critic S1: `severities.mutable_ref_pin_enabled` is the designated
+    /// on/off switch for the mutable-ref-pin *diagnostic* (`DiagnosticSeverity` has no
+    /// suppression value — see `mutable_ref_pin_diagnostics`'s own gate in
+    /// `generate_diagnostics`), and a lens is push-based/permanently rendered unlike the
+    /// pull-based per-step quickfix — so disabling the flag must also suppress this lens,
+    /// not just the diagnostic, or a user who opts out still gets a standing banner.
+    #[tokio::test]
+    async fn test_generate_code_lenses_pin_all_lens_absent_when_mutable_ref_pin_disabled() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = GithubActionsEcosystem::new(cache);
+        seed_tag(&eco, "actions/checkout", "v4", &"a".repeat(40));
+
+        let content = "steps:\n  - uses: actions/checkout@v4\n";
+        let severities = deps_core::lsp_helpers::DiagnosticSeverities {
+            mutable_ref_pin_enabled: false,
+            ..deps_core::lsp_helpers::DiagnosticSeverities::default()
+        };
+        let lenses = code_lenses_for_with_severities(content, &eco, severities).await;
+
+        assert!(
+            !lenses.iter().any(|l| l
+                .command
+                .as_ref()
+                .is_some_and(|c| c.command == crate::PIN_ALL_TO_SHA_COMMAND_ID)),
+            "mutable_ref_pin_enabled: false must suppress the Pin-all-to-SHA lens, \
+             mirroring the diagnostic's own suppression: {lenses:?}"
+        );
+    }
+
+    /// Companion to the disabled-flag test above: the *default* (enabled) flag must not
+    /// accidentally suppress the sibling "Update N outdated dependencies" lens — the two
+    /// lenses are independent, and this gate must be scoped to the pin-all lens only.
+    #[tokio::test]
+    async fn test_generate_code_lenses_update_all_outdated_lens_unaffected_by_mutable_ref_pin_flag()
+    {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = GithubActionsEcosystem::new(cache);
+        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+        let content = "steps:\n  - uses: actions/checkout@v3\n";
+        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+        let mut cached = HashMap::new();
+        cached.insert(
+            deps_core::PackageName::new("actions/checkout"),
+            deps_core::PackageVersions::latest_only("v4"),
+        );
+        let resolved = HashMap::new();
+        let severities = deps_core::lsp_helpers::DiagnosticSeverities {
+            mutable_ref_pin_enabled: false,
+            ..deps_core::lsp_helpers::DiagnosticSeverities::default()
+        };
+
+        let lenses = eco
+            .generate_code_lenses(
+                parse_result.as_ref(),
+                content,
+                deps_core::VersionData::new(&cached, &resolved),
+                &uri,
+                "deps-lsp.updateAllOutdated",
+                severities,
+            )
+            .await;
+
+        assert!(
+            lenses.iter().any(|l| l
+                .command
+                .as_ref()
+                .is_some_and(|c| c.command == "deps-lsp.updateAllOutdated")),
+            "the update-all-outdated lens must be unaffected by mutable_ref_pin_enabled: {lenses:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_code_lenses_pin_all_lens_singular_title_for_one_step() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = GithubActionsEcosystem::new(cache);
+        seed_tag(&eco, "actions/checkout", "v4", &"a".repeat(40));
+
+        let content = "steps:\n  - uses: actions/checkout@v4\n";
+        let lenses = code_lenses_for(content, &eco).await;
+
+        let pin_all = lenses
+            .iter()
+            .find(|l| {
+                l.command
+                    .as_ref()
+                    .is_some_and(|c| c.command == crate::PIN_ALL_TO_SHA_COMMAND_ID)
+            })
+            .expect("expected a Pin-all-to-SHA lens");
+        assert_eq!(
+            pin_all.command.as_ref().unwrap().title,
+            "Pin 1 action to commit SHA"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_code_lenses_pin_all_lens_absent_when_no_tag_pins() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = GithubActionsEcosystem::new(cache);
+
+        let content = format!("steps:\n  - uses: actions/checkout@{}\n", "a".repeat(40));
+        let lenses = code_lenses_for(&content, &eco).await;
+
+        assert!(
+            !lenses.iter().any(|l| l
+                .command
+                .as_ref()
+                .is_some_and(|c| c.command == crate::PIN_ALL_TO_SHA_COMMAND_ID)),
+            "an already-SHA-pinned workflow must get no Pin-all-to-SHA lens: {lenses:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_code_lenses_pin_all_lens_absent_when_tag_index_miss() {
+        // No `seed_tag` call: the TagIndex has no entry, so every Tag-pinned step is a
+        // cache miss and must be skipped gracefully — not blocking, not erroring.
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = GithubActionsEcosystem::new(cache);
+
+        let content = "steps:\n  - uses: actions/checkout@v4\n";
+        let lenses = code_lenses_for(content, &eco).await;
+
+        assert!(
+            !lenses.iter().any(|l| l
+                .command
+                .as_ref()
+                .is_some_and(|c| c.command == crate::PIN_ALL_TO_SHA_COMMAND_ID)),
+            "a TagIndex cache miss must be skipped gracefully, not surfaced as a lens \
+             promising a no-op edit: {lenses:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_code_lenses_pin_all_lens_skips_unresolvable_step_but_counts_others() {
+        // A mix of one resolvable Tag pin and one cache-miss Tag pin: the lens must count
+        // only the resolvable one, silently skipping the other rather than refusing the
+        // whole lens or counting a step it cannot actually edit.
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = GithubActionsEcosystem::new(cache);
+        seed_tag(&eco, "actions/checkout", "v4", &"a".repeat(40));
+
+        let content = "steps:\n\
+             \x20 - uses: actions/checkout@v4\n\
+             \x20 - uses: some-org/unresolved-action@v1\n";
+        let lenses = code_lenses_for(content, &eco).await;
+
+        let pin_all = lenses
+            .iter()
+            .find(|l| {
+                l.command
+                    .as_ref()
+                    .is_some_and(|c| c.command == crate::PIN_ALL_TO_SHA_COMMAND_ID)
+            })
+            .expect("expected a Pin-all-to-SHA lens for the one resolvable step");
+        assert_eq!(
+            pin_all.command.as_ref().unwrap().title,
+            "Pin 1 action to commit SHA"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_collect_pin_all_to_sha_edits_produces_correct_workspace_edit_for_multiple_steps()
+    {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = GithubActionsEcosystem::new(cache);
+        let sha1 = "a".repeat(40);
+        let sha2 = "b".repeat(40);
+        seed_tag(&eco, "actions/checkout", "v4", &sha1);
+        seed_tag(&eco, "actions/setup-node", "v3", &sha2);
+
+        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+        let content = "steps:\n\
+             \x20 - uses: actions/checkout@v4\n\
+             \x20 - uses: actions/setup-node@v3\n";
+        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+        let deps = deps_core::ParseResult::dependencies(parse_result.as_ref());
+        let checkout_range = deps
+            .iter()
+            .find(|d| d.name().as_str() == "actions/checkout")
+            .and_then(|d| d.version_range())
+            .expect("actions/checkout must have a version_range");
+        let setup_node_range = deps
+            .iter()
+            .find(|d| d.name().as_str() == "actions/setup-node")
+            .and_then(|d| d.version_range())
+            .expect("actions/setup-node must have a version_range");
+
+        let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref());
+        assert_eq!(edits.len(), 2);
+        // M1 (critic): the entire risk of this feature is writing 40+ chars at the wrong
+        // span, so the range each edit targets must be pinned, not just its text —
+        // proving the aggregator's dep-to-range mapping doesn't swap or shift.
+        let checkout_edit = edits
+            .iter()
+            .find(|e| e.new_text == format!("{sha1} # v4"))
+            .expect("expected an edit for actions/checkout");
+        assert_eq!(checkout_edit.range, checkout_range);
+        let setup_node_edit = edits
+            .iter()
+            .find(|e| e.new_text == format!("{sha2} # v3"))
+            .expect("expected an edit for actions/setup-node");
+        assert_eq!(setup_node_edit.range, setup_node_range);
+    }
+
+    #[tokio::test]
+    async fn test_collect_pin_all_to_sha_edits_empty_for_branch_and_quoted_scalar() {
+        // A `PinStyle::Branch` step and a quoted-scalar `PinStyle::Tag` step must both be
+        // withheld, matching `build_sha_pin_action`'s own guards (FR-005/plan §11,
+        // FR-010) — the bulk aggregator must never be laxer than the per-step quickfix.
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = GithubActionsEcosystem::new(cache);
+        seed_tag(&eco, "some-org/some-action", "main", &"a".repeat(40));
+        seed_tag(&eco, "actions/checkout", "v4", &"b".repeat(40));
+
+        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+        let content = "steps:\n\
+             \x20 - uses: some-org/some-action@main\n\
+             \x20 - uses: \"actions/checkout@v4\"\n";
+        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+
+        let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref());
+        assert!(
+            edits.is_empty(),
+            "a branch pin and a quoted-scalar tag pin must both be withheld: {edits:?}"
+        );
+    }
+
+    /// Security audit finding (issue #633): the bulk aggregator must skip a flow-mapping
+    /// `uses:` step the same way the per-step quickfix does — a click on "Pin N actions
+    /// to commit SHA" must never turn a real click into workflow-wide YAML corruption.
+    #[tokio::test]
+    async fn test_collect_pin_all_to_sha_edits_empty_for_flow_mapping_step() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = GithubActionsEcosystem::new(cache);
+        seed_tag(&eco, "actions/checkout", "v4", &"a".repeat(40));
+
+        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+        let content = "steps:\n  - {uses: actions/checkout@v4, with: {node: 20}}\n";
+        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+
+        let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref());
+        assert!(
+            edits.is_empty(),
+            "a flow-mapping tag pin must be withheld, not corrupted: {edits:?}"
         );
     }
 }

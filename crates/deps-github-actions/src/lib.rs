@@ -47,6 +47,15 @@ pub use types::{
 /// Open Questions), so generalizing into `deps-core` would be premature.
 pub const MUTABLE_REF_PIN_DIAGNOSTIC_CODE: &str = "mutable-ref-pin";
 
+/// `workspace/executeCommand` id for the "Pin N actions to commit SHA" bulk code lens
+/// (issue #633).
+///
+/// Bulk counterpart of the per-step "Pin to commit SHA" quickfix (issue #473): rewrites
+/// every `PinStyle::Tag` step in a workflow that has a resolvable `TagIndex` entry in one
+/// `WorkspaceEdit`, mirroring `deps-lsp`'s `deps-lsp.updateAllOutdated` command for the
+/// "Update N outdated dependencies" lens.
+pub const PIN_ALL_TO_SHA_COMMAND_ID: &str = "deps-lsp.pinAllToSha";
+
 /// Whether `name` matches the `owner/repo` GitHub identifier shape this crate accepts:
 /// `[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+`, with neither segment being exactly `.`/`..` (see
 /// [`deps_core::is_dot_segment`]).

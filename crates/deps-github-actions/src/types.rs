@@ -65,6 +65,20 @@ pub struct GithubActionsDependency {
     /// follow the ref text — see `crate::formatter::GithubActionsFormatter::sha_pin_replacement_for`'s
     /// caller.
     pub is_plain_scalar: bool,
+    /// Whether only whitespace, or a whitespace-preceded YAML comment, follows the ref
+    /// text on its source line — `true` for `None`-`pin`/non-ref sources, where the value
+    /// is irrelevant.
+    ///
+    /// `false` for a `uses:` step written in YAML **flow** style
+    /// (`{uses: actions/checkout@v4, with: {node: 20}}`), where real YAML content
+    /// (`, with: {...}}`) follows the ref on the same line. A SHA-pin edit appends
+    /// `# <tag>` right after the ref text — safe for ordinary block-style lines, but for
+    /// a flow-style line it turns the rest of the flow collection into a comment,
+    /// producing invalid (unterminated) YAML. A SHA-pin code action must check this
+    /// alongside [`Self::is_plain_scalar`] before writing any such edit (security audit
+    /// finding, issue #633) — see
+    /// `crate::formatter::GithubActionsFormatter::sha_pin_replacement_for`'s caller.
+    pub is_last_on_line: bool,
 }
 
 impl deps_core::ecosystem::Dependency for GithubActionsDependency {
@@ -178,6 +192,7 @@ mod tests {
             pin: Some(PinStyle::Tag),
             source: DependencySource::Registry,
             is_plain_scalar: true,
+            is_last_on_line: true,
         };
         assert_eq!(dep.name(), "actions/checkout");
         assert_eq!(
@@ -200,6 +215,7 @@ mod tests {
             }),
             source: DependencySource::Registry,
             is_plain_scalar: true,
+            is_last_on_line: true,
         };
         assert_eq!(dep.version_literal(), dep.version_literal.as_deref());
         assert_ne!(
@@ -240,6 +256,7 @@ mod tests {
                 pin: Some(PinStyle::Tag),
                 source: DependencySource::Registry,
                 is_plain_scalar: true,
+                is_last_on_line: true,
             }],
             uri,
         };

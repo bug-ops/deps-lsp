@@ -45,6 +45,33 @@ pub(crate) use deps_core::lsp_helpers::is_tag_shaped;
 /// preceded by whitespace is not a YAML comment and is skipped (only the *first*
 /// whitespace-preceded `#` is considered); a shape-rejected token (`# v4`, `# v4.2`) or
 /// no `#` at all yields `None` — the ref degrades to a bare, commentless pin.
+/// Whether nothing unsafe to overwrite follows the ref on its source line: only
+/// whitespace, or a whitespace-preceded YAML comment (the same comment-start rule
+/// [`extract_comment_tag`] uses), all the way to end of line.
+///
+/// Security audit finding (pre-existing in the #473 quickfix, now shared by the bulk
+/// pin-all-to-SHA aggregator, issue #633): a SHA-pin edit appends `# <tag>` right after
+/// the ref, turning everything after it into a YAML comment. For a `uses:` step written
+/// in **block** style that is safe — nothing meaningful follows on the line. For a step
+/// written in YAML **flow** style (`{uses: actions/checkout@v4, with: {node: 20}}`), real
+/// YAML content (`, with: {...}}`) follows the ref on the same line, and commenting it out
+/// produces invalid YAML (an unterminated flow mapping) — silently breaking the workflow
+/// rather than merely leaving it unpinned. This function has no notion of flow vs. block
+/// context itself; it just checks "would writing a comment here swallow real content",
+/// which is true in exactly the flow-style case and false for ordinary block-style lines.
+fn ref_is_last_token_on_line(rest_of_line: &str) -> bool {
+    let bytes = rest_of_line.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'#' && i > 0 && bytes[i - 1].is_ascii_whitespace() {
+            return true;
+        }
+        if !b.is_ascii_whitespace() {
+            return false;
+        }
+    }
+    true
+}
+
 fn extract_comment_tag(rest_of_line: &str) -> Option<(&str, usize)> {
     let bytes = rest_of_line.as_bytes();
     for i in 0..bytes.len() {
@@ -329,6 +356,7 @@ fn build_dependency(
                 path: trimmed_value,
             },
             is_plain_scalar,
+            is_last_on_line: true,
         }),
         ParsedUses::Docker => Some(GithubActionsDependency {
             name: trimmed_value.clone().into(),
@@ -339,6 +367,7 @@ fn build_dependency(
             pin: None,
             source: DependencySource::Url { url: trimmed_value },
             is_plain_scalar,
+            is_last_on_line: true,
         }),
         ParsedUses::NoAt { name } => {
             let name_end = span_start + name.len();
@@ -351,6 +380,7 @@ fn build_dependency(
                 pin: None,
                 source: DependencySource::Registry,
                 is_plain_scalar,
+                is_last_on_line: true,
             })
         }
         ParsedUses::Ref {
@@ -380,14 +410,21 @@ fn build_dependency(
                         url: format!("https://github.com/{name}"),
                     },
                     is_plain_scalar,
+                    is_last_on_line: true,
                 });
             }
 
-            if is_full_sha(&ref_text) {
-                let rest_of_line = &content[ref_end..];
-                let rest_of_line_end = rest_of_line.find('\n').unwrap_or(rest_of_line.len());
-                let rest_of_line = &rest_of_line[..rest_of_line_end];
+            let rest_of_line = &content[ref_end..];
+            let rest_of_line_end = rest_of_line.find('\n').unwrap_or(rest_of_line.len());
+            let rest_of_line = &rest_of_line[..rest_of_line_end];
+            // Security audit finding (issue #633): computed for every ref-pinned form,
+            // not just the SHA-with-comment case below, since the mutable-tag SHA-pin
+            // edit (`sha_pin_text_edit_for`) needs it for `PinStyle::Tag` too — a flow-
+            // style step (`{uses: actions/checkout@v4, with: {...}}`) has real YAML
+            // content after the ref that a trailing `# <tag>` comment would swallow.
+            let is_last_on_line = ref_is_last_token_on_line(rest_of_line);
 
+            if is_full_sha(&ref_text) {
                 let comment = is_plain_scalar
                     .then(|| extract_comment_tag(rest_of_line))
                     .flatten();
@@ -404,6 +441,7 @@ fn build_dependency(
                         }),
                         source: DependencySource::Registry,
                         is_plain_scalar,
+                        is_last_on_line,
                     },
                     None => GithubActionsDependency {
                         name: name.into(),
@@ -414,6 +452,7 @@ fn build_dependency(
                         pin: Some(PinStyle::Sha { comment_tag: None }),
                         source: DependencySource::Registry,
                         is_plain_scalar,
+                        is_last_on_line,
                     },
                 });
             }
@@ -432,6 +471,7 @@ fn build_dependency(
                 pin: Some(pin),
                 source: DependencySource::Registry,
                 is_plain_scalar,
+                is_last_on_line,
             })
         }
         ParsedUses::Malformed => {
@@ -876,6 +916,67 @@ mod tests {
         let content = "steps:\n  - uses: 'actions/checkout@v4'\n";
         let result = parse_workflow_yaml(content, &test_uri()).unwrap();
         assert!(!result.dependencies[0].is_plain_scalar);
+    }
+
+    // --- issue #633 security audit finding: `is_last_on_line` / YAML flow-style guard ---
+
+    #[test]
+    fn test_ref_is_last_token_on_line_true_for_empty_and_whitespace_only() {
+        assert!(ref_is_last_token_on_line(""));
+        assert!(ref_is_last_token_on_line("   "));
+    }
+
+    #[test]
+    fn test_ref_is_last_token_on_line_true_for_trailing_comment() {
+        assert!(ref_is_last_token_on_line(" # my note"));
+    }
+
+    #[test]
+    fn test_ref_is_last_token_on_line_false_for_flow_collection_continuation() {
+        // The exact shape from the security audit's reproduction: `, with: {node: 20}}`
+        // immediately follows a tag ref inside a YAML flow mapping.
+        assert!(!ref_is_last_token_on_line(", with: {node: 20}}"));
+        assert!(!ref_is_last_token_on_line("}"));
+        assert!(!ref_is_last_token_on_line("]"));
+    }
+
+    /// Regression for the security audit's live reproduction: a `uses:` step written in
+    /// YAML flow-mapping style has real content (`, with: {...}}`) after the ref on the
+    /// same line — `is_last_on_line` must be `false` so a SHA-pin edit is withheld
+    /// (`sha_pin_text_edit_for`'s guard) rather than commenting out the rest of the flow
+    /// collection and producing invalid, unterminated YAML.
+    #[test]
+    fn test_flow_mapping_uses_step_is_not_last_on_line() {
+        let content = "steps:\n  - {uses: actions/checkout@v4, with: {node: 20}}\n";
+        let result = parse_workflow_yaml(content, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        let dep = &result.dependencies[0];
+        assert_eq!(dep.name(), "actions/checkout");
+        assert_matches!(dep.pin, Some(PinStyle::Tag));
+        assert!(
+            !dep.is_last_on_line,
+            "a flow-mapping uses: step must not be considered safe for a trailing comment"
+        );
+    }
+
+    /// Non-regression companion: a flow-*sequence* step (`steps: [{uses: ...}]`) has the
+    /// same corruption risk and must be caught the same way.
+    #[test]
+    fn test_flow_sequence_uses_step_is_not_last_on_line() {
+        let content = "steps: [{uses: actions/checkout@v4, with: {node: 20}}]\n";
+        let result = parse_workflow_yaml(content, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert!(!result.dependencies[0].is_last_on_line);
+    }
+
+    /// Non-regression: an ordinary block-style step (the overwhelming common case) must
+    /// keep `is_last_on_line: true` — the guard must not withhold the quickfix/bulk lens
+    /// for every step, only the genuinely unsafe flow-style ones.
+    #[test]
+    fn test_block_style_uses_step_is_last_on_line() {
+        let content = "steps:\n  - uses: actions/checkout@v4\n";
+        let result = parse_workflow_yaml(content, &test_uri()).unwrap();
+        assert!(result.dependencies[0].is_last_on_line);
     }
 
     #[test]
