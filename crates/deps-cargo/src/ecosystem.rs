@@ -336,6 +336,7 @@ mod tests {
             features_range: None,
             source: DependencySource::Registry,
             section: DependencySection::Dependencies,
+            package: None,
         }
     }
 

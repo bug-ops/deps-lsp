@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **deps-cargo**: an explicit `package = "..."` rename now resolves hover/diagnostics/completion/code actions/code lenses/inlay hints against the real crate name instead of the local TOML alias (resolves #648)
+
 ## [0.13.0] - 2026-09-05
 
 ### Added

@@ -435,6 +435,7 @@ fn parse_dependencies_section(
             features_range: None,
             source: DependencySource::Registry,
             section,
+            package: None,
         };
 
         if let Some(s) = value.as_str() {
@@ -467,6 +468,10 @@ fn parse_table_dependency(
     // value is collected here and applied to `dep.source` once the whole table has
     // been walked, so the result doesn't depend on that ordering (#393).
     let mut git_rev: Option<String> = None;
+    // `package` is likewise collected and applied only after the whole table has been
+    // walked, since alphabetically `"package"` (p) sorts before `"workspace"` (w) and
+    // may be visited before `workspace = true` is seen.
+    let mut package_rename: Option<String> = None;
 
     for (key, value) in table {
         match key.name.as_ref() {
@@ -512,6 +517,20 @@ fn parse_table_dependency(
                     };
                 }
             }
+            // `package = "..."` renames the dependency: the TOML table key becomes a
+            // local import alias, and `package` names the actual crate to resolve
+            // against the registry (Cargo's "renaming dependencies" feature). `dep.name`
+            // stays the alias — it anchors `name_range` for LSP positions — while
+            // `dep.package` becomes the registry lookup name via `Dependency::name()`.
+            // Applied after the loop (see `package_rename` above): combined with
+            // `workspace = true`, Cargo silently discards `package` and resolves by the
+            // table key alone (verified via `cargo metadata`), so it must not win here
+            // either.
+            "package" => {
+                if let Some(name) = value.as_str() {
+                    package_rename = Some(name.to_string());
+                }
+            }
             // `registry = "my-corp"` names an alternative registry defined in
             // `.cargo/config.toml`, not crates.io. deps-cargo has no client
             // for it, so it must not stay classified as the plain `Registry`
@@ -550,6 +569,15 @@ fn parse_table_dependency(
 
     if let DependencySource::Git { rev, .. } = &mut dep.source {
         *rev = git_rev;
+    }
+
+    // An empty `package = ""` is rejected by Cargo itself ("package name cannot be
+    // empty"), so it must not silently become a lookup key that clears every other
+    // consumer's diagnostic anchor.
+    if !matches!(dep.source, DependencySource::Workspace)
+        && let Some(name) = package_rename.filter(|s| !s.is_empty())
+    {
+        dep.package = Some(name.into());
     }
 }
 
@@ -771,6 +799,123 @@ serde = { version = "1.0", features = ["derive"] }"#;
         assert_eq!(result.dependencies.len(), 1);
         assert_eq!(result.dependencies[0].version_req, Some("1.0".into()));
         assert_eq!(result.dependencies[0].features, vec!["derive"]);
+    }
+
+    /// Issue #648's exact repro: `package = "..."` renames the dependency. The TOML table
+    /// key (`totally-nonexistent-alias-xyz123`) stays the alias, anchoring `name_range`, while
+    /// `Dependency::name()` resolves to the real registry name (`serde`) so hover/diagnostics/
+    /// completion/code-actions key off the crate that actually exists on crates.io.
+    #[test]
+    fn test_parse_table_dependency_with_package_rename_resolves_registry_name() {
+        use deps_core::Dependency as _;
+
+        let toml = r#"[dependencies]
+totally-nonexistent-alias-xyz123 = { package = "serde", version = "1" }"#;
+        let result = parse_cargo_toml(toml, &test_url()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+
+        let dep = &result.dependencies[0];
+        assert_eq!(dep.name, "totally-nonexistent-alias-xyz123");
+        assert_eq!(dep.package, Some("serde".into()));
+        assert_eq!(dep.name(), "serde");
+        assert_eq!(dep.version_req, Some("1".into()));
+
+        // The alias's own source position, not serde's (nonexistent) one.
+        assert_eq!(dep.name_range.start.character, 0);
+        assert_eq!(
+            dep.name_range.end.character,
+            "totally-nonexistent-alias-xyz123".len() as u32
+        );
+    }
+
+    /// `package = ""`: Cargo itself rejects an empty package name at the manifest
+    /// level, so this LSP must not treat it as a valid rename target either — the
+    /// alias stays authoritative rather than resolving `Dependency::name()` to an
+    /// empty `PackageName` (which would otherwise surface a confusing "name cannot
+    /// be empty" diagnostic anchored on an otherwise-valid alias).
+    #[test]
+    fn test_parse_table_dependency_with_empty_package_string_is_ignored() {
+        use deps_core::Dependency as _;
+
+        let toml = r#"[dependencies]
+foo = { package = "", version = "1.0" }"#;
+        let result = parse_cargo_toml(toml, &test_url()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+
+        let dep = &result.dependencies[0];
+        assert_eq!(dep.package, None);
+        assert_eq!(dep.name(), "foo");
+    }
+
+    /// No-regression check: a dependency without `package = "..."` still resolves
+    /// `Dependency::name()` to the TOML table key, exactly as before this fix.
+    #[test]
+    fn test_parse_table_dependency_without_package_resolves_table_key() {
+        use deps_core::Dependency as _;
+
+        let toml = r#"[dependencies]
+serde = { version = "1.0", features = ["derive"] }"#;
+        let result = parse_cargo_toml(toml, &test_url()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+
+        let dep = &result.dependencies[0];
+        assert_eq!(dep.package, None);
+        assert_eq!(dep.name(), "serde");
+    }
+
+    /// `package = "..."` combined with `git`: the source classification is independent of
+    /// the rename, but the registry-lookup name must still resolve to the real crate.
+    #[test]
+    fn test_parse_git_dependency_with_package_rename() {
+        use deps_core::Dependency as _;
+
+        let toml = r#"[dependencies]
+my-fork = { package = "tower-lsp", git = "https://github.com/ebkalderon/tower-lsp" }"#;
+        let result = parse_cargo_toml(toml, &test_url()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+
+        let dep = &result.dependencies[0];
+        assert_eq!(dep.name, "my-fork");
+        assert_eq!(dep.name(), "tower-lsp");
+        assert_matches!(dep.source, DependencySource::Git { .. });
+    }
+
+    /// `package = "..."` combined with `path`.
+    #[test]
+    fn test_parse_path_dependency_with_package_rename() {
+        use deps_core::Dependency as _;
+
+        let toml = r#"[dependencies]
+local-alias = { package = "local-crate", path = "../local" }"#;
+        let result = parse_cargo_toml(toml, &test_url()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+
+        let dep = &result.dependencies[0];
+        assert_eq!(dep.name, "local-alias");
+        assert_eq!(dep.name(), "local-crate");
+        assert_matches!(dep.source, DependencySource::Path { .. });
+    }
+
+    /// `package = "..."` combined with `workspace = true`: verified via `cargo metadata`
+    /// that Cargo silently discards `package` in this combination — the TOML table key
+    /// is the only lookup key workspace-inheritance resolution ever uses, and a member's
+    /// `package` naming a *different* crate than the workspace's own dependency entry is
+    /// simply ignored, not an error. `Dependency::name()` must therefore stay the alias
+    /// here rather than resolve to a value Cargo itself never looks up.
+    #[test]
+    fn test_parse_workspace_dependency_with_package_rename_is_ignored() {
+        use deps_core::Dependency as _;
+
+        let toml = r#"[dependencies]
+ws-alias = { package = "ws-crate", workspace = true }"#;
+        let result = parse_cargo_toml(toml, &test_url()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+
+        let dep = &result.dependencies[0];
+        assert_eq!(dep.name, "ws-alias");
+        assert_eq!(dep.package, None);
+        assert_eq!(dep.name(), "ws-alias");
+        assert_matches!(dep.source, DependencySource::Workspace);
     }
 
     #[test]
