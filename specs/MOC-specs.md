@@ -64,12 +64,12 @@ status: moc
 | 040 | [[040-github-token-redaction-trusted-origin-pin/spec\|GitHub auth token redaction and trusted-origin pinning]] | specify | shipped — security/hardening, P3 (PR #487, issue #484) |
 | 041 | [[041-credential-redaction-hardening/spec\|Redact user:pass@ credentials from registry-index logs and errors]] | specify | shipped — security, P2, two stages (PR #529 issue #522, PR #540 issue #536) |
 | 042 | [[042-docker-base-image-ecosystem/spec\|New ecosystem: Dockerfile FROM base-image tag/digest freshness]] | specify | draft — research/new ecosystem, P4, 5 open `[NEEDS CLARIFICATION]` items, no user demand signal (issue #557) |
-| 043 | [[043-nuget-feed-authentication/spec\|NuGet Feed Authentication (credentialed NuGet.Config sources)]] | specify | draft — enhancement/security, P3, design finalized via 3-round architect/critic review, no open clarifications (issues #561, #562) |
+| 043 | [[043-nuget-feed-authentication/spec\|NuGet Feed Authentication (credentialed NuGet.Config sources)]] | specify | shipped — enhancement/security, P3 (PR #572, issues #561, #562) |
 | 044 | [[044-precommit-hooks-ecosystem/spec\|New ecosystem: pre-commit hooks (.pre-commit-config.yaml repo/rev pins)]] | specify | draft — research/new ecosystem, P4, 6 open `[NEEDS CLARIFICATION]` items, no tracking issue filed yet |
-| 045 | [[045-secret-accessor-auditable-naming/spec\|Rename Redacted<T>/wrapper as_str() secret accessors to an auditable name]] | specify | enhancement/security, P3, ready for implementation (issue #581) |
-| 046 | [[046-pnpm-catalogs/spec\|pnpm catalogs + workspace: protocol resolution support]] | specify | research/enhancement, P3, clarifications resolved 2026-09-04, ready for implementation (issue #587) |
+| 045 | [[045-secret-accessor-auditable-naming/spec\|Rename Redacted<T>/wrapper as_str() secret accessors to an auditable name]] | specify | shipped — enhancement/security, P3 (PR #582, issue #581) |
+| 046 | [[046-pnpm-catalogs/spec\|pnpm catalogs + workspace: protocol resolution support]] | specify | shipped — research/enhancement, P3 (PR #589, issue #587) |
 | 047 | [[047-elixir-hex-ecosystem/spec\|New ecosystem: Elixir Hex (mix.exs dependency version hints)]] | specify | draft — research/new-ecosystem, P4, 6 open `[NEEDS CLARIFICATION]` items, issue #642 |
-| 048 | [[048-gitlab-ci-mutable-pin-message-contradicts-quickfix/spec\|GitLab CI mutable-ref-pin diagnostic wrongly claims no automated fix for component Latest/Partial pins]] | specify | approved — bug, P2, 0 open `[NEEDS CLARIFICATION]` items, issue #643, in implementation on `feat/640-643-gitlab-ci-pin-parity` |
+| 048 | [[048-gitlab-ci-mutable-pin-message-contradicts-quickfix/spec\|GitLab CI mutable-ref-pin diagnostic wrongly claims no automated fix for component Latest/Partial pins]] | specify | shipped — bug, P2 (PR #645, issues #640, #643) |
 | 049 | [[049-osv-malicious-package-severity/spec\|OSV malicious-package (MAL-*) advisory severity distinguishing]] | specify | draft — research/correctness, P2, 6 open `[NEEDS CLARIFICATION]` items |
 
 ## Completed Specs

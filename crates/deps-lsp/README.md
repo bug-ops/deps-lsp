@@ -45,7 +45,7 @@ All ecosystems are enabled by default. Disable unused ones to reduce binary size
 
 ```toml
 [dependencies]
-deps-lsp = { version = "0.12", default-features = false, features = ["cargo", "npm"] }
+deps-lsp = { version = "0.13", default-features = false, features = ["cargo", "npm"] }
 ```
 
 | Feature | Ecosystem | Default |
@@ -63,6 +63,7 @@ deps-lsp = { version = "0.12", default-features = false, features = ["cargo", "n
 | `nuget` | C# / .csproj, Directory.Packages.props, packages.config | Yes |
 | `deno` | Deno (JSR/npm) / deno.json, deno.jsonc | Yes |
 | `github-actions` | YAML / .github/workflows/*.yml, *.yaml | Yes |
+| `gitlab-ci` | YAML / .gitlab-ci.yml, .gitlab/ci/*.yml | Yes |
 
 `deno` pulls in `deps-npm` transitively (`DenoRegistry` delegates `npm:` specifiers to it, per its D3 architecture), even when the `npm` feature itself is disabled.
 
