@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-npm, deps-composer**: `deps-npm` and `deps-composer` now share a single `deps_core::json_helpers::string_valued_entries` helper (and its test coverage) for skipping non-string dependency-map values, instead of each crate carrying its own duplicated guard and tests (resolves #624) (#630)
 
 ### Added
-- **deps-core, deps-github-actions, deps-gitlab-ci, deps-lsp**: bulk "Pin N {noun} to commit SHA" code lens generalized cross-ecosystem — GitLab CI `include:` entries now get the same batch quickfix GitHub Actions workflows already had (resolves #640)
+- **deps-core, deps-github-actions, deps-gitlab-ci, deps-lsp**: bulk "Pin N {noun} to commit SHA" code lens generalized cross-ecosystem — GitLab CI `include:` entries now get the same batch quickfix GitHub Actions workflows already had (resolves #640) (#645)
 - **deps-github-actions, deps-lsp**: bulk "Pin N actions to commit SHA" code lens for GitHub Actions workflows, applying every resolvable mutable-tag `uses:` pin in one edit via the existing per-step quickfix's `TagIndex` lookup (resolves #633) (#639)
 - **deps-gitlab-ci**: mutable-ref SHA-pin diagnostic and "Pin to commit SHA" quickfix for `include: - project:`/`component:` entries (resolves #634)
 - **deps-lsp**: `workspace/didChangeConfiguration` now re-parses and forces a full re-fetch for every open document affected by a live-reloaded setting that alters registry routing (`registries.workspace_registries`, `registries.nuget_user_profile_sources`, `registries.gitlab_instance_host`), bounded by a server-wide fetch-concurrency cap shared with cold-start loading (resolves #592) (#600)
@@ -29,7 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-go**: `$GOENV` `GOPROXY`/`GOPRIVATE` follow-up hardening — test-injectable `$GOENV` path, oversized-`GOPRIVATE`-pattern warning, expanded edge-case/integration test coverage, and `GOPROXY` `,`/`|` separator docs (#563)
 
 ### Fixed
-- **deps-gitlab-ci**: the mutable-ref-pin diagnostic's "no automated fix available" suffix is no longer shown for a `component:` `~latest`/partial pin when a "Pin to commit SHA" quickfix is actually available (resolves #643)
+- **deps-gitlab-ci**: the mutable-ref-pin diagnostic's "no automated fix available" suffix is no longer shown for a `component:` `~latest`/partial pin when a "Pin to commit SHA" quickfix is actually available (resolves #643) (#645)
 - **deps-lsp**: the diagnostics loading ceiling now scales with dependency count and `cache.max_concurrent_fetches` instead of a fixed multiplier, so a low concurrency setting on a larger manifest no longer forces premature `Failed` diagnostics (resolves #636) (#638)
 - **deps-lsp**: diagnostics no longer stay stuck forever for a document that never leaves `LoadingState::Loading` (e.g. a background fetch task panic) — a fetch-timeout-derived ceiling now forces it to `Failed`, and a panicking background task is now supervised instead of silently discarding its result (resolves #632) (#635)
 - **deps-gradle**: recognize modern/variant configuration names (`androidTestImplementation`, `debugImplementation`, `compileOnlyApi`, `kaptAndroidTest`, etc.) instead of a fixed literal whitelist (resolves #627) (#631)
