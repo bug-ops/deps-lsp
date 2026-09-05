@@ -216,6 +216,89 @@ fn is_concrete_version(requirement: &str, ecosystem: EcosystemId) -> bool {
     concrete_pin_version(requirement, ecosystem).is_some()
 }
 
+/// Picks the lock-file-resolved candidate that best matches one dependency occurrence's own
+/// version requirement (FR-001/FR-002), among a name's multiple retained lock-file entries.
+///
+/// Filters `candidates` down to those [`EcosystemFormatter::version_satisfies_requirement`]
+/// accepts, then returns the highest-semver entry among that satisfying subset — falling back
+/// to [`crate::lockfile`]'s lexicographic tiebreak for non-parseable versions
+/// ([`crate::lockfile::compare_lockfile_versions`]), the same ordering a single-candidate
+/// collapse already uses, so this never diverges from it. Returns `None` when nothing
+/// satisfies the requirement (FR-003) — the caller must not then substitute an arbitrary
+/// non-matching entry.
+/// Prefers [`RequirementResolution::compile_requirement`]'s precise, ecosystem-native
+/// comparator (e.g. `deps-cargo`'s real `semver::VersionReq` range semantics) over
+/// [`RequirementResolution::version_satisfies_requirement`]'s looser heuristic — critical
+/// here specifically because that heuristic's plain/partial-requirement branch requires
+/// *minor-version equality* (`is_same_major_minor`), so a caret-range requirement like
+/// Cargo's `"2.4"` (meaning `>=2.4.0, <3.0.0`) would wrongly reject a `2.9.4` candidate,
+/// turning a real match into a false FR-003 skip. `compile_requirement` is only used when
+/// it succeeds; an ecosystem that returns `None` (requirement fails to parse under its own
+/// comparator) falls back to the heuristic exactly as it did before this existed.
+fn version_matches_requirement(
+    formatter: &dyn EcosystemFormatter,
+    version: &ConcreteVersion,
+    requirement: &crate::VersionReq,
+) -> bool {
+    if let Some(matcher) = formatter.compile_requirement(requirement) {
+        matcher.matches(version) == Some(true)
+    } else {
+        formatter.version_satisfies_requirement(version, requirement.as_str())
+    }
+}
+
+fn best_candidate_for_requirement<'a>(
+    candidates: &'a [ConcreteVersion],
+    requirement: &crate::VersionReq,
+    formatter: &dyn EcosystemFormatter,
+) -> Option<&'a ConcreteVersion> {
+    candidates
+        .iter()
+        .filter(|v| version_matches_requirement(formatter, v, requirement))
+        .max_by(|a, b| crate::lockfile::compare_lockfile_versions(a.as_str(), b.as_str()))
+}
+
+/// Resolves one dependency occurrence's lock-file version, disambiguating by its own
+/// `version_requirement()` when the resolved name has more than one retained lock-file entry
+/// (issue #649).
+///
+/// `resolved_version_candidates` holds every retained lock-file entry per name (built from
+/// [`crate::lockfile::ResolvedPackages::iter_all`]) but, per NFR-003, is expected to carry an
+/// entry **only** for names with more than one occurrence — the common single-occurrence case
+/// falls straight through to `resolved_versions` (the fast `HashMap` lookup, unchanged from
+/// before this function existed, FR-005) without ever consulting the candidates map. The same
+/// fallback applies when `dep.version_requirement()` is `None` (edge case: a renamed
+/// occurrence with no version to disambiguate against) or when no candidate satisfies the
+/// requirement (FR-003) — that last case intentionally does not substitute the collapsed
+/// value, since it would be an arbitrary, possibly wrong, non-matching entry.
+///
+/// Shared by [`in_use_version`] and the resolved-version lookups in
+/// [`super::hover::generate_hover`] and [`super::inlay_hints::generate_inlay_hints`] so all
+/// three surfaces (hover, inlay hints, OSV target selection) apply the identical
+/// per-occurrence disambiguation policy (US-001/US-002).
+pub(crate) fn resolve_occurrence_version<'a>(
+    dep: &dyn Dependency,
+    normalized_name: &str,
+    resolved_versions: &'a HashMap<PackageName, ConcreteVersion>,
+    resolved_version_candidates: Option<&'a HashMap<PackageName, Vec<ConcreteVersion>>>,
+    formatter: &dyn EcosystemFormatter,
+) -> Option<&'a ConcreteVersion> {
+    let candidates = resolved_version_candidates.and_then(|candidates| {
+        candidates
+            .get(normalized_name)
+            .or_else(|| candidates.get(dep.name()))
+    });
+
+    match (candidates, dep.version_requirement()) {
+        (Some(candidates), Some(req)) if candidates.len() > 1 => {
+            best_candidate_for_requirement(candidates, req, formatter)
+        }
+        _ => resolved_versions
+            .get(normalized_name)
+            .or_else(|| resolved_versions.get(dep.name())),
+    }
+}
+
 /// The version of `dep` this project treats as actually in use.
 ///
 /// The lock-file-resolved version, else the declared requirement when it is
@@ -233,6 +316,11 @@ fn is_concrete_version(requirement: &str, ecosystem: EcosystemId) -> bool {
 /// (#394 S1) — all three need "what version does the user actually have"
 /// for the same reason: querying a fabricated version produces a silent
 /// false negative.
+///
+/// `resolved_version_candidates` disambiguates a name with more than one lock-file entry by
+/// the occurrence's own `version_requirement()` (issue #649) — see this module's
+/// `resolve_occurrence_version` for the exact policy. `None` (most callers with no such map
+/// to give) behaves exactly as before this parameter existed.
 ///
 /// # Examples
 ///
@@ -297,7 +385,7 @@ fn is_concrete_version(requirement: &str, ecosystem: EcosystemId) -> bool {
 /// // No lock file, but the requirement is already an exact pin — falls
 /// // back to it, stripped of its `=` marker.
 /// assert_eq!(
-///     in_use_version(&dep, "time", &resolved_versions, &SimpleFormatter, EcosystemId::Cargo),
+///     in_use_version(&dep, "time", &resolved_versions, None, &SimpleFormatter, EcosystemId::Cargo),
 ///     Some("0.1.43".to_string())
 /// );
 /// ```
@@ -305,29 +393,80 @@ pub fn in_use_version(
     dep: &dyn Dependency,
     normalized_name: &str,
     resolved_versions: &HashMap<PackageName, ConcreteVersion>,
+    resolved_version_candidates: Option<&HashMap<PackageName, Vec<ConcreteVersion>>>,
     formatter: &dyn EcosystemFormatter,
     ecosystem: EcosystemId,
 ) -> Option<String> {
     if formatter.manifest_requirement_is_resolved_version(dep) {
+        return dep
+            .version_requirement()
+            .and_then(|req| concrete_pin_version(req.as_str(), ecosystem))
+            .map(str::to_string);
+    }
+
+    resolve_occurrence_version(
+        dep,
+        normalized_name,
+        resolved_versions,
+        resolved_version_candidates,
+        formatter,
+    )
+    .map(ConcreteVersion::to_string)
+    .or_else(|| {
         dep.version_requirement()
             .and_then(|req| concrete_pin_version(req.as_str(), ecosystem))
             .map(str::to_string)
-    } else {
-        resolved_versions
-            .get(normalized_name)
-            .or_else(|| resolved_versions.get(dep.name()))
-            .map(ConcreteVersion::to_string)
-            .or_else(|| {
-                dep.version_requirement()
-                    .and_then(|req| concrete_pin_version(req.as_str(), ecosystem))
-                    .map(str::to_string)
-            })
-    }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Minimal formatter with a real `compile_requirement` (Cargo-style `semver::VersionReq`
+    /// semantics), for tests that must distinguish `best_candidate_for_requirement`'s
+    /// precise `compile_requirement` path from `MockFormatter`'s heuristic-only fallback
+    /// (issue #649 critic finding C1).
+    struct CaretFormatter;
+
+    struct SemverMatcher(semver::VersionReq);
+    impl crate::lsp_helpers::RequirementMatcher for SemverMatcher {
+        fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
+            version
+                .as_str()
+                .parse::<semver::Version>()
+                .ok()
+                .map(|v| self.0.matches(&v))
+        }
+    }
+
+    impl crate::lsp_helpers::PackageNaming for CaretFormatter {}
+    impl crate::lsp_helpers::PackageRendering for CaretFormatter {
+        fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+            version.to_string()
+        }
+        fn package_url(&self, name: &PackageName) -> String {
+            name.to_string()
+        }
+    }
+    impl crate::lsp_helpers::RequirementResolution for CaretFormatter {
+        fn compile_requirement(
+            &self,
+            requirement: &crate::VersionReq,
+        ) -> Option<Box<dyn crate::lsp_helpers::RequirementMatcher>> {
+            requirement
+                .as_str()
+                .parse::<semver::VersionReq>()
+                .ok()
+                .map(|req| {
+                    Box::new(SemverMatcher(req)) as Box<dyn crate::lsp_helpers::RequirementMatcher>
+                })
+        }
+    }
+    impl crate::lsp_helpers::DiagnosticMessages for CaretFormatter {}
+    impl crate::lsp_helpers::DiagnosticPolicy for CaretFormatter {}
+    impl crate::lsp_helpers::SourcePolicy for CaretFormatter {}
+    impl crate::lsp_helpers::OsvNaming for CaretFormatter {}
 
     #[test]
     fn is_concrete_version_accepts_explicit_pins_in_any_ecosystem() {
@@ -568,23 +707,18 @@ mod tests {
         );
     }
 
-    /// Known-limitation regression guard (deps-cargo `package = "..."` rename, issue
-    /// #648's follow-up): `resolved_versions` is keyed by name alone with one
-    /// highest-semver value per name (`ResolvedPackages`'s `best_package` collapse in
-    /// `crate::lockfile`), so two manifest occurrences of the same crate — one plain,
-    /// one renamed via `package = "..."` to select an older major — both resolve
-    /// `Dependency::name()` to the same registry name and therefore collide on the
-    /// same lockfile entry.
-    ///
-    /// This pins *today's* behavior (the renamed, older-major occurrence incorrectly
-    /// reports the newer major's lockfile version) so a fix — per-occurrence
-    /// resolution filtered by `version_requirement()`, the same class of gap as #394
-    /// — is a deliberate, visible behavior change here, not a silent one. Not a
-    /// desired outcome: see the critic handoff
-    /// (`.local/handoff/2026-09-05T23-48-31-critic.md`, finding S1) for the full
-    /// failure-mode analysis and the tracking follow-up.
+    /// Regression guard for issue #649 (deps-cargo `package = "..."` rename, follow-up to
+    /// #648): two manifest occurrences of the same crate — one plain, one renamed via
+    /// `package = "..."` to select an older major — both resolve `Dependency::name()` to
+    /// the same registry name. Before this fix, both collided on `resolved_versions`'s
+    /// single collapsed highest-semver entry (asserted by a since-superseded version of
+    /// this test — see the critic handoff `.local/handoff/2026-09-05T23-48-31-critic.md`,
+    /// finding S1, for the original failure-mode analysis). With
+    /// `resolved_version_candidates` populated, each occurrence now resolves to the
+    /// lock-file entry that actually satisfies its own `version_requirement()`
+    /// (US-001/US-002, FR-001/FR-002).
     #[test]
-    fn in_use_version_known_limitation_renamed_occurrence_collides_with_plain_one() {
+    fn in_use_version_renamed_occurrence_resolves_its_own_major() {
         use crate::VersionReq;
         use crate::lsp_helpers::test_support::MockDep;
 
@@ -594,22 +728,269 @@ mod tests {
             version_range: tower_lsp_server::ls_types::Range::default(),
             name_range: tower_lsp_server::ls_types::Range::default(),
         };
+        let plain_current_major = MockDep {
+            name: PackageName::new("serde"),
+            version_req: VersionReq::new("1.0"),
+            version_range: tower_lsp_server::ls_types::Range::default(),
+            name_range: tower_lsp_server::ls_types::Range::default(),
+        };
 
         let mut resolved_versions = HashMap::new();
         resolved_versions.insert(PackageName::new("serde"), ConcreteVersion::from("1.0.219"));
+        let mut candidates = HashMap::new();
+        candidates.insert(
+            PackageName::new("serde"),
+            vec![
+                ConcreteVersion::from("0.9.15"),
+                ConcreteVersion::from("1.0.219"),
+            ],
+        );
 
-        let result = in_use_version(
+        let renamed_result = in_use_version(
             &renamed_old_major,
             "serde",
             &resolved_versions,
+            Some(&candidates),
+            &crate::lsp_helpers::test_support::MockFormatter,
+            EcosystemId::Cargo,
+        );
+        let plain_result = in_use_version(
+            &plain_current_major,
+            "serde",
+            &resolved_versions,
+            Some(&candidates),
             &crate::lsp_helpers::test_support::MockFormatter,
             EcosystemId::Cargo,
         );
 
-        // Wrong today: this is `serde 0.9`'s occurrence, but the collapsed
-        // single-value-per-name map hands back the unrelated 1.x entry instead of
-        // `None` (which is what pre-#648 behavior produced for an unresolvable
-        // alias name — an honest "unknown" rather than a confidently wrong answer).
+        assert_eq!(renamed_result, Some("0.9.15".to_string()));
+        assert_eq!(plain_result, Some("1.0.219".to_string()));
+    }
+
+    /// FR-003: when no lock-file candidate satisfies the occurrence's own requirement, the
+    /// result is the honest "no concrete version" skip — never an arbitrary non-matching
+    /// entry.
+    #[test]
+    fn in_use_version_no_candidate_satisfies_requirement_returns_none() {
+        use crate::VersionReq;
+        use crate::lsp_helpers::test_support::MockDep;
+
+        let dep = MockDep {
+            name: PackageName::new("serde"),
+            version_req: VersionReq::new("0.9"),
+            version_range: tower_lsp_server::ls_types::Range::default(),
+            name_range: tower_lsp_server::ls_types::Range::default(),
+        };
+
+        let resolved_versions = HashMap::new();
+        let mut candidates = HashMap::new();
+        candidates.insert(
+            PackageName::new("serde"),
+            vec![
+                ConcreteVersion::from("1.0.219"),
+                ConcreteVersion::from("1.1.0"),
+            ],
+        );
+
+        let result = in_use_version(
+            &dep,
+            "serde",
+            &resolved_versions,
+            Some(&candidates),
+            &crate::lsp_helpers::test_support::MockFormatter,
+            EcosystemId::Cargo,
+        );
+
+        assert_eq!(result, None);
+    }
+
+    /// Edge case (spec section 6): a renamed occurrence with no `version_requirement()` to
+    /// disambiguate against falls back to the collapsed highest-semver value, same as
+    /// before this fix — no new skip-reason variant.
+    #[test]
+    fn in_use_version_no_requirement_falls_back_to_collapsed_value() {
+        use crate::lsp_helpers::test_support::MockMarkedDep;
+
+        let dep = MockMarkedDep {
+            name: PackageName::new("serde"),
+            name_range: tower_lsp_server::ls_types::Range::default(),
+            markers: None,
+        };
+
+        let mut resolved_versions = HashMap::new();
+        resolved_versions.insert(PackageName::new("serde"), ConcreteVersion::from("1.0.219"));
+        let mut candidates = HashMap::new();
+        candidates.insert(
+            PackageName::new("serde"),
+            vec![
+                ConcreteVersion::from("0.9.15"),
+                ConcreteVersion::from("1.0.219"),
+            ],
+        );
+
+        let result = in_use_version(
+            &dep,
+            "serde",
+            &resolved_versions,
+            Some(&candidates),
+            &crate::lsp_helpers::test_support::MockFormatter,
+            EcosystemId::Cargo,
+        );
+
         assert_eq!(result, Some("1.0.219".to_string()));
+    }
+
+    /// FR-005/NFR-001: a single-candidate name (the dominant case, no rename involved)
+    /// behaves identically whether or not a candidates map is supplied — the fast path
+    /// never routes through the per-occurrence filter.
+    #[test]
+    fn in_use_version_single_candidate_matches_collapsed_fast_path() {
+        use crate::VersionReq;
+        use crate::lsp_helpers::test_support::MockDep;
+
+        let dep = MockDep {
+            name: PackageName::new("serde"),
+            version_req: VersionReq::new("1.0"),
+            version_range: tower_lsp_server::ls_types::Range::default(),
+            name_range: tower_lsp_server::ls_types::Range::default(),
+        };
+
+        let mut resolved_versions = HashMap::new();
+        resolved_versions.insert(PackageName::new("serde"), ConcreteVersion::from("1.0.219"));
+        let mut candidates = HashMap::new();
+        candidates.insert(
+            PackageName::new("serde"),
+            vec![ConcreteVersion::from("1.0.219")],
+        );
+
+        let with_candidates = in_use_version(
+            &dep,
+            "serde",
+            &resolved_versions,
+            Some(&candidates),
+            &crate::lsp_helpers::test_support::MockFormatter,
+            EcosystemId::Cargo,
+        );
+        let without_candidates = in_use_version(
+            &dep,
+            "serde",
+            &resolved_versions,
+            None,
+            &crate::lsp_helpers::test_support::MockFormatter,
+            EcosystemId::Cargo,
+        );
+
+        assert_eq!(with_candidates, Some("1.0.219".to_string()));
+        assert_eq!(with_candidates, without_candidates);
+    }
+
+    /// Edge case (spec section 6): non-semver-parseable versions among the candidates fall
+    /// back to `compare_lockfile_versions`'s lexicographic tiebreak, not a second, divergent
+    /// comparison policy.
+    #[test]
+    fn best_candidate_for_requirement_non_semver_uses_lexicographic_tiebreak() {
+        // Testing gap 2 fix: both candidates must actually satisfy the requirement and
+        // both must fail semver parsing, so `max_by` is genuinely invoked on two elements
+        // and falls all the way to `compare_lockfile_versions`'s `(Err, Err) => a.cmp(b)`
+        // branch — a single-match case (the previous version of this test) never calls the
+        // comparator at all. `MockFormatter` has no `compile_requirement` override (default
+        // `None`), so this exercises the `version_satisfies_requirement` fallback path:
+        // requirement `"1"` is a partial-version bare requirement, and both `"1-rc1"` and
+        // `"1-rc2"` satisfy it via the `starts_with` branch (`lsp_helpers::mod::is_same_major_minor`
+        // fails for both, since neither has a `.`, but `starts_with("1")` holds for both).
+        let candidates = vec![
+            ConcreteVersion::from("1-rc1"),
+            ConcreteVersion::from("1-rc2"),
+        ];
+
+        let result = best_candidate_for_requirement(
+            &candidates,
+            &crate::VersionReq::new("1"),
+            &crate::lsp_helpers::test_support::MockFormatter,
+        );
+
+        assert_eq!(result, Some(&ConcreteVersion::from("1-rc2")));
+    }
+
+    /// C1 fix regression guard: `best_candidate_for_requirement` must prefer
+    /// `compile_requirement`'s precise comparator over `version_satisfies_requirement`'s
+    /// heuristic. The heuristic's partial-requirement branch requires *minor-version
+    /// equality*, so a Cargo-style caret requirement `"2.4"` (meaning `>=2.4.0, <3.0.0`)
+    /// would wrongly reject `2.9.4` under the heuristic alone — this is the exact
+    /// false-negative the critic's C1 finding identified (a real dependency silently
+    /// dropped from in-use-version resolution, and therefore from the OSV scan).
+    #[test]
+    fn best_candidate_for_requirement_uses_compile_requirement_when_available() {
+        use crate::VersionReq;
+
+        let candidates = vec![
+            ConcreteVersion::from("1.3.2"),
+            ConcreteVersion::from("2.9.4"),
+        ];
+
+        // Bare "2.4" under Cargo's real semver semantics is a caret range matching
+        // 2.9.4, not 1.3.2 — but the heuristic's minor-equality check would reject both
+        // (neither candidate has minor "4"), producing a false FR-003 skip.
+        let result =
+            best_candidate_for_requirement(&candidates, &VersionReq::new("2.4"), &CaretFormatter);
+
+        assert_eq!(result, Some(&ConcreteVersion::from("2.9.4")));
+    }
+
+    /// FR-002: when more than one lock-file entry satisfies an occurrence's requirement,
+    /// the tiebreak must pick the highest-semver *among the satisfying subset*, not the
+    /// highest overall — `2.0.0` here is the highest candidate but does not satisfy `^1.0`,
+    /// so it must never be picked.
+    #[test]
+    fn best_candidate_for_requirement_picks_highest_of_satisfying_subset() {
+        use crate::VersionReq;
+
+        let candidates = vec![
+            ConcreteVersion::from("1.0.1"),
+            ConcreteVersion::from("1.0.5"),
+            ConcreteVersion::from("2.0.0"),
+        ];
+
+        let result =
+            best_candidate_for_requirement(&candidates, &VersionReq::new("^1.0"), &CaretFormatter);
+
+        assert_eq!(result, Some(&ConcreteVersion::from("1.0.5")));
+    }
+
+    /// FR-002 end-to-end through `in_use_version`/`resolve_occurrence_version`, not just the
+    /// isolated `best_candidate_for_requirement` helper.
+    #[test]
+    fn in_use_version_tiebreaks_among_multiple_satisfying_candidates() {
+        use crate::VersionReq;
+        use crate::lsp_helpers::test_support::MockDep;
+
+        let dep = MockDep {
+            name: PackageName::new("pkg"),
+            version_req: VersionReq::new("^1.0"),
+            version_range: tower_lsp_server::ls_types::Range::default(),
+            name_range: tower_lsp_server::ls_types::Range::default(),
+        };
+
+        let resolved_versions = HashMap::new();
+        let mut candidates = HashMap::new();
+        candidates.insert(
+            PackageName::new("pkg"),
+            vec![
+                ConcreteVersion::from("1.0.1"),
+                ConcreteVersion::from("1.0.5"),
+                ConcreteVersion::from("2.0.0"),
+            ],
+        );
+
+        let result = in_use_version(
+            &dep,
+            "pkg",
+            &resolved_versions,
+            Some(&candidates),
+            &CaretFormatter,
+            EcosystemId::Cargo,
+        );
+
+        assert_eq!(result, Some("1.0.5".to_string()));
     }
 }

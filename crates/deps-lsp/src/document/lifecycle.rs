@@ -185,6 +185,14 @@ fn preserve_cache(new_state: &mut DocumentState, old_state: &DocumentState) {
     new_state
         .resolved_versions
         .clone_from(&old_state.resolved_versions);
+    // Must travel with `resolved_versions` (issue #649 critic S1): a per-occurrence
+    // resolution that only preserved the collapsed map while resetting this sibling to
+    // empty would silently reintroduce the mis-attribution bug for the ~100ms debounce +
+    // lockfile-reload window on every keystroke, since `resolve_occurrence_version` only
+    // consults the candidates map when it is populated.
+    new_state
+        .resolved_version_candidates
+        .clone_from(&old_state.resolved_version_candidates);
     // DocumentState is rebuilt on every change, so without this the OSV scan
     // result would be wiped on every keystroke — `run_osv_scan` overwrites it
     // once the (cheap, cache-backed) rescan completes, see §4.
@@ -347,6 +355,7 @@ const OSV_SCAN_TIMEOUT_CEILING_SECS: u64 = 30;
 fn collect_in_use_versions(
     parse_result: &dyn deps_core::ParseResult,
     resolved_versions: &HashMap<PackageName, ConcreteVersion>,
+    resolved_version_candidates: &HashMap<PackageName, Vec<ConcreteVersion>>,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
     ecosystem: EcosystemId,
 ) -> HashMap<PackageName, Vec<String>> {
@@ -361,6 +370,7 @@ fn collect_in_use_versions(
             dep,
             &normalized_name,
             resolved_versions,
+            Some(resolved_version_candidates),
             formatter,
             ecosystem,
         ) {
@@ -417,6 +427,7 @@ fn collect_in_use_versions(
 fn build_scan_targets(
     parse_result: &dyn deps_core::ParseResult,
     resolved_versions: &HashMap<PackageName, ConcreteVersion>,
+    resolved_version_candidates: &HashMap<PackageName, Vec<ConcreteVersion>>,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
     ecosystem: EcosystemId,
 ) -> (
@@ -427,8 +438,13 @@ fn build_scan_targets(
 
     let mut targets = Vec::new();
     let mut skipped = deps_core::osv::VulnerabilityMap::new();
-    let keys =
-        deps_core::osv::vulnerability_keys(parse_result, resolved_versions, formatter, ecosystem);
+    let keys = deps_core::osv::vulnerability_keys(
+        parse_result,
+        resolved_versions,
+        Some(resolved_version_candidates),
+        formatter,
+        ecosystem,
+    );
 
     for dep in parse_result.dependencies() {
         let normalized_name = formatter.normalize_package_name(dep.name());
@@ -456,6 +472,7 @@ fn build_scan_targets(
             dep,
             &normalized_name,
             resolved_versions,
+            Some(resolved_version_candidates),
             formatter,
             ecosystem,
         );
@@ -543,6 +560,7 @@ async fn run_osv_scan_phase_a(
         let (targets, skipped) = build_scan_targets(
             parse_result,
             &doc.resolved_versions,
+            &doc.resolved_version_candidates,
             ecosystem.formatter(),
             ecosystem_id,
         );
@@ -553,6 +571,7 @@ async fn run_osv_scan_phase_a(
         let vuln_keys = deps_core::osv::vulnerability_keys(
             parse_result,
             &doc.resolved_versions,
+            Some(&doc.resolved_version_candidates),
             ecosystem.formatter(),
             ecosystem_id,
         );
@@ -1700,13 +1719,17 @@ async fn run_document_open_background_task(
     tracing::debug!("background task started");
 
     // Load resolved versions from lock file first (instant, no network)
-    let resolved_versions = load_resolved_versions(&uri, &state, ecosystem.as_ref()).await;
+    let (resolved_versions, resolved_version_candidates) =
+        load_resolved_versions(&uri, &state, ecosystem.as_ref()).await;
 
     // Update document state with resolved versions immediately
     if !resolved_versions.is_empty()
         && let Some(mut doc) = state.documents.get_mut(&uri)
     {
-        doc.update_resolved_versions(resolved_versions.clone());
+        doc.update_resolved_versions(
+            resolved_versions.clone(),
+            resolved_version_candidates.clone(),
+        );
 
         // Use resolved versions as cached versions for instant display,
         // except for a dependency whose manifest requirement is itself
@@ -1783,6 +1806,7 @@ async fn run_document_open_background_task(
         let in_use = collect_in_use_versions(
             parse_result,
             &resolved_versions,
+            &resolved_version_candidates,
             ecosystem.formatter(),
             resolve_ecosystem_id(ecosystem.as_ref()),
         );
@@ -2111,6 +2135,9 @@ fn commit_parsed_document(
     for removed_dep in &diff.removed {
         doc_state.cached_versions.remove(removed_dep);
         doc_state.resolved_versions.remove(removed_dep);
+        // Raw-`dep.name()`-keyed, same as `resolved_versions` above (issue #649) — must be
+        // pruned alongside it so a removed dependency's stale candidates never linger.
+        doc_state.resolved_version_candidates.remove(removed_dep);
         doc_state
             .vulnerabilities
             .remove(&formatter.normalize_package_name(removed_dep));
@@ -2324,14 +2351,18 @@ async fn run_document_change_task(
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     // Load resolved versions from lock file first (instant, no network)
-    let resolved_versions = load_resolved_versions(&uri, &state, ecosystem.as_ref()).await;
+    let (resolved_versions, resolved_version_candidates) =
+        load_resolved_versions(&uri, &state, ecosystem.as_ref()).await;
 
     // Update document state with resolved versions only
     // Do NOT touch cached_versions - they contain latest registry versions
     if !resolved_versions.is_empty()
         && let Some(mut doc) = state.documents.get_mut(&uri)
     {
-        doc.update_resolved_versions(resolved_versions.clone());
+        doc.update_resolved_versions(
+            resolved_versions.clone(),
+            resolved_version_candidates.clone(),
+        );
     }
 
     // Phase A OSV scan (only when a dependency was added or an existing
@@ -2399,6 +2430,7 @@ async fn run_document_change_task(
             &client,
             ecosystem.as_ref(),
             &resolved_versions,
+            &resolved_version_candidates,
             deps_to_fetch,
             config.freshness,
             config.cache.fetch_timeout_secs,
@@ -2536,6 +2568,7 @@ async fn fetch_registry_versions_for_change(
     client: &Client,
     ecosystem: &dyn Ecosystem,
     resolved_versions: &HashMap<PackageName, ConcreteVersion>,
+    resolved_version_candidates: &HashMap<PackageName, Vec<ConcreteVersion>>,
     deps_to_fetch: Vec<PackageName>,
     freshness_settings: deps_core::FreshnessSettings,
     fetch_timeout_secs: u64,
@@ -2600,6 +2633,7 @@ async fn fetch_registry_versions_for_change(
                     collect_in_use_versions(
                         pr,
                         resolved_versions,
+                        resolved_version_candidates,
                         ecosystem.formatter(),
                         resolve_ecosystem_id(ecosystem),
                     ),
@@ -2728,21 +2762,59 @@ fn cached_versions_from_lockfile(
         .collect()
 }
 
+/// Splits a parsed [`deps_core::lockfile::ResolvedPackages`] into the collapsed
+/// `dep_name -> version` map (`ResolvedPackages::iter`, unchanged FR-005 fast path) and a
+/// sibling `dep_name -> [version, ...]` map (issue #649) holding every retained lock-file
+/// entry for names with more than one — built from `ResolvedPackages::iter_all`, and
+/// deliberately omitting a single-occurrence name entirely (NFR-003: the common case never
+/// pays for a candidates-map lookup).
+///
+/// Shared by [`load_resolved_versions`] and `DepsLanguageServer`'s watched-lock-file-change
+/// handler (`server.rs`) — both re-parse a lock file and need the identical split.
+pub(crate) fn split_resolved_packages(
+    resolved: &deps_core::lockfile::ResolvedPackages,
+) -> (
+    HashMap<PackageName, ConcreteVersion>,
+    HashMap<PackageName, Vec<ConcreteVersion>>,
+) {
+    let versions = resolved
+        .iter()
+        .map(|(name, pkg)| (PackageName::new(name.as_str()), pkg.version.clone().into()))
+        .collect();
+    let candidates = resolved
+        .iter_all()
+        .filter(|(_, versions)| versions.len() > 1)
+        .map(|(name, versions)| {
+            (
+                PackageName::new(name.as_str()),
+                versions
+                    .iter()
+                    .map(|pkg| ConcreteVersion::from(pkg.version.clone()))
+                    .collect(),
+            )
+        })
+        .collect();
+    (versions, candidates)
+}
+
 /// Loads resolved versions from lock file for a given manifest URI.
 ///
-/// Uses the ecosystem's lockfile provider to parse the lock file.
-/// Returns a HashMap mapping package names to their resolved versions.
-/// Returns an empty HashMap if no lock file is found or parsing fails.
+/// Uses the ecosystem's lockfile provider to parse the lock file, then
+/// [`split_resolved_packages`]. Both returned maps are empty if no lock file is found or
+/// parsing fails.
 async fn load_resolved_versions(
     uri: &Uri,
     state: &ServerState,
     ecosystem: &dyn Ecosystem,
-) -> HashMap<PackageName, ConcreteVersion> {
+) -> (
+    HashMap<PackageName, ConcreteVersion>,
+    HashMap<PackageName, Vec<ConcreteVersion>>,
+) {
     let lock_provider = match ecosystem.lockfile_provider() {
         Some(p) => p,
         None => {
             tracing::debug!("No lock file provider for ecosystem {}", ecosystem.id());
-            return HashMap::new();
+            return (HashMap::new(), HashMap::new());
         }
     };
 
@@ -2750,7 +2822,7 @@ async fn load_resolved_versions(
         Some(path) => path,
         None => {
             tracing::debug!("No lock file found for {:?}", uri);
-            return HashMap::new();
+            return (HashMap::new(), HashMap::new());
         }
     };
 
@@ -2765,14 +2837,11 @@ async fn load_resolved_versions(
                 resolved.len(),
                 lockfile_path.display()
             );
-            resolved
-                .iter()
-                .map(|(name, pkg)| (PackageName::new(name.as_str()), pkg.version.clone().into()))
-                .collect()
+            split_resolved_packages(&resolved)
         }
         Err(e) => {
             tracing::warn!("Failed to parse lock file: {}", e);
-            HashMap::new()
+            (HashMap::new(), HashMap::new())
         }
     }
 }
@@ -2993,10 +3062,10 @@ mod tests {
                 PackageName::new("serde"),
                 PackageVersions::latest_only("1.0.0"),
             )]));
-            doc.update_resolved_versions(HashMap::from([(
-                PackageName::new("serde"),
-                ConcreteVersion::new("1.0.0"),
-            )]));
+            doc.update_resolved_versions(
+                HashMap::from([(PackageName::new("serde"), ConcreteVersion::new("1.0.0"))]),
+                HashMap::new(),
+            );
             doc.replace_outcomes(
                 DependencyOutcomes::new()
                     .with_fetch_failure("serde", FetchFailure::Transient)
@@ -6714,6 +6783,7 @@ dependencies = ["requests>=2.0.0"]
             let in_use = collect_in_use_versions(
                 parse_result.as_ref(),
                 &resolved_versions,
+                &HashMap::new(),
                 formatter,
                 EcosystemId::Pypi,
             );
@@ -7022,6 +7092,66 @@ tokio = "1.0"
             }
         }
 
+        /// Regression guard for issue #649 critic finding S1: `resolved_version_candidates`
+        /// must travel with `resolved_versions` through `preserve_cache`, not reset to empty
+        /// on every keystroke — a desync here would silently reintroduce #649's
+        /// mis-attribution bug for the debounce + lockfile-reload window between each edit
+        /// and `run_document_change_task`'s repopulation of the candidates map.
+        #[tokio::test]
+        async fn test_preserve_cache_carries_resolved_version_candidates_across_edit() {
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+
+            let content1 = r#"[dependencies]
+serde = "1.0"
+serde_old = { package = "serde", version = "0.9" }
+"#;
+
+            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let parse_result1 = ecosystem.parse_manifest(content1, &uri).await.unwrap();
+            let doc_state1 = DocumentState::new_from_parse_result(
+                EcosystemId::Cargo,
+                content1.to_string(),
+                parse_result1,
+            );
+            state.update_document(uri.clone(), doc_state1);
+
+            // Manually populate the candidates map (simulating a completed lockfile load).
+            {
+                let mut doc = state.documents.get_mut(&uri).unwrap();
+                doc.resolved_versions
+                    .insert("serde".into(), "1.0.219".into());
+                doc.resolved_version_candidates
+                    .insert("serde".into(), vec!["0.9.15".into(), "1.0.219".into()]);
+            }
+
+            // Trivial re-edit (whitespace-only) — this must not reset the candidates map.
+            let content2 = r#"[dependencies]
+serde = "1.0"
+serde_old = { package = "serde", version = "0.9" }
+
+"#;
+            let parse_result2 = ecosystem.parse_manifest(content2, &uri).await.unwrap();
+            let mut doc_state2 = DocumentState::new_from_parse_result(
+                EcosystemId::Cargo,
+                content2.to_string(),
+                parse_result2,
+            );
+
+            if let Some(old_doc) = state.get_document(&uri) {
+                preserve_cache(&mut doc_state2, &old_doc);
+            }
+
+            assert_eq!(
+                doc_state2.resolved_version_candidates.get("serde"),
+                Some(&vec![
+                    ConcreteVersion::from("0.9.15"),
+                    ConcreteVersion::from("1.0.219")
+                ]),
+                "resolved_version_candidates must survive preserve_cache alongside resolved_versions"
+            );
+        }
+
         #[tokio::test]
         async fn test_preserve_cache_carries_vulnerabilities_across_edit() {
             use deps_core::osv::{ScanOutcome, VulnerabilityMap};
@@ -7245,6 +7375,67 @@ serde = "1.0"
             assert!(
                 doc.outcomes.deprecation("time").is_none(),
                 "removed dependency's deprecation entry must be pruned"
+            );
+        }
+
+        /// Regression guard for issue #649 critic finding S1: `resolved_version_candidates`
+        /// is raw-`dep.name()`-keyed exactly like `resolved_versions`, so it must be pruned
+        /// on dependency removal the same way, not left holding a stale candidates list for
+        /// a name no longer in the manifest.
+        #[tokio::test]
+        async fn test_resolved_version_candidates_pruned_on_dependency_removal() {
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+
+            let content1 = r#"[dependencies]
+serde = "1.0"
+serde_old = { package = "serde", version = "0.9" }
+"#;
+            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let parse_result1 = ecosystem.parse_manifest(content1, &uri).await.unwrap();
+            let doc_state1 = DocumentState::new_from_parse_result(
+                EcosystemId::Cargo,
+                content1.to_string(),
+                parse_result1,
+            );
+            state.update_document(uri.clone(), doc_state1);
+
+            {
+                let mut doc = state.documents.get_mut(&uri).unwrap();
+                doc.resolved_versions
+                    .insert("serde".into(), "1.0.219".into());
+                doc.resolved_version_candidates
+                    .insert("serde".into(), vec!["0.9.15".into(), "1.0.219".into()]);
+            }
+
+            // Both manifest entries removed — `serde`'s candidates must be pruned along
+            // with `resolved_versions`, not left behind as stale data.
+            let content2 = "[dependencies]\n";
+            let old_deps: HashMap<PackageName, Vec<Option<VersionReq>>> =
+                std::iter::once((PackageName::new("serde"), vec![None])).collect();
+            let new_deps: HashMap<PackageName, Vec<Option<VersionReq>>> = HashMap::new();
+            let diff = DependencyDiff::compute(&old_deps, &new_deps);
+            assert_eq!(diff.removed, vec![PackageName::new("serde")]);
+
+            let parse_result2 = ecosystem.parse_manifest(content2, &uri).await.unwrap();
+            let mut doc_state2 = DocumentState::new_from_parse_result(
+                EcosystemId::Cargo,
+                content2.to_string(),
+                parse_result2,
+            );
+
+            if let Some(old_doc) = state.get_document(&uri) {
+                preserve_cache(&mut doc_state2, &old_doc);
+            }
+            for removed_dep in &diff.removed {
+                doc_state2.cached_versions.remove(removed_dep);
+                doc_state2.resolved_versions.remove(removed_dep);
+                doc_state2.resolved_version_candidates.remove(removed_dep);
+            }
+
+            assert!(
+                !doc_state2.resolved_version_candidates.contains_key("serde"),
+                "removed dependency's candidates entry must be pruned"
             );
         }
 
@@ -8543,8 +8734,13 @@ tokio = "1.0"
             let mut resolved = HashMap::new();
             resolved.insert(PackageName::new("time"), "0.1.43".into());
 
-            let (targets, skipped) =
-                build_scan_targets(&parse_result, &resolved, &MockFormatter, EcosystemId::Cargo);
+            let (targets, skipped) = build_scan_targets(
+                &parse_result,
+                &resolved,
+                &HashMap::new(),
+                &MockFormatter,
+                EcosystemId::Cargo,
+            );
             assert!(targets.is_empty());
             assert_matches!(
                 skipped.get("time"),
@@ -8564,8 +8760,13 @@ tokio = "1.0"
             let mut resolved = HashMap::new();
             resolved.insert(PackageName::new("serde"), "1.0.195".into());
 
-            let (targets, skipped) =
-                build_scan_targets(&parse_result, &resolved, &MockFormatter, EcosystemId::Cargo);
+            let (targets, skipped) = build_scan_targets(
+                &parse_result,
+                &resolved,
+                &HashMap::new(),
+                &MockFormatter,
+                EcosystemId::Cargo,
+            );
             assert_eq!(targets.len(), 1);
             assert_eq!(targets[0].version, "1.0.195");
             assert!(skipped.is_empty());
@@ -8650,6 +8851,7 @@ tokio = "1.0"
             let (targets, skipped) = build_scan_targets(
                 &parse_result,
                 &resolved,
+                &HashMap::new(),
                 &MockVPrefixFormatter,
                 EcosystemId::Go,
             );
@@ -8676,8 +8878,13 @@ tokio = "1.0"
             let mut resolved = HashMap::new();
             resolved.insert(PackageName::new("serde"), "1.0.195".into());
 
-            let (targets, skipped) =
-                build_scan_targets(&parse_result, &resolved, &MockFormatter, EcosystemId::Cargo);
+            let (targets, skipped) = build_scan_targets(
+                &parse_result,
+                &resolved,
+                &HashMap::new(),
+                &MockFormatter,
+                EcosystemId::Cargo,
+            );
             assert_eq!(targets.len(), 1);
             assert_eq!(targets[0].version, "1.0.195");
             assert_eq!(targets[0].display_version, "1.0.195");
@@ -8708,8 +8915,13 @@ tokio = "1.0"
             // tidy`) performed.
             resolved.insert(PackageName::new("github.com/pkg/errors"), "v0.9.1".into());
 
-            let (targets, skipped) =
-                build_scan_targets(&parse_result, &resolved, &MockGoFormatter, EcosystemId::Go);
+            let (targets, skipped) = build_scan_targets(
+                &parse_result,
+                &resolved,
+                &HashMap::new(),
+                &MockGoFormatter,
+                EcosystemId::Go,
+            );
             assert_eq!(targets.len(), 1);
             assert_eq!(targets[0].version, "v0.8.1");
             assert_eq!(targets[0].display_version, "v0.8.1");
@@ -8727,8 +8939,13 @@ tokio = "1.0"
             };
             let resolved = HashMap::new();
 
-            let (targets, skipped) =
-                build_scan_targets(&parse_result, &resolved, &MockFormatter, EcosystemId::Maven);
+            let (targets, skipped) = build_scan_targets(
+                &parse_result,
+                &resolved,
+                &HashMap::new(),
+                &MockFormatter,
+                EcosystemId::Maven,
+            );
             assert_eq!(targets.len(), 1);
             assert_eq!(targets[0].version, "2.14.1");
             assert!(skipped.is_empty());
@@ -8752,6 +8969,7 @@ tokio = "1.0"
             let (targets, skipped) = build_scan_targets(
                 &cargo_result,
                 &HashMap::new(),
+                &HashMap::new(),
                 &MockFormatter,
                 EcosystemId::Cargo,
             );
@@ -8768,6 +8986,7 @@ tokio = "1.0"
             };
             let (targets, skipped) = build_scan_targets(
                 &nuget_result,
+                &HashMap::new(),
                 &HashMap::new(),
                 &MockFormatter,
                 EcosystemId::NuGet,
@@ -8788,8 +9007,13 @@ tokio = "1.0"
             };
             let resolved = HashMap::new();
 
-            let (targets, skipped) =
-                build_scan_targets(&parse_result, &resolved, &MockFormatter, EcosystemId::Cargo);
+            let (targets, skipped) = build_scan_targets(
+                &parse_result,
+                &resolved,
+                &HashMap::new(),
+                &MockFormatter,
+                EcosystemId::Cargo,
+            );
             assert!(targets.is_empty());
             assert_matches!(
                 skipped.get("serde"),
@@ -8808,8 +9032,13 @@ tokio = "1.0"
             };
             let resolved = HashMap::new();
 
-            let (targets, skipped) =
-                build_scan_targets(&parse_result, &resolved, &MockFormatter, EcosystemId::Cargo);
+            let (targets, skipped) = build_scan_targets(
+                &parse_result,
+                &resolved,
+                &HashMap::new(),
+                &MockFormatter,
+                EcosystemId::Cargo,
+            );
             assert!(targets.is_empty());
             assert_matches!(
                 skipped.get("serde"),
@@ -8849,6 +9078,7 @@ tokio = "1.0"
                 let (targets, skipped) = build_scan_targets(
                     &parse_result,
                     &resolved,
+                    &HashMap::new(),
                     &MockFormatter,
                     EcosystemId::Cargo,
                 );
@@ -8888,8 +9118,13 @@ tokio = "1.0"
             };
             let resolved = HashMap::new();
 
-            let (targets, skipped) =
-                build_scan_targets(&parse_result, &resolved, &MockFormatter, EcosystemId::Maven);
+            let (targets, skipped) = build_scan_targets(
+                &parse_result,
+                &resolved,
+                &HashMap::new(),
+                &MockFormatter,
+                EcosystemId::Maven,
+            );
 
             assert_eq!(targets.len(), 1);
             assert_eq!(targets[0].key, "concrete");
@@ -8923,6 +9158,7 @@ tokio = "1.0"
             let in_use = collect_in_use_versions(
                 &parse_result,
                 &resolved,
+                &HashMap::new(),
                 &MockFormatter,
                 EcosystemId::Cargo,
             );
@@ -8948,6 +9184,7 @@ tokio = "1.0"
             let in_use = collect_in_use_versions(
                 &parse_result,
                 &resolved,
+                &HashMap::new(),
                 &MockFormatter,
                 EcosystemId::Maven,
             );
@@ -8975,6 +9212,7 @@ tokio = "1.0"
             let in_use = collect_in_use_versions(
                 &parse_result,
                 &resolved,
+                &HashMap::new(),
                 &MockFormatter,
                 EcosystemId::Pypi,
             );
@@ -8999,6 +9237,7 @@ tokio = "1.0"
             let in_use = collect_in_use_versions(
                 &parse_result,
                 &resolved,
+                &HashMap::new(),
                 &MockFormatter,
                 EcosystemId::Cargo,
             );
@@ -9025,6 +9264,7 @@ tokio = "1.0"
             let in_use = collect_in_use_versions(
                 &parse_result,
                 &resolved,
+                &HashMap::new(),
                 &MockFormatter,
                 EcosystemId::Cargo,
             );
@@ -9059,6 +9299,7 @@ tokio = "1.0"
             let in_use = collect_in_use_versions(
                 &parse_result,
                 &resolved,
+                &HashMap::new(),
                 &MockFormatter,
                 EcosystemId::Cargo,
             );

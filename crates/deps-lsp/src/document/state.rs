@@ -80,6 +80,12 @@ pub struct DocumentState {
     pub cached_versions: HashMap<PackageName, PackageVersions>,
     /// Resolved versions from lock file
     pub resolved_versions: HashMap<PackageName, ConcreteVersion>,
+    /// Every lock-file-resolved version for a package name with more than one retained
+    /// entry (issue #649), built alongside [`Self::resolved_versions`] by the same lock
+    /// file load. Additive: only names with more than one occurrence get an entry here —
+    /// see [`deps_core::VersionData::resolved_version_candidates`] for the per-occurrence
+    /// disambiguation this enables.
+    pub resolved_version_candidates: HashMap<PackageName, Vec<ConcreteVersion>>,
     /// OSV.dev scan results, keyed by normalized package name. Empty until
     /// the first background scan completes; carried across document edits
     /// by `preserve_cache` so it is not wiped on every keystroke.
@@ -117,6 +123,7 @@ impl Clone for DocumentState {
             parse_result: self.parse_result.clone(),
             cached_versions: self.cached_versions.clone(),
             resolved_versions: self.resolved_versions.clone(),
+            resolved_version_candidates: self.resolved_version_candidates.clone(),
             vulnerabilities: self.vulnerabilities.clone(),
             outcomes: self.outcomes.clone(),
             parsed_at: self.parsed_at,
@@ -229,6 +236,10 @@ impl std::fmt::Debug for DocumentState {
             .field("has_parse_result", &self.parse_result.is_some())
             .field("cached_versions_count", &self.cached_versions.len())
             .field("resolved_versions_count", &self.resolved_versions.len())
+            .field(
+                "resolved_version_candidates_count",
+                &self.resolved_version_candidates.len(),
+            )
             .field("vulnerabilities_count", &self.vulnerabilities.len())
             .field("yanked_versions_count", &self.outcomes.yanked_count())
             .field("deprecations_count", &self.outcomes.deprecation_count())
@@ -256,6 +267,7 @@ impl DocumentState {
             parse_result: Some(Arc::from(parse_result)),
             cached_versions: HashMap::new(),
             resolved_versions: HashMap::new(),
+            resolved_version_candidates: HashMap::new(),
             vulnerabilities: VulnerabilityMap::new(),
             outcomes: DependencyOutcomes::new(),
             parsed_at: Instant::now(),
@@ -276,6 +288,7 @@ impl DocumentState {
             parse_result: None,
             cached_versions: HashMap::new(),
             resolved_versions: HashMap::new(),
+            resolved_version_candidates: HashMap::new(),
             vulnerabilities: VulnerabilityMap::new(),
             outcomes: DependencyOutcomes::new(),
             parsed_at: Instant::now(),
@@ -312,9 +325,19 @@ impl DocumentState {
         self.cached_versions = versions;
     }
 
-    /// Updates the resolved versions from lock file.
-    pub fn update_resolved_versions(&mut self, versions: HashMap<PackageName, ConcreteVersion>) {
+    /// Updates the resolved versions from lock file, together with the per-name candidates
+    /// map (issue #649).
+    ///
+    /// Takes both in one call, rather than two separate setters, so the two can never drift
+    /// out of sync — the same rationale [`PackageVersions::published_at`](deps_core::PackageVersions)
+    /// documents for bundling `latest`/`published_at` together.
+    pub fn update_resolved_versions(
+        &mut self,
+        versions: HashMap<PackageName, ConcreteVersion>,
+        candidates: HashMap<PackageName, Vec<ConcreteVersion>>,
+    ) {
         self.resolved_versions = versions;
+        self.resolved_version_candidates = candidates;
     }
 
     /// Updates the OSV.dev scan results.
@@ -2037,7 +2060,7 @@ mod tests {
             let mut resolved = HashMap::new();
             resolved.insert("serde".into(), "1.0.195".into());
 
-            state.update_resolved_versions(resolved);
+            state.update_resolved_versions(resolved, HashMap::new());
             assert_eq!(state.resolved_versions.len(), 1);
             assert_eq!(
                 state.resolved_versions.get("serde"),

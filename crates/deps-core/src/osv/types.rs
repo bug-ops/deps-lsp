@@ -639,7 +639,7 @@ pub type VulnerabilityMap = HashMap<String, ScanOutcome>;
 /// };
 /// let resolved: HashMap<PackageName, ConcreteVersion> = HashMap::new();
 ///
-/// let keys = vulnerability_keys(&parse_result, &resolved, &SimpleFormatter, EcosystemId::Cargo);
+/// let keys = vulnerability_keys(&parse_result, &resolved, None, &SimpleFormatter, EcosystemId::Cargo);
 /// let deps = parse_result.dependencies();
 /// let key0 = keys.get(&deps[0].name_range()).unwrap();
 /// let key1 = keys.get(&deps[1].name_range()).unwrap();
@@ -648,6 +648,7 @@ pub type VulnerabilityMap = HashMap<String, ScanOutcome>;
 pub fn vulnerability_keys(
     parse_result: &dyn crate::ParseResult,
     resolved: &HashMap<crate::PackageName, crate::ConcreteVersion>,
+    resolved_candidates: Option<&HashMap<crate::PackageName, Vec<crate::ConcreteVersion>>>,
     formatter: &dyn crate::lsp_helpers::EcosystemFormatter,
     ecosystem: crate::EcosystemId,
 ) -> HashMap<tower_lsp_server::ls_types::Range, String> {
@@ -661,12 +662,24 @@ pub fn vulnerability_keys(
     // lock file); every other source (git/path forks, a genuinely different private
     // registry) always carries "n", since their `ScanOutcome` is always
     // `Skipped(NonRegistrySource)` regardless of any declared version.
+    //
+    // `resolved_candidates` (issue #649) lets two occurrences of a renamed/aliased name
+    // pinned to different lock-file majors compute distinct `v:{version}` signatures
+    // instead of colliding on one collapsed value — see
+    // `crate::lsp_helpers::in_use_version::resolve_occurrence_version`.
     let signatures: Vec<(String, String)> = deps
         .iter()
         .map(|dep| {
             let name = formatter.normalize_package_name(dep.name());
             let signature = if formatter.source_is_public_registry_content(&dep.source()) {
-                match in_use_version(*dep, &name, resolved, formatter, ecosystem) {
+                match in_use_version(
+                    *dep,
+                    &name,
+                    resolved,
+                    resolved_candidates,
+                    formatter,
+                    ecosystem,
+                ) {
                     Some(v) => format!("v:{v}"),
                     None => "u".to_string(),
                 }
@@ -1164,5 +1177,100 @@ mod osv_version_validation_tests {
         for v in ["1.0.0\", git = \"evil", "1.0.0,2.0.0", "1.0.0\nEvil", ""] {
             assert!(!is_safe_version_string(v), "expected {v:?} to be rejected");
         }
+    }
+}
+
+/// Issue #649 FR-004: `vulnerability_keys` with a populated `resolved_candidates` map, the
+/// exact call shape `deps-lsp`'s `build_scan_targets`/phase A OSV scan use. Every production
+/// `vulnerability_keys` call site was migrated to accept this parameter, but per the
+/// pre-review test-coverage audit, every *test* call site only ever passed `None` — this
+/// closes that direct-coverage gap.
+#[cfg(test)]
+mod vulnerability_keys_candidates_tests {
+    use super::*;
+    use crate::lsp_helpers::test_support::{MockDep, MockFormatter};
+    use crate::{ConcreteVersion, EcosystemId, PackageName, ParseResult, VersionReq};
+    use tower_lsp_server::ls_types::{Position, Range};
+
+    #[test]
+    fn distinct_signatures_for_two_occurrences_resolving_to_different_candidates() {
+        // The serde/serde_old shape from issue #649: one plain occurrence pinned to the
+        // current major, one renamed occurrence pinned to an older major, both sharing the
+        // resolved package name `serde`.
+        let current_major = MockDep {
+            name: PackageName::new("serde"),
+            version_req: VersionReq::new("1.0"),
+            version_range: Range::new(Position::new(0, 0), Position::new(0, 4)),
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+        };
+        let renamed_old_major = MockDep {
+            name: PackageName::new("serde"),
+            version_req: VersionReq::new("0.9"),
+            version_range: Range::new(Position::new(1, 0), Position::new(1, 4)),
+            name_range: Range::new(Position::new(1, 0), Position::new(1, 9)),
+        };
+
+        struct TwoOccurrenceParseResult {
+            deps: Vec<MockDep>,
+            uri: tower_lsp_server::ls_types::Uri,
+        }
+        impl crate::ParseResult for TwoOccurrenceParseResult {
+            fn dependencies(&self) -> Vec<&dyn crate::Dependency> {
+                self.deps
+                    .iter()
+                    .map(|d| d as &dyn crate::Dependency)
+                    .collect()
+            }
+            fn workspace_root(&self) -> Option<&std::path::Path> {
+                None
+            }
+            fn uri(&self) -> &tower_lsp_server::ls_types::Uri {
+                &self.uri
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        let parse_result = TwoOccurrenceParseResult {
+            deps: vec![current_major, renamed_old_major],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let mut resolved = std::collections::HashMap::new();
+        resolved.insert(PackageName::new("serde"), ConcreteVersion::from("1.0.219"));
+        let mut candidates = std::collections::HashMap::new();
+        candidates.insert(
+            PackageName::new("serde"),
+            vec![
+                ConcreteVersion::from("0.9.15"),
+                ConcreteVersion::from("1.0.219"),
+            ],
+        );
+
+        let keys = vulnerability_keys(
+            &parse_result,
+            &resolved,
+            Some(&candidates),
+            &MockFormatter,
+            EcosystemId::Cargo,
+        );
+        let deps = parse_result.dependencies();
+        let current_key = keys.get(&deps[0].name_range()).unwrap();
+        let renamed_key = keys.get(&deps[1].name_range()).unwrap();
+
+        assert_ne!(
+            current_key, renamed_key,
+            "the current-major and renamed-old-major occurrences must not share an OSV key"
+        );
+        assert!(
+            current_key.ends_with("v:1.0.219"),
+            "current-major occurrence's key must carry its own resolved version: {current_key}"
+        );
+        assert!(
+            renamed_key.ends_with("v:0.9.15"),
+            "renamed occurrence's key must carry its own resolved version, not the collapsed \
+             1.0.219: {renamed_key}"
+        );
     }
 }

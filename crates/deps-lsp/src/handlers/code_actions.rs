@@ -40,6 +40,7 @@ pub async fn handle_code_actions(
         parse_result,
         cached_versions,
         resolved_versions,
+        resolved_version_candidates,
         vulnerabilities,
         outcomes,
         content,
@@ -53,6 +54,7 @@ pub async fn handle_code_actions(
                 parse_result,
                 doc.cached_versions.clone(),
                 doc.resolved_versions.clone(),
+                doc.resolved_version_candidates.clone(),
                 doc.vulnerabilities.clone(),
                 doc.outcomes.clone(),
                 doc.content.clone(),
@@ -69,6 +71,7 @@ pub async fn handle_code_actions(
             position,
             uri,
             VersionData::new(&cached_versions, &resolved_versions)
+                .with_resolved_version_candidates(&resolved_version_candidates)
                 .with_vulnerabilities(&vulnerabilities)
                 .with_outcomes(&outcomes)
                 .with_ecosystem(ecosystem_id)

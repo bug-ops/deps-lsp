@@ -176,6 +176,7 @@ pub(crate) async fn generate_diagnostics_internal(
             parse_result,
             doc.cached_versions.clone(),
             doc.resolved_versions.clone(),
+            doc.resolved_version_candidates.clone(),
             doc.vulnerabilities.clone(),
             doc.outcomes.clone(),
         ))
@@ -190,6 +191,7 @@ pub(crate) async fn generate_diagnostics_internal(
         parse_result,
         cached_versions,
         resolved_versions,
+        resolved_version_candidates,
         vulnerabilities,
         outcomes,
     )) = extracted
@@ -201,6 +203,7 @@ pub(crate) async fn generate_diagnostics_internal(
         .generate_diagnostics(
             parse_result.as_ref(),
             VersionData::new(&cached_versions, &resolved_versions)
+                .with_resolved_version_candidates(&resolved_version_candidates)
                 .with_vulnerabilities(&vulnerabilities)
                 .with_outcomes(&outcomes)
                 .with_ecosystem(ecosystem_id)
@@ -1064,7 +1067,7 @@ serde = "1.0.0"
             // in-use-version check (#263), not the manifest-requirement check (#247).
             let mut resolved = std::collections::HashMap::new();
             resolved.insert("left-pad".into(), "1.0.1".into());
-            doc_state.update_resolved_versions(resolved);
+            doc_state.update_resolved_versions(resolved, std::collections::HashMap::new());
 
             doc_state.replace_outcomes(deps_core::DependencyOutcomes::new().with_yanked(
                 "left-pad",

@@ -281,19 +281,27 @@ pub struct ResolvedPackages {
     packages: HashMap<String, Vec<ResolvedPackage>>,
 }
 
+/// Orders two version strings, preferring a valid semver parse over a non-parseable one and
+/// falling back to a lexicographic compare when both (or neither) parse.
+///
+/// Shared by [`best_package`] and the per-occurrence candidate selection in
+/// [`crate::lsp_helpers::in_use_version`] (issue #649) so a lock file entry with a
+/// non-semver version string is never ordered by two diverging policies depending on which
+/// caller is asking.
+pub(crate) fn compare_lockfile_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    match (semver::Version::parse(a), semver::Version::parse(b)) {
+        (Ok(va), Ok(vb)) => va.cmp(&vb),
+        (Ok(_), Err(_)) => std::cmp::Ordering::Greater,
+        (Err(_), Ok(_)) => std::cmp::Ordering::Less,
+        (Err(_), Err(_)) => a.cmp(b),
+    }
+}
+
 /// Returns the package with the highest semver version from a slice.
 fn best_package(packages: &[ResolvedPackage]) -> Option<&ResolvedPackage> {
-    packages.iter().max_by(|a, b| {
-        match (
-            semver::Version::parse(&a.version),
-            semver::Version::parse(&b.version),
-        ) {
-            (Ok(va), Ok(vb)) => va.cmp(&vb),
-            (Ok(_), Err(_)) => std::cmp::Ordering::Greater,
-            (Err(_), Ok(_)) => std::cmp::Ordering::Less,
-            (Err(_), Err(_)) => a.version.cmp(&b.version),
-        }
-    })
+    packages
+        .iter()
+        .max_by(|a, b| compare_lockfile_versions(&a.version, &b.version))
 }
 
 impl ResolvedPackages {
@@ -325,6 +333,21 @@ impl ResolvedPackages {
     /// Returns all stored versions for a package.
     pub fn get_all(&self, name: &str) -> Option<&[ResolvedPackage]> {
         self.packages.get(name).map(|v| v.as_slice())
+    }
+
+    /// Returns an iterator yielding every stored version for each unique package name,
+    /// unlike [`Self::iter`] which collapses each name down to `best_package`'s single
+    /// pick.
+    ///
+    /// The building block for per-occurrence lock-file resolution (issue #649): a caller
+    /// disambiguating two manifest occurrences of the same resolved package name (e.g. a
+    /// Cargo `package = "..."` rename pinning an older major alongside a plain dependency
+    /// on the current major) needs every retained version for that name, not just the one
+    /// [`Self::iter`]/[`Self::into_map`] would collapse it to.
+    pub fn iter_all(&self) -> impl Iterator<Item = (&String, &[ResolvedPackage])> {
+        self.packages
+            .iter()
+            .map(|(name, versions)| (name, versions.as_slice()))
     }
 
     /// Returns the number of unique package names.

@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: OSV malicious-package advisories (`MAL-*` id or alias) now classify as a distinct `VulnSeverity::Malicious` instead of falling through to "unknown severity" in hover/diagnostics (resolves #646) (#652)
 
 ### Fixed
+- **deps-core, deps-lsp**: hover/inlay-hint in-use-version and OSV vulnerability lookups now resolve each manifest occurrence against its own `version_requirement()` instead of a single collapsed lock-file value, so a renamed/aliased dependency pinned to a different major no longer mis-reports the other occurrence's version (resolves #649) (#653)
 - **deps-cargo**: an explicit `package = "..."` rename now resolves hover/diagnostics/completion/code actions/code lenses/inlay hints against the real crate name instead of the local TOML alias (resolves #648)
 
 ## [0.13.0] - 2026-09-05
