@@ -57,6 +57,7 @@ pub async fn handle_inlay_hints(
             parse_result,
             doc.cached_versions.clone(),
             doc.resolved_versions.clone(),
+            doc.resolved_version_candidates.clone(),
             doc.loading_state,
         ))
     }) else {
@@ -64,8 +65,14 @@ pub async fn handle_inlay_hints(
         return vec![];
     };
 
-    let Some((ecosystem, parse_result, cached_versions, resolved_versions, loading_state)) =
-        extracted
+    let Some((
+        ecosystem,
+        parse_result,
+        cached_versions,
+        resolved_versions,
+        resolved_version_candidates,
+        loading_state,
+    )) = extracted
     else {
         return vec![];
     };
@@ -82,7 +89,8 @@ pub async fn handle_inlay_hints(
     ecosystem
         .generate_inlay_hints(
             parse_result.as_ref(),
-            VersionData::new(&cached_versions, &resolved_versions),
+            VersionData::new(&cached_versions, &resolved_versions)
+                .with_resolved_version_candidates(&resolved_version_candidates),
             loading_state,
             &ecosystem_config,
         )

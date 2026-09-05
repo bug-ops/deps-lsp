@@ -6,7 +6,7 @@ use crate::file_watcher;
 use crate::handlers::{
     code_actions, code_lens, completion, diagnostics, document_link, hover, inlay_hints,
 };
-use deps_core::{PackageName, is_safe_version_string};
+use deps_core::is_safe_version_string;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -232,16 +232,13 @@ impl Backend {
         );
 
         // Reload lock file (cache was invalidated, so this re-parses)
-        let resolved_versions = match self
+        let (resolved_versions, resolved_version_candidates) = match self
             .state
             .lockfile_cache
             .get_or_parse(lock_provider.as_ref(), lockfile_path)
             .await
         {
-            Ok(packages) => packages
-                .iter()
-                .map(|(name, pkg)| (PackageName::new(name.as_str()), pkg.version.clone().into()))
-                .collect::<HashMap<PackageName, deps_core::ConcreteVersion>>(),
+            Ok(packages) => crate::document::split_resolved_packages(&packages),
             Err(e) => {
                 tracing::error!("Failed to reload lock file: {}", e);
                 self.client
@@ -250,7 +247,7 @@ impl Backend {
                         format!("Failed to reload lock file: {e}"),
                     )
                     .await;
-                HashMap::new()
+                (HashMap::new(), HashMap::new())
             }
         };
 
@@ -273,7 +270,10 @@ impl Backend {
 
         for uri in affected_uris {
             if let Some(mut doc) = self.state.documents.get_mut(&uri) {
-                doc.update_resolved_versions(resolved_versions.clone());
+                doc.update_resolved_versions(
+                    resolved_versions.clone(),
+                    resolved_version_candidates.clone(),
+                );
             }
 
             // Issue #636 introduced `loading_ceiling`'s dependency-count parameter: before

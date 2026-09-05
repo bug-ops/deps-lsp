@@ -19,7 +19,7 @@ mod hover;
 mod in_use_version;
 mod inlay_hints;
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 
 pub use code_actions::generate_code_actions;
 pub use code_lenses::{
@@ -432,6 +432,15 @@ pub struct VersionData<'a> {
     pub cached: &'a HashMap<PackageName, PackageVersions>,
     /// Versions actually resolved in the lock file, keyed by package name.
     pub resolved: &'a HashMap<PackageName, ConcreteVersion>,
+    /// Every lock-file-resolved version for a package name, when more than one is retained
+    /// (issue #649) — additive alongside [`Self::resolved`], which stays the single
+    /// collapsed value for the common case. `None` by default (most call sites have no such
+    /// map); [`crate::lsp_helpers::in_use_version`] and [`crate::osv::vulnerability_keys`]
+    /// consult it to disambiguate two manifest occurrences of one resolved name (e.g. a
+    /// Cargo `package = "..."` rename pinning an older major) by each occurrence's own
+    /// `version_requirement()`, falling back to [`Self::resolved`] when a name has at most
+    /// one candidate.
+    pub resolved_version_candidates: Option<&'a HashMap<PackageName, Vec<ConcreteVersion>>>,
     /// OSV scan results, keyed by normalized package name. `None` when no
     /// scan has run yet (e.g. the feature is disabled) — distinct from an
     /// empty map, which would mean "scanned, nothing found".
@@ -501,12 +510,38 @@ impl<'a> VersionData<'a> {
         Self {
             cached,
             resolved,
+            resolved_version_candidates: None,
             vulnerabilities: None,
             outcomes: None,
             ecosystem: None,
             offline: false,
             trust: None,
         }
+    }
+
+    /// Attaches the per-name lock-file candidates map, enabling the per-occurrence
+    /// disambiguation described on [`Self::resolved_version_candidates`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::VersionData;
+    /// use std::collections::HashMap;
+    ///
+    /// let cached = HashMap::new();
+    /// let resolved = HashMap::new();
+    /// let candidates = HashMap::new();
+    /// let versions =
+    ///     VersionData::new(&cached, &resolved).with_resolved_version_candidates(&candidates);
+    /// assert!(versions.resolved_version_candidates.is_some());
+    /// ```
+    #[must_use]
+    pub const fn with_resolved_version_candidates(
+        mut self,
+        candidates: &'a HashMap<PackageName, Vec<ConcreteVersion>>,
+    ) -> Self {
+        self.resolved_version_candidates = Some(candidates);
+        self
     }
 
     /// Attaches an OSV scan result to this `VersionData`.

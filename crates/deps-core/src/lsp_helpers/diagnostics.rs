@@ -526,7 +526,13 @@ pub fn generate_diagnostics_from_cache(
     // fixtures) — the per-dep lookup below then falls back to the plain
     // name, unaffected.
     let vuln_keys = versions.ecosystem.map(|ecosystem| {
-        crate::osv::vulnerability_keys(parse_result, versions.resolved, formatter, ecosystem)
+        crate::osv::vulnerability_keys(
+            parse_result,
+            versions.resolved,
+            versions.resolved_version_candidates,
+            formatter,
+            ecosystem,
+        )
     });
 
     for dep in deps {
@@ -892,6 +898,7 @@ fn apply_in_use_yanked_rule(
                 ctx.dep,
                 ctx.normalized_name,
                 ctx.versions.resolved,
+                ctx.versions.resolved_version_candidates,
                 ctx.formatter,
                 ecosystem,
             )
@@ -3983,6 +3990,7 @@ mod tests {
         let keys = vulnerability_keys(
             &parse_result,
             &resolved_versions,
+            None,
             &formatter,
             crate::EcosystemId::Cargo,
         );
@@ -4032,6 +4040,112 @@ mod tests {
         assert_eq!(
             advisory_diags[0].range.start.line, 0,
             "must land on the vulnerable occurrence's own line, not the patched one"
+        );
+    }
+
+    /// Issue #649 US-002/SC-002, end-to-end through `generate_diagnostics_from_cache` with a
+    /// real `resolved_version_candidates` map — the largest gap flagged by the pre-review
+    /// test-coverage audit: every prior duplicate-name test disambiguated via a concrete
+    /// manifest pin (`=1.0.0`/`=2.0.0`) with `resolved_versions` empty, never exercising the
+    /// lockfile-candidates path at all. This mirrors the actual serde/serde_old rename
+    /// scenario: two occurrences share the resolved name `serde`, one plain (`"1.0"`,
+    /// resolving via the candidates map to `1.0.219`) and one renamed to an older major
+    /// (`"0.9"`, resolving to `0.9.15`) — an advisory affecting only `1.0.219` must anchor
+    /// solely on the plain occurrence.
+    #[test]
+    fn test_generate_diagnostics_vulnerability_attributed_via_resolved_version_candidates() {
+        use crate::osv::{
+            Capped, DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity,
+            VulnerabilityMap, vulnerability_keys,
+        };
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let formatter = MockFormatter;
+
+        let current_major = MockDep {
+            name: "serde".into(),
+            version_req: "1.0".into(),
+            version_range: Range::new(Position::new(0, 8), Position::new(0, 13)),
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+        };
+        let renamed_old_major = MockDep {
+            name: "serde".into(),
+            version_req: "0.9".into(),
+            version_range: Range::new(Position::new(1, 8), Position::new(1, 13)),
+            name_range: Range::new(Position::new(1, 0), Position::new(1, 9)),
+        };
+        let parse_result = MockParseResult {
+            deps: vec![current_major, renamed_old_major],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let cached_versions = HashMap::new();
+        let mut resolved_versions = HashMap::new();
+        resolved_versions.insert("serde".into(), ConcreteVersion::from("1.0.219"));
+        let mut resolved_version_candidates = HashMap::new();
+        resolved_version_candidates.insert(
+            "serde".into(),
+            vec![
+                ConcreteVersion::from("0.9.15"),
+                ConcreteVersion::from("1.0.219"),
+            ],
+        );
+
+        let keys = vulnerability_keys(
+            &parse_result,
+            &resolved_versions,
+            Some(&resolved_version_candidates),
+            &formatter,
+            crate::EcosystemId::Cargo,
+        );
+        let deps = parse_result.dependencies();
+        let current_key = keys.get(&deps[0].name_range()).unwrap().clone();
+        let renamed_key = keys.get(&deps[1].name_range()).unwrap().clone();
+        assert_ne!(
+            current_key, renamed_key,
+            "occurrences resolving to different lockfile candidates must get distinct keys"
+        );
+
+        let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
+        vulns.insert(
+            current_key,
+            ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                advisories: Capped::new(
+                    vec![sample_advisory("RUSTSEC-2020-0071", VulnSeverity::High)],
+                    1,
+                ),
+                fix_target_status: UpgradeStatus::NotChecked,
+                upgrade_status: UpgradeStatus::NotChecked,
+            }),
+        );
+        vulns.insert(renamed_key, ScanOutcome::Clean);
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions)
+                .with_resolved_version_candidates(&resolved_version_candidates)
+                .with_vulnerabilities(&vulns)
+                .with_ecosystem(crate::EcosystemId::Cargo),
+            &formatter,
+            parse_result.uri(),
+            crate::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        let advisory_diags: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.contains("RUSTSEC-2020-0071"))
+            .collect();
+        assert_eq!(
+            advisory_diags.len(),
+            1,
+            "exactly one occurrence must get the advisory diagnostic, got: {diagnostics:?}"
+        );
+        assert_eq!(
+            advisory_diags[0].range.start.line, 0,
+            "the advisory affecting 1.0.219 must land on the plain (1.0) occurrence's line, \
+             not the renamed (0.9) occurrence sharing the same resolved name"
         );
     }
 

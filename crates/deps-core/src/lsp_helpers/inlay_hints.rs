@@ -2,7 +2,7 @@ use tower_lsp_server::ls_types::{InlayHint, InlayHintKind, InlayHintLabel, Inlay
 
 use crate::{ConcreteVersion, EcosystemConfig, ParseResult};
 
-use super::{EcosystemFormatter, RequirementStatus, VersionData};
+use super::{EcosystemFormatter, RequirementStatus, VersionData, in_use_version};
 
 pub fn generate_inlay_hints(
     parse_result: &dyn ParseResult,
@@ -30,11 +30,14 @@ pub fn generate_inlay_hints(
                 dep.version_requirement()
                     .map(|r| ConcreteVersion::new(r.as_str()))
             } else {
-                versions
-                    .resolved
-                    .get(normalized_name.as_str())
-                    .or_else(|| versions.resolved.get(dep.name()))
-                    .cloned()
+                in_use_version::resolve_occurrence_version(
+                    dep,
+                    normalized_name.as_str(),
+                    versions.resolved,
+                    versions.resolved_version_candidates,
+                    formatter,
+                )
+                .cloned()
             };
 
         // Show loading hint if loading and no cached version

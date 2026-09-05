@@ -108,8 +108,14 @@ fn build_vulnerability_fix_action(
     // occurrence of a duplicated name is never built from another
     // occurrence's OSV result. See `crate::osv::vulnerability_keys`.
     let vuln_key = versions.ecosystem.and_then(|ecosystem| {
-        crate::osv::vulnerability_keys(parse_result, versions.resolved, formatter, ecosystem)
-            .remove(&dep.name_range())
+        crate::osv::vulnerability_keys(
+            parse_result,
+            versions.resolved,
+            versions.resolved_version_candidates,
+            formatter,
+            ecosystem,
+        )
+        .remove(&dep.name_range())
     });
     let outcome = versions.vulnerabilities.and_then(|m| {
         vuln_key
@@ -1654,6 +1660,7 @@ mod tests {
         let keys = crate::osv::vulnerability_keys(
             &parse_result,
             &resolved,
+            None,
             &IdentityFormatter,
             crate::EcosystemId::Cargo,
         );

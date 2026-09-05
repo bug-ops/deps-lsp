@@ -46,6 +46,7 @@ pub async fn handle_hover(
         parse_result,
         cached_versions,
         resolved_versions,
+        resolved_version_candidates,
         vulnerabilities,
         outcomes,
     ) = state
@@ -58,6 +59,7 @@ pub async fn handle_hover(
                 parse_result,
                 doc.cached_versions.clone(),
                 doc.resolved_versions.clone(),
+                doc.resolved_version_candidates.clone(),
                 doc.vulnerabilities.clone(),
                 doc.outcomes.clone(),
             ))
@@ -65,6 +67,7 @@ pub async fn handle_hover(
         .flatten()?;
 
     let mut versions = VersionData::new(&cached_versions, &resolved_versions)
+        .with_resolved_version_candidates(&resolved_version_candidates)
         .with_vulnerabilities(&vulnerabilities)
         .with_outcomes(&outcomes)
         .with_ecosystem(ecosystem_id)

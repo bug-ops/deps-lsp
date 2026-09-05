@@ -148,11 +148,14 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     let resolved: Option<&str> = if formatter.manifest_requirement_is_resolved_version(dep) {
         dep.version_requirement().map(VersionReq::as_str)
     } else {
-        versions
-            .resolved
-            .get(normalized_name.as_str())
-            .or_else(|| versions.resolved.get(dep.name()))
-            .map(ConcreteVersion::as_str)
+        in_use_version::resolve_occurrence_version(
+            dep,
+            normalized_name.as_str(),
+            versions.resolved,
+            versions.resolved_version_candidates,
+            formatter,
+        )
+        .map(ConcreteVersion::as_str)
     };
     push_current_or_requirement_hover_section(&mut markdown, dep, resolved);
 
@@ -274,8 +277,14 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     // of a duplicated name never shows another occurrence's OSV result. See
     // `crate::osv::vulnerability_keys` for when qualification kicks in.
     let vuln_key = versions.ecosystem.and_then(|ecosystem| {
-        crate::osv::vulnerability_keys(parse_result, versions.resolved, formatter, ecosystem)
-            .remove(&dep.name_range())
+        crate::osv::vulnerability_keys(
+            parse_result,
+            versions.resolved,
+            versions.resolved_version_candidates,
+            formatter,
+            ecosystem,
+        )
+        .remove(&dep.name_range())
     });
     let vuln_outcome = versions.vulnerabilities.and_then(|m| {
         vuln_key
@@ -393,6 +402,7 @@ fn spawn_trust_signal_fetch(
             dep,
             normalized_name,
             versions.resolved,
+            versions.resolved_version_candidates,
             formatter,
             ecosystem,
         )?;
@@ -2575,6 +2585,7 @@ mod tests {
         let keys = crate::osv::vulnerability_keys(
             &parse_result,
             &resolved_versions,
+            None,
             &MockFormatter,
             crate::EcosystemId::Cargo,
         );
@@ -2637,6 +2648,124 @@ mod tests {
             panic!("expected markup hover contents");
         };
         assert!(vulnerable_content.value.contains("RUSTSEC-2020-0071"));
+    }
+
+    /// Issue #649 US-001/US-002/SC-001/SC-002, end-to-end through `generate_hover` with a
+    /// real `resolved_version_candidates` map (the largest gap flagged by the pre-review
+    /// test-coverage audit — every prior duplicate-name hover test disambiguated via a
+    /// concrete manifest pin, never exercising the lockfile-candidates path). Mirrors the
+    /// serde/serde_old rename scenario: both occurrences resolve the name `serde`, one
+    /// plain (`"1.0"`) and one renamed to an older major (`"0.9"`); the "Current" line must
+    /// show each occurrence's own resolved version (SC-001), and an advisory affecting only
+    /// the current major must not leak onto the renamed occurrence's hover (SC-002).
+    #[tokio::test]
+    async fn test_generate_hover_attributed_via_resolved_version_candidates() {
+        use crate::osv::{
+            Capped, DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity,
+            VulnerabilityMap,
+        };
+
+        let current_major = MockDep {
+            name: "serde".into(),
+            version_req: "1.0".into(),
+            version_range: Range::new(Position::new(0, 8), Position::new(0, 13)),
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+        };
+        let renamed_old_major = MockDep {
+            name: "serde".into(),
+            version_req: "0.9".into(),
+            version_range: Range::new(Position::new(1, 8), Position::new(1, 13)),
+            name_range: Range::new(Position::new(1, 0), Position::new(1, 9)),
+        };
+        let parse_result = MockParseResult {
+            deps: vec![current_major, renamed_old_major],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+        let cached_versions = HashMap::new();
+        let mut resolved_versions = HashMap::new();
+        resolved_versions.insert("serde".into(), ConcreteVersion::from("1.0.219"));
+        let mut resolved_version_candidates = HashMap::new();
+        resolved_version_candidates.insert(
+            "serde".into(),
+            vec![
+                ConcreteVersion::from("0.9.15"),
+                ConcreteVersion::from("1.0.219"),
+            ],
+        );
+
+        let keys = crate::osv::vulnerability_keys(
+            &parse_result,
+            &resolved_versions,
+            Some(&resolved_version_candidates),
+            &MockFormatter,
+            crate::EcosystemId::Cargo,
+        );
+        let deps = parse_result.dependencies();
+        let current_key = keys.get(&deps[0].name_range()).unwrap().clone();
+        let renamed_key = keys.get(&deps[1].name_range()).unwrap().clone();
+        assert_ne!(current_key, renamed_key);
+
+        let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
+        vulns.insert(
+            current_key,
+            ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                advisories: Capped::new(
+                    vec![sample_advisory("RUSTSEC-2020-0071", VulnSeverity::Critical)],
+                    1,
+                ),
+                fix_target_status: UpgradeStatus::NotChecked,
+                upgrade_status: UpgradeStatus::NotChecked,
+            }),
+        );
+        vulns.insert(renamed_key, ScanOutcome::Clean);
+
+        let versions = VersionData::new(&cached_versions, &resolved_versions)
+            .with_resolved_version_candidates(&resolved_version_candidates)
+            .with_vulnerabilities(&vulns)
+            .with_ecosystem(crate::EcosystemId::Cargo);
+
+        let hover_on_renamed = generate_hover(
+            &parse_result,
+            Position::new(1, 2),
+            versions,
+            &MockRegistry,
+            &MockFormatter,
+            crate::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated");
+        let HoverContents::Markup(renamed_content) = hover_on_renamed.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            renamed_content.value.contains("0.9.15"),
+            "renamed occurrence must show its own resolved version, not the collapsed 1.0.219: {}",
+            renamed_content.value
+        );
+        assert!(
+            !renamed_content.value.contains("RUSTSEC-2020-0071"),
+            "the renamed (0.9) occurrence must not show the other occurrence's advisory: {}",
+            renamed_content.value
+        );
+        assert!(renamed_content.value.contains("No known vulnerabilities"));
+
+        let hover_on_current = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            versions,
+            &MockRegistry,
+            &MockFormatter,
+            crate::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated");
+        let HoverContents::Markup(current_content) = hover_on_current.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(current_content.value.contains("1.0.219"));
+        assert!(current_content.value.contains("RUSTSEC-2020-0071"));
     }
 
     /// #366, revised by the PR-431 review's Critical finding #3: a registry error

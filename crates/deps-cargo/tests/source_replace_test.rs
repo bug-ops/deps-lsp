@@ -278,6 +278,7 @@ fn test_mirror_distinct_pinned_versions_produce_distinct_vulnerability_keys() {
     let keys = deps_core::osv::vulnerability_keys(
         &parse_result,
         &resolved,
+        None,
         &formatter,
         EcosystemId::Cargo,
     );
