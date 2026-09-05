@@ -19,6 +19,18 @@
 use std::io::Read;
 use std::path::Path;
 
+/// Shared upper bound on how many ancestor directories a config-file discovery walk
+/// climbs, independent of whether the filesystem root has been reached.
+///
+/// `deps-cargo`, `deps-npm`, and `deps-nuget` each still carry their own pre-existing
+/// `MAX_CONFIG_ANCESTOR_DEPTH` copy of this same value (64) for their workspace-root /
+/// config-file ancestor walks; this is the canonical definition new call sites (starting
+/// with `deps-gradle`'s `load_gradle_properties`) should reuse directly rather than adding
+/// a further duplicate — see #611 for the tracked follow-up to hoist those three onto this
+/// one. 64 directories up is not a realistic project layout — a pathologically deep or
+/// hostile tree hits this cap instead of doing unbounded work per parse (CWE-400).
+pub const MAX_CONFIG_ANCESTOR_DEPTH: usize = 64;
+
 #[cfg(any(test, feature = "test-util"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
 

@@ -7,6 +7,7 @@
 //! without network requests to registries.
 
 use crate::error::{DepsError, Result};
+use crate::fs_probe;
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -16,6 +17,18 @@ use tower_lsp_server::ls_types::Uri;
 /// Maximum depth to search for workspace root lock file.
 const MAX_WORKSPACE_DEPTH: usize = 5;
 
+/// Maximum lock file size [`read_lockfile_content`] reads before parsing.
+///
+/// Deliberately a separate, larger constant than [`crate::mtime_cache::MAX_CACHED_FILE_BYTES`]
+/// — that cap is scoped to small config files (`.cargo/config.toml`, `.npmrc`, typically a
+/// few KB), while a lock file records every transitively resolved package across an entire
+/// dependency graph, and a large npm monorepo `package-lock.json` can legitimately run well
+/// past 8 MiB. 32 MiB matches [`crate::cache`]'s `MAX_RESPONSE_BYTES` order of magnitude —
+/// generous for any realistic lock file while still bounding the read against a
+/// maliciously large one discovered by an unauthenticated ancestor walk over a cloned
+/// repository (CWE-400).
+pub const MAX_LOCKFILE_BYTES: u64 = 32 * 1024 * 1024;
+
 /// Reads a lock file's contents, wrapping any I/O failure into a [`DepsError::ParseError`]
 /// tagged with the ecosystem's `file_type` label and the file's path.
 ///
@@ -23,10 +36,21 @@ const MAX_WORKSPACE_DEPTH: usize = 5;
 /// way; this shares that boilerplate and keeps the error message format consistent
 /// across ecosystems.
 ///
+/// Bounded by [`MAX_LOCKFILE_BYTES`] via [`fs_probe::read_to_string_capped`] — a lock file
+/// is discovered by an unauthenticated ancestor walk ([`locate_lockfile_for_manifest`]) over
+/// a possibly hostile cloned repository, so nothing here may assume it is reasonably sized
+/// or a regular file before reading it in full (CWE-400). The capped read itself runs on
+/// the blocking-thread pool via [`tokio::task::spawn_blocking`], not on the calling tokio
+/// worker thread: it is synchronous I/O with no `.await` of its own, and every
+/// `LockFileProvider::parse_lockfile` call site sits on the LSP request path, where a
+/// worker thread blocked on an 8+ MiB read — or indefinitely, on a FIFO — would violate the
+/// project's non-blocking-handler rule.
+///
 /// # Errors
 ///
-/// Returns [`DepsError::ParseError`] if the file cannot be read (e.g. missing, unreadable,
-/// invalid UTF-8).
+/// Returns [`DepsError::ParseError`] if the file cannot be read (e.g. missing, not a
+/// regular file, unreadable, invalid UTF-8), exceeds [`MAX_LOCKFILE_BYTES`], or the
+/// blocking read task panicked.
 ///
 /// # Examples
 ///
@@ -41,12 +65,60 @@ const MAX_WORKSPACE_DEPTH: usize = 5;
 /// # }
 /// ```
 pub async fn read_lockfile_content(path: &Path, file_type: &str) -> Result<String> {
-    tokio::fs::read_to_string(path)
-        .await
-        .map_err(|e| DepsError::ParseError {
-            file_type: format!("{file_type} at {}", path.display()),
-            source: Box::new(e),
-        })
+    let to_parse_error = |e: std::io::Error| DepsError::ParseError {
+        file_type: format!("{file_type} at {}", path.display()),
+        source: Box::new(e),
+    };
+    let oversized_error = || {
+        to_parse_error(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("exceeds {MAX_LOCKFILE_BYTES} byte size cap"),
+        ))
+    };
+
+    // Cheap `stat` pre-filter (mirrors `MtimeFileCache::get_or_parse`): rejects a
+    // non-regular file (FIFO, socket, directory — reading one of those can block
+    // indefinitely) and an obviously oversized file before it is ever opened. The capped
+    // read below still enforces the size bound on the read itself regardless of what this
+    // reports, closing the same TOCTOU gap (CWE-367) a stat-only check alone would leave
+    // open (e.g. a symlink swapped to a FIFO, or the file growing, between this stat and
+    // the read).
+    if let Ok(metadata) = fs_probe::metadata(path) {
+        if !metadata.is_file() {
+            return Err(to_parse_error(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "not a regular file",
+            )));
+        }
+        if metadata.len() > MAX_LOCKFILE_BYTES {
+            tracing::warn!(
+                path = %path.display(),
+                len = metadata.len(),
+                cap = MAX_LOCKFILE_BYTES,
+                "lock file exceeds size cap; not reading"
+            );
+            return Err(oversized_error());
+        }
+    }
+
+    let path_buf = path.to_path_buf();
+    let read_result = tokio::task::spawn_blocking(move || {
+        fs_probe::read_to_string_capped(&path_buf, MAX_LOCKFILE_BYTES)
+    })
+    .await
+    .map_err(|e| to_parse_error(std::io::Error::other(e)))?;
+
+    match read_result.map_err(to_parse_error)? {
+        Some(content) => Ok(content),
+        None => {
+            tracing::warn!(
+                path = %path.display(),
+                cap = MAX_LOCKFILE_BYTES,
+                "lock file exceeds size cap during read; not reading"
+            );
+            Err(oversized_error())
+        }
+    }
 }
 
 /// Generic lock file locator.
@@ -54,6 +126,11 @@ pub async fn read_lockfile_content(path: &Path, file_type: &str) -> Result<Strin
 /// Searches for lock files in the following order:
 /// 1. Same directory as the manifest
 /// 2. Parent directories (up to MAX_WORKSPACE_DEPTH levels) for workspace root
+///
+/// Each candidate is checked with [`fs_probe::is_file`], not a plain existence check — a
+/// FIFO or socket happening to sit at a lock file's conventional name must never be
+/// returned as "found", since [`read_lockfile_content`] opening one would block
+/// indefinitely.
 ///
 /// This function is ecosystem-agnostic and works with any lock file name.
 ///
@@ -92,7 +169,7 @@ pub fn locate_lockfile_for_manifest(
     // Try same directory as manifest
     for &name in lockfile_names {
         lock_path.push(name);
-        if lock_path.exists() {
+        if fs_probe::is_file(&lock_path) {
             tracing::debug!("Found {} at: {}", name, lock_path.display());
             return Some(lock_path);
         }
@@ -111,7 +188,7 @@ pub fn locate_lockfile_for_manifest(
 
         for &name in lockfile_names {
             lock_path.push(name);
-            if lock_path.exists() {
+            if fs_probe::is_file(&lock_path) {
                 tracing::debug!(
                     "Found workspace {} at depth {}: {}",
                     name,
@@ -515,6 +592,53 @@ mod tests {
         assert_eq!(content, "version = 4");
     }
 
+    /// An oversized lock file must be rejected by the capped read rather than read into
+    /// memory in full (CWE-400) — `read_lockfile_content` previously had no size gate at
+    /// all (#607). Uses a sparse file (`set_len`, all-zero bytes, valid UTF-8) so the test
+    /// does not need to write `MAX_LOCKFILE_BYTES` of real content to disk — `unwrap_err()`
+    /// panics outright if the cap is not actually applied, since a sparse file's all-NUL
+    /// content is otherwise perfectly valid `String` content for the success path to return.
+    #[tokio::test]
+    async fn test_read_lockfile_content_rejects_oversized_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lock_path = temp_dir.path().join("Cargo.lock");
+        let file = std::fs::File::create(&lock_path).unwrap();
+        file.set_len(MAX_LOCKFILE_BYTES + 1).unwrap();
+
+        let err = read_lockfile_content(&lock_path, "Cargo.lock")
+            .await
+            .unwrap_err();
+
+        match err {
+            DepsError::ParseError { file_type, .. } => {
+                assert_eq!(file_type, format!("Cargo.lock at {}", lock_path.display()));
+            }
+            other => panic!("Expected ParseError, got: {other:?}"),
+        }
+    }
+
+    /// A non-regular file (a directory here, portable across platforms unlike a FIFO) at
+    /// the lock file path must be rejected by the `is_file` stat pre-filter, not handed to
+    /// `File::open`/`read_to_string_capped` — the same class of hazard `fs_probe::is_file`'s
+    /// own doc warns about (a FIFO would block the read indefinitely).
+    #[tokio::test]
+    async fn test_read_lockfile_content_rejects_non_regular_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lock_path = temp_dir.path().join("Cargo.lock");
+        std::fs::create_dir(&lock_path).unwrap();
+
+        let err = read_lockfile_content(&lock_path, "Cargo.lock")
+            .await
+            .unwrap_err();
+
+        match err {
+            DepsError::ParseError { file_type, .. } => {
+                assert_eq!(file_type, format!("Cargo.lock at {}", lock_path.display()));
+            }
+            other => panic!("Expected ParseError, got: {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn test_read_lockfile_content_missing_file_wraps_error() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -816,6 +940,28 @@ mod tests {
 
         assert!(located.is_some());
         assert_eq!(located.unwrap(), workspace_lock);
+    }
+
+    /// A directory named `Cargo.lock` (portable stand-in for a FIFO, which
+    /// `std::fs::exists`-style checks would also wrongly treat as "found") must not be
+    /// returned as a located lock file — `fs_probe::is_file` rejects anything but a
+    /// regular file, unlike the plain `Path::exists()` this locator used before the fix.
+    #[test]
+    fn test_locate_lockfile_for_manifest_skips_non_regular_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manifest_path = temp_dir.path().join("Cargo.toml");
+        let lock_path = temp_dir.path().join("Cargo.lock");
+
+        std::fs::write(&manifest_path, "[package]\nname = \"test\"").unwrap();
+        std::fs::create_dir(&lock_path).unwrap();
+
+        let manifest_uri = Uri::from_file_path(&manifest_path).unwrap();
+        let located = locate_lockfile_for_manifest(&manifest_uri, &["Cargo.lock"]);
+
+        assert!(
+            located.is_none(),
+            "a directory at the lock file path must not be treated as a found lock file"
+        );
     }
 
     #[test]
