@@ -23,6 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-go**: `$GOENV` `GOPROXY`/`GOPRIVATE` follow-up hardening — test-injectable `$GOENV` path, oversized-`GOPRIVATE`-pattern warning, expanded edge-case/integration test coverage, and `GOPROXY` `,`/`|` separator docs (#563)
 
 ### Fixed
+- **deps-gradle**: recognize modern/variant configuration names (`androidTestImplementation`, `debugImplementation`, `compileOnlyApi`, `kaptAndroidTest`, etc.) instead of a fixed literal whitelist (resolves #627) (#631)
+- **deps-gradle**: fix mis-attributed name/version ranges for same-line dependencies sharing an identical coordinate or version (resolves #628) (#631)
+- **deps-gradle**: fix `dependencies { }` block guard false-positiving on unrelated blocks like `dependenciesInfo { }` (resolves #629) (#631)
 - **deps-gradle**: Kotlin DSL parser now shares a single capture-to-`GradleDependency` builder with Groovy DSL and recognizes the legacy `compile`/`testCompile`/`provided` configurations (resolves #625) (#626)
 - **deps-composer**: a `require`/`require-dev` entry whose value isn't a string (e.g. an object) is now skipped instead of producing a dependency entry queried against Packagist (resolves #621) (#623)
 - **deps-cargo, deps-npm, deps-nuget**: ancestor-walk depth cap now imports `deps-core`'s canonical `MAX_CONFIG_ANCESTOR_DEPTH` instead of each declaring its own duplicate copy (resolves #611) (#616)

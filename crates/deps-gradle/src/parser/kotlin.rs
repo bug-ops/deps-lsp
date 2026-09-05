@@ -2,7 +2,9 @@
 //!
 //! Regex-based extraction of dependency declarations from dependencies { } blocks.
 
-use crate::parser::{CONFIGURATIONS, GradleParseResult, build_dependency};
+use crate::parser::{
+    GradleParseResult, build_dependency, is_dependency_configuration, opens_dependencies_block,
+};
 use deps_core::Result;
 use regex::Regex;
 use std::sync::LazyLock;
@@ -43,9 +45,7 @@ pub fn parse_kotlin_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
         let trimmed = line.trim();
 
         // Detect entry into dependencies { block
-        if !in_dependencies_block
-            && (trimmed == "dependencies {" || trimmed.starts_with("dependencies {"))
-        {
+        if !in_dependencies_block && opens_dependencies_block(trimmed) {
             in_dependencies_block = true;
             deps_brace_depth = brace_depth + 1;
         }
@@ -64,7 +64,7 @@ pub fn parse_kotlin_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
             }
         }
 
-        if !in_dependencies_block && !line.trim_start().starts_with("dependencies") {
+        if !in_dependencies_block && !opens_dependencies_block(trimmed) {
             continue;
         }
 
@@ -73,7 +73,7 @@ pub fn parse_kotlin_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
         // Try pattern with version first
         for caps in RE_WITH_VERSION.captures_iter(line) {
             let config = caps.get(1).map_or("", |m| m.as_str());
-            if !CONFIGURATIONS.contains(&config) {
+            if !is_dependency_configuration(config) {
                 continue;
             }
             dependencies.push(build_dependency(&caps, line, line_u32, true, config));
@@ -85,15 +85,13 @@ pub fn parse_kotlin_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
             .captures_iter(line)
             .filter_map(|c| {
                 let config = c.get(1)?.as_str();
-                CONFIGURATIONS
-                    .contains(&config)
-                    .then_some(c.get(0)?.start())
+                is_dependency_configuration(config).then_some(c.get(0)?.start())
             })
             .collect();
 
         for caps in RE_NO_VERSION.captures_iter(line) {
             let config = caps.get(1).map_or("", |m| m.as_str());
-            if !CONFIGURATIONS.contains(&config) {
+            if !is_dependency_configuration(config) {
                 continue;
             }
             // Skip if this match overlaps with a versioned match
@@ -109,15 +107,13 @@ pub fn parse_kotlin_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
             .captures_iter(line)
             .filter_map(|c| {
                 let config = c.get(1)?.as_str();
-                CONFIGURATIONS
-                    .contains(&config)
-                    .then_some(c.get(0)?.start())
+                is_dependency_configuration(config).then_some(c.get(0)?.start())
             })
             .collect();
 
         for caps in RE_PLATFORM_WITH_VERSION.captures_iter(line) {
             let config = caps.get(1).map_or("", |m| m.as_str());
-            if !CONFIGURATIONS.contains(&config) {
+            if !is_dependency_configuration(config) {
                 continue;
             }
             dependencies.push(build_dependency(&caps, line, line_u32, true, config));
@@ -125,7 +121,7 @@ pub fn parse_kotlin_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
 
         for caps in RE_PLATFORM_NO_VERSION.captures_iter(line) {
             let config = caps.get(1).map_or("", |m| m.as_str());
-            if !CONFIGURATIONS.contains(&config) {
+            if !is_dependency_configuration(config) {
                 continue;
             }
             let match_start = caps.get(0).map_or(0, |m| m.start());
@@ -208,6 +204,15 @@ mod tests {
         assert_eq!(result.dependencies[1].configuration, "compileOnly");
         assert_eq!(result.dependencies[2].configuration, "runtimeOnly");
         assert_eq!(result.dependencies[3].configuration, "kapt");
+    }
+
+    #[test]
+    fn test_parse_bare_annotation_processor() {
+        // Bare (no variant prefix) form of a CONFIGURATION_SUFFIXES entry.
+        let content = "dependencies {\n    annotationProcessor(\"com.example:foo:1.0\")\n}\n";
+        let result = parse_kotlin_dsl(content, &make_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].configuration, "annotationProcessor");
     }
 
     #[test]
@@ -376,6 +381,117 @@ mod tests {
         assert_eq!(result.dependencies.len(), 1);
         assert_eq!(result.dependencies[0].name, "junit:junit-bom");
         assert_eq!(result.dependencies[0].version_req, Some("5.10.0".into()));
+    }
+
+    #[test]
+    fn test_parse_modern_configurations() {
+        // #627: androidTestImplementation, debugImplementation, compileOnlyApi,
+        // and testFixturesImplementation were missing from the whitelist and
+        // parsed to zero results.
+        let content = r#"dependencies {
+    androidTestImplementation("a:b:1.0")
+    debugImplementation("c:d:2.0")
+    compileOnlyApi("e:f:3.0")
+    testFixturesImplementation("g:h:4.0")
+}
+"#;
+        let result = parse_kotlin_dsl(content, &make_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 4);
+        assert_eq!(
+            result.dependencies[0].configuration,
+            "androidTestImplementation"
+        );
+        assert_eq!(result.dependencies[1].configuration, "debugImplementation");
+        assert_eq!(result.dependencies[2].configuration, "compileOnlyApi");
+        assert_eq!(
+            result.dependencies[3].configuration,
+            "testFixturesImplementation"
+        );
+    }
+
+    #[test]
+    fn test_same_line_dependencies_distinct_version_ranges() {
+        // #628: three dependencies sharing an identical version string on
+        // one line must each resolve to their own position, not collapse to
+        // the first dependency's position.
+        let content = "dependencies {\n    implementation(\"com.example:foo:1.0.0\"); implementation(\"com.example:bar:1.0.0\"); implementation(\"com.example:baz:1.0.0\")\n}\n";
+        let result = parse_kotlin_dsl(content, &make_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 3);
+        let ranges: Vec<_> = result
+            .dependencies
+            .iter()
+            .map(|d| d.version_range.expect("version_range"))
+            .collect();
+        assert_ne!(ranges[0], ranges[1]);
+        assert_ne!(ranges[1], ranges[2]);
+        assert_ne!(ranges[0], ranges[2]);
+        assert!(ranges[1].start.character > ranges[0].start.character);
+        assert!(ranges[2].start.character > ranges[1].start.character);
+    }
+
+    #[test]
+    fn test_same_line_duplicate_coordinate_distinct_name_ranges() {
+        // Regression for the S1 gap found in review of #628: two
+        // dependencies with an *identical coordinate* (not just the same
+        // version) on one line must each get their own name_range, since
+        // name_range uniquely keys OSV/diagnostic lookups.
+        let content = "dependencies {\n    implementation(\"com.example:lib:1.0.0\"); testImplementation(\"com.example:lib:1.0.0\")\n}\n";
+        let result = parse_kotlin_dsl(content, &make_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 2);
+        let first = result.dependencies[0].name_range;
+        let second = result.dependencies[1].name_range;
+        assert_ne!(first, second);
+        assert!(second.start.character > first.start.character);
+    }
+
+    #[test]
+    fn test_dependencies_info_block_not_scanned() {
+        // #629: `dependenciesInfo { }` (Android Gradle Plugin block) must not
+        // be mistaken for the `dependencies { }` block due to a prefix match.
+        // The dependency call must be on the SAME line as the block opener —
+        // a multi-line form doesn't discriminate old vs. new guard code,
+        // since the old guard only checked the continuation line's prefix.
+        let content = "dependenciesInfo { compile(\"com.example:foo:1.0.0\") }\n";
+        let result = parse_kotlin_dsl(content, &make_uri()).unwrap();
+        assert!(result.dependencies.is_empty());
+    }
+
+    #[test]
+    fn test_dependencies_block_tolerates_extra_whitespace_before_brace() {
+        // S2: the block-open guard must not regress `dependencies` followed
+        // by more than one space/tab before `{`.
+        let content = "dependencies  {\n    implementation(\"a:b:1.0\")\n}\n";
+        let result = parse_kotlin_dsl(content, &make_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+
+        let content_tab = "dependencies\t{\n    implementation(\"a:b:1.0\")\n}\n";
+        let result_tab = parse_kotlin_dsl(content_tab, &make_uri()).unwrap();
+        assert_eq!(result_tab.dependencies.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_kapt_ksp_prefix_variants() {
+        // S3: kapt/ksp follow a prefix convention (word + capitalized
+        // variant), not the suffix convention used by Implementation/Api.
+        let content = "dependencies {\n    kaptTest(\"a:b:1.0\")\n    kaptAndroidTest(\"c:d:2.0\")\n    kspDebug(\"e:f:3.0\")\n}\n";
+        let result = parse_kotlin_dsl(content, &make_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 3);
+        assert_eq!(result.dependencies[0].configuration, "kaptTest");
+        assert_eq!(result.dependencies[1].configuration, "kaptAndroidTest");
+        assert_eq!(result.dependencies[2].configuration, "kspDebug");
+    }
+
+    #[test]
+    fn test_suffix_matching_accepts_near_miss_configuration_name() {
+        // Documents a known, accepted tradeoff of suffix-based matching
+        // (#627): a name ending in a recognized suffix is treated as a
+        // dependency configuration even if it isn't a real Gradle one. Risk
+        // is bounded — a coordinate-shaped string literal is still required,
+        // and Gradle itself would reject an actually-unknown configuration.
+        let content = "dependencies {\n    someRandomApi(\"a:b:1.0\")\n}\n";
+        let result = parse_kotlin_dsl(content, &make_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].configuration, "someRandomApi");
     }
 
     #[test]
