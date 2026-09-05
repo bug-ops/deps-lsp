@@ -567,4 +567,49 @@ mod tests {
             None
         );
     }
+
+    /// Known-limitation regression guard (deps-cargo `package = "..."` rename, issue
+    /// #648's follow-up): `resolved_versions` is keyed by name alone with one
+    /// highest-semver value per name (`ResolvedPackages`'s `best_package` collapse in
+    /// `crate::lockfile`), so two manifest occurrences of the same crate — one plain,
+    /// one renamed via `package = "..."` to select an older major — both resolve
+    /// `Dependency::name()` to the same registry name and therefore collide on the
+    /// same lockfile entry.
+    ///
+    /// This pins *today's* behavior (the renamed, older-major occurrence incorrectly
+    /// reports the newer major's lockfile version) so a fix — per-occurrence
+    /// resolution filtered by `version_requirement()`, the same class of gap as #394
+    /// — is a deliberate, visible behavior change here, not a silent one. Not a
+    /// desired outcome: see the critic handoff
+    /// (`.local/handoff/2026-09-05T23-48-31-critic.md`, finding S1) for the full
+    /// failure-mode analysis and the tracking follow-up.
+    #[test]
+    fn in_use_version_known_limitation_renamed_occurrence_collides_with_plain_one() {
+        use crate::VersionReq;
+        use crate::lsp_helpers::test_support::MockDep;
+
+        let renamed_old_major = MockDep {
+            name: PackageName::new("serde"),
+            version_req: VersionReq::new("0.9"),
+            version_range: tower_lsp_server::ls_types::Range::default(),
+            name_range: tower_lsp_server::ls_types::Range::default(),
+        };
+
+        let mut resolved_versions = HashMap::new();
+        resolved_versions.insert(PackageName::new("serde"), ConcreteVersion::from("1.0.219"));
+
+        let result = in_use_version(
+            &renamed_old_major,
+            "serde",
+            &resolved_versions,
+            &crate::lsp_helpers::test_support::MockFormatter,
+            EcosystemId::Cargo,
+        );
+
+        // Wrong today: this is `serde 0.9`'s occurrence, but the collapsed
+        // single-value-per-name map hands back the unrelated 1.x entry instead of
+        // `None` (which is what pre-#648 behavior produced for an unresolvable
+        // alias name — an honest "unknown" rather than a confidently wrong answer).
+        assert_eq!(result, Some("1.0.219".to_string()));
+    }
 }

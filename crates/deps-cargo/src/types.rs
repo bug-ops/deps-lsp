@@ -26,6 +26,7 @@ pub use deps_core::parser::DependencySource;
 ///     features_range: None,
 ///     source: DependencySource::Registry,
 ///     section: DependencySection::Dependencies,
+///     package: None,
 /// };
 ///
 /// assert_eq!(dep.name, "serde");
@@ -33,6 +34,9 @@ pub use deps_core::parser::DependencySource;
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedDependency {
+    /// The TOML table key: the local import alias when [`Self::package`] is set,
+    /// otherwise the actual crate name. Always the position anchor for
+    /// [`Self::name_range`], regardless of renaming.
     pub name: deps_core::PackageName,
     pub name_range: Range,
     pub version_req: Option<deps_core::VersionReq>,
@@ -41,6 +45,16 @@ pub struct ParsedDependency {
     pub features_range: Option<Range>,
     pub source: DependencySource,
     pub section: DependencySection,
+    /// The real crate name from an explicit `package = "..."` key
+    /// ([renaming dependencies](https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html#renaming-dependencies-in-cargotoml)),
+    /// when present. `None` for an ordinary, non-renamed dependency, in which
+    /// case [`Self::name`] is both the local alias and the registry name.
+    ///
+    /// Never set when [`Self::source`] is [`DependencySource::Workspace`]: Cargo
+    /// silently discards `package` alongside `workspace = true` (the table key is
+    /// the only workspace-inheritance lookup key), so honoring it here would
+    /// resolve `Dependency::name()` to a value Cargo itself ignores.
+    pub package: Option<deps_core::PackageName>,
 }
 
 /// Section in Cargo.toml where a dependency is declared.
@@ -142,8 +156,10 @@ pub struct CrateInfo {
 // Trait implementations for deps-core integration
 
 impl deps_core::Dependency for ParsedDependency {
+    /// Returns the registry lookup name: [`Self::package`] when this dependency was
+    /// renamed via `package = "..."`, otherwise the TOML table key.
     fn name(&self) -> &deps_core::PackageName {
-        &self.name
+        self.package.as_ref().unwrap_or(&self.name)
     }
 
     fn name_range(&self) -> Range {

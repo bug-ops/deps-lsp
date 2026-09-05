@@ -1516,6 +1516,7 @@ token = "secret-token"
                     url: "my-corp".into(),
                 },
                 section: DependencySection::Dependencies,
+                package: None,
             },
             ParsedDependency {
                 name: "b".into(),
@@ -1526,6 +1527,7 @@ token = "secret-token"
                 features_range: None,
                 source: DependencySource::Registry,
                 section: DependencySection::Dependencies,
+                package: None,
             },
         ];
 
