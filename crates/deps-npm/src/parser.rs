@@ -209,7 +209,12 @@ fn parse_dependency_section(
     let mut result = Vec::new();
 
     for (name, value) in deps {
-        let version_req = value.as_str().map(String::from);
+        // A manifest entry whose value isn't a string (e.g. an object) is not a valid
+        // dependency declaration — skip it rather than fabricating an entry with no
+        // `version_req` that would still be queried against the registry (#619).
+        let Some(version_req) = value.as_str() else {
+            continue;
+        };
 
         let (name_range, version_range) = positions
             .and_then(|s| s.position(name, content, line_table))
@@ -218,7 +223,7 @@ fn parse_dependency_section(
         result.push(NpmDependency {
             name: name.clone().into(),
             name_range,
-            version_req: version_req.map(Into::into),
+            version_req: Some(version_req.into()),
             version_range,
             section,
             // Overwritten by `parse_package_json_with_context` once `.npmrc` resolution has
@@ -348,6 +353,58 @@ mod tests {
 
         assert_eq!(deps_count, 1);
         assert_eq!(dev_deps_count, 1);
+    }
+
+    #[test]
+    fn test_non_string_dependency_value_is_skipped() {
+        // #619: an object-valued entry (e.g. accidentally nested config) is not a valid
+        // dependency declaration and must not be surfaced or queried against the registry.
+        let json = r#"{
+  "dependencies": {
+    "nested-shadow": { "express": "0.0.1" },
+    "express": "^4.18.2"
+  }
+}"#;
+
+        let result = parse_package_json(json, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "express");
+        assert_eq!(result.dependencies[0].version_req, Some("^4.18.2".into()));
+    }
+
+    #[test]
+    fn test_various_non_string_dependency_value_kinds_are_skipped() {
+        // #619: `value.as_str()` returns `None` uniformly for every non-string JSON kind, not
+        // just objects — cover number, bool, null and array alongside one valid entry.
+        let json = r#"{
+  "dependencies": {
+    "bad-number": 1,
+    "bad-bool": true,
+    "bad-null": null,
+    "bad-array": ["1.0.0"],
+    "express": "^4.18.2"
+  }
+}"#;
+
+        let result = parse_package_json(json, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "express");
+        assert_eq!(result.dependencies[0].version_req, Some("^4.18.2".into()));
+    }
+
+    #[test]
+    fn test_all_invalid_dependency_values_in_section_yields_empty_list() {
+        // #619: a section present in the manifest but whose every entry has a non-string value
+        // must resolve to an empty list, not an error or a panic.
+        let json = r#"{
+  "dependencies": {
+    "bad-object": { "nested": "0.0.1" },
+    "bad-number": 1
+  }
+}"#;
+
+        let result = parse_package_json(json, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 0);
     }
 
     #[test]
@@ -1153,7 +1210,8 @@ mod tests {
     /// name as a real top-level dependency in this section. A text-based scanner finds the
     /// nested occurrence first; the AST only ever indexes a section's own *direct*
     /// properties, so the real top-level occurrence's position is never stolen by one nested
-    /// inside a sibling's value.
+    /// inside a sibling's value. `a-lib` itself has an object value, so it is skipped
+    /// entirely (#619) — only `b-lib` survives.
     #[test]
     fn test_nested_object_value_with_colliding_key_resolves_to_top_level_position() {
         let json = r#"{
@@ -1166,7 +1224,7 @@ mod tests {
 }"#;
 
         let result = parse_package_json(json, &test_uri()).unwrap();
-        assert_eq!(result.dependencies.len(), 2);
+        assert_eq!(result.dependencies.len(), 1);
 
         let b_lib = result
             .dependencies
