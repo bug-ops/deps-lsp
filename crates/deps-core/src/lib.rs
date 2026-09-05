@@ -20,6 +20,7 @@ pub mod freshness;
 pub mod fs_probe;
 pub mod github;
 pub mod json_ast;
+pub mod json_helpers;
 pub mod lockfile;
 pub mod lsp_helpers;
 pub mod macros;
@@ -45,6 +46,7 @@ pub use freshness::{
     DEFAULT_COOLDOWN_SECS, FreshnessSettings, PublishTime, format_relative_age, is_within_cooldown,
 };
 pub use json_ast::{JsonAst, JsonSection, find_last_prop};
+pub use json_helpers::string_valued_entries;
 pub use lockfile::{
     LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource, read_lockfile_content,
 };

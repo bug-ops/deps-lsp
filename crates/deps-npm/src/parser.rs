@@ -7,6 +7,7 @@ use crate::config::{NpmConfig, NpmParseContext, NpmRegistryIndex};
 use crate::types::{NpmDependency, NpmDependencySection};
 use deps_core::Result;
 use deps_core::json_ast::{JsonAst, JsonSection};
+use deps_core::json_helpers::string_valued_entries;
 use deps_core::lsp_helpers::LineOffsetTable;
 use serde_json::Value;
 use std::any::Any;
@@ -208,20 +209,16 @@ fn parse_dependency_section(
 ) -> Vec<NpmDependency> {
     let mut result = Vec::new();
 
-    for (name, value) in deps {
-        // A manifest entry whose value isn't a string (e.g. an object) is not a valid
-        // dependency declaration — skip it rather than fabricating an entry with no
-        // `version_req` that would still be queried against the registry (#619).
-        let Some(version_req) = value.as_str() else {
-            continue;
-        };
-
+    // A manifest entry whose value isn't a string (e.g. an object) is not a valid dependency
+    // declaration — `string_valued_entries` skips it rather than fabricating an entry with no
+    // `version_req` that would still be queried against the registry (#619).
+    for (name, version_req) in string_valued_entries(deps) {
         let (name_range, version_range) = positions
             .and_then(|s| s.position(name, content, line_table))
             .unwrap_or_default();
 
         result.push(NpmDependency {
-            name: name.clone().into(),
+            name: name.into(),
             name_range,
             version_req: Some(version_req.into()),
             version_range,
@@ -359,6 +356,8 @@ mod tests {
     fn test_non_string_dependency_value_is_skipped() {
         // #619: an object-valued entry (e.g. accidentally nested config) is not a valid
         // dependency declaration and must not be surfaced or queried against the registry.
+        // Full coverage of every non-string value kind lives in
+        // `deps_core::json_helpers::string_valued_entries`'s own tests (#624).
         let json = r#"{
   "dependencies": {
     "nested-shadow": { "express": "0.0.1" },
@@ -373,15 +372,13 @@ mod tests {
     }
 
     #[test]
-    fn test_various_non_string_dependency_value_kinds_are_skipped() {
-        // #619: `value.as_str()` returns `None` uniformly for every non-string JSON kind, not
-        // just objects — cover number, bool, null and array alongside one valid entry.
+    fn test_non_string_dependency_value_of_another_kind_is_skipped_end_to_end() {
+        // #619: end-to-end confirmation that a non-object non-string kind (number) is skipped
+        // too, not just objects — this only guards the parser/helper wiring; full value-kind
+        // coverage lives in `deps_core::json_helpers::string_valued_entries`'s own tests (#624).
         let json = r#"{
   "dependencies": {
     "bad-number": 1,
-    "bad-bool": true,
-    "bad-null": null,
-    "bad-array": ["1.0.0"],
     "express": "^4.18.2"
   }
 }"#;
@@ -389,22 +386,6 @@ mod tests {
         let result = parse_package_json(json, &test_uri()).unwrap();
         assert_eq!(result.dependencies.len(), 1);
         assert_eq!(result.dependencies[0].name, "express");
-        assert_eq!(result.dependencies[0].version_req, Some("^4.18.2".into()));
-    }
-
-    #[test]
-    fn test_all_invalid_dependency_values_in_section_yields_empty_list() {
-        // #619: a section present in the manifest but whose every entry has a non-string value
-        // must resolve to an empty list, not an error or a panic.
-        let json = r#"{
-  "dependencies": {
-    "bad-object": { "nested": "0.0.1" },
-    "bad-number": 1
-  }
-}"#;
-
-        let result = parse_package_json(json, &test_uri()).unwrap();
-        assert_eq!(result.dependencies.len(), 0);
     }
 
     #[test]

@@ -7,6 +7,7 @@
 use crate::types::{ComposerDependency, ComposerSection};
 use deps_core::Result;
 use deps_core::json_ast::{JsonAst, JsonSection};
+use deps_core::json_helpers::string_valued_entries;
 use deps_core::lsp_helpers::LineOffsetTable;
 use serde_json::Value;
 use std::any::Any;
@@ -179,24 +180,21 @@ fn parse_section(
 ) -> Vec<ComposerDependency> {
     let mut result = Vec::new();
 
-    for (name, value) in deps {
+    // A manifest entry whose value isn't a string (e.g. an object) is not a valid dependency
+    // declaration — `string_valued_entries` skips it rather than fabricating an entry with no
+    // `version_req` that would still be queried against the registry (#621, same bug class as
+    // npm's #619).
+    for (name, version_req) in string_valued_entries(deps) {
         if is_platform_package(name) {
             continue;
         }
 
-        // A manifest entry whose value isn't a string (e.g. an object) is not a valid
-        // dependency declaration — skip it rather than fabricating an entry with no
-        // `version_req` that would still be queried against the registry (#621, same bug
-        // class as npm's #619).
-        let Some(version_req) = value.as_str() else {
-            continue;
-        };
         let (name_range, version_range) = positions
             .and_then(|s| s.position(name, content, line_table))
             .unwrap_or_default();
 
         result.push(ComposerDependency {
-            name: name.clone().into(),
+            name: name.into(),
             name_range,
             version_req: Some(version_req.into()),
             version_range,
@@ -367,7 +365,8 @@ mod tests {
     fn test_non_string_dependency_value_is_skipped() {
         // #621, same bug class as npm's #619: an object-valued entry (e.g. accidentally
         // nested config) is not a valid dependency declaration and must not be surfaced or
-        // queried against the registry.
+        // queried against the registry. Full coverage of every non-string value kind lives in
+        // `deps_core::json_helpers::string_valued_entries`'s own tests (#624).
         let json = r#"{
   "require": {
     "nested-shadow": { "acme/express": "0.0.1" },
@@ -382,33 +381,16 @@ mod tests {
     }
 
     #[test]
-    fn test_various_non_string_dependency_value_kinds_are_skipped() {
-        // #621: `value.as_str()` returns `None` uniformly for every non-string JSON kind, not
-        // just objects — cover number, bool, null and array alongside one valid entry.
-        let json = r#"{
-  "require": {
-    "bad/number": 1,
-    "bad/bool": true,
-    "bad/null": null,
-    "bad/array": ["1.0.0"],
-    "symfony/console": "^6.0"
-  }
-}"#;
-
-        let result = parse_composer_json(json, &test_uri()).unwrap();
-        assert_eq!(result.dependencies.len(), 1);
-        assert_eq!(result.dependencies[0].name, "symfony/console");
-        assert_eq!(result.dependencies[0].version_req, Some("^6.0".into()));
-    }
-
-    #[test]
-    fn test_all_invalid_dependency_values_in_section_yields_empty_list() {
-        // #621: a section present in the manifest but whose every entry has a non-string
-        // value must resolve to an empty list, not an error or a panic.
+    fn test_all_invalid_dependency_values_skipped_across_both_sections_end_to_end() {
+        // #621: end-to-end confirmation that the skip applies uniformly across `require` and
+        // `require-dev`, and to more than one non-string kind — this only guards the
+        // parser/helper wiring; full value-kind coverage lives in
+        // `deps_core::json_helpers::string_valued_entries`'s own tests (#624).
         let json = r#"{
   "require": {
     "bad/object": { "nested": "0.0.1" },
-    "bad/number": 1
+    "bad/number": 1,
+    "symfony/console": "^6.0"
   },
   "require-dev": {
     "bad/object-dev": { "nested": "0.0.1" }
@@ -416,7 +398,8 @@ mod tests {
 }"#;
 
         let result = parse_composer_json(json, &test_uri()).unwrap();
-        assert_eq!(result.dependencies.len(), 0);
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "symfony/console");
     }
 
     /// #424: `minimum-stability` is parsed from the manifest root when present.
