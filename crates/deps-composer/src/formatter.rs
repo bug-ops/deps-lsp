@@ -1167,17 +1167,24 @@ mod tests {
         assert!(f.is_position_on_dependency(&dep, Position::new(1, 10)));
     }
 
-    /// T1 (D7(a)/C2): a Composer manifest whose name locator misses — a legal
-    /// escaped-solidus `"vendor\/package"` key, which `find_positions`'s literal search
-    /// for the serde-unescaped `"vendor/package"` never matches — must never offer a
-    /// "Replace with X" rename action, rather than emitting a corrupting edit at
-    /// `(0,0)`.
+    /// T1 (D7(a)/C2): a Composer manifest with a legal escaped-solidus `"vendor\/package"`
+    /// key must never offer a "Replace with X" rename action, rather than emitting a
+    /// corrupting edit.
     ///
-    /// Exercised two ways: end to end through the real parser (today's actual
-    /// behavior — safe only because `version_range` also stays `None`, an incidental
-    /// coupling, not a guarantee), and directly against `name_literal_guard`-shaped
-    /// input (`version_range: Some(..)`, `name_range: Range::default()`) so the test
-    /// still catches a regression if that coupling is ever broken by a parser change.
+    /// #613: positions now come directly from the jsonc-parser AST, which correctly
+    /// locates the escaped-solidus key's real span — unlike the pre-#613 literal-text
+    /// search for the serde-unescaped `"vendor/package"`, which never matched it and left
+    /// both `name_range` and `version_range` at their sentinel defaults. The *no rename
+    /// action* guarantee no longer depends on that miss: it now holds because
+    /// `build_replacement_action` slices `name_range` back out of `content` and compares
+    /// it against the dependency's *unescaped* semantic name — the raw literal slice
+    /// (`vendor\/package`, escape included) never textually equals the unescaped name
+    /// (`vendor/package`), so the rename action is still correctly withheld.
+    ///
+    /// Exercised two ways: end to end through the real parser (today's actual behavior),
+    /// and directly against `name_literal_guard`-shaped input (`version_range: Some(..)`,
+    /// `name_range: Range::default()`) so the test still catches a regression if a future
+    /// parser change ever reintroduces a degenerate `name_range`.
     #[tokio::test]
     async fn test_generate_code_actions_escaped_solidus_name_offers_no_rename_action() {
         let json = r#"{"require": {"vendor\/package": "^1.0"}}"#;
@@ -1185,14 +1192,15 @@ mod tests {
         let parse_result = crate::parser::parse_composer_json(json, &uri).unwrap();
         assert_eq!(parse_result.dependencies.len(), 1);
         let dep = &parse_result.dependencies[0];
-        assert_eq!(
+        assert_ne!(
             dep.name_range,
             Range::default(),
-            "escaped-solidus key must miss the literal-text search"
+            "AST-derived positions must locate the escaped-solidus key's real span"
         );
         assert!(
-            dep.version_range.is_none(),
-            "today's incidental coupling: the version search never runs either"
+            dep.version_range.is_some(),
+            "AST-derived positions must find the version literal too, decoupled from the \
+             name lookup"
         );
 
         let outcomes = deps_core::lsp_helpers::DependencyOutcomes::new().with_deprecation(
@@ -1218,7 +1226,8 @@ mod tests {
         .await;
         assert!(
             actions.iter().all(|a| !a.title.starts_with("Replace with")),
-            "no rename action may be offered when the name locator missed: {actions:?}"
+            "no rename action may be offered when the raw literal span (with its escape) \
+             does not match the unescaped semantic name: {actions:?}"
         );
 
         // Direct regression guard for the guard mechanism itself (not just today's

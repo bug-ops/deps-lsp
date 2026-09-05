@@ -6,10 +6,11 @@
 
 use crate::types::{ComposerDependency, ComposerSection};
 use deps_core::Result;
+use deps_core::json_ast::{JsonAst, JsonSection};
 use deps_core::lsp_helpers::LineOffsetTable;
 use serde_json::Value;
 use std::any::Any;
-use tower_lsp_server::ls_types::{Range, Uri};
+use tower_lsp_server::ls_types::Uri;
 
 /// Result of parsing a composer.json file.
 ///
@@ -119,14 +120,20 @@ pub fn parse_composer_json(content: &str, uri: &Uri) -> Result<ComposerParseResu
     let root: Value = deps_core::parse_json_checked(content.as_bytes())?;
 
     let line_table = LineOffsetTable::new(content);
+    let ast = JsonAst::parse(content);
+    if ast.is_none() {
+        tracing::warn!(
+            "jsonc-parser failed to parse composer.json content serde_json already accepted; \
+             dependency positions will default to (0,0)"
+        );
+    }
     let mut dependencies = Vec::new();
 
-    // Parse each section, scoping position search to that section's own byte range (see
-    // `deps_core::parser::find_json_section_byte_range`) so a name repeated across sections
-    // (e.g. also present in `require-dev`) does not have both occurrences resolve to the
-    // same, monotonically-advancing search cursor position — `serde_json::Map` iteration
-    // order (alphabetical without `preserve_order`) cannot be relied on to match source-text
-    // order (#610).
+    // Parse each section, reading each entry's position directly from the AST (#613) — the
+    // AST's own `Object::properties` only ever lists a given object's *direct* children, so a
+    // name repeated across sections (e.g. also present in `require-dev`) or nested inside an
+    // unrelated value never gets confused with the real top-level occurrence, independent of
+    // `serde_json::Map` iteration order (#610).
     const SECTIONS: [(&str, ComposerSection); 2] = [
         ("require", ComposerSection::Require),
         ("require-dev", ComposerSection::RequireDev),
@@ -134,21 +141,12 @@ pub fn parse_composer_json(content: &str, uri: &Uri) -> Result<ComposerParseResu
 
     for (key, section) in SECTIONS {
         if let Some(deps) = root.get(key).and_then(|v| v.as_object()) {
-            // Fall back to the whole-file range (pre-fix behavior) if the section's own
-            // bounds cannot be located — never drop a section's dependencies over this.
-            let section_range = deps_core::parser::find_json_section_byte_range(content, key)
-                .unwrap_or_else(|| {
-                    tracing::debug!(
-                        section = key,
-                        "section byte range not found, falling back to whole-file position search"
-                    );
-                    (0, content.len())
-                });
+            let positions = ast.as_ref().and_then(|ast| ast.section(key));
             dependencies.extend(parse_section(
                 content,
                 deps,
                 section,
-                section_range,
+                positions.as_ref(),
                 &line_table,
             ));
         }
@@ -168,14 +166,15 @@ pub fn parse_composer_json(content: &str, uri: &Uri) -> Result<ComposerParseResu
 
 /// Parses a single dependency section and extracts positions, filtering platform packages.
 ///
-/// `section_range` bounds the search performed by `find_positions` to this section's own
-/// `{...}` byte range, so a name that also appears in another section (e.g. `require` and
-/// `require-dev`) does not resolve to that other section's occurrence.
+/// `positions` is this section's own direct properties, pre-indexed by name (see
+/// [`JsonAst::section`]) — `None` when the AST parse degraded (see [`parse_composer_json`]),
+/// in which case every dependency falls back to a default, zero position rather than being
+/// dropped.
 fn parse_section(
     content: &str,
     deps: &serde_json::Map<String, Value>,
     section: ComposerSection,
-    section_range: (usize, usize),
+    positions: Option<&JsonSection<'_>>,
     line_table: &LineOffsetTable,
 ) -> Vec<ComposerDependency> {
     let mut result = Vec::new();
@@ -186,13 +185,9 @@ fn parse_section(
         }
 
         let version_req = value.as_str().map(String::from);
-        let (name_range, version_range) = find_positions(
-            content,
-            name,
-            version_req.as_ref(),
-            section_range,
-            line_table,
-        );
+        let (name_range, version_range) = positions
+            .and_then(|s| s.position(name, content, line_table))
+            .unwrap_or_default();
 
         result.push(ComposerDependency {
             name: name.clone().into(),
@@ -206,80 +201,12 @@ fn parse_section(
     result
 }
 
-/// Finds the byte positions of a dependency name and version in the source text.
-///
-/// Searches for the dependency as a JSON key-value pair within `section_range` (the
-/// enclosing section's own `{...}` byte range) to avoid false matches both from unrelated
-/// text elsewhere in the file and from the same name declared in a *different* dependency
-/// section.
-fn find_positions(
-    content: &str,
-    name: &str,
-    version_req: Option<&String>,
-    section_range: (usize, usize),
-    line_table: &LineOffsetTable,
-) -> (Range, Option<Range>) {
-    let mut name_range = Range::default();
-    let mut version_range = None;
-
-    let name_pattern = format!("\"{name}\"");
-    let (range_start, range_end) = section_range;
-    let section_content = &content[range_start..range_end];
-
-    let mut search_start = 0;
-    while let Some(rel_idx) = section_content[search_start..].find(&name_pattern) {
-        let name_start_idx = range_start + search_start + rel_idx;
-        let after_name = &content[name_start_idx + name_pattern.len()..range_end];
-        let trimmed = after_name.trim_start();
-
-        if !trimmed.starts_with(':') {
-            search_start = (name_start_idx + name_pattern.len()) - range_start;
-            continue;
-        }
-
-        let name_start = line_table.byte_offset_to_position(content, name_start_idx + 1);
-        let name_end = line_table.byte_offset_to_position(content, name_start_idx + 1 + name.len());
-        name_range = Range::new(name_start, name_end);
-
-        if let Some(version) = version_req {
-            let version_search = format!("\"{version}\"");
-            let colon_offset =
-                name_start_idx + name_pattern.len() + (after_name.len() - trimmed.len());
-            let after_colon = &content[colon_offset..];
-
-            // Limit search to the next 100 chars to stay within this key-value pair, and
-            // never past the enclosing section's own end — otherwise a version search
-            // starting near a section boundary could bleed into the next section's text.
-            // Round down to a char boundary since `version.len()` is a byte count that
-            // can land mid-character when the source contains multi-byte UTF-8.
-            let search_limit = after_colon.floor_char_boundary(
-                after_colon
-                    .len()
-                    .min(100 + version.len())
-                    .min(range_end.saturating_sub(colon_offset)),
-            );
-            let search_area = &after_colon[..search_limit];
-
-            if let Some(ver_rel_idx) = search_area.find(&version_search) {
-                let version_start_idx = colon_offset + ver_rel_idx + 1;
-                let version_start = line_table.byte_offset_to_position(content, version_start_idx);
-                let version_end =
-                    line_table.byte_offset_to_position(content, version_start_idx + version.len());
-                version_range = Some(Range::new(version_start, version_end));
-            }
-        }
-
-        break;
-    }
-
-    (name_range, version_range)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use std::assert_matches;
+    use tower_lsp_server::ls_types::Range;
 
     fn test_uri() -> Uri {
         deps_core::test_util::test_uri("/test/composer.json")
@@ -519,9 +446,9 @@ mod tests {
     /// implementation searched for each dependency's position using a single
     /// monotonically-advancing cursor in that iteration order, so laravel/framework (file
     /// line 2) was searched for only after the cursor had already advanced past line 3,
-    /// leaving its name_range and version_range at (0,0)→(0,0). Fixed by scoping each
-    /// section's search to its own byte range (see `find_positions`), independent of
-    /// iteration order — the same fix later generalized for the cross-section case in #610.
+    /// leaving its name_range and version_range at (0,0)→(0,0). Positions now come from an
+    /// AST index keyed by name (#613), independent of `serde_json::Map` iteration order
+    /// entirely — the same fix later generalized for the cross-section case in #610.
     #[test]
     fn test_position_tracking_out_of_alphabetical_order() {
         let json = r#"{
@@ -571,69 +498,13 @@ mod tests {
     }
 
     #[test]
-    fn test_find_positions_no_panic_on_multibyte_utf8_boundary() {
-        // The search window is `100 + version.len()` bytes after the colon. Placing a
-        // 2-byte UTF-8 character ('é') to straddle that exact byte offset used to panic
-        // when the raw offset was used to slice the string directly (issue #245, same
-        // pattern as #230 in deps-npm).
-        let name = "vendor/pkg";
-        let version = "1.0.0".to_string();
-        let padding = "a".repeat(103);
-        let content = format!("\"{name}\":{padding}é more text \"{version}\" end");
-
-        let line_table = LineOffsetTable::new(&content);
-        let (name_range, version_range) = find_positions(
-            &content,
-            name,
-            Some(&version),
-            (0, content.len()),
-            &line_table,
-        );
-
-        assert_eq!(name_range.start.line, 0);
-        // The multibyte character falls right at the truncated search boundary, so the
-        // version string (placed after it) is outside the search window and not found.
-        assert!(version_range.is_none());
-    }
-
-    #[test]
-    fn test_find_positions_finds_version_when_multibyte_char_is_further_out() {
-        // Same truncation boundary as above, but this time the version sits well inside
-        // the truncated window while the 2-byte UTF-8 character ('é') straddles the exact
-        // raw byte offset (107) that used to be sliced naively. Confirms the fix does not
-        // just avoid panicking but still returns the correct, real match.
-        let name = "vendor/pkg";
-        let version = "1.0.0-x".to_string(); // 7 bytes -> raw window limit = 100 + 7 = 107
-        let quoted_version = format!("\"{version}\"");
-        let padding = "a".repeat(95);
-        let content = format!("\"{name}\": {quoted_version}{padding}é end");
-
-        let line_table = LineOffsetTable::new(&content);
-        let (name_range, version_range) = find_positions(
-            &content,
-            name,
-            Some(&version),
-            (0, content.len()),
-            &line_table,
-        );
-
-        assert_eq!(name_range.start.line, 0);
-        let version_range = version_range.expect("version should still be found after truncation");
-        assert_eq!(version_range.start.line, 0);
-
-        // Version content starts right after the opening quote; everything before it is
-        // ASCII, so byte offset and UTF-16 character offset coincide.
-        let expected_start = content.find(&quoted_version).unwrap() + 1;
-        assert_eq!(version_range.start.character, expected_start as u32);
-    }
-
-    #[test]
     fn test_parse_composer_json_no_panic_with_multibyte_field_after_dependency() {
         // Public-API-level regression test for issue #245: an ordinary manifest where a
-        // later top-level field (`description`) contains multi-byte UTF-8 can still land
-        // the search-window offset for an *earlier* dependency's version mid-character.
-        // This reaches the panic through `parse_composer_json`, the only entry point the
-        // LSP layer actually calls, rather than the private `find_positions` helper.
+        // later top-level field (`description`) contains multi-byte UTF-8 must not upset
+        // position tracking for an *earlier* dependency. AST-derived positions (#613) make
+        // this structurally impossible (no byte-offset search window to straddle), but the
+        // regression test stays as end-to-end coverage through the only entry point the LSP
+        // layer actually calls.
         let json = r#"{
   "require": {
     "symfony/console": "^6.0"
@@ -657,13 +528,12 @@ mod tests {
     fn test_duplicate_name_across_require_and_require_dev() {
         // #610, same bug class as npm's #605: "vendor/pkg" appears in both `require` and
         // `require-dev`, with keys not in source-text order relative to each section's
-        // start. The old implementation threaded a single, monotonically-advancing
+        // start. The original implementation threaded a single, monotonically-advancing
         // `search_start` cursor across `serde_json::Map` iteration, so it could skip past —
         // or land on — the wrong occurrence whenever `Map` iteration order didn't match
-        // source-text order. The fix no longer depends on `Map` iteration order at all: each
-        // section's own byte range is located up front, and every entry's position is
-        // searched fresh within it. Each occurrence must resolve to its own section's
-        // position.
+        // source-text order. Positions now come from a per-section AST index (#613), so each
+        // occurrence resolves to its own section's node directly, independent of both
+        // `Map` iteration order and source-text order entirely.
         let json = r#"{
   "require": {
     "zzz/other": "^1.0",
@@ -703,5 +573,84 @@ mod tests {
             .expect("require-dev vendor/pkg version_range");
         assert_eq!(require_version.start.line, 3);
         assert_eq!(dev_version.start.line, 6);
+    }
+
+    // --- #613: AST-based position recovery edge cases ---
+
+    /// A dependency's value can itself be a nested object containing a key with the same
+    /// name as a real top-level dependency in this section (e.g. a malformed/unusual
+    /// manifest). A text-based scanner finds the nested occurrence first; the AST only
+    /// ever indexes a section's own *direct* properties, so the real top-level occurrence's
+    /// position is never stolen by one nested inside a sibling's value.
+    #[test]
+    fn test_nested_object_value_with_colliding_key_resolves_to_top_level_position() {
+        let json = r#"{
+  "require": {
+    "a/b": {
+      "c/d": "0.0.1"
+    },
+    "c/d": "^2.0"
+  }
+}"#;
+
+        let result = parse_composer_json(json, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 2);
+
+        let c_d = result
+            .dependencies
+            .iter()
+            .find(|d| d.name == "c/d")
+            .expect("c/d");
+        assert_eq!(c_d.version_req, Some("^2.0".into()));
+        // The real top-level "c/d" is on line 5, not line 3 (nested inside "a/b"'s value).
+        assert_eq!(c_d.name_range.start.line, 5);
+        let version_range = c_d.version_range.expect("c/d version_range");
+        assert_eq!(version_range.start.line, 5);
+    }
+
+    /// JSON permits (if unusual) a duplicate top-level key; `serde_json::Map` keeps only the
+    /// *last* occurrence's value (last-key-wins during deserialization, `preserve_order` or
+    /// not). The AST lookup must resolve the identically-named "require" key the same way —
+    /// the last one — not the first, or the surviving dependency's position silently defaults
+    /// to `Range::default()` whenever the two sections don't share every name.
+    #[test]
+    fn test_duplicate_top_level_section_key_resolves_to_last_occurrence() {
+        let json = r#"{
+  "require": {
+    "only-in-first": "^1.0"
+  },
+  "require": {
+    "vendor/pkg": "^2.0"
+  }
+}"#;
+
+        let result = parse_composer_json(json, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+
+        let pkg = &result.dependencies[0];
+        assert_eq!(pkg.name, "vendor/pkg");
+        assert_eq!(pkg.version_req, Some("^2.0".into()));
+        assert_ne!(pkg.name_range, Range::default());
+        assert_eq!(pkg.name_range.start.line, 5);
+        assert!(pkg.version_range.is_some());
+    }
+
+    /// M6(c): when the AST parse degrades (e.g. a future `jsonc-parser` disagreement with
+    /// `serde_json` on content this crate's own `parse_composer_json` never actually
+    /// produces — see [`JsonAst::parse`]'s doc), `positions: None` must still yield a
+    /// dependency entry with a default, zero position rather than dropping it or panicking.
+    #[test]
+    fn test_parse_section_with_no_ast_positions_falls_back_to_default_range() {
+        let mut deps = serde_json::Map::new();
+        deps.insert("vendor/pkg".to_string(), Value::String("^1.0".into()));
+        let content = r#"{"require": {"vendor/pkg": "^1.0"}}"#;
+        let line_table = LineOffsetTable::new(content);
+
+        let result = parse_section(content, &deps, ComposerSection::Require, None, &line_table);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "vendor/pkg");
+        assert_eq!(result[0].name_range, Range::default());
+        assert!(result[0].version_range.is_none());
     }
 }

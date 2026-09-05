@@ -6,10 +6,11 @@
 use crate::config::{NpmConfig, NpmParseContext, NpmRegistryIndex};
 use crate::types::{NpmDependency, NpmDependencySection};
 use deps_core::Result;
+use deps_core::json_ast::{JsonAst, JsonSection};
 use deps_core::lsp_helpers::LineOffsetTable;
 use serde_json::Value;
 use std::any::Any;
-use tower_lsp_server::ls_types::{Range, Uri};
+use tower_lsp_server::ls_types::Uri;
 
 /// Result of parsing a package.json file.
 ///
@@ -100,13 +101,21 @@ pub fn parse_package_json_with_context(
 
     // Build line offset table once for O(log n) position lookups
     let line_table = LineOffsetTable::new(content);
+    let ast = JsonAst::parse(content);
+    if ast.is_none() {
+        tracing::warn!(
+            "jsonc-parser failed to parse package.json content serde_json already accepted; \
+             dependency positions will default to (0,0)"
+        );
+    }
 
     let mut dependencies = Vec::new();
 
-    // Parse each dependency section, scoping position search to that section's own byte
-    // range (see `deps_core::parser::find_json_section_byte_range`) so a name repeated
-    // across sections (e.g. also present in `devDependencies`) does not have both
-    // occurrences resolve to the first match in the file.
+    // Parse each dependency section, reading each entry's position directly from the AST
+    // (#613) — the AST's own `Object::properties` only ever lists a given object's *direct*
+    // children, so a name repeated across sections (e.g. also present in `devDependencies`)
+    // or nested inside an unrelated value (e.g. `packageExtensions`) never gets confused with
+    // the real top-level occurrence.
     const SECTIONS: [(&str, NpmDependencySection); 4] = [
         ("dependencies", NpmDependencySection::Dependencies),
         ("devDependencies", NpmDependencySection::DevDependencies),
@@ -119,21 +128,12 @@ pub fn parse_package_json_with_context(
 
     for (key, section) in SECTIONS {
         if let Some(deps) = root.get(key).and_then(|v| v.as_object()) {
-            // Fall back to the whole-file range (pre-fix behavior) if the section's own
-            // bounds cannot be located — never drop a section's dependencies over this.
-            let section_range = deps_core::parser::find_json_section_byte_range(content, key)
-                .unwrap_or_else(|| {
-                    tracing::debug!(
-                        section = key,
-                        "section byte range not found, falling back to whole-file position search"
-                    );
-                    (0, content.len())
-                });
+            let positions = ast.as_ref().and_then(|ast| ast.section(key));
             dependencies.extend(parse_dependency_section(
                 content,
                 deps,
                 section,
-                section_range,
+                positions.as_ref(),
                 &line_table,
             ));
         }
@@ -195,14 +195,15 @@ pub fn parse_package_json_with_context(
 
 /// Parses a single dependency section and extracts positions.
 ///
-/// `section_range` bounds the search performed by `find_dependency_positions` to this
-/// section's own `{...}` byte range, so a name that also appears in another section does
-/// not resolve to that other section's occurrence.
+/// `positions` is this section's own direct properties, pre-indexed by name (see
+/// [`JsonAst::section`]) — `None` when the AST parse degraded (see
+/// [`parse_package_json_with_context`]), in which case every dependency falls back to a
+/// default, zero position rather than being dropped.
 fn parse_dependency_section(
     content: &str,
     deps: &serde_json::Map<String, Value>,
     section: NpmDependencySection,
-    section_range: (usize, usize),
+    positions: Option<&JsonSection<'_>>,
     line_table: &LineOffsetTable,
 ) -> Vec<NpmDependency> {
     let mut result = Vec::new();
@@ -210,14 +211,9 @@ fn parse_dependency_section(
     for (name, value) in deps {
         let version_req = value.as_str().map(String::from);
 
-        // Calculate positions for name and version
-        let (name_range, version_range) = find_dependency_positions(
-            content,
-            name,
-            version_req.as_ref(),
-            section_range,
-            line_table,
-        );
+        let (name_range, version_range) = positions
+            .and_then(|s| s.position(name, content, line_table))
+            .unwrap_or_default();
 
         result.push(NpmDependency {
             name: name.clone().into(),
@@ -240,87 +236,12 @@ fn parse_dependency_section(
     result
 }
 
-/// Finds the position of a dependency name and version in the source text.
-///
-/// Searches for the dependency as a JSON key-value pair within `section_range` (the
-/// enclosing section's own `{...}` byte range) to avoid false matches both from unrelated
-/// text elsewhere in the file (e.g., in `scripts`) and from the same name declared in a
-/// *different* dependency section.
-fn find_dependency_positions(
-    content: &str,
-    name: &str,
-    version_req: Option<&String>,
-    section_range: (usize, usize),
-    line_table: &LineOffsetTable,
-) -> (Range, Option<Range>) {
-    let mut name_range = Range::default();
-    let mut version_range = None;
-
-    let name_pattern = format!("\"{name}\"");
-    let (range_start, range_end) = section_range;
-    let section_content = &content[range_start..range_end];
-
-    // Find all occurrences of the name pattern and check which one is a dependency key
-    let mut search_start = 0;
-    while let Some(rel_idx) = section_content[search_start..].find(&name_pattern) {
-        let name_start_idx = range_start + search_start + rel_idx;
-        let after_name = &content[name_start_idx + name_pattern.len()..range_end];
-
-        // Check if this is a JSON key (followed by optional whitespace and colon)
-        let trimmed = after_name.trim_start();
-        if !trimmed.starts_with(':') {
-            // Not a key, continue searching
-            search_start = (name_start_idx + name_pattern.len()) - range_start;
-            continue;
-        }
-
-        // Found a valid key, calculate position
-        let name_start = line_table.byte_offset_to_position(content, name_start_idx + 1);
-        let name_end = line_table.byte_offset_to_position(content, name_start_idx + 1 + name.len());
-        name_range = Range::new(name_start, name_end);
-
-        // Find version position (after the colon)
-        if let Some(version) = version_req {
-            let version_search = format!("\"{version}\"");
-            // Search for version only in the portion after the colon
-            let colon_offset =
-                name_start_idx + name_pattern.len() + (after_name.len() - trimmed.len());
-            let after_colon = &content[colon_offset..];
-
-            // Limit search to the next 100 chars to stay within this key-value pair, and
-            // never past the enclosing section's own end — otherwise a version search
-            // starting near a section boundary could bleed into the next section's text.
-            // Round down to a char boundary since `version.len()` is a byte count that
-            // can land mid-character when the source contains multi-byte UTF-8.
-            let search_limit = after_colon.floor_char_boundary(
-                after_colon
-                    .len()
-                    .min(100 + version.len())
-                    .min(range_end.saturating_sub(colon_offset)),
-            );
-            let search_area = &after_colon[..search_limit];
-
-            if let Some(ver_rel_idx) = search_area.find(&version_search) {
-                let version_start_idx = colon_offset + ver_rel_idx + 1;
-                let version_start = line_table.byte_offset_to_position(content, version_start_idx);
-                let version_end =
-                    line_table.byte_offset_to_position(content, version_start_idx + version.len());
-                version_range = Some(Range::new(version_start, version_end));
-            }
-        }
-
-        // Found valid dependency, stop searching
-        break;
-    }
-
-    (name_range, version_range)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use std::assert_matches;
+    use tower_lsp_server::ls_types::Range;
 
     fn test_uri() -> Uri {
         deps_core::test_util::test_uri("/test/package.json")
@@ -679,62 +600,6 @@ mod tests {
             coverage_pos.start.line, vitest_pos.start.line,
             "version positions should be on different lines"
         );
-    }
-
-    #[test]
-    fn test_find_dependency_positions_no_panic_on_multibyte_utf8_boundary() {
-        // The search window is `100 + version.len()` bytes after the colon. Placing a
-        // 2-byte UTF-8 character ('é') to straddle that exact byte offset used to panic
-        // when the raw offset was used to slice the string directly (issue #230).
-        let name = "pkg";
-        let version = "1.0.0".to_string();
-        let padding = "a".repeat(103);
-        let content = format!("\"{name}\":{padding}é more text \"{version}\" end");
-
-        let line_table = LineOffsetTable::new(&content);
-        let (name_range, version_range) = find_dependency_positions(
-            &content,
-            name,
-            Some(&version),
-            (0, content.len()),
-            &line_table,
-        );
-
-        assert_eq!(name_range.start.line, 0);
-        // The multibyte character falls right at the truncated search boundary, so the
-        // version string (placed after it) is outside the search window and not found.
-        assert!(version_range.is_none());
-    }
-
-    #[test]
-    fn test_find_dependency_positions_finds_version_when_multibyte_char_is_further_out() {
-        // Same truncation boundary as above, but this time the version sits well inside
-        // the truncated window while the 2-byte UTF-8 character ('é') straddles the exact
-        // raw byte offset (107) that used to be sliced naively. Confirms the fix does not
-        // just avoid panicking but still returns the correct, real match.
-        let name = "pkg";
-        let version = "1.0.0-x".to_string(); // 7 bytes -> raw window limit = 100 + 7 = 107
-        let quoted_version = format!("\"{version}\"");
-        let padding = "a".repeat(95);
-        let content = format!("\"{name}\": {quoted_version}{padding}é end");
-
-        let line_table = LineOffsetTable::new(&content);
-        let (name_range, version_range) = find_dependency_positions(
-            &content,
-            name,
-            Some(&version),
-            (0, content.len()),
-            &line_table,
-        );
-
-        assert_eq!(name_range.start.line, 0);
-        let version_range = version_range.expect("version should still be found after truncation");
-        assert_eq!(version_range.start.line, 0);
-
-        // Version content starts right after the opening quote; everything before it is
-        // ASCII, so byte offset and UTF-16 character offset coincide.
-        let expected_start = content.find(&quoted_version).unwrap() + 1;
-        assert_eq!(version_range.start.character, expected_start as u32);
     }
 
     // --- `.npmrc` registry resolution (spec FR-002–FR-008, FR-010) ---
@@ -1141,10 +1006,9 @@ mod tests {
 
     #[test]
     fn test_section_range_unaffected_by_unbalanced_brace_inside_version_string() {
-        // The section's own byte range is located by depth-scanning `{`/`}`, skipping string
-        // contents (`deps_core::parser::find_json_section_byte_range`). An unbalanced `{`
-        // inside a version string must
-        // not miscount that depth and truncate (or overextend) the section's own range.
+        // The AST (#613) parses strings as atomic tokens, so an unbalanced `{` inside a
+        // version string can never be miscounted as real object structure — this exercises
+        // that guarantee end-to-end through the public API.
         let json = r#"{
   "dependencies": {
     "weird": "pkg@file:../{unbalanced",
@@ -1195,8 +1059,9 @@ mod tests {
     #[test]
     fn test_section_key_nested_under_package_extensions_not_mistaken_for_top_level() {
         // impl-critic C1: pnpm's `packageExtensions` can declare a nested `dependencies`
-        // object before the manifest's real top-level `dependencies`. The nested key must
-        // not be mistaken for the section start — depth 1 is required.
+        // object before the manifest's real top-level `dependencies`. The AST (#613) only
+        // ever looks at the root object's own direct properties, so the nested key is never
+        // visible to the top-level section lookup at all.
         let json = r#"{
   "packageExtensions": {
     "some-pkg": {
@@ -1257,9 +1122,8 @@ mod tests {
 
     #[test]
     fn test_dependencies_section_not_matched_by_run_dependencies_script_key() {
-        // `deps_core::parser::find_json_section_byte_range` matches the exact quoted key
-        // `"dependencies"`; a script literally named "run-dependencies" must not be
-        // mistaken for the real section start.
+        // The AST's `find_last_prop` matches by exact property-name equality; a script
+        // literally named "run-dependencies" must not be mistaken for the real section key.
         let json = r#"{
   "scripts": {
     "run-dependencies": "some-cli-tool"
@@ -1281,5 +1145,90 @@ mod tests {
         ));
         assert_eq!(express.name_range.start.line, 5);
         assert!(express.version_range.is_some());
+    }
+
+    // --- #613: AST-based position recovery edge cases ---
+
+    /// A dependency's value can itself be a nested object containing a key with the same
+    /// name as a real top-level dependency in this section. A text-based scanner finds the
+    /// nested occurrence first; the AST only ever indexes a section's own *direct*
+    /// properties, so the real top-level occurrence's position is never stolen by one nested
+    /// inside a sibling's value.
+    #[test]
+    fn test_nested_object_value_with_colliding_key_resolves_to_top_level_position() {
+        let json = r#"{
+  "dependencies": {
+    "a-lib": {
+      "b-lib": "0.0.1"
+    },
+    "b-lib": "^2.0.0"
+  }
+}"#;
+
+        let result = parse_package_json(json, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 2);
+
+        let b_lib = result
+            .dependencies
+            .iter()
+            .find(|d| d.name == "b-lib")
+            .expect("b-lib");
+        assert_eq!(b_lib.version_req, Some("^2.0.0".into()));
+        // The real top-level "b-lib" is on line 5, not line 3 (nested inside "a-lib"'s value).
+        assert_eq!(b_lib.name_range.start.line, 5);
+        let version_range = b_lib.version_range.expect("b-lib version_range");
+        assert_eq!(version_range.start.line, 5);
+    }
+
+    /// JSON permits (if unusual) a duplicate top-level key; `serde_json::Map` keeps only the
+    /// *last* occurrence's value (last-key-wins during deserialization). The AST lookup must
+    /// resolve the identically-named "dependencies" key the same way — the last one — not the
+    /// first, or the surviving dependency's position silently defaults to `Range::default()`
+    /// whenever the two sections don't share every name.
+    #[test]
+    fn test_duplicate_top_level_section_key_resolves_to_last_occurrence() {
+        let json = r#"{
+  "dependencies": {
+    "only-in-first": "^1.0.0"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}"#;
+
+        let result = parse_package_json(json, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+
+        let express = &result.dependencies[0];
+        assert_eq!(express.name, "express");
+        assert_eq!(express.version_req, Some("^4.18.2".into()));
+        assert_ne!(express.name_range, Range::default());
+        assert_eq!(express.name_range.start.line, 5);
+        assert!(express.version_range.is_some());
+    }
+
+    /// M6(c): when the AST parse degrades (e.g. a future `jsonc-parser` disagreement with
+    /// `serde_json` on content this crate's own `parse_package_json` never actually produces
+    /// — see [`JsonAst::parse`]'s doc), `positions: None` must still yield a dependency entry
+    /// with a default, zero position rather than dropping it or panicking.
+    #[test]
+    fn test_parse_dependency_section_with_no_ast_positions_falls_back_to_default_range() {
+        let mut deps = serde_json::Map::new();
+        deps.insert("express".to_string(), Value::String("^4.18.2".into()));
+        let content = r#"{"dependencies": {"express": "^4.18.2"}}"#;
+        let line_table = LineOffsetTable::new(content);
+
+        let result = parse_dependency_section(
+            content,
+            &deps,
+            NpmDependencySection::Dependencies,
+            None,
+            &line_table,
+        );
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "express");
+        assert_eq!(result[0].name_range, Range::default());
+        assert!(result[0].version_range.is_none());
     }
 }
