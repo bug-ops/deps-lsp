@@ -11,7 +11,7 @@ tags:
   - deps-lsp
   - deps-core
 created: 2026-09-05
-status: draft
+status: ready
 related:
   - "[[constitution]]"
   - "[[002-osv-vulnerability-diagnostics/spec|OSV vulnerability diagnostics]]"
@@ -160,9 +160,9 @@ Use EARS notation. Prefix with FR-NNN.
 
 | ID | Requirement | Priority |
 |----|------------|----------|
-| FR-001 | WHEN an OSV record's advisory `id` has the `MAL-` prefix, OR any `affected[].database_specific.cwes[].cweId` on the record equals `CWE-506`, THE SYSTEM SHALL classify that advisory as confirmed-malicious rather than falling through to `VulnSeverity::Unknown` | must |
+| FR-001 | WHEN an OSV record's advisory `id` has the `MAL-` prefix THE SYSTEM SHALL classify that advisory as confirmed-malicious rather than falling through to `VulnSeverity::Unknown` (resolved: id-prefix detection only — no live-observed OSV record pairs `CWE-506` with a non-`MAL-` id, so the CWE check is dropped as unnecessary complexity per NFR-001) | must |
 | FR-002 | WHEN an advisory is classified as confirmed-malicious THE SYSTEM SHALL render a hover label distinct from `"unknown severity"` and distinct from every existing graded label (`critical`/`high`/`medium`/`low`) | must |
-| FR-003 | WHEN an advisory is classified as confirmed-malicious THE SYSTEM SHALL produce a diagnostic that is distinguishable from a `VulnSeverity::Unknown` diagnostic for an ordinary CVE — at minimum via message content; `[NEEDS CLARIFICATION: also via DiagnosticSeverity::ERROR instead of WARNING? see Open Questions]` | must |
+| FR-003 | WHEN an advisory is classified as confirmed-malicious THE SYSTEM SHALL produce a diagnostic that is distinguishable from a `VulnSeverity::Unknown` diagnostic for an ordinary CVE via message content and diagnostic code, while remaining at `DiagnosticSeverity::WARNING` (resolved: keeps the existing "ERROR means broken manifest" convention from `architecture.md` §6 intact) | must |
 | FR-004 | WHEN an OSV record has both a graded CVSS-style severity field AND is classified as confirmed-malicious (a record can in principle carry both) THE SYSTEM SHALL still surface the confirmed-malicious classification — a malicious-package finding must never be silently masked by an unrelated graded-severity value taking precedence | must |
 | FR-005 | WHEN `classify()`'s existing 3-tier severity fallback (`database_specific.severity` -> `ecosystem_specific.severity` -> `Unknown`) runs on a record that is NOT confirmed-malicious THE SYSTEM SHALL continue to behave exactly as today — this spec adds a new classification branch, it does not change existing graded-severity precedence | must |
 
@@ -178,19 +178,18 @@ Use EARS notation. Prefix with FR-NNN.
 
 | Entity | Description | Key Attributes |
 |--------|-------------|----------------|
-| `VulnSeverity` (existing, `crates/deps-core/src/osv/types.rs`, line ~70) | Severity bucket enum | Currently `Critical`, `High`, `Medium`, `Low`, `Unknown` — needs a new variant or an orthogonal flag for confirmed-malicious; `[NEEDS CLARIFICATION: see Open Questions — new enum variant vs. separate boolean/flag field on Advisory]` |
+| `VulnSeverity` (existing, `crates/deps-core/src/osv/types.rs`, line ~70) | Severity bucket enum | Currently `Critical`, `High`, `Medium`, `Low`, `Unknown` — resolved: add a new `Malicious` variant (forces every exhaustive `match` on `VulnSeverity` to be updated, consistent with this project's `EcosystemId` precedent) |
 | `Advisory` (existing, same file, line ~104) | Per-advisory data surfaced to hover/diagnostics | `id`, `summary`, `aliases`, `severity`, `cvss_vector`, `fixed_versions`, `url` — the classification signal (id prefix and/or CWE) must be read at construction time from the raw OSV record, since `Advisory` itself does not currently carry `cwes` |
-| *(new)* Malicious-package classification signal | Where the `MAL-`/`CWE-506` check reads from | Raw OSV record's `id` field (already available) and `affected[].database_specific.cwes[].cweId` (not currently parsed into any existing type — needs to be threaded through `classify()`'s call site, likely in `OsvVulnRecord::into_advisory` or equivalent construction path) |
+| *(new)* Malicious-package classification signal | Where the `MAL-` check reads from | Raw OSV record's `id` field (already available at `classify()`'s call site — no new field needs to be threaded through `OsvVulnRecord`/`Advisory`) |
 
 ## 6. Edge Cases and Error Handling
 
 | Scenario | Expected Behavior |
 |----------|-------------------|
-| Record has `MAL-` id prefix but also a graded `database_specific.severity` (hypothetical, not observed live) | Per FR-004, confirmed-malicious classification must still surface; exact interaction with the graded label is an open design question (see Open Questions) |
-| Record has `CWE-506` but a non-`MAL-` id (e.g. a CVE that happens to be tagged with the "Embedded Malicious Code" CWE without being sourced from the malicious-packages feed) | Still treated as confirmed-malicious per FR-001's OR condition — CWE-506 is itself a strong enough signal per OSV's documented usage; `[NEEDS CLARIFICATION: has this cross-tagging pattern actually been observed for any live OSV record, or is CWE-506-without-MAL-prefix a purely theoretical case that could be dropped from the detection OR entirely?]` |
-| Record has `MAL-` id prefix but the CWE data is entirely absent (matches the live `@ctrl/tinycolor` `MAL-2025-47141` case) | Still classified as confirmed-malicious — the id prefix alone is sufficient per FR-001's OR condition |
-| A dependency has both a confirmed-malicious advisory and one or more ordinary graded/unscored advisories | Each advisory keeps its own independent classification; the malicious one must not be diluted or hidden by unrelated advisories on the same dependency (relates to FR-003's diagnostic ordering question) |
-| `Capped` truncation (`ADVISORY_DISPLAY_CAP`) causes a confirmed-malicious advisory to fall outside the displayed slice | Out of scope for this spec (pre-existing truncation/ordering behavior) unless the ordering `[NEEDS CLARIFICATION]` below resolves to "sort malicious first" — if so, truncation must never drop a confirmed-malicious advisory in favor of a lower-priority one |
+| Record has `MAL-` id prefix but also a graded `database_specific.severity` (hypothetical, not observed live) | Per FR-004, confirmed-malicious classification (the new `VulnSeverity::Malicious` variant) still takes precedence and is surfaced — the id-prefix check runs before the existing 3-tier graded-severity fallback |
+| Record has `MAL-` id prefix but the CWE data is entirely absent (matches the live `@ctrl/tinycolor` `MAL-2025-47141` case) | Classified as confirmed-malicious — the id prefix alone is sufficient (resolved: no CWE-506 check, see FR-001) |
+| A dependency has both a confirmed-malicious advisory and one or more ordinary graded/unscored advisories | Each advisory keeps its own independent classification; the malicious one must not be diluted or hidden by unrelated advisories on the same dependency |
+| `Capped` truncation (`ADVISORY_DISPLAY_CAP`) causes a confirmed-malicious advisory to fall outside the displayed slice | Out of scope for this spec (resolved: no reordering — pre-existing truncation/ordering behavior is unchanged; a dedicated "sort malicious first" enhancement is deferred to a follow-up if truncation drops turn out to matter in practice) |
 
 ## 7. Success Criteria
 
@@ -222,15 +221,10 @@ Use EARS notation. Prefix with FR-NNN.
   reading or unit tests alone
 
 ### Ask First
-- Whether to add a new `VulnSeverity` variant vs. an orthogonal flag/field
-  (data model open question below) — this is a public API shape decision in
-  `deps-core::osv`
-- Whether to raise the diagnostic severity above `WARNING` for confirmed-
-  malicious findings, given `architecture.md` §6's stated rationale for
-  capping at `WARNING` is explicitly about *graded but uncertain*
-  vulnerabilities, not confirmed compromise (Open Questions below)
-- Whether diagnostic/advisory ordering should change to surface
-  confirmed-malicious findings first (Open Questions below)
+- All data-model and severity-handling design decisions were already made
+  with the user before implementation began — see §9 Resolved Decisions.
+  Any further deviation from those decisions (e.g. reconsidering the
+  `VulnSeverity::Malicious` variant shape) should be raised before proceeding.
 
 ### Never
 - Fold confirmed-malicious classification into the existing graded-severity
@@ -242,14 +236,16 @@ Use EARS notation. Prefix with FR-NNN.
 - File this as fixed without live-testing against a real `MAL-*` OSV record,
   per the project's Live Testing Principle
 
-## 9. Open Questions
+## 9. Resolved Decisions
 
-- [NEEDS CLARIFICATION: Should confirmed-malicious status be a new `VulnSeverity` variant (e.g. `VulnSeverity::Malicious`, sorted/handled as a case alongside `Critical`/`High`/etc. in every existing `match`), or an orthogonal boolean/flag field on `Advisory` (e.g. `is_malicious: bool`) that composes with the existing severity enum? A new enum variant forces every exhaustive `match` on `VulnSeverity` to be updated (compile-time safety, matching this project's `EcosystemId` precedent), but a record's malicious status and its graded severity are conceptually orthogonal axes, which a flag models more accurately if FR-004's both-signals-present case matters in practice.]
-- [NEEDS CLARIFICATION: Is `CWE-506` detection, `MAL-` id-prefix detection, or both OR'd together the more robust classifier? The live-verified `@ctrl/tinycolor` example only has the id prefix (no CWE data present at all) — is there a real observed OSV record where `CWE-506` appears without a `MAL-` prefix, justifying the OR, or is the id prefix alone sufficient and the CWE check unnecessary complexity?]
-- [NEEDS CLARIFICATION: Should confirmed-malicious diagnostics be raised above `DiagnosticSeverity::WARNING` (e.g. to `ERROR`), overriding the existing WARNING-cap rationale in `architecture.md` §6 (which reasons about graded-but-uncertain risk, not confirmed compromise) — or is a distinguishing message/code prefix at the existing WARNING level sufficient, keeping the "ERROR means broken manifest" convention intact?]
-- [NEEDS CLARIFICATION: Should this also affect diagnostic ordering/prioritization — e.g. sorting a dependency's confirmed-malicious advisory ahead of its other advisories within `push_vulnerability_diagnostics`, so a `Capped`-truncated advisory list (`ADVISORY_DISPLAY_CAP`) never silently drops a `MAL-*` finding in favor of a lower-priority graded CVE?]
-- [NEEDS CLARIFICATION: Should inlay hints and/or code lens also get a distinct malicious-package indicator (e.g. a warning icon inline at the dependency's version), beyond hover text and diagnostics, matching how prominently GitHub Dependabot and JetBrains Package Checker surface this category in their respective UIs? Or is hover + diagnostics sufficient for this spec's scope, with inlay-hint/code-lens treatment deferred to a follow-up?]
-- [NEEDS CLARIFICATION: Should a GitHub issue be filed for this finding (with `enhancement` + `P2` labels, referencing this spec) before implementation starts, per the project's continuous-improvement workflow? No issue currently exists — this spec was requested to be produced first.]
+All open questions were resolved with the user before implementation:
+
+- **Data model**: add a new `VulnSeverity::Malicious` variant (not an orthogonal flag). Forces every exhaustive `match` on `VulnSeverity` to be updated at compile time, consistent with this project's `EcosystemId` precedent.
+- **Detection signal**: `MAL-` id-prefix only. No live-observed OSV record pairs `CWE-506` with a non-`MAL-` id, so the CWE check is dropped as unnecessary complexity (NFR-001).
+- **Diagnostic severity**: stays `DiagnosticSeverity::WARNING`, distinguished via message content and diagnostic code — keeps the existing "ERROR means broken manifest" convention (`architecture.md` §6) intact.
+- **Ordering**: no change to advisory/diagnostic ordering or `ADVISORY_DISPLAY_CAP` truncation behavior in this spec — deferred to a follow-up if it turns out to matter in practice.
+- **Scope**: hover + diagnostics only, matching US-001/US-002. Inlay hints / code lens treatment is deferred to a follow-up.
+- **GitHub issue**: filed as #646 (`enhancement`, `P2`, `research`), referencing this spec.
 
 ## 10. See Also
 
