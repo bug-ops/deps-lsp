@@ -21,8 +21,12 @@ pub struct GitlabCiFormatter {
     /// §8.2): a `component:`'s heading link is suppressed, since its name ends in the
     /// component segment rather than the project path.
     pub(crate) routes: Arc<DashMap<String, GitlabRoute>>,
-    /// Shared handle to [`crate::registry::GitlabCiRegistry`]'s tag/SHA cross-reference.
-    pub(crate) tag_index: Arc<DashMap<PackageName, Arc<crate::registry::TagIndex>>>,
+    /// Shared handle to [`crate::registry::GitlabCiRegistry`]'s tag/SHA cross-reference,
+    /// keyed by `(EndpointKind, PackageName)` — not `PackageName` alone (validation finding
+    /// S2, see [`crate::types::IncludeKind::endpoint`]'s doc) — so an unrelated `project:`
+    /// and `component:` include can never share one entry even when their host-qualified
+    /// names collide textually.
+    pub(crate) tag_index: Arc<DashMap<(EndpointKind, PackageName), Arc<crate::registry::TagIndex>>>,
 }
 
 impl GitlabCiFormatter {
@@ -30,19 +34,80 @@ impl GitlabCiFormatter {
     #[must_use]
     pub fn new(
         routes: Arc<DashMap<String, GitlabRoute>>,
-        tag_index: Arc<DashMap<PackageName, Arc<crate::registry::TagIndex>>>,
+        tag_index: Arc<DashMap<(EndpointKind, PackageName), Arc<crate::registry::TagIndex>>>,
     ) -> Self {
         Self { routes, tag_index }
     }
 
-    /// Looks up `pin`'s commit SHA for `name` in the shared tag index, mirroring
-    /// `deps_github_actions::GithubActionsFormatter::sha_pin_replacement_for`'s lookup
-    /// shape (used by hover's `**Resolved**` splice, `crate::ecosystem`).
+    /// Looks up `pin`'s commit SHA for `name` under `endpoint` in the shared tag index,
+    /// mirroring `deps_github_actions::GithubActionsFormatter::sha_pin_replacement_for`'s
+    /// lookup shape (used by hover's `**Resolved**` splice, `crate::ecosystem`).
     #[must_use]
-    pub(crate) fn resolved_tag_for_sha(&self, name: &PackageName, sha: &str) -> Option<String> {
+    pub(crate) fn resolved_tag_for_sha(
+        &self,
+        endpoint: EndpointKind,
+        name: &PackageName,
+        sha: &str,
+    ) -> Option<String> {
         self.tag_index
-            .get(name)
+            .get(&(endpoint, name.clone()))
             .and_then(|index| index.sha_to_tag.get(sha).cloned())
+    }
+
+    /// Looks up `tag`'s commit SHA for `name` under `endpoint` in the shared tag index —
+    /// the reverse direction of `Self::resolved_tag_for_sha`, both read from the very
+    /// same [`crate::registry::TagIndex`] entry (issue #634: no second parallel cache).
+    /// Backs the "Pin to commit SHA" quickfix (`crate::ecosystem::build_sha_pin_action`).
+    ///
+    /// `endpoint` disambiguates a `project:` (Tags) include from a `component:` (Releases)
+    /// include whose host-qualified names happen to collide textually (validation finding
+    /// S2) — always <code>[GitlabCiDependency::kind].endpoint()</code> at call sites, never
+    /// guessed.
+    ///
+    /// Unlike `deps_github_actions`'s counterpart, the replacement is the bare SHA — no
+    /// `# {tag}` trailing comment: GitLab CI's `PinStyle::Sha` has no comment-tag
+    /// convention for a `ref:`/`component:` pin to preserve (`crate::types::PinStyle`),
+    /// so appending one would be new, unparsed-back behavior rather than mirroring an
+    /// existing one.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use dashmap::DashMap;
+    /// use deps_gitlab_ci::{EndpointKind, GitlabCiFormatter};
+    /// use deps_gitlab_ci::registry::TagIndex;
+    /// use deps_core::PackageName;
+    /// use std::sync::Arc;
+    ///
+    /// let tag_index = Arc::new(DashMap::new());
+    /// let mut index = TagIndex::default();
+    /// index.tag_to_sha.insert("v1.0.0".to_string(), "a".repeat(40));
+    /// tag_index.insert(
+    ///     (EndpointKind::Tags, PackageName::new("gitlab.com/org/proj")),
+    ///     Arc::new(index),
+    /// );
+    ///
+    /// let formatter = GitlabCiFormatter::new(Arc::new(DashMap::new()), tag_index);
+    /// // Miss: no entry for this tag.
+    /// assert_eq!(
+    ///     formatter.sha_pin_replacement_for(
+    ///         EndpointKind::Tags,
+    ///         &PackageName::new("gitlab.com/org/proj"),
+    ///         "v2.0.0",
+    ///     ),
+    ///     None
+    /// );
+    /// ```
+    #[must_use]
+    pub fn sha_pin_replacement_for(
+        &self,
+        endpoint: EndpointKind,
+        name: &PackageName,
+        tag: &str,
+    ) -> Option<String> {
+        self.tag_index
+            .get(&(endpoint, name.clone()))
+            .and_then(|index| index.tag_to_sha.get(tag).cloned())
     }
 }
 

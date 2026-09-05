@@ -52,3 +52,12 @@ pub use types::{
 /// `deps_github_actions::MUTABLE_REF_PIN_DIAGNOSTIC_CODE`'s precedent of a crate-local
 /// stable code for a crate-specific diagnostic.
 pub const UNRESOLVED_HOST_DIAGNOSTIC_CODE: &str = "unresolved-gitlab-host";
+
+/// Stable [`tower_lsp_server::ls_types::Diagnostic::code`] for the mutable-ref-pin
+/// diagnostic (issue #634).
+///
+/// Fired on a `project:`/`component:` include pinned to a mutable tag/branch instead of a
+/// commit SHA — mirrors `deps_github_actions::MUTABLE_REF_PIN_DIAGNOSTIC_CODE`'s pattern,
+/// kept as its own crate-local string (not reused verbatim) so the two crates' diagnostics
+/// stay independently identifiable.
+pub const MUTABLE_REF_PIN_DIAGNOSTIC_CODE: &str = "gitlab-ci-mutable-ref-pin";

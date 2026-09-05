@@ -14,6 +14,27 @@ pub enum IncludeKind {
     Component,
 }
 
+impl IncludeKind {
+    /// The [`EndpointKind`] an include of this kind always resolves against — the fixed,
+    /// 1:1 correspondence `crate::parser::build_project_dependency`/
+    /// `crate::parser::build_component_dependency` bake in at parse time.
+    ///
+    /// Used to key [`crate::registry::TagIndex`] lookups by `(EndpointKind, PackageName)`
+    /// rather than by `PackageName` alone (validation finding S2): a `component:`'s
+    /// host-qualified name can textually collide with an unrelated `project:` include's own
+    /// name (spec §3.1's documented residual collision is same-project only; this is the
+    /// cross-project case it does not cover), and without the endpoint in the key the two
+    /// would share one `TagIndex` entry, letting a quickfix resolve a SHA from the wrong
+    /// repository.
+    #[must_use]
+    pub const fn endpoint(self) -> EndpointKind {
+        match self {
+            Self::Project => EndpointKind::Tags,
+            Self::Component => EndpointKind::Releases,
+        }
+    }
+}
+
 /// Which GitLab REST endpoint a [`crate::registry::GitlabCiRegistry`] route resolves
 /// against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -301,5 +322,11 @@ mod tests {
     fn test_endpoint_kind_as_str() {
         assert_eq!(EndpointKind::Tags.as_str(), "tags");
         assert_eq!(EndpointKind::Releases.as_str(), "releases");
+    }
+
+    #[test]
+    fn test_include_kind_endpoint() {
+        assert_eq!(IncludeKind::Project.endpoint(), EndpointKind::Tags);
+        assert_eq!(IncludeKind::Component.endpoint(), EndpointKind::Releases);
     }
 }

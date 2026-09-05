@@ -111,7 +111,7 @@ impl Default for InlayHintsConfig {
 /// - `yanked_severity`: `WARNING` - Dependencies using yanked versions
 /// - `unsatisfiable_severity`: `WARNING` - Dependencies whose requirement matches zero published versions
 /// - `deprecated_severity`: `WARNING` - Dependencies on a package the registry reports as deprecated/abandoned
-/// - `mutable_ref_pin_severity`: `HINT` - GitHub Actions `uses:` steps pinned to a mutable ref (tag) instead of a commit SHA
+/// - `mutable_ref_pin_severity`: `HINT` - Dependencies pinned to a mutable ref (tag/branch) instead of a commit SHA (GitHub Actions `uses:` steps, GitLab CI `project:`/`component:` includes)
 /// - `mutable_ref_pin_enabled`: `true` - Whether the mutable-ref-pin diagnostic runs at all
 ///
 /// # Examples
@@ -151,12 +151,14 @@ pub struct DiagnosticsConfig {
     /// call. Matches the severity-only precedent set by the four fields above.
     #[serde(default = "default_deprecated_severity")]
     pub deprecated_severity: DiagnosticSeverity,
-    /// Severity for a GitHub Actions `uses:` step pinned to a mutable ref (a tag)
-    /// instead of a full commit SHA (issue #473). Tunes loudness only; see
+    /// Severity for a dependency pinned to a mutable ref (a tag/branch) instead of a
+    /// full commit SHA — a GitHub Actions `uses:` step (issue #473) or a GitLab CI
+    /// `project:`/`component:` include (issue #634). Tunes loudness only; see
     /// `mutable_ref_pin_enabled` for the on/off toggle.
     #[serde(default = "default_mutable_ref_pin_severity")]
     pub mutable_ref_pin_severity: DiagnosticSeverity,
-    /// Whether the mutable-ref-pin diagnostic (issue #473) runs at all. Default
+    /// Whether the mutable-ref-pin diagnostic (issue #473, extended to GitLab CI by
+    /// issue #634) runs at all. Default
     /// `true`. **Corrected during implementation review (spec 031 FR-009)**: unlike
     /// `deprecated_severity`, this diagnostic *does* need a real `_enabled` toggle —
     /// `DiagnosticSeverity` has no suppression value, and severity is never treated
