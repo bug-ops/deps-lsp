@@ -388,6 +388,7 @@ mod tests {
             section: crate::types::NpmDependencySection::Dependencies,
             source,
             catalog: None,
+            package: None,
         }
     }
 
@@ -860,6 +861,53 @@ mod tests {
             .await;
 
         assert!(actions.is_empty());
+    }
+
+    /// Critique M3: code actions/lens are deliberately suppressed for an `npm:`-aliased
+    /// dependency, not just untested. `version_range` still spans the whole literal
+    /// (`"npm:react@^17.0.0"`), but `version_requirement()` is only the real range
+    /// (`"^17.0.0"`) — `literal_span_matches` (`deps-core`'s shared code-action guard)
+    /// compares the two, sees a mismatch, and refuses to build a fix/refactor edit. This is
+    /// the safe outcome: a naive edit would write `"my-react": "18.2.0"`, destroying the
+    /// alias. Pinning this here so a future change to `version_literal()`/`version_range`
+    /// doesn't silently re-enable a destructive edit (see `NpmDependency`'s doc and
+    /// `deps_core::lsp_helpers::code_actions::generate_code_actions`'s guard).
+    #[tokio::test]
+    async fn test_generate_code_actions_suppressed_for_npm_alias() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = NpmEcosystem::new(cache);
+        let uri = deps_core::test_util::test_uri("/test/package.json");
+
+        let content = r#"{
+  "dependencies": {
+    "my-react": "npm:react@^17.0.0"
+  }
+}"#;
+        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            pkg("react"),
+            deps_core::lsp_helpers::PackageVersions::latest_only("18.2.0"),
+        );
+        let resolved_versions = HashMap::new();
+
+        // Inside the version literal's text on its line.
+        let position = Position::new(2, 20);
+        let actions = ecosystem
+            .generate_code_actions(
+                parse_result.as_ref(),
+                position,
+                &uri,
+                VersionData::new(&cached_versions, &resolved_versions),
+                content,
+            )
+            .await;
+
+        assert!(
+            actions.is_empty(),
+            "expected no fix/refactor action for an npm: alias, got {actions:?}"
+        );
     }
 
     #[tokio::test]

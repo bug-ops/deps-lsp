@@ -172,7 +172,11 @@ pub fn parse_package_json_with_context(
         .unwrap_or_default();
 
     for dep in &mut dependencies {
-        dep.source = npm_config.resolve_source_for(&dep.name);
+        // Route by the real registry package name, not the manifest alias (issue #654 S2):
+        // a `.npmrc` scope entry (`@myorg:registry=...`) matches the package actually being
+        // installed, and routing by the alias instead can send a private scoped package's
+        // name to the public registry, or a public package to a private feed.
+        dep.source = npm_config.resolve_source_for(deps_core::Dependency::name(dep));
     }
 
     // Spec 046 FR-001/NFR-002: cheap fast-path — a non-pnpm manifest pays one string check per
@@ -217,6 +221,11 @@ fn parse_dependency_section(
             .and_then(|s| s.position(name, content, line_table))
             .unwrap_or_default();
 
+        let (package, version_req) = match parse_npm_alias(version_req) {
+            Some(alias) => (Some(alias.package.into()), alias.version_req),
+            None => (None, version_req.to_string()),
+        };
+
         result.push(NpmDependency {
             name: name.into(),
             name_range,
@@ -232,10 +241,110 @@ fn parse_dependency_section(
             // `catalog:` gate fires; `None` here is correct for both a non-pnpm manifest and
             // for this function's own unit tests.
             catalog: None,
+            package,
         });
     }
 
     result
+}
+
+/// The real registry package name and version requirement parsed out of an `npm:` alias value.
+struct NpmAlias {
+    package: String,
+    version_req: String,
+}
+
+/// Parses an `npm:` alias specifier (issue #654): npm/pnpm/yarn let a manifest install a
+/// dependency under a different registry name than its JSON key
+/// (`"my-react": "npm:react@^18.0.0"`) — the key becomes a local import alias, and the value
+/// names the real package to resolve against the registry, with everything after the package
+/// name's own trailing `@` as its version requirement.
+///
+/// Returns `None` when `value` (after trimming surrounding whitespace — `npm`'s own
+/// `npm-package-arg` parser tolerates it, so a manifest author accidentally adding it should
+/// not silently disable the alias) doesn't start with `npm:`, when the parsed package name
+/// is empty (e.g. `"npm:"`, `"npm:@"`, `"npm:@/pkg"`, `"npm:@scope/"`), or for the
+/// pnpm-catalog combination form (`npm:<pkg>@catalog:<name>`, deliberately unhandled — see
+/// below) — the caller then falls back to the original literal value, matching
+/// pre-alias-support behavior.
+///
+/// The name/version boundary is [`deps_core::package::npm_style_name_boundary`] — shared
+/// with `deps-deno`'s `npm:`/`jsr:` specifier grammar so a scoped real package name
+/// (`@scope/pkg`) is bounded identically in both crates (issue #654 S3) rather than
+/// reimplemented here more loosely. A trailing `/` right after the name (that helper's
+/// subpath-boundary behavior, meaningful for Deno's own `npm:` import specifiers) has no
+/// equivalent in a `package.json` dependency value, so it is treated as malformed here, not
+/// silently truncated.
+///
+/// A dist-tag alias (`"npm:react@beta"`, `"npm:foo@latest"`) is legal npm syntax but not a
+/// semver range `NpmFormatter::compile_requirement`'s `node_semver::Range` can parse, which
+/// would otherwise silently match no version at all — treated the same as the
+/// missing-version case below.
+///
+/// The pnpm-catalog combination form is left to the caller's literal-value fallback rather
+/// than resolved here: `catalog.rs`'s `apply` looks up the catalog map by
+/// [`crate::types::NpmDependency::name`] (the JSON key/alias), not the real package this
+/// function would extract, so resolving the alias here would feed the catalog lookup the
+/// wrong key — see `catalog.rs`'s "Known limitations" doc, which this leaves unchanged.
+fn parse_npm_alias(value: &str) -> Option<NpmAlias> {
+    let rest = value.trim().strip_prefix("npm:")?;
+
+    let Some(name_len) = deps_core::package::npm_style_name_boundary(rest) else {
+        tracing::debug!(
+            value,
+            "npm: alias has a malformed package name, using literal value"
+        );
+        return None;
+    };
+    let package = rest[..name_len].trim();
+    if package.is_empty() {
+        tracing::debug!(
+            value,
+            "npm: alias has an empty package name, using literal value"
+        );
+        return None;
+    }
+
+    let after_name = &rest[name_len..];
+    let version_req = match after_name.strip_prefix('@') {
+        Some(v) => v.trim(),
+        // Empty: no version at all (`"npm:react"`). Anything else starts with `/` — Deno's
+        // subpath syntax, not valid here (see this function's doc) — reject rather than
+        // truncate.
+        None if after_name.is_empty() => "",
+        None => {
+            tracing::debug!(
+                value,
+                "npm: alias has a subpath after the package name, using literal value"
+            );
+            return None;
+        }
+    };
+
+    if version_req.starts_with("catalog:") {
+        tracing::debug!(
+            value,
+            "npm: alias is the pnpm-catalog combination form, deferring to catalog.rs"
+        );
+        return None;
+    }
+
+    // No version requirement at all, an empty one (`"npm:react@"`), or one that isn't a
+    // semver range `node_semver::Range` accepts (a dist-tag like `"beta"`/`"latest"`) is a
+    // valid, if unusual, alias: treat it as an existence wildcard rather than fabricating an
+    // invalid semver range or dropping the dependency outright — mirrors the `"*"`
+    // existence-wildcard convention `deps_core::registry::is_existence_wildcard` already
+    // recognizes for every ecosystem's version resolution.
+    let version_req = if version_req.is_empty() || node_semver::Range::parse(version_req).is_err() {
+        "*"
+    } else {
+        version_req
+    };
+
+    Some(NpmAlias {
+        package: package.to_string(),
+        version_req: version_req.to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -563,6 +672,141 @@ mod tests {
         assert!(result.dependencies[0].version_range.is_some());
     }
 
+    /// Issue #654: `"npm:<pkg>@<range>"` resolves the real registry package name while the
+    /// JSON key stays the position anchor.
+    #[test]
+    fn test_parse_npm_alias_resolves_real_package_name() {
+        let json = r#"{
+  "dependencies": {
+    "my-react": "npm:react@^18.0.0"
+  }
+}"#;
+
+        let result = parse_package_json(json, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+
+        let dep = &result.dependencies[0];
+        assert_eq!(dep.name, "my-react");
+        assert_eq!(dep.package, Some("react".into()));
+        assert_eq!(
+            deps_core::Dependency::name(dep).as_str(),
+            "react",
+            "registry lookups must use the real package name"
+        );
+        assert_eq!(dep.version_req, Some("^18.0.0".into()));
+    }
+
+    /// Issue #654: a scoped real package name (`@scope/pkg`) must not be split on its own
+    /// leading `@` when locating the name/version boundary.
+    #[test]
+    fn test_parse_npm_alias_resolves_scoped_real_package_name() {
+        let json = r#"{
+  "dependencies": {
+    "my-pkg": "npm:@scope/pkg@^1.0.0"
+  }
+}"#;
+
+        let result = parse_package_json(json, &test_uri()).unwrap();
+        let dep = &result.dependencies[0];
+        assert_eq!(dep.name, "my-pkg");
+        assert_eq!(dep.package, Some("@scope/pkg".into()));
+        assert_eq!(dep.version_req, Some("^1.0.0".into()));
+    }
+
+    /// Issue #654: no version at all after the real package name falls back to the
+    /// existence-wildcard `"*"` rather than an invalid semver range.
+    #[test]
+    fn test_parse_npm_alias_without_version_falls_back_to_wildcard() {
+        let json = r#"{
+  "dependencies": {
+    "my-react": "npm:react"
+  }
+}"#;
+
+        let result = parse_package_json(json, &test_uri()).unwrap();
+        let dep = &result.dependencies[0];
+        assert_eq!(dep.package, Some("react".into()));
+        assert_eq!(dep.version_req, Some("*".into()));
+    }
+
+    /// Issue #654: the pnpm-catalog combination form (`npm:<pkg>@catalog:<name>`) is left as
+    /// the original literal value — resolving the alias here would feed `catalog::apply`'s
+    /// name-keyed lookup the wrong key (see `catalog.rs`'s `apply` doc).
+    #[test]
+    fn test_parse_npm_alias_catalog_combination_form_left_unresolved() {
+        let json = r#"{
+  "dependencies": {
+    "my-pkg": "npm:lodash@catalog:utils"
+  }
+}"#;
+
+        let result = parse_package_json(json, &test_uri()).unwrap();
+        let dep = &result.dependencies[0];
+        assert_eq!(dep.package, None);
+        assert_eq!(dep.version_req, Some("npm:lodash@catalog:utils".into()));
+    }
+
+    /// Critique M1: a lone `"npm:@"` (empty scope, no `/pkg`) must be rejected like `"npm:"`
+    /// is, not parsed as a real package literally named `"@"`.
+    #[test]
+    fn test_parse_npm_alias_lone_at_sign_is_rejected() {
+        let json = r#"{"dependencies": {"my-pkg": "npm:@"}}"#;
+        let result = parse_package_json(json, &test_uri()).unwrap();
+        let dep = &result.dependencies[0];
+        assert_eq!(dep.package, None);
+        assert_eq!(dep.version_req, Some("npm:@".into()));
+    }
+
+    /// Critique S3: an empty scope (`"npm:@/pkg@^1"`) or empty package segment
+    /// (`"npm:@scope/@1.0"`) must be rejected, matching `deps-deno`'s stricter grammar for
+    /// the same `@scope/pkg` shape.
+    #[test]
+    fn test_parse_npm_alias_malformed_scope_is_rejected() {
+        for value in ["npm:@/pkg@^1", "npm:@scope/@1.0"] {
+            let json = format!(r#"{{"dependencies": {{"my-pkg": "{value}"}}}}"#);
+            let result = parse_package_json(&json, &test_uri()).unwrap();
+            let dep = &result.dependencies[0];
+            assert_eq!(dep.package, None, "{value} should not resolve a package");
+            assert_eq!(dep.version_req, Some(value.into()));
+        }
+    }
+
+    /// Critique M1b/M6: whitespace around the `npm:` prefix, the real package name, or the
+    /// version must not silently produce a garbage package/version.
+    #[test]
+    fn test_parse_npm_alias_trims_whitespace() {
+        let json = r#"{
+  "dependencies": {
+    "leading-space-before-prefix": " npm:react@^18.0.0",
+    "space-after-colon": "npm: react@^18.0.0",
+    "space-before-version-at": "npm:react @^18.0.0"
+  }
+}"#;
+
+        let result = parse_package_json(json, &test_uri()).unwrap();
+        for dep in &result.dependencies {
+            assert_eq!(dep.package, Some("react".into()), "{}", dep.name);
+            assert_eq!(dep.version_req, Some("^18.0.0".into()), "{}", dep.name);
+        }
+    }
+
+    /// Critique M2: a dist-tag alias (`"npm:react@beta"`) is legal npm syntax but not a
+    /// `node_semver::Range` — it must fall back to the existence wildcard rather than
+    /// silently matching no version.
+    #[test]
+    fn test_parse_npm_alias_dist_tag_falls_back_to_wildcard() {
+        let json = r#"{
+  "dependencies": {
+    "my-react": "npm:react@beta"
+  }
+}"#;
+
+        let result = parse_package_json(json, &test_uri()).unwrap();
+        let dep = &result.dependencies[0];
+        assert_eq!(dep.package, Some("react".into()));
+        assert_eq!(dep.version_req, Some("*".into()));
+    }
+
     #[test]
     fn test_package_name_in_scripts_not_confused() {
         // Regression test: "vitest" appears in scripts as a value,
@@ -695,6 +939,37 @@ mod tests {
         );
 
         assert_eq!(result.resolved_registries.len(), 2);
+    }
+
+    /// Critique S2: `.npmrc` scoped-registry routing must key off the real registry package
+    /// name, not the manifest alias — otherwise a private scoped package aliased to an
+    /// unscoped local key gets routed to (and queried against) the *public* registry,
+    /// disclosing the private name.
+    #[test]
+    fn test_parse_with_context_npm_alias_routes_by_real_package_name() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join(".npmrc"),
+            "@myorg:registry=https://npm.pkg.github.com\n",
+        )
+        .unwrap();
+        let manifest_path = root.path().join("package.json");
+        let uri = Uri::from_file_path(&manifest_path).unwrap();
+
+        let json = r#"{"dependencies": {"my-lib": "npm:@myorg/internal@^1.0.0"}}"#;
+        let result = parse_package_json_with_context(json, &uri, &all_policy()).unwrap();
+
+        let dep = &result.dependencies[0];
+        assert_eq!(dep.name, "my-lib");
+        assert_eq!(dep.package, Some("@myorg/internal".into()));
+        assert_eq!(
+            dep.source,
+            deps_core::parser::DependencySource::AlternateRegistry {
+                index: "https://npm.pkg.github.com".to_string(),
+                mirrors_crates_io: false,
+            },
+            "routing must follow the real package's scope, not the unscoped alias key"
+        );
     }
 
     /// FR-006/US-004/SC-004: the npm form of issue #248 — a misconfigured `@scope:registry=`

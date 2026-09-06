@@ -513,6 +513,7 @@ mod tests {
                 section: NpmDependencySection::Dependencies,
                 source: deps_core::parser::DependencySource::Registry,
                 catalog: None,
+                package: None,
             };
             assert!(
                 !formatter.yanked_diagnostic_applies_to(&dep, &VersionReq::new(requirement)),

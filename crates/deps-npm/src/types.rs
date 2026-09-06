@@ -22,6 +22,7 @@ use crate::catalog::CatalogOrigin;
 ///     section: NpmDependencySection::Dependencies,
 ///     source: deps_core::parser::DependencySource::Registry,
 ///     catalog: None,
+///     package: None,
 /// };
 ///
 /// assert_eq!(dep.name, "express");
@@ -29,6 +30,9 @@ use crate::catalog::CatalogOrigin;
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NpmDependency {
+    /// The JSON key: the local import alias when [`Self::package`] is set (via an `npm:`
+    /// alias value), otherwise the actual registry package name. Always the position anchor
+    /// for [`Self::name_range`], regardless of aliasing.
     pub name: deps_core::PackageName,
     pub name_range: Range,
     pub version_req: Option<deps_core::VersionReq>,
@@ -41,6 +45,19 @@ pub struct NpmDependency {
     /// `catalog:`/`catalog:<name>` specifier (spec `046-pnpm-catalogs`); `None` for every
     /// ordinary literal-range dependency.
     pub catalog: Option<CatalogOrigin>,
+    /// The real registry package name from an
+    /// [`npm:` alias value](https://docs.npmjs.com/cli/v10/configuring-npm/package-json#dependencies)
+    /// (`"my-react": "npm:react@^18.0.0"`), when present. `None` for an ordinary, non-aliased
+    /// dependency, in which case [`Self::name`] is both the local alias and the registry name.
+    ///
+    /// When `Some`, [`Self::version_range`] still spans the *whole* `npm:pkg@range` literal
+    /// (unsplit) while `version_requirement()` (`deps_core::Dependency`'s trait method)
+    /// returns only the real range (`"^18.0.0"`) — this mismatch is deliberate: it makes
+    /// `deps_core::lsp_helpers`'s
+    /// shared `literal_span_matches` code-action guard fail closed, suppressing every
+    /// fix/refactor edit for an aliased dependency rather than writing a version literal
+    /// over the whole alias text and destroying it.
+    pub package: Option<deps_core::PackageName>,
 }
 
 // Implemented by hand rather than via `deps_core::impl_dependency!`: the macro's `source:
@@ -50,8 +67,10 @@ pub struct NpmDependency {
 // `self.source.clone()` cannot be passed through the macro at all. Mirrors `deps-cargo`'s
 // identical direct `impl deps_core::Dependency for ParsedDependency`.
 impl deps_core::Dependency for NpmDependency {
+    /// Returns the registry lookup name: [`Self::package`] when this dependency was
+    /// aliased via an `npm:` value, otherwise the JSON key.
     fn name(&self) -> &deps_core::PackageName {
-        &self.name
+        self.package.as_ref().unwrap_or(&self.name)
     }
 
     fn name_range(&self) -> Range {
@@ -211,6 +230,7 @@ mod tests {
             section: NpmDependencySection::Dependencies,
             source: deps_core::parser::DependencySource::Registry,
             catalog: None,
+            package: None,
         };
 
         assert_eq!(dep.name, "react");

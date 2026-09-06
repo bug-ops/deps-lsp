@@ -83,6 +83,13 @@ struct PackageLockJson {
 /// Individual package entry in the "packages" object.
 #[derive(Debug, Deserialize)]
 struct PackageEntry {
+    /// The package's own name, present when it differs from the lockfile key's physical
+    /// install-path basename — npm writes this whenever a dependency is installed under an
+    /// `npm:` alias (issue #654), so `node_modules/my-react` carries `"name": "react"`. `None`
+    /// for the common case where the two already agree; [`extract_package_name`] is the
+    /// fallback then.
+    name: Option<String>,
+
     /// Package version
     version: Option<String>,
 
@@ -129,8 +136,14 @@ impl LockFileProvider for NpmLockParser {
                     continue;
                 }
 
-                // Extract package name from key (e.g., "node_modules/express" -> "express")
-                let name = extract_package_name(&key);
+                // Prefer the entry's own `name` (npm writes this when it differs from the
+                // physical install path — always the case for an `npm:` alias, issue #654)
+                // over the key-derived basename, so an aliased dependency's lock-file entry
+                // groups under its real registry name, matching `Dependency::name()`.
+                let name = entry
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| extract_package_name(&key).to_string());
 
                 // Version is required for actual dependencies
                 let Some(ref version) = entry.version else {
@@ -145,7 +158,7 @@ impl LockFileProvider for NpmLockParser {
                 let dependencies: Vec<String> = entry.dependencies.keys().cloned().collect();
 
                 packages.insert(ResolvedPackage {
-                    name: name.to_string(),
+                    name,
                     version: version.clone(),
                     source,
                     dependencies,
@@ -287,6 +300,7 @@ mod tests {
     #[test]
     fn test_parse_npm_source_registry() {
         let entry = PackageEntry {
+            name: None,
             version: Some("4.18.2".into()),
             resolved: Some("https://registry.npmjs.org/express/-/express-4.18.2.tgz".into()),
             integrity: Some("sha512-abc123".into()),
@@ -311,6 +325,7 @@ mod tests {
     #[test]
     fn test_parse_npm_source_link() {
         let entry = PackageEntry {
+            name: None,
             version: Some("1.0.0".into()),
             resolved: None,
             integrity: None,
@@ -409,6 +424,48 @@ mod tests {
         let express_pkg = resolved.get("express").unwrap();
         assert_eq!(express_pkg.dependencies.len(), 1);
         assert_eq!(express_pkg.dependencies[0], "body-parser");
+    }
+
+    /// Issue #654 S1: an `npm:` alias installs under `node_modules/<alias>`, but npm records
+    /// the real package name in the entry's own `"name"` field — that must win over the
+    /// key-derived alias basename, so `Dependency::name()` (the real name) finds this entry.
+    #[tokio::test]
+    async fn test_parse_package_lock_with_npm_alias_resolves_real_name() {
+        let lockfile_content = r#"{
+  "name": "my-project",
+  "lockfileVersion": 3,
+  "packages": {
+    "": {
+      "name": "my-project",
+      "dependencies": {
+        "my-react": "npm:react@^18.0.0"
+      }
+    },
+    "node_modules/my-react": {
+      "name": "react",
+      "version": "18.2.0",
+      "resolved": "https://registry.npmjs.org/react/-/react-18.2.0.tgz",
+      "integrity": "sha512-abc123"
+    }
+  }
+}"#;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lockfile_path = temp_dir.path().join("package-lock.json");
+        tokio::fs::write(&lockfile_path, lockfile_content)
+            .await
+            .unwrap();
+
+        let parser = NpmLockParser;
+        let resolved = parser.parse_lockfile(&lockfile_path).await.unwrap();
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved.get_version("react"), Some("18.2.0"));
+        assert_eq!(
+            resolved.get_version("my-react"),
+            None,
+            "the alias key must not shadow the real package name"
+        );
     }
 
     #[tokio::test]
