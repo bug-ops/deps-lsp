@@ -173,26 +173,9 @@ pub fn parse_specifier(value: &str) -> Option<ParsedSpecifier> {
     let (scheme, rest) = split_scheme(value)?;
     let prefix_len = value.len() - rest.len();
 
-    let name_end_in_rest = if let Some(after_at) = rest.strip_prefix('@') {
-        // Scoped: exactly two segments, "@scope/pkg".
-        let slash_rel = after_at.find('/')?;
-        if slash_rel == 0 {
-            return None; // empty scope, e.g. "jsr:@/pkg"
-        }
-        let after_slash = &after_at[slash_rel + 1..];
-        let pkg_end_rel = after_slash.find(['@', '/']).unwrap_or(after_slash.len());
-        if pkg_end_rel == 0 {
-            return None; // empty pkg name, e.g. "jsr:@std/"
-        }
-        1 + slash_rel + 1 + pkg_end_rel
-    } else {
-        // Unscoped: exactly one segment.
-        rest.find(['@', '/']).unwrap_or(rest.len())
-    };
-
-    if name_end_in_rest == 0 {
-        return None;
-    }
+    // Scope-aware name/version(/subpath) boundary, shared with `deps-npm`'s `npm:` alias
+    // parsing (issue #654 S3) — see that function's doc for why this lives in `deps-core`.
+    let name_end_in_rest = deps_core::package::npm_style_name_boundary(rest)?;
 
     let name_range = 0..prefix_len + name_end_in_rest;
     let name = value[name_range.clone()].to_string();

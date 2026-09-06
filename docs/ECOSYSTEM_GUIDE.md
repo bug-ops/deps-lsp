@@ -172,6 +172,31 @@ setting's own doc above.
   standard `.npmrc` present in the workspace is still honored either way.
   pnpm's own `pnpm-workspace.yaml` catalog extension *is* read — see below.
 
+### npm `npm:` Alias Resolution
+
+npm/pnpm/yarn let a `package.json` dependency install under a different local
+import name than its registry package, via the `npm:` protocol prefix:
+`"my-react": "npm:react@^18.0.0"` — `my-react` is the local key, `react` is the
+real package to resolve, `^18.0.0` is its version requirement. Hover,
+completion, diagnostics, code lens, inlay hints, `.npmrc` scoped-registry
+routing, and OSV vulnerability lookups all resolve against the real package
+name (`react`), while the local alias key stays the position anchor for
+hover/diagnostic ranges in the editor (resolves #654). A scoped real package
+name (`"my-pkg": "npm:@scope/pkg@^1.0.0"`) is supported the same way. A
+dist-tag alias (`"npm:react@beta"`) or one with no version at all
+(`"npm:react"`) resolves as an existence check (equivalent to a bare `"*"`
+requirement) rather than a specific version comparison.
+
+**Code actions/lens are not offered** for an `npm:`-aliased dependency: the
+manifest text at the version position is the whole `npm:pkg@range` literal,
+not just the range, so an automated rewrite would need to preserve the alias
+prefix — not yet implemented. This is a deliberate, safe degradation (no
+version data is lost, only the one-click fix), not a bug.
+
+**Known limitation**: the pnpm-catalog combination form
+(`npm:<pkg>@catalog:<name>`) is not detected — see the pnpm Catalogs section
+below.
+
 ### npm pnpm Catalogs
 
 A `package.json` dependency declared as `"catalog:"` (the default catalog) or
@@ -213,7 +238,10 @@ never per-key-merges the two sections.
   `deps-npm` lockfile support for it yet — see the lock-file column above);
   this is a pre-existing gap shared with every other npm dependency in a pnpm
   workspace, not specific to catalogs.
-- The `npm:<pkg>@catalog:<name>` alias form is not detected.
+- The `npm:<pkg>@catalog:<name>` combination form (an `npm:` alias whose
+  version is itself a catalog reference) is not detected — the base `npm:`
+  alias form (no catalog combination) *is* resolved, see the npm `npm:` Alias
+  Resolution section above.
 - A catalog entry whose value isn't a scalar string (e.g. a nested mapping)
   gets its own distinct "not a version string" message rather than being
   validated against pnpm's own schema further.

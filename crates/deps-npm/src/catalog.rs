@@ -538,9 +538,15 @@ pub fn load(
 /// `version_req` for a resolved one), including when `config` is `None`. See the module's
 /// totality invariant.
 ///
-/// Deliberately does not detect the npm-alias form `"npm:<pkg>@catalog:<name>"` — no user
-/// story covers it and it is not a regression (today's pre-feature behavior is identical); see
-/// `docs/ECOSYSTEM_GUIDE.md`'s pnpm Catalogs "Known limitations".
+/// The base `npm:<pkg>@<version>` alias form (issue #654) is resolved earlier, by
+/// `parser::parse_npm_alias`, before `apply` ever sees the dependency. Deliberately still does
+/// not detect the pnpm-catalog *combination* form `"npm:<pkg>@catalog:<name>"`, though:
+/// `parse_npm_alias` itself declines to resolve it (see that function's doc) precisely so it
+/// reaches `apply` as the original, unaliased literal value — and `CatalogSpecifier::parse`
+/// above only matches a bare `catalog:` prefix, so this combination form still falls through
+/// unresolved here too. No user story covers it and it is not a regression (today's
+/// pre-feature behavior is identical); see `docs/ECOSYSTEM_GUIDE.md`'s pnpm Catalogs "Known
+/// limitations".
 pub fn apply(deps: &mut [NpmDependency], config: Option<&PnpmWorkspaceConfig>) {
     for dep in deps {
         let Some(raw) = dep.version_req.as_ref().map(deps_core::VersionReq::as_str) else {
@@ -585,6 +591,7 @@ mod tests {
             section: NpmDependencySection::Dependencies,
             source: deps_core::parser::DependencySource::Registry,
             catalog: None,
+            package: None,
         }
     }
 

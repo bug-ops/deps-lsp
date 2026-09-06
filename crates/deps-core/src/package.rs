@@ -390,6 +390,53 @@ impl PartialEq<&str> for ConcreteVersion {
     }
 }
 
+/// Length, in bytes, of an `@scope/pkg` or unscoped `pkg` name at the start of `rest`.
+///
+/// Follows the scoped-package grammar shared by npm-style ecosystems: the name runs up to
+/// (but excludes) the first `@` or `/` after it, without mistaking a scoped name's own
+/// leading `@` or inner `/` for that boundary.
+///
+/// Shared by `deps-npm`'s `npm:` alias parsing (issue #654) and `deps-deno`'s
+/// `jsr:`/`npm:` specifier grammar (`deps_deno::specifier::parse_specifier`) — both need
+/// the identical scope-aware boundary, and a per-crate reimplementation had drifted looser
+/// than this one (accepting `"@/pkg"`, `"@scope/"`, and a lone `"@"` as valid names).
+///
+/// Returns `None` for a malformed scoped name (empty scope `"@/pkg"`, missing `/` `"@std"`,
+/// or an empty package segment `"@std/"`) or an empty unscoped name (`rest` is empty, or
+/// starts with `@`/`/`).
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::package::npm_style_name_boundary;
+///
+/// assert_eq!(npm_style_name_boundary("react@^18.0.0"), Some(5));
+/// assert_eq!(npm_style_name_boundary("@scope/pkg@^1.0.0"), Some(10));
+/// assert_eq!(npm_style_name_boundary("@scope/pkg"), Some(10));
+/// assert_eq!(npm_style_name_boundary("@/pkg"), None);
+/// assert_eq!(npm_style_name_boundary("@scope/"), None);
+/// assert_eq!(npm_style_name_boundary("@"), None);
+/// assert_eq!(npm_style_name_boundary(""), None);
+/// ```
+#[must_use]
+pub fn npm_style_name_boundary(rest: &str) -> Option<usize> {
+    if let Some(after_at) = rest.strip_prefix('@') {
+        let slash_rel = after_at.find('/')?;
+        if slash_rel == 0 {
+            return None; // empty scope, e.g. "@/pkg"
+        }
+        let after_slash = &after_at[slash_rel + 1..];
+        let pkg_end_rel = after_slash.find(['@', '/']).unwrap_or(after_slash.len());
+        if pkg_end_rel == 0 {
+            return None; // empty pkg name, e.g. "@scope/"
+        }
+        Some(1 + slash_rel + 1 + pkg_end_rel)
+    } else {
+        let end = rest.find(['@', '/']).unwrap_or(rest.len());
+        (end > 0).then_some(end)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ConcreteVersion, PackageName, VersionReq};
