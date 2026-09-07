@@ -12,7 +12,7 @@ license = "MIT"
 repository = "https://github.com/bug-ops/deps-lsp"
 
 [workspace.dependencies]
-base64 = "0.22"
+base64 = "0.23"
 bytes = "1"
 criterion = "0.8"
 dashmap = "6.2"
