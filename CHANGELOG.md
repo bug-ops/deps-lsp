@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: OSV malicious-package advisories (`MAL-*` id or alias) now classify as a distinct `VulnSeverity::Malicious` instead of falling through to "unknown severity" in hover/diagnostics (resolves #646) (#652)
 
 ### Fixed
-- **deps-cargo**: sparse-index bearer token header value now zeroizes on drop instead of leaking a plaintext copy in an ordinary `String` (resolves #672)
+- **deps-cargo**: sparse-index bearer token header value now zeroizes on drop instead of leaking a plaintext copy in an ordinary `String` (resolves #672) (#675)
 - **deps-core, deps-deno**: a bare (operator-less) Deno `jsr:`/`npm:` version requirement with no lock file present is now treated as an exact pin when it has the shape of a full version, instead of being misclassified as a Cargo-style implicit caret range — fixes a bare full-version `npm:` pin never receiving an OSV scan, and strips a leading `v`/`V` before it reaches the OSV wire query (resolves #667) (#668)
 - **deps-core**: a bare (operator-less) npm/Composer version requirement with no lock file present is now treated as an exact pin when it has the shape of a full version (npm/Composer's own semver rules), instead of being misclassified as a Cargo-style implicit caret range — fixes hover silently dropping License/Security/Supply-chain sections for such dependencies (resolves #664) (#666)
 - **deps-core**: `net_policy.rs` doc comment no longer describes the DNS-rebinding gap as open — it is already closed by `BlockedAddrResolver` (resolves #655) (#656)
@@ -25,7 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-npm**: `package-lock.json` parsing now prefers a package entry's own `name` field (npm writes this when it differs from the physical `node_modules/` path, e.g. for an `npm:` alias) over the lockfile-key-derived name (#657)
 - **deps-core, deps-composer, deps-nuget**: extracted the duplicated lenient string-or-string-array JSON deserializer into a shared `deps_core::json_helpers::deserialize_string_or_string_array` helper (resolves #662) (#665)
 - **deps-core, deps-lsp**: documented NuGet's bare-version pin approximation and added a cross-ecosystem consistency test guarding `bare_requirement_policy` (resolves #669) (#674)
-- **workspace**: removed 18 unused dependencies across 11 crates and moved 3 test-only dependencies to `[dev-dependencies]` (touching a 12th crate, `deps-gitlab-ci`); added a `cargo machete` CI gate (resolves #670)
+- **workspace**: removed 18 unused dependencies across 11 crates and moved 3 test-only dependencies to `[dev-dependencies]` (touching a 12th crate, `deps-gitlab-ci`); added a `cargo machete` CI gate (resolves #670) (#675)
 
 ### Dependencies
 - Bump `dirs` from 6 to 7.0.0, plus transitive `Cargo.lock` refresh (#659)
