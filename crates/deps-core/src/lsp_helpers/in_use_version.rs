@@ -17,61 +17,106 @@ use crate::{ConcreteVersion, Dependency, EcosystemId, PackageName};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BareRequirementPolicy {
     /// A bare requirement is always a range under this ecosystem's own default
-    /// semantics (Cargo's implicit caret, npm/Composer's implicit caret) — never
-    /// treated as concrete without an explicit `=`/`==` pin marker.
+    /// semantics (Cargo's implicit caret) — never treated as concrete without an
+    /// explicit `=`/`==` pin marker.
     AlwaysRange,
     /// A bare requirement is concrete only when it has the shape of a full
     /// `major.minor.patch` version ([`is_full_semver_shape`]); a partial form (a bare
-    /// major or major.minor, e.g. GitHub Actions' moving-major `v4` tag) is treated as
-    /// a range instead, since it is one.
+    /// major or major.minor, e.g. GitHub Actions' moving-major `v4` tag, or npm's
+    /// bare `"4.17"`) is treated as a range instead, since it is one.
     ConcreteIfFullVersion,
     /// A bare requirement is already exact (no implicit range operator).
     Concrete,
 }
 
-/// Ecosystems whose *bare* (no explicit pin marker) version requirement is a
-/// range under that ecosystem's own default semantics — Cargo's implicit
-/// caret, npm/Composer's implicit caret. For these, [`is_concrete_version`]
-/// requires an explicit `=`/`==` (or an exact-bracket wrap) before treating a
-/// requirement as concrete; a bare `"1.2.3"` alone is not enough evidence
-/// (critique C2).
+/// Ecosystems whose *bare* (no explicit pin marker) version requirement is
+/// unconditionally a range under that ecosystem's own default semantics —
+/// Cargo's implicit caret. For these, [`is_concrete_version`] requires an
+/// explicit `=`/`==` (or an exact-bracket wrap) before treating a requirement
+/// as concrete; a bare `"1.2.3"` alone is not enough evidence (critique C2).
 ///
 /// Deno reuses npm's exact grammar for both its `jsr:` and `npm:` specifiers
 /// (`DenoFormatter::compile_requirement` compiles both through the same
-/// `node_semver::Range` npm itself uses), so it gets the same treatment here.
+/// `node_semver::Range` npm itself uses), so — unlike Cargo — a bare Deno
+/// requirement is genuinely **not** unconditionally a range either; it stays
+/// `AlwaysRange` here anyway, deliberately conservative rather than
+/// following npm/Composer into `ConcreteIfFullVersion` in this PR
+/// (impl-critic #664 review, finding S2, corrects an earlier draft of this
+/// comment that asserted the opposite rationale — that Deno's lack of a
+/// resolved-version concept made the fix low-value for it; the code says the
+/// reverse: `deps-deno` has **no lockfile support at all**
+/// (`crates/deps-deno/src/ecosystem.rs`'s `LockFileProvider` is unimplemented
+/// for Deno), so `concrete_pin_version` is the *only* possible source of an
+/// in-use version for any Deno dependency — a `deno.json` `"npm:express@4.17.0"`
+/// import parses to the bare requirement `"4.17.0"`, and with `AlwaysRange`
+/// that requirement can never resolve to a concrete version, so **no Deno
+/// dependency ever receives an OSV scan, under any manifest**, bare-pinned or
+/// not). Left unconditionally range-only here pending a dedicated follow-up
+/// issue to move Deno to `ConcreteIfFullVersion` — out of #664's own scope,
+/// which is limited to npm/Composer.
 ///
-/// GitHub Actions gets [`BareRequirementPolicy::ConcreteIfFullVersion`]: a bare `v4`
-/// (a moving-major tag) genuinely is a range, so it must not be queried as if it were
-/// the concrete version `4`, but a bare `v4.2.0` is a pin — see
-/// [`BareRequirementPolicy`]'s docs. A bare 40-character SHA also falls to the
-/// `None` side of this gate ([`is_full_semver_shape`] rejects it), which is the
-/// correct "honest unknown" outcome: resolving a SHA to its tag would need registry
-/// access this pure function does not have.
+/// GitHub Actions, GitLab CI, npm, and Composer all get
+/// [`BareRequirementPolicy::ConcreteIfFullVersion`] instead — see that
+/// variant's docs for the shared "full version is a pin, partial version is
+/// a range" rule, and below for why each of the four qualifies:
 ///
-/// GitLab CI gets the identical policy for the identical reason: a `component:`
-/// include's partial-semver pin (`1`, `1.2`) is a range exactly like GitHub Actions'
-/// moving-major tag ([`is_full_semver_shape`] correctly rejects it, since it requires
-/// all three components), while a full `1.2.3`/`v1.2.3` tag or release-name pin is
-/// concrete. A SHA pin (`project:`'s or `component:`'s) falls to the same honest
-/// "unknown" `None` as GitHub Actions' bare SHA, and `~latest`/a branch-shaped ref
-/// never look like a full version shape either, so both also correctly fall through
-/// to `None`.
+/// - GitHub Actions: a bare `v4` (a moving-major tag) genuinely is a range,
+///   so it must not be queried as if it were the concrete version `4`, but a
+///   bare `v4.2.0` is a pin. A bare 40-character SHA also falls to the
+///   `None` side of this gate ([`is_full_semver_shape`] rejects it), which is
+///   the correct "honest unknown" outcome: resolving a SHA to its tag would
+///   need registry access this pure function does not have.
+/// - GitLab CI: a `component:` include's partial-semver pin (`1`, `1.2`) is a
+///   range exactly like GitHub Actions' moving-major tag
+///   ([`is_full_semver_shape`] correctly rejects it, since it requires all
+///   three components), while a full `1.2.3`/`v1.2.3` tag or release-name pin
+///   is concrete. A SHA pin (`project:`'s or `component:`'s) falls to the
+///   same honest "unknown" `None` as GitHub Actions' bare SHA, and
+///   `~latest`/a branch-shaped ref never look like a full version shape
+///   either, so both also correctly fall through to `None`.
+/// - npm and Composer (#664): unlike Cargo, a bare version is **not**
+///   unconditionally a range under either ecosystem's own semver grammar. A
+///   bare *full* `major.minor.patch` (e.g. npm's `"4.17.0"`,
+///   `deps-npm::formatter`'s `node_semver::Range` compiles it to an exact
+///   match; Composer's `version_satisfies_requirement` treats a full bare
+///   version identically) is an exact pin. Only a bare *partial* version
+///   (`"4.17"`, `"4"`) expands to an implicit range/prefix match — npm's
+///   X-range semantics, Composer's `ver_parts.starts_with(&req_parts)`
+///   prefix match in `deps-composer::formatter`. Before this fix both
+///   ecosystems were grouped with Cargo under `AlwaysRange`, which silently
+///   dropped `in_use_version` resolution (and therefore hover License/OSV
+///   sections) for any bare-pinned npm/Composer manifest with no lock file.
 ///
-/// Gradle is deliberately excluded: a bare Gradle coordinate version (e.g.
-/// `"2.14.1"`) is an exact match under `GradleFormatter`'s own
-/// `version_satisfies_requirement` unless it uses the `+` dynamic-version
-/// suffix, which [`looks_like_a_single_version`] already rejects via its
-/// reject-char set — Gradle has no implicit-caret default the way
-/// Cargo/npm/Composer do.
+/// Every remaining ecosystem (Pypi, Go, Bundler, Dart, Maven, Gradle, Swift,
+/// NuGet) gets plain [`BareRequirementPolicy::Concrete`]: none of them has an
+/// implicit-range default the way Cargo/Deno do. Gradle in particular: a bare
+/// coordinate version (e.g. `"2.14.1"`) is an exact match under
+/// `GradleFormatter`'s own `version_satisfies_requirement` unless it uses the
+/// `+` dynamic-version suffix, which [`looks_like_a_single_version`] already
+/// rejects via its reject-char set.
+///
+/// Spelled out as explicit arms rather than a `_` catch-all (impl-critic
+/// #664 review, finding M4): `EcosystemId` is deliberately exhaustive so a
+/// 15th ecosystem forces every `match` on it to be updated at compile time
+/// (`.claude/CLAUDE.md`'s bug-class-#118 rule) — a wildcard here would
+/// silently default a new ecosystem to `Concrete`, the *least* conservative
+/// policy, contradicting [`concrete_pin_version`]'s own doc that a false
+/// positive is worse than a false negative.
 const fn bare_requirement_policy(ecosystem: EcosystemId) -> BareRequirementPolicy {
     match ecosystem {
-        EcosystemId::Cargo | EcosystemId::Npm | EcosystemId::Composer | EcosystemId::Deno => {
-            BareRequirementPolicy::AlwaysRange
-        }
-        EcosystemId::GithubActions | EcosystemId::GitlabCi => {
-            BareRequirementPolicy::ConcreteIfFullVersion
-        }
-        _ => BareRequirementPolicy::Concrete,
+        EcosystemId::Cargo | EcosystemId::Deno => BareRequirementPolicy::AlwaysRange,
+        EcosystemId::GithubActions
+        | EcosystemId::GitlabCi
+        | EcosystemId::Npm
+        | EcosystemId::Composer => BareRequirementPolicy::ConcreteIfFullVersion,
+        EcosystemId::Pypi
+        | EcosystemId::Go
+        | EcosystemId::Bundler
+        | EcosystemId::Dart
+        | EcosystemId::Maven
+        | EcosystemId::Gradle
+        | EcosystemId::Swift
+        | EcosystemId::NuGet => BareRequirementPolicy::Concrete,
     }
 }
 
@@ -102,7 +147,7 @@ const fn bare_requirement_policy(ecosystem: EcosystemId) -> BareRequirementPolic
 /// ```
 #[must_use]
 pub fn is_full_semver_shape(s: &str) -> bool {
-    let s = s.strip_prefix(['v', 'V']).unwrap_or(s);
+    let s = crate::github::normalize_tag(s);
     let core = match s.find(['-', '+']) {
         Some(idx) => &s[..idx],
         None => s,
@@ -134,7 +179,7 @@ fn looks_like_a_single_version(s: &str) -> bool {
     ]) {
         return false;
     }
-    let core = s.strip_prefix(['v', 'V']).unwrap_or(s);
+    let core = crate::github::normalize_tag(s);
     core.chars().next().is_some_and(|c| c.is_ascii_digit())
 }
 
@@ -508,17 +553,13 @@ mod tests {
 
     #[test]
     fn is_concrete_version_bare_digit_rejected_for_range_default_ecosystems() {
-        // Critique C2: Cargo's bare "1.2.3" is a caret range under
-        // Cargo's own default operator, not a pin — same for npm and
-        // Composer's implicit range notations. Deno reuses npm's exact
-        // grammar for both `jsr:` and `npm:` requirements, so it gets the
-        // same treatment (`bare_version_is_a_range`'s doc comment).
-        for eco in [
-            EcosystemId::Cargo,
-            EcosystemId::Npm,
-            EcosystemId::Composer,
-            EcosystemId::Deno,
-        ] {
+        // Critique C2: Cargo's bare "1.2.3" is a caret range under Cargo's
+        // own default operator, not a pin. Deno reuses npm's exact grammar
+        // for both `jsr:` and `npm:` requirements but keeps `AlwaysRange`
+        // (`bare_requirement_policy`'s doc comment) — npm/Composer
+        // themselves moved to `ConcreteIfFullVersion` (#664), since a bare
+        // *full* version is their own exact pin.
+        for eco in [EcosystemId::Cargo, EcosystemId::Deno] {
             assert!(!is_concrete_version("1.2.3", eco), "{eco:?}");
             // ...but an explicit pin is still accepted.
             assert!(is_concrete_version("=1.2.3", eco), "{eco:?}");
@@ -529,7 +570,11 @@ mod tests {
     fn is_concrete_version_rejects_partials_and_wildcards() {
         // Critique C2: npm/Composer "1.x"/"1.2.x" and bare partials like
         // "1.2" are ranges, and Gradle's "1.+" is a dynamic version —
-        // none of these contained a previously-rejected character.
+        // "1.x"/"1.2.x" are rejected by the `x` reject-char regardless of
+        // policy, and "1.2" is rejected by `ConcreteIfFullVersion`'s
+        // `is_full_semver_shape` gate (#664: a bare partial version is
+        // still a range for npm/Composer, only a bare *full* version is
+        // now concrete).
         for eco in [EcosystemId::Npm, EcosystemId::Composer] {
             assert!(!is_concrete_version("1.x", eco), "{eco:?}");
             assert!(!is_concrete_version("1.2.x", eco), "{eco:?}");
@@ -704,6 +749,56 @@ mod tests {
                 EcosystemId::GitlabCi
             ),
             None
+        );
+    }
+
+    // --- concrete_pin_version: BareRequirementPolicy::ConcreteIfFullVersion (npm/Composer, #664) ---
+
+    #[test]
+    fn concrete_pin_version_npm_full_bare_version_is_concrete() {
+        assert_eq!(
+            concrete_pin_version("4.17.0", EcosystemId::Npm),
+            Some("4.17.0")
+        );
+    }
+
+    #[test]
+    fn concrete_pin_version_npm_partial_bare_version_is_a_range() {
+        // node-semver's implicit X-range: a bare partial version expands to
+        // `>=4.17.0 <4.18.0` (or wider), not a single version.
+        assert_eq!(concrete_pin_version("4.17", EcosystemId::Npm), None);
+        assert_eq!(concrete_pin_version("4", EcosystemId::Npm), None);
+    }
+
+    #[test]
+    fn concrete_pin_version_npm_explicit_pin_still_concrete() {
+        assert_eq!(
+            concrete_pin_version("=4.17.0", EcosystemId::Npm),
+            Some("4.17.0")
+        );
+    }
+
+    #[test]
+    fn concrete_pin_version_composer_full_bare_version_is_concrete() {
+        assert_eq!(
+            concrete_pin_version("2.0.0", EcosystemId::Composer),
+            Some("2.0.0")
+        );
+    }
+
+    #[test]
+    fn concrete_pin_version_composer_partial_bare_version_is_a_range() {
+        // Composer's prefix-match semantics: a bare partial version matches
+        // any version sharing that prefix, not a single version.
+        assert_eq!(concrete_pin_version("2.0", EcosystemId::Composer), None);
+        assert_eq!(concrete_pin_version("2", EcosystemId::Composer), None);
+    }
+
+    #[test]
+    fn concrete_pin_version_composer_explicit_pin_still_concrete() {
+        assert_eq!(
+            concrete_pin_version("=2.0.0", EcosystemId::Composer),
+            Some("2.0.0")
         );
     }
 
@@ -992,5 +1087,88 @@ mod tests {
         );
 
         assert_eq!(result, Some("1.0.5".to_string()));
+    }
+
+    // --- in_use_version end-to-end: #664's exact repro (no lock file, bare full version) ---
+
+    /// #664's exact repro: `"express": "4.17.0"` in `package.json` with no
+    /// `package-lock.json` — `resolve_occurrence_version` has nothing to resolve from
+    /// (empty `resolved_versions`, no candidates), so the fix must be observable through
+    /// the fallback to `concrete_pin_version`, not just in that helper in isolation.
+    #[test]
+    fn in_use_version_npm_bare_full_version_no_lockfile_resolves_664_repro() {
+        use crate::VersionReq;
+        use crate::lsp_helpers::test_support::MockDep;
+
+        let dep = MockDep {
+            name: PackageName::new("express"),
+            version_req: VersionReq::new("4.17.0"),
+            version_range: tower_lsp_server::ls_types::Range::default(),
+            name_range: tower_lsp_server::ls_types::Range::default(),
+        };
+
+        let result = in_use_version(
+            &dep,
+            "express",
+            &HashMap::new(),
+            None,
+            &crate::lsp_helpers::test_support::MockFormatter,
+            EcosystemId::Npm,
+        );
+
+        assert_eq!(result, Some("4.17.0".to_string()));
+    }
+
+    /// Composer counterpart of the #664 repro: `"monolog/monolog": "2.0.0"` in
+    /// `composer.json` with no `composer.lock`.
+    #[test]
+    fn in_use_version_composer_bare_full_version_no_lockfile_resolves_664_repro() {
+        use crate::VersionReq;
+        use crate::lsp_helpers::test_support::MockDep;
+
+        let dep = MockDep {
+            name: PackageName::new("monolog/monolog"),
+            version_req: VersionReq::new("2.0.0"),
+            version_range: tower_lsp_server::ls_types::Range::default(),
+            name_range: tower_lsp_server::ls_types::Range::default(),
+        };
+
+        let result = in_use_version(
+            &dep,
+            "monolog/monolog",
+            &HashMap::new(),
+            None,
+            &crate::lsp_helpers::test_support::MockFormatter,
+            EcosystemId::Composer,
+        );
+
+        assert_eq!(result, Some("2.0.0".to_string()));
+    }
+
+    /// Regression guard: Cargo's identically-shaped bare full version must still resolve
+    /// to no concrete pin end-to-end (not just via `concrete_pin_version` in isolation) —
+    /// #664 only reclassified npm/Composer, not Cargo's real implicit-caret default.
+    #[test]
+    fn in_use_version_cargo_bare_full_version_no_lockfile_still_none() {
+        use crate::VersionReq;
+        use crate::lsp_helpers::test_support::MockDep;
+
+        let dep = MockDep {
+            name: PackageName::new("serde"),
+            version_req: VersionReq::new("1.0.219"),
+            version_range: tower_lsp_server::ls_types::Range::default(),
+            name_range: tower_lsp_server::ls_types::Range::default(),
+        };
+
+        let result = in_use_version(
+            &dep,
+            "serde",
+            &HashMap::new(),
+            None,
+            &crate::lsp_helpers::test_support::MockFormatter,
+            EcosystemId::Cargo,
+        );
+
+        assert_eq!(result, None);
     }
 }

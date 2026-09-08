@@ -15,6 +15,7 @@ use super::{
     EcosystemFormatter, HOVER_RECENT_VERSIONS, VersionData, escape_markdown, in_use_version,
     markdown_code_span, position_in_range,
 };
+use crate::github::normalize_tag;
 
 /// Bounds how long [`generate_hover`] *waits* for the spawned deps.dev trust-signal
 /// fetch — never the fetch itself, which keeps running to completion and warms
@@ -356,11 +357,19 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     // spurious "unavailable" note for exactly the concrete-pin-no-lockfile case
     // this key exists to cover).
     let resolved_key: Option<&str> = in_use_version_str.as_deref().or(resolved);
+    // `normalize_tag` on both sides, not a plain `==` (impl-critic #664 review,
+    // finding S1): a bare pin with no `v` (Composer's `"8.1.6"`) must still match a
+    // registry entry whose own version string carries one (Packagist's
+    // `symfony/console` tags are `v8.1.6`) — and the reverse, a manifest pin that
+    // itself carries `v` (legal npm/Composer syntax) must still match an
+    // never-`v`-prefixed registry list.
     let resolved_license: Vec<String> = resolved_key
         .and_then(|r| {
-            available_versions
-                .as_ref()
-                .and_then(|versions| versions.iter().find(|v| v.version_string().as_str() == r))
+            available_versions.as_ref().and_then(|versions| {
+                versions
+                    .iter()
+                    .find(|v| normalize_tag(v.version_string().as_str()) == normalize_tag(r))
+            })
         })
         .map(|v| v.license().to_vec())
         .filter(|l| !l.is_empty())
