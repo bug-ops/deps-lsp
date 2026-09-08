@@ -708,6 +708,10 @@ fn parse_metadata_xml(data: &[u8]) -> Result<(Vec<MavenVersion>, Option<String>)
 /// Bounded by the same 32 MiB response cap [`HttpCache`] applies to every fetch (not a
 /// meaningfully tight bound on its own); real listings are far smaller (up to ~245 KB /
 /// ~2000 anchors observed for a large artifact).
+// `date_str` is `find_date_time`'s output: an `is_date_time_shape`-validated all-ASCII
+// 16-byte window (`registry.rs:764`), so its `[..10]`/`[11..16]` sub-slices are always char
+// boundaries.
+#[allow(clippy::string_slice)]
 fn parse_publish_times(html: &[u8]) -> HashMap<String, PublishTime> {
     let mut map = HashMap::new();
     let text = String::from_utf8_lossy(html);
@@ -745,6 +749,9 @@ fn parse_publish_times(html: &[u8]) -> HashMap<String, PublishTime> {
 /// Central and the Gradle Plugin Portal both emit lowercase tags). Returns `None` when no
 /// `<pre>` block is present, so a page shaped nothing like a directory listing yields an
 /// empty map rather than scanning arbitrary HTML for anchor-shaped text.
+// All offsets come from `find` of ASCII tokens (`"<pre"`, `'>'`, `"</pre"`), so every slice
+// bound is always a char boundary.
+#[allow(clippy::string_slice)]
 fn extract_pre_block(html: &str) -> Option<&str> {
     let open = html.find("<pre")?;
     let content_start = html[open..].find('>')? + open + 1;
@@ -753,6 +760,9 @@ fn extract_pre_block(html: &str) -> Option<&str> {
 }
 
 /// Extracts an anchor's `href` attribute value from a listing line, ignoring display text.
+// Both offsets come from `find` of ASCII tokens (`"href=\""`, `'"'`), so both slice bounds
+// are always char boundaries.
+#[allow(clippy::string_slice)]
 fn extract_href(line: &str) -> Option<&str> {
     let idx = line.find("href=\"")?;
     let rest = &line[idx + 6..];
@@ -763,6 +773,9 @@ fn extract_href(line: &str) -> Option<&str> {
 /// Finds the first `YYYY-MM-DD HH:MM` substring anywhere in `line`, independent of column
 /// alignment or padding. All matched bytes are ASCII, so the returned slice's byte offsets
 /// are always valid `str` char boundaries.
+// All matched bytes are ASCII (per doc comment above), so this slice's byte offsets are
+// always valid char boundaries.
+#[allow(clippy::string_slice)]
 fn find_date_time(line: &str) -> Option<&str> {
     let bytes = line.as_bytes();
     let window = 16; // "YYYY-MM-DD HH:MM"

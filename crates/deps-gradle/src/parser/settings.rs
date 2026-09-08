@@ -16,6 +16,9 @@ static RE_PLUGIN: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// Finds the LSP range of `plugin_id` within `line`.
+// `col` comes from `find(plugin_id)`; `plugin_id` is a name string, so this slice bound is
+// always a char boundary.
+#[allow(clippy::string_slice)]
 fn find_plugin_name_range(line: &str, line_idx: u32, plugin_id: &str) -> Range {
     if let Some(col) = line.find(plugin_id) {
         let col_u32 = utf16_len(&line[..col]) as u32;
@@ -30,6 +33,9 @@ fn find_plugin_name_range(line: &str, line_idx: u32, plugin_id: &str) -> Range {
 }
 
 /// Finds the LSP range of `version` in `line` after the `version` keyword.
+// `kw_pos` comes from `find("version")`, an ASCII token; `abs_start` derives from a further
+// ASCII `find`. Every slice bound is always a char boundary.
+#[allow(clippy::string_slice)]
 fn find_plugin_version_range(line: &str, line_idx: u32, version: &str) -> Range {
     // Find "version" keyword, then locate the version string after it
     if let Some(kw_pos) = line.find("version") {

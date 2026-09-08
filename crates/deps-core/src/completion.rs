@@ -301,12 +301,8 @@ pub fn utf16_to_byte_offset(s: &str, utf16_offset: u32) -> Option<usize> {
 
 /// Converts a byte offset within `s` to a UTF-16 code unit offset (LSP `Position.character`).
 ///
-/// `byte_offset` must fall on a UTF-8 char boundary of `s` (e.g. one produced by
-/// `str::find`/`rfind`/slicing, never an arbitrary user-controlled value).
-///
-/// # Panics
-///
-/// Panics if `byte_offset` is out of bounds or does not fall on a UTF-8 char boundary of `s`.
+/// `byte_offset` may be an arbitrary caller-supplied value: it is clamped to `s.len()` and
+/// floored down to the nearest UTF-8 char boundary before use, so this never panics.
 ///
 /// # Examples
 ///
@@ -322,12 +318,27 @@ pub fn utf16_to_byte_offset(s: &str, utf16_offset: u32) -> Option<usize> {
 ///
 /// // Emoji: "😀" is 4 bytes but 2 UTF-16 code units (surrogate pair)
 /// assert_eq!(byte_to_utf16_offset("😀test", 4), 2);
+///
+/// // Never panics: an offset landing mid-character floors down to the start of that
+/// // character, and an offset past the end saturates to the string's length.
+/// assert_eq!(byte_to_utf16_offset("日本語", 1), 0); // inside the first character
+/// assert_eq!(byte_to_utf16_offset("日本語", 999), 3); // past the end
 /// ```
+// `end` is floor_char_boundary-clamped just above, mirroring the already-hardened
+// `LineOffsetTable::byte_offset_to_position` (lsp_helpers/mod.rs).
+#[allow(clippy::string_slice)]
 pub fn byte_to_utf16_offset(s: &str, byte_offset: usize) -> u32 {
     // Saturate rather than silently wrap: an LSP `Position.character` past `u32::MAX` UTF-16
     // units is already meaningless, but a wrapped value would be a wrong-but-plausible one
     // (#673 — the exact offset-math bug class #244 shipped).
-    u32::try_from(s[..byte_offset].encode_utf16().count()).unwrap_or(u32::MAX)
+    //
+    // `byte_offset` is not guaranteed to be in bounds or on a char boundary (a caller-supplied
+    // offset can be past `s.len()` or land mid-character); `floor_char_boundary` clamps both
+    // — past-the-end saturates to `s.len()` and any other in-bounds index floors to the
+    // nearest char boundary — mirroring `LineOffsetTable::byte_offset_to_position`
+    // (lsp_helpers/mod.rs).
+    let end = s.floor_char_boundary(byte_offset);
+    u32::try_from(s[..end].encode_utf16().count()).unwrap_or(u32::MAX)
 }
 
 /// Extracts the prefix text from content at a position within a range.
@@ -361,6 +372,9 @@ pub fn byte_to_utf16_offset(s: &str, byte_offset: usize) -> u32 {
 /// let prefix = extract_prefix(content, position, range);
 /// assert_eq!(prefix, "1.");
 /// ```
+// `start_byte`/`cursor_byte` come from `utf16_to_byte_offset` (char_indices-based) and are
+// bounds/ordering-checked above, so both are verified char boundaries.
+#[allow(clippy::string_slice)]
 pub fn extract_prefix(content: &str, position: Position, range: Range) -> String {
     // Get the line at the position - use nth() instead of collecting all lines
     let line = match content.lines().nth(position.line as usize) {
@@ -421,6 +435,9 @@ pub fn extract_prefix(content: &str, position: Position, range: Range) -> String
 /// let prefix = extract_feature_prefix(content, pos);
 /// assert_eq!(prefix, "ser");
 /// ```
+// `cursor_byte` comes from `utf16_to_byte_offset` (char_indices-based) and is clamped to
+// `line.len()`; `segment_start`/the `rfind('"')` offset are ASCII-char indices (`[`/`"`).
+#[allow(clippy::string_slice)]
 pub fn extract_feature_prefix(content: &str, position: Position) -> String {
     let line = match content.lines().nth(position.line as usize) {
         Some(l) => l,
@@ -484,6 +501,8 @@ pub fn extract_feature_prefix(content: &str, position: Position) -> String {
 /// assert_eq!(item.label, metadata.name().as_str());
 /// # }
 /// ```
+// `end` is floor_char_boundary-clamped just below before slicing `desc`.
+#[allow(clippy::string_slice)]
 pub fn build_package_completion(
     metadata: &dyn Metadata,
     insert_range: Range,
@@ -2770,6 +2789,23 @@ mod tests {
     fn test_byte_to_utf16_offset_empty() {
         let s = "";
         assert_eq!(byte_to_utf16_offset(s, 0), 0);
+    }
+
+    #[test]
+    fn test_byte_to_utf16_offset_never_panics_on_bad_offsets() {
+        // #680: `byte_offset` is not guaranteed to be a valid char boundary or even in
+        // bounds — `floor_char_boundary` must clamp both cases rather than let the
+        // internal slice panic.
+        let s = "日本語";
+
+        // Offset 1 lands inside the first 3-byte character ('日'); floors down to 0.
+        assert_eq!(byte_to_utf16_offset(s, 1), 0);
+        // Offset 2 also lands inside '日'; still floors down to 0.
+        assert_eq!(byte_to_utf16_offset(s, 2), 0);
+        // Exactly at `s.len()` (9 bytes): the whole string.
+        assert_eq!(byte_to_utf16_offset(s, 9), 3);
+        // Past the end: saturates to `s.len()` rather than panicking.
+        assert_eq!(byte_to_utf16_offset(s, 999), 3);
     }
 
     // Unicode truncation tests

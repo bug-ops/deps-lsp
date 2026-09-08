@@ -418,6 +418,9 @@ impl PartialEq<&str> for ConcreteVersion {
 /// assert_eq!(npm_style_name_boundary("@"), None);
 /// assert_eq!(npm_style_name_boundary(""), None);
 /// ```
+// `slash_rel` comes from `str::find('/')`, an ASCII byte, so `slash_rel + 1` is always a
+// char boundary.
+#[allow(clippy::string_slice)]
 #[must_use]
 pub fn npm_style_name_boundary(rest: &str) -> Option<usize> {
     if let Some(after_at) = rest.strip_prefix('@') {

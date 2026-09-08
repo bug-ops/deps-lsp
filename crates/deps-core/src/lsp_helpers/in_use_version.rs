@@ -182,6 +182,8 @@ const fn bare_requirement_policy(ecosystem: EcosystemId) -> BareRequirementPolic
 /// assert!(!is_full_semver_shape("v4.2"));
 /// assert!(!is_full_semver_shape("not-a-version"));
 /// ```
+// `idx` comes from `str::find(['-', '+'])`, both ASCII bytes, so it is always a char boundary.
+#[allow(clippy::string_slice)]
 #[must_use]
 pub fn is_full_semver_shape(s: &str) -> bool {
     let s = crate::github::normalize_tag(s);

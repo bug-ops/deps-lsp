@@ -28,7 +28,15 @@
 // added to `[workspace.lints.clippy]` itself (the three lints must stay opt-in per crate,
 // not workspace-wide — see PR discussion). Sites confirmed safe are individually
 // `#[allow]`ed with a one-line justification, not blanket-allowed.
-#![warn(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used)]
+// #680: `clippy::string_slice` appended to the same restriction-lint attribute for the
+// same reason — string slicing on a byte index that isn't a verified char boundary
+// panics; sites confirmed boundary-safe by construction are individually `#[allow]`ed.
+#![warn(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::string_slice
+)]
 
 pub mod cache;
 pub mod completion;

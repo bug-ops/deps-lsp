@@ -513,6 +513,9 @@ pub fn redact_userinfo(raw: &str) -> String {
 /// #536 C2) is treated the same way, scanning from the very start of `raw` instead of skipping
 /// a scheme. Returns `raw` unchanged only when no `@` is found in the searched span — nothing
 /// looks like a userinfo component to redact.
+// All indices (`authority_start`, `host_boundary`, `at`) come from `find`/`rfind` of ASCII
+// tokens (`"://"`, `/`, `?`, `#`, `@`), so every slice bound is always a char boundary.
+#[allow(clippy::string_slice)]
 fn redact_userinfo_unparseable(raw: &str) -> String {
     let authority_start = raw.find("://").map_or(0, |scheme_end| scheme_end + 3);
     let authority = &raw[authority_start..];

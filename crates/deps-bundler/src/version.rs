@@ -75,6 +75,9 @@ fn cmp_digits(a: &str, b: &str) -> Ordering {
 /// glued directly onto the preceding numeric segment (`0.2.19b1`) —
 /// scanning the whole string instead of splitting on `.` first handles both
 /// shapes uniformly (#323).
+// `start`/`i` are byte offsets from a single-pass ASCII digit/alpha scan, so every run
+// boundary always sits at a char boundary.
+#[allow(clippy::string_slice)]
 fn tokenize(version: &str) -> Vec<Token> {
     let normalized = version.replace('-', ".pre.");
     let bytes = normalized.as_bytes();
@@ -108,6 +111,8 @@ fn tokenize(version: &str) -> Vec<Token> {
 /// porting the pattern as a literal `Regex`: it finds the smallest index `i` such that the
 /// byte before `i` is a letter or `.` and every byte from `i` onward is `.`/`0`, matching
 /// Ruby's leftmost-match semantics for an anchored-at-end pattern.
+// `i` is a byte offset from a single-pass ASCII scan, always a char boundary.
+#[allow(clippy::string_slice)]
 fn strip_trailing_padding(version: &str) -> &str {
     let bytes = version.as_bytes();
     for i in 1..bytes.len() {
@@ -128,6 +133,8 @@ fn strip_trailing_padding(version: &str) -> &str {
 /// second zero-padding run elsewhere in the string is left untouched). E.g.
 /// `"1.pre.0.beta1"` -> `"1.pre.beta1"`, so a padding zero segment right before a prerelease
 /// tag does not become its own token (#331).
+// `i`/`end` are byte offsets from a single-pass ASCII scan, always char boundaries.
+#[allow(clippy::string_slice)]
 fn strip_padding_before_tag(version: &str) -> String {
     let bytes = version.as_bytes();
     for i in 0..bytes.len() {

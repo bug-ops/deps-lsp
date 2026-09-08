@@ -188,6 +188,9 @@ fn collect_imports(
 /// value is neither a recognized `jsr:`/`npm:` specifier nor a syntactically incomplete,
 /// still-being-typed one (D7 — e.g. `http://`, `file:`, a bare alias — silently skipped,
 /// same as an unparseable entry in any other ecosystem).
+// `partial_range` comes from `partial_name_range`, itself built from ASCII-find-derived
+// offsets, so it is always a char-boundary range.
+#[allow(clippy::string_slice)]
 fn build_dependency(
     value_lit: &StringLit,
     content: &str,

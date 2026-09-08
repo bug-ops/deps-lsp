@@ -804,6 +804,8 @@ impl LineOffsetTable {
     }
 
     /// Converts a byte offset into an LSP `Position`.
+    // `offset` is floor_char_boundary-clamped just below before slicing `content`.
+    #[allow(clippy::string_slice)]
     pub fn byte_offset_to_position(&self, content: &str, offset: usize) -> Position {
         let offset = offset.min(content.len());
         // `offset` is not always a toml-span offset (boundary-safe by
@@ -840,6 +842,9 @@ impl LineOffsetTable {
     /// [`byte_offset_to_position`](Self::byte_offset_to_position). Out-of-range lines or
     /// UTF-16 characters clamp to `content.len()` rather than panicking, matching the
     /// forward conversion's `.min(content.len())` guard.
+    // `line_start`/`line_end` come from `line_starts` (post-newline offsets, always char
+    // boundaries) or `content.len()`.
+    #[allow(clippy::string_slice)]
     pub fn position_to_byte_offset(&self, content: &str, position: Position) -> usize {
         let Some(&line_start) = self.line_starts.get(position.line as usize) else {
             return content.len();
@@ -1347,6 +1352,8 @@ fn literal_span_matches(slice: &str, requirement: &str) -> bool {
 }
 
 #[cfg(test)]
+// Fixtures are single-line ASCII literals with hand-computed byte offsets.
+#[allow(clippy::string_slice)]
 mod tests {
     use super::*;
     use crate::lsp_helpers::test_support::*;

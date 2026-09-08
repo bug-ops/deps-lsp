@@ -18,6 +18,8 @@ use crate::interval::{BracketStyle, VersionRange, contains, parse_interval};
 /// Splits `s` on commas that are not nested inside a `[`/`(` ... `]`/`)` pair, so a
 /// union like `[1.0,2.0),[3.0,4.0)` yields two members while the inner min/max comma of
 /// a single member (handled by [`crate::interval::parse_interval`]) is left untouched.
+// `i`/`start` come from `char_indices()`, always char boundaries.
+#[allow(clippy::string_slice)]
 fn split_top_level(s: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut depth = 0i32;

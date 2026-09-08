@@ -957,6 +957,9 @@ fn reconstitute_component_releases(
 
 /// Inserts a `**Project**: [name](url)` line immediately after the hover heading, for a
 /// `component:` include whose heading link is suppressed (spec §8.2).
+// `pos`/`insert_at` come from `find("\n\n")`, an ASCII token, so both are always char
+// boundaries.
+#[allow(clippy::string_slice)]
 fn splice_project_line(markdown: &str, url: &str) -> String {
     let line = format!("**Project**: [{url}]({url})\n\n");
     if let Some(pos) = markdown.find("\n\n") {
@@ -974,6 +977,9 @@ fn splice_project_line(markdown: &str, url: &str) -> String {
 /// Inserts a `**Resolved**: `tag` (`sha…`)` line immediately after the shared hover's
 /// `**Current**`/`**Requirement**` line, mirroring
 /// `deps_github_actions::ecosystem::splice_resolved_line` exactly.
+// `pos`/`rel_end`/`insert_at` come from `find` of ASCII anchors (`"**Current**: "`,
+// `"\n\n"`), so all are always char boundaries.
+#[allow(clippy::string_slice)]
 fn splice_resolved_line(markdown: &str, resolved_tag: &str, sha: &str) -> String {
     let short_sha = sha.get(..7).unwrap_or(sha);
     let line = format!(
@@ -997,6 +1003,8 @@ fn splice_resolved_line(markdown: &str, resolved_tag: &str, sha: &str) -> String
 }
 
 #[cfg(test)]
+// Fixtures are single-line ASCII literals with hand-computed byte offsets.
+#[allow(clippy::string_slice)]
 mod tests {
     use super::*;
     use crate::registry::TagIndex;

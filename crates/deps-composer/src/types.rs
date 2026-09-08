@@ -165,6 +165,10 @@ fn has_short_stability_alias(s: &str) -> bool {
 /// Deliberately excludes `-`: a hyphen-separated qualifier is already covered by
 /// [`deps_core::has_default_prerelease_marker`]/[`has_short_stability_alias`] via a different
 /// algorithm, so including it here would only duplicate, not extend, coverage.
+// `lower[start..]` indexes `lower` (a lowercased copy of `s`), with `start` derived from a
+// previous ASCII `find` result plus `keyword.len()` (also ASCII), so it is always a char
+// boundary.
+#[allow(clippy::string_slice)]
 fn has_separatorless_stability_keyword(s: &str) -> bool {
     let lower = s.to_lowercase();
     let bytes = lower.as_bytes();

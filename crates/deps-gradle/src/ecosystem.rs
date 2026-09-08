@@ -82,6 +82,9 @@ impl GradleEcosystem {
     /// slicing, avoiding panics on multi-byte content preceding the cursor (e.g. an accented
     /// character in a `groupId`); the returned `range`'s `character` fields are converted
     /// back to UTF-16 units via [`deps_core::completion::byte_to_utf16_offset`].
+    // `col_idx` comes from `utf16_to_byte_offset` (char_indices-based), so it is always a
+    // char boundary.
+    #[allow(clippy::string_slice)]
     fn detect_completion_context<'a>(
         content: &'a str,
         position: Position,
@@ -154,6 +157,10 @@ fn current_field_start(before_cursor: &str) -> usize {
 /// `col_idx`/`before_cursor` are byte offsets (see
 /// `GradleEcosystem::detect_completion_context`'s doc comment); the returned `Range`'s
 /// character fields are UTF-16 code unit offsets.
+// Every offset below (`field_start`, `rel_eq_pos`, `quote_start`, `value_start`/`value_end`)
+// derives from `char_indices()` or `find`/`rfind` of an ASCII token (`"`, `=`, `version`,
+// `module`), so every slice bound is always a char boundary.
+#[allow(clippy::string_slice)]
 fn detect_catalog_context<'a>(
     before_cursor: &str,
     line: &'a str,
@@ -215,6 +222,10 @@ fn detect_catalog_context<'a>(
 /// `col_idx`/`before_cursor` are byte offsets (see
 /// `GradleEcosystem::detect_completion_context`'s doc comment); the returned `Range`'s
 /// character fields are UTF-16 code unit offsets.
+// Every offset below (`open_pos`, `end_rel`, `version_start`) derives from `rfind`/`find` of
+// an ASCII `'"'`/`'\''`/`':'` token or `char_indices()`, so every slice bound is always a
+// char boundary.
+#[allow(clippy::string_slice)]
 fn detect_dsl_context<'a>(
     before_cursor: &str,
     line: &'a str,
@@ -356,6 +367,9 @@ impl Ecosystem for GradleEcosystem {
 }
 
 #[cfg(test)]
+// Fixtures are single-line ASCII (or explicitly UTF-16-tested) literals with
+// hand-computed byte offsets.
+#[allow(clippy::string_slice)]
 mod tests {
     use super::*;
 

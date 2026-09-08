@@ -314,6 +314,9 @@ fn expand_env_vars(raw: &str) -> Result<String, String> {
 /// [`std::env::var`] directly — lets tests inject a fake environment instead of mutating the
 /// real process environment (this workspace forbids `unsafe`, and Rust 2024 made
 /// `std::env::set_var` an `unsafe fn`, so a test cannot do that mutation at all).
+// All indices come from `find("${")`/`find('}')`, both ASCII tokens, so every slice bound
+// is always a char boundary.
+#[allow(clippy::string_slice)]
 fn expand_env_vars_with(
     raw: &str,
     lookup: impl Fn(&str) -> Option<String>,

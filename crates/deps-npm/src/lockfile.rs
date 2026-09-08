@@ -243,6 +243,9 @@ fn parse_npm_source(entry: &PackageEntry) -> ResolvedSource {
 /// - `git+https://github.com/user/repo.git#abc123` → rev: abc123
 /// - `https://github.com/user/repo/tarball/abc123` → rev: abc123
 /// - `git://github.com/user/repo.git#v1.0.0` → rev: v1.0.0
+// `idx` comes from `rfind("/tarball/")`, an ASCII token, so `idx` and `idx + 9` are always
+// char boundaries.
+#[allow(clippy::string_slice)]
 fn parse_git_source(url: &str) -> ResolvedSource {
     // Try to extract commit hash from URL
     let (clean_url, rev) = if let Some((base, hash)) = url.split_once('#') {

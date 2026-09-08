@@ -399,6 +399,11 @@ fn collect_index_config(content: &str, policy: &RegistryAccessPolicy) -> PypiInd
 /// matched `=`) or the space-separated spelling (target is whatever follows
 /// `first_token`, whitespace-trimmed). Returns `None` when the option carries
 /// no target text at all (a bare `-r` with nothing after it).
+// Indexes `text` with offsets derived from `first_token`/ASCII `find`s (`=`, whitespace).
+// Sound only because every caller passes a `text` whose leading token IS `first_token`
+// (verified by construction at the single call site), so `first_token.len()` and
+// `eq_idx`/`value_end`/`leading_ws` (all ASCII-byte offsets) are always char boundaries.
+#[allow(clippy::string_slice)]
 fn extract_option_target<'a>(first_token: &str, text: &'a str) -> Option<(&'a str, usize)> {
     if let Some(eq_idx) = first_token.find('=') {
         let after_eq = &text[eq_idx + 1..];
@@ -425,6 +430,8 @@ fn extract_option_target<'a>(first_token: &str, text: &'a str) -> Option<(&'a st
 
 /// Cuts `line` at the first `#` that is at index 0 or preceded by ASCII
 /// whitespace, matching pip's `COMMENT_RE = r'(^|\s+)#.*$'`.
+// `i` is a byte index that holds ASCII `b'#'`, so it is always a char boundary.
+#[allow(clippy::string_slice)]
 fn strip_comment(line: &str) -> &str {
     let bytes = line.as_bytes();
     // `i == 0` short-circuits before `bytes[i - 1]` is evaluated whenever `i == 0`.
@@ -441,6 +448,9 @@ fn strip_comment(line: &str) -> &str {
 /// `--` (a per-requirement option like `--hash=sha256:...`), returning the
 /// requirement text before it and whether a `--hash`/`--hash=...` token was
 /// present anywhere on the line.
+// `offset` is derived by pointer arithmetic from `token`, a genuine subslice of `text`
+// produced by `split_whitespace`, so it is always a char boundary.
+#[allow(clippy::string_slice)]
 fn split_requirement_options(text: &str) -> (&str, bool) {
     let had_hash = text
         .split_whitespace()
@@ -473,6 +483,8 @@ fn is_nameless_requirement(text: &str) -> bool {
 }
 
 #[cfg(test)]
+// Fixtures are single-line ASCII literals with hand-computed byte offsets.
+#[allow(clippy::string_slice)]
 mod tests {
     use super::*;
 

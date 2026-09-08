@@ -489,6 +489,9 @@ impl PypiParser {
     /// - String: `requests = "^2.28.0"`
     /// - String with marker: `requests = "^2.28.0; sys_platform == 'win32'"`
     /// - Table: `flask = { version = "^3.0", extras = ["async"] }`
+    // `value_span` offsets come from toml-span (always char boundaries); the `find(';')`
+    // index is ASCII, so both slice bounds are always char boundaries.
+    #[allow(clippy::string_slice)]
     fn parse_poetry_dependency(
         &self,
         name: &str,
@@ -768,6 +771,8 @@ fn collect_uv_sources(uv: &Table<'_>, uv_named_by_dep: &mut HashMap<String, Stri
 }
 
 #[cfg(test)]
+// Fixtures are single-line ASCII literals with hand-computed byte offsets.
+#[allow(clippy::string_slice)]
 mod tests {
     use super::super::{MAX_MARKER_LEN, marker_too_deep};
     use super::*;

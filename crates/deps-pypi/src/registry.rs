@@ -955,6 +955,9 @@ const KNOWN_ARCHIVE_EXTENSIONS: &[&str] = &[
 /// Returns `None` if `filename` doesn't conform closely enough to derive a
 /// version unambiguously; callers skip attributing that file rather than
 /// guess (see [`build_version_metadata`]).
+// `fi` only advances over ASCII-compared bytes and is checked to sit on `b'-'` before use;
+// `end` comes from `find('-')`, also ASCII. Both slice bounds are always char boundaries.
+#[allow(clippy::string_slice)]
 fn parse_version_from_filename<'a>(filename: &'a str, normalized_name: &str) -> Option<&'a str> {
     let bytes = filename.as_bytes();
     let mut fi = 0usize;

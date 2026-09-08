@@ -112,8 +112,9 @@ enum MarkerToken {
 /// no escape handling — so quoted content, including non-ASCII bytes, is
 /// opaque to this scanner.
 // Every `bytes[i]` below is preceded by an `i < bytes.len()` bounds check (loop condition
-// or `if` guard); single-pass byte scanner.
-#[allow(clippy::indexing_slicing)]
+// or `if` guard); single-pass byte scanner. `start`/`i` slice bounds are ASCII-byte offsets
+// from that same scan, so they are always char boundaries.
+#[allow(clippy::indexing_slicing, clippy::string_slice)]
 fn tokenize_marker(text: &str) -> Option<Vec<MarkerToken>> {
     let bytes = text.as_bytes();
     let mut i = 0;
@@ -330,6 +331,8 @@ const MAX_LOGGED_LEN: usize = 200;
 /// unbuffered, stderr-backed) log sink — exactly the size range
 /// [`MAX_REQUIREMENT_LEN`] exists to reject, up to the ~10 MB overall file
 /// cap. Falls back to `s` unchanged when it's already short enough.
+// `boundary` is floor_char_boundary-clamped just above before slicing `s`.
+#[allow(clippy::string_slice)]
 fn truncate_for_log(s: &str) -> std::borrow::Cow<'_, str> {
     if s.len() <= MAX_LOGGED_LEN {
         return std::borrow::Cow::Borrowed(s);
@@ -346,7 +349,7 @@ fn pep508_leading_name(s: &str) -> &str {
     let is_name_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-');
     let end = s.find(|c: char| !is_name_char(c)).unwrap_or(s.len());
     // `find` returns either a valid char-boundary byte index into `s` or `s.len()`.
-    #[allow(clippy::indexing_slicing)]
+    #[allow(clippy::indexing_slicing, clippy::string_slice)]
     &s[..end]
 }
 
@@ -463,6 +466,10 @@ impl PypiParser {
     /// `markers_range` computation). TOML callers pass `value.span.start..value.span.end`;
     /// the requirements.txt line parser passes the requirement text's absolute
     /// byte offsets directly, with no TOML dependency.
+    // Every slice of `requirement_str` below is bounded by `semicolon_idx`/`idx`/`version_end`
+    // (from `.find(';')`, an ASCII byte) or `requirement_str.len()`, so all bounds are always
+    // char boundaries.
+    #[allow(clippy::string_slice)]
     fn parse_pep508_requirement(
         &self,
         requirement_str: &str,

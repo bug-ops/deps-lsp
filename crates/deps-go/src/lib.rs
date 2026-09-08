@@ -28,6 +28,10 @@
 //! assert_eq!(result.dependencies.len(), 1);
 //! ```
 
+// #680: string slicing on a byte index that isn't a verified char boundary panics; sites
+// confirmed boundary-safe by construction are individually `#[allow]`ed with a justification.
+#![warn(clippy::string_slice)]
+
 pub mod config;
 pub mod ecosystem;
 pub mod formatter;

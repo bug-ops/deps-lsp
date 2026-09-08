@@ -376,6 +376,9 @@ impl Ecosystem for NuGetEcosystem {
 /// `formatter.yanked_label()` occupies for other ecosystems' `*(yanked)*` markers. Lines
 /// that don't match the bullet format (the `**Latest**`/`**Requirement**` lines, the footer)
 /// pass through unchanged.
+// `tick` comes from `find('`')`, an ASCII byte, so both slice bounds are always char
+// boundaries.
+#[allow(clippy::string_slice)]
 fn annotate_unlisted_versions(markdown: &str, unlisted: &HashSet<String>) -> String {
     let mut out = String::with_capacity(markdown.len() + unlisted.len() * 14);
     for line in markdown.split_inclusive('\n') {

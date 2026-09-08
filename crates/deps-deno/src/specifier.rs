@@ -168,6 +168,10 @@ pub struct ParsedSpecifier {
 /// assert_eq!(parsed.name, "jsr:@std/fs");
 /// assert_eq!(parsed.version_req, None);
 /// ```
+// Every slice bound (`name_range`, `name_end_in_rest`, `ver_end_rel`) comes from
+// `npm_style_name_boundary` or `find('/')` — both ASCII-derived — so all are always char
+// boundaries.
+#[allow(clippy::string_slice)]
 #[must_use]
 pub fn parse_specifier(value: &str) -> Option<ParsedSpecifier> {
     let (scheme, rest) = split_scheme(value)?;
@@ -237,6 +241,9 @@ pub fn parse_specifier(value: &str) -> Option<ParsedSpecifier> {
 /// // No recognized scheme at all.
 /// assert_eq!(partial_name_range("https://example.com"), None);
 /// ```
+// `slash_rel` comes from `find('/')`, an ASCII byte, so both slice bounds are always char
+// boundaries.
+#[allow(clippy::string_slice)]
 #[must_use]
 pub fn partial_name_range(value: &str) -> Option<Range<usize>> {
     if parse_specifier(value).is_some() {
@@ -269,6 +276,8 @@ pub fn partial_name_range(value: &str) -> Option<Range<usize>> {
 }
 
 #[cfg(test)]
+// Fixtures are single-line ASCII literals with hand-computed byte offsets.
+#[allow(clippy::string_slice)]
 mod tests {
     use super::*;
 

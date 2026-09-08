@@ -185,6 +185,9 @@ fn parse_git_source(git_val: &Yaml) -> (DependencySource, Option<String>) {
     }
 }
 
+// `i` comes from `match_indices`; `line_start` from `rfind('\n')` (an ASCII byte) or 0 —
+// both always char boundaries.
+#[allow(clippy::string_slice)]
 fn find_key_range(key: &str, content: &str, line_table: &LineOffsetTable) -> Range {
     // Search for "key:" pattern in YAML content
     for (i, _) in content.match_indices(key) {
@@ -206,6 +209,9 @@ fn find_key_range(key: &str, content: &str, line_table: &LineOffsetTable) -> Ran
     Range::default()
 }
 
+// `after_colon` is `i + pattern.len()`, both byte offsets from an ASCII pattern match, so it
+// is always a char boundary.
+#[allow(clippy::string_slice)]
 fn find_value_range_after_key(
     key: &str,
     value: &str,
@@ -250,6 +256,8 @@ impl deps_core::ParseResult for DartParseResult {
 }
 
 #[cfg(test)]
+// Fixtures are single-line ASCII literals with hand-computed byte offsets.
+#[allow(clippy::string_slice)]
 mod tests {
     use super::*;
 

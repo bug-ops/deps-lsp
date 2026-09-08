@@ -137,6 +137,9 @@ impl RequirementResolution for ComposerFormatter {
     /// - `X.Y.*` — wildcard patch
     /// - `>=X <Y` — range (space = AND)
     /// - `X || Y` — OR combinator
+    // `version.starts_with(prefix)` short-circuits before `prefix.len()` is used as a slice
+    // bound, so it is always a char boundary.
+    #[allow(clippy::string_slice)]
     fn version_satisfies_requirement(&self, version: &ConcreteVersion, requirement: &str) -> bool {
         let version = version.as_str();
         let version = version.strip_prefix(['v', 'V']).unwrap_or(version);
@@ -456,6 +459,9 @@ pub(crate) fn composer_version_stability_rank(version: &str) -> u8 {
 /// default and any manifest-level `minimum-stability`.
 ///
 /// [`effective_minimum_stability_rank`]: crate::registry::effective_minimum_stability_rank
+// `at_idx` comes from `rfind('@')`, an ASCII byte, so both slice bounds are always char
+// boundaries.
+#[allow(clippy::string_slice)]
 pub(crate) fn strip_stability_flag(requirement: &str) -> (&str, Option<&str>) {
     let Some(at_idx) = requirement.rfind('@') else {
         return (requirement, None);
@@ -499,6 +505,9 @@ fn parse_composer_qualifier(suffix: &str) -> ComposerQualifier {
 /// Splits `version` into its bare numeric-dot core and, if present, its raw stability
 /// qualifier suffix (leading `-`/`_`/`.` separator stripped). Build metadata (after `+`) is
 /// discarded first.
+// `split_at` comes from `find` of an ASCII predicate (non-digit, non-`.`) or `.len()`, so
+// it is always a char boundary.
+#[allow(clippy::string_slice)]
 fn split_composer_core_and_suffix(version: &str) -> (&str, Option<&str>) {
     let without_build = version.split('+').next().unwrap_or(version);
     let split_at = without_build

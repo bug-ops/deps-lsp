@@ -253,6 +253,9 @@ fn finalize_dep(
 ///
 /// Handles `${project.version}` and similar Maven property expressions.
 /// Unresolved properties are left as-is.
+// All indices come from `find("${")`/`find('}')`, both ASCII tokens, so every slice bound
+// is always a char boundary.
+#[allow(clippy::string_slice)]
 fn resolve_properties(input: &str, properties: &HashMap<String, String>) -> String {
     let mut result = input.to_string();
     // Iterate until no more replacements (handles nested, though rare)
@@ -284,6 +287,8 @@ fn resolve_properties(input: &str, properties: &HashMap<String, String>) -> Stri
 /// `hint_start`. For pom.xml files with duplicate artifactId values across
 /// different groupIds, the range may point to an earlier occurrence if the
 /// byte hint is imprecise. This is acceptable for MVP single-version-tag use.
+// `search_from` is floor_char_boundary-clamped just below before slicing `content`.
+#[allow(clippy::string_slice)]
 fn text_range(
     content: &str,
     line_table: &LineOffsetTable,
@@ -294,7 +299,10 @@ fn text_range(
     if text.is_empty() {
         return Range::default();
     }
-    let search_from = hint_start.min(content.len());
+    // `hint_start` is a quick-xml buffer offset; `floor_char_boundary` clamps it to both
+    // `content.len()` (if past the end) and the nearest char boundary, since it is not
+    // guaranteed to land on either (#680).
+    let search_from = content.floor_char_boundary(hint_start);
     if let Some(rel) = content[search_from..].find(text) {
         let abs_start = search_from + rel;
         let abs_end = abs_start + text.len();
@@ -601,6 +609,29 @@ mod tests {
         let dep = &result.dependencies[0];
         // artifactId "my-lib" is on line 4 (0-indexed)
         assert_eq!(dep.name_range.start.line, 4);
+    }
+
+    #[test]
+    fn test_text_range_hint_start_inside_multibyte_char_does_not_panic() {
+        // #680: `hint_start` (a quick-xml buffer offset) is not guaranteed to land on a char
+        // boundary. "café" is 5 bytes ('é' occupies bytes 3-4); hint_start = 4 lands inside it.
+        let content = "café<version>1.0</version>";
+        let line_table = LineOffsetTable::new(content);
+
+        // hint_start = 0 is a safe boundary, used as the known-good baseline.
+        let expected = text_range(content, &line_table, 0, 0, "1.0");
+        // hint_start = 4 lands mid-character in 'é' and must clamp down rather than panic,
+        // while still locating the same text.
+        let actual = text_range(content, &line_table, 4, 4, "1.0");
+
+        assert_eq!(actual.start.line, expected.start.line);
+        assert_eq!(actual.start.character, expected.start.character);
+        assert_eq!(actual.end.line, expected.end.line);
+        assert_eq!(actual.end.character, expected.end.character);
+        assert_ne!(
+            actual.start.character, actual.end.character,
+            "must locate real text"
+        );
     }
 
     #[test]

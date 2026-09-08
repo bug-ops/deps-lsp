@@ -26,6 +26,10 @@
 //! (spec FR-003) — not version-pinnable. `image:`/`services:` Docker tags are out of scope
 //! entirely (spec FR-016) and never parsed.
 
+// #680: string slicing on a byte index that isn't a verified char boundary panics; sites
+// confirmed boundary-safe by construction are individually `#[allow]`ed with a justification.
+#![warn(clippy::string_slice)]
+
 pub mod client;
 pub mod component;
 pub mod ecosystem;

@@ -170,6 +170,9 @@ impl MavenEcosystem {
     /// units via [`deps_core::completion::byte_to_utf16_offset`]. This avoids panics on
     /// multi-byte tag content (e.g. accented characters) and keeps the returned range valid
     /// for LSP clients.
+    // `col_idx` comes from `utf16_to_byte_offset` (char_indices-based); tag offsets come from
+    // `rfind`/`find` of ASCII `<tag>`/`</` tokens. Every slice bound is always a char boundary.
+    #[allow(clippy::string_slice)]
     fn detect_xml_context<'a>(
         content: &'a str,
         position: Position,

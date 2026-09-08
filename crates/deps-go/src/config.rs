@@ -249,6 +249,9 @@ pub const GOPRIVATE_CHAIN_KEY: &str = "go-private:direct";
 /// #564). E.g. `a|invalid,c` records `|` (the separator the user wrote before the dropped
 /// entry), not `,` (the separator that happened to follow it) — a user-written `|` must never
 /// be silently downgraded to `,` just because the entry it preceded turned out invalid.
+// `idx` comes from `find([',', '|'])`, both ASCII bytes, so both slice bounds are always
+// char boundaries.
+#[allow(clippy::string_slice)]
 fn parse_goproxy(raw: &str, policy: &RegistryAccessPolicy) -> Result<GoProxyChain, InvalidEntry> {
     let mut hops: Vec<GoProxyHop> = Vec::new();
     let mut separators: Vec<ChainSeparator> = Vec::new();
@@ -439,6 +442,8 @@ impl GlobPattern {
     /// assert!(pattern.matches("git.mycorp.example/internal/auth"));
     /// assert!(!pattern.matches("github.com/other/repo"));
     /// ```
+    // `i` is a byte index that holds ASCII `b'/'`, so it is always a char boundary.
+    #[allow(clippy::string_slice)]
     #[must_use]
     pub fn matches(&self, module_path: &str) -> bool {
         let Some(tokens) = &self.tokens else {

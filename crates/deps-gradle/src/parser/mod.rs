@@ -227,6 +227,9 @@ pub(crate) fn utf16_len(s: &str) -> usize {
 /// coordinate on one line — e.g.
 /// `implementation("a:b:1.0.0"); testImplementation("a:b:1.0.0")` — so the
 /// second dependency's range isn't mis-attributed to the first's position.
+// `match_start` is a regex match start; `abs_start` derives from `find` of an ASCII
+// coordinate string. Every slice bound is always a char boundary.
+#[allow(clippy::string_slice)]
 pub(crate) fn find_name_range(
     line: &str,
     line_idx: u32,
@@ -257,6 +260,9 @@ pub(crate) fn find_name_range(
 /// version string on one line — e.g.
 /// `implementation("a:b:1.0.0"); implementation("c:d:1.0.0")` — so the
 /// second dependency's range isn't mis-attributed to the first's position.
+// `match_start` is a regex match start; `colon_pos` comes from `char_indices()`; `abs_start`
+// derives from `find` of the version string. Every slice bound is always a char boundary.
+#[allow(clippy::string_slice)]
 pub(crate) fn find_version_range(
     line: &str,
     line_idx: u32,

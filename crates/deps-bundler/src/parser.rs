@@ -58,6 +58,8 @@ static PLATFORMS_OPTION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"platforms:\s*(\[.+?\]|:\w+)").expect("Invalid regex"));
 
 /// Parses a Gemfile and extracts all dependencies with positions.
+// The `caps.get(0).unwrap().end()` offset is a regex match end, always a char boundary.
+#[allow(clippy::string_slice)]
 pub fn parse_gemfile(content: &str, doc_uri: &Uri) -> Result<BundlerParseResult> {
     let line_table = LineOffsetTable::new(content);
     let mut dependencies = Vec::new();
