@@ -34,31 +34,15 @@ enum BareRequirementPolicy {
 /// Cargo's implicit caret. For these, [`is_concrete_version`] requires an
 /// explicit `=`/`==` (or an exact-bracket wrap) before treating a requirement
 /// as concrete; a bare `"1.2.3"` alone is not enough evidence (critique C2).
+/// Cargo is the sole remaining member of this group: every other ecosystem
+/// with an implicit-range default distinguishes a bare *full* version (a
+/// pin) from a bare *partial* one (a range) instead, so it belongs under
+/// [`BareRequirementPolicy::ConcreteIfFullVersion`] rather than here.
 ///
-/// Deno reuses npm's exact grammar for both its `jsr:` and `npm:` specifiers
-/// (`DenoFormatter::compile_requirement` compiles both through the same
-/// `node_semver::Range` npm itself uses), so — unlike Cargo — a bare Deno
-/// requirement is genuinely **not** unconditionally a range either; it stays
-/// `AlwaysRange` here anyway, deliberately conservative rather than
-/// following npm/Composer into `ConcreteIfFullVersion` in this PR
-/// (impl-critic #664 review, finding S2, corrects an earlier draft of this
-/// comment that asserted the opposite rationale — that Deno's lack of a
-/// resolved-version concept made the fix low-value for it; the code says the
-/// reverse: `deps-deno` has **no lockfile support at all**
-/// (`crates/deps-deno/src/ecosystem.rs`'s `LockFileProvider` is unimplemented
-/// for Deno), so `concrete_pin_version` is the *only* possible source of an
-/// in-use version for any Deno dependency — a `deno.json` `"npm:express@4.17.0"`
-/// import parses to the bare requirement `"4.17.0"`, and with `AlwaysRange`
-/// that requirement can never resolve to a concrete version, so **no Deno
-/// dependency ever receives an OSV scan, under any manifest**, bare-pinned or
-/// not). Left unconditionally range-only here pending a dedicated follow-up
-/// issue to move Deno to `ConcreteIfFullVersion` — out of #664's own scope,
-/// which is limited to npm/Composer.
-///
-/// GitHub Actions, GitLab CI, npm, and Composer all get
+/// GitHub Actions, GitLab CI, npm, Composer, and Deno all get
 /// [`BareRequirementPolicy::ConcreteIfFullVersion`] instead — see that
 /// variant's docs for the shared "full version is a pin, partial version is
-/// a range" rule, and below for why each of the four qualifies:
+/// a range" rule, and below for why each of the five qualifies:
 ///
 /// - GitHub Actions: a bare `v4` (a moving-major tag) genuinely is a range,
 ///   so it must not be queried as if it were the concrete version `4`, but a
@@ -86,10 +70,26 @@ enum BareRequirementPolicy {
 ///   ecosystems were grouped with Cargo under `AlwaysRange`, which silently
 ///   dropped `in_use_version` resolution (and therefore hover License/OSV
 ///   sections) for any bare-pinned npm/Composer manifest with no lock file.
+/// - Deno (#667): `DenoFormatter::compile_requirement`
+///   (`crates/deps-deno/src/formatter.rs`) compiles both its `jsr:` and
+///   `npm:` specifiers through the identical `node_semver::Range` grammar
+///   npm itself uses, so the same full-vs-partial distinction applies
+///   unchanged. This matters more for Deno than for npm/Composer:
+///   `deps-deno` has no lockfile support at all (`DenoEcosystem`'s
+///   `LockFileProvider` is unimplemented), so `concrete_pin_version` is the
+///   *only* possible source of an in-use version for any Deno dependency — a
+///   `deno.json` `"npm:express@4.17.0"` import parses to the bare
+///   requirement `"4.17.0"`, and grouping Deno with Cargo under
+///   `AlwaysRange` meant that requirement could never resolve to a concrete
+///   version, so no Deno dependency ever received an OSV scan under any
+///   manifest, bare-pinned or not. Reclassifying it here does not change
+///   `osv_package_name` returning `None` for `jsr:` specifiers
+///   (`deps-deno/src/formatter.rs`, OSV has no JSR ecosystem) — that is an
+///   independent, already-correct downstream filter.
 ///
 /// Every remaining ecosystem (Pypi, Go, Bundler, Dart, Maven, Gradle, Swift,
 /// NuGet) gets plain [`BareRequirementPolicy::Concrete`]: none of them has an
-/// implicit-range default the way Cargo/Deno do. Gradle in particular: a bare
+/// implicit-range default the way Cargo does. Gradle in particular: a bare
 /// coordinate version (e.g. `"2.14.1"`) is an exact match under
 /// `GradleFormatter`'s own `version_satisfies_requirement` unless it uses the
 /// `+` dynamic-version suffix, which [`looks_like_a_single_version`] already
@@ -104,11 +104,12 @@ enum BareRequirementPolicy {
 /// positive is worse than a false negative.
 const fn bare_requirement_policy(ecosystem: EcosystemId) -> BareRequirementPolicy {
     match ecosystem {
-        EcosystemId::Cargo | EcosystemId::Deno => BareRequirementPolicy::AlwaysRange,
+        EcosystemId::Cargo => BareRequirementPolicy::AlwaysRange,
         EcosystemId::GithubActions
         | EcosystemId::GitlabCi
         | EcosystemId::Npm
-        | EcosystemId::Composer => BareRequirementPolicy::ConcreteIfFullVersion,
+        | EcosystemId::Composer
+        | EcosystemId::Deno => BareRequirementPolicy::ConcreteIfFullVersion,
         EcosystemId::Pypi
         | EcosystemId::Go
         | EcosystemId::Bundler
@@ -554,16 +555,13 @@ mod tests {
     #[test]
     fn is_concrete_version_bare_digit_rejected_for_range_default_ecosystems() {
         // Critique C2: Cargo's bare "1.2.3" is a caret range under Cargo's
-        // own default operator, not a pin. Deno reuses npm's exact grammar
-        // for both `jsr:` and `npm:` requirements but keeps `AlwaysRange`
-        // (`bare_requirement_policy`'s doc comment) — npm/Composer
-        // themselves moved to `ConcreteIfFullVersion` (#664), since a bare
-        // *full* version is their own exact pin.
-        for eco in [EcosystemId::Cargo, EcosystemId::Deno] {
-            assert!(!is_concrete_version("1.2.3", eco), "{eco:?}");
-            // ...but an explicit pin is still accepted.
-            assert!(is_concrete_version("=1.2.3", eco), "{eco:?}");
-        }
+        // own default operator, not a pin. Cargo is the sole remaining
+        // `AlwaysRange` ecosystem — npm/Composer (#664) and Deno (#667)
+        // moved to `ConcreteIfFullVersion`, since a bare *full* version is
+        // their own exact pin.
+        assert!(!is_concrete_version("1.2.3", EcosystemId::Cargo));
+        // ...but an explicit pin is still accepted.
+        assert!(is_concrete_version("=1.2.3", EcosystemId::Cargo));
     }
 
     #[test]
@@ -799,6 +797,33 @@ mod tests {
         assert_eq!(
             concrete_pin_version("=2.0.0", EcosystemId::Composer),
             Some("2.0.0")
+        );
+    }
+
+    // --- concrete_pin_version: BareRequirementPolicy::ConcreteIfFullVersion (Deno, #667) ---
+
+    #[test]
+    fn concrete_pin_version_deno_full_bare_version_is_concrete() {
+        assert_eq!(
+            concrete_pin_version("4.17.0", EcosystemId::Deno),
+            Some("4.17.0")
+        );
+    }
+
+    #[test]
+    fn concrete_pin_version_deno_partial_bare_version_is_a_range() {
+        // `DenoFormatter::compile_requirement` compiles `jsr:`/`npm:` requirements
+        // through the same `node_semver::Range` npm uses, so a bare partial version
+        // expands to an implicit X-range, not a single version.
+        assert_eq!(concrete_pin_version("4.17", EcosystemId::Deno), None);
+        assert_eq!(concrete_pin_version("4", EcosystemId::Deno), None);
+    }
+
+    #[test]
+    fn concrete_pin_version_deno_explicit_pin_still_concrete() {
+        assert_eq!(
+            concrete_pin_version("=1.0.0", EcosystemId::Deno),
+            Some("1.0.0")
         );
     }
 
@@ -1170,5 +1195,34 @@ mod tests {
         );
 
         assert_eq!(result, None);
+    }
+
+    /// #667's exact repro: a `deno.json` `"npm:express@4.17.0"` import with no lock
+    /// file — `deps-deno` has no `LockFileProvider` implementation at all, so this is
+    /// the *only* path through which a Deno dependency can ever resolve an in-use
+    /// version. Before this fix, Deno was grouped with Cargo under `AlwaysRange`, so
+    /// this bare full-version pin resolved to `None` and never received an OSV scan.
+    #[test]
+    fn in_use_version_deno_bare_full_version_no_lockfile_resolves_667_repro() {
+        use crate::VersionReq;
+        use crate::lsp_helpers::test_support::MockDep;
+
+        let dep = MockDep {
+            name: PackageName::new("express"),
+            version_req: VersionReq::new("4.17.0"),
+            version_range: tower_lsp_server::ls_types::Range::default(),
+            name_range: tower_lsp_server::ls_types::Range::default(),
+        };
+
+        let result = in_use_version(
+            &dep,
+            "express",
+            &HashMap::new(),
+            None,
+            &crate::lsp_helpers::test_support::MockFormatter,
+            EcosystemId::Deno,
+        );
+
+        assert_eq!(result, Some("4.17.0".to_string()));
     }
 }

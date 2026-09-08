@@ -448,4 +448,11 @@ mod tests {
         let jsr_dep = FakeDep(PackageName::new("jsr:@std/fs"));
         assert_eq!(formatter.osv_package_name(&jsr_dep), None);
     }
+
+    #[test]
+    fn test_osv_version_strips_v_prefix() {
+        let formatter = DenoFormatter;
+        assert_eq!(formatter.osv_version("v4.17.0"), "4.17.0");
+        assert_eq!(formatter.osv_version("4.17.0"), "4.17.0");
+    }
 }

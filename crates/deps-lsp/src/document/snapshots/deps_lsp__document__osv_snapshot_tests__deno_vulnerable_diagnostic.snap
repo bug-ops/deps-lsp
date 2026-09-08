@@ -1,0 +1,7 @@
+---
+source: crates/deps-lsp/src/document/osv_snapshot_tests.rs
+expression: rendered
+---
+Some(Warning) | GHSA-xxxx-yyyy-zzzz: Example vulnerability for snapshot testing | code=true
+Some(Information) | +5 more advisories | code=false
+Some(Warning) | Unknown package 'npm:express' | code=false
