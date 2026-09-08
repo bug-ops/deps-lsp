@@ -21,7 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-npm**: `package-lock.json` parsing now prefers a package entry's own `name` field (npm writes this when it differs from the physical `node_modules/` path, e.g. for an `npm:` alias) over the lockfile-key-derived name (#657)
 
 ### Dependencies
-- Bump `dirs` from 6 to 7.0.0, plus transitive `Cargo.lock` refresh
+- Bump `dirs` from 6 to 7.0.0, plus transitive `Cargo.lock` refresh (#659)
 
 ## [0.13.0] - 2026-09-05
 
