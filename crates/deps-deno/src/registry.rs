@@ -49,6 +49,36 @@ fn meta_json_url(base: &str, scope: &str, name: &str) -> String {
     )
 }
 
+/// Builds the `api.jsr.io` per-version endpoint URL (issue #660) — `base` is
+/// [`JsrRegistry`]'s `api_base`, not `base` (the `jsr.io` package-page/`meta.json`
+/// host `meta_json_url` targets).
+fn version_url(api_base: &str, scope: &str, name: &str, version: &str) -> String {
+    format!(
+        "{api_base}/scopes/{}/packages/{}/versions/{}",
+        urlencoding::encode(scope),
+        urlencoding::encode(name),
+        urlencoding::encode(version)
+    )
+}
+
+/// The subset of `api.jsr.io`'s per-version response this client needs (issue #660).
+#[derive(Deserialize)]
+struct VersionResponse {
+    #[serde(default)]
+    license: Option<String>,
+}
+
+fn parse_version_license(data: &[u8]) -> Vec<String> {
+    let Ok(response) = deps_core::parse_json_checked::<VersionResponse>(data) else {
+        return Vec::new();
+    };
+    response
+        .license
+        .filter(|l| !l.is_empty())
+        .map(|l| vec![l])
+        .unwrap_or_default()
+}
+
 /// Upper bound on how many results [`JsrRegistry::search`] fetches from the wire before
 /// reordering/truncating to the caller's requested `limit`, for a scope-qualified query
 /// (N1). Bounds the request even if `limit` itself is large; JSR's search API returns
@@ -231,6 +261,30 @@ impl JsrRegistry {
         parse_meta_json(&data)
     }
 
+    /// Fetches `@{scope}/{name}@{version}`'s SPDX license identifier from JSR's
+    /// per-version API (issue #660, spec 010 plan §1 — live-verified 2026-09-08 against
+    /// `@std/fs@1.0.24`: `GET /scopes/{scope}/packages/{name}/versions/{version}`
+    /// returns a top-level `license` string, e.g. `"MIT"` — unlike [`Self::get_versions`]'s
+    /// `meta.json`, which carries no license field at all).
+    ///
+    /// Returns an empty `Vec` (never an error) on any fetch failure, a missing/empty
+    /// `license` field, or a dot-prefixed `scope`/`name`/`version` segment — graceful
+    /// degradation (NFR-003), since this is a best-effort secondary signal, not core
+    /// version data.
+    pub async fn get_license(&self, scope: &str, name: &str, version: &str) -> Vec<String> {
+        if is_dot_prefixed(scope) || is_dot_prefixed(name) || is_dot_prefixed(version) {
+            return Vec::new();
+        }
+        let url = version_url(&self.api_base, scope, name, version);
+        match self.cache.get_cached(&url).await {
+            Ok(data) => parse_version_license(&data),
+            Err(e) => {
+                tracing::debug!(scope, name, version, error = %e, "jsr version license fetch failed");
+                Vec::new()
+            }
+        }
+    }
+
     /// Searches JSR for packages matching `query`.
     ///
     /// If `query` is scope-qualified (`"@scope/pkg-prefix"`), the scope is split off
@@ -399,6 +453,26 @@ impl DenoRegistry {
         Self {
             jsr: JsrRegistry::new(cache),
             npm,
+        }
+    }
+
+    /// Fetches `name`'s (already scheme-qualified, e.g. `"jsr:@std/fs"`) license at
+    /// `version` (issue #660).
+    ///
+    /// Only `jsr:` specifiers have a reachable license source: `deps_dev_system`
+    /// excludes the Deno ecosystem entirely (spec 010 plan §1), and reaching an
+    /// `npm:` specifier's license would mean a second, full (non-abbreviated) npm
+    /// packument fetch beyond what `deps-npm`'s existing hot-path abbreviated fetch
+    /// already does — out of scope for this pre-fetch (deferred as a follow-up, see
+    /// spec 010's tier-3 rollout notes). An `npm:` specifier degrades gracefully to an
+    /// empty `Vec` (NFR-003), same as any other missing-source case.
+    pub async fn get_license(&self, name: &PackageName, version: &str) -> Vec<String> {
+        match split_scheme(name.as_str()) {
+            Some((Scheme::Jsr, rest)) => match split_scoped(rest) {
+                Some((scope, pkg)) => self.jsr.get_license(scope, pkg, version).await,
+                None => Vec::new(),
+            },
+            Some((Scheme::Npm, _)) | None => Vec::new(),
         }
     }
 }
@@ -1285,5 +1359,102 @@ mod tests {
             .await
             .unwrap_err();
         assert_matches!(err, DepsError::PackageNotFound { .. });
+    }
+
+    // --- issue #660: license detection ---
+
+    #[test]
+    fn parse_version_license_extracts_field() {
+        let body = br#"{"scope":"std","package":"fs","version":"1.0.24","license":"MIT"}"#;
+        assert_eq!(parse_version_license(body), vec!["MIT".to_string()]);
+    }
+
+    #[test]
+    fn parse_version_license_missing_field_is_empty() {
+        let body = br#"{"scope":"std","package":"fs","version":"1.0.24"}"#;
+        assert!(parse_version_license(body).is_empty());
+    }
+
+    #[test]
+    fn parse_version_license_malformed_json_degrades_to_empty() {
+        assert!(parse_version_license(b"not json").is_empty());
+    }
+
+    #[tokio::test]
+    async fn jsr_get_license_fetches_version_endpoint() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/scopes/std/packages/fs/versions/1.0.24")
+            .with_status(200)
+            .with_body(r#"{"license":"MIT"}"#)
+            .create_async()
+            .await;
+
+        let jsr = JsrRegistry::with_bases(Arc::new(HttpCache::new()), server.url(), server.url());
+        assert_eq!(
+            jsr.get_license("std", "fs", "1.0.24").await,
+            vec!["MIT".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn jsr_get_license_dot_prefixed_segment_returns_empty_without_network() {
+        let jsr = JsrRegistry::with_bases(
+            Arc::new(HttpCache::new()),
+            "http://[::1]:1".into(),
+            "http://[::1]:1".into(),
+        );
+        assert!(jsr.get_license("..", "fs", "1.0.0").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn jsr_get_license_fetch_failure_degrades_to_empty() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/scopes/std/packages/missing/versions/1.0.0")
+            .with_status(404)
+            .create_async()
+            .await;
+
+        let jsr = JsrRegistry::with_bases(Arc::new(HttpCache::new()), server.url(), server.url());
+        assert!(jsr.get_license("std", "missing", "1.0.0").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn deno_registry_get_license_dispatches_jsr_specifier() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/scopes/std/packages/fs/versions/1.0.24")
+            .with_status(200)
+            .with_body(r#"{"license":"MIT"}"#)
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = DenoRegistry {
+            jsr: JsrRegistry::with_bases(Arc::clone(&cache), server.url(), server.url()),
+            npm: NpmRegistry::new(cache),
+        };
+        let license = registry
+            .get_license(&PackageName::new("jsr:@std/fs"), "1.0.24")
+            .await;
+        assert_eq!(license, vec!["MIT".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn deno_registry_get_license_npm_specifier_is_empty_without_network() {
+        let cache = Arc::new(HttpCache::new());
+        let registry = DenoRegistry {
+            jsr: JsrRegistry::with_bases(
+                Arc::clone(&cache),
+                "http://[::1]:1".into(),
+                "http://[::1]:1".into(),
+            ),
+            npm: NpmRegistry::new(cache),
+        };
+        let license = registry
+            .get_license(&PackageName::new("npm:react"), "18.0.0")
+            .await;
+        assert!(license.is_empty());
     }
 }

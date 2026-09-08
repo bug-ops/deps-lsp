@@ -205,6 +205,10 @@ fn preserve_cache(new_state: &mut DocumentState, old_state: &DocumentState) {
     // (or, for a registry-outage package, flip back to a misleading "Unknown package"
     // diagnostic until the next fetch cycle re-populates it, #267).
     new_state.outcomes.clone_from(&old_state.outcomes);
+    // Same rationale again (issue #660): without this, a tier-3 ecosystem's hover
+    // license would flicker off on every keystroke until `run_license_prefetch`'s next
+    // background pass re-populates it.
+    new_state.licenses.clone_from(&old_state.licenses);
 }
 
 /// Drops previously cached version and fetch-failure data ahead of a forced re-fetch
@@ -618,6 +622,232 @@ async fn run_osv_scan_phase_a(
         osv_name_by_key,
         raw_name_by_key,
     })
+}
+
+/// Ecosystems `deps_dev_system` doesn't cover and whose hot-path registry response
+/// carries no license field (issue #660, spec 010 plan §1 tier 3) — the only four
+/// [`run_license_prefetch`] ever does any work for.
+fn is_license_prefetch_ecosystem(ecosystem_id: EcosystemId) -> bool {
+    matches!(
+        ecosystem_id,
+        EcosystemId::Dart | EcosystemId::Swift | EcosystemId::Gradle | EcosystemId::Deno
+    )
+}
+
+/// Background pre-fetch of each dependency's license, for the four ecosystems
+/// [`is_license_prefetch_ecosystem`] covers (issue #660, spec 010 plan §1 tier 3):
+/// pub.dev's `/score` endpoint (Dart), the GitHub repository API (Swift), a Maven
+/// Central POM fetch (Gradle), and the JSR per-version API (Deno). Mirrors
+/// [`run_osv_scan_phase_a`]'s spawn-concurrently-with-the-registry-fetch shape, but
+/// commits directly with no phase B. Callers must `.await` the returned
+/// [`JoinHandle`] (via `tokio::spawn`) before their own diagnostics publish, exactly
+/// like the OSV `osv_task` join — a tier-3 license-policy violation must be able to
+/// appear in the *first* diagnostics publish after the triggering edit, not only
+/// whenever some later, unrelated event happens to regenerate diagnostics (code-review
+/// round 3 finding #3).
+///
+/// The commit at the end is staleness-guarded (`doc.content == content_snapshot`,
+/// mirroring [`run_osv_phase_b_and_commit`]'s identical guard) and merges rather than
+/// replaces (round 3 finding #1/#2): two overlapping edits can spawn two overlapping
+/// pre-fetches, and without the guard the older one finishing last could silently
+/// overwrite the newer one's results with stale data; without a merge, a transient
+/// per-dependency fetch failure this round (already filtered out below, before this
+/// point) would drop that dependency's previously-cached, still-valid license instead
+/// of just failing to refresh it. [`DocumentState::merge_licenses`]'s own additive
+/// contract already provides exactly this — a genuinely *removed* dependency's stale
+/// entry is reclaimed separately, by the manifest-diff pruning loop in
+/// `commit_parsed_document`, not by this function replacing the whole map.
+///
+/// **What version each source actually reflects is per-ecosystem, not uniform**
+/// (critic S1 — corrects this doc's previous blanket "only ever targets the
+/// resolved/in-use version" claim): Gradle's POM fetch and Deno's JSR API are
+/// genuinely version-specific (fetched at the dependency's resolved/in-use version, the
+/// `version` passed into [`fetch_tier3_license`]). Dart's `get_license` calls
+/// pub.dev's per-*package* `/score` endpoint, which carries no version parameter at
+/// all — it reflects pana's detection on whatever pub.dev last scored, not necessarily
+/// the resolved version. Swift's `get_license` calls GitHub's `GET /repos/{owner}/{repo}`,
+/// which reflects the repository's *default branch*, not the resolved version's tag.
+/// `in_use_version` below is still required as a *gate* for all four (no version
+/// resolved means nothing to look up), but for Dart/Swift it does not pin which
+/// version's license is actually returned.
+///
+/// Filters on [`deps_core::lsp_helpers::SourcePolicy::source_is_public_registry_content`]
+/// (critic M3/S6), the same stricter filter [`build_scan_targets`]'s OSV path already
+/// uses, not the looser [`deps_core::lsp_helpers::SourcePolicy::can_resolve_source`]: a
+/// patched git/path fork is resolvable but must never have its license misattributed to
+/// the upstream registry package it forked from — the identical "is this really the
+/// same package" problem OSV's stricter filter exists to solve.
+///
+/// No-op (returns immediately) for every other ecosystem.
+async fn run_license_prefetch(
+    uri: Uri,
+    state: Arc<ServerState>,
+    ecosystem: Arc<dyn Ecosystem>,
+    fetch_timeout_secs: u64,
+) {
+    let ecosystem_id = resolve_ecosystem_id(ecosystem.as_ref());
+    if !is_license_prefetch_ecosystem(ecosystem_id) {
+        return;
+    }
+
+    let (content_snapshot, targets): (String, Vec<(PackageName, String)>) = {
+        let Some(doc) = state.get_document(&uri) else {
+            return;
+        };
+        let Some(parse_result) = doc.parse_result() else {
+            return;
+        };
+        let formatter = ecosystem.formatter();
+        let targets = parse_result
+            .dependencies()
+            .into_iter()
+            .filter(|d| formatter.source_is_public_registry_content(&d.source()))
+            .filter_map(|d| {
+                let normalized = formatter.normalize_package_name(d.name());
+                let version = in_use_version(
+                    d,
+                    normalized.as_str(),
+                    &doc.resolved_versions,
+                    Some(&doc.resolved_version_candidates),
+                    formatter,
+                    ecosystem_id,
+                )?;
+                Some((d.name().clone(), version))
+            })
+            .collect();
+        (doc.content.clone(), targets)
+    };
+
+    if targets.is_empty() {
+        return;
+    }
+
+    use futures::stream::{self, StreamExt};
+
+    let timeout_duration =
+        Duration::from_secs(fetch_timeout_secs.min(LICENSE_PREFETCH_TIMEOUT_CEILING_SECS));
+    let ecosystem = &ecosystem;
+    let licenses: HashMap<PackageName, Vec<String>> = stream::iter(targets)
+        .map(|(name, version)| async move {
+            let found = tokio::time::timeout(
+                timeout_duration,
+                fetch_tier3_license(ecosystem.as_ref(), ecosystem_id, name.as_str(), &version),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                tracing::debug!(package = %name, "tier-3 license fetch timed out");
+                Vec::new()
+            });
+            (name, found)
+        })
+        .buffer_unordered(LICENSE_PREFETCH_CONCURRENCY)
+        .filter(|(_, found)| std::future::ready(!found.is_empty()))
+        .collect()
+        .await;
+
+    if let Some(mut doc) = state.documents.get_mut(&uri) {
+        if doc.content == content_snapshot {
+            doc.merge_licenses(licenses);
+        } else {
+            tracing::debug!(
+                "dropping stale tier-3 license pre-fetch result: document content changed mid-fetch"
+            );
+        }
+    }
+}
+
+/// Bounds how many concurrent per-dependency license fetches [`run_license_prefetch`]
+/// issues at once — same rationale as `fetch_latest_versions_parallel`'s
+/// `max_concurrent`, scaled down: tier-3 documents rarely carry more than a handful of
+/// dependencies (Dart/Swift/Gradle/Deno are all comparatively small ecosystems in this
+/// project's usage), and this pre-fetch is a background nice-to-have, not on the hover
+/// critical path, so there is no latency pressure to fan out aggressively.
+const LICENSE_PREFETCH_CONCURRENCY: usize = 8;
+
+/// Ceiling on the per-dependency tier-3 license fetch timeout, independent of the
+/// configured `fetch_timeout_secs` (critic S4/M2: `fetch_tier3_license` previously had
+/// no bound at all, unlike every other registry call in this codebase, e.g.
+/// `fetch_and_classify_package`'s `tokio::time::timeout(timeout, ...)`). Mirrors
+/// [`OSV_SCAN_TIMEOUT_CEILING_SECS`]'s rationale: the shared `reqwest` client behind
+/// `HttpCache` already imposes its own client-wide 30s timeout, so a per-call timeout
+/// longer than that would never actually bind.
+const LICENSE_PREFETCH_TIMEOUT_CEILING_SECS: u64 = 30;
+
+/// Dispatches to the concrete ecosystem's license fetch, downcasting `ecosystem` via
+/// [`Ecosystem::as_any`] rather than adding a new sealed-trait method — license
+/// pre-fetch is a tier-3-only concern (four ecosystems), not a capability every
+/// `Ecosystem` implementor needs to carry. Returns an empty `Vec` (graceful
+/// degradation, spec 010 NFR-003) for any ecosystem other than the four
+/// [`is_license_prefetch_ecosystem`] covers, or when the downcast fails (the ecosystem
+/// crate's Cargo feature is disabled, so no instance of that concrete type can ever
+/// reach this function).
+async fn fetch_tier3_license(
+    ecosystem: &dyn Ecosystem,
+    ecosystem_id: EcosystemId,
+    name: &str,
+    version: &str,
+) -> Vec<String> {
+    match ecosystem_id {
+        EcosystemId::Dart => {
+            #[cfg(feature = "dart")]
+            if let Some(eco) = ecosystem
+                .as_any()
+                .downcast_ref::<deps_dart::DartEcosystem>()
+            {
+                return eco.fetch_license(name).await;
+            }
+            Vec::new()
+        }
+        EcosystemId::Swift => {
+            #[cfg(feature = "swift")]
+            if let Some(eco) = ecosystem
+                .as_any()
+                .downcast_ref::<deps_swift::SwiftEcosystem>()
+            {
+                return eco.fetch_license(name).await;
+            }
+            Vec::new()
+        }
+        EcosystemId::Gradle => {
+            #[cfg(feature = "gradle")]
+            if let Some(eco) = ecosystem
+                .as_any()
+                .downcast_ref::<deps_gradle::GradleEcosystem>()
+            {
+                return eco.fetch_license(name, version).await;
+            }
+            Vec::new()
+        }
+        EcosystemId::Deno => {
+            #[cfg(feature = "deno")]
+            if let Some(eco) = ecosystem
+                .as_any()
+                .downcast_ref::<deps_deno::DenoEcosystem>()
+            {
+                return eco.fetch_license(name, version).await;
+            }
+            Vec::new()
+        }
+        // Every non-tier-3 ecosystem (round 3 finding #4): an exhaustive match, not a
+        // bare `_`, so this project's #118 precedent applies here too — adding a 15th
+        // `EcosystemId` variant forces a compile error at this call site instead of
+        // silently falling through to an empty-forever result for it. All of these
+        // ecosystems are either `deps_dev_system`-covered (tier 2) or already carry a
+        // native license field, so none is ever routed here in the first place —
+        // `run_license_prefetch`'s [`is_license_prefetch_ecosystem`] gate means this
+        // function is never even called for them, but the match must still say so
+        // explicitly rather than relying on that caller-side gate alone.
+        EcosystemId::Cargo
+        | EcosystemId::Npm
+        | EcosystemId::Pypi
+        | EcosystemId::Go
+        | EcosystemId::Bundler
+        | EcosystemId::Maven
+        | EcosystemId::Composer
+        | EcosystemId::NuGet
+        | EcosystemId::GithubActions
+        | EcosystemId::GitlabCi => Vec::new(),
+    }
 }
 
 /// Phase B: for every dependency phase A flagged [`deps_core::osv::ScanOutcome::Vulnerable`],
@@ -1090,6 +1320,21 @@ struct FetchResult {
     failed_count: usize,
     /// First actionable error message (shown to user via `window/showMessage`)
     first_error: Option<String>,
+    /// SPDX license identifier(s) for the resolved/"latest" pick, for every package
+    /// whose [`Version::license`] on the already-fetched version-list entry is
+    /// non-empty (issue #660/#661 tier-1 backfill) — today, only the native-list
+    /// ecosystems (PyPI, Composer) ever populate this; every other ecosystem's
+    /// `Version::license` default is empty, so this map stays empty for them.
+    /// Deliberately *not* threaded into [`PackageVersions`] itself (that type is
+    /// constructed identically across ~40 call sites throughout the workspace,
+    /// including files outside this crate's ownership for this change) —
+    /// `merge_registry_fetch_result` merges this map directly into
+    /// [`crate::document::DocumentState::licenses`] instead, the same map the tier-3
+    /// background pre-fetch (`run_license_prefetch`) already populates for
+    /// Dart/Swift/Gradle/Deno. A merge (not replace), since the two sources are
+    /// always disjoint per document (one ecosystem per document) but run as
+    /// independent, non-ordered background tasks.
+    licenses: HashMap<PackageName, Vec<String>>,
 }
 
 /// Fetches latest versions for multiple packages in parallel with progress reporting.
@@ -1213,11 +1458,13 @@ async fn fetch_latest_versions_parallel(
     let mut fetch_failed = HashMap::new();
     let mut deprecations = HashMap::new();
     let mut no_comparable_versions = HashSet::new();
+    let mut licenses = HashMap::new();
     // First actionable failure in completion order — `results` is collected from
     // `buffer_unordered`, so its order already reflects real finishing order, the same
     // order a shared `Arc<Mutex>` written from inside each task would have observed.
     let mut priority_error: Option<String> = None;
-    for (version, yanked, failed_name, deprecation, no_comparable_versions_name) in results {
+    for (version, yanked, failed_name, deprecation, no_comparable_versions_name, license) in results
+    {
         if let Some((name, v)) = version {
             versions.insert(name, v);
         }
@@ -1236,6 +1483,9 @@ async fn fetch_latest_versions_parallel(
         if let Some(name) = no_comparable_versions_name {
             no_comparable_versions.insert(name);
         }
+        if let Some((name, license)) = license {
+            licenses.insert(name, license);
+        }
     }
 
     // `priority_error` (an actual fetch failure — rate limit, timeout, outage, ...)
@@ -1253,20 +1503,30 @@ async fn fetch_latest_versions_parallel(
         no_comparable_versions,
         failed_count: failed.load(std::sync::atomic::Ordering::Relaxed),
         first_error: error_message,
+        licenses,
     }
 }
 
 /// Per-package outcome returned by [`fetch_and_classify_package`]: the resolved
 /// `(name, PackageVersions)` entry, a yanked finding, a fetch failure, a package-level
-/// deprecation finding, and a name whose fetch succeeded with no comparable versions
-/// (#550) — folded into [`fetch_latest_versions_parallel`]'s aggregate `FetchResult`
-/// once every package in the stream has finished.
+/// deprecation finding, a name whose fetch succeeded with no comparable versions
+/// (#550), and the resolved/"latest" pick's license when the ecosystem's already-fetched
+/// version-list entries carry it (issue #660/#661 tier-1 backfill — see
+/// [`FetchResult::licenses`]) — folded into [`fetch_latest_versions_parallel`]'s
+/// aggregate `FetchResult` once every package in the stream has finished.
+///
+/// The license entry specifically comes from `select_latest_matching_with_context`'s
+/// pick below (critic S1: previously documented here as "the resolved version's
+/// license", which is wrong — this function never reads `resolved_versions` at all, it
+/// picks the latest version matching the requirement/stability floor, same as
+/// `PackageVersions.latest`).
 type PackageFetchOutcome = (
     Option<(PackageName, PackageVersions)>,
     Option<(PackageName, ConcreteVersion, RemovalStatus)>,
     Option<(PackageName, FetchFailure, String)>,
     Option<(PackageName, Deprecation)>,
     Option<PackageName>,
+    Option<(PackageName, Vec<String>)>,
 );
 
 /// Fetches, classifies, and version-selects a single package within
@@ -1316,6 +1576,7 @@ async fn fetch_and_classify_package(
     let mut yanked: Option<(PackageName, ConcreteVersion, RemovalStatus)> = None;
     let mut failed_name: Option<(PackageName, FetchFailure, String)> = None;
     let mut deprecation: Option<(PackageName, Deprecation)> = None;
+    let mut license: Option<(PackageName, Vec<String>)> = None;
     // Set only when the fetch (and its `get_latest_matching` fallback) both
     // genuinely succeeded yet resolved to no version at all (#550) — see the
     // `Ok(Ok(None))` fallback arm below.
@@ -1365,6 +1626,7 @@ async fn fetch_and_classify_package(
                     v.removal_status(),
                     v.published_at(),
                     v.deprecation().cloned(),
+                    v.license().to_vec(),
                 ))
             } else {
                 // The pure list-based pick found nothing — for most
@@ -1401,6 +1663,7 @@ async fn fetch_and_classify_package(
                             v.removal_status(),
                             v.published_at(),
                             v.deprecation().cloned(),
+                            v.license().to_vec(),
                         ))
                     }
                     Ok(Ok(None)) => {
@@ -1464,7 +1727,7 @@ async fn fetch_and_classify_package(
                 // registry under today's hardcoded wildcard (one
                 // never returns a yanked version for `*`), but
                 // stays correct as a defense-in-depth check.
-                if let Some((latest, status, _, _)) = &resolved
+                if let Some((latest, status, _, _, _)) = &resolved
                     && status.is_flagged()
                 {
                     yanked = Some((name.clone(), latest.clone(), *status));
@@ -1513,13 +1776,25 @@ async fn fetch_and_classify_package(
             // whose returned `Version` is not a member of `versions` at all. See
             // `FetchResult::deprecations`'s docs for why this must not instead
             // scan `versions`.
-            if let Some((_, _, _, dep_info)) = &resolved
+            if let Some((_, _, _, dep_info, _)) = &resolved
                 && let Some(dep_info) = dep_info
             {
                 deprecation = Some((name.clone(), dep_info.clone()));
             }
 
-            resolved.map(|(latest, _, published_at, _)| {
+            // Issue #660/#661 tier-1 backfill: extracted from the same `resolved` pick
+            // before `.map()` below consumes it — non-empty only for the native-list
+            // ecosystems whose `Version::license` isn't the default empty (PyPI,
+            // Composer today). Filtered here (not left to the aggregation loop) so a
+            // `Some((name, vec![]))` entry — indistinguishable from "no data" once
+            // merged into `DocumentState::licenses` — never gets inserted.
+            license = resolved
+                .as_ref()
+                .map(|(_, _, _, _, lic)| lic)
+                .filter(|lic| !lic.is_empty())
+                .map(|lic| (name.clone(), lic.clone()));
+
+            resolved.map(|(latest, _, published_at, _, _)| {
                 (
                     name.clone(),
                     PackageVersions {
@@ -1587,6 +1862,7 @@ async fn fetch_and_classify_package(
         failed_name,
         deprecation,
         no_comparable_versions_name,
+        license,
     )
 }
 
@@ -1777,6 +2053,19 @@ async fn run_document_open_background_task(
             cache_config.fetch_timeout_secs,
         ))
     });
+
+    // Tier-3 license pre-fetch (issue #660), spawned concurrently with the registry
+    // fetch below, same shape as OSV phase A — joined (round 3 finding #3) just before
+    // this function's diagnostics publish so a tier-3 license-policy violation can
+    // appear in the *first* publish after this open, not only whenever some later,
+    // unrelated event happens to regenerate diagnostics. No-op for every ecosystem but
+    // Dart/Swift/Gradle/Deno.
+    let license_task = tokio::spawn(run_license_prefetch(
+        uri.clone(),
+        Arc::clone(&state),
+        Arc::clone(&ecosystem),
+        cache_config.fetch_timeout_secs,
+    ));
 
     // Collect dependency names+sources and the in-use-version map (§4.6) in one
     // pass while holding the reference (can't hold across await).
@@ -1988,6 +2277,10 @@ async fn run_document_open_background_task(
         }
     }
 
+    // Join the tier-3 license pre-fetch too (round 3 finding #3), for the same reason:
+    // its commit must land before this publish, not after.
+    await_license_prefetch(Some(license_task)).await;
+
     // Publish diagnostics (may be slower, runs after hints are already visible)
     let diags = diagnostics::generate_diagnostics_internal(
         Arc::clone(&state),
@@ -2149,6 +2442,12 @@ fn commit_parsed_document(
         // Raw-`dep.name()`-keyed, same as `resolved_versions` above (issue #649) — must be
         // pruned alongside it so a removed dependency's stale candidates never linger.
         doc_state.resolved_version_candidates.remove(removed_dep);
+        // Raw-`dep.name()`-keyed, same as `resolved_versions`/`resolved_version_candidates`
+        // above (see `DocumentState::licenses`' doc) — round 3 finding #5: previously
+        // missing from this loop, so a document with dependencies repeatedly added and
+        // removed while staying open accumulated an ever-growing set of orphaned license
+        // entries never reclaimed until the document closed.
+        doc_state.licenses.remove(removed_dep);
         doc_state
             .vulnerabilities
             .remove(&formatter.normalize_package_name(removed_dep));
@@ -2398,6 +2697,22 @@ async fn run_document_change_task(
         ))
     });
 
+    // Tier-3 license pre-fetch (issue #660), re-run on the same trigger as the OSV
+    // rescan above (a dependency was added or an existing one's version changed) —
+    // an edit that touches neither has no new resolved version to fetch a license
+    // for, so re-running would just repeat the previous pre-fetch's result. Joined
+    // (round 3 finding #3) via `await_license_prefetch` below, same shape as
+    // `osv_task`, so its commit lands before either of this function's diagnostics
+    // publishes below, not after.
+    let license_task = needs_osv_rescan.then(|| {
+        tokio::spawn(run_license_prefetch(
+            uri.clone(),
+            Arc::clone(&state),
+            Arc::clone(&ecosystem),
+            config.cache.fetch_timeout_secs,
+        ))
+    });
+
     // Skip registry fetch if nothing new was added and no existing
     // dependency's version changed.
     //
@@ -2427,6 +2742,7 @@ async fn run_document_change_task(
             config.cache.fetch_timeout_secs,
         )
         .await;
+        await_license_prefetch(license_task).await;
 
         generate_and_publish_diagnostics(&state, &uri, &client, &config, 0).await;
         return;
@@ -2512,6 +2828,7 @@ async fn run_document_change_task(
         config.cache.fetch_timeout_secs,
     )
     .await;
+    await_license_prefetch(license_task).await;
 
     generate_and_publish_diagnostics(&state, &uri, &client, &config, dep_count).await;
 }
@@ -2546,6 +2863,22 @@ async fn await_and_commit_osv_phase_b(
         }
         Ok(None) => {}
         Err(e) => tracing::warn!("OSV scan task failed: {e}"),
+    }
+}
+
+/// Awaits a concurrently-spawned [`run_license_prefetch`] task, if one was started, so
+/// its commit lands before the caller's own diagnostics publish (round 3 finding #3) —
+/// mirrors [`await_and_commit_osv_phase_b`]'s join shape, minus the phase-B step
+/// `run_license_prefetch` doesn't have (it commits directly, no separate phase). `task`
+/// is `Option`-wrapped for the change-path call site, which only spawns the pre-fetch
+/// when a rescan is actually needed; the open-path call site always spawns one, so it
+/// wraps its `JoinHandle` in `Some` itself.
+async fn await_license_prefetch(task: Option<JoinHandle<()>>) {
+    let Some(task) = task else {
+        return;
+    };
+    if let Err(e) = task.await {
+        tracing::warn!("license pre-fetch task failed: {e}");
     }
 }
 
@@ -2723,6 +3056,10 @@ fn merge_registry_fetch_result(
         for (name, version) in fetch_result.versions {
             doc.cached_versions.insert(name, version);
         }
+        // Issue #660/#661 tier-1 backfill: merge (never replace — see
+        // `DocumentState::merge_licenses`'s docs), so this coexists safely with the
+        // independent tier-3 background pre-fetch's own write to the same map.
+        doc.merge_licenses(fetch_result.licenses);
         // Re-key raw -> normalized (§3.1), same as the didOpen path.
         for (name, version) in fetch_result.yanked_versions {
             doc.outcomes
@@ -3005,6 +3342,214 @@ mod tests {
             .collect()
     }
 
+    /// Issue #660: `run_license_prefetch`'s ecosystem gate — only the four tier-3
+    /// ecosystems (no `deps_dev_system` coverage, no license in the hot-path
+    /// version-list response) should ever reach a network call.
+    mod license_prefetch_tests {
+        use super::*;
+
+        #[test]
+        fn is_license_prefetch_ecosystem_covers_exactly_the_four_tier3_ecosystems() {
+            assert!(is_license_prefetch_ecosystem(EcosystemId::Dart));
+            assert!(is_license_prefetch_ecosystem(EcosystemId::Swift));
+            assert!(is_license_prefetch_ecosystem(EcosystemId::Gradle));
+            assert!(is_license_prefetch_ecosystem(EcosystemId::Deno));
+
+            assert!(!is_license_prefetch_ecosystem(EcosystemId::Cargo));
+            assert!(!is_license_prefetch_ecosystem(EcosystemId::Npm));
+            assert!(!is_license_prefetch_ecosystem(EcosystemId::Pypi));
+            assert!(!is_license_prefetch_ecosystem(EcosystemId::Go));
+            assert!(!is_license_prefetch_ecosystem(EcosystemId::Bundler));
+            assert!(!is_license_prefetch_ecosystem(EcosystemId::Maven));
+            assert!(!is_license_prefetch_ecosystem(EcosystemId::Composer));
+            assert!(!is_license_prefetch_ecosystem(EcosystemId::NuGet));
+        }
+
+        /// A non-tier-3 ecosystem must return immediately without touching
+        /// `DocumentState` at all (not even an empty-map write) — asserted by never
+        /// inserting a document for `uri` and confirming `run_license_prefetch`
+        /// doesn't panic on a missing document, which it would if it read past the
+        /// ecosystem gate.
+        #[cfg(feature = "cargo")]
+        #[tokio::test]
+        async fn run_license_prefetch_no_op_for_non_tier3_ecosystem() {
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let ecosystem = state
+                .ecosystem_registry
+                .get_for_uri(&uri)
+                .expect("Cargo ecosystem not found");
+
+            // No document inserted for `uri` at all — if the ecosystem gate didn't
+            // short-circuit first, `state.get_document(&uri)` inside would return
+            // `None` and the function would still just return early, so this also
+            // doubles as a "never panics on a missing document" check.
+            run_license_prefetch(uri, Arc::clone(&state), ecosystem, 5).await;
+
+            assert_eq!(state.document_count(), 0);
+        }
+
+        /// Live end-to-end (Registry Integration Gate): a real Dart document, routed
+        /// through the real `EcosystemRegistry` (no mock), fetching `http`'s license
+        /// from the real pub.dev `/score` endpoint and committing it into
+        /// `DocumentState.licenses`.
+        #[cfg(feature = "dart")]
+        #[tokio::test]
+        #[ignore = "hits the real pub.dev API"]
+        async fn run_license_prefetch_live_dart_populates_document_licenses() {
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/pubspec.yaml");
+            let content = "dependencies:\n  http: ^1.0.0\n";
+
+            let ecosystem = state
+                .ecosystem_registry
+                .get_for_uri(&uri)
+                .expect("Dart ecosystem not found");
+            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let mut doc_state = DocumentState::new_from_parse_result(
+                EcosystemId::Dart,
+                content.to_string(),
+                parse_result,
+            );
+            doc_state.update_resolved_versions(
+                HashMap::from([(PackageName::new("http"), "1.2.0".into())]),
+                HashMap::new(),
+            );
+            state.update_document(uri.clone(), doc_state);
+
+            run_license_prefetch(uri.clone(), Arc::clone(&state), ecosystem, 5).await;
+
+            let doc = state.get_document(&uri).unwrap();
+            assert!(
+                doc.licenses.contains_key(&PackageName::new("http")),
+                "expected a pre-fetched license for 'http', got: {:?}",
+                doc.licenses
+            );
+        }
+
+        /// Live end-to-end, mirroring the Dart test above: a real `Package.swift`
+        /// dependency, routed through the real `EcosystemRegistry`, fetching
+        /// `apple/swift-nio`'s license from the real GitHub repository API.
+        ///
+        /// Unauthenticated GitHub API calls are capped at 60 req/h — this can fail
+        /// with an empty result under an exhausted rate limit (no `GITHUB_TOKEN` set)
+        /// rather than a genuine regression; that is the same graceful-degradation
+        /// path `SwiftRegistry::get_license` takes for any fetch failure (NFR-003).
+        #[cfg(feature = "swift")]
+        #[tokio::test]
+        #[ignore = "hits the real GitHub API"]
+        async fn run_license_prefetch_live_swift_populates_document_licenses() {
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/Package.swift");
+            let content = r#".package(url: "https://github.com/apple/swift-nio.git", .upToNextMajor(from: "2.0.0"))"#;
+
+            let ecosystem = state
+                .ecosystem_registry
+                .get_for_uri(&uri)
+                .expect("Swift ecosystem not found");
+            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let mut doc_state = DocumentState::new_from_parse_result(
+                EcosystemId::Swift,
+                content.to_string(),
+                parse_result,
+            );
+            doc_state.update_resolved_versions(
+                HashMap::from([(PackageName::new("apple/swift-nio"), "2.65.0".into())]),
+                HashMap::new(),
+            );
+            state.update_document(uri.clone(), doc_state);
+
+            run_license_prefetch(uri.clone(), Arc::clone(&state), ecosystem, 5).await;
+
+            let doc = state.get_document(&uri).unwrap();
+            assert!(
+                doc.licenses
+                    .contains_key(&PackageName::new("apple/swift-nio")),
+                "expected a pre-fetched license for 'apple/swift-nio', got: {:?}",
+                doc.licenses
+            );
+        }
+
+        /// Live end-to-end, mirroring the Dart test above: a real `build.gradle.kts`
+        /// dependency, routed through the real `EcosystemRegistry`, fetching
+        /// `com.squareup.okhttp3:okhttp`'s license from the real Maven Central POM.
+        #[cfg(feature = "gradle")]
+        #[tokio::test]
+        #[ignore = "hits the real Maven Central API"]
+        async fn run_license_prefetch_live_gradle_populates_document_licenses() {
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/build.gradle.kts");
+            let content =
+                "dependencies {\n    implementation(\"com.squareup.okhttp3:okhttp:4.12.0\")\n}\n";
+
+            let ecosystem = state
+                .ecosystem_registry
+                .get_for_uri(&uri)
+                .expect("Gradle ecosystem not found");
+            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let mut doc_state = DocumentState::new_from_parse_result(
+                EcosystemId::Gradle,
+                content.to_string(),
+                parse_result,
+            );
+            doc_state.update_resolved_versions(
+                HashMap::from([(
+                    PackageName::new("com.squareup.okhttp3:okhttp"),
+                    "4.12.0".into(),
+                )]),
+                HashMap::new(),
+            );
+            state.update_document(uri.clone(), doc_state);
+
+            run_license_prefetch(uri.clone(), Arc::clone(&state), ecosystem, 5).await;
+
+            let doc = state.get_document(&uri).unwrap();
+            assert!(
+                doc.licenses
+                    .contains_key(&PackageName::new("com.squareup.okhttp3:okhttp")),
+                "expected a pre-fetched license for 'com.squareup.okhttp3:okhttp', got: {:?}",
+                doc.licenses
+            );
+        }
+
+        /// Live end-to-end, mirroring the Dart test above: a real `deno.json`
+        /// `jsr:` dependency, routed through the real `EcosystemRegistry`, fetching
+        /// `@std/fs`'s license from the real JSR per-version API.
+        #[cfg(feature = "deno")]
+        #[tokio::test]
+        #[ignore = "hits the real JSR API"]
+        async fn run_license_prefetch_live_deno_populates_document_licenses() {
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/deno.json");
+            let content = r#"{"imports": {"@std/fs": "jsr:@std/fs@^1.0"}}"#;
+
+            let ecosystem = state
+                .ecosystem_registry
+                .get_for_uri(&uri)
+                .expect("Deno ecosystem not found");
+            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let mut doc_state = DocumentState::new_from_parse_result(
+                EcosystemId::Deno,
+                content.to_string(),
+                parse_result,
+            );
+            doc_state.update_resolved_versions(
+                HashMap::from([(PackageName::new("jsr:@std/fs"), "1.0.24".into())]),
+                HashMap::new(),
+            );
+            state.update_document(uri.clone(), doc_state);
+
+            run_license_prefetch(uri.clone(), Arc::clone(&state), ecosystem, 5).await;
+
+            let doc = state.get_document(&uri).unwrap();
+            assert!(
+                doc.licenses.contains_key(&PackageName::new("jsr:@std/fs")),
+                "expected a pre-fetched license for 'jsr:@std/fs', got: {:?}",
+                doc.licenses
+            );
+        }
+    }
+
     /// Issue #483: `fetch_failure_toast` is the pure decision both `handle_document_open`
     /// and `handle_document_change` delegate to, factored out specifically so the
     /// suppress-while-offline policy is unit-testable without an LSP transport to capture
@@ -3193,6 +3738,7 @@ mod tests {
                 no_comparable_versions: HashSet::new(),
                 failed_count: 1,
                 first_error: Some("network down".to_string()),
+                licenses: HashMap::new(),
             };
 
             let (failed_count, _) = merge_registry_fetch_result(
@@ -4605,6 +5151,120 @@ mod tests {
             serde.published_at,
             Some(PublishTime::from_unix_secs(2_000)),
             "published_at must be 1.0.214's own timestamp, not the yanked 1.0.213 entry's"
+        );
+    }
+
+    /// Issue #660/#661 tier-1 backfill: a `Version::license()` override on the
+    /// already-fetched version-list entry (today, only Composer's `impl_version!`
+    /// includes one — `deps-composer/src/types.rs`) must flow into
+    /// `FetchResult::licenses`, keyed by package name — this is what
+    /// `merge_registry_fetch_result` then merges into `DocumentState::licenses`,
+    /// letting #661's policy diagnostics see it without a second, ecosystem-specific
+    /// fetch. An empty `license()` (every other ecosystem's default) must produce no
+    /// entry at all, not an empty-vec one — `merge_licenses` relies on this to never
+    /// accidentally overwrite real data with a spurious empty entry.
+    #[tokio::test]
+    async fn test_fetch_latest_versions_parallel_carries_license_into_fetch_result() {
+        use deps_core::{Metadata, Registry, Version};
+        use std::any::Any;
+
+        #[derive(Debug)]
+        struct MockVersion {
+            version: ConcreteVersion,
+            license: Vec<String>,
+        }
+
+        impl Version for MockVersion {
+            fn version_string(&self) -> &ConcreteVersion {
+                &self.version
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+            fn license(&self) -> &[String] {
+                &self.license
+            }
+        }
+
+        struct LicensedRegistry;
+
+        impl Registry for LicensedRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                name: &'a PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                let license = if name.as_str() == "licensed-pkg" {
+                    vec!["MIT".to_string()]
+                } else {
+                    vec![]
+                };
+                Box::pin(async move {
+                    Ok(vec![Box::new(MockVersion {
+                        version: "1.0.0".into(),
+                        license,
+                    }) as Box<dyn Version>])
+                })
+            }
+
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a PackageName,
+                _req: &'a deps_core::VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(None) })
+            }
+
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+
+            fn select_latest_matching(
+                &self,
+                versions: &[Box<dyn Version>],
+                _req: &deps_core::VersionReq,
+            ) -> Option<usize> {
+                (!versions.is_empty()).then_some(0)
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let registry: Arc<dyn Registry> = Arc::new(LicensedRegistry);
+        let packages = vec![
+            PackageName::new("licensed-pkg"),
+            PackageName::new("unlicensed-pkg"),
+        ];
+
+        let result = fetch_latest_versions_parallel(
+            registry,
+            with_registry_source(packages),
+            &HashMap::new(),
+            None,
+            deps_core::freshness::FreshnessSettings::default(),
+            10,
+            10,
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            result.licenses.get(&PackageName::new("licensed-pkg")),
+            Some(&vec!["MIT".to_string()])
+        );
+        assert!(
+            !result
+                .licenses
+                .contains_key(&PackageName::new("unlicensed-pkg")),
+            "an empty Version::license() must produce no entry, not an empty-vec one"
         );
     }
 
@@ -7461,6 +8121,80 @@ serde_old = { package = "serde", version = "0.9" }
             assert!(
                 !doc_state2.resolved_version_candidates.contains_key("serde"),
                 "removed dependency's candidates entry must be pruned"
+            );
+        }
+
+        /// Round 3 code-review finding #5: `licenses` (raw-name-keyed, same as
+        /// `resolved_version_candidates`) was missing from `commit_parsed_document`'s
+        /// removed-dependency pruning loop entirely — a document with dependencies
+        /// repeatedly added and removed while staying open would accumulate an
+        /// ever-growing set of orphaned license entries never reclaimed until the
+        /// document closed. Calls the real `commit_parsed_document` (not a hand-copied
+        /// pruning loop, unlike the sibling tests above) so this actually exercises the
+        /// fixed function, not a re-implementation of it.
+        #[tokio::test]
+        async fn test_licenses_pruned_on_dependency_removal() {
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+
+            let content1 = r#"[dependencies]
+serde = "1.0"
+anyhow = "1.0"
+"#;
+            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let parse_result1 = ecosystem.parse_manifest(content1, &uri).await.unwrap();
+            let doc_state1 = DocumentState::new_from_parse_result(
+                EcosystemId::Cargo,
+                content1.to_string(),
+                parse_result1,
+            );
+            state.update_document(uri.clone(), doc_state1);
+
+            {
+                let mut doc = state.documents.get_mut(&uri).unwrap();
+                doc.licenses
+                    .insert(PackageName::new("serde"), vec!["MIT".to_string()]);
+                doc.licenses
+                    .insert(PackageName::new("anyhow"), vec!["Apache-2.0".to_string()]);
+            }
+
+            // `anyhow` removed from the manifest — its license entry must be pruned
+            // along with it, not left behind as an orphaned entry.
+            let content2 = "[dependencies]\nserde = \"1.0\"\n";
+            let old_deps: HashMap<PackageName, Vec<Option<VersionReq>>> = ["serde", "anyhow"]
+                .iter()
+                .map(|s| (PackageName::new(*s), vec![None]))
+                .collect();
+            let new_deps: HashMap<PackageName, Vec<Option<VersionReq>>> =
+                std::iter::once((PackageName::new("serde"), vec![None])).collect();
+            let diff = DependencyDiff::compute(&old_deps, &new_deps);
+            assert_eq!(diff.removed, vec![PackageName::new("anyhow")]);
+
+            let parse_result2 = ecosystem.parse_manifest(content2, &uri).await.unwrap();
+            let committed = commit_parsed_document(
+                &uri,
+                ecosystem.as_ref(),
+                content2.to_string(),
+                Some(parse_result2),
+                None,
+                &state,
+                CommitOptions {
+                    diff: &diff,
+                    guard: CommitGuard::Unconditional,
+                },
+            );
+            assert!(committed);
+
+            let doc = state.get_document(&uri).unwrap();
+            assert!(
+                !doc.licenses.contains_key(&PackageName::new("anyhow")),
+                "removed dependency's license entry must be pruned, got: {:?}",
+                doc.licenses
+            );
+            assert_eq!(
+                doc.licenses.get(&PackageName::new("serde")),
+                Some(&vec!["MIT".to_string()]),
+                "surviving dependency's license entry must be preserved"
             );
         }
 

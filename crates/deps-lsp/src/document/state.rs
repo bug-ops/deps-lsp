@@ -5,7 +5,7 @@ use deps_core::net_policy::RegistryAccessPolicy;
 use deps_core::osv::{OsvClient, VulnerabilityMap};
 use deps_core::{
     ConcreteVersion, DependencyOutcomes, DepsDevClient, EcosystemId, EcosystemRegistry,
-    PackageName, PackageVersions, ParseResult,
+    LicensePolicy, PackageName, PackageVersions, ParseResult,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -100,6 +100,36 @@ pub struct DocumentState {
     /// channels means. Empty until the first fetch completes; carried across document
     /// edits by `preserve_cache` so it doesn't flicker off on every keystroke.
     pub outcomes: DependencyOutcomes,
+    /// License data available *synchronously* for this document's dependencies (issue
+    /// #660/#661), keyed by raw (unnormalized) package name — the map #661's policy
+    /// diagnostics reads, since diagnostics generation is sync/cache-only by design and
+    /// cannot await hover's live per-request fetch. Two disjoint populating sources,
+    /// which can coexist safely because a document has exactly one ecosystem, so only
+    /// one of the two ever contributes real (non-empty) data for it:
+    /// - **Tier-1 backfill**: `document::lifecycle::merge_registry_fetch_result`, via
+    ///   [`Self::merge_licenses`], from `Version::license()` on the already-fetched
+    ///   version-list entry — today, only Composer's `impl_version!` includes a
+    ///   `license:` field (`deps-composer/src/types.rs`); any ecosystem whose
+    ///   `impl_version!` gains one automatically starts populating this map with no
+    ///   further `lifecycle.rs` changes. **Not** populated for the deps.dev-routed tier-2
+    ///   ecosystems (Cargo, npm, PyPI, Go, Bundler, Maven, NuGet) — their license is only
+    ///   ever fetched by `trust_signal()`, which is deliberately hover-only (see
+    ///   `VersionData::trust`'s docs); reaching it from here would mean a new deps.dev
+    ///   call on every document open/edit, out of this backfill's "already in hand, no
+    ///   new network calls" scope.
+    /// - **Tier-3 pre-fetch**: `document::lifecycle::run_license_prefetch` (Dart, Swift,
+    ///   Gradle, Deno only — see that function's docs), via [`Self::merge_licenses`] (round
+    ///   3 finding #2: a plain [`Self::update_licenses`] full replace would drop a
+    ///   dependency's previously-cached, still-valid license whenever *any other*
+    ///   dependency's fetch transiently failed this round), from a dedicated
+    ///   per-ecosystem background fetch, mirroring [`Self::vulnerabilities`]'s
+    ///   background-pre-fetch shape. A genuinely removed dependency's stale entry is
+    ///   reclaimed by `document::lifecycle::commit_parsed_document`'s manifest-diff
+    ///   pruning loop, not by this merge.
+    ///
+    /// Empty until the relevant fetch completes; carried across document edits by
+    /// `preserve_cache` so it doesn't flicker off on every keystroke.
+    pub licenses: HashMap<PackageName, Vec<String>>,
     /// Last successful parse time
     pub parsed_at: Instant,
     /// Current loading state for registry data
@@ -127,6 +157,7 @@ impl Clone for DocumentState {
             resolved_version_candidates: self.resolved_version_candidates.clone(),
             vulnerabilities: self.vulnerabilities.clone(),
             outcomes: self.outcomes.clone(),
+            licenses: self.licenses.clone(),
             parsed_at: self.parsed_at,
             loading_state: self.loading_state,
             // Note: Instant is Copy. Clones share the same loading start time.
@@ -242,6 +273,7 @@ impl std::fmt::Debug for DocumentState {
                 &self.resolved_version_candidates.len(),
             )
             .field("vulnerabilities_count", &self.vulnerabilities.len())
+            .field("licenses_count", &self.licenses.len())
             .field("yanked_versions_count", &self.outcomes.yanked_count())
             .field("deprecations_count", &self.outcomes.deprecation_count())
             .field("fetch_failed_count", &self.outcomes.fetch_failure_count())
@@ -271,6 +303,7 @@ impl DocumentState {
             resolved_version_candidates: HashMap::new(),
             vulnerabilities: VulnerabilityMap::new(),
             outcomes: DependencyOutcomes::new(),
+            licenses: HashMap::new(),
             parsed_at: Instant::now(),
             loading_state: LoadingState::Idle,
             loading_started_at: None,
@@ -292,6 +325,7 @@ impl DocumentState {
             resolved_version_candidates: HashMap::new(),
             vulnerabilities: VulnerabilityMap::new(),
             outcomes: DependencyOutcomes::new(),
+            licenses: HashMap::new(),
             parsed_at: Instant::now(),
             loading_state: LoadingState::Idle,
             loading_started_at: None,
@@ -344,6 +378,39 @@ impl DocumentState {
     /// Updates the OSV.dev scan results.
     pub fn update_vulnerabilities(&mut self, vulnerabilities: VulnerabilityMap) {
         self.vulnerabilities = vulnerabilities;
+    }
+
+    /// Full-replace update of [`Self::licenses`] — every existing entry is discarded and
+    /// replaced with exactly `licenses`, the same "one background task owns the whole
+    /// map" contract [`Self::update_vulnerabilities`] has for `vulnerabilities`.
+    ///
+    /// Not currently called from `document::lifecycle` (round 3 finding #2 moved the
+    /// tier-3 pre-fetch's own commit to [`Self::merge_licenses`] instead, since a
+    /// full-replace there would drop a dependency's previously-cached, still-valid
+    /// license whenever any *other* dependency's fetch transiently failed this round).
+    /// Kept as a tested public primitive for a caller that genuinely owns the entire map
+    /// and needs a real replace (e.g. clearing every entry for a document being reset).
+    pub fn update_licenses(&mut self, licenses: HashMap<PackageName, Vec<String>>) {
+        self.licenses = licenses;
+    }
+
+    /// Merges license findings into [`Self::licenses`] without disturbing existing
+    /// entries — unlike [`Self::update_licenses`], which replaces the map wholesale.
+    ///
+    /// Both of [`Self::licenses`]' populating sources use this: the tier-1 backfill
+    /// (`document::lifecycle::merge_registry_fetch_result`, for every ecosystem) and the
+    /// tier-3 pre-fetch (`document::lifecycle::run_license_prefetch`, Dart/Swift/
+    /// Gradle/Deno only). A tier-3 document's tier-1 call always contributes an empty
+    /// map (no ecosystem's `Version::license` is both non-empty *and* backed by the
+    /// tier-3 pre-fetch path), so the two never actually race for the same key in
+    /// practice — but merging rather than replacing means neither call can ever drop
+    /// entries the *other* source (or an earlier call from the same source, for a
+    /// dependency that failed to refresh this round) already put there. A genuinely
+    /// removed dependency's stale entry is reclaimed by
+    /// `document::lifecycle::commit_parsed_document`'s manifest-diff pruning loop, not
+    /// by this merge.
+    pub fn merge_licenses(&mut self, licenses: HashMap<PackageName, Vec<String>>) {
+        self.licenses.extend(licenses);
     }
 
     /// Replaces the yanked/deprecation/fetch-failure outcome map wholesale (normalized-keyed,
@@ -535,6 +602,23 @@ pub struct ServerState {
     /// struct's docs for why this is a feature-agnostic `Arc<RwLock<Option<String>>>`
     /// rather than a `deps-gitlab-ci` type.
     pub gitlab_instance_host: Arc<RwLock<Option<String>>>,
+    /// Live-updatable `license_policy` setting (issue #660/#661 critic C1), the single
+    /// resolved policy `handlers::diagnostics::generate_diagnostics_internal` reads on
+    /// *every* diagnostics generation call — both the `textDocument/diagnostic` pull path
+    /// and every background-refresh push path (`document::lifecycle`'s fetch-completion
+    /// refreshes, `server.rs`'s lockfile-change refresh). Replaces an earlier design that
+    /// threaded `Option<&LicensePolicy>` as a caller-supplied parameter only the pull path
+    /// populated — false analogy to [`crate::document::DocumentState`]'s hover-only
+    /// `trust` precedent, which is safe because hover has exactly one producer per
+    /// request, whereas diagnostics has multiple producers all replacing the same
+    /// client-visible diagnostic set (LSP `publish_diagnostics` replaces, it doesn't
+    /// merge). `RwLock<Arc<..>>`, not `RwLock<LicensePolicy>` (mirrors
+    /// `gitlab_instance_host`'s small-value-behind-a-lock shape above, but Arc-wrapped so
+    /// a read on this hot path is a refcount bump, not a `Vec<String>` deep clone).
+    /// Defaults to an empty policy (a no-op for `apply_license_policy_rule`) until
+    /// `Backend::initialize`/`did_change_configuration` first parses
+    /// `initializationOptions.license_policy`.
+    pub license_policy: RwLock<Arc<LicensePolicy>>,
     /// Ecosystem ids `crate::register_ecosystems` actually threaded the live
     /// `registry_policy` handle into (issue #592 security M1) — the single source of truth
     /// `config::reparse_scope`'s caller uses to scope a `registries.workspace_registries`
@@ -642,6 +726,7 @@ impl ServerState {
             registry_policy,
             nuget_user_profile_sources,
             gitlab_instance_host,
+            license_policy: RwLock::new(Arc::new(LicensePolicy::default())),
             workspace_registry_ecosystems,
             cold_start_limiter,
             tasks: tokio::sync::RwLock::new(HashMap::new()),
@@ -708,6 +793,34 @@ impl ServerState {
     pub fn set_diagnostic_refresh_supported(&self, supported: bool) {
         self.diagnostic_refresh_supported
             .store(supported, Ordering::Relaxed);
+    }
+
+    /// Returns the currently active license policy (issue #660/#661 critic C1).
+    ///
+    /// Read by every diagnostics-generation call site — see [`Self::license_policy`]'s
+    /// field doc for why this replaced a caller-supplied `Option<&LicensePolicy>`
+    /// parameter.
+    pub fn license_policy(&self) -> Arc<LicensePolicy> {
+        Arc::clone(
+            &self
+                .license_policy
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// Replaces the active license policy (issue #660/#661 critic C1).
+    ///
+    /// Called from `Backend::initialize`/`did_change_configuration` once the new
+    /// `DepsConfig` is parsed, so every subsequent diagnostics generation call —
+    /// including the four background-refresh push-path call sites in
+    /// `document::lifecycle` and the lockfile-change refresh in `server.rs` — picks up the
+    /// new policy without any of those call sites needing a signature change.
+    pub fn set_license_policy(&self, policy: LicensePolicy) {
+        *self
+            .license_policy
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(policy);
     }
 
     /// Unions `scope` into the pending coalesced reparse and bumps the generation counter
@@ -1095,6 +1208,114 @@ mod tests {
     // =========================================================================
     // Generic tests (no feature flag required)
     // =========================================================================
+
+    // =========================================================================
+    // License race-safety tests (issue #660/#661, critic S4/M2)
+    //
+    // `update_licenses` (tier-3 pre-fetch, full replace) and `merge_licenses`
+    // (tier-1 backfill, additive merge) are two independent background-task writers
+    // into `DocumentState.licenses`. The doc comments on both claim they can never
+    // clobber each other because at most one of the two ever contributes real
+    // (non-empty) data for a given document's single ecosystem — this was previously
+    // asserted only in prose, never exercised by a test in either call order.
+    // =========================================================================
+
+    mod license_race_safety_tests {
+        use super::*;
+
+        fn doc() -> DocumentState {
+            DocumentState::new_without_parse_result(EcosystemId::Dart, String::new())
+        }
+
+        /// Tier-3 write (`update_licenses`) first, then a tier-1 backfill merge
+        /// (`merge_licenses`) for the same document: the tier-3 entry must survive
+        /// un-clobbered, and the merge's own entries must still land.
+        #[test]
+        fn update_then_merge_does_not_clobber_tier3_entry() {
+            let mut doc = doc();
+            let tier3_name = PackageName::new("http");
+            doc.update_licenses(HashMap::from([(
+                tier3_name.clone(),
+                vec!["BSD-3-Clause".to_string()],
+            )]));
+
+            let tier1_name = PackageName::new("some/other-package");
+            doc.merge_licenses(HashMap::from([(
+                tier1_name.clone(),
+                vec!["MIT".to_string()],
+            )]));
+
+            assert_eq!(
+                doc.licenses.get(&tier3_name),
+                Some(&vec!["BSD-3-Clause".to_string()]),
+                "merge_licenses must not clobber update_licenses' entry"
+            );
+            assert_eq!(
+                doc.licenses.get(&tier1_name),
+                Some(&vec!["MIT".to_string()])
+            );
+        }
+
+        /// Reverse call order: a tier-1 backfill merge first, then a tier-3
+        /// `update_licenses` full replace — the replace must not silently drop the
+        /// merge's entry for an *unrelated* package while still returning the
+        /// tier-3 pre-fetch's own results.
+        #[test]
+        fn merge_then_update_replaces_wholesale_per_its_own_documented_contract() {
+            let mut doc = doc();
+            let tier1_name = PackageName::new("some/other-package");
+            doc.merge_licenses(HashMap::from([(
+                tier1_name.clone(),
+                vec!["MIT".to_string()],
+            )]));
+
+            let tier3_name = PackageName::new("http");
+            doc.update_licenses(HashMap::from([(
+                tier3_name.clone(),
+                vec!["BSD-3-Clause".to_string()],
+            )]));
+
+            // `update_licenses` is documented as a full replace (the tier-3 background
+            // task always recomputes the complete set for its own ecosystem in one
+            // pass) — so after it runs, only its own entries remain. This is the
+            // documented contract, not a bug: for a genuinely tier-3 document, the
+            // tier-1 merge above never actually contributes real data in production
+            // (see `DocumentState::licenses`' doc), so this asserts the replace
+            // behaves exactly as documented rather than silently merging instead.
+            assert_eq!(doc.licenses.len(), 1);
+            assert_eq!(
+                doc.licenses.get(&tier3_name),
+                Some(&vec!["BSD-3-Clause".to_string()])
+            );
+            assert!(!doc.licenses.contains_key(&tier1_name));
+        }
+
+        /// `merge_licenses` called twice for two different packages accumulates
+        /// both, rather than the second call replacing the first — the additive
+        /// contract [`DocumentState::merge_licenses`]'s doc promises.
+        #[test]
+        fn merge_licenses_accumulates_across_calls() {
+            let mut doc = doc();
+            doc.merge_licenses(HashMap::from([(
+                PackageName::new("pkg-a"),
+                vec!["MIT".to_string()],
+            )]));
+            doc.merge_licenses(HashMap::from([(
+                PackageName::new("pkg-b"),
+                vec!["Apache-2.0".to_string()],
+            )]));
+
+            assert_eq!(doc.licenses.len(), 2);
+            assert_eq!(
+                doc.licenses.get(&PackageName::new("pkg-a")),
+                Some(&vec!["MIT".to_string()])
+            );
+            assert_eq!(
+                doc.licenses.get(&PackageName::new("pkg-b")),
+                Some(&vec!["Apache-2.0".to_string()])
+            );
+        }
+    }
 
     // =========================================================================
     // LoadingState tests

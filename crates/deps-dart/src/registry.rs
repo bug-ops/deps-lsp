@@ -131,6 +131,113 @@ impl PubDevRegistry {
         let data = self.cache.get_cached(&url).await?;
         parse_package_info(&data)
     }
+
+    /// Fetches pub.dev's per-package `/score` response and extracts its best-effort
+    /// license tag (issue #660, spec 010 plan §1 "Dart source" row).
+    ///
+    /// pub.dev's package/version API (the endpoint [`Self::get_versions`]/
+    /// [`Self::get_package_info`] already fetch) has no SPDX license field at all
+    /// (live-verified during #204 planning) — the only license signal anywhere in
+    /// pub.dev's API is a `license:<slug>` entry in this separate `/score` endpoint's
+    /// `tags` array, itself the output of pub.dev's own automated license detector
+    /// (`package:pana`), not an author-declared field. Callers must label this
+    /// "detected", never plain "License", per spec 010 NFR-005's documented exception —
+    /// see [`deps_core::lsp_helpers`]'s `push_license_hover_section` doc.
+    ///
+    /// Returns an empty `Vec` (never an error) when the fetch fails or no `license:`
+    /// tag is present — graceful degradation (NFR-003), since this is a best-effort
+    /// secondary signal, not core version data.
+    pub async fn get_license(&self, name: &str) -> Vec<String> {
+        if reject_dot_segment(name).is_err() {
+            return Vec::new();
+        }
+        let url = score_url(&self.base, name);
+        match self.cache.get_cached(&url).await {
+            Ok(data) => parse_score_license(&data),
+            Err(e) => {
+                tracing::debug!(package = name, error = %e, "pub.dev score fetch failed");
+                Vec::new()
+            }
+        }
+    }
+}
+
+/// Builds the pub.dev request URL for a package's `/score` response (license detector
+/// tags, likes, download counts). Mirrors [`package_metadata_url`]'s encoding — `name`
+/// must already be dot-segment-checked by the caller.
+fn score_url(base: &str, name: &str) -> String {
+    format!("{base}/packages/{}/score", urlencoding::encode(name))
+}
+
+/// The subset of pub.dev's `/score` response this client needs.
+#[derive(Deserialize)]
+struct ScoreResponse {
+    #[serde(default)]
+    tags: Vec<String>,
+}
+
+/// pana's non-SPDX tags in the `license:` namespace (`PanaTags` in
+/// `dart-lang/pana`'s `lib/src/tag/pana_tags.dart`, live-verified 2026-09-08): every
+/// other `license:<slug>` tag is `license:${l.spdxIdentifier.toLowerCase()}`, a real
+/// SPDX identifier, but pana also always emits these three meta-tags alongside it —
+/// `fsf-libre`/`osi-approved` classify an already-reported license, and `unknown` marks
+/// its *absence*, so none of the three is itself a license (critic C3). Live-verified
+/// against pub.dev's `/api/packages/http/score`: its `tags` includes
+/// `license:bsd-3-clause`, `license:fsf-libre`, `license:osi-approved` together — an
+/// unfiltered extraction would render hover as "BSD-3-Clause, FSF-Libre, OSI-Approved".
+const PANA_NON_LICENSE_TAGS: [&str; 3] = ["fsf-libre", "osi-approved", "unknown"];
+
+/// Extracts every `license:<slug>` tag from a `/score` response and formats each slug
+/// for display. A package can carry more than one (e.g. a dual-licensed package), so
+/// this collects all of them rather than just the first — consistent with every other
+/// ecosystem's `license: Vec<String>` shape (spec 010 plan §1 "License shape" decision).
+///
+/// [`PANA_NON_LICENSE_TAGS`] slugs are dropped rather than formatted — `unknown` in
+/// particular must become an empty `Vec`, not `["Unknown"]`: a non-empty `Vec` for "no
+/// license data" would be evaluated against an allow/deny list and can produce a false
+/// `NotAllowed` diagnostic, breaking `deps_core::licenses`' NFR-003 "unknown license
+/// never violates a policy" guarantee (critic C3).
+fn parse_score_license(data: &[u8]) -> Vec<String> {
+    let Ok(response) = deps_core::parse_json_checked::<ScoreResponse>(data) else {
+        return Vec::new();
+    };
+    response
+        .tags
+        .iter()
+        .filter_map(|t| t.strip_prefix("license:"))
+        .filter(|slug| !slug.is_empty() && !PANA_NON_LICENSE_TAGS.contains(slug))
+        .map(format_detected_license_tag)
+        .collect()
+}
+
+/// Best-effort formatting of a pub.dev `license:<slug>` tag (e.g. `"bsd-3-clause"`) into
+/// something closer to its SPDX identifier (`"BSD-3-Clause"`) for display.
+///
+/// This is deliberately a heuristic, not a lookup against the full SPDX license list
+/// (spec 010 §8 "Ask First": no new dependency for this): splits on `-`, uppercasing a
+/// short (≤4 char) all-alphabetic segment (acronyms like `mit`, `bsd`, `gpl`, `lgpl`,
+/// `mpl`, `isc`) and title-casing a longer one (`unlicense` → `Unlicense`,
+/// `clause` → `Clause`), while a segment containing a digit (`2.0`, `3.0`) passes
+/// through unchanged. Covers every license tag pub.dev commonly reports; an unusual
+/// slug this heuristic mis-cases is still legible and still correctly labeled
+/// "(detected)" in hover, so no functional harm from an imperfect guess.
+fn format_detected_license_tag(slug: &str) -> String {
+    slug.split('-')
+        .map(|segment| {
+            if segment.chars().any(|c| c.is_ascii_digit()) || segment.is_empty() {
+                segment.to_string()
+            } else if segment.len() <= 4 {
+                segment.to_ascii_uppercase()
+            } else {
+                let mut chars = segment.chars();
+                match chars.next() {
+                    Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+                    None => String::new(),
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
 #[derive(Deserialize)]
@@ -751,5 +858,88 @@ mod tests {
         ];
         let req = VersionReq::new("*");
         assert_eq!(registry.select_latest_matching(&versions, &req), Some(0));
+    }
+
+    // --- issue #660: license detection ---
+
+    #[test]
+    fn format_detected_license_tag_common_slugs() {
+        assert_eq!(format_detected_license_tag("mit"), "MIT");
+        assert_eq!(format_detected_license_tag("bsd-3-clause"), "BSD-3-Clause");
+        assert_eq!(format_detected_license_tag("bsd-2-clause"), "BSD-2-Clause");
+        assert_eq!(format_detected_license_tag("apache-2.0"), "Apache-2.0");
+        assert_eq!(format_detected_license_tag("gpl-3.0"), "GPL-3.0");
+        assert_eq!(format_detected_license_tag("lgpl-3.0"), "LGPL-3.0");
+        assert_eq!(format_detected_license_tag("mpl-2.0"), "MPL-2.0");
+        assert_eq!(format_detected_license_tag("isc"), "ISC");
+        assert_eq!(format_detected_license_tag("unlicense"), "Unlicense");
+    }
+
+    #[test]
+    fn parse_score_license_extracts_license_tag() {
+        // Live-verified pana meta-tag shape (critic C3): `fsf-libre`/`osi-approved`
+        // ride alongside the real SPDX slug and must not appear in the result.
+        let body = br#"{"tags":["sdk:dart","license:bsd-3-clause","license:fsf-libre","license:osi-approved"]}"#;
+        assert_eq!(parse_score_license(body), vec!["BSD-3-Clause".to_string()]);
+    }
+
+    #[test]
+    fn parse_score_license_no_license_tag_is_empty() {
+        let body = br#"{"tags":["sdk:dart","platform:web"]}"#;
+        assert!(parse_score_license(body).is_empty());
+    }
+
+    #[test]
+    fn parse_score_license_unknown_tag_is_empty_not_a_literal_unknown_string() {
+        // Critic C3: `license:unknown` must map to an empty Vec, not `["Unknown"]` — a
+        // non-empty Vec for "no license data" would violate NFR-003's "unknown license
+        // never violates a policy" guarantee once evaluated against an allow/deny list.
+        let body = br#"{"tags":["sdk:dart","license:unknown"]}"#;
+        assert!(parse_score_license(body).is_empty());
+    }
+
+    #[test]
+    fn parse_score_license_meta_tags_alone_are_empty() {
+        let body = br#"{"tags":["license:fsf-libre","license:osi-approved"]}"#;
+        assert!(parse_score_license(body).is_empty());
+    }
+
+    #[test]
+    fn parse_score_license_malformed_json_degrades_to_empty() {
+        assert!(parse_score_license(b"not json").is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_license_fetches_score_endpoint() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/packages/http/score")
+            .with_status(200)
+            .with_body(r#"{"tags":["license:mit"]}"#)
+            .create_async()
+            .await;
+
+        let registry = PubDevRegistry::with_base(Arc::new(HttpCache::new()), server.url());
+        assert_eq!(registry.get_license("http").await, vec!["MIT".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn get_license_dot_segment_name_returns_empty_without_network() {
+        let registry =
+            PubDevRegistry::with_base(Arc::new(HttpCache::new()), "http://[::1]:1".into());
+        assert!(registry.get_license("..").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_license_fetch_failure_degrades_to_empty() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/packages/missing/score")
+            .with_status(404)
+            .create_async()
+            .await;
+
+        let registry = PubDevRegistry::with_base(Arc::new(HttpCache::new()), server.url());
+        assert!(registry.get_license("missing").await.is_empty());
     }
 }

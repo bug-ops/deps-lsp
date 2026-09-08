@@ -41,6 +41,7 @@ pub mod fs_probe;
 pub mod github;
 pub mod json_ast;
 pub mod json_helpers;
+pub mod licenses;
 pub mod lockfile;
 pub mod lsp_helpers;
 pub mod macros;
@@ -67,13 +68,17 @@ pub use freshness::{
 };
 pub use json_ast::{JsonAst, JsonSection, find_last_prop};
 pub use json_helpers::string_valued_entries;
+pub use licenses::{
+    LicensePolicy, LicenseViolation, ViolationReason, evaluate as evaluate_license_policy,
+};
 pub use lockfile::{
     LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource, read_lockfile_content,
 };
 pub use lsp_helpers::{
     DependencyOutcome, DependencyOutcomes, DiagnosticMessages, DiagnosticPolicy,
-    DiagnosticSeverities, EcosystemFormatter, HOVER_RECENT_VERSIONS, LineOffsetTable, OsvNaming,
-    PackageNaming, PackageRendering, PackageVersions, RequirementMatcher, RequirementResolution,
+    DiagnosticSeverities, EcosystemFormatter, HOVER_RECENT_VERSIONS,
+    LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE, LineOffsetTable, OsvNaming, PackageNaming,
+    PackageRendering, PackageVersions, RequirementMatcher, RequirementResolution,
     RequirementStatus, SourcePolicy, UNSATISFIABLE_DIAGNOSTIC_CODE, VersionData,
     collect_update_all_edits, generate_code_actions as lsp_generate_code_actions,
     generate_code_lenses as lsp_generate_code_lenses, generate_hover as lsp_generate_hover,

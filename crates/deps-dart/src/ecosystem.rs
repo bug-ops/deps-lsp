@@ -50,6 +50,15 @@ impl DartEcosystem {
         )
         .await
     }
+
+    /// Fetches `name`'s best-effort detected license (issue #660), for
+    /// `deps-lsp::document::lifecycle::run_license_prefetch`'s tier-3 background
+    /// pre-fetch — never called from the hover critical path directly. See
+    /// [`crate::registry::PubDevRegistry::get_license`] for the source and its
+    /// "detected, not declared" caveat.
+    pub async fn fetch_license(&self, name: &str) -> Vec<String> {
+        self.registry.get_license(name).await
+    }
 }
 
 impl deps_core::ecosystem::private::Sealed for DartEcosystem {}

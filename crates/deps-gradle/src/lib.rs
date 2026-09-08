@@ -9,6 +9,7 @@
 
 pub mod ecosystem;
 pub mod formatter;
+mod license;
 pub mod parser;
 pub mod range;
 pub mod types;

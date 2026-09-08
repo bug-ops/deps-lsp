@@ -114,6 +114,19 @@ pub async fn handle_diagnostics(
 /// Internal diagnostic generation without cold start support.
 ///
 /// This is used when we know the document is already loaded (e.g., from background tasks).
+/// Shared by every reachable path to diagnostics generation — the `textDocument/diagnostic`
+/// pull path ([`handle_diagnostics`]) and every push-path background refresh
+/// (`document::lifecycle`'s fetch-completion refreshes, `server.rs`'s lockfile-change
+/// refresh) — so all of them evaluate the license policy identically (issue #660/#661
+/// critic C1). Earlier revisions split this into a policy-blind `generate_diagnostics_internal`
+/// plus a `generate_diagnostics_with_license_policy` variant only `handle_diagnostics`
+/// called, threading `Option<&LicensePolicy>` as a caller-supplied parameter — that design
+/// followed a false analogy to [`deps_core::VersionData::trust`]'s hover-only scope: `trust`
+/// is safe hover-only because hover has exactly one producer per request, but diagnostics
+/// has multiple producers all replacing the same client-visible `publish_diagnostics` set,
+/// so a caller-scoped policy meant the license diagnostic flickered in and out on every
+/// edit and was invisible to push-only clients. The policy is now read unconditionally from
+/// [`ServerState::license_policy`] instead, so no call site needs a signature change.
 pub(crate) async fn generate_diagnostics_internal(
     state: Arc<ServerState>,
     uri: &Uri,
@@ -179,6 +192,7 @@ pub(crate) async fn generate_diagnostics_internal(
             doc.resolved_version_candidates.clone(),
             doc.vulnerabilities.clone(),
             doc.outcomes.clone(),
+            doc.licenses.clone(),
         ))
     }) else {
         tracing::warn!("Document not found for diagnostics: {:?}", uri);
@@ -194,20 +208,31 @@ pub(crate) async fn generate_diagnostics_internal(
         resolved_version_candidates,
         vulnerabilities,
         outcomes,
+        licenses,
     )) = extracted
     else {
         return vec![];
     };
 
+    // Issue #660/#661 critic C1: read from `ServerState` rather than a caller-supplied
+    // parameter, so every call site (push and pull) evaluates the same policy — see this
+    // function's doc comment. `apply_license_policy_rule` is a no-op for an empty policy
+    // (the default until config is first loaded), so attaching it unconditionally costs
+    // nothing when no policy is configured.
+    let policy = state.license_policy();
+    let version_data = VersionData::new(&cached_versions, &resolved_versions)
+        .with_resolved_version_candidates(&resolved_version_candidates)
+        .with_vulnerabilities(&vulnerabilities)
+        .with_outcomes(&outcomes)
+        .with_ecosystem(ecosystem_id)
+        .with_offline(offline)
+        .with_license_policy(&policy)
+        .with_license_prefetch(&licenses);
+
     ecosystem
         .generate_diagnostics(
             parse_result.as_ref(),
-            VersionData::new(&cached_versions, &resolved_versions)
-                .with_resolved_version_candidates(&resolved_version_candidates)
-                .with_vulnerabilities(&vulnerabilities)
-                .with_outcomes(&outcomes)
-                .with_ecosystem(ecosystem_id)
-                .with_offline(offline),
+            version_data,
             uri,
             freshness,
             severities,
@@ -1359,6 +1384,219 @@ dependencies = ["requests>=2.0.0"]
             let (client, full_config) = create_test_client_and_config();
             let _result = handle_diagnostics(state, &uri, &config, client, full_config).await;
             // Test passes if no panic occurs
+        }
+    }
+
+    // License-policy diagnostic tests (issue #661)
+    #[cfg(feature = "cargo")]
+    mod license_policy_tests {
+        use super::*;
+        use crate::config::LicensePolicyConfig;
+        use crate::document::DocumentState;
+        use deps_core::{EcosystemId, PackageName, ParseResult};
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{DiagnosticSeverity, NumberOrString};
+
+        async fn cargo_parse_result(
+            state: &ServerState,
+            uri: &Uri,
+            content: &str,
+        ) -> Box<dyn ParseResult> {
+            state
+                .ecosystem_registry
+                .get("cargo")
+                .unwrap()
+                .parse_manifest(content, uri)
+                .await
+                .expect("failed to parse manifest")
+        }
+
+        /// Sets up a document with `serde`'s license pre-fetched, ready for
+        /// `handle_diagnostics` — the real `ServerState`/`DocumentState`/`DepsConfig` path
+        /// (`textDocument/diagnostic` pull), not a pure-function shortcut, so this proves
+        /// the end-to-end wiring (`generate_diagnostics_internal` ->
+        /// `VersionData::with_license_policy`/`with_license_prefetch` ->
+        /// `apply_license_policy_rule`) actually works, not just `deps_core::licenses`'
+        /// own unit tests.
+        ///
+        /// Sets the policy via `ServerState::set_license_policy` (issue #660/#661 critic
+        /// C1), mirroring what `Backend::initialize`/`did_change_configuration` do in
+        /// production — `handle_diagnostics` no longer reads `DepsConfig::license_policy`
+        /// directly.
+        async fn setup(
+            license: &str,
+            allow: Vec<String>,
+            deny: Vec<String>,
+        ) -> (Arc<ServerState>, Uri, Client, Arc<RwLock<DepsConfig>>) {
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
+            let parse_result = cargo_parse_result(&state, &uri, &content).await;
+
+            let mut doc_state =
+                DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert(
+                PackageName::from("serde"),
+                deps_core::PackageVersions::latest_only("1.0.0"),
+            );
+            doc_state.update_cached_versions(cached_versions);
+            let mut licenses = HashMap::new();
+            licenses.insert(PackageName::from("serde"), vec![license.to_string()]);
+            doc_state.update_licenses(licenses);
+            state.update_document(uri.clone(), doc_state);
+
+            let (client, full_config) = create_test_client_and_config();
+            let policy_config = LicensePolicyConfig { allow, deny };
+            state.set_license_policy(policy_config.to_policy());
+            full_config.write().await.license_policy = policy_config;
+
+            (state, uri, client, full_config)
+        }
+
+        #[tokio::test]
+        async fn empty_policy_produces_no_diagnostics() {
+            let (state, uri, client, full_config) = setup("GPL-3.0", Vec::new(), Vec::new()).await;
+            let config = DiagnosticsConfig::default();
+
+            let result = handle_diagnostics(state, &uri, &config, client, full_config).await;
+            assert!(result.is_empty());
+        }
+
+        #[tokio::test]
+        async fn denied_license_produces_error_diagnostic() {
+            let (state, uri, client, full_config) =
+                setup("GPL-3.0", Vec::new(), vec!["GPL-3.0".to_string()]).await;
+            let config = DiagnosticsConfig::default();
+
+            let result = handle_diagnostics(state, &uri, &config, client, full_config).await;
+
+            assert_eq!(
+                result.len(),
+                1,
+                "expected exactly one diagnostic, got: {result:?}"
+            );
+            assert_eq!(result[0].severity, Some(DiagnosticSeverity::ERROR));
+            assert_eq!(result[0].message, "serde: GPL-3.0 denied by policy");
+            assert_eq!(
+                result[0].code,
+                Some(NumberOrString::String(
+                    deps_core::LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE.into()
+                ))
+            );
+        }
+
+        #[tokio::test]
+        async fn not_allowed_license_produces_warning_diagnostic() {
+            let (state, uri, client, full_config) =
+                setup("ISC", vec!["MIT".to_string()], Vec::new()).await;
+            let config = DiagnosticsConfig::default();
+
+            let result = handle_diagnostics(state, &uri, &config, client, full_config).await;
+
+            assert_eq!(
+                result.len(),
+                1,
+                "expected exactly one diagnostic, got: {result:?}"
+            );
+            assert_eq!(result[0].severity, Some(DiagnosticSeverity::WARNING));
+            assert_eq!(
+                result[0].message,
+                "serde: ISC not on the allowed license list"
+            );
+        }
+
+        #[tokio::test]
+        async fn compliant_license_produces_no_diagnostic() {
+            let (state, uri, client, full_config) =
+                setup("MIT", vec!["MIT".to_string()], vec!["GPL-3.0".to_string()]).await;
+            let config = DiagnosticsConfig::default();
+
+            let result = handle_diagnostics(state, &uri, &config, client, full_config).await;
+            assert!(result.is_empty(), "got: {result:?}");
+        }
+
+        /// A dependency this feature has no license data for (not in the pre-fetch map —
+        /// e.g. an ecosystem/tier the background pre-fetch doesn't cover yet) must never
+        /// be treated as a violation (NFR-003 graceful degradation).
+        #[tokio::test]
+        async fn dependency_with_no_known_license_produces_no_diagnostic() {
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
+            let parse_result = cargo_parse_result(&state, &uri, &content).await;
+            let mut doc_state =
+                DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert(
+                PackageName::from("serde"),
+                deps_core::PackageVersions::latest_only("1.0.0"),
+            );
+            doc_state.update_cached_versions(cached_versions);
+            // No `update_licenses` call — `licenses` stays empty.
+            state.update_document(uri.clone(), doc_state);
+
+            let (client, full_config) = create_test_client_and_config();
+            let policy_config = LicensePolicyConfig {
+                allow: vec!["MIT".to_string()],
+                deny: Vec::new(),
+            };
+            state.set_license_policy(policy_config.to_policy());
+            full_config.write().await.license_policy = policy_config;
+            let config = DiagnosticsConfig::default();
+
+            let result = handle_diagnostics(state, &uri, &config, client, full_config).await;
+            assert!(result.is_empty(), "got: {result:?}");
+        }
+
+        /// Issue #660/#661 critic C1 regression: the push path — `generate_diagnostics_internal`,
+        /// called directly by every background-refresh call site in `document::lifecycle`/
+        /// `server.rs` with no `Option<&LicensePolicy>` parameter — must evaluate the same
+        /// policy as the pull path (`handle_diagnostics`), both reading
+        /// `ServerState::license_policy`. Before this fix, only `handle_diagnostics` ever
+        /// saw a configured policy.
+        #[tokio::test]
+        async fn push_path_also_evaluates_license_policy() {
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
+            let parse_result = cargo_parse_result(&state, &uri, &content).await;
+
+            let mut doc_state =
+                DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert(
+                PackageName::from("serde"),
+                deps_core::PackageVersions::latest_only("1.0.0"),
+            );
+            doc_state.update_cached_versions(cached_versions);
+            let mut licenses = HashMap::new();
+            licenses.insert(PackageName::from("serde"), vec!["GPL-3.0".to_string()]);
+            doc_state.update_licenses(licenses);
+            state.update_document(uri.clone(), doc_state);
+
+            state.set_license_policy(deps_core::LicensePolicy::new(
+                Vec::new(),
+                vec!["GPL-3.0".to_string()],
+            ));
+
+            let result = generate_diagnostics_internal(
+                Arc::clone(&state),
+                &uri,
+                deps_core::FreshnessSettings::default(),
+                deps_core::DiagnosticSeverities::default(),
+                false,
+                std::time::Duration::from_secs(60),
+            )
+            .await;
+
+            assert_eq!(
+                result.len(),
+                1,
+                "expected the license-policy diagnostic to fire on the push path too, got: \
+                 {result:?}"
+            );
+            assert_eq!(result[0].severity, Some(DiagnosticSeverity::ERROR));
         }
     }
 }

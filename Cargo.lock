@@ -635,6 +635,8 @@ dependencies = [
  "deps-core",
  "deps-maven",
  "insta",
+ "mockito",
+ "quick-xml",
  "regex",
  "tempfile",
  "tokio",

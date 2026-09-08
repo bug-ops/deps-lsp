@@ -93,6 +93,29 @@ impl SwiftRegistry {
         self.release_dates.fetch(&self.github, name, "Swift").await
     }
 
+    /// Fetches `name`'s (`owner/repo`) SPDX license identifier from the GitHub
+    /// repository API (issue #660, spec 010 plan §1 — live-verified 2026-09-08 against
+    /// `apple/swift-nio`: `GET /repos/{owner}/{repo}` returns `license.spdx_id`, a real
+    /// SPDX identifier, e.g. `"Apache-2.0"`).
+    ///
+    /// Returns an empty `Vec` (never an error) on any fetch failure, a missing
+    /// `license` field, or GitHub's `"NOASSERTION"` sentinel (a detected-but-
+    /// unclassified `LICENSE` file, not a real SPDX identifier) — graceful degradation
+    /// (NFR-003), since this is a best-effort secondary signal, not core version data.
+    pub async fn get_license(&self, name: &str) -> Vec<String> {
+        if validate_owner_repo(name).is_err() {
+            return Vec::new();
+        }
+        let url = format!("{}/repos/{name}", self.github.api_base());
+        match self.github.fetch_authenticated(&url).await {
+            Ok(data) => parse_license_response(&data),
+            Err(e) => {
+                tracing::debug!(package = name, error = %e, "github repo license fetch failed");
+                Vec::new()
+            }
+        }
+    }
+
     /// Finds the latest version satisfying the given semver requirement.
     #[tracing::instrument(skip_all, fields(package = ?name, version = ?req_str), level = "debug")]
     pub async fn get_latest_matching(
@@ -205,6 +228,36 @@ fn parse_search_response(data: &[u8]) -> Result<Vec<SwiftPackage>> {
             latest_version: deps_core::ConcreteVersion::new(""),
         })
         .collect())
+}
+
+/// GitHub repository API response, license subset only (issue #660).
+#[derive(Deserialize)]
+struct RepoResponse {
+    #[serde(default)]
+    license: Option<RepoLicense>,
+}
+
+/// `GET /repos/{owner}/{repo}`'s `license` object.
+#[derive(Deserialize)]
+struct RepoLicense {
+    #[serde(default)]
+    spdx_id: Option<String>,
+}
+
+/// GitHub's sentinel `spdx_id` for a `LICENSE` file it detected but could not classify
+/// against a known SPDX identifier — not a real license, must not be shown as one.
+const GITHUB_LICENSE_NOASSERTION: &str = "NOASSERTION";
+
+fn parse_license_response(data: &[u8]) -> Vec<String> {
+    let Ok(response) = deps_core::parse_json_checked::<RepoResponse>(data) else {
+        return Vec::new();
+    };
+    response
+        .license
+        .and_then(|l| l.spdx_id)
+        .filter(|id| !id.is_empty() && id != GITHUB_LICENSE_NOASSERTION)
+        .map(|id| vec![id])
+        .unwrap_or_default()
 }
 
 impl deps_core::Registry for SwiftRegistry {
@@ -671,5 +724,66 @@ mod tests {
         assert!(output.contains("Swift"), "output was: {output}");
         assert!(output.contains("cap"), "output was: {output}");
         assert!(!output.contains("GitHub Actions"), "output was: {output}");
+    }
+
+    // --- issue #660: license detection ---
+
+    #[test]
+    fn parse_license_response_extracts_spdx_id() {
+        let body = br#"{"license":{"key":"apache-2.0","spdx_id":"Apache-2.0"}}"#;
+        assert_eq!(parse_license_response(body), vec!["Apache-2.0".to_string()]);
+    }
+
+    #[test]
+    fn parse_license_response_filters_noassertion() {
+        let body = br#"{"license":{"key":null,"spdx_id":"NOASSERTION"}}"#;
+        assert!(parse_license_response(body).is_empty());
+    }
+
+    #[test]
+    fn parse_license_response_no_license_field_is_empty() {
+        let body = br#"{"full_name":"owner/repo"}"#;
+        assert!(parse_license_response(body).is_empty());
+    }
+
+    #[test]
+    fn parse_license_response_malformed_json_degrades_to_empty() {
+        assert!(parse_license_response(b"not json").is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_license_fetches_repo_endpoint() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/repos/owner/repo")
+            .with_status(200)
+            .with_body(r#"{"license":{"spdx_id":"MIT"}}"#)
+            .create_async()
+            .await;
+
+        let registry = mock_registry(&server.url(), false);
+        assert_eq!(
+            registry.get_license("owner/repo").await,
+            vec!["MIT".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn get_license_invalid_owner_repo_returns_empty_without_network() {
+        let registry = mock_registry("http://[::1]:1", false);
+        assert!(registry.get_license("not-a-valid-name").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_license_fetch_failure_degrades_to_empty() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/repos/owner/missing")
+            .with_status(404)
+            .create_async()
+            .await;
+
+        let registry = mock_registry(&server.url(), false);
+        assert!(registry.get_license("owner/missing").await.is_empty());
     }
 }
