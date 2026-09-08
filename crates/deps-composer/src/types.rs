@@ -72,6 +72,7 @@ pub enum ComposerSection {
 ///     abandoned: false,
 ///     deprecation: None,
 ///     published_at: None,
+///     license: vec![],
 /// };
 ///
 /// assert!(!version.abandoned);
@@ -93,6 +94,13 @@ pub struct ComposerVersion {
     /// not apply to `time`, since inheriting it would attribute one
     /// release's publish date to another.
     pub published_at: Option<deps_core::PublishTime>,
+    /// SPDX license identifier(s) from the p2 entry's `license` field (issue #204).
+    ///
+    /// Unlike `time`, this *does* participate in the Packagist v2 minified-entry
+    /// inheritance scheme (`expand_minified_versions`) — a release's `composer.json`
+    /// commonly repeats the same `license` as the previous tag, and Packagist only
+    /// sends the field again when it actually changes.
+    pub license: Vec<String>,
 }
 
 /// Whether `s` contains Composer's short `-a`/`-b` stability alias (`-a1`,
@@ -217,6 +225,7 @@ deps_core::impl_version!(ComposerVersion {
             || deps_core::has_default_prerelease_marker(&v.version_normalized)
     },
     deprecation: |v: &ComposerVersion| v.deprecation.as_ref(),
+    license: license,
 });
 
 /// Package metadata from Packagist search.
@@ -292,6 +301,7 @@ mod tests {
             abandoned: true,
             deprecation: None,
             published_at: None,
+            license: vec![],
         };
 
         assert_eq!(version.version_string(), "2.0.0");
@@ -300,6 +310,33 @@ mod tests {
             deps_core::RemovalStatus::AdvisoryDeprecated
         );
         assert!(!version.removal_status().blocks_resolution());
+    }
+
+    /// Issue #204: `Version::license()` reads the dedicated field.
+    #[test]
+    fn test_composer_version_license_accessor() {
+        let with_license = ComposerVersion {
+            version: "2.0.0".into(),
+            version_normalized: "2.0.0.0".into(),
+            abandoned: false,
+            deprecation: None,
+            published_at: None,
+            license: vec!["MIT".to_string(), "Apache-2.0".to_string()],
+        };
+        assert_eq!(
+            with_license.license(),
+            &["MIT".to_string(), "Apache-2.0".to_string()]
+        );
+
+        let without_license = ComposerVersion {
+            version: "1.0.0".into(),
+            version_normalized: "1.0.0.0".into(),
+            abandoned: false,
+            deprecation: None,
+            published_at: None,
+            license: vec![],
+        };
+        assert!(without_license.license().is_empty());
     }
 
     /// #205: `Version::deprecation()` reads the dedicated field, independent of the
@@ -315,6 +352,7 @@ mod tests {
                 replacement: Some("other/package".to_string()),
             }),
             published_at: None,
+            license: vec![],
         };
         assert_eq!(
             with_payload
@@ -329,6 +367,7 @@ mod tests {
             abandoned: false,
             deprecation: None,
             published_at: None,
+            license: vec![],
         };
         assert!(without_payload.deprecation().is_none());
     }
@@ -344,6 +383,7 @@ mod tests {
             abandoned: false,
             deprecation: None,
             published_at: None,
+            license: vec![],
         };
         let beta = ComposerVersion {
             version: "1.0.0-b1".into(),
@@ -351,6 +391,7 @@ mod tests {
             abandoned: false,
             deprecation: None,
             published_at: None,
+            license: vec![],
         };
         assert!(alpha.is_prerelease());
         assert!(beta.is_prerelease());
@@ -378,6 +419,7 @@ mod tests {
                 abandoned: false,
                 deprecation: None,
                 published_at: None,
+                license: vec![],
             };
             assert_eq!(
                 version.is_prerelease(),
@@ -503,6 +545,7 @@ mod tests {
             abandoned: false,
             deprecation: None,
             published_at: None,
+            license: vec![],
         };
         assert!(version.is_prerelease());
     }
@@ -515,6 +558,7 @@ mod tests {
             abandoned: false,
             deprecation: None,
             published_at: None,
+            license: vec![],
         };
         assert!(!version.is_prerelease());
     }

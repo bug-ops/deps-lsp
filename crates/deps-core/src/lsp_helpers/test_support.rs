@@ -488,6 +488,82 @@ impl crate::Registry for MockRegistryWithVersions {
     }
 }
 
+/// A version carrying an SPDX `license` list (issue #204), used by hover tests that
+/// exercise `push_license_hover_section`'s native-version-list path without touching
+/// every existing [`MockVersionWithAge`] call site.
+pub(crate) struct MockVersionWithLicense {
+    pub(crate) version: ConcreteVersion,
+    pub(crate) license: Vec<String>,
+}
+
+impl crate::Version for MockVersionWithLicense {
+    fn version_string(&self) -> &ConcreteVersion {
+        &self.version
+    }
+
+    fn license(&self) -> &[String] {
+        &self.license
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Registry stub serving [`MockVersionWithLicense`] entries — the license-hover
+/// counterpart of [`MockRegistryWithVersions`].
+pub(crate) struct MockRegistryWithLicensedVersions {
+    pub(crate) versions: Vec<MockVersionWithLicense>,
+}
+
+impl crate::Registry for MockRegistryWithLicensedVersions {
+    fn get_versions<'a>(
+        &'a self,
+        _name: &'a crate::PackageName,
+    ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Version>>>> {
+        let versions = self
+            .versions
+            .iter()
+            .map(|v| {
+                Box::new(MockVersionWithLicense {
+                    version: v.version.clone(),
+                    license: v.license.clone(),
+                }) as Box<dyn crate::Version>
+            })
+            .collect();
+        Box::pin(async move { Ok(versions) })
+    }
+
+    fn get_latest_matching<'a>(
+        &'a self,
+        _name: &'a crate::PackageName,
+        _req: &'a crate::VersionReq,
+    ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Option<Box<dyn crate::Version>>>>
+    {
+        Box::pin(async move { Ok(None) })
+    }
+
+    fn search<'a>(
+        &'a self,
+        _query: &'a str,
+        _limit: usize,
+    ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Metadata>>>> {
+        Box::pin(async move { Ok(Vec::new()) })
+    }
+
+    fn select_latest_matching(
+        &self,
+        versions: &[Box<dyn crate::Version>],
+        _req: &crate::VersionReq,
+    ) -> Option<usize> {
+        versions.iter().position(|v| v.is_stable())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 /// A version carrying an explicit [`RemovalStatus`], used where a test needs
 /// `AdvisoryDeprecated` specifically — `MockVersionWithAge`'s `bool` field can only
 /// express `Available`/`Yanked` via [`RemovalStatus::from_yanked`].

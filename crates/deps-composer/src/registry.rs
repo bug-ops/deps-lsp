@@ -403,6 +403,61 @@ struct MinifiedVersion {
     /// Publish timestamp (RFC 3339, e.g. `"2026-01-02T08:56:05+00:00"`).
     #[serde(default)]
     time: Option<String>,
+    /// SPDX license identifier(s) (issue #204). `None` means "not present on this
+    /// minified entry" (inherit from the previous one), distinct from `Some(vec![])`
+    /// ("this release explicitly declares no license").
+    ///
+    /// `composer.json`'s own `license` field is documented as either a single string
+    /// or an array of strings — [`deserialize_license`] accepts both shapes rather
+    /// than only the array form, mirroring [`Self::abandoned`]'s
+    /// `Option<serde_json::Value>` defense-in-depth: an unexpected shape here (a
+    /// bare string, or malformed data of any other JSON type) must degrade to `None`
+    /// rather than fail `serde_json::from_slice` for the *entire* `PackagistResponse`
+    /// — which would otherwise drop every version of the package, not just its
+    /// license (security review S3-2).
+    #[serde(default, deserialize_with = "deserialize_license")]
+    license: Option<Vec<String>>,
+}
+
+/// Accepts `composer.json`'s documented `license` shapes — a single string, an array
+/// of strings, or absent/`null` — and normalizes to `Option<Vec<String>>`. Any other
+/// JSON shape (a number, object, bool, or an array containing non-string elements)
+/// degrades to `None`/skips the offending element rather than erroring the whole
+/// response (see [`MinifiedVersion::license`]'s doc).
+fn deserialize_license<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(match value {
+        serde_json::Value::String(s) => Some(vec![s]),
+        serde_json::Value::Array(entries) => {
+            // Review round 3 fix: a non-empty raw array whose every element is a
+            // non-string (a malformed `license: [7, 8]`) must degrade to `None`
+            // ("not present on this entry", inherit), not `Some(vec![])` ("this
+            // entry explicitly declares no license"). `expand_minified_versions`
+            // treats `Some(_)` as an override — a stray `Some(vec![])` here would
+            // silently overwrite an earlier real license and then get inherited by
+            // every later entry that omits `license` entirely, corrupting the whole
+            // rest of the inheritance chain from one malformed entry.
+            let had_entries = !entries.is_empty();
+            let strings: Vec<String> = entries
+                .into_iter()
+                .filter_map(|entry| match entry {
+                    serde_json::Value::String(s) => Some(s),
+                    _ => None,
+                })
+                .collect();
+            if had_entries && strings.is_empty() {
+                None
+            } else {
+                Some(strings)
+            }
+        }
+        _ => None,
+    })
 }
 
 /// Expands minified Packagist v2 versions using field inheritance.
@@ -437,6 +492,9 @@ fn expand_minified_versions(entries: Vec<MinifiedVersion>) -> Vec<ComposerVersio
         if entry.abandoned.is_some() {
             current.abandoned = entry.abandoned;
         }
+        if entry.license.is_some() {
+            current.license = entry.license;
+        }
 
         let Some(ref version) = current.version else {
             continue;
@@ -462,6 +520,7 @@ fn expand_minified_versions(entries: Vec<MinifiedVersion>) -> Vec<ComposerVersio
             abandoned,
             deprecation,
             published_at,
+            license: current.license.clone().unwrap_or_default(),
         });
     }
 
@@ -784,12 +843,14 @@ mod tests {
                 version_normalized: Some("3.0.0.0".into()),
                 abandoned: None,
                 time: None,
+                license: None,
             },
             MinifiedVersion {
                 version: Some("2.0.0".into()),
                 version_normalized: Some("2.0.0.0".into()),
                 abandoned: None,
                 time: None,
+                license: None,
             },
         ];
 
@@ -809,12 +870,14 @@ mod tests {
                 version_normalized: Some("3.0.0.0".into()),
                 abandoned: None,
                 time: None,
+                license: None,
             },
             MinifiedVersion {
                 version: Some("2.9.0".into()),
                 version_normalized: None, // inherited
                 abandoned: None,
                 time: None,
+                license: None,
             },
         ];
 
@@ -822,6 +885,64 @@ mod tests {
         assert_eq!(versions.len(), 2);
         assert_eq!(versions[1].version, "2.9.0");
         assert_eq!(versions[1].version_normalized, "3.0.0.0"); // inherited
+    }
+
+    /// Issue #204: `license` participates in the minified-entry inheritance scheme
+    /// (unlike `time`) — a second entry with no `license` key must inherit the
+    /// first's, mirroring `version_normalized`/`abandoned`.
+    #[test]
+    fn test_expand_minified_versions_license_inherits_like_version_normalized() {
+        let entries = vec![
+            MinifiedVersion {
+                version: Some("3.0.0".into()),
+                version_normalized: Some("3.0.0.0".into()),
+                abandoned: None,
+                time: None,
+                license: Some(vec!["MIT".to_string()]),
+            },
+            MinifiedVersion {
+                version: Some("2.9.0".into()),
+                version_normalized: None,
+                abandoned: None,
+                time: None,
+                license: None, // inherited
+            },
+        ];
+
+        let versions = expand_minified_versions(entries);
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0].license, vec!["MIT".to_string()]);
+        assert_eq!(versions[1].license, vec!["MIT".to_string()]);
+    }
+
+    /// A later entry's own `license` overrides the inherited one, and an entry with
+    /// no `license` ever set (neither its own nor inherited) defaults to empty.
+    #[test]
+    fn test_expand_minified_versions_license_override_and_default_empty() {
+        let entries = vec![
+            MinifiedVersion {
+                version: Some("3.0.0".into()),
+                version_normalized: Some("3.0.0.0".into()),
+                abandoned: None,
+                time: None,
+                license: None,
+            },
+            MinifiedVersion {
+                version: Some("2.0.0".into()),
+                version_normalized: None,
+                abandoned: None,
+                time: None,
+                license: Some(vec!["Apache-2.0".to_string()]),
+            },
+        ];
+
+        let versions = expand_minified_versions(entries);
+        assert_eq!(versions.len(), 2);
+        assert!(
+            versions[0].license.is_empty(),
+            "no license was ever set for the first entry"
+        );
+        assert_eq!(versions[1].license, vec!["Apache-2.0".to_string()]);
     }
 
     #[test]
@@ -832,18 +953,21 @@ mod tests {
                 version_normalized: Some("3.0.0.0".into()),
                 abandoned: None,
                 time: None,
+                license: None,
             },
             MinifiedVersion {
                 version: Some("dev-main".into()),
                 version_normalized: None,
                 abandoned: None,
                 time: None,
+                license: None,
             },
             MinifiedVersion {
                 version: Some("2.0.0-dev".into()),
                 version_normalized: None,
                 abandoned: None,
                 time: None,
+                license: None,
             },
         ];
 
@@ -859,6 +983,7 @@ mod tests {
             version_normalized: Some("3.0.0.0".into()),
             abandoned: Some(serde_json::Value::String("Use other/package".into())),
             time: None,
+            license: None,
         }];
 
         let versions = expand_minified_versions(entries);
@@ -882,6 +1007,7 @@ mod tests {
             version_normalized: Some("3.0.0.0".into()),
             abandoned: Some(serde_json::Value::Bool(true)),
             time: None,
+            license: None,
         }];
 
         let versions = expand_minified_versions(entries);
@@ -903,6 +1029,7 @@ mod tests {
             version_normalized: Some("3.0.0.0".into()),
             abandoned: Some(serde_json::Value::String("   ".into())),
             time: None,
+            license: None,
         }];
 
         let versions = expand_minified_versions(entries);
@@ -923,6 +1050,7 @@ mod tests {
             version_normalized: Some("3.0.0.0".into()),
             abandoned: None,
             time: None,
+            license: None,
         }];
 
         let versions = expand_minified_versions(entries);
@@ -936,6 +1064,7 @@ mod tests {
             version_normalized: Some("3.0.0.0".into()),
             abandoned: None,
             time: Some("2026-01-02T08:56:05+00:00".into()),
+            license: None,
         }];
 
         let versions = expand_minified_versions(entries);
@@ -953,6 +1082,7 @@ mod tests {
             version_normalized: Some("3.0.0.0".into()),
             abandoned: None,
             time: None,
+            license: None,
         }];
 
         let versions = expand_minified_versions(entries);
@@ -967,6 +1097,7 @@ mod tests {
             version_normalized: Some("3.0.0.0".into()),
             abandoned: None,
             time: Some("not-a-timestamp".into()),
+            license: None,
         }];
 
         let versions = expand_minified_versions(entries);
@@ -988,12 +1119,14 @@ mod tests {
                 version_normalized: Some("3.0.0.0".into()),
                 abandoned: None,
                 time: Some("2026-01-02T08:56:05+00:00".into()),
+                license: None,
             },
             MinifiedVersion {
                 version: Some("2.9.0".into()),
                 version_normalized: None, // inherited
                 abandoned: None,
                 time: None, // must NOT inherit the previous entry's time
+                license: None,
             },
         ];
 
@@ -1075,6 +1208,154 @@ mod tests {
         assert_eq!(versions[0].version, "3.0.0");
     }
 
+    /// Issue #204: `license[]` shape live-verified against Packagist's real p2 API
+    /// response — the second entry omits `license` entirely and must inherit the
+    /// first's, matching every other minified field.
+    #[test]
+    fn test_parse_package_metadata_parses_license() {
+        let json = r#"{
+  "packages": {
+    "monolog/monolog": [
+      {
+        "version": "3.0.0",
+        "version_normalized": "3.0.0.0",
+        "abandoned": null,
+        "license": ["MIT"]
+      },
+      {
+        "version": "2.0.0",
+        "version_normalized": "2.0.0.0"
+      }
+    ]
+  }
+}"#;
+
+        let versions = parse_package_metadata("monolog/monolog", json.as_bytes()).unwrap();
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0].license, vec!["MIT".to_string()]);
+        assert_eq!(
+            versions[1].license,
+            vec!["MIT".to_string()],
+            "license inherits like version_normalized/abandoned"
+        );
+    }
+
+    /// Security review S3-2: `composer.json`'s `license` field is documented as
+    /// either a single string or an array of strings — a bare string must parse to
+    /// a one-element `Vec`, not fail the whole `PackagistResponse` deserialization
+    /// (which would otherwise drop every version of the package).
+    #[test]
+    fn test_parse_package_metadata_license_as_bare_string() {
+        let json = r#"{
+  "packages": {
+    "monolog/monolog": [
+      {
+        "version": "3.0.0",
+        "version_normalized": "3.0.0.0",
+        "abandoned": null,
+        "license": "MIT"
+      }
+    ]
+  }
+}"#;
+
+        let versions = parse_package_metadata("monolog/monolog", json.as_bytes()).unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].license, vec!["MIT".to_string()]);
+    }
+
+    /// An unexpected `license` shape (neither string nor array) must degrade to
+    /// "no license" rather than fail the whole response.
+    #[test]
+    fn test_parse_package_metadata_license_unexpected_shape_degrades_gracefully() {
+        let json = r#"{
+  "packages": {
+    "monolog/monolog": [
+      {
+        "version": "3.0.0",
+        "version_normalized": "3.0.0.0",
+        "abandoned": null,
+        "license": 42
+      }
+    ]
+  }
+}"#;
+
+        let versions = parse_package_metadata("monolog/monolog", json.as_bytes()).unwrap();
+        assert_eq!(versions.len(), 1);
+        assert!(versions[0].license.is_empty());
+    }
+
+    /// An array with a mix of string and non-string entries keeps only the string
+    /// entries rather than failing the whole response.
+    #[test]
+    fn test_parse_package_metadata_license_array_skips_non_string_entries() {
+        let json = r#"{
+  "packages": {
+    "monolog/monolog": [
+      {
+        "version": "3.0.0",
+        "version_normalized": "3.0.0.0",
+        "abandoned": null,
+        "license": ["MIT", 7, "Apache-2.0"]
+      }
+    ]
+  }
+}"#;
+
+        let versions = parse_package_metadata("monolog/monolog", json.as_bytes()).unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(
+            versions[0].license,
+            vec!["MIT".to_string(), "Apache-2.0".to_string()]
+        );
+    }
+
+    /// Review round 3 fix: a malformed all-non-string `license` array on a middle
+    /// entry must not corrupt the inheritance chain for every entry after it. Entry 1
+    /// declares a real license, entry 2's `license: [7, 8]` has no usable string
+    /// (must degrade to "not present", not "explicitly empty"), entry 3 omits
+    /// `license` entirely and must still inherit entry 1's real license through
+    /// entry 2 — not entry 2's would-be `Some(vec![])`.
+    #[test]
+    fn test_parse_package_metadata_license_all_non_string_array_does_not_corrupt_inheritance() {
+        let json = r#"{
+  "packages": {
+    "monolog/monolog": [
+      {
+        "version": "3.0.0",
+        "version_normalized": "3.0.0.0",
+        "abandoned": null,
+        "license": ["MIT"]
+      },
+      {
+        "version": "2.9.0",
+        "license": [7, 8]
+      },
+      {
+        "version": "2.8.0"
+      }
+    ]
+  }
+}"#;
+
+        let versions = parse_package_metadata("monolog/monolog", json.as_bytes()).unwrap();
+        assert_eq!(versions.len(), 3);
+        assert_eq!(versions[0].license, vec!["MIT".to_string()]);
+        assert_eq!(
+            versions[1].license,
+            vec!["MIT".to_string()],
+            "an all-non-string license array must inherit the prior entry's real \
+             license rather than overriding it with an empty one"
+        );
+        assert_eq!(
+            versions[2].license,
+            vec!["MIT".to_string()],
+            "the third entry (no license key at all) must still inherit MIT through \
+             the malformed second entry, not lose it"
+        );
+    }
+
     #[test]
     fn test_parse_package_metadata_deeply_nested_json_rejected_before_parse() {
         // #430: a deeply nested `abandoned` value must be rejected by the
@@ -1106,6 +1387,7 @@ mod tests {
                 abandoned: true,
                 deprecation: None,
                 published_at: None,
+                license: vec![],
             }),
             Box::new(ComposerVersion {
                 version: "1.0.0".into(),
@@ -1113,6 +1395,7 @@ mod tests {
                 abandoned: false,
                 deprecation: None,
                 published_at: None,
+                license: vec![],
             }),
         ];
         let req = VersionReq::new("*");
@@ -1135,6 +1418,7 @@ mod tests {
                 abandoned: true,
                 deprecation: None,
                 published_at: None,
+                license: vec![],
             }),
             Box::new(ComposerVersion {
                 version: "1.0.0".into(),
@@ -1142,6 +1426,7 @@ mod tests {
                 abandoned: true,
                 deprecation: None,
                 published_at: None,
+                license: vec![],
             }),
         ];
         let req = VersionReq::new("*");
@@ -1197,6 +1482,7 @@ mod tests {
                 abandoned: false,
                 deprecation: None,
                 published_at: None,
+                license: vec![],
             }),
             Box::new(ComposerVersion {
                 version: "1.5.0".into(),
@@ -1204,6 +1490,7 @@ mod tests {
                 abandoned: false,
                 deprecation: None,
                 published_at: None,
+                license: vec![],
             }),
         ];
         let req = VersionReq::new(">=1.0");
@@ -1226,6 +1513,7 @@ mod tests {
                 abandoned: false,
                 deprecation: None,
                 published_at: None,
+                license: vec![],
             }),
             Box::new(ComposerVersion {
                 version: "1.5.0".into(),
@@ -1233,6 +1521,7 @@ mod tests {
                 abandoned: false,
                 deprecation: None,
                 published_at: None,
+                license: vec![],
             }),
         ];
         let req = VersionReq::new("2.0.0-beta1");
@@ -1287,6 +1576,7 @@ mod tests {
                 abandoned: false,
                 deprecation: None,
                 published_at: None,
+                license: vec![],
             }),
             Box::new(ComposerVersion {
                 version: "1.5.0".into(),
@@ -1294,6 +1584,7 @@ mod tests {
                 abandoned: false,
                 deprecation: None,
                 published_at: None,
+                license: vec![],
             }),
         ];
         let req = VersionReq::new("2.0.0-a1");
@@ -1315,6 +1606,7 @@ mod tests {
             abandoned: false,
             deprecation: None,
             published_at: None,
+            license: vec![],
         })];
         let req = VersionReq::new("^1.0.0-a1");
         assert_eq!(registry.select_latest_matching(&versions, &req), Some(0));
@@ -1367,6 +1659,7 @@ mod tests {
                 abandoned: false,
                 deprecation: None,
                 published_at: None,
+                license: vec![],
             }),
             Box::new(ComposerVersion {
                 version: "2.0.0-beta1".into(),
@@ -1374,6 +1667,7 @@ mod tests {
                 abandoned: false,
                 deprecation: None,
                 published_at: None,
+                license: vec![],
             }),
         ];
         let req = VersionReq::new("*");
@@ -1420,6 +1714,7 @@ mod tests {
                 abandoned: false,
                 deprecation: None,
                 published_at: None,
+                license: vec![],
             }),
             Box::new(ComposerVersion {
                 version: "2.0.0-beta1".into(),
@@ -1427,6 +1722,7 @@ mod tests {
                 abandoned: false,
                 deprecation: None,
                 published_at: None,
+                license: vec![],
             }),
             Box::new(ComposerVersion {
                 version: "1.5.0".into(),
@@ -1434,6 +1730,7 @@ mod tests {
                 abandoned: false,
                 deprecation: None,
                 published_at: None,
+                license: vec![],
             }),
         ]
     }
@@ -1553,6 +1850,7 @@ mod tests {
                 abandoned: false,
                 deprecation: None,
                 published_at: None,
+                license: vec![],
             }),
             Box::new(ComposerVersion {
                 version: "1.0.0".into(),
@@ -1560,6 +1858,7 @@ mod tests {
                 abandoned: false,
                 deprecation: None,
                 published_at: None,
+                license: vec![],
             }),
         ];
         let req = VersionReq::new("^1.0@beta");
@@ -1585,6 +1884,7 @@ mod tests {
                 abandoned: false,
                 deprecation: None,
                 published_at: None,
+                license: vec![],
             }),
             Box::new(ComposerVersion {
                 version: "1.0.0".into(),
@@ -1592,6 +1892,7 @@ mod tests {
                 abandoned: false,
                 deprecation: None,
                 published_at: None,
+                license: vec![],
             }),
         ];
         let req = VersionReq::new("^1.0@beta");
@@ -1618,6 +1919,7 @@ mod tests {
                 abandoned: false,
                 deprecation: None,
                 published_at: None,
+                license: vec![],
             }),
             Box::new(ComposerVersion {
                 version: "1.0.0".into(),
@@ -1625,6 +1927,7 @@ mod tests {
                 abandoned: false,
                 deprecation: None,
                 published_at: None,
+                license: vec![],
             }),
         ];
         let req = VersionReq::new("^1.0@stable");
@@ -1647,6 +1950,7 @@ mod tests {
                 abandoned: false,
                 deprecation: None,
                 published_at: None,
+                license: vec![],
             }),
             Box::new(ComposerVersion {
                 version: "1.4.0-RC1".into(),
@@ -1654,6 +1958,7 @@ mod tests {
                 abandoned: false,
                 deprecation: None,
                 published_at: None,
+                license: vec![],
             }),
             Box::new(ComposerVersion {
                 version: "1.0.0".into(),
@@ -1661,6 +1966,7 @@ mod tests {
                 abandoned: false,
                 deprecation: None,
                 published_at: None,
+                license: vec![],
             }),
         ];
         let req = VersionReq::new("^1.0@RC");
@@ -1687,6 +1993,7 @@ mod tests {
                 abandoned: false,
                 deprecation: None,
                 published_at: None,
+                license: vec![],
             }),
             Box::new(ComposerVersion {
                 version: "1.0.0".into(),
@@ -1694,6 +2001,7 @@ mod tests {
                 abandoned: false,
                 deprecation: None,
                 published_at: None,
+                license: vec![],
             }),
         ];
         let req = VersionReq::new("^1.0@alpha");
@@ -1715,6 +2023,7 @@ mod tests {
                 abandoned: false,
                 deprecation: None,
                 published_at: None,
+                license: vec![],
             }),
             Box::new(ComposerVersion {
                 version: "1.0.0".into(),
@@ -1722,6 +2031,7 @@ mod tests {
                 abandoned: false,
                 deprecation: None,
                 published_at: None,
+                license: vec![],
             }),
         ];
         let req = VersionReq::new("^1.0@dev");
@@ -1745,6 +2055,7 @@ mod tests {
             abandoned: false,
             deprecation: None,
             published_at: None,
+            license: vec![],
         })];
         let req = VersionReq::new("^1.0@beta || ^2.0");
         assert_eq!(registry.select_latest_matching(&versions, &req), Some(0));
@@ -1764,6 +2075,7 @@ mod tests {
             abandoned: false,
             deprecation: None,
             published_at: None,
+            license: vec![],
         })];
         let req = VersionReq::new(">=1.0@dev <2.0");
         assert_eq!(registry.select_latest_matching(&versions, &req), Some(0));
@@ -1807,6 +2119,7 @@ mod tests {
                 abandoned: false,
                 deprecation: None,
                 published_at: None,
+                license: vec![],
             }),
             Box::new(ComposerVersion {
                 version: "1.5.0".into(),
@@ -1814,6 +2127,7 @@ mod tests {
                 abandoned: false,
                 deprecation: None,
                 published_at: None,
+                license: vec![],
             }),
         ];
         let req = VersionReq::new(">=1.0");
@@ -1836,6 +2150,7 @@ mod tests {
                 abandoned: false,
                 deprecation: None,
                 published_at: None,
+                license: vec![],
             }),
             Box::new(ComposerVersion {
                 version: "1.5.0".into(),
@@ -1843,6 +2158,7 @@ mod tests {
                 abandoned: false,
                 deprecation: None,
                 published_at: None,
+                license: vec![],
             }),
         ];
         let req = VersionReq::new("2.0.0a1");
@@ -1863,6 +2179,7 @@ mod tests {
                 abandoned: false,
                 deprecation: None,
                 published_at: None,
+                license: vec![],
             }),
             Box::new(ComposerVersion {
                 version: "1.5.0".into(),
@@ -1870,6 +2187,7 @@ mod tests {
                 abandoned: false,
                 deprecation: None,
                 published_at: None,
+                license: vec![],
             }),
         ];
         let req = VersionReq::new(">=1.0");
@@ -1895,6 +2213,7 @@ mod tests {
                 abandoned: false,
                 deprecation: None,
                 published_at: None,
+                license: vec![],
             }),
             Box::new(ComposerVersion {
                 version: "v2.2.8".into(),
@@ -1902,6 +2221,7 @@ mod tests {
                 abandoned: false,
                 deprecation: None,
                 published_at: None,
+                license: vec![],
             }),
         ];
         let req = VersionReq::new("*");
@@ -1928,6 +2248,7 @@ mod tests {
                 abandoned: false,
                 deprecation: None,
                 published_at: None,
+                license: vec![],
             }),
             Box::new(ComposerVersion {
                 version: "v2.9.0".into(),
@@ -1935,6 +2256,7 @@ mod tests {
                 abandoned: false,
                 deprecation: None,
                 published_at: None,
+                license: vec![],
             }),
         ];
         let req = VersionReq::new(">=2.0");
@@ -1962,6 +2284,7 @@ mod tests {
             abandoned: false,
             deprecation: None,
             published_at: None,
+            license: vec![],
         })];
         let req = VersionReq::new(">=3.0");
         assert_eq!(
@@ -1991,6 +2314,7 @@ mod tests {
                 abandoned: false,
                 deprecation: None,
                 published_at: None,
+                license: vec![],
             }),
             Box::new(ComposerVersion {
                 version: "1.5.0".into(),
@@ -1998,6 +2322,7 @@ mod tests {
                 abandoned: false,
                 deprecation: None,
                 published_at: None,
+                license: vec![],
             }),
         ];
         let req = VersionReq::new(">=1.0");
@@ -2020,6 +2345,7 @@ mod tests {
                 abandoned: false,
                 deprecation: None,
                 published_at: None,
+                license: vec![],
             }),
             Box::new(ComposerVersion {
                 version: "1.5.0".into(),
@@ -2027,6 +2353,7 @@ mod tests {
                 abandoned: false,
                 deprecation: None,
                 published_at: None,
+                license: vec![],
             }),
         ];
         let req = VersionReq::new("2.0.0RC1");
@@ -2049,6 +2376,7 @@ mod tests {
                 abandoned: false,
                 deprecation: None,
                 published_at: None,
+                license: vec![],
             }),
             Box::new(ComposerVersion {
                 version: "2.6.2".into(),
@@ -2056,6 +2384,7 @@ mod tests {
                 abandoned: false,
                 deprecation: None,
                 published_at: None,
+                license: vec![],
             }),
         ];
         let req = VersionReq::new(">=2.0");
@@ -2079,6 +2408,7 @@ mod tests {
                 abandoned: false,
                 deprecation: None,
                 published_at: None,
+                license: vec![],
             }),
             Box::new(ComposerVersion {
                 version: "2.6.2".into(),
@@ -2086,6 +2416,7 @@ mod tests {
                 abandoned: false,
                 deprecation: None,
                 published_at: None,
+                license: vec![],
             }),
         ];
         let req = VersionReq::new("2.6.3.alpha");
@@ -2104,6 +2435,12 @@ mod tests {
             versions
                 .iter()
                 .any(|v| v.version.as_str().starts_with("3."))
+        );
+        // Issue #204: license must be parsed (and inherited across minified
+        // entries) from the real Packagist v2 response, not just the fixture.
+        assert!(
+            versions.iter().any(|v| !v.license.is_empty()),
+            "expected at least one real monolog/monolog version to carry a license"
         );
     }
 
