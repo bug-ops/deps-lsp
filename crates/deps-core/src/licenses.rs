@@ -263,7 +263,11 @@ fn contains_ci(haystack: &[String], needle: &str) -> bool {
 /// registry-controlled, unbounded-length data.
 fn join_capped(licenses: &[String], max_entries: usize) -> String {
     let shown = licenses.len().min(max_entries);
-    let mut joined = licenses[..shown].join(", ");
+    // `shown <= licenses.len()` by construction (the `.min` above), so `.get(..shown)`
+    // never actually falls back — `unwrap_or(licenses)` just satisfies
+    // `clippy::indexing_slicing` (issue #678 hardening) without panicking if that
+    // invariant is ever violated.
+    let mut joined = licenses.get(..shown).unwrap_or(licenses).join(", ");
     let remaining = licenses.len() - shown;
     if remaining > 0 {
         joined.push_str(&format!(" (+{remaining} more)"));
