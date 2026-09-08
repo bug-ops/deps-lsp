@@ -46,6 +46,7 @@ impl SwiftRegistry {
     /// Follows GitHub tags pagination up to `MAX_TAG_PAGES` pages, stopping
     /// as soon as a page comes back with fewer than 100 entries (no further
     /// pages exist).
+    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
     pub async fn get_versions(&self, name: &str) -> Result<Vec<SwiftVersion>> {
         validate_owner_repo(name)?;
         let tags = paginate_tags("Swift", name, |page| async move {
@@ -75,6 +76,7 @@ impl SwiftRegistry {
     /// so it can never perturb `get_versions`'s error propagation. This removes one
     /// round trip out of the tag-pagination loop's `P+1`, not half the latency (#223
     /// R7), and on a memo hit the join costs nothing at all.
+    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
     pub async fn get_versions_with_release_dates(&self, name: &str) -> Result<Vec<SwiftVersion>> {
         let (versions, dates) = tokio::join!(self.get_versions(name), self.release_dates(name));
         let mut versions = versions?;
@@ -92,6 +94,7 @@ impl SwiftRegistry {
     }
 
     /// Finds the latest version satisfying the given semver requirement.
+    #[tracing::instrument(skip_all, fields(package = ?name, version = ?req_str), level = "debug")]
     pub async fn get_latest_matching(
         &self,
         name: &str,
@@ -116,6 +119,7 @@ impl SwiftRegistry {
     ///
     /// Returns up to `limit` results. `latest_version` is left empty to avoid
     /// N+1 API calls per search result.
+    #[tracing::instrument(skip_all, fields(query = ?query), level = "debug")]
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<SwiftPackage>> {
         let url = format!(
             "{}/search/repositories?q={}+language:swift&per_page={limit}",

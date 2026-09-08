@@ -56,6 +56,7 @@ impl RubyGemsRegistry {
     }
 
     /// Fetches all versions for a gem.
+    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
     pub async fn get_versions(&self, name: &str) -> Result<Vec<BundlerVersion>> {
         let url = versions_url(name);
         let data = self.cache.get_cached(&url).await?;
@@ -63,6 +64,7 @@ impl RubyGemsRegistry {
     }
 
     /// Finds the latest version matching the given requirement.
+    #[tracing::instrument(skip_all, fields(package = ?name, version = ?req_str), level = "debug")]
     pub async fn get_latest_matching(
         &self,
         name: &str,
@@ -75,6 +77,7 @@ impl RubyGemsRegistry {
     }
 
     /// Searches for gems by name/keywords.
+    #[tracing::instrument(skip_all, fields(query = ?query), level = "debug")]
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<GemInfo>> {
         let url = format!(
             "{}/search.json?query={}",
@@ -87,6 +90,7 @@ impl RubyGemsRegistry {
     }
 
     /// Gets detailed gem information.
+    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
     pub async fn get_gem_info(&self, name: &str) -> Result<GemInfo> {
         let url = gem_info_url(name);
         let data = self.cache.get_cached(&url).await?;

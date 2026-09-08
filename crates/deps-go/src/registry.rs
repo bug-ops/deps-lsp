@@ -396,6 +396,7 @@ impl GoRegistry {
     /// `deps-pypi`'s identical FR-005(c) trade-off for the default `,`-separated case:
     /// silently falling through on transport failure risks resolving a module through a
     /// fallback the user did not intend for the reachability state they are actually in.
+    #[tracing::instrument(skip_all, fields(package = ?module_path), level = "debug")]
     async fn get_versions_chained(&self, module_path: &str) -> Result<Vec<GoVersion>> {
         let mut last_miss: Result<Vec<GoVersion>> = Err(DepsError::PackageNotFound {
             package: module_path.to_string(),
@@ -478,6 +479,7 @@ impl GoRegistry {
     /// assert!(!versions.is_empty());
     /// # }
     /// ```
+    #[tracing::instrument(skip_all, fields(package = ?module_path), level = "debug")]
     pub async fn get_versions(&self, module_path: &str) -> Result<Vec<GoVersion>> {
         if self.tier == GoRegistryTier::Terminal {
             return Err(DepsError::PackageNotFound {
@@ -525,6 +527,7 @@ impl GoRegistry {
     /// assert_eq!(info.version, "v1.9.1");
     /// # }
     /// ```
+    #[tracing::instrument(skip_all, fields(package = ?module_path, version = ?version), level = "debug")]
     pub async fn get_version_info(&self, module_path: &str, version: &str) -> Result<GoVersion> {
         if self.tier == GoRegistryTier::Terminal {
             return Err(DepsError::PackageNotFound {
@@ -573,6 +576,7 @@ impl GoRegistry {
     /// assert!(!latest.is_pseudo);
     /// # }
     /// ```
+    #[tracing::instrument(skip_all, fields(package = ?module_path), level = "debug")]
     pub async fn get_latest(&self, module_path: &str) -> Result<GoVersion> {
         if self.tier == GoRegistryTier::Terminal {
             return Err(DepsError::PackageNotFound {
@@ -621,6 +625,7 @@ impl GoRegistry {
     /// assert!(go_mod.contains("module github.com/gin-gonic/gin"));
     /// # }
     /// ```
+    #[tracing::instrument(skip_all, fields(package = ?module_path, version = ?version), level = "debug")]
     pub async fn get_go_mod(&self, module_path: &str, version: &str) -> Result<String> {
         if self.tier == GoRegistryTier::Terminal {
             return Err(DepsError::PackageNotFound {

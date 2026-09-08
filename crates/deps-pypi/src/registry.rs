@@ -419,6 +419,7 @@ impl PypiRegistry {
     /// reaches hover/diagnostics text, not just the `tracing::warn!` below (which still logs
     /// the real underlying error for debugging) — this is NFR-003(3)'s required
     /// distinguishable diagnostic.
+    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
     async fn get_versions_chained(&self, name: &str) -> Result<Vec<PypiVersion>> {
         let mut last_miss: Result<Vec<PypiVersion>> = Err(DepsError::PackageNotFound {
             package: name.to_string(),
@@ -486,6 +487,7 @@ impl PypiRegistry {
     /// assert!(!versions.is_empty());
     /// # }
     /// ```
+    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
     pub async fn get_versions(&self, name: &str) -> Result<Vec<PypiVersion>> {
         let normalized = crate::name::normalize(name);
         if normalized.is_empty() {
@@ -540,6 +542,7 @@ impl PypiRegistry {
     /// assert!(latest.is_some());
     /// # }
     /// ```
+    #[tracing::instrument(skip_all, fields(package = ?name, version = ?req_str), level = "debug")]
     pub async fn get_latest_matching(
         &self,
         name: &str,
@@ -671,6 +674,7 @@ impl PypiRegistry {
     ///   name to `pypi.org`'s JSON API (`metadata_url` is always built from the hardcoded
     ///   `PYPI_BASE`, never parameterized — see `metadata_url`'s doc) — closed here before
     ///   any such call site exists, not relied on via the call graph
+    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
     pub async fn get_package_metadata(&self, name: &str) -> Result<PypiPackage> {
         if self.tier == PypiRegistryTier::WorkspaceDeclared {
             return Err(DepsError::PackageNotFound {

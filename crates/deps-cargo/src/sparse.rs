@@ -318,6 +318,7 @@ impl SparseIndexClient {
     /// assert!(!versions.is_empty());
     /// # }
     /// ```
+    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
     pub async fn get_versions(&self, name: &str) -> Result<Vec<CargoVersion>> {
         reject_unsafe_crate_name(name, self.registry_display_name)?;
         let url = sparse_index_url(&self.base_url, name);
@@ -334,6 +335,7 @@ impl SparseIndexClient {
     /// Returns an error if:
     /// - Version requirement string is invalid semver
     /// - HTTP request fails
+    #[tracing::instrument(skip_all, fields(package = ?name, version = ?req_str), level = "debug")]
     pub async fn get_latest_matching(
         &self,
         name: &str,

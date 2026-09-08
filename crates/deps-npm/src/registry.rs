@@ -358,6 +358,7 @@ impl NpmRegistry {
     /// assert!(!versions.is_empty());
     /// # }
     /// ```
+    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
     pub async fn get_versions(&self, name: &str) -> Result<Vec<NpmVersion>> {
         if has_dot_segment(name) {
             warn_rejected_value("npm_dot_segment_guard", "npm packument request URL", name);
@@ -523,6 +524,7 @@ impl NpmRegistry {
     /// assert!(latest.is_some());
     /// # }
     /// ```
+    #[tracing::instrument(skip_all, fields(package = ?name, version = ?req_str), level = "debug")]
     pub async fn get_latest_matching(
         &self,
         name: &str,
@@ -575,6 +577,7 @@ impl NpmRegistry {
     /// assert!(!results.is_empty());
     /// # }
     /// ```
+    #[tracing::instrument(skip_all, fields(query = ?query), level = "debug")]
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<NpmPackage>> {
         // N-M3: an alternate registry never performs a package-*name* search. Today's
         // routing never reaches this on a `WorkspaceDeclared` instance (`complete_package_names`

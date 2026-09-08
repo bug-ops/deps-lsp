@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 use tower_lsp_server::Client;
 use tower_lsp_server::ls_types::Uri;
+use tracing::Instrument;
 
 /// Upper bound on how long a server-to-client request is allowed to wait for a
 /// reply before being abandoned (issue #493). Used both for the detached
@@ -791,30 +792,41 @@ impl ServerState {
     pub fn spawn_refresh_requests(&self, client: &Client) {
         if self.inlay_hint_refresh_supported() {
             let client = client.clone();
-            tokio::spawn(async move {
-                match tokio::time::timeout(CLIENT_REFRESH_TIMEOUT, client.inlay_hint_refresh())
-                    .await
-                {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => tracing::debug!("inlay_hint_refresh failed: {:?}", e),
-                    Err(_) => tracing::debug!(
-                        "inlay_hint_refresh timed out after {CLIENT_REFRESH_TIMEOUT:?}"
-                    ),
+            // Captured before `tokio::spawn` so this detached refresh's failure/timeout
+            // logs stay correlated with whichever document/ecosystem span triggered it.
+            let span = tracing::Span::current();
+            tokio::spawn(
+                async move {
+                    match tokio::time::timeout(CLIENT_REFRESH_TIMEOUT, client.inlay_hint_refresh())
+                        .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => tracing::debug!("inlay_hint_refresh failed: {:?}", e),
+                        Err(_) => tracing::debug!(
+                            "inlay_hint_refresh timed out after {CLIENT_REFRESH_TIMEOUT:?}"
+                        ),
+                    }
                 }
-            });
+                .instrument(span),
+            );
         }
         if self.code_lens_refresh_supported() {
             let client = client.clone();
-            tokio::spawn(async move {
-                match tokio::time::timeout(CLIENT_REFRESH_TIMEOUT, client.code_lens_refresh()).await
-                {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => tracing::debug!("code_lens_refresh failed: {:?}", e),
-                    Err(_) => tracing::debug!(
-                        "code_lens_refresh timed out after {CLIENT_REFRESH_TIMEOUT:?}"
-                    ),
+            let span = tracing::Span::current();
+            tokio::spawn(
+                async move {
+                    match tokio::time::timeout(CLIENT_REFRESH_TIMEOUT, client.code_lens_refresh())
+                        .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => tracing::debug!("code_lens_refresh failed: {:?}", e),
+                        Err(_) => tracing::debug!(
+                            "code_lens_refresh timed out after {CLIENT_REFRESH_TIMEOUT:?}"
+                        ),
+                    }
                 }
-            });
+                .instrument(span),
+            );
         }
     }
 
@@ -907,6 +919,7 @@ impl ServerState {
     /// Removes document state and returns the removed entry.
     ///
     /// Returns `None` if no document exists at the given URI.
+    #[tracing::instrument(skip_all, fields(uri = ?uri))]
     pub fn remove_document(&self, uri: &Uri) -> Option<(Uri, DocumentState)> {
         self.documents.remove(uri)
     }
@@ -932,6 +945,7 @@ impl ServerState {
     /// already panicked (finished, not cancelled) before a newer task was registered for
     /// the same URI must not have its belated supervisor clobber that newer task's
     /// in-flight load.
+    #[tracing::instrument(skip_all, fields(uri = ?uri))]
     pub async fn spawn_background_task(self: &Arc<Self>, uri: Uri, task: JoinHandle<()>) {
         let task_id = task.id();
         let abort_handle = task.abort_handle();
@@ -945,27 +959,34 @@ impl ServerState {
         }
 
         let state = Arc::clone(self);
-        tokio::spawn(async move {
-            if let Err(join_error) = task.await
-                && !join_error.is_cancelled()
-            {
-                if !state.is_current_background_task(&uri, task_id).await {
-                    tracing::debug!(
-                        "background task for {:?} panicked ({}) after being superseded; \
-                         ignoring stale panic",
+        // Captured before `tokio::spawn` (rather than relying on `#[instrument]` on a
+        // supervisor fn) so this detached supervisor's panic/debug logs stay correlated
+        // with the document/ecosystem context of the caller that installed this task.
+        let supervisor_span = tracing::Span::current();
+        tokio::spawn(
+            async move {
+                if let Err(join_error) = task.await
+                    && !join_error.is_cancelled()
+                {
+                    if !state.is_current_background_task(&uri, task_id).await {
+                        tracing::debug!(
+                            "background task for {:?} panicked ({}) after being superseded; \
+                             ignoring stale panic",
+                            uri,
+                            join_error
+                        );
+                        return;
+                    }
+                    tracing::error!(
+                        "background task for {:?} panicked ({}); forcing loading_state to Failed",
                         uri,
                         join_error
                     );
-                    return;
+                    state.force_document_failed_with_not_attempted(&uri);
                 }
-                tracing::error!(
-                    "background task for {:?} panicked ({}); forcing loading_state to Failed",
-                    uri,
-                    join_error
-                );
-                state.force_document_failed_with_not_attempted(&uri);
             }
-        });
+            .instrument(supervisor_span),
+        );
     }
 
     /// Whether `task_id` is still the background task currently registered for `uri`
@@ -1045,6 +1066,7 @@ impl ServerState {
     /// Cancels the background task for a document.
     ///
     /// If no task exists, this is a no-op.
+    #[tracing::instrument(skip_all, fields(uri = ?uri))]
     pub async fn cancel_background_task(&self, uri: &Uri) {
         let mut tasks = self.tasks.write().await;
         if let Some((_, task)) = tasks.remove(uri) {

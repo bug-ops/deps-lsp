@@ -110,6 +110,7 @@ impl CratesIoRegistry {
     /// drop it if crates.io ever gains its own publish-time enrichment (issue #588 critic
     /// M10) — today this is a pure pass-through, identical to [`Self::get_versions`], since
     /// crates.io's sparse index carries no such enrichment yet.
+    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
     pub async fn get_versions_with(
         &self,
         name: &str,
@@ -143,6 +144,7 @@ impl CratesIoRegistry {
     /// assert!(latest.is_some());
     /// # }
     /// ```
+    #[tracing::instrument(skip_all, fields(package = ?name, version = ?req_str), level = "debug")]
     pub async fn get_latest_matching(
         &self,
         name: &str,
@@ -176,6 +178,7 @@ impl CratesIoRegistry {
     /// assert!(!results.is_empty());
     /// # }
     /// ```
+    #[tracing::instrument(skip_all, fields(query = ?query), level = "debug")]
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<CrateInfo>> {
         let url = format!(
             "{}/crates?q={}&per_page={}&sort=downloads",

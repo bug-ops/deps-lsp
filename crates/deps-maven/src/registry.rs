@@ -342,6 +342,7 @@ impl MavenCentralRegistry {
     /// caching in [`HttpCache`], so an unconditional fetch would retry forever) and the
     /// Gradle Plugin Portal's listing has no date column (a wasted fetch+parse on every
     /// call). Both degrade to zero extra requests here rather than one doomed one.
+    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
     pub async fn get_versions_typed_with(
         &self,
         name: &str,
@@ -365,6 +366,7 @@ impl MavenCentralRegistry {
         self.get_versions_typed_with(name, false).await
     }
 
+    #[tracing::instrument(skip_all, fields(package = ?name, version = ?req), level = "debug")]
     pub async fn get_latest_matching_typed(
         &self,
         name: &str,
@@ -401,6 +403,7 @@ impl MavenCentralRegistry {
     ///
     /// Returns the last error (an HTTP/network error, or a synthesized timeout error)
     /// if every attempt fails and no cached result is available to fall back to.
+    #[tracing::instrument(skip_all, fields(query = ?query), level = "debug")]
     pub async fn search_typed(&self, query: &str, limit: usize) -> Result<Vec<ArtifactInfo>> {
         debug_assert!(
             limit <= SEARCH_CACHE_ROWS,
