@@ -15,6 +15,14 @@
 //! Beyond redacting `Debug`/`Display`, [`Redacted<T>`] zeroizes its backing memory on drop
 //! (issue #574) — after the value goes out of scope, a core dump or a read of freed/swapped
 //! memory cannot recover the plaintext credential.
+//!
+//! That guarantee only holds for the wrapper itself: a caller that copies
+//! [`Redacted::expose_secret`]'s result into a plain `String` (e.g. via `format!`) must not
+//! let that copy outlive an unzeroized scope. The preferred fix (issue #672) is to format the
+//! derived value — e.g. a `Bearer`/`Basic` `Authorization` header — once at construction time
+//! and rewrap it in a new [`Redacted<T>`] right away, the way `deps_core::github::AuthToken`,
+//! `deps_cargo::config::AuthToken`, and `deps_nuget::config::NuGetAuth` all do; reach for a
+//! bare [`zeroize::Zeroizing`] only when that per-request re-derivation is unavoidable.
 
 use zeroize::{Zeroize, Zeroizing};
 

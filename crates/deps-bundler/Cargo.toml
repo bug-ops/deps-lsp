@@ -16,8 +16,6 @@ workspace = true
 deps-core = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }
-thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs"] }
 tower-lsp-server = { workspace = true }
 tracing = { workspace = true }

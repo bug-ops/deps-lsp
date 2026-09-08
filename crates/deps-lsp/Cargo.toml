@@ -39,6 +39,11 @@ gitlab-ci = ["dep:deps-gitlab-ci"]
 # when the "npm" feature itself is disabled.
 deno = ["dep:deps-deno"]
 
+# Consumed only through the `ecosystem!`/`register!` macros in `src/lib.rs`, not via direct
+# `use` statements, so cargo-machete cannot see the usage and flags them as unused.
+[package.metadata.cargo-machete]
+ignored = ["deps-bundler", "deps-composer", "deps-dart", "deps-gradle", "deps-maven", "deps-pypi", "deps-swift"]
+
 [dependencies]
 # Internal crates
 deps-bundler = { workspace = true, optional = true }
@@ -60,7 +65,6 @@ deps-swift = { workspace = true, optional = true }
 # External dependencies
 dashmap = { workspace = true }
 futures = { workspace = true }
-semver = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "io-std"] }

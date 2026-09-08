@@ -213,12 +213,17 @@ fn parse_index_json(data: &[u8]) -> Result<Vec<CargoVersion>> {
 pub struct SparseIndexClient {
     base_url: String,
     cache: Arc<HttpCache>,
-    /// Bearer token attached to every request, when present. See
-    /// [`crate::config::ResolvedRegistryEntry::auth`] for the security invariant on how
-    /// this is populated — this client has no opinion on that; it just attaches whatever
-    /// it is given, over an origin-pinned transport ([`deps_core::HttpCache::get_cached_trusted_origin_with_headers`])
-    /// so the header cannot survive a cross-origin redirect.
-    auth: Option<AuthToken>,
+    /// Pre-formatted `Bearer <token>` `Authorization` header value, when a credential is
+    /// present. Formatted once in [`Self::with_auth`] and held [`deps_core::secret::Redacted`]
+    /// from that point on (issue #672) — mirrors [`deps_core::github::GithubTagsClient::new`]
+    /// and `deps_nuget::config::NuGetAuth::new`'s format-once-at-construction pattern, rather
+    /// than re-formatting a fresh unzeroized copy on every [`Self::fetch`] call. See
+    /// [`crate::config::ResolvedRegistryEntry::auth`] for the security invariant on how the
+    /// source token is populated — this client has no opinion on that; it just attaches
+    /// whatever it is given, over an origin-pinned transport
+    /// ([`deps_core::HttpCache::get_cached_trusted_origin_with_headers`]) so the header cannot
+    /// survive a cross-origin redirect.
+    auth_header: Option<deps_core::secret::Redacted>,
     /// The [`IndexTrust`] tier `index` was validated under (issue #455, C2): governs which
     /// transport [`Self::fetch`] routes through — a `WorkspaceDeclared` index always goes
     /// through [`deps_core::HttpCache::get_cached_workspace`], regardless of whether `auth` is
@@ -240,7 +245,7 @@ impl SparseIndexClient {
             trust: index.trust(),
             base_url: index.as_str().to_string(),
             cache,
-            auth: None,
+            auth_header: None,
             registry_display_name: "sparse index",
         }
     }
@@ -254,11 +259,14 @@ impl SparseIndexClient {
         auth: Option<AuthToken>,
         registry_display_name: &'static str,
     ) -> Self {
+        let auth_header = auth.map(|token| {
+            deps_core::secret::Redacted::new(format!("Bearer {}", token.expose_secret()))
+        });
         Self {
             trust: index.trust(),
             base_url: index.as_str().to_string(),
             cache,
-            auth,
+            auth_header,
             registry_display_name,
         }
     }
@@ -275,7 +283,7 @@ impl SparseIndexClient {
     /// [`Self::trust`].
     #[cfg(test)]
     pub(crate) fn has_auth(&self) -> bool {
-        self.auth.is_some()
+        self.auth_header.is_some()
     }
 
     /// Fetches all versions for a crate from the sparse index.
@@ -343,7 +351,7 @@ impl SparseIndexClient {
         }))
     }
 
-    /// Routes the request through the transport matching [`Self::auth`] and [`Self::trust`]
+    /// Routes the request through the transport matching [`Self::auth_header`] and [`Self::trust`]
     /// — the sole call site deciding between [`deps_core::HttpCache::get_cached`],
     /// [`deps_core::HttpCache::get_cached_trusted_origin_with_headers`], and (issue #455)
     /// [`deps_core::HttpCache::get_cached_workspace`], so the two
@@ -361,14 +369,13 @@ impl SparseIndexClient {
     ///
     /// Same as [`Self::get_versions`], plus `DepsError::CacheError` for the fail-closed arm.
     async fn fetch(&self, url: &str) -> Result<bytes::Bytes> {
-        match (&self.auth, self.trust) {
-            (Some(token), IndexTrust::Trusted) => {
-                let header_value = format!("Bearer {}", token.expose_secret());
+        match (&self.auth_header, self.trust) {
+            (Some(header_value), IndexTrust::Trusted) => {
                 self.cache
                     .get_cached_trusted_origin_with_headers(
                         url,
                         &self.base_url,
-                        &[(reqwest::header::AUTHORIZATION, header_value.as_str())],
+                        &[(reqwest::header::AUTHORIZATION, header_value.expose_secret())],
                     )
                     .await
             }

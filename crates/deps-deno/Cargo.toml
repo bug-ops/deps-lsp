@@ -18,8 +18,6 @@ deps-npm = { workspace = true }
 jsonc-parser = { workspace = true }
 node-semver = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }
-thiserror = { workspace = true }
 tokio = { workspace = true }
 tower-lsp-server = { workspace = true }
 tracing = { workspace = true }

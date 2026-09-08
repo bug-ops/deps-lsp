@@ -26,13 +26,11 @@ pep440_rs = { workspace = true }
 pep508_rs = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 toml-span = { workspace = true }
 tower-lsp-server = { workspace = true }
 tracing = { workspace = true }
-url = { workspace = true }
 urlencoding = { workspace = true }
 
 [dev-dependencies]
@@ -42,6 +40,7 @@ insta = { workspace = true, features = ["json"] }
 mockito = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+url = { workspace = true }
 
 [[bench]]
 name = "pypi_benchmarks"

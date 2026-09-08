@@ -32,7 +32,6 @@ reqwest = { workspace = true }
 semver = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs"] }
 toml-span = { workspace = true }
 tower-lsp-server = { workspace = true }
