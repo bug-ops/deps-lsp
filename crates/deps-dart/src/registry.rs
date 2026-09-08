@@ -78,6 +78,7 @@ impl PubDevRegistry {
         Self { cache, base }
     }
 
+    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
     pub async fn get_versions(&self, name: &str) -> Result<Vec<DartVersion>> {
         reject_dot_segment(name)?;
         let url = package_metadata_url(&self.base, name);
@@ -85,6 +86,7 @@ impl PubDevRegistry {
         parse_versions_response(&data)
     }
 
+    #[tracing::instrument(skip_all, fields(package = ?name, version = ?req_str), level = "debug")]
     pub async fn get_latest_matching(
         &self,
         name: &str,
@@ -96,6 +98,7 @@ impl PubDevRegistry {
         }))
     }
 
+    #[tracing::instrument(skip_all, fields(query = ?query), level = "debug")]
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<PackageInfo>> {
         let url = format!("{}/search?q={}", self.base, urlencoding::encode(query));
         let data = self.cache.get_cached(&url).await?;
@@ -121,6 +124,7 @@ impl PubDevRegistry {
         Ok(results)
     }
 
+    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
     pub async fn get_package_info(&self, name: &str) -> Result<PackageInfo> {
         reject_dot_segment(name)?;
         let url = package_metadata_url(&self.base, name);

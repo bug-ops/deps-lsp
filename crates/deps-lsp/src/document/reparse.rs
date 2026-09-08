@@ -11,6 +11,7 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tower_lsp_server::Client;
 use tower_lsp_server::ls_types::Uri;
+use tracing::Instrument;
 
 /// Debounce window for coalescing a burst of `workspace/didChangeConfiguration`
 /// notifications (issue #592) into a single reparse — a settings-file save can emit
@@ -83,18 +84,24 @@ pub(crate) async fn reparse_open_documents(
     // that invalidation signal just because nothing needed reparsing *this time*.
     if state.diagnostic_refresh_supported() {
         let client = client.clone();
-        tokio::spawn(async move {
-            match tokio::time::timeout(
-                CLIENT_REFRESH_TIMEOUT,
-                client.workspace_diagnostic_refresh(),
-            )
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => tracing::debug!("workspace/diagnostic/refresh failed: {:?}", e),
-                Err(_) => tracing::debug!("workspace/diagnostic/refresh timed out"),
+        // Captured before `tokio::spawn` so this detached refresh's failure/timeout logs
+        // stay correlated with whatever span triggered this reparse.
+        let span = tracing::Span::current();
+        tokio::spawn(
+            async move {
+                match tokio::time::timeout(
+                    CLIENT_REFRESH_TIMEOUT,
+                    client.workspace_diagnostic_refresh(),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => tracing::debug!("workspace/diagnostic/refresh failed: {:?}", e),
+                    Err(_) => tracing::debug!("workspace/diagnostic/refresh timed out"),
+                }
             }
-        });
+            .instrument(span),
+        );
     }
 
     if affected.is_empty() {

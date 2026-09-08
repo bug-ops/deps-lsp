@@ -546,6 +546,7 @@ struct OsvScanResult {
 /// Returns `None` only when there is nothing to report at all (no
 /// dependencies reached any of steps 0-3, including the pre-filter skips —
 /// i.e. an empty manifest).
+#[tracing::instrument(skip_all, fields(uri = ?uri, ecosystem = ecosystem.id()))]
 async fn run_osv_scan_phase_a(
     uri: Uri,
     state: Arc<ServerState>,
@@ -1622,6 +1623,10 @@ fn fetch_failure_toast(
 ///
 /// Parses manifest using the ecosystem's parser, creates document state,
 /// and spawns a background task to fetch version information from the registry.
+#[tracing::instrument(
+    skip_all,
+    fields(uri = ?uri, ecosystem = tracing::field::Empty, doc_version = ?version)
+)]
 pub async fn handle_document_open(
     uri: Uri,
     content: String,
@@ -1640,6 +1645,7 @@ pub async fn handle_document_open(
             )));
         }
     };
+    tracing::Span::current().record("ecosystem", ecosystem.id());
 
     check_content_size(&content, &uri)?;
 
@@ -1705,6 +1711,7 @@ pub async fn handle_document_open(
               handle_document_open, so a config struct here would only relocate, not \
               reduce, the parameter list"
 )]
+#[tracing::instrument(skip_all, fields(uri = ?uri, ecosystem = ecosystem.id()))]
 async fn run_document_open_background_task(
     uri: Uri,
     state: Arc<ServerState>,
@@ -2174,6 +2181,7 @@ fn commit_parsed_document(
 ///
 /// Re-parses manifest when document content changes and spawns a debounced
 /// task to update diagnostics and request inlay hint refresh.
+#[tracing::instrument(skip_all, fields(uri = ?uri, doc_version = ?version))]
 pub async fn handle_document_change(
     uri: Uri,
     content: String,
@@ -2222,6 +2230,10 @@ pub async fn handle_document_change(
               independently; bundling them into one struct would only relocate, not reduce, \
               the parameter list"
 )]
+#[tracing::instrument(
+    skip_all,
+    fields(uri = ?uri, ecosystem = tracing::field::Empty, doc_version = ?version)
+)]
 pub(crate) async fn handle_document_change_guarded(
     uri: Uri,
     content: String,
@@ -2242,6 +2254,7 @@ pub(crate) async fn handle_document_change_guarded(
             )));
         }
     };
+    tracing::Span::current().record("ecosystem", ecosystem.id());
 
     check_content_size(&content, &uri)?;
 
@@ -2338,6 +2351,7 @@ struct ChangeTaskConfig {
 /// been committed: reloads lock-file-resolved versions, then runs the OSV rescan
 /// concurrently with any registry fetch the diff calls for, and finally publishes the
 /// resulting diagnostics.
+#[tracing::instrument(skip_all, fields(uri = ?uri, ecosystem = ecosystem.id()))]
 async fn run_document_change_task(
     uri: Uri,
     state: Arc<ServerState>,
@@ -2892,6 +2906,7 @@ async fn load_resolved_versions(
 /// }
 /// # }
 /// ```
+#[tracing::instrument(skip_all, fields(uri = ?uri), level = "debug")]
 pub async fn ensure_document_loaded(
     uri: &Uri,
     state: Arc<ServerState>,

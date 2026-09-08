@@ -338,6 +338,7 @@ impl GitlabCiRegistry {
 
     /// Fetches and converts the version list for `name` via `route`, gated by the route's
     /// origin-scoped rate-limit gate.
+    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
     async fn fetch_route(
         &self,
         name: &PackageName,
@@ -431,6 +432,7 @@ impl GitlabCiRegistry {
     /// # Errors
     ///
     /// Propagates the underlying fetch error unchanged (rate limit, not-found, etc).
+    #[tracing::instrument(skip_all, fields(package = ?name, version = ?raw), level = "debug")]
     pub async fn resolve_component_pin(
         &self,
         name: &PackageName,

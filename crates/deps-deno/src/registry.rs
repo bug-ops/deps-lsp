@@ -205,8 +205,10 @@ impl JsrRegistry {
     /// assert!(!versions.is_empty());
     /// # }
     /// ```
+    #[tracing::instrument(skip_all, fields(package = tracing::field::Empty), level = "debug")]
     pub async fn get_versions(&self, scope: &str, name: &str) -> Result<Vec<JsrVersion>> {
         let full_name = format!("@{scope}/{name}");
+        tracing::Span::current().record("package", tracing::field::debug(&full_name));
         // S-L1: a dot-prefixed segment must be rejected before it ever reaches
         // `meta_json_url` — `url::Url::parse` decodes percent-encoding before dot-segment
         // normalization, so encoding alone cannot prevent `..`/`.` from collapsing the
@@ -260,6 +262,7 @@ impl JsrRegistry {
     /// assert!(!results.is_empty());
     /// # }
     /// ```
+    #[tracing::instrument(skip_all, fields(query = ?query), level = "debug")]
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<JsrPackage>> {
         let Some((scope, pkg_prefix)) = split_scope_query(query) else {
             return self.fetch_search(query, limit).await;

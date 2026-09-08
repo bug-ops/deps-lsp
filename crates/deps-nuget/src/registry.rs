@@ -689,6 +689,7 @@ impl NuGetRegistry {
     /// [`DepsError::ChainResolutionHalted`] rather than the underlying error unchanged — never
     /// falling back to api.nuget.org or the next configured feed, which would leak the
     /// package's name past a merely-unreachable private feed.
+    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
     async fn get_versions_chained(&self, name: &str) -> Result<Vec<NuGetVersion>> {
         let mut last_miss: Result<Vec<NuGetVersion>> = Err(DepsError::PackageNotFound {
             package: name.to_string(),
@@ -781,6 +782,7 @@ impl NuGetRegistry {
     ///
     /// Returns an error if the service index cannot be resolved or the flat-container
     /// request fails.
+    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
     pub async fn get_versions_typed_with(
         &self,
         name: &str,
@@ -917,6 +919,7 @@ impl NuGetRegistry {
     /// Returns an error only if `name` is rejected as a dot-segment or the service index
     /// itself cannot be resolved — both of which also fail the hover response's main
     /// version fetch, so this never surfaces a *distinct* failure mode to the caller.
+    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
     pub async fn unlisted_versions_for_hover(&self, name: &str) -> Result<HashSet<String>> {
         // Issue #562, FR-012: registration-hive enrichment is no longer skipped for
         // `WorkspaceDeclared`-tier feeds — routed through `Self::fetch` (§3.9) like every
@@ -945,6 +948,7 @@ impl NuGetRegistry {
     ///
     /// Returns an error if the service index cannot be resolved or the flat-container
     /// request fails.
+    #[tracing::instrument(skip_all, fields(package = ?name, version = ?req), level = "debug")]
     pub async fn get_latest_matching_typed(
         &self,
         name: &str,
@@ -959,6 +963,7 @@ impl NuGetRegistry {
     /// # Errors
     ///
     /// Returns an error if the service index cannot be resolved or the search request fails.
+    #[tracing::instrument(skip_all, fields(query = ?query), level = "debug")]
     pub async fn search_typed(&self, query: &str, limit: usize) -> Result<Vec<PackageInfo>> {
         let index = self.service_index().await?;
         // FR-016 (spec 035): a feed may omit `SearchQueryService` entirely (e.g. GitHub

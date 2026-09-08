@@ -305,6 +305,7 @@ impl GithubActionsRegistry {
     /// concurrent callers for the same repository on a cold cache issue one request, not
     /// N (S2) — and short-circuits locally, without touching the network, once the
     /// rate-limit gate has been tripped by an earlier 403 (critic C1).
+    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
     pub async fn get_versions(&self, name: &str) -> Result<Vec<GithubActionsVersion>> {
         validate_owner_repo(name)?;
         if self.rate_limit.is_tripped() {
@@ -356,6 +357,7 @@ impl GithubActionsRegistry {
     /// repository, not treated as a workspace-wide outage), so the gate never becomes
     /// tripped while a token is present. Left unfixed rather than adding a check that
     /// would never fire in the tokened case it targets.
+    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
     pub async fn get_versions_with_release_dates(
         &self,
         name: &str,
@@ -371,6 +373,7 @@ impl GithubActionsRegistry {
     }
 
     /// Finds the latest version satisfying the given semver requirement.
+    #[tracing::instrument(skip_all, fields(package = ?name, version = ?req_str), level = "debug")]
     pub async fn get_latest_matching(
         &self,
         name: &str,
