@@ -53,6 +53,8 @@ pub struct DepsConfig {
     pub registries: RegistriesConfig,
     #[serde(default)]
     pub network: NetworkConfig,
+    #[serde(default)]
+    pub license_policy: LicensePolicyConfig,
 }
 
 /// Configuration for inlay hints (inline version annotations).
@@ -812,6 +814,79 @@ pub struct NetworkConfig {
     pub offline: bool,
 }
 
+/// SPDX allow-list/deny-list policy for the license-policy diagnostic (issue #661, spec 010
+/// Phase 2).
+///
+/// Both lists are independently optional; an empty/default policy produces no diagnostics.
+/// Not parse-affecting (see `reparse_scope`): a change here is picked up the next time
+/// diagnostics are pulled, without forcing a document reparse, since policy evaluation reads
+/// the current config fresh on every diagnostics request rather than being baked into
+/// parse-time state.
+///
+/// # Defaults
+///
+/// - `allow`: `[]`
+/// - `deny`: `[]`
+///
+/// # Examples
+///
+/// ```
+/// use deps_lsp::config::LicensePolicyConfig;
+///
+/// let config = LicensePolicyConfig::default();
+/// assert!(config.to_policy().is_empty());
+/// ```
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct LicensePolicyConfig {
+    /// SPDX identifiers a dependency's license must include at least one of, when non-empty.
+    #[serde(default, deserialize_with = "deserialize_spdx_list")]
+    pub allow: Vec<String>,
+    /// SPDX identifiers a dependency's license must not include any of.
+    #[serde(default, deserialize_with = "deserialize_spdx_list")]
+    pub deny: Vec<String>,
+}
+
+impl LicensePolicyConfig {
+    /// Converts this LSP-facing config into the `deps-core` policy threaded through
+    /// [`deps_core::licenses::evaluate`].
+    ///
+    /// Both fields already went through `deserialize_spdx_list` at config-load time, so
+    /// this never drops entries or logs a warning of its own — [`deps_core::LicensePolicy::new`]
+    /// simply re-validates already-clean data, which is a no-op.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_lsp::config::LicensePolicyConfig;
+    ///
+    /// let config = LicensePolicyConfig {
+    ///     allow: vec!["MIT".to_string()],
+    ///     deny: vec!["GPL-3.0".to_string()],
+    /// };
+    /// let policy = config.to_policy();
+    /// assert_eq!(policy.allow, vec!["MIT".to_string()]);
+    /// ```
+    #[must_use]
+    pub fn to_policy(&self) -> deps_core::LicensePolicy {
+        deps_core::LicensePolicy::new(self.allow.clone(), self.deny.clone())
+    }
+}
+
+/// Custom deserializer for `LicensePolicyConfig`'s `allow`/`deny` lists: drops (and warns
+/// about, via [`deps_core::licenses::filter_valid_spdx_ids`]) any entry that isn't
+/// syntactically a plausible single SPDX identifier, exactly once at config-load time —
+/// same "warn, never crash" contract as every other custom deserializer in this module (spec
+/// 010 plan.md's "Invalid SPDX identifier in policy" decision: `initializationOptions` has no
+/// document URI to anchor an LSP diagnostic to, so a log warning is the only feedback
+/// channel).
+fn deserialize_spdx_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Vec::<String>::deserialize(deserializer)?;
+    Ok(deps_core::licenses::filter_valid_spdx_ids(raw))
+}
+
 /// Which open documents a config change invalidates and must reparse (issue #592).
 ///
 /// `All` and a named `Ecosystems` set both exist so a change with a narrow, known blast
@@ -920,6 +995,7 @@ pub(crate) fn reparse_scope(
         supply_chain: new_supply_chain,
         registries: new_registries,
         network: new_network,
+        license_policy: new_license_policy,
     } = new;
 
     // Not parse-affecting: every field is named (never `..`), so its value is simply
@@ -961,6 +1037,7 @@ pub(crate) fn reparse_scope(
     } = new_freshness;
     let SupplyChainConfig { enabled: _ } = new_supply_chain;
     let NetworkConfig { offline: _ } = new_network;
+    let LicensePolicyConfig { allow: _, deny: _ } = new_license_policy;
 
     // Parse-affecting.
     let RegistriesConfig {

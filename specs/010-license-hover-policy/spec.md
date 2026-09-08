@@ -130,7 +130,7 @@ THEN the license field format, position in the hover, and "license changed" sign
 | FR-005 | FOR ecosystems where the hot-path registry endpoint does NOT include license (crates.io sparse index, npm abbreviated packument, Go module proxy — all verified live to lack it), THE SYSTEM SHALL reuse the existing deps.dev `trust_signal()` call (tier 2, covers cargo/npm/go/maven/bundler/nuget — and is the *only* working source for Go) or, where deps.dev doesn't cover the ecosystem, pre-fetch via a background task into `DocumentState` (tier 3), without blocking the initial hover latency — **RESOLVED (2026-09-08, see [[plan#1-architecture]])** | must |
 | FR-006 | FOR ecosystems without coverage in deps.dev (Composer, Dart, Swift) THE SYSTEM SHALL attempt to retrieve license from the native registry API (e.g., Packagist, pub.dev, SwiftPM index); if unavailable, the system SHALL display "License: (not found)" or similar gracefully | should |
 | FR-007 | (Optional / Phase 2) IF the user provides a license policy via initializationOptions OR a project config file THE SYSTEM SHALL compute diagnostics at manifest lines for dependencies whose licenses violate the policy (deny-list or allow-list) | should |
-| FR-008 | (Phase 2) THE SYSTEM SHALL allow policy configuration via `initializationOptions.licensePolicy: { allow?: string[], deny?: string[] }`, validated through the existing `parse_config` path; a workspace config file is explicit out-of-scope for v1 — **RESOLVED (2026-09-08, see [[plan#1-architecture]])** | should |
+| FR-008 | (Phase 2) THE SYSTEM SHALL allow policy configuration via `initializationOptions.license_policy: { allow?: string[], deny?: string[] }`, validated through the existing `parse_config` path; a workspace config file is explicit out-of-scope for v1 — **RESOLVED (2026-09-08, see [[plan#1-architecture]])** | should |
 | FR-009 | THE SYSTEM SHALL produce equivalent license hover behavior (capability, field format, "license changed" signaling) across all 11 supported ecosystem crates, per the cross-ecosystem-consistency rule | must |
 | FR-010 | WHEN a manifest is edited and dependencies change THE SYSTEM SHALL recompute license information on the next hover request (or per the existing document-change event pathway) rather than serving stale license data | must |
 
@@ -230,7 +230,7 @@ ecosystem).
   PyPI need no secondary fetch at all — license is already in their existing hot-path response.
 - **RESOLVED**: Fetch is eager where free (PyPI, Composer), reuses the existing bounded-wait
   pattern where deps.dev-covered, and is background-pre-fetched (never blocking hover) elsewhere.
-- **RESOLVED**: Phase 2 config channel is `initializationOptions.licensePolicy`, validated via the
+- **RESOLVED**: Phase 2 config channel is `initializationOptions.license_policy`, validated via the
   existing `parse_config` path; a workspace config file is out of scope for v1.
 - **RESOLVED**: Policy matching is exact top-level SPDX identifier set-membership, no expression
   operators, no new SPDX-parsing dependency.

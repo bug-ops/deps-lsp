@@ -291,6 +291,10 @@ Configure via LSP initialization options:
   },
   "supply_chain": {
     "enabled": true
+  },
+  "license_policy": {
+    "allow": [],
+    "deny": []
   }
 }
 ```
@@ -322,6 +326,8 @@ Configure via LSP initialization options:
 | `registries` | `gitlab_instance_host` | `""` | The self-hosted GitLab instance host that a `project:` include and a `$CI_SERVER_FQDN`-relative `component:` include resolve against, and the *only* host an optional `GITLAB_TOKEN` is ever sent to — replacing, not joined with, `gitlab.com`. Unset (`""`) means neither form is version-resolved; see [GitLab CI/CD Self-Hosted Instances](docs/ECOSYSTEM_GUIDE.md#gitlab-cicd-self-hosted-instances) |
 | `network` | `offline` | `false` | Block every outbound registry/OSV/GitHub request; already-cached data still serves, uncached dependencies show an offline marker |
 | `supply_chain` | `enabled` | `true` | Show the OpenSSF Scorecard/build-provenance hover line, backed by deps.dev requests; `false` disables the requests and the section entirely |
+| `license_policy` | `allow` | `[]` | SPDX identifiers a dependency's license must include at least one of, when non-empty; produces a WARNING diagnostic otherwise. Invalid entries are dropped with a logged warning, not rejected |
+| `license_policy` | `deny` | `[]` | SPDX identifiers a dependency's license must not include any of; produces an ERROR diagnostic when matched (wins over `allow`). Invalid entries are dropped with a logged warning, not rejected |
 
 > [!NOTE]
 > The release-freshness signal applies uniformly across all ecosystems — there is no per-ecosystem override. Coverage depth varies with what each registry exposes (e.g. Deno's `jsr:` specifiers get full coverage at no extra request cost; Swift, GitHub Actions, and Maven/Gradle have partial coverage since their APIs don't expose per-version publish dates directly). See [Swift/GitHub Actions Release-Freshness Coverage](docs/ECOSYSTEM_GUIDE.md#swift-and-github-actions-release-freshness-coverage) and [Maven/Gradle Release-Freshness Coverage](docs/ECOSYSTEM_GUIDE.md#mavengradle-release-freshness-coverage) for per-ecosystem details.
@@ -331,6 +337,9 @@ Configure via LSP initialization options:
 
 > [!NOTE]
 > The supply-chain trust signal only appears for **npm, Cargo, Go, Maven, PyPI, Bundler, and NuGet** (Composer, Dart, and Swift have no deps.dev coverage) and only for a dependency with a concrete in-use version — a lock-file-resolved version, or an exact requirement pin. It shows the linked source repository's OpenSSF Scorecard score and the resolved version's SLSA/attestation provenance status; a Scorecard fetched via a package-self-reported (rather than attested) repository link is marked `*(self-reported repo)*`. Informational only — a low score never becomes a diagnostic. See [Supply-Chain Trust Signal](docs/ECOSYSTEM_GUIDE.md#supply-chain-trust-signal-issue-543) for the full details.
+
+> [!NOTE]
+> `license_policy` diagnostics only fire for dependencies this feature already has license data for — today **Dart, Swift, and Deno** (Gradle is deliberately excluded: its POM licenses are free text, not SPDX identifiers). A dependency with no known license is never treated as a violation. `allow`/`deny` take exact, case-insensitive SPDX identifiers only — no `AND`/`OR`/`WITH` expression parsing. See [License Policy Diagnostic](docs/ECOSYSTEM_GUIDE.md#license-policy-diagnostic-issue-661) for matching rules and precedence.
 
 > [!TIP]
 > Increase `fetch_timeout_secs` for slower networks. The per-dependency timeout prevents slow packages from blocking others. Cold start support ensures LSP features work immediately when your IDE restores previously opened files.

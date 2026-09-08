@@ -93,6 +93,17 @@ impl DenoEcosystem {
         )
         .await
     }
+
+    /// Fetches `name`'s (already scheme-qualified, e.g. `"jsr:@std/fs"`) license at
+    /// `version` (issue #660), for
+    /// `deps-lsp::document::lifecycle::run_license_prefetch`'s tier-3 background
+    /// pre-fetch — never called from the hover critical path directly. See
+    /// [`crate::registry::DenoRegistry::get_license`].
+    pub async fn fetch_license(&self, name: &str, version: &str) -> Vec<String> {
+        self.registry
+            .get_license(&deps_core::PackageName::new(name), version)
+            .await
+    }
 }
 
 impl deps_core::ecosystem::private::Sealed for DenoEcosystem {}

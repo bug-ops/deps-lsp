@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tower_lsp_server::ls_types::{Position, Range, TextEdit, Uri};
 
+use crate::licenses::LicensePolicy;
 use crate::osv::VulnerabilityMap;
 use crate::{
     ConcreteVersion, Deprecation, DepsDevClient, EcosystemId, FetchFailure, PackageName,
@@ -27,9 +28,9 @@ pub use code_lenses::{
     dedup_overlapping_edits, generate_code_lenses,
 };
 pub use diagnostics::{
-    DEPRECATED_DIAGNOSTIC_CODE, DiagnosticSeverities, UNSATISFIABLE_DIAGNOSTIC_CODE,
-    compile_requirement_unless, generate_diagnostics_from_cache, requirement_is_unsatisfiable,
-    truncate_for_diagnostic,
+    DEPRECATED_DIAGNOSTIC_CODE, DiagnosticSeverities, LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE,
+    UNSATISFIABLE_DIAGNOSTIC_CODE, compile_requirement_unless, generate_diagnostics_from_cache,
+    requirement_is_unsatisfiable, truncate_for_diagnostic,
 };
 pub use formatter::{
     DiagnosticMessages, DiagnosticPolicy, EcosystemFormatter, OsvNaming, PackageNaming,
@@ -483,6 +484,52 @@ pub struct VersionData<'a> {
     /// `&'a DepsDevClient`, so [`generate_hover`] can clone the `Arc` into a
     /// detached background task.
     pub trust: Option<&'a Arc<DepsDevClient>>,
+    /// Background-pre-fetched license data for ecosystems `deps_dev_system` doesn't
+    /// cover and whose hot-path registry response carries no license field — Dart,
+    /// Swift, Gradle, Deno (issue #660, spec 010 plan §1 tier 3), keyed by raw
+    /// (unnormalized) package name. `None` by default. Populated from `DocumentState`'s
+    /// per-document pre-fetch cache (`document::lifecycle::run_license_prefetch` on
+    /// document open/change — mirrors [`Self::vulnerabilities`]'s "populated by a
+    /// background task, read synchronously here" shape) by `handlers/hover.rs` (deps-lsp)
+    /// for hover, and by `handlers/diagnostics.rs`'s `textDocument/diagnostic` pull path
+    /// for [`generate_diagnostics_from_cache`]'s license-policy rule (issue #661) — see
+    /// [`Self::license_policy`].
+    ///
+    /// **What version this actually reflects is per-ecosystem, not uniformly the
+    /// resolved version** (critic S1 — corrects a previous blanket claim here that it
+    /// "only ever covers the resolved version"): Gradle's Maven Central POM fetch and
+    /// Deno's JSR per-version API are genuinely fetched at the dependency's resolved/
+    /// in-use version. Dart's pub.dev `/score` endpoint is per-*package*, not
+    /// per-version — it reflects pana's detection on whatever pub.dev most recently
+    /// scored, unrelated to which version is resolved. Swift's GitHub
+    /// `GET /repos/{owner}/{repo}` reflects the repository's default branch, not the
+    /// resolved version's tag. Every source here is still a background pre-fetch gated
+    /// on a version having been resolved at all (no in-use version means nothing to
+    /// look up), but only Gradle/Deno are actually version-*specific* in what they
+    /// return.
+    pub license_prefetch: Option<&'a HashMap<PackageName, Vec<String>>>,
+    /// SPDX allow-list/deny-list license policy (issue #661, spec 010 Phase 2), when the
+    /// caller wants diagnostics evaluated against one. `None` by default.
+    ///
+    /// Unlike [`Self::trust`], this is **not** hover-only-scoped: `deps-lsp`'s
+    /// `handlers/diagnostics.rs::generate_diagnostics_internal` attaches the currently
+    /// configured policy (cached on `ServerState`, kept live-updated by
+    /// `Backend::initialize`/`did_change_configuration`) unconditionally, so every
+    /// diagnostics-generation call site — the `textDocument/diagnostic` pull path *and*
+    /// every push-path background refresh (fetch-completion, watched-config reparse,
+    /// lock-file change) — evaluates the same policy. An earlier revision scoped this
+    /// field to the pull path only, following `Self::trust`'s hover-only precedent; that
+    /// was a false analogy (issue #660/#661 critic C1) — `trust` is safe hover-only
+    /// because hover has exactly one producer per request, but diagnostics has multiple
+    /// producers all replacing the same client-visible `publish_diagnostics` set, so a
+    /// caller-scoped policy meant the license diagnostic flickered in and out on every
+    /// edit and was invisible to push-only clients.
+    /// [`generate_diagnostics_from_cache`]'s license-policy rule reads this alongside
+    /// [`Self::license_prefetch`] — so today it only actually fires for tier-3 ecosystems
+    /// (Dart/Swift/Deno; Gradle is explicitly excluded, see that rule's doc comment), the
+    /// only ones `license_prefetch` covers; this field and the rule are otherwise
+    /// ecosystem-agnostic and need no change as `license_prefetch`'s coverage widens.
+    pub license_policy: Option<&'a LicensePolicy>,
 }
 
 impl<'a> VersionData<'a> {
@@ -516,6 +563,8 @@ impl<'a> VersionData<'a> {
             ecosystem: None,
             offline: false,
             trust: None,
+            license_prefetch: None,
+            license_policy: None,
         }
     }
 
@@ -647,6 +696,49 @@ impl<'a> VersionData<'a> {
     #[must_use]
     pub const fn with_trust(mut self, client: &'a Arc<DepsDevClient>) -> Self {
         self.trust = Some(client);
+        self
+    }
+
+    /// Attaches tier-3 pre-fetched license data. See [`Self::license_prefetch`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::VersionData;
+    /// use std::collections::HashMap;
+    ///
+    /// let cached = HashMap::new();
+    /// let resolved = HashMap::new();
+    /// let licenses = HashMap::new();
+    /// let versions = VersionData::new(&cached, &resolved).with_license_prefetch(&licenses);
+    /// assert!(versions.license_prefetch.is_some());
+    /// ```
+    #[must_use]
+    pub const fn with_license_prefetch(
+        mut self,
+        licenses: &'a HashMap<PackageName, Vec<String>>,
+    ) -> Self {
+        self.license_prefetch = Some(licenses);
+        self
+    }
+
+    /// Attaches a license policy for diagnostics evaluation. See [`Self::license_policy`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::{LicensePolicy, VersionData};
+    /// use std::collections::HashMap;
+    ///
+    /// let cached = HashMap::new();
+    /// let resolved = HashMap::new();
+    /// let policy = LicensePolicy::new(vec!["MIT".to_string()], vec![]);
+    /// let versions = VersionData::new(&cached, &resolved).with_license_policy(&policy);
+    /// assert!(versions.license_policy.is_some());
+    /// ```
+    #[must_use]
+    pub const fn with_license_policy(mut self, policy: &'a LicensePolicy) -> Self {
+        self.license_policy = Some(policy);
         self
     }
 }

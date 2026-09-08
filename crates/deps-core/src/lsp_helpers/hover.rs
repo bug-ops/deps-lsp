@@ -382,6 +382,17 @@ pub async fn generate_hover<R: Registry + ?Sized>(
                 .map(|s| s.licenses.clone())
                 .filter(|l| !l.is_empty())
         })
+        // Tier 3 (issue #660): Dart/Swift/Gradle/Deno have no deps.dev coverage and no
+        // license field in their hot-path version-list response, so the only remaining
+        // source is `DocumentState`'s background pre-fetch cache, keyed by the dep's raw
+        // (unnormalized) manifest name — see `VersionData::license_prefetch`'s docs.
+        .or_else(|| {
+            versions
+                .license_prefetch
+                .and_then(|m| m.get(dep.name()))
+                .cloned()
+                .filter(|l| !l.is_empty())
+        })
         .unwrap_or_default();
     // `None` (no latest version at all — `latest_line` is `None`) is distinct from
     // `Some(&[])` (a latest version exists but its license is unknown): the former
@@ -391,6 +402,18 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     // avoids a spurious "unavailable" note on the single most common hover case.
     // Skipped entirely once `resolved_license` is already empty: nothing to compare
     // against, and `push_license_hover_section` discards it on its own early return.
+    //
+    // Deliberately has no `license_prefetch` fallback of its own, unlike
+    // `resolved_license` above (round 3 finding #6) — "License changed" detection is
+    // simply unavailable for a tier-3 dependency when `resolved_key != latest_ver`,
+    // not a bug: `license_prefetch` is a single per-*package* (Dart/Swift) or
+    // per-*resolved-version* (Gradle/Deno) entry, never a per-*latest-version* one (see
+    // `VersionData::license_prefetch`'s doc), so there is no genuine "the latest
+    // version's license" data to fall back to here. Reusing the same single value
+    // `resolved_license` already fell back to would be actively misleading for
+    // Gradle/Deno specifically — it would silently pass off the *resolved* version's
+    // license as the *latest* version's, which could suppress a real "License changed"
+    // note or fabricate a false "no change" the tier-3 fetch never actually checked.
     let latest_license: Option<Vec<String>> = (!resolved_license.is_empty())
         .then(|| {
             latest_line.map(|(latest_ver, _)| {
@@ -406,7 +429,25 @@ pub async fn generate_hover<R: Registry + ?Sized>(
             })
         })
         .flatten();
-    push_license_hover_section(&mut markdown, &resolved_license, latest_license.as_deref());
+    // Dart's license comes from pub.dev's `/score` best-effort detector tag (pana's own
+    // license-detection heuristic, not author-declared registry metadata), and Swift's
+    // comes from GitHub's `license.spdx_id` — also detector output (the `licensee` gem
+    // GitHub runs against the repo's default branch), not a field the package author
+    // declared to a registry (spec 010 plan §1 "Dart source"/"Swift source" rows, NFR-005
+    // exception; critic S2). Every other ecosystem's license is a genuine
+    // registry-declared field (author's own `Cargo.toml`/`package.json`/POM `<licenses>`
+    // entry, or deps.dev's pass-through of the same), so only Dart and Swift get the
+    // "(detected)" qualifier.
+    let license_is_detected = matches!(
+        versions.ecosystem,
+        Some(crate::EcosystemId::Dart | crate::EcosystemId::Swift)
+    );
+    push_license_hover_section(
+        &mut markdown,
+        &resolved_license,
+        latest_license.as_deref(),
+        license_is_detected,
+    );
 
     // `!v.is_empty()`, not just `Some(_)` (#550): a resolvable source's live fetch can
     // succeed with a genuinely empty list — e.g. a real GitHub repository whose only
@@ -974,6 +1015,13 @@ fn license_sets_differ(a: &[String], b: &[String]) -> bool {
 /// SPDX license identifier(s), and — when the latest version's license is also known
 /// and differs (order/case-insensitive) — a "License changed" flag (FR-003).
 ///
+/// `detected` renders the line as "**License (detected)**" instead of "**License**"
+/// (issue #660, spec 010 plan §1 "Dart source"/"Swift source" rows, NFR-005 exception;
+/// critic S2): Dart's license comes from pub.dev's best-effort `/score` detector tag,
+/// and Swift's from GitHub's `licensee`-detected `license.spdx_id`, rather than
+/// author-declared registry metadata, so both must be visually distinguished from
+/// Gradle/Deno's genuinely registry-declared license fields.
+///
 /// Renders nothing when `resolved_license` is empty: mirrors
 /// [`push_vulnerability_hover_section`]'s discipline of never rendering a positive
 /// "License: (unknown)" claim for a dependency this feature never actually checked
@@ -995,6 +1043,7 @@ fn push_license_hover_section(
     markdown: &mut String,
     resolved_license: &[String],
     latest_license: Option<&[String]>,
+    detected: bool,
 ) {
     use std::fmt::Write;
 
@@ -1006,7 +1055,8 @@ fn push_license_hover_section(
     // discarded rather than `.unwrap()`ed (#673 M3).
     let _ = write!(
         markdown,
-        "**License**: {}",
+        "**License{}**: {}",
+        if detected { " (detected)" } else { "" },
         format_license_list(resolved_license)
     );
 
@@ -1090,7 +1140,7 @@ mod tests {
     #[test]
     fn push_license_hover_section_renders_nothing_when_resolved_unknown() {
         let mut markdown = String::new();
-        push_license_hover_section(&mut markdown, &[], Some(&["MIT".to_string()]));
+        push_license_hover_section(&mut markdown, &[], Some(&["MIT".to_string()]), false);
         assert!(markdown.is_empty());
     }
 
@@ -1100,7 +1150,7 @@ mod tests {
     #[test]
     fn push_license_hover_section_renders_nothing_extra_when_no_latest_version_exists() {
         let mut markdown = String::new();
-        push_license_hover_section(&mut markdown, &["MIT".to_string()], None);
+        push_license_hover_section(&mut markdown, &["MIT".to_string()], None, false);
         assert!(markdown.contains("**License**: `MIT`"));
         assert!(!markdown.contains("unavailable"));
         assert!(!markdown.contains("License changed"));
@@ -1109,7 +1159,7 @@ mod tests {
     #[test]
     fn push_license_hover_section_renders_resolved_only_when_latest_unavailable() {
         let mut markdown = String::new();
-        push_license_hover_section(&mut markdown, &["MIT".to_string()], Some(&[]));
+        push_license_hover_section(&mut markdown, &["MIT".to_string()], Some(&[]), false);
         assert!(markdown.contains("**License**: `MIT`"));
         assert!(markdown.contains("latest version license unavailable"));
         assert!(!markdown.contains("License changed"));
@@ -1122,10 +1172,21 @@ mod tests {
             &mut markdown,
             &["MIT".to_string()],
             Some(&["Apache-2.0".to_string()]),
+            false,
         );
         assert!(markdown.contains("**License**: `MIT`"));
         assert!(markdown.contains("License changed"));
         assert!(markdown.contains("`MIT` \u{2192} `Apache-2.0`"));
+    }
+
+    /// Issue #660: Dart's best-effort detected license must render with the
+    /// "(detected)" qualifier, distinguishing it from every other ecosystem's
+    /// genuinely registry-declared license field (spec 010 NFR-005 exception).
+    #[test]
+    fn push_license_hover_section_detected_flag_adds_qualifier() {
+        let mut markdown = String::new();
+        push_license_hover_section(&mut markdown, &["MIT".to_string()], None, true);
+        assert!(markdown.contains("**License (detected)**: `MIT`"));
     }
 
     /// impl-critic review S3: the "License changed" line must be its own Markdown
@@ -1139,6 +1200,7 @@ mod tests {
             &mut markdown,
             &["MIT".to_string()],
             Some(&["Apache-2.0".to_string()]),
+            false,
         );
         assert!(
             markdown.contains("`MIT`\n\n\u{26a0}\u{fe0f} **License changed**"),
@@ -1153,6 +1215,7 @@ mod tests {
             &mut markdown,
             &["MIT".to_string()],
             Some(&["MIT".to_string()]),
+            false,
         );
         assert!(markdown.contains("**License**: `MIT`"));
         assert!(!markdown.contains("License changed"));
@@ -1311,6 +1374,135 @@ mod tests {
              without a lock-file match; got: {}",
             content.value
         );
+    }
+
+    /// Issue #660 (spec 010 plan §1 tier 3): with no license in the native version list
+    /// and no deps.dev trust signal, the only remaining source is
+    /// `VersionData::license_prefetch` — and for the Dart ecosystem specifically, the
+    /// line must carry the "(detected)" qualifier (NFR-005 exception).
+    #[tokio::test]
+    async fn test_generate_hover_dart_license_from_prefetch_is_labeled_detected() {
+        use std::collections::HashMap;
+
+        let parse_result = freshness_test_parse_result("example");
+        let mut resolved_versions = HashMap::new();
+        resolved_versions.insert("example".into(), "1.0.0".into());
+        let mut licenses = HashMap::new();
+        licenses.insert(
+            crate::PackageName::new("example"),
+            vec!["BSD-3-Clause".to_string()],
+        );
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&HashMap::new(), &resolved_versions)
+                .with_ecosystem(crate::EcosystemId::Dart)
+                .with_license_prefetch(&licenses),
+            &MockRegistry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            content
+                .value
+                .contains("**License (detected)**: `BSD-3-Clause`"),
+            "got: {}",
+            content.value
+        );
+    }
+
+    /// Same tier-3 pre-fetch source as above, for Swift: GitHub's `license.spdx_id` is
+    /// `licensee` detector output on the repo's default branch, not an author-declared
+    /// registry field, so it must carry the same "(detected)" qualifier as Dart's
+    /// pana-detected license (critic S2 — the doc comment previously claiming every
+    /// non-Dart source is "author-declared registry metadata" was factually wrong for
+    /// Swift specifically).
+    #[tokio::test]
+    async fn test_generate_hover_swift_license_from_prefetch_is_labeled_detected() {
+        use std::collections::HashMap;
+
+        let parse_result = freshness_test_parse_result("example");
+        let mut resolved_versions = HashMap::new();
+        resolved_versions.insert("example".into(), "1.0.0".into());
+        let mut licenses = HashMap::new();
+        licenses.insert(
+            crate::PackageName::new("example"),
+            vec!["Apache-2.0".to_string()],
+        );
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&HashMap::new(), &resolved_versions)
+                .with_ecosystem(crate::EcosystemId::Swift)
+                .with_license_prefetch(&licenses),
+            &MockRegistry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            content
+                .value
+                .contains("**License (detected)**: `Apache-2.0`"),
+            "got: {}",
+            content.value
+        );
+    }
+
+    /// Tier-3 pre-fetch source for Gradle (a genuine registry-declared POM
+    /// `<licenses>` field, not detector output): the license line must render as plain
+    /// "**License**", with no "(detected)" qualifier — that label is Dart/Swift-only.
+    #[tokio::test]
+    async fn test_generate_hover_gradle_license_from_prefetch_is_not_labeled_detected() {
+        use std::collections::HashMap;
+
+        let parse_result = freshness_test_parse_result("example");
+        let mut resolved_versions = HashMap::new();
+        resolved_versions.insert("example".into(), "1.0.0".into());
+        let mut licenses = HashMap::new();
+        licenses.insert(
+            crate::PackageName::new("example"),
+            vec!["Apache-2.0".to_string()],
+        );
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&HashMap::new(), &resolved_versions)
+                .with_ecosystem(crate::EcosystemId::Gradle)
+                .with_license_prefetch(&licenses),
+            &MockRegistry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            content.value.contains("**License**: `Apache-2.0`"),
+            "got: {}",
+            content.value
+        );
+        assert!(!content.value.contains("(detected)"));
     }
 
     /// Review round 3 regression: for a deps.dev-routed ecosystem, `available_versions[idx]`

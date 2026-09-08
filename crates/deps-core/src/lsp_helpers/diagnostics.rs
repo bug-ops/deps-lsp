@@ -5,6 +5,7 @@ use tower_lsp_server::ls_types::{
     NumberOrString, Position, Range, Uri,
 };
 
+use crate::licenses::{ViolationReason, evaluate as evaluate_license_policy};
 use crate::osv::{ScanOutcome, diagnostic_severity_for};
 use crate::{
     ConcreteVersion, Dependency, Deprecation, FetchFailure, ParseResult, PublishTime,
@@ -24,6 +25,10 @@ use super::{
 /// identifier.
 pub const UNSATISFIABLE_DIAGNOSTIC_CODE: &str = "unsatisfiable-requirement";
 
+/// Stable [`Diagnostic::code`] set on the license-policy-violation diagnostic (issue #661,
+/// spec 010 Phase 2). See `apply_license_policy_rule`.
+pub const LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE: &str = "license-policy-violation";
+
 /// Maximum character count of a blocked-registry diagnostic's raw declared value (an alias
 /// or literal URL) before it is truncated with an ellipsis marker.
 ///
@@ -33,6 +38,17 @@ pub const UNSATISFIABLE_DIAGNOSTIC_CODE: &str = "unsatisfiable-requirement";
 /// this is the last chokepoint before it renders inline in the editor as a
 /// [`DiagnosticSeverity::INFORMATION`] message.
 const MAX_BLOCKED_REGISTRY_MESSAGE_VALUE_CHARS: usize = 128;
+
+/// Maximum character count of the license text interpolated into the license-policy
+/// violation diagnostic message (issue #660/#661 critic security P2).
+///
+/// `violation.license` is registry-declared, untrusted-length data (a single denied entry,
+/// or — for [`crate::licenses::ViolationReason::NotAllowed`] — a list already capped in
+/// *entry count* by `crate::licenses::evaluate`, but not yet in character length); this
+/// bounds its per-message character length the same way
+/// [`MAX_BLOCKED_REGISTRY_MESSAGE_VALUE_CHARS`] bounds the blocked-registry diagnostic's
+/// attacker-controlled value.
+const MAX_LICENSE_POLICY_VIOLATION_LICENSE_CHARS: usize = 128;
 
 /// Truncates `value` to at most `max_chars` characters, appending `…` when truncated.
 ///
@@ -554,6 +570,7 @@ pub fn generate_diagnostics_from_cache(
         // hidden by an unrelated "latest" lookup failure (FR-007/US-004) — each reads
         // an independent data source.
         apply_vulnerability_rule(&mut diagnostics, &ctx, vuln_keys.as_ref());
+        apply_license_policy_rule(&mut diagnostics, &ctx);
         let deprecation_found = apply_deprecation_rule(&mut diagnostics, &ctx);
         let in_use_yanked_emitted =
             apply_in_use_yanked_rule(&mut diagnostics, &ctx, deprecation_found);
@@ -778,6 +795,81 @@ fn apply_vulnerability_rule(
     {
         push_vulnerability_diagnostics(diagnostics, ctx.dep, dv);
     }
+}
+
+/// R2a — SPDX license-policy violation (issue #661, spec 010 Phase 2).
+///
+/// Runs between R2 and R3 in the pipeline (not renumbered as R3 to avoid relabeling every
+/// subsequent rule's doc comment) — independent of registry-cache lookup like R2/R3/R4, so
+/// it must never be hidden by an unrelated "latest" lookup failure.
+///
+/// Reads: `ctx.versions.license_policy` — the gate; `None` (no policy configured) or an
+/// empty policy means nothing to check. `deps-lsp`'s `handlers/diagnostics.rs::
+/// generate_diagnostics_internal` attaches this unconditionally at every diagnostics-
+/// generation call site (pull *and* push paths alike — see
+/// [`super::VersionData::license_policy`]'s doc comment), so this is a no-op only when no
+/// policy is actually configured. `ctx.versions.license_prefetch`, keyed by raw (unnormalized)
+/// package name — today populated for tier-3 ecosystems only (Dart/Swift/Gradle/Deno, see
+/// that field's own doc comment), but this rule makes no ecosystem-specific assumption and
+/// needs no change as coverage widens. A dependency with no entry in `license_prefetch` is
+/// silently skipped (NFR-003 graceful degradation) — there is no license data to evaluate,
+/// which must never be treated as a violation.
+/// Emits: at most one diagnostic (`LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE`) on
+/// `ctx.dep.name_range()` via [`crate::licenses::evaluate`] — [`ViolationReason::Denied`]
+/// renders [`DiagnosticSeverity::ERROR`], [`ViolationReason::NotAllowed`]
+/// [`DiagnosticSeverity::WARNING`] (severity is not user-configurable: spec 010 plan.md's
+/// resolved config shape is `{ allow?, deny? }` only).
+/// Suppressed by: Gradle (issue #660/#661 critic C2, see the ecosystem check below).
+/// Suppresses: nothing.
+fn apply_license_policy_rule(diagnostics: &mut Vec<Diagnostic>, ctx: &RuleContext<'_>) {
+    let Some(policy) = ctx.versions.license_policy else {
+        return;
+    };
+    // Gradle POM licenses are free text (e.g. Maven Central's `"The Apache Software
+    // License, Version 2.0"`), never SPDX identifiers — `deps-gradle`'s
+    // `parse_pom_licenses` returns the POM `<license><name>` verbatim. Matching that
+    // against an SPDX allow/deny list produces false positives (a compliant
+    // `Apache-2.0` dependency reported "not on the allowed license list") and false
+    // negatives (a `GPL-3.0` deny-list entry never matches "GNU General Public License
+    // v3"). Normalizing free text to SPDX is out of scope for v1 (spec 010 plan.md's "no
+    // SPDX-expression parsing" decision) — tracked as a fast-follow in issue #679. Hover
+    // still renders Gradle's free-text license as-is; only policy evaluation is skipped.
+    if ctx.versions.ecosystem == Some(crate::EcosystemId::Gradle) {
+        return;
+    }
+    let Some(license) = ctx
+        .versions
+        .license_prefetch
+        .and_then(|prefetch| prefetch.get(ctx.dep.name()))
+    else {
+        return;
+    };
+    let Some(violation) = evaluate_license_policy(license, policy) else {
+        return;
+    };
+
+    let severity = match violation.reason {
+        ViolationReason::Denied => DiagnosticSeverity::ERROR,
+        ViolationReason::NotAllowed => DiagnosticSeverity::WARNING,
+    };
+    diagnostics.push(Diagnostic {
+        range: ctx.dep.name_range(),
+        severity: Some(severity),
+        message: format!(
+            "{}: {} {}",
+            ctx.dep.name(),
+            truncate_for_diagnostic(
+                &violation.license,
+                MAX_LICENSE_POLICY_VIOLATION_LICENSE_CHARS
+            ),
+            violation.reason
+        ),
+        source: Some("deps-lsp".into()),
+        code: Some(NumberOrString::String(
+            LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE.into(),
+        )),
+        ..Default::default()
+    });
 }
 
 /// R3 — package-level deprecation finding (#205, I4).
@@ -5498,6 +5590,351 @@ mod tests {
                     .iter()
                     .any(|d| d.message.contains("Newer version available")),
                 "the yanked diagnostic must suppress the outdated hint, not add to it, got: {diagnostics:?}"
+            );
+        }
+    }
+
+    // apply_license_policy_rule / R2a tests (issue #661)
+    mod license_policy_tests {
+        use super::*;
+        use crate::LicensePolicy;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        fn single_dep_parse_result() -> MockParseResult {
+            MockParseResult {
+                deps: vec![MockDep {
+                    name: "serde".into(),
+                    version_req: "1.0.0".into(),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                }],
+                uri: crate::test_util::test_uri("/test/Cargo.toml"),
+            }
+        }
+
+        #[test]
+        fn no_policy_configured_produces_no_diagnostic() {
+            let formatter = MockFormatter;
+            let parse_result = single_dep_parse_result();
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert(
+                PackageName::from("serde"),
+                PackageVersions::latest_only("1.0.0"),
+            );
+            let resolved_versions = HashMap::new();
+            let mut license_prefetch = HashMap::new();
+            license_prefetch.insert(PackageName::from("serde"), vec!["GPL-3.0".to_string()]);
+
+            let diagnostics = generate_diagnostics_from_cache(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions)
+                    .with_license_prefetch(&license_prefetch),
+                &formatter,
+                parse_result.uri(),
+                crate::freshness::FreshnessSettings::default(),
+                DiagnosticSeverities::default(),
+                PublishTime::now(),
+            );
+
+            assert!(
+                diagnostics.is_empty(),
+                "no VersionData::license_policy attached must produce no license diagnostic, got: {diagnostics:?}"
+            );
+        }
+
+        #[test]
+        fn policy_configured_but_no_prefetch_data_produces_no_diagnostic() {
+            let formatter = MockFormatter;
+            let parse_result = single_dep_parse_result();
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert(
+                PackageName::from("serde"),
+                PackageVersions::latest_only("1.0.0"),
+            );
+            let resolved_versions = HashMap::new();
+            let policy = LicensePolicy::new(vec![], vec!["GPL-3.0".to_string()]);
+
+            let diagnostics = generate_diagnostics_from_cache(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions).with_license_policy(&policy),
+                &formatter,
+                parse_result.uri(),
+                crate::freshness::FreshnessSettings::default(),
+                DiagnosticSeverities::default(),
+                PublishTime::now(),
+            );
+
+            assert!(
+                diagnostics.is_empty(),
+                "a dependency with no known license (NFR-003) must never be treated as a \
+                 violation, got: {diagnostics:?}"
+            );
+        }
+
+        #[test]
+        fn denied_license_emits_error_diagnostic() {
+            let formatter = MockFormatter;
+            let parse_result = single_dep_parse_result();
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert(
+                PackageName::from("serde"),
+                PackageVersions::latest_only("1.0.0"),
+            );
+            let resolved_versions = HashMap::new();
+            let mut license_prefetch = HashMap::new();
+            license_prefetch.insert(PackageName::from("serde"), vec!["GPL-3.0".to_string()]);
+            let policy = LicensePolicy::new(vec![], vec!["GPL-3.0".to_string()]);
+
+            let diagnostics = generate_diagnostics_from_cache(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions)
+                    .with_license_prefetch(&license_prefetch)
+                    .with_license_policy(&policy),
+                &formatter,
+                parse_result.uri(),
+                crate::freshness::FreshnessSettings::default(),
+                DiagnosticSeverities::default(),
+                PublishTime::now(),
+            );
+
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
+            assert_eq!(diagnostics[0].message, "serde: GPL-3.0 denied by policy");
+            assert_eq!(
+                diagnostics[0].code,
+                Some(NumberOrString::String(
+                    LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE.into()
+                ))
+            );
+            assert_eq!(
+                diagnostics[0].range,
+                Range::new(Position::new(0, 0), Position::new(0, 5))
+            );
+        }
+
+        #[test]
+        fn not_allowed_license_emits_warning_diagnostic() {
+            let formatter = MockFormatter;
+            let parse_result = single_dep_parse_result();
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert(
+                PackageName::from("serde"),
+                PackageVersions::latest_only("1.0.0"),
+            );
+            let resolved_versions = HashMap::new();
+            let mut license_prefetch = HashMap::new();
+            license_prefetch.insert(PackageName::from("serde"), vec!["ISC".to_string()]);
+            let policy = LicensePolicy::new(vec!["MIT".to_string()], vec![]);
+
+            let diagnostics = generate_diagnostics_from_cache(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions)
+                    .with_license_prefetch(&license_prefetch)
+                    .with_license_policy(&policy),
+                &formatter,
+                parse_result.uri(),
+                crate::freshness::FreshnessSettings::default(),
+                DiagnosticSeverities::default(),
+                PublishTime::now(),
+            );
+
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
+            assert_eq!(
+                diagnostics[0].message,
+                "serde: ISC not on the allowed license list"
+            );
+        }
+
+        #[test]
+        fn compliant_license_produces_no_diagnostic() {
+            let formatter = MockFormatter;
+            let parse_result = single_dep_parse_result();
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert(
+                PackageName::from("serde"),
+                PackageVersions::latest_only("1.0.0"),
+            );
+            let resolved_versions = HashMap::new();
+            let mut license_prefetch = HashMap::new();
+            license_prefetch.insert(PackageName::from("serde"), vec!["MIT".to_string()]);
+            let policy = LicensePolicy::new(vec!["MIT".to_string()], vec!["GPL-3.0".to_string()]);
+
+            let diagnostics = generate_diagnostics_from_cache(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions)
+                    .with_license_prefetch(&license_prefetch)
+                    .with_license_policy(&policy),
+                &formatter,
+                parse_result.uri(),
+                crate::freshness::FreshnessSettings::default(),
+                DiagnosticSeverities::default(),
+                PublishTime::now(),
+            );
+
+            assert!(diagnostics.is_empty());
+        }
+
+        /// The license-policy rule must fire independently of registry-cache state (like
+        /// R2/R3/R4) — an unknown package (no cache entry) still gets its "Unknown package"
+        /// diagnostic *and* the license-policy diagnostic, not one instead of the other.
+        #[test]
+        fn fires_alongside_unknown_package_diagnostic() {
+            let formatter = MockFormatter;
+            let parse_result = single_dep_parse_result();
+            let cached_versions = HashMap::new();
+            let resolved_versions = HashMap::new();
+            let mut license_prefetch = HashMap::new();
+            license_prefetch.insert(PackageName::from("serde"), vec!["GPL-3.0".to_string()]);
+            let policy = LicensePolicy::new(vec![], vec!["GPL-3.0".to_string()]);
+
+            let diagnostics = generate_diagnostics_from_cache(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions)
+                    .with_license_prefetch(&license_prefetch)
+                    .with_license_policy(&policy),
+                &formatter,
+                parse_result.uri(),
+                crate::freshness::FreshnessSettings::default(),
+                DiagnosticSeverities::default(),
+                PublishTime::now(),
+            );
+
+            assert_eq!(
+                diagnostics.len(),
+                2,
+                "expected both diagnostics, got: {diagnostics:?}"
+            );
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|d| d.message.contains("Unknown package"))
+            );
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|d| d.message.contains("denied by policy"))
+            );
+        }
+
+        /// Issue #660/#661 critic C2: Gradle POM licenses are free text, never SPDX, so
+        /// the rule must skip evaluation entirely for Gradle rather than falsely flagging
+        /// (or falsely passing) a free-text license against an SPDX allow/deny list.
+        #[test]
+        fn gradle_dependency_is_excluded_from_policy_evaluation() {
+            let formatter = MockFormatter;
+            let parse_result = single_dep_parse_result();
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert(
+                PackageName::from("serde"),
+                PackageVersions::latest_only("1.0.0"),
+            );
+            let resolved_versions = HashMap::new();
+            let mut license_prefetch = HashMap::new();
+            // Free-text POM license that would never match an SPDX allow-list entry.
+            license_prefetch.insert(
+                PackageName::from("serde"),
+                vec!["The Apache Software License, Version 2.0".to_string()],
+            );
+            let policy = LicensePolicy::new(vec!["Apache-2.0".to_string()], vec![]);
+
+            let diagnostics = generate_diagnostics_from_cache(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions)
+                    .with_license_prefetch(&license_prefetch)
+                    .with_license_policy(&policy)
+                    .with_ecosystem(crate::EcosystemId::Gradle),
+                &formatter,
+                parse_result.uri(),
+                crate::freshness::FreshnessSettings::default(),
+                DiagnosticSeverities::default(),
+                PublishTime::now(),
+            );
+
+            assert!(
+                diagnostics.is_empty(),
+                "Gradle must be excluded from license-policy evaluation, got: {diagnostics:?}"
+            );
+        }
+
+        /// Issue #660/#661 critic security P2: a registry-declared license entry longer
+        /// than `MAX_LICENSE_POLICY_VIOLATION_LICENSE_CHARS` must be truncated in the
+        /// rendered diagnostic message rather than interpolated verbatim. Uses the
+        /// `NotAllowed` branch (not `Denied`): an entry long enough to matter here can
+        /// never also be a `policy.deny` match, since `LicensePolicy::new` itself caps
+        /// every *configured* SPDX identifier at 128 chars — only the untrusted
+        /// `license_prefetch` side is unbounded.
+        #[test]
+        fn overlong_not_allowed_license_is_truncated_in_message() {
+            let formatter = MockFormatter;
+            let parse_result = single_dep_parse_result();
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert(
+                PackageName::from("serde"),
+                PackageVersions::latest_only("1.0.0"),
+            );
+            let resolved_versions = HashMap::new();
+            let overlong = "X".repeat(MAX_LICENSE_POLICY_VIOLATION_LICENSE_CHARS + 50);
+            let mut license_prefetch = HashMap::new();
+            license_prefetch.insert(PackageName::from("serde"), vec![overlong.clone()]);
+            let policy = LicensePolicy::new(vec!["MIT".to_string()], vec![]);
+
+            let diagnostics = generate_diagnostics_from_cache(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions)
+                    .with_license_prefetch(&license_prefetch)
+                    .with_license_policy(&policy),
+                &formatter,
+                parse_result.uri(),
+                crate::freshness::FreshnessSettings::default(),
+                DiagnosticSeverities::default(),
+                PublishTime::now(),
+            );
+
+            assert_eq!(diagnostics.len(), 1);
+            assert!(
+                diagnostics[0].message.len() < overlong.len(),
+                "expected the message to be truncated, got: {:?}",
+                diagnostics[0].message
+            );
+            assert!(diagnostics[0].message.contains('…'));
+        }
+
+        /// Issue #660/#661 critic security P2: a `NotAllowed` violation against a
+        /// dependency declaring many license entries must cap the number of entries
+        /// joined into the message, not render an unbounded list.
+        #[test]
+        fn many_license_entries_are_capped_in_not_allowed_message() {
+            let formatter = MockFormatter;
+            let parse_result = single_dep_parse_result();
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert(
+                PackageName::from("serde"),
+                PackageVersions::latest_only("1.0.0"),
+            );
+            let resolved_versions = HashMap::new();
+            let many: Vec<String> = (0..50).map(|i| format!("License-{i}")).collect();
+            let mut license_prefetch = HashMap::new();
+            license_prefetch.insert(PackageName::from("serde"), many);
+            let policy = LicensePolicy::new(vec!["MIT".to_string()], vec![]);
+
+            let diagnostics = generate_diagnostics_from_cache(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions)
+                    .with_license_prefetch(&license_prefetch)
+                    .with_license_policy(&policy),
+                &formatter,
+                parse_result.uri(),
+                crate::freshness::FreshnessSettings::default(),
+                DiagnosticSeverities::default(),
+                PublishTime::now(),
+            );
+
+            assert_eq!(diagnostics.len(), 1);
+            assert!(
+                diagnostics[0].message.contains("more)"),
+                "expected the entry list to be capped with a '(+N more)' suffix, got: {:?}",
+                diagnostics[0].message
             );
         }
     }

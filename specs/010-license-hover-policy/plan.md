@@ -99,7 +99,7 @@ graph TD
 | Swift / Gradle / Deno source | Not decided here — each requires the same live-verification pass Cargo/npm/PyPI/Composer/Dart already got (§1.4) | These weren't live-checked in this planning session; guessing risks another silent-wrong assumption like the one this session already caught and corrected (Cargo sparse index) | Guess from documentation — rejected, this project's Registry Integration Gate rule already mandates live verification before any registry-client PR; deferred to task-level, not invented here |
 | GitHub Actions / GitLab CI/CD | Out of scope | Not versioned packages with a per-version SPDX field; a repo-level GitHub license lookup is a different data model (repo license, not package-version license) than every other ecosystem this spec covers | Repo-level GitHub API license lookup — rejected as scope creep, no demand signal, different data shape from every other row in the hover |
 | Eager vs lazy | Per-tier: tier 1 eager/inline (free), tier 2 reuses existing bounded-wait (already lazy-with-timeout), tier 3 pre-fetched into `DocumentState` on open/change (OSV pattern, `lifecycle.rs:1765`/`:2372`, `run_osv_scan_phase_a` `lifecycle.rs:549-619`) | No tier introduces a *new* blocking network call inside `generate_hover`; NFR-002's <100ms-cached target holds because every tier either has zero network cost or reuses an already-async-fetched cache | A uniform "lazy with loading placeholder" for all ecosystems — rejected, unnecessary complexity where data is already free or already async |
-| Policy config channel | `initializationOptions.licensePolicy { allow: [String], deny: [String] }`, validated through the existing `parse_config` (`deny_unknown_fields`) path (`crates/deps-lsp/src/server.rs`) | Reuses the one existing config-validation path per CLAUDE.md's rule ("no separate, weaker validation path for a config reload") | A new workspace config file (`.depsrc.json`) — rejected for v1, no existing file-based config infrastructure in this project; documented as an explicit follow-up if demand appears |
+| Policy config channel | `initializationOptions.license_policy { allow: [String], deny: [String] }`, validated through the existing `parse_config` (`deny_unknown_fields`) path (`crates/deps-lsp/src/server.rs`) | Reuses the one existing config-validation path per CLAUDE.md's rule ("no separate, weaker validation path for a config reload") | A new workspace config file (`.depsrc.json`) — rejected for v1, no existing file-based config infrastructure in this project; documented as an explicit follow-up if demand appears |
 | Policy matching | Exact top-level SPDX identifier, set-membership against the dependency's `license: Vec<String>` | `license` is already a set of discrete identifiers (not a raw `"MIT OR Apache-2.0"` expression string) for every source this plan uses; set membership needs no new dependency | Full SPDX-expression-operator parser (`OR`/`AND`/`WITH`) — rejected, "Ask First" boundary in spec §8 flags new deps for this; no current requirement needs it |
 | Allow vs deny precedence | Both independently optional; if a license matches both, **deny wins** | Defense-in-depth default, matches `cargo deny licenses`' own precedence convention cited as this feature's inspiration | Allow always wins — rejected, weaker compliance guarantee |
 | Invalid SPDX identifier in policy | Log one warning at config-load time, drop the invalid entry from the effective policy, do not crash, do not block other valid entries | Matches NFR-003 (no crash) and the project's single-config-validation-path principle | Diagnostic anchored to the config file — rejected, LSP diagnostics are anchored to open text documents, not `initializationOptions` payloads which have no document URI to anchor to |
@@ -166,7 +166,7 @@ additional content:
 | Surface | Change |
 |---|---|
 | Hover markdown | New `push_license_hover_section` line(s): `License: <SPDX>` for resolved version, `Latest version: License: <SPDX>` for latest, `License changed: <old> → <new>` when the sets differ |
-| `initializationOptions` | New optional `licensePolicy: { allow?: string[], deny?: string[] }` block, validated via existing `parse_config` |
+| `initializationOptions` | New optional `license_policy: { allow?: string[], deny?: string[] }` block, validated via existing `parse_config` |
 | Diagnostics (Phase 2) | New diagnostic per dependency whose `license` set violates the configured policy, anchored at the existing manifest-line range already used for outdated/vulnerability diagnostics |
 
 ## 5. Integration Points
@@ -182,7 +182,7 @@ additional content:
 ## 6. Security
 
 No new secrets, no new auth. All endpoints used (deps.dev, PyPI, Packagist, pub.dev) are already
-in this project's `net_policy.rs`-governed keyless/public-API set. `initializationOptions.licensePolicy`
+in this project's `net_policy.rs`-governed keyless/public-API set. `initializationOptions.license_policy`
 is user/editor-supplied config, not external network input — validated the same way every other
 `initializationOptions` field is (`parse_config`, `deny_unknown_fields`).
 

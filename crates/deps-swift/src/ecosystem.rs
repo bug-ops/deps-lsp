@@ -136,6 +136,14 @@ impl SwiftEcosystem {
         )
         .await
     }
+
+    /// Fetches `name`'s (`owner/repo`) SPDX license identifier from GitHub (issue
+    /// #660), for `deps-lsp::document::lifecycle::run_license_prefetch`'s tier-3
+    /// background pre-fetch — never called from the hover critical path directly. See
+    /// [`crate::registry::SwiftRegistry::get_license`].
+    pub async fn fetch_license(&self, name: &str) -> Vec<String> {
+        self.registry.get_license(name).await
+    }
 }
 
 impl deps_core::ecosystem::private::Sealed for SwiftEcosystem {}

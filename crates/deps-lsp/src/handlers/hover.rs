@@ -49,6 +49,7 @@ pub async fn handle_hover(
         resolved_version_candidates,
         vulnerabilities,
         outcomes,
+        licenses,
     ) = state
         .with_document(uri, |doc| {
             let ecosystem = state.ecosystem_registry.get(doc.ecosystem_id())?;
@@ -62,6 +63,7 @@ pub async fn handle_hover(
                 doc.resolved_version_candidates.clone(),
                 doc.vulnerabilities.clone(),
                 doc.outcomes.clone(),
+                doc.licenses.clone(),
             ))
         })
         .flatten()?;
@@ -71,7 +73,8 @@ pub async fn handle_hover(
         .with_vulnerabilities(&vulnerabilities)
         .with_outcomes(&outcomes)
         .with_ecosystem(ecosystem_id)
-        .with_offline(offline);
+        .with_offline(offline)
+        .with_license_prefetch(&licenses);
     // The only call site that ever sets `VersionData::trust` (deps-core's
     // `lsp_helpers::hover` module docs) — this is what makes the supply-chain
     // trust signal hover-only by construction (FR-010): diagnostics, code

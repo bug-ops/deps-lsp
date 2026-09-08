@@ -15,13 +15,22 @@ use crate::formatter::GradleFormatter;
 pub struct GradleEcosystem {
     registry: Arc<MavenCentralRegistry>,
     formatter: GradleFormatter,
+    /// Kept alongside `registry` (which owns its own clone, internal to
+    /// `MavenCentralRegistry`) for [`Self::fetch_license`]'s independent POM fetch
+    /// (issue #660) — that fetch targets a different Maven Central endpoint
+    /// (`{coord}/{version}/{artifact}-{version}.pom`) than any `MavenCentralRegistry`
+    /// method exposes, so it goes through `crate::license` directly rather than
+    /// growing `MavenCentralRegistry`'s own (differently-scoped, `deps-maven`-owned)
+    /// public API.
+    http_cache: Arc<deps_core::HttpCache>,
 }
 
 impl GradleEcosystem {
     pub fn new(cache: Arc<deps_core::HttpCache>) -> Self {
         Self {
-            registry: Arc::new(MavenCentralRegistry::new(cache)),
+            registry: Arc::new(MavenCentralRegistry::new(Arc::clone(&cache))),
             formatter: GradleFormatter,
+            http_cache: cache,
         }
     }
 
@@ -49,6 +58,15 @@ impl GradleEcosystem {
             freshness,
         )
         .await
+    }
+
+    /// Fetches `coordinate`'s (`"group:artifact"`) license at `version` from Maven
+    /// Central (issue #660), for
+    /// `deps-lsp::document::lifecycle::run_license_prefetch`'s tier-3 background
+    /// pre-fetch — never called from the hover critical path directly. See
+    /// `crate::license::fetch_license`.
+    pub async fn fetch_license(&self, coordinate: &str, version: &str) -> Vec<String> {
+        crate::license::fetch_license(&self.http_cache, coordinate, version).await
     }
 
     /// Detects completion context for Gradle files at the given position.

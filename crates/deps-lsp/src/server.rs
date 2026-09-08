@@ -510,6 +510,11 @@ impl LanguageServer for Backend {
                 .set_min_interval(std::time::Duration::from_millis(
                     config.cold_start.rate_limit_ms,
                 ));
+            // Issue #660/#661 critic C1: mirrored onto `ServerState` so every diagnostics
+            // generation call site (push and pull) reads the same resolved policy — see
+            // `ServerState::license_policy`'s doc.
+            self.state
+                .set_license_policy(config.license_policy.to_policy());
             *self.config.write().await = config;
         }
 
@@ -665,6 +670,8 @@ impl LanguageServer for Backend {
         let cold_start_rate_limit_ms = config.cold_start.rate_limit_ms;
         let gitlab_instance_host = (!config.registries.gitlab_instance_host.is_empty())
             .then(|| config.registries.gitlab_instance_host.clone());
+        // Issue #660/#661 critic C1: see the mirroring call after the config swap below.
+        let license_policy = config.license_policy.to_policy();
 
         // Diff the old vs new config for parse-affecting changes (issue #592) and swap in
         // the new config under one write-guard acquisition — `DepsConfig` has no `Clone`,
@@ -708,6 +715,10 @@ impl LanguageServer for Backend {
         self.state
             .cold_start_limiter
             .set_min_interval(std::time::Duration::from_millis(cold_start_rate_limit_ms));
+        // Issue #660/#661 critic C1: mirrored onto `ServerState` so every diagnostics
+        // generation call site (push and pull) reads the same resolved policy — see
+        // `ServerState::license_policy`'s doc.
+        self.state.set_license_policy(license_policy);
 
         match scope {
             Some(scope) => {
@@ -2123,6 +2134,73 @@ mod tests {
             assert!(result.is_ok());
             assert!(backend.config.read().await.freshness.enabled);
         }
+
+        /// Tester gap (issue #660/#661): `initializationOptions.license_policy` had no
+        /// coverage through the real JSON -> `parse_config` -> `LicensePolicyConfig`
+        /// deserializer path — existing tests only constructed `LicensePolicyConfig` as a
+        /// Rust struct literal. Also proves `initialize` mirrors the parsed policy onto
+        /// `ServerState` (critic C1), not just `Backend::config`.
+        #[tokio::test]
+        async fn test_initialize_applies_valid_license_policy() {
+            let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+            let backend = service.inner();
+
+            let result = backend
+                .initialize(InitializeParams {
+                    initialization_options: Some(serde_json::json!({
+                        "license_policy": { "allow": ["MIT", "Apache-2.0"], "deny": ["GPL-3.0"] }
+                    })),
+                    ..Default::default()
+                })
+                .await;
+
+            assert!(result.is_ok());
+            let config = backend.config.read().await;
+            assert_eq!(
+                config.license_policy.allow,
+                vec!["MIT".to_string(), "Apache-2.0".to_string()]
+            );
+            assert_eq!(config.license_policy.deny, vec!["GPL-3.0".to_string()]);
+            drop(config);
+
+            let mirrored = backend.state.license_policy();
+            assert_eq!(
+                mirrored.allow,
+                vec!["MIT".to_string(), "Apache-2.0".to_string()]
+            );
+            assert_eq!(mirrored.deny, vec!["GPL-3.0".to_string()]);
+        }
+
+        /// Tester gap: an invalid SPDX entry must be dropped (with a warning) rather than
+        /// rejecting the whole `initializationOptions` payload — `deserialize_spdx_list`
+        /// filters at deserialize time, not `deny_unknown_fields`-style hard rejection.
+        #[tokio::test]
+        async fn test_initialize_drops_invalid_spdx_entry_keeps_rest_of_config() {
+            let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+            let backend = service.inner();
+
+            let result = backend
+                .initialize(InitializeParams {
+                    initialization_options: Some(serde_json::json!({
+                        "license_policy": { "allow": ["MIT", "not a valid spdx expression"] },
+                        "freshness": { "cooldown_secs": 60 }
+                    })),
+                    ..Default::default()
+                })
+                .await;
+
+            assert!(result.is_ok());
+            let config = backend.config.read().await;
+            assert_eq!(
+                config.license_policy.allow,
+                vec!["MIT".to_string()],
+                "the invalid entry must be dropped, not reject the whole payload"
+            );
+            assert_eq!(
+                config.freshness.cooldown_secs, 60,
+                "the rest of the config must still apply"
+            );
+        }
     }
 
     mod did_change_configuration_tests {
@@ -2192,6 +2270,41 @@ mod tests {
                 .await;
 
             assert_eq!(backend.config.read().await.freshness.cooldown_secs, 60);
+        }
+
+        /// Tester gap (issue #660/#661): mirrors `initialize_tests::
+        /// test_initialize_applies_valid_license_policy` for `did_change_configuration`,
+        /// proving both `initializationOptions` and `workspace/didChangeConfiguration`
+        /// reach the same `parse_config`/`LicensePolicyConfig` deserializer and both
+        /// mirror the result onto `ServerState` (critic C1) — not just one of the two
+        /// entry points.
+        #[tokio::test]
+        async fn test_did_change_configuration_applies_valid_license_policy() {
+            let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+            let backend = service.inner();
+
+            backend
+                .did_change_configuration(DidChangeConfigurationParams {
+                    settings: serde_json::json!({
+                        "license_policy": { "allow": ["MIT"], "deny": ["GPL-3.0", "AGPL-3.0"] }
+                    }),
+                })
+                .await;
+
+            let config = backend.config.read().await;
+            assert_eq!(config.license_policy.allow, vec!["MIT".to_string()]);
+            assert_eq!(
+                config.license_policy.deny,
+                vec!["GPL-3.0".to_string(), "AGPL-3.0".to_string()]
+            );
+            drop(config);
+
+            let mirrored = backend.state.license_policy();
+            assert_eq!(mirrored.allow, vec!["MIT".to_string()]);
+            assert_eq!(
+                mirrored.deny,
+                vec!["GPL-3.0".to_string(), "AGPL-3.0".to_string()]
+            );
         }
 
         /// Issue #483 (critic M6a): the primary UX of the flag — a live
