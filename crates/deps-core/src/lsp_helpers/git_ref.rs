@@ -63,6 +63,9 @@ pub fn is_tag_shaped(s: &str) -> bool {
 /// assert_eq!(match_v_prefix_style("v4", "5.0.0"), "v5.0.0");
 /// assert_eq!(match_v_prefix_style("4", "v5.0.0"), "5.0.0");
 /// ```
+// `tag[1..]` only runs when `tag_has_v` (an ASCII 'v'/'V' prefix check), so index 1 is
+// always a char boundary.
+#[allow(clippy::string_slice)]
 #[must_use]
 pub fn match_v_prefix_style(current: &str, tag: &str) -> String {
     let current_has_v = current.starts_with(['v', 'V']);
@@ -186,6 +189,8 @@ pub fn locate_value_span(content: &str, search_from: usize, value: &str) -> Opti
 }
 
 #[cfg(test)]
+// Fixtures are single-line ASCII literals with hand-computed byte offsets.
+#[allow(clippy::string_slice)]
 mod tests {
     use super::*;
 

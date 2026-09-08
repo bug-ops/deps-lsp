@@ -76,6 +76,9 @@ static RE_PATH: LazyLock<Regex> = LazyLock::new(|| {
 /// Converts a GitHub or generic Git URL to `owner/repo` identity string.
 ///
 /// Strips trailing `.git` and extracts the last two path segments.
+// `colon_pos` comes from `find(':')`, an ASCII byte, so both slice bounds are always char
+// boundaries.
+#[allow(clippy::string_slice)]
 pub fn url_to_identity(url: &str) -> Option<String> {
     // Handle SSH-style URLs: git@github.com:user/repo.git
     let url = if let Some(rest) = url.strip_prefix("git@") {
@@ -185,6 +188,10 @@ fn next_minor(major: &str, minor: &str) -> String {
 ///
 /// Uses regex matching after stripping comments. Byte offsets are preserved
 /// throughout so LSP positions are computed correctly.
+// Every capture-group slice below (`url.start()..url.end()`, etc.) uses regex match offsets,
+// always char boundaries; offsets taken on `stripped` are valid in `content` too because
+// `strip_comments` overwrites byte-for-byte (length- and boundary-preserving).
+#[allow(clippy::string_slice)]
 pub fn parse_package_swift(content: &str, uri: &Uri) -> Result<SwiftParseResult> {
     let stripped = strip_comments(content);
     let line_table = LineOffsetTable::new(content);
@@ -938,6 +945,7 @@ let package = Package(
     /// `deps_core::lsp_helpers`'s private `slice_for_range`, reimplemented here since
     /// that helper isn't public. Every fixture below is single-line ASCII, so character
     /// offsets equal byte offsets.
+    #[allow(clippy::string_slice)] // single-line ASCII fixture
     fn slice(content: &str, range: Range) -> &str {
         assert_eq!(
             range.start.line, range.end.line,

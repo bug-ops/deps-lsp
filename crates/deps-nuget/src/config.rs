@@ -1850,6 +1850,9 @@ fn expand_env_vars(raw: &str) -> Result<Zeroizing<String>, NuGetFeedUrlError> {
 /// past its initial capacity. `zeroize`'s own docs note it cannot guarantee a `Vec`/`String`
 /// reallocation didn't leave a stale copy on the heap; sizing exactly once, up front, is what
 /// avoids that reallocation in the first place, rather than merely zeroizing after the fact.
+// All indices come from `find('%')`, an ASCII byte, so every slice bound is always a char
+// boundary.
+#[allow(clippy::string_slice)]
 fn expand_env_vars_with(
     raw: &str,
     lookup: impl Fn(&str) -> Option<Zeroizing<String>>,

@@ -286,6 +286,9 @@ struct NpmAlias {
 /// [`crate::types::NpmDependency::name`] (the JSON key/alias), not the real package this
 /// function would extract, so resolving the alias here would feed the catalog lookup the
 /// wrong key — see `catalog.rs`'s "Known limitations" doc, which this leaves unchanged.
+// `name_len` comes from `npm_style_name_boundary` (ASCII-find derived), so it is always a
+// char boundary.
+#[allow(clippy::string_slice)]
 fn parse_npm_alias(value: &str) -> Option<NpmAlias> {
     let rest = value.trim().strip_prefix("npm:")?;
 

@@ -3,6 +3,10 @@
 //! This module provides composer.json parsing and Packagist registry integration
 //! for PHP projects.
 
+// #680: string slicing on a byte index that isn't a verified char boundary panics; sites
+// confirmed boundary-safe by construction are individually `#[allow]`ed with a justification.
+#![warn(clippy::string_slice)]
+
 pub mod ecosystem;
 pub mod formatter;
 pub mod lockfile;

@@ -662,6 +662,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_versions_populates_tag_index() {
         let sha = "abc123".repeat(7); // 42 chars, trimmed below to exactly 40
+        #[allow(clippy::string_slice)] // 40-char ASCII SHA fixture
         let sha = &sha[..40];
         let mut server = mockito::Server::new_async().await;
         let _mock = server
@@ -691,6 +692,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_versions_populates_tag_index_for_bare_major_tag() {
         let sha = "abc123".repeat(7);
+        #[allow(clippy::string_slice)] // 40-char ASCII SHA fixture
         let sha = &sha[..40];
         let mut server = mockito::Server::new_async().await;
         let _mock = server

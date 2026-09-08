@@ -167,6 +167,9 @@ pub(crate) enum VersionRange {
     },
 }
 
+// `first`/`last` are validated ASCII brackets before slicing at `len_utf8`, so this slice
+// bound is always a char boundary.
+#[allow(clippy::string_slice)]
 pub(crate) fn parse_range(range: &str) -> Option<VersionRange> {
     let range = range.trim();
     if range.is_empty() {

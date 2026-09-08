@@ -76,6 +76,9 @@ pub enum BracketStyle {
 /// inclusive pair `[...]` (`[1.0)`, `(1.0]` — neither grammar has a reversed-bracket
 /// exact-pin form). Callers treat an unparseable interval as satisfying nothing
 /// rather than panicking.
+// `first`/`last` are `chars()` ends sliced at `len_utf8`, and the explicit length guard
+// above prevents `start > end`, so the slice bound is always a char boundary.
+#[allow(clippy::string_slice)]
 pub fn parse_interval(s: &str, style: BracketStyle) -> Option<VersionRange> {
     let s = s.trim();
     let first = s.chars().next()?;

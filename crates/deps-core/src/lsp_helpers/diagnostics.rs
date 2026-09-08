@@ -341,6 +341,8 @@ pub fn requirement_is_unsatisfiable(
 /// strict-SemVer ecosystems (see
 /// [`EcosystemFormatter::strict_semver_prerelease_exclusion`]), whose registries only
 /// publish spec-conformant version strings.
+// `dash` comes from `str::find('-')`, an ASCII byte, so it is always a char boundary.
+#[allow(clippy::string_slice)]
 fn semver_prerelease_base(version: &str) -> Option<&str> {
     let core = version.split('+').next().unwrap_or(version);
     core.find('-').map(|dash| &core[..dash])

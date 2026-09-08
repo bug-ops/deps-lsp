@@ -72,6 +72,9 @@ fn ref_is_last_token_on_line(rest_of_line: &str) -> bool {
     true
 }
 
+// `i` is a byte index holding ASCII `b'#'`; `token_len` from `find(char::is_whitespace)` or
+// `.len()`. Both slice bounds are always char boundaries.
+#[allow(clippy::string_slice)]
 fn extract_comment_tag(rest_of_line: &str) -> Option<(&str, usize)> {
     let bytes = rest_of_line.as_bytes();
     for i in 0..bytes.len() {
@@ -298,6 +301,12 @@ impl MarkedEventReceiver for WorkflowReceiver {
 
 /// Builds a [`GithubActionsDependency`] for one `uses:` candidate, or `None` if its
 /// `owner/repo` prefix does not look like a GitHub identifier (logged and skipped, FR-015).
+// `ref_start`/`ref_end` build on `span_start`, which is char-boundary-aligned in `content` via
+// `CharOffsets::byte_offset` + `locate_value_span` and then re-anchored to the trimmed value
+// (see the trim re-anchoring comment below) — plus `before_at_len`/`ref_text.len()`, both
+// whole-substring byte counts, so the arithmetic never lands mid-character. `token_end` is
+// relative to `content[ref_end..]` and derived from `find('\n')` (ASCII) or `.len()`.
+#[allow(clippy::string_slice)]
 fn build_dependency(
     content: &str,
     line_table: &LineOffsetTable,
@@ -575,6 +584,7 @@ mod tests {
 
     /// Slices `content` over a single-line LSP `Range` (every fixture below is
     /// single-line ASCII, so character offsets equal byte offsets).
+    #[allow(clippy::string_slice)] // fixtures are single-line ASCII literals
     fn slice(content: &str, range: Range) -> &str {
         assert_eq!(
             range.start.line, range.end.line,

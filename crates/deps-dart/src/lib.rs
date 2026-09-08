@@ -4,6 +4,10 @@
 //! including pubspec.yaml parsing, dependency extraction, and pub.dev
 //! registry integration.
 
+// #680: string slicing on a byte index that isn't a verified char boundary panics; sites
+// confirmed boundary-safe by construction are individually `#[allow]`ed with a justification.
+#![warn(clippy::string_slice)]
+
 pub mod ecosystem;
 pub mod formatter;
 pub mod lockfile;

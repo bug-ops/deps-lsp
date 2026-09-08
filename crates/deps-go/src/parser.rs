@@ -165,6 +165,8 @@ pub fn parse_go_mod_with_context(
 /// Strips line comments from a line (everything after //).
 ///
 /// Handles URL schemes (e.g., https://) to avoid stripping URL paths.
+// `i` comes from `char_indices()`, always a char boundary.
+#[allow(clippy::string_slice)]
 fn strip_line_comment(line: &str) -> &str {
     let mut in_url = false;
     for (i, c) in line.char_indices() {

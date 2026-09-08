@@ -396,6 +396,9 @@ impl Ecosystem for GithubActionsEcosystem {
 /// Inserts a `**Resolved**: `tag` (`sha…`)` line immediately after the shared hover's
 /// `**Current**`/`**Requirement**` line (whichever is present), falling back to append
 /// only if neither anchor is found.
+// `pos`/`rel_end`/`insert_at` come from `find` of ASCII anchors (`"**Current**: "`,
+// `"\n\n"`), so all are always char boundaries.
+#[allow(clippy::string_slice)]
 fn splice_resolved_line(markdown: &str, resolved_tag: &str, sha: &str) -> String {
     // `sha` is expected to be a validated, pure-ASCII full hex SHA by the time it
     // reaches here (`TagIndex` entries are filtered in `populate_tag_index`, security

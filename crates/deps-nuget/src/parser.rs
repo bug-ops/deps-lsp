@@ -449,6 +449,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::string_slice)] // ASCII fixture literal
     fn test_attribute_byte_range_matches_source_bytes() {
         // Guards the reader-setup constraint: attribute values must borrow directly from
         // `content` (Reader::from_str + read_event()), not a scratch buffer, or this
@@ -475,6 +476,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::string_slice)] // ASCII fixture literal
     fn test_attribute_byte_range_checked_sub_fallback_on_invariant_violation() {
         // Deterministically construct `raw` at a lower memory address than `content` by
         // slicing the same backing buffer in reverse order — this violates the "raw

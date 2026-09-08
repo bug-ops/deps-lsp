@@ -692,6 +692,7 @@ mod tests {
         (policy, instance_host)
     }
 
+    #[allow(clippy::string_slice)] // single-line ASCII fixtures
     fn slice(content: &str, range: Range) -> String {
         let start_line = range.start.line as usize;
         let end_line = range.end.line as usize;

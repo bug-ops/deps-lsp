@@ -21,6 +21,10 @@
 //! `./local`/`docker://` — because the referenced workflow's version and the host repo's
 //! release tags are not reliably the same thing (see `parser` module docs).
 
+// #680: string slicing on a byte index that isn't a verified char boundary panics; sites
+// confirmed boundary-safe by construction are individually `#[allow]`ed with a justification.
+#![warn(clippy::string_slice)]
+
 pub mod ecosystem;
 pub mod formatter;
 pub mod parser;

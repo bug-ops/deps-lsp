@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: property tests (`proptest`) asserting the parser depth/expansion checkers and JSONC position recovery never panic on arbitrary input (#673)
 
 ### Fixed
+- **deps-core, deps-maven**: `deps_core::completion::byte_to_utf16_offset` and `deps-maven`'s `text_range` no longer panic on a caller-supplied byte offset that lands mid-character — both now clamp via `floor_char_boundary`. `clippy::string_slice` is now enforced on every library/binary crate root in the workspace (deps-lsp already had it from #676) as a regression gate against this class of panic (resolves #680) (#684)
 - **deps-cargo**: sparse-index bearer token header value now zeroizes on drop instead of leaking a plaintext copy in an ordinary `String` (resolves #672) (#675)
 - **deps-pypi**: a PEP 508 requirement with a malformed package name or extras entry no longer panics the parser — rejected upfront by a grammar pre-check, with `catch_unwind` as a backstop (found via fuzzing, resolves #673)
 - **deps-core, deps-deno**: a bare (operator-less) Deno `jsr:`/`npm:` version requirement with no lock file present is now treated as an exact pin when it has the shape of a full version, instead of being misclassified as a Cargo-style implicit caret range — fixes a bare full-version `npm:` pin never receiving an OSV scan, and strips a leading `v`/`V` before it reaches the OSV wire query (resolves #667) (#668)
