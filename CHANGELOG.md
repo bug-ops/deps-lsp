@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **deps-core, deps-composer**: hover now shows the SPDX license for the resolved and latest version (Cargo, npm, PyPI, Go, Maven, Bundler, NuGet, Composer), flagging a "License changed" when they differ (resolves #204)
+- **deps-core, deps-composer**: hover now shows the SPDX license for the resolved and latest version (Cargo, npm, PyPI, Go, Maven, Bundler, NuGet, Composer), flagging a "License changed" when they differ (resolves #204) (#663)
 - **deps-core**: OSV malicious-package advisories (`MAL-*` id or alias) now classify as a distinct `VulnSeverity::Malicious` instead of falling through to "unknown severity" in hover/diagnostics (resolves #646) (#652)
 
 ### Fixed
