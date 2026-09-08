@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **deps-npm**: `package-lock.json` parsing now prefers a package entry's own `name` field (npm writes this when it differs from the physical `node_modules/` path, e.g. for an `npm:` alias) over the lockfile-key-derived name (#657)
+- **deps-core, deps-composer, deps-nuget**: extracted the duplicated lenient string-or-string-array JSON deserializer into a shared `deps_core::json_helpers::deserialize_string_or_string_array` helper (resolves #662) (#665)
 
 ### Dependencies
 - Bump `dirs` from 6 to 7.0.0, plus transitive `Cargo.lock` refresh (#659)
