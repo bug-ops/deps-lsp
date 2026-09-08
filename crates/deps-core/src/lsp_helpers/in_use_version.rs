@@ -34,10 +34,13 @@ enum BareRequirementPolicy {
 /// Cargo's implicit caret. For these, [`is_concrete_version`] requires an
 /// explicit `=`/`==` (or an exact-bracket wrap) before treating a requirement
 /// as concrete; a bare `"1.2.3"` alone is not enough evidence (critique C2).
-/// Cargo is the sole remaining member of this group: every other ecosystem
-/// with an implicit-range default distinguishes a bare *full* version (a
-/// pin) from a bare *partial* one (a range) instead, so it belongs under
-/// [`BareRequirementPolicy::ConcreteIfFullVersion`] rather than here.
+/// Cargo is the sole member of this group: every other ecosystem with an
+/// implicit-range default distinguishes a bare *full* version (a pin) from a
+/// bare *partial* one (a range) instead, so it belongs under
+/// [`BareRequirementPolicy::ConcreteIfFullVersion`] rather than here — and
+/// NuGet, whose bare form is a range under its own registry-comparator
+/// semantics too, is deliberately kept out of this group anyway; see
+/// [`BareRequirementPolicy::Concrete`]'s doc for why.
 ///
 /// GitHub Actions, GitLab CI, npm, Composer, and Deno all get
 /// [`BareRequirementPolicy::ConcreteIfFullVersion`] instead — see that
@@ -88,12 +91,45 @@ enum BareRequirementPolicy {
 ///   independent, already-correct downstream filter.
 ///
 /// Every remaining ecosystem (Pypi, Go, Bundler, Dart, Maven, Gradle, Swift,
-/// NuGet) gets plain [`BareRequirementPolicy::Concrete`]: none of them has an
-/// implicit-range default the way Cargo does. Gradle in particular: a bare
-/// coordinate version (e.g. `"2.14.1"`) is an exact match under
-/// `GradleFormatter`'s own `version_satisfies_requirement` unless it uses the
-/// `+` dynamic-version suffix, which [`looks_like_a_single_version`] already
-/// rejects via its reject-char set.
+/// NuGet) gets plain [`BareRequirementPolicy::Concrete`]. Gradle in
+/// particular: a bare coordinate version (e.g. `"2.14.1"`) is an exact match
+/// under `GradleFormatter`'s own `version_satisfies_requirement` unless it
+/// uses the `+` dynamic-version suffix, which [`looks_like_a_single_version`]
+/// already rejects via its reject-char set.
+///
+/// NuGet (#669) is the one member of this group that does *not* have "no
+/// implicit-range default" in the strict sense: a bare `Version="1.0.0"`
+/// under `PackageReference`/`PackageVersion` is actually a *minimum-only
+/// floor* — `NuGetFormatter::version_satisfies_requirement`'s
+/// `test_version_satisfies_bare_floor` shows `satisfies("2.5.0", "1.0.0")`
+/// and `satisfies("9.9.9", "1.0.0")` are both `true`, which would put it
+/// under `AlwaysRange` (Cargo's group) by the same reasoning that moved
+/// npm/Composer/Deno to `ConcreteIfFullVersion`. It is deliberately kept
+/// under `Concrete` anyway, as a documented approximation rather than an
+/// oversight: `NuGetFormatter::is_requirement_up_to_date` (this crate's
+/// sibling `deps-nuget`) already treats a bare floor as a pin for the
+/// identical reason — restore resolves a direct `PackageReference` to
+/// *exactly* its floor version unless something else forces a higher one,
+/// so "the floor is the version in practice" is the right default answer for
+/// "what version does this project actually have" even though it is not the
+/// only version the requirement's own comparator would accept. Moving NuGet
+/// to `AlwaysRange` (tried and reverted during #669's implementation) makes
+/// `concrete_pin_version` return `None` for the dominant bare
+/// `Version="12.0.1"` .csproj spelling with no lock file present — verified
+/// live to silently drop OSV vulnerability scanning, hover
+/// Security/Current/License sections, deps.dev trust signals, yanked
+/// checks, and inlay hints for that dependency, since NuGet's
+/// `packages.lock.json` is opt-in (`RestorePackagesWithLockFile`) and rarely
+/// present to rescue it via the lockfile path instead. `Concrete` keeps all
+/// of that working for the common case, at the cost of being wrong in two
+/// narrower situations: the pinned floor version doesn't actually exist on
+/// the feed, or a transitive dependency elsewhere in the graph raises the
+/// effective floor above what this bare requirement alone states — both
+/// already-known limitations of "lowest applicable version" as an
+/// approximation, not new ones introduced by keeping this policy. An
+/// explicit exact-bracket pin (`[1.0.0]`) is unaffected either way — it is
+/// stripped and matched before `bare_requirement_policy` is ever consulted
+/// (see [`concrete_pin_version`]).
 ///
 /// Spelled out as explicit arms rather than a `_` catch-all (impl-critic
 /// #664 review, finding M4): `EcosystemId` is deliberately exhaustive so a
@@ -550,6 +586,26 @@ mod tests {
         ] {
             assert!(is_concrete_version("2.14.1", eco), "{eco:?}");
         }
+    }
+
+    #[test]
+    fn is_concrete_version_nuget_bare_version_is_a_deliberate_pin_approximation() {
+        // #669: a bare NuGet `Version="1.0.0"` is a minimum-only floor under
+        // `PackageReference`/`PackageVersion` semantics — `NuGetFormatter`'s own
+        // `version_satisfies_requirement` accepts any version `>= 1.0.0`, not just
+        // `1.0.0` itself. `deps-core` still treats it as concrete here anyway: this is
+        // a deliberate approximation of "restore resolves a direct reference to its
+        // floor version in practice" (mirrored by `NuGetFormatter::
+        // is_requirement_up_to_date`, which treats the same bare floor as a pin for
+        // outdated-checking), not an oversight — reclassifying NuGet to always-range
+        // was tried and reverted during #669's implementation because it silently
+        // dropped OSV/hover/license resolution for the dominant bare `Version="X"`
+        // spelling with no lock file present. See this module's `Concrete` doc for
+        // the full rationale and known limitations of the approximation.
+        assert!(is_concrete_version("1.0.0", EcosystemId::NuGet));
+        // An explicit exact-bracket pin is unaffected either way — it is stripped
+        // and matched before `bare_requirement_policy` is ever consulted.
+        assert!(is_concrete_version("[1.0.0]", EcosystemId::NuGet));
     }
 
     #[test]
@@ -1224,5 +1280,41 @@ mod tests {
         );
 
         assert_eq!(result, Some("4.17.0".to_string()));
+    }
+
+    /// #669's exact scenario: a `.csproj` `<PackageReference Include="Newtonsoft.Json"
+    /// Version="1.0.0" />` with no lock file present. `NuGetFormatter::
+    /// version_satisfies_requirement` would accept `"2.5.0"`/`"9.9.9"` too (the bare
+    /// requirement is really an unbounded minimum floor), but `in_use_version` still
+    /// resolves this to the pin-approximation `Some("1.0.0")` — restore resolves a
+    /// direct `PackageReference` to exactly its floor version in practice, so this is
+    /// the right default answer for "what version does the project actually have"
+    /// even though it is not the only version the requirement's own comparator would
+    /// accept. Reclassifying NuGet to always-range instead (tried and reverted during
+    /// #669's implementation) made this `None`, which silently dropped OSV scanning
+    /// and hover Security/License sections for the dominant bare `Version="X"`
+    /// spelling — see this module's `Concrete` doc for the full rationale.
+    #[test]
+    fn in_use_version_nuget_bare_floor_resolves_as_pin_approximation() {
+        use crate::VersionReq;
+        use crate::lsp_helpers::test_support::MockDep;
+
+        let dep = MockDep {
+            name: PackageName::new("Newtonsoft.Json"),
+            version_req: VersionReq::new("1.0.0"),
+            version_range: tower_lsp_server::ls_types::Range::default(),
+            name_range: tower_lsp_server::ls_types::Range::default(),
+        };
+
+        let result = in_use_version(
+            &dep,
+            "newtonsoft.json",
+            &HashMap::new(),
+            None,
+            &crate::lsp_helpers::test_support::MockFormatter,
+            EcosystemId::NuGet,
+        );
+
+        assert_eq!(result, Some("1.0.0".to_string()));
     }
 }
