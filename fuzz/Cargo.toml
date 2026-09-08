@@ -1,0 +1,97 @@
+[package]
+name = "deps-lsp-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Deliberately its own workspace (cargo-fuzz's standard layout): keeps this crate's
+# dependency resolution independent of the root workspace, and avoids inheriting
+# `unsafe_code = "forbid"`/`[workspace.lints]` from `../Cargo.toml`, which cargo-fuzz's
+# generated libFuzzer harness plumbing is not written to satisfy (see #673 and
+# `.claude/rules/branching.md` on `crates/deps-zed`'s equivalent exclusion pattern).
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+tower-lsp-server = "0.23"
+
+[dependencies.deps-core]
+path = "../crates/deps-core"
+
+[dependencies.deps-bundler]
+path = "../crates/deps-bundler"
+
+[dependencies.deps-go]
+path = "../crates/deps-go"
+
+[dependencies.deps-swift]
+path = "../crates/deps-swift"
+
+[dependencies.deps-gradle]
+path = "../crates/deps-gradle"
+
+[dependencies.deps-pypi]
+path = "../crates/deps-pypi"
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "parser_checks"
+path = "fuzz_targets/parser_checks.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_json_checked"
+path = "fuzz_targets/parse_json_checked.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "json_ast"
+path = "fuzz_targets/json_ast.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bundler_parser"
+path = "fuzz_targets/bundler_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "go_parser"
+path = "fuzz_targets/go_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "swift_parser"
+path = "fuzz_targets/swift_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gradle_parser"
+path = "fuzz_targets/gradle_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pypi_requirement"
+path = "fuzz_targets/pypi_requirement.rs"
+test = false
+doc = false
+bench = false

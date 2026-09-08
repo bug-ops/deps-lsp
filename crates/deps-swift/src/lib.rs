@@ -1,3 +1,10 @@
+// `SwiftRegistry::get_versions`'s boxed-future coercion nests through several layers of
+// `tokio::join!`/`MaybeDone` combinators; rustc's default recursion limit is occasionally
+// insufficient to prove the resulting `Send` bound and downgrades a previously-silent
+// trait-solver retry into `recursion_depth_exceeding_limit`, which the new #673 fuzz CI
+// job's `-D warnings` nightly build turns into a hard error (rust-lang/rust#159228).
+#![recursion_limit = "256"]
+
 //! Swift Package Manager ecosystem support for deps-lsp.
 //!
 //! Provides LSP features for `Package.swift` files:

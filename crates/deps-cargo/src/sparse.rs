@@ -102,6 +102,9 @@ fn sparse_index_path(name: &str) -> String {
     let name_lower = name.to_lowercase();
     let chars: Vec<char> = name_lower.chars().collect();
 
+    // Each arm's indexing is safe by construction: the `3` arm only runs when
+    // `chars.len() == 3`, and `_` only when `chars.len() >= 4` (0/1/2/3 handled above).
+    #[allow(clippy::indexing_slicing)]
     match chars.len() {
         0 => name_lower,
         1 => {

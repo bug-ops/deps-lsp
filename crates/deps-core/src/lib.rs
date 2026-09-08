@@ -10,6 +10,26 @@
 //! - **HTTP Cache**: Shared caching layer with ETag/Last-Modified validation
 //! - **Error Types**: Unified error handling across all ecosystems
 
+// #673: re-enable the three cast-safety pedantic lints the workspace allows by default
+// (`Cargo.toml`'s `[workspace.lints.clippy]`), specifically for this crate — deps-core
+// computes LSP offset/length/position math from parsed, attacker-influenceable input,
+// where a silent truncation/sign-loss/precision-loss cast is exactly the class of bug
+// this issue is about. Sites confirmed safe are individually `#[allow]`ed with a
+// one-line justification, not blanket-allowed.
+#![warn(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+// #673 S5: restriction lints, scoped to this crate only via a source attribute (which
+// overrides the crate's `[lints] workspace = true` Cargo.toml table regardless of that
+// table's level) rather than a duplicated `[lints.clippy]` table in Cargo.toml — avoids
+// ~90 lines of drift-prone duplication of the workspace allow-list. Deliberately never
+// added to `[workspace.lints.clippy]` itself (the three lints must stay opt-in per crate,
+// not workspace-wide — see PR discussion). Sites confirmed safe are individually
+// `#[allow]`ed with a one-line justification, not blanket-allowed.
+#![warn(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used)]
+
 pub mod cache;
 pub mod completion;
 pub mod deps_dev;

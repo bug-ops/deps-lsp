@@ -162,6 +162,10 @@ impl PackageIndex {
     }
 
     /// The normalized name at `index`.
+    // Private method; both call sites (`lower_bound`'s binary search, `prefix_matches`'s
+    // `..self.len()` scan) only ever pass `index < self.len() == self.offsets.len() - 1`,
+    // so `index + 1 < self.offsets.len()`.
+    #[allow(clippy::indexing_slicing)]
     fn name(&self, index: usize) -> &str {
         &self.blob[self.offsets[index] as usize..self.offsets[index + 1] as usize]
     }

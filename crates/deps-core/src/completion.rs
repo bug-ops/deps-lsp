@@ -287,7 +287,11 @@ pub fn utf16_to_byte_offset(s: &str, utf16_offset: u32) -> Option<usize> {
         if utf16_count >= utf16_offset {
             return Some(byte_idx);
         }
-        utf16_count += ch.len_utf16() as u32;
+        // `char::len_utf16` always returns 1 or 2, so this cast never truncates.
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            utf16_count += ch.len_utf16() as u32;
+        }
     }
     if utf16_count == utf16_offset {
         return Some(s.len());
@@ -320,7 +324,10 @@ pub fn utf16_to_byte_offset(s: &str, utf16_offset: u32) -> Option<usize> {
 /// assert_eq!(byte_to_utf16_offset("😀test", 4), 2);
 /// ```
 pub fn byte_to_utf16_offset(s: &str, byte_offset: usize) -> u32 {
-    s[..byte_offset].encode_utf16().count() as u32
+    // Saturate rather than silently wrap: an LSP `Position.character` past `u32::MAX` UTF-16
+    // units is already meaningless, but a wrapped value would be a wrong-but-plausible one
+    // (#673 — the exact offset-math bug class #244 shipped).
+    u32::try_from(s[..byte_offset].encode_utf16().count()).unwrap_or(u32::MAX)
 }
 
 /// Extracts the prefix text from content at a position within a range.

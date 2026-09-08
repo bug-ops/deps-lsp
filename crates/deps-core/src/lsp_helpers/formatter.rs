@@ -197,6 +197,8 @@ pub trait RequirementResolution: Send + Sync {
             }
 
             // For ^0.Y, must have same minor
+            // Guarded by the length check on the same line.
+            #[allow(clippy::indexing_slicing)]
             if req_parts.len() >= 2 && ver_parts.len() >= 2 {
                 return req_parts[1] == ver_parts[1];
             }

@@ -142,6 +142,8 @@ impl PublishTime {
         // the diff can still be negative (a future `self`), so clamp that
         // case to 0 explicitly before the `as u64` cast.
         let diff = now.0.saturating_sub(self.0);
+        // `diff >= 0` is guaranteed in the `else` branch by the check on the same line.
+        #[allow(clippy::cast_sign_loss)]
         if diff < 0 { 0 } else { diff as u64 }
     }
 }

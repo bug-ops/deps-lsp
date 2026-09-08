@@ -231,7 +231,11 @@ fn quoted_lsp_range(
     )
 }
 
+// #673: fixed test-fixture lengths cast to `u32` for `Position`/`Range` assertions never
+// approach truncation range; not the request-path cast concern the crate-level `warn`
+// targets.
 #[cfg(test)]
+#[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
 
@@ -361,5 +365,64 @@ mod tests {
                 .position("does-not-exist", content, &table)
                 .is_none()
         );
+    }
+
+    // #673: property tests for JSONC parsing/position recovery, shared by every
+    // JSON-manifest ecosystem (npm, Composer, NuGet, Deno). Complements the `fuzz/`
+    // corpus with a fast, CI-covered "never panics, never returns an out-of-bounds
+    // offset" gate over arbitrary input.
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            // #673 S3: random bytes gated on `str::from_utf8` *and* `JsonAst::parse`
+            // returning `Some` (random text is essentially never valid JSON syntax) meant
+            // the original version of this property almost never reached `section.position`
+            // at all. Generates a manifest-shaped grammar instead — arbitrary `name`/
+            // `version` string pairs serialized through `serde_json` into a real
+            // `{"dependencies": {...}}` document — so parsing succeeds and position
+            // recovery actually runs on every case.
+            #[test]
+            fn parse_and_position_never_panic(
+                pairs in proptest::collection::vec(
+                    ("[a-zA-Z0-9_.-]{1,20}", "[a-zA-Z0-9_.-]{1,20}"),
+                    0..8,
+                )
+            ) {
+                let mut deps = serde_json::Map::new();
+                for (name, version) in &pairs {
+                    deps.insert(name.clone(), serde_json::Value::String(version.clone()));
+                }
+                let mut root = serde_json::Map::new();
+                root.insert("dependencies".to_string(), serde_json::Value::Object(deps));
+                let content = serde_json::to_string_pretty(&serde_json::Value::Object(root))
+                    .expect("serde_json::Value serialization is infallible");
+
+                let Some(ast) = JsonAst::parse(&content) else {
+                    return Ok(());
+                };
+                let table = LineOffsetTable::new(&content);
+                let Some(section) = ast.section("dependencies") else {
+                    return Ok(());
+                };
+
+                for (name, _) in &pairs {
+                    // Property: any returned range's start line must be a real line in
+                    // `table` — position recovery must never invent an out-of-bounds
+                    // line/offset for content it was itself derived from.
+                    if let Some((name_range, version_range)) =
+                        section.position(name, &content, &table)
+                    {
+                        prop_assert!(table.line_start(name_range.start.line as usize).is_some());
+                        if let Some(version_range) = version_range {
+                            prop_assert!(
+                                table.line_start(version_range.start.line as usize).is_some()
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }

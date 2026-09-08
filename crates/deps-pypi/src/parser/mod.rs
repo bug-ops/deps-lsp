@@ -111,6 +111,9 @@ enum MarkerToken {
 /// unquoted `'`/`"` and closes on the next occurrence of that same byte, with
 /// no escape handling — so quoted content, including non-ASCII bytes, is
 /// opaque to this scanner.
+// Every `bytes[i]` below is preceded by an `i < bytes.len()` bounds check (loop condition
+// or `if` guard); single-pass byte scanner.
+#[allow(clippy::indexing_slicing)]
 fn tokenize_marker(text: &str) -> Option<Vec<MarkerToken>> {
     let bytes = text.as_bytes();
     let mut i = 0;
@@ -335,6 +338,32 @@ fn truncate_for_log(s: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(format!("{}... ({} bytes total)", &s[..boundary], s.len()))
 }
 
+/// Extracts the leading PEP 508 name token from `s` (the part before any `[extras]`,
+/// version specifier, or whitespace) — `s` is not assumed to be trimmed. Always returns
+/// some prefix of `s`, possibly empty.
+fn pep508_leading_name(s: &str) -> &str {
+    let s = s.trim_start();
+    let is_name_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-');
+    let end = s.find(|c: char| !is_name_char(c)).unwrap_or(s.len());
+    // `find` returns either a valid char-boundary byte index into `s` or `s.len()`.
+    #[allow(clippy::indexing_slicing)]
+    &s[..end]
+}
+
+/// Whether `name` matches PEP 508's package-name grammar
+/// (`^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$`) — starts and ends with an ASCII
+/// alphanumeric, with any run of `.`/`_`/`-` allowed in between.
+///
+/// Used to pre-validate before handing a requirement to
+/// `pep508_rs::Requirement::from_str`: see the `#673` comment at its call site for why.
+fn looks_like_valid_pep508_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    let is_name_byte = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-');
+    bytes.iter().all(|&b| is_name_byte(b))
+        && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+}
+
 /// A `-r`/`-c` reference to another requirements/constraints file.
 ///
 /// Surfaced as a `textDocument/documentLink` so it can be ctrl/cmd-clicked
@@ -483,14 +512,49 @@ impl PypiParser {
             let marker_text = &requirement_str[idx..];
             marker_text.len() > MAX_MARKER_LEN || marker_too_deep(marker_text)
         });
-        let parse_str = if marker_too_complex {
-            &requirement_str[..semicolon_idx.unwrap()]
-        } else {
-            requirement_str
+        // Structurally tie the slice to the `Some` case rather than relying on
+        // `marker_too_complex` (a separately-computed bool) to imply `semicolon_idx.is_some()`
+        // — see #673: avoids an `.unwrap()` whose safety depended on reading two lines apart.
+        // `idx` is a valid byte index into `requirement_str` (from `.find(';')` above).
+        #[allow(clippy::indexing_slicing)]
+        let parse_str = match (marker_too_complex, semicolon_idx) {
+            (true, Some(idx)) => &requirement_str[..idx],
+            _ => requirement_str,
         };
 
-        let requirement = Requirement::from_str(parse_str)
-            .map_err(|e| PypiError::InvalidDependencySpec { source: e })?;
+        // #673 S4: fuzzing found `pep508_rs` 0.9.2 itself panics (rather than returning its
+        // own `Err`) on certain malformed-but-tokenizable package names — e.g. a name
+        // ending in `-`, such as `"D-"` — via an internal `PackageName` re-validation
+        // `.expect()` (`pep508_rs::lib.rs:477`; not yet reported upstream — see PR
+        // description for the tracking decision).
+        // Pre-validating the leading name token against PEP 508's own grammar rejects those
+        // cleanly before ever reaching `pep508_rs`'s tokenizer, so a document with N
+        // malformed names costs N cheap regex-shaped checks rather than N panic-unwind-log
+        // cycles on the didOpen/didChange path. `catch_unwind` below stays as a last-resort
+        // backstop for whatever this pre-check doesn't anticipate.
+        if !looks_like_valid_pep508_name(pep508_leading_name(parse_str)) {
+            tracing::warn!(
+                "PEP 508 requirement's leading name token is not a valid package name, rejecting: {}",
+                truncate_for_log(parse_str)
+            );
+            return Err(PypiError::unsupported_format(
+                "PEP 508 requirement's name does not match the PEP 508 package-name grammar",
+            ));
+        }
+
+        let requirement = match std::panic::catch_unwind(|| Requirement::from_str(parse_str)) {
+            Ok(Ok(requirement)) => requirement,
+            Ok(Err(e)) => return Err(PypiError::InvalidDependencySpec { source: e }),
+            Err(_) => {
+                tracing::warn!(
+                    "pep508_rs panicked parsing a PEP 508 requirement, rejecting: {}",
+                    truncate_for_log(parse_str)
+                );
+                return Err(PypiError::unsupported_format(
+                    "PEP 508 requirement parser panicked",
+                ));
+            }
+        };
 
         let name = requirement.name.to_string();
         let name_range = base_position
@@ -599,8 +663,13 @@ impl PypiParser {
             .map(|e| e.to_string())
             .collect();
 
-        let markers = if marker_too_complex {
-            let raw_marker = requirement_str[semicolon_idx.unwrap() + 1..].trim();
+        let markers = if let (true, Some(idx)) = (marker_too_complex, semicolon_idx) {
+            // #673: structurally tied to the `Some` case rather than a separate `.unwrap()`
+            // relying on `marker_too_complex` to imply `semicolon_idx.is_some()`. `idx` is a
+            // valid byte index into `requirement_str` (from `.find(';')`), so `idx + 1 <=
+            // requirement_str.len()`.
+            #[allow(clippy::indexing_slicing)]
+            let raw_marker = requirement_str[idx + 1..].trim();
             if raw_marker.is_empty() {
                 None
             } else {
@@ -700,5 +769,58 @@ fn normalize_marker_string(raw: &str) -> Option<String> {
             tracing::warn!("Failed to parse marker expression '{}': {}", trimmed, e);
             bounded_marker_fallback(trimmed)
         }
+    }
+}
+
+#[cfg(test)]
+mod pep508_name_tests {
+    use super::{looks_like_valid_pep508_name, pep508_leading_name};
+
+    #[test]
+    fn leading_name_stops_at_extras_bracket() {
+        assert_eq!(pep508_leading_name("requests[security]>=2.0"), "requests");
+    }
+
+    #[test]
+    fn leading_name_stops_at_whitespace() {
+        assert_eq!(pep508_leading_name("requests >=2.0"), "requests");
+    }
+
+    #[test]
+    fn leading_name_trims_leading_whitespace() {
+        assert_eq!(pep508_leading_name("  requests"), "requests");
+    }
+
+    #[test]
+    fn leading_name_of_empty_string_is_empty() {
+        assert_eq!(pep508_leading_name(""), "");
+    }
+
+    #[test]
+    fn valid_names_accepted() {
+        for name in ["requests", "a", "flask-sqlalchemy", "my.pkg_name", "A1"] {
+            assert!(looks_like_valid_pep508_name(name), "{name} should be valid");
+        }
+    }
+
+    #[test]
+    fn name_ending_in_hyphen_rejected() {
+        // #673 S4: the exact shape that panicked `pep508_rs` 0.9.2 (fuzzing).
+        assert!(!looks_like_valid_pep508_name("D-"));
+    }
+
+    #[test]
+    fn name_starting_or_ending_with_special_char_rejected() {
+        for name in ["-pkg", "pkg-", ".pkg", "pkg.", "_pkg", "pkg_"] {
+            assert!(
+                !looks_like_valid_pep508_name(name),
+                "{name} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_name_rejected() {
+        assert!(!looks_like_valid_pep508_name(""));
     }
 }

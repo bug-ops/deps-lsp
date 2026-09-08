@@ -313,6 +313,63 @@ jobs:
       - name: Build benchmarks
         run: cargo build --workspace --benches
 
+  fuzz:
+    name: Fuzz (bounded)
+    needs: [changes, fmt, check]
+    # Deliberately not in `ci-success`'s `needs` (#673): a bounded regression run, not a
+    # merge gate — a flaky/slow nightly toolchain or libFuzzer environment issue here must
+    # never block an otherwise-green PR (fuzzing did find a real bug during development —
+    # the `pep508_rs` panic in `.local/testing/regressions.md` — so this is a real signal
+    # channel, just not one that should ever fail someone else's unrelated PR).
+    # `continue-on-error: true` is a deliberate, not decorative, tradeoff: it means nobody
+    # is alerted by a red check if this job breaks (verified during review — see PR
+    # discussion). Accepted for now given this job's scope; a scheduled weekly run that
+    # files an issue on failure would close that gap and is a reasonable follow-up.
+    # `fuzz/` is its own nested workspace (see `fuzz/Cargo.toml`), independent of the root
+    # `[workspace.lints]`/`unsafe_code = "forbid"` this job's targets don't need to satisfy.
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        # `pypi_requirement` is deliberately excluded: `pep508_rs` 0.9.2 panics on certain
+        # malformed package names (see `.local/testing/regressions.md`), which the
+        # application code already catches via `catch_unwind` — but `libfuzzer-sys`
+        # installs its own panic hook that aborts on *any* panic regardless, so this
+        # target would always report a "crash" here even though the real request path is
+        # protected (verified by a passing unit test). Run it locally/manually instead.
+        target:
+          - parser_checks
+          - parse_json_checked
+          - json_ast
+          - bundler_parser
+          - go_parser
+          - swift_parser
+          - gradle_parser
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+
+      - uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3  # v1
+        with:
+          channel: nightly
+          cache: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install cargo-fuzz
+        # `taiki-e/install-action` has no `cargo-fuzz` manifest (verified: not present in
+        # https://github.com/taiki-e/install-action/tree/main/manifests) — the previous
+        # attempt here (`uses: taiki-e/install-action@...  # cargo-fuzz`, no `with.tool`)
+        # silently installed the SHA's *default* tool, cargo-deny, and this job could never
+        # actually run a fuzz target. `cargo install` from source instead.
+        run: cargo install cargo-fuzz --locked
+
+      - name: Run ${{ matrix.target }} for 60s
+        working-directory: fuzz
+        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=60
+
   release-check:
     name: Release Build Check
     needs: [test]

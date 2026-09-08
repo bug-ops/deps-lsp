@@ -1,3 +1,8 @@
+// #673: fixed test-fixture lengths cast to `u32` never approach truncation range; this
+// whole module is `#[cfg(test)]`-gated fixture support, not the request-path cast concern
+// the crate-level `warn` targets.
+#![allow(clippy::cast_possible_truncation)]
+
 //! Shared test fixtures (mock formatters, dependencies, registries) reused across
 //! this module's per-feature test suites.
 
