@@ -821,24 +821,28 @@ fn apply_vulnerability_rule(
 /// renders [`DiagnosticSeverity::ERROR`], [`ViolationReason::NotAllowed`]
 /// [`DiagnosticSeverity::WARNING`] (severity is not user-configurable: spec 010 plan.md's
 /// resolved config shape is `{ allow?, deny? }` only).
-/// Suppressed by: Gradle (issue #660/#661 critic C2, see the ecosystem check below).
+/// Suppressed by: nothing outright — Gradle's Maven Central POM license names are free
+/// text (e.g. `"The Apache Software License, Version 2.0"`), never SPDX identifiers, so
+/// they are normalized via [`crate::licenses::normalize_pom_license_names_checked`]
+/// before evaluation (issue #679; previously Gradle was excluded from this rule entirely,
+/// issue #660/#661 critic C2). An entry the normalization table doesn't recognize is
+/// dropped rather than guessed at, and if *any* of a Gradle dependency's declared
+/// license entries fails to normalize, this rule suppresses only a `NotAllowed`
+/// conclusion (issue #679 critic S1: the surviving, normalized entries are incomplete
+/// evidence — an allow-list check that fires on "no entry matches" would otherwise
+/// manufacture a false violation from the entries that happened to drop). A `Denied`
+/// conclusion is still emitted even with a partially-unrecognized license list, since a
+/// normalized entry matching `deny` is real evidence regardless of what else on the POM
+/// wasn't recognized — dropping entries can only ever *miss* a denial, never fabricate
+/// one. `Maven`'s POM shares this exact free-text `<license><name>` shape (currently
+/// unused here — `deps-maven` has no license fetch yet) — if Maven gains license
+/// support, this Gradle-specific `==` should become a shared "POM-sourced free text"
+/// property rather than a second ecosystem check (issue #679 critic M2).
 /// Suppresses: nothing.
 fn apply_license_policy_rule(diagnostics: &mut Vec<Diagnostic>, ctx: &RuleContext<'_>) {
     let Some(policy) = ctx.versions.license_policy else {
         return;
     };
-    // Gradle POM licenses are free text (e.g. Maven Central's `"The Apache Software
-    // License, Version 2.0"`), never SPDX identifiers — `deps-gradle`'s
-    // `parse_pom_licenses` returns the POM `<license><name>` verbatim. Matching that
-    // against an SPDX allow/deny list produces false positives (a compliant
-    // `Apache-2.0` dependency reported "not on the allowed license list") and false
-    // negatives (a `GPL-3.0` deny-list entry never matches "GNU General Public License
-    // v3"). Normalizing free text to SPDX is out of scope for v1 (spec 010 plan.md's "no
-    // SPDX-expression parsing" decision) — tracked as a fast-follow in issue #679. Hover
-    // still renders Gradle's free-text license as-is; only policy evaluation is skipped.
-    if ctx.versions.ecosystem == Some(crate::EcosystemId::Gradle) {
-        return;
-    }
     let Some(license) = ctx
         .versions
         .license_prefetch
@@ -846,9 +850,23 @@ fn apply_license_policy_rule(diagnostics: &mut Vec<Diagnostic>, ctx: &RuleContex
     else {
         return;
     };
+    let normalized_gradle_license;
+    let mut suppress_not_allowed = false;
+    let license: &[String] = if ctx.versions.ecosystem == Some(crate::EcosystemId::Gradle) {
+        let (normalized, all_matched) =
+            crate::licenses::normalize_pom_license_names_checked(license);
+        suppress_not_allowed = !all_matched;
+        normalized_gradle_license = normalized;
+        &normalized_gradle_license
+    } else {
+        license.as_slice()
+    };
     let Some(violation) = evaluate_license_policy(license, policy) else {
         return;
     };
+    if suppress_not_allowed && violation.reason == ViolationReason::NotAllowed {
+        return;
+    }
 
     let severity = match violation.reason {
         ViolationReason::Denied => DiagnosticSeverity::ERROR,
@@ -5819,11 +5837,13 @@ mod tests {
             );
         }
 
-        /// Issue #660/#661 critic C2: Gradle POM licenses are free text, never SPDX, so
-        /// the rule must skip evaluation entirely for Gradle rather than falsely flagging
-        /// (or falsely passing) a free-text license against an SPDX allow/deny list.
+        /// Issue #679: a Gradle POM free-text license recognized by
+        /// [`crate::licenses::normalize_pom_license_names_checked`] normalizes to its
+        /// SPDX id before evaluation, so a compliant dependency produces no diagnostic — Gradle
+        /// is no longer unconditionally excluded from this rule (issue #660/#661 critic
+        /// C2's original gate).
         #[test]
-        fn gradle_dependency_is_excluded_from_policy_evaluation() {
+        fn gradle_dependency_with_recognized_license_is_evaluated_and_compliant() {
             let formatter = MockFormatter;
             let parse_result = single_dep_parse_result();
             let mut cached_versions = HashMap::new();
@@ -5833,7 +5853,6 @@ mod tests {
             );
             let resolved_versions = HashMap::new();
             let mut license_prefetch = HashMap::new();
-            // Free-text POM license that would never match an SPDX allow-list entry.
             license_prefetch.insert(
                 PackageName::from("serde"),
                 vec!["The Apache Software License, Version 2.0".to_string()],
@@ -5855,7 +5874,277 @@ mod tests {
 
             assert!(
                 diagnostics.is_empty(),
-                "Gradle must be excluded from license-policy evaluation, got: {diagnostics:?}"
+                "normalized Apache-2.0 must be compliant with an Apache-2.0 allow-list, \
+                 got: {diagnostics:?}"
+            );
+        }
+
+        /// Issue #679: a Gradle POM free-text license that normalizes to a denied SPDX
+        /// id must produce a violation diagnostic — normalization re-enables real policy
+        /// enforcement for Gradle, not just a no-op pass-through.
+        #[test]
+        fn gradle_dependency_with_recognized_license_is_denied() {
+            let formatter = MockFormatter;
+            let parse_result = single_dep_parse_result();
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert(
+                PackageName::from("serde"),
+                PackageVersions::latest_only("1.0.0"),
+            );
+            let resolved_versions = HashMap::new();
+            let mut license_prefetch = HashMap::new();
+            license_prefetch.insert(
+                PackageName::from("serde"),
+                vec!["GNU General Public License v3".to_string()],
+            );
+            let policy = LicensePolicy::new(vec![], vec!["GPL-3.0".to_string()]);
+
+            let diagnostics = generate_diagnostics_from_cache(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions)
+                    .with_license_prefetch(&license_prefetch)
+                    .with_license_policy(&policy)
+                    .with_ecosystem(crate::EcosystemId::Gradle),
+                &formatter,
+                parse_result.uri(),
+                crate::freshness::FreshnessSettings::default(),
+                DiagnosticSeverities::default(),
+                PublishTime::now(),
+            );
+
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|d| d.message.contains("denied by policy")),
+                "normalized GPL-3.0 must be denied by a GPL-3.0 deny-list, got: {diagnostics:?}"
+            );
+        }
+
+        /// Issue #679 fail-closed contract: a Gradle POM free-text license the
+        /// normalization table doesn't recognize must never be flagged as a violation —
+        /// it is dropped before evaluation, the same as a dependency with no license
+        /// data at all (NFR-003 graceful degradation), not guessed at.
+        #[test]
+        fn gradle_dependency_with_unrecognized_license_fails_closed() {
+            let formatter = MockFormatter;
+            let parse_result = single_dep_parse_result();
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert(
+                PackageName::from("serde"),
+                PackageVersions::latest_only("1.0.0"),
+            );
+            let resolved_versions = HashMap::new();
+            let mut license_prefetch = HashMap::new();
+            license_prefetch.insert(
+                PackageName::from("serde"),
+                vec!["Some Bespoke Corporate License".to_string()],
+            );
+            let policy = LicensePolicy::new(vec!["Apache-2.0".to_string()], vec![]);
+
+            let diagnostics = generate_diagnostics_from_cache(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions)
+                    .with_license_prefetch(&license_prefetch)
+                    .with_license_policy(&policy)
+                    .with_ecosystem(crate::EcosystemId::Gradle),
+                &formatter,
+                parse_result.uri(),
+                crate::freshness::FreshnessSettings::default(),
+                DiagnosticSeverities::default(),
+                PublishTime::now(),
+            );
+
+            assert!(
+                diagnostics.is_empty(),
+                "unrecognized free-text license must never be flagged, got: {diagnostics:?}"
+            );
+        }
+
+        /// Issue #679 critic S1: a Gradle POM with one recognized and one unrecognized
+        /// license entry must never manufacture a `NotAllowed` violation from the
+        /// recognized entry alone — the unrecognized entry might have been the one that
+        /// actually satisfied the allow-list, and dropping it silently shrinks the
+        /// evidence. General form of the critic's `EPL-2.0` + `Eclipse Distribution
+        /// License` repro (the exact EDL string is now in the table, so this test uses
+        /// a still-unrecognized second entry to keep exercising the suppression path).
+        #[test]
+        fn gradle_partial_normalization_never_manufactures_false_not_allowed() {
+            let formatter = MockFormatter;
+            let parse_result = single_dep_parse_result();
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert(
+                PackageName::from("serde"),
+                PackageVersions::latest_only("1.0.0"),
+            );
+            let resolved_versions = HashMap::new();
+            let mut license_prefetch = HashMap::new();
+            license_prefetch.insert(
+                PackageName::from("serde"),
+                vec![
+                    "Eclipse Public License 2.0".to_string(),
+                    "Some Custom OEM License Addendum".to_string(),
+                ],
+            );
+            // The recognized entry (EPL-2.0) does not itself satisfy this allow-list —
+            // only the dropped, unrecognized entry could have, and this rule cannot
+            // know whether it would have.
+            let policy = LicensePolicy::new(vec!["BSD-3-Clause".to_string()], vec![]);
+
+            let diagnostics = generate_diagnostics_from_cache(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions)
+                    .with_license_prefetch(&license_prefetch)
+                    .with_license_policy(&policy)
+                    .with_ecosystem(crate::EcosystemId::Gradle),
+                &formatter,
+                parse_result.uri(),
+                crate::freshness::FreshnessSettings::default(),
+                DiagnosticSeverities::default(),
+                PublishTime::now(),
+            );
+
+            assert!(
+                diagnostics.is_empty(),
+                "partial normalization must never manufacture a NotAllowed violation, \
+                 got: {diagnostics:?}"
+            );
+        }
+
+        /// Issue #679 critic S1: unlike `NotAllowed`, a `Denied` conclusion must still
+        /// fire even when another entry on the same POM failed to normalize — a
+        /// recognized entry matching `deny` is real evidence regardless of what else
+        /// wasn't recognized (dropping entries can only ever miss a denial, never
+        /// fabricate one).
+        #[test]
+        fn gradle_partial_normalization_still_allows_denied_to_fire() {
+            let formatter = MockFormatter;
+            let parse_result = single_dep_parse_result();
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert(
+                PackageName::from("serde"),
+                PackageVersions::latest_only("1.0.0"),
+            );
+            let resolved_versions = HashMap::new();
+            let mut license_prefetch = HashMap::new();
+            license_prefetch.insert(
+                PackageName::from("serde"),
+                vec![
+                    "GNU General Public License v3".to_string(),
+                    "Some Custom OEM License Addendum".to_string(),
+                ],
+            );
+            let policy = LicensePolicy::new(vec![], vec!["GPL-3.0".to_string()]);
+
+            let diagnostics = generate_diagnostics_from_cache(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions)
+                    .with_license_prefetch(&license_prefetch)
+                    .with_license_policy(&policy)
+                    .with_ecosystem(crate::EcosystemId::Gradle),
+                &formatter,
+                parse_result.uri(),
+                crate::freshness::FreshnessSettings::default(),
+                DiagnosticSeverities::default(),
+                PublishTime::now(),
+            );
+
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|d| d.message.contains("denied by policy")),
+                "a recognized denied entry must still fire despite a sibling \
+                 unrecognized entry, got: {diagnostics:?}"
+            );
+        }
+
+        /// Tester gap: a genuinely dual-licensed Gradle POM (two distinct, both
+        /// recognized, free-text license entries) must flow through the full pipeline —
+        /// normalization inside `apply_license_policy_rule` feeding
+        /// `evaluate_license_policy`'s "any entry matches allow" logic — not just a
+        /// single-entry POM.
+        #[test]
+        fn gradle_dual_licensed_pom_is_compliant_if_any_normalized_entry_matches_allow() {
+            let formatter = MockFormatter;
+            let parse_result = single_dep_parse_result();
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert(
+                PackageName::from("serde"),
+                PackageVersions::latest_only("1.0.0"),
+            );
+            let resolved_versions = HashMap::new();
+            let mut license_prefetch = HashMap::new();
+            license_prefetch.insert(
+                PackageName::from("serde"),
+                vec![
+                    "Apache License, Version 2.0".to_string(),
+                    "GNU General Public License v3".to_string(),
+                ],
+            );
+            let policy = LicensePolicy::new(vec!["Apache-2.0".to_string()], vec![]);
+
+            let diagnostics = generate_diagnostics_from_cache(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions)
+                    .with_license_prefetch(&license_prefetch)
+                    .with_license_policy(&policy)
+                    .with_ecosystem(crate::EcosystemId::Gradle),
+                &formatter,
+                parse_result.uri(),
+                crate::freshness::FreshnessSettings::default(),
+                DiagnosticSeverities::default(),
+                PublishTime::now(),
+            );
+
+            assert!(
+                diagnostics.is_empty(),
+                "dual-licensed dependency must be compliant when the Apache-2.0 side \
+                 matches the allow-list, got: {diagnostics:?}"
+            );
+        }
+
+        /// Tester gap (continued): the same dual-licensed POM is denied when the GPL-3.0
+        /// side matches a deny-list — deny wins over allow even though the Apache-2.0
+        /// side would otherwise be compliant.
+        #[test]
+        fn gradle_dual_licensed_pom_denied_wins_over_allow() {
+            let formatter = MockFormatter;
+            let parse_result = single_dep_parse_result();
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert(
+                PackageName::from("serde"),
+                PackageVersions::latest_only("1.0.0"),
+            );
+            let resolved_versions = HashMap::new();
+            let mut license_prefetch = HashMap::new();
+            license_prefetch.insert(
+                PackageName::from("serde"),
+                vec![
+                    "Apache License, Version 2.0".to_string(),
+                    "GNU General Public License v3".to_string(),
+                ],
+            );
+            let policy =
+                LicensePolicy::new(vec!["Apache-2.0".to_string()], vec!["GPL-3.0".to_string()]);
+
+            let diagnostics = generate_diagnostics_from_cache(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions)
+                    .with_license_prefetch(&license_prefetch)
+                    .with_license_policy(&policy)
+                    .with_ecosystem(crate::EcosystemId::Gradle),
+                &formatter,
+                parse_result.uri(),
+                crate::freshness::FreshnessSettings::default(),
+                DiagnosticSeverities::default(),
+                PublishTime::now(),
+            );
+
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|d| d.message.contains("denied by policy")),
+                "GPL-3.0 side must be denied even though Apache-2.0 is also present and \
+                 allow-listed, got: {diagnostics:?}"
             );
         }
 

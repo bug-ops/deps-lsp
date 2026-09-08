@@ -664,12 +664,12 @@ Dart and Swift render the `(detected)` qualifier because their license comes fro
 a best-effort *detector*, not author-declared registry metadata — visually
 distinguishing them from every other source, including Gradle/Deno, which are
 genuinely registry-declared. Gradle's POM license is free text (e.g. `"The Apache
-Software License, Version 2.0"`), not an SPDX identifier — hover still renders it
-as-is, but see [License Policy Diagnostic](#license-policy-diagnostic-issue-661)
-below for why Gradle is excluded from policy *evaluation*. Dart/Swift have no
-license data at all without a resolved version (`pubspec.lock`/`Package.resolved`
-— both endpoints require an in-use version to look up, even though the data
-itself isn't version-specific).
+Software License, Version 2.0"`), not an SPDX identifier — hover always renders it
+as-is (unnormalized); see [License Policy Diagnostic](#license-policy-diagnostic-issue-661)
+below for how that free text is normalized to SPDX for policy *evaluation* only.
+Dart/Swift have no license data at all without a resolved version
+(`pubspec.lock`/`Package.resolved` — both endpoints require an in-use version to
+look up, even though the data itself isn't version-specific).
 
 ### License Policy Diagnostic (issue #661)
 
@@ -695,16 +695,30 @@ dropped with a logged warning at config-load time rather than rejecting the whol
   can pick whichever license they comply with).
 
 **Coverage is exactly the ecosystems [License Hover](#license-hover)'s
-background pre-fetch covers — Dart, Swift, and Deno — with one deliberate
-exception: Gradle is excluded.** Gradle's Maven Central POM licenses are free
-text (e.g. `"The Apache Software License, Version 2.0"`), never SPDX
-identifiers, so matching them against an SPDX allow/deny list would produce both
-false positives (a compliant `Apache-2.0` dependency reported "not on the
-allowed license list") and false negatives (a `GPL-3.0` deny-list entry never
-matching `"GNU General Public License v3"`). Hover still shows Gradle's
-free-text license as-is (see [License Hover](#license-hover) above) — only
-policy *evaluation* is skipped. Normalizing free text to SPDX is tracked as a
-fast-follow (issue #679).
+background pre-fetch covers — Dart, Swift, Deno, and Gradle.** Gradle's Maven
+Central POM licenses are free text (e.g. `"The Apache Software License, Version
+2.0"`), never SPDX identifiers, so directly matching them against an SPDX
+allow/deny list would produce both false positives (a compliant `Apache-2.0`
+dependency reported "not on the allowed license list") and false negatives (a
+`GPL-3.0` deny-list entry never matching `"GNU General Public License v3"`).
+`deps-core::licenses::normalize_pom_license_names` (issue #679) maps known Maven
+Central POM free-text variants (Apache/MIT/BSD/GPL/LGPL/AGPL/EPL/MPL/CDDL/ISC)
+to their canonical SPDX identifier(s) before evaluation — free text that never
+disambiguates the deprecated bare id from the current `-only`/`-or-later` split
+(e.g. `"GNU General Public License v3"`) normalizes to all three forms, so a
+`deny`/`allow` list written in either convention still matches. If *any* of a
+dependency's declared license entries fails to normalize, only a `NotAllowed`
+conclusion is suppressed for it (the surviving evidence is incomplete, so
+"nothing matched" can't be trusted); a `Denied` match on a normalized entry
+still fires regardless. A Gradle license this table doesn't recognize is never
+falsely flagged, but it is also **not enforced** — it is excluded from
+evaluation rather than guessed at, the same as a dependency with no license
+data. The table is not exhaustive; an unrecognized license on a `deny` list
+silently escapes enforcement until that variant is added to
+`KNOWN_POM_LICENSE_NAMES`. Hover still shows Gradle's free-text license as-is
+(see [License Hover](#license-hover) above); only policy *evaluation* uses the
+normalized SPDX id — the license-policy diagnostic message for Gradle therefore
+reads e.g. `Apache-2.0`, not the original free text.
 
 This diagnostic is evaluated identically whether it was triggered by a
 `textDocument/diagnostic` pull request or a background push refresh (a
