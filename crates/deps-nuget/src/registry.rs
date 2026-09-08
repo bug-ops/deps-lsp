@@ -197,25 +197,20 @@ where
 }
 
 /// Lenient `@type` deserializer: accepts a single string, an array of values (keeping only the
-/// string entries), or degrades any other shape (a bare number, `null`, an object) to an empty
-/// list — never an error, so one malformed resource entry cannot fail the whole document. No
-/// existing lenient-deserialization helper exists elsewhere in this workspace to reuse.
+/// string entries), or degrades any other shape (a bare number, `null`, an object, or a
+/// non-empty array with no string element) to an empty list — never an error, so one malformed
+/// resource entry cannot fail the whole document. `@type` has no absent-vs-empty distinction to
+/// preserve (unlike `deps-composer`'s `license`, which does), so both of
+/// [`deps_core::json_helpers::deserialize_string_or_string_array`]'s `None` and `Some(vec![])`
+/// results collapse to the same "matches no type we look for" outcome here.
 fn deserialize_type_list<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let value = serde_json::Value::deserialize(deserializer)?;
-    Ok(match value {
-        serde_json::Value::String(s) => vec![s],
-        serde_json::Value::Array(items) => items
-            .into_iter()
-            .filter_map(|v| match v {
-                serde_json::Value::String(s) => Some(s),
-                _ => None,
-            })
-            .collect(),
-        _ => Vec::new(),
-    })
+    Ok(
+        deps_core::json_helpers::deserialize_string_or_string_array(deserializer)?
+            .unwrap_or_default(),
+    )
 }
 
 /// Resolved base URLs from the NuGet service index.
@@ -1585,6 +1580,30 @@ mod tests {
             ]}"#,
         )
         .unwrap();
+        let index =
+            ServiceIndex::resolve(&response, NuGetRegistryTier::Public, &public_policy()).unwrap();
+        assert_eq!(index.package_base_address, "https://flat");
+    }
+
+    /// #662: a `@type` array with no string element at all (the
+    /// [`deps_core::json_helpers::deserialize_string_or_string_array`] `None` row) must still
+    /// degrade to "doesn't match any type we look for" via `unwrap_or_default()`, exactly like
+    /// every other malformed shape — the one truth-table row not otherwise covered by NuGet's
+    /// existing tests.
+    #[test]
+    fn test_service_index_resolve_type_array_of_non_strings_degrades() {
+        let response: ServiceIndexResponse = serde_json::from_str(
+            r#"{"version": "3.0.0", "resources": [
+                {"@id": "https://malformed/", "@type": [7, 8]},
+                {"@id": "https://flat/", "@type": "PackageBaseAddress/3.0.0"},
+                {"@id": "https://search/", "@type": "SearchQueryService"}
+            ]}"#,
+        )
+        .unwrap();
+        // Pins that the malformed resource is *retained* with an empty type list (this
+        // test's intent), not silently dropped by `deserialize_resources`'s per-entry
+        // `.ok()` fallback, which would also leave `package_base_address` resolvable.
+        assert_eq!(response.resources.len(), 3);
         let index =
             ServiceIndex::resolve(&response, NuGetRegistryTier::Public, &public_policy()).unwrap();
         assert_eq!(index.package_base_address, "https://flat");

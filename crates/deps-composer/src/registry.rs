@@ -405,59 +405,26 @@ struct MinifiedVersion {
     time: Option<String>,
     /// SPDX license identifier(s) (issue #204). `None` means "not present on this
     /// minified entry" (inherit from the previous one), distinct from `Some(vec![])`
-    /// ("this release explicitly declares no license").
+    /// ("this release explicitly declares no license") — this is the specific reason
+    /// Composer needs the richer `Option<Vec<String>>` shape rather than collapsing
+    /// straight to `Vec<String>` like `deps-nuget` does: `expand_minified_versions`
+    /// treats `Some(_)` as an explicit override into its inheritance chain, so an
+    /// absent-vs-empty distinction here is load-bearing.
     ///
     /// `composer.json`'s own `license` field is documented as either a single string
-    /// or an array of strings — [`deserialize_license`] accepts both shapes rather
-    /// than only the array form, mirroring [`Self::abandoned`]'s
-    /// `Option<serde_json::Value>` defense-in-depth: an unexpected shape here (a
-    /// bare string, or malformed data of any other JSON type) must degrade to `None`
-    /// rather than fail `serde_json::from_slice` for the *entire* `PackagistResponse`
-    /// — which would otherwise drop every version of the package, not just its
-    /// license (security review S3-2).
-    #[serde(default, deserialize_with = "deserialize_license")]
+    /// or an array of strings —
+    /// [`deps_core::json_helpers::deserialize_string_or_string_array`] accepts both
+    /// shapes (see that function's doc for the full input-shape contract), mirroring
+    /// [`Self::abandoned`]'s `Option<serde_json::Value>` defense-in-depth: an
+    /// unexpected shape here (a bare string, or malformed data of any other JSON
+    /// type) must degrade to `None` rather than fail `serde_json::from_slice` for the
+    /// *entire* `PackagistResponse` — which would otherwise drop every version of the
+    /// package, not just its license (security review S3-2).
+    #[serde(
+        default,
+        deserialize_with = "deps_core::json_helpers::deserialize_string_or_string_array"
+    )]
     license: Option<Vec<String>>,
-}
-
-/// Accepts `composer.json`'s documented `license` shapes — a single string, an array
-/// of strings, or absent/`null` — and normalizes to `Option<Vec<String>>`. Any other
-/// JSON shape (a number, object, bool, or an array containing non-string elements)
-/// degrades to `None`/skips the offending element rather than erroring the whole
-/// response (see [`MinifiedVersion::license`]'s doc).
-fn deserialize_license<'de, D>(
-    deserializer: D,
-) -> std::result::Result<Option<Vec<String>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = serde_json::Value::deserialize(deserializer)?;
-    Ok(match value {
-        serde_json::Value::String(s) => Some(vec![s]),
-        serde_json::Value::Array(entries) => {
-            // Review round 3 fix: a non-empty raw array whose every element is a
-            // non-string (a malformed `license: [7, 8]`) must degrade to `None`
-            // ("not present on this entry", inherit), not `Some(vec![])` ("this
-            // entry explicitly declares no license"). `expand_minified_versions`
-            // treats `Some(_)` as an override — a stray `Some(vec![])` here would
-            // silently overwrite an earlier real license and then get inherited by
-            // every later entry that omits `license` entirely, corrupting the whole
-            // rest of the inheritance chain from one malformed entry.
-            let had_entries = !entries.is_empty();
-            let strings: Vec<String> = entries
-                .into_iter()
-                .filter_map(|entry| match entry {
-                    serde_json::Value::String(s) => Some(s),
-                    _ => None,
-                })
-                .collect();
-            if had_entries && strings.is_empty() {
-                None
-            } else {
-                Some(strings)
-            }
-        }
-        _ => None,
-    })
 }
 
 /// Expands minified Packagist v2 versions using field inheritance.
