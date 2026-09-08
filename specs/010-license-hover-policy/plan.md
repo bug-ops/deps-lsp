@@ -210,12 +210,12 @@ is user/editor-supplied config, not external network input — validated the sam
 
 Single PR per phase is preferred over one omnibus PR, to keep the check suite fast and review
 scoped:
-1. PR 1 — Phase 1, tier 1+2 ecosystems (PyPI, Composer, Cargo, npm, Go, Maven, Bundler, NuGet):
-   highest-confidence, live-verified or well-understood sources.
-2. PR 2 — Phase 1, tier 3 ecosystems (Dart, Swift, Gradle, Deno): each needs its own live
-   verification per §1.4 before implementation.
-3. PR 3 — Phase 2 (policy diagnostics): depends on PR 1's `license: Vec<String>` data model
-   being in place.
+1. PR 1 — issue #204 (this issue), Phase 1, tier 1+2 ecosystems (PyPI, Composer, Cargo, npm, Go,
+   Maven, Bundler, NuGet): highest-confidence, live-verified or well-understood sources.
+2. PR 2 — issue #660, Phase 1, tier 3 ecosystems (Dart, Swift, Gradle, Deno): each needs its own
+   live verification per §1.4 before implementation. Blocked by PR 1.
+3. PR 3 — issue #661, Phase 2 (policy diagnostics): depends on PR 1's `license: Vec<String>`
+   data model being in place. Blocked by PR 1.
 
 ## 10. Constitution Compliance
 
