@@ -132,6 +132,10 @@ pub const MAX_FALLBACK_SCAN_BYTES: usize = 1024;
 /// [`MAX_FALLBACK_SCAN_BYTES`]), which is exact for the unescaped ASCII text most manifest
 /// values are.
 ///
+/// Returns `None` if `search_from` is past the end of `content` (checked first, before the
+/// `value.is_empty()` short-circuit below — #673 M2) or `value` cannot be located within
+/// the bounded fallback scan.
+///
 /// # Examples
 ///
 /// ```
@@ -143,20 +147,36 @@ pub const MAX_FALLBACK_SCAN_BYTES: usize = 1024;
 /// ```
 #[must_use]
 pub fn locate_value_span(content: &str, search_from: usize, value: &str) -> Option<(usize, usize)> {
+    let bytes = content.as_bytes();
+    // `search_from` is a caller-supplied byte offset (`#673`: this is a `pub fn`, so its
+    // bound is not otherwise mechanically guaranteed) — reject it upfront, before the
+    // `value.is_empty()` case below, rather than letting either slice further down panic on
+    // an out-of-range start index (#673 M2: this must run first, or an empty `value` would
+    // return `Some((search_from, search_from))` unchecked for an out-of-range `search_from`).
+    if search_from > bytes.len() {
+        return None;
+    }
     if value.is_empty() {
         return Some((search_from, search_from));
     }
-    let bytes = content.as_bytes();
-    if search_from + value.len() <= bytes.len()
-        && &bytes[search_from..search_from + value.len()] == value.as_bytes()
+    // Every slice/index from here on is bounds-checked by the `search_from <= bytes.len()`
+    // guard above combined with each expression's own `<=`/`.min(...)` clamp.
+    #[allow(clippy::indexing_slicing)]
     {
-        return Some((search_from, search_from + value.len()));
+        if search_from + value.len() <= bytes.len()
+            && &bytes[search_from..search_from + value.len()] == value.as_bytes()
+        {
+            return Some((search_from, search_from + value.len()));
+        }
     }
+    // Guarded by the `search_from <= bytes.len()` check above.
+    #[allow(clippy::indexing_slicing)]
     let line_end = bytes[search_from..]
         .iter()
         .position(|&b| b == b'\n')
         .map_or(bytes.len(), |p| search_from + p);
     let scan_end = line_end.min(search_from.saturating_add(MAX_FALLBACK_SCAN_BYTES));
+    #[allow(clippy::indexing_slicing)]
     let haystack = &bytes[search_from..scan_end];
     let needle = value.as_bytes();
     haystack
@@ -198,6 +218,15 @@ mod tests {
         let value = "actions/checkout@v4";
         let (start, end) = locate_value_span(content, 0, value).unwrap();
         assert_eq!(&content[start..end], value);
+    }
+
+    #[test]
+    fn test_locate_value_span_out_of_bounds_search_from_rejected_even_with_empty_value() {
+        // #673 M2: the `search_from > bytes.len()` guard must run before the
+        // `value.is_empty()` early return, or this returned `Some((usize::MAX, usize::MAX))`.
+        let content = "short";
+        assert_eq!(locate_value_span(content, usize::MAX, ""), None);
+        assert_eq!(locate_value_span(content, content.len() + 1, ""), None);
     }
 
     #[test]

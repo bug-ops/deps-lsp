@@ -1,3 +1,9 @@
+// #673: this entire module is test-only fixture/helper infrastructure (most of it gated
+// behind the `test-util` feature), not the request-path parsers the restriction lints
+// target — every `.unwrap()`/`.expect()` here is on a fixture `Mutex`/UTF-8 conversion
+// that cannot fail in a single-threaded test harness.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 //! Test fixtures and helpers shared across ecosystem crates.
 //!
 //! Test fixtures throughout the workspace write absolute paths in Unix

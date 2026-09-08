@@ -725,12 +725,23 @@ impl LineOffsetTable {
             .line_starts
             .partition_point(|&start| start <= offset)
             .saturating_sub(1);
+        // `line_starts` always has at least one element (`vec![0]` at construction), so
+        // `partition_point().saturating_sub(1)` is always a valid index into it.
+        #[allow(clippy::indexing_slicing)]
         let line_start = self.line_starts[line];
-        let character = content[line_start..offset]
-            .chars()
-            .map(|c| c.len_utf16() as u32)
-            .sum();
-        Position::new(line as u32, character)
+        // #673 M1: `line`/`character` are NOT bounded by `fs_probe::read_to_string_capped`
+        // or `HttpCache`'s body caps for a `textDocument/didChange` full-document-sync
+        // text sent directly by the editor, so this saturates rather than assuming an
+        // upstream cap that doesn't universally hold (mirrors
+        // `completion::byte_to_utf16_offset`'s identical fix).
+        let character = u32::try_from(
+            content[line_start..offset]
+                .chars()
+                .map(char::len_utf16)
+                .sum::<usize>(),
+        )
+        .unwrap_or(u32::MAX);
+        Position::new(u32::try_from(line).unwrap_or(u32::MAX), character)
     }
 
     /// Converts an LSP `Position` back into a byte offset — the inverse of

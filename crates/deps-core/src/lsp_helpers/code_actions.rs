@@ -713,6 +713,9 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
     // through this function that can reach here, including the registry-outage path
     // (`registry_versions.is_none()`), so an outage never drops `isPreferred` from an
     // already-built fix action.
+    // Each `*_idx` was captured as `actions.len()` immediately before its matching
+    // `push`, so it is a valid index into `actions` now (nothing is removed between).
+    #[allow(clippy::indexing_slicing)]
     if let Some(i) = vuln_idx.or(unsat_idx).or(latest_refactor_idx) {
         actions[i].is_preferred = Some(true);
     }
@@ -720,7 +723,11 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
     actions
 }
 
+// #673: fixed test-fixture lengths cast to `u32` for `Position`/`Range` fixtures never
+// approach truncation range; not the request-path cast concern the crate-level `warn`
+// targets.
 #[cfg(test)]
+#[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
     use crate::lsp_helpers::test_support::*;

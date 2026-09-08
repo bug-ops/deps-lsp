@@ -427,6 +427,8 @@ fn extract_option_target<'a>(first_token: &str, text: &'a str) -> Option<(&'a st
 /// whitespace, matching pip's `COMMENT_RE = r'(^|\s+)#.*$'`.
 fn strip_comment(line: &str) -> &str {
     let bytes = line.as_bytes();
+    // `i == 0` short-circuits before `bytes[i - 1]` is evaluated whenever `i == 0`.
+    #[allow(clippy::indexing_slicing)]
     for (i, &b) in bytes.iter().enumerate() {
         if b == b'#' && (i == 0 || bytes[i - 1].is_ascii_whitespace()) {
             return &line[..i];
@@ -1448,5 +1450,36 @@ mod tests {
             result.dependencies[0].source,
             PypiDependencySource::AlternateRegistry { .. }
         );
+    }
+
+    /// Regression for #673: fuzzing `PypiParser::parse_requirements` found `pep508_rs`
+    /// 0.9.2 itself panics (rather than returning its own `Err`) on a package name ending
+    /// in `-` (e.g. `"D-"`) — a malformed-but-tokenizable name its internal
+    /// `PackageName` re-validation doesn't expect to fail. Must degrade to skipping the
+    /// line, not crash the request path.
+    ///
+    /// Originally this exercised the `catch_unwind` backstop directly (before the #673 S4
+    /// pre-validation existed). Since S4 landed, `"D-"` is rejected by
+    /// `looks_like_valid_pep508_name` before `Requirement::from_str`/`catch_unwind` are ever
+    /// reached — `catch_unwind` itself is now covered by
+    /// `test_pep508_rs_panic_on_malformed_extra_name_is_caught` below instead. This test
+    /// still guards the same end-to-end outcome (a malformed name never panics the parser),
+    /// just via the pre-check rather than the backstop.
+    #[test]
+    fn test_malformed_package_name_rejected_by_pep508_precheck() {
+        let result = parse("D-\n");
+        assert!(result.dependencies.is_empty());
+    }
+
+    #[test]
+    fn test_pep508_rs_panic_on_malformed_extra_name_is_caught() {
+        // #673: a second, distinct `pep508_rs` 0.9.2 panic found by fuzzing (same bug
+        // class as `test_pep508_rs_panic_on_malformed_name_is_caught`, but in
+        // `ExtraName` re-validation rather than `PackageName`) — an extras entry like
+        // `1A.` (starts with a digit, ends with `.`) panics `pep508_rs::lib.rs:658`.
+        // The package-name pre-check (#673 S4) does not cover extras syntax, so this
+        // relies on the `catch_unwind` backstop, which is confirmed here to still work.
+        let result = parse("0m[1A.]\n");
+        assert!(result.dependencies.is_empty());
     }
 }

@@ -527,6 +527,9 @@ impl OsvClient {
             return ScanOutcome::Clean;
         }
 
+        // The slice upper bound is `min(vuln_ids.len(), ADVISORY_DISPLAY_CAP)`, always `<=
+        // vuln_ids.len()`.
+        #[allow(clippy::indexing_slicing)]
         let to_fetch = &vuln_ids[..vuln_ids.len().min(ADVISORY_DISPLAY_CAP)];
         let advisories = self.fetch_records(osv_eco, osv_name, to_fetch).await;
 

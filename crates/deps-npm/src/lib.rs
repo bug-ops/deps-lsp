@@ -3,6 +3,14 @@
 //! This module provides package.json parsing and npm registry integration
 //! for JavaScript/TypeScript projects.
 
+// #673: restriction lints, scoped to this crate only via a source attribute (overrides
+// this crate's `[lints] workspace = true` Cargo.toml table regardless of that table's
+// level) rather than a duplicated `[lints.clippy]` table — avoids ~90 lines of
+// drift-prone duplication of the workspace allow-list. Deliberately never added to
+// `[workspace.lints.clippy]` itself (must stay opt-in per crate, not workspace-wide).
+// Sites confirmed safe are individually `#[allow]`ed with a one-line justification.
+#![warn(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used)]
+
 pub mod catalog;
 pub mod config;
 pub mod ecosystem;

@@ -234,6 +234,8 @@ fn truncate_release_to_match(source_version: &str, latest: &str) -> Option<Strin
     if latest_release.len() < source_release_len {
         return None;
     }
+    // Guarded by the `latest_release.len() < source_release_len` early return above.
+    #[allow(clippy::indexing_slicing)]
     Some(
         latest_release[..source_release_len]
             .iter()

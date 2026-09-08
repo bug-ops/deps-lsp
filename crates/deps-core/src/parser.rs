@@ -84,6 +84,10 @@ pub const MAX_TOML_NESTING_DEPTH: usize = 64;
 /// let deep_dotted_key = format!("a{} = 1", ".a".repeat(10));
 /// assert_eq!(check_toml_nesting_depth(&deep_dotted_key, 4), Err(5));
 /// ```
+// Every `bytes[i]` below is preceded by an `i < len` bounds check (loop
+// condition or `if` guard); `dot_frames[0]` stays valid because it is the
+// permanent first element of `vec![0]` and only ever popped while `len() > 1`.
+#[allow(clippy::indexing_slicing)]
 pub fn check_toml_nesting_depth(content: &str, max_depth: usize) -> std::result::Result<(), usize> {
     let bytes = content.as_bytes();
     let len = bytes.len();
@@ -195,6 +199,8 @@ pub fn check_toml_nesting_depth(content: &str, max_depth: usize) -> std::result:
 /// the index just past its closing quote (or `bytes.len()` if unterminated —
 /// `toml_span` reports the real syntax error in that case, so it is safe for
 /// the rest of the file to be treated as string content here).
+// Every `bytes[i]` below is preceded by an `i < len` bounds check.
+#[allow(clippy::indexing_slicing)]
 fn skip_single_line_string(bytes: &[u8], mut i: usize, quote: u8) -> usize {
     let len = bytes.len();
     while i < len {
@@ -220,6 +226,8 @@ fn skip_single_line_string(bytes: &[u8], mut i: usize, quote: u8) -> usize {
 /// the closing delimiter, regardless of how many of those quotes are "extra"
 /// literal content versus the delimiter itself — the distinction does not
 /// matter here since the whole run is consumed either way.
+// Every `bytes[i]` below is preceded by an `i < len` bounds check.
+#[allow(clippy::indexing_slicing)]
 fn skip_multiline_string(bytes: &[u8], mut i: usize, quote: u8) -> usize {
     let len = bytes.len();
     while i < len {
@@ -329,6 +337,9 @@ pub const MAX_YAML_NESTING_DEPTH: usize = 64;
 /// let content = format!("a: it doesn't panic\n{}1", "- ".repeat(10));
 /// assert!(check_yaml_nesting_depth(&content, 4).is_err());
 /// ```
+// Every `bytes[i]` below is preceded by an `i < len` bounds check (loop
+// condition or `if` guard); single-pass byte scanner, see doc comment above.
+#[allow(clippy::indexing_slicing)]
 pub fn check_yaml_nesting_depth(content: &str, max_depth: usize) -> std::result::Result<(), usize> {
     let bytes = content.as_bytes();
     let len = bytes.len();
@@ -430,6 +441,8 @@ pub fn check_yaml_nesting_depth(content: &str, max_depth: usize) -> std::result:
 
 /// Advances past the rest of the current line (used for blank and comment
 /// lines), returning the index of the `\n` or `bytes.len()`.
+// Every `bytes[i]` below is preceded by an `i < len` bounds check.
+#[allow(clippy::indexing_slicing)]
 fn skip_to_eol(bytes: &[u8], mut i: usize) -> usize {
     let len = bytes.len();
     while i < len && bytes[i] != b'\n' {
@@ -450,6 +463,8 @@ fn skip_to_eol(bytes: &[u8], mut i: usize) -> usize {
 /// (impl-critic C1). `yaml-rust2` reports the real syntax error for content
 /// this treats as unterminated. Handles double-quote backslash escapes and
 /// single-quote `''` escapes.
+// Every `bytes[i]` below is preceded by an `i < len` bounds check.
+#[allow(clippy::indexing_slicing)]
 fn skip_yaml_string(bytes: &[u8], mut i: usize, quote: u8) -> usize {
     let len = bytes.len();
     while i < len && bytes[i] != b'\n' {
@@ -1047,7 +1062,10 @@ pub enum LoadingState {
     Failed,
 }
 
+// #673: fixed test-fixture constants cast to `usize` never approach truncation range; not
+// the request-path cast concern the crate-level `warn` targets.
 #[cfg(test)]
+#[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
 
@@ -1979,6 +1997,52 @@ dev_dependencies:
                 } else {
                     assert_ne!(v1, v2);
                 }
+            }
+        }
+    }
+
+    // #673: property tests for the depth/expansion checkers shared by all 14 ecosystem
+    // crates — complements the `fuzz/` corpus (which explores much longer runs but isn't
+    // part of `cargo test`) with a fast, CI-covered "never panics" gate over arbitrary
+    // input, not just the hand-picked cases above.
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            // #673 S3: generates `String` directly (always valid UTF-8) rather than random
+            // `Vec<u8>` gated on `str::from_utf8` — random bytes are valid UTF-8 with
+            // vanishing probability (~0.05% per byte for non-ASCII-heavy input), so that
+            // gate made this property almost never actually reach the function under test.
+            // `any::<String>()` resolves to proptest's default `\PC*` string strategy, which
+            // excludes *all* Unicode category-C control characters — including `\n` — so it
+            // never exercises the `b'\n'` arm (`check_toml_nesting_depth`'s `dot_frames[0]`
+            // reset) or any of `check_yaml_nesting_depth`'s block-style path (indent_stack,
+            // `- ` sequences, `skip_to_eol`), which are only reachable via newlines. Adding
+            // `\n`/`\t` back into the character class keeps those paths in play (code review).
+            #[test]
+            fn check_toml_nesting_depth_never_panics(text in "(?s)[\\PC\\n\\t]{0,256}") {
+                let _ = check_toml_nesting_depth(&text, MAX_TOML_NESTING_DEPTH);
+            }
+
+            #[test]
+            fn check_yaml_nesting_depth_never_panics(text in "(?s)[\\PC\\n\\t]{0,256}") {
+                let _ = check_yaml_nesting_depth(&text, MAX_YAML_NESTING_DEPTH);
+            }
+
+            #[test]
+            fn check_yaml_expansion_never_panics(text in any::<String>()) {
+                let _ = check_yaml_expansion(&text, MAX_YAML_EXPANDED_BYTES);
+            }
+
+            #[test]
+            fn check_json_nesting_depth_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..4096)) {
+                let _ = check_json_nesting_depth(&bytes, MAX_JSON_NESTING_DEPTH);
+            }
+
+            #[test]
+            fn parse_json_checked_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..4096)) {
+                let _ = parse_json_checked::<serde_json::Value>(&bytes);
             }
         }
     }

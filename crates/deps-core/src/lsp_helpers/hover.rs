@@ -261,9 +261,12 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     // "Recent versions" list right beneath it). An empty live list carries no such
     // contradiction risk — it has nothing to contradict — so it keeps falling back to Ch1,
     // same as when there's no live fetch.
+    // `select_latest_matching` is overridden per-ecosystem (14 implementations) with no
+    // documented in-bounds contract for the index it returns, so `.get(idx)` degrades to
+    // the fallback below rather than trusting a cross-crate convention (#673 S2).
     let latest_line: Option<(&str, Option<PublishTime>)> = match &available_versions {
         Some(v) if !v.is_empty() => live_latest_idx
-            .map(|idx| &v[idx])
+            .and_then(|idx| v.get(idx))
             .map(|live| (live.version_string().as_str(), live.published_at()))
             .or_else(|| {
                 list_fallback_latest
@@ -507,7 +510,9 @@ fn spawn_trust_signal_fetch(
 fn push_header_hover_section(markdown: &mut String, dep: &dyn Dependency, url: Option<&str>) {
     use std::fmt::Write as _;
 
-    match url {
+    // `write!` to a `&mut String` via `std::fmt::Write` is infallible — the `Result` is
+    // discarded rather than `.unwrap()`ed (#673 M3).
+    let _ = match url {
         Some(url) => write!(
             markdown,
             "# [{}]({})\n\n",
@@ -515,8 +520,7 @@ fn push_header_hover_section(markdown: &mut String, dep: &dyn Dependency, url: O
             url
         ),
         None => write!(markdown, "# {}\n\n", escape_markdown(dep.name().as_str())),
-    }
-    .unwrap();
+    };
 }
 
 /// Appends the hover "Current"/"Requirement" line. `resolved` — already selecting
@@ -530,20 +534,20 @@ fn push_current_or_requirement_hover_section(
 ) {
     use std::fmt::Write as _;
 
+    // `write!` to a `&mut String` via `std::fmt::Write` is infallible — the `Result` is
+    // discarded rather than `.unwrap()`ed (#673 M3).
     if let Some(resolved_ver) = resolved {
-        write!(
+        let _ = write!(
             markdown,
             "**Current**: {}\n\n",
             markdown_code_span(resolved_ver)
-        )
-        .unwrap();
+        );
     } else if let Some(version_req) = dep.version_requirement() {
-        write!(
+        let _ = write!(
             markdown,
             "**Requirement**: {}\n\n",
             markdown_code_span(version_req.as_str())
-        )
-        .unwrap();
+        );
     }
 }
 
@@ -554,12 +558,13 @@ fn push_markers_hover_section(markdown: &mut String, dep: &dyn Dependency) {
     use std::fmt::Write as _;
 
     if let Some(marker_expr) = dep.markers() {
-        write!(
+        // `write!` to a `&mut String` via `std::fmt::Write` is infallible — the `Result` is
+        // discarded rather than `.unwrap()`ed (#673 M3).
+        let _ = write!(
             markdown,
             "**Active when**: {}\n\n",
             markdown_code_span(marker_expr)
-        )
-        .unwrap();
+        );
     }
 }
 
@@ -582,9 +587,11 @@ fn push_latest_hover_section(
     };
     let published_at = freshness.enabled.then_some(raw_published_at).flatten();
     let age_secs = published_at.map(|p| p.age_secs_from(now));
-    write!(markdown, "**Latest**: {}", markdown_code_span(latest_ver)).unwrap();
+    // `write!` to a `&mut String` via `std::fmt::Write` is infallible — the `Result` is
+    // discarded rather than `.unwrap()`ed (#673 M3).
+    let _ = write!(markdown, "**Latest**: {}", markdown_code_span(latest_ver));
     if let Some(age_secs) = age_secs {
-        write!(markdown, " *(published {})*", format_relative_age(age_secs)).unwrap();
+        let _ = write!(markdown, " *(published {})*", format_relative_age(age_secs));
     }
     markdown.push_str("\n\n");
     if age_secs.is_some_and(|age| is_within_cooldown(age, freshness.cooldown_secs)) {
@@ -632,32 +639,32 @@ fn push_recent_versions_hover_section(
         } else {
             String::new()
         };
+        // `writeln!` to a `&mut String` via `std::fmt::Write` is infallible — the `Result`
+        // is discarded rather than `.unwrap()`ed (#673 M3).
         if Some(i) == live_latest_idx {
             if version.removal_status().is_flagged() {
                 // The resolved "latest" can itself be flagged (e.g. npm's ranking
                 // preference falls through to a deprecated version when no clean one
                 // exists) — the deprecation/yank warning must not silently vanish just
                 // because this entry also carries the `(latest)` marker (#347/#348 S1).
-                writeln!(
+                let _ = writeln!(
                     markdown,
                     "- {version_span} *(latest)* {}{age_suffix}",
                     formatter.yanked_label()
-                )
-                .unwrap();
+                );
             } else {
-                writeln!(markdown, "- {version_span} *(latest)*{age_suffix}").unwrap();
+                let _ = writeln!(markdown, "- {version_span} *(latest)*{age_suffix}");
             }
         } else if version.removal_status().is_flagged() {
-            writeln!(
+            let _ = writeln!(
                 markdown,
                 "- {} {}{}",
                 version_span,
                 formatter.yanked_label(),
                 age_suffix
-            )
-            .unwrap();
+            );
         } else {
-            writeln!(markdown, "- {version_span}{age_suffix}").unwrap();
+            let _ = writeln!(markdown, "- {version_span}{age_suffix}");
         }
     }
 }
@@ -803,20 +810,21 @@ fn push_deprecation_hover_section(
 fn push_vulnerability_hover_section(markdown: &mut String, outcome: Option<&ScanOutcome>) {
     use std::fmt::Write;
 
+    // `writeln!` to a `&mut String` via `std::fmt::Write` is infallible — the `Result` is
+    // discarded rather than `.unwrap()`ed (#673 M3).
     match outcome {
         Some(ScanOutcome::Vulnerable(dv)) => {
             markdown.push_str("### Security advisories\n\n");
 
             for advisory in dv.advisories.items() {
-                writeln!(
+                let _ = writeln!(
                     markdown,
                     "- **[{}]({})** — {}",
                     escape_markdown(&advisory.id),
                     advisory.url,
                     severity_label(advisory.severity)
-                )
-                .unwrap();
-                writeln!(
+                );
+                let _ = writeln!(
                     markdown,
                     "  {}",
                     escape_markdown(
@@ -825,8 +833,7 @@ fn push_vulnerability_hover_section(markdown: &mut String, outcome: Option<&Scan
                             .as_deref()
                             .unwrap_or("(no summary provided)")
                     )
-                )
-                .unwrap();
+                );
 
                 let mut details = Vec::with_capacity(2);
                 if let Some(fixed) = advisory.fixed_versions.last() {
@@ -839,24 +846,23 @@ fn push_vulnerability_hover_section(markdown: &mut String, outcome: Option<&Scan
                     ));
                 }
                 if !details.is_empty() {
-                    writeln!(markdown, "  {}", details.join(" \u{b7} ")).unwrap();
+                    let _ = writeln!(markdown, "  {}", details.join(" \u{b7} "));
                 }
             }
 
             let remaining = dv.advisories.remaining();
             if remaining > 0 {
-                writeln!(markdown, "- *(+{remaining} more advisories)*").unwrap();
+                let _ = writeln!(markdown, "- *(+{remaining} more advisories)*");
             }
 
             if let crate::osv::UpgradeStatus::CandidateVulnerable { version, .. } =
                 &dv.upgrade_status
             {
-                writeln!(
+                let _ = writeln!(
                     markdown,
                     "\n\u{26a0}\u{fe0f} Latest version {} is also affected.",
                     markdown_code_span(version)
-                )
-                .unwrap();
+                );
             }
 
             markdown.push('\n');
@@ -913,12 +919,13 @@ fn push_trust_signal_hover_section(markdown: &mut String, signal: Option<&Supply
         parts.push(format!("Provenance: {label}"));
     }
 
-    writeln!(
+    // `writeln!` to a `&mut String` via `std::fmt::Write` is infallible — the `Result` is
+    // discarded rather than `.unwrap()`ed (#673 M3).
+    let _ = writeln!(
         markdown,
         "\u{1f510} **Supply chain**: {}",
         parts.join(" \u{b7} ")
-    )
-    .unwrap();
+    );
     markdown.push('\n');
 }
 
@@ -940,6 +947,8 @@ const MAX_LICENSE_ID_CHARS: usize = 128;
 /// registry-reported data, not validated or bounded upstream.
 fn format_license_list(licenses: &[String]) -> String {
     let shown = licenses.len().min(MAX_LICENSE_ENTRIES_RENDERED);
+    // `shown` is `min(licenses.len(), MAX_LICENSE_ENTRIES_RENDERED)`, always `<= licenses.len()`.
+    #[allow(clippy::indexing_slicing)]
     let mut rendered: Vec<String> = licenses[..shown]
         .iter()
         .map(|l| markdown_code_span(&super::truncate_for_diagnostic(l, MAX_LICENSE_ID_CHARS)))
@@ -993,12 +1002,13 @@ fn push_license_hover_section(
         return;
     }
 
-    write!(
+    // `write!` to a `&mut String` via `std::fmt::Write` is infallible — the `Result` is
+    // discarded rather than `.unwrap()`ed (#673 M3).
+    let _ = write!(
         markdown,
         "**License**: {}",
         format_license_list(resolved_license)
-    )
-    .unwrap();
+    );
 
     match latest_license {
         None => {}
@@ -1006,20 +1016,22 @@ fn push_license_hover_section(
             markdown.push_str(" *(latest version license unavailable)*");
         }
         Some(latest) if license_sets_differ(resolved_license, latest) => {
-            write!(
+            let _ = write!(
                 markdown,
                 "\n\n\u{26a0}\u{fe0f} **License changed**: {} \u{2192} {}",
                 format_license_list(resolved_license),
                 format_license_list(latest)
-            )
-            .unwrap();
+            );
         }
         Some(_) => {}
     }
     markdown.push_str("\n\n");
 }
 
+// #673: fixed test-fixture lengths cast to `u32` for `Position` fixtures never approach
+// truncation range; not the request-path cast concern the crate-level `warn` targets.
 #[cfg(test)]
+#[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
     use crate::RemovalStatus;

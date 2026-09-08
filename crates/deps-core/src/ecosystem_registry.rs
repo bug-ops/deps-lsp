@@ -526,6 +526,9 @@ fn directory_pattern_matches(path: &str, filename: &str, dir_pattern: &str, suff
         return false;
     };
     let dir_path = dir_path.trim_end_matches('/');
+    // `n` comes from `checked_sub` and is matched separately from the `Some(0)` arm, so
+    // `1 <= n <= dir_path.len()`, making `n - 1` a valid index into `dir_path`.
+    #[allow(clippy::indexing_slicing)]
     match dir_path.len().checked_sub(dir_pattern.len()) {
         Some(0) => dir_path == dir_pattern,
         Some(n) => dir_path.ends_with(dir_pattern) && dir_path.as_bytes()[n - 1] == b'/',

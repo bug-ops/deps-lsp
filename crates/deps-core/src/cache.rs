@@ -502,6 +502,9 @@ fn build_client_inner(
     redirect: reqwest::redirect::Policy,
     resolver: BlockedAddrResolver,
 ) -> Client {
+    // Fixed, hardcoded client configuration — no attacker-influenced input; can only
+    // fail on a genuinely broken TLS backend, which is unrecoverable anyway.
+    #[allow(clippy::expect_used)]
     Client::builder()
         .user_agent(format!("deps-lsp/{}", env!("CARGO_PKG_VERSION")))
         .timeout(std::time::Duration::from_secs(HTTP_TIMEOUT_SECS))
@@ -1226,6 +1229,10 @@ impl HttpCache {
         url: &str,
         extra_headers: &[(header::HeaderName, &str)],
     ) -> Result<Bytes> {
+        // Poisoned only if another thread panicked while holding the lock, at which point
+        // the process is already in an unrecoverable state — propagating via panic here
+        // matches the standard `RwLock` poisoning contract.
+        #[allow(clippy::expect_used)]
         let transport = self
             .workspace
             .read()
@@ -1262,10 +1269,15 @@ impl HttpCache {
         }
         self.policy.set(value);
         let rebuilt = Transport::workspace(&self.policy);
-        *self
-            .workspace
-            .write()
-            .expect("workspace transport lock poisoned") = rebuilt;
+        // Poisoned only if another thread panicked while holding the lock — see the
+        // matching justification on `get_cached_workspace_with_headers` above.
+        #[allow(clippy::expect_used)]
+        {
+            *self
+                .workspace
+                .write()
+                .expect("workspace transport lock poisoned") = rebuilt;
+        }
         #[cfg(test)]
         self.workspace_rebuilds.fetch_add(1, Ordering::Relaxed);
 

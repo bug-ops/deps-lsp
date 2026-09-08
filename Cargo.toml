@@ -1,6 +1,9 @@
 [workspace]
 members = ["crates/*"]
-exclude = ["crates/deps-zed"]
+# `crates/deps-zed` is a separate git submodule/repo; `fuzz` is cargo-fuzz's own nested
+# workspace (see `fuzz/Cargo.toml`'s `[workspace]` table) with dependency needs and
+# `unsafe_code`/lint requirements that don't fit this workspace's `[workspace.lints]` (#673).
+exclude = ["crates/deps-zed", "fuzz"]
 resolver = "3"
 
 [workspace.package]
@@ -40,6 +43,7 @@ mockito = "1"
 node-semver = "2.2"
 pep440_rs = "0.7"
 pep508_rs = "0.9"
+proptest = "1.11"
 quick-xml = "0.42"
 regex = "1"
 reqwest = "0.13"

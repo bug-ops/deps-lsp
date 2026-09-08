@@ -3,6 +3,13 @@
 # shard for the duration of the await. Activates the already-enabled
 # `clippy::await_holding_invalid_type` lint (see `[workspace.lints.clippy]` in the
 # root `Cargo.toml`) for these types project-wide.
+# Restriction lints added for #673 (indexing_slicing/unwrap_used/expect_used) guard
+# the request path; idiomatic `.unwrap()`/`[idx]` in test code is not part of that
+# threat model, so exempt test functions/modules and `tests/` integration binaries.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-indexing-slicing-in-tests = true
+
 await-holding-invalid-types = [
     { path = "dashmap::mapref::one::Ref", reason = "holds a DashMap shard lock; release it before awaiting (see `ServerState::with_document`)" },
     { path = "dashmap::mapref::one::RefMut", reason = "holds a DashMap shard lock; release it before awaiting (see `ServerState::with_document`)" },
