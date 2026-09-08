@@ -59,7 +59,7 @@ status: moc
 | 035 | [[035-nuget-private-feed-support/spec\|NuGet private/custom feed support (NuGet.Config packageSources)]] | specify | shipped — research/parity, P3 (PR #560, issue #523) |
 | 036 | [[036-composer-uppercase-v-prefix-bug/spec\|Composer requirement matching fails for uppercase-V-prefixed versions]] | specify | shipped — bug, P1 (PR #538, issue #534) |
 | 037 | [[037-supply-chain-trust-signal/spec\|Supply-chain trust signal (OpenSSF Scorecard + SLSA provenance) via deps.dev]] | plan | shipped — research/parity, P3 (PR #554, issue #543) |
-| 038 | [[038-workspace-diagnostics-pull-support/spec\|Workspace Diagnostics Pull Support]] | specify | draft — research/enhancement, P4, 4 open `[NEEDS CLARIFICATION]` items (issue #547) |
+| 038 | [[038-workspace-diagnostics-pull-support/spec\|Workspace Diagnostics Pull Support]] | specify | parked — research/enhancement, P4, adoption-question resolved 2026-09-08 (wait for client support), 3 open plan-level `[NEEDS CLARIFICATION]` items remain moot until revisited (issue #547) |
 | 039 | [[039-github-rate-limit-actionable-diagnostic/spec\|Actionable rate-limit hint in registry diagnostics]] | specify | shipped — bug, P1 (PR #485, issue #478) |
 | 040 | [[040-github-token-redaction-trusted-origin-pin/spec\|GitHub auth token redaction and trusted-origin pinning]] | specify | shipped — security/hardening, P3 (PR #487, issue #484) |
 | 041 | [[041-credential-redaction-hardening/spec\|Redact user:pass@ credentials from registry-index logs and errors]] | specify | shipped — security, P2, two stages (PR #529 issue #522, PR #540 issue #536) |

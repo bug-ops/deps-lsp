@@ -9,7 +9,7 @@ tags:
   - diagnostics
   - research
 created: 2026-09-03
-status: draft
+status: parked
 related:
   - "[[constitution]]"
   - "[[015-lsp-3-18-diagnostic-markup-tooltip-gap/spec|LSP 3.18 diagnostic markup / command-tooltip gap]]"
@@ -241,12 +241,38 @@ enough to proceed to `/sdd plan`.
 
 ## 9. Open Questions
 
-- [NEEDS CLARIFICATION: Given confirmed uneven client-side support for
+- **RESOLVED (2026-09-08)**: Given confirmed uneven client-side support for
   `workspace/diagnostic` as of September 2026 (narrower than the already
   patchy `textDocument/diagnostic` adoption), should deps-lsp implement this
   now as a differentiator bet, or wait for broader editor adoption and
   revisit in a future research cycle? Affects FR-001's "should" and whether
-  this spec proceeds to `/sdd plan` at all.]
+  this spec proceeds to `/sdd plan` at all.
+
+  **Decision: wait.** Targeted research against the three editors most
+  relevant to deps-lsp's user base confirms zero current client-side demand:
+  - **Zed** implements only `textDocument/diagnostic` (per-document pull,
+    zed-industries/zed#19230, #23639); `workspace_diagnostic` is explicitly
+    tracked as missing, though some result-id groundwork exists.
+  - **Neovim**'s built-in LSP client defaults to the push model
+    (`publishDiagnostics`) and does not issue `workspace/diagnostic`
+    requests.
+  - **Helix** implements only `textDocument/diagnostic`
+    (helix-editor/helix#11315, #7900); no `workspace/diagnostic` client
+    support.
+  - **rust-analyzer** (checked as a reference Rust LSP *server*, not a
+    client analogue) implements `workspace/diagnostic/refresh` —
+    server-initiated notice to re-pull — which is a different capability
+    from a client actually sending `workspace/diagnostic` for many files
+    at once, so it is not evidence of client-side demand either.
+
+  Implementing this now would add new, non-trivial surface area (workspace-
+  folder enumeration, result-ID caching — both currently absent from the
+  codebase) with no editor in deps-lsp's primary support set able to
+  exercise it. This spec is **parked**, not abandoned: revisit in a future
+  `continuous-improvement` research cycle once client-side adoption of
+  `workspace/diagnostic` broadens (watch Zed's `workspace_diagnostic`
+  tracking issue and Helix/Neovim client-capability changes as the trigger
+  signal).
 - [NEEDS CLARIFICATION: Should the workspace-pull diagnostic generation path
   reuse `generate_diagnostics_from_cache` as-is (now ~87 lines post-#500
   refactor, called once per manifest), or does aggregating results across
