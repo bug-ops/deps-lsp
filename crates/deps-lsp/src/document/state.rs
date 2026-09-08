@@ -195,7 +195,7 @@ impl ColdStartLimiter {
         if let Some(mut entry) = self.last_attempts.get_mut(uri) {
             let elapsed = now.duration_since(*entry);
             if elapsed < min_interval {
-                let retry_after = min_interval.checked_sub(elapsed).unwrap();
+                let retry_after = min_interval.saturating_sub(elapsed);
                 tracing::warn!(
                     "Cold start rate limited for {:?} (retry after {:?})",
                     uri,
