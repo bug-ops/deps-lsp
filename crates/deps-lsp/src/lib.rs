@@ -1,3 +1,16 @@
+// #676: `clippy::indexing_slicing`/`unwrap_used`/`expect_used` (from #673) don't cover
+// `str` range slicing — that's `clippy::string_slice` — and every #244-class byte/UTF-16
+// offset bug site in this crate is a `str` slice, so add it as a fourth lint. Source
+// attribute (not a `[lints.clippy]` Cargo.toml table) mirrors `deps-core/src/lib.rs`;
+// `main.rs` is a separate crate root and needs the same attribute independently. Sites
+// confirmed safe are individually `#[allow]`ed with a one-line justification.
+#![warn(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::string_slice
+)]
+
 pub mod config;
 pub mod document;
 pub mod file_watcher;

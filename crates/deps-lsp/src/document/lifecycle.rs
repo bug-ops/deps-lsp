@@ -38,6 +38,7 @@ type DepSources = Vec<(PackageName, deps_core::parser::DependencySource)>;
 /// `ecosystem.id()` always originates from a statically registered ecosystem
 /// (see `crate::register_ecosystems`), so parsing it back to `EcosystemId` can
 /// only fail on an internal registration bug, not on user input.
+#[allow(clippy::expect_used)] // safe per the invariant documented above
 fn resolve_ecosystem_id(ecosystem: &dyn Ecosystem) -> EcosystemId {
     ecosystem
         .id()
@@ -1833,6 +1834,9 @@ async fn run_document_open_background_task(
     // progress notifications. `P` is deliberately independent of
     // `cache.max_concurrent_fetches` (that bounds dependencies within one document's
     // fetch; this bounds documents fetching at once).
+    // `state.fetch_permits` is never `.close()`d anywhere in deps-lsp, so `acquire()`
+    // cannot return `Closed`.
+    #[allow(clippy::expect_used)]
     let fetch_permit = state
         .fetch_permits
         .acquire()
@@ -2201,6 +2205,9 @@ pub async fn handle_document_change(
         config,
     )
     .await?;
+    // `CommitGuard::Unconditional` always commits, so `handle_document_change_guarded`
+    // never returns `Ok(None)` for it.
+    #[allow(clippy::expect_used)]
     Ok(task.expect("CommitGuard::Unconditional never skips the commit"))
 }
 
@@ -2430,6 +2437,9 @@ async fn run_document_change_task(
     // before the failure toast / OSV phase B / diagnostics publish — none of those take a
     // permit themselves, and OSV phase A (spawned separately, above) never does either, so
     // there is no permit-holder-awaits-permit-taker deadlock shape here.
+    // `state.fetch_permits` is never `.close()`d anywhere in deps-lsp, so `acquire()`
+    // cannot return `Closed`.
+    #[allow(clippy::expect_used)]
     let fetch_permit = state
         .fetch_permits
         .acquire()

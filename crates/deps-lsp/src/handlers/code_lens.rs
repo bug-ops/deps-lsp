@@ -344,6 +344,9 @@ mod tests {
     /// asserts the *resulting document text is a valid, re-parseable declaration* (not
     /// merely "an edit exists"); every "skipped" fixture asserts no edit is produced at
     /// all, proving the guard — not the absence of a fixture — is what stops it.
+    // `clippy::string_slice` has no `allow-*-in-tests` clippy.toml knob (unlike
+    // indexing_slicing/unwrap_used/expect_used), so it needs an explicit allow here.
+    #[allow(clippy::string_slice)]
     mod cross_ecosystem_tests {
         use super::*;
         use std::collections::HashMap;

@@ -302,7 +302,11 @@ async fn fallback_completion(
 fn extract_prefix(line: &str, character: u32, ecosystem_kind: EcosystemId) -> &str {
     let prefix_end =
         deps_core::completion::utf16_to_byte_offset(line, character).unwrap_or(line.len());
-    let prefix = line[..prefix_end].trim();
+    debug_assert!(
+        line.is_char_boundary(prefix_end),
+        "prefix_end must be a char boundary"
+    );
+    let prefix = line.get(..prefix_end).unwrap_or(line).trim();
     if uses_json_quoted_keys(ecosystem_kind) || uses_toml_string_array_values(ecosystem_kind) {
         prefix.trim_matches('"')
     } else if uses_xml_tag_values(ecosystem_kind) {
@@ -356,7 +360,11 @@ const fn uses_xml_tag_values(ecosystem_kind: EcosystemId) -> bool {
 /// `detect_xml_context`'s own "no context" outcome for that position, since its
 /// `between.contains("</")` guard rejects it too).
 fn strip_leading_xml_tag(prefix: &str) -> &str {
-    prefix.rfind('>').map_or(prefix, |gt| &prefix[gt + 1..])
+    // `>` is a single-byte ASCII char, so `gt + 1` is always a valid char boundary.
+    #[allow(clippy::string_slice)]
+    {
+        prefix.rfind('>').map_or(prefix, |gt| &prefix[gt + 1..])
+    }
 }
 
 /// Whether `ecosystem_kind`'s manifest keys are typed as JSON string literals
@@ -616,6 +624,8 @@ fn strip_trailing_toml_comment(line: &str) -> &str {
             Some(quote) if ch == quote => in_string = None,
             Some(_) => {}
             None if ch == '"' || ch == '\'' => in_string = Some(ch),
+            // `idx` comes from `char_indices`, so it is always a char boundary.
+            #[allow(clippy::string_slice)]
             None if ch == '#' => return line[..idx].trim_end(),
             None => {}
         }
@@ -724,6 +734,10 @@ fn is_in_xml_tag_section(content: &str, line_number: usize, tag: &str) -> bool {
 /// Counts real `<{open_prefix}...>` tag occurrences on `line`, i.e. `open_prefix`
 /// followed by `>` or whitespace (an attribute) rather than more tag-name characters
 /// (so `<dependencies` doesn't also match a longer, unrelated tag name).
+// `search_from` starts at 0 and is only ever advanced to `idx + open_prefix.len()`,
+// where `idx` is a `str::find` match start (always a char boundary) and the offset
+// lands exactly at the end of that matched substring (also always a char boundary).
+#[allow(clippy::string_slice)]
 fn count_open_tags(line: &str, open_prefix: &str) -> usize {
     let mut count = 0;
     let mut search_from = 0;

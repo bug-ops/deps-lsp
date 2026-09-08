@@ -499,7 +499,10 @@ impl LanguageServer for Backend {
                 .state
                 .gitlab_instance_host
                 .write()
-                .expect("gitlab_instance_host lock poisoned") = gitlab_instance_host;
+                // The write below is a single infallible assignment, so this lock can
+                // never actually be poisoned; recover rather than propagate for
+                // defense in depth.
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = gitlab_instance_host;
             self.state.cache.set_offline(config.network.offline);
             self.state.cache.set_cache_enabled(config.cache.enabled);
             self.state
@@ -694,7 +697,10 @@ impl LanguageServer for Backend {
             .state
             .gitlab_instance_host
             .write()
-            .expect("gitlab_instance_host lock poisoned") = gitlab_instance_host;
+            // The write below is a single infallible assignment, so this lock can
+            // never actually be poisoned; recover rather than propagate for defense
+            // in depth.
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = gitlab_instance_host;
         // Must land before either refresh notification below, or the refresh re-renders
         // diagnostics under the stale flag values (critic M5).
         self.state.cache.set_offline(offline);

@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: OSV malicious-package advisories (`MAL-*` id or alias) now classify as a distinct `VulnSeverity::Malicious` instead of falling through to "unknown severity" in hover/diagnostics (resolves #646) (#652)
 - `fuzz/` workspace: cargo-fuzz targets for the shared TOML/YAML/JSON depth checkers, JSONC position recovery, and the Bundler/Go/Swift/Gradle/PyPI parsers, plus a bounded (non-blocking) CI job running each nightly-toolchain (resolves #673)
 - **deps-core, deps-cargo, deps-npm, deps-pypi**: clippy restriction lints (`indexing_slicing`/`unwrap_used`/`expect_used`) plus deps-core's re-enabled `cast_*` truncation lints, as a regression gate against panic-DoS bugs in the request-path parsers (resolves #673, deps-lsp follow-up #676)
+- **deps-lsp**: clippy restriction lints (`indexing_slicing`/`unwrap_used`/`expect_used`/`string_slice`) enforced at the crate root (resolves #676; `string_slice` coverage for the rest of the workspace tracked in #680)
 - **deps-core**: property tests (`proptest`) asserting the parser depth/expansion checkers and JSONC position recovery never panic on arbitrary input (#673)
 
 ### Fixed
