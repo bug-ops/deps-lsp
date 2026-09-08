@@ -587,6 +587,276 @@ mod tests {
         );
     }
 
+    /// Whether `formatter`'s own comparator (preferring
+    /// [`deps_core::lsp_helpers::RequirementResolution::compile_requirement`], falling back to
+    /// [`deps_core::lsp_helpers::RequirementResolution::version_satisfies_requirement`] when it
+    /// declines to compile) treats a bare `requirement` as an exact pin: it must match
+    /// `requirement` itself but reject both a higher patch (`"1.2.9"`) and a higher
+    /// minor/major (`"9.9.9"`) — the same "matches only this one version" shape
+    /// [`deps_core::lsp_helpers::concrete_pin_version`] asserts. Also correctly says `false`
+    /// for a genuine partial-version range (e.g. `"1.2"`), since that legitimately matches
+    /// more than one candidate.
+    #[cfg(any(
+        feature = "cargo",
+        feature = "npm",
+        feature = "go",
+        feature = "bundler",
+        feature = "dart",
+        feature = "maven",
+        feature = "composer",
+        feature = "gradle",
+        feature = "nuget",
+        feature = "deno",
+        feature = "github-actions",
+        feature = "gitlab-ci",
+        feature = "swift",
+        feature = "pypi"
+    ))]
+    fn formatter_treats_bare_version_as_exact_pin(
+        formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
+        bare: &str,
+    ) -> bool {
+        use deps_core::{ConcreteVersion, VersionReq};
+
+        let requirement = VersionReq::new(bare);
+        let matches = |candidate: &str| -> bool {
+            let version = ConcreteVersion::from(candidate);
+            if let Some(matcher) = formatter.compile_requirement(&requirement) {
+                matcher.matches(&version) == Some(true)
+            } else {
+                formatter.version_satisfies_requirement(&version, bare)
+            }
+        };
+
+        matches(bare) && !matches("9.9.9") && !matches("1.2.9")
+    }
+
+    /// How a given ecosystem's bare-version-is-a-pin verdict relates to its own formatter's
+    /// comparator — see [`bare_version_agreement_expectation`].
+    #[cfg(any(
+        feature = "cargo",
+        feature = "npm",
+        feature = "go",
+        feature = "bundler",
+        feature = "dart",
+        feature = "maven",
+        feature = "composer",
+        feature = "gradle",
+        feature = "nuget",
+        feature = "deno",
+        feature = "github-actions",
+        feature = "gitlab-ci",
+        feature = "swift",
+        feature = "pypi"
+    ))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum BareVersionAgreementExpectation {
+        /// `deps-core`'s `concrete_pin_version` and the ecosystem's own comparator must
+        /// agree on whether a bare full version (`"1.2.3"`) is an exact pin. When `true`,
+        /// also checked against a bare *partial* version (`"1.2"`, impl-critic M1) —
+        /// gated per-ecosystem because a partial-version *requirement* is not a concept
+        /// every `Concrete`-policy ecosystem actually has: Go's own comparator, for
+        /// instance, treats a bare string as a version *prefix* to support pseudo-version
+        /// and `+incompatible`-suffix matching (`go_version_matches`), which makes it
+        /// (correctly, for its real purpose) accept `"1.2"` against a candidate `"1.2.9"`
+        /// — a false "divergence" against `deps-core` if compared as though `"1.2"` were
+        /// a genuine partial-version requirement, which go.mod's `require` directive
+        /// never actually contains (it is always a complete version). Only the
+        /// ecosystems with a real bare-partial-is-a-range grammar (`AlwaysRange`'s Cargo
+        /// caret, `ConcreteIfFullVersion`'s X-range/moving-tag ecosystems) get `true`.
+        Checked { test_partial: bool },
+        /// The ecosystem's own comparator would disagree with `deps-core`'s verdict, but
+        /// the parser can never actually emit a bare requirement in the first place, so the
+        /// divergence never reaches `concrete_pin_version` in practice (Swift, PyPI).
+        LatentOnly,
+        /// `deps-core` deliberately reports a bare requirement as a pin even though the
+        /// ecosystem's own comparator disagrees — a documented approximation, not an
+        /// oversight (NuGet).
+        DeliberateApproximation,
+    }
+
+    /// #669 regression guard: `deps-core`'s `bare_requirement_policy` hand-maintains a
+    /// per-ecosystem model of "is a bare version requirement a pin or a range", but every
+    /// ecosystem's own formatter already has the authoritative answer via
+    /// `compile_requirement`/`version_satisfies_requirement`, and nothing kept the two in
+    /// sync — this already caused two shipped bugs (#664 npm/Composer, #667 Deno). For every
+    /// ecosystem this crate can register, classifies it via [`BareVersionAgreementExpectation`]
+    /// and checks the matching invariant: `Checked` ecosystems must agree on both a bare full
+    /// version (`"1.2.3"`) and a bare partial version (`"1.2"`, impl-critic M1); `LatentOnly`
+    /// and `DeliberateApproximation` ecosystems must instead still exhibit the disagreement
+    /// their exemption relies on (impl-critic M2) — so an alignment on either side (a parser
+    /// change, a comparator change) fails this test instead of silently going stale.
+    ///
+    /// The `match` in [`bare_version_agreement_expectation`] is deliberately exhaustive
+    /// (`.claude/CLAUDE.md`'s bug-class-#118 rule): a future 15th ecosystem must get an
+    /// explicit arm — added to `Checked` or listed as a commented, reviewed exemption —
+    /// rather than silently falling through a wildcard.
+    #[cfg(any(
+        feature = "cargo",
+        feature = "npm",
+        feature = "go",
+        feature = "bundler",
+        feature = "dart",
+        feature = "maven",
+        feature = "composer",
+        feature = "gradle",
+        feature = "nuget",
+        feature = "deno",
+        feature = "github-actions",
+        feature = "gitlab-ci",
+        feature = "swift",
+        feature = "pypi"
+    ))]
+    fn bare_version_agreement_expectation(
+        id: deps_core::EcosystemId,
+    ) -> BareVersionAgreementExpectation {
+        use BareVersionAgreementExpectation::{Checked, DeliberateApproximation, LatentOnly};
+
+        match id {
+            // Cargo (caret), and the `ConcreteIfFullVersion` ecosystems (npm/Composer/Deno's
+            // X-ranges, GitHub Actions'/GitLab CI's moving-major tags): a bare *partial*
+            // version is a real, distinct requirement shape from a bare full version under
+            // these ecosystems' own grammar, so both are worth checking.
+            deps_core::EcosystemId::Cargo
+            | deps_core::EcosystemId::Npm
+            | deps_core::EcosystemId::Composer
+            | deps_core::EcosystemId::Deno
+            | deps_core::EcosystemId::GithubActions
+            | deps_core::EcosystemId::GitlabCi => Checked { test_partial: true },
+            // Go/Bundler/Dart/Maven/Gradle: no partial-version requirement concept exists in
+            // these ecosystems' own manifests (a bare version is always a complete one), so a
+            // synthetic partial input like `"1.2"` isn't a meaningful requirement to compare —
+            // only the full-version case is checked. (Go's own comparator in particular
+            // treats a bare string as a version *prefix*, for pseudo-version/`+incompatible`
+            // matching, not as a partial-version range — comparing it against `"1.2"` as if it
+            // were a partial-range requirement produces a false divergence.)
+            deps_core::EcosystemId::Go
+            | deps_core::EcosystemId::Bundler
+            | deps_core::EcosystemId::Dart
+            | deps_core::EcosystemId::Maven
+            | deps_core::EcosystemId::Gradle => Checked {
+                test_partial: false,
+            },
+            // Swift: `SwiftFormatter::compile_requirement` parses a requirement via
+            // `semver::VersionReq`, whose bare-string default is a caret range — the same
+            // divergence NuGet has — but `deps-swift`'s parser always emits an explicit
+            // range spelling (`">=X, <Y"`) or an exact `"=X"` pin, never a bare `"X.Y.Z"`
+            // string (see `deps-swift/src/parser.rs`'s `upToNextMajor`/`.exact(...)`
+            // handling), so this can't fire today. Re-review if the parser ever changes to
+            // emit a bare form.
+            deps_core::EcosystemId::Swift => LatentOnly,
+            // PyPI: the parser retains the pep440 comparator on every requirement (e.g. an
+            // exact pin parses to `"==1.2.3"`, never bare `"1.2.3"` — see `deps-core`'s
+            // `concrete_pin_version_strips_pep440_double_equals_comparator`), so a bare
+            // requirement never reaches this check either. Re-review if the parser ever
+            // changes to emit a bare form.
+            deps_core::EcosystemId::Pypi => LatentOnly,
+            // NuGet (#669): a bare `Version="X"` is really an unbounded minimum floor under
+            // `NuGetFormatter`'s own comparator, but `deps-core` deliberately still reports
+            // it as a pin — restore resolves a direct `PackageReference` to its floor
+            // version in practice, mirrored by `NuGetFormatter::is_requirement_up_to_date`
+            // treating the same bare floor as a pin for outdated-checking. See
+            // `deps-core`'s `bare_requirement_policy` doc for the full rationale, including
+            // why the alternative (an always-range policy) was tried and reverted.
+            deps_core::EcosystemId::NuGet => DeliberateApproximation,
+        }
+    }
+
+    #[test]
+    fn test_concrete_pin_version_agrees_with_formatter_for_bare_version() {
+        use deps_core::{ConcreteVersion, VersionReq};
+
+        let registry = Arc::new(EcosystemRegistry::new());
+        let cache = Arc::new(HttpCache::new());
+        register_ecosystems(&registry, Arc::clone(&cache), &test_runtime());
+
+        const BARE_FULL_VERSION: &str = "1.2.3";
+        const BARE_PARTIAL_VERSION: &str = "1.2";
+
+        for str_id in registry.ecosystem_ids() {
+            let id: deps_core::EcosystemId = str_id.parse().unwrap_or_else(|_| {
+                panic!("registered ecosystem id {str_id:?} has no matching EcosystemId variant")
+            });
+            let ecosystem = registry
+                .get(str_id)
+                .unwrap_or_else(|| panic!("{str_id:?} just parsed from the registry's own ids"));
+            let formatter = ecosystem.formatter();
+
+            match bare_version_agreement_expectation(id) {
+                BareVersionAgreementExpectation::Checked { test_partial } => {
+                    let bare_inputs: &[&str] = if test_partial {
+                        &[BARE_FULL_VERSION, BARE_PARTIAL_VERSION]
+                    } else {
+                        &[BARE_FULL_VERSION]
+                    };
+                    for &bare in bare_inputs {
+                        let deps_core_says_pin =
+                            deps_core::lsp_helpers::concrete_pin_version(bare, id).is_some();
+                        let formatter_says_pin =
+                            formatter_treats_bare_version_as_exact_pin(formatter, bare);
+
+                        assert_eq!(
+                            deps_core_says_pin, formatter_says_pin,
+                            "{id:?} ({bare:?}): deps-core's concrete_pin_version and the \
+                             ecosystem's own compile_requirement/version_satisfies_requirement \
+                             disagree on whether this bare requirement is an exact pin"
+                        );
+                    }
+                }
+                BareVersionAgreementExpectation::LatentOnly => {
+                    let deps_core_says_pin =
+                        deps_core::lsp_helpers::concrete_pin_version(BARE_FULL_VERSION, id)
+                            .is_some();
+                    let formatter_says_pin =
+                        formatter_treats_bare_version_as_exact_pin(formatter, BARE_FULL_VERSION);
+
+                    assert_ne!(
+                        deps_core_says_pin, formatter_says_pin,
+                        "{id:?}: this ecosystem is exempted as a latent-only mismatch, but its \
+                         comparator no longer disagrees with deps-core's verdict — either the \
+                         parser started emitting a bare requirement (making this a live bug, \
+                         not a latent one) or the comparator changed; re-review this exemption \
+                         in bare_version_agreement_expectation"
+                    );
+                }
+                BareVersionAgreementExpectation::DeliberateApproximation => {
+                    assert!(
+                        deps_core::lsp_helpers::concrete_pin_version(BARE_FULL_VERSION, id)
+                            .is_some(),
+                        "{id:?}: deps-core should still report a bare full version as a pin \
+                         (the deliberate approximation this exemption documents)"
+                    );
+                    assert!(
+                        !formatter_treats_bare_version_as_exact_pin(formatter, BARE_FULL_VERSION),
+                        "{id:?}: the ecosystem's own comparator no longer disagrees with a \
+                         strict pin verdict — re-review whether this exemption (and the \
+                         Concrete-policy approximation it documents) is still needed"
+                    );
+
+                    let requirement = VersionReq::new(BARE_FULL_VERSION);
+                    assert!(
+                        formatter.is_requirement_up_to_date(
+                            &requirement,
+                            &ConcreteVersion::from(BARE_FULL_VERSION)
+                        ),
+                        "{id:?}: is_requirement_up_to_date should treat a bare floor as \
+                         up to date when latest equals the floor — the pin-like precedent \
+                         this exemption relies on"
+                    );
+                    assert!(
+                        !formatter.is_requirement_up_to_date(
+                            &requirement,
+                            &ConcreteVersion::from("9.9.9")
+                        ),
+                        "{id:?}: is_requirement_up_to_date should treat a bare floor as \
+                         outdated once latest moves past it — confirming it is handled as a \
+                         pin, not an auto-following range"
+                    );
+                }
+            }
+        }
+    }
+
     /// #348 regression: `select_latest_matching` must resolve an all-`AdvisoryDeprecated`
     /// version list under a wildcard requirement for every registered ecosystem — an
     /// advisory-only flag (npm `deprecated`, Composer `abandoned`, ...) must never make an
