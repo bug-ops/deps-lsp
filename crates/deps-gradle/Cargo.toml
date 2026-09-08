@@ -16,7 +16,6 @@ workspace = true
 deps-core = { workspace = true }
 deps-maven = { workspace = true }
 regex = { workspace = true }
-thiserror = { workspace = true }
 tokio = { workspace = true }
 toml-span = { workspace = true }
 tower-lsp-server = { workspace = true }

@@ -86,6 +86,17 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+      - name: Install cargo-machete
+        uses: taiki-e/install-action@7b8d4719ee4aaa279bdf55df38dacb9ebfe12a6c  # v2
+        with:
+          tool: cargo-machete
+
+      - name: Check for unused dependencies
+        # Scoped to `crates` (not a bare `cargo machete`) so it never walks into
+        # `crates/deps-zed` — a git submodule excluded from `[workspace]` in root
+        # Cargo.toml, not a crate this repo's dependency hygiene applies to.
+        run: cargo machete crates
+
       - name: Check documentation
         run: cargo doc --workspace --no-deps --all-features
         env:
