@@ -284,26 +284,7 @@ impl DiagnosticPolicy for GithubActionsFormatter {}
 
 impl SourcePolicy for GithubActionsFormatter {}
 
-impl OsvNaming for GithubActionsFormatter {
-    /// Rewrites a native tag string into the spelling OSV.dev's SEMVER range matching
-    /// expects: unprefixed (verified live against `GHSA-mrrh-fwg8-r2c3`, whose ranges
-    /// carry no `v` prefix regardless of the affected repository's own tagging
-    /// convention).
-    ///
-    /// `osv_version_to_native` is deliberately left at its default identity: adding a `v`
-    /// prefix unconditionally, the way `deps-go` does for module versions, would be wrong
-    /// for a GitHub Actions repository that tags without one — and
-    /// `format_version_replacing_for`'s `match_v_prefix_style` already reconciles the
-    /// prefix against the dependency's *own* declared pin style downstream, so no native
-    /// version ever reaches the manifest with the wrong style regardless of what this
-    /// method returns.
-    fn osv_version(&self, version: &str) -> String {
-        version
-            .strip_prefix(['v', 'V'])
-            .unwrap_or(version)
-            .to_string()
-    }
-}
+impl OsvNaming for GithubActionsFormatter {}
 
 #[cfg(test)]
 mod tests {

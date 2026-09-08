@@ -223,3 +223,18 @@ ecosystem_snapshot_test!(
   </ItemGroup>
 </Project>"#
 );
+
+// Deno's OSV-diagnostic rendering shape, matching every other ecosystem case in this
+// suite — a pre-existing coverage gap (alongside GitHub Actions' #471), closed here.
+// Like the rest of this harness, it exercises only diagnostic rendering from a
+// hand-populated `VulnerabilityMap` (`VersionData.ecosystem` stays `None`), not the
+// #667 gate logic itself (`bare_requirement_policy`/`build_scan_targets`/`osv_version`)
+// — that is covered by `deps-core`'s `in_use_version` unit tests and this crate's
+// `build_scan_targets_deno_bare_pinned_jsr_dep_is_unmappable_name_skip`.
+ecosystem_snapshot_test!(
+    deno_vulnerable_diagnostic,
+    "deno",
+    "deno",
+    "deno.json",
+    r#"{"imports": {"express": "npm:express@4.17.0"}}"#
+);

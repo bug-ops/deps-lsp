@@ -313,14 +313,7 @@ impl SourcePolicy for GitlabCiFormatter {
     }
 }
 
-impl OsvNaming for GitlabCiFormatter {
-    /// Unprefixed — mirrors `deps-github-actions`'s identical rationale, kept for
-    /// cross-ecosystem consistency even though it is largely unreachable here (a git-tag
-    /// pin has no OSV coordinate by name).
-    fn osv_version(&self, version: &str) -> String {
-        deps_core::github::normalize_tag(version).to_string()
-    }
-}
+impl OsvNaming for GitlabCiFormatter {}
 
 #[cfg(test)]
 mod tests {

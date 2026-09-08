@@ -213,22 +213,7 @@ impl SourcePolicy for NpmFormatter {
     }
 }
 
-impl OsvNaming for NpmFormatter {
-    /// Strips a leading `v`/`V` from the native version before it reaches an OSV.dev
-    /// scan target.
-    ///
-    /// Mirrors `deps-github-actions`/`deps-gitlab-ci`'s identical override for the same
-    /// reason: `#664` moved npm's bare (operator-less) `package.json` requirement into
-    /// `BareRequirementPolicy::ConcreteIfFullVersion`, whose `is_full_semver_shape` gate
-    /// accepts an optional `v`/`V` prefix (`"v4.17.0"` is legal node-semver syntax) and
-    /// returns it verbatim — but npm's own registry/OSV version namespace is never
-    /// `v`-prefixed, so an unstripped `"v4.17.0"` scan target would query OSV for a
-    /// version it will never see in an advisory's affected-range data (impl-critic #664
-    /// review, finding M1).
-    fn osv_version(&self, version: &str) -> String {
-        deps_core::github::normalize_tag(version).to_string()
-    }
-}
+impl OsvNaming for NpmFormatter {}
 
 #[cfg(test)]
 mod tests {

@@ -8923,9 +8923,52 @@ tokio = "1.0"
                 EcosystemId::Go,
             );
             assert_eq!(targets.len(), 1);
-            assert_eq!(targets[0].version, "v0.8.1");
+            // `.version` (the wire-format value) goes through `formatter.osv_version`,
+            // whose shared default (`deps-core`) strips a leading `v`/`V` — `MockGoFormatter`
+            // doesn't override it, unlike the real `GoFormatter`. `.display_version` is the
+            // raw, untransformed value this test is actually about (manifest vs. lockfile
+            // authority), so it keeps the native "v" spelling.
+            assert_eq!(targets[0].version, "0.8.1");
             assert_eq!(targets[0].display_version, "v0.8.1");
             assert!(skipped.is_empty());
+        }
+
+        /// #667 follow-up (impl-critic): before this reclassification, a Deno `jsr:`
+        /// dependency's bare requirement always failed the version gate under
+        /// `AlwaysRange` (`in_use_version` always `None`), so `DenoFormatter::
+        /// osv_package_name`'s `_ => None` arm for `jsr:` never actually ran in a live
+        /// scan. Now that Deno is `ConcreteIfFullVersion`, a bare-full-version-pinned
+        /// `jsr:` dependency passes the version gate and correctness rests entirely on
+        /// that match arm — this exercises it end-to-end through the real
+        /// `DenoFormatter`, not just `osv_package_name`'s own unit test in isolation.
+        #[cfg(feature = "deno")]
+        #[test]
+        fn build_scan_targets_deno_bare_pinned_jsr_dep_is_unmappable_name_skip() {
+            let parse_result = MockParseResult {
+                deps: vec![MockDep {
+                    name: PackageName::new("jsr:@std/fs"),
+                    version_req: Some(VersionReq::new("1.0.0")),
+                    source: DependencySource::Registry,
+                }],
+            };
+
+            let (targets, skipped) = build_scan_targets(
+                &parse_result,
+                &HashMap::new(),
+                &HashMap::new(),
+                &deps_deno::DenoFormatter,
+                EcosystemId::Deno,
+            );
+
+            assert!(targets.is_empty(), "jsr: dep must never reach an OSV query");
+            assert_eq!(skipped.len(), 1);
+            // Key is the full scheme-qualified name: `DenoFormatter` doesn't override
+            // `normalize_package_name`, unlike `osv_package_name` (which strips the
+            // scheme only for `npm:` and returns `None` for everything else).
+            assert_matches!(
+                skipped.get("jsr:@std/fs"),
+                Some(ScanOutcome::Skipped(SkipReason::UnmappableName))
+            );
         }
 
         #[test]

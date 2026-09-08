@@ -749,11 +749,20 @@ pub trait OsvNaming: Send + Sync {
     /// field on [`crate::osv::ScanTarget`] itself: the caller (`deps-lsp`'s
     /// scan-target builder) has only the native version string at hand, so
     /// each ecosystem's formatter is the natural place to own the transform.
-    /// The default implementation is the identity: OSV accepts every
-    /// supported ecosystem's native version spelling unchanged except Go,
-    /// whose module versions carry a mandatory `v` prefix
-    /// (`golang.org/x/mod/module` convention) that OSV's SEMVER matcher
-    /// rejects — overridden in `deps-go` to strip it.
+    ///
+    /// The default strips a single leading `v`/`V` via
+    /// [`crate::github::normalize_tag`]: OSV's SEMVER range matching never
+    /// carries that prefix, while a native version can legitimately carry
+    /// one — either because an ecosystem's own tagging convention always
+    /// does (GitHub Actions/GitLab CI tags), or because a bare full-version
+    /// requirement's optional `v`/`V` prefix (accepted by
+    /// `is_full_semver_shape`) is returned verbatim as the resolved in-use
+    /// version (npm, Deno — see `BareRequirementPolicy::ConcreteIfFullVersion`).
+    /// A no-op when the native spelling never carries the prefix, so this is
+    /// safe as a blanket default. Only Go needs a genuinely different
+    /// transform — its version namespace *requires* the prefix, so
+    /// `deps-go` overrides both this and [`Self::osv_version_to_native`] to
+    /// add it back rather than strip it once.
     ///
     /// # Examples
     ///
@@ -764,9 +773,10 @@ pub trait OsvNaming: Send + Sync {
     /// impl OsvNaming for DefaultFormatter {}
     ///
     /// assert_eq!(DefaultFormatter.osv_version("1.2.3"), "1.2.3");
+    /// assert_eq!(DefaultFormatter.osv_version("v1.2.3"), "1.2.3");
     /// ```
     fn osv_version(&self, version: &str) -> String {
-        version.to_string()
+        crate::github::normalize_tag(version).to_string()
     }
 }
 
