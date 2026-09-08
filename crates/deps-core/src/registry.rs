@@ -600,6 +600,20 @@ pub trait Version: Send + Sync {
     fn published_at(&self) -> Option<crate::freshness::PublishTime> {
         None
     }
+
+    /// SPDX license identifier(s) declared for this version, when the registry's
+    /// already-fetched version-list response carries them.
+    ///
+    /// Default: empty slice — the capability gate for ecosystems whose hot-path
+    /// version fetch doesn't carry license data (issue #204). `Vec<String>`, never
+    /// `Option<String>`, everywhere this is implemented: a package can declare more
+    /// than one license (an SPDX `OR`/dual-license split reported as discrete
+    /// identifiers by the registry), and a single shape avoids an `Option` vs `Vec`
+    /// split across ecosystems (spec 010 plan.md's "License shape" decision). An
+    /// empty slice means "unknown/not reported", never "explicitly no license".
+    fn license(&self) -> &[String] {
+        &[]
+    }
 }
 
 /// Finds the latest stable version from a list of versions.

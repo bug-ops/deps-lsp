@@ -293,6 +293,45 @@ macro_rules! impl_version {
             }
         }
     };
+    ($type:ty {
+        version: $version:ident,
+        status: $status:expr,
+        published_at: $published_at:ident,
+        prerelease: $prerelease:expr,
+        deprecation: $deprecation:expr,
+        license: $license:ident $(,)?
+    }) => {
+        impl $crate::registry::Version for $type {
+            fn version_string(&self) -> &$crate::ConcreteVersion {
+                &self.$version
+            }
+
+            fn removal_status(&self) -> $crate::registry::RemovalStatus {
+                ($status)(self)
+            }
+
+            fn published_at(&self) -> Option<$crate::freshness::PublishTime> {
+                self.$published_at
+            }
+
+            fn is_prerelease(&self) -> bool {
+                ($prerelease)(self)
+            }
+
+            fn deprecation(&self) -> Option<&$crate::registry::Deprecation> {
+                let f: fn(&$type) -> Option<&$crate::registry::Deprecation> = $deprecation;
+                f(self)
+            }
+
+            fn license(&self) -> &[String] {
+                &self.$license
+            }
+
+            fn as_any(&self) -> &dyn ::std::any::Any {
+                self
+            }
+        }
+    };
 }
 
 /// Implement `Metadata` trait for a struct.

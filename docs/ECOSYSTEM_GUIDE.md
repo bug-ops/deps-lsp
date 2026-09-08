@@ -638,6 +638,18 @@ now closed, not accepted risk:
   package name, so this is safe but not feed-aware (mirrors npm's/PyPI's
   identical choice).
 
+### License Hover
+
+Hover shows the SPDX license identifier(s) for the resolved version, and flags a
+"License changed" warning when the latest version's license differs (issue #204).
+Covered for Cargo, npm, PyPI, Go, Maven, Bundler, NuGet (via the deps.dev
+supply-chain call — resolved version only, the "latest" license degrades to
+"unavailable" since no second network call is made) and Composer (via Packagist's
+own version list, which carries license for both the resolved and latest version,
+enabling the "License changed" comparison). Dart, Swift, Gradle, and Deno are not
+yet covered (tracked separately, issue #660). When license data is unavailable for
+a dependency, the section is omitted rather than shown as "unknown".
+
 ### Yanked-Version Diagnostics
 
 `diagnostics.yanked_severity` flags a dependency pinned to a version the registry

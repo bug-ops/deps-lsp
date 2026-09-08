@@ -19,6 +19,11 @@ pub(super) struct DepsDevVersionInfo {
     pub(super) attestations: Vec<ProvenanceEntry>,
     #[serde(default)]
     pub(super) related_projects: Vec<RelatedProject>,
+    /// SPDX license identifier(s) reported for this version (issue #204). Read
+    /// directly from the same version-call response `slsa_provenances`/`attestations`
+    /// come from — no new deps.dev endpoint.
+    #[serde(default)]
+    pub(super) licenses: Vec<String>,
 }
 
 /// One `slsaProvenances[]`/`attestations[]` entry.
@@ -115,4 +120,10 @@ pub struct SupplyChainTrustSignal {
     /// This version's SLSA/attestation provenance status, when the
     /// version-level query itself succeeded (FR-004).
     pub provenance: Option<ProvenanceStatus>,
+    /// SPDX license identifier(s) for this resolved version (issue #204), from the
+    /// same version-level deps.dev call `provenance` is derived from. Empty when the
+    /// version call succeeded but reported no license, or when the call itself never
+    /// succeeded (mirrors [`crate::registry::Version::license`]'s "empty means
+    /// unknown" convention).
+    pub licenses: Vec<String>,
 }

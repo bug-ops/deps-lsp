@@ -446,12 +446,12 @@ impl DepsDevClient {
             urlencoding::encode(version),
         );
 
-        let (provenance, related_projects) = match self.get(&version_url).await {
+        let (provenance, related_projects, licenses) = match self.get(&version_url).await {
             Ok(bytes) => match crate::parser::parse_json_checked::<DepsDevVersionInfo>(&bytes) {
                 Ok(info) => {
                     let provenance =
                         classify_provenance(&info.slsa_provenances, &info.attestations);
-                    (Some(provenance), info.related_projects)
+                    (Some(provenance), info.related_projects, info.licenses)
                 }
                 Err(e) => {
                     tracing::debug!(error = %e, "deps.dev version response parse failed");
@@ -490,6 +490,7 @@ impl DepsDevClient {
         let signal = SupplyChainTrustSignal {
             scorecard,
             provenance,
+            licenses,
         };
         (Some(signal), DEPS_DEV_SUCCESS_TTL.min(project_ttl))
     }
@@ -690,6 +691,50 @@ mod tests {
         let scorecard = signal.scorecard.expect("scorecard expected");
         assert!((scorecard.overall_score - 9.1).abs() < f32::EPSILON);
         assert!(!scorecard.self_reported);
+    }
+
+    /// Issue #204: `licenses[]` on the same version-call response `provenance` is
+    /// parsed from is threaded into `SupplyChainTrustSignal.licenses`, with no new
+    /// deps.dev endpoint or call.
+    #[tokio::test]
+    async fn trust_signal_parses_licenses_from_version_response() {
+        let (mut server, client) = mock_client().await;
+        let _version = server
+            .mock("GET", "/v3/systems/npm/packages/sigstore/versions/2.3.1")
+            .with_status(200)
+            .with_body(
+                r#"{"slsaProvenances": [], "attestations": [], "relatedProjects": [], "licenses": ["MIT", "Apache-2.0"]}"#,
+            )
+            .create_async()
+            .await;
+
+        let signal = client
+            .trust_signal("npm", "sigstore", "2.3.1")
+            .await
+            .expect("signal expected");
+        assert_eq!(
+            signal.licenses,
+            vec!["MIT".to_string(), "Apache-2.0".to_string()]
+        );
+    }
+
+    /// A version response with no `licenses` key must degrade to an empty `Vec`,
+    /// never a panic or a default `None`-then-unwrap.
+    #[tokio::test]
+    async fn trust_signal_missing_licenses_field_is_empty_vec() {
+        let (mut server, client) = mock_client().await;
+        let _version = server
+            .mock("GET", "/v3/systems/npm/packages/express/versions/4.19.2")
+            .with_status(200)
+            .with_body(EXPRESS_VERSION_NO_PROVENANCE)
+            .create_async()
+            .await;
+
+        let signal = client
+            .trust_signal("npm", "express", "4.19.2")
+            .await
+            .expect("signal expected");
+        assert!(signal.licenses.is_empty());
     }
 
     #[tokio::test]
@@ -1343,6 +1388,24 @@ mod tests {
             client.memo.len() <= MAX_MEMO_ENTRIES,
             "memo must stay bounded at MAX_MEMO_ENTRIES, got {}",
             client.memo.len()
+        );
+    }
+
+    /// Issue #204, live-verified against the real deps.dev API (curl-equivalent
+    /// checks during implementation confirmed `licenses[]` on all 7 covered
+    /// systems): the real npm `express` version response carries a non-empty
+    /// `licenses[]` array, threaded through into `SupplyChainTrustSignal.licenses`.
+    #[tokio::test]
+    #[ignore]
+    async fn trust_signal_real_npm_express_carries_license() {
+        let client = client();
+        let signal = client
+            .trust_signal("npm", "express", "4.19.2")
+            .await
+            .expect("signal expected for a real, well-known package");
+        assert!(
+            !signal.licenses.is_empty(),
+            "expected express@4.19.2 to report a real license"
         );
     }
 

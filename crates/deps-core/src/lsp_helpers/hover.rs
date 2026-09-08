@@ -317,6 +317,85 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     };
     push_trust_signal_hover_section(&mut markdown, trust_signal.as_ref());
 
+    // Issue #204 (spec 010): resolved-version license first tries the already-fetched
+    // `available_versions` list (free for ecosystems whose hot-path version list
+    // carries license per entry, e.g. Composer), then falls back to `trust_signal`'s
+    // `licenses` (deps.dev-covered ecosystems: Cargo, npm, Go, Maven, Bundler, NuGet,
+    // PyPI — the version list itself never carries license for these, live-verified).
+    // Latest-version license only ever comes from the native list — deps.dev's
+    // version-level call only ever targets the *resolved* version
+    // (`spawn_trust_signal_fetch`'s `in_use_version` argument), so a deps.dev-routed
+    // ecosystem's latest license degrades to "(unavailable)", the graceful-degradation
+    // edge case spec 010 §6 explicitly sanctions rather than a second network call.
+    //
+    // The native-list lookup keys on `in_use_version` (the same helper
+    // `spawn_trust_signal_fetch` already uses above), not the weaker `resolved`
+    // variable the `**Current**`/`**Requirement**` line uses — `in_use_version` adds
+    // a `concrete_pin_version` fallback for an exact manifest pin with no lock file
+    // (e.g. a `composer.json` `"3.0.0"` dependency with no `composer.lock`), which
+    // `resolved` alone doesn't have. Falls back to `resolved` when no ecosystem is
+    // set (`in_use_version` requires one) — a handful of test fixtures only
+    // (impl-critic review M1: keeps this lookup as least as capable as the
+    // deps.dev-routed ecosystems', not just consistent with the Current line).
+    let in_use_version_str: Option<String> = versions.ecosystem.and_then(|ecosystem| {
+        in_use_version(
+            dep,
+            normalized_name.as_str(),
+            versions.resolved,
+            versions.resolved_version_candidates,
+            formatter,
+            ecosystem,
+        )
+    });
+    // The single "which concrete version is actually in use" key, shared by the
+    // resolved-license lookup below *and* the latest-license "is this the same
+    // version" shortcut further down — both must agree on the same key, or the
+    // shortcut can miss a version the lookup itself found (review round 3 M1
+    // regression: an earlier draft compared the shortcut against the weaker
+    // `resolved` while the lookup used this stronger key, reintroducing S1's
+    // spurious "unavailable" note for exactly the concrete-pin-no-lockfile case
+    // this key exists to cover).
+    let resolved_key: Option<&str> = in_use_version_str.as_deref().or(resolved);
+    let resolved_license: Vec<String> = resolved_key
+        .and_then(|r| {
+            available_versions
+                .as_ref()
+                .and_then(|versions| versions.iter().find(|v| v.version_string().as_str() == r))
+        })
+        .map(|v| v.license().to_vec())
+        .filter(|l| !l.is_empty())
+        .or_else(|| {
+            trust_signal
+                .as_ref()
+                .map(|s| s.licenses.clone())
+                .filter(|l| !l.is_empty())
+        })
+        .unwrap_or_default();
+    // `None` (no latest version at all — `latest_line` is `None`) is distinct from
+    // `Some(&[])` (a latest version exists but its license is unknown): the former
+    // must render no note at all, the latter renders "(latest version license
+    // unavailable)" (impl-critic S1). When the latest version *is* the resolved
+    // version (up to date), reuse `resolved_license` instead of re-deriving it —
+    // avoids a spurious "unavailable" note on the single most common hover case.
+    // Skipped entirely once `resolved_license` is already empty: nothing to compare
+    // against, and `push_license_hover_section` discards it on its own early return.
+    let latest_license: Option<Vec<String>> = (!resolved_license.is_empty())
+        .then(|| {
+            latest_line.map(|(latest_ver, _)| {
+                if resolved_key == Some(latest_ver) {
+                    resolved_license.clone()
+                } else {
+                    live_latest_idx
+                        .and_then(|idx| available_versions.as_ref().and_then(|v| v.get(idx)))
+                        .map(|v| v.license().to_vec())
+                        .filter(|l| !l.is_empty())
+                        .unwrap_or_default()
+                }
+            })
+        })
+        .flatten();
+    push_license_hover_section(&mut markdown, &resolved_license, latest_license.as_deref());
+
     // `!v.is_empty()`, not just `Some(_)` (#550): a resolvable source's live fetch can
     // succeed with a genuinely empty list — e.g. a real GitHub repository whose only
     // tags don't parse as full semver (`dtolnay/rust-toolchain`'s sole tag `v1`) — and
@@ -834,6 +913,103 @@ fn push_trust_signal_hover_section(markdown: &mut String, signal: Option<&Supply
     markdown.push('\n');
 }
 
+/// Cap on how many license identifiers [`format_license_list`] renders from one
+/// version's license list before collapsing the remainder into "(+N more)" —
+/// defense-in-depth against a malicious/compromised registry response reporting an
+/// excessive number of license entries for a single version (security review S3-1).
+const MAX_LICENSE_ENTRIES_RENDERED: usize = 8;
+
+/// Cap on how many characters of a single license identifier
+/// [`format_license_list`] renders before truncating it — mirrors
+/// `diagnostics::MAX_BLOCKED_REGISTRY_MESSAGE_VALUE_CHARS`'s reasoning for the same
+/// untrusted-registry-string concern (security review S3-1).
+const MAX_LICENSE_ID_CHARS: usize = 128;
+
+/// Formats a license list as comma-separated Markdown code spans, e.g. `` `MIT`, `Apache-2.0` ``.
+/// Each identifier is truncated at [`MAX_LICENSE_ID_CHARS`] and the list itself capped at
+/// [`MAX_LICENSE_ENTRIES_RENDERED`] entries (with a "(+N more)" suffix) — `licenses` is
+/// registry-reported data, not validated or bounded upstream.
+fn format_license_list(licenses: &[String]) -> String {
+    let shown = licenses.len().min(MAX_LICENSE_ENTRIES_RENDERED);
+    let mut rendered: Vec<String> = licenses[..shown]
+        .iter()
+        .map(|l| markdown_code_span(&super::truncate_for_diagnostic(l, MAX_LICENSE_ID_CHARS)))
+        .collect();
+    let remaining = licenses.len() - shown;
+    if remaining > 0 {
+        rendered.push(format!("(+{remaining} more)"));
+    }
+    rendered.join(", ")
+}
+
+/// Order-insensitive, case-insensitive set comparison for two license lists (spec 010
+/// FR-003): a dependency re-declaring the same licenses in a different order or
+/// casing (registry `license[]` fields are author-supplied free text, not a
+/// normalized enum — e.g. `"MIT"` vs `"mit"`) must not be reported as "changed".
+fn license_sets_differ(a: &[String], b: &[String]) -> bool {
+    let a_set: std::collections::BTreeSet<String> = a.iter().map(|l| l.to_lowercase()).collect();
+    let b_set: std::collections::BTreeSet<String> = b.iter().map(|l| l.to_lowercase()).collect();
+    a_set != b_set
+}
+
+/// Appends the hover "License" line (issue #204, spec 010): the resolved version's
+/// SPDX license identifier(s), and — when the latest version's license is also known
+/// and differs (order/case-insensitive) — a "License changed" flag (FR-003).
+///
+/// Renders nothing when `resolved_license` is empty: mirrors
+/// [`push_vulnerability_hover_section`]'s discipline of never rendering a positive
+/// "License: (unknown)" claim for a dependency this feature never actually checked
+/// (no resolved version, an ecosystem/source out of this PR's scope, ...) — spec 010
+/// NFR-003 permits either wording or omission for missing data, and omission avoids
+/// noise on every dependency this PR simply doesn't cover yet.
+///
+/// `latest_license` is three-valued (impl-critic review S1): `None` means no latest
+/// version exists to compare against at all (no `**Latest**` line was rendered
+/// either) — renders no note. `Some(&[])` means a latest version exists but its
+/// license could not be determined — renders the "(unavailable)" note. `Some(licenses)`
+/// with entries renders a "License changed" flag only when the sets actually differ.
+///
+/// The "License changed" line is written as its own Markdown paragraph (blank line
+/// before it, via `\n\n`) rather than a single `\n` — a lone `\n` is a CommonMark soft
+/// break, which strict renderers (e.g. VS Code's hover widget) collapse onto the same
+/// visual line as the License line above it (impl-critic review S3).
+fn push_license_hover_section(
+    markdown: &mut String,
+    resolved_license: &[String],
+    latest_license: Option<&[String]>,
+) {
+    use std::fmt::Write;
+
+    if resolved_license.is_empty() {
+        return;
+    }
+
+    write!(
+        markdown,
+        "**License**: {}",
+        format_license_list(resolved_license)
+    )
+    .unwrap();
+
+    match latest_license {
+        None => {}
+        Some([]) => {
+            markdown.push_str(" *(latest version license unavailable)*");
+        }
+        Some(latest) if license_sets_differ(resolved_license, latest) => {
+            write!(
+                markdown,
+                "\n\n\u{26a0}\u{fe0f} **License changed**: {} \u{2192} {}",
+                format_license_list(resolved_license),
+                format_license_list(latest)
+            )
+            .unwrap();
+        }
+        Some(_) => {}
+    }
+    markdown.push_str("\n\n");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -843,6 +1019,358 @@ mod tests {
 
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    #[test]
+    fn license_sets_differ_is_order_insensitive() {
+        let a = vec!["MIT".to_string(), "Apache-2.0".to_string()];
+        let b = vec!["Apache-2.0".to_string(), "MIT".to_string()];
+        assert!(!license_sets_differ(&a, &b));
+    }
+
+    #[test]
+    fn license_sets_differ_detects_real_change() {
+        let a = vec!["MIT".to_string()];
+        let b = vec!["GPL-3.0".to_string()];
+        assert!(license_sets_differ(&a, &b));
+    }
+
+    /// impl-critic review M2: `license[]` is author-supplied free text, not a
+    /// normalized enum — a casing difference alone must not flag a false change.
+    #[test]
+    fn license_sets_differ_is_case_insensitive() {
+        let a = vec!["MIT".to_string()];
+        let b = vec!["mit".to_string()];
+        assert!(!license_sets_differ(&a, &b));
+    }
+
+    #[test]
+    fn format_license_list_caps_entries_and_labels_the_remainder() {
+        let licenses: Vec<String> = (0..12).map(|i| format!("LICENSE-{i}")).collect();
+        let rendered = format_license_list(&licenses);
+        assert!(rendered.contains("(+4 more)"), "got: {rendered}");
+        assert!(rendered.contains("`LICENSE-0`"));
+        assert!(
+            !rendered.contains("LICENSE-11"),
+            "the 12th entry must not render; got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn format_license_list_truncates_an_overlong_identifier() {
+        let long_id = "A".repeat(500);
+        let rendered = format_license_list(std::slice::from_ref(&long_id));
+        assert!(
+            rendered.len() < long_id.len(),
+            "an untrusted, excessively long license id must be truncated; got len {}",
+            rendered.len()
+        );
+    }
+
+    #[test]
+    fn push_license_hover_section_renders_nothing_when_resolved_unknown() {
+        let mut markdown = String::new();
+        push_license_hover_section(&mut markdown, &[], Some(&["MIT".to_string()]));
+        assert!(markdown.is_empty());
+    }
+
+    /// impl-critic review S1: no latest version exists at all (`None`, distinct from
+    /// `Some(&[])`) — no note should render, since nothing was ever shown to compare
+    /// against.
+    #[test]
+    fn push_license_hover_section_renders_nothing_extra_when_no_latest_version_exists() {
+        let mut markdown = String::new();
+        push_license_hover_section(&mut markdown, &["MIT".to_string()], None);
+        assert!(markdown.contains("**License**: `MIT`"));
+        assert!(!markdown.contains("unavailable"));
+        assert!(!markdown.contains("License changed"));
+    }
+
+    #[test]
+    fn push_license_hover_section_renders_resolved_only_when_latest_unavailable() {
+        let mut markdown = String::new();
+        push_license_hover_section(&mut markdown, &["MIT".to_string()], Some(&[]));
+        assert!(markdown.contains("**License**: `MIT`"));
+        assert!(markdown.contains("latest version license unavailable"));
+        assert!(!markdown.contains("License changed"));
+    }
+
+    #[test]
+    fn push_license_hover_section_flags_change_when_licenses_differ() {
+        let mut markdown = String::new();
+        push_license_hover_section(
+            &mut markdown,
+            &["MIT".to_string()],
+            Some(&["Apache-2.0".to_string()]),
+        );
+        assert!(markdown.contains("**License**: `MIT`"));
+        assert!(markdown.contains("License changed"));
+        assert!(markdown.contains("`MIT` \u{2192} `Apache-2.0`"));
+    }
+
+    /// impl-critic review S3: the "License changed" line must be its own Markdown
+    /// paragraph (blank line before it), not a bare `\n` soft break that a strict
+    /// CommonMark renderer (VS Code's hover widget) would collapse onto the License
+    /// line above it.
+    #[test]
+    fn push_license_hover_section_change_line_is_a_separate_paragraph() {
+        let mut markdown = String::new();
+        push_license_hover_section(
+            &mut markdown,
+            &["MIT".to_string()],
+            Some(&["Apache-2.0".to_string()]),
+        );
+        assert!(
+            markdown.contains("`MIT`\n\n\u{26a0}\u{fe0f} **License changed**"),
+            "expected a blank line (paragraph break) before the License changed line; got: {markdown:?}"
+        );
+    }
+
+    #[test]
+    fn push_license_hover_section_no_flag_when_licenses_equal() {
+        let mut markdown = String::new();
+        push_license_hover_section(
+            &mut markdown,
+            &["MIT".to_string()],
+            Some(&["MIT".to_string()]),
+        );
+        assert!(markdown.contains("**License**: `MIT`"));
+        assert!(!markdown.contains("License changed"));
+        assert!(!markdown.contains("unavailable"));
+    }
+
+    /// Issue #204 end-to-end: a native version-list source (Composer/tier-1 shape,
+    /// via `MockRegistryWithLicensedVersions`) whose resolved and latest versions
+    /// carry different licenses renders both the resolved license and the "License
+    /// changed" flag in the actual hover response.
+    #[tokio::test]
+    async fn test_generate_hover_renders_license_changed_from_native_version_list() {
+        use std::collections::HashMap;
+
+        let registry = MockRegistryWithLicensedVersions {
+            versions: vec![
+                MockVersionWithLicense {
+                    version: "2.0.0".into(),
+                    license: vec!["Apache-2.0".to_string()],
+                },
+                MockVersionWithLicense {
+                    version: "1.0.0".into(),
+                    license: vec!["MIT".to_string()],
+                },
+            ],
+        };
+        let parse_result = freshness_test_parse_result("example");
+        let mut resolved_versions = HashMap::new();
+        resolved_versions.insert("example".into(), "1.0.0".into());
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&HashMap::new(), &resolved_versions),
+            &registry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            content.value.contains("**License**: `MIT`"),
+            "got: {}",
+            content.value
+        );
+        assert!(
+            content.value.contains("License changed"),
+            "resolved (1.0.0/MIT) and latest (2.0.0/Apache-2.0) licenses differ; got: {}",
+            content.value
+        );
+    }
+
+    /// impl-critic review S1: when the resolved version *is* the latest version (the
+    /// common up-to-date case), the resolved license must be reused for the latest
+    /// comparison instead of re-deriving it — must render neither a spurious
+    /// "(unavailable)" note nor a self-vs-self "License changed" flag.
+    #[tokio::test]
+    async fn test_generate_hover_up_to_date_dependency_shows_no_spurious_unavailable_note() {
+        use std::collections::HashMap;
+
+        let registry = MockRegistryWithLicensedVersions {
+            versions: vec![MockVersionWithLicense {
+                version: "1.0.0".into(),
+                license: vec!["MIT".to_string()],
+            }],
+        };
+        let parse_result = freshness_test_parse_result("example");
+        let mut resolved_versions = HashMap::new();
+        resolved_versions.insert("example".into(), "1.0.0".into());
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&HashMap::new(), &resolved_versions),
+            &registry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(content.value.contains("**License**: `MIT`"));
+        assert!(
+            !content.value.contains("unavailable"),
+            "the resolved version is the latest version, so its already-known license \
+             must be reused rather than reported unavailable; got: {}",
+            content.value
+        );
+        assert!(
+            !content.value.contains("License changed"),
+            "resolved and latest are the same version, so no change flag should fire; got: {}",
+            content.value
+        );
+    }
+
+    /// impl-critic review M1: an exact manifest pin (`=1.0.0`) with no lock-file
+    /// resolution renders no `**Current**` line (`resolved` stays `None` —
+    /// `resolve_occurrence_version` has nothing to match against an empty
+    /// `resolved_versions` map), but the license must still be found via the same
+    /// `in_use_version` concrete-pin fallback `spawn_trust_signal_fetch` already
+    /// uses for the deps.dev path — the native-list lookup must be at least as
+    /// capable, not silently weaker just because it reused the `resolved` variable.
+    #[tokio::test]
+    async fn test_generate_hover_native_list_license_found_via_concrete_pin_fallback() {
+        use std::collections::HashMap;
+
+        let registry = MockRegistryWithLicensedVersions {
+            versions: vec![MockVersionWithLicense {
+                version: "1.0.0".into(),
+                license: vec!["MIT".to_string()],
+            }],
+        };
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "example".into(),
+                version_req: "=1.0.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 7)),
+            }],
+            uri: crate::test_util::test_uri("/test/composer.json"),
+        };
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&HashMap::new(), &HashMap::new())
+                .with_ecosystem(crate::EcosystemId::Composer),
+            &registry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            !content.value.contains("**Current**"),
+            "no lock-file resolution exists, so no Current line should render; got: {}",
+            content.value
+        );
+        assert!(
+            content.value.contains("**License**: `MIT`"),
+            "the concrete-pin fallback (=1.0.0) should still resolve a license even \
+             without a lock-file match; got: {}",
+            content.value
+        );
+    }
+
+    /// Review round 3 regression: for a deps.dev-routed ecosystem, `available_versions[idx]`
+    /// entries never carry license (that trait method's default is empty — only the
+    /// native-list ecosystems like Composer override it), so the "latest == resolved"
+    /// shortcut MUST use the same `in_use_version`-derived key the resolved-license
+    /// lookup itself used, not the weaker bare `resolved`. An earlier draft compared
+    /// the shortcut against `resolved` (which stays `None` here — no lock-file entry
+    /// matches an exact `=4.19.2` pin) while the lookup used `in_use_version_str`
+    /// (which resolves the pin via `concrete_pin_version`): the mismatch made the
+    /// shortcut miss, falling through to the empty-by-default native-list branch and
+    /// re-introducing S1's spurious "(latest version license unavailable)" note right
+    /// next to an already-known, unchanged license.
+    #[tokio::test]
+    async fn test_generate_hover_deps_dev_no_lockfile_exact_pin_matching_latest_reuses_license() {
+        let (mut server, deps_dev) = deps_dev_mock_client().await;
+        let _version = server
+            .mock("GET", "/v3/systems/npm/packages/express/versions/4.19.2")
+            .with_status(200)
+            .with_body(
+                r#"{"slsaProvenances": [], "attestations": [], "relatedProjects": [], "licenses": ["MIT"]}"#,
+            )
+            .create_async()
+            .await;
+        let deps_dev = Arc::new(deps_dev);
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "express".into(),
+                version_req: "=4.19.2".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 7)),
+            }],
+            uri: crate::test_util::test_uri("/test/package.json"),
+        };
+        // No lock-file entries: `versions.resolved` stays empty, so the bare
+        // `resolved` variable used for the `**Current**` line has no match — only
+        // `in_use_version`'s `concrete_pin_version` fallback resolves the pin.
+        let registry = MockRegistryWithVersions {
+            versions: vec![MockVersionWithAge {
+                version: "4.19.2".into(),
+                yanked: false,
+                published_at: None,
+            }],
+        };
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&HashMap::new(), &HashMap::new())
+                .with_ecosystem(crate::EcosystemId::Npm)
+                .with_trust(&deps_dev),
+            &registry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            !content.value.contains("**Current**"),
+            "no lock-file resolution exists, so no Current line should render; got: {}",
+            content.value
+        );
+        assert!(
+            content.value.contains("**License**: `MIT`"),
+            "got: {}",
+            content.value
+        );
+        assert!(
+            !content.value.contains("unavailable"),
+            "the exact pin (4.19.2) equals the only/live-latest version, so the \
+             already-known license must be reused, not reported unavailable; got: {}",
+            content.value
+        );
+        assert!(!content.value.contains("License changed"));
+    }
 
     #[test]
     fn severity_label_for_malicious_is_distinct_from_unknown_and_every_graded_label() {
@@ -3158,6 +3686,59 @@ mod tests {
             .find(|l| l.contains("Supply chain"))
             .unwrap_or_else(|| panic!("expected a Supply chain line, got: {}", content.value));
         insta::assert_snapshot!(line, @"🔐 **Supply chain**: OpenSSF Scorecard `8.5`/10 · Provenance: verified");
+    }
+
+    /// Issue #204 (impl-critic review S2 / tester's independent gap): the deps.dev
+    /// path is the *only* license source for 7 of this PR's 8 ecosystems
+    /// (Cargo/npm/Go/Maven/Bundler/NuGet/PyPI) — only Composer's native-list path had
+    /// an end-to-end `generate_hover` test before this one.
+    #[tokio::test]
+    async fn test_generate_hover_deps_dev_license_renders_license_line() {
+        let (mut server, deps_dev) = deps_dev_mock_client().await;
+        let _version = server
+            .mock("GET", "/v3/systems/npm/packages/express/versions/4.19.2")
+            .with_status(200)
+            .with_body(
+                r#"{"slsaProvenances": [], "attestations": [], "relatedProjects": [], "licenses": ["MIT"]}"#,
+            )
+            .create_async()
+            .await;
+        let deps_dev = Arc::new(deps_dev);
+
+        let (parse_result, resolved_versions) = express_fixture();
+        let registry = MockRegistryWithVersions { versions: vec![] };
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&HashMap::new(), &resolved_versions)
+                .with_ecosystem(crate::EcosystemId::Npm)
+                .with_trust(&deps_dev),
+            &registry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            content.value.contains("**License**: `MIT`"),
+            "expected the deps.dev-sourced license to render; got: {}",
+            content.value
+        );
+        // No live version list was fetched (`MockRegistryWithVersions { versions: vec![] }`),
+        // so no `**Latest**` line exists either — the "(latest version license
+        // unavailable)" note must not render for a dependency with no latest version
+        // at all (impl-critic review S1).
+        assert!(
+            !content.value.contains("unavailable"),
+            "no latest version exists to compare against; got: {}",
+            content.value
+        );
     }
 
     #[tokio::test]
