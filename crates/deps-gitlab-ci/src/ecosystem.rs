@@ -473,6 +473,22 @@ impl Ecosystem for GitlabCiEcosystem {
         })
     }
 
+    fn completion_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
+        let name = metadata.name();
+        let latest = metadata.latest_version().as_str();
+        // `search()` always returns `Ok(vec![])` (spec NFR-002 — no cheap GitLab
+        // search endpoint under the rate-limit budget), so this is unreachable in
+        // practice; it exists only to keep the trait implementation total. GitLab CI
+        // has two structurally different include forms (`project:`+`ref:` vs.
+        // `component:` `name@ref`), so there is no single insertable snippet shape —
+        // this mirrors GitHub Actions' bare `name`/`name@version` fallback.
+        if latest.is_empty() {
+            Some(name.to_string())
+        } else {
+            Some(format!("{name}@{latest}"))
+        }
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -2415,5 +2431,55 @@ mod tests {
         eco.parse_manifest(&new_content, &uri)
             .await
             .expect("resulting text must still parse");
+    }
+
+    /// `deps-gitlab-ci` never supports raw-text section detection at all (no cheap
+    /// section boundary shared by `project:`/`component:` include forms) — no override.
+    #[test]
+    fn test_fallback_completion_prefix_default_none() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = GitlabCiEcosystem::new(cache);
+        assert!(
+            eco.fallback_completion_prefix("anything at all\n", Position::new(0, 0))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_completion_insert_text() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = GitlabCiEcosystem::new(cache);
+        struct MockMetadata {
+            name: deps_core::PackageName,
+            latest_version: deps_core::ConcreteVersion,
+        }
+        impl deps_core::Metadata for MockMetadata {
+            fn name(&self) -> &deps_core::PackageName {
+                &self.name
+            }
+            fn description(&self) -> Option<&str> {
+                None
+            }
+            fn repository(&self) -> Option<&str> {
+                None
+            }
+            fn documentation(&self) -> Option<&str> {
+                None
+            }
+            fn latest_version(&self) -> &deps_core::ConcreteVersion {
+                &self.latest_version
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("my-component"),
+            latest_version: "1.2.3".into(),
+        };
+        assert_eq!(
+            eco.completion_insert_text(&meta),
+            Some("my-component@1.2.3".to_string())
+        );
     }
 }

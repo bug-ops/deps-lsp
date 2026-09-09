@@ -365,9 +365,69 @@ impl Ecosystem for NuGetEcosystem {
         })
     }
 
+    fn fallback_completion_prefix<'a>(
+        &self,
+        content: &'a str,
+        position: Position,
+    ) -> Option<&'a str> {
+        let line = deps_core::fallback_completion::line_at(content, position)?;
+        if !is_in_dependencies_section(content, position.line as usize) {
+            return None;
+        }
+        Some(extract_prefix(line, position.character))
+    }
+
+    fn fallback_completion_is_bare(&self, _content: &str, _position: Position) -> bool {
+        // `extract_prefix` (`strip_open_xml_attribute_value`) only ever produces a
+        // non-empty prefix when the cursor is already inside an open `Include="`/`id="`
+        // attribute value — the caller's empty-prefix guard rejects every other case
+        // before this method is reached, so whenever `fallback_completion_prefix`
+        // returned a completable prefix at all, the surrounding `<PackageReference
+        // .../>` markup is already open around the cursor. Inserting the full tag there
+        // would nest a second copy of it inside the attribute value it was typed into
+        // (#724/#728) — the default `fallback_bare_insert_text` (the bare package name)
+        // is always the safe insert here.
+        true
+    }
+
+    fn completion_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
+        let name = metadata.name();
+        let latest = metadata.latest_version().as_str();
+        Some(format!(
+            "<PackageReference Include=\"{name}\" Version=\"{latest}\" />"
+        ))
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
+}
+
+/// Element/attribute names carrying a NuGet dependency name across its three manifest
+/// schemas: `PackageReference`/`PackageVersion`'s `Include="..."` (csproj/fsproj/vbproj,
+/// `Directory.Packages.props`) and `packages.config`'s `<package id="..."/>`.
+const PACKAGE_ELEMENTS: &[&str] = &["PackageReference", "PackageVersion", "package"];
+const PACKAGE_NAME_ATTRS: &[&str] = &["Include", "id"];
+
+/// Checks if `line_number` of `content` is inside one of NuGet's three manifest
+/// schemas' dependency-element wrapper — `<ItemGroup>` (csproj/fsproj/vbproj,
+/// `Directory.Packages.props`) or `<packages>` (`packages.config`) — for
+/// `deps-lsp`'s raw-text fallback completion (parse-failure path).
+fn is_in_dependencies_section(content: &str, line_number: usize) -> bool {
+    deps_core::fallback_completion::is_in_xml_tag_section(content, line_number, "ItemGroup")
+        || deps_core::fallback_completion::is_in_xml_tag_section(content, line_number, "packages")
+}
+
+/// Extracts the fallback-completion prefix on `line` up to `character`, pulling the
+/// value out of an open `Include="..."`/`id="..."` attribute on one of
+/// [`PACKAGE_ELEMENTS`] (`<PackageReference Include="Newt` -> `Newt`) — NuGet's
+/// dependencies are attribute-valued, unlike Maven's tag-content shape.
+fn extract_prefix(line: &str, character: u32) -> &str {
+    deps_core::fallback_completion::strip_open_xml_attribute_value(
+        deps_core::fallback_completion::raw_prefix(line, character),
+        PACKAGE_ELEMENTS,
+        PACKAGE_NAME_ATTRS,
+    )
 }
 
 /// Injects a `*(unlisted)*` marker into each `"- \`VERSION\` ..."` "Recent versions" bullet
@@ -1527,5 +1587,272 @@ mod tests {
         _corp_index_mock.assert_async().await;
         _corp_flat_mock.assert_async().await;
         _corp_reg_mock.assert_async().await;
+    }
+
+    /// Composition regression guard (#390/#282/#699 bug class, mirrors the deleted
+    /// `deps-lsp` end-to-end test `test_fallback_completion_nuget_query_matches_attribute_value`):
+    /// proves `line_at` + `is_in_xml_tag_section` + `strip_open_xml_attribute_value`
+    /// compose correctly through the real trait method on realistic multi-line
+    /// `.csproj` content.
+    #[test]
+    fn test_fallback_completion_prefix_multi_line_composition_include_attribute() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = NuGetEcosystem::new(cache);
+        let content = "<Project>\n  <ItemGroup>\n    <PackageReference Include=\"Newt";
+        let line = content.lines().nth(2).unwrap();
+        let position = Position::new(2, line.chars().count() as u32);
+        assert_eq!(
+            eco.fallback_completion_prefix(content, position),
+            Some("Newt")
+        );
+    }
+
+    /// Same composition, `packages.config`'s `id="..."` attribute instead of
+    /// `PackageReference`'s `Include="..."`.
+    #[test]
+    fn test_fallback_completion_prefix_multi_line_composition_id_attribute() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = NuGetEcosystem::new(cache);
+        let content = "<packages>\n  <package id=\"Newt";
+        let line = content.lines().nth(1).unwrap();
+        let position = Position::new(1, line.chars().count() as u32);
+        assert_eq!(
+            eco.fallback_completion_prefix(content, position),
+            Some("Newt")
+        );
+    }
+
+    /// Typing inside a non-target attribute's value (`Version="1.0`, after `Include`
+    /// already closed) must not compose into a search prefix — an *empty* one, not
+    /// `None`. This is the load-bearing case for `fallback_completion_is_bare`'s
+    /// hardcoded `true`: since `fallback_completion`'s caller rejects an empty prefix
+    /// before ever calling `fallback_completion_is_bare`, the only way this method is
+    /// reached at all is with a non-empty prefix, which `strip_open_xml_attribute_value`
+    /// only ever produces from inside an open target attribute value (#724/#728).
+    #[test]
+    fn test_fallback_completion_prefix_multi_line_composition_non_target_attribute() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = NuGetEcosystem::new(cache);
+        let content = "<ItemGroup>\n  <PackageReference Include=\"Foo\" Version=\"1.0";
+        let line = content.lines().nth(1).unwrap();
+        let position = Position::new(1, line.chars().count() as u32);
+        assert_eq!(eco.fallback_completion_prefix(content, position), Some(""));
+    }
+
+    /// A `<PropertyGroup>` is outside `<ItemGroup>`/`<packages>` entirely — the
+    /// section gate itself must reject it, composed through the real trait method.
+    #[test]
+    fn test_fallback_completion_prefix_multi_line_composition_outside_section() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = NuGetEcosystem::new(cache);
+        let content = "<Project>\n  <PropertyGroup>\n    <TargetFramework>net8.0";
+        let line = content.lines().nth(2).unwrap();
+        let position = Position::new(2, line.chars().count() as u32);
+        assert_eq!(eco.fallback_completion_prefix(content, position), None);
+    }
+
+    /// #724/#728: whenever the raw-text fallback path reaches a completable prefix at
+    /// all, the cursor is already inside an open `Include="`/`id="` attribute value —
+    /// `fallback_completion_is_bare` must always report that so the caller inserts the
+    /// bare package name instead of a full `<PackageReference .../>` tag that would
+    /// nest inside the attribute value it was typed into.
+    #[test]
+    fn test_fallback_completion_is_bare_always_true() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = NuGetEcosystem::new(cache);
+        let content = "<Project>\n  <ItemGroup>\n    <PackageReference Include=\"Newt";
+        let line = content.lines().nth(2).unwrap();
+        let position = Position::new(2, line.chars().count() as u32);
+        assert!(eco.fallback_completion_is_bare(content, position));
+    }
+
+    /// #724: the default `fallback_bare_insert_text` (bare `metadata.name()`) is the
+    /// text actually inserted through the fallback path — not `completion_insert_text`'s
+    /// full tag, which would duplicate the markup already open around the cursor.
+    #[test]
+    fn test_fallback_bare_insert_text_is_bare_name() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = NuGetEcosystem::new(cache);
+        struct MockMetadata {
+            name: deps_core::PackageName,
+            latest_version: deps_core::ConcreteVersion,
+        }
+        impl deps_core::Metadata for MockMetadata {
+            fn name(&self) -> &deps_core::PackageName {
+                &self.name
+            }
+            fn description(&self) -> Option<&str> {
+                None
+            }
+            fn repository(&self) -> Option<&str> {
+                None
+            }
+            fn documentation(&self) -> Option<&str> {
+                None
+            }
+            fn latest_version(&self) -> &deps_core::ConcreteVersion {
+                &self.latest_version
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("Newtonsoft.Json"),
+            latest_version: "13.0.3".into(),
+        };
+        assert_eq!(
+            eco.fallback_bare_insert_text(&meta),
+            Some("Newtonsoft.Json".to_string())
+        );
+    }
+
+    #[test]
+    fn test_is_in_dependencies_section_csproj_item_group() {
+        let content = "<Project>\n  <ItemGroup>\n    <PackageReference Include=\"Foo\" />\n  </ItemGroup>\n</Project>\n";
+        assert!(is_in_dependencies_section(content, 2));
+        assert!(!is_in_dependencies_section(content, 0));
+    }
+
+    #[test]
+    fn test_is_in_dependencies_section_packages_config() {
+        let content = "<packages>\n  <package id=\"Foo\" version=\"1.0.0\" />\n</packages>\n";
+        assert!(is_in_dependencies_section(content, 1));
+        // The closing `</packages>` line itself is outside the section.
+        assert!(!is_in_dependencies_section(content, 2));
+    }
+
+    /// `Directory.Packages.props` reuses the same `<ItemGroup>` wrapper as
+    /// `PackageReference`, just with `PackageVersion` elements inside it.
+    #[test]
+    fn test_is_in_dependencies_section_directory_packages_props() {
+        let content = "<Project>\n  <ItemGroup>\n    <PackageVersion Include=\"Foo\" Version=\"1.0.0\" />\n  </ItemGroup>\n</Project>\n";
+        assert!(is_in_dependencies_section(content, 2));
+    }
+
+    /// A `<PropertyGroup>` (e.g. `<TargetFramework>`) is a real, common csproj section
+    /// that is not `<ItemGroup>`/`<packages>` — must not be mistaken for one.
+    #[test]
+    fn test_is_in_dependencies_section_outside_item_group() {
+        let content = "<Project>\n  <PropertyGroup>\n    <TargetFramework>net8.0</TargetFramework>\n  </PropertyGroup>\n</Project>\n";
+        assert!(!is_in_dependencies_section(content, 2));
+    }
+
+    /// Cursor right after "gua" in `<PackageReference Include="Newt`.
+    #[test]
+    fn test_extract_prefix_include_attribute() {
+        let line = "    <PackageReference Include=\"Newt";
+        assert_eq!(extract_prefix(line, line.chars().count() as u32), "Newt");
+    }
+
+    /// `packages.config`'s `<package id="..."/>` uses a different attribute name than
+    /// `PackageReference`'s `Include=`, but must be recognized the same way.
+    #[test]
+    fn test_extract_prefix_id_attribute() {
+        let line = "  <package id=\"Newt";
+        assert_eq!(extract_prefix(line, line.chars().count() as u32), "Newt");
+    }
+
+    /// Spacing around `=` (`Include = "..."`, as MSBuild allows) must not defeat the
+    /// attribute-name match.
+    #[test]
+    fn test_extract_prefix_spaced_equals() {
+        let line = "<PackageReference Include = \"Newt";
+        assert_eq!(extract_prefix(line, line.chars().count() as u32), "Newt");
+    }
+
+    #[test]
+    fn test_extract_prefix_single_quote() {
+        let line = "<PackageReference Include='Newt";
+        assert_eq!(extract_prefix(line, line.chars().count() as u32), "Newt");
+    }
+
+    /// Cursor inside a *different* attribute's value (`Version="1.0`, after `Include`
+    /// was already closed) must not be mistaken for the package-name attribute.
+    #[test]
+    fn test_extract_prefix_non_target_attribute_is_empty() {
+        let line = "<PackageReference Include=\"Foo\" Version=\"1.0";
+        assert_eq!(extract_prefix(line, line.chars().count() as u32), "");
+    }
+
+    /// `Include="..."` also appears on everyday MSBuild items that are not NuGet
+    /// package references at all (`<Compile Include="..`, source-file globs, etc.) —
+    /// the element name, not just the attribute name, must gate extraction.
+    #[test]
+    fn test_extract_prefix_non_package_element_include_is_unchanged() {
+        let line = "<Compile Include=\"Mode";
+        assert_eq!(extract_prefix(line, line.chars().count() as u32), "");
+    }
+
+    #[test]
+    fn test_extract_prefix_using_element_include_is_unchanged() {
+        let line = "<Using Include=\"Serilog";
+        assert_eq!(extract_prefix(line, line.chars().count() as u32), "");
+    }
+
+    /// Typing the element name itself, before any attribute quote has opened, must
+    /// not be treated as a search prefix.
+    #[test]
+    fn test_extract_prefix_element_name_only_is_empty() {
+        let line = "<PackageReference ";
+        assert_eq!(extract_prefix(line, line.chars().count() as u32), "");
+    }
+
+    #[test]
+    fn test_extract_prefix_comment_text_is_empty() {
+        let line = "<!-- TODO fix";
+        assert_eq!(extract_prefix(line, line.chars().count() as u32), "");
+    }
+
+    #[test]
+    fn test_extract_prefix_bare_word_is_empty() {
+        let line = "  Model";
+        assert_eq!(extract_prefix(line, line.chars().count() as u32), "");
+    }
+
+    /// A stray quote of the *other* type inside an unclosed value must not leak into
+    /// the extracted text.
+    #[test]
+    fn test_extract_prefix_mismatched_quote_does_not_leak() {
+        let line = "<PackageReference Include=\"Foo'";
+        assert_eq!(extract_prefix(line, line.chars().count() as u32), "Foo");
+    }
+
+    #[test]
+    fn test_completion_insert_text() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = NuGetEcosystem::new(cache);
+        struct MockMetadata {
+            name: deps_core::PackageName,
+            latest_version: deps_core::ConcreteVersion,
+        }
+        impl deps_core::Metadata for MockMetadata {
+            fn name(&self) -> &deps_core::PackageName {
+                &self.name
+            }
+            fn description(&self) -> Option<&str> {
+                None
+            }
+            fn repository(&self) -> Option<&str> {
+                None
+            }
+            fn documentation(&self) -> Option<&str> {
+                None
+            }
+            fn latest_version(&self) -> &deps_core::ConcreteVersion {
+                &self.latest_version
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("Newtonsoft.Json"),
+            latest_version: "13.0.3".into(),
+        };
+        assert_eq!(
+            eco.completion_insert_text(&meta),
+            Some("<PackageReference Include=\"Newtonsoft.Json\" Version=\"13.0.3\" />".to_string())
+        );
     }
 }

@@ -696,6 +696,10 @@ mod tests {
             Box::pin(async move { Completions::default() })
         }
 
+        fn completion_insert_text(&self, _metadata: &dyn crate::Metadata) -> Option<String> {
+            unimplemented!()
+        }
+
         fn as_any(&self) -> &dyn Any {
             self
         }
@@ -751,6 +755,10 @@ mod tests {
             _freshness: crate::FreshnessSettings,
         ) -> crate::ecosystem::BoxFuture<'a, Completions> {
             Box::pin(async move { Completions::default() })
+        }
+
+        fn completion_insert_text(&self, _metadata: &dyn crate::Metadata) -> Option<String> {
+            unimplemented!()
         }
 
         fn as_any(&self) -> &dyn Any {
@@ -815,6 +823,10 @@ mod tests {
             _freshness: crate::FreshnessSettings,
         ) -> crate::ecosystem::BoxFuture<'a, Completions> {
             Box::pin(async move { Completions::default() })
+        }
+
+        fn completion_insert_text(&self, _metadata: &dyn crate::Metadata) -> Option<String> {
+            unimplemented!()
         }
 
         fn as_any(&self) -> &dyn Any {

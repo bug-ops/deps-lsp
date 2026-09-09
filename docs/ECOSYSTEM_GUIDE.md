@@ -1970,6 +1970,22 @@ impl Ecosystem for {Ecosystem}Ecosystem {
         Box::pin(async move { Vec::new().into() })
     }
 
+    // Raw-text fallback completion (parse-failure path, issue #722): override
+    // `fallback_completion_prefix` only if this manifest format has a cheap raw-text
+    // section boundary to detect (most do — see e.g. `deps_core::fallback_completion`'s
+    // shared TOML/JSON/XML-tag scanners). Default `None` disables fallback completion
+    // for this ecosystem, which is correct if there is none (e.g. a manifest format
+    // with no delimited dependencies section).
+    //
+    // `completion_insert_text` is REQUIRED — no default — since a missing override
+    // would silently insert another ecosystem's manifest syntax (issue #118's failure
+    // mode). Called only from the raw-text fallback path above — the primary (parsed)
+    // completion path builds its own insert text via
+    // `build_package_completion`/`complete_package_names_generic` and never calls this.
+    fn completion_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
+        Some(format!("\"{}\" = \"{}\"", metadata.name(), metadata.latest_version()))
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -2162,6 +2178,10 @@ Before submitting a PR for a new ecosystem:
 - [ ] Formatter implementing `EcosystemFormatter` trait (`format_version_for_text_edit` + `package_url`)
 - [ ] Registry client implementing `deps_core::Registry` trait with BoxFuture signatures
 - [ ] Ecosystem impl with `impl deps_core::ecosystem::private::Sealed` block
+- [ ] `completion_insert_text` implemented (required, no default — issue #722); override
+      `fallback_completion_prefix` too if this manifest format has a raw-text
+      dependencies-section boundary to detect, reusing `deps_core::fallback_completion`'s
+      shared TOML/JSON/XML-tag scanners where the syntax shape matches an existing one
 - [ ] Unit tests for parser edge cases
 - [ ] Integration tests for registry (can be `#[ignore]`)
 - [ ] Documentation in lib.rs with examples

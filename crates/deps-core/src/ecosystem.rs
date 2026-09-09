@@ -9,6 +9,7 @@ use crate::{
     Registry,
     completion::Completions,
     lsp_helpers::{EcosystemFormatter, VersionData},
+    registry::Metadata,
 };
 
 pub mod private {
@@ -401,7 +402,7 @@ impl LicenseSource {
 /// # Examples
 ///
 /// ```no_run
-/// use deps_core::{Ecosystem, ParseResult, Registry, EcosystemConfig, PackageName, ConcreteVersion};
+/// use deps_core::{Ecosystem, ParseResult, Registry, EcosystemConfig, PackageName, ConcreteVersion, Metadata};
 /// use deps_core::completion::Completions;
 /// use deps_core::lsp_helpers::{
 ///     DiagnosticMessages, DiagnosticPolicy, EcosystemFormatter, OsvNaming, PackageNaming,
@@ -455,6 +456,10 @@ impl LicenseSource {
 ///         _freshness: deps_core::FreshnessSettings,
 ///     ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
 ///         Box::pin(async move { Completions::default() })
+///     }
+///
+///     fn completion_insert_text(&self, metadata: &dyn Metadata) -> Option<String> {
+///         Some(format!("\"{}\" = \"{}\"", metadata.name(), metadata.latest_version()))
 ///     }
 ///
 ///     fn as_any(&self) -> &dyn Any { self }
@@ -774,6 +779,119 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
         content: &'a str,
         freshness: crate::FreshnessSettings,
     ) -> BoxFuture<'a, Completions>;
+
+    /// Raw-text search prefix at `position` for `deps-lsp`'s fallback (parse-failure)
+    /// completion path, used when the manifest failed to parse (typically mid-edit) so
+    /// [`Self::generate_completions`]'s parsed-AST path has no [`ParseResult`] to work
+    /// from.
+    ///
+    /// `content` is the whole manifest text; the implementation locates the line at
+    /// `position`, decides whether that line falls inside a dependencies-like section
+    /// using its own raw-text heuristic (see `deps_core::fallback_completion` for the
+    /// scanners shared across ecosystems, e.g. [`crate::fallback_completion::
+    /// is_in_toml_dependencies`]), and — only when it does — extracts the text the user
+    /// has typed up to the cursor, stripping any manifest-syntax wrapper (a JSON
+    /// string's quotes, an XML tag or attribute value) so the returned prefix is a bare
+    /// candidate package-name fragment. `None` means either the cursor is not at a
+    /// completable position at all, or this ecosystem's manifest format has no raw-text
+    /// section boundary cheap enough to detect this way (e.g. Gradle's five manifest
+    /// formats, or Swift's/Bundler's whole-file-scoped dependency calls).
+    ///
+    /// The caller applies its own ecosystem-agnostic guards to the returned prefix
+    /// (minimum length, no `=` character) before searching the registry — this method
+    /// only answers "is there a prefix here, and what manifest-syntax wrapper does it
+    /// need stripped", not "is this prefix worth searching for".
+    ///
+    /// Default `None`: correct for every ecosystem with no raw-text section boundary.
+    /// Unlike [`Self::completion_insert_text`], deliberately *not* required — a missing
+    /// override only disables fallback completion for a 15th ecosystem (a feature gap),
+    /// never silently emits wrong manifest syntax the way an unhandled
+    /// [`Self::completion_insert_text`] arm could (see issue #118's failure mode).
+    fn fallback_completion_prefix<'a>(
+        &self,
+        _content: &'a str,
+        _position: Position,
+    ) -> Option<&'a str> {
+        None
+    }
+
+    /// Manifest-syntax snippet to insert for a completed package, given its registry
+    /// search `metadata` — the ecosystem-specific counterpart to
+    /// [`Self::fallback_completion_prefix`]. Called only from `deps-lsp`'s raw-text
+    /// fallback (parse-failure) completion path; the primary (parsed) completion path
+    /// builds its own insert text via `deps_core::completion::build_package_completion`
+    /// / `complete_package_names_generic` and never calls this method.
+    ///
+    /// Takes `&dyn Metadata` rather than separate `name`/`latest_version` parameters:
+    /// an ecosystem's snippet may need more than those two fields (Swift's needs
+    /// [`Metadata::repository`] to build a `.package(url:, from:)` call). Returns `None`
+    /// to reject the completion entirely — e.g. a per-ecosystem gate on a structural
+    /// character that would otherwise let a malicious/compromised registry response
+    /// break out of the inserted snippet's syntax (Maven's coordinate-segment gate,
+    /// Swift's registry-URL gate, GitHub Actions' `owner/repo` shape check). The caller
+    /// (`deps-lsp`) does not log a rejection itself — an implementation that rejects a
+    /// value is expected to log it via [`crate::lsp_helpers::warn_rejected_value`]
+    /// first, the way Maven/Swift/GitHub Actions do inside their own overrides.
+    ///
+    /// Deliberately **required**, no default: a missing override here would silently
+    /// insert wrong manifest syntax for whatever ecosystem forgot to implement it
+    /// (exactly the failure mode issue #118 fixed for ecosystem-identity matching in
+    /// general — this is the same principle applied to completion-insert syntax).
+    ///
+    /// The two upfront, ecosystem-agnostic gates — [`crate::lsp_helpers::
+    /// is_safe_package_name`] on `metadata.name()` and [`crate::lsp_helpers::
+    /// is_safe_version_string`] on `metadata.latest_version()` (whenever non-empty) —
+    /// run in the caller before this method is invoked, not inside it: every ecosystem
+    /// interpolates those two fields, so checking them once in `deps-lsp` avoids
+    /// re-deriving the same two allowlist checks in every implementation.
+    fn completion_insert_text(&self, metadata: &dyn Metadata) -> Option<String>;
+
+    /// Whether the prefix [`Self::fallback_completion_prefix`] just returned for this
+    /// `content`/`position` sits inside manifest markup that can only safely hold the
+    /// bare candidate text — an already-open XML tag or attribute value — rather than
+    /// [`Self::completion_insert_text`]'s normal full snippet.
+    ///
+    /// Inserting the full snippet where markup is already open would nest a duplicate
+    /// copy of it (issue #724, the original NuGet report: `Include="Newt` accepting a
+    /// completion produced `Include="Newt<PackageReference Include="..." .../>`).
+    /// `deps-lsp`'s fallback-completion caller checks this once per call, alongside
+    /// [`Self::fallback_completion_prefix`], and routes to
+    /// [`Self::fallback_bare_insert_text`] instead of [`Self::completion_insert_text`]
+    /// when it returns `true`.
+    ///
+    /// Default `false`: correct for every ecosystem whose manifest syntax has no
+    /// concept of "already open" markup around a fallback-completion cursor (i.e. every
+    /// ecosystem but Maven and NuGet today). Not required, like
+    /// [`Self::fallback_completion_prefix`]: a missing override only means a future
+    /// XML-shaped ecosystem always gets the full-snippet insert, a feature gap rather
+    /// than #118's "silently wrong syntax" failure mode.
+    fn fallback_completion_is_bare(&self, _content: &str, _position: Position) -> bool {
+        false
+    }
+
+    /// Bare candidate-name text to insert when [`Self::fallback_completion_is_bare`]
+    /// reports the cursor already sits inside open markup — the counterpart to
+    /// [`Self::completion_insert_text`] for that case. Only called when
+    /// [`Self::fallback_completion_is_bare`] returned `true` for the same
+    /// `content`/`position`.
+    ///
+    /// Returns `None` to reject the completion entirely, the same rejection semantics
+    /// as [`Self::completion_insert_text`] — e.g. Maven's `artifactId` half still needs
+    /// its own [`crate::is_safe_maven_coordinate_segment`] gate here, since the two
+    /// upfront ecosystem-agnostic gates the caller runs beforehand
+    /// ([`crate::lsp_helpers::is_safe_package_name`] on `metadata.name()` and
+    /// [`crate::lsp_helpers::is_safe_version_string`] on `metadata.latest_version()`)
+    /// validate the *whole* `name`, not a substring split out of it.
+    ///
+    /// Default: `metadata.name()` verbatim — correct for NuGet (and any future
+    /// attribute-valued ecosystem whose full snippet's name field is the bare name
+    /// unmodified), since `metadata.name()` already passed the caller's
+    /// `is_safe_package_name` gate before this method runs. Maven overrides this: its
+    /// `name` is a `group:artifact` compound, and only the `artifact` half belongs in
+    /// an already-open `<artifactId>` tag.
+    fn fallback_bare_insert_text(&self, metadata: &dyn Metadata) -> Option<String> {
+        Some(metadata.name().to_string())
+    }
 
     /// Whether this ecosystem's package-name search may return a truncated view of
     /// a larger candidate set (see e.g. `PypiRegistry::search`'s doc comment).

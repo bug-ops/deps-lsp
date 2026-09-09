@@ -203,9 +203,65 @@ impl Ecosystem for GoEcosystem {
         })
     }
 
+    fn fallback_completion_prefix<'a>(
+        &self,
+        content: &'a str,
+        position: Position,
+    ) -> Option<&'a str> {
+        let line = deps_core::fallback_completion::line_at(content, position)?;
+        if !is_in_dependencies_section(content, position.line as usize) {
+            return None;
+        }
+        Some(extract_prefix(line, position.character))
+    }
+
+    fn completion_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
+        let name = metadata.name();
+        let latest = metadata.latest_version().as_str();
+        Some(format!("{name} {latest}"))
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
+}
+
+/// Checks if `line_number` of `content` is inside a go.mod `require` directive.
+///
+/// Handles both the single-line form (`require module version`) and the
+/// parenthesized block form (`require (` ... `)`), for `deps-lsp`'s raw-text fallback
+/// completion (parse-failure path).
+fn is_in_dependencies_section(content: &str, line_number: usize) -> bool {
+    let mut in_require_block = false;
+
+    for (i, line) in content.lines().enumerate() {
+        if i > line_number {
+            break;
+        }
+
+        let trimmed = line.trim();
+        let is_block_start = trimmed
+            .strip_prefix("require")
+            .is_some_and(|rest| rest.trim_start().starts_with('('));
+
+        if is_block_start {
+            in_require_block = true;
+        } else if in_require_block && trimmed.starts_with(')') {
+            in_require_block = false;
+        }
+
+        if i == line_number {
+            return in_require_block || is_block_start || trimmed.starts_with("require ");
+        }
+    }
+
+    false
+}
+
+/// Extracts the fallback-completion prefix on `line` up to `character` — a bare
+/// module path, with no manifest-syntax wrapper to strip.
+fn extract_prefix(line: &str, character: u32) -> &str {
+    deps_core::fallback_completion::raw_prefix(line, character)
 }
 
 #[cfg(test)]
@@ -981,5 +1037,75 @@ require github.com/gin-gonic/gin v1.9.1
             )
             .await;
         assert!(!results.is_empty());
+    }
+
+    /// Composition regression guard (#390/#282 bug class): proves `line_at` +
+    /// `is_in_dependencies_section`'s `require (...)` block scan compose correctly
+    /// through the real trait method on realistic multi-line `go.mod` content.
+    #[test]
+    fn test_fallback_completion_prefix_multi_line_composition() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = GoEcosystem::new(cache);
+        let content = "module example.com/myapp\n\nrequire (\n\tgithub.com/gin-gonic/g";
+        let line = content.lines().nth(3).unwrap();
+        let position = Position::new(3, line.chars().count() as u32);
+        assert_eq!(
+            ecosystem.fallback_completion_prefix(content, position),
+            Some("github.com/gin-gonic/g")
+        );
+    }
+
+    #[test]
+    fn test_is_in_dependencies_section_single_line() {
+        let content = "module example.com/myapp\n\nrequire github.com/gin-gonic/gin v1.9.1\n";
+        assert!(is_in_dependencies_section(content, 2));
+        assert!(!is_in_dependencies_section(content, 0));
+    }
+
+    #[test]
+    fn test_is_in_dependencies_section_block() {
+        let content =
+            "module example.com/myapp\n\nrequire (\n\tgithub.com/gin-gonic/gin v1.9.1\n)\n";
+        assert!(is_in_dependencies_section(content, 2));
+        assert!(is_in_dependencies_section(content, 3));
+        assert!(!is_in_dependencies_section(content, 4));
+    }
+
+    #[test]
+    fn test_completion_insert_text() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = GoEcosystem::new(cache);
+        struct MockMetadata {
+            name: deps_core::PackageName,
+            latest_version: deps_core::ConcreteVersion,
+        }
+        impl deps_core::Metadata for MockMetadata {
+            fn name(&self) -> &deps_core::PackageName {
+                &self.name
+            }
+            fn description(&self) -> Option<&str> {
+                None
+            }
+            fn repository(&self) -> Option<&str> {
+                None
+            }
+            fn documentation(&self) -> Option<&str> {
+                None
+            }
+            fn latest_version(&self) -> &deps_core::ConcreteVersion {
+                &self.latest_version
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+        let meta = MockMetadata {
+            name: pkg("github.com/stretchr/testify"),
+            latest_version: "v1.9.0".into(),
+        };
+        assert_eq!(
+            ecosystem.completion_insert_text(&meta),
+            Some("github.com/stretchr/testify v1.9.0".to_string())
+        );
     }
 }

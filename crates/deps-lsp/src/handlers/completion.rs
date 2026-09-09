@@ -6,10 +6,7 @@ use crate::config::DepsConfig;
 use crate::document::{ServerState, ensure_document_loaded};
 use deps_core::EcosystemId;
 use deps_core::completion::COMPLETION_SEARCH_TIMEOUT;
-use deps_core::{
-    is_safe_maven_coordinate_segment, is_safe_package_name, is_safe_registry_url,
-    is_safe_version_string, lsp_helpers::warn_rejected_value,
-};
+use deps_core::{is_safe_package_name, is_safe_version_string, lsp_helpers::warn_rejected_value};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_lsp_server::Client;
@@ -227,7 +224,15 @@ pub async fn handle_completion(
 
 /// Fallback completion when document parsing fails.
 ///
-/// Detects dependencies sections from raw text and provides package name suggestions.
+/// Delegates the raw-text section/prefix detection entirely to the resolved
+/// ecosystem's [`deps_core::Ecosystem::fallback_completion_prefix`] (issue #722) — the
+/// per-ecosystem section-boundary and manifest-syntax-stripping heuristics that used to
+/// live here now live with each ecosystem crate. This function only owns the two
+/// ecosystem-agnostic pieces: resolving the ecosystem, and the minimum-length/no-`=`
+/// guard on whatever prefix comes back.
+///
+/// The ecosystem lookup now happens *before* the section/prefix check (previously
+/// after) — same return value either way (empty vec), only log ordering changes.
 async fn fallback_completion(
     state: &ServerState,
     ecosystem_kind: EcosystemId,
@@ -239,28 +244,22 @@ async fn fallback_completion(
         ecosystem_kind
     );
 
-    // Get the current line
-    let line = match content.lines().nth(position.line as usize) {
-        Some(l) => l,
-        None => {
-            tracing::info!("fallback_completion: line {} not found", position.line);
-            return vec![];
-        }
+    let Some(ecosystem) = state.ecosystem_registry.get(ecosystem_kind.id()) else {
+        tracing::warn!(
+            "fallback_completion: ecosystem not found for id: {}",
+            ecosystem_kind
+        );
+        return vec![];
     };
 
-    tracing::info!("fallback_completion: line content = {:?}", line);
-
-    if !is_in_dependencies_section(content, position.line as usize, ecosystem_kind) {
-        tracing::info!("fallback_completion: not in dependencies section");
+    // Collapses this file's former separate "line not found" / "not in dependencies
+    // section" log lines into one — both are now internal to the ecosystem's own
+    // `fallback_completion_prefix`, which has no completable position to report either
+    // way.
+    let Some(prefix) = ecosystem.fallback_completion_prefix(content, position) else {
+        tracing::info!("fallback_completion: no completable prefix at this position");
         return vec![];
-    }
-
-    // Extract what user has typed (from start of line to cursor), plus what kind of
-    // markup (if any) is already open around the cursor — `create_package_completion_item`
-    // needs this to decide between a bare-text insert and a full markup snippet (#724).
-    let (prefix, open_markup) = extract_prefix(line, position.character, ecosystem_kind);
-
-    tracing::info!("fallback_completion: prefix = {:?}", prefix);
+    };
 
     // If it looks like a package name (letters, no = sign, at least 2 chars).
     // Count Unicode scalar values, not bytes: a single multi-byte character
@@ -270,787 +269,22 @@ async fn fallback_completion(
         return vec![];
     }
 
-    // `create_package_completion_item` unconditionally returns `None` for every result
-    // when the cursor is inside an already-open Maven tag other than `artifactId`
-    // (critic S1 on #724) — no completion item can ever come out of this search, so
-    // skip the live registry round-trip entirely instead of firing one on every
-    // keystroke just to discard all of its results.
-    if open_markup == OpenMarkupContext::MavenOtherTag {
-        tracing::info!("fallback_completion: inside a non-artifactId Maven tag, skipping search");
-        return vec![];
-    }
+    // Whether the cursor sits inside manifest markup that's already open (an XML
+    // tag or attribute value) and can only safely hold the bare candidate text,
+    // rather than `completion_insert_text`'s normal full snippet — inserting the
+    // full snippet there would nest a duplicate copy of the markup already open
+    // around the cursor (#724/#728). Decided once per call, from the same
+    // `content`/`position` `fallback_completion_prefix` used, and applied to every
+    // result.
+    let bare = ecosystem.fallback_completion_is_bare(content, position);
 
-    // Get ecosystem and search for packages
-    let ecosystem = match state.ecosystem_registry.get(ecosystem_kind.id()) {
-        Some(e) => e,
-        None => return vec![],
-    };
-
-    let registry = ecosystem.registry();
-
-    // Search for packages matching the prefix
-    search_packages(registry.as_ref(), ecosystem_kind, prefix, open_markup).await
-}
-
-/// What kind of markup, if any, is already open around the cursor position
-/// [`extract_prefix`] extracted `prefix` from — used by
-/// [`create_package_completion_item`] to decide between a bare-text insert and a full
-/// markup snippet.
-///
-/// Inserting the full snippet where markup is already open would nest a duplicate copy
-/// of it (#724 — the original NuGet report). Inserting bare text into the *wrong*
-/// already-open tag (e.g. an artifact id into `<groupId>`) is the same silent-corruption
-/// class, just with well-formed instead of malformed XML, so only the one Maven tag this
-/// file knows how to complete safely (`artifactId`) gets the bare-insert treatment —
-/// [`MavenOtherTag`](Self::MavenOtherTag) suppresses the completion item entirely rather
-/// than guessing (critic S1/M3 on #724).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OpenMarkupContext {
-    /// Not inside any open tag/attribute value this file's heuristics recognize —
-    /// `prefix` is either plain text or, for the JSON/TOML-array ecosystems, sits
-    /// inside a quoted value whose surrounding quotes already exist (npm/Composer/PyPI
-    /// intentionally collapse to this variant rather than a dedicated one: see the
-    /// note in [`extract_prefix`]).
-    None,
-    /// Inside an open Maven `<artifactId>` tag's content.
-    MavenArtifactId,
-    /// Inside some other open Maven tag's content (`groupId`, `version`, or an
-    /// unrecognized element) — this fallback path has no safe bare text to offer here.
-    MavenOtherTag,
-    /// Inside an already-open NuGet target attribute value (`Include="`/`id="`).
-    NuGetAttribute,
-}
-
-/// Extracts what the user has typed on `line` up to the cursor (`character`), trimmed
-/// of whitespace, along with the [`OpenMarkupContext`] it was extracted from.
-///
-/// For JSON manifests (package.json, composer.json) a quote can survive on either
-/// side: a leading `"` when the cursor sits before the closing quote of a still-typed
-/// key, or a trailing `"` when the cursor sits right after a closing quote (e.g. an
-/// editor auto-closed it, or the user retyped it). Either would otherwise reach the
-/// registry as part of the search query and suppress exact matches. PyPI's
-/// `pyproject.toml` entries (`"pytes` inside `dependencies = [...]`) carry the same
-/// surviving-quote shape, just as a TOML array element rather than a JSON key — see
-/// [`uses_toml_string_array_values`]. This branch always returns
-/// [`OpenMarkupContext::None`], which is imprecise for npm/Composer specifically (the
-/// surviving quote proves the value's own quotes are already open, the same shape as
-/// NuGet's attribute case) — `create_package_completion_item`'s npm/Composer arm can
-/// still insert a full `"{name}": "^{latest}"` pair into that already-open string,
-/// producing invalid JSON. Tracked as a known follow-up gap (critic S2 on #724, filed as
-/// #729), out of scope for #724 itself (npm/Composer weren't in the original report);
-/// PyPI is exempt since its arm already inserts a bare string.
-///
-/// For XML manifests (`pom.xml`) an opening tag survives on the left instead (cursor
-/// inside `<artifactId>gua`) — stripped so the extracted text matches what the
-/// ecosystem's own primary completion path (e.g. `MavenEcosystem::detect_xml_context`)
-/// searches for at the same cursor position. Without this, the raw-text fallback path
-/// searches the registry for markup-polluted text instead of the real prefix, and (#282
-/// C1) a per-query dedup/cache mechanism keyed on the search string never recognizes
-/// the fallback's call as a repeat of the primary path's call for the same prefix.
-fn extract_prefix(
-    line: &str,
-    character: u32,
-    ecosystem_kind: EcosystemId,
-) -> (&str, OpenMarkupContext) {
-    let prefix_end =
-        deps_core::completion::utf16_to_byte_offset(line, character).unwrap_or(line.len());
-    debug_assert!(
-        line.is_char_boundary(prefix_end),
-        "prefix_end must be a char boundary"
+    tracing::info!(
+        "fallback_completion: prefix = {:?}, bare = {}",
+        prefix,
+        bare
     );
-    let prefix = line.get(..prefix_end).unwrap_or(line).trim();
-    if uses_json_quoted_keys(ecosystem_kind) || uses_toml_string_array_values(ecosystem_kind) {
-        // Known gap for npm/Composer specifically (tracked as #729, not #724 itself —
-        // see this function's doc comment): the trimmed `"` proves the
-        // value's own quotes are already open, the same shape as NuGet's attribute
-        // case, but this always reports `None` rather than a dedicated context.
-        (prefix.trim_matches('"'), OpenMarkupContext::None)
-    } else if uses_xml_tag_values(ecosystem_kind) {
-        let (stripped, tag) = strip_leading_xml_tag(prefix);
-        let context = match tag {
-            Some("artifactId") => OpenMarkupContext::MavenArtifactId,
-            Some(_) => OpenMarkupContext::MavenOtherTag,
-            None => OpenMarkupContext::None,
-        };
-        (stripped, context)
-    } else if uses_xml_attribute_values(ecosystem_kind) {
-        let (stripped, in_target_attr) = strip_leading_xml_attribute(prefix);
-        let context = if in_target_attr {
-            OpenMarkupContext::NuGetAttribute
-        } else {
-            OpenMarkupContext::None
-        };
-        (stripped, context)
-    } else {
-        (prefix, OpenMarkupContext::None)
-    }
-}
 
-/// Whether `ecosystem_kind`'s manifest wraps a completable value in an XML open tag on
-/// the same line (`<artifactId>gua`), so [`extract_prefix`] must strip that tag.
-///
-/// Exhaustively matched, like [`uses_json_quoted_keys`], so a future XML-manifest
-/// ecosystem forces a decision here instead of silently leaking tag markup into a
-/// registry search query. NuGet is XML too but correctly `false` here: its
-/// dependencies are attribute-valued (`<PackageReference Include="..." Version="..."
-/// />`), not tag-value wrapped like Maven's, so it needs its own extraction — see
-/// [`uses_xml_attribute_values`] instead.
-const fn uses_xml_tag_values(ecosystem_kind: EcosystemId) -> bool {
-    match ecosystem_kind {
-        EcosystemId::Maven => true,
-        EcosystemId::Npm
-        | EcosystemId::Composer
-        | EcosystemId::Cargo
-        | EcosystemId::Pypi
-        | EcosystemId::Go
-        | EcosystemId::Dart
-        | EcosystemId::Gradle
-        | EcosystemId::Swift
-        | EcosystemId::NuGet
-        | EcosystemId::Bundler
-        | EcosystemId::Deno
-        | EcosystemId::GithubActions
-        | EcosystemId::GitlabCi => false,
-    }
-}
-
-/// Strips everything up to and including the *last* `>` in `prefix` (`<artifactId>gua`
-/// -> `gua`); returns `prefix` unchanged if it contains no `>` at all (e.g. the tag is
-/// not yet closed, as when the user is still typing the tag name itself). Also returns
-/// the name of the tag whose content the cursor now sits inside, when there is one.
-///
-/// Scans for the last `>`, not the first, to mirror `MavenEcosystem::
-/// detect_xml_context`'s own `rfind`-based tag lookup (`crates/deps-maven/src/
-/// ecosystem.rs`): that function locates the closest opening tag *before the cursor*,
-/// which is the last one on the line, not the first. A first-`>` version of this
-/// function diverges from it whenever more than one tag precedes the cursor on a line
-/// (`<groupId>com.google.guava</groupId><artifactId>gua` — the first `>` sits inside
-/// `<groupId>`, well short of the real value).
-///
-/// The returned tag name is `None` in three cases: no `>` at all (see above); the `<...>`
-/// ending at that `>` is a *closing* tag (`</artifactId>` — its name slice starts with
-/// `/`), e.g. cursor right after `<artifactId>guava</artifactId>` — the last `>` is the
-/// line's very last character, correctly yielding an empty stripped string and no open
-/// tag, matching `detect_xml_context`'s own "no context" outcome for that position (its
-/// `between.contains("</")` guard rejects it too); or loose text after a closed tag
-/// (`<artifactId>guava</artifactId> comm` — same closing-tag case, `Some(" comm")` would
-/// otherwise wrongly read as "inside `artifactId`" (critic M3 on #724)). Otherwise the
-/// name is the element name immediately after that tag's `<` (attributes and a trailing
-/// `/` stripped, mirroring [`strip_leading_xml_attribute`]'s own element extraction) —
-/// `Some("artifactId")` is the only value [`create_package_completion_item`]'s Maven arm
-/// currently treats specially (critic S1 on #724); any other tag name still signals
-/// "already inside open markup" so the full-snippet insert isn't offered there either.
-fn strip_leading_xml_tag(prefix: &str) -> (&str, Option<&str>) {
-    // `>`/`<` are single-byte ASCII chars, so `gt + 1`/`lt + 1` are always valid char
-    // boundaries, and slicing at `gt`/`lt` (found via `rfind` on the byte string) is too.
-    #[allow(clippy::string_slice)]
-    {
-        let Some(gt) = prefix.rfind('>') else {
-            return (prefix, None);
-        };
-        let stripped = &prefix[gt + 1..];
-        let Some(lt) = prefix[..gt].rfind('<') else {
-            return (stripped, None);
-        };
-        // A closing tag's name segment (`/artifactId` for `</artifactId>`) splits to an
-        // empty first token, since `/` is itself a delimiter — that's what makes
-        // `name.is_empty()` double as the "not a closing tag" check.
-        let name = prefix[lt + 1..gt]
-            .split(|c: char| c == '/' || c.is_whitespace())
-            .next()
-            .unwrap_or("");
-        if name.is_empty() {
-            (stripped, None)
-        } else {
-            (stripped, Some(name))
-        }
-    }
-}
-
-/// Whether `ecosystem_kind`'s manifest carries a completable value in an XML
-/// *attribute* rather than tag content (`Include="Newt`), so [`extract_prefix`] must
-/// use [`strip_leading_xml_attribute`] instead of [`strip_leading_xml_tag`].
-///
-/// Exhaustively matched, like [`uses_xml_tag_values`], so a future ecosystem whose
-/// manifest is XML-attribute-valued forces a decision here instead of silently
-/// falling through to the tag-content (or unmodified) path.
-///
-/// NuGet only: `PackageReference`/`PackageVersion`'s `Include="..."` and
-/// `packages.config`'s `<package id="..."/>` are the two element+attribute pairs that
-/// carry a dependency name across NuGet's three manifest schemas (`crates/deps-nuget/
-/// src/parser.rs`), unlike Maven's tag-content shape.
-const fn uses_xml_attribute_values(ecosystem_kind: EcosystemId) -> bool {
-    match ecosystem_kind {
-        EcosystemId::NuGet => true,
-        EcosystemId::Maven
-        | EcosystemId::Npm
-        | EcosystemId::Composer
-        | EcosystemId::Cargo
-        | EcosystemId::Pypi
-        | EcosystemId::Go
-        | EcosystemId::Dart
-        | EcosystemId::Gradle
-        | EcosystemId::Swift
-        | EcosystemId::Bundler
-        | EcosystemId::Deno
-        | EcosystemId::GithubActions
-        | EcosystemId::GitlabCi => false,
-    }
-}
-
-/// Extracts the value being typed inside an open `Include="..."` or `id="..."`
-/// attribute at the end of `prefix`, on a `PackageReference`/`PackageVersion`/
-/// `package` element (`<PackageReference Include="Newt` -> `Newt`).
-///
-/// Returns an *empty* string whenever the cursor is not inside one of those two
-/// attributes' *unclosed* values on one of those three elements — still inside the
-/// element/attribute name itself (`<PackageReference `, no attribute typed yet: there
-/// is no candidate package-name text at that position), inside a different
-/// attribute's value (`Version="1.0`), past an already-closed value, inside
-/// `Include="..."` on an unrelated MSBuild item (`<Compile Include="..`,
-/// `<Using Include="..`, `<ProjectReference Include="..` — all common in real
-/// `.csproj` files and *not* NuGet package references), or plain non-markup text
-/// (comments, a bare word) that happens to sit inside an `<ItemGroup>`/`<packages>`
-/// section. Deliberately empty rather than the raw `prefix`, unlike
-/// [`strip_leading_xml_tag`]'s "return unchanged" fallback: an unmodified prefix here
-/// would usually contain no `=` either (comment text, a bare word, or the still-typed
-/// element/attribute name), so `fallback_completion`'s `contains('=')` guard alone
-/// cannot reject it, and a search on that raw text would query the registry for
-/// markup or arbitrary noise (#699 code-review finding). Mirrors the real parser's
-/// own element-name dispatch (`crates/deps-nuget/src/parser.rs:46,53,58`), which is
-/// strictly narrower than "any `Include=`/`id=` attribute" would be.
-///
-/// Scans the whole `prefix` tracking the currently open quote, rather than `rfind`
-/// as [`strip_leading_xml_tag`] does for tag content: an attribute value's opening
-/// quote is the same character as a closed value's closing quote, so telling them
-/// apart requires tracking quote parity from the start of the element instead of
-/// searching backwards from the end. Only sees the element opening tag when it is on
-/// the same line as the cursor — a `PackageReference` whose element and `Include=`
-/// attribute are split across lines is not detected, matching this file's other
-/// raw-text heuristics' single-line scope.
-///
-/// The returned `bool` is the same `quote.is_some() && in_target_attr` condition that
-/// gates the non-empty-string return below, exposed to the caller directly rather than
-/// re-derived from `stripped.is_empty()` — the two conditions coincide today, but
-/// deriving the flag from emptiness elsewhere would silently break if a future change
-/// let a target-attribute value legitimately extract to `""` (critic M2 on #724).
-fn strip_leading_xml_attribute(prefix: &str) -> (&str, bool) {
-    let mut quote: Option<char> = None;
-    let mut value_start = 0usize;
-    let mut in_target_attr = false;
-    let mut segment_start = 0usize;
-    let mut element = "";
-
-    for (idx, ch) in prefix.char_indices() {
-        if let Some(open) = quote {
-            if ch == open {
-                quote = None;
-                segment_start = idx + ch.len_utf8();
-            }
-            continue;
-        }
-        if ch == '<' {
-            // `idx + 1` is a char boundary: `<` is a single-byte ASCII char. Reset
-            // here too (not just on a closing quote) so `before_quote` below never
-            // spans back across a *previous* element's tail — correctness doesn't
-            // currently depend on this (`split_whitespace().next_back()` already
-            // discards everything but the token right before the quote), but keeping
-            // `segment_start` anchored to the most recent tag boundary keeps that
-            // true by construction rather than by a non-obvious side effect.
-            segment_start = idx + ch.len_utf8();
-            #[allow(clippy::string_slice)]
-            let rest = &prefix[segment_start..];
-            element = rest
-                .split(|c: char| c == '>' || c == '/' || c.is_whitespace())
-                .next()
-                .unwrap_or("");
-            continue;
-        }
-        if ch == '"' || ch == '\'' {
-            // `idx` is a char boundary (from `char_indices`), so this slice is valid.
-            #[allow(clippy::string_slice)]
-            let before_quote = prefix[segment_start..idx].trim_end();
-            let name = before_quote
-                .strip_suffix('=')
-                .unwrap_or(before_quote)
-                .split_whitespace()
-                .next_back()
-                .unwrap_or("");
-            in_target_attr = matches!(element, "PackageReference" | "PackageVersion" | "package")
-                && (name == "Include" || name == "id");
-            quote = Some(ch);
-            value_start = idx + ch.len_utf8();
-        }
-    }
-
-    if quote.is_some() && in_target_attr {
-        // `value_start` is `idx + ch.len_utf8()` for the opening quote char, always a
-        // char boundary.
-        #[allow(clippy::string_slice)]
-        let value = &prefix[value_start..];
-        // A package id never contains a quote character. The scan above only closes
-        // `quote` on the *matching* delimiter, so an opposite-type quote character
-        // (e.g. a stray `'` inside an unclosed `"`-delimited value) would otherwise
-        // survive into the extracted value and the registry search query built from
-        // it; stop at the first quote of either kind instead.
-        return (value.split(['"', '\'']).next().unwrap_or(value), true);
-    }
-    ("", false)
-}
-
-/// Whether `ecosystem_kind`'s manifest keys are typed as JSON string literals
-/// (package.json, composer.json), and so can carry a stray quote into [`extract_prefix`].
-///
-/// Exhaustively matched, like [`is_in_dependencies_section`], so a future JSON-manifest
-/// ecosystem forces a decision here instead of silently keeping a stray quote.
-///
-/// `Deno` is deliberately `false` despite `deno.json` being JSON, unlike npm/Composer:
-/// the npm analogy doesn't hold here because the completable text at a package-name
-/// position in `deno.json` is the JSON *value* (the `jsr:`/`npm:` specifier string), not
-/// the *key* (the import alias) — `extract_prefix`'s whole-line-to-cursor-then-trim
-/// approach only strips a stray quote correctly for a key-position completion, so
-/// applying it to Deno would leak the alias and colon into the fallback search query.
-///
-/// Fallback (raw-text) completion does still *run* for Deno — `is_in_dependencies_section`
-/// returns `true` inside `imports`, same as any other JSON ecosystem — but it is harmless:
-/// the raw line-start-to-cursor text `extract_prefix` produces is always preceded by the
-/// alias key, colon and opening quote in real JSON (`"@std/fs": "jsr:@std/f`), so it can
-/// never coincide with a bare `jsr:`/`npm:` prefix. `DenoRegistry::search` (`deps-deno`)
-/// therefore always takes its scheme-less `None => Ok(vec![])` arm for this path, so the
-/// fallback query is effectively a no-op rather than a source of garbage results — it is
-/// the primary `detect_completion_context`-based path
-/// (`DenoEcosystem::generate_completions`) that does the real work.
-const fn uses_json_quoted_keys(ecosystem_kind: EcosystemId) -> bool {
-    match ecosystem_kind {
-        EcosystemId::Npm | EcosystemId::Composer => true,
-        EcosystemId::Cargo
-        | EcosystemId::Pypi
-        | EcosystemId::Go
-        | EcosystemId::Dart
-        | EcosystemId::Maven
-        | EcosystemId::Gradle
-        | EcosystemId::Swift
-        | EcosystemId::NuGet
-        | EcosystemId::Bundler
-        | EcosystemId::Deno
-        | EcosystemId::GithubActions
-        | EcosystemId::GitlabCi => false,
-    }
-}
-
-/// Whether `ecosystem_kind`'s manifest completes a value positioned as a TOML
-/// string-array *element* (`"pytes` inside `dependencies = [...]`), so
-/// [`extract_prefix`] must strip a surviving quote the same way it does for
-/// [`uses_json_quoted_keys`]'s JSON object-key shape.
-///
-/// PyPI only for now: PEP 621's `dependencies`/`optional-dependencies` entries are
-/// the only raw-text-detected (see [`is_in_dependencies_section`]) dependency shape
-/// in this file that is a bare TOML array of strings. Cargo also flows through
-/// `is_in_toml_dependencies`, but its dependency shape is a *key* (`name =
-/// "version"`), not an array element, so it must stay `false` here — a `true`
-/// value would incorrectly strip a quote from a still-typed Cargo key.
-const fn uses_toml_string_array_values(ecosystem_kind: EcosystemId) -> bool {
-    match ecosystem_kind {
-        EcosystemId::Pypi => true,
-        EcosystemId::Cargo
-        | EcosystemId::Npm
-        | EcosystemId::Composer
-        | EcosystemId::Go
-        | EcosystemId::Dart
-        | EcosystemId::Maven
-        | EcosystemId::Gradle
-        | EcosystemId::Swift
-        | EcosystemId::NuGet
-        | EcosystemId::Bundler
-        | EcosystemId::Deno
-        | EcosystemId::GithubActions
-        | EcosystemId::GitlabCi => false,
-    }
-}
-
-/// Checks if a line is inside a dependencies section.
-///
-/// Dispatches to a per-ecosystem raw-text heuristic. Matching on [`EcosystemId`]
-/// rather than the raw ecosystem id string makes this exhaustive: adding a new
-/// ecosystem forces a decision here instead of silently disabling section-aware
-/// completion for it (see issue #118).
-fn is_in_dependencies_section(
-    content: &str,
-    line_number: usize,
-    ecosystem_id: EcosystemId,
-) -> bool {
-    match ecosystem_id {
-        EcosystemId::Cargo => is_in_toml_dependencies(content, line_number),
-        // PyPI's PEP 621 primary dependency list is a `dependencies = [...]` array
-        // under `[project]`, not a section header like Cargo's `[dependencies]` —
-        // `is_in_toml_dependencies` alone never matches it (see
-        // `is_in_pypi_project_dependencies_array`'s doc). `[project.optional-
-        // dependencies]` groups, by contrast, ARE a real header and stay covered by
-        // `is_in_toml_dependencies`.
-        EcosystemId::Pypi => {
-            is_in_toml_dependencies(content, line_number)
-                || is_in_pypi_project_dependencies_array(content, line_number)
-        }
-        EcosystemId::Npm => is_in_json_dependencies(
-            content,
-            line_number,
-            &[
-                "dependencies",
-                "devDependencies",
-                "peerDependencies",
-                "optionalDependencies",
-            ],
-        ),
-        EcosystemId::Composer => {
-            is_in_json_dependencies(content, line_number, &["require", "require-dev"])
-        }
-        EcosystemId::Maven => is_in_xml_tag_section(content, line_number, "dependencies"),
-        EcosystemId::Go => is_in_go_require(content, line_number),
-        EcosystemId::Dart => is_in_yaml_dependencies(content, line_number),
-        // Gemfile has no delimited dependencies section — `gem "name"` calls are
-        // valid anywhere at the top level or inside `group ... do ... end` blocks, so
-        // there is no raw-text boundary to detect. `false` disables fallback
-        // completion rather than enabling it unconditionally: `fallback_completion`
-        // fires on every keystroke where the ecosystem's own completion is empty,
-        // using the *whole trimmed line* as the search query (not a token), so a
-        // permissive `true` here would fire a live registry search on unrelated text
-        // and insert results with unrelated syntax.
-        EcosystemId::Bundler => false,
-        // Package.swift dependencies are `.package(...)` calls matched anywhere in
-        // the file by the real parser (not confined to the `dependencies: [...]`
-        // array), so there is no reliable raw-text section boundary here either. See
-        // the Bundler arm above for why this is `false`.
-        EcosystemId::Swift => false,
-        // Gradle spans five manifest formats (TOML version catalog, Groovy DSL,
-        // Kotlin DSL) with no raw-text section marker shared across all of them. See
-        // the Bundler arm above for why this is `false`.
-        EcosystemId::Gradle => false,
-        // NuGet spans three schemas, all of which nest their dependency elements
-        // under a named tag: csproj/fsproj/vbproj and Directory.Packages.props wrap
-        // PackageReference/PackageVersion in `<ItemGroup>`, while packages.config
-        // lists `<package>` elements directly under `<packages>`. Unlike
-        // Bundler/Swift/Gradle above, both boundaries are cheap raw-text XML tags, so
-        // `is_in_xml_tag_section` (already used by the Maven arm) covers them.
-        EcosystemId::NuGet => {
-            is_in_xml_tag_section(content, line_number, "ItemGroup")
-                || is_in_xml_tag_section(content, line_number, "packages")
-        }
-        EcosystemId::Deno => is_in_json_dependencies(content, line_number, &["imports"]),
-        // A `uses:` step key can appear at any nesting depth in a workflow file
-        // (`jobs.*.steps[].uses`, `jobs.<id>.uses`), so unlike the other YAML/TOML/
-        // JSON ecosystems above there is no enclosing section header to track —
-        // the target line itself is the only signal needed.
-        EcosystemId::GithubActions => is_github_actions_uses_line(content, line_number),
-        // `deps-gitlab-ci` never supports `PackageName` completion at all (spec
-        // NFR-002 — no cheap GitLab search endpoint), so the raw-text fallback this
-        // function drives is never reached for it either. `false` matches the
-        // Bundler/Swift/Gradle arms above.
-        EcosystemId::GitlabCi => false,
-    }
-}
-
-/// Whether line `line_number` of `content` is a workflow `uses:` step key
-/// (`uses: owner/repo@ref` or, as a sequence item, `- uses: owner/repo@ref`).
-fn is_github_actions_uses_line(content: &str, line_number: usize) -> bool {
-    content
-        .lines()
-        .nth(line_number)
-        .map(str::trim_start)
-        .is_some_and(|trimmed| trimmed.starts_with("uses:") || trimmed.starts_with("- uses:"))
-}
-
-/// Checks if a line is inside a TOML dependencies section.
-///
-/// Looks for `[dependencies]`, `[dev-dependencies]`, `[build-dependencies]` sections
-/// in Cargo.toml or `[project.dependencies]` in pyproject.toml.
-fn is_in_toml_dependencies(content: &str, line_number: usize) -> bool {
-    // Walk backwards from current line to find the most recent section header
-    // Collect lines up to target, then iterate backwards
-    let lines: Vec<_> = content.lines().enumerate().take(line_number + 1).collect();
-
-    for (_, line) in lines.iter().rev() {
-        let line = line.trim();
-
-        // Check if this is a section header
-        if line.starts_with('[') && line.ends_with(']') {
-            // Check if it's a dependencies section
-            return line == "[dependencies]"
-                || line == "[dev-dependencies]"
-                || line == "[build-dependencies]"
-                || line == "[workspace.dependencies]"
-                || line == "[project.dependencies]"
-                || line == "[project.optional-dependencies]"
-                || line.starts_with("[target.")
-                    && (line.contains(".dependencies]")
-                        || line.contains(".dev-dependencies]")
-                        || line.contains(".build-dependencies]"));
-        }
-    }
-
-    false
-}
-
-/// Checks if a line is inside PEP 621's `dependencies = [...]` array under the
-/// `[project]` table.
-///
-/// Unlike `[dependencies]`/`[project.optional-dependencies]`, PEP 621's primary
-/// dependency list is a *value* (an array assigned to the `dependencies` key), not
-/// a section header — no real `pyproject.toml` ever writes a literal
-/// `[project.dependencies]` header — so it needs its own bracket-depth scan rather
-/// than `is_in_toml_dependencies`'s header-string match.
-///
-/// The bracket-depth counter has no string awareness, so an unbalanced `[`/`]`
-/// inside a still-typed extras spec (`"uvicorn[stan`) or a comment would otherwise
-/// desync it permanently. TOML forbids a table header inside an array value, so a
-/// bare `[...]` header line (checked on every line, not just outside the array) is
-/// used as an unambiguous resync point regardless of the counter's state.
-fn is_in_pypi_project_dependencies_array(content: &str, line_number: usize) -> bool {
-    let mut in_project = false;
-    let mut in_array = false;
-    let mut depth: i32 = 0;
-
-    for (i, line) in content.lines().enumerate() {
-        if i > line_number {
-            break;
-        }
-        let trimmed = strip_trailing_toml_comment(line.trim());
-
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            in_array = false;
-            in_project = trimmed == "[project]";
-            continue;
-        }
-
-        if !in_array && in_project && is_dependencies_array_start(trimmed) {
-            in_array = true;
-            depth = 0;
-        }
-
-        if in_array {
-            if i == line_number {
-                return true;
-            }
-            for ch in trimmed.chars() {
-                match ch {
-                    '[' => depth += 1,
-                    ']' => depth -= 1,
-                    _ => {}
-                }
-            }
-            if depth <= 0 {
-                in_array = false;
-            }
-        }
-    }
-
-    false
-}
-
-/// Strips a trailing TOML comment (`# ...`) from `line`, ignoring a `#` that
-/// appears inside a quoted string.
-///
-/// Naive like this file's other hand-rolled raw-text scanners (e.g.
-/// `is_in_json_dependencies`'s brace counting): does not handle a `\"` escape
-/// inside a double-quoted string, which would end the string one character too
-/// early. Good enough for the fallback-completion heuristic this feeds.
-fn strip_trailing_toml_comment(line: &str) -> &str {
-    let mut in_string: Option<char> = None;
-    for (idx, ch) in line.char_indices() {
-        match in_string {
-            Some(quote) if ch == quote => in_string = None,
-            Some(_) => {}
-            None if ch == '"' || ch == '\'' => in_string = Some(ch),
-            // `idx` comes from `char_indices`, so it is always a char boundary.
-            #[allow(clippy::string_slice)]
-            None if ch == '#' => return line[..idx].trim_end(),
-            None => {}
-        }
-    }
-    line
-}
-
-/// Whether `trimmed` opens the `dependencies = [...]` array (`dependencies = [` or
-/// the single-line `dependencies = [...]`), used by
-/// [`is_in_pypi_project_dependencies_array`].
-fn is_dependencies_array_start(trimmed: &str) -> bool {
-    trimmed
-        .strip_prefix("dependencies")
-        .map(str::trim_start)
-        .and_then(|rest| rest.strip_prefix('='))
-        .is_some_and(|rest| rest.trim_start().starts_with('['))
-}
-
-/// Checks if a line is inside a JSON dependencies-like section.
-///
-/// Looks for `"{key}": {` for any of the given `keys`, e.g. `dependencies` /
-/// `devDependencies` in package.json, or `require` / `require-dev` in composer.json.
-fn is_in_json_dependencies(content: &str, line_number: usize, keys: &[&str]) -> bool {
-    let mut in_dependencies = false;
-    let mut brace_depth = 0;
-    // Build each `"{key}":` needle once per call rather than once per line.
-    let needles: Vec<String> = keys.iter().map(|key| format!("\"{key}\":")).collect();
-
-    for (i, line) in content.lines().enumerate() {
-        // Early exit: stop if we've passed the target line
-        if i > line_number {
-            break;
-        }
-
-        let trimmed = line.trim();
-
-        // Check if we're entering a dependencies-like section
-        if trimmed.starts_with('"')
-            && needles
-                .iter()
-                .any(|needle| trimmed.contains(needle.as_str()))
-        {
-            in_dependencies = true;
-            brace_depth = 0;
-        }
-
-        // Track brace depth when in dependencies section
-        if in_dependencies {
-            for ch in trimmed.chars() {
-                match ch {
-                    '{' => brace_depth += 1,
-                    '}' => {
-                        brace_depth -= 1;
-                        // If we've closed the dependencies section
-                        if brace_depth <= 0 {
-                            in_dependencies = false;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            // If we're at the target line and inside dependencies section with depth > 0
-            if i == line_number && in_dependencies && brace_depth > 0 {
-                return true;
-            }
-        }
-    }
-
-    false
-}
-
-/// Checks if a line is inside an XML `<tag>...</tag>` element.
-///
-/// Tracks nested open/close tag counts (ignoring attributes and self-closing tags) to
-/// find whether the target line falls within any occurrence of the element, e.g.
-/// `<dependencies>` in pom.xml (including nested inside `<dependencyManagement>`).
-fn is_in_xml_tag_section(content: &str, line_number: usize, tag: &str) -> bool {
-    let open_prefix = format!("<{tag}");
-    let close = format!("</{tag}>");
-    let mut depth: usize = 0;
-
-    for (i, line) in content.lines().enumerate() {
-        if i > line_number {
-            break;
-        }
-
-        let opens_here = count_open_tags(line, &open_prefix);
-        depth += opens_here;
-        // A line with an opening tag counts as "inside" even if the same line also
-        // closes it (`<dependencies></dependencies>`), consistent with the target
-        // line being the header itself in `is_in_toml_dependencies`.
-        if i == line_number && opens_here > 0 {
-            return true;
-        }
-
-        depth = depth.saturating_sub(line.matches(close.as_str()).count());
-        if i == line_number && depth > 0 {
-            return true;
-        }
-    }
-
-    false
-}
-
-/// Counts real `<{open_prefix}...>` tag occurrences on `line`, i.e. `open_prefix`
-/// followed by `>` or whitespace (an attribute) rather than more tag-name characters
-/// (so `<dependencies` doesn't also match a longer, unrelated tag name).
-// `search_from` starts at 0 and is only ever advanced to `idx + open_prefix.len()`,
-// where `idx` is a `str::find` match start (always a char boundary) and the offset
-// lands exactly at the end of that matched substring (also always a char boundary).
-#[allow(clippy::string_slice)]
-fn count_open_tags(line: &str, open_prefix: &str) -> usize {
-    let mut count = 0;
-    let mut search_from = 0;
-
-    while let Some(rel_idx) = line[search_from..].find(open_prefix) {
-        let idx = search_from + rel_idx;
-        let after = &line[idx + open_prefix.len()..];
-        if after.starts_with('>') || after.starts_with(char::is_whitespace) {
-            count += 1;
-        }
-        search_from = idx + open_prefix.len();
-    }
-
-    count
-}
-
-/// Checks if a line is inside a go.mod `require` directive.
-///
-/// Handles both the single-line form (`require module version`) and the
-/// parenthesized block form (`require (` ... `)`).
-fn is_in_go_require(content: &str, line_number: usize) -> bool {
-    let mut in_require_block = false;
-
-    for (i, line) in content.lines().enumerate() {
-        if i > line_number {
-            break;
-        }
-
-        let trimmed = line.trim();
-        let is_block_start = trimmed
-            .strip_prefix("require")
-            .is_some_and(|rest| rest.trim_start().starts_with('('));
-
-        if is_block_start {
-            in_require_block = true;
-        } else if in_require_block && trimmed.starts_with(')') {
-            in_require_block = false;
-        }
-
-        if i == line_number {
-            return in_require_block || is_block_start || trimmed.starts_with("require ");
-        }
-    }
-
-    false
-}
-
-/// Checks if a line is inside a pubspec.yaml dependency section.
-///
-/// Dart's `dependencies`, `dev_dependencies`, and `dependency_overrides` keys are
-/// top-level (unindented) YAML mappings; their entries stay part of the section until
-/// the next unindented key starts a new one.
-fn is_in_yaml_dependencies(content: &str, line_number: usize) -> bool {
-    const SECTION_KEYS: &[&str] = &[
-        "dependencies:",
-        "dev_dependencies:",
-        "dependency_overrides:",
-    ];
-    let mut in_dependencies = false;
-
-    for (i, line) in content.lines().enumerate() {
-        if i > line_number {
-            break;
-        }
-
-        let trimmed = line.trim_start();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-
-        // Top-level (unindented) key: starts a new section, or leaves the current one.
-        if trimmed.len() == line.len() {
-            in_dependencies = SECTION_KEYS.iter().any(|key| trimmed.starts_with(key));
-        }
-    }
-
-    in_dependencies
+    search_packages(ecosystem.as_ref(), prefix, bare).await
 }
 
 /// Searches for packages and returns completion items.
@@ -1061,17 +295,17 @@ fn is_in_yaml_dependencies(content: &str, line_number: usize) -> bool {
 /// cancellation — a detached task would sit outside that abort and keep the request's
 /// registry connection open regardless.
 async fn search_packages(
-    registry: &dyn deps_core::Registry,
-    ecosystem_id: EcosystemId,
+    ecosystem: &dyn deps_core::Ecosystem,
     query: &str,
-    open_markup: OpenMarkupContext,
+    bare: bool,
 ) -> Vec<CompletionItem> {
     tracing::info!(
         "search_packages: query={:?}, ecosystem={}",
         query,
-        ecosystem_id
+        ecosystem.id()
     );
 
+    let registry = ecosystem.registry();
     let results =
         match tokio::time::timeout(COMPLETION_SEARCH_TIMEOUT, registry.search(query, 50)).await {
             Ok(Ok(r)) => {
@@ -1094,44 +328,37 @@ async fn search_packages(
     // Convert search results to completion items
     results
         .iter()
-        .filter_map(|metadata| {
-            create_package_completion_item(metadata.as_ref(), ecosystem_id, open_markup)
-        })
+        .filter_map(|metadata| create_package_completion_item(metadata.as_ref(), ecosystem, bare))
         .collect()
 }
 
 /// Creates a completion item for a package.
 ///
-/// The insert text mirrors each ecosystem's manifest syntax, exhaustively matched on
-/// [`EcosystemId`] so a new ecosystem must supply its own snippet instead of silently
-/// inheriting Cargo's `name = "version"` TOML syntax (see issue #118).
+/// The insert text mirrors the ecosystem's own manifest syntax, via
+/// [`deps_core::Ecosystem::completion_insert_text`] — required, no default, so a new
+/// ecosystem must supply its own snippet instead of silently inheriting another
+/// ecosystem's syntax (see issue #118).
 ///
-/// Returns `None` either when a value this function interpolates into `insert_text`
-/// fails its allowlist — `latest` against [`is_safe_version_string`] (whenever
-/// non-empty; several arms legitimately omit the version clause when it's empty, so an
-/// empty `latest` is not itself unsafe), a Maven `groupId`/`artifactId` against
-/// [`is_safe_maven_coordinate_segment`], and a Swift repository URL against
-/// [`is_safe_registry_url`] (`metadata` comes straight from a registry search response,
-/// so a malicious/compromised registry must not be able to write structural characters
-/// into the manifest this text is inserted into) — or when `open_markup` is
-/// [`OpenMarkupContext::MavenOtherTag`] (see below), where no `insert_text` is safe to
-/// offer at all, independent of validation.
+/// Returns `None` when `latest` (whenever non-empty) fails
+/// [`is_safe_version_string`], `name` fails [`is_safe_package_name`], or the
+/// ecosystem's own `completion_insert_text`/`fallback_bare_insert_text` rejects the
+/// metadata for an ecosystem-specific reason (a Maven `groupId`/`artifactId`
+/// breakout, an unsafe Swift repository URL, GitHub Actions' `owner/repo` shape).
+/// `metadata` comes straight from a registry search response, so a
+/// malicious/compromised registry must not be able to write structural characters
+/// into the manifest this text is inserted into. The two upfront gates run here,
+/// once, rather than being re-implemented by every `completion_insert_text`/
+/// `fallback_bare_insert_text` override — see those methods' docs.
 ///
-/// `open_markup` (from [`extract_prefix`]'s second return value) tells the Maven and
-/// NuGet arms what kind of markup, if any, is already open around the cursor:
-/// [`OpenMarkupContext::MavenArtifactId`] and [`OpenMarkupContext::NuGetAttribute`]
-/// insert just the bare completable text at that position instead of a full markup
-/// snippet — inserting the full snippet there would nest a second copy of the
-/// surrounding tag/attribute inside the one already open around the cursor (#724).
-/// [`OpenMarkupContext::MavenOtherTag`] (an open `groupId`/`version`/unrecognized tag)
-/// suppresses the item entirely, since neither the bare artifact id nor the full
-/// snippet is a safe insert into a *different* tag. [`OpenMarkupContext::None`] builds
-/// the ecosystem's normal full-snippet `insert_text`, same as every non-XML ecosystem
-/// (which `open_markup` doesn't change).
+/// `bare` (from `fallback_completion`'s `Ecosystem::fallback_completion_is_bare`
+/// call) selects which of the two ecosystem hooks builds `insert_text`: `true`
+/// routes to `Ecosystem::fallback_bare_insert_text` (the cursor already sits inside
+/// open manifest markup that can only safely hold the bare candidate text — #724/
+/// #728), `false` to `Ecosystem::completion_insert_text` (the normal full snippet).
 fn create_package_completion_item(
     metadata: &dyn deps_core::Metadata,
-    ecosystem_id: EcosystemId,
-    open_markup: OpenMarkupContext,
+    ecosystem: &dyn deps_core::Ecosystem,
+    bare: bool,
 ) -> Option<CompletionItem> {
     let name = metadata.name();
     let latest = metadata.latest_version().as_str();
@@ -1155,180 +382,10 @@ fn create_package_completion_item(
         return None;
     }
 
-    let insert_text = match ecosystem_id {
-        // The key is quoted, not bare: a bare TOML key containing `.` (allowed by
-        // `is_safe_package_name` for Cargo crate names) expands into a nested table
-        // instead of a dependency entry — quoting closes that dotted-key injection.
-        EcosystemId::Cargo => format!("\"{name}\" = \"{latest}\""),
-        // Both real PEP 621 shapes (`dependencies = [...]` and an
-        // `[project.optional-dependencies]` group) are TOML string-array elements,
-        // not a key=value table entry like Cargo's — the surrounding quotes already
-        // exist in the manifest (or the user is still typing them), matching the
-        // bare-name insert `build_package_completion` already uses for PyPI at the
-        // same cursor position on the primary (parsed) completion path.
-        EcosystemId::Pypi => name.to_string(),
-        EcosystemId::Npm | EcosystemId::Composer => format!("\"{name}\": \"^{latest}\""),
-        EcosystemId::Go => format!("{name} {latest}"),
-        // The key is quoted: an unquoted YAML plain scalar can't start with `@`
-        // (allowed by `is_safe_package_name` for npm/Deno-shaped names), which would
-        // otherwise emit invalid YAML instead of a dependency entry.
-        EcosystemId::Dart => format!("\"{name}\": ^{latest}"),
-        EcosystemId::Maven => {
-            // The predicate rejects `:` by design (see its doc comment), so it must
-            // validate each half of the coordinate after splitting, never the joined
-            // `name`.
-            let (group_id, artifact_id) = match name.as_str().split_once(':') {
-                Some((group_id, artifact_id)) => (Some(group_id), artifact_id),
-                None => (None, name.as_str()),
-            };
-            if !is_safe_maven_coordinate_segment(artifact_id) {
-                warn_rejected_value(
-                    "is_safe_maven_coordinate_segment",
-                    "maven package name completion item",
-                    artifact_id,
-                );
-                return None;
-            }
-            match open_markup {
-                OpenMarkupContext::MavenArtifactId => {
-                    // Cursor is already inside an open `<artifactId>gua` tag's content
-                    // (see `strip_leading_xml_tag`): only the bare artifact id belongs
-                    // at that position, matching the primary AST-anchored path's bare
-                    // artifact-id `textEdit` (`MavenEcosystem::detect_xml_context`).
-                    // Inserting the full `<groupId>...<artifactId>...<version>...`
-                    // snippet here would nest it inside the tag already open around
-                    // the cursor (#724). `group_id` is unused on this branch, so it
-                    // doesn't need its own `is_safe_maven_coordinate_segment` check.
-                    artifact_id.to_string()
-                }
-                OpenMarkupContext::MavenOtherTag => {
-                    // Cursor is inside some *other* already-open Maven tag (`groupId`,
-                    // `version`, or an unrecognized element) — this raw-text fallback
-                    // has no safe bare text to offer at that position (a `groupId`
-                    // completion is a different search than the combined
-                    // `group:artifact` query this function received), and the full
-                    // snippet below would be exactly as wrong-context as inserting the
-                    // bare artifact id would be (critic S1 on #724). Suppress the item
-                    // entirely rather than guessing.
-                    return None;
-                }
-                // `NuGetAttribute` never actually occurs here — `extract_prefix` only
-                // produces it for `EcosystemId::NuGet` — but is included so this match
-                // stays exhaustive without a wildcard arm silently swallowing a future
-                // `OpenMarkupContext` variant.
-                OpenMarkupContext::None | OpenMarkupContext::NuGetAttribute => {
-                    if let Some(g) = group_id
-                        && !is_safe_maven_coordinate_segment(g)
-                    {
-                        warn_rejected_value(
-                            "is_safe_maven_coordinate_segment",
-                            "maven package name completion item",
-                            g,
-                        );
-                        return None;
-                    }
-                    group_id.map_or_else(
-                        || format!("<artifactId>{artifact_id}</artifactId><version>{latest}</version>"),
-                        |group_id| format!(
-                            "<groupId>{group_id}</groupId><artifactId>{artifact_id}</artifactId><version>{latest}</version>"
-                        ),
-                    )
-                }
-            }
-        }
-        EcosystemId::Gradle => format!("implementation(\"{name}:{latest}\")"),
-        EcosystemId::Swift => {
-            let url = metadata
-                .repository()
-                .map_or_else(|| format!("https://github.com/{name}"), str::to_string);
-            if !is_safe_registry_url(&url) {
-                warn_rejected_value(
-                    "is_safe_registry_url",
-                    "swift package name completion item",
-                    &url,
-                );
-                return None;
-            }
-            if latest.is_empty() {
-                format!(".package(url: \"{url}\")")
-            } else {
-                format!(".package(url: \"{url}\", from: \"{latest}\")")
-            }
-        }
-        EcosystemId::NuGet => {
-            if open_markup == OpenMarkupContext::NuGetAttribute {
-                // Cursor is already inside an open `Include="`/`id="` attribute value
-                // (the only way the raw-text fallback path reaches this ecosystem —
-                // see `strip_leading_xml_attribute`): the surrounding
-                // `<PackageReference Include="..." Version="..." />` markup already
-                // exists (or is being typed) around the cursor, so inserting the full
-                // tag here would nest a second copy of it inside the attribute value
-                // it was typed into (#724).
-                name.to_string()
-            } else {
-                // Unreachable in production: `open_markup` is only ever
-                // `NuGetAttribute` or (via `strip_leading_xml_attribute` returning an
-                // empty string) rejected before this function is called at all — see
-                // `fallback_completion`'s `prefix.is_empty()` guard (critic M1 on
-                // #724). Kept, like the GHA/GitLab arms below, so this match doesn't
-                // need a `EcosystemId`-exhaustiveness-breaking early return, and so a
-                // unit test can still pin the full-tag shape directly.
-                format!("<PackageReference Include=\"{name}\" Version=\"{latest}\" />")
-            }
-        }
-        EcosystemId::Bundler => format!("gem \"{name}\", \"~> {latest}\""),
-        EcosystemId::Deno => {
-            // D11: the alias key is conventionally the bare name (scheme stripped); the
-            // value is the full scheme-qualified specifier.
-            let bare = name
-                .as_str()
-                .split_once(':')
-                .map_or(name.as_str(), |(_, rest)| rest);
-            // N5: an empty `latest` (a JSR search hit with no `latestVersion`) must not
-            // insert a dangling `@^` with nothing after it — mirrors the Swift arm's
-            // `latest.is_empty()` guard above.
-            if latest.is_empty() {
-                format!("\"{bare}\": \"{name}\"")
-            } else {
-                format!("\"{bare}\": \"{name}@^{latest}\"")
-            }
-        }
-        // GHA's `search()` always returns `Ok(vec![])` (MVP scope — see
-        // `deps-github-actions`'s registry docs), so this arm is unreachable in
-        // practice today; it exists only to keep the match exhaustive (#118) and to
-        // behave correctly if package-name search is ever added. The `owner/repo`
-        // shape check is inlined rather than calling
-        // `deps_github_actions::is_valid_github_identity` — that dependency is
-        // feature-gated, while this match (on `EcosystemId`, not a per-feature type)
-        // is compiled unconditionally.
-        EcosystemId::GithubActions => {
-            if !name.as_str().contains('/') {
-                warn_rejected_value(
-                    "owner/repo shape",
-                    "github actions package name completion item",
-                    name.as_str(),
-                );
-                return None;
-            }
-            if latest.is_empty() {
-                name.to_string()
-            } else {
-                format!("{name}@{latest}")
-            }
-        }
-        // `deps-gitlab-ci`'s `search()` always returns `Ok(vec![])` (spec NFR-002 — no
-        // cheap GitLab search endpoint under the rate-limit budget), so this arm is
-        // unreachable in practice; it exists only to keep the match exhaustive (#118).
-        // GitLab CI has two structurally different include forms (`project:`+`ref:` vs.
-        // `component:` `name@ref`), so there is no single insertable snippet shape —
-        // this mirrors the GitHub Actions arm's bare `name`/`name@version` fallback.
-        EcosystemId::GitlabCi => {
-            if latest.is_empty() {
-                name.to_string()
-            } else {
-                format!("{name}@{latest}")
-            }
-        }
+    let insert_text = if bare {
+        ecosystem.fallback_bare_insert_text(metadata)?
+    } else {
+        ecosystem.completion_insert_text(metadata)?
     };
 
     // Build detail text
@@ -1359,118 +416,143 @@ mod tests {
         Position, TextDocumentIdentifier, TextDocumentPositionParams,
     };
 
-    /// Builds a `ServerState` whose `id`/`manifest_filename` ecosystem entry is
-    /// overridden to route registry search through `registry`, so `fallback_completion`
-    /// tests can observe (or forbid) a search call without hitting the network.
-    fn mock_ecosystem_state(
+    struct MockFormatter;
+    impl deps_core::PackageNaming for MockFormatter {}
+
+    impl deps_core::PackageRendering for MockFormatter {
+        fn format_version_for_text_edit(&self, version: &deps_core::ConcreteVersion) -> String {
+            version.to_string()
+        }
+
+        fn package_url(&self, name: &deps_core::PackageName) -> String {
+            format!("https://example.com/{name}")
+        }
+    }
+
+    impl deps_core::RequirementResolution for MockFormatter {}
+    impl deps_core::DiagnosticMessages for MockFormatter {}
+    impl deps_core::DiagnosticPolicy for MockFormatter {}
+    impl deps_core::SourcePolicy for MockFormatter {}
+    impl deps_core::OsvNaming for MockFormatter {}
+
+    /// Generic test double for [`deps_core::Ecosystem`], configurable per test so
+    /// `fallback_completion`/`search_packages` tests can observe (or forbid) a
+    /// registry search, and control the resulting completion item's insert text,
+    /// without hitting the network or depending on any real ecosystem's raw-text
+    /// syntax — per-ecosystem section/prefix/insert-text syntax is now covered
+    /// directly in each owning ecosystem crate (issue #722).
+    struct MockEcosystem {
         id: &'static str,
-        manifest_filename: &'static str,
         registry: Arc<dyn deps_core::Registry>,
+        /// Canned return value for `fallback_completion_prefix`, ignoring
+        /// `content`/`position` entirely.
+        fallback_prefix: Option<&'static str>,
+        insert_text: fn(&dyn deps_core::Metadata) -> Option<String>,
+        /// Canned return value for `fallback_completion_is_bare`, ignoring
+        /// `content`/`position` entirely.
+        is_bare: bool,
+        bare_insert_text: fn(&dyn deps_core::Metadata) -> Option<String>,
+    }
+    impl deps_core::ecosystem::private::Sealed for MockEcosystem {}
+    impl deps_core::Ecosystem for MockEcosystem {
+        fn id(&self) -> &'static str {
+            self.id
+        }
+        fn display_name(&self) -> &'static str {
+            self.id
+        }
+        fn manifest_filenames(&self) -> &[&'static str] {
+            &["Cargo.toml"]
+        }
+        fn parse_manifest<'a>(
+            &'a self,
+            _content: &'a str,
+            _uri: &'a tower_lsp_server::ls_types::Uri,
+        ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Box<dyn deps_core::ParseResult>>>
+        {
+            Box::pin(async move { unimplemented!() })
+        }
+        fn registry(&self) -> Arc<dyn deps_core::Registry> {
+            Arc::clone(&self.registry)
+        }
+        fn formatter(&self) -> &dyn deps_core::lsp_helpers::EcosystemFormatter {
+            &MockFormatter
+        }
+        fn generate_completions<'a>(
+            &'a self,
+            _parse_result: &'a dyn deps_core::ParseResult,
+            _position: tower_lsp_server::ls_types::Position,
+            _content: &'a str,
+            _freshness: deps_core::FreshnessSettings,
+        ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::completion::Completions> {
+            Box::pin(async move { unimplemented!() })
+        }
+        fn fallback_completion_prefix<'a>(
+            &self,
+            _content: &'a str,
+            _position: tower_lsp_server::ls_types::Position,
+        ) -> Option<&'a str> {
+            self.fallback_prefix
+        }
+        fn completion_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
+            (self.insert_text)(metadata)
+        }
+        fn fallback_completion_is_bare(
+            &self,
+            _content: &str,
+            _position: tower_lsp_server::ls_types::Position,
+        ) -> bool {
+            self.is_bare
+        }
+        fn fallback_bare_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
+            (self.bare_insert_text)(metadata)
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Default `completion_insert_text`/`fallback_bare_insert_text` for
+    /// [`MockEcosystem`]: the bare package name, sufficient whenever a test only
+    /// asserts on the completion item's `label` or on whether a search happened at
+    /// all, not on the inserted snippet's syntax.
+    fn default_insert_text(metadata: &dyn deps_core::Metadata) -> Option<String> {
+        Some(metadata.name().to_string())
+    }
+
+    /// Builds a [`MockEcosystem`] with `id`, routing registry search through
+    /// `registry`, using [`default_insert_text`].
+    fn mock_ecosystem(
+        id: &'static str,
+        registry: Arc<dyn deps_core::Registry>,
+    ) -> Arc<dyn deps_core::Ecosystem> {
+        Arc::new(MockEcosystem {
+            id,
+            registry,
+            fallback_prefix: None,
+            insert_text: default_insert_text,
+            is_bare: false,
+            bare_insert_text: default_insert_text,
+        })
+    }
+
+    /// Builds a `ServerState` whose `"cargo"` ecosystem entry is a [`MockEcosystem`]
+    /// routing registry search through `registry` and returning `fallback_prefix`
+    /// (verbatim) from `fallback_completion_prefix`.
+    fn mock_cargo_state(
+        registry: Arc<dyn deps_core::Registry>,
+        fallback_prefix: Option<&'static str>,
     ) -> ServerState {
-        use deps_core::{
-            DiagnosticMessages, DiagnosticPolicy, Ecosystem, EcosystemFormatter, OsvNaming,
-            PackageNaming, PackageRendering, ParseResult, RequirementResolution, SourcePolicy,
-        };
-        use std::any::Any;
-        use tower_lsp_server::ls_types::Uri;
-
-        struct MockFormatter;
-        impl PackageNaming for MockFormatter {}
-
-        impl PackageRendering for MockFormatter {
-            fn format_version_for_text_edit(&self, version: &deps_core::ConcreteVersion) -> String {
-                version.to_string()
-            }
-
-            fn package_url(&self, name: &deps_core::PackageName) -> String {
-                format!("https://example.com/{name}")
-            }
-        }
-
-        impl RequirementResolution for MockFormatter {}
-
-        impl DiagnosticMessages for MockFormatter {}
-
-        impl DiagnosticPolicy for MockFormatter {}
-
-        impl SourcePolicy for MockFormatter {}
-
-        impl OsvNaming for MockFormatter {}
-
-        struct MockEcosystem {
-            id: &'static str,
-            manifest_filename: &'static str,
-            registry: Arc<dyn deps_core::Registry>,
-        }
-        impl deps_core::ecosystem::private::Sealed for MockEcosystem {}
-        impl Ecosystem for MockEcosystem {
-            fn id(&self) -> &'static str {
-                self.id
-            }
-            fn display_name(&self) -> &'static str {
-                self.id
-            }
-            fn manifest_filenames(&self) -> &[&'static str] {
-                std::slice::from_ref(&self.manifest_filename)
-            }
-            fn parse_manifest<'a>(
-                &'a self,
-                _content: &'a str,
-                _uri: &'a Uri,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Box<dyn ParseResult>>>
-            {
-                Box::pin(async move { unimplemented!() })
-            }
-            fn registry(&self) -> Arc<dyn deps_core::Registry> {
-                Arc::clone(&self.registry)
-            }
-            fn formatter(&self) -> &dyn EcosystemFormatter {
-                &MockFormatter
-            }
-            fn generate_completions<'a>(
-                &'a self,
-                _parse_result: &'a dyn ParseResult,
-                _position: tower_lsp_server::ls_types::Position,
-                _content: &'a str,
-                _freshness: deps_core::FreshnessSettings,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::completion::Completions>
-            {
-                Box::pin(async move { unimplemented!() })
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
-
         let state = ServerState::new();
         state.ecosystem_registry.register(Arc::new(MockEcosystem {
-            id,
-            manifest_filename,
+            id: "cargo",
             registry,
+            fallback_prefix,
+            insert_text: default_insert_text,
+            is_bare: false,
+            bare_insert_text: default_insert_text,
         }));
         state
-    }
-
-    /// Builds a `ServerState` whose `"cargo"` ecosystem entry is overridden to route
-    /// registry search through `registry`, so `fallback_completion` tests can observe
-    /// (or forbid) a search call without hitting the network.
-    fn mock_cargo_state(registry: Arc<dyn deps_core::Registry>) -> ServerState {
-        mock_ecosystem_state("cargo", "Cargo.toml", registry)
-    }
-
-    /// Same as [`mock_cargo_state`], but for the `"maven"` ecosystem.
-    fn mock_maven_state(registry: Arc<dyn deps_core::Registry>) -> ServerState {
-        mock_ecosystem_state("maven", "pom.xml", registry)
-    }
-
-    /// Same as [`mock_cargo_state`], but for the `"pypi"` ecosystem.
-    fn mock_pypi_state(registry: Arc<dyn deps_core::Registry>) -> ServerState {
-        mock_ecosystem_state("pypi", "pyproject.toml", registry)
-    }
-
-    /// Same as [`mock_cargo_state`], but for the `"nuget"` ecosystem.
-    fn mock_nuget_state(registry: Arc<dyn deps_core::Registry>) -> ServerState {
-        mock_ecosystem_state("nuget", "csproj", registry)
     }
 
     #[tokio::test]
@@ -1609,6 +691,12 @@ mod tests {
                 _freshness: deps_core::FreshnessSettings,
             ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
                 Box::pin(async move { unimplemented!() })
+            }
+            fn completion_insert_text(
+                &self,
+                _metadata: &dyn deps_core::Metadata,
+            ) -> Option<String> {
+                unimplemented!()
             }
             fn as_any(&self) -> &dyn Any {
                 self
@@ -1891,6 +979,12 @@ mod tests {
                     .into()
                 })
             }
+            fn completion_insert_text(
+                &self,
+                _metadata: &dyn deps_core::Metadata,
+            ) -> Option<String> {
+                unimplemented!()
+            }
             fn as_any(&self) -> &dyn Any {
                 self
             }
@@ -1975,1111 +1069,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_is_in_toml_dependencies_basic() {
-        let content = r#"
-[package]
-name = "test"
-
-[dependencies]
-serde
-"#;
-        assert!(is_in_toml_dependencies(content, 5));
-        assert!(!is_in_toml_dependencies(content, 1));
-    }
-
-    #[test]
-    fn test_is_in_toml_dependencies_dev_deps() {
-        let content = r"
-[dev-dependencies]
-tokio
-";
-        assert!(is_in_toml_dependencies(content, 2));
-    }
-
-    #[test]
-    fn test_is_in_toml_dependencies_build_deps() {
-        let content = r"
-[build-dependencies]
-cc
-";
-        assert!(is_in_toml_dependencies(content, 2));
-    }
-
-    #[test]
-    fn test_is_in_toml_dependencies_project_deps() {
-        let content = r"
-[project.dependencies]
-requests
-";
-        assert!(is_in_toml_dependencies(content, 2));
-    }
-
-    #[test]
-    fn test_is_in_toml_dependencies_workspace_deps() {
-        let content = r#"
-[workspace.dependencies]
-serde = "1.0"
-"#;
-        assert!(is_in_toml_dependencies(content, 2));
-    }
-
-    #[test]
-    fn test_is_in_toml_dependencies_target_specific() {
-        let content = r"
-[target.'cfg(windows)'.dependencies]
-winapi
-";
-        assert!(is_in_toml_dependencies(content, 2));
-    }
-
-    #[test]
-    fn test_is_in_toml_dependencies_wrong_section() {
-        let content = r#"
-[package]
-name = "test"
-
-[profile.release]
-opt-level = 3
-"#;
-        assert!(!is_in_toml_dependencies(content, 2));
-        assert!(!is_in_toml_dependencies(content, 5));
-    }
-
-    #[test]
-    fn test_is_in_toml_dependencies_multiple_sections() {
-        let content = r#"
-[dependencies]
-serde = "1.0"
-
-[dev-dependencies]
-tokio
-"#;
-        assert!(is_in_toml_dependencies(content, 2));
-        assert!(is_in_toml_dependencies(content, 5));
-    }
-
-    const NPM_KEYS: &[&str] = &[
-        "dependencies",
-        "devDependencies",
-        "peerDependencies",
-        "optionalDependencies",
-    ];
-
-    #[test]
-    fn test_is_in_json_dependencies_basic() {
-        let content = r#"{
-  "name": "test",
-  "dependencies": {
-    "express"
-  }
-}"#;
-        assert!(is_in_json_dependencies(content, 3, NPM_KEYS));
-        assert!(!is_in_json_dependencies(content, 1, NPM_KEYS));
-    }
-
-    #[test]
-    fn test_is_in_json_dependencies_dev_deps() {
-        let content = r#"{
-  "devDependencies": {
-    "jest": "^29.0.0"
-  }
-}"#;
-        assert!(is_in_json_dependencies(content, 2, NPM_KEYS));
-    }
-
-    #[test]
-    fn test_is_in_json_dependencies_peer_deps() {
-        let content = r#"{
-  "peerDependencies": {
-    "react"
-  }
-}"#;
-        assert!(is_in_json_dependencies(content, 2, NPM_KEYS));
-    }
-
-    #[test]
-    fn test_is_in_json_dependencies_optional_deps() {
-        let content = r#"{
-  "optionalDependencies": {
-    "fsevents": "^2.0.0"
-  }
-}"#;
-        assert!(is_in_json_dependencies(content, 2, NPM_KEYS));
-    }
-
-    #[test]
-    fn test_is_in_json_dependencies_outside_section() {
-        let content = r#"{
-  "name": "test",
-  "dependencies": {
-    "express": "^4.0.0"
-  },
-  "scripts": {
-    "start": "node index.js"
-  }
-}"#;
-        assert!(is_in_json_dependencies(content, 3, NPM_KEYS));
-        assert!(!is_in_json_dependencies(content, 6, NPM_KEYS));
-    }
-
-    #[test]
-    fn test_is_in_json_dependencies_nested_braces() {
-        let content = r#"{
-  "dependencies": {
-    "package": "1.0.0"
-  }
-}"#;
-        assert!(is_in_json_dependencies(content, 2, NPM_KEYS));
-    }
-
-    #[test]
-    fn test_is_in_json_dependencies_custom_keys() {
-        let content = r#"{
-  "require": {
-    "monolog/monolog": "^2.0"
-  },
-  "require-dev": {
-    "phpunit/phpunit": "^9.0"
-  }
-}"#;
-        assert!(is_in_json_dependencies(
-            content,
-            2,
-            &["require", "require-dev"]
-        ));
-        assert!(is_in_json_dependencies(
-            content,
-            5,
-            &["require", "require-dev"]
-        ));
-    }
-
-    #[test]
-    fn test_is_in_dependencies_section_cargo() {
-        let content = r"
-[dependencies]
-serde
-";
-        assert!(is_in_dependencies_section(content, 2, EcosystemId::Cargo));
-        assert!(!is_in_dependencies_section(content, 0, EcosystemId::Cargo));
-    }
-
-    #[test]
-    fn test_is_in_dependencies_section_pypi() {
-        let content = r"
-[project.dependencies]
-requests
-";
-        assert!(is_in_dependencies_section(content, 2, EcosystemId::Pypi));
-    }
-
-    /// #390 root cause 1: real PEP 621 files never write a literal
-    /// `[project.dependencies]` header — the primary dependency list is a
-    /// `dependencies = [...]` array under `[project]`.
-    #[test]
-    fn test_is_in_dependencies_section_pypi_project_array_no_literal_header() {
-        let content = "[project]\nname = \"myapp\"\nversion = \"0.1.0\"\ndependencies = [\n    \"requests>=2.31.0\",\n    \"flas\n]\n";
-        // Unterminated entry line ("flas), mid-array.
-        assert!(is_in_dependencies_section(content, 5, EcosystemId::Pypi));
-        // A completed entry line.
-        assert!(is_in_dependencies_section(content, 4, EcosystemId::Pypi));
-        // Unrelated `[project]` keys must not be treated as inside the array.
-        assert!(!is_in_dependencies_section(content, 1, EcosystemId::Pypi));
-        assert!(!is_in_dependencies_section(content, 2, EcosystemId::Pypi));
-        // The `[project]` header line itself is not "inside" the array.
-        assert!(!is_in_dependencies_section(content, 0, EcosystemId::Pypi));
-    }
-
-    #[test]
-    fn test_is_in_dependencies_section_pypi_project_array_single_line() {
-        let content = "[project]\ndependencies = [\"requests>=2.0.0\"]\n";
-        assert!(is_in_dependencies_section(content, 1, EcosystemId::Pypi));
-    }
-
-    /// A `dependencies = [...]` array under a table other than `[project]` (e.g. an
-    /// optional-dependencies group using the same key name) must not be picked up
-    /// by the `[project]`-scoped array scan.
-    #[test]
-    fn test_is_in_dependencies_section_pypi_project_array_scoped_to_project_table() {
-        let content = "[tool.other]\ndependencies = [\n    \"foo\n]\n";
-        assert!(!is_in_dependencies_section(content, 2, EcosystemId::Pypi));
-    }
-
-    /// #390 C2: an unbalanced `[` inside a still-typed extras spec (`"uvicorn[stan`,
-    /// common real syntax like `celery[redis]`) must not permanently desync the
-    /// bracket-depth counter. A later, real table header is an unambiguous resync
-    /// point (TOML forbids a header inside an array), so lines under it must not be
-    /// misreported as still inside the dependencies array.
-    #[test]
-    fn test_is_in_dependencies_section_pypi_project_array_resyncs_after_unbalanced_extras_bracket()
-    {
-        let content = "[project]\ndependencies = [\n    \"uvicorn[stan\n]\n\n[tool.pytest.ini_options]\naddopts = \"-v\"\n";
-        // Mid-typing the extras spec: still correctly inside the array.
-        assert!(is_in_dependencies_section(content, 2, EcosystemId::Pypi));
-        // A line under the unrelated later table must not be swept in by the
-        // desynced counter.
-        assert!(!is_in_dependencies_section(content, 6, EcosystemId::Pypi));
-    }
-
-    /// #390 C2: a `#` comment containing `[` inside the array (e.g. `# pinned per
-    /// [PEP 621`) must not be counted as a real bracket — the comment is stripped
-    /// before depth tracking, so the array still closes at its real `]`.
-    #[test]
-    fn test_is_in_dependencies_section_pypi_project_array_ignores_bracket_in_comment() {
-        let content = "[project]\ndependencies = [\n    \"requests>=2.0.0\",  # pinned per [PEP 621\n    \"flas\n]\nrequires-python = \">=3.9\"\n";
-        // Still inside the array on the unterminated entry.
-        assert!(is_in_dependencies_section(content, 3, EcosystemId::Pypi));
-        // The array has closed by the time an unrelated `[project]` key follows.
-        assert!(!is_in_dependencies_section(content, 5, EcosystemId::Pypi));
-    }
-
-    /// #390 C3: a trailing comment on the `[project]` header itself (ordinary TOML)
-    /// must not make the whole array-detection scan inert.
-    #[test]
-    fn test_is_in_dependencies_section_pypi_project_header_with_trailing_comment() {
-        let content = "[project]  # main metadata\ndependencies = [\n    \"flas\n]\n";
-        assert!(is_in_dependencies_section(content, 2, EcosystemId::Pypi));
-    }
-
-    /// #390 C4: a commented non-`[project]` header must correctly clear `in_project`
-    /// (fixed for free by C3's comment stripping) — a later table's own
-    /// `dependencies = [...]` array must not be mistaken for PEP 621's.
-    #[test]
-    fn test_is_in_dependencies_section_pypi_project_state_cleared_by_commented_other_header() {
-        let content = "[project]\nname = \"x\"\n\n[tool.hatch.envs.default] # test env\ndependencies = [\n    \"other\n]\n";
-        assert!(!is_in_dependencies_section(content, 5, EcosystemId::Pypi));
-    }
-
-    #[test]
-    fn test_is_in_dependencies_section_npm() {
-        let content = r#"{
-  "dependencies": {
-    "express"
-  }
-}"#;
-        assert!(is_in_dependencies_section(content, 2, EcosystemId::Npm));
-    }
-
-    #[test]
-    fn test_is_in_dependencies_section_composer() {
-        let content = r#"{
-  "require": {
-    "monolog/monolog": "^2.0"
-  },
-  "scripts": {
-    "test": "phpunit"
-  }
-}"#;
-        assert!(is_in_dependencies_section(
-            content,
-            2,
-            EcosystemId::Composer
-        ));
-        assert!(!is_in_dependencies_section(
-            content,
-            5,
-            EcosystemId::Composer
-        ));
-    }
-
-    #[test]
-    fn test_is_in_dependencies_section_maven() {
-        let content = r"
-<project>
-  <dependencies>
-    <dependency></dependency>
-  </dependencies>
-</project>
-";
-        assert!(is_in_dependencies_section(content, 3, EcosystemId::Maven));
-        assert!(!is_in_dependencies_section(content, 1, EcosystemId::Maven));
-    }
-
-    #[test]
-    fn test_is_in_dependencies_section_maven_single_line() {
-        let content = "<project><dependencies></dependencies></project>\n";
-        assert!(is_in_dependencies_section(content, 0, EcosystemId::Maven));
-    }
-
-    #[test]
-    fn test_is_in_dependencies_section_maven_attributed_tag() {
-        let content = r#"
-<project>
-  <dependencies xmlns="http://maven.apache.org/POM/4.0.0">
-    <dependency></dependency>
-  </dependencies>
-</project>
-"#;
-        assert!(is_in_dependencies_section(content, 3, EcosystemId::Maven));
-    }
-
-    #[test]
-    fn test_is_in_dependencies_section_maven_no_false_positive_on_longer_tag_name() {
-        let content = r"
-<project>
-  <dependencyManagement>
-    <dependencies>
-      <dependency></dependency>
-    </dependencies>
-  </dependencyManagement>
-</project>
-";
-        // Line 2 opens `<dependencyManagement>`, not `<dependencies>` — must not match.
-        assert!(!is_in_dependencies_section(content, 2, EcosystemId::Maven));
-        // Line 4 is genuinely inside the nested `<dependencies>` block.
-        assert!(is_in_dependencies_section(content, 4, EcosystemId::Maven));
-    }
-
-    #[test]
-    fn test_is_in_dependencies_section_go_single_line() {
-        let content = "module example.com/myapp\n\nrequire github.com/gin-gonic/gin v1.9.1\n";
-        assert!(is_in_dependencies_section(content, 2, EcosystemId::Go));
-        assert!(!is_in_dependencies_section(content, 0, EcosystemId::Go));
-    }
-
-    #[test]
-    fn test_is_in_dependencies_section_go_block() {
-        let content =
-            "module example.com/myapp\n\nrequire (\n\tgithub.com/gin-gonic/gin v1.9.1\n)\n";
-        assert!(is_in_dependencies_section(content, 2, EcosystemId::Go));
-        assert!(is_in_dependencies_section(content, 3, EcosystemId::Go));
-        assert!(!is_in_dependencies_section(content, 4, EcosystemId::Go));
-    }
-
-    #[test]
-    fn test_is_in_dependencies_section_dart() {
-        let content =
-            "name: myapp\ndependencies:\n  http: ^1.0.0\nenvironment:\n  sdk: '>=3.0.0'\n";
-        assert!(is_in_dependencies_section(content, 2, EcosystemId::Dart));
-        assert!(!is_in_dependencies_section(content, 4, EcosystemId::Dart));
-    }
-
-    #[test]
-    fn test_is_in_dependencies_section_dart_column_zero_comment() {
-        // A column-0 `#` comment inside a section must not read as a new top-level
-        // key and reset `in_dependencies` to false.
-        let content = "name: myapp\ndependencies:\n# a comment\n  http: ^1.0.0\n";
-        assert!(is_in_dependencies_section(content, 2, EcosystemId::Dart));
-        assert!(is_in_dependencies_section(content, 3, EcosystemId::Dart));
-    }
-
-    #[test]
-    fn test_is_in_dependencies_section_deno() {
-        let content = r#"{
-  "name": "test",
-  "imports": {
-    "@std/fs": "jsr:@std/fs@^1.0"
-  }
-}"#;
-        assert!(is_in_dependencies_section(content, 3, EcosystemId::Deno));
-        assert!(!is_in_dependencies_section(content, 1, EcosystemId::Deno));
-    }
-
-    #[test]
-    fn test_is_in_dependencies_section_no_raw_text_boundary_ecosystems() {
-        // No existing raw-text section boundary: `false` preserves pre-fix behavior
-        // (fallback completion disabled) rather than risking spurious registry
-        // searches on arbitrary lines. See the comments in `is_in_dependencies_section`
-        // for the per-ecosystem rationale. NuGet is covered separately below — unlike
-        // these three, it does have a raw-text section boundary (`<ItemGroup>`/
-        // `<packages>`).
-        let content = "anything at all\n";
-        assert!(!is_in_dependencies_section(
-            content,
-            0,
-            EcosystemId::Bundler
-        ));
-        assert!(!is_in_dependencies_section(content, 0, EcosystemId::Swift));
-        assert!(!is_in_dependencies_section(content, 0, EcosystemId::Gradle));
-    }
-
-    #[test]
-    fn test_is_in_dependencies_section_nuget_csproj_item_group() {
-        let content = "<Project>\n  <ItemGroup>\n    <PackageReference Include=\"Foo\" />\n  </ItemGroup>\n</Project>\n";
-        assert!(is_in_dependencies_section(content, 2, EcosystemId::NuGet));
-        assert!(!is_in_dependencies_section(content, 0, EcosystemId::NuGet));
-    }
-
-    #[test]
-    fn test_is_in_dependencies_section_nuget_packages_config() {
-        let content = "<packages>\n  <package id=\"Foo\" version=\"1.0.0\" />\n</packages>\n";
-        assert!(is_in_dependencies_section(content, 1, EcosystemId::NuGet));
-        // The closing `</packages>` line itself is outside the section.
-        assert!(!is_in_dependencies_section(content, 2, EcosystemId::NuGet));
-    }
-
-    /// `Directory.Packages.props` reuses the same `<ItemGroup>` wrapper as
-    /// `PackageReference`, just with `PackageVersion` elements inside it.
-    #[test]
-    fn test_is_in_dependencies_section_nuget_directory_packages_props() {
-        let content = "<Project>\n  <ItemGroup>\n    <PackageVersion Include=\"Foo\" Version=\"1.0.0\" />\n  </ItemGroup>\n</Project>\n";
-        assert!(is_in_dependencies_section(content, 2, EcosystemId::NuGet));
-    }
-
-    /// A `<PropertyGroup>` (e.g. `<TargetFramework>`) is a real, common csproj section
-    /// that is not `<ItemGroup>`/`<packages>` — must not be mistaken for one.
-    #[test]
-    fn test_is_in_dependencies_section_nuget_outside_item_group() {
-        let content = "<Project>\n  <PropertyGroup>\n    <TargetFramework>net8.0</TargetFramework>\n  </PropertyGroup>\n</Project>\n";
-        assert!(!is_in_dependencies_section(content, 2, EcosystemId::NuGet));
-    }
-
-    #[test]
-    fn test_create_package_completion_item_cargo() {
-        struct MockMetadata {
-            name: deps_core::PackageName,
-        }
-        impl deps_core::Metadata for MockMetadata {
-            fn name(&self) -> &deps_core::PackageName {
-                &self.name
-            }
-            fn description(&self) -> Option<&str> {
-                Some("A serialization framework")
-            }
-            fn repository(&self) -> Option<&str> {
-                None
-            }
-            fn documentation(&self) -> Option<&str> {
-                None
-            }
-            fn latest_version(&self) -> &deps_core::ConcreteVersion {
-                static VERSION: std::sync::LazyLock<deps_core::ConcreteVersion> =
-                    std::sync::LazyLock::new(|| deps_core::ConcreteVersion::new("1.0.214"));
-                &VERSION
-            }
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
-            }
-        }
-
-        let meta = MockMetadata {
-            name: deps_core::PackageName::new("serde"),
-        };
-        let item =
-            create_package_completion_item(&meta, EcosystemId::Cargo, OpenMarkupContext::None)
-                .unwrap();
-
-        assert_eq!(item.label, "serde");
-        assert_eq!(item.kind, Some(CompletionItemKind::MODULE));
-        assert_eq!(item.detail, Some("Latest: 1.0.214".to_string()));
-        assert_eq!(
-            item.insert_text,
-            Some("\"serde\" = \"1.0.214\"".to_string())
-        );
-        assert_eq!(item.insert_text_format, Some(InsertTextFormat::PLAIN_TEXT));
-    }
-
-    #[test]
-    fn test_create_package_completion_item_npm() {
-        struct MockMetadata {
-            name: deps_core::PackageName,
-        }
-        impl deps_core::Metadata for MockMetadata {
-            fn name(&self) -> &deps_core::PackageName {
-                &self.name
-            }
-            fn description(&self) -> Option<&str> {
-                Some("Fast web framework")
-            }
-            fn repository(&self) -> Option<&str> {
-                None
-            }
-            fn documentation(&self) -> Option<&str> {
-                None
-            }
-            fn latest_version(&self) -> &deps_core::ConcreteVersion {
-                static VERSION: std::sync::LazyLock<deps_core::ConcreteVersion> =
-                    std::sync::LazyLock::new(|| deps_core::ConcreteVersion::new("4.18.2"));
-                &VERSION
-            }
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
-            }
-        }
-
-        let meta = MockMetadata {
-            name: deps_core::PackageName::new("express"),
-        };
-        let item = create_package_completion_item(&meta, EcosystemId::Npm, OpenMarkupContext::None)
-            .unwrap();
-
-        assert_eq!(item.label, "express");
-        assert_eq!(
-            item.insert_text,
-            Some("\"express\": \"^4.18.2\"".to_string())
-        );
-    }
-
-    #[test]
-    fn test_create_package_completion_item_pypi() {
-        struct MockMetadata {
-            name: deps_core::PackageName,
-        }
-        impl deps_core::Metadata for MockMetadata {
-            fn name(&self) -> &deps_core::PackageName {
-                &self.name
-            }
-            fn description(&self) -> Option<&str> {
-                None
-            }
-            fn repository(&self) -> Option<&str> {
-                None
-            }
-            fn documentation(&self) -> Option<&str> {
-                None
-            }
-            fn latest_version(&self) -> &deps_core::ConcreteVersion {
-                static VERSION: std::sync::LazyLock<deps_core::ConcreteVersion> =
-                    std::sync::LazyLock::new(|| deps_core::ConcreteVersion::new("2.31.0"));
-                &VERSION
-            }
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
-            }
-        }
-
-        let meta = MockMetadata {
-            name: deps_core::PackageName::new("requests"),
-        };
-        let item =
-            create_package_completion_item(&meta, EcosystemId::Pypi, OpenMarkupContext::None)
-                .unwrap();
-
-        assert_eq!(item.label, "requests");
-        // #390 C1: both real PEP 621 shapes (`dependencies = [...]` and an
-        // `[project.optional-dependencies]` group) are TOML array elements, so the
-        // surrounding quotes already exist in the manifest — a bare name matches
-        // `build_package_completion`'s primary-path insert for PyPI at the same
-        // cursor position, unlike Cargo's key=value table-entry shape.
-        assert_eq!(item.insert_text, Some("requests".to_string()));
-    }
-
-    struct MockMetadata {
-        name: deps_core::PackageName,
-        repository: Option<&'static str>,
-        latest_version: deps_core::ConcreteVersion,
-    }
-    impl deps_core::Metadata for MockMetadata {
-        fn name(&self) -> &deps_core::PackageName {
-            &self.name
-        }
-        fn description(&self) -> Option<&str> {
-            None
-        }
-        fn repository(&self) -> Option<&str> {
-            self.repository
-        }
-        fn documentation(&self) -> Option<&str> {
-            None
-        }
-        fn latest_version(&self) -> &deps_core::ConcreteVersion {
-            &self.latest_version
-        }
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-    }
-
-    #[test]
-    fn test_create_package_completion_item_cargo_dotted_name_quotes_toml_key() {
-        // S1: a bare TOML key containing `.` (legal here — real crate names can use
-        // it) expands into a nested table instead of a dependency entry
-        // (`serde.path = "vendor"` parses as `serde = { path = "vendor" }`). Quoting
-        // the key keeps the dotted name a single dependency entry regardless of
-        // ecosystem-legit or attacker-supplied intent. Cargo only: after #390 C1,
-        // PyPI no longer emits a TOML key at all (see
-        // `test_create_package_completion_item_pypi_dotted_name_stays_bare_string`).
-        let meta = MockMetadata {
-            name: deps_core::PackageName::new("some.crate"),
-            repository: None,
-            latest_version: "6.1".into(),
-        };
-        let item =
-            create_package_completion_item(&meta, EcosystemId::Cargo, OpenMarkupContext::None)
-                .unwrap();
-
-        assert_eq!(
-            item.insert_text,
-            Some("\"some.crate\" = \"6.1\"".to_string())
-        );
-    }
-
-    #[test]
-    fn test_create_package_completion_item_pypi_dotted_name_stays_bare_string() {
-        // A dotted PyPI name (`zope.interface`) has no TOML-key-injection meaning
-        // once the insert is a bare array-element string, unlike Cargo's key=value
-        // shape (see `test_create_package_completion_item_cargo_dotted_name_quotes_toml_key`).
-        let meta = MockMetadata {
-            name: deps_core::PackageName::new("zope.interface"),
-            repository: None,
-            latest_version: "6.1".into(),
-        };
-        let item =
-            create_package_completion_item(&meta, EcosystemId::Pypi, OpenMarkupContext::None)
-                .unwrap();
-
-        assert_eq!(item.insert_text, Some("zope.interface".to_string()));
-    }
-
-    #[test]
-    fn test_create_package_completion_item_maven_group_artifact() {
-        let meta = MockMetadata {
-            name: deps_core::PackageName::new("org.apache.commons:commons-lang3"),
-            repository: None,
-            latest_version: "3.14.0".into(),
-        };
-        let item =
-            create_package_completion_item(&meta, EcosystemId::Maven, OpenMarkupContext::None)
-                .unwrap();
-
-        assert_eq!(
-            item.insert_text,
-            Some(
-                "<groupId>org.apache.commons</groupId><artifactId>commons-lang3</artifactId>\
-                 <version>3.14.0</version>"
-                    .to_string()
-            )
-        );
-    }
-
-    #[test]
-    fn test_create_package_completion_item_maven_no_colon() {
-        let meta = MockMetadata {
-            name: deps_core::PackageName::new("commons-lang3"),
-            repository: None,
-            latest_version: "3.14.0".into(),
-        };
-        let item =
-            create_package_completion_item(&meta, EcosystemId::Maven, OpenMarkupContext::None)
-                .unwrap();
-
-        assert_eq!(
-            item.insert_text,
-            Some("<artifactId>commons-lang3</artifactId><version>3.14.0</version>".to_string())
-        );
-    }
-
-    /// #724: when the cursor is already inside an open `<artifactId>gua` tag's
-    /// content (`OpenMarkupContext::MavenArtifactId`), only the bare artifact id must
-    /// be inserted — the full `<groupId>...<artifactId>...<version>...` snippet would
-    /// nest a second copy of the tag inside the one already open around the cursor.
-    #[test]
-    fn test_create_package_completion_item_maven_in_open_xml_value_inserts_bare_artifact_id() {
-        let meta = MockMetadata {
-            name: deps_core::PackageName::new("org.apache.commons:commons-lang3"),
-            repository: None,
-            latest_version: "3.14.0".into(),
-        };
-        let item = create_package_completion_item(
-            &meta,
-            EcosystemId::Maven,
-            OpenMarkupContext::MavenArtifactId,
-        )
-        .unwrap();
-
-        assert_eq!(item.insert_text, Some("commons-lang3".to_string()));
-    }
-
-    /// critic S1 on #724: the cursor being inside *some* open Maven tag isn't enough —
-    /// it must specifically be `artifactId`. Inside an open `<groupId>org.apa` (or
-    /// `<version>3.1`), neither the bare artifact id nor the full snippet is a safe
-    /// insert at that position, so the completion item must be suppressed entirely
-    /// rather than silently writing a wrong value into a well-formed tag.
-    #[test]
-    fn test_create_package_completion_item_maven_other_open_tag_suppresses_item() {
-        let meta = MockMetadata {
-            name: deps_core::PackageName::new("org.apache.commons:commons-lang3"),
-            repository: None,
-            latest_version: "3.14.0".into(),
-        };
-
-        assert!(
-            create_package_completion_item(
-                &meta,
-                EcosystemId::Maven,
-                OpenMarkupContext::MavenOtherTag,
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn test_create_package_completion_item_maven_rejects_xml_breakout_artifact_id() {
-        // S1: the identical breakout `build_field_completion` (deps-maven) now guards
-        // against must also be rejected on this fallback-search path, not just the
-        // primary XML-context path.
-        let meta = MockMetadata {
-            name: deps_core::PackageName::new(
-                "org.apache.commons:commons</artifactId><parent><groupId>evil",
-            ),
-            repository: None,
-            latest_version: "3.14.0".into(),
-        };
-
-        assert!(
-            create_package_completion_item(&meta, EcosystemId::Maven, OpenMarkupContext::None)
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn test_create_package_completion_item_maven_rejects_xml_breakout_group_id() {
-        let meta = MockMetadata {
-            name: deps_core::PackageName::new("org.evil</groupId><parent>:commons-lang3"),
-            repository: None,
-            latest_version: "3.14.0".into(),
-        };
-
-        assert!(
-            create_package_completion_item(&meta, EcosystemId::Maven, OpenMarkupContext::None)
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn test_create_package_completion_item_maven_no_colon_rejects_xml_breakout() {
-        let meta = MockMetadata {
-            name: deps_core::PackageName::new("commons</artifactId><parent>"),
-            repository: None,
-            latest_version: "3.14.0".into(),
-        };
-
-        assert!(
-            create_package_completion_item(&meta, EcosystemId::Maven, OpenMarkupContext::None)
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn test_create_package_completion_item_rejects_unsafe_latest_version() {
-        // S2: `latest` is interpolated into every ecosystem's insert_text but was
-        // previously never validated on this path (unlike the other five `TextEdit`
-        // producers `is_safe_version_string` guards).
-        let meta = MockMetadata {
-            name: deps_core::PackageName::new("serde"),
-            repository: None,
-            latest_version: "1.0.0\", git = \"https://evil".into(),
-        };
-
-        assert!(
-            create_package_completion_item(&meta, EcosystemId::Cargo, OpenMarkupContext::None)
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn test_create_package_completion_item_swift_with_repository() {
-        let meta = MockMetadata {
-            name: deps_core::PackageName::new("apple/swift-nio"),
-            repository: Some("https://github.com/apple/swift-nio"),
-            latest_version: "2.62.0".into(),
-        };
-        let item =
-            create_package_completion_item(&meta, EcosystemId::Swift, OpenMarkupContext::None)
-                .unwrap();
-
-        assert_eq!(
-            item.insert_text,
-            Some(
-                ".package(url: \"https://github.com/apple/swift-nio\", from: \"2.62.0\")"
-                    .to_string()
-            )
-        );
-    }
-
-    #[test]
-    fn test_create_package_completion_item_swift_empty_latest_omits_from_clause() {
-        let meta = MockMetadata {
-            name: deps_core::PackageName::new("apple/swift-nio"),
-            repository: Some("https://github.com/apple/swift-nio"),
-            latest_version: "".into(),
-        };
-        let item =
-            create_package_completion_item(&meta, EcosystemId::Swift, OpenMarkupContext::None)
-                .unwrap();
-
-        assert_eq!(
-            item.insert_text,
-            Some(".package(url: \"https://github.com/apple/swift-nio\")".to_string())
-        );
-    }
-
-    #[test]
-    fn test_create_package_completion_item_swift_no_repository_falls_back_to_name() {
-        let meta = MockMetadata {
-            name: deps_core::PackageName::new("apple/swift-nio"),
-            repository: None,
-            latest_version: "2.62.0".into(),
-        };
-        let item =
-            create_package_completion_item(&meta, EcosystemId::Swift, OpenMarkupContext::None)
-                .unwrap();
-
-        assert_eq!(
-            item.insert_text,
-            Some(
-                ".package(url: \"https://github.com/apple/swift-nio\", from: \"2.62.0\")"
-                    .to_string()
-            )
-        );
-    }
-
-    #[test]
-    fn test_create_package_completion_item_swift_rejects_string_literal_breakout_repository() {
-        // S1: the identical breakout `build_url_completion` (deps-swift) now guards
-        // against must also be rejected on this fallback-search path.
-        let meta = MockMetadata {
-            name: deps_core::PackageName::new("apple/swift-nio"),
-            repository: Some(
-                "https://evil.example\", .exact(\"1.0.0\")), .package(url: \"https://real",
-            ),
-            latest_version: "2.62.0".into(),
-        };
-
-        assert!(
-            create_package_completion_item(&meta, EcosystemId::Swift, OpenMarkupContext::None)
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn test_create_package_completion_item_swift_rejects_malicious_name_in_fallback_url() {
-        let meta = MockMetadata {
-            name: deps_core::PackageName::new("apple/swift-nio\", .exact(\"1\")) //"),
-            repository: None,
-            latest_version: "2.62.0".into(),
-        };
-
-        assert!(
-            create_package_completion_item(&meta, EcosystemId::Swift, OpenMarkupContext::None)
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn test_create_package_completion_item_swift_rejects_malicious_name_even_with_repository() {
-        // M4: the upfront `is_safe_package_name` gate runs before the match arm, so it
-        // now also filters names that never reach `insert_text` on this path — when
-        // `repository` is provided, the name-derived fallback-URL branch doesn't run
-        // at all. Intentional: a registry response with a malicious name is
-        // untrustworthy as a whole, not just in the fields the formatter happens to
-        // interpolate.
-        let meta = MockMetadata {
-            name: deps_core::PackageName::new("apple/swift-nio\", .exact(\"1\")) //"),
-            repository: Some("https://github.com/apple/swift-nio"),
-            latest_version: "2.62.0".into(),
-        };
-
-        assert!(
-            create_package_completion_item(&meta, EcosystemId::Swift, OpenMarkupContext::None)
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn test_create_package_completion_item_deno_strips_scheme_for_alias_key() {
-        let meta = MockMetadata {
-            name: deps_core::PackageName::new("jsr:@std/fs"),
-            repository: None,
-            latest_version: "1.0.24".into(),
-        };
-        let item =
-            create_package_completion_item(&meta, EcosystemId::Deno, OpenMarkupContext::None)
-                .unwrap();
-
-        assert_eq!(
-            item.insert_text,
-            Some("\"@std/fs\": \"jsr:@std/fs@^1.0.24\"".to_string())
-        );
-    }
-
-    #[test]
-    fn test_create_package_completion_item_deno_npm_scheme() {
-        let meta = MockMetadata {
-            name: deps_core::PackageName::new("npm:react"),
-            repository: None,
-            latest_version: "18.3.1".into(),
-        };
-        let item =
-            create_package_completion_item(&meta, EcosystemId::Deno, OpenMarkupContext::None)
-                .unwrap();
-
-        assert_eq!(
-            item.insert_text,
-            Some("\"react\": \"npm:react@^18.3.1\"".to_string())
-        );
-    }
-
-    #[test]
-    fn test_create_package_completion_item_deno_empty_latest_omits_version_clause() {
-        // N5: a JSR search hit lacking `latestVersion` must not insert a dangling `@^`.
-        let meta = MockMetadata {
-            name: deps_core::PackageName::new("jsr:@std/fs"),
-            repository: None,
-            latest_version: "".into(),
-        };
-        let item =
-            create_package_completion_item(&meta, EcosystemId::Deno, OpenMarkupContext::None)
-                .unwrap();
-
-        assert_eq!(
-            item.insert_text,
-            Some("\"@std/fs\": \"jsr:@std/fs\"".to_string())
-        );
-    }
-
-    #[test]
-    fn test_create_package_completion_item_composer() {
-        let meta = MockMetadata {
-            name: deps_core::PackageName::new("monolog/monolog"),
-            repository: None,
-            latest_version: "3.5.0".into(),
-        };
-        let item =
-            create_package_completion_item(&meta, EcosystemId::Composer, OpenMarkupContext::None)
-                .unwrap();
-
-        assert_eq!(
-            item.insert_text,
-            Some("\"monolog/monolog\": \"^3.5.0\"".to_string())
-        );
-    }
-
-    #[test]
-    fn test_create_package_completion_item_go() {
-        let meta = MockMetadata {
-            name: deps_core::PackageName::new("github.com/stretchr/testify"),
-            repository: None,
-            latest_version: "v1.9.0".into(),
-        };
-        let item = create_package_completion_item(&meta, EcosystemId::Go, OpenMarkupContext::None)
-            .unwrap();
-
-        assert_eq!(
-            item.insert_text,
-            Some("github.com/stretchr/testify v1.9.0".to_string())
-        );
-    }
-
-    #[test]
-    fn test_create_package_completion_item_dart() {
-        let meta = MockMetadata {
-            name: deps_core::PackageName::new("path"),
-            repository: None,
-            latest_version: "1.9.0".into(),
-        };
-        let item =
-            create_package_completion_item(&meta, EcosystemId::Dart, OpenMarkupContext::None)
-                .unwrap();
-
-        assert_eq!(item.insert_text, Some("\"path\": ^1.9.0".to_string()));
-    }
-
-    #[test]
-    fn test_create_package_completion_item_gradle() {
-        let meta = MockMetadata {
-            name: deps_core::PackageName::new("org.apache.commons:commons-lang3"),
-            repository: None,
-            latest_version: "3.14.0".into(),
-        };
-        let item =
-            create_package_completion_item(&meta, EcosystemId::Gradle, OpenMarkupContext::None)
-                .unwrap();
-
-        assert_eq!(
-            item.insert_text,
-            Some("implementation(\"org.apache.commons:commons-lang3:3.14.0\")".to_string())
-        );
-    }
-
-    #[test]
-    fn test_create_package_completion_item_nuget() {
-        let meta = MockMetadata {
-            name: deps_core::PackageName::new("Newtonsoft.Json"),
-            repository: None,
-            latest_version: "13.0.3".into(),
-        };
-        let item =
-            create_package_completion_item(&meta, EcosystemId::NuGet, OpenMarkupContext::None)
-                .unwrap();
-
-        assert_eq!(
-            item.insert_text,
-            Some("<PackageReference Include=\"Newtonsoft.Json\" Version=\"13.0.3\" />".to_string())
-        );
-    }
-
-    /// #724: when the cursor is already inside an open `Include="Newt` attribute value
-    /// (`in_open_xml_value: true`, the only context the raw-text fallback path ever
-    /// reaches for NuGet — see `strip_leading_xml_attribute`), only the bare package
-    /// name must be inserted. Inserting the full `<PackageReference Include="..."
-    /// Version="..." />` tag there nests a second copy of it inside the attribute
-    /// value it was typed into, corrupting the manifest.
-    #[test]
-    fn test_create_package_completion_item_nuget_in_open_xml_value_inserts_bare_name() {
-        let meta = MockMetadata {
-            name: deps_core::PackageName::new("Newtonsoft.Json"),
-            repository: None,
-            latest_version: "13.0.3".into(),
-        };
-        let item = create_package_completion_item(
-            &meta,
-            EcosystemId::NuGet,
-            OpenMarkupContext::NuGetAttribute,
-        )
-        .unwrap();
-
-        assert_eq!(item.insert_text, Some("Newtonsoft.Json".to_string()));
-    }
-
-    #[test]
-    fn test_create_package_completion_item_bundler() {
-        let meta = MockMetadata {
-            name: deps_core::PackageName::new("rails"),
-            repository: None,
-            latest_version: "7.1.3".into(),
-        };
-        let item =
-            create_package_completion_item(&meta, EcosystemId::Bundler, OpenMarkupContext::None)
-                .unwrap();
-
-        assert_eq!(
-            item.insert_text,
-            Some("gem \"rails\", \"~> 7.1.3\"".to_string())
-        );
-    }
-
-    #[test]
-    fn test_create_package_completion_item_rejects_malicious_name_toml_json_breakout() {
-        // Issue #336: a registry-reported name breaking out of a TOML/JSON/XML/YAML/
-        // Kotlin-Groovy-DSL/Ruby string literal must be rejected for every ecosystem
-        // that interpolates it raw, not just Maven/Swift.
-        let evil = deps_core::PackageName::new("evil\"\nbackdoor = \"9.9.9");
-        for ecosystem in [
-            EcosystemId::Cargo,
-            EcosystemId::Pypi,
-            EcosystemId::Npm,
-            EcosystemId::Composer,
-            EcosystemId::Go,
-            EcosystemId::Dart,
-            EcosystemId::Gradle,
-            EcosystemId::NuGet,
-            EcosystemId::Bundler,
-            EcosystemId::Deno,
-        ] {
-            let meta = MockMetadata {
-                name: evil.clone(),
-                repository: None,
-                latest_version: "9.9.9".into(),
-            };
-            assert!(
-                create_package_completion_item(&meta, ecosystem, OpenMarkupContext::None).is_none(),
-                "expected {ecosystem:?} to reject the malicious name"
-            );
-        }
-    }
-
     #[tokio::test]
     async fn test_fallback_triggered_when_parse_fails() {
         let state = Arc::new(ServerState::new());
@@ -3112,30 +1101,15 @@ ser"
         drop(result);
     }
 
-    #[test]
-    fn test_fallback_rejects_single_char_prefix() {
-        let content = r"
-[dependencies]
-s
-";
-
-        // Extract prefix at position (1 char)
-        let line = content.lines().nth(2).unwrap();
-        let (prefix, _) = extract_prefix(line, 1, EcosystemId::Cargo);
-
-        // Should reject single char (< 2 chars requirement)
-        assert_eq!(prefix.len(), 1);
-        assert!(prefix.chars().count() < 2);
-    }
-
+    /// A single CJK character is 3 bytes, so a byte-length guard `prefix.len() < 2`
+    /// would wrongly let it reach the registry; `search` panics here so the test fails
+    /// loudly if the char-count guard regresses instead of silently returning empty
+    /// either way.
     #[tokio::test]
     async fn test_fallback_completion_rejects_single_cjk_char_prefix() {
         use deps_core::{Metadata, Registry, Version};
         use std::any::Any;
 
-        // A single CJK character is 3 bytes, so byte-length guard `prefix.len() < 2`
-        // wrongly let it reach the registry; `search` panics here so the test fails
-        // loudly if the guard regresses instead of silently returning empty either way.
         struct PanicsIfSearchedRegistry;
         impl Registry for PanicsIfSearchedRegistry {
             fn get_versions<'a>(
@@ -3166,11 +1140,9 @@ s
             }
         }
 
-        let state = mock_cargo_state(Arc::new(PanicsIfSearchedRegistry));
-        let content = "[dependencies]\n日\n";
-        let position = Position::new(1, 1); // after the single CJK char
-
-        let items = fallback_completion(&state, EcosystemId::Cargo, position, content).await;
+        let state = mock_cargo_state(Arc::new(PanicsIfSearchedRegistry), Some("日"));
+        let items =
+            fallback_completion(&state, EcosystemId::Cargo, Position::new(1, 1), "unused").await;
         assert!(items.is_empty());
     }
 
@@ -3178,32 +1150,6 @@ s
     async fn test_fallback_completion_passes_two_char_prefixes_to_search() {
         use deps_core::{Metadata, Registry, Version};
         use std::any::Any;
-
-        struct MockMetadata {
-            name: deps_core::PackageName,
-        }
-        impl Metadata for MockMetadata {
-            fn name(&self) -> &deps_core::PackageName {
-                &self.name
-            }
-            fn description(&self) -> Option<&str> {
-                None
-            }
-            fn repository(&self) -> Option<&str> {
-                None
-            }
-            fn documentation(&self) -> Option<&str> {
-                None
-            }
-            fn latest_version(&self) -> &deps_core::ConcreteVersion {
-                static VERSION: std::sync::LazyLock<deps_core::ConcreteVersion> =
-                    std::sync::LazyLock::new(|| deps_core::ConcreteVersion::new("1.0.0"));
-                &VERSION
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
 
         struct StubRegistry;
         impl Registry for StubRegistry {
@@ -3231,6 +1177,7 @@ s
                 Box::pin(async move {
                     Ok(vec![Box::new(MockMetadata {
                         name: deps_core::PackageName::new("serde"),
+                        latest_version: "1.0.0".into(),
                     }) as Box<dyn Metadata>])
                 })
             }
@@ -3240,13 +1187,14 @@ s
         }
 
         // Two CJK characters: byte count (6) and char count (2) agree, so this was
-        // never affected by the bug, but it must keep passing through to search.
-        let cjk_state = mock_cargo_state(Arc::new(StubRegistry));
+        // never affected by the byte-length bug, but it must keep passing through to
+        // search.
+        let cjk_state = mock_cargo_state(Arc::new(StubRegistry), Some("日本"));
         let cjk_items = fallback_completion(
             &cjk_state,
             EcosystemId::Cargo,
             Position::new(1, 2),
-            "[dependencies]\n日本\n",
+            "unused",
         )
         .await;
         assert_eq!(cjk_items.len(), 1);
@@ -3254,313 +1202,72 @@ s
 
         // Two ASCII chars: regression check that the char-count guard didn't change
         // behavior for the common case.
-        let ascii_state = mock_cargo_state(Arc::new(StubRegistry));
+        let ascii_state = mock_cargo_state(Arc::new(StubRegistry), Some("se"));
         let ascii_items = fallback_completion(
             &ascii_state,
             EcosystemId::Cargo,
             Position::new(1, 2),
-            "[dependencies]\nse\n",
+            "unused",
         )
         .await;
         assert_eq!(ascii_items.len(), 1);
         assert_eq!(ascii_items[0].label, "serde");
     }
 
-    #[test]
-    fn test_extract_prefix_strips_leading_xml_tag_for_maven() {
-        // Cursor right after "gua" in `<artifactId>gua`.
-        assert_eq!(
-            extract_prefix("  <artifactId>gua", 17, EcosystemId::Maven),
-            ("gua", OpenMarkupContext::MavenArtifactId)
-        );
-    }
-
-    #[test]
-    fn test_extract_prefix_maven_unclosed_tag_is_unchanged() {
-        // Cursor mid-tag-name, before `>` exists yet: nothing to strip.
-        assert_eq!(
-            extract_prefix("  <artifactId", 13, EcosystemId::Maven),
-            ("<artifactId", OpenMarkupContext::None)
-        );
-    }
-
-    /// #282 S1 (second critic round): a first-`>`-based strip diverges from
-    /// `MavenEcosystem::detect_xml_context`'s own `rfind`-based (last-tag) lookup
-    /// whenever more than one tag precedes the cursor on a line — the first `>` here
-    /// sits inside `<groupId>`, well short of the real value. Mirrored by
-    /// `deps-maven`'s `test_detect_xml_context_compact_multi_tag_line_matches_completion_extractor`
-    /// using the identical line/cursor position.
-    #[test]
-    fn test_extract_prefix_maven_strips_last_tag_not_first() {
-        let line = "    <dependency><groupId>com.google.guava</groupId><artifactId>gua";
-        assert_eq!(
-            extract_prefix(line, 66, EcosystemId::Maven),
-            ("gua", OpenMarkupContext::MavenArtifactId)
-        );
-    }
-
-    /// #282 S1 (second critic round): cursor right after a fully closed tag must yield
-    /// an empty prefix (rejected by `fallback_completion`'s existing empty-prefix
-    /// guard), matching `detect_xml_context`'s own "no context" outcome for the same
-    /// position (its `between.contains("</")` guard rejects it too) instead of sending
-    /// `solrsearch` a markup-polluted live query for an ordinary explicit-invoke
-    /// position. Mirrored by `deps-maven`'s
-    /// `test_detect_xml_context_after_closed_tag_yields_no_context` using the identical
-    /// line/cursor position.
-    #[test]
-    fn test_extract_prefix_maven_after_closed_tag_is_empty() {
-        let line = "    <artifactId>guava</artifactId>";
-        assert_eq!(
-            extract_prefix(line, 34, EcosystemId::Maven),
-            ("", OpenMarkupContext::None)
-        );
-    }
-
-    /// critic M3 on #724: loose inter-element text right after a closed tag
-    /// (`<artifactId>guava</artifactId> comm`) must not be read as "inside the
-    /// `artifactId` tag" — the closing `</artifactId>` is the last `>` on the line, so
-    /// a naive "found a `>`" check would wrongly signal `MavenArtifactId` here and
-    /// have `create_package_completion_item` bare-insert an artifact id into stray
-    /// text instead of offering the (more correct, pre-#724) full snippet.
-    #[test]
-    fn test_extract_prefix_maven_loose_text_after_closed_tag_is_not_artifact_id() {
-        let line = "    <artifactId>guava</artifactId> comm";
-        assert_eq!(
-            extract_prefix(line, line.len() as u32, EcosystemId::Maven),
-            (" comm", OpenMarkupContext::None)
-        );
-    }
-
-    /// #699: cursor mid-typing inside `PackageReference`'s `Include="..."` attribute
-    /// value must yield the bare package-name text, not the surrounding markup — a raw
-    /// `<PackageReference Include="Newt` prefix contains `=` and would otherwise be
-    /// rejected outright by `fallback_completion`'s `contains('=')` guard.
-    #[test]
-    fn test_extract_prefix_strips_leading_xml_attribute_for_nuget_include() {
-        let line = "    <PackageReference Include=\"Newt";
-        assert_eq!(
-            extract_prefix(line, line.chars().count() as u32, EcosystemId::NuGet),
-            ("Newt", OpenMarkupContext::NuGetAttribute)
-        );
-    }
-
-    /// `packages.config`'s `<package id="..."/>` uses a different attribute name than
-    /// `PackageReference`'s `Include=`, but must be recognized the same way.
-    #[test]
-    fn test_extract_prefix_strips_leading_xml_attribute_for_nuget_id() {
-        let line = "  <package id=\"Newt";
-        assert_eq!(
-            extract_prefix(line, line.chars().count() as u32, EcosystemId::NuGet),
-            ("Newt", OpenMarkupContext::NuGetAttribute)
-        );
-    }
-
-    /// Spacing around `=` (`Include = "..."`, as MSBuild allows) must not defeat the
-    /// attribute-name match.
-    #[test]
-    fn test_extract_prefix_strips_leading_xml_attribute_for_nuget_spaced_equals() {
-        let line = "<PackageReference Include = \"Newt";
-        assert_eq!(
-            extract_prefix(line, line.chars().count() as u32, EcosystemId::NuGet),
-            ("Newt", OpenMarkupContext::NuGetAttribute)
-        );
-    }
-
-    /// Single-quoted attribute values are valid XML too.
-    #[test]
-    fn test_extract_prefix_strips_leading_xml_attribute_for_nuget_single_quote() {
-        let line = "<PackageReference Include='Newt";
-        assert_eq!(
-            extract_prefix(line, line.chars().count() as u32, EcosystemId::NuGet),
-            ("Newt", OpenMarkupContext::NuGetAttribute)
-        );
-    }
-
-    /// Cursor inside a *different* attribute's value (`Version="1.0`, after `Include`
-    /// was already closed) must not be mistaken for the package-name attribute — an
-    /// empty prefix is rejected outright by `fallback_completion`'s empty-prefix
-    /// guard rather than firing a bogus search for `"1.0"`.
-    #[test]
-    fn test_extract_prefix_nuget_non_target_attribute_is_unchanged() {
-        let line = "<PackageReference Include=\"Foo\" Version=\"1.0";
-        assert_eq!(
-            extract_prefix(line, line.chars().count() as u32, EcosystemId::NuGet),
-            ("", OpenMarkupContext::None)
-        );
-    }
-
-    /// impl-critic S3: `Include="..."` also appears on everyday MSBuild items that are
-    /// not NuGet package references at all (`<Compile Include="..`, source-file globs,
-    /// etc.) — the element name, not just the attribute name, must gate extraction, or
-    /// typing inside one of these fires a bogus (or worse, coincidentally real but
-    /// wrong) nuget.org search.
-    #[test]
-    fn test_extract_prefix_nuget_non_package_element_include_is_unchanged() {
-        let line = "<Compile Include=\"Mode";
-        assert_eq!(
-            extract_prefix(line, line.chars().count() as u32, EcosystemId::NuGet),
-            ("", OpenMarkupContext::None)
-        );
-    }
-
-    /// Same as above for `<Using Include="..."/>` — a real, common `.csproj` item that
-    /// also happens to have an `Include=` attribute.
-    #[test]
-    fn test_extract_prefix_nuget_using_element_include_is_unchanged() {
-        let line = "<Using Include=\"Serilog";
-        assert_eq!(
-            extract_prefix(line, line.chars().count() as u32, EcosystemId::NuGet),
-            ("", OpenMarkupContext::None)
-        );
-    }
-
-    /// #699 (code-review): typing the element name itself, before any attribute quote
-    /// has opened, must not be treated as a search prefix — there is no candidate
-    /// package-name text yet at that cursor position.
-    #[test]
-    fn test_extract_prefix_nuget_element_name_only_is_empty() {
-        let line = "<PackageReference ";
-        assert_eq!(
-            extract_prefix(line, line.chars().count() as u32, EcosystemId::NuGet),
-            ("", OpenMarkupContext::None)
-        );
-    }
-
-    /// #699 (code-review): comment text or any other non-markup content inside an
-    /// `<ItemGroup>` must not reach the registry just because it lacks a literal `=`.
-    #[test]
-    fn test_extract_prefix_nuget_comment_text_is_empty() {
-        let line = "<!-- TODO fix";
-        assert_eq!(
-            extract_prefix(line, line.chars().count() as u32, EcosystemId::NuGet),
-            ("", OpenMarkupContext::None)
-        );
-    }
-
-    /// #699 (code-review): a bare word with no markup at all — the `is_in_dependencies_
-    /// section` gate only requires *some* `<ItemGroup>` on the file, which can hold
-    /// non-package items (`<Compile>`/`<None>`/...) exclusively — must not reach the
-    /// registry either.
-    #[test]
-    fn test_extract_prefix_nuget_bare_word_is_empty() {
-        let line = "  Model";
-        assert_eq!(
-            extract_prefix(line, line.chars().count() as u32, EcosystemId::NuGet),
-            ("", OpenMarkupContext::None)
-        );
-    }
-
-    /// A stray quote of the *other* type inside an unclosed value (impl-critic M6)
-    /// must not leak into the extracted text — a package id never contains a quote
-    /// character, so extraction stops at the first one of either kind.
-    #[test]
-    fn test_extract_prefix_nuget_mismatched_quote_does_not_leak() {
-        let line = "<PackageReference Include=\"Foo'";
-        assert_eq!(
-            extract_prefix(line, line.chars().count() as u32, EcosystemId::NuGet),
-            ("Foo", OpenMarkupContext::NuGetAttribute)
-        );
-    }
-
-    /// #282 C1 regression guard: the primary completion path (`MavenEcosystem::
-    /// detect_xml_context`) searches the registry for the bare tag value (`"gua"` for
-    /// `<artifactId>gua`), not the raw line text. Before this fix, `fallback_completion`
-    /// searched for `"<artifactId>gua"` instead — a different query string that broke
-    /// both search relevance and any per-query dedup/cache mechanism (the fast-failure
-    /// amplification fix in `deps-maven`) keyed on the query matching across the
-    /// primary and fallback paths for the same cursor position.
     #[tokio::test]
-    async fn test_fallback_completion_maven_query_matches_tag_value() {
-        use deps_core::{Metadata, Registry};
+    async fn test_fallback_completion_rejects_prefix_with_equals() {
+        use deps_core::{Metadata, Registry, Version};
         use std::any::Any;
-        use std::sync::Mutex;
 
-        struct CapturingRegistry {
-            captured_query: Mutex<Option<String>>,
-        }
-        impl Registry for CapturingRegistry {
+        struct PanicsIfSearchedRegistry;
+        impl Registry for PanicsIfSearchedRegistry {
             fn get_versions<'a>(
                 &'a self,
                 _name: &'a deps_core::PackageName,
-            ) -> deps_core::ecosystem::BoxFuture<
-                'a,
-                deps_core::Result<Vec<Box<dyn deps_core::Version>>>,
-            > {
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
                 Box::pin(async move { Ok(vec![]) })
             }
             fn get_latest_matching<'a>(
                 &'a self,
                 _name: &'a deps_core::PackageName,
                 _req: &'a deps_core::VersionReq,
-            ) -> deps_core::ecosystem::BoxFuture<
-                'a,
-                deps_core::Result<Option<Box<dyn deps_core::Version>>>,
-            > {
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
                 Box::pin(async move { Ok(None) })
             }
             fn search<'a>(
                 &'a self,
-                query: &'a str,
+                _query: &'a str,
                 _limit: usize,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
             {
-                *self.captured_query.lock().unwrap() = Some(query.to_string());
-                Box::pin(async move { Ok(vec![]) })
+                panic!("guard must short-circuit before reaching registry search");
             }
             fn as_any(&self) -> &dyn Any {
                 self
             }
         }
 
-        let registry = Arc::new(CapturingRegistry {
-            captured_query: Mutex::new(None),
-        });
-        let state = mock_maven_state(Arc::clone(&registry) as Arc<dyn Registry>);
-
-        let content = "<dependencies>\n  <dependency>\n    <artifactId>gua\n";
-        fallback_completion(&state, EcosystemId::Maven, Position::new(2, 19), content).await;
-
-        assert_eq!(
-            registry.captured_query.lock().unwrap().as_deref(),
-            Some("gua")
-        );
+        let state = mock_cargo_state(Arc::new(PanicsIfSearchedRegistry), Some("se = \"1.0"));
+        let items =
+            fallback_completion(&state, EcosystemId::Cargo, Position::new(1, 9), "unused").await;
+        assert!(items.is_empty());
     }
 
-    /// #724: end-to-end regression guard through `fallback_completion` itself — typing
-    /// inside an already-open `<artifactId>gua` tag's content must produce a
-    /// completion item that inserts just the bare artifact id, not a second copy of
-    /// `<groupId>...<artifactId>...<version>...` nested inside the tag it was typed
-    /// into (the same corruption class the issue reported for NuGet).
+    /// #724/#728 end-to-end wiring guard: `fallback_completion` must actually reach
+    /// `Ecosystem::fallback_completion_is_bare`/`fallback_bare_insert_text` when an
+    /// ecosystem's prefix-extraction step reports `bare = true`, not just
+    /// `create_package_completion_item` in isolation (see the unit-level
+    /// `test_create_package_completion_item_bare_routes_to_fallback_bare_insert_text`).
+    /// `insert_text` panics if invoked, so this fails loudly if the `bare` flag
+    /// silently regresses to `false` on the wiring path (critic S1 on the #721/#722
+    /// rebase: nothing in `deps-lsp` previously reached `fallback_completion` with
+    /// `bare = true` at all, since `mock_cargo_state` always builds `is_bare: false`).
     #[tokio::test]
-    async fn test_fallback_completion_maven_in_open_tag_inserts_bare_artifact_id() {
+    async fn test_fallback_completion_bare_routes_through_to_fallback_bare_insert_text() {
         use deps_core::{Metadata, Registry, Version};
         use std::any::Any;
-
-        struct MockMetadata {
-            name: deps_core::PackageName,
-        }
-        impl Metadata for MockMetadata {
-            fn name(&self) -> &deps_core::PackageName {
-                &self.name
-            }
-            fn description(&self) -> Option<&str> {
-                None
-            }
-            fn repository(&self) -> Option<&str> {
-                None
-            }
-            fn documentation(&self) -> Option<&str> {
-                None
-            }
-            fn latest_version(&self) -> &deps_core::ConcreteVersion {
-                static VERSION: std::sync::LazyLock<deps_core::ConcreteVersion> =
-                    std::sync::LazyLock::new(|| deps_core::ConcreteVersion::new("33.0.0-jre"));
-                &VERSION
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
 
         struct StubRegistry;
         impl Registry for StubRegistry {
@@ -3587,7 +1294,8 @@ s
             {
                 Box::pin(async move {
                     Ok(vec![Box::new(MockMetadata {
-                        name: deps_core::PackageName::new("com.google.guava:guava"),
+                        name: deps_core::PackageName::new("guava"),
+                        latest_version: "33.0.0".into(),
                     }) as Box<dyn Metadata>])
                 })
             }
@@ -3596,25 +1304,31 @@ s
             }
         }
 
-        let state = mock_maven_state(Arc::new(StubRegistry));
-        let content = "<dependencies>\n  <dependency>\n    <artifactId>gua\n";
+        let state = ServerState::new();
+        state.ecosystem_registry.register(Arc::new(MockEcosystem {
+            id: "cargo",
+            registry: Arc::new(StubRegistry),
+            fallback_prefix: Some("gua"),
+            insert_text: |_| panic!("bare=true must not call completion_insert_text"),
+            is_bare: true,
+            bare_insert_text: |metadata| Some(format!("bare:{}", metadata.name())),
+        }));
 
         let items =
-            fallback_completion(&state, EcosystemId::Maven, Position::new(2, 19), content).await;
+            fallback_completion(&state, EcosystemId::Cargo, Position::new(0, 0), "unused").await;
 
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].insert_text, Some("guava".to_string()));
+        assert_eq!(items[0].insert_text, Some("bare:guava".to_string()));
     }
 
-    /// critic S1 + team-lead correctness-gate follow-up on #724: an open
-    /// `<groupId>org.apa` tag (not `artifactId`) must suppress the completion item
-    /// AND skip the live registry search entirely — `create_package_completion_item`
-    /// would discard every result anyway, so firing an HTTP call to Maven Central on
-    /// every keystroke while typing inside `<groupId>`/`<version>` wastes the network
-    /// round-trip and rate-limit budget for nothing. `search` panics here so the test
-    /// fails loudly if `fallback_completion`'s short-circuit regresses.
+    /// #724/#728 end-to-end wiring guard, the suppression half: when an ecosystem's
+    /// `fallback_completion_prefix` returns `None` (Maven's open-non-`artifactId`-tag
+    /// case), `fallback_completion` must return empty *without* ever reaching the
+    /// registry — `search` panics here so this fails loudly if that short-circuit
+    /// regresses (mirrors #728's own
+    /// `test_fallback_completion_maven_in_open_group_id_tag_suppresses_item`).
     #[tokio::test]
-    async fn test_fallback_completion_maven_in_open_group_id_tag_suppresses_item() {
+    async fn test_fallback_completion_none_prefix_never_reaches_registry() {
         use deps_core::{Metadata, Registry, Version};
         use std::any::Any;
 
@@ -3641,102 +1355,31 @@ s
                 _limit: usize,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
             {
-                panic!("typing inside a non-artifactId Maven tag must not reach registry search");
+                panic!("None prefix must short-circuit before reaching registry search");
             }
             fn as_any(&self) -> &dyn Any {
                 self
             }
         }
 
-        let state = mock_maven_state(Arc::new(PanicsIfSearchedRegistry));
-        let content = "<dependencies>\n  <dependency>\n    <groupId>org.apa\n";
-        let line = content.lines().nth(2).unwrap();
-        let position = Position::new(2, line.chars().count() as u32);
-
-        let items = fallback_completion(&state, EcosystemId::Maven, position, content).await;
-
+        let state = mock_cargo_state(Arc::new(PanicsIfSearchedRegistry), None);
+        let items =
+            fallback_completion(&state, EcosystemId::Cargo, Position::new(0, 0), "unused").await;
         assert!(items.is_empty());
     }
 
-    /// #699 (impl-critic S1): a direct end-to-end proof, through `fallback_completion`
-    /// itself, that typing a package name inside `PackageReference`'s `Include="..."`
-    /// attribute actually fires a registry search — before this fix, `is_in_dependencies_
-    /// section` correctly detected the `<ItemGroup>` section, but the raw
-    /// `<PackageReference Include="Newt` prefix still contained `=`, so `fallback_
-    /// completion`'s own guard silently rejected it before any search ever ran.
-    #[tokio::test]
-    async fn test_fallback_completion_nuget_query_matches_attribute_value() {
-        use deps_core::{Metadata, Registry};
-        use std::any::Any;
-        use std::sync::Mutex;
-
-        struct CapturingRegistry {
-            captured_query: Mutex<Option<String>>,
-        }
-        impl Registry for CapturingRegistry {
-            fn get_versions<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-            ) -> deps_core::ecosystem::BoxFuture<
-                'a,
-                deps_core::Result<Vec<Box<dyn deps_core::Version>>>,
-            > {
-                Box::pin(async move { Ok(vec![]) })
-            }
-            fn get_latest_matching<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-                _req: &'a deps_core::VersionReq,
-            ) -> deps_core::ecosystem::BoxFuture<
-                'a,
-                deps_core::Result<Option<Box<dyn deps_core::Version>>>,
-            > {
-                Box::pin(async move { Ok(None) })
-            }
-            fn search<'a>(
-                &'a self,
-                query: &'a str,
-                _limit: usize,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
-            {
-                *self.captured_query.lock().unwrap() = Some(query.to_string());
-                Box::pin(async move { Ok(vec![]) })
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
-
-        let registry = Arc::new(CapturingRegistry {
-            captured_query: Mutex::new(None),
-        });
-        let state = mock_nuget_state(Arc::clone(&registry) as Arc<dyn Registry>);
-
-        let content = "<Project>\n  <ItemGroup>\n    <PackageReference Include=\"Newt\n";
-        let line = content.lines().nth(2).unwrap();
-        let position = Position::new(2, line.chars().count() as u32);
-        fallback_completion(&state, EcosystemId::NuGet, position, content).await;
-
-        assert_eq!(
-            registry.captured_query.lock().unwrap().as_deref(),
-            Some("Newt")
-        );
-    }
-
-    /// #724: end-to-end regression guard through `fallback_completion` itself — typing
-    /// inside an already-open `Include="Newt` attribute value must produce a completion
-    /// item that inserts just the bare package name, not a second copy of the
-    /// `<PackageReference .../>` tag nested inside the attribute value it was typed
-    /// into (the corruption the issue reported).
-    #[tokio::test]
-    async fn test_fallback_completion_nuget_in_open_attribute_inserts_bare_name() {
-        use deps_core::{Metadata, Registry, Version};
-        use std::any::Any;
-
+    /// #118: a value this function interpolates into `insert_text` must fail its
+    /// allowlist gate *before* the ecosystem's own `completion_insert_text` is ever
+    /// called — proven here via a `MockEcosystem` whose `insert_text` panics if
+    /// invoked, so the test fails loudly if the upfront gate regresses to running
+    /// after (or not at all).
+    #[test]
+    fn test_create_package_completion_item_rejects_unsafe_latest_version() {
         struct MockMetadata {
             name: deps_core::PackageName,
+            latest_version: deps_core::ConcreteVersion,
         }
-        impl Metadata for MockMetadata {
+        impl deps_core::Metadata for MockMetadata {
             fn name(&self) -> &deps_core::PackageName {
                 &self.name
             }
@@ -3750,564 +1393,137 @@ s
                 None
             }
             fn latest_version(&self) -> &deps_core::ConcreteVersion {
-                static VERSION: std::sync::LazyLock<deps_core::ConcreteVersion> =
-                    std::sync::LazyLock::new(|| deps_core::ConcreteVersion::new("13.0.4"));
-                &VERSION
+                &self.latest_version
             }
-            fn as_any(&self) -> &dyn Any {
+            fn as_any(&self) -> &dyn std::any::Any {
                 self
             }
         }
 
-        struct StubRegistry;
-        impl Registry for StubRegistry {
-            fn get_versions<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(vec![]) })
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("serde"),
+            latest_version: "1.0.0\", git = \"https://evil".into(),
+        };
+        let ecosystem = MockEcosystem {
+            id: "cargo",
+            registry: Arc::new(NoopRegistry),
+            fallback_prefix: None,
+            insert_text: |_| panic!("gate must reject before completion_insert_text runs"),
+            is_bare: false,
+            bare_insert_text: default_insert_text,
+        };
+
+        assert!(create_package_completion_item(&meta, &ecosystem, false).is_none());
+    }
+
+    /// Issue #336: a registry-reported name breaking out of a manifest string literal
+    /// must be rejected before dispatch to any ecosystem's `completion_insert_text` —
+    /// this is the single ecosystem-agnostic gate every ecosystem relies on, proven
+    /// here with a `MockEcosystem` whose `insert_text` panics if invoked.
+    #[test]
+    fn test_create_package_completion_item_rejects_malicious_name() {
+        struct MockMetadata {
+            name: deps_core::PackageName,
+            latest_version: deps_core::ConcreteVersion,
+        }
+        impl deps_core::Metadata for MockMetadata {
+            fn name(&self) -> &deps_core::PackageName {
+                &self.name
             }
-            fn get_latest_matching<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-                _req: &'a deps_core::VersionReq,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(None) })
+            fn description(&self) -> Option<&str> {
+                None
             }
-            fn search<'a>(
-                &'a self,
-                _query: &'a str,
-                _limit: usize,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
-            {
-                Box::pin(async move {
-                    Ok(vec![Box::new(MockMetadata {
-                        name: deps_core::PackageName::new("Newtonsoft.Json"),
-                    }) as Box<dyn Metadata>])
-                })
+            fn repository(&self) -> Option<&str> {
+                None
             }
-            fn as_any(&self) -> &dyn Any {
+            fn documentation(&self) -> Option<&str> {
+                None
+            }
+            fn latest_version(&self) -> &deps_core::ConcreteVersion {
+                &self.latest_version
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
                 self
             }
         }
 
-        let state = mock_nuget_state(Arc::new(StubRegistry));
-        let content = "<Project>\n  <ItemGroup>\n    <PackageReference Include=\"Newt\n";
-        let line = content.lines().nth(2).unwrap();
-        let position = Position::new(2, line.chars().count() as u32);
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("evil\"\nbackdoor = \"9.9.9"),
+            latest_version: "9.9.9".into(),
+        };
+        let ecosystem = MockEcosystem {
+            id: "cargo",
+            registry: Arc::new(NoopRegistry),
+            fallback_prefix: None,
+            insert_text: |_| panic!("gate must reject before completion_insert_text runs"),
+            is_bare: false,
+            bare_insert_text: default_insert_text,
+        };
 
-        let items = fallback_completion(&state, EcosystemId::NuGet, position, content).await;
-
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].insert_text, Some("Newtonsoft.Json".to_string()));
+        assert!(create_package_completion_item(&meta, &ecosystem, false).is_none());
     }
 
-    /// #699: typing inside a *non*-target attribute's value (`Version="1.0`, after
-    /// `Include` was already closed) must not reach the registry — `extract_prefix`
-    /// leaves the whole `=`-containing line untouched for this position (see
-    /// `test_extract_prefix_nuget_non_target_attribute_is_unchanged`), and
-    /// `fallback_completion`'s `contains('=')` guard rejects it before any search.
-    #[tokio::test]
-    async fn test_fallback_completion_nuget_non_target_attribute_value_does_not_search() {
-        use deps_core::{Metadata, Registry, Version};
-        use std::any::Any;
-
-        struct PanicsIfSearchedRegistry;
-        impl Registry for PanicsIfSearchedRegistry {
-            fn get_versions<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(vec![]) })
-            }
-            fn get_latest_matching<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-                _req: &'a deps_core::VersionReq,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(None) })
-            }
-            fn search<'a>(
-                &'a self,
-                _query: &'a str,
-                _limit: usize,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
-            {
-                panic!("non-target attribute-value typing must not reach registry search");
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
+    struct NoopRegistry;
+    impl deps_core::Registry for NoopRegistry {
+        fn get_versions<'a>(
+            &'a self,
+            _name: &'a deps_core::PackageName,
+        ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn deps_core::Version>>>>
+        {
+            Box::pin(async move { Ok(vec![]) })
         }
-
-        let state = mock_nuget_state(Arc::new(PanicsIfSearchedRegistry));
-        let content =
-            "<ItemGroup>\n  <PackageReference Include=\"Foo\" Version=\"1.0\n</ItemGroup>\n";
-        let line = content.lines().nth(1).unwrap();
-        let position = Position::new(1, line.chars().count() as u32);
-
-        let items = fallback_completion(&state, EcosystemId::NuGet, position, content).await;
-        assert!(items.is_empty());
-    }
-
-    /// impl-critic S3: an `<ItemGroup>` in a real `.csproj` commonly holds non-package
-    /// MSBuild items (`<Compile Include="..`, source-file globs, etc.) that also carry
-    /// an `Include=` attribute. Typing inside one of these must not reach the registry
-    /// — this is a direct end-to-end regression guard for the bug the fix addressed
-    /// (`test_extract_prefix_nuget_non_package_element_include_is_unchanged` covers the
-    /// same case at the `extract_prefix` level).
-    #[tokio::test]
-    async fn test_fallback_completion_nuget_non_package_element_does_not_search() {
-        use deps_core::{Metadata, Registry, Version};
-        use std::any::Any;
-
-        struct PanicsIfSearchedRegistry;
-        impl Registry for PanicsIfSearchedRegistry {
-            fn get_versions<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(vec![]) })
-            }
-            fn get_latest_matching<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-                _req: &'a deps_core::VersionReq,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(None) })
-            }
-            fn search<'a>(
-                &'a self,
-                _query: &'a str,
-                _limit: usize,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
-            {
-                panic!("non-package-element attribute typing must not reach registry search");
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
+        fn get_latest_matching<'a>(
+            &'a self,
+            _name: &'a deps_core::PackageName,
+            _req: &'a deps_core::VersionReq,
+        ) -> deps_core::ecosystem::BoxFuture<
+            'a,
+            deps_core::Result<Option<Box<dyn deps_core::Version>>>,
+        > {
+            Box::pin(async move { Ok(None) })
         }
-
-        let state = mock_nuget_state(Arc::new(PanicsIfSearchedRegistry));
-        let content = "<ItemGroup>\n  <Compile Include=\"Mode\n</ItemGroup>\n";
-        let line = content.lines().nth(1).unwrap();
-        let position = Position::new(1, line.chars().count() as u32);
-
-        let items = fallback_completion(&state, EcosystemId::NuGet, position, content).await;
-        assert!(items.is_empty());
-    }
-
-    /// #699 (code-review): a bare word typed inside `<ItemGroup>` with no markup at
-    /// all on the line yet must NOT reach the registry — `is_in_dependencies_section`
-    /// only requires *some* `<ItemGroup>` on the file (which can hold non-package
-    /// items like `<Compile>`/`<None>` exclusively), so nothing about this position
-    /// establishes that a package name is actually being typed. Regression guard: an
-    /// earlier version of this fix returned the unmodified line here, which contains
-    /// no `=` and so slipped past `fallback_completion`'s only remaining guard,
-    /// firing a live registry search on arbitrary non-markup text.
-    #[tokio::test]
-    async fn test_fallback_completion_nuget_bare_line_in_item_group_does_not_search() {
-        use deps_core::{Metadata, Registry, Version};
-        use std::any::Any;
-
-        struct PanicsIfSearchedRegistry;
-        impl Registry for PanicsIfSearchedRegistry {
-            fn get_versions<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(vec![]) })
-            }
-            fn get_latest_matching<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-                _req: &'a deps_core::VersionReq,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(None) })
-            }
-            fn search<'a>(
-                &'a self,
-                _query: &'a str,
-                _limit: usize,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
-            {
-                panic!("bare non-markup text inside <ItemGroup> must not reach registry search");
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
+        fn search<'a>(
+            &'a self,
+            _query: &'a str,
+            _limit: usize,
+        ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn deps_core::Metadata>>>>
+        {
+            Box::pin(async move { Ok(vec![]) })
         }
-
-        let state = mock_nuget_state(Arc::new(PanicsIfSearchedRegistry));
-        let content = "<ItemGroup>\n  Model\n</ItemGroup>\n";
-        let line = content.lines().nth(1).unwrap();
-        let position = Position::new(1, line.chars().count() as u32);
-
-        let items = fallback_completion(&state, EcosystemId::NuGet, position, content).await;
-        assert!(items.is_empty());
-    }
-
-    /// #699 (code-review): comment text inside `<ItemGroup>` must not reach the
-    /// registry either — same failure mode as the bare-word case above, just with
-    /// comment markup instead of a plain word.
-    #[tokio::test]
-    async fn test_fallback_completion_nuget_comment_text_does_not_search() {
-        use deps_core::{Metadata, Registry, Version};
-        use std::any::Any;
-
-        struct PanicsIfSearchedRegistry;
-        impl Registry for PanicsIfSearchedRegistry {
-            fn get_versions<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(vec![]) })
-            }
-            fn get_latest_matching<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-                _req: &'a deps_core::VersionReq,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(None) })
-            }
-            fn search<'a>(
-                &'a self,
-                _query: &'a str,
-                _limit: usize,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
-            {
-                panic!("comment text inside <ItemGroup> must not reach registry search");
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
         }
-
-        let state = mock_nuget_state(Arc::new(PanicsIfSearchedRegistry));
-        let content = "<ItemGroup>\n  <!-- TODO fix\n</ItemGroup>\n";
-        let line = content.lines().nth(1).unwrap();
-        let position = Position::new(1, line.chars().count() as u32);
-
-        let items = fallback_completion(&state, EcosystemId::NuGet, position, content).await;
-        assert!(items.is_empty());
     }
 
-    /// #699 (code-review): typing the element name itself (`<PackageReference `, no
-    /// attribute quote opened yet) must not reach the registry either — there is no
-    /// candidate package-name text at that cursor position, and the primary
-    /// (non-fallback) completion path is the right place for tag/attribute-name
-    /// completion, not this raw-text search fallback.
-    #[tokio::test]
-    async fn test_fallback_completion_nuget_element_name_only_does_not_search() {
-        use deps_core::{Metadata, Registry, Version};
-        use std::any::Any;
-
-        struct PanicsIfSearchedRegistry;
-        impl Registry for PanicsIfSearchedRegistry {
-            fn get_versions<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(vec![]) })
-            }
-            fn get_latest_matching<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-                _req: &'a deps_core::VersionReq,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(None) })
-            }
-            fn search<'a>(
-                &'a self,
-                _query: &'a str,
-                _limit: usize,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
-            {
-                panic!("element-name-only typing must not reach registry search");
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
+    struct MockMetadata {
+        name: deps_core::PackageName,
+        latest_version: deps_core::ConcreteVersion,
+    }
+    impl deps_core::Metadata for MockMetadata {
+        fn name(&self) -> &deps_core::PackageName {
+            &self.name
         }
-
-        let state = mock_nuget_state(Arc::new(PanicsIfSearchedRegistry));
-        let content = "<ItemGroup>\n  <PackageReference \n</ItemGroup>\n";
-        let line = content.lines().nth(1).unwrap();
-        let position = Position::new(1, line.chars().count() as u32);
-
-        let items = fallback_completion(&state, EcosystemId::NuGet, position, content).await;
-        assert!(items.is_empty());
-    }
-
-    /// #390 (C5, tester Gap 1 / critic): a direct end-to-end proof, through
-    /// `fallback_completion` itself rather than `is_in_dependencies_section` and
-    /// `extract_prefix` in isolation, that the two root-cause fixes actually compose.
-    /// Verbatim issue repro step 1: an unterminated entry inside the primary
-    /// `dependencies = [...]` array (no literal `[project.dependencies]` header
-    /// anywhere in the fixture) — the registry must see `flas`, not `"flas`.
-    #[tokio::test]
-    async fn test_fallback_completion_pypi_project_array_query_has_no_leaked_quote() {
-        use deps_core::{Metadata, Registry};
-        use std::any::Any;
-        use std::sync::Mutex;
-
-        struct CapturingRegistry {
-            captured_query: Mutex<Option<String>>,
+        fn description(&self) -> Option<&str> {
+            None
         }
-        impl Registry for CapturingRegistry {
-            fn get_versions<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-            ) -> deps_core::ecosystem::BoxFuture<
-                'a,
-                deps_core::Result<Vec<Box<dyn deps_core::Version>>>,
-            > {
-                Box::pin(async move { Ok(vec![]) })
-            }
-            fn get_latest_matching<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-                _req: &'a deps_core::VersionReq,
-            ) -> deps_core::ecosystem::BoxFuture<
-                'a,
-                deps_core::Result<Option<Box<dyn deps_core::Version>>>,
-            > {
-                Box::pin(async move { Ok(None) })
-            }
-            fn search<'a>(
-                &'a self,
-                query: &'a str,
-                _limit: usize,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
-            {
-                *self.captured_query.lock().unwrap() = Some(query.to_string());
-                Box::pin(async move { Ok(vec![]) })
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
+        fn repository(&self) -> Option<&str> {
+            None
         }
-
-        let registry = Arc::new(CapturingRegistry {
-            captured_query: Mutex::new(None),
-        });
-        let state = mock_pypi_state(Arc::clone(&registry) as Arc<dyn Registry>);
-
-        let content = "[project]\nname = \"myapp\"\nversion = \"0.1.0\"\ndependencies = [\n    \"requests>=2.31.0\",\n    \"flas\n]\n";
-        fallback_completion(&state, EcosystemId::Pypi, Position::new(5, 9), content).await;
-
-        assert_eq!(
-            registry.captured_query.lock().unwrap().as_deref(),
-            Some("flas")
-        );
-    }
-
-    /// #390 (C5, tester Gap 1): the one PEP 621 shape that legitimately uses a
-    /// section header (`[project.optional-dependencies]`) exercised through the real
-    /// `is_in_dependencies_section`/`extract_prefix` composition, not just
-    /// `is_in_toml_dependencies`'s header match in isolation — the existing
-    /// `test_is_in_dependencies_section_pypi` only covers the literal
-    /// `[project.dependencies]` header this fix's own docs say never occurs in real
-    /// files.
-    #[test]
-    fn test_is_in_dependencies_section_and_extract_prefix_pypi_optional_dependencies_group() {
-        let content = "[project.optional-dependencies]\ndev = [\n    \"pytest\",\n    \"flas\n]\n";
-        assert!(is_in_dependencies_section(content, 3, EcosystemId::Pypi));
-
-        let line = content.lines().nth(3).unwrap();
-        assert_eq!(
-            extract_prefix(line, line.len() as u32, EcosystemId::Pypi),
-            ("flas", OpenMarkupContext::None)
-        );
-    }
-
-    #[test]
-    fn test_fallback_rejects_prefix_with_equals() {
-        let content = r#"
-[dependencies]
-serde = "1.0"
-"#;
-
-        // Extract prefix at position (contains '=')
-        let line = content.lines().nth(2).unwrap();
-        let (prefix, _) = extract_prefix(line, 12, EcosystemId::Cargo); // "serde = \"1.0"
-
-        // Should reject prefix containing '='
-        assert!(prefix.contains('='));
-    }
-
-    #[test]
-    fn test_prefix_extraction_cursor_beyond_line() {
-        let content = r"
-[dependencies]
-serde
-";
-
-        // Try to extract prefix with cursor beyond line length
-        let line = content.lines().nth(2).unwrap();
-        assert_eq!(line, "serde");
-
-        // Cursor at position 100 (beyond line)
-        let (prefix, _) = extract_prefix(line, 100, EcosystemId::Cargo);
-
-        // Should clamp to line length
-        assert_eq!(prefix, "serde");
-        assert_eq!(prefix.len(), 5); // Not 100
-    }
-
-    #[test]
-    fn test_extract_prefix_fallback_when_character_exceeds_line() {
-        // `character` beyond the line's UTF-16 length hits `utf16_to_byte_offset`'s
-        // `None` branch; `unwrap_or(line.len())` must clamp to the full line rather
-        // than panic, even when the line contains multi-byte characters.
-        let line = "café";
-        let character = line.chars().map(|c| c.len_utf16() as u32).sum::<u32>() + 10;
-        assert_eq!(
-            extract_prefix(line, character, EcosystemId::Cargo),
-            ("café", OpenMarkupContext::None)
-        );
-    }
-
-    #[test]
-    fn test_extract_prefix_strips_leading_quote_for_json_ecosystems() {
-        // package.json / composer.json: cursor sits before the closing quote while the
-        // key is still being typed, e.g. `    "expr` with the cursor right after "expr".
-        let line = "    \"expr";
-        assert_eq!(
-            extract_prefix(line, line.len() as u32, EcosystemId::Npm),
-            ("expr", OpenMarkupContext::None)
-        );
-        assert_eq!(
-            extract_prefix(line, line.len() as u32, EcosystemId::Composer),
-            ("expr", OpenMarkupContext::None)
-        );
-    }
-
-    #[test]
-    fn test_extract_prefix_strips_trailing_quote_for_json_ecosystems() {
-        // Cursor right after a closing quote (editor auto-close, or the user retyped
-        // it): `    "express"` with the cursor placed just past the closing quote.
-        let line = "    \"express\"";
-        assert_eq!(
-            extract_prefix(line, line.len() as u32, EcosystemId::Npm),
-            ("express", OpenMarkupContext::None)
-        );
-        assert_eq!(
-            extract_prefix(line, line.len() as u32, EcosystemId::Composer),
-            ("express", OpenMarkupContext::None)
-        );
-    }
-
-    #[test]
-    fn test_extract_prefix_leaves_quotes_for_non_json_ecosystems() {
-        // Cargo keys are typed unquoted, so a leading/trailing `"` should never appear
-        // in practice, but the strip must stay scoped: Cargo does not get it (unlike
-        // PyPI's TOML array-element shape, see
-        // `test_extract_prefix_strips_leading_quote_for_pypi_toml_array`).
-        let line = "\"expr";
-        assert_eq!(
-            extract_prefix(line, line.len() as u32, EcosystemId::Cargo),
-            ("\"expr", OpenMarkupContext::None)
-        );
-    }
-
-    /// #390 root cause 2: PyPI's `dependencies`/`optional-dependencies` entries are
-    /// TOML array elements (`"pytes`), a different quoting shape from JSON-quoted
-    /// keys, but must still have the surviving quote stripped before it reaches the
-    /// registry search.
-    #[test]
-    fn test_extract_prefix_strips_leading_quote_for_pypi_toml_array() {
-        let line = "    \"flas";
-        assert_eq!(
-            extract_prefix(line, line.len() as u32, EcosystemId::Pypi),
-            ("flas", OpenMarkupContext::None)
-        );
-    }
-
-    #[test]
-    fn test_extract_prefix_strips_trailing_quote_for_pypi_toml_array() {
-        let line = "    \"pytest\"";
-        assert_eq!(
-            extract_prefix(line, line.len() as u32, EcosystemId::Pypi),
-            ("pytest", OpenMarkupContext::None)
-        );
-    }
-
-    #[test]
-    fn test_extract_prefix_does_not_panic_on_multibyte_char_boundary() {
-        // `character` is a UTF-16 code unit count; using it as a raw byte index (the
-        // pre-fix bug) split "é" mid-encoding here and panicked on the slice.
-        let line = "    \"é";
-        let character: u32 = line.chars().map(|c| c.len_utf16() as u32).sum();
-        assert_eq!(
-            extract_prefix(line, character, EcosystemId::Cargo),
-            ("\"é", OpenMarkupContext::None)
-        );
-    }
-
-    #[test]
-    fn test_extract_prefix_multibyte_word_not_truncated() {
-        let line = "café";
-        let character: u32 = line.chars().map(|c| c.len_utf16() as u32).sum();
-        assert_eq!(
-            extract_prefix(line, character, EcosystemId::Cargo),
-            ("café", OpenMarkupContext::None)
-        );
-    }
-
-    #[test]
-    fn test_extract_prefix_cjk_word_not_truncated() {
-        let line = "日本";
-        let character: u32 = line.chars().map(|c| c.len_utf16() as u32).sum();
-        assert_eq!(
-            extract_prefix(line, character, EcosystemId::Cargo),
-            ("日本", OpenMarkupContext::None)
-        );
+        fn documentation(&self) -> Option<&str> {
+            None
+        }
+        fn latest_version(&self) -> &deps_core::ConcreteVersion {
+            &self.latest_version
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
     }
 
     #[tokio::test]
     async fn test_search_packages_returns_results_within_timeout() {
         use deps_core::{Metadata, Registry, Version};
         use std::any::Any;
-
-        struct MockMetadata {
-            name: deps_core::PackageName,
-        }
-        impl Metadata for MockMetadata {
-            fn name(&self) -> &deps_core::PackageName {
-                &self.name
-            }
-            fn description(&self) -> Option<&str> {
-                None
-            }
-            fn repository(&self) -> Option<&str> {
-                None
-            }
-            fn documentation(&self) -> Option<&str> {
-                None
-            }
-            fn latest_version(&self) -> &deps_core::ConcreteVersion {
-                static VERSION: std::sync::LazyLock<deps_core::ConcreteVersion> =
-                    std::sync::LazyLock::new(|| deps_core::ConcreteVersion::new("4.18.2"));
-                &VERSION
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
 
         struct FastRegistry;
         impl Registry for FastRegistry {
@@ -4337,6 +1553,7 @@ serde
                 Box::pin(async move {
                     Ok(vec![Box::new(MockMetadata {
                         name: deps_core::PackageName::new("express"),
+                        latest_version: "4.18.2".into(),
                     }) as Box<dyn Metadata>])
                 })
             }
@@ -4346,54 +1563,26 @@ serde
             }
         }
 
-        let items = search_packages(
-            &FastRegistry,
-            EcosystemId::Npm,
-            "express",
-            OpenMarkupContext::None,
-        )
-        .await;
+        let ecosystem = mock_ecosystem("npm", Arc::new(FastRegistry));
+        let items = search_packages(ecosystem.as_ref(), "express", false).await;
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "express");
     }
 
+    /// `search_packages` drops any result whose `completion_insert_text` rejects it
+    /// (e.g. a malicious/compromised registry response breaking out of the inserted
+    /// snippet's syntax) but keeps the others — the ecosystem-specific *reasons* for a
+    /// rejection (a Maven coordinate XML breakout, an unsafe Swift URL, ...) are
+    /// covered directly in each owning ecosystem crate's own `completion_insert_text`
+    /// tests (issue #722); this is the generic `filter_map` plumbing only.
     #[tokio::test]
-    async fn test_search_packages_drops_maven_xml_breakout_keeps_safe_result() {
-        // S1: this is the fallback-search path a malicious/compromised Maven registry
-        // response can reach when `deps-maven`'s own XML-context completion produces no
-        // (safe) results — it must apply the same allowlist, not just the primary path.
+    async fn test_search_packages_filters_rejected_completion_items_keeps_safe_ones() {
         use deps_core::{Metadata, Registry, Version};
         use std::any::Any;
 
-        struct MockMetadata {
-            name: deps_core::PackageName,
-        }
-        impl Metadata for MockMetadata {
-            fn name(&self) -> &deps_core::PackageName {
-                &self.name
-            }
-            fn description(&self) -> Option<&str> {
-                None
-            }
-            fn repository(&self) -> Option<&str> {
-                None
-            }
-            fn documentation(&self) -> Option<&str> {
-                None
-            }
-            fn latest_version(&self) -> &deps_core::ConcreteVersion {
-                static VERSION: std::sync::LazyLock<deps_core::ConcreteVersion> =
-                    std::sync::LazyLock::new(|| deps_core::ConcreteVersion::new("3.14.0"));
-                &VERSION
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
-
-        struct MavenRegistry;
-        impl Registry for MavenRegistry {
+        struct TwoResultRegistry;
+        impl Registry for TwoResultRegistry {
             fn get_versions<'a>(
                 &'a self,
                 _name: &'a deps_core::PackageName,
@@ -4420,12 +1609,12 @@ serde
                 Box::pin(async move {
                     Ok(vec![
                         Box::new(MockMetadata {
-                            name: deps_core::PackageName::new("org.apache.commons:commons-lang3"),
+                            name: deps_core::PackageName::new("safe-package"),
+                            latest_version: "1.0.0".into(),
                         }) as Box<dyn Metadata>,
                         Box::new(MockMetadata {
-                            name: deps_core::PackageName::new(
-                                "org.evil:payload</artifactId><parent>",
-                            ),
+                            name: deps_core::PackageName::new("rejected-package"),
+                            latest_version: "1.0.0".into(),
                         }) as Box<dyn Metadata>,
                     ])
                 })
@@ -4436,16 +1625,55 @@ serde
             }
         }
 
-        let items = search_packages(
-            &MavenRegistry,
-            EcosystemId::Maven,
-            "commons",
-            OpenMarkupContext::None,
-        )
-        .await;
+        let ecosystem = Arc::new(MockEcosystem {
+            id: "cargo",
+            registry: Arc::new(TwoResultRegistry),
+            fallback_prefix: None,
+            insert_text: |metadata| {
+                if metadata.name().as_str() == "rejected-package" {
+                    None
+                } else {
+                    Some(metadata.name().to_string())
+                }
+            },
+            is_bare: false,
+            bare_insert_text: default_insert_text,
+        });
+
+        let items = search_packages(ecosystem.as_ref(), "package", false).await;
 
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].label, "org.apache.commons:commons-lang3");
+        assert_eq!(items[0].label, "safe-package");
+    }
+
+    /// #724/#728 plumbing guard: `create_package_completion_item` must route to
+    /// `Ecosystem::fallback_bare_insert_text` when `bare` is `true`, never
+    /// `completion_insert_text` — proven with a `MockEcosystem` whose
+    /// `completion_insert_text` panics if invoked, so the test fails loudly if the
+    /// routing regresses. The ecosystem-specific *reasons* a real ecosystem sets
+    /// `fallback_completion_is_bare`/builds a bare insert (an already-open Maven
+    /// `<artifactId>` tag, a NuGet attribute value) are covered directly in
+    /// `deps-maven`'s and `deps-nuget`'s own tests.
+    #[test]
+    fn test_create_package_completion_item_bare_routes_to_fallback_bare_insert_text() {
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("guava"),
+            latest_version: "33.0.0".into(),
+        };
+        let ecosystem = MockEcosystem {
+            id: "maven",
+            registry: Arc::new(NoopRegistry),
+            fallback_prefix: None,
+            insert_text: |_| panic!("bare=true must not call completion_insert_text"),
+            is_bare: true,
+            bare_insert_text: |metadata| Some(format!("bare:{}", metadata.name())),
+        };
+
+        assert_eq!(
+            create_package_completion_item(&meta, &ecosystem, true)
+                .and_then(|item| item.insert_text),
+            Some("bare:guava".to_string())
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -4492,13 +1720,8 @@ serde
             }
         }
 
-        let items = search_packages(
-            &SlowRegistry,
-            EcosystemId::Npm,
-            "expr",
-            OpenMarkupContext::None,
-        )
-        .await;
+        let ecosystem = mock_ecosystem("npm", Arc::new(SlowRegistry));
+        let items = search_packages(ecosystem.as_ref(), "expr", false).await;
 
         assert!(
             items.is_empty(),
@@ -4584,6 +1807,12 @@ serde
                     tokio::time::sleep(Duration::from_mins(1)).await;
                     deps_core::completion::Completions::default()
                 })
+            }
+            fn completion_insert_text(
+                &self,
+                _metadata: &dyn deps_core::Metadata,
+            ) -> Option<String> {
+                unimplemented!()
             }
             fn as_any(&self) -> &dyn Any {
                 self
@@ -4764,6 +1993,12 @@ serde
                         is_incomplete: true,
                     }
                 })
+            }
+            fn completion_insert_text(
+                &self,
+                _metadata: &dyn deps_core::Metadata,
+            ) -> Option<String> {
+                unimplemented!()
             }
             fn as_any(&self) -> &dyn Any {
                 self

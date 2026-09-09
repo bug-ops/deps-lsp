@@ -215,6 +215,27 @@ impl Ecosystem for SwiftEcosystem {
         })
     }
 
+    fn completion_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
+        let name = metadata.name();
+        let latest = metadata.latest_version().as_str();
+        let url = metadata
+            .repository()
+            .map_or_else(|| format!("https://github.com/{name}"), str::to_string);
+        if !is_safe_registry_url(&url) {
+            warn_rejected_value(
+                "is_safe_registry_url",
+                "swift package name completion item",
+                &url,
+            );
+            return None;
+        }
+        if latest.is_empty() {
+            Some(format!(".package(url: \"{url}\")"))
+        } else {
+            Some(format!(".package(url: \"{url}\", from: \"{latest}\")"))
+        }
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -436,5 +457,109 @@ mod tests {
         let result = eco.parse_manifest("// empty file", &uri).await;
         assert!(result.is_ok());
         assert!(result.unwrap().dependencies().is_empty());
+    }
+
+    /// `Package.swift` dependencies are `.package(...)` calls matched anywhere in the
+    /// file, not confined to a `dependencies: [...]` array — no raw-text section
+    /// boundary, so no override.
+    #[test]
+    fn test_fallback_completion_prefix_default_none() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = SwiftEcosystem::new(cache);
+        assert!(
+            eco.fallback_completion_prefix("anything at all\n", Position::new(0, 0))
+                .is_none()
+        );
+    }
+
+    struct MockMetadata {
+        name: deps_core::PackageName,
+        repository: Option<&'static str>,
+        latest_version: deps_core::ConcreteVersion,
+    }
+    impl deps_core::Metadata for MockMetadata {
+        fn name(&self) -> &deps_core::PackageName {
+            &self.name
+        }
+        fn description(&self) -> Option<&str> {
+            None
+        }
+        fn repository(&self) -> Option<&str> {
+            self.repository
+        }
+        fn documentation(&self) -> Option<&str> {
+            None
+        }
+        fn latest_version(&self) -> &deps_core::ConcreteVersion {
+            &self.latest_version
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    #[test]
+    fn test_completion_insert_text_with_repository() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = SwiftEcosystem::new(cache);
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("apple/swift-nio"),
+            repository: Some("https://github.com/apple/swift-nio"),
+            latest_version: "2.62.0".into(),
+        };
+        assert_eq!(
+            eco.completion_insert_text(&meta),
+            Some(
+                ".package(url: \"https://github.com/apple/swift-nio\", from: \"2.62.0\")"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_completion_insert_text_empty_latest_omits_from_clause() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = SwiftEcosystem::new(cache);
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("apple/swift-nio"),
+            repository: Some("https://github.com/apple/swift-nio"),
+            latest_version: "".into(),
+        };
+        assert_eq!(
+            eco.completion_insert_text(&meta),
+            Some(".package(url: \"https://github.com/apple/swift-nio\")".to_string())
+        );
+    }
+
+    #[test]
+    fn test_completion_insert_text_no_repository_falls_back_to_name() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = SwiftEcosystem::new(cache);
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("apple/swift-nio"),
+            repository: None,
+            latest_version: "2.62.0".into(),
+        };
+        assert_eq!(
+            eco.completion_insert_text(&meta),
+            Some(
+                ".package(url: \"https://github.com/apple/swift-nio\", from: \"2.62.0\")"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_completion_insert_text_rejects_string_literal_breakout_repository() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = SwiftEcosystem::new(cache);
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("apple/swift-nio"),
+            repository: Some(
+                "https://evil.example\", .exact(\"1.0.0\")), .package(url: \"https://real",
+            ),
+            latest_version: "2.62.0".into(),
+        };
+        assert!(eco.completion_insert_text(&meta).is_none());
     }
 }

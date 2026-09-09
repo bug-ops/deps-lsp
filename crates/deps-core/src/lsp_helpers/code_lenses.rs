@@ -1168,6 +1168,12 @@ mod tests {
                 {
                     unimplemented!()
                 }
+                fn completion_insert_text(
+                    &self,
+                    _metadata: &dyn crate::Metadata,
+                ) -> Option<String> {
+                    unimplemented!()
+                }
                 fn as_any(&self) -> &dyn std::any::Any {
                     self
                 }

@@ -27,6 +27,7 @@ pub mod deps_dev;
 pub mod ecosystem;
 pub mod ecosystem_registry;
 pub mod error;
+pub mod fallback_completion;
 pub mod freshness;
 pub mod fs_probe;
 pub mod github;
