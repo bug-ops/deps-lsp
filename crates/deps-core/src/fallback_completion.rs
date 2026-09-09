@@ -333,6 +333,9 @@ pub fn strip_open_xml_attribute_value<'a>(
 /// counting both over-counts, flipping a closed key+value pair to look "open", and
 /// under-counts the inverse, flipping a still-open key to look "closed").
 ///
+/// Thin wrapper around [`count_real_quotes_with`] for `"`, the quote character every
+/// existing caller of this function needs.
+///
 /// # Examples
 ///
 /// ```
@@ -346,23 +349,90 @@ pub fn strip_open_xml_attribute_value<'a>(
 /// ```
 #[must_use]
 pub fn count_real_quotes(segment: &str) -> (usize, Option<usize>) {
-    let mut backslash_run = 0usize;
+    count_real_quotes_with(segment, '"')
+}
+
+/// Same escape-aware counting as [`count_real_quotes`], parameterized over which
+/// character counts as a quote.
+///
+/// Gradle's Kotlin/Groovy DSL accepts either `"..."` or `'...'` string literals (e.g.
+/// `version.ref = "..."` or `version.ref = '...'`), so a single hard-coded `"` check
+/// can't serve it — this lets a caller reuse the same escape-aware parity logic for
+/// whichever quote character its manifest syntax actually uses (#738), instead of
+/// keeping a second, naive (non-escape-aware) counter for `'`.
+///
+/// `quote` must not be `\`: the backslash-run tracking that recognizes an escape
+/// always consumes a `\` character first, so passing `\` itself as `quote` can never
+/// match and this always returns `(0, None)`.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::fallback_completion::count_real_quotes_with;
+///
+/// // Two plain single quotes, both real: last one is at byte index 7.
+/// assert_eq!(count_real_quotes_with("'pytest'", '\''), (2, Some(7)));
+/// // The middle quote is escaped (one preceding `\`), so it isn't counted.
+/// assert_eq!(count_real_quotes_with("'a\\'b", '\''), (1, Some(0)));
+/// ```
+#[must_use]
+pub fn count_real_quotes_with(segment: &str, quote: char) -> (usize, Option<usize>) {
     let mut count = 0usize;
     let mut last_real_quote = None;
-    for (idx, ch) in segment.char_indices() {
-        match ch {
-            '\\' => backslash_run += 1,
-            '"' => {
-                if backslash_run.is_multiple_of(2) {
-                    count += 1;
-                    last_real_quote = Some(idx);
-                }
-                backslash_run = 0;
-            }
-            _ => backslash_run = 0,
-        }
+    for idx in real_quote_indices(segment, quote) {
+        count += 1;
+        last_real_quote = Some(idx);
     }
     (count, last_real_quote)
+}
+
+/// Finds the byte offset of the first real (escape-aware, see [`count_real_quotes`])
+/// `quote` character in `segment`, scanning forward from the beginning.
+///
+/// The forward-scanning, first-match counterpart to [`count_real_quotes_with`]'s
+/// backward-looking last-match — same escape rule (shared via a private
+/// `real_quote_indices` scan), opposite question. Useful when a string's content is
+/// known to start at byte `0` of `segment` (e.g. the text immediately after an opening
+/// quote), so the first real quote encountered is that string's closing quote.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::fallback_completion::find_closing_quote;
+///
+/// assert_eq!(find_closing_quote("pytest\" extra", '"'), Some(6));
+/// // The escaped quote is skipped; the real closing quote is found after it.
+/// assert_eq!(find_closing_quote("a\\\"b\"", '"'), Some(4));
+/// assert_eq!(find_closing_quote("no quote here", '"'), None);
+/// ```
+#[must_use]
+pub fn find_closing_quote(segment: &str, quote: char) -> Option<usize> {
+    real_quote_indices(segment, quote).next()
+}
+
+/// Shared escape-aware scan backing both [`count_real_quotes_with`] and
+/// [`find_closing_quote`]: yields the byte offset of every real (non-escaped) `quote`
+/// character in `segment`, in order. See [`count_real_quotes`]'s doc comment for the
+/// escape rule (an odd run of consecutive `\` immediately before `quote` escapes it).
+fn real_quote_indices(segment: &str, quote: char) -> impl Iterator<Item = usize> + '_ {
+    let mut backslash_run = 0usize;
+    segment
+        .char_indices()
+        .filter_map(move |(idx, ch)| match ch {
+            '\\' => {
+                backslash_run += 1;
+                None
+            }
+            ch if ch == quote => {
+                let is_real = backslash_run.is_multiple_of(2);
+                backslash_run = 0;
+                is_real.then_some(idx)
+            }
+            _ => {
+                backslash_run = 0;
+                None
+            }
+        })
 }
 
 /// Classifies whether `prefix` (the trimmed line text up to the cursor) sits inside an
@@ -992,5 +1062,32 @@ tokio
         let (count, last) = count_real_quotes("\"a\\\"b\"");
         assert_eq!(count, 2);
         assert_eq!(last, Some(5));
+    }
+
+    #[test]
+    fn test_count_real_quotes_with_single_quote_skips_escaped_quote() {
+        let (count, last) = count_real_quotes_with("'a\\'b'", '\'');
+        assert_eq!(count, 2);
+        assert_eq!(last, Some(5));
+    }
+
+    #[test]
+    fn test_find_closing_quote_finds_first_real_quote() {
+        assert_eq!(find_closing_quote("pytest\" extra", '"'), Some(6));
+    }
+
+    #[test]
+    fn test_find_closing_quote_skips_escaped_quote() {
+        assert_eq!(find_closing_quote("a\\\"b\"", '"'), Some(4));
+    }
+
+    #[test]
+    fn test_find_closing_quote_no_quote_is_none() {
+        assert_eq!(find_closing_quote("no quote here", '"'), None);
+    }
+
+    #[test]
+    fn test_find_closing_quote_single_quote_variant() {
+        assert_eq!(find_closing_quote("a\\'b'", '\''), Some(4));
     }
 }
