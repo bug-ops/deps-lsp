@@ -28,7 +28,7 @@
 use deps_core::error::Result;
 use deps_core::lockfile::{
     LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource,
-    locate_lockfile_for_manifest, read_lockfile_content,
+    locate_lockfile_for_manifest, read_and_parse_lockfile,
 };
 use std::path::{Path, PathBuf};
 use tower_lsp_server::ls_types::Uri;
@@ -80,9 +80,10 @@ impl LockFileProvider for GoSumParser {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ResolvedPackages>> + Send + 'a>>
     {
         Box::pin(async move {
-            let content = read_lockfile_content(lockfile_path, "go.sum").await?;
-
-            Ok(parse_go_sum(&content))
+            read_and_parse_lockfile(lockfile_path, "go.sum", |content| {
+                Ok(parse_go_sum(&content))
+            })
+            .await
         })
     }
 }

@@ -11,7 +11,7 @@ use crate::parser::url_to_identity;
 use deps_core::error::{DepsError, Result};
 use deps_core::lockfile::{
     LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource,
-    locate_lockfile_for_manifest, read_lockfile_content,
+    locate_lockfile_for_manifest, read_and_parse_lockfile,
 };
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -77,81 +77,9 @@ impl LockFileProvider for SwiftLockParser {
         Box::pin(async move {
             tracing::debug!("Parsing Package.resolved: {}", lockfile_path.display());
 
-            let content = read_lockfile_content(lockfile_path, "Package.resolved").await?;
-
-            let lock_data: PackageResolved = deps_core::parse_json_checked(content.as_bytes())
-                .map_err(|e| DepsError::ParseError {
-                    file_type: "Package.resolved".into(),
-                    source: Box::new(e),
-                })?;
-
-            let mut packages = ResolvedPackages::new();
-
-            match lock_data.version {
-                1 => {
-                    let Some(obj) = lock_data.object else {
-                        return Ok(packages);
-                    };
-                    for pin in obj.pins {
-                        let name =
-                            url_to_identity(&pin.repository_url).unwrap_or(pin.package.clone());
-                        if let Some(version) = pin.state.version {
-                            let version = version
-                                .strip_prefix(['v', 'V'])
-                                .unwrap_or(&version)
-                                .to_string();
-                            packages.insert(ResolvedPackage {
-                                name,
-                                version,
-                                source: ResolvedSource::Git {
-                                    url: pin.repository_url,
-                                    rev: pin.state.revision.unwrap_or_default(),
-                                },
-                                dependencies: vec![],
-                            });
-                        }
-                    }
-                }
-                2 | 3 => {
-                    let Some(pins) = lock_data.pins else {
-                        return Ok(packages);
-                    };
-                    for pin in pins {
-                        // For fileSystem pins, location is a local path — use identity as name.
-                        // For remote pins, derive owner/repo from the URL.
-                        let name = if pin.kind == "fileSystem" {
-                            pin.identity.clone()
-                        } else {
-                            url_to_identity(&pin.location).unwrap_or(pin.identity.clone())
-                        };
-                        if let Some(version) = pin.state.version {
-                            let version = version
-                                .strip_prefix(['v', 'V'])
-                                .unwrap_or(&version)
-                                .to_string();
-                            let source = if pin.kind == "fileSystem" {
-                                ResolvedSource::Path {
-                                    path: pin.location.clone(),
-                                }
-                            } else {
-                                ResolvedSource::Git {
-                                    url: pin.location,
-                                    rev: pin.state.revision.unwrap_or_default(),
-                                }
-                            };
-                            packages.insert(ResolvedPackage {
-                                name,
-                                version,
-                                source,
-                                dependencies: vec![],
-                            });
-                        }
-                    }
-                }
-                v => {
-                    tracing::warn!("Unknown Package.resolved version: {}", v);
-                }
-            }
+            let packages =
+                read_and_parse_lockfile(lockfile_path, "Package.resolved", parse_package_resolved)
+                    .await?;
 
             tracing::info!(
                 "Parsed Package.resolved: {} packages from {}",
@@ -162,6 +90,87 @@ impl LockFileProvider for SwiftLockParser {
             Ok(packages)
         })
     }
+}
+
+/// Parses `Package.resolved` content (already read and size-capped) into resolved packages.
+///
+/// The CPU-bound half of [`SwiftLockParser::parse_lockfile`], run inside
+/// [`deps_core::lockfile::read_and_parse_lockfile`]'s `spawn_blocking`.
+fn parse_package_resolved(content: String) -> Result<ResolvedPackages> {
+    let lock_data: PackageResolved =
+        deps_core::parse_json_checked(content.as_bytes()).map_err(|e| DepsError::ParseError {
+            file_type: "Package.resolved".into(),
+            source: Box::new(e),
+        })?;
+
+    let mut packages = ResolvedPackages::new();
+
+    match lock_data.version {
+        1 => {
+            let Some(obj) = lock_data.object else {
+                return Ok(packages);
+            };
+            for pin in obj.pins {
+                let name = url_to_identity(&pin.repository_url).unwrap_or(pin.package.clone());
+                if let Some(version) = pin.state.version {
+                    let version = version
+                        .strip_prefix(['v', 'V'])
+                        .unwrap_or(&version)
+                        .to_string();
+                    packages.insert(ResolvedPackage {
+                        name,
+                        version,
+                        source: ResolvedSource::Git {
+                            url: pin.repository_url,
+                            rev: pin.state.revision.unwrap_or_default(),
+                        },
+                        dependencies: vec![],
+                    });
+                }
+            }
+        }
+        2 | 3 => {
+            let Some(pins) = lock_data.pins else {
+                return Ok(packages);
+            };
+            for pin in pins {
+                // For fileSystem pins, location is a local path — use identity as name.
+                // For remote pins, derive owner/repo from the URL.
+                let name = if pin.kind == "fileSystem" {
+                    pin.identity.clone()
+                } else {
+                    url_to_identity(&pin.location).unwrap_or(pin.identity.clone())
+                };
+                if let Some(version) = pin.state.version {
+                    let version = version
+                        .strip_prefix(['v', 'V'])
+                        .unwrap_or(&version)
+                        .to_string();
+                    let source = if pin.kind == "fileSystem" {
+                        ResolvedSource::Path {
+                            path: pin.location.clone(),
+                        }
+                    } else {
+                        ResolvedSource::Git {
+                            url: pin.location,
+                            rev: pin.state.revision.unwrap_or_default(),
+                        }
+                    };
+                    packages.insert(ResolvedPackage {
+                        name,
+                        version,
+                        source,
+                        dependencies: vec![],
+                    });
+                }
+            }
+        }
+        v => {
+            tracing::warn!("Unknown Package.resolved version: {}", v);
+        }
+    }
+
+    Ok(packages)
 }
 
 #[cfg(test)]
