@@ -2,7 +2,6 @@
 //!
 //! Provides key-value parsing and directory-walking lookup.
 
-use deps_core::fs_probe::MAX_CONFIG_ANCESTOR_DEPTH;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -22,7 +21,7 @@ pub fn parse_properties(content: &str) -> HashMap<String, String> {
 /// Finds and parses gradle.properties files by walking up from `start_dir`.
 ///
 /// Merges properties from all levels, with child values overriding parent values. The walk
-/// stops after [`MAX_CONFIG_ANCESTOR_DEPTH`] ancestors regardless of whether the filesystem
+/// stops after [`deps_core::fs_probe::MAX_CONFIG_ANCESTOR_DEPTH`] ancestors regardless of whether the filesystem
 /// root has been reached, and each file is read through
 /// [`deps_core::fs_probe::read_to_string_capped`] — bounded by
 /// [`deps_core::MAX_CACHED_FILE_BYTES`], the same cap `deps-cargo`'s/`deps-npm`'s own
@@ -32,20 +31,12 @@ pub fn parse_properties(content: &str) -> HashMap<String, String> {
 pub fn load_gradle_properties(start_dir: &Path) -> HashMap<String, String> {
     let mut result = HashMap::new();
     let mut chain = Vec::new();
-    let mut dir = Some(start_dir);
-    let mut depth = 0usize;
 
-    while let Some(d) = dir {
-        if depth >= MAX_CONFIG_ANCESTOR_DEPTH {
-            break;
-        }
-        depth += 1;
-
+    for d in deps_core::fs_probe::config_ancestors(start_dir) {
         let props_file = d.join("gradle.properties");
         if deps_core::fs_probe::is_file(&props_file) {
             chain.push(props_file);
         }
-        dir = d.parent();
     }
 
     // Apply from root to leaf so child values override parent
@@ -85,6 +76,7 @@ pub fn load_gradle_properties(start_dir: &Path) -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::fs_probe::MAX_CONFIG_ANCESTOR_DEPTH;
 
     #[test]
     fn test_parse_basic() {

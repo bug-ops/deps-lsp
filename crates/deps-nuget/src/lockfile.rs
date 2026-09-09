@@ -59,14 +59,14 @@ fn locate_multi_project_lockfile(manifest_uri: &Uri) -> Option<PathBuf> {
 
     let mut lock_path = manifest_dir.to_path_buf();
     lock_path.push(&lock_filename);
-    if lock_path.is_file() {
+    if deps_core::fs_probe::is_file(&lock_path) {
         return Some(lock_path);
     }
 
     let mut current_dir = manifest_dir.parent()?;
     for _ in 0..MAX_WORKSPACE_DEPTH {
         lock_path = current_dir.join(&lock_filename);
-        if lock_path.is_file() {
+        if deps_core::fs_probe::is_file(&lock_path) {
             return Some(lock_path);
         }
         current_dir = current_dir.parent()?;

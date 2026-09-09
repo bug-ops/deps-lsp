@@ -489,24 +489,16 @@ fn resolve(
 /// first match wins and the walk stops there, matching pnpm's own `find-workspace-dir`
 /// algorithm and its documented single-root-per-tree design (spec §6/§9).
 fn find_workspace_file(manifest_dir: &Path) -> Option<PathBuf> {
-    let mut current = Some(manifest_dir);
-    let mut depth = 0usize;
-    while let Some(dir) = current {
-        if depth >= deps_core::fs_probe::MAX_CONFIG_ANCESTOR_DEPTH {
-            break;
-        }
-        depth += 1;
-
+    for dir in deps_core::fs_probe::config_ancestors(manifest_dir) {
         // `exists()` rather than `is_file()`: a `pnpm-workspace.yaml` that exists but is a
         // directory (or another irregular file) still counts as "found" here — the file-type
         // check belongs to `PnpmWorkspaceCache::get_or_parse`, whose `None` `load` maps to a
         // defective `Malformed` config rather than to a *different* ancestor's file (or none
         // at all) being silently substituted.
         let candidate = dir.join("pnpm-workspace.yaml");
-        if candidate.exists() {
+        if deps_core::fs_probe::exists(&candidate) {
             return Some(candidate);
         }
-        current = dir.parent();
     }
     None
 }
@@ -1172,6 +1164,37 @@ mod tests {
             message.len() < 1_000,
             "diagnostic message was not truncated: {} bytes",
             message.len()
+        );
+    }
+
+    // --- find_workspace_file ancestor walk (#757) ---
+
+    /// #757: `find_workspace_file`'s ancestor walk now runs on
+    /// `deps_core::fs_probe::config_ancestors` instead of a hand-written loop — verified by
+    /// counting `stat` calls via `deps_core::fs_probe`, mirroring `deps-gradle`'s
+    /// `test_load_gradle_properties_stats_exactly_once_per_ancestor`. No `pnpm-workspace.yaml`
+    /// exists anywhere in the synthetic chain, so `exists()` misses on every ancestor and the
+    /// walk never short-circuits early on a hit.
+    #[test]
+    fn test_find_workspace_file_stats_exactly_once_per_ancestor() {
+        use deps_core::fs_probe::MAX_CONFIG_ANCESTOR_DEPTH;
+
+        let root = tempfile::tempdir().unwrap();
+        let mut current = root.path().to_path_buf();
+        for i in 0..(MAX_CONFIG_ANCESTOR_DEPTH + 5) {
+            current = current.join(format!("d{i}"));
+        }
+        std::fs::create_dir_all(&current).unwrap();
+
+        let (stats_before, _) = deps_core::fs_probe::snapshot();
+        let found = find_workspace_file(&current);
+        let (stats_after, _) = deps_core::fs_probe::snapshot();
+
+        assert!(found.is_none());
+        assert_eq!(
+            stats_after - stats_before,
+            MAX_CONFIG_ANCESTOR_DEPTH,
+            "expected exactly one stat per ancestor for all MAX_CONFIG_ANCESTOR_DEPTH levels"
         );
     }
 }
