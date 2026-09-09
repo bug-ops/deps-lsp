@@ -1,5 +1,11 @@
 //! Integration tests using fixture files.
 
+// #689: workspace-level `clippy::unwrap_used` (moved from a per-crate lib.rs attribute)
+// now reaches this integration test's separate crate root. `clippy.toml`'s
+// `allow-unwrap-in-tests` already exempts `#[test]` functions, so this covers only the
+// non-`#[test]` helper (`fixture_uri`) calling `unwrap()` on a known-good path.
+#![allow(clippy::unwrap_used)]
+
 use deps_core::lockfile::LockFileProvider;
 use deps_nuget::{
     NuGetLockParser, parse_directory_packages_props, parse_packages_config, parse_project_file,

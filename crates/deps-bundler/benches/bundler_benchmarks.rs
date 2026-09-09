@@ -6,6 +6,11 @@
 //! - Parsing large files (100+ deps): < 20ms
 //! - Gemfile.lock parsing: < 10ms for 100 packages
 
+// #689: workspace-level `clippy::unwrap_used` (moved from a per-crate lib.rs attribute)
+// now reaches this bench's separate crate root; benches use `unwrap()` on known-good
+// fixture data, which is idiomatic outside production parsing/registry code.
+#![allow(clippy::unwrap_used)]
+
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use deps_bundler::lockfile::parse_gemfile_lock;
 use deps_bundler::parser::parse_gemfile;

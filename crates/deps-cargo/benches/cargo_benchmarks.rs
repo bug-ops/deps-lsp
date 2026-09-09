@@ -7,6 +7,11 @@
 //! - Registry JSON parsing: < 1ms per package
 //! - Version matching: < 100μs per operation
 
+// #689: workspace-level `clippy::unwrap_used` (moved from a per-crate lib.rs attribute)
+// now reaches this bench's separate crate root; benches use `unwrap()` on known-good
+// fixture data, which is idiomatic outside production parsing/registry code.
+#![allow(clippy::unwrap_used)]
+
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use deps_cargo::parse_cargo_toml;
 use std::hint::black_box;

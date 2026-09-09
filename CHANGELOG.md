@@ -35,6 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-deno**: extracted `deps-deno`'s scope-aware `@scope/pkg` name-boundary parser into a shared `deps_core::package::npm_style_name_boundary` helper, reused by the `deps-npm` alias fix above instead of a per-crate reimplementation (#657)
 
 ### Changed
+- Consolidated the `indexing_slicing`/`unwrap_used`/`expect_used`/`string_slice` clippy restriction lints, previously duplicated as an identical `#![warn(...)]` attribute across all 16 workspace crates, into `[workspace.lints.clippy]`; removed the dead `non_std_lazy_statics` allow (LazyLock has been stable since Rust 1.80, workspace MSRV is 1.98) (resolves #689) (#693)
 - **deps-npm**: `package-lock.json` parsing now prefers a package entry's own `name` field (npm writes this when it differs from the physical `node_modules/` path, e.g. for an `npm:` alias) over the lockfile-key-derived name (#657)
 - **deps-core, deps-composer, deps-nuget**: extracted the duplicated lenient string-or-string-array JSON deserializer into a shared `deps_core::json_helpers::deserialize_string_or_string_array` helper (resolves #662) (#665)
 - **deps-core, deps-lsp**: documented NuGet's bare-version pin approximation and added a cross-ecosystem consistency test guarding `bare_requirement_policy` (resolves #669) (#674)

@@ -2127,6 +2127,9 @@ Before submitting a PR for a new ecosystem:
 - [ ] Integration tests for registry (can be `#[ignore]`)
 - [ ] Documentation in lib.rs with examples
 - [ ] Added to workspace members in root Cargo.toml
+- [ ] `[lints] workspace = true` in the new crate's Cargo.toml (otherwise it silently gets
+      none of the `indexing_slicing`/`unwrap_used`/`expect_used`/`string_slice` restriction
+      lints consolidated into `[workspace.lints.clippy]` by #689, and CI stays green)
 - [ ] Feature flag added in deps-lsp/Cargo.toml
 - [ ] Re-exports via `ecosystem!()` macro in deps-lsp/src/lib.rs
 - [ ] Registration via `register!()` macro in deps-lsp/src/lib.rs

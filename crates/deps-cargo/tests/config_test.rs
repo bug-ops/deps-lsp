@@ -3,6 +3,12 @@
 //! exercised through the crate's public API rather than `config.rs`'s own
 //! module-internal unit tests.
 
+// #689: workspace-level `clippy::unwrap_used` (moved from a per-crate lib.rs attribute)
+// now reaches this integration test's separate crate root. `clippy.toml`'s
+// `allow-unwrap-in-tests` already exempts `#[test]` functions, so this covers only the
+// non-`#[test]` helper (`write_manifest`) calling `unwrap()` on known-good fixture data.
+#![allow(clippy::unwrap_used)]
+
 use deps_cargo::DependencySource;
 use deps_cargo::config::{
     ConfigFileCache, IndexTrust, RegistryIndex, cargo_home_config_path, resolve,

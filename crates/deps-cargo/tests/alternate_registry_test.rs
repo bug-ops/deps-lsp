@@ -21,6 +21,13 @@
 //! alternate-index response. [`test_get_latest_matching_from_on_empty_list_routes_to_alternate_index`]
 //! covers exactly that case.
 
+// #689: workspace-level `clippy::unwrap_used` (moved from a per-crate lib.rs attribute)
+// now reaches this integration test's separate crate root. `clippy.toml`'s
+// `allow-unwrap-in-tests` already exempts `#[test]`/`#[tokio::test]` functions, so this
+// covers only the non-`#[test]` helper (`test_index`) calling `unwrap()` on known-good
+// fixture data.
+#![allow(clippy::unwrap_used)]
+
 use deps_cargo::config::{ConfigFileCache, IndexTrust};
 use deps_cargo::{CargoConfig, CargoRegistry, DependencySource};
 use deps_core::freshness::FreshnessSettings;
