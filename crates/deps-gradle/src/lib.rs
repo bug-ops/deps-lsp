@@ -1,3 +1,11 @@
+// This crate delegates version lookups to `deps-maven`'s `MavenCentralRegistry`, whose
+// `Registry::get_latest_matching` boxed-future coercion is close enough to rustc's default
+// recursion limit that the fuzz CI job's `-D warnings` nightly build has turned a
+// previously-silent trait-solver retry into a hard `recursion_depth_exceeding_limit` error in
+// several other ecosystem crates (rust-lang/rust#159228; same class of fix as deps-cargo
+// #745, deps-nuget #696, deps-swift #673, deps-composer). Pre-emptive, matching convention.
+#![recursion_limit = "256"]
+
 //! Gradle build system support for deps-lsp.
 //!
 //! Provides parsing and version resolution for Gradle manifest formats:

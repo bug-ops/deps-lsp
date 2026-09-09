@@ -1,3 +1,13 @@
+// This crate defines the `Registry`/`Ecosystem` boxed-future trait signatures (and the
+// `impl_dependency!`/`impl_version!` macros generating their `Send`-bound futures) that every
+// ecosystem crate's `get_latest_matching`-style implementation coerces into; rustc's default
+// recursion limit has proven occasionally insufficient to prove that bound for several such
+// implementations, downgrading a previously-silent trait-solver retry into
+// `recursion_depth_exceeding_limit`, which the fuzz CI job's `-D warnings` nightly build turns
+// into a hard error (rust-lang/rust#159228). Same class of fix as deps-cargo (#745),
+// deps-nuget (#696), deps-swift (#673), deps-composer.
+#![recursion_limit = "256"]
+
 //! Core abstractions for deps-lsp.
 //!
 //! This crate provides the foundational traits and utilities used across
