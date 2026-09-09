@@ -72,6 +72,7 @@ status: moc
 | 048 | [[048-gitlab-ci-mutable-pin-message-contradicts-quickfix/spec\|GitLab CI mutable-ref-pin diagnostic wrongly claims no automated fix for component Latest/Partial pins]] | specify | shipped — bug, P2 (PR #645, issues #640, #643) |
 | 049 | [[049-osv-malicious-package-severity/spec\|OSV malicious-package (MAL-*) advisory severity distinguishing]] | specify | research/correctness, P2, implemented (issue #646, branch feat/646-osv-malicious-severity) |
 | 050 | [[050-cargo-renamed-dependency-lockfile-resolution/spec\|Per-occurrence lockfile version resolution for renamed/aliased dependencies]] | specify | shipped — bug, P1 (PR #653, issue #649) |
+| 051 | [[051-disk-persistent-registry-cache/spec\|Disk-persistent registry cache]] | specify | research/parity, P3, 9 open `[NEEDS CLARIFICATION]` items |
 
 ## Completed Specs
 
