@@ -33,7 +33,6 @@ use crate::config::{
     AuthToken, ConfigFileCache, IndexTrust, RegistryIndex, RegistryIndexError, SourceReplacement,
 };
 use crate::types::{CargoDependency, CargoDependencySection, DependencySource};
-use deps_core::fs_probe::MAX_CONFIG_ANCESTOR_DEPTH;
 use deps_core::net_policy::RegistryAccessPolicy;
 use deps_core::{DepsError, Result};
 use std::any::Any;
