@@ -8,6 +8,11 @@
 //!
 //! These benchmarks test user-facing performance - the most critical bottleneck.
 
+// #689: workspace-level `clippy::unwrap_used`/`expect_used` (moved from a per-crate
+// lib.rs/main.rs attribute) now reach this bench's separate crate root; benches
+// unwrap/expect known-good fixture data, which is idiomatic outside production code.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use criterion::{Criterion, criterion_group, criterion_main};
 use deps_core::EcosystemId;
 use deps_lsp::config::DepsConfig;

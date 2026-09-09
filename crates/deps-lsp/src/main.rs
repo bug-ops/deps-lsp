@@ -1,13 +1,3 @@
-// #676: mirrors `src/lib.rs` — `main.rs` is a separate crate root, so the four
-// restriction lints (indexing_slicing/unwrap_used/expect_used/string_slice) must be
-// warned here independently.
-#![warn(
-    clippy::indexing_slicing,
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::string_slice
-)]
-
 use deps_lsp::server::Backend;
 use std::env;
 use tower_lsp_server::{LspService, Server};

@@ -9,6 +9,13 @@
 //! pinned occurrences (F1b), and its crates.io hover link was being suppressed (F2) — by
 //! asserting the fixed behavior end to end against a mocked mirror.
 
+// #689: workspace-level `clippy::unwrap_used` (moved from a per-crate lib.rs attribute)
+// now reaches this integration test's separate crate root. `clippy.toml`'s
+// `allow-unwrap-in-tests` already exempts `#[tokio::test]` functions, so this covers
+// only the non-`#[test]` helper (`write_manifest`) calling `unwrap()` on known-good
+// fixture data.
+#![allow(clippy::unwrap_used)]
+
 use deps_cargo::config::ConfigFileCache;
 use deps_cargo::parser::CargoParseContext;
 use deps_cargo::{CargoFormatter, DependencySource};

@@ -77,6 +77,13 @@ pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
 cargo = { level = "warn", priority = -1 }
 
+# Restriction lints - previously duplicated as a per-crate #![warn(...)] source attribute
+# across all 16 workspace crates (#673/#680/#683/#686); consolidated here (#689)
+indexing_slicing = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+string_slice = "warn"
+
 # Allowed lints - too noisy for this codebase
 module_name_repetitions = "allow"
 similar_names = "allow"
@@ -126,9 +133,6 @@ match_wildcard_for_single_variants = "allow"
 # Function lints - allow for now
 missing_const_for_fn = "allow"
 unnecessary_wraps = "allow"
-
-# LazyLock migration - allow until we can target newer MSRV
-non_std_lazy_statics = "allow"
 
 # HashMap generics - too noisy for internal APIs
 implicit_hasher = "allow"

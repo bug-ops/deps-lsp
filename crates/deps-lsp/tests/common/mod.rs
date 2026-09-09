@@ -3,6 +3,13 @@
 //! This module provides shared infrastructure for LSP integration tests,
 //! including the `LspClient` for communicating with the server binary.
 
+// #689: workspace-level `clippy::unwrap_used`/`expect_used` (moved from a per-crate
+// lib.rs/main.rs attribute) now reach this integration test module. `clippy.toml`'s
+// allow-*-in-tests exemptions only cover `#[test]` functions, and this module is all
+// non-`#[test]` helpers (`LspClient` and friends) unwrapping/expecting known-good
+// process/protocol state, so the allow is needed here.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdout, Command, Stdio};

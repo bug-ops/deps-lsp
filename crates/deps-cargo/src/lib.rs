@@ -20,22 +20,6 @@
 //! let _deps: Vec<ParsedDependency> = vec![];
 //! ```
 
-// #673: restriction lints, scoped to this crate only via a source attribute (overrides
-// this crate's `[lints] workspace = true` Cargo.toml table regardless of that table's
-// level) rather than a duplicated `[lints.clippy]` table — avoids ~90 lines of
-// drift-prone duplication of the workspace allow-list. Deliberately never added to
-// `[workspace.lints.clippy]` itself (must stay opt-in per crate, not workspace-wide).
-// Sites confirmed safe are individually `#[allow]`ed with a one-line justification.
-// #680: `clippy::string_slice` appended to the same restriction-lint attribute for the
-// same reason — string slicing on a byte index that isn't a verified char boundary
-// panics; sites confirmed boundary-safe by construction are individually `#[allow]`ed.
-#![warn(
-    clippy::indexing_slicing,
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::string_slice
-)]
-
 pub mod config;
 pub mod ecosystem;
 pub mod formatter;
