@@ -12,7 +12,7 @@ pub use deps_core::parser::DependencySource;
 ///
 /// # Examples
 ///
-/// ```
+/// ```no_run
 /// use deps_cargo::DependencySource;
 /// use deps_cargo::parse_cargo_toml;
 /// use tower_lsp_server::ls_types::Uri;

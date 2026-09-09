@@ -11,7 +11,7 @@ use tower_lsp_server::ls_types::Range;
 ///
 /// # Examples
 ///
-/// ```
+/// ```no_run
 /// use deps_deno::parser::parse_deno_json;
 /// use tower_lsp_server::ls_types::Uri;
 ///

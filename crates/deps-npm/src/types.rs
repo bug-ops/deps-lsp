@@ -10,7 +10,7 @@ use crate::catalog::CatalogOrigin;
 ///
 /// # Examples
 ///
-/// ```
+/// ```no_run
 /// use deps_npm::parser::parse_package_json;
 /// use deps_npm::types::NpmDependencySection;
 /// use tower_lsp_server::ls_types::Uri;

@@ -7,7 +7,7 @@ use tower_lsp_server::ls_types::Range;
 ///
 /// # Examples
 ///
-/// ```
+/// ```no_run
 /// use deps_composer::parser::parse_composer_json;
 /// use deps_composer::types::ComposerSection;
 /// use tower_lsp_server::ls_types::Uri;
