@@ -6,7 +6,7 @@
 use deps_core::error::{DepsError, Result};
 use deps_core::lockfile::{
     LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource,
-    locate_lockfile_for_manifest, read_lockfile_content,
+    locate_lockfile_for_manifest, read_and_parse_lockfile,
 };
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -68,42 +68,9 @@ impl LockFileProvider for ComposerLockParser {
         Box::pin(async move {
             tracing::debug!("Parsing composer.lock: {}", lockfile_path.display());
 
-            let content = read_lockfile_content(lockfile_path, "composer.lock").await?;
-
-            let lock_data: ComposerLock = deps_core::parse_json_checked(content.as_bytes())
-                .map_err(|e| DepsError::ParseError {
-                    file_type: "composer.lock".into(),
-                    source: Box::new(e),
-                })?;
-
-            let mut packages = ResolvedPackages::new();
-
-            for pkg in lock_data.packages.into_iter().chain(lock_data.packages_dev) {
-                let source = pkg.source.map_or(
-                    ResolvedSource::Registry {
-                        url: String::new(),
-                        checksum: String::new(),
-                    },
-                    |s| match s.source_type.as_str() {
-                        "git" => ResolvedSource::Git {
-                            url: s.url,
-                            rev: s.reference.unwrap_or_default(),
-                        },
-                        "path" => ResolvedSource::Path { path: s.url },
-                        _ => ResolvedSource::Registry {
-                            url: s.url,
-                            checksum: String::new(),
-                        },
-                    },
-                );
-
-                packages.insert(ResolvedPackage {
-                    name: pkg.name.to_lowercase(),
-                    version: pkg.version,
-                    source,
-                    dependencies: Vec::new(),
-                });
-            }
+            let packages =
+                read_and_parse_lockfile(lockfile_path, "composer.lock", parse_composer_lock)
+                    .await?;
 
             tracing::info!(
                 "Parsed composer.lock: {} packages from {}",
@@ -114,6 +81,49 @@ impl LockFileProvider for ComposerLockParser {
             Ok(packages)
         })
     }
+}
+
+/// Parses `composer.lock` content (already read and size-capped) into resolved packages.
+///
+/// The CPU-bound half of [`ComposerLockParser::parse_lockfile`], run inside
+/// [`deps_core::lockfile::read_and_parse_lockfile`]'s `spawn_blocking`.
+fn parse_composer_lock(content: String) -> Result<ResolvedPackages> {
+    let lock_data: ComposerLock =
+        deps_core::parse_json_checked(content.as_bytes()).map_err(|e| DepsError::ParseError {
+            file_type: "composer.lock".into(),
+            source: Box::new(e),
+        })?;
+
+    let mut packages = ResolvedPackages::new();
+
+    for pkg in lock_data.packages.into_iter().chain(lock_data.packages_dev) {
+        let source = pkg.source.map_or(
+            ResolvedSource::Registry {
+                url: String::new(),
+                checksum: String::new(),
+            },
+            |s| match s.source_type.as_str() {
+                "git" => ResolvedSource::Git {
+                    url: s.url,
+                    rev: s.reference.unwrap_or_default(),
+                },
+                "path" => ResolvedSource::Path { path: s.url },
+                _ => ResolvedSource::Registry {
+                    url: s.url,
+                    checksum: String::new(),
+                },
+            },
+        );
+
+        packages.insert(ResolvedPackage {
+            name: pkg.name.to_lowercase(),
+            version: pkg.version,
+            source,
+            dependencies: Vec::new(),
+        });
+    }
+
+    Ok(packages)
 }
 
 #[cfg(test)]

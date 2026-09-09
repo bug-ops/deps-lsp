@@ -67,7 +67,8 @@ pub use licenses::{
     evaluate as evaluate_license_policy, resolve_license_entries,
 };
 pub use lockfile::{
-    LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource, read_lockfile_content,
+    LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource, read_and_parse_lockfile,
+    read_lockfile_content,
 };
 pub use lsp_helpers::{
     DependencyOutcome, DependencyOutcomes, DiagnosticMessages, DiagnosticPolicy,

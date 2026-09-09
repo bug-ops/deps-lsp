@@ -3,7 +3,7 @@
 use deps_core::error::{DepsError, Result};
 use deps_core::lockfile::{
     LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource,
-    locate_lockfile_for_manifest, read_lockfile_content,
+    locate_lockfile_for_manifest, read_and_parse_lockfile,
 };
 use std::path::{Path, PathBuf};
 use tower_lsp_server::ls_types::Uri;
@@ -28,9 +28,10 @@ impl LockFileProvider for PubspecLockParser {
         Box::pin(async move {
             tracing::debug!("Parsing pubspec.lock: {}", lockfile_path.display());
 
-            let content = read_lockfile_content(lockfile_path, "pubspec.lock").await?;
-
-            parse_pubspec_lock(&content)
+            read_and_parse_lockfile(lockfile_path, "pubspec.lock", |content| {
+                parse_pubspec_lock(&content)
+            })
+            .await
         })
     }
 }

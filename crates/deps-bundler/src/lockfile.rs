@@ -5,7 +5,7 @@
 use deps_core::error::Result;
 use deps_core::lockfile::{
     LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource,
-    locate_lockfile_for_manifest, read_lockfile_content,
+    locate_lockfile_for_manifest, read_and_parse_lockfile,
 };
 use regex::Regex;
 use std::path::{Path, PathBuf};
@@ -51,9 +51,10 @@ impl LockFileProvider for GemfileLockParser {
         Box::pin(async move {
             tracing::debug!("Parsing Gemfile.lock: {}", lockfile_path.display());
 
-            let content = read_lockfile_content(lockfile_path, "Gemfile.lock").await?;
-
-            parse_gemfile_lock(&content)
+            read_and_parse_lockfile(lockfile_path, "Gemfile.lock", |content| {
+                parse_gemfile_lock(&content)
+            })
+            .await
         })
     }
 }

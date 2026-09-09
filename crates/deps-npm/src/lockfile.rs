@@ -28,7 +28,7 @@
 use deps_core::error::{DepsError, Result};
 use deps_core::lockfile::{
     LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource,
-    locate_lockfile_for_manifest, read_lockfile_content,
+    locate_lockfile_for_manifest, read_and_parse_lockfile,
 };
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -133,8 +133,27 @@ impl LockFileProvider for NpmLockParser {
 async fn parse_package_lock_json(lockfile_path: &Path) -> Result<ResolvedPackages> {
     tracing::debug!("Parsing package-lock.json: {}", lockfile_path.display());
 
-    let content = read_lockfile_content(lockfile_path, "package-lock.json").await?;
+    let packages = read_and_parse_lockfile(
+        lockfile_path,
+        "package-lock.json",
+        parse_package_lock_json_content,
+    )
+    .await?;
 
+    tracing::info!(
+        "Parsed package-lock.json: {} packages from {}",
+        packages.len(),
+        lockfile_path.display()
+    );
+
+    Ok(packages)
+}
+
+/// Parses `package-lock.json` content (already read and size-capped) into resolved packages.
+///
+/// The CPU-bound half of [`parse_package_lock_json`], run inside
+/// [`deps_core::lockfile::read_and_parse_lockfile`]'s `spawn_blocking`.
+fn parse_package_lock_json_content(content: String) -> Result<ResolvedPackages> {
     let lock_data: PackageLockJson =
         deps_core::parse_json_checked(content.as_bytes()).map_err(|e| DepsError::ParseError {
             file_type: "package-lock.json".into(),
@@ -178,12 +197,6 @@ async fn parse_package_lock_json(lockfile_path: &Path) -> Result<ResolvedPackage
         });
     }
 
-    tracing::info!(
-        "Parsed package-lock.json: {} packages from {}",
-        packages.len(),
-        lockfile_path.display()
-    );
-
     Ok(packages)
 }
 
@@ -208,19 +221,15 @@ const MIN_PNPM_LOCKFILE_MAJOR_VERSION: u32 = 6;
 async fn parse_pnpm_lock(lockfile_path: &Path) -> Result<ResolvedPackages> {
     tracing::debug!("Parsing pnpm-lock.yaml: {}", lockfile_path.display());
 
-    let content = read_lockfile_content(lockfile_path, "pnpm-lock.yaml").await?;
-
     // NFR-001: the nesting/expansion guards and the YAML parse itself are CPU-bound work on
-    // already-read, untrusted content — run them on the blocking-thread pool (mirrors
-    // `read_lockfile_content`'s own `spawn_blocking` for the file read) rather than on the
-    // calling tokio worker, so a large `pnpm-lock.yaml` near the 32 MiB cap can't stall the
-    // async executor.
-    let packages = tokio::task::spawn_blocking(move || parse_pnpm_lock_yaml(&content))
-        .await
-        .map_err(|e| DepsError::ParseError {
-            file_type: "pnpm-lock.yaml".into(),
-            source: Box::new(std::io::Error::other(e)),
-        })??;
+    // already-read, untrusted content — `read_and_parse_lockfile` runs `parse_pnpm_lock_yaml`
+    // on the blocking-thread pool (mirrors `read_lockfile_content`'s own `spawn_blocking` for
+    // the file read) rather than on the calling tokio worker, so a large `pnpm-lock.yaml` near
+    // the 32 MiB cap can't stall the async executor.
+    let packages = read_and_parse_lockfile(lockfile_path, "pnpm-lock.yaml", |content| {
+        parse_pnpm_lock_yaml(&content)
+    })
+    .await?;
 
     tracing::info!(
         "Parsed pnpm-lock.yaml: {} packages from {}",
@@ -231,7 +240,8 @@ async fn parse_pnpm_lock(lockfile_path: &Path) -> Result<ResolvedPackages> {
     Ok(packages)
 }
 
-/// The CPU-bound half of [`parse_pnpm_lock`], run inside `spawn_blocking`.
+/// The CPU-bound half of [`parse_pnpm_lock`], run inside
+/// [`deps_core::lockfile::read_and_parse_lockfile`]'s `spawn_blocking`.
 fn parse_pnpm_lock_yaml(content: &str) -> Result<ResolvedPackages> {
     let to_parse_error = |message: String| DepsError::ParseError {
         file_type: "pnpm-lock.yaml".into(),

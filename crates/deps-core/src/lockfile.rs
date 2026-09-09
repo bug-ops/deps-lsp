@@ -121,6 +121,55 @@ pub async fn read_lockfile_content(path: &Path, file_type: &str) -> Result<Strin
     }
 }
 
+/// Reads a lock file via [`read_lockfile_content`] and runs `parse` on the blocking-thread
+/// pool, returning the parsed result.
+///
+/// Every `LockFileProvider::parse_lockfile` implementation reads its lock file's content and
+/// then parses it; this shares that second half of the boilerplate too. The parse step is
+/// CPU-bound work over content bounded by the same [`MAX_LOCKFILE_BYTES`] cap as the read
+/// (a `Cargo.lock`/`package-lock.json`/... TOML, JSON, or YAML document up to 32 MiB), so —
+/// like the read itself — it must never run on the calling tokio worker thread: every
+/// `LockFileProvider::parse_lockfile` call site sits on the LSP request path, where a worker
+/// thread blocked on parsing a multi-megabyte document would violate the project's
+/// non-blocking-handler rule.
+///
+/// # Errors
+///
+/// Returns whatever [`read_lockfile_content`] returns for a read failure, whatever `parse`
+/// itself returns for a malformed document, or a [`DepsError::ParseError`] if the blocking
+/// parse task panics or is cancelled.
+///
+/// # Examples
+///
+/// ```no_run
+/// use deps_core::lockfile::{read_and_parse_lockfile, ResolvedPackages};
+/// use std::path::Path;
+///
+/// # async fn example() -> deps_core::error::Result<()> {
+/// let packages: ResolvedPackages = read_and_parse_lockfile(
+///     Path::new("Cargo.lock"),
+///     "Cargo.lock",
+///     |content| Ok(ResolvedPackages::new()), // real parsers inspect `content`
+/// )
+/// .await?;
+/// # Ok(())
+/// # }
+/// ```
+pub async fn read_and_parse_lockfile<T, F>(path: &Path, file_type: &str, parse: F) -> Result<T>
+where
+    F: FnOnce(String) -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let content = read_lockfile_content(path, file_type).await?;
+
+    tokio::task::spawn_blocking(move || parse(content))
+        .await
+        .map_err(|e| DepsError::ParseError {
+            file_type: format!("{file_type} at {}", path.display()),
+            source: Box::new(std::io::Error::other(e)),
+        })?
+}
+
 /// Generic lock file locator.
 ///
 /// Searches for lock files in the following order:
@@ -677,6 +726,61 @@ mod tests {
             }
             other => panic!("Expected ParseError, got: {other:?}"),
         }
+    }
+
+    /// The `spawn_blocking` `JoinError`→`DepsError::ParseError` mapping is issue #723's core
+    /// concern (a panicking/blocking parse must not silently misbehave or unwind the caller),
+    /// but had zero executable coverage — only the `no_run` doctest, which never runs. A
+    /// panicking `parse` closure must surface as `Err(DepsError::ParseError)`, labeled the
+    /// same way as every other `read_and_parse_lockfile` failure (`"{file_type} at {path}"`),
+    /// with the panic message preserved in `source` (tokio's `JoinError: Display` carries it).
+    #[tokio::test]
+    async fn test_read_and_parse_lockfile_panic_in_parse_becomes_parse_error() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lock_path = temp_dir.path().join("Cargo.lock");
+        std::fs::write(&lock_path, "version = 4").unwrap();
+
+        let err = read_and_parse_lockfile(&lock_path, "Cargo.lock", |_content| -> Result<()> {
+            panic!("boom")
+        })
+        .await
+        .unwrap_err();
+
+        match err {
+            DepsError::ParseError { file_type, source } => {
+                assert_eq!(file_type, format!("Cargo.lock at {}", lock_path.display()));
+                assert!(
+                    source.to_string().contains("boom"),
+                    "panic message should be preserved in the error source, got: {source}"
+                );
+            }
+            other => panic!("Expected ParseError, got: {other:?}"),
+        }
+    }
+
+    /// Proves `parse` actually runs off the calling (async) thread via `spawn_blocking`, not
+    /// merely that the return type happens to line up — the whole point of the fix is that
+    /// CPU-bound parsing no longer executes on the tokio worker driving the LSP request.
+    #[tokio::test]
+    async fn test_read_and_parse_lockfile_runs_parse_off_calling_thread() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lock_path = temp_dir.path().join("Cargo.lock");
+        std::fs::write(&lock_path, "version = 4").unwrap();
+
+        let calling_thread = std::thread::current().id();
+
+        let content = read_and_parse_lockfile(&lock_path, "Cargo.lock", move |content| {
+            assert_ne!(
+                std::thread::current().id(),
+                calling_thread,
+                "parse must run on the blocking pool, not the calling thread"
+            );
+            Ok(content)
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(content, "version = 4");
     }
 
     #[test]

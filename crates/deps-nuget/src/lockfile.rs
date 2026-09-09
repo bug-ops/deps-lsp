@@ -19,7 +19,7 @@
 use deps_core::error::{DepsError, Result};
 use deps_core::lockfile::{
     LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource,
-    locate_lockfile_for_manifest, read_lockfile_content,
+    locate_lockfile_for_manifest, read_and_parse_lockfile,
 };
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -104,56 +104,12 @@ impl LockFileProvider for NuGetLockParser {
         Box::pin(async move {
             tracing::debug!("Parsing packages.lock.json: {}", lockfile_path.display());
 
-            let content = read_lockfile_content(lockfile_path, "packages.lock.json").await?;
-
-            let lock_data: PackagesLock = deps_core::parse_json_checked(content.as_bytes())
-                .map_err(|e| DepsError::ParseError {
-                    file_type: "packages.lock.json".into(),
-                    source: Box::new(e),
-                })?;
-
-            // Collect every TFM's resolved version per package name, then resolve the
-            // cross-TFM tie-break with the crate's own `compare_versions` (S6) instead of
-            // `deps_core::lockfile::best_package`, whose `semver::Version::parse` fallback
-            // always fails on NuGet's 4-component versions and degrades to string
-            // comparison (e.g. "1.10.0" < "1.9.0"). Only the single winner is ever handed
-            // to `ResolvedPackages`, so that broken comparator is never reached.
-            let mut candidates: HashMap<String, Vec<(String, Option<String>)>> = HashMap::new();
-            for packages in lock_data.dependencies.into_values() {
-                for (name, entry) in packages {
-                    // "type": "Project" / "CentralTransitive" entries carry no `resolved`
-                    // at all — skip rather than aborting the whole file (S2).
-                    if let Some(resolved) = entry.resolved {
-                        candidates
-                            .entry(name)
-                            .or_default()
-                            .push((resolved, entry.content_hash));
-                    }
-                }
-            }
-
-            let mut packages = ResolvedPackages::new();
-            for (name, versions) in candidates {
-                let best = versions
-                    .into_iter()
-                    .max_by(|a, b| crate::version::compare_versions(&a.0, &b.0));
-                if let Some((version, content_hash)) = best {
-                    packages.insert(ResolvedPackage {
-                        name,
-                        version,
-                        source: ResolvedSource::Registry {
-                            // Informational only — nothing in `deps-lsp`/`deps-core::lsp_helpers`
-                            // reads `ResolvedSource`, and this path makes no network request, so
-                            // it never routes a lockfile-resolved version against a private feed
-                            // (issue #523's config resolution intentionally stops at
-                            // `NuGetDependency::source`, not `ResolvedPackage::source`).
-                            url: crate::registry::NUGET_ORG_INDEX_URL.into(),
-                            checksum: content_hash.unwrap_or_default(),
-                        },
-                        dependencies: vec![],
-                    });
-                }
-            }
+            let packages = read_and_parse_lockfile(
+                lockfile_path,
+                "packages.lock.json",
+                parse_packages_lock_json,
+            )
+            .await?;
 
             tracing::info!(
                 "Parsed packages.lock.json: {} packages from {}",
@@ -164,6 +120,63 @@ impl LockFileProvider for NuGetLockParser {
             Ok(packages)
         })
     }
+}
+
+/// Parses `packages.lock.json` content (already read and size-capped) into resolved packages.
+///
+/// The CPU-bound half of [`NuGetLockParser::parse_lockfile`], run inside
+/// [`deps_core::lockfile::read_and_parse_lockfile`]'s `spawn_blocking`.
+fn parse_packages_lock_json(content: String) -> Result<ResolvedPackages> {
+    let lock_data: PackagesLock =
+        deps_core::parse_json_checked(content.as_bytes()).map_err(|e| DepsError::ParseError {
+            file_type: "packages.lock.json".into(),
+            source: Box::new(e),
+        })?;
+
+    // Collect every TFM's resolved version per package name, then resolve the
+    // cross-TFM tie-break with the crate's own `compare_versions` (S6) instead of
+    // `deps_core::lockfile::best_package`, whose `semver::Version::parse` fallback
+    // always fails on NuGet's 4-component versions and degrades to string
+    // comparison (e.g. "1.10.0" < "1.9.0"). Only the single winner is ever handed
+    // to `ResolvedPackages`, so that broken comparator is never reached.
+    let mut candidates: HashMap<String, Vec<(String, Option<String>)>> = HashMap::new();
+    for packages in lock_data.dependencies.into_values() {
+        for (name, entry) in packages {
+            // "type": "Project" / "CentralTransitive" entries carry no `resolved`
+            // at all — skip rather than aborting the whole file (S2).
+            if let Some(resolved) = entry.resolved {
+                candidates
+                    .entry(name)
+                    .or_default()
+                    .push((resolved, entry.content_hash));
+            }
+        }
+    }
+
+    let mut packages = ResolvedPackages::new();
+    for (name, versions) in candidates {
+        let best = versions
+            .into_iter()
+            .max_by(|a, b| crate::version::compare_versions(&a.0, &b.0));
+        if let Some((version, content_hash)) = best {
+            packages.insert(ResolvedPackage {
+                name,
+                version,
+                source: ResolvedSource::Registry {
+                    // Informational only — nothing in `deps-lsp`/`deps-core::lsp_helpers`
+                    // reads `ResolvedSource`, and this path makes no network request, so
+                    // it never routes a lockfile-resolved version against a private feed
+                    // (issue #523's config resolution intentionally stops at
+                    // `NuGetDependency::source`, not `ResolvedPackage::source`).
+                    url: crate::registry::NUGET_ORG_INDEX_URL.into(),
+                    checksum: content_hash.unwrap_or_default(),
+                },
+                dependencies: vec![],
+            });
+        }
+    }
+
+    Ok(packages)
 }
 
 #[cfg(test)]

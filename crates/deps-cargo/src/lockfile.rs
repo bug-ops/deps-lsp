@@ -25,7 +25,7 @@
 use deps_core::error::{DepsError, Result};
 use deps_core::lockfile::{
     LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource,
-    locate_lockfile_for_manifest, read_lockfile_content,
+    locate_lockfile_for_manifest, read_and_parse_lockfile,
 };
 use std::path::{Path, PathBuf};
 use tower_lsp_server::ls_types::Uri;
@@ -79,71 +79,8 @@ impl LockFileProvider for CargoLockParser {
         Box::pin(async move {
             tracing::debug!("Parsing Cargo.lock: {}", lockfile_path.display());
 
-            let content = read_lockfile_content(lockfile_path, "Cargo.lock").await?;
-
-            if let Err(depth) =
-                deps_core::check_toml_nesting_depth(&content, deps_core::MAX_TOML_NESTING_DEPTH)
-            {
-                return Err(DepsError::ParseError {
-                    file_type: "Cargo.lock".into(),
-                    source: Box::new(std::io::Error::other(format!(
-                        "array/table nesting depth {depth} exceeds maximum of {}",
-                        deps_core::MAX_TOML_NESTING_DEPTH
-                    ))),
-                });
-            }
-
-            let doc = toml_span::parse(&content).map_err(|e| DepsError::ParseError {
-                file_type: "Cargo.lock".into(),
-                source: Box::new(std::io::Error::other(e.to_string())),
-            })?;
-
-            let mut packages = ResolvedPackages::new();
-
-            let Some(root_table) = doc.as_table() else {
-                tracing::warn!("Cargo.lock root is not a table");
-                return Ok(packages);
-            };
-
-            let Some(package_array_val) = root_table.get("package") else {
-                tracing::warn!("Cargo.lock missing [[package]] array of tables");
-                return Ok(packages);
-            };
-
-            let Some(package_array) = package_array_val.as_array() else {
-                tracing::warn!("Cargo.lock [[package]] is not an array");
-                return Ok(packages);
-            };
-
-            for entry in package_array {
-                let Some(table) = entry.as_table() else {
-                    continue;
-                };
-
-                // Extract required fields
-                let Some(name) = table.get("name").and_then(|v| v.as_str()) else {
-                    tracing::warn!("Package missing name field");
-                    continue;
-                };
-
-                let Some(version) = table.get("version").and_then(|v| v.as_str()) else {
-                    tracing::warn!("Package '{}' missing version field", name);
-                    continue;
-                };
-
-                // Parse source (optional for path dependencies)
-                let source = parse_cargo_source(table.get("source").and_then(|v| v.as_str()));
-
-                // Parse dependencies array (optional)
-                let dependencies = parse_cargo_dependencies_from_table(table);
-
-                packages.insert(ResolvedPackage {
-                    name: name.to_string(),
-                    version: version.to_string(),
-                    source,
-                    dependencies,
-                });
-            }
+            let packages =
+                read_and_parse_lockfile(lockfile_path, "Cargo.lock", parse_cargo_lock).await?;
 
             tracing::info!(
                 "Parsed Cargo.lock: {} packages from {}",
@@ -154,6 +91,78 @@ impl LockFileProvider for CargoLockParser {
             Ok(packages)
         })
     }
+}
+
+/// Parses `Cargo.lock` content (already read and size-capped) into resolved packages.
+///
+/// The CPU-bound half of [`CargoLockParser::parse_lockfile`], run inside
+/// [`deps_core::lockfile::read_and_parse_lockfile`]'s `spawn_blocking`.
+fn parse_cargo_lock(content: String) -> Result<ResolvedPackages> {
+    if let Err(depth) =
+        deps_core::check_toml_nesting_depth(&content, deps_core::MAX_TOML_NESTING_DEPTH)
+    {
+        return Err(DepsError::ParseError {
+            file_type: "Cargo.lock".into(),
+            source: Box::new(std::io::Error::other(format!(
+                "array/table nesting depth {depth} exceeds maximum of {}",
+                deps_core::MAX_TOML_NESTING_DEPTH
+            ))),
+        });
+    }
+
+    let doc = toml_span::parse(&content).map_err(|e| DepsError::ParseError {
+        file_type: "Cargo.lock".into(),
+        source: Box::new(std::io::Error::other(e.to_string())),
+    })?;
+
+    let mut packages = ResolvedPackages::new();
+
+    let Some(root_table) = doc.as_table() else {
+        tracing::warn!("Cargo.lock root is not a table");
+        return Ok(packages);
+    };
+
+    let Some(package_array_val) = root_table.get("package") else {
+        tracing::warn!("Cargo.lock missing [[package]] array of tables");
+        return Ok(packages);
+    };
+
+    let Some(package_array) = package_array_val.as_array() else {
+        tracing::warn!("Cargo.lock [[package]] is not an array");
+        return Ok(packages);
+    };
+
+    for entry in package_array {
+        let Some(table) = entry.as_table() else {
+            continue;
+        };
+
+        // Extract required fields
+        let Some(name) = table.get("name").and_then(|v| v.as_str()) else {
+            tracing::warn!("Package missing name field");
+            continue;
+        };
+
+        let Some(version) = table.get("version").and_then(|v| v.as_str()) else {
+            tracing::warn!("Package '{}' missing version field", name);
+            continue;
+        };
+
+        // Parse source (optional for path dependencies)
+        let source = parse_cargo_source(table.get("source").and_then(|v| v.as_str()));
+
+        // Parse dependencies array (optional)
+        let dependencies = parse_cargo_dependencies_from_table(table);
+
+        packages.insert(ResolvedPackage {
+            name: name.to_string(),
+            version: version.to_string(),
+            source,
+            dependencies,
+        });
+    }
+
+    Ok(packages)
 }
 
 /// Parses Cargo source field into ResolvedSource.
