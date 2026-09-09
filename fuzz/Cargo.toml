@@ -33,6 +33,14 @@ path = "../crates/deps-swift"
 
 [dependencies.deps-gradle]
 path = "../crates/deps-gradle"
+features = ["fuzzing"]
+
+[dependencies.deps-maven]
+path = "../crates/deps-maven"
+features = ["fuzzing"]
+
+[dependencies.deps-nuget]
+path = "../crates/deps-nuget"
 
 [dependencies.deps-pypi]
 path = "../crates/deps-pypi"
@@ -92,6 +100,27 @@ bench = false
 [[bin]]
 name = "pypi_requirement"
 path = "fuzz_targets/pypi_requirement.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "maven_parser"
+path = "fuzz_targets/maven_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "nuget_parser"
+path = "fuzz_targets/nuget_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "registry_xml_parser"
+path = "fuzz_targets/registry_xml_parser.rs"
 test = false
 doc = false
 bench = false
