@@ -307,10 +307,12 @@ async fn fallback_completion(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OpenMarkupContext {
     /// Not inside any open tag/attribute value this file's heuristics recognize —
-    /// `prefix` is either plain text or, for the JSON/TOML-array ecosystems, sits
-    /// inside a quoted value whose surrounding quotes already exist (npm/Composer/PyPI
-    /// intentionally collapse to this variant rather than a dedicated one: see the
-    /// note in [`extract_prefix`]).
+    /// `prefix` is either plain text or, for PyPI's TOML string-array elements, sits
+    /// inside a quoted value whose surrounding quotes already exist without a
+    /// dedicated context (see the note on [`uses_toml_string_array_values`] in
+    /// [`extract_prefix`]): its arm always inserts a bare string regardless of
+    /// `open_markup`, so no distinct variant is needed for it, unlike npm/Composer's
+    /// [`JsonQuotedKey`](Self::JsonQuotedKey).
     None,
     /// Inside an open Maven `<artifactId>` tag's content.
     MavenArtifactId,
@@ -319,26 +321,45 @@ enum OpenMarkupContext {
     MavenOtherTag,
     /// Inside an already-open NuGet target attribute value (`Include="`/`id="`).
     NuGetAttribute,
+    /// Inside an already-open JSON string that is npm/Composer's quoted dependency
+    /// *key* (`package.json`/`composer.json`), e.g. `"expr` while the key is still
+    /// being typed. Detected by quote parity (see [`classify_json_key_context`]), not
+    /// merely "a `"` appears at either end of `prefix`" — a closed key
+    /// (`"express"` with the cursor past both quotes) and an open *value* string
+    /// (`"express": "^4`) both fail the check and fall back to
+    /// [`None`](Self::None)/an empty prefix instead (#729 critic S1/S2). The key's own
+    /// quotes already being open is the same shape as
+    /// [`NuGetAttribute`](Self::NuGetAttribute) — inserting the full
+    /// `"{name}": "^{latest}"` pair here would duplicate the open quote and leave the
+    /// rest of the pair dangling next to the already-typed text instead of forming
+    /// valid JSON (#729, a follow-up to #724's NuGet/Maven fix, which left
+    /// npm/Composer out of scope).
+    JsonQuotedKey,
 }
 
 /// Extracts what the user has typed on `line` up to the cursor (`character`), trimmed
 /// of whitespace, along with the [`OpenMarkupContext`] it was extracted from.
 ///
-/// For JSON manifests (package.json, composer.json) a quote can survive on either
-/// side: a leading `"` when the cursor sits before the closing quote of a still-typed
-/// key, or a trailing `"` when the cursor sits right after a closing quote (e.g. an
-/// editor auto-closed it, or the user retyped it). Either would otherwise reach the
-/// registry as part of the search query and suppress exact matches. PyPI's
-/// `pyproject.toml` entries (`"pytes` inside `dependencies = [...]`) carry the same
-/// surviving-quote shape, just as a TOML array element rather than a JSON key — see
-/// [`uses_toml_string_array_values`]. This branch always returns
-/// [`OpenMarkupContext::None`], which is imprecise for npm/Composer specifically (the
-/// surviving quote proves the value's own quotes are already open, the same shape as
-/// NuGet's attribute case) — `create_package_completion_item`'s npm/Composer arm can
-/// still insert a full `"{name}": "^{latest}"` pair into that already-open string,
-/// producing invalid JSON. Tracked as a known follow-up gap (critic S2 on #724, filed as
-/// #729), out of scope for #724 itself (npm/Composer weren't in the original report);
-/// PyPI is exempt since its arm already inserts a bare string.
+/// For JSON manifests (package.json, composer.json), [`classify_json_key_context`]
+/// determines both the extracted text and the [`OpenMarkupContext`] using quote parity
+/// (the same technique as [`deps_core::completion::extract_feature_prefix`]) rather
+/// than a naive "a `"` appears at either end" check — that naive check both
+/// misclassifies a fully-closed key (`"express"` with the cursor past both quotes,
+/// where quote parity is even — not open) and fails to distinguish an open *key*
+/// string from an open *value* string (`"express": "^4`, where a bare package-name
+/// insert would corrupt the version instead of completing the key). Only a
+/// genuinely-open key string reports [`OpenMarkupContext::JsonQuotedKey`]; every other
+/// shape (closed key, open value, or an otherwise-ambiguous position) reports
+/// [`OpenMarkupContext::None`] with an empty extracted prefix, which
+/// `fallback_completion`'s `prefix.is_empty()` guard rejects before any registry
+/// search fires — suppressing rather than guessing, matching `MavenOtherTag`'s
+/// discipline (#729 critic S1/S2, following up on #724, which left npm/Composer out of
+/// scope). PyPI's `pyproject.toml` entries (`"pytes` inside `dependencies = [...]`)
+/// carry the same surviving-quote shape, just as a TOML array element rather than a
+/// JSON key — see [`uses_toml_string_array_values`] — but keep reporting
+/// [`OpenMarkupContext::None`] unconditionally (with the prefix merely
+/// quote-trimmed, never suppressed) since PyPI's arm already inserts a bare string
+/// regardless of `open_markup`.
 ///
 /// For XML manifests (`pom.xml`) an opening tag survives on the left instead (cursor
 /// inside `<artifactId>gua`) — stripped so the extracted text matches what the
@@ -359,11 +380,22 @@ fn extract_prefix(
         "prefix_end must be a char boundary"
     );
     let prefix = line.get(..prefix_end).unwrap_or(line).trim();
-    if uses_json_quoted_keys(ecosystem_kind) || uses_toml_string_array_values(ecosystem_kind) {
-        // Known gap for npm/Composer specifically (tracked as #729, not #724 itself —
-        // see this function's doc comment): the trimmed `"` proves the
-        // value's own quotes are already open, the same shape as NuGet's attribute
-        // case, but this always reports `None` rather than a dedicated context.
+    if uses_json_quoted_keys(ecosystem_kind) {
+        // See `classify_json_key_context`'s doc comment and this function's own
+        // (#729): only a genuinely-open key string gets `JsonQuotedKey`; every other
+        // shape gets an empty prefix, which `fallback_completion`'s `prefix.is_empty()`
+        // guard rejects before any registry search fires.
+        let (value, is_open_key) = classify_json_key_context(prefix);
+        let context = if is_open_key {
+            OpenMarkupContext::JsonQuotedKey
+        } else {
+            OpenMarkupContext::None
+        };
+        (value, context)
+    } else if uses_toml_string_array_values(ecosystem_kind) {
+        // PyPI's arm always inserts a bare string regardless of `open_markup` (see
+        // `OpenMarkupContext::None`'s doc comment), so no dedicated context is needed
+        // here even though the surviving-quote shape is identical to npm/Composer's.
         (prefix.trim_matches('"'), OpenMarkupContext::None)
     } else if uses_xml_tag_values(ecosystem_kind) {
         let (stripped, tag) = strip_leading_xml_tag(prefix);
@@ -383,6 +415,92 @@ fn extract_prefix(
         (stripped, context)
     } else {
         (prefix, OpenMarkupContext::None)
+    }
+}
+
+/// Counts the `"` characters in `prefix` that actually open or close a JSON string —
+/// skipping any `\"` escape sequence — and returns that count along with the byte
+/// index of the last such real quote, if any.
+///
+/// A `"` is escaped, and does not toggle string state, when it is preceded by an *odd*
+/// number of consecutive `\` characters immediately before it (an even count, zero
+/// included, means those backslashes are themselves pairwise-escaped, so the quote is
+/// real) — e.g. in `"a\"b"` the middle `"` is escaped (one preceding `\`), so the
+/// string is `a"b`, not two separate strings. A naive per-`"` count desyncs from real
+/// JSON open/close state on any key or value containing `\"` (#729 code-review: raw
+/// counting both over-counts, flipping a closed key+value pair to look "open", and
+/// under-counts the inverse, flipping a still-open key to look "closed").
+fn count_real_json_quotes(prefix: &str) -> (usize, Option<usize>) {
+    let mut backslash_run = 0usize;
+    let mut count = 0usize;
+    let mut last_real_quote = None;
+    for (idx, ch) in prefix.char_indices() {
+        match ch {
+            '\\' => backslash_run += 1,
+            '"' => {
+                if backslash_run.is_multiple_of(2) {
+                    count += 1;
+                    last_real_quote = Some(idx);
+                }
+                backslash_run = 0;
+            }
+            _ => backslash_run = 0,
+        }
+    }
+    (count, last_real_quote)
+}
+
+/// Classifies whether `prefix` (the trimmed line text up to the cursor) has the cursor
+/// inside an open JSON string that is npm/Composer's dependency *key*, distinguishing
+/// that from a closed key, an open value string, or plain unquoted text.
+///
+/// Uses the same quote-parity technique as
+/// [`deps_core::completion::extract_feature_prefix`] — an odd count of real (see
+/// [`count_real_json_quotes`]) `"` characters means the cursor sits inside an open
+/// string literal — adapted for a JSON object key instead of a TOML array element: the
+/// relevant segment is the whole `prefix` (a JSON key is never preceded by a `[` the
+/// way a TOML array element is), and the text immediately before the open string's
+/// opening quote decides key-vs-value: a `:` right before it (`"express": "^4`) means
+/// the open string is the *value*, not the key.
+///
+/// Returns `(text_after_the_open_quote, true)` only when the cursor is genuinely
+/// inside an open key string — the one case
+/// [`create_package_completion_item`]'s npm/Composer arm should bare-insert into.
+/// Every other shape returns `("", false)`:
+/// - Even quote count with at least one real `"` present means the cursor sits right
+///   after a fully-closed string (`"express"` with the cursor past both quotes) —
+///   quote parity alone cannot tell whether that position wants a new key, is
+///   mid-value, or something else, so this suppresses rather than guesses (#729
+///   critic S1, matching `MavenOtherTag`'s "no safe bare text to offer here"
+///   discipline).
+/// - Odd quote count whose open string's text is preceded by `:` means the cursor is
+///   inside an open *value* string, not the key — a bare package-name insert there
+///   would corrupt the version instead of completing the key (#729 critic S2).
+///
+/// Even quote count with *zero* real `"` present (plain unquoted text, or nothing
+/// typed yet) is the one exception: it returns `(prefix, false)` unchanged, since no
+/// quote has been opened at all and the normal full-pair insert is still correct
+/// there.
+fn classify_json_key_context(prefix: &str) -> (&str, bool) {
+    let (quote_count, last_quote) = count_real_json_quotes(prefix);
+    if quote_count == 0 {
+        return (prefix, false);
+    }
+    if quote_count.is_multiple_of(2) {
+        return ("", false);
+    }
+    // `quote_count` odd (so >= 1) guarantees `count_real_json_quotes` found one; `"`
+    // is a single-byte ASCII char, so `last_quote + 1` is always a char boundary.
+    #[allow(clippy::string_slice)]
+    let Some(last_quote) = last_quote else {
+        return ("", false);
+    };
+    #[allow(clippy::string_slice)]
+    let (before_quote, after_quote) = (&prefix[..last_quote], &prefix[last_quote + 1..]);
+    if before_quote.trim_end().ends_with(':') {
+        ("", false)
+    } else {
+        (after_quote, true)
     }
 }
 
@@ -1117,17 +1235,18 @@ async fn search_packages(
 /// [`OpenMarkupContext::MavenOtherTag`] (see below), where no `insert_text` is safe to
 /// offer at all, independent of validation.
 ///
-/// `open_markup` (from [`extract_prefix`]'s second return value) tells the Maven and
-/// NuGet arms what kind of markup, if any, is already open around the cursor:
-/// [`OpenMarkupContext::MavenArtifactId`] and [`OpenMarkupContext::NuGetAttribute`]
-/// insert just the bare completable text at that position instead of a full markup
-/// snippet — inserting the full snippet there would nest a second copy of the
-/// surrounding tag/attribute inside the one already open around the cursor (#724).
-/// [`OpenMarkupContext::MavenOtherTag`] (an open `groupId`/`version`/unrecognized tag)
-/// suppresses the item entirely, since neither the bare artifact id nor the full
-/// snippet is a safe insert into a *different* tag. [`OpenMarkupContext::None`] builds
-/// the ecosystem's normal full-snippet `insert_text`, same as every non-XML ecosystem
-/// (which `open_markup` doesn't change).
+/// `open_markup` (from [`extract_prefix`]'s second return value) tells the Maven,
+/// NuGet, and npm/Composer arms what kind of markup, if any, is already open around
+/// the cursor: [`OpenMarkupContext::MavenArtifactId`],
+/// [`OpenMarkupContext::NuGetAttribute`], and [`OpenMarkupContext::JsonQuotedKey`]
+/// each insert just the bare completable text at that position instead of a full
+/// markup/JSON snippet — inserting the full snippet there would nest a second copy of
+/// the surrounding tag/attribute/quote inside the one already open around the cursor
+/// (#724 for Maven/NuGet, #729 for npm/Composer). [`OpenMarkupContext::MavenOtherTag`]
+/// (an open `groupId`/`version`/unrecognized tag) suppresses the item entirely, since
+/// neither the bare artifact id nor the full snippet is a safe insert into a
+/// *different* tag. [`OpenMarkupContext::None`] builds the ecosystem's normal
+/// full-snippet `insert_text`, same as every ecosystem `open_markup` doesn't affect.
 fn create_package_completion_item(
     metadata: &dyn deps_core::Metadata,
     ecosystem_id: EcosystemId,
@@ -1167,7 +1286,23 @@ fn create_package_completion_item(
         // bare-name insert `build_package_completion` already uses for PyPI at the
         // same cursor position on the primary (parsed) completion path.
         EcosystemId::Pypi => name.to_string(),
-        EcosystemId::Npm | EcosystemId::Composer => format!("\"{name}\": \"^{latest}\""),
+        EcosystemId::Npm | EcosystemId::Composer => {
+            if open_markup == OpenMarkupContext::JsonQuotedKey {
+                // Cursor is genuinely inside an open key string (see
+                // `classify_json_key_context`): the key's own opening quote already
+                // exists around the cursor, so inserting the full
+                // `"{name}": "^{latest}"` pair here would nest a duplicate quote into
+                // the one already open, producing invalid JSON (#729). This bare
+                // insert leaves the key without a value clause — this path carries no
+                // `text_edit` range to also place `: "^{latest}"` after the closing
+                // quote, so completing the version is left to a follow-up keystroke or
+                // completion, the same residual limitation as the NuGet/Maven
+                // bare-insert arms above (#729 critic M2).
+                name.to_string()
+            } else {
+                format!("\"{name}\": \"^{latest}\"")
+            }
+        }
         EcosystemId::Go => format!("{name} {latest}"),
         // The key is quoted: an unquoted YAML plain scalar can't start with `@`
         // (allowed by `is_safe_package_name` for npm/Deno-shaped names), which would
@@ -1212,11 +1347,14 @@ fn create_package_completion_item(
                     // entirely rather than guessing.
                     return None;
                 }
-                // `NuGetAttribute` never actually occurs here — `extract_prefix` only
-                // produces it for `EcosystemId::NuGet` — but is included so this match
-                // stays exhaustive without a wildcard arm silently swallowing a future
+                // `NuGetAttribute`/`JsonQuotedKey` never actually occur here —
+                // `extract_prefix` only produces them for `EcosystemId::NuGet` and
+                // npm/Composer respectively — but are included so this match stays
+                // exhaustive without a wildcard arm silently swallowing a future
                 // `OpenMarkupContext` variant.
-                OpenMarkupContext::None | OpenMarkupContext::NuGetAttribute => {
+                OpenMarkupContext::None
+                | OpenMarkupContext::NuGetAttribute
+                | OpenMarkupContext::JsonQuotedKey => {
                     if let Some(g) = group_id
                         && !is_safe_maven_coordinate_segment(g)
                     {
@@ -1471,6 +1609,16 @@ mod tests {
     /// Same as [`mock_cargo_state`], but for the `"nuget"` ecosystem.
     fn mock_nuget_state(registry: Arc<dyn deps_core::Registry>) -> ServerState {
         mock_ecosystem_state("nuget", "csproj", registry)
+    }
+
+    /// Same as [`mock_cargo_state`], but for the `"npm"` ecosystem.
+    fn mock_npm_state(registry: Arc<dyn deps_core::Registry>) -> ServerState {
+        mock_ecosystem_state("npm", "package.json", registry)
+    }
+
+    /// Same as [`mock_cargo_state`], but for the `"composer"` ecosystem.
+    fn mock_composer_state(registry: Arc<dyn deps_core::Registry>) -> ServerState {
+        mock_ecosystem_state("composer", "composer.json", registry)
     }
 
     #[tokio::test]
@@ -2509,6 +2657,17 @@ requests
             item.insert_text,
             Some("\"express\": \"^4.18.2\"".to_string())
         );
+
+        // #729: cursor already inside an open key string (see `extract_prefix`) must
+        // insert only the bare name, not a full pair that would duplicate the
+        // surviving quote and produce invalid JSON.
+        let open_string_item = create_package_completion_item(
+            &meta,
+            EcosystemId::Npm,
+            OpenMarkupContext::JsonQuotedKey,
+        )
+        .unwrap();
+        assert_eq!(open_string_item.insert_text, Some("express".to_string()));
     }
 
     #[test]
@@ -2943,6 +3102,18 @@ requests
         assert_eq!(
             item.insert_text,
             Some("\"monolog/monolog\": \"^3.5.0\"".to_string())
+        );
+
+        // #729: same open-string fix as npm, exercised for Composer.
+        let open_string_item = create_package_completion_item(
+            &meta,
+            EcosystemId::Composer,
+            OpenMarkupContext::JsonQuotedKey,
+        )
+        .unwrap();
+        assert_eq!(
+            open_string_item.insert_text,
+            Some("monolog/monolog".to_string())
         );
     }
 
@@ -3804,6 +3975,165 @@ s
         assert_eq!(items[0].insert_text, Some("Newtonsoft.Json".to_string()));
     }
 
+    /// #729: end-to-end regression guard through `fallback_completion` itself — typing
+    /// inside an already-open `"expr` key string in `package.json`'s `dependencies`
+    /// must produce a completion item that inserts just the bare package name, not a
+    /// full `"{name}": "^{latest}"` pair that would duplicate the open quote (the
+    /// corruption the issue reported).
+    #[tokio::test]
+    async fn test_fallback_completion_npm_in_open_string_inserts_bare_name() {
+        use deps_core::{Metadata, Registry, Version};
+        use std::any::Any;
+
+        struct MockMetadata {
+            name: deps_core::PackageName,
+        }
+        impl Metadata for MockMetadata {
+            fn name(&self) -> &deps_core::PackageName {
+                &self.name
+            }
+            fn description(&self) -> Option<&str> {
+                None
+            }
+            fn repository(&self) -> Option<&str> {
+                None
+            }
+            fn documentation(&self) -> Option<&str> {
+                None
+            }
+            fn latest_version(&self) -> &deps_core::ConcreteVersion {
+                static VERSION: std::sync::LazyLock<deps_core::ConcreteVersion> =
+                    std::sync::LazyLock::new(|| deps_core::ConcreteVersion::new("4.19.2"));
+                &VERSION
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        struct StubRegistry;
+        impl Registry for StubRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(None) })
+            }
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                Box::pin(async move {
+                    Ok(vec![Box::new(MockMetadata {
+                        name: deps_core::PackageName::new("express"),
+                    }) as Box<dyn Metadata>])
+                })
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let state = mock_npm_state(Arc::new(StubRegistry));
+        let content = "{\n  \"dependencies\": {\n    \"expr\n  }\n}\n";
+        let line = content.lines().nth(2).unwrap();
+        let position = Position::new(2, line.chars().count() as u32);
+
+        let items = fallback_completion(&state, EcosystemId::Npm, position, content).await;
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].insert_text, Some("express".to_string()));
+    }
+
+    /// #729: same open-string fix as npm, exercised end-to-end for Composer's
+    /// `require` section in `composer.json`.
+    #[tokio::test]
+    async fn test_fallback_completion_composer_in_open_string_inserts_bare_name() {
+        use deps_core::{Metadata, Registry, Version};
+        use std::any::Any;
+
+        struct MockMetadata {
+            name: deps_core::PackageName,
+        }
+        impl Metadata for MockMetadata {
+            fn name(&self) -> &deps_core::PackageName {
+                &self.name
+            }
+            fn description(&self) -> Option<&str> {
+                None
+            }
+            fn repository(&self) -> Option<&str> {
+                None
+            }
+            fn documentation(&self) -> Option<&str> {
+                None
+            }
+            fn latest_version(&self) -> &deps_core::ConcreteVersion {
+                static VERSION: std::sync::LazyLock<deps_core::ConcreteVersion> =
+                    std::sync::LazyLock::new(|| deps_core::ConcreteVersion::new("3.5.0"));
+                &VERSION
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        struct StubRegistry;
+        impl Registry for StubRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(None) })
+            }
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                Box::pin(async move {
+                    Ok(vec![Box::new(MockMetadata {
+                        name: deps_core::PackageName::new("monolog/monolog"),
+                    }) as Box<dyn Metadata>])
+                })
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let state = mock_composer_state(Arc::new(StubRegistry));
+        let content = "{\n  \"require\": {\n    \"monolog/mon\n  }\n}\n";
+        let line = content.lines().nth(2).unwrap();
+        let position = Position::new(2, line.chars().count() as u32);
+
+        let items = fallback_completion(&state, EcosystemId::Composer, position, content).await;
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].insert_text, Some("monolog/monolog".to_string()));
+    }
+
     /// #699: typing inside a *non*-target attribute's value (`Version="1.0`, after
     /// `Include` was already closed) must not reach the registry — `extract_prefix`
     /// leaves the whole `=`-containing line untouched for this position (see
@@ -4185,29 +4515,110 @@ serde
     fn test_extract_prefix_strips_leading_quote_for_json_ecosystems() {
         // package.json / composer.json: cursor sits before the closing quote while the
         // key is still being typed, e.g. `    "expr` with the cursor right after "expr".
+        // The surviving leading `"` proves the key's own quotes are already open (#729).
         let line = "    \"expr";
         assert_eq!(
             extract_prefix(line, line.len() as u32, EcosystemId::Npm),
-            ("expr", OpenMarkupContext::None)
+            ("expr", OpenMarkupContext::JsonQuotedKey)
         );
         assert_eq!(
             extract_prefix(line, line.len() as u32, EcosystemId::Composer),
-            ("expr", OpenMarkupContext::None)
+            ("expr", OpenMarkupContext::JsonQuotedKey)
         );
     }
 
     #[test]
-    fn test_extract_prefix_strips_trailing_quote_for_json_ecosystems() {
-        // Cursor right after a closing quote (editor auto-close, or the user retyped
-        // it): `    "express"` with the cursor placed just past the closing quote.
+    fn test_extract_prefix_closed_json_key_is_suppressed_not_reopened() {
+        // #729 critic S1: cursor right after an already fully-closed key
+        // (`    "express"`, quote parity even) is NOT an open string — a naive
+        // `ends_with('"')` check used to misclassify this as `JsonQuotedKey` and
+        // bare-insert into it (`"express"express`, still invalid JSON). Quote parity
+        // correctly reports this as ambiguous instead, suppressing the item (empty
+        // prefix) rather than guessing what belongs there.
         let line = "    \"express\"";
         assert_eq!(
             extract_prefix(line, line.len() as u32, EcosystemId::Npm),
-            ("express", OpenMarkupContext::None)
+            ("", OpenMarkupContext::None)
         );
         assert_eq!(
             extract_prefix(line, line.len() as u32, EcosystemId::Composer),
-            ("express", OpenMarkupContext::None)
+            ("", OpenMarkupContext::None)
+        );
+    }
+
+    #[test]
+    fn test_extract_prefix_json_open_value_string_is_suppressed_not_key() {
+        // #729 critic S2: cursor inside an open *value* string (`"express": "^4`, odd
+        // quote parity) must not be reported as an open key — a bare package-name
+        // insert there would corrupt the version string, not complete the key. The
+        // text before the open string's quote ends with `:`, so this is suppressed
+        // (empty prefix) instead of misreported as `JsonQuotedKey`.
+        let line = "    \"express\": \"^4";
+        assert_eq!(
+            extract_prefix(line, line.len() as u32, EcosystemId::Npm),
+            ("", OpenMarkupContext::None)
+        );
+        assert_eq!(
+            extract_prefix(line, line.len() as u32, EcosystemId::Composer),
+            ("", OpenMarkupContext::None)
+        );
+    }
+
+    #[test]
+    fn test_extract_prefix_json_open_key_after_prior_closed_entry_on_same_line() {
+        // A second key on the same line as an already-closed entry (`"express":
+        // "4.19.2", "look`) must still be recognized as an open key: the text right
+        // before its opening quote is `, `, not `:`, so quote parity correctly
+        // distinguishes it from the value-position case above.
+        let line = "    \"express\": \"4.19.2\", \"look";
+        assert_eq!(
+            extract_prefix(line, line.len() as u32, EcosystemId::Npm),
+            ("look", OpenMarkupContext::JsonQuotedKey)
+        );
+    }
+
+    #[test]
+    fn test_extract_prefix_closed_entry_with_escaped_quote_is_not_miscounted_open() {
+        // Code-review repro: a closed key containing an escaped quote (`"a\"b"`), a
+        // closed value (`"1"`), then unquoted trailing text with no opening quote yet
+        // (`, lodash`). Real state: nothing is open. A naive per-`"` count sees 5 quote
+        // characters (including the escaped one) — odd — and wrongly treats the
+        // trailing text as an open key; the escape-aware count sees 4 real quotes
+        // (even) and correctly suppresses instead.
+        let line = "    \"a\\\"b\": \"1\", lodash";
+        assert_eq!(
+            extract_prefix(line, line.len() as u32, EcosystemId::Npm),
+            ("", OpenMarkupContext::None)
+        );
+    }
+
+    #[test]
+    fn test_extract_prefix_open_key_with_escaped_quote_stays_open() {
+        // Inverse of the repro above: an escaped quote inside a still-open key
+        // (`"a\"b`, cursor mid-key). A naive per-`"` count sees 2 quote characters
+        // (opening quote + the escaped one) — even — and wrongly suppresses a
+        // genuinely open key; the escape-aware count sees 1 real quote (odd) and
+        // correctly reports it as open.
+        let line = "    \"a\\\"b";
+        assert_eq!(
+            extract_prefix(line, line.len() as u32, EcosystemId::Npm),
+            ("a\\\"b", OpenMarkupContext::JsonQuotedKey)
+        );
+    }
+
+    #[test]
+    fn test_extract_prefix_no_quote_survives_for_json_ecosystems_reports_none() {
+        // No `"` typed yet at all (e.g. the user deleted the key and is retyping bare
+        // text): nothing proves a string is already open, so the normal full-pair
+        // insert via `OpenMarkupContext::None` is still correct here (#729).
+        let line = "    expr";
+        assert_eq!(
+            extract_prefix(line, line.len() as u32, EcosystemId::Npm),
+            ("expr", OpenMarkupContext::None)
+        );
+        assert_eq!(
+            extract_prefix(line, line.len() as u32, EcosystemId::Composer),
+            ("expr", OpenMarkupContext::None)
         );
     }
 

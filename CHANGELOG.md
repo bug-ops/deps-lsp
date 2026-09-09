@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: property tests (`proptest`) asserting the parser depth/expansion checkers and JSONC position recovery never panic on arbitrary input (#673)
 
 ### Fixed
+- **deps-lsp**: npm/Composer raw-text fallback completion no longer inserts a duplicate-quoted key-value pair when the cursor is already inside an open JSON key string (resolves #729)
 - **deps-core** + all 9 lock-file providers: lock-file parsing now runs on the blocking-thread pool via a shared `read_and_parse_lockfile` helper, no longer stalling the LSP request worker (resolves #723) (#730)
 - **deps-lsp**: NuGet/Maven raw-text fallback completion no longer inserts duplicate markup when the cursor is already inside an open attribute value or tag (resolves #724) (#728)
 - **deps-lsp**: NuGet raw-text fallback completion now actually fires inside `Include="..."`/`id="..."` on `PackageReference`/`PackageVersion`/`package` elements, instead of being permanently disabled; stale `TODO(#118 follow-up)` markers on the still-disabled Bundler/Swift/Gradle arms were rewritten to plain comments explaining the settled design decision (resolves #699)
