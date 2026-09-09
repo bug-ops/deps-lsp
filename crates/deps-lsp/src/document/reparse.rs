@@ -3,7 +3,8 @@
 //! a [`ReparseScope`], reusing the version-guarded, sequential-await machinery
 //! [`handle_document_change_guarded`] already provides against a concurrent `did_change`.
 
-use super::lifecycle::{CommitGuard, RefetchPolicy, handle_document_change_guarded};
+use super::lifecycle::{CommitGuard, handle_document_change_guarded};
+use super::resolved::RefetchPolicy;
 use super::state::{CLIENT_REFRESH_TIMEOUT, ServerState};
 use crate::config::{DepsConfig, ReparseScope};
 use std::sync::Arc;

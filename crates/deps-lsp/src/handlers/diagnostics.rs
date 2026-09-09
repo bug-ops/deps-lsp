@@ -34,7 +34,7 @@ pub(crate) const MAX_LOADING_CEILING: Duration = Duration::from_mins(30);
 ///
 /// Models the actual worst case: a single package fetch can take up to roughly
 /// `2 * fetch_timeout_secs` (the primary registry call plus its own timeout-bounded
-/// `get_latest_matching_from` fallback — see `document::lifecycle::fetch_and_classify_package`),
+/// `get_latest_matching_from` fallback — see `document::fetch::fetch_and_classify_package`),
 /// run `max_concurrent_fetches`-wide via `buffer_unordered` — so `dep_count` dependencies
 /// take roughly `ceil(dep_count / max_concurrent_fetches) * 2 * fetch_timeout_secs` even when
 /// nothing is wrong (issue #636: a fixed multiplier under-counted this for a low
