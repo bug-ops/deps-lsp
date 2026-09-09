@@ -14,6 +14,14 @@
 //! those two are edge cases for the small minority of Android/plugin-only coordinates,
 //! and this is a best-effort secondary signal (NFR-003 graceful degradation already
 //! covers a POM that 404s there).
+//!
+//! **Parent POM traversal (issue #692)**: a Maven multi-module project commonly declares
+//! `<licenses>` only on a shared parent POM, leaving each module's own (leaf) POM to
+//! reference it via `<parent>` — Guava's own leaf POM (`guava-32.0.1-jre.pom`) has no
+//! `<licenses>` element at all; the license is declared only on `guava-parent`'s POM.
+//! [`fetch_license_from`] follows a leaf POM's `<parent>` coordinate when its own
+//! `<licenses>` block is empty, bounded by [`MAX_POM_FETCHES`] so a pathological (or
+//! adversarial) parent chain can't turn one hover request into an unbounded fetch chain.
 
 use deps_core::{HttpCache, is_safe_maven_coordinate_segment};
 use quick_xml::Reader;
@@ -122,15 +130,24 @@ fn pom_url(base: &str, coordinate: &str, version: &str) -> Option<String> {
     ))
 }
 
+/// Bounds how many POM fetches [`fetch_license_from`] performs for one license lookup —
+/// the requested (leaf) coordinate itself, plus up to `MAX_POM_FETCHES - 1` `<parent>`
+/// hops when each POM in the chain declares no `<licenses>` block of its own (issue
+/// #692). A real Maven parent chain is rarely more than one or two levels deep (a leaf
+/// module -> its immediate parent POM), so this leaves headroom for that common shape
+/// while still capping a pathological or adversarial chain at a small, fixed number of
+/// network round trips.
+const MAX_POM_FETCHES: u8 = 3;
+
 /// Fetches `coordinate`'s (`"group:artifact"`) license at `version` from Maven
 /// Central.
 ///
 /// Returns an empty `Vec` (never an error) when `coordinate` isn't in the expected
 /// `"group:artifact"` shape, the fetch fails (network error, 404 — a large fraction of
 /// Gradle plugin/Android coordinates live on Google Maven or the Gradle Plugin Portal
-/// instead, not Maven Central), or the POM has no `<licenses>` block — graceful
-/// degradation (NFR-003), since this is a best-effort secondary signal, not core
-/// version data.
+/// instead, not Maven Central), or neither the POM nor any `<parent>` POM within
+/// [`MAX_POM_FETCHES`] declares a `<licenses>` block — graceful degradation (NFR-003),
+/// since this is a best-effort secondary signal, not core version data.
 pub(crate) async fn fetch_license(
     cache: &Arc<HttpCache>,
     coordinate: &str,
@@ -144,34 +161,84 @@ pub(crate) async fn fetch_license(
 /// `deps-dart::PubDevRegistry::with_base`/`deps-swift`'s equivalent test-only base
 /// override (tester gap: unlike Swift/Dart/Deno's fetch layer, Gradle's had no
 /// HTTP-mocked coverage at all, only the malformed-coordinate short-circuit below).
+///
+/// Follows `<parent>` POM coordinates (issue #692) when a fetched POM's own
+/// `<licenses>` is empty, up to [`MAX_POM_FETCHES`] total fetches (the leaf plus its
+/// parent chain). Each hop re-validates its coordinate/version through [`pom_url`] —
+/// the same allowlist the leaf fetch uses — so a malicious `<parent>` value can no more
+/// escape Maven Central's URL space than a malicious leaf coordinate could.
 async fn fetch_license_from(
     cache: &Arc<HttpCache>,
     base: &str,
     coordinate: &str,
     version: &str,
 ) -> Vec<String> {
-    let Some(url) = pom_url(base, coordinate, version) else {
-        return Vec::new();
-    };
-    match cache.get_cached(&url).await {
-        Ok(data) => parse_pom_licenses(&data),
-        Err(e) => {
-            tracing::debug!(coordinate, version, error = %e, "gradle license pom fetch failed");
-            Vec::new()
+    let mut current_coordinate = coordinate.to_string();
+    let mut current_version = version.to_string();
+
+    for _ in 0..MAX_POM_FETCHES {
+        let Some(url) = pom_url(base, &current_coordinate, &current_version) else {
+            return Vec::new();
+        };
+        let pom = match cache.get_cached(&url).await {
+            Ok(data) => parse_pom(&data),
+            Err(e) => {
+                // Logs both the requested (leaf) coordinate and the current hop's —
+                // code-review nit: a parent-hop failure logged only the reassigned
+                // parent coordinate, making it hard to correlate back to the dependency
+                // the manifest/hover actually shows (e.g. `guava-parent` instead of
+                // `guava` for a failed hop past a successfully-fetched leaf POM).
+                tracing::debug!(
+                    requested_coordinate = coordinate,
+                    requested_version = version,
+                    coordinate = current_coordinate,
+                    version = current_version,
+                    error = %e,
+                    "gradle license pom fetch failed"
+                );
+                return Vec::new();
+            }
+        };
+        if !pom.licenses.is_empty() {
+            return pom.licenses;
+        }
+        match pom.parent {
+            Some((parent_coordinate, parent_version)) => {
+                current_coordinate = parent_coordinate;
+                current_version = parent_version;
+            }
+            None => return Vec::new(),
         }
     }
+
+    Vec::new()
 }
 
-/// Extracts every `<licenses><license><name>` text value from a POM XML document.
+/// One parsed Maven POM XML document's license-relevant content: its own declared
+/// licenses, and — when present — the `<parent>` coordinate/version
+/// [`fetch_license_from`] follows next if [`Self::licenses`] is empty (issue #692).
+struct PomInfo {
+    licenses: Vec<String>,
+    /// `("group:artifact", version)` from `<parent><groupId>`/`<artifactId>`/`<version>`,
+    /// present only when the POM declares all three.
+    parent: Option<(String, String)>,
+}
+
+/// Extracts every `<licenses><license><name>` text value, and the `<parent>` coordinate
+/// if any, from a POM XML document.
 ///
 /// A dependency can declare more than one license (dual-licensed artifacts, e.g. EPL
 /// and GPL-with-classpath-exception), so this collects all of them — consistent with
 /// every other ecosystem's `license: Vec<String>` shape (spec 010 plan §1 "License
-/// shape" decision). Non-UTF-8 or malformed XML degrades to an empty `Vec` rather than
-/// an error, matching this module's overall graceful-degradation contract.
-fn parse_pom_licenses(data: &[u8]) -> Vec<String> {
+/// shape" decision). Non-UTF-8 or malformed XML degrades to an empty `Vec` and no
+/// parent rather than an error, matching this module's overall graceful-degradation
+/// contract.
+fn parse_pom(data: &[u8]) -> PomInfo {
     let Ok(content) = std::str::from_utf8(data) else {
-        return Vec::new();
+        return PomInfo {
+            licenses: Vec::new(),
+            parent: None,
+        };
     };
 
     let mut reader = Reader::from_str(content);
@@ -181,6 +248,17 @@ fn parse_pom_licenses(data: &[u8]) -> Vec<String> {
     let mut in_licenses = false;
     let mut in_license = false;
     let mut in_name = false;
+
+    // Scoped to `<parent>...</parent>` (via `in_parent`) so the project's own top-level
+    // `<groupId>`/`<artifactId>`/`<version>` elements — which every POM also has,
+    // outside `<parent>` — are never mistaken for the parent coordinate.
+    let mut in_parent = false;
+    let mut in_parent_group_id = false;
+    let mut in_parent_artifact_id = false;
+    let mut in_parent_version = false;
+    let mut parent_group_id = String::new();
+    let mut parent_artifact_id = String::new();
+    let mut parent_version = String::new();
 
     loop {
         // Shape-independent budget (impl-critic S1, through three rounds of
@@ -197,6 +275,10 @@ fn parse_pom_licenses(data: &[u8]) -> Vec<String> {
                 "licenses" => in_licenses = true,
                 "license" if in_licenses => in_license = true,
                 "name" if in_license => in_name = true,
+                "parent" => in_parent = true,
+                "groupId" if in_parent => in_parent_group_id = true,
+                "artifactId" if in_parent => in_parent_artifact_id = true,
+                "version" if in_parent => in_parent_version = true,
                 _ => {}
             },
             Ok(Event::Text(ref e)) if in_name => {
@@ -211,10 +293,23 @@ fn parse_pom_licenses(data: &[u8]) -> Vec<String> {
                     }
                 }
             }
+            Ok(Event::Text(ref e)) if in_parent_group_id => {
+                parent_group_id = e.trim().to_string();
+            }
+            Ok(Event::Text(ref e)) if in_parent_artifact_id => {
+                parent_artifact_id = e.trim().to_string();
+            }
+            Ok(Event::Text(ref e)) if in_parent_version => {
+                parent_version = e.trim().to_string();
+            }
             Ok(Event::End(ref e)) => match e.local_name().as_ref() {
                 "licenses" => in_licenses = false,
                 "license" => in_license = false,
                 "name" => in_name = false,
+                "parent" => in_parent = false,
+                "groupId" => in_parent_group_id = false,
+                "artifactId" => in_parent_artifact_id = false,
+                "version" => in_parent_version = false,
                 _ => {}
             },
             Ok(Event::Eof) | Err(_) => break,
@@ -222,18 +317,39 @@ fn parse_pom_licenses(data: &[u8]) -> Vec<String> {
         }
     }
 
-    licenses
+    let parent =
+        if parent_group_id.is_empty() || parent_artifact_id.is_empty() || parent_version.is_empty()
+        {
+            None
+        } else {
+            Some((
+                format!("{parent_group_id}:{parent_artifact_id}"),
+                parent_version,
+            ))
+        };
+
+    PomInfo { licenses, parent }
 }
 
-/// Fuzz-only entry point for [`parse_pom_licenses`] (issue #691). Gated on the `fuzzing`
-/// Cargo feature (never enabled by this crate's own default set) so this stays out of the
+/// Thin [`parse_pom`] wrapper keeping the pre-#692 `Vec<String>`-only shape for callers
+/// (and existing tests) that only need the declared licenses, not parent traversal.
+#[cfg(test)]
+fn parse_pom_licenses(data: &[u8]) -> Vec<String> {
+    parse_pom(data).licenses
+}
+
+/// Fuzz-only entry point for [`parse_pom`] (issue #691). Gated on the `fuzzing` Cargo
+/// feature (never enabled by this crate's own default set) so this stays out of the
 /// crate's public API surface in a normal build. This module itself stays unconditionally
 /// private (impl-critic M1) — only this one function is reachable externally, via the
-/// `#[doc(hidden)]` `pub use` re-export in `lib.rs`.
+/// `#[doc(hidden)]` `pub use` re-export in `lib.rs`. Targets `parse_pom` directly (not the
+/// test-only `parse_pom_licenses` wrapper, added by #692's parent-POM traversal) so
+/// fuzzing continues to exercise the real production parser, including its `<parent>`
+/// coordinate extraction.
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub fn fuzz_parse_pom_licenses(data: &[u8]) {
-    let _ = parse_pom_licenses(data);
+    let _ = parse_pom(data);
 }
 
 #[cfg(test)]
@@ -514,5 +630,313 @@ mod tests {
             fetch_license_from(&cache, &server.url(), "com.example:broken", "1.0.0").await;
 
         assert!(licenses.is_empty());
+    }
+
+    // --- Issue #692: parent POM traversal ---
+
+    #[test]
+    fn parse_pom_extracts_parent_coordinate() {
+        let pom = r#"<?xml version="1.0"?>
+<project>
+  <parent>
+    <groupId>com.google.guava</groupId>
+    <artifactId>guava-parent</artifactId>
+    <version>32.0.1-jre</version>
+  </parent>
+  <artifactId>guava</artifactId>
+</project>"#;
+        let info = parse_pom(pom.as_bytes());
+        assert!(info.licenses.is_empty());
+        assert_eq!(
+            info.parent,
+            Some((
+                "com.google.guava:guava-parent".to_string(),
+                "32.0.1-jre".to_string()
+            ))
+        );
+    }
+
+    /// The project's own top-level `<artifactId>`/`<version>` (outside `<parent>`) must
+    /// never be mistaken for the parent coordinate.
+    #[test]
+    fn parse_pom_ignores_project_own_coordinate_outside_parent() {
+        let pom = r#"<?xml version="1.0"?>
+<project>
+  <groupId>com.example</groupId>
+  <artifactId>leaf</artifactId>
+  <version>9.9.9</version>
+</project>"#;
+        assert_eq!(parse_pom(pom.as_bytes()).parent, None);
+    }
+
+    #[test]
+    fn parse_pom_parent_missing_a_field_returns_none() {
+        let pom = r#"<?xml version="1.0"?>
+<project>
+  <parent>
+    <groupId>com.example</groupId>
+    <artifactId>parent-module</artifactId>
+  </parent>
+</project>"#;
+        assert_eq!(parse_pom(pom.as_bytes()).parent, None);
+    }
+
+    #[test]
+    fn parse_pom_licenses_and_parent_together() {
+        let pom = r#"<?xml version="1.0"?>
+<project>
+  <parent>
+    <groupId>com.example</groupId>
+    <artifactId>parent-module</artifactId>
+    <version>1.0.0</version>
+  </parent>
+  <licenses>
+    <license><name>MIT</name></license>
+  </licenses>
+</project>"#;
+        let info = parse_pom(pom.as_bytes());
+        assert_eq!(info.licenses, vec!["MIT".to_string()]);
+        assert_eq!(
+            info.parent,
+            Some(("com.example:parent-module".to_string(), "1.0.0".to_string()))
+        );
+    }
+
+    /// Live pattern (issue #692): Guava's own leaf POM has no `<licenses>` at all — the
+    /// license is declared only on `guava-parent`'s POM.
+    #[tokio::test]
+    async fn fetch_license_from_follows_parent_pom_when_leaf_has_no_licenses() {
+        let mut server = mockito::Server::new_async().await;
+        let _leaf = server
+            .mock(
+                "GET",
+                "/com/google/guava/guava/32.0.1-jre/guava-32.0.1-jre.pom",
+            )
+            .with_status(200)
+            .with_body(
+                r#"<?xml version="1.0"?>
+<project>
+  <parent>
+    <groupId>com.google.guava</groupId>
+    <artifactId>guava-parent</artifactId>
+    <version>32.0.1-jre</version>
+  </parent>
+  <artifactId>guava</artifactId>
+</project>"#,
+            )
+            .create_async()
+            .await;
+        let _parent = server
+            .mock(
+                "GET",
+                "/com/google/guava/guava-parent/32.0.1-jre/guava-parent-32.0.1-jre.pom",
+            )
+            .with_status(200)
+            .with_body(
+                r#"<?xml version="1.0"?>
+<project>
+  <licenses>
+    <license><name>Apache-2.0</name></license>
+  </licenses>
+</project>"#,
+            )
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        let licenses = fetch_license_from(
+            &cache,
+            &server.url(),
+            "com.google.guava:guava",
+            "32.0.1-jre",
+        )
+        .await;
+
+        assert_eq!(licenses, vec!["Apache-2.0".to_string()]);
+    }
+
+    /// Tester gap: the single-hop test above (leaf -> parent, license found on the
+    /// immediate parent) and `fetch_license_from_bounds_parent_hops` (a >3-hop chain
+    /// that never finds a license) don't together prove a genuine 2-hop *success* case —
+    /// leaf -> parent -> grandparent, with the license found on the grandparent, staying
+    /// within `MAX_POM_FETCHES`. This is the one scenario mockito coverage didn't
+    /// actually exercise before this test.
+    #[tokio::test]
+    async fn fetch_license_from_follows_two_parent_hops_to_grandparent_license() {
+        let mut server = mockito::Server::new_async().await;
+        let _leaf = server
+            .mock("GET", "/com/example/leaf/1.0.0/leaf-1.0.0.pom")
+            .with_status(200)
+            .with_body(
+                r#"<?xml version="1.0"?>
+<project>
+  <parent>
+    <groupId>com.example</groupId>
+    <artifactId>parent-module</artifactId>
+    <version>1.0.0</version>
+  </parent>
+</project>"#,
+            )
+            .create_async()
+            .await;
+        let _parent = server
+            .mock(
+                "GET",
+                "/com/example/parent-module/1.0.0/parent-module-1.0.0.pom",
+            )
+            .with_status(200)
+            .with_body(
+                r#"<?xml version="1.0"?>
+<project>
+  <parent>
+    <groupId>com.example</groupId>
+    <artifactId>grandparent-module</artifactId>
+    <version>1.0.0</version>
+  </parent>
+</project>"#,
+            )
+            .create_async()
+            .await;
+        let _grandparent = server
+            .mock(
+                "GET",
+                "/com/example/grandparent-module/1.0.0/grandparent-module-1.0.0.pom",
+            )
+            .with_status(200)
+            .with_body(
+                r#"<?xml version="1.0"?>
+<project>
+  <licenses>
+    <license><name>MIT</name></license>
+  </licenses>
+</project>"#,
+            )
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        let licenses = fetch_license_from(&cache, &server.url(), "com.example:leaf", "1.0.0").await;
+
+        assert_eq!(
+            licenses,
+            vec!["MIT".to_string()],
+            "expected the grandparent POM's license, found within MAX_POM_FETCHES"
+        );
+    }
+
+    /// Security (critic L1): `fetch_license_from`'s doc claims a malicious `<parent>`
+    /// coordinate can no more escape Maven Central's URL space than a malicious leaf
+    /// coordinate could, since every hop re-enters [`pom_url`]'s same allowlist — this
+    /// locks that claim in with a test, mirroring the leaf-level
+    /// `pom_url_rejects_embedded_slash_path_traversal_in_group` coverage. No mock is
+    /// registered for a "second" request: if the parent hop's own `pom_url` validation
+    /// were bypassed, the fetch would 501 from mockito's unmatched-route handling and
+    /// still degrade to empty — this test instead asserts the malicious-parent case
+    /// takes the same `None`-from-`pom_url` short-circuit as a malformed leaf coordinate,
+    /// never issuing a second HTTP request at all.
+    #[tokio::test]
+    async fn fetch_license_from_rejects_path_traversal_in_parent_coordinate() {
+        let mut server = mockito::Server::new_async().await;
+        let _leaf = server
+            .mock("GET", "/com/example/leaf/1.0.0/leaf-1.0.0.pom")
+            .with_status(200)
+            .with_body(
+                r#"<?xml version="1.0"?>
+<project>
+  <parent>
+    <groupId>com.example/../evil</groupId>
+    <artifactId>parent-module</artifactId>
+    <version>1.0.0</version>
+  </parent>
+</project>"#,
+            )
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        let licenses = fetch_license_from(&cache, &server.url(), "com.example:leaf", "1.0.0").await;
+
+        assert!(
+            licenses.is_empty(),
+            "a path-traversal parent coordinate must degrade to empty, not be followed"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_license_from_leaf_with_no_licenses_and_no_parent_returns_empty() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/com/example/orphan/1.0.0/orphan-1.0.0.pom")
+            .with_status(200)
+            .with_body(r#"<?xml version="1.0"?><project><artifactId>orphan</artifactId></project>"#)
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        let licenses =
+            fetch_license_from(&cache, &server.url(), "com.example:orphan", "1.0.0").await;
+
+        assert!(licenses.is_empty());
+    }
+
+    /// A parent chain longer than [`MAX_POM_FETCHES`] must stop rather than keep
+    /// following `<parent>` indefinitely — `mod3`'s POM (which does declare a license)
+    /// must never be fetched.
+    #[tokio::test]
+    async fn fetch_license_from_bounds_parent_hops() {
+        let mut server = mockito::Server::new_async().await;
+        let parent_pom = |next: &str| {
+            format!(
+                r#"<?xml version="1.0"?>
+<project>
+  <parent>
+    <groupId>com.example</groupId>
+    <artifactId>{next}</artifactId>
+    <version>1.0.0</version>
+  </parent>
+</project>"#
+            )
+        };
+        let _mod0 = server
+            .mock("GET", "/com/example/mod0/1.0.0/mod0-1.0.0.pom")
+            .with_status(200)
+            .with_body(parent_pom("mod1"))
+            .create_async()
+            .await;
+        let _mod1 = server
+            .mock("GET", "/com/example/mod1/1.0.0/mod1-1.0.0.pom")
+            .with_status(200)
+            .with_body(parent_pom("mod2"))
+            .create_async()
+            .await;
+        let _mod2 = server
+            .mock("GET", "/com/example/mod2/1.0.0/mod2-1.0.0.pom")
+            .with_status(200)
+            .with_body(parent_pom("mod3"))
+            .create_async()
+            .await;
+        let mod3 = server
+            .mock("GET", "/com/example/mod3/1.0.0/mod3-1.0.0.pom")
+            .with_status(200)
+            .with_body(
+                r#"<?xml version="1.0"?>
+<project>
+  <licenses>
+    <license><name>Should-Not-Be-Reached</name></license>
+  </licenses>
+</project>"#,
+            )
+            .expect(0)
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        let licenses = fetch_license_from(&cache, &server.url(), "com.example:mod0", "1.0.0").await;
+
+        assert!(
+            licenses.is_empty(),
+            "parent traversal must stop at MAX_POM_FETCHES, got: {licenses:?}"
+        );
+        mod3.assert_async().await;
     }
 }

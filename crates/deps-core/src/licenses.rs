@@ -635,6 +635,185 @@ pub fn normalize_pom_license_names_checked(raw: &[String]) -> (Vec<String>, bool
     (normalized, all_matched)
 }
 
+/// Resolves `raw` tier-3 pre-fetched license text into policy-evaluation-ready SPDX
+/// identifiers for `source` (issue #687/#688).
+///
+/// See [`resolve_license_entries_for_display`] for the sibling used to *render* the same
+/// data in hover. Applies [`normalize_pom_license_names_checked`] for [`crate::LicenseSource::PomFreeText`]
+/// and passes every other source through unchanged. The single normalization call site
+/// `generate_diagnostics_from_cache`'s license-policy rule reads through — before this,
+/// it re-derived its own Gradle-only `==` branch inline.
+///
+/// Deliberately fail-closed, unlike [`resolve_license_entries_for_display`]: an entry the
+/// normalization table doesn't recognize is dropped rather than guessed at (never
+/// fabricate a policy violation), and a POM entry that is genuinely one declared license
+/// but ambiguous between SPDX conventions (e.g. `"GNU General Public License v3"`)
+/// expands to every synonym (`GPL-3.0`/`-only`/`-or-later`) so a `deny`/`allow` list
+/// written in any of them still matches — both are correct for policy evaluation and
+/// wrong for a human-facing hover line, which is exactly why display uses a different
+/// function.
+///
+/// The second element mirrors [`normalize_pom_license_names_checked`]'s "did every entry
+/// normalize" flag — always `true` for a source with nothing to normalize, so a caller
+/// that uses it to gate a policy conclusion (see that function's doc) behaves identically
+/// for both a genuinely non-`PomFreeText` source and a `PomFreeText` source whose entries
+/// all recognized.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::LicenseSource;
+/// use deps_core::licenses::resolve_license_entries;
+///
+/// let (ids, all_matched) = resolve_license_entries(
+///     LicenseSource::PomFreeText,
+///     &["The Apache Software License, Version 2.0".to_string()],
+/// );
+/// assert_eq!(ids, vec!["Apache-2.0".to_string()]);
+/// assert!(all_matched);
+///
+/// let (ids, all_matched) =
+///     resolve_license_entries(LicenseSource::RegistryDeclaredSpdx, &["MIT".to_string()]);
+/// assert_eq!(ids, vec!["MIT".to_string()]);
+/// assert!(all_matched);
+/// ```
+#[must_use]
+pub fn resolve_license_entries(
+    source: crate::LicenseSource,
+    raw: &[String],
+) -> (Vec<String>, bool) {
+    match source {
+        crate::LicenseSource::PomFreeText => normalize_pom_license_names_checked(raw),
+        crate::LicenseSource::RegistryDeclaredSpdx | crate::LicenseSource::DetectedSpdx => {
+            (raw.to_vec(), true)
+        }
+    }
+}
+
+/// Resolves `raw` tier-3 pre-fetched license text for *display* (hover), for `source`
+/// (issue #687 critic S1/S2).
+///
+/// See [`resolve_license_entries`] for the sibling used to *evaluate* the same data
+/// against a [`LicensePolicy`]. Differs from it in exactly the two ways display needs:
+/// - **Never drops an entry.** [`resolve_license_entries`] fails closed and drops an
+///   entry [`normalize_pom_license_name`] doesn't recognize (correct for policy
+///   evaluation: never fabricate a violation from guessed data) — but the
+///   `KNOWN_POM_LICENSE_NAMES` table is deliberately non-exhaustive (see the module
+///   docs above), so dropping is the *designed-for* path, not a rare edge case, and
+///   applying it to hover made the license line silently vanish for any unrecognized
+///   POM name. Falls back to the raw text instead, since showing the author's declared
+///   string is strictly more useful to a reader than showing nothing.
+/// - **One id per entry when the ids are synonyms, not a policy-matching slice.** A POM
+///   name ambiguous between SPDX conventions (e.g. the GPL family) normalizes to three
+///   synonymous ids for [`resolve_license_entries`] so a `deny`/`allow` list written in
+///   any of them still matches — correct for policy, but printing `` `GPL-3.0`,
+///   `GPL-3.0-only`, `GPL-3.0-or-later` `` in hover for what is genuinely one declared
+///   license reads as three licenses. Keeps only the first (canonical) id in that case —
+///   but a genuinely disjunctive entry (`"CDDL + GPLv2 with classpath exception"` names
+///   two unrelated licenses, not synonyms of one) still shows every id, or a
+///   dual-licensed dependency would misleadingly read as single-licensed. See this
+///   module's private `ids_are_synonyms` helper for how the two shapes are told apart.
+///
+/// Entries are deduplicated (preserving first-seen order), same as
+/// [`normalize_pom_license_names_checked`].
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::LicenseSource;
+/// use deps_core::licenses::resolve_license_entries_for_display;
+///
+/// // Recognized: normalizes to its canonical id, like `resolve_license_entries`.
+/// let ids = resolve_license_entries_for_display(
+///     LicenseSource::PomFreeText,
+///     &["The Apache Software License, Version 2.0".to_string()],
+/// );
+/// assert_eq!(ids, vec!["Apache-2.0".to_string()]);
+///
+/// // Unrecognized: falls back to the raw text instead of vanishing (issue #687 S1).
+/// let ids = resolve_license_entries_for_display(
+///     LicenseSource::PomFreeText,
+///     &["Some Bespoke Corporate License".to_string()],
+/// );
+/// assert_eq!(ids, vec!["Some Bespoke Corporate License".to_string()]);
+///
+/// // Ambiguous SPDX convention: one canonical id, not the full policy-matching slice
+/// // (issue #687 S2).
+/// let ids = resolve_license_entries_for_display(
+///     LicenseSource::PomFreeText,
+///     &["GNU General Public License v3".to_string()],
+/// );
+/// assert_eq!(ids, vec!["GPL-3.0".to_string()]);
+///
+/// // Genuinely disjunctive (two unrelated licenses, not synonyms of one): both ids
+/// // are kept, unlike the GPL-family case above (code-review must-fix).
+/// let ids = resolve_license_entries_for_display(
+///     LicenseSource::PomFreeText,
+///     &["CDDL + GPLv2 with classpath exception".to_string()],
+/// );
+/// assert_eq!(
+///     ids,
+///     vec!["CDDL-1.1".to_string(), "GPL-2.0-with-classpath-exception".to_string()]
+/// );
+/// ```
+#[must_use]
+pub fn resolve_license_entries_for_display(
+    source: crate::LicenseSource,
+    raw: &[String],
+) -> Vec<String> {
+    match source {
+        crate::LicenseSource::PomFreeText => {
+            let mut resolved = Vec::new();
+            for name in raw {
+                let ids = normalize_pom_license_name(name);
+                let display_ids: Vec<String> = if ids.is_empty() {
+                    vec![name.clone()]
+                } else if ids_are_synonyms(&ids) {
+                    // Safe to collapse: every id names the same declared license,
+                    // just a different SPDX-convention spelling of it.
+                    ids.into_iter().take(1).collect()
+                } else {
+                    // A genuine multi-license OR (e.g. `"CDDL + GPLv2 with classpath
+                    // exception"`) — every id names a different license, so all must
+                    // be shown or a dual-licensed dependency reads as single-licensed.
+                    ids
+                };
+                for id in display_ids {
+                    if !resolved.contains(&id) {
+                        resolved.push(id);
+                    }
+                }
+            }
+            resolved
+        }
+        crate::LicenseSource::RegistryDeclaredSpdx | crate::LicenseSource::DetectedSpdx => {
+            raw.to_vec()
+        }
+    }
+}
+
+/// Whether `ids` — one [`KNOWN_POM_LICENSE_NAMES`] entry's normalized SPDX id list —
+/// represents interchangeable synonyms of a single declared license (safe for
+/// [`resolve_license_entries_for_display`] to collapse to one representative id)
+/// rather than a genuine multi-license OR (every id must be shown, code-review
+/// must-fix: collapsing `"CDDL + GPLv2 with classpath exception"` to one id
+/// misrepresented a dual-licensed dependency as solely CDDL-licensed).
+///
+/// Every synonym-set entry in the table is formed by SPDX's own `-only`/`-or-later`
+/// suffix convention over one shared base id (e.g. `GPL-3.0`, `GPL-3.0-only`,
+/// `GPL-3.0-or-later` — see the table's own doc comment on why free text can't
+/// disambiguate the convention), so every id after the first is that first id with a
+/// suffix appended. The table's one genuinely disjunctive entry names two unrelated
+/// license families with no such shared prefix, so a plain prefix check tells the two
+/// shapes apart without a separate marker on every one of the table's ~90 rows. A
+/// single-id (or empty) list is trivially "synonyms" — there is nothing to collapse.
+fn ids_are_synonyms(ids: &[String]) -> bool {
+    match ids.split_first() {
+        Some((first, rest)) => rest.iter().all(|id| id.starts_with(first.as_str())),
+        None => true,
+    }
+}
+
 /// Case-insensitive `haystack.contains(needle)` for SPDX identifiers —
 /// registry-declared and user-configured license strings are free text, not
 /// a normalized enum, mirroring `deps-core::lsp_helpers::hover`'s
@@ -1136,6 +1315,38 @@ mod tests {
                     "duplicate (case-insensitive) table key: {key_a:?}"
                 );
             }
+        }
+    }
+
+    /// Code-review follow-up: `ids_are_synonyms` assumes every synonym-set entry in
+    /// `KNOWN_POM_LICENSE_NAMES` lists its base SPDX id first, with every later id
+    /// formed by appending an `-only`/`-or-later` suffix to it —
+    /// `resolve_license_entries_for_display` relies on that ordering to collapse a
+    /// synonym set to one id for hover (issue #687 S2) without also collapsing the
+    /// table's genuinely disjunctive entry. This walks the whole table and locks the
+    /// classification in, so a future entry added base-id-last (or a new disjunctive
+    /// entry not added to `DISJUNCTIVE_KEYS` below) fails loudly here instead of
+    /// silently breaking hover's collapse/no-collapse decision.
+    #[test]
+    fn known_pom_license_names_synonym_entries_list_base_id_first() {
+        // The table's only entry naming two genuinely unrelated licenses (not
+        // convention-ambiguous synonyms of one) — see that entry's own comment.
+        const DISJUNCTIVE_KEYS: &[&str] = &["CDDL + GPLv2 with classpath exception"];
+
+        for &(key, ids) in KNOWN_POM_LICENSE_NAMES {
+            let ids_owned: Vec<String> = ids.iter().map(|id| (*id).to_string()).collect();
+            let expected_disjunctive = DISJUNCTIVE_KEYS.contains(&key);
+            assert_eq!(
+                ids_are_synonyms(&ids_owned),
+                !expected_disjunctive,
+                "{key:?} -> {ids:?}: expected {}, ids_are_synonyms said {}",
+                if expected_disjunctive {
+                    "disjunctive (base id not first, or a new genuine OR)"
+                } else {
+                    "synonyms (base id first)"
+                },
+                ids_are_synonyms(&ids_owned)
+            );
         }
     }
 

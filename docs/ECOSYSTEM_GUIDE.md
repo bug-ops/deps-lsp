@@ -651,25 +651,45 @@ a dependency, the section is omitted rather than shown as "unknown".
 
 Dart, Swift, Gradle, and Deno (issue #660) are covered via a per-ecosystem
 background pre-fetch (mirroring the OSV vulnerability-scan pattern — never
-blocking hover latency) instead of the deps.dev/Packagist hot-path call above:
+blocking hover latency) instead of the deps.dev/Packagist hot-path call above.
+This pre-fetch has its own **10-second timeout floor**, independent of a lower
+configured [`fetch_timeout_secs`](../README.md#configuration-reference) (which
+can be set as low as 1s): Gradle's `<parent>` POM traversal (below) may need up
+to a few sequential HTTPS round trips for one dependency, so clamping the
+pre-fetch's timeout down to a very low `fetch_timeout_secs` would silently
+starve exactly the parent-chained licenses this feature exists to resolve
+(issue #692 critic M2). A user tuning `fetch_timeout_secs` down for fast
+feedback on the hot registry-fetch path is unaffected there — only this
+background license pre-fetch keeps a higher floor.
 
 | Ecosystem | Source | Renders as |
 |-----------|--------|------------|
 | Dart | pub.dev `/score` best-effort license *detector* tag, per-**package** (not per-version) | `**License (detected)**` |
 | Swift | GitHub's `licensee`-detected `license.spdx_id` on the repository's default branch (not the resolved version's tag) | `**License (detected)**` |
-| Gradle | Maven Central POM `<license><name>`, fetched for the resolved version | `**License**` |
+| Gradle | Maven Central POM `<license><name>`, fetched for the resolved version — following the POM's `<parent>` coordinate (bounded to a few hops) when that POM declares no `<licenses>` block of its own (issue #692, e.g. Guava's license is declared only on `guava-parent`'s POM) | `**License**` |
 | Deno | JSR's per-version `license` field (`jsr:` specifiers only) | `**License**` |
 
-Dart and Swift render the `(detected)` qualifier because their license comes from
-a best-effort *detector*, not author-declared registry metadata — visually
-distinguishing them from every other source, including Gradle/Deno, which are
-genuinely registry-declared. Gradle's POM license is free text (e.g. `"The Apache
-Software License, Version 2.0"`), not an SPDX identifier — hover always renders it
-as-is (unnormalized); see [License Policy Diagnostic](#license-policy-diagnostic-issue-661)
-below for how that free text is normalized to SPDX for policy *evaluation* only.
-Dart/Swift have no license data at all without a resolved version
-(`pubspec.lock`/`Package.resolved` — both endpoints require an in-use version to
-look up, even though the data itself isn't version-specific).
+Which of these four "sources" a dependency's license is depends on the ecosystem
+crate's `Ecosystem::license_source()` (issue #688): `RegistryDeclaredSpdx`
+(author-declared, the default — every ecosystem above except Dart/Swift/Gradle),
+`DetectedSpdx` (Dart/Swift — a best-effort *detector*, not author-declared
+metadata, hence the `(detected)` qualifier), or `PomFreeText` (Gradle only —
+Maven POM `<license><name>` free text, e.g. `"The Apache Software License,
+Version 2.0"`, never an SPDX identifier). Gradle's free text is normalized once,
+at the shared pre-fetch data boundary (issue #687), but hover and
+[License Policy Diagnostic](#license-policy-diagnostic-issue-661) below use two
+different views of that normalization
+(`deps_core::licenses::resolve_license_entries_for_display` vs
+`resolve_license_entries`), not identical output: hover renders a single
+canonical id (`Apache-2.0`), while policy evaluation gets the full
+SPDX-convention-ambiguous synonym slice a `deny`/`allow` list needs to match
+against (the GPL family normalizes to three ids — see below) — printing all
+three in hover would read as three licenses for what is genuinely one. A POM
+name the normalization table doesn't recognize falls back to the raw text in
+hover (never silently vanishes) but is dropped, not guessed at, for policy
+evaluation. Dart/Swift have no license data at all without a resolved version
+(`pubspec.lock`/`Package.resolved` — both endpoints require an in-use version
+to look up, even though the data itself isn't version-specific).
 
 ### License Policy Diagnostic (issue #661)
 
@@ -715,10 +735,14 @@ falsely flagged, but it is also **not enforced** — it is excluded from
 evaluation rather than guessed at, the same as a dependency with no license
 data. The table is not exhaustive; an unrecognized license on a `deny` list
 silently escapes enforcement until that variant is added to
-`KNOWN_POM_LICENSE_NAMES`. Hover still shows Gradle's free-text license as-is
-(see [License Hover](#license-hover) above); only policy *evaluation* uses the
-normalized SPDX id — the license-policy diagnostic message for Gradle therefore
-reads e.g. `Apache-2.0`, not the original free text.
+`KNOWN_POM_LICENSE_NAMES`. Hover and this diagnostic normalize through the same
+data boundary but read two different views of it (see [License Hover](#license-hover)
+above, issue #687): a recognized entry's diagnostic message shows the same
+canonical id hover does (e.g. `Apache-2.0`), but an SPDX-convention-ambiguous
+entry's message may list more ids than hover's single canonical one (the GPL
+family's `GPL-3.0`, `GPL-3.0-only`, `GPL-3.0-or-later`) — that expansion is
+policy-matching evidence, not something hover should also print. Either way,
+neither surface ever shows the original free text for a recognized entry.
 
 This diagnostic is evaluated identically whether it was triggered by a
 `textDocument/diagnostic` pull request or a background push refresh (a

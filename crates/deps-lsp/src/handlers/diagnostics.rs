@@ -226,6 +226,7 @@ pub(crate) async fn generate_diagnostics_internal(
         .with_outcomes(&outcomes)
         .with_ecosystem(ecosystem_id)
         .with_offline(offline)
+        .with_license_source(ecosystem.license_source())
         .with_license_policy(&policy)
         .with_license_prefetch(&licenses);
 

@@ -50,15 +50,6 @@ impl DartEcosystem {
         )
         .await
     }
-
-    /// Fetches `name`'s best-effort detected license (issue #660), for
-    /// `deps-lsp::document::lifecycle::run_license_prefetch`'s tier-3 background
-    /// pre-fetch — never called from the hover critical path directly. See
-    /// [`crate::registry::PubDevRegistry::get_license`] for the source and its
-    /// "detected, not declared" caveat.
-    pub async fn fetch_license(&self, name: &str) -> Vec<String> {
-        self.registry.get_license(name).await
-    }
 }
 
 impl deps_core::ecosystem::private::Sealed for DartEcosystem {}
@@ -134,6 +125,24 @@ impl Ecosystem for DartEcosystem {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    /// Fetches `name`'s best-effort detected license (issue #660/#688) — `version` is
+    /// unused, since pub.dev's `/score` endpoint is per-*package*, not per-version. See
+    /// [`crate::registry::PubDevRegistry::get_license`] for the source and its
+    /// "detected, not declared" caveat.
+    fn fetch_license<'a>(
+        &'a self,
+        name: &'a str,
+        _version: &'a str,
+    ) -> Option<deps_core::ecosystem::BoxFuture<'a, Vec<String>>> {
+        Some(Box::pin(self.registry.get_license(name)))
+    }
+
+    /// pub.dev's `/score` endpoint is pana's own license-detection heuristic, not an
+    /// author-declared registry field — see [`deps_core::LicenseSource::DetectedSpdx`].
+    fn license_source(&self) -> deps_core::LicenseSource {
+        deps_core::LicenseSource::DetectedSpdx
     }
 }
 

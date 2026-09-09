@@ -315,6 +315,42 @@ impl Default for EcosystemConfig {
     }
 }
 
+/// How this ecosystem's license strings are sourced.
+///
+/// Drives two ecosystem-specific license behaviors that used to be re-derived
+/// independently at each consumer via a non-exhaustive `matches!`/`==` on
+/// [`EcosystemId`] instead of the sealed [`Ecosystem`] trait every other per-ecosystem
+/// capability goes through (issue #688): hover's "(detected)" qualifier, which only
+/// applies to [`Self::DetectedSpdx`], and whether
+/// [`crate::licenses::resolve_license_entries`] must normalize free text to SPDX
+/// identifiers before hover displays it or a [`crate::licenses::LicensePolicy`]
+/// evaluates it, which only applies to [`Self::PomFreeText`].
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::LicenseSource;
+///
+/// assert_eq!(LicenseSource::default(), LicenseSource::RegistryDeclaredSpdx);
+/// assert_ne!(LicenseSource::PomFreeText, LicenseSource::DetectedSpdx);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LicenseSource {
+    /// Author-declared SPDX identifier(s) in registry metadata — the default for every
+    /// ecosystem that doesn't override [`Ecosystem::license_source`].
+    #[default]
+    RegistryDeclaredSpdx,
+    /// A detector's best-effort guess, not an author declaration: pub.dev's `/score`
+    /// endpoint (Dart) and GitHub's `license.spdx_id` (Swift) are both driven by a
+    /// license-detection heuristic run against repository content, rather than metadata
+    /// the package author explicitly declared to a registry.
+    DetectedSpdx,
+    /// Maven POM `<licenses><license><name>` free text (Gradle) — never an SPDX
+    /// identifier, so it must be normalized via
+    /// [`crate::licenses::resolve_license_entries`] before display or policy evaluation.
+    PomFreeText,
+}
+
 /// Main trait that all ecosystem implementations must implement.
 ///
 /// Each ecosystem (Cargo, npm, PyPI, etc.) provides its own implementation.
@@ -540,7 +576,11 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     /// Generate hover information for a position.
     ///
     /// Default implementation delegates to `lsp_helpers::generate_hover`
-    /// using `self.formatter()` and `self.registry()`.
+    /// using `self.formatter()` and `self.registry()`. `versions.license_source` is
+    /// attached by the caller (`deps-lsp::handlers::hover`), not here — the single
+    /// `VersionData` construction site every path funnels through, override or not
+    /// (issue #688 critic M1: attaching it in this default only would silently drop it
+    /// for the ecosystems that override `generate_hover` instead of using this default).
     fn generate_hover<'a>(
         &'a self,
         parse_result: &'a dyn ParseResult,
@@ -599,7 +639,9 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     /// Generate diagnostics for the document.
     ///
     /// Default implementation delegates to `lsp_helpers::generate_diagnostics_from_cache`
-    /// using `self.formatter()`.
+    /// using `self.formatter()`. `versions.license_source` is attached by the caller
+    /// (`deps-lsp::handlers::diagnostics`), not here — see [`Self::generate_hover`]'s doc
+    /// for why (issue #688 critic M1).
     fn generate_diagnostics<'a>(
         &'a self,
         parse_result: &'a dyn ParseResult,
@@ -719,6 +761,38 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     /// package-name search is always exhaustive.
     fn package_search_is_incomplete(&self) -> bool {
         false
+    }
+
+    /// Fetches `name`'s license at `version` from this ecosystem's own tier-3 license
+    /// source (issue #660/#688), for
+    /// `deps-lsp::document::lifecycle::run_license_prefetch`'s background pre-fetch —
+    /// never called from the hover critical path directly, since it may perform network
+    /// I/O.
+    ///
+    /// Returns `None` when this ecosystem has no tier-3 license source of its own —
+    /// either its hot-path registry response already carries a license field, or
+    /// `deps_dev_system` (this crate's `deps_dev` module) covers it. `Some` for the four
+    /// ecosystems (Dart, Swift, Gradle, Deno) whose license needs a dedicated fetch. An
+    /// `async fn` body returns a lazy future that performs no I/O until polled, so a
+    /// caller may test capability alone (`fetch_license(name, version).is_some()`)
+    /// without triggering a fetch — `deps-lsp`'s `document::lifecycle::run_license_prefetch`
+    /// ecosystem gate relies on exactly this.
+    fn fetch_license<'a>(
+        &'a self,
+        _name: &'a str,
+        _version: &'a str,
+    ) -> Option<BoxFuture<'a, Vec<String>>> {
+        None
+    }
+
+    /// How this ecosystem's license strings are sourced. See [`LicenseSource`].
+    ///
+    /// Default [`LicenseSource::RegistryDeclaredSpdx`] is correct for every ecosystem
+    /// whose license is an author-declared SPDX identifier from registry metadata —
+    /// every ecosystem except Dart/Swift (detector output) and Gradle (POM free text),
+    /// which override this.
+    fn license_source(&self) -> LicenseSource {
+        LicenseSource::RegistryDeclaredSpdx
     }
 
     /// Support for downcasting to concrete ecosystem type

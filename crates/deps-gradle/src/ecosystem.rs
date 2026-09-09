@@ -60,15 +60,6 @@ impl GradleEcosystem {
         .await
     }
 
-    /// Fetches `coordinate`'s (`"group:artifact"`) license at `version` from Maven
-    /// Central (issue #660), for
-    /// `deps-lsp::document::lifecycle::run_license_prefetch`'s tier-3 background
-    /// pre-fetch — never called from the hover critical path directly. See
-    /// `crate::license::fetch_license`.
-    pub async fn fetch_license(&self, coordinate: &str, version: &str) -> Vec<String> {
-        crate::license::fetch_license(&self.http_cache, coordinate, version).await
-    }
-
     /// Detects completion context for Gradle files at the given position.
     ///
     /// Returns `(context_type, value, range)` where `context_type` is
@@ -361,6 +352,28 @@ impl Ecosystem for GradleEcosystem {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    /// Fetches `name`'s (`"group:artifact"`) license at `version` from Maven Central,
+    /// following one or more `<parent>` POM hops when the leaf POM declares no
+    /// `<licenses>` block of its own (issue #660/#688/#692). See
+    /// `crate::license::fetch_license`.
+    fn fetch_license<'a>(
+        &'a self,
+        name: &'a str,
+        version: &'a str,
+    ) -> Option<deps_core::ecosystem::BoxFuture<'a, Vec<String>>> {
+        Some(Box::pin(crate::license::fetch_license(
+            &self.http_cache,
+            name,
+            version,
+        )))
+    }
+
+    /// Gradle's Maven Central POM `<licenses><license><name>` is free text, not an SPDX
+    /// identifier — see [`deps_core::LicenseSource::PomFreeText`].
+    fn license_source(&self) -> deps_core::LicenseSource {
+        deps_core::LicenseSource::PomFreeText
     }
 }
 

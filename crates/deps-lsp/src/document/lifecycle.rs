@@ -624,20 +624,11 @@ async fn run_osv_scan_phase_a(
     })
 }
 
-/// Ecosystems `deps_dev_system` doesn't cover and whose hot-path registry response
-/// carries no license field (issue #660, spec 010 plan §1 tier 3) — the only four
-/// [`run_license_prefetch`] ever does any work for.
-fn is_license_prefetch_ecosystem(ecosystem_id: EcosystemId) -> bool {
-    matches!(
-        ecosystem_id,
-        EcosystemId::Dart | EcosystemId::Swift | EcosystemId::Gradle | EcosystemId::Deno
-    )
-}
-
-/// Background pre-fetch of each dependency's license, for the four ecosystems
-/// [`is_license_prefetch_ecosystem`] covers (issue #660, spec 010 plan §1 tier 3):
-/// pub.dev's `/score` endpoint (Dart), the GitHub repository API (Swift), a Maven
-/// Central POM fetch (Gradle), and the JSR per-version API (Deno). Mirrors
+/// Background pre-fetch of each dependency's license, for whichever ecosystems
+/// override [`deps_core::Ecosystem::fetch_license`] (issue #660/#688, spec 010 plan §1
+/// tier 3) — today, pub.dev's `/score` endpoint (Dart), the GitHub repository API
+/// (Swift), a Maven Central POM fetch (Gradle), and the JSR per-version API (Deno).
+/// Mirrors
 /// [`run_osv_scan_phase_a`]'s spawn-concurrently-with-the-registry-fetch shape, but
 /// commits directly with no phase B. Callers must `.await` the returned
 /// [`JoinHandle`] (via `tokio::spawn`) before their own diagnostics publish, exactly
@@ -686,7 +677,10 @@ async fn run_license_prefetch(
     fetch_timeout_secs: u64,
 ) {
     let ecosystem_id = resolve_ecosystem_id(ecosystem.as_ref());
-    if !is_license_prefetch_ecosystem(ecosystem_id) {
+    // An `async fn` body performs no I/O until polled, so probing capability with dummy
+    // arguments here triggers no network call — see [`deps_core::Ecosystem::fetch_license`]'s
+    // doc comment.
+    if ecosystem.fetch_license("", "").is_none() {
         return;
     }
 
@@ -724,14 +718,16 @@ async fn run_license_prefetch(
 
     use futures::stream::{self, StreamExt};
 
-    let timeout_duration =
-        Duration::from_secs(fetch_timeout_secs.min(LICENSE_PREFETCH_TIMEOUT_CEILING_SECS));
+    let timeout_duration = Duration::from_secs(fetch_timeout_secs.clamp(
+        LICENSE_PREFETCH_TIMEOUT_FLOOR_SECS,
+        LICENSE_PREFETCH_TIMEOUT_CEILING_SECS,
+    ));
     let ecosystem = &ecosystem;
     let licenses: HashMap<PackageName, Vec<String>> = stream::iter(targets)
         .map(|(name, version)| async move {
             let found = tokio::time::timeout(
                 timeout_duration,
-                fetch_tier3_license(ecosystem.as_ref(), ecosystem_id, name.as_str(), &version),
+                fetch_tier3_license(ecosystem.as_ref(), name.as_str(), &version),
             )
             .await
             .unwrap_or_else(|_| {
@@ -773,80 +769,31 @@ const LICENSE_PREFETCH_CONCURRENCY: usize = 8;
 /// longer than that would never actually bind.
 const LICENSE_PREFETCH_TIMEOUT_CEILING_SECS: u64 = 30;
 
-/// Dispatches to the concrete ecosystem's license fetch, downcasting `ecosystem` via
-/// [`Ecosystem::as_any`] rather than adding a new sealed-trait method — license
-/// pre-fetch is a tier-3-only concern (four ecosystems), not a capability every
-/// `Ecosystem` implementor needs to carry. Returns an empty `Vec` (graceful
-/// degradation, spec 010 NFR-003) for any ecosystem other than the four
-/// [`is_license_prefetch_ecosystem`] covers, or when the downcast fails (the ecosystem
-/// crate's Cargo feature is disabled, so no instance of that concrete type can ever
-/// reach this function).
-async fn fetch_tier3_license(
-    ecosystem: &dyn Ecosystem,
-    ecosystem_id: EcosystemId,
-    name: &str,
-    version: &str,
-) -> Vec<String> {
-    match ecosystem_id {
-        EcosystemId::Dart => {
-            #[cfg(feature = "dart")]
-            if let Some(eco) = ecosystem
-                .as_any()
-                .downcast_ref::<deps_dart::DartEcosystem>()
-            {
-                return eco.fetch_license(name).await;
-            }
-            Vec::new()
-        }
-        EcosystemId::Swift => {
-            #[cfg(feature = "swift")]
-            if let Some(eco) = ecosystem
-                .as_any()
-                .downcast_ref::<deps_swift::SwiftEcosystem>()
-            {
-                return eco.fetch_license(name).await;
-            }
-            Vec::new()
-        }
-        EcosystemId::Gradle => {
-            #[cfg(feature = "gradle")]
-            if let Some(eco) = ecosystem
-                .as_any()
-                .downcast_ref::<deps_gradle::GradleEcosystem>()
-            {
-                return eco.fetch_license(name, version).await;
-            }
-            Vec::new()
-        }
-        EcosystemId::Deno => {
-            #[cfg(feature = "deno")]
-            if let Some(eco) = ecosystem
-                .as_any()
-                .downcast_ref::<deps_deno::DenoEcosystem>()
-            {
-                return eco.fetch_license(name, version).await;
-            }
-            Vec::new()
-        }
-        // Every non-tier-3 ecosystem (round 3 finding #4): an exhaustive match, not a
-        // bare `_`, so this project's #118 precedent applies here too — adding a 15th
-        // `EcosystemId` variant forces a compile error at this call site instead of
-        // silently falling through to an empty-forever result for it. All of these
-        // ecosystems are either `deps_dev_system`-covered (tier 2) or already carry a
-        // native license field, so none is ever routed here in the first place —
-        // `run_license_prefetch`'s [`is_license_prefetch_ecosystem`] gate means this
-        // function is never even called for them, but the match must still say so
-        // explicitly rather than relying on that caller-side gate alone.
-        EcosystemId::Cargo
-        | EcosystemId::Npm
-        | EcosystemId::Pypi
-        | EcosystemId::Go
-        | EcosystemId::Bundler
-        | EcosystemId::Maven
-        | EcosystemId::Composer
-        | EcosystemId::NuGet
-        | EcosystemId::GithubActions
-        | EcosystemId::GitlabCi => Vec::new(),
+/// Floor on the per-dependency tier-3 license fetch timeout, independent of the
+/// configured `fetch_timeout_secs` (issue #692 critic M2). `fetch_timeout_secs` is
+/// user-configurable down to a minimum of 1s (see `config.rs`'s validation), but
+/// `deps_gradle::license::fetch_license_from` may now perform up to
+/// `deps_gradle::license::MAX_POM_FETCHES` **sequential** HTTPS round trips inside the
+/// single `tokio::time::timeout` this budget bounds, where it previously performed one
+/// — a low `fetch_timeout_secs` would otherwise silently starve exactly the
+/// parent-chained artifacts (e.g. Guava) issue #692 exists to resolve. This pre-fetch is
+/// a background nice-to-have, never on the hover critical path (see
+/// [`run_license_prefetch`]'s doc), so raising its effective minimum costs nothing but a
+/// few extra seconds before this best-effort signal gives up.
+const LICENSE_PREFETCH_TIMEOUT_FLOOR_SECS: u64 = 10;
+
+/// Dispatches to `ecosystem`'s own [`Ecosystem::fetch_license`] (issue #688 — previously
+/// a hand-written exhaustive `match` on [`EcosystemId`] downcasting via
+/// [`Ecosystem::as_any`] to one of four concrete tier-3 ecosystem types). Returns an
+/// empty `Vec` (graceful degradation, spec 010 NFR-003) for any ecosystem that returns
+/// `None` — every ecosystem this is actually called for already passed
+/// [`run_license_prefetch`]'s own `fetch_license(..).is_some()` gate, so `None` here
+/// would only happen if that gate's result somehow changed between the two calls, which
+/// it cannot for a `&self`-based capability check.
+async fn fetch_tier3_license(ecosystem: &dyn Ecosystem, name: &str, version: &str) -> Vec<String> {
+    match ecosystem.fetch_license(name, version) {
+        Some(fut) => fut.await,
+        None => Vec::new(),
     }
 }
 
@@ -3348,21 +3295,72 @@ mod tests {
     mod license_prefetch_tests {
         use super::*;
 
+        /// Issue #688: the ecosystem gate is now `Ecosystem::fetch_license(..).is_some()`
+        /// directly, not a hand-written `EcosystemId` predicate — this exercises the real
+        /// concrete ecosystem instances (routed through `EcosystemRegistry`, mirroring
+        /// the live end-to-end tests below) rather than re-deriving a second parallel
+        /// list of "which four" ecosystems here.
         #[test]
-        fn is_license_prefetch_ecosystem_covers_exactly_the_four_tier3_ecosystems() {
-            assert!(is_license_prefetch_ecosystem(EcosystemId::Dart));
-            assert!(is_license_prefetch_ecosystem(EcosystemId::Swift));
-            assert!(is_license_prefetch_ecosystem(EcosystemId::Gradle));
-            assert!(is_license_prefetch_ecosystem(EcosystemId::Deno));
+        fn fetch_license_is_some_only_for_the_four_tier3_ecosystems() {
+            let state = ServerState::new();
 
-            assert!(!is_license_prefetch_ecosystem(EcosystemId::Cargo));
-            assert!(!is_license_prefetch_ecosystem(EcosystemId::Npm));
-            assert!(!is_license_prefetch_ecosystem(EcosystemId::Pypi));
-            assert!(!is_license_prefetch_ecosystem(EcosystemId::Go));
-            assert!(!is_license_prefetch_ecosystem(EcosystemId::Bundler));
-            assert!(!is_license_prefetch_ecosystem(EcosystemId::Maven));
-            assert!(!is_license_prefetch_ecosystem(EcosystemId::Composer));
-            assert!(!is_license_prefetch_ecosystem(EcosystemId::NuGet));
+            #[cfg(feature = "dart")]
+            {
+                let uri = deps_core::test_util::test_uri("/test/pubspec.yaml");
+                let eco = state
+                    .ecosystem_registry
+                    .get_for_uri(&uri)
+                    .expect("Dart ecosystem not found");
+                assert!(eco.fetch_license("http", "1.0.0").is_some());
+            }
+            #[cfg(feature = "swift")]
+            {
+                let uri = deps_core::test_util::test_uri("/test/Package.swift");
+                let eco = state
+                    .ecosystem_registry
+                    .get_for_uri(&uri)
+                    .expect("Swift ecosystem not found");
+                assert!(eco.fetch_license("apple/swift-nio", "2.0.0").is_some());
+            }
+            #[cfg(feature = "gradle")]
+            {
+                let uri = deps_core::test_util::test_uri("/test/build.gradle.kts");
+                let eco = state
+                    .ecosystem_registry
+                    .get_for_uri(&uri)
+                    .expect("Gradle ecosystem not found");
+                assert!(
+                    eco.fetch_license("com.squareup.okhttp3:okhttp", "4.12.0")
+                        .is_some()
+                );
+            }
+            #[cfg(feature = "deno")]
+            {
+                let uri = deps_core::test_util::test_uri("/test/deno.json");
+                let eco = state
+                    .ecosystem_registry
+                    .get_for_uri(&uri)
+                    .expect("Deno ecosystem not found");
+                assert!(eco.fetch_license("jsr:@std/fs", "1.0.0").is_some());
+            }
+            #[cfg(feature = "cargo")]
+            {
+                let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+                let eco = state
+                    .ecosystem_registry
+                    .get_for_uri(&uri)
+                    .expect("Cargo ecosystem not found");
+                assert!(eco.fetch_license("serde", "1.0.0").is_none());
+            }
+            #[cfg(feature = "npm")]
+            {
+                let uri = deps_core::test_util::test_uri("/test/package.json");
+                let eco = state
+                    .ecosystem_registry
+                    .get_for_uri(&uri)
+                    .expect("npm ecosystem not found");
+                assert!(eco.fetch_license("left-pad", "1.0.0").is_none());
+            }
         }
 
         /// A non-tier-3 ecosystem must return immediately without touching
@@ -3508,6 +3506,53 @@ mod tests {
                 doc.licenses
                     .contains_key(&PackageName::new("com.squareup.okhttp3:okhttp")),
                 "expected a pre-fetched license for 'com.squareup.okhttp3:okhttp', got: {:?}",
+                doc.licenses
+            );
+        }
+
+        /// Live end-to-end, issue #692: Guava's own leaf POM
+        /// (`guava-32.0.1-jre.pom`) has no `<licenses>` block at all — the license is
+        /// declared only on its `guava-parent` POM. Unlike the okhttp test above (whose
+        /// own leaf POM already carries `<licenses>`), this specifically exercises
+        /// `fetch_license_from`'s `<parent>`-following path against real Maven Central.
+        #[cfg(feature = "gradle")]
+        #[tokio::test]
+        #[ignore = "hits the real Maven Central API"]
+        async fn run_license_prefetch_live_gradle_follows_parent_pom_for_guava() {
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/build.gradle.kts");
+            let content =
+                "dependencies {\n    implementation(\"com.google.guava:guava:32.0.1-jre\")\n}\n";
+
+            let ecosystem = state
+                .ecosystem_registry
+                .get_for_uri(&uri)
+                .expect("Gradle ecosystem not found");
+            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let mut doc_state = DocumentState::new_from_parse_result(
+                EcosystemId::Gradle,
+                content.to_string(),
+                parse_result,
+            );
+            doc_state.update_resolved_versions(
+                HashMap::from([(
+                    PackageName::new("com.google.guava:guava"),
+                    "32.0.1-jre".into(),
+                )]),
+                HashMap::new(),
+            );
+            state.update_document(uri.clone(), doc_state);
+
+            run_license_prefetch(uri.clone(), Arc::clone(&state), ecosystem, 5).await;
+
+            let doc = state.get_document(&uri).unwrap();
+            let license = doc
+                .licenses
+                .get(&PackageName::new("com.google.guava:guava"));
+            assert!(
+                license.is_some_and(|l| !l.is_empty()),
+                "expected a pre-fetched license for 'com.google.guava:guava' via its \
+                 parent POM, got: {:?}",
                 doc.licenses
             );
         }
