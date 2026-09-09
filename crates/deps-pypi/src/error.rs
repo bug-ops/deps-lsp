@@ -16,18 +16,25 @@ use thiserror::Error;
 pub enum PypiError {
     /// Failed to parse pyproject.toml
     #[error("Failed to parse pyproject.toml: {message}")]
-    TomlParseError { message: String },
+    TomlParseError {
+        /// Description of the TOML parse failure.
+        message: String,
+    },
 
     /// Invalid PEP 508 dependency specification
     #[error("Invalid PEP 508 dependency specification: {source}")]
     InvalidDependencySpec {
+        /// The underlying PEP 508 parser error.
         #[source]
         source: pep508_rs::Pep508Error,
     },
 
     /// Unsupported dependency format
     #[error("Unsupported dependency format: {message}")]
-    UnsupportedFormat { message: String },
+    UnsupportedFormat {
+        /// Description of why the format is unsupported.
+        message: String,
+    },
 
     /// PEP 508 requirement string exceeded the length cap protecting against
     /// `pep508_rs`'s O(n²) extras-list parser (see
@@ -37,7 +44,12 @@ pub enum PypiError {
     /// two must be counted differently by heuristics like the
     /// `requirements.txt` "is this really a manifest" signal.
     #[error("requirement string too long: {len} bytes (max {max} bytes)")]
-    RequirementTooLong { len: usize, max: usize },
+    RequirementTooLong {
+        /// Length of the rejected requirement string, in bytes.
+        len: usize,
+        /// The length cap that was exceeded, in bytes.
+        max: usize,
+    },
 }
 
 /// Result type alias for PyPI operations.

@@ -54,6 +54,7 @@ fn reject_dot_segment(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// pub.dev registry client implementing [`deps_core::Registry`] for Dart/Pub.
 #[derive(Clone)]
 pub struct PubDevRegistry {
     cache: Arc<HttpCache>,
@@ -64,6 +65,7 @@ pub struct PubDevRegistry {
 }
 
 impl PubDevRegistry {
+    /// Creates a client backed by the given shared HTTP cache, pointed at the real pub.dev API.
     pub fn new(cache: Arc<HttpCache>) -> Self {
         Self {
             cache,
@@ -78,6 +80,12 @@ impl PubDevRegistry {
         Self { cache, base }
     }
 
+    /// Fetches all published versions of a package from pub.dev.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `name` is a dot-segment, the request fails, or the
+    /// response body fails to parse.
     #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
     pub async fn get_versions(&self, name: &str) -> Result<Vec<DartVersion>> {
         reject_dot_segment(name)?;
@@ -86,6 +94,11 @@ impl PubDevRegistry {
         parse_versions_response(&data)
     }
 
+    /// Returns the newest non-retracted version of `name` matching `req_str`, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if fetching the package's versions fails.
     #[tracing::instrument(skip_all, fields(package = ?name, version = ?req_str), level = "debug")]
     pub async fn get_latest_matching(
         &self,
@@ -98,6 +111,11 @@ impl PubDevRegistry {
         }))
     }
 
+    /// Searches pub.dev for packages matching `query`, returning at most `limit` results.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the search request fails or its response body fails to parse.
     #[tracing::instrument(skip_all, fields(query = ?query), level = "debug")]
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<PackageInfo>> {
         let url = format!("{}/search?q={}", self.base, urlencoding::encode(query));
@@ -124,6 +142,12 @@ impl PubDevRegistry {
         Ok(results)
     }
 
+    /// Fetches package metadata (description, homepage, license, etc.) from pub.dev.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `name` is a dot-segment, the request fails, or the
+    /// response body fails to parse.
     #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
     pub async fn get_package_info(&self, name: &str) -> Result<PackageInfo> {
         reject_dot_segment(name)?;

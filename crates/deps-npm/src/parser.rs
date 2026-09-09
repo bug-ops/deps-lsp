@@ -18,7 +18,9 @@ use tower_lsp_server::ls_types::Uri;
 /// Contains all dependencies found in the file with their positions.
 #[derive(Debug)]
 pub struct NpmParseResult {
+    /// Dependencies found across all `package.json` sections.
     pub dependencies: Vec<NpmDependency>,
+    /// URI of the manifest this result was parsed from.
     pub uri: Uri,
     /// Every `.npmrc`-resolved alternate registry this parse's dependencies reference,
     /// deduplicated (spec FR-002–004) — fed to `NpmRegistry::register_alternate` by

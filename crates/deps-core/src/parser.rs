@@ -921,19 +921,29 @@ pub enum DependencySource {
 
     /// Git repository dependency.
     Git {
+        /// Repository URL.
         url: String,
         /// Git ref: commit SHA, tag, or branch name (ecosystem-specific semantics).
         rev: Option<String>,
     },
 
     /// Local filesystem path dependency.
-    Path { path: String },
+    Path {
+        /// Filesystem path, relative or absolute, as written in the manifest.
+        path: String,
+    },
 
     /// Direct URL to artifact (PyPI wheels, npm tarballs).
-    Url { url: String },
+    Url {
+        /// URL the artifact is fetched from.
+        url: String,
+    },
 
     /// SDK-provided dependency (Dart: `sdk: flutter`).
-    Sdk { sdk: String },
+    Sdk {
+        /// Name of the SDK providing this dependency.
+        sdk: String,
+    },
 
     /// Workspace-inherited dependency (Cargo: `workspace = true`).
     Workspace,
@@ -952,7 +962,10 @@ pub enum DependencySource {
     /// carrying `user:pass@` userinfo that fails to resolve lands here verbatim. Currently
     /// latent — nothing renders `CustomRegistry::url` in hover/diagnostics text today — but a
     /// future caller surfacing it must redact first, matching every logging call site.
-    CustomRegistry { url: String },
+    CustomRegistry {
+        /// Unresolved alias or raw index URL, never redacted (see the variant's own doc).
+        url: String,
+    },
 
     /// A custom/alternative registry resolved to a concrete, fetchable index URL.
     ///

@@ -63,6 +63,12 @@ const HOVER_FALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// and risking drift between the two.
 pub const CMD_DOT_FOOTER: &str = "\n---\n⌨️ **Press `Cmd+.` to update version**";
 
+/// Builds the hover response for the dependency under `position`, if any.
+///
+/// Shared by every ecosystem's default [`crate::ecosystem::Ecosystem::generate_hover`]
+/// implementation: locates the dependency whose name or version range contains
+/// `position`, resolves its version data against `registry`, and renders the
+/// result through `formatter`. Returns `None` when no dependency covers the position.
 pub async fn generate_hover<R: Registry + ?Sized>(
     parse_result: &dyn ParseResult,
     position: Position,

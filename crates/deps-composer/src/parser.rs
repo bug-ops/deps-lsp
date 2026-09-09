@@ -18,7 +18,9 @@ use tower_lsp_server::ls_types::Uri;
 /// Contains all non-platform dependencies found in the file with their positions.
 #[derive(Debug)]
 pub struct ComposerParseResult {
+    /// Non-platform dependencies found in the manifest.
     pub dependencies: Vec<ComposerDependency>,
+    /// URI of the manifest this result was parsed from.
     pub uri: Uri,
     /// Raw value of the manifest's own top-level `minimum-stability` field (e.g. `"beta"`),
     /// if present — Composer's project-wide default stability floor, one of `dev`, `alpha`,

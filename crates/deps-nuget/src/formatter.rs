@@ -46,6 +46,7 @@ impl RequirementMatcher for NuGetMatcher {
     }
 }
 
+/// [`EcosystemFormatter`](deps_core::lsp_helpers::EcosystemFormatter) implementation for NuGet.
 pub struct NuGetFormatter;
 
 impl PackageNaming for NuGetFormatter {

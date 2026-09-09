@@ -38,12 +38,19 @@ pub struct ParsedDependency {
     /// otherwise the actual crate name. Always the position anchor for
     /// [`Self::name_range`], regardless of renaming.
     pub name: deps_core::PackageName,
+    /// Document range of the TOML table key, for hover/diagnostic positioning.
     pub name_range: Range,
+    /// Version requirement, if the manifest specifies one.
     pub version_req: Option<deps_core::VersionReq>,
+    /// Document range of the version requirement string.
     pub version_range: Option<Range>,
+    /// Feature flags requested via `features = [...]`.
     pub features: Vec<String>,
+    /// Document range of the `features` array, if present.
     pub features_range: Option<Range>,
+    /// Where this dependency resolves from (registry, git, path, etc.).
     pub source: DependencySource,
+    /// Which `Cargo.toml` section this dependency was declared under.
     pub section: DependencySection,
     /// The real crate name from an explicit `package = "..."` key
     /// ([renaming dependencies](https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html#renaming-dependencies-in-cargotoml)),
@@ -113,8 +120,11 @@ pub enum DependencySection {
 /// ```
 #[derive(Debug, Clone)]
 pub struct CargoVersion {
+    /// The parsed version number.
     pub num: deps_core::ConcreteVersion,
+    /// Whether this version has been yanked from crates.io.
     pub yanked: bool,
+    /// Available feature flags mapped to the other features/deps they enable.
     pub features: HashMap<String, Vec<String>>,
     /// Publish timestamp, parsed from the sparse index's `pubtime` field.
     ///
@@ -146,10 +156,15 @@ pub struct CargoVersion {
 /// ```
 #[derive(Debug, Clone)]
 pub struct CrateInfo {
+    /// Crate name.
     pub name: deps_core::PackageName,
+    /// Short crate description.
     pub description: Option<String>,
+    /// Source repository URL.
     pub repository: Option<String>,
+    /// Documentation URL.
     pub documentation: Option<String>,
+    /// Latest (highest) published version.
     pub max_version: deps_core::ConcreteVersion,
 }
 

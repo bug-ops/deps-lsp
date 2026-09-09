@@ -3,32 +3,46 @@
 use std::any::Any;
 use tower_lsp_server::ls_types::Range;
 
+/// A single dependency declaration parsed from a `pubspec.yaml`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DartDependency {
+    /// Package name.
     pub name: deps_core::PackageName,
+    /// Document range of the package name, for hover/diagnostic positioning.
     pub name_range: Range,
+    /// Version requirement, if the manifest specifies one.
     pub version_req: Option<deps_core::VersionReq>,
+    /// Document range of the version requirement string.
     pub version_range: Option<Range>,
+    /// Which `pubspec.yaml` section this dependency was declared under.
     pub section: DependencySection,
+    /// Where this dependency resolves from (registry, git, path, etc.).
     pub source: DependencySource,
     /// Dart-specific Git sub-path (e.g., `path: packages/pkg` inside a repo).
     /// Only meaningful when `source` is `DependencySource::Git`.
     pub git_path: Option<String>,
 }
 
+/// Which `pubspec.yaml` top-level section a dependency was declared under.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum DependencySection {
+    /// The `dependencies:` section.
     #[default]
     Dependencies,
+    /// The `dev_dependencies:` section.
     DevDependencies,
+    /// The `dependency_overrides:` section.
     DependencyOverrides,
 }
 
 pub use deps_core::parser::DependencySource;
 
+/// A single published version of a Dart/Pub package.
 #[derive(Debug, Clone)]
 pub struct DartVersion {
+    /// The parsed version number.
     pub version: deps_core::ConcreteVersion,
+    /// Whether pub.dev has retracted this version.
     pub retracted: bool,
     /// Publish timestamp, parsed eagerly from the API's `published` field.
     ///
@@ -38,14 +52,22 @@ pub struct DartVersion {
     pub published_at: Option<deps_core::PublishTime>,
 }
 
+/// Package metadata as returned by the pub.dev API.
 #[derive(Debug, Clone)]
 pub struct PackageInfo {
+    /// Package name.
     pub name: deps_core::PackageName,
+    /// Short package description.
     pub description: Option<String>,
+    /// Homepage URL.
     pub homepage: Option<String>,
+    /// Source repository URL.
     pub repository: Option<String>,
+    /// Documentation URL.
     pub documentation: Option<String>,
+    /// Latest published version.
     pub version: deps_core::ConcreteVersion,
+    /// SPDX license identifier, if declared.
     pub license: Option<String>,
 }
 

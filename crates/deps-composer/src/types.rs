@@ -24,10 +24,15 @@ use tower_lsp_server::ls_types::Range;
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComposerDependency {
+    /// Package name (`vendor/package`).
     pub name: deps_core::PackageName,
+    /// Document range of the package name, for hover/diagnostic positioning.
     pub name_range: Range,
+    /// Version requirement, if the manifest specifies one.
     pub version_req: Option<deps_core::VersionReq>,
+    /// Document range of the version requirement string.
     pub version_range: Option<Range>,
+    /// Which `composer.json` section this dependency was declared under.
     pub section: ComposerSection,
 }
 
@@ -79,8 +84,11 @@ pub enum ComposerSection {
 /// ```
 #[derive(Debug, Clone)]
 pub struct ComposerVersion {
+    /// The parsed version number.
     pub version: deps_core::ConcreteVersion,
+    /// Packagist's normalized 4-part version string (e.g. `"6.0.0.0"`).
     pub version_normalized: String,
+    /// Whether Packagist marks this package/version as abandoned.
     pub abandoned: bool,
     /// Package-level deprecation payload (issue #205), derived from Packagist's
     /// `abandoned` field. `Some(Deprecation { reason: None, replacement: None })` for a
@@ -256,10 +264,15 @@ deps_core::impl_version!(ComposerVersion {
 /// ```
 #[derive(Debug, Clone)]
 pub struct ComposerPackage {
+    /// Package name (`vendor/package`).
     pub name: deps_core::PackageName,
+    /// Short package description.
     pub description: Option<String>,
+    /// Source repository URL.
     pub repository: Option<String>,
+    /// Homepage URL.
     pub homepage: Option<String>,
+    /// Latest published version.
     pub latest_version: deps_core::ConcreteVersion,
 }
 

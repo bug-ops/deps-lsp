@@ -1,3 +1,6 @@
+//! Build script that captures the current git commit hash and build timestamp
+//! as `GIT_HASH`/`BUILD_TIME` environment variables, surfaced by `--version`.
+
 fn main() {
     let hash = std::process::Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])

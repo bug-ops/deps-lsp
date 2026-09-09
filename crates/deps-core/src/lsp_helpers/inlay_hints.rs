@@ -4,6 +4,12 @@ use crate::{ConcreteVersion, EcosystemConfig, ParseResult};
 
 use super::{EcosystemFormatter, RequirementStatus, VersionData, in_use_version};
 
+/// Builds inlay hints showing the latest/in-use version next to each dependency's declaration.
+///
+/// Shared by every ecosystem's default
+/// [`crate::ecosystem::Ecosystem::generate_inlay_hints`] implementation: one hint is
+/// emitted per dependency that has a version range, using `versions` and
+/// `loading_state` to decide whether cached data is ready to render yet.
 pub fn generate_inlay_hints(
     parse_result: &dyn ParseResult,
     versions: VersionData<'_>,

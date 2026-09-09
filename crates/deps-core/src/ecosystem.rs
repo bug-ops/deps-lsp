@@ -12,10 +12,18 @@ use crate::{
     registry::Metadata,
 };
 
+/// Sealing mechanism restricting [`Ecosystem`] implementations to this workspace.
 pub mod private {
+    /// Marker trait that only crates inside this workspace can implement.
+    ///
+    /// [`Ecosystem`](super::Ecosystem) requires `Self: Sealed`, which is how the
+    /// trait stays extensible (new default methods can be added without
+    /// breaking downstream implementors) while still forbidding external
+    /// crates from implementing it.
     pub trait Sealed {}
 }
 
+/// A boxed, type-erased future used throughout the [`Ecosystem`] trait's async methods.
 pub type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
 /// Canonical, exhaustive identifier for every package ecosystem the workspace supports.

@@ -103,6 +103,10 @@ fn extract_matches(
     }
 }
 
+/// Parses a Groovy-DSL `build.gradle` file into a [`GradleParseResult`].
+///
+/// Always succeeds: unrecognized lines are simply skipped. Returns [`Result`]
+/// only to match the shared parser signature every ecosystem implements.
 pub fn parse_groovy_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
     let mut dependencies = Vec::new();
 

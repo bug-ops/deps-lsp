@@ -6,10 +6,12 @@
 pub mod catalog;
 pub mod config;
 pub mod ecosystem;
+/// Version formatting and comparison for npm (node-semver ranges).
 pub mod formatter;
 pub mod lockfile;
 pub mod parser;
 pub mod registry;
+/// Domain types for npm dependencies (parsed `package.json` entries, registry versions).
 pub mod types;
 
 pub use catalog::{CatalogOrigin, CatalogOutcome, PnpmWorkspaceCache};
@@ -33,4 +35,5 @@ pub use parser::{NpmParseResult, parse_package_json, parse_package_json_with_con
 pub use registry::{NpmRegistry, package_url};
 pub use types::{NpmDependency, NpmDependencySection, NpmPackage, NpmVersion};
 
+/// npm's version-requirement range type (a node-semver range, e.g. `"^1.2.0"`).
 pub type NpmVersionReq = node_semver::Range;

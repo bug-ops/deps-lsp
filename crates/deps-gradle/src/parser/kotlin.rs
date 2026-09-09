@@ -42,6 +42,10 @@ static RE_PLATFORM_NO_VERSION: LazyLock<Regex> = LazyLock::new(|| {
     .expect("RE_PLATFORM_NO_VERSION")
 });
 
+/// Parses a Kotlin-DSL `build.gradle.kts` file into a [`GradleParseResult`].
+///
+/// Always succeeds: unrecognized lines are simply skipped. Returns [`Result`]
+/// only to match the shared parser signature every ecosystem implements.
 pub fn parse_kotlin_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
     let mut dependencies = Vec::new();
 

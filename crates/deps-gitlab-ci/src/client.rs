@@ -98,7 +98,9 @@ pub fn gitlab_rate_limit_error() -> DepsError {
 /// GitLab tags API response item (`GET /projects/:id/repository/tags`).
 #[derive(Debug, Default, Deserialize)]
 pub struct GitlabTag {
+    /// The tag name (e.g. `"v1.2.3"`).
     pub name: String,
+    /// The tagged commit.
     #[serde(default)]
     pub commit: GitlabCommit,
 }
@@ -106,9 +108,12 @@ pub struct GitlabTag {
 /// GitLab releases API response item (`GET /projects/:id/releases`).
 #[derive(Debug, Default, Deserialize)]
 pub struct GitlabRelease {
+    /// The release's associated tag name.
     pub tag_name: String,
+    /// The tagged commit.
     #[serde(default)]
     pub commit: GitlabCommit,
+    /// When the release was published, if GitLab reports it.
     #[serde(default)]
     pub released_at: Option<String>,
 }
@@ -116,6 +121,7 @@ pub struct GitlabRelease {
 /// The `commit` object nested in a [`GitlabTag`]/[`GitlabRelease`].
 #[derive(Debug, Default, Deserialize)]
 pub struct GitlabCommit {
+    /// The full commit SHA the tag/release points at.
     #[serde(default)]
     pub id: String,
 }

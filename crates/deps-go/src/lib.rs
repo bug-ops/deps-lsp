@@ -30,6 +30,7 @@
 
 pub mod config;
 pub mod ecosystem;
+/// Version formatting and comparison for Go modules (semver, pseudo-versions, `+incompatible`).
 pub mod formatter;
 pub mod lockfile;
 pub mod parser;

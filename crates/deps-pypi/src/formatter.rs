@@ -22,6 +22,7 @@ impl RequirementMatcher for Pep440Matcher {
     }
 }
 
+/// [`EcosystemFormatter`](deps_core::lsp_helpers::EcosystemFormatter) implementation for PyPI.
 pub struct PypiFormatter;
 
 impl PackageNaming for PypiFormatter {

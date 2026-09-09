@@ -33,26 +33,37 @@ use tower_lsp_server::ls_types::DiagnosticSeverity;
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct DepsConfig {
+    /// Inline version-annotation settings.
     #[serde(default)]
     pub inlay_hints: InlayHintsConfig,
+    /// Diagnostic severity and behavior settings.
     #[serde(default)]
     pub diagnostics: DiagnosticsConfig,
+    /// HTTP response cache settings.
     #[serde(default)]
     pub cache: CacheConfig,
+    /// Cold-start disk-load behavior settings.
     #[serde(default)]
     pub cold_start: ColdStartConfig,
+    /// Loading-indicator (spinner/progress) settings.
     #[serde(default)]
     pub loading_indicator: LoadingIndicatorConfig,
+    /// Code lens (update-all action) settings.
     #[serde(default)]
     pub code_lens: CodeLensConfig,
+    /// Release-cooldown / freshness-window settings.
     #[serde(default)]
     pub freshness: FreshnessConfig,
+    /// Supply-chain trust signal (Scorecard/SLSA) settings.
     #[serde(default)]
     pub supply_chain: SupplyChainConfig,
+    /// Custom/alternate registry settings.
     #[serde(default)]
     pub registries: RegistriesConfig,
+    /// Network access and offline-mode settings.
     #[serde(default)]
     pub network: NetworkConfig,
+    /// License policy (allow/deny list) settings.
     #[serde(default)]
     pub license_policy: LicensePolicyConfig,
 }
@@ -83,10 +94,13 @@ pub struct DepsConfig {
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct InlayHintsConfig {
+    /// Whether inlay hints are shown at all.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Text shown when the dependency is already at the latest version.
     #[serde(default = "default_up_to_date")]
     pub up_to_date_text: String,
+    /// Text shown when an update is available; `{}` is replaced with the latest version.
     #[serde(default = "default_needs_update")]
     pub needs_update_text: String,
 }
@@ -137,12 +151,16 @@ impl Default for InlayHintsConfig {
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct DiagnosticsConfig {
+    /// Severity for a dependency with a newer version available.
     #[serde(default = "default_outdated_severity")]
     pub outdated_severity: DiagnosticSeverity,
+    /// Severity for a dependency not found in the registry.
     #[serde(default = "default_unknown_severity")]
     pub unknown_severity: DiagnosticSeverity,
+    /// Severity for a dependency pinned to a yanked/retracted version.
     #[serde(default = "default_yanked_severity")]
     pub yanked_severity: DiagnosticSeverity,
+    /// Severity for a dependency whose requirement matches zero published versions.
     #[serde(default = "default_unsatisfiable_severity")]
     pub unsatisfiable_severity: DiagnosticSeverity,
     /// Severity for a dependency on a package the registry reports as
@@ -484,8 +502,10 @@ where
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct ColdStartConfig {
+    /// Whether cold-start disk loading is enabled at all.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Minimum delay in milliseconds between cold-start registry fetches for the same URI.
     #[serde(default = "default_rate_limit_ms")]
     pub rate_limit_ms: u64,
 }
@@ -519,6 +539,7 @@ const fn default_rate_limit_ms() -> u64 {
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct CodeLensConfig {
+    /// Whether the "Update N outdated dependencies" code lens is shown at all.
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
@@ -558,6 +579,7 @@ impl Default for CodeLensConfig {
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct FreshnessConfig {
+    /// Whether the release-cooldown freshness signal is enabled at all.
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// Cooldown window in seconds, clamped to 0..=30 days (default: 3 days)
@@ -626,6 +648,7 @@ const fn default_cooldown_secs() -> u64 {
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct SupplyChainConfig {
+    /// Whether supply-chain trust signals (OpenSSF Scorecard/SLSA provenance) are fetched.
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
@@ -689,6 +712,8 @@ where
 /// ```
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct RegistriesConfig {
+    /// Whether workspace-declared registry hosts (e.g. a manifest's own custom index
+    /// URLs) may be reached at all, or only the default public registry.
     #[serde(default)]
     pub workspace_registries: WorkspaceRegistriesSetting,
     /// Issue #561, FR-006: whether a NuGet user-profile-tier `NuGet.Config` `<add>` with no

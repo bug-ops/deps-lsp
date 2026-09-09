@@ -34,9 +34,13 @@ pub struct NpmDependency {
     /// alias value), otherwise the actual registry package name. Always the position anchor
     /// for [`Self::name_range`], regardless of aliasing.
     pub name: deps_core::PackageName,
+    /// Document range of the JSON key, for hover/diagnostic positioning.
     pub name_range: Range,
+    /// Version requirement, if the manifest specifies one.
     pub version_req: Option<deps_core::VersionReq>,
+    /// Document range of the version requirement string.
     pub version_range: Option<Range>,
+    /// Which `package.json` section this dependency was declared under.
     pub section: NpmDependencySection,
     /// Resolved by `.npmrc` lookup (spec `032-npm-npmrc-registry-support`) — `Registry`
     /// (the public default) unless a `registry=`/`@scope:registry=` entry applies.
@@ -143,7 +147,9 @@ pub enum NpmDependencySection {
 /// ```
 #[derive(Debug, Clone)]
 pub struct NpmVersion {
+    /// The parsed version number.
     pub version: deps_core::ConcreteVersion,
+    /// Whether the packument marks this version as deprecated.
     pub deprecated: bool,
     /// Package-level deprecation payload (issue #205), derived from the packument's
     /// `deprecated` free-text field. `None` whenever `deprecated` is absent, `null`, or
@@ -197,10 +203,15 @@ deps_core::impl_version!(NpmVersion {
 /// ```
 #[derive(Debug, Clone)]
 pub struct NpmPackage {
+    /// Package name.
     pub name: deps_core::PackageName,
+    /// Short package description.
     pub description: Option<String>,
+    /// Homepage URL.
     pub homepage: Option<String>,
+    /// Source repository URL.
     pub repository: Option<String>,
+    /// Latest published version.
     pub latest_version: deps_core::ConcreteVersion,
 }
 

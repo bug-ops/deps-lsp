@@ -21,11 +21,16 @@
     clippy::cast_precision_loss,
     clippy::cast_sign_loss
 )]
+/// HTTP response cache with `ETag`/`Last-Modified` conditional-request validation.
 pub mod cache;
 pub mod completion;
 pub mod deps_dev;
+/// The [`ecosystem::Ecosystem`] trait: the sealed extension point every package
+/// ecosystem crate implements to plug into the LSP server.
 pub mod ecosystem;
+/// Routes a manifest path to its owning [`ecosystem::Ecosystem`] implementation.
 pub mod ecosystem_registry;
+/// Unified error types (`DepsError`, `FetchFailure`) shared across ecosystems.
 pub mod error;
 pub mod fallback_completion;
 pub mod freshness;
@@ -42,7 +47,11 @@ pub mod net_policy;
 pub mod osv;
 pub mod package;
 pub mod pagination;
+/// Shared manifest-parsing helpers: bounded JSON/TOML/YAML nesting checks and
+/// depth-limited parsing used by every ecosystem's manifest parser.
 pub mod parser;
+/// The [`registry::Registry`] trait: version lookup and search that every
+/// ecosystem's registry client implements.
 pub mod registry;
 pub mod secret;
 #[cfg(any(test, feature = "test-util"))]

@@ -36,6 +36,7 @@ impl RequirementMatcher for PubDevMatcher {
     }
 }
 
+/// [`EcosystemFormatter`](deps_core::lsp_helpers::EcosystemFormatter) implementation for Dart/Pub.
 pub struct DartFormatter;
 
 impl PackageNaming for DartFormatter {

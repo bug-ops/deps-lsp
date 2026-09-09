@@ -39,20 +39,27 @@ fn http_status_message(status: u16, url: &str) -> String {
 /// ```
 #[derive(Error, Debug)]
 pub enum DepsError {
+    /// A manifest or lockfile failed to parse.
     #[error("failed to parse {file_type}: {source}")]
     ParseError {
+        /// Ecosystem/file kind being parsed (e.g. `"Cargo.toml"`), for the error message.
         file_type: String,
+        /// The underlying parser error.
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    /// A registry HTTP request failed at the transport layer.
     #[error("registry request failed for {package}: {source}")]
     RegistryError {
+        /// Name of the package the request was for.
         package: String,
+        /// The underlying `reqwest` error.
         #[source]
         source: reqwest::Error,
     },
 
+    /// The cache layer itself failed (e.g. a poisoned lock), independent of any registry request.
     #[error("cache error: {0}")]
     CacheError(String),
 
@@ -61,27 +68,49 @@ pub enum DepsError {
     /// per-dependency diagnostic (see [`Self::fetch_failure`]) — never build one from a raw
     /// registry error body, which can embed the caller's public IP (`github.rs:332-346`).
     #[error("{message}")]
-    RateLimited { message: String },
+    RateLimited {
+        /// Pre-vetted, IP-free message safe to surface verbatim in a diagnostic.
+        message: String,
+    },
 
+    /// A package name was not found on the given registry.
     #[error("{package} not found on {registry}")]
     PackageNotFound {
+        /// Name of the package that was looked up.
         package: String,
+        /// Name of the registry that reported the package as missing.
         registry: &'static str,
     },
 
+    /// A registry HTTP request returned a non-success status code.
     #[error("{}", http_status_message(*status, url))]
-    HttpStatus { url: String, status: u16 },
+    HttpStatus {
+        /// URL that was requested.
+        url: String,
+        /// HTTP status code returned.
+        status: u16,
+    },
 
+    /// A registry's response body failed to deserialize as JSON.
     #[error("failed to parse {registry} response for {package}: {source}")]
     ApiResponse {
+        /// Name of the package whose response failed to parse.
         package: String,
+        /// Name of the registry the response came from.
         registry: &'static str,
+        /// The underlying JSON deserialization error.
         #[source]
         source: serde_json::Error,
     },
 
+    /// A response body exceeded the configured size cap and was rejected before full download.
     #[error("response body for {url} exceeds {limit} byte limit")]
-    ResponseTooLarge { url: String, limit: usize },
+    ResponseTooLarge {
+        /// URL the oversized response came from.
+        url: String,
+        /// The size cap, in bytes, that was exceeded.
+        limit: usize,
+    },
 
     /// Deliberately shared between two distinct rejection kinds: malformed version-requirement
     /// strings (all ecosystems) and malformed Go module paths (`deps-go`, which has no separate
@@ -91,18 +120,23 @@ pub enum DepsError {
     #[error("invalid version requirement: {0}")]
     InvalidVersionReq(String),
 
+    /// A filesystem I/O operation failed.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// A JSON parsing operation failed outside of a registry response context.
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
+    /// The manifest file's ecosystem could not be determined from any registered router.
     #[error("unsupported ecosystem: {0}")]
     UnsupportedEcosystem(String),
 
+    /// More than one ecosystem's routing rules matched the same manifest path.
     #[error("ambiguous ecosystem detection for file: {0}")]
     AmbiguousEcosystem(String),
 
+    /// A URI supplied by the client or a manifest could not be parsed.
     #[error("invalid URI: {0}")]
     InvalidUri(String),
 
@@ -110,7 +144,10 @@ pub enum DepsError {
     /// `network.offline` is set, instead of attempting the request. `url` is the request
     /// that was blocked, for diagnostic/logging purposes.
     #[error("offline: request to {url} was blocked by network.offline")]
-    Offline { url: String },
+    Offline {
+        /// The request URL that was blocked.
+        url: String,
+    },
 
     /// A multi-hop alternate/private-index chain's resolution was halted because a hop
     /// returned a genuine transport error (5xx, timeout, connection failure) rather than a

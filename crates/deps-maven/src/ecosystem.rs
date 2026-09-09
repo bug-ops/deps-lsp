@@ -18,6 +18,7 @@ use crate::formatter::MavenFormatter;
 use crate::registry::MavenCentralRegistry;
 use crate::types::ArtifactInfo;
 
+/// [`Ecosystem`] implementation for Maven (`pom.xml`).
 pub struct MavenEcosystem {
     registry: Arc<MavenCentralRegistry>,
     formatter: MavenFormatter,
@@ -110,6 +111,7 @@ fn build_deduped_field_completions(
 }
 
 impl MavenEcosystem {
+    /// Creates a Maven ecosystem instance backed by the given shared HTTP cache.
     pub fn new(cache: Arc<deps_core::HttpCache>) -> Self {
         Self {
             registry: Arc::new(MavenCentralRegistry::new(cache)),

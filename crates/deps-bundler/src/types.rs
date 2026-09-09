@@ -6,13 +6,21 @@ use tower_lsp_server::ls_types::Range;
 /// Parsed dependency from Gemfile with position tracking.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BundlerDependency {
+    /// Gem name.
     pub name: deps_core::PackageName,
+    /// Document range of the gem name, for hover/diagnostic positioning.
     pub name_range: Range,
+    /// Version requirement, if the `Gemfile` specifies one.
     pub version_req: Option<deps_core::VersionReq>,
+    /// Document range of the version requirement string.
     pub version_range: Option<Range>,
+    /// Which `Gemfile` group this gem was declared under.
     pub group: DependencyGroup,
+    /// Where this gem resolves from (rubygems, git, path, etc.).
     pub source: DependencySource,
+    /// Platform constraints from a `platforms:` argument, if any.
     pub platforms: Vec<String>,
+    /// The `require:` argument, if the gem specifies a custom require path.
     pub require: Option<String>,
 }
 
@@ -37,8 +45,11 @@ pub enum DependencyGroup {
 /// Version information for a gem from rubygems.org.
 #[derive(Debug, Clone)]
 pub struct BundlerVersion {
+    /// The parsed version number.
     pub number: deps_core::ConcreteVersion,
+    /// Whether rubygems.org marks this version as a prerelease.
     pub prerelease: bool,
+    /// Whether this version has been yanked from rubygems.org.
     pub yanked: bool,
     /// Publish timestamp, parsed eagerly from the API's `created_at` field.
     ///
@@ -46,6 +57,7 @@ pub struct BundlerVersion {
     /// RFC 3339 — degrades gracefully, per
     /// [US-003](https://github.com/bug-ops/deps-lsp/issues/145).
     pub published_at: Option<deps_core::PublishTime>,
+    /// Target platform string (e.g. `"ruby"`, `"x86_64-linux"`).
     pub platform: String,
 }
 
@@ -59,14 +71,23 @@ impl BundlerVersion {
 /// Gem metadata from rubygems.org.
 #[derive(Debug, Clone)]
 pub struct GemInfo {
+    /// Gem name.
     pub name: deps_core::PackageName,
+    /// Short gem description.
     pub info: Option<String>,
+    /// Homepage URL.
     pub homepage_uri: Option<String>,
+    /// Source repository URL.
     pub source_code_uri: Option<String>,
+    /// Documentation URL.
     pub documentation_uri: Option<String>,
+    /// Latest published version.
     pub version: deps_core::ConcreteVersion,
+    /// SPDX license identifiers declared for this gem.
     pub licenses: Vec<String>,
+    /// Author names, as a single comma-separated string.
     pub authors: Option<String>,
+    /// Total download count reported by rubygems.org.
     pub downloads: u64,
 }
 
