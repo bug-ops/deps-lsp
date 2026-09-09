@@ -34,6 +34,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tower_lsp_server::ls_types::Uri;
+use yaml_rust2::{Yaml, YamlLoader};
 
 /// package-lock.json file parser.
 ///
@@ -67,8 +68,9 @@ use tower_lsp_server::ls_types::Uri;
 pub struct NpmLockParser;
 
 impl NpmLockParser {
-    /// Lock file names for npm ecosystem.
-    const LOCKFILE_NAMES: &'static [&'static str] = &["package-lock.json"];
+    /// Lock file names for npm ecosystem, in resolution-precedence order: `package-lock.json`
+    /// wins over `pnpm-lock.yaml` when both exist in the same directory (spec 052 FR-001/FR-002).
+    const LOCKFILE_NAMES: &'static [&'static str] = &["package-lock.json", "pnpm-lock.yaml"];
 }
 
 /// package-lock.json structure (partial, only fields we need).
@@ -118,61 +120,267 @@ impl LockFileProvider for NpmLockParser {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ResolvedPackages>> + Send + 'a>>
     {
         Box::pin(async move {
-            tracing::debug!("Parsing package-lock.json: {}", lockfile_path.display());
+            if lockfile_path.file_name().and_then(|n| n.to_str()) == Some("pnpm-lock.yaml") {
+                parse_pnpm_lock(lockfile_path).await
+            } else {
+                parse_package_lock_json(lockfile_path).await
+            }
+        })
+    }
+}
 
-            let content = read_lockfile_content(lockfile_path, "package-lock.json").await?;
+/// Parses a `package-lock.json` at `lockfile_path` into resolved packages.
+async fn parse_package_lock_json(lockfile_path: &Path) -> Result<ResolvedPackages> {
+    tracing::debug!("Parsing package-lock.json: {}", lockfile_path.display());
 
-            let lock_data: PackageLockJson = deps_core::parse_json_checked(content.as_bytes())
-                .map_err(|e| DepsError::ParseError {
-                    file_type: "package-lock.json".into(),
-                    source: Box::new(e),
-                })?;
+    let content = read_lockfile_content(lockfile_path, "package-lock.json").await?;
 
-            let mut packages = ResolvedPackages::new();
+    let lock_data: PackageLockJson =
+        deps_core::parse_json_checked(content.as_bytes()).map_err(|e| DepsError::ParseError {
+            file_type: "package-lock.json".into(),
+            source: Box::new(e),
+        })?;
 
-            for (key, entry) in lock_data.packages {
-                // Skip root package (empty key)
-                if key.is_empty() {
+    let mut packages = ResolvedPackages::new();
+
+    for (key, entry) in lock_data.packages {
+        // Skip root package (empty key)
+        if key.is_empty() {
+            continue;
+        }
+
+        // Prefer the entry's own `name` (npm writes this when it differs from the
+        // physical install path — always the case for an `npm:` alias, issue #654)
+        // over the key-derived basename, so an aliased dependency's lock-file entry
+        // groups under its real registry name, matching `Dependency::name()`.
+        let name = entry
+            .name
+            .clone()
+            .unwrap_or_else(|| extract_package_name(&key).to_string());
+
+        // Version is required for actual dependencies
+        let Some(ref version) = entry.version else {
+            tracing::debug!("Skipping package '{}' with no version", name);
+            continue;
+        };
+
+        // Parse source based on link, resolved, and integrity fields
+        let source = parse_npm_source(&entry);
+
+        // Extract dependency names
+        let dependencies: Vec<String> = entry.dependencies.keys().cloned().collect();
+
+        packages.insert(ResolvedPackage {
+            name,
+            version: version.clone(),
+            source,
+            dependencies,
+        });
+    }
+
+    tracing::info!(
+        "Parsed package-lock.json: {} packages from {}",
+        packages.len(),
+        lockfile_path.display()
+    );
+
+    Ok(packages)
+}
+
+/// Lowest supported `pnpm-lock.yaml` `lockfileVersion` major component (spec 052 FR-006, Out
+/// of Scope): pre-pnpm-8 lock files use an incompatible `packages` shape and peer-suffix
+/// syntax, so they are rejected rather than silently misparsed.
+const MIN_PNPM_LOCKFILE_MAJOR_VERSION: u32 = 6;
+
+/// Parses a `pnpm-lock.yaml` at `lockfile_path` into resolved packages, aggregating every
+/// workspace importer (spec 052 FR-004/FR-007).
+///
+/// **Known limitation**: importers are aggregated flatly into one shared version pool per
+/// package name, with no correlation back to the specific `package.json` being queried (spec
+/// 052's deliberate scoping — Out of Scope forbids importer-to-manifest correlation). When two
+/// importers have *overlapping* semver ranges that pnpm resolved to *different* concrete
+/// versions, a caller resolving one importer's dependency can be handed the version resolved
+/// for a different importer instead of its own — a false-negative risk for OSV vulnerability
+/// matching, not merely an imprecision. The same applies to any `package.json` under the
+/// workspace root that isn't itself a registered importer, since it inherits whichever
+/// importer's version the ancestor lock-file search happens to attach to. See
+/// `docs/ECOSYSTEM_GUIDE.md`'s pnpm section for the user-facing note.
+async fn parse_pnpm_lock(lockfile_path: &Path) -> Result<ResolvedPackages> {
+    tracing::debug!("Parsing pnpm-lock.yaml: {}", lockfile_path.display());
+
+    let content = read_lockfile_content(lockfile_path, "pnpm-lock.yaml").await?;
+
+    // NFR-001: the nesting/expansion guards and the YAML parse itself are CPU-bound work on
+    // already-read, untrusted content — run them on the blocking-thread pool (mirrors
+    // `read_lockfile_content`'s own `spawn_blocking` for the file read) rather than on the
+    // calling tokio worker, so a large `pnpm-lock.yaml` near the 32 MiB cap can't stall the
+    // async executor.
+    let packages = tokio::task::spawn_blocking(move || parse_pnpm_lock_yaml(&content))
+        .await
+        .map_err(|e| DepsError::ParseError {
+            file_type: "pnpm-lock.yaml".into(),
+            source: Box::new(std::io::Error::other(e)),
+        })??;
+
+    tracing::info!(
+        "Parsed pnpm-lock.yaml: {} packages from {}",
+        packages.len(),
+        lockfile_path.display()
+    );
+
+    Ok(packages)
+}
+
+/// The CPU-bound half of [`parse_pnpm_lock`], run inside `spawn_blocking`.
+fn parse_pnpm_lock_yaml(content: &str) -> Result<ResolvedPackages> {
+    let to_parse_error = |message: String| DepsError::ParseError {
+        file_type: "pnpm-lock.yaml".into(),
+        source: Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            message,
+        )),
+    };
+
+    if deps_core::check_yaml_nesting_depth(content, deps_core::MAX_YAML_NESTING_DEPTH).is_err()
+        || deps_core::check_yaml_expansion(content, deps_core::MAX_YAML_EXPANDED_BYTES).is_err()
+    {
+        return Err(to_parse_error(
+            "exceeds YAML nesting depth or expansion bounds".into(),
+        ));
+    }
+
+    let docs = YamlLoader::load_from_str(content)
+        .map_err(|e| to_parse_error(format!("invalid YAML: {e}")))?;
+    let Some(doc) = docs.first() else {
+        return Ok(ResolvedPackages::new());
+    };
+
+    // FR-006/L4: an absent or explicit-null `lockfileVersion` is permitted (matches
+    // `catalog.rs`'s `Yaml::BadValue | Yaml::Null` "absent" convention) — but once the key is
+    // present with any other shape, it must resolve to a supported version or the file is
+    // rejected outright, rather than silently treating a non-scalar value (e.g. a nested
+    // mapping) the same as "absent".
+    match &doc["lockfileVersion"] {
+        Yaml::BadValue | Yaml::Null => {}
+        node => {
+            let Some(version) = yaml_scalar_string(node) else {
+                return Err(to_parse_error(
+                    "lockfileVersion is present but not a scalar value".into(),
+                ));
+            };
+            let major = version.split('.').next().unwrap_or(&version);
+            let major: u32 = major
+                .parse()
+                .map_err(|_| to_parse_error(format!("unparseable lockfileVersion '{version}'")))?;
+            if major < MIN_PNPM_LOCKFILE_MAJOR_VERSION {
+                return Err(to_parse_error(format!(
+                    "unsupported lockfileVersion '{version}' (requires {MIN_PNPM_LOCKFILE_MAJOR_VERSION}.0 or newer)"
+                )));
+            }
+        }
+    }
+
+    let mut packages = ResolvedPackages::new();
+
+    let Yaml::Hash(importers) = &doc["importers"] else {
+        tracing::debug!("pnpm-lock.yaml has no importers");
+        return Ok(packages);
+    };
+
+    for (_importer_path, importer) in importers {
+        for section in ["dependencies", "devDependencies", "optionalDependencies"] {
+            let Yaml::Hash(deps) = &importer[section] else {
+                continue;
+            };
+            for (name, entry) in deps {
+                let Some(importer_key) = name.as_str() else {
+                    continue;
+                };
+                // `yaml_scalar_string` coerces an unquoted, numeric-looking `version` (e.g.
+                // `version: 1.0`, parsed as `Yaml::Real`) the same way the `lockfileVersion`
+                // gate above does — `as_str()` alone would silently drop such an entry.
+                let Some(raw_version) = yaml_scalar_string(&entry["version"]) else {
+                    tracing::debug!(
+                        "Skipping pnpm entry '{importer_key}' with missing or non-scalar version field"
+                    );
+                    continue;
+                };
+                // FR-005: a workspace-local sibling package, not a registry resolution.
+                if raw_version.starts_with("link:") {
                     continue;
                 }
 
-                // Prefer the entry's own `name` (npm writes this when it differs from the
-                // physical install path — always the case for an `npm:` alias, issue #654)
-                // over the key-derived basename, so an aliased dependency's lock-file entry
-                // groups under its real registry name, matching `Dependency::name()`.
-                let name = entry
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| extract_package_name(&key).to_string());
+                let (name, version) =
+                    resolve_pnpm_entry_name_and_version(importer_key, &raw_version);
 
-                // Version is required for actual dependencies
-                let Some(ref version) = entry.version else {
-                    tracing::debug!("Skipping package '{}' with no version", name);
+                // S2: anything that isn't a semver-shaped resolution (`file:...`, `git+...`, a
+                // bare tarball URL, `workspace:...`, a malformed value) must not be stored as a
+                // fake "resolved version" — it would otherwise flow verbatim into hover text and
+                // OSV vulnerability-lookup queries.
+                if node_semver::Version::parse(version).is_err() {
+                    tracing::debug!(
+                        "Skipping pnpm entry '{name}' with non-semver version '{version}'"
+                    );
                     continue;
-                };
-
-                // Parse source based on link, resolved, and integrity fields
-                let source = parse_npm_source(&entry);
-
-                // Extract dependency names
-                let dependencies: Vec<String> = entry.dependencies.keys().cloned().collect();
+                }
 
                 packages.insert(ResolvedPackage {
-                    name,
-                    version: version.clone(),
-                    source,
-                    dependencies,
+                    name: name.to_string(),
+                    version: version.to_string(),
+                    source: ResolvedSource::Registry {
+                        url: String::new(),
+                        checksum: String::new(),
+                    },
+                    dependencies: Vec::new(),
                 });
             }
+        }
+    }
 
-            tracing::info!(
-                "Parsed package-lock.json: {} packages from {}",
-                packages.len(),
-                lockfile_path.display()
-            );
+    Ok(packages)
+}
 
-            Ok(packages)
-        })
+/// Resolves one importer dependency entry's real package name and plain version, handling
+/// pnpm's `name@version` alias-resolution form.
+///
+/// pnpm keys an aliased dependency (e.g. `"my-lodash": "npm:lodash@^4.17.0"` in `package.json`)
+/// by the manifest alias in `importers.<path>.dependencies`, but resolves its `version` field to
+/// `<real-name>@<real-version>` rather than a plain semver string — so the importer key must
+/// never be used as the resolved package name for an aliased entry (mirrors
+/// [`parse_package_lock_json`]'s `entry.name`-based handling of npm's own `npm:` alias form,
+/// issue #654). A regular, non-aliased entry's `version` field never contains `@` (semver
+/// strings don't use it), so splitting on the *last* `@` — which also correctly separates a
+/// scoped real name like `@myorg/pkg@1.2.3` — is an unambiguous signal: no split point falls
+/// back to treating `raw_version` as a plain version under `importer_key`'s name.
+fn resolve_pnpm_entry_name_and_version<'a>(
+    importer_key: &'a str,
+    raw_version: &'a str,
+) -> (&'a str, &'a str) {
+    let base = strip_peer_suffix(raw_version);
+    match base.rsplit_once('@') {
+        Some((name, version)) if !name.is_empty() => (name, version),
+        _ => (importer_key, base),
+    }
+}
+
+/// Strips a parenthesized peer-dependency suffix from a pnpm-resolved version string, e.g.
+/// `"1.2.3(react@18.2.0)"` -> `"1.2.3"` (spec 052 FR-004).
+fn strip_peer_suffix(version: &str) -> &str {
+    version.split_once('(').map_or(version, |(base, _)| base)
+}
+
+/// Renders a scalar YAML node as a string regardless of whether pnpm wrote it quoted
+/// (`Yaml::String`) or bare (`Yaml::Real`/`Yaml::Integer`) — `yaml-rust2`'s `as_str` only
+/// matches `Yaml::String`, so an unquoted numeric-looking scalar (a bare `6.0` `lockfileVersion`,
+/// or a two-component `version: 1.0`) would otherwise be silently treated as absent. Shared by
+/// the `lockfileVersion` gate and the per-entry `version` field read, both of which face the
+/// same yaml-rust2 String/Real/Integer gotcha.
+fn yaml_scalar_string(node: &Yaml) -> Option<String> {
+    match node {
+        Yaml::String(s) => Some(s.clone()),
+        Yaml::Real(s) => Some(s.clone()),
+        Yaml::Integer(i) => Some(i.to_string()),
+        _ => None,
     }
 }
 
@@ -724,5 +932,480 @@ mod tests {
             !parser.is_lockfile_stale(&lockfile_path, future_time),
             "Lock file should not be stale when last_modified is in the future"
         );
+    }
+
+    // --- pnpm-lock.yaml (spec 052) ---
+
+    #[tokio::test]
+    async fn test_parse_pnpm_lock_single_importer() {
+        let lockfile_content = r"
+lockfileVersion: '9.0'
+importers:
+  .:
+    dependencies:
+      react:
+        specifier: ^18.0.0
+        version: 18.2.0
+    devDependencies:
+      typescript:
+        specifier: ^5.3.0
+        version: 5.3.3
+";
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lockfile_path = temp_dir.path().join("pnpm-lock.yaml");
+        tokio::fs::write(&lockfile_path, lockfile_content)
+            .await
+            .unwrap();
+
+        let parser = NpmLockParser;
+        let resolved = parser.parse_lockfile(&lockfile_path).await.unwrap();
+
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved.get_version("react"), Some("18.2.0"));
+        assert_eq!(resolved.get_version("typescript"), Some("5.3.3"));
+    }
+
+    #[tokio::test]
+    async fn test_parse_pnpm_lock_monorepo_multi_importer_aggregation() {
+        let lockfile_content = r"
+lockfileVersion: '9.0'
+importers:
+  .:
+    dependencies:
+      lodash:
+        specifier: ^4.0.0
+        version: 4.17.21
+  packages/foo:
+    dependencies:
+      lodash:
+        specifier: ^3.0.0
+        version: 3.10.1
+      react:
+        specifier: ^18.0.0
+        version: 18.2.0
+";
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lockfile_path = temp_dir.path().join("pnpm-lock.yaml");
+        tokio::fs::write(&lockfile_path, lockfile_content)
+            .await
+            .unwrap();
+
+        let parser = NpmLockParser;
+        let resolved = parser.parse_lockfile(&lockfile_path).await.unwrap();
+
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved.get_all("lodash").unwrap().len(), 2);
+        assert_eq!(resolved.get_version("lodash"), Some("4.17.21"));
+        assert_eq!(resolved.get_version("react"), Some("18.2.0"));
+    }
+
+    #[tokio::test]
+    async fn test_parse_pnpm_lock_strips_peer_suffix() {
+        let lockfile_content = r"
+lockfileVersion: '9.0'
+importers:
+  .:
+    dependencies:
+      use-sync-external-store:
+        specifier: ^1.2.0
+        version: 1.2.0(react@18.2.0)
+";
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lockfile_path = temp_dir.path().join("pnpm-lock.yaml");
+        tokio::fs::write(&lockfile_path, lockfile_content)
+            .await
+            .unwrap();
+
+        let parser = NpmLockParser;
+        let resolved = parser.parse_lockfile(&lockfile_path).await.unwrap();
+
+        assert_eq!(
+            resolved.get_version("use-sync-external-store"),
+            Some("1.2.0")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_pnpm_lock_skips_link_entries() {
+        let lockfile_content = r"
+lockfileVersion: '9.0'
+importers:
+  .:
+    dependencies:
+      shared-lib:
+        specifier: workspace:*
+        version: link:../shared-lib
+      react:
+        specifier: ^18.0.0
+        version: 18.2.0
+";
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lockfile_path = temp_dir.path().join("pnpm-lock.yaml");
+        tokio::fs::write(&lockfile_path, lockfile_content)
+            .await
+            .unwrap();
+
+        let parser = NpmLockParser;
+        let resolved = parser.parse_lockfile(&lockfile_path).await.unwrap();
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved.get_version("shared-lib"), None);
+        assert_eq!(resolved.get_version("react"), Some("18.2.0"));
+    }
+
+    #[tokio::test]
+    async fn test_parse_pnpm_lock_malformed_yaml_is_parse_error() {
+        let lockfile_content = "importers: [unterminated";
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lockfile_path = temp_dir.path().join("pnpm-lock.yaml");
+        tokio::fs::write(&lockfile_path, lockfile_content)
+            .await
+            .unwrap();
+
+        let parser = NpmLockParser;
+        let result = parser.parse_lockfile(&lockfile_path).await;
+
+        let Err(DepsError::ParseError { file_type, .. }) = result else {
+            panic!("expected DepsError::ParseError, got {result:?}");
+        };
+        assert!(file_type.contains("pnpm-lock.yaml"));
+    }
+
+    #[tokio::test]
+    async fn test_parse_pnpm_lock_empty_importers_is_empty_not_error() {
+        let lockfile_content = "lockfileVersion: '9.0'\n";
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lockfile_path = temp_dir.path().join("pnpm-lock.yaml");
+        tokio::fs::write(&lockfile_path, lockfile_content)
+            .await
+            .unwrap();
+
+        let parser = NpmLockParser;
+        let resolved = parser.parse_lockfile(&lockfile_path).await.unwrap();
+
+        assert!(resolved.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_parse_pnpm_lock_explicit_empty_importers_map_is_empty_not_error() {
+        let lockfile_content = "lockfileVersion: '9.0'\nimporters: {}\n";
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lockfile_path = temp_dir.path().join("pnpm-lock.yaml");
+        tokio::fs::write(&lockfile_path, lockfile_content)
+            .await
+            .unwrap();
+
+        let parser = NpmLockParser;
+        let resolved = parser.parse_lockfile(&lockfile_path).await.unwrap();
+
+        assert!(resolved.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_parse_pnpm_lock_unsupported_lockfile_version_is_parse_error() {
+        let lockfile_content = r"
+lockfileVersion: '5.4'
+importers:
+  .:
+    dependencies:
+      react:
+        specifier: ^18.0.0
+        version: 18.2.0
+";
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lockfile_path = temp_dir.path().join("pnpm-lock.yaml");
+        tokio::fs::write(&lockfile_path, lockfile_content)
+            .await
+            .unwrap();
+
+        let parser = NpmLockParser;
+        let result = parser.parse_lockfile(&lockfile_path).await;
+
+        let Err(DepsError::ParseError { file_type, source }) = result else {
+            panic!("expected DepsError::ParseError, got {result:?}");
+        };
+        assert!(file_type.contains("pnpm-lock.yaml"));
+        assert!(source.to_string().contains("5.4"));
+    }
+
+    #[tokio::test]
+    async fn test_parse_pnpm_lock_non_scalar_lockfile_version_is_parse_error() {
+        let lockfile_content = r"
+lockfileVersion:
+  - 9
+  - 0
+importers:
+  .:
+    dependencies:
+      react:
+        specifier: ^18.0.0
+        version: 18.2.0
+";
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lockfile_path = temp_dir.path().join("pnpm-lock.yaml");
+        tokio::fs::write(&lockfile_path, lockfile_content)
+            .await
+            .unwrap();
+
+        let parser = NpmLockParser;
+        let result = parser.parse_lockfile(&lockfile_path).await;
+
+        assert!(matches!(result, Err(DepsError::ParseError { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_parse_pnpm_lock_optional_dependencies() {
+        let lockfile_content = r"
+lockfileVersion: '9.0'
+importers:
+  .:
+    optionalDependencies:
+      fsevents:
+        specifier: ^2.3.0
+        version: 2.3.3
+";
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lockfile_path = temp_dir.path().join("pnpm-lock.yaml");
+        tokio::fs::write(&lockfile_path, lockfile_content)
+            .await
+            .unwrap();
+
+        let parser = NpmLockParser;
+        let resolved = parser.parse_lockfile(&lockfile_path).await.unwrap();
+
+        assert_eq!(resolved.get_version("fsevents"), Some("2.3.3"));
+    }
+
+    /// One importer with `dependencies`, `devDependencies`, and `optionalDependencies` all
+    /// present — every section must contribute its entries to the same aggregated result.
+    #[tokio::test]
+    async fn test_parse_pnpm_lock_all_three_sections_in_one_importer() {
+        let lockfile_content = r"
+lockfileVersion: '9.0'
+importers:
+  .:
+    dependencies:
+      react:
+        specifier: ^18.0.0
+        version: 18.2.0
+    devDependencies:
+      typescript:
+        specifier: ^5.3.0
+        version: 5.3.3
+    optionalDependencies:
+      fsevents:
+        specifier: ^2.3.0
+        version: 2.3.3
+";
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lockfile_path = temp_dir.path().join("pnpm-lock.yaml");
+        tokio::fs::write(&lockfile_path, lockfile_content)
+            .await
+            .unwrap();
+
+        let parser = NpmLockParser;
+        let resolved = parser.parse_lockfile(&lockfile_path).await.unwrap();
+
+        assert_eq!(resolved.len(), 3);
+        assert_eq!(resolved.get_version("react"), Some("18.2.0"));
+        assert_eq!(resolved.get_version("typescript"), Some("5.3.3"));
+        assert_eq!(resolved.get_version("fsevents"), Some("2.3.3"));
+    }
+
+    /// S3 regression: pnpm resolves an `npm:`-aliased importer dependency's `version` field to
+    /// `<real-name>@<real-version>`, keyed in `importers.<path>.dependencies` by the manifest
+    /// alias — the alias key must never leak in as the resolved package name (mirrors issue
+    /// #654's `package-lock.json` handling).
+    #[tokio::test]
+    async fn test_parse_pnpm_lock_npm_alias_resolves_real_name() {
+        let lockfile_content = r"
+lockfileVersion: '9.0'
+importers:
+  .:
+    dependencies:
+      my-lodash:
+        specifier: npm:lodash@^4.17.0
+        version: lodash@4.17.21
+";
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lockfile_path = temp_dir.path().join("pnpm-lock.yaml");
+        tokio::fs::write(&lockfile_path, lockfile_content)
+            .await
+            .unwrap();
+
+        let parser = NpmLockParser;
+        let resolved = parser.parse_lockfile(&lockfile_path).await.unwrap();
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved.get_version("lodash"), Some("4.17.21"));
+        assert_eq!(
+            resolved.get_version("my-lodash"),
+            None,
+            "the alias key must not shadow the real package name"
+        );
+    }
+
+    /// S3: a scoped real package name behind an alias (`@myorg/pkg@1.2.3`) must still split on
+    /// the *last* `@`, not the first (which would land inside the scope segment).
+    #[tokio::test]
+    async fn test_parse_pnpm_lock_npm_alias_resolves_scoped_real_name() {
+        let lockfile_content = r"
+lockfileVersion: '9.0'
+importers:
+  .:
+    dependencies:
+      my-pkg:
+        specifier: npm:@myorg/pkg@^1.0.0
+        version: '@myorg/pkg@1.2.3'
+";
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lockfile_path = temp_dir.path().join("pnpm-lock.yaml");
+        tokio::fs::write(&lockfile_path, lockfile_content)
+            .await
+            .unwrap();
+
+        let parser = NpmLockParser;
+        let resolved = parser.parse_lockfile(&lockfile_path).await.unwrap();
+
+        assert_eq!(resolved.get_version("@myorg/pkg"), Some("1.2.3"));
+        assert_eq!(resolved.get_version("my-pkg"), None);
+    }
+
+    /// S2 regression: a non-semver-shaped resolution (`file:`, a bare tarball URL,
+    /// `workspace:*`) must not be stored as a fake resolved version — it would otherwise flow
+    /// verbatim into hover text and OSV vulnerability-lookup queries.
+    #[tokio::test]
+    async fn test_parse_pnpm_lock_skips_non_semver_versions() {
+        let lockfile_content = r"
+lockfileVersion: '9.0'
+importers:
+  .:
+    dependencies:
+      local-tarball:
+        specifier: file:../local-tarball.tgz
+        version: file:../local-tarball.tgz
+      from-git:
+        specifier: git+https://github.com/user/repo.git
+        version: https://codeload.github.com/user/repo/tar.gz/abc123
+      workspace-star:
+        specifier: workspace:*
+        version: workspace:*
+      react:
+        specifier: ^18.0.0
+        version: 18.2.0
+";
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lockfile_path = temp_dir.path().join("pnpm-lock.yaml");
+        tokio::fs::write(&lockfile_path, lockfile_content)
+            .await
+            .unwrap();
+
+        let parser = NpmLockParser;
+        let resolved = parser.parse_lockfile(&lockfile_path).await.unwrap();
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved.get_version("react"), Some("18.2.0"));
+        assert_eq!(resolved.get_version("local-tarball"), None);
+        assert_eq!(resolved.get_version("from-git"), None);
+        assert_eq!(resolved.get_version("workspace-star"), None);
+    }
+
+    /// Code-review regression: an unquoted, numeric-looking `version` (e.g. `version: 1.0`)
+    /// parses as `Yaml::Real`, not `Yaml::String` — `as_str()` alone would silently drop the
+    /// entry via `continue` with no explanation. `yaml_scalar_string` coerces it the same way
+    /// it already does for `lockfileVersion`, so the entry reaches the (still-applicable)
+    /// semver-shape gate — a two-component value is not a valid registry-resolved version
+    /// either way, but it is now evaluated and skipped for that reason, not silently dropped
+    /// for looking like the wrong YAML type.
+    #[tokio::test]
+    async fn test_parse_pnpm_lock_coerces_unquoted_numeric_version_then_semver_gate_skips_it() {
+        let lockfile_content = r"
+lockfileVersion: '9.0'
+importers:
+  .:
+    dependencies:
+      widget:
+        specifier: ^1.0.0
+        version: 1.0
+      react:
+        specifier: ^18.0.0
+        version: 18.2.0
+";
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lockfile_path = temp_dir.path().join("pnpm-lock.yaml");
+        tokio::fs::write(&lockfile_path, lockfile_content)
+            .await
+            .unwrap();
+
+        let parser = NpmLockParser;
+        let resolved = parser.parse_lockfile(&lockfile_path).await.unwrap();
+
+        assert_eq!(resolved.get_version("widget"), None);
+        assert_eq!(resolved.get_version("react"), Some("18.2.0"));
+    }
+
+    /// A `version` field that isn't even a scalar (e.g. a nested mapping) must be logged and
+    /// skipped without panicking, and must not affect resolution of sibling entries.
+    #[tokio::test]
+    async fn test_parse_pnpm_lock_non_scalar_version_field_is_skipped_without_panic() {
+        let lockfile_content = r"
+lockfileVersion: '9.0'
+importers:
+  .:
+    dependencies:
+      broken:
+        specifier: ^1.0.0
+        version:
+          nested: mapping
+      react:
+        specifier: ^18.0.0
+        version: 18.2.0
+";
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lockfile_path = temp_dir.path().join("pnpm-lock.yaml");
+        tokio::fs::write(&lockfile_path, lockfile_content)
+            .await
+            .unwrap();
+
+        let parser = NpmLockParser;
+        let resolved = parser.parse_lockfile(&lockfile_path).await.unwrap();
+
+        assert_eq!(resolved.get_version("broken"), None);
+        assert_eq!(resolved.get_version("react"), Some("18.2.0"));
+    }
+
+    #[test]
+    fn test_locate_lockfile_prefers_package_lock_json_over_pnpm() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manifest_path = temp_dir.path().join("package.json");
+        let npm_lock = temp_dir.path().join("package-lock.json");
+        let pnpm_lock = temp_dir.path().join("pnpm-lock.yaml");
+
+        std::fs::write(&manifest_path, r#"{"name": "test"}"#).unwrap();
+        std::fs::write(&npm_lock, r#"{"lockfileVersion": 3}"#).unwrap();
+        std::fs::write(&pnpm_lock, "lockfileVersion: '9.0'\n").unwrap();
+
+        let manifest_uri = Uri::from_file_path(&manifest_path).unwrap();
+        let parser = NpmLockParser;
+
+        assert_eq!(parser.locate_lockfile(&manifest_uri).unwrap(), npm_lock);
+    }
+
+    #[test]
+    fn test_locate_lockfile_falls_back_to_pnpm_when_no_package_lock() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manifest_path = temp_dir.path().join("package.json");
+        let pnpm_lock = temp_dir.path().join("pnpm-lock.yaml");
+
+        std::fs::write(&manifest_path, r#"{"name": "test"}"#).unwrap();
+        std::fs::write(&pnpm_lock, "lockfileVersion: '9.0'\n").unwrap();
+
+        let manifest_uri = Uri::from_file_path(&manifest_path).unwrap();
+        let parser = NpmLockParser;
+
+        assert_eq!(parser.locate_lockfile(&manifest_uri).unwrap(), pnpm_lock);
     }
 }

@@ -9,7 +9,7 @@ deps-lsp provides comprehensive LSP support for 14 package ecosystems:
 | Ecosystem | Language | Manifest File(s) | Lock File(s) | Features |
 |-----------|----------|-----------------|--------------|----------|
 | **Cargo** | Rust | `Cargo.toml` | `Cargo.lock` | Hover, inlay hints, completion, code actions, diagnostics, code lens, feature flag completion, alternate/private registry resolution via `.cargo/config.toml` (see below) |
-| **npm** | JavaScript/TypeScript | `package.json` | `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml` | Hover, inlay hints, completion, code actions, diagnostics, code lens, custom/private registry resolution via `.npmrc`, pnpm workspace catalog (`catalog:`/`catalog:<name>`) resolution via `pnpm-workspace.yaml` (see below) |
+| **npm** | JavaScript/TypeScript | `package.json` | `package-lock.json`, `pnpm-lock.yaml` | Hover, inlay hints, completion, code actions, diagnostics, code lens, custom/private registry resolution via `.npmrc`, pnpm workspace catalog (`catalog:`/`catalog:<name>`) resolution via `pnpm-workspace.yaml` (see below) |
 | **PyPI** | Python | `pyproject.toml`, `requirements.txt`, `constraints.txt` (also recognized under a `requirements/` directory, e.g. `requirements/base.txt`) | `poetry.lock`, `uv.lock` | Hover with PEP 508 environment marker display ("Active when: `<marker>`"), inlay hints, completion, code actions, diagnostics, code lens, document links for `-r`/`-c`/`--requirement`/`--constraint` file references, private/custom index resolution via `--index-url`/`--extra-index-url`, Poetry `[[tool.poetry.source]]`, and uv `[tool.uv.index]`/`[tool.uv.sources]` (see below) |
 | **Go** | Go | `go.mod` | `go.sum` | Hover, inlay hints, completion, code actions, diagnostics, code lens, pseudo-version support, `$GOENV` `GOPROXY`/`GOPRIVATE` proxy-chain resolution (see below) |
 | **Bundler** | Ruby | `Gemfile` | `Gemfile.lock` | Hover, inlay hints, completion, code actions, diagnostics, code lens |
@@ -234,10 +234,6 @@ in this situation before returning any catalog map at all; this deliberately
 never per-key-merges the two sections.
 
 **Known limitations**:
-- `pnpm-lock.yaml` is not read for in-use/resolved-version detection (no
-  `deps-npm` lockfile support for it yet — see the lock-file column above);
-  this is a pre-existing gap shared with every other npm dependency in a pnpm
-  workspace, not specific to catalogs.
 - The `npm:<pkg>@catalog:<name>` combination form (an `npm:` alias whose
   version is itself a catalog reference) is not detected — the base `npm:`
   alias form (no catalog combination) *is* resolved, see the npm `npm:` Alias
@@ -245,6 +241,20 @@ never per-key-merges the two sections.
 - A catalog entry whose value isn't a scalar string (e.g. a nested mapping)
   gets its own distinct "not a version string" message rather than being
   validated against pnpm's own schema further.
+- `yarn.lock` and `bun.lock` are not read for in-use/resolved-version
+  detection — only `package-lock.json` and `pnpm-lock.yaml` are supported
+  lock file formats (tracked as follow-ups on issue #709).
+- `pnpm-lock.yaml`'s `importers` map is aggregated flatly across every
+  workspace member into one shared version pool per package name, without
+  correlating an importer entry back to the specific `package.json` being
+  queried (spec 052's deliberate scoping). When two importers have
+  *overlapping* semver ranges that pnpm resolved to *different* concrete
+  versions, hover/OSV scanning for one importer's `package.json` can show the
+  version resolved for a different importer instead of its own — a
+  false-negative risk for vulnerability scanning, not just an imprecision.
+  The same applies to any `package.json` under the workspace root that isn't
+  itself a registered importer: it inherits whichever importer's version the
+  ancestor lock file search happens to attach to.
 
 ### PyPI Custom/Private Indexes
 
