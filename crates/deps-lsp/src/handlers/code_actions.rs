@@ -550,16 +550,16 @@ serde = "1.0.0"
                 "serde".to_string(),
                 ScanOutcome::Vulnerable(DependencyVulnerabilities {
                     advisories: Capped::new(
-                        vec![Arc::new(Advisory {
-                            id: "RUSTSEC-2020-0071".to_string(),
-                            modified: "2023-01-01T00:00:00Z".to_string(),
-                            summary: None,
-                            aliases: vec![],
-                            severity: VulnSeverity::High,
-                            cvss_vector: None,
-                            fixed_versions: vec!["1.0.5".to_string()],
-                            url: String::new(),
-                        })],
+                        vec![Arc::new(Advisory::new(
+                            "RUSTSEC-2020-0071".to_string(),
+                            "2023-01-01T00:00:00Z".to_string(),
+                            None,
+                            vec![],
+                            VulnSeverity::High,
+                            None,
+                            vec!["1.0.5".to_string()],
+                            String::new(),
+                        ))],
                         1,
                     ),
                     fix_target_status: UpgradeStatus::CandidateClean {
@@ -719,16 +719,16 @@ serde = "1.0.0"
                 "vapor/vapor".to_string(),
                 ScanOutcome::Vulnerable(DependencyVulnerabilities {
                     advisories: Capped::new(
-                        vec![Arc::new(Advisory {
-                            id: "GHSA-test-0001".to_string(),
-                            modified: "2023-01-01T00:00:00Z".to_string(),
-                            summary: None,
-                            aliases: vec![],
-                            severity: VulnSeverity::High,
-                            cvss_vector: None,
-                            fixed_versions: vec!["4.50.1".to_string()],
-                            url: String::new(),
-                        })],
+                        vec![Arc::new(Advisory::new(
+                            "GHSA-test-0001".to_string(),
+                            "2023-01-01T00:00:00Z".to_string(),
+                            None,
+                            vec![],
+                            VulnSeverity::High,
+                            None,
+                            vec!["4.50.1".to_string()],
+                            String::new(),
+                        ))],
                         1,
                     ),
                     fix_target_status: UpgradeStatus::CandidateClean {

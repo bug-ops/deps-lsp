@@ -7,21 +7,20 @@ use tower_lsp_server::ls_types::Range;
 ///
 /// # Examples
 ///
-/// ```
-/// use deps_composer::types::{ComposerDependency, ComposerSection};
-/// use tower_lsp_server::ls_types::{Position, Range};
+/// ```no_run
+/// use deps_composer::parser::parse_composer_json;
+/// use deps_composer::types::ComposerSection;
+/// use tower_lsp_server::ls_types::Uri;
 ///
-/// let dep = ComposerDependency {
-///     name: "symfony/console".into(),
-///     name_range: Range::new(Position::new(3, 4), Position::new(3, 20)),
-///     version_req: Some("^6.0".into()),
-///     version_range: Some(Range::new(Position::new(3, 23), Position::new(3, 28))),
-///     section: ComposerSection::Require,
-/// };
+/// let json = r#"{ "require": { "symfony/console": "^6.0" } }"#;
+/// let uri = Uri::from_file_path("/test/composer.json").unwrap();
+/// let result = parse_composer_json(json, &uri).unwrap();
+/// let dep = &result.dependencies[0];
 ///
 /// assert_eq!(dep.name, "symfony/console");
 /// assert!(matches!(dep.section, ComposerSection::Require));
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComposerDependency {
     /// Package name (`vendor/package`).
@@ -53,6 +52,7 @@ deps_core::impl_dependency!(ComposerDependency {
 /// let section = ComposerSection::Require;
 /// assert!(matches!(section, ComposerSection::Require));
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComposerSection {
     /// Production dependencies (`require`)
@@ -71,17 +71,18 @@ pub enum ComposerSection {
 /// ```
 /// use deps_composer::types::ComposerVersion;
 ///
-/// let version = ComposerVersion {
-///     version: "6.0.0".into(),
-///     version_normalized: "6.0.0.0".into(),
-///     abandoned: false,
-///     deprecation: None,
-///     published_at: None,
-///     license: vec![],
-/// };
+/// let version = ComposerVersion::new(
+///     "6.0.0".into(),
+///     "6.0.0.0".into(),
+///     false,
+///     None,
+///     None,
+///     vec![],
+/// );
 ///
 /// assert!(!version.abandoned);
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ComposerVersion {
     /// The parsed version number.
@@ -109,6 +110,41 @@ pub struct ComposerVersion {
     /// commonly repeats the same `license` as the previous tag, and Packagist only
     /// sends the field again when it actually changes.
     pub license: Vec<String>,
+}
+
+impl ComposerVersion {
+    /// Constructs a `ComposerVersion` from its six fields.
+    ///
+    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
+    /// this crate, so every other crate must go through this constructor instead.
+    ///
+    /// # Arguments
+    ///
+    /// * `version` - The parsed version number
+    /// * `version_normalized` - Packagist's normalized 4-part version string (e.g.
+    ///   `"6.0.0.0"`)
+    /// * `abandoned` - Whether Packagist marks this package/version as abandoned
+    /// * `deprecation` - Package-level deprecation payload derived from `abandoned`, if any
+    /// * `published_at` - Publish timestamp from the p2 entry's own `time` field
+    /// * `license` - SPDX license identifier(s) from the p2 entry's `license` field
+    #[must_use]
+    pub fn new(
+        version: deps_core::ConcreteVersion,
+        version_normalized: String,
+        abandoned: bool,
+        deprecation: Option<deps_core::Deprecation>,
+        published_at: Option<deps_core::PublishTime>,
+        license: Vec<String>,
+    ) -> Self {
+        Self {
+            version,
+            version_normalized,
+            abandoned,
+            deprecation,
+            published_at,
+            license,
+        }
+    }
 }
 
 /// Whether `s` contains Composer's short `-a`/`-b` stability alias (`-a1`,

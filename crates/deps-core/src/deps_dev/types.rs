@@ -77,6 +77,7 @@ pub(super) struct DepsDevScorecardWire {
 /// version-level query itself succeeded, so a caller can distinguish "we checked and
 /// found nothing" from "we didn't check" via `Option<ProvenanceStatus>` at the
 /// [`SupplyChainTrustSignal`] level.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProvenanceStatus {
     /// At least one `slsaProvenances[]`/`attestations[]` entry has `verified == true`.
@@ -112,6 +113,7 @@ pub struct ScorecardSummary {
 /// fields as independently `Option` still matters: see
 /// [`ProvenanceStatus`]'s docs for why `provenance` in particular stays
 /// `Option` rather than collapsing into `scorecard`'s shape.
+#[non_exhaustive]
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SupplyChainTrustSignal {
     /// The linked source repository's OpenSSF Scorecard, when one could be

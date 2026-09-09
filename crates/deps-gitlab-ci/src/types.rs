@@ -105,6 +105,7 @@ pub enum PinStyle {
 
 /// Parsed `include:` dependency from a `.gitlab-ci.yml`-syntax file, with position
 /// tracking.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitlabCiDependency {
     /// Host-qualified when the host is known: `{host}/{project_path}` for [`IncludeKind::Project`],
@@ -175,6 +176,7 @@ impl deps_core::ecosystem::Dependency for GitlabCiDependency {
 
 /// Version information for a GitLab CI dependency: a repository tag (`project:`) or a
 /// project release (`component:`).
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct GitlabCiVersion {
     /// The tag/release name as published, `v` prefix (or lack of one) kept as-is.
@@ -189,6 +191,45 @@ pub struct GitlabCiVersion {
     pub published_at: Option<deps_core::PublishTime>,
 }
 
+impl GitlabCiVersion {
+    /// Constructs a `GitlabCiVersion` from its four fields.
+    ///
+    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
+    /// this crate, so every other crate must go through this constructor instead.
+    ///
+    /// # Arguments
+    ///
+    /// * `version` - The tag/release name as published, `v` prefix (or lack of one) kept
+    ///   as-is
+    /// * `sha` - The commit SHA this tag/release points at
+    /// * `prerelease` - Whether the semver `pre` component is non-empty
+    /// * `published_at` - `Some(released_at)` for the releases endpoint; `None` for tags
+    ///   (see [`Self::published_at`]'s docs for why)
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_gitlab_ci::GitlabCiVersion;
+    ///
+    /// let version = GitlabCiVersion::new("1.2.0".into(), "a".repeat(40), false, None);
+    /// assert_eq!(version.version.as_str(), "1.2.0");
+    /// ```
+    #[must_use]
+    pub fn new(
+        version: deps_core::ConcreteVersion,
+        sha: String,
+        prerelease: bool,
+        published_at: Option<deps_core::PublishTime>,
+    ) -> Self {
+        Self {
+            version,
+            sha,
+            prerelease,
+            published_at,
+        }
+    }
+}
+
 // GitLab exposes no yank/deprecation signal for either endpoint, so `status` is
 // unconditionally `Available` (mirrors `deps-github-actions`'s `GithubActionsVersion`).
 deps_core::impl_version!(GitlabCiVersion {
@@ -199,6 +240,7 @@ deps_core::impl_version!(GitlabCiVersion {
 });
 
 /// Result of parsing a `.gitlab-ci.yml`-syntax file.
+#[non_exhaustive]
 #[derive(Debug)]
 pub struct GitlabCiParseResult {
     /// Every `include:` dependency found, including ones with an unresolved host (their

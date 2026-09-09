@@ -246,6 +246,10 @@ pub fn format_relative_age(age_secs: u64) -> String {
 /// assert!(settings.enabled);
 /// assert_eq!(settings.cooldown_secs, deps_core::DEFAULT_COOLDOWN_SECS);
 /// ```
+// Exhaustive: a `Copy` DTO snapshot meant for direct struct-literal construction by
+// callers (see the docs above) — several ecosystem crates and `deps-lsp`'s `const fn
+// to_settings` build it by literal today, which `#[non_exhaustive]` would break for no
+// benefit, since both fields are simple, unlikely-to-change scalars (issue #755).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FreshnessSettings {
     /// Whether the freshness signal is rendered at all.

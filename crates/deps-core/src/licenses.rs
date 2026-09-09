@@ -105,6 +105,7 @@ pub fn filter_valid_spdx_ids(ids: Vec<String>) -> Vec<String> {
 /// Both lists are independently optional; an empty policy (`is_empty()`)
 /// matches nothing and [`evaluate`] always returns `None` for it. See
 /// [`evaluate`] for matching and precedence rules.
+#[non_exhaustive]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LicensePolicy {
     /// SPDX identifiers a dependency's license must include at least one of,

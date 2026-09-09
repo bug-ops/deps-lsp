@@ -127,7 +127,7 @@ impl Ecosystem for BundlerEcosystem {
                     self.complete_versions(&package_name, &prefix, freshness)
                         .await
                 }
-                CompletionContext::Feature { .. } | CompletionContext::None => vec![],
+                CompletionContext::Feature { .. } | CompletionContext::None | _ => vec![],
             }
             .into()
         })

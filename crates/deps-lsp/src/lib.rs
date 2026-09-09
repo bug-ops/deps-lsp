@@ -1,3 +1,12 @@
+// `document/fetch.rs` and the test-only mock `Registry` implementations in `test_utils.rs`/
+// `handlers/completion.rs` box futures for every ecosystem's `get_latest_matching`-style call;
+// rustc's default recursion limit has proven occasionally insufficient to prove the resulting
+// `Send` bound for several ecosystem crates' own implementations, downgrading a
+// previously-silent trait-solver retry into `recursion_depth_exceeding_limit`, which the fuzz
+// CI job's `-D warnings` nightly build turns into a hard error (rust-lang/rust#159228). Same
+// class of fix as deps-cargo (#745), deps-nuget (#696), deps-swift (#673), deps-composer.
+#![recursion_limit = "256"]
+
 //! The `deps-lsp` binary crate: wires the 14 ecosystem crates into a running
 //! `tower-lsp-server` [`LanguageServer`](tower_lsp_server::LanguageServer)
 //! implementation.
@@ -23,6 +32,7 @@ mod test_utils;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+pub use deps_core::parser::DependencySource;
 pub use deps_core::{DepsError, EcosystemRegistry, HttpCache, Result};
 pub use server::Backend;
 
@@ -72,14 +82,13 @@ ecosystem!(
     deps_cargo,
     CargoEcosystem,
     [
+        CargoDependency,
+        CargoDependencySection,
+        CargoParseResult,
         CargoParser,
         CargoVersion,
         CrateInfo,
         CratesIoRegistry,
-        DependencySection,
-        DependencySource,
-        ParseResult,
-        ParsedDependency,
         parse_cargo_toml,
     ]
 );

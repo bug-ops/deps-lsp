@@ -11,20 +11,18 @@ use tower_lsp_server::ls_types::Range;
 ///
 /// # Examples
 ///
-/// ```
-/// use deps_deno::types::{DenoDependency, DenoDependencySection};
-/// use tower_lsp_server::ls_types::{Position, Range};
+/// ```no_run
+/// use deps_deno::parser::parse_deno_json;
+/// use tower_lsp_server::ls_types::Uri;
 ///
-/// let dep = DenoDependency {
-///     name: "jsr:@std/fs".into(),
-///     name_range: Range::new(Position::new(2, 4), Position::new(2, 15)),
-///     version_req: Some("^1.0".into()),
-///     version_range: Some(Range::new(Position::new(2, 17), Position::new(2, 21))),
-///     section: DenoDependencySection::Imports,
-/// };
+/// let json = r#"{ "imports": { "jsr:@std/fs": "jsr:@std/fs@^1.0" } }"#;
+/// let uri = Uri::from_file_path("/test/deno.json").unwrap();
+/// let result = parse_deno_json(json, &uri).unwrap();
+/// let dep = &result.dependencies[0];
 ///
 /// assert_eq!(dep.name, "jsr:@std/fs");
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DenoDependency {
     /// Scheme-qualified package name (`"jsr:@std/fs"`, `"npm:react"`).
@@ -51,6 +49,7 @@ deps_core::impl_dependency!(DenoDependency {
 /// Single-variant today (D8): only the `imports` map is parsed in the MVP — `scopes` and
 /// `importMap` are out of scope (spec §1). Kept as an enum rather than a unit struct so a
 /// future `Scopes` variant slots in without changing every call site.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DenoDependencySection {
     /// The `imports` map.
@@ -68,14 +67,11 @@ pub enum DenoDependencySection {
 /// ```
 /// use deps_deno::types::JsrVersion;
 ///
-/// let version = JsrVersion {
-///     version: "1.0.24".into(),
-///     yanked: false,
-///     published_at: None,
-/// };
+/// let version = JsrVersion::new("1.0.24".into(), false, None);
 ///
 /// assert!(!version.yanked);
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct JsrVersion {
     /// The version string (e.g. `"1.0.24"`).
@@ -84,6 +80,32 @@ pub struct JsrVersion {
     pub yanked: bool,
     /// When this version was published, parsed from `meta.json`'s `createdAt`.
     pub published_at: Option<deps_core::PublishTime>,
+}
+
+impl JsrVersion {
+    /// Constructs a `JsrVersion` from its three fields.
+    ///
+    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
+    /// this crate, so every other crate must go through this constructor instead.
+    ///
+    /// # Arguments
+    ///
+    /// * `version` - The version string (e.g. `"1.0.24"`)
+    /// * `yanked` - Whether JSR marked this specific version as yanked
+    /// * `published_at` - When this version was published, parsed from `meta.json`'s
+    ///   `createdAt`
+    #[must_use]
+    pub fn new(
+        version: deps_core::ConcreteVersion,
+        yanked: bool,
+        published_at: Option<deps_core::PublishTime>,
+    ) -> Self {
+        Self {
+            version,
+            yanked,
+            published_at,
+        }
+    }
 }
 
 // JSR mandates strict semver, so `node_semver` reliably exposes the

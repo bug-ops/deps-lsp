@@ -4,6 +4,7 @@ use std::any::Any;
 use tower_lsp_server::ls_types::Range;
 
 /// Parsed dependency from Gemfile with position tracking.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BundlerDependency {
     /// Gem name.
@@ -27,6 +28,7 @@ pub struct BundlerDependency {
 pub use deps_core::parser::DependencySource;
 
 /// Gem group classification.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum DependencyGroup {
     /// No explicit group (runtime dependency)
@@ -43,6 +45,7 @@ pub enum DependencyGroup {
 }
 
 /// Version information for a gem from rubygems.org.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct BundlerVersion {
     /// The parsed version number.

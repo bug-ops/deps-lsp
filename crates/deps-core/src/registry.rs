@@ -417,6 +417,7 @@ pub fn hash_routing_key<'a>(prefix: &str, parts: impl Iterator<Item = &'a str>) 
 /// assert!(RemovalStatus::Yanked.is_flagged());
 /// assert!(!RemovalStatus::Available.is_flagged());
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RemovalStatus {
     /// The registry reports no removal/deprecation signal for this version.
@@ -532,6 +533,11 @@ impl RemovalStatus {
 /// assert_eq!(deprecation.reason.as_deref(), Some("no longer maintained"));
 /// assert_eq!(deprecation.replacement.as_deref(), Some("some-other/package"));
 /// ```
+// Exhaustive: 25+ existing struct-literal construction sites across `deps-npm`,
+// `deps-composer`, and `deps-lsp` (production code and tests) already build this directly
+// by field; adding `#[non_exhaustive]` here would force a wide, low-value migration to a
+// constructor for a two-field type that isn't expected to grow often, not because it's
+// somehow less likely to grow than other types in this pass (issue #755).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Deprecation {
     /// Free-text reason the registry gives for the deprecation, if any.

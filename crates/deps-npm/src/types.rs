@@ -10,24 +10,20 @@ use crate::catalog::CatalogOrigin;
 ///
 /// # Examples
 ///
-/// ```
-/// use deps_npm::types::{NpmDependency, NpmDependencySection};
-/// use tower_lsp_server::ls_types::{Position, Range};
+/// ```no_run
+/// use deps_npm::parser::parse_package_json;
+/// use deps_npm::types::NpmDependencySection;
+/// use tower_lsp_server::ls_types::Uri;
 ///
-/// let dep = NpmDependency {
-///     name: "express".into(),
-///     name_range: Range::new(Position::new(5, 4), Position::new(5, 13)),
-///     version_req: Some("^4.18.2".into()),
-///     version_range: Some(Range::new(Position::new(5, 16), Position::new(5, 25))),
-///     section: NpmDependencySection::Dependencies,
-///     source: deps_core::parser::DependencySource::Registry,
-///     catalog: None,
-///     package: None,
-/// };
+/// let json = r#"{ "dependencies": { "express": "^4.18.2" } }"#;
+/// let uri = Uri::from_file_path("/test/package.json").unwrap();
+/// let result = parse_package_json(json, &uri).unwrap();
+/// let dep = &result.dependencies[0];
 ///
 /// assert_eq!(dep.name, "express");
 /// assert!(matches!(dep.section, NpmDependencySection::Dependencies));
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NpmDependency {
     /// The JSON key: the local import alias when [`Self::package`] is set (via an `npm:`
@@ -69,7 +65,7 @@ pub struct NpmDependency {
 // macro hygiene ties a `self` token written at the call site to the call site's own scope
 // (module-level, not a method), not to the generated function's `&self` parameter — so
 // `self.source.clone()` cannot be passed through the macro at all. Mirrors `deps-cargo`'s
-// identical direct `impl deps_core::Dependency for ParsedDependency`.
+// identical direct `impl deps_core::Dependency for CargoDependency`.
 impl deps_core::Dependency for NpmDependency {
     /// Returns the registry lookup name: [`Self::package`] when this dependency was
     /// aliased via an `npm:` value, otherwise the JSON key.
@@ -114,6 +110,7 @@ impl deps_core::Dependency for NpmDependency {
 /// let section = NpmDependencySection::Dependencies;
 /// assert!(matches!(section, NpmDependencySection::Dependencies));
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NpmDependencySection {
     /// Production dependencies (`dependencies`)
@@ -136,15 +133,11 @@ pub enum NpmDependencySection {
 /// ```
 /// use deps_npm::types::NpmVersion;
 ///
-/// let version = NpmVersion {
-///     version: "4.18.2".into(),
-///     deprecated: false,
-///     deprecation: None,
-///     published_at: None,
-/// };
+/// let version = NpmVersion::new("4.18.2".into(), false, None, None);
 ///
 /// assert!(!version.deprecated);
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct NpmVersion {
     /// The parsed version number.
@@ -164,6 +157,36 @@ pub struct NpmVersion {
     /// freshness enabled — derived from the full packument's `time` map, never the
     /// abbreviated packument `get_versions` otherwise uses.
     pub published_at: Option<deps_core::PublishTime>,
+}
+
+impl NpmVersion {
+    /// Constructs an `NpmVersion` from its four fields.
+    ///
+    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
+    /// this crate, so every other crate must go through this constructor instead.
+    ///
+    /// # Arguments
+    ///
+    /// * `version` - The parsed version number
+    /// * `deprecated` - Whether the packument marks this version as deprecated
+    /// * `deprecation` - Package-level deprecation payload, if `deprecated` carries a
+    ///   non-empty free-text reason
+    /// * `published_at` - Publish timestamp, populated only when requested with freshness
+    ///   enabled
+    #[must_use]
+    pub fn new(
+        version: deps_core::ConcreteVersion,
+        deprecated: bool,
+        deprecation: Option<deps_core::Deprecation>,
+        published_at: Option<deps_core::PublishTime>,
+    ) -> Self {
+        Self {
+            version,
+            deprecated,
+            deprecation,
+            published_at,
+        }
+    }
 }
 
 // Use macro to implement VersionInfo and Version traits. `node_semver`

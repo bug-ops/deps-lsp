@@ -5,6 +5,7 @@ use std::any::Any;
 use tower_lsp_server::ls_types::Range;
 
 /// A dependency from a go.mod file.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GoDependency {
     /// Module path (e.g., "github.com/gin-gonic/gin")
@@ -38,6 +39,7 @@ pub enum GoDirective {
 }
 
 /// Version information from proxy.golang.org.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct GoVersion {
     /// Version string (e.g., "v1.9.1")

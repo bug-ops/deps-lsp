@@ -242,7 +242,7 @@ impl Ecosystem for CargoEcosystem {
             // shared router, including its credential (if any) — the only point in the
             // whole pipeline where a `.cargo/config.toml`/`$CARGO_HOME` resolution and the
             // long-lived `CargoRegistry` this ecosystem shares across every document ever
-            // meet. See `crate::parser::ParseResult::resolved_registries`'s docs.
+            // meet. See `crate::parser::CargoParseResult::resolved_registries`'s docs.
             for (index, auth) in result.resolved_registries.clone() {
                 self.registry.register_alternate(index, auth);
             }
@@ -289,7 +289,7 @@ impl Ecosystem for CargoEcosystem {
                     self.complete_features(parse_result, &package_name, &prefix)
                         .await
                 }
-                CompletionContext::None => vec![],
+                CompletionContext::None | _ => vec![],
             }
             .into()
         })
@@ -337,7 +337,7 @@ fn extract_prefix(line: &str, character: u32) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{DependencySection, DependencySource, ParsedDependency};
+    use crate::types::{CargoDependency, CargoDependencySection, DependencySource};
     use deps_core::{EcosystemConfig, PackageVersions, VersionData};
     use std::collections::HashMap;
     use tower_lsp_server::ls_types::{InlayHintLabel, Position, Range};
@@ -352,8 +352,8 @@ mod tests {
         version: Option<&str>,
         name_line: u32,
         version_line: u32,
-    ) -> ParsedDependency {
-        ParsedDependency {
+    ) -> CargoDependency {
+        CargoDependency {
             name: name.into(),
             name_range: Range::new(
                 Position::new(name_line, 0),
@@ -369,14 +369,14 @@ mod tests {
             features: vec![],
             features_range: None,
             source: DependencySource::Registry,
-            section: DependencySection::Dependencies,
+            section: CargoDependencySection::Dependencies,
             package: None,
         }
     }
 
     /// Mock parse result for testing
     struct MockParseResult {
-        dependencies: Vec<ParsedDependency>,
+        dependencies: Vec<CargoDependency>,
     }
 
     impl deps_core::ParseResult for MockParseResult {

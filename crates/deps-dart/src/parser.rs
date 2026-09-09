@@ -8,6 +8,7 @@ use tower_lsp_server::ls_types::{Range, Uri};
 use yaml_rust2::{Yaml, YamlLoader};
 
 /// Result of parsing a `pubspec.yaml` file.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct DartParseResult {
     /// Dependencies found across all sections.

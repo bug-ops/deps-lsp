@@ -12,28 +12,22 @@ pub use deps_core::parser::DependencySource;
 ///
 /// # Examples
 ///
-/// ```
-/// use deps_cargo::types::{ParsedDependency, DependencySection};
+/// ```no_run
 /// use deps_cargo::DependencySource;
-/// use tower_lsp_server::ls_types::{Position, Range};
+/// use deps_cargo::parse_cargo_toml;
+/// use tower_lsp_server::ls_types::Uri;
 ///
-/// let dep = ParsedDependency {
-///     name: "serde".into(),
-///     name_range: Range::new(Position::new(5, 0), Position::new(5, 5)),
-///     version_req: Some("1.0".into()),
-///     version_range: Some(Range::new(Position::new(5, 9), Position::new(5, 14))),
-///     features: vec!["derive".into()],
-///     features_range: None,
-///     source: DependencySource::Registry,
-///     section: DependencySection::Dependencies,
-///     package: None,
-/// };
+/// let toml = "[dependencies]\nserde = { version = \"1.0\", features = [\"derive\"] }";
+/// let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
+/// let result = parse_cargo_toml(toml, &uri).unwrap();
+/// let dep = &result.dependencies[0];
 ///
 /// assert_eq!(dep.name, "serde");
 /// assert!(matches!(dep.source, DependencySource::Registry));
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParsedDependency {
+pub struct CargoDependency {
     /// The TOML table key: the local import alias when [`Self::package`] is set,
     /// otherwise the actual crate name. Always the position anchor for
     /// [`Self::name_range`], regardless of renaming.
@@ -51,7 +45,7 @@ pub struct ParsedDependency {
     /// Where this dependency resolves from (registry, git, path, etc.).
     pub source: DependencySource,
     /// Which `Cargo.toml` section this dependency was declared under.
-    pub section: DependencySection,
+    pub section: CargoDependencySection,
     /// The real crate name from an explicit `package = "..."` key
     /// ([renaming dependencies](https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html#renaming-dependencies-in-cargotoml)),
     /// when present. `None` for an ordinary, non-renamed dependency, in which
@@ -75,13 +69,14 @@ pub struct ParsedDependency {
 /// # Examples
 ///
 /// ```
-/// use deps_cargo::types::DependencySection;
+/// use deps_cargo::types::CargoDependencySection;
 ///
-/// let section = DependencySection::Dependencies;
-/// assert!(matches!(section, DependencySection::Dependencies));
+/// let section = CargoDependencySection::Dependencies;
+/// assert!(matches!(section, CargoDependencySection::Dependencies));
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DependencySection {
+pub enum CargoDependencySection {
     /// Runtime dependencies (`[dependencies]`)
     Dependencies,
     /// Development dependencies (`[dev-dependencies]`)
@@ -104,20 +99,14 @@ pub enum DependencySection {
 /// use deps_cargo::types::CargoVersion;
 /// use std::collections::HashMap;
 ///
-/// let version = CargoVersion {
-///     num: "1.0.214".into(),
-///     yanked: false,
-///     features: {
-///         let mut f = HashMap::new();
-///         f.insert("derive".into(), vec!["serde_derive".into()]);
-///         f
-///     },
-///     published_at: None,
-/// };
+/// let mut features = HashMap::new();
+/// features.insert("derive".into(), vec!["serde_derive".into()]);
+/// let version = CargoVersion::new("1.0.214".into(), false, features, None);
 ///
 /// assert!(!version.yanked);
 /// assert!(version.features.contains_key("derive"));
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct CargoVersion {
     /// The parsed version number.
@@ -132,6 +121,34 @@ pub struct CargoVersion {
     /// the value fails to parse as RFC 3339 — degrades gracefully, per
     /// [US-003](https://github.com/bug-ops/deps-lsp/issues/145).
     pub published_at: Option<deps_core::PublishTime>,
+}
+
+impl CargoVersion {
+    /// Constructs a `CargoVersion` from its four fields.
+    ///
+    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
+    /// this crate, so every other crate must go through this constructor instead.
+    ///
+    /// # Arguments
+    ///
+    /// * `num` - The parsed version number
+    /// * `yanked` - Whether this version has been yanked from crates.io
+    /// * `features` - Available feature flags mapped to the other features/deps they enable
+    /// * `published_at` - Publish timestamp, if the sparse index entry carried one
+    #[must_use]
+    pub fn new(
+        num: deps_core::ConcreteVersion,
+        yanked: bool,
+        features: HashMap<String, Vec<String>>,
+        published_at: Option<deps_core::PublishTime>,
+    ) -> Self {
+        Self {
+            num,
+            yanked,
+            features,
+            published_at,
+        }
+    }
 }
 
 /// Crate metadata from crates.io search API.
@@ -170,7 +187,7 @@ pub struct CrateInfo {
 
 // Trait implementations for deps-core integration
 
-impl deps_core::Dependency for ParsedDependency {
+impl deps_core::Dependency for CargoDependency {
     /// Returns the registry lookup name: [`Self::package`] when this dependency was
     /// renamed via `package = "..."`, otherwise the TOML table key.
     fn name(&self) -> &deps_core::PackageName {
@@ -288,15 +305,18 @@ mod tests {
 
     #[test]
     fn test_dependency_section_variants() {
-        let deps = DependencySection::Dependencies;
-        let dev_deps = DependencySection::DevDependencies;
-        let build_deps = DependencySection::BuildDependencies;
-        let workspace_deps = DependencySection::WorkspaceDependencies;
+        let deps = CargoDependencySection::Dependencies;
+        let dev_deps = CargoDependencySection::DevDependencies;
+        let build_deps = CargoDependencySection::BuildDependencies;
+        let workspace_deps = CargoDependencySection::WorkspaceDependencies;
 
-        assert_matches!(deps, DependencySection::Dependencies);
-        assert_matches!(dev_deps, DependencySection::DevDependencies);
-        assert_matches!(build_deps, DependencySection::BuildDependencies);
-        assert_matches!(workspace_deps, DependencySection::WorkspaceDependencies);
+        assert_matches!(deps, CargoDependencySection::Dependencies);
+        assert_matches!(dev_deps, CargoDependencySection::DevDependencies);
+        assert_matches!(build_deps, CargoDependencySection::BuildDependencies);
+        assert_matches!(
+            workspace_deps,
+            CargoDependencySection::WorkspaceDependencies
+        );
     }
 
     #[test]

@@ -16,6 +16,7 @@ use tower_lsp_server::ls_types::Uri;
 /// Result of parsing a package.json file.
 ///
 /// Contains all dependencies found in the file with their positions.
+#[non_exhaustive]
 #[derive(Debug)]
 pub struct NpmParseResult {
     /// Dependencies found across all `package.json` sections.

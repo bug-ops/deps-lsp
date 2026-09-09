@@ -248,7 +248,7 @@ impl Ecosystem for NuGetEcosystem {
                     self.complete_versions(parse_result, position, &prefix, freshness)
                         .await
                 }
-                CompletionContext::Feature { .. } | CompletionContext::None => vec![],
+                CompletionContext::Feature { .. } | CompletionContext::None | _ => vec![],
             }
             .into()
         })

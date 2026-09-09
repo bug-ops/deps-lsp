@@ -23,10 +23,10 @@
 //! # Examples
 //!
 //! ```
-//! use deps_cargo::{ParsedDependency, CratesIoRegistry};
+//! use deps_cargo::{CargoDependency, CratesIoRegistry};
 //!
 //! // Types are re-exported for convenience
-//! let _deps: Vec<ParsedDependency> = vec![];
+//! let _deps: Vec<CargoDependency> = vec![];
 //! ```
 
 pub mod config;
@@ -45,7 +45,9 @@ pub use config::{CargoConfig, Provenance, RegistryIndex, ResolvedRegistryEntry};
 pub use ecosystem::CargoEcosystem;
 pub use formatter::CargoFormatter;
 pub use lockfile::CargoLockParser;
-pub use parser::{CargoParser, ParseResult, parse_cargo_toml};
+pub use parser::{CargoParseResult, CargoParser, parse_cargo_toml};
 pub use registry::{CargoRegistry, CratesIoRegistry, crate_url};
 pub use sparse::SparseIndexClient;
-pub use types::{CargoVersion, CrateInfo, DependencySection, DependencySource, ParsedDependency};
+pub use types::{
+    CargoDependency, CargoDependencySection, CargoVersion, CrateInfo, DependencySource,
+};

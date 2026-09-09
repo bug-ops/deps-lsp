@@ -311,7 +311,7 @@ impl Ecosystem for PypiEcosystem {
                     .complete_versions(parse_result, position, &prefix, freshness)
                     .await
                     .into(),
-                CompletionContext::Feature { .. } | CompletionContext::None => {
+                CompletionContext::Feature { .. } | CompletionContext::None | _ => {
                     Completions::default()
                 }
             }

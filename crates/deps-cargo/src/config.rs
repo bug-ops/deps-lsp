@@ -1039,7 +1039,7 @@ fn finalize_source_replacement(
 /// This is the input [`resolve`] needs to know which aliases are actually worth
 /// resolving, so config discovery is skipped entirely (spec NFR-004) when this is empty.
 #[must_use]
-pub fn referenced_aliases(dependencies: &[crate::types::ParsedDependency]) -> HashSet<String> {
+pub fn referenced_aliases(dependencies: &[crate::types::CargoDependency]) -> HashSet<String> {
     dependencies
         .iter()
         .filter_map(|dep| match &dep.source {
@@ -1500,12 +1500,12 @@ token = "secret-token"
 
     #[test]
     fn test_referenced_aliases_collects_custom_registry_urls() {
-        use crate::types::{DependencySection, ParsedDependency};
+        use crate::types::{CargoDependency, CargoDependencySection};
         use deps_core::parser::DependencySource;
         use tower_lsp_server::ls_types::Range;
 
         let deps = vec![
-            ParsedDependency {
+            CargoDependency {
                 name: "a".into(),
                 name_range: Range::default(),
                 version_req: None,
@@ -1515,10 +1515,10 @@ token = "secret-token"
                 source: DependencySource::CustomRegistry {
                     url: "my-corp".into(),
                 },
-                section: DependencySection::Dependencies,
+                section: CargoDependencySection::Dependencies,
                 package: None,
             },
-            ParsedDependency {
+            CargoDependency {
                 name: "b".into(),
                 name_range: Range::default(),
                 version_req: None,
@@ -1526,7 +1526,7 @@ token = "secret-token"
                 features: vec![],
                 features_range: None,
                 source: DependencySource::Registry,
-                section: DependencySection::Dependencies,
+                section: CargoDependencySection::Dependencies,
                 package: None,
             },
         ];

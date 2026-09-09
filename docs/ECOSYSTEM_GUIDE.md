@@ -1631,7 +1631,10 @@ fn fetch_versions(package: &str) -> deps_core::Result<Vec<Version>> {
 
 ## Step 3: Define Types
 
-Create ecosystem-specific types in `types.rs`:
+Create ecosystem-specific types in `types.rs`. **Every public type must be prefixed with
+`<Ecosystem>`** (e.g. `NpmDependency`, `NpmParseResult`, `NpmDependencySection` — not bare
+`Dependency`, `ParseResult`, `DependencySection`), matching the convention every ecosystem
+crate now follows (`deps-cargo` was the sole historical exception, fixed in #760).
 
 ```rust
 //! Types for {Ecosystem} dependency management.
@@ -2172,6 +2175,8 @@ mod tests {
 Before submitting a PR for a new ecosystem:
 
 - [ ] Error types with conversions to `deps_core::DepsError`
+- [ ] Every public type prefixed with `<Ecosystem>` (`NpmDependency`, not `Dependency`) — see
+      Step 3
 - [ ] Types implementing `Dependency` and `Version` traits (with `source()` method)
 - [ ] Parser with accurate position tracking for names AND versions
 - [ ] Lock file parser implementing `LockFileProvider` trait (`locate_lockfile` + `parse_lockfile`)

@@ -31,16 +31,16 @@ use deps_core::osv::{
 use super::ServerState;
 
 fn sample_advisory() -> Arc<Advisory> {
-    Arc::new(Advisory {
-        id: "GHSA-xxxx-yyyy-zzzz".to_string(),
-        modified: "2023-01-01T00:00:00Z".to_string(),
-        summary: Some("Example vulnerability for snapshot testing".to_string()),
-        aliases: vec!["CVE-2023-00000".to_string()],
-        severity: VulnSeverity::High,
-        cvss_vector: None,
-        fixed_versions: vec!["9.9.9".to_string()],
-        url: "https://osv.dev/vulnerability/GHSA-xxxx-yyyy-zzzz".to_string(),
-    })
+    Arc::new(Advisory::new(
+        "GHSA-xxxx-yyyy-zzzz".to_string(),
+        "2023-01-01T00:00:00Z".to_string(),
+        Some("Example vulnerability for snapshot testing".to_string()),
+        vec!["CVE-2023-00000".to_string()],
+        VulnSeverity::High,
+        None,
+        vec!["9.9.9".to_string()],
+        "https://osv.dev/vulnerability/GHSA-xxxx-yyyy-zzzz".to_string(),
+    ))
 }
 
 /// Runs the shared scenario for one ecosystem: parse `content`, flag the

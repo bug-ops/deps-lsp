@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use tower_lsp_server::ls_types::{Range, Uri};
 
 /// Result of parsing a `pom.xml` file.
+#[non_exhaustive]
 #[derive(Debug)]
 pub struct MavenParseResult {
     /// Dependencies found across `<dependencies>` and `<dependencyManagement>`.

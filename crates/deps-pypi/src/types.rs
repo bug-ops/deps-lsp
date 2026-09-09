@@ -9,26 +9,20 @@ use tower_lsp_server::ls_types::Range;
 ///
 /// # Examples
 ///
-/// ```
-/// use deps_pypi::types::{PypiDependency, PypiDependencySection, PypiDependencySource};
-/// use tower_lsp_server::ls_types::{Position, Range};
+/// ```no_run
+/// use deps_pypi::PypiParser;
+/// use deps_pypi::types::PypiDependencySection;
+/// use tower_lsp_server::ls_types::Uri;
 ///
-/// let dep = PypiDependency {
-///     name: "requests".into(),
-///     name_range: Range::new(Position::new(5, 4), Position::new(5, 12)),
-///     version_req: Some(">=2.28.0,<3.0".into()),
-///     version_range: Some(Range::new(Position::new(5, 13), Position::new(5, 27))),
-///     extras: vec!["security".into()],
-///     extras_range: None,
-///     markers: Some("python_full_version >= '3.8'".into()),
-///     markers_range: None,
-///     section: PypiDependencySection::Dependencies,
-///     source: PypiDependencySource::Registry,
-/// };
+/// let toml = "[project]\ndependencies = [\"requests>=2.28.0,<3.0\"]";
+/// let uri = Uri::from_file_path("/test/pyproject.toml").unwrap();
+/// let result = PypiParser::new().parse_content(toml, &uri).unwrap();
+/// let dep = &result.dependencies[0];
 ///
 /// assert_eq!(dep.name, "requests");
 /// assert!(matches!(dep.section, PypiDependencySection::Dependencies));
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub struct PypiDependency {
     /// The package name **as produced by the parse path that created this
@@ -125,15 +119,12 @@ pub use deps_core::parser::DependencySource as PypiDependencySource;
 /// ```
 /// use deps_pypi::types::PypiVersion;
 ///
-/// let version = PypiVersion {
-///     version: "2.28.2".into(),
-///     yanked: false,
-///     published_at: None,
-/// };
+/// let version = PypiVersion::new("2.28.2".into(), false, None);
 ///
 /// assert!(!version.yanked);
 /// assert!(!version.is_prerelease());
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct PypiVersion {
     /// Version string (PEP 440 compliant)
@@ -149,6 +140,30 @@ pub struct PypiVersion {
 }
 
 impl PypiVersion {
+    /// Constructs a `PypiVersion` from its three fields.
+    ///
+    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
+    /// this crate, so every other crate must go through this constructor instead.
+    ///
+    /// # Arguments
+    ///
+    /// * `version` - Version string (PEP 440 compliant)
+    /// * `yanked` - Whether this version has been yanked from PyPI
+    /// * `published_at` - Earliest `upload-time` across this version's release files, if any
+    ///   parsed successfully
+    #[must_use]
+    pub fn new(
+        version: deps_core::ConcreteVersion,
+        yanked: bool,
+        published_at: Option<deps_core::PublishTime>,
+    ) -> Self {
+        Self {
+            version,
+            yanked,
+            published_at,
+        }
+    }
+
     /// Check if this version is a prerelease (alpha, beta, rc).
     ///
     /// Uses PEP 440 version parsing for accurate prerelease detection.
@@ -158,10 +173,10 @@ impl PypiVersion {
     /// ```
     /// use deps_pypi::types::PypiVersion;
     ///
-    /// let stable = PypiVersion { version: "1.0.0".into(), yanked: false, published_at: None };
-    /// let alpha = PypiVersion { version: "1.0.0a1".into(), yanked: false, published_at: None };
-    /// let beta = PypiVersion { version: "1.0.0b2".into(), yanked: false, published_at: None };
-    /// let rc = PypiVersion { version: "1.0.0rc1".into(), yanked: false, published_at: None };
+    /// let stable = PypiVersion::new("1.0.0".into(), false, None);
+    /// let alpha = PypiVersion::new("1.0.0a1".into(), false, None);
+    /// let beta = PypiVersion::new("1.0.0b2".into(), false, None);
+    /// let rc = PypiVersion::new("1.0.0rc1".into(), false, None);
     ///
     /// assert!(!stable.is_prerelease());
     /// assert!(alpha.is_prerelease());

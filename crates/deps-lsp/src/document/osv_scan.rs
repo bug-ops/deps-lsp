@@ -127,12 +127,12 @@ fn build_scan_targets(
             continue;
         };
 
-        targets.push(deps_core::osv::ScanTarget {
+        targets.push(deps_core::osv::ScanTarget::new(
             key,
             osv_name,
-            version: formatter.osv_version(&version),
-            display_version: version,
-        });
+            formatter.osv_version(&version),
+            version,
+        ));
     }
 
     (targets, skipped)
@@ -492,12 +492,12 @@ pub(crate) async fn run_osv_phase_b_and_commit(
             .filter_map(|key| {
                 let osv_name = result.osv_name_by_key.get(key)?.clone();
                 let latest_native = latest_native_by_key.get(key)?.clone();
-                Some(deps_core::osv::ScanTarget {
-                    key: key.clone(),
+                Some(deps_core::osv::ScanTarget::new(
+                    key.clone(),
                     osv_name,
-                    version: formatter.osv_version(&latest_native),
-                    display_version: latest_native,
-                })
+                    formatter.osv_version(&latest_native),
+                    latest_native,
+                ))
             })
             .collect();
 
@@ -667,12 +667,12 @@ fn resolve_fix_target(
         );
         return FixTargetResolution::Skip;
     };
-    FixTargetResolution::NeedsLiveCheck(ScanTarget {
-        key: format!("{key}{FIX_TARGET_KEY_SUFFIX}"),
+    FixTargetResolution::NeedsLiveCheck(ScanTarget::new(
+        format!("{key}{FIX_TARGET_KEY_SUFFIX}"),
         osv_name,
-        version: fix.version,
-        display_version: version_native,
-    })
+        fix.version,
+        version_native,
+    ))
 }
 
 /// Pure aggregation step of [`run_osv_fix_target_verification`]: resolves every vulnerable
@@ -1797,16 +1797,16 @@ mod tests {
         impl OsvNaming for IdentityFormatter {}
 
         fn advisory(id: &str, fixed_versions: &[&str]) -> Arc<Advisory> {
-            Arc::new(Advisory {
-                id: id.to_string(),
-                modified: "2023-01-01T00:00:00Z".to_string(),
-                summary: None,
-                aliases: vec![],
-                severity: VulnSeverity::High,
-                cvss_vector: None,
-                fixed_versions: fixed_versions.iter().map(ToString::to_string).collect(),
-                url: String::new(),
-            })
+            Arc::new(Advisory::new(
+                id.to_string(),
+                "2023-01-01T00:00:00Z".to_string(),
+                None,
+                vec![],
+                VulnSeverity::High,
+                None,
+                fixed_versions.iter().map(ToString::to_string).collect(),
+                String::new(),
+            ))
         }
 
         fn dv(
@@ -1884,12 +1884,12 @@ mod tests {
             );
             assert_eq!(
                 resolution,
-                FixTargetResolution::NeedsLiveCheck(deps_core::osv::ScanTarget {
-                    key: format!("pkg{FIX_TARGET_KEY_SUFFIX}"),
-                    osv_name: "pkg".to_string(),
-                    version: "1.2.0".to_string(),
-                    display_version: "1.2.0".to_string(),
-                })
+                FixTargetResolution::NeedsLiveCheck(deps_core::osv::ScanTarget::new(
+                    format!("pkg{FIX_TARGET_KEY_SUFFIX}"),
+                    "pkg".to_string(),
+                    "1.2.0".to_string(),
+                    "1.2.0".to_string(),
+                ))
             );
         }
 

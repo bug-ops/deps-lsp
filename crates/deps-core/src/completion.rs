@@ -101,6 +101,13 @@ impl From<Vec<CompletionItem>> for Completions {
 ///
 /// This enum represents what type of completion is appropriate at the
 /// current cursor location within a manifest file.
+///
+/// `#[non_exhaustive]`: adding a new variant requires reviewing every ecosystem's
+/// `generate_completions` match arm. Every existing arm currently wildcards a new,
+/// unrecognized variant to the same behavior as [`Self::None`] (no completions) rather
+/// than failing to compile — so a new variant will silently produce no completions
+/// everywhere until each ecosystem crate is updated to handle it explicitly.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompletionContext {
     /// Cursor is within or after a package name.

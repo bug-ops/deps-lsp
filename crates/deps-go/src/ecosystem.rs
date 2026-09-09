@@ -197,7 +197,7 @@ impl Ecosystem for GoEcosystem {
                     package_name,
                     prefix,
                 } => self.complete_features(&package_name, &prefix).await,
-                CompletionContext::None => vec![],
+                CompletionContext::None | _ => vec![],
             }
             .into()
         })

@@ -28,6 +28,7 @@ pub enum PinStyle {
 /// `name` is `owner/repo` — truncated at the second `/` for a subdirectory action
 /// (`github/codeql-action/init@v3` -> `github/codeql-action`) or a reusable-workflow call
 /// (`owner/repo/.github/workflows/x.yml@ref` -> `owner/repo`).
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GithubActionsDependency {
     /// `owner/repo` identity.
@@ -112,6 +113,7 @@ impl deps_core::ecosystem::Dependency for GithubActionsDependency {
 }
 
 /// Version information for a GitHub Actions dependency (a repository tag).
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct GithubActionsVersion {
     /// The tag as published on GitHub, `v` prefix (or lack of one) kept as-is.
@@ -140,6 +142,7 @@ deps_core::impl_version!(GithubActionsVersion {
 });
 
 /// Result of parsing a `.github/workflows/*.yml`/`*.yaml` file.
+#[non_exhaustive]
 #[derive(Debug)]
 pub struct GithubActionsParseResult {
     /// Every `uses:` dependency found, including non-resolvable ones (their consumers
