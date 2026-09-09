@@ -7,8 +7,8 @@ use tower_lsp_server::ls_types::{Position, Range, TextEdit, Uri};
 use crate::licenses::LicensePolicy;
 use crate::osv::VulnerabilityMap;
 use crate::{
-    ConcreteVersion, Deprecation, DepsDevClient, EcosystemId, FetchFailure, PackageName,
-    RemovalStatus,
+    ConcreteVersion, Deprecation, DepsDevClient, EcosystemId, FetchFailure, LicenseSource,
+    PackageName, RemovalStatus,
 };
 
 mod code_actions;
@@ -508,6 +508,17 @@ pub struct VersionData<'a> {
     /// look up), but only Gradle/Deno are actually version-*specific* in what they
     /// return.
     pub license_prefetch: Option<&'a HashMap<PackageName, Vec<String>>>,
+    /// How [`Self::license_prefetch`]'s (and, for a resolved-version match, the
+    /// registry-declared) license strings are sourced (issue #688), consulted by
+    /// [`generate_hover`] for the "(detected)" qualifier and by
+    /// [`generate_diagnostics_from_cache`]'s license-policy rule to decide whether
+    /// [`crate::licenses::resolve_license_entries`] must normalize free text before
+    /// evaluation. `None` in most test fixtures and any handler that doesn't go through
+    /// [`crate::Ecosystem::generate_hover`]/[`crate::Ecosystem::generate_diagnostics`]'s
+    /// default implementation, which is what actually attaches this field via
+    /// `self.license_source()` — falls back to
+    /// [`LicenseSource::RegistryDeclaredSpdx`] (`Default`) wherever consumed.
+    pub license_source: Option<LicenseSource>,
     /// SPDX allow-list/deny-list license policy (issue #661, spec 010 Phase 2), when the
     /// caller wants diagnostics evaluated against one. `None` by default.
     ///
@@ -564,6 +575,7 @@ impl<'a> VersionData<'a> {
             offline: false,
             trust: None,
             license_prefetch: None,
+            license_source: None,
             license_policy: None,
         }
     }
@@ -719,6 +731,26 @@ impl<'a> VersionData<'a> {
         licenses: &'a HashMap<PackageName, Vec<String>>,
     ) -> Self {
         self.license_prefetch = Some(licenses);
+        self
+    }
+
+    /// Attaches this ecosystem's license source. See [`Self::license_source`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::{LicenseSource, VersionData};
+    /// use std::collections::HashMap;
+    ///
+    /// let cached = HashMap::new();
+    /// let resolved = HashMap::new();
+    /// let versions =
+    ///     VersionData::new(&cached, &resolved).with_license_source(LicenseSource::PomFreeText);
+    /// assert_eq!(versions.license_source, Some(LicenseSource::PomFreeText));
+    /// ```
+    #[must_use]
+    pub const fn with_license_source(mut self, source: LicenseSource) -> Self {
+        self.license_source = Some(source);
         self
     }
 

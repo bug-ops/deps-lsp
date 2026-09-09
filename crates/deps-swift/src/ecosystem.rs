@@ -136,14 +136,6 @@ impl SwiftEcosystem {
         )
         .await
     }
-
-    /// Fetches `name`'s (`owner/repo`) SPDX license identifier from GitHub (issue
-    /// #660), for `deps-lsp::document::lifecycle::run_license_prefetch`'s tier-3
-    /// background pre-fetch — never called from the hover critical path directly. See
-    /// [`crate::registry::SwiftRegistry::get_license`].
-    pub async fn fetch_license(&self, name: &str) -> Vec<String> {
-        self.registry.get_license(name).await
-    }
 }
 
 impl deps_core::ecosystem::private::Sealed for SwiftEcosystem {}
@@ -225,6 +217,25 @@ impl Ecosystem for SwiftEcosystem {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    /// Fetches `name`'s (`owner/repo`) SPDX license identifier from GitHub (issue
+    /// #660/#688) — `version` is unused, since GitHub's `GET /repos/{owner}/{repo}`
+    /// reflects the repository's default branch, not a resolved tag. See
+    /// [`crate::registry::SwiftRegistry::get_license`].
+    fn fetch_license<'a>(
+        &'a self,
+        name: &'a str,
+        _version: &'a str,
+    ) -> Option<deps_core::ecosystem::BoxFuture<'a, Vec<String>>> {
+        Some(Box::pin(self.registry.get_license(name)))
+    }
+
+    /// GitHub's `license.spdx_id` is `licensee` detector output on the repo's default
+    /// branch, not an author-declared registry field — see
+    /// [`deps_core::LicenseSource::DetectedSpdx`].
+    fn license_source(&self) -> deps_core::LicenseSource {
+        deps_core::LicenseSource::DetectedSpdx
     }
 }
 

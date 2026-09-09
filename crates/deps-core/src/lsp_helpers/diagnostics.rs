@@ -5,7 +5,9 @@ use tower_lsp_server::ls_types::{
     NumberOrString, Position, Range, Uri,
 };
 
-use crate::licenses::{ViolationReason, evaluate as evaluate_license_policy};
+use crate::licenses::{
+    ViolationReason, evaluate as evaluate_license_policy, resolve_license_entries,
+};
 use crate::osv::{ScanOutcome, diagnostic_severity_for};
 use crate::{
     ConcreteVersion, Dependency, Deprecation, FetchFailure, ParseResult, PublishTime,
@@ -821,23 +823,20 @@ fn apply_vulnerability_rule(
 /// renders [`DiagnosticSeverity::ERROR`], [`ViolationReason::NotAllowed`]
 /// [`DiagnosticSeverity::WARNING`] (severity is not user-configurable: spec 010 plan.md's
 /// resolved config shape is `{ allow?, deny? }` only).
-/// Suppressed by: nothing outright — Gradle's Maven Central POM license names are free
-/// text (e.g. `"The Apache Software License, Version 2.0"`), never SPDX identifiers, so
-/// they are normalized via [`crate::licenses::normalize_pom_license_names_checked`]
-/// before evaluation (issue #679; previously Gradle was excluded from this rule entirely,
-/// issue #660/#661 critic C2). An entry the normalization table doesn't recognize is
-/// dropped rather than guessed at, and if *any* of a Gradle dependency's declared
-/// license entries fails to normalize, this rule suppresses only a `NotAllowed`
-/// conclusion (issue #679 critic S1: the surviving, normalized entries are incomplete
-/// evidence — an allow-list check that fires on "no entry matches" would otherwise
-/// manufacture a false violation from the entries that happened to drop). A `Denied`
-/// conclusion is still emitted even with a partially-unrecognized license list, since a
-/// normalized entry matching `deny` is real evidence regardless of what else on the POM
-/// wasn't recognized — dropping entries can only ever *miss* a denial, never fabricate
-/// one. `Maven`'s POM shares this exact free-text `<license><name>` shape (currently
-/// unused here — `deps-maven` has no license fetch yet) — if Maven gains license
-/// support, this Gradle-specific `==` should become a shared "POM-sourced free text"
-/// property rather than a second ecosystem check (issue #679 critic M2).
+/// Suppressed by: nothing outright — a [`crate::LicenseSource::PomFreeText`] ecosystem's
+/// (Gradle's Maven Central POM) license names are free text (e.g. `"The Apache Software
+/// License, Version 2.0"`), never SPDX identifiers, so they are normalized via
+/// [`resolve_license_entries`] before evaluation (issue #679/#687/#688; previously
+/// Gradle was excluded from this rule entirely, issue #660/#661 critic C2). An entry the
+/// normalization table doesn't recognize is dropped rather than guessed at, and if *any*
+/// of a dependency's declared license entries fails to normalize, this rule suppresses
+/// only a `NotAllowed` conclusion (issue #679 critic S1: the surviving, normalized
+/// entries are incomplete evidence — an allow-list check that fires on "no entry
+/// matches" would otherwise manufacture a false violation from the entries that happened
+/// to drop). A `Denied` conclusion is still emitted even with a partially-unrecognized
+/// license list, since a normalized entry matching `deny` is real evidence regardless of
+/// what else on the POM wasn't recognized — dropping entries can only ever *miss* a
+/// denial, never fabricate one.
 /// Suppresses: nothing.
 fn apply_license_policy_rule(diagnostics: &mut Vec<Diagnostic>, ctx: &RuleContext<'_>) {
     let Some(policy) = ctx.versions.license_policy else {
@@ -850,18 +849,10 @@ fn apply_license_policy_rule(diagnostics: &mut Vec<Diagnostic>, ctx: &RuleContex
     else {
         return;
     };
-    let normalized_gradle_license;
-    let mut suppress_not_allowed = false;
-    let license: &[String] = if ctx.versions.ecosystem == Some(crate::EcosystemId::Gradle) {
-        let (normalized, all_matched) =
-            crate::licenses::normalize_pom_license_names_checked(license);
-        suppress_not_allowed = !all_matched;
-        normalized_gradle_license = normalized;
-        &normalized_gradle_license
-    } else {
-        license.as_slice()
-    };
-    let Some(violation) = evaluate_license_policy(license, policy) else {
+    let license_source = ctx.versions.license_source.unwrap_or_default();
+    let (normalized_license, all_matched) = resolve_license_entries(license_source, license);
+    let suppress_not_allowed = !all_matched;
+    let Some(violation) = evaluate_license_policy(&normalized_license, policy) else {
         return;
     };
     if suppress_not_allowed && violation.reason == ViolationReason::NotAllowed {
@@ -5864,7 +5855,8 @@ mod tests {
                 VersionData::new(&cached_versions, &resolved_versions)
                     .with_license_prefetch(&license_prefetch)
                     .with_license_policy(&policy)
-                    .with_ecosystem(crate::EcosystemId::Gradle),
+                    .with_ecosystem(crate::EcosystemId::Gradle)
+                    .with_license_source(crate::LicenseSource::PomFreeText),
                 &formatter,
                 parse_result.uri(),
                 crate::freshness::FreshnessSettings::default(),
@@ -5904,7 +5896,8 @@ mod tests {
                 VersionData::new(&cached_versions, &resolved_versions)
                     .with_license_prefetch(&license_prefetch)
                     .with_license_policy(&policy)
-                    .with_ecosystem(crate::EcosystemId::Gradle),
+                    .with_ecosystem(crate::EcosystemId::Gradle)
+                    .with_license_source(crate::LicenseSource::PomFreeText),
                 &formatter,
                 parse_result.uri(),
                 crate::freshness::FreshnessSettings::default(),
@@ -5946,7 +5939,8 @@ mod tests {
                 VersionData::new(&cached_versions, &resolved_versions)
                     .with_license_prefetch(&license_prefetch)
                     .with_license_policy(&policy)
-                    .with_ecosystem(crate::EcosystemId::Gradle),
+                    .with_ecosystem(crate::EcosystemId::Gradle)
+                    .with_license_source(crate::LicenseSource::PomFreeText),
                 &formatter,
                 parse_result.uri(),
                 crate::freshness::FreshnessSettings::default(),
@@ -5995,7 +5989,8 @@ mod tests {
                 VersionData::new(&cached_versions, &resolved_versions)
                     .with_license_prefetch(&license_prefetch)
                     .with_license_policy(&policy)
-                    .with_ecosystem(crate::EcosystemId::Gradle),
+                    .with_ecosystem(crate::EcosystemId::Gradle)
+                    .with_license_source(crate::LicenseSource::PomFreeText),
                 &formatter,
                 parse_result.uri(),
                 crate::freshness::FreshnessSettings::default(),
@@ -6040,7 +6035,8 @@ mod tests {
                 VersionData::new(&cached_versions, &resolved_versions)
                     .with_license_prefetch(&license_prefetch)
                     .with_license_policy(&policy)
-                    .with_ecosystem(crate::EcosystemId::Gradle),
+                    .with_ecosystem(crate::EcosystemId::Gradle)
+                    .with_license_source(crate::LicenseSource::PomFreeText),
                 &formatter,
                 parse_result.uri(),
                 crate::freshness::FreshnessSettings::default(),
@@ -6087,7 +6083,8 @@ mod tests {
                 VersionData::new(&cached_versions, &resolved_versions)
                     .with_license_prefetch(&license_prefetch)
                     .with_license_policy(&policy)
-                    .with_ecosystem(crate::EcosystemId::Gradle),
+                    .with_ecosystem(crate::EcosystemId::Gradle)
+                    .with_license_source(crate::LicenseSource::PomFreeText),
                 &formatter,
                 parse_result.uri(),
                 crate::freshness::FreshnessSettings::default(),
@@ -6131,7 +6128,8 @@ mod tests {
                 VersionData::new(&cached_versions, &resolved_versions)
                     .with_license_prefetch(&license_prefetch)
                     .with_license_policy(&policy)
-                    .with_ecosystem(crate::EcosystemId::Gradle),
+                    .with_ecosystem(crate::EcosystemId::Gradle)
+                    .with_license_source(crate::LicenseSource::PomFreeText),
                 &formatter,
                 parse_result.uri(),
                 crate::freshness::FreshnessSettings::default(),

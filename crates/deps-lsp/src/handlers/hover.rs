@@ -74,6 +74,7 @@ pub async fn handle_hover(
         .with_outcomes(&outcomes)
         .with_ecosystem(ecosystem_id)
         .with_offline(offline)
+        .with_license_source(ecosystem.license_source())
         .with_license_prefetch(&licenses);
     // The only call site that ever sets `VersionData::trust` (deps-core's
     // `lsp_helpers::hover` module docs) — this is what makes the supply-chain

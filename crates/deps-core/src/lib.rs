@@ -51,7 +51,9 @@ pub mod version_matcher;
 // Re-export commonly used types
 pub use cache::{BodyLimit, CachedResponse, HttpCache};
 pub use deps_dev::{DepsDevClient, ProvenanceStatus, ScorecardSummary, SupplyChainTrustSignal};
-pub use ecosystem::{Dependency, Ecosystem, EcosystemConfig, EcosystemId, ParseResult};
+pub use ecosystem::{
+    Dependency, Ecosystem, EcosystemConfig, EcosystemId, LicenseSource, ParseResult,
+};
 pub use ecosystem_registry::EcosystemRegistry;
 pub use error::{DepsError, FetchFailure, Result};
 pub use freshness::{
@@ -61,6 +63,7 @@ pub use json_ast::{JsonAst, JsonSection, find_last_prop};
 pub use json_helpers::string_valued_entries;
 pub use licenses::{
     LicensePolicy, LicenseViolation, ViolationReason, evaluate as evaluate_license_policy,
+    resolve_license_entries,
 };
 pub use lockfile::{
     LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource, read_lockfile_content,

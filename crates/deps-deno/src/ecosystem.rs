@@ -93,17 +93,6 @@ impl DenoEcosystem {
         )
         .await
     }
-
-    /// Fetches `name`'s (already scheme-qualified, e.g. `"jsr:@std/fs"`) license at
-    /// `version` (issue #660), for
-    /// `deps-lsp::document::lifecycle::run_license_prefetch`'s tier-3 background
-    /// pre-fetch — never called from the hover critical path directly. See
-    /// [`crate::registry::DenoRegistry::get_license`].
-    pub async fn fetch_license(&self, name: &str, version: &str) -> Vec<String> {
-        self.registry
-            .get_license(&deps_core::PackageName::new(name), version)
-            .await
-    }
 }
 
 impl deps_core::ecosystem::private::Sealed for DenoEcosystem {}
@@ -172,6 +161,26 @@ impl Ecosystem for DenoEcosystem {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    /// Fetches `name`'s (already scheme-qualified, e.g. `"jsr:@std/fs"`) license at
+    /// `version` (issue #660/#688) from the JSR per-version API. See
+    /// [`crate::registry::DenoRegistry::get_license`].
+    fn fetch_license<'a>(
+        &'a self,
+        name: &'a str,
+        version: &'a str,
+    ) -> Option<deps_core::ecosystem::BoxFuture<'a, Vec<String>>> {
+        // Wrapped in an explicit `async move` block (rather than boxing the inner async
+        // fn's future directly, as the other three tier-3 ecosystems' `fetch_license` do)
+        // because `PackageName::new(name)` is a temporary: borrowing it outside an async
+        // block that also performs the `.await` would only live to the end of this
+        // statement, not for the lifetime of the returned, not-yet-polled future.
+        Some(Box::pin(async move {
+            self.registry
+                .get_license(&deps_core::PackageName::new(name), version)
+                .await
+        }))
     }
 }
 

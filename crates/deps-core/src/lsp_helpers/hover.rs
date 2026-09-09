@@ -4,11 +4,12 @@ use std::time::Duration;
 use tower_lsp_server::ls_types::{Hover, HoverContents, MarkupContent, MarkupKind, Position};
 
 use crate::deps_dev::deps_dev_system;
+use crate::licenses::resolve_license_entries_for_display;
 use crate::osv::ScanOutcome;
 use crate::{
-    ConcreteVersion, Dependency, DependencySource, Deprecation, ParseResult, ProvenanceStatus,
-    PublishTime, Registry, SupplyChainTrustSignal, Version, VersionReq, format_relative_age,
-    is_within_cooldown,
+    ConcreteVersion, Dependency, DependencySource, Deprecation, LicenseSource, ParseResult,
+    ProvenanceStatus, PublishTime, Registry, SupplyChainTrustSignal, Version, VersionReq,
+    format_relative_age, is_within_cooldown,
 };
 
 use super::{
@@ -360,6 +361,9 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     // spurious "unavailable" note for exactly the concrete-pin-no-lockfile case
     // this key exists to cover).
     let resolved_key: Option<&str> = in_use_version_str.as_deref().or(resolved);
+    // Drives the `resolve_license_entries_for_display` call below and `license_is_detected`
+    // further down — see [`crate::LicenseSource`]'s docs (issue #687/#688).
+    let license_source = versions.license_source.unwrap_or_default();
     // `normalize_tag` on both sides, not a plain `==` (impl-critic #664 review,
     // finding S1): a bare pin with no `v` (Composer's `"8.1.6"`) must still match a
     // registry entry whose own version string carries one (Packagist's
@@ -386,12 +390,17 @@ pub async fn generate_hover<R: Registry + ?Sized>(
         // license field in their hot-path version-list response, so the only remaining
         // source is `DocumentState`'s background pre-fetch cache, keyed by the dep's raw
         // (unnormalized) manifest name — see `VersionData::license_prefetch`'s docs.
+        // Resolved via `resolve_license_entries_for_display` (issue #687 critic S1/S2),
+        // not the policy-evaluation `resolve_license_entries`: a Gradle POM name the
+        // normalization table doesn't recognize falls back to its raw text instead of
+        // vanishing, and a recognized name keeps only its single canonical id instead of
+        // the full policy-matching synonym slice (e.g. the GPL family's three ids).
         .or_else(|| {
             versions
                 .license_prefetch
                 .and_then(|m| m.get(dep.name()))
-                .cloned()
-                .filter(|l| !l.is_empty())
+                .filter(|raw| !raw.is_empty())
+                .map(|raw| resolve_license_entries_for_display(license_source, raw))
         })
         .unwrap_or_default();
     // `None` (no latest version at all — `latest_line` is `None`) is distinct from
@@ -436,12 +445,10 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     // declared to a registry (spec 010 plan §1 "Dart source"/"Swift source" rows, NFR-005
     // exception; critic S2). Every other ecosystem's license is a genuine
     // registry-declared field (author's own `Cargo.toml`/`package.json`/POM `<licenses>`
-    // entry, or deps.dev's pass-through of the same), so only Dart and Swift get the
+    // entry, or deps.dev's pass-through of the same), so only a `DetectedSpdx` source
+    // (Dart, Swift — see [`crate::Ecosystem::license_source`], issue #688) gets the
     // "(detected)" qualifier.
-    let license_is_detected = matches!(
-        versions.ecosystem,
-        Some(crate::EcosystemId::Dart | crate::EcosystemId::Swift)
-    );
+    let license_is_detected = license_source == LicenseSource::DetectedSpdx;
     push_license_hover_section(
         &mut markdown,
         &resolved_license,
@@ -1398,6 +1405,7 @@ mod tests {
             Position::new(0, 2),
             VersionData::new(&HashMap::new(), &resolved_versions)
                 .with_ecosystem(crate::EcosystemId::Dart)
+                .with_license_source(crate::LicenseSource::DetectedSpdx)
                 .with_license_prefetch(&licenses),
             &MockRegistry,
             &MockFormatter,
@@ -1443,6 +1451,7 @@ mod tests {
             Position::new(0, 2),
             VersionData::new(&HashMap::new(), &resolved_versions)
                 .with_ecosystem(crate::EcosystemId::Swift)
+                .with_license_source(crate::LicenseSource::DetectedSpdx)
                 .with_license_prefetch(&licenses),
             &MockRegistry,
             &MockFormatter,
@@ -1485,6 +1494,7 @@ mod tests {
             Position::new(0, 2),
             VersionData::new(&HashMap::new(), &resolved_versions)
                 .with_ecosystem(crate::EcosystemId::Gradle)
+                .with_license_source(crate::LicenseSource::PomFreeText)
                 .with_license_prefetch(&licenses),
             &MockRegistry,
             &MockFormatter,
@@ -1503,6 +1513,194 @@ mod tests {
             content.value
         );
         assert!(!content.value.contains("(detected)"));
+    }
+
+    /// Issue #687: hover must render the *normalized* SPDX id for a recognized Gradle
+    /// POM free-text `<license><name>` value, not the raw POM text — matching what
+    /// `generate_diagnostics_from_cache`'s license-policy rule evaluates for the same
+    /// dependency (`resolve_license_entries_for_display`, driven by
+    /// [`crate::LicenseSource::PomFreeText`], is the single normalization call site both
+    /// read through). See the two tests below for the unrecognized-entry and
+    /// ambiguous-SPDX-convention cases this function's display semantics diverge from
+    /// the policy-evaluation `resolve_license_entries` for (issue #687 critic S1/S2).
+    #[tokio::test]
+    async fn test_generate_hover_gradle_pom_free_text_license_is_normalized() {
+        use std::collections::HashMap;
+
+        let parse_result = freshness_test_parse_result("example");
+        let mut resolved_versions = HashMap::new();
+        resolved_versions.insert("example".into(), "1.0.0".into());
+        let mut licenses = HashMap::new();
+        licenses.insert(
+            crate::PackageName::new("example"),
+            vec!["The Apache Software License, Version 2.0".to_string()],
+        );
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&HashMap::new(), &resolved_versions)
+                .with_ecosystem(crate::EcosystemId::Gradle)
+                .with_license_source(crate::LicenseSource::PomFreeText)
+                .with_license_prefetch(&licenses),
+            &MockRegistry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            content.value.contains("**License**: `Apache-2.0`"),
+            "expected the normalized SPDX id, not raw POM text, got: {}",
+            content.value
+        );
+        assert!(!content.value.contains("The Apache Software License"));
+    }
+
+    /// Issue #687 critic S1: a Gradle POM free-text license the normalization table
+    /// doesn't recognize must still render *something* in hover — falling back to the
+    /// raw POM text — rather than vanishing entirely. `KNOWN_POM_LICENSE_NAMES` is
+    /// deliberately non-exhaustive (see `deps_core::licenses`' module docs), so this is
+    /// the designed-for path, not a rare edge case: before this fix, routing hover
+    /// through the same fail-closed function `generate_diagnostics_from_cache` uses for
+    /// policy evaluation dropped the entry and `push_license_hover_section` rendered no
+    /// License line at all.
+    #[tokio::test]
+    async fn test_generate_hover_gradle_unrecognized_pom_license_falls_back_to_raw_text() {
+        use std::collections::HashMap;
+
+        let parse_result = freshness_test_parse_result("example");
+        let mut resolved_versions = HashMap::new();
+        resolved_versions.insert("example".into(), "1.0.0".into());
+        let mut licenses = HashMap::new();
+        licenses.insert(
+            crate::PackageName::new("example"),
+            vec!["Some Bespoke Corporate License".to_string()],
+        );
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&HashMap::new(), &resolved_versions)
+                .with_ecosystem(crate::EcosystemId::Gradle)
+                .with_license_source(crate::LicenseSource::PomFreeText)
+                .with_license_prefetch(&licenses),
+            &MockRegistry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            content
+                .value
+                .contains("**License**: `Some Bespoke Corporate License`"),
+            "expected the raw POM text as a fallback, got: {}",
+            content.value
+        );
+    }
+
+    /// Issue #687 critic S2: a POM free-text license ambiguous between SPDX conventions
+    /// (the GPL/LGPL/AGPL families) normalizes to a multi-id synonym slice for policy
+    /// matching (`GPL-3.0`/`GPL-3.0-only`/`GPL-3.0-or-later`, so a `deny`/`allow` list
+    /// written in any convention still matches) — but hover must render only the single
+    /// canonical id, not all three, since this is genuinely one declared license, not
+    /// three.
+    #[tokio::test]
+    async fn test_generate_hover_gradle_gpl_family_renders_single_canonical_id() {
+        use std::collections::HashMap;
+
+        let parse_result = freshness_test_parse_result("example");
+        let mut resolved_versions = HashMap::new();
+        resolved_versions.insert("example".into(), "1.0.0".into());
+        let mut licenses = HashMap::new();
+        licenses.insert(
+            crate::PackageName::new("example"),
+            vec!["GNU General Public License v3".to_string()],
+        );
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&HashMap::new(), &resolved_versions)
+                .with_ecosystem(crate::EcosystemId::Gradle)
+                .with_license_source(crate::LicenseSource::PomFreeText)
+                .with_license_prefetch(&licenses),
+            &MockRegistry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            content.value.contains("**License**: `GPL-3.0`"),
+            "expected exactly one canonical id, got: {}",
+            content.value
+        );
+        assert!(
+            !content.value.contains("GPL-3.0-only") && !content.value.contains("GPL-3.0-or-later"),
+            "must not render the full policy-matching synonym slice in hover, got: {}",
+            content.value
+        );
+    }
+
+    /// Code-review must-fix: unlike the GPL-family case above, `"CDDL + GPLv2 with
+    /// classpath exception"` normalizes to two SPDX ids naming two genuinely different
+    /// licenses (`CDDL-1.1` and `GPL-2.0-with-classpath-exception`), not synonyms of
+    /// one — collapsing this to a single id would misrepresent a dual-licensed
+    /// dependency as solely CDDL-licensed. Both ids must render.
+    #[tokio::test]
+    async fn test_generate_hover_gradle_disjunctive_license_renders_both_ids() {
+        use std::collections::HashMap;
+
+        let parse_result = freshness_test_parse_result("example");
+        let mut resolved_versions = HashMap::new();
+        resolved_versions.insert("example".into(), "1.0.0".into());
+        let mut licenses = HashMap::new();
+        licenses.insert(
+            crate::PackageName::new("example"),
+            vec!["CDDL + GPLv2 with classpath exception".to_string()],
+        );
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&HashMap::new(), &resolved_versions)
+                .with_ecosystem(crate::EcosystemId::Gradle)
+                .with_license_source(crate::LicenseSource::PomFreeText)
+                .with_license_prefetch(&licenses),
+            &MockRegistry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            content.value.contains("CDDL-1.1")
+                && content.value.contains("GPL-2.0-with-classpath-exception"),
+            "expected both disjunctive ids, got: {}",
+            content.value
+        );
     }
 
     /// Review round 3 regression: for a deps.dev-routed ecosystem, `available_versions[idx]`
