@@ -29,7 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: property tests (`proptest`) asserting the parser depth/expansion checkers and JSONC position recovery never panic on arbitrary input (#673)
 
 ### Fixed
-- **deps-gradle**: version catalog/DSL completion no longer miscounts an escaped quote, via a generalized, quote-character-parameterized `deps-core` quote-parity helper (resolves #738)
+- **deps-gradle**: version catalog/DSL completion no longer miscounts an escaped quote, via a generalized, quote-character-parameterized `deps-core` quote-parity helper (resolves #738) (#771)
 - **deps-core**: manifest parsing now runs on the blocking-thread pool instead of the calling tokio worker, no longer stalling the LSP request worker on a large manifest (resolves #743) (#747)
 - **deps-core**: `LineOffsetTable::byte_offset_to_position` no longer rescans an ASCII line from its start on every call, fixing an O(n^2) slowdown on large single-line (minified) manifests (resolves #742) (#747)
 - **deps-pypi**: raw-text fallback completion no longer bare-inserts an unquoted package name into a `pyproject.toml` dependency array when no quote has been typed yet, producing invalid TOML (resolves #737) (#741)
@@ -62,7 +62,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-deno**: extracted `deps-deno`'s scope-aware `@scope/pkg` name-boundary parser into a shared `deps_core::package::npm_style_name_boundary` helper, reused by the `deps-npm` alias fix above instead of a per-crate reimplementation (#657)
 
 ### Changed
-- **deps-gradle, deps-core**: POM license scan's byte-budget guard now shares a new `deps-core::xml_bounds::exhausted_with` instead of a private lossy `as usize` cast — hardens the fail-closed conversion for a 32-bit target (no behavior change on the 64-bit targets this project builds for) (resolves #725)
+- **deps-gradle, deps-core**: POM license scan's byte-budget guard now shares a new `deps-core::xml_bounds::exhausted_with` instead of a private lossy `as usize` cast — hardens the fail-closed conversion for a 32-bit target (no behavior change on the 64-bit targets this project builds for) (resolves #725) (#771)
 - **deps-lsp**: split the 11k-line `document/lifecycle.rs` god module into `lifecycle.rs`/`fetch.rs`/`osv_scan.rs`/`diff.rs`/`resolved.rs` by responsibility; pure move/re-export, no behavior change (resolves #754) (#764)
 - **deps-core, deps-lsp, deps-cargo, deps-npm, deps-pypi, deps-composer, deps-deno, deps-maven, deps-nuget, deps-go, deps-dart, deps-github-actions, deps-gradle, deps-swift, deps-bundler, deps-gitlab-ci**: raw-text fallback completion (parse-failure path) syntax and package-name completion insert-text are now two `Ecosystem` trait hooks (`fallback_completion_prefix`, `completion_insert_text`) each ecosystem crate implements directly, replacing six non-exhaustive `EcosystemId` match tables previously centralized in `deps-lsp` (resolves #722) (#731)
 - Consolidated the `indexing_slicing`/`unwrap_used`/`expect_used`/`string_slice` clippy restriction lints, previously duplicated as an identical `#![warn(...)]` attribute across all 16 workspace crates, into `[workspace.lints.clippy]`; removed the dead `non_std_lazy_statics` allow (LazyLock has been stable since Rust 1.80, workspace MSRV is 1.98) (resolves #689) (#693)
