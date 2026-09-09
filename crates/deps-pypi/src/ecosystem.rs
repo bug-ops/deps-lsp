@@ -512,12 +512,40 @@ fn is_dependencies_array_start(trimmed: &str) -> bool {
         .is_some_and(|rest| rest.trim_start().starts_with('['))
 }
 
-/// Extracts the fallback-completion prefix on `line` up to `character`, stripping a
-/// surviving quote on either side — PyPI's dependency entries are TOML string-array
-/// elements (`"pytes`), a different quoting shape from JSON-quoted keys, but still
-/// need the surviving quote stripped before it reaches the registry search.
+/// Extracts the fallback-completion prefix on `line` up to `character` — PyPI's
+/// dependency entries are TOML string-array elements (`"pytes`), a different quoting
+/// shape from JSON-quoted keys.
+///
+/// Returns an empty prefix when the cursor sits right after an already-closed value
+/// (`"pytest"`), rather than unconditionally stripping quotes on either side:
+/// [`PypiEcosystem::completion_insert_text`]'s fallback arm always bare-inserts the
+/// package name, so reporting a prefix for an already-closed value would fire a
+/// registry search and bare-insert the result straight into the manifest text next to
+/// it, producing invalid TOML (`"pytest"pytest-cov`, #734) — the same defect class as
+/// #729 for npm/Composer's JSON keys, just without a key-vs-value split since a TOML
+/// array element has no `:` clause to disambiguate.
+///
+/// Uses [`deps_core::fallback_completion::count_real_quotes`]'s escape-aware
+/// quote-parity check directly rather than
+/// [`deps_core::fallback_completion::open_quoted_tail`]: a *zero* real-quote count
+/// (the opening quote not typed yet — a realistic mid-edit state, since the fallback
+/// path only runs on parse failure) must return `prefix` unchanged, matching this
+/// function's pre-#734 no-op behavior on unquoted text, not the empty string
+/// `open_quoted_tail` returns for that count. Only a non-zero, even count (a genuinely
+/// closed value) suppresses the prefix.
 fn extract_prefix(line: &str, character: u32) -> &str {
-    deps_core::fallback_completion::raw_prefix(line, character).trim_matches('"')
+    let prefix = deps_core::fallback_completion::raw_prefix(line, character);
+    let (count, last_quote) = deps_core::fallback_completion::count_real_quotes(prefix);
+    if count == 0 {
+        return prefix;
+    }
+    if count.is_multiple_of(2) {
+        return "";
+    }
+    // `count` odd (so >= 1) guarantees `count_real_quotes` found a real quote; `"` is
+    // a single-byte ASCII char, so `pos + 1` is always a char boundary.
+    #[allow(clippy::string_slice)]
+    last_quote.map_or("", |pos| &prefix[pos + 1..])
 }
 
 /// Whether `target` is safe to resolve into a clickable `DocumentLink`.
@@ -2018,10 +2046,35 @@ dependencies = []
         assert_eq!(extract_prefix(line, line.len() as u32), "flas");
     }
 
+    /// No quote typed yet at all (zero real-quote count) must return the raw prefix
+    /// unchanged, not empty — a still-reachable mid-edit state (e.g. a bare
+    /// `requests` line under `[project.optional-dependencies]` before the user has
+    /// typed the opening quote), and the pre-#734 no-op behavior on unquoted text.
+    /// Regression guard: routing this case through
+    /// `open_quoted_tail`'s `None` would wrongly collapse it to `""`, suppressing
+    /// completion entirely.
     #[test]
-    fn test_extract_prefix_strips_trailing_quote() {
+    fn test_extract_prefix_no_quote_returns_unchanged() {
+        let line = "    req";
+        assert_eq!(extract_prefix(line, line.len() as u32), "req");
+    }
+
+    /// #734: the cursor sits right after an already-closed value (both quotes
+    /// present) — reporting `"pytest"` here would fire a registry search and
+    /// bare-insert the result right next to it, producing invalid TOML
+    /// (`"pytest"pytest-cov`). Must fall back to an empty prefix instead.
+    #[test]
+    fn test_extract_prefix_closed_value_is_empty() {
         let line = "    \"pytest\"";
-        assert_eq!(extract_prefix(line, line.len() as u32), "pytest");
+        assert_eq!(extract_prefix(line, line.len() as u32), "");
+    }
+
+    /// The escaped `\"` inside the value must not be counted as a real delimiter,
+    /// otherwise this would misclassify a still-open value as closed.
+    #[test]
+    fn test_extract_prefix_skips_escaped_quote() {
+        let line = "    \"py\\\"te";
+        assert_eq!(extract_prefix(line, line.len() as u32), "py\\\"te");
     }
 
     #[test]

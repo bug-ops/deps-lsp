@@ -420,7 +420,9 @@ pub fn extract_prefix(content: &str, position: Position, range: Range) -> String
 /// the feature string being typed. Handles both inline and multi-line arrays.
 ///
 /// Returns an empty string when the cursor is not inside a quoted string
-/// (e.g. right after `[` or between `, ` and the next `"`).
+/// (e.g. right after `[` or between `, ` and the next `"`), using
+/// [`crate::fallback_completion::open_quoted_tail`]'s escape-aware quote-parity check
+/// (#733) rather than a naive `"` count, which would miscount an escaped `\"`.
 ///
 /// # Examples
 ///
@@ -436,7 +438,7 @@ pub fn extract_prefix(content: &str, position: Position, range: Range) -> String
 /// assert_eq!(prefix, "ser");
 /// ```
 // `cursor_byte` comes from `utf16_to_byte_offset` (char_indices-based) and is clamped to
-// `line.len()`; `segment_start`/the `rfind('"')` offset are ASCII-char indices (`[`/`"`).
+// `line.len()`; `segment_start` is an ASCII-char (`[`) index.
 #[allow(clippy::string_slice)]
 pub fn extract_feature_prefix(content: &str, position: Position) -> String {
     let line = match content.lines().nth(position.line as usize) {
@@ -457,18 +459,12 @@ pub fn extract_feature_prefix(content: &str, position: Position) -> String {
     let segment_start = before_cursor.rfind('[').map_or(0, |i| i + 1);
     let segment = &before_cursor[segment_start..];
 
-    // Count '"' characters to determine whether the cursor is inside a string.
-    // An odd count means the cursor is inside an open string literal.
-    let quote_count = segment.chars().filter(|&c| c == '"').count();
-    if quote_count % 2 == 0 {
-        return String::new();
-    }
-
-    // Find the last opening quote and return the text after it.
-    match segment.rfind('"') {
-        Some(pos) => segment[pos + 1..].to_string(),
-        None => String::new(),
-    }
+    // Escape-aware quote-parity check (#733): a naive `filter(|&c| c == '"').count()`
+    // miscounts a `\"` escape inside a feature name, desyncing the open/closed check
+    // from the string's real state.
+    crate::fallback_completion::open_quoted_tail(segment)
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// Builds a completion item for a package name.
@@ -3629,6 +3625,26 @@ mod tests {
         };
         let prefix = extract_feature_prefix(content, position);
         assert_eq!(prefix, "");
+    }
+
+    /// #733: a naive `"` count miscounts an escaped `\"` inside a feature name,
+    /// desyncing the open/closed check from the segment's real quote state. Here the
+    /// segment up to the cursor (`"a\"b`) has one real quote (the opening quote; the
+    /// escaped one doesn't count) — an odd count, correctly "open" with tail `a\"b`.
+    /// A naive count sees two `"` characters (even, wrongly "closed") and would
+    /// collapse the prefix to empty; the escape-aware check must still find the
+    /// string open with the correct tail.
+    // A short ASCII test line can never overflow `u32`.
+    #[allow(clippy::cast_possible_truncation)]
+    #[test]
+    fn test_extract_feature_prefix_skips_escaped_quote() {
+        let content = r#"features = ["a\"b"#;
+        let position = Position {
+            line: 0,
+            character: content.chars().count() as u32,
+        };
+        let prefix = extract_feature_prefix(content, position);
+        assert_eq!(prefix, r#"a\"b"#);
     }
 
     // --- Release-freshness signal (issue #145): VersionDisplayItem.published_at,
