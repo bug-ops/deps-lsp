@@ -139,7 +139,8 @@ deps-lsp --stdio
 > [!IMPORTANT]
 > Inlay hints, code lens, and (in some editors) inline diagnostics are off by default at the *editor* level, independent of `deps-lsp`'s own [`initialization_options`](#configuration). The server always advertises support for all three — each section below covers the editor-side toggle needed to actually see them.
 
-### Zed
+<details>
+<summary><strong>Zed</strong></summary>
 
 Install the **Deps** extension from Zed Extensions marketplace. Ruby support is enabled for Gemfile files.
 
@@ -161,7 +162,10 @@ Enable inlay hints, code lens, and (optionally) inline diagnostics in Zed settin
 
 `code_lens` accepts `"on"`, `"off"` (default), or `"menu"`, and is required for the "Update N outdated dependencies" lens to appear. `diagnostics.inline` is optional — diagnostics already show in the gutter and Problems panel without it; this additionally renders `deps-lsp`'s short one-line messages inline next to each dependency.
 
-### Neovim
+</details>
+
+<details>
+<summary><strong>Neovim</strong></summary>
 
 ```lua
 require('lspconfig').deps_lsp.setup({
@@ -197,7 +201,10 @@ vim.keymap.set("n", "<leader>cl", vim.lsp.codelens.run, { desc = "Run code lens"
 > [!WARNING]
 > Neovim 0.11 changed diagnostic virtual text (inline diagnostics) from opt-out to opt-in. On 0.11+, run `vim.diagnostic.config({ virtual_text = true })` if `deps-lsp`'s warnings aren't appearing inline — on 0.10 and earlier this was already the default.
 
-### Helix
+</details>
+
+<details>
+<summary><strong>Helix</strong></summary>
 
 ```toml
 # ~/.config/helix/languages.toml
@@ -227,7 +234,10 @@ Diagnostics render inline by default with no configuration needed.
 > [!NOTE]
 > Helix does not implement `textDocument/codeLens` — the "Update N outdated dependencies" batch action is unavailable there; use the per-dependency code action (`Cmd+.`/`Ctrl+.` equivalent) instead.
 
-### VS Code
+</details>
+
+<details>
+<summary><strong>VS Code</strong></summary>
 
 Install an LSP client extension and configure deps-lsp. Enable inlay hints:
 
@@ -238,6 +248,97 @@ Install an LSP client extension and configure deps-lsp. Enable inlay hints:
 ```
 
 `editor.codeLens` is `true` by default in VS Code itself, so `deps-lsp`'s code lens should appear automatically — provided your chosen generic LSP client extension forwards the `codeLens` capability (most do; check its documentation if the lens doesn't show up). Diagnostics render as squiggles plus entries in the Problems panel by default; for an always-visible inline message next to each dependency, install the third-party [Error Lens](https://marketplace.visualstudio.com/items?itemName=usernamehw.errorlens) extension.
+
+</details>
+
+<details>
+<summary><strong>Emacs (<code>eglot</code>)</strong></summary>
+
+```elisp
+(with-eval-after-load 'eglot
+  (add-to-list 'eglot-server-programs
+               '((conf-toml-mode yaml-mode json-mode) . ("deps-lsp" "--stdio"))))
+```
+
+> [!NOTE]
+> `eglot` manages one server per buffer by default, so running `deps-lsp` alongside a primary language server for the same buffer (e.g. `rust-analyzer` on `Cargo.toml`) needs `eglot`'s multi-server support rather than this snippet alone.
+
+</details>
+
+<details>
+<summary><strong>Emacs (<code>lsp-mode</code>)</strong></summary>
+
+A first-party `lsp-mode` client is tracked in [#712](https://github.com/bug-ops/deps-lsp/issues/712); until it ships, register `deps-lsp` manually as an add-on server:
+
+```elisp
+(with-eval-after-load 'lsp-mode
+  (lsp-register-client
+   (make-lsp-client
+    :new-connection (lsp-stdio-connection '("deps-lsp" "--stdio"))
+    :activation-fn (lsp-activate-on 'toml-mode 'json-mode 'yaml-mode)
+    :add-on? t
+    :server-id 'deps-lsp)))
+```
+
+`:add-on? t` is required so `deps-lsp` runs in addition to, not instead of, the buffer's primary server.
+
+</details>
+
+<details>
+<summary><strong>Sublime Text (LSP package)</strong></summary>
+
+```json
+{
+  "clients": {
+    "deps-lsp": {
+      "enabled": true,
+      "command": ["deps-lsp", "--stdio"],
+      "selector": "source.toml | source.json | source.yaml"
+    }
+  }
+}
+```
+
+Add to `LSP.sublime-settings`. The `sublimelsp/LSP` package runs multiple clients per view, so this coexists with any primary language server already configured for the same selector.
+
+</details>
+
+<details>
+<summary><strong>Kate</strong></summary>
+
+```json
+{
+  "servers": {
+    "deps-lsp": {
+      "command": ["deps-lsp", "--stdio"],
+      "highlightingModeRegex": "^(TOML|JSON|YAML)$"
+    }
+  }
+}
+```
+
+Add to Kate's built-in LSP Client plugin settings (Settings → Configure Kate → LSP Client → User Server Settings). Kate supports multiple LSP servers per document, so this runs alongside any primary language server already registered for the same syntax.
+
+</details>
+
+<details>
+<summary><strong>coc.nvim</strong></summary>
+
+```json
+{
+  "languageserver": {
+    "deps-lsp": {
+      "command": "deps-lsp",
+      "args": ["--stdio"],
+      "filetypes": ["toml", "json", "yaml", "gomod", "ruby", "xml", "swift", "php", "requirements"]
+    }
+  }
+}
+```
+
+Add to `coc-settings.json` (`:CocConfig`). `coc.nvim` attaches every configured `languageserver` entry whose `filetypes` match, so this coexists with a primary language server for the same filetype.
+
+</details>
 
 ## Configuration
 
