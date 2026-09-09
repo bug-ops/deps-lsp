@@ -341,7 +341,7 @@ pub fn requirement_is_unsatisfiable(
 /// `None` means `version` is already a stable release, not that it failed to parse — this
 /// is a textual SemVer split, not a validating parse. Callers only rely on it for
 /// strict-SemVer ecosystems (see
-/// [`EcosystemFormatter::strict_semver_prerelease_exclusion`]), whose registries only
+/// [`crate::lsp_helpers::DiagnosticPolicy::strict_semver_prerelease_exclusion`]), whose registries only
 /// publish spec-conformant version strings.
 // `dash` comes from `str::find('-')`, an ASCII byte, so it is always a char boundary.
 #[allow(clippy::string_slice)]
@@ -373,7 +373,7 @@ fn requirement_names_prerelease(requirement: &str) -> bool {
 }
 
 /// For strict-SemVer ecosystems (see
-/// [`EcosystemFormatter::strict_semver_prerelease_exclusion`]), finds the newest published,
+/// [`crate::lsp_helpers::DiagnosticPolicy::strict_semver_prerelease_exclusion`]), finds the newest published,
 /// non-yanked pre-release in `available` whose stable core would satisfy `requirement` —
 /// evidence that `requirement` reads as unsatisfiable only because SemVer's default comparator
 /// excludes pre-releases, not because no compatible version was ever published (#299).
@@ -436,7 +436,7 @@ fn status_for_version(
 /// The aggregate is `Yanked` if any matching entry's status is `Yanked`, else
 /// `AdvisoryDeprecated` (the only other status `yanked` entries carry — see
 /// [`PackageVersions::yanked`]). This lets the caller apply the same D5 gate #263 uses
-/// (see [`VersionData::yanked`]'s docs): suppress the diagnostic for an `AdvisoryDeprecated`
+/// (see [`crate::lsp_helpers::DependencyOutcome::yanked`]'s docs): suppress the diagnostic for an `AdvisoryDeprecated`
 /// aggregate when a package-level deprecation finding co-occurs, but never for a `Yanked`
 /// one, even if one of several matching entries is merely deprecated (#437).
 ///
@@ -946,7 +946,7 @@ fn apply_deprecation_rule(diagnostics: &mut Vec<Diagnostic>, ctx: &RuleContext<'
 /// scope here.
 ///
 /// Reads: `ctx.versions.outcomes.yanked(ctx.normalized_name)` -> `(yanked_version,
-/// status)`; `ctx.versions.ecosystem`; `super::in_use_version(...)`.
+/// status)`; `ctx.versions.ecosystem`; `super::resolve_in_use_version(...)`.
 /// Gate D5 (`deprecation_found`): a package-level deprecation finding suppresses this
 /// check — but only when the underlying yanked finding's status is
 /// `AdvisoryDeprecated`, never when it is `Yanked`. A genuine hard yank ("the exact
@@ -999,7 +999,7 @@ fn apply_in_use_yanked_rule(
         .outcomes
         .and_then(|o| o.yanked(ctx.normalized_name))
         && ctx.versions.ecosystem.is_none_or(|ecosystem| {
-            super::in_use_version(
+            super::resolve_in_use_version(
                 ctx.dep,
                 ctx.normalized_name,
                 ctx.versions.resolved,

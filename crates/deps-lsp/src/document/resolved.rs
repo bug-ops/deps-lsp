@@ -7,7 +7,7 @@ use deps_core::EcosystemId;
 use deps_core::PackageName;
 use deps_core::PackageVersions;
 use deps_core::VersionReq;
-use deps_core::lsp_helpers::in_use_version;
+use deps_core::lsp_helpers::resolve_in_use_version;
 use std::collections::HashMap;
 use tower_lsp_server::ls_types::Uri;
 
@@ -73,7 +73,7 @@ pub(crate) fn collect_in_use_versions(
         .filter(|dep| formatter.source_is_public_registry_content(&dep.source()))
     {
         let normalized_name = formatter.normalize_package_name(dep.name());
-        if let Some(v) = in_use_version(
+        if let Some(v) = resolve_in_use_version(
             dep,
             &normalized_name,
             resolved_versions,
