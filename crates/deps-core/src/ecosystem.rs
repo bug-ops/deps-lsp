@@ -26,6 +26,71 @@ pub mod private {
 /// A boxed, type-erased future used throughout the [`Ecosystem`] trait's async methods.
 pub type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
+/// Runs `ecosystem.parse_manifest(content, uri)` on the blocking-thread pool instead of the
+/// calling tokio worker.
+///
+/// Every [`Ecosystem::parse_manifest`] implementation is synchronous work wrapped in an
+/// immediately-ready `async move` block (verified: no implementation contains a real
+/// `.await`). Driving that future to completion via [`tokio::runtime::Handle::block_on`]
+/// from inside [`tokio::task::spawn_blocking`] moves the CPU-bound parse off the tokio
+/// worker without changing the trait's async signature — mirrors
+/// [`crate::lockfile::read_and_parse_lockfile`]'s `spawn_blocking` pattern for the
+/// equivalent lock-file path (#723/#730). This closes #743: a large minified manifest
+/// parsed synchronously on an LSP request's tokio worker would otherwise stall every other
+/// request sharing that worker for the parse's full duration.
+///
+/// `content`/`uri` are cloned internally rather than moved+returned: the caller's own copy
+/// must remain valid (to store into `DocumentState`) even if the blocking task panics, and a
+/// panic here is already an anomalous condition, not a path worth optimizing a clone away
+/// for. Manifest sizes are capped (10MB) and typically far smaller, so the clone's added
+/// *time* cost is negligible next to the parse itself and the thread-pool hop. It does
+/// briefly double transient *peak memory* (both the caller's and the cloned copy live at
+/// once) on exactly the large-manifest path this function targets; a future `Arc<str>`
+/// threaded through the caller would remove that duplication if it ever proves significant.
+///
+/// `Handle::block_on` called from inside a `spawn_blocking` closure is a documented,
+/// supported tokio pattern (distinct from `Runtime::block_on`, which panics if called from
+/// within a runtime). Since the future never actually yields (`Poll::Pending`), `block_on`
+/// resolves on the first poll — negligible overhead beyond the `spawn_blocking` thread-hop
+/// itself.
+///
+/// # Errors
+///
+/// Returns whatever [`Ecosystem::parse_manifest`] returns for a malformed manifest, or a
+/// [`crate::error::DepsError::ParseError`] if the blocking task panics or is cancelled.
+///
+/// # Examples
+///
+/// ```no_run
+/// use deps_core::Ecosystem;
+/// use std::sync::Arc;
+/// use tower_lsp_server::ls_types::Uri;
+///
+/// # async fn example(ecosystem: Arc<dyn Ecosystem>, uri: Uri) -> deps_core::error::Result<()> {
+/// let parsed = deps_core::ecosystem::parse_manifest_blocking(&ecosystem, "content", &uri).await?;
+/// println!("{} dependencies", parsed.dependencies().len());
+/// # Ok(())
+/// # }
+/// ```
+pub async fn parse_manifest_blocking(
+    ecosystem: &Arc<dyn Ecosystem>,
+    content: &str,
+    uri: &Uri,
+) -> crate::error::Result<Box<dyn ParseResult>> {
+    let ecosystem = Arc::clone(ecosystem);
+    let owned_content = content.to_owned();
+    let owned_uri = uri.clone();
+    let handle = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        handle.block_on(ecosystem.parse_manifest(&owned_content, &owned_uri))
+    })
+    .await
+    .map_err(|e| crate::error::DepsError::ParseError {
+        file_type: format!("manifest at {uri:?}"),
+        source: Box::new(std::io::Error::other(e)),
+    })?
+}
+
 /// Canonical, exhaustive identifier for every package ecosystem the workspace supports.
 ///
 /// [`Ecosystem::id`] returns a `&'static str` for registry lookups and document
@@ -575,6 +640,14 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     /// # Errors
     ///
     /// Returns error if manifest cannot be parsed
+    ///
+    /// # Invariant
+    ///
+    /// Implementations must not contain a real `.await` (no network/file I/O, no yielding to
+    /// the scheduler) — the body must be synchronous work wrapped in an immediately-ready
+    /// `async move` block. [`parse_manifest_blocking`] relies on this to drive the future via
+    /// `Handle::block_on` on the blocking-thread pool; violating it doesn't deadlock, but
+    /// silently reintroduces the exact worker-thread stall #743 fixed.
     fn parse_manifest<'a>(
         &'a self,
         content: &'a str,
@@ -1128,5 +1201,138 @@ mod tests {
 
         let dep = MockDep;
         assert_eq!(dep.features(), &[] as &[String]);
+    }
+
+    /// Minimal [`ParseResult`] returned by [`StubEcosystem::parse_manifest`] below —
+    /// only [`parse_manifest_blocking`] tests need it, so it carries nothing beyond a URI.
+    struct StubParseResult {
+        uri: Uri,
+    }
+
+    impl ParseResult for StubParseResult {
+        fn dependencies(&self) -> Vec<&dyn Dependency> {
+            Vec::new()
+        }
+
+        fn workspace_root(&self) -> Option<&std::path::Path> {
+            None
+        }
+
+        fn uri(&self) -> &Uri {
+            &self.uri
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    /// Ecosystem stub for [`parse_manifest_blocking`] tests: `parse_manifest` either
+    /// asserts it runs off `calling_thread` or panics, per `should_panic`.
+    struct StubEcosystem {
+        calling_thread: std::thread::ThreadId,
+        should_panic: bool,
+    }
+
+    impl private::Sealed for StubEcosystem {}
+
+    impl Ecosystem for StubEcosystem {
+        fn id(&self) -> &'static str {
+            "stub"
+        }
+
+        fn display_name(&self) -> &'static str {
+            "Stub"
+        }
+
+        fn manifest_filenames(&self) -> &[&'static str] {
+            &[]
+        }
+
+        fn parse_manifest<'a>(
+            &'a self,
+            _content: &'a str,
+            uri: &'a Uri,
+        ) -> BoxFuture<'a, crate::error::Result<Box<dyn ParseResult>>> {
+            Box::pin(async move {
+                assert!(!self.should_panic, "boom");
+                assert_ne!(
+                    std::thread::current().id(),
+                    self.calling_thread,
+                    "parse must run on the blocking pool, not the calling thread"
+                );
+                Ok(Box::new(StubParseResult { uri: uri.clone() }) as Box<dyn ParseResult>)
+            })
+        }
+
+        fn registry(&self) -> Arc<dyn crate::Registry> {
+            unimplemented!()
+        }
+
+        fn formatter(&self) -> &dyn crate::lsp_helpers::EcosystemFormatter {
+            unimplemented!()
+        }
+
+        fn generate_completions<'a>(
+            &'a self,
+            _parse_result: &'a dyn ParseResult,
+            _position: Position,
+            _content: &'a str,
+            _freshness: crate::FreshnessSettings,
+        ) -> BoxFuture<'a, crate::completion::Completions> {
+            unimplemented!()
+        }
+
+        fn completion_insert_text(&self, _metadata: &dyn crate::Metadata) -> Option<String> {
+            unimplemented!()
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    /// Proves `parse_manifest_blocking` actually runs the parse off the calling (async)
+    /// thread via `spawn_blocking`, mirroring `lockfile.rs`'s
+    /// `test_read_and_parse_lockfile_runs_parse_off_calling_thread`.
+    #[tokio::test]
+    async fn test_parse_manifest_blocking_runs_parse_off_calling_thread() {
+        let ecosystem: Arc<dyn Ecosystem> = Arc::new(StubEcosystem {
+            calling_thread: std::thread::current().id(),
+            should_panic: false,
+        });
+        let uri = crate::test_util::test_uri("/test/manifest.toml");
+
+        let parsed = parse_manifest_blocking(&ecosystem, "content", &uri)
+            .await
+            .unwrap();
+        assert_eq!(parsed.uri(), &uri);
+    }
+
+    /// A panicking `parse_manifest` must surface as `Err(DepsError::ParseError)` with the
+    /// panic message preserved, mirroring `lockfile.rs`'s
+    /// `test_read_and_parse_lockfile_panic_in_parse_becomes_parse_error`.
+    #[tokio::test]
+    async fn test_parse_manifest_blocking_panic_becomes_parse_error() {
+        let ecosystem: Arc<dyn Ecosystem> = Arc::new(StubEcosystem {
+            calling_thread: std::thread::current().id(),
+            should_panic: true,
+        });
+        let uri = crate::test_util::test_uri("/test/manifest.toml");
+
+        let Err(err) = parse_manifest_blocking(&ecosystem, "content", &uri).await else {
+            panic!("expected parse_manifest_blocking to return an error");
+        };
+
+        match err {
+            crate::error::DepsError::ParseError { file_type, source } => {
+                assert!(file_type.contains("manifest at"));
+                assert!(
+                    source.to_string().contains("boom"),
+                    "panic message should be preserved in the error source, got: {source}"
+                );
+            }
+            other => panic!("Expected ParseError, got: {other:?}"),
+        }
     }
 }

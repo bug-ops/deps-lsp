@@ -1865,7 +1865,9 @@ pub async fn handle_document_open(
     );
 
     // Try to parse manifest (may fail for incomplete syntax)
-    let parse_result = ecosystem.parse_manifest(&content, &uri).await.ok();
+    let parse_result = deps_core::ecosystem::parse_manifest_blocking(&ecosystem, &content, &uri)
+        .await
+        .ok();
 
     // Create document state (parse_result may be None)
     let mut doc_state = if let Some(pr) = parse_result {
@@ -2239,7 +2241,7 @@ async fn parse_and_diff_manifest(
     uri: &Uri,
     content: &str,
     state: &ServerState,
-    ecosystem: &dyn Ecosystem,
+    ecosystem: &Arc<dyn Ecosystem>,
 ) -> (Option<Box<dyn deps_core::ParseResult>>, DependencyDiff) {
     // Extract old dependency name -> version_requirement map before parsing
     // (for diff computation)
@@ -2251,7 +2253,9 @@ async fn parse_and_diff_manifest(
         });
 
     // Try to parse manifest (may fail for incomplete syntax)
-    let parse_result = ecosystem.parse_manifest(content, uri).await.ok();
+    let parse_result = deps_core::ecosystem::parse_manifest_blocking(ecosystem, content, uri)
+        .await
+        .ok();
 
     // Extract new dependency name -> version_requirement map for diff
     let new_deps: HashMap<PackageName, Vec<Option<VersionReq>>> = parse_result
@@ -2496,8 +2500,7 @@ pub(crate) async fn handle_document_change_guarded(
 
     check_content_size(&content, &uri)?;
 
-    let (parse_result, diff) =
-        parse_and_diff_manifest(&uri, &content, &state, ecosystem.as_ref()).await;
+    let (parse_result, diff) = parse_and_diff_manifest(&uri, &content, &state, &ecosystem).await;
 
     // Captured before `commit_parsed_document` consumes `parse_result` — only needed under
     // `RefetchPolicy::AllDependencies` (issue #592), where the fetch must cover every

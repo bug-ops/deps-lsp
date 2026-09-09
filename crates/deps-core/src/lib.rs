@@ -64,6 +64,7 @@ pub use cache::{BodyLimit, CachedResponse, HttpCache};
 pub use deps_dev::{DepsDevClient, ProvenanceStatus, ScorecardSummary, SupplyChainTrustSignal};
 pub use ecosystem::{
     Dependency, Ecosystem, EcosystemConfig, EcosystemId, LicenseSource, ParseResult,
+    parse_manifest_blocking,
 };
 pub use ecosystem_registry::EcosystemRegistry;
 pub use error::{DepsError, FetchFailure, Result};

@@ -794,20 +794,47 @@ pub fn position_in_range(pos: Position, range: Range) -> bool {
 /// Precomputes line-start byte offsets once, then maps any byte offset to a
 /// `(line, character)` position. Characters are counted as UTF-16 code units
 /// as required by the LSP specification.
+///
+/// Also precomputes, per line, whether that line is pure ASCII (`line_is_ascii`): for an
+/// ASCII-only line, byte offset and UTF-16 code-unit
+/// offset are always equal, so [`byte_offset_to_position`](Self::byte_offset_to_position)
+/// can skip the `chars().map(char::len_utf16).sum()` scan entirely and compute the
+/// character offset in O(1). This matters because a single minified manifest line (e.g. a
+/// `package.json` with hundreds of dependencies on one line) turns per-offset lookups into
+/// an O(n) scan each, and O(n) lookups across the line's length make the whole document
+/// O(n^2) (#742) — the common case of an ASCII-only line now stays O(1) per lookup; a
+/// non-ASCII line still takes the O(n) scan, unchanged.
 pub struct LineOffsetTable {
     line_starts: Vec<usize>,
+    line_is_ascii: Vec<bool>,
 }
 
 impl LineOffsetTable {
     /// Builds the table for `content`.
     pub fn new(content: &str) -> Self {
         let mut line_starts = vec![0];
+        let mut line_is_ascii = Vec::new();
+        let mut current_ascii = true;
         for (i, c) in content.char_indices() {
+            if !c.is_ascii() {
+                current_ascii = false;
+            }
             if c == '\n' {
                 line_starts.push(i + 1);
+                line_is_ascii.push(current_ascii);
+                current_ascii = true;
             }
         }
-        Self { line_starts }
+        line_is_ascii.push(current_ascii);
+        debug_assert_eq!(
+            line_starts.len(),
+            line_is_ascii.len(),
+            "line_starts and line_is_ascii must stay in lockstep — one entry per line"
+        );
+        Self {
+            line_starts,
+            line_is_ascii,
+        }
     }
 
     /// Absolute byte offset where `line` (0-indexed) starts, or `None` if
@@ -860,13 +887,20 @@ impl LineOffsetTable {
         // text sent directly by the editor, so this saturates rather than assuming an
         // upstream cap that doesn't universally hold (mirrors
         // `completion::byte_to_utf16_offset`'s identical fix).
-        let character = u32::try_from(
-            content[line_start..offset]
-                .chars()
-                .map(char::len_utf16)
-                .sum::<usize>(),
-        )
-        .unwrap_or(u32::MAX);
+        //
+        // #742: an ASCII-only line has 1 UTF-16 unit per byte, so the character offset is
+        // just the byte delta — no need to walk the line's `chars()` to sum `len_utf16`.
+        let character = if self.line_is_ascii.get(line).copied().unwrap_or(false) {
+            u32::try_from(offset - line_start).unwrap_or(u32::MAX)
+        } else {
+            u32::try_from(
+                content[line_start..offset]
+                    .chars()
+                    .map(char::len_utf16)
+                    .sum::<usize>(),
+            )
+            .unwrap_or(u32::MAX)
+        };
         Position::new(u32::try_from(line).unwrap_or(u32::MAX), character)
     }
 
@@ -1596,6 +1630,73 @@ mod tests {
         assert!(!content.is_char_boundary(4));
         let pos = table.byte_offset_to_position(content, 4);
         assert_eq!(pos, table.byte_offset_to_position(content, 3));
+    }
+
+    /// Covers the ASCII/non-ASCII fast-path split introduced for #742: an ASCII-only line
+    /// (line 0), a non-ASCII line mixing a BMP accented character with a surrogate-pair
+    /// emoji (line 1), and a mixed line (line 2) must all still resolve to the same
+    /// `Position`s as the original `chars().map(char::len_utf16).sum()` scan would produce.
+    #[test]
+    fn test_byte_offset_to_position_ascii_and_non_ascii_lines_agree() {
+        let content = "abcde\nhéllo 😀\nab café end";
+        let table = LineOffsetTable::new(content);
+
+        // Line 0 ("abcde"): ASCII fast path, byte offset == UTF-16 character offset.
+        assert_eq!(
+            table.byte_offset_to_position(content, 3),
+            Position::new(0, 3)
+        );
+        assert_eq!(
+            table.byte_offset_to_position(content, 5),
+            Position::new(0, 5)
+        );
+
+        // Line 1 ("héllo 😀"): non-ASCII scan path.
+        // Offset after "h\u{e9}" (1 + 2 bytes into the line): 'h' + 'é' = 2 UTF-16 units.
+        assert_eq!(
+            table.byte_offset_to_position(content, 6 + 3),
+            Position::new(1, 2)
+        );
+        // Offset at the end of the line: "héllo 😀" = 8 UTF-16 units (emoji is a surrogate pair).
+        assert_eq!(
+            table.byte_offset_to_position(content, 6 + 11),
+            Position::new(1, 8)
+        );
+
+        // Line 2 ("ab café end"): mixed line, still takes the non-ASCII scan path.
+        // Offset after "ab café" (8 bytes into the line): 7 UTF-16 units ('é' is 1 BMP unit).
+        assert_eq!(
+            table.byte_offset_to_position(content, 18 + 8),
+            Position::new(2, 7)
+        );
+    }
+
+    /// Regression guard for #742: `byte_offset_to_position` on a large single-line
+    /// (minified) manifest must stay near-instant. The pre-fix implementation rescanned
+    /// the line from its start on every call, making repeated lookups over such a line
+    /// O(n^2) in the line's length (~350ms for 8000 calls on an ~180KB line on the
+    /// reporter's machine); the ASCII fast path makes each call O(1), so this generous
+    /// wall-clock bound leaves wide margin without being flaky.
+    #[test]
+    fn test_byte_offset_to_position_minified_line_stays_fast() {
+        let mut content = String::from("{\"dependencies\":{");
+        for i in 0..8000 {
+            content.push_str(&format!("\"dep{i}\":\"1.0.{i}\","));
+        }
+        content.push_str("}}");
+
+        let table = LineOffsetTable::new(&content);
+        let step = (content.len() / 8000).max(1);
+        let start = std::time::Instant::now();
+        for offset in (0..content.len()).step_by(step) {
+            std::hint::black_box(table.byte_offset_to_position(&content, offset));
+        }
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "8000 byte_offset_to_position calls on a minified line took {elapsed:?}, expected < 100ms"
+        );
     }
 
     #[test]
