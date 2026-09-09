@@ -106,18 +106,18 @@ pub struct DocumentState {
     /// cannot await hover's live per-request fetch. Two disjoint populating sources,
     /// which can coexist safely because a document has exactly one ecosystem, so only
     /// one of the two ever contributes real (non-empty) data for it:
-    /// - **Tier-1 backfill**: `document::lifecycle::merge_registry_fetch_result`, via
+    /// - **Tier-1 backfill**: `document::fetch::merge_registry_fetch_result`, via
     ///   [`Self::merge_licenses`], from `Version::license()` on the already-fetched
     ///   version-list entry — today, only Composer's `impl_version!` includes a
     ///   `license:` field (`deps-composer/src/types.rs`); any ecosystem whose
     ///   `impl_version!` gains one automatically starts populating this map with no
-    ///   further `lifecycle.rs` changes. **Not** populated for the deps.dev-routed tier-2
+    ///   further `fetch.rs` changes. **Not** populated for the deps.dev-routed tier-2
     ///   ecosystems (Cargo, npm, PyPI, Go, Bundler, Maven, NuGet) — their license is only
     ///   ever fetched by `trust_signal()`, which is deliberately hover-only (see
     ///   `VersionData::trust`'s docs); reaching it from here would mean a new deps.dev
     ///   call on every document open/edit, out of this backfill's "already in hand, no
     ///   new network calls" scope.
-    /// - **Tier-3 pre-fetch**: `document::lifecycle::run_license_prefetch` (Dart, Swift,
+    /// - **Tier-3 pre-fetch**: `document::osv_scan::run_license_prefetch` (Dart, Swift,
     ///   Gradle, Deno only — see that function's docs), via [`Self::merge_licenses`] (round
     ///   3 finding #2: a plain [`Self::update_licenses`] full replace would drop a
     ///   dependency's previously-cached, still-valid license whenever *any other*
@@ -398,8 +398,8 @@ impl DocumentState {
     /// entries — unlike [`Self::update_licenses`], which replaces the map wholesale.
     ///
     /// Both of [`Self::licenses`]' populating sources use this: the tier-1 backfill
-    /// (`document::lifecycle::merge_registry_fetch_result`, for every ecosystem) and the
-    /// tier-3 pre-fetch (`document::lifecycle::run_license_prefetch`, Dart/Swift/
+    /// (`document::fetch::merge_registry_fetch_result`, for every ecosystem) and the
+    /// tier-3 pre-fetch (`document::osv_scan::run_license_prefetch`, Dart/Swift/
     /// Gradle/Deno only). A tier-3 document's tier-1 call always contributes an empty
     /// map (no ecosystem's `Version::license` is both non-empty *and* backed by the
     /// tier-3 pre-fetch path), so the two never actually race for the same key in
@@ -2192,7 +2192,7 @@ mod tests {
     /// Same regression as above, but through `new_from_parse_result` with a real
     /// `ParseResult` for one of the previously-misclassified ecosystems (maven).
     /// Parses `"maven"` explicitly first, mirroring the parse-then-construct
-    /// sequence `document::lifecycle::resolve_ecosystem_id` performs in production.
+    /// sequence `document::resolved::resolve_ecosystem_id` performs in production.
     #[cfg(feature = "maven")]
     #[test]
     fn test_document_state_new_from_parse_result_maven_not_misclassified_as_cargo() {
