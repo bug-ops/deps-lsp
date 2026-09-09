@@ -1,6 +1,8 @@
 //! GitHub Actions ecosystem support for deps-lsp.
 //!
-//! Provides LSP features for `.github/workflows/*.yml`/`*.yaml` files:
+//! Provides LSP features for `.github/workflows/*.yml`/`*.yaml` workflow files, and for
+//! `action.yml`/`action.yaml` composite/Docker/JavaScript action manifests (a repository
+//! root, or `.github/actions/<name>/`, issue #706):
 //! - Version autocomplete and hover for `uses: owner/repo@ref` steps
 //! - Diagnostics and code actions for outdated tag pins and SHA-with-comment pins
 //! - GitHub tags API for version discovery, with per-repository commit SHA resolution

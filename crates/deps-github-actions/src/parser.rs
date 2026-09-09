@@ -208,9 +208,27 @@ struct UsesCandidate {
 /// Collects every `uses:` value-scalar event, skipping any `uses` key that has a `with:`
 /// ancestor (a step input literally named `uses`) — covers `jobs.*.steps[].uses` and
 /// `jobs.<id>.uses` (reusable-workflow calls) with one rule, matching Renovate.
+///
+/// Also tracks [`Self::has_top_level_runs_key`] alongside `candidates`: both are derived
+/// from the same single streaming pass over the document's YAML events, so recomputing
+/// the `runs:` check separately (e.g. from the URI path instead) would mean a second,
+/// redundant walk of the same event stream for one boolean.
 struct WorkflowReceiver {
     stack: Vec<Frame>,
     candidates: Vec<UsesCandidate>,
+    /// Whether a `runs:` key was seen in the *document root* mapping (`stack.len() == 1`
+    /// at the time its key scalar fired) — issue #706 review finding (security, LOW):
+    /// `action.yml`/`action.yaml` is now routed by bare basename, matching any file with
+    /// that name anywhere in an opened workspace, not just real GitHub Action manifests.
+    /// GitHub requires every `action.yml`/`action.yaml` to declare a top-level `runs:`
+    /// key; [`parse_workflow_yaml`] uses this flag (via [`is_action_manifest_filename`])
+    /// to withhold every candidate for such a file when it's missing, cutting
+    /// false-positive registry fetches and diagnostics on a coincidentally-named,
+    /// unrelated file. Known limitation: a `runs:` key expressed only through a YAML
+    /// merge key (`<<: *anchor`) is not detected — this flag only recognizes a literal
+    /// `runs` scalar key, so such an action would be misclassified. Considered too
+    /// obscure to warrant merge-key resolution here.
+    has_top_level_runs_key: bool,
 }
 
 impl WorkflowReceiver {
@@ -218,6 +236,7 @@ impl WorkflowReceiver {
         Self {
             stack: Vec::new(),
             candidates: Vec::new(),
+            has_top_level_runs_key: false,
         }
     }
 
@@ -262,6 +281,9 @@ impl MarkedEventReceiver for WorkflowReceiver {
                     .last()
                     .is_some_and(|top| matches!(top.kind, FrameKind::Mapping) && top.awaiting_key);
                 if is_key {
+                    if self.stack.len() == 1 && value == "runs" {
+                        self.has_top_level_runs_key = true;
+                    }
                     if let Some(top) = self.stack.last_mut() {
                         top.pending_key = if value == "uses" && !top.is_with_ancestor {
                             PendingKey::Uses
@@ -561,6 +583,23 @@ pub fn parse_workflow_yaml(content: &str, uri: &Uri) -> Result<GithubActionsPars
         });
     }
 
+    // Issue #706 review finding (security, LOW): `action.yml`/`action.yaml` is routed by
+    // bare basename (`Ecosystem::manifest_filenames`), which matches anywhere in an
+    // opened workspace — not just real GitHub Action manifests. Withhold every candidate
+    // for such a file unless it actually declares GitHub's own required top-level
+    // `runs:` key, so a coincidentally-named, unrelated `action.yml` degrades to zero
+    // dependencies instead of issuing live registry fetches and diagnostics.
+    if is_action_manifest_filename(uri) && !receiver.has_top_level_runs_key {
+        tracing::debug!(
+            "action.yml/action.yaml with no top-level `runs:` key, treating as not a \
+             GitHub Action manifest"
+        );
+        return Ok(GithubActionsParseResult {
+            dependencies: Vec::new(),
+            uri: uri.clone(),
+        });
+    }
+
     let line_table = LineOffsetTable::new(content);
     let char_offsets = CharOffsets::new(content);
     let dependencies = receiver
@@ -573,6 +612,24 @@ pub fn parse_workflow_yaml(content: &str, uri: &Uri) -> Result<GithubActionsPars
         dependencies,
         uri: uri.clone(),
     })
+}
+
+/// Whether `uri`'s basename is exactly `action.yml` or `action.yaml` — the same
+/// case-sensitive exact-name match [`crate::ecosystem::GithubActionsEcosystem::manifest_filenames`]
+/// registers with [`deps_core::EcosystemRegistry`], recomputed here since routing itself
+/// carries no signal into [`parse_workflow_yaml`] about *which* rule matched.
+///
+/// Deliberately does not special-case `.github/workflows/`: GitHub's own naming
+/// convention makes a *workflow* actually named `action.yml` vanishingly unlikely (that
+/// name specifically signals "this is an action manifest", not a workflow), so per the
+/// project's MVP convention this stays a plain basename check rather than adding a
+/// directory carve-out (and its own tests) for a near-hypothetical file. Should such a
+/// workflow exist, [`parse_workflow_yaml`]'s "requires a top-level `runs:` key" guard
+/// below would misclassify it and drop its `uses:` steps until renamed.
+fn is_action_manifest_filename(uri: &Uri) -> bool {
+    let path = uri.path().as_str();
+    let filename = path.rsplit('/').next().unwrap_or(path);
+    filename == "action.yml" || filename == "action.yaml"
 }
 
 #[cfg(test)]
@@ -1106,5 +1163,149 @@ mod tests {
     #[test]
     fn test_extract_comment_tag_no_hash_returns_none() {
         assert_eq!(extract_comment_tag(" no comment here"), None);
+    }
+
+    // --- issue #706: composite action.yml routing (parsing side) ---
+    //
+    // `WorkflowReceiver` is key-driven, not path-driven — it recognizes any `uses:`
+    // scalar not nested under `with:`, regardless of whether it sits under
+    // `jobs.*.steps` (a workflow) or `runs.steps` (a composite action). These tests
+    // confirm that already holds for `action.yml`'s own grammar; only routing
+    // (`ecosystem.rs`) needed a change to reach this parser with such a file.
+
+    fn action_test_uri() -> Uri {
+        deps_core::test_util::test_uri("/repo/.github/actions/my-action/action.yml")
+    }
+
+    #[test]
+    fn test_composite_action_uses_steps_are_parsed() {
+        let content = "name: My Action\n\
+             description: Does a thing\n\
+             runs:\n\
+             \x20 using: composite\n\
+             \x20 steps:\n\
+             \x20   - uses: actions/checkout@v4\n\
+             \x20   - uses: actions/setup-node@v4.2.0\n\
+             \x20     with:\n\
+             \x20       node-version: 20\n";
+        let result = parse_workflow_yaml(content, &action_test_uri()).unwrap();
+        let names: Vec<&str> = result
+            .dependencies
+            .iter()
+            .map(|d| d.name().as_str())
+            .collect();
+        assert_eq!(names, vec!["actions/checkout", "actions/setup-node"]);
+    }
+
+    /// A `docker`-`using:` composite action has no `runs.steps` at all — must parse to
+    /// zero dependencies, not error, and (per `ecosystem.rs`'s routing change) must never
+    /// surface a spurious "no dependencies" diagnostic since no such path exists in
+    /// `deps-lsp`.
+    #[test]
+    fn test_docker_action_yields_no_dependencies() {
+        let content = "name: My Docker Action\n\
+             description: Runs in a container\n\
+             runs:\n\
+             \x20 using: docker\n\
+             \x20 image: Dockerfile\n";
+        let result = parse_workflow_yaml(content, &action_test_uri()).unwrap();
+        assert!(result.dependencies.is_empty());
+    }
+
+    /// A `node20`-`using:` composite action likewise has no `uses:` steps.
+    #[test]
+    fn test_node_action_yields_no_dependencies() {
+        let content = "name: My JS Action\n\
+             description: Runs on Node\n\
+             runs:\n\
+             \x20 using: node20\n\
+             \x20 main: index.js\n";
+        let result = parse_workflow_yaml(content, &action_test_uri()).unwrap();
+        assert!(result.dependencies.is_empty());
+    }
+
+    /// Security audit finding (LOW, issue #706 review): `action.yml`/`action.yaml` is
+    /// routed by bare basename anywhere in an opened workspace, not just real GitHub
+    /// Action manifests. A file coincidentally named `action.yml` that happens to contain
+    /// a `uses:`-shaped key but declares no top-level `runs:` (GitHub's own requirement
+    /// for a real action manifest) must yield zero dependencies — no live registry fetch,
+    /// no diagnostic — rather than being treated as a real action.
+    #[test]
+    fn test_action_yml_without_top_level_runs_key_yields_no_dependencies() {
+        let content = "name: Not Actually a GitHub Action\n\
+             uses: internal/base-template@stable\n";
+        let result = parse_workflow_yaml(content, &action_test_uri()).unwrap();
+        assert!(
+            result.dependencies.is_empty(),
+            "an action.yml/action.yaml with no top-level runs: key must not be treated \
+             as a real GitHub Action manifest: {:?}",
+            result.dependencies
+        );
+    }
+
+    /// Companion to the guard above: a genuine root-level `action.yml` (no `.github/`
+    /// ancestry at all) with a top-level `runs:` key must still be treated as a real
+    /// action manifest and parse its `uses:` steps normally.
+    #[test]
+    fn test_root_level_action_yml_with_runs_key_is_parsed() {
+        let uri = deps_core::test_util::test_uri("/repo/action.yml");
+        let content = "name: My Action\n\
+             runs:\n\
+             \x20 using: composite\n\
+             \x20 steps:\n\
+             \x20   - uses: actions/checkout@v4\n";
+        let result = parse_workflow_yaml(content, &uri).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name(), "actions/checkout");
+    }
+
+    /// Documents the accepted known limitation (review finding, item 1): `is_action_manifest_filename`
+    /// is a plain basename check with no `.github/workflows` carve-out, so a workflow
+    /// file unusually named `action.yml` (GitHub imposes no filename requirement on
+    /// workflows, only the containing directory) is misclassified as a non-manifest and
+    /// has its `uses:` steps dropped until renamed — accepted per the project's MVP
+    /// convention since GitHub's own naming guidance makes this combination
+    /// vanishingly unlikely in practice.
+    #[test]
+    fn test_workflow_file_named_action_yml_without_runs_key_loses_its_uses_steps() {
+        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/action.yml");
+        let content = "on: push\njobs:\n  build:\n    steps:\n      - uses: actions/checkout@v4\n";
+        let result = parse_workflow_yaml(content, &uri).unwrap();
+        assert!(
+            result.dependencies.is_empty(),
+            "known limitation: a workflow file literally named action.yml with no \
+             top-level runs: key is misclassified as a non-manifest: {:?}",
+            result.dependencies
+        );
+    }
+
+    /// Companion to the limitation above: the same workflow file is parsed normally once
+    /// it happens to declare a top-level `runs:` key (an unlikely but not forbidden
+    /// combination) — the guard only ever looks at content, never at directory.
+    #[test]
+    fn test_workflow_file_named_action_yml_with_runs_key_is_parsed() {
+        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/action.yml");
+        let content = "on: push\n\
+             runs: {}\n\
+             jobs:\n  build:\n    steps:\n      - uses: actions/checkout@v4\n";
+        let result = parse_workflow_yaml(content, &uri).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name(), "actions/checkout");
+    }
+
+    #[test]
+    fn test_is_action_manifest_filename() {
+        let cases = [
+            ("/repo/action.yml", true),
+            ("/repo/action.yaml", true),
+            ("/repo/.github/actions/my-action/action.yml", true),
+            ("/repo/.github/workflows/action.yml", true),
+            ("/repo/.github/workflows/ci.yml", false),
+            ("/repo/not-action.yml", false),
+        ];
+        for (path, expected) in cases {
+            let uri = deps_core::test_util::test_uri(path);
+            assert_eq!(is_action_manifest_filename(&uri), expected, "{path}");
+        }
     }
 }

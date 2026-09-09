@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **README**: editor setup snippets for Emacs (`eglot`, `lsp-mode`), Sublime Text LSP, Kate, and coc.nvim, each noting the add-on requirement alongside a primary language server (partial work on #712) (#717)
+- **deps-github-actions**: `action.yml`/`action.yaml` composite/Docker/JS action manifests (a repository root or `.github/actions/<name>/`) now get the same hover, diagnostics, SHA-pin quick fix, and code lens as workflow files (resolves #706) (#718)
 - **deps-lsp, deps-cargo, deps-npm, deps-deno, deps-pypi, deps-go, deps-bundler, deps-dart, deps-maven, deps-gitlab-ci, deps-composer, deps-swift, deps-nuget, deps-github-actions**: `tracing::instrument` spans on document lifecycle handlers, background fetch-task spawning, and every ecosystem registry fetch entry point, correlating log events by document URI, ecosystem, package name, and requested version (resolves #671) (#677)
 - **deps-core, deps-composer**: hover now shows the SPDX license for the resolved and latest version (Cargo, npm, PyPI, Go, Maven, Bundler, NuGet, Composer), flagging a "License changed" when they differ (resolves #204) (#663)
 - **deps-dart, deps-swift, deps-gradle, deps-deno, deps-lsp**: hover now shows the license for Dart, Swift, Gradle, and Deno dependencies via a background pre-fetch, including a "(detected)" qualifier for Dart's best-effort pana-scored result (resolves #660) (#682)
