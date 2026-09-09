@@ -321,16 +321,24 @@ jobs:
     # never block an otherwise-green PR (fuzzing did find a real bug during development —
     # the `pep508_rs` panic in `.local/testing/regressions.md` — so this is a real signal
     # channel, just not one that should ever fail someone else's unrelated PR).
-    # `continue-on-error: true` is a deliberate, not decorative, tradeoff: it means nobody
-    # is alerted by a red check if this job breaks (verified during review — see PR
-    # discussion). Accepted for now given this job's scope; a scheduled weekly run that
-    # files an issue on failure would close that gap and is a reasonable follow-up.
+    # `continue-on-error` is conditional (#701): PR/push runs stay non-blocking exactly as
+    # before, but the weekly scheduled sweep (`github.event_name == 'schedule'`) hard-fails
+    # and the "File or update tracking issue" step below opens/updates a GitHub issue, so a
+    # regression in this job is no longer silent.
     # `fuzz/` is its own nested workspace (see `fuzz/Cargo.toml`), independent of the root
     # `[workspace.lints]`/`unsafe_code = "forbid"` this job's targets don't need to satisfy.
-    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true'
+    #
+    # `github.event_name == 'schedule'` is included in `if` (not just in `continue-on-error`)
+    # because `changes.outputs.rust`/`workflows` reflect only the most recent commit's diff
+    # (#701) — without this, a doc-only last commit on `main` would skip the entire weekly
+    # regression sweep, not just report it quietly.
+    if: github.event_name == 'schedule' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    continue-on-error: true
+    continue-on-error: ${{ github.event_name != 'schedule' }}
+    permissions:
+      contents: read
+      issues: write
     strategy:
       fail-fast: false
       matrix:
@@ -372,6 +380,24 @@ jobs:
       - name: Run ${{ matrix.target }} for 60s
         working-directory: fuzz
         run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=60
+
+      - name: File or update tracking issue on scheduled failure
+        if: failure() && github.event_name == 'schedule'
+        run: |
+          title="fuzz: ${TARGET} failed in scheduled run"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          body="Scheduled fuzz run ${run_url} failed for target \`${TARGET}\`.
+
+          This target is part of the weekly regression sweep (\`.github/workflows/ci.yml\`, job \`fuzz\`). See the run log for the crash/build failure detail."
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --search "in:title \"${title}\"" --state open --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body" --label security --label testing-infra
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET: ${{ matrix.target }}
 
   release-check:
     name: Release Build Check
