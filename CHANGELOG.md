@@ -26,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: property tests (`proptest`) asserting the parser depth/expansion checkers and JSONC position recovery never panic on arbitrary input (#673)
 
 ### Fixed
+- **deps-pypi**: raw-text fallback completion no longer bare-inserts an unquoted package name into a `pyproject.toml` dependency array when no quote has been typed yet, producing invalid TOML (resolves #737) (#741)
 - **deps-pypi**: raw-text fallback completion no longer bare-inserts a package name right after an already-closed `pyproject.toml` TOML array value, via a shared escape-aware quote-parity check in `deps-core` (now the single implementation backing #732's `strip_open_json_key` too) — also fixes the same escaped-quote gap in Cargo's `extract_feature_prefix` (resolves #734, #733)
 - **deps-core, deps-npm, deps-composer**: npm/Composer raw-text fallback completion no longer inserts a duplicate-quoted key-value pair when the cursor is already inside an open JSON key string (resolves #729) (#732)
 - **deps-core** + all 9 lock-file providers: lock-file parsing now runs on the blocking-thread pool via a shared `read_and_parse_lockfile` helper, no longer stalling the LSP request worker (resolves #723) (#730)
