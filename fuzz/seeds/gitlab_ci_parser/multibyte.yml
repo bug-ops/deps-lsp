@@ -1,0 +1,6 @@
+include:
+  - project: "　　org/proj"
+    ref: v1.2.3
+  - project: org/proj
+    ref: "　　v1.2.3"
+  - component: gitlab.com/org/prôj/comp@1.0.0

@@ -45,6 +45,19 @@ path = "../crates/deps-nuget"
 [dependencies.deps-pypi]
 path = "../crates/deps-pypi"
 
+[dependencies.deps-github-actions]
+path = "../crates/deps-github-actions"
+
+[dependencies.deps-gitlab-ci]
+path = "../crates/deps-gitlab-ci"
+
+[dependencies.deps-dart]
+path = "../crates/deps-dart"
+
+[dependencies.deps-npm]
+path = "../crates/deps-npm"
+features = ["fuzzing"]
+
 [profile.release]
 debug = 1
 
@@ -121,6 +134,48 @@ bench = false
 [[bin]]
 name = "registry_xml_parser"
 path = "fuzz_targets/registry_xml_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "github_actions_parser"
+path = "fuzz_targets/github_actions_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gitlab_ci_parser"
+path = "fuzz_targets/gitlab_ci_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dart_parser"
+path = "fuzz_targets/dart_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dart_lockfile"
+path = "fuzz_targets/dart_lockfile.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pnpm_lockfile"
+path = "fuzz_targets/pnpm_lockfile.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pnpm_catalog"
+path = "fuzz_targets/pnpm_catalog.rs"
 test = false
 doc = false
 bench = false

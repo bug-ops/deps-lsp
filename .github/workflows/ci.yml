@@ -359,6 +359,12 @@ jobs:
           - maven_parser
           - nuget_parser
           - registry_xml_parser
+          - github_actions_parser
+          - gitlab_ci_parser
+          - dart_parser
+          - dart_lockfile
+          - pnpm_lockfile
+          - pnpm_catalog
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
 
@@ -379,7 +385,25 @@ jobs:
 
       - name: Run ${{ matrix.target }} for 60s
         working-directory: fuzz
-        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=60
+        # `seeds/<target>/` (issue #727), when present, is a tracked, read-only starting
+        # corpus — libFuzzer only ever writes newly-discovered interesting inputs back into
+        # the first CORPUS directory (the auto-managed, gitignored `corpus/<target>/`), never
+        # into later ones, so this cannot mutate the tracked seeds. Targets whose key-driven
+        # YAML dispatch (a whole-string compare on a mapping key, e.g. `value == "uses"`) gives
+        # libFuzzer no per-byte coverage gradient need this to reach the real dependency-
+        # extraction code within the 60s budget, rather than only ever re-deriving syntactically
+        # valid YAML that never contains the right key text.
+        run: |
+          seed_dir="seeds/${{ matrix.target }}"
+          if [ -d "$seed_dir" ]; then
+            # libFuzzer requires the (mutable) main corpus directory to already exist when
+            # any CORPUS argument is passed explicitly — unlike the no-argument default form
+            # below, it won't create it on its own.
+            mkdir -p "corpus/${{ matrix.target }}"
+            cargo +nightly fuzz run ${{ matrix.target }} "corpus/${{ matrix.target }}" "$seed_dir" -- -max_total_time=60
+          else
+            cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=60
+          fi
 
       - name: File or update tracking issue on scheduled failure
         if: failure() && github.event_name == 'schedule'
