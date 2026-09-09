@@ -311,6 +311,8 @@ fn extract_prefix(line: &str, character: u32, ecosystem_kind: EcosystemId) -> &s
         prefix.trim_matches('"')
     } else if uses_xml_tag_values(ecosystem_kind) {
         strip_leading_xml_tag(prefix)
+    } else if uses_xml_attribute_values(ecosystem_kind) {
+        strip_leading_xml_attribute(prefix)
     } else {
         prefix
     }
@@ -321,10 +323,10 @@ fn extract_prefix(line: &str, character: u32, ecosystem_kind: EcosystemId) -> &s
 ///
 /// Exhaustively matched, like [`uses_json_quoted_keys`], so a future XML-manifest
 /// ecosystem forces a decision here instead of silently leaking tag markup into a
-/// registry search query. NuGet is XML too but correctly `false`: its dependencies are
-/// attribute-valued (`<PackageReference Include="..." Version="..." />`), not tag-value
-/// wrapped like Maven's, and its `is_in_dependencies_section` arm is already `false`
-/// (see that function's doc), so it never reaches `extract_prefix` regardless.
+/// registry search query. NuGet is XML too but correctly `false` here: its
+/// dependencies are attribute-valued (`<PackageReference Include="..." Version="..."
+/// />`), not tag-value wrapped like Maven's, so it needs its own extraction — see
+/// [`uses_xml_attribute_values`] instead.
 const fn uses_xml_tag_values(ecosystem_kind: EcosystemId) -> bool {
     match ecosystem_kind {
         EcosystemId::Maven => true,
@@ -365,6 +367,131 @@ fn strip_leading_xml_tag(prefix: &str) -> &str {
     {
         prefix.rfind('>').map_or(prefix, |gt| &prefix[gt + 1..])
     }
+}
+
+/// Whether `ecosystem_kind`'s manifest carries a completable value in an XML
+/// *attribute* rather than tag content (`Include="Newt`), so [`extract_prefix`] must
+/// use [`strip_leading_xml_attribute`] instead of [`strip_leading_xml_tag`].
+///
+/// Exhaustively matched, like [`uses_xml_tag_values`], so a future ecosystem whose
+/// manifest is XML-attribute-valued forces a decision here instead of silently
+/// falling through to the tag-content (or unmodified) path.
+///
+/// NuGet only: `PackageReference`/`PackageVersion`'s `Include="..."` and
+/// `packages.config`'s `<package id="..."/>` are the two element+attribute pairs that
+/// carry a dependency name across NuGet's three manifest schemas (`crates/deps-nuget/
+/// src/parser.rs`), unlike Maven's tag-content shape.
+const fn uses_xml_attribute_values(ecosystem_kind: EcosystemId) -> bool {
+    match ecosystem_kind {
+        EcosystemId::NuGet => true,
+        EcosystemId::Maven
+        | EcosystemId::Npm
+        | EcosystemId::Composer
+        | EcosystemId::Cargo
+        | EcosystemId::Pypi
+        | EcosystemId::Go
+        | EcosystemId::Dart
+        | EcosystemId::Gradle
+        | EcosystemId::Swift
+        | EcosystemId::Bundler
+        | EcosystemId::Deno
+        | EcosystemId::GithubActions
+        | EcosystemId::GitlabCi => false,
+    }
+}
+
+/// Extracts the value being typed inside an open `Include="..."` or `id="..."`
+/// attribute at the end of `prefix`, on a `PackageReference`/`PackageVersion`/
+/// `package` element (`<PackageReference Include="Newt` -> `Newt`).
+///
+/// Returns an *empty* string whenever the cursor is not inside one of those two
+/// attributes' *unclosed* values on one of those three elements — still inside the
+/// element/attribute name itself (`<PackageReference `, no attribute typed yet: there
+/// is no candidate package-name text at that position), inside a different
+/// attribute's value (`Version="1.0`), past an already-closed value, inside
+/// `Include="..."` on an unrelated MSBuild item (`<Compile Include="..`,
+/// `<Using Include="..`, `<ProjectReference Include="..` — all common in real
+/// `.csproj` files and *not* NuGet package references), or plain non-markup text
+/// (comments, a bare word) that happens to sit inside an `<ItemGroup>`/`<packages>`
+/// section. Deliberately empty rather than the raw `prefix`, unlike
+/// [`strip_leading_xml_tag`]'s "return unchanged" fallback: an unmodified prefix here
+/// would usually contain no `=` either (comment text, a bare word, or the still-typed
+/// element/attribute name), so `fallback_completion`'s `contains('=')` guard alone
+/// cannot reject it, and a search on that raw text would query the registry for
+/// markup or arbitrary noise (#699 code-review finding). Mirrors the real parser's
+/// own element-name dispatch (`crates/deps-nuget/src/parser.rs:46,53,58`), which is
+/// strictly narrower than "any `Include=`/`id=` attribute" would be.
+///
+/// Scans the whole `prefix` tracking the currently open quote, rather than `rfind`
+/// as [`strip_leading_xml_tag`] does for tag content: an attribute value's opening
+/// quote is the same character as a closed value's closing quote, so telling them
+/// apart requires tracking quote parity from the start of the element instead of
+/// searching backwards from the end. Only sees the element opening tag when it is on
+/// the same line as the cursor — a `PackageReference` whose element and `Include=`
+/// attribute are split across lines is not detected, matching this file's other
+/// raw-text heuristics' single-line scope.
+fn strip_leading_xml_attribute(prefix: &str) -> &str {
+    let mut quote: Option<char> = None;
+    let mut value_start = 0usize;
+    let mut in_target_attr = false;
+    let mut segment_start = 0usize;
+    let mut element = "";
+
+    for (idx, ch) in prefix.char_indices() {
+        if let Some(open) = quote {
+            if ch == open {
+                quote = None;
+                segment_start = idx + ch.len_utf8();
+            }
+            continue;
+        }
+        if ch == '<' {
+            // `idx + 1` is a char boundary: `<` is a single-byte ASCII char. Reset
+            // here too (not just on a closing quote) so `before_quote` below never
+            // spans back across a *previous* element's tail — correctness doesn't
+            // currently depend on this (`split_whitespace().next_back()` already
+            // discards everything but the token right before the quote), but keeping
+            // `segment_start` anchored to the most recent tag boundary keeps that
+            // true by construction rather than by a non-obvious side effect.
+            segment_start = idx + ch.len_utf8();
+            #[allow(clippy::string_slice)]
+            let rest = &prefix[segment_start..];
+            element = rest
+                .split(|c: char| c == '>' || c == '/' || c.is_whitespace())
+                .next()
+                .unwrap_or("");
+            continue;
+        }
+        if ch == '"' || ch == '\'' {
+            // `idx` is a char boundary (from `char_indices`), so this slice is valid.
+            #[allow(clippy::string_slice)]
+            let before_quote = prefix[segment_start..idx].trim_end();
+            let name = before_quote
+                .strip_suffix('=')
+                .unwrap_or(before_quote)
+                .split_whitespace()
+                .next_back()
+                .unwrap_or("");
+            in_target_attr = matches!(element, "PackageReference" | "PackageVersion" | "package")
+                && (name == "Include" || name == "id");
+            quote = Some(ch);
+            value_start = idx + ch.len_utf8();
+        }
+    }
+
+    if quote.is_some() && in_target_attr {
+        // `value_start` is `idx + ch.len_utf8()` for the opening quote char, always a
+        // char boundary.
+        #[allow(clippy::string_slice)]
+        let value = &prefix[value_start..];
+        // A package id never contains a quote character. The scan above only closes
+        // `quote` on the *matching* delimiter, so an opposite-type quote character
+        // (e.g. a stray `'` inside an unclosed `"`-delimited value) would otherwise
+        // survive into the extracted value and the registry search query built from
+        // it; stop at the first quote of either kind instead.
+        return value.split(['"', '\'']).next().unwrap_or(value);
+    }
+    ""
 }
 
 /// Whether `ecosystem_kind`'s manifest keys are typed as JSON string literals
@@ -476,29 +603,34 @@ fn is_in_dependencies_section(
         EcosystemId::Maven => is_in_xml_tag_section(content, line_number, "dependencies"),
         EcosystemId::Go => is_in_go_require(content, line_number),
         EcosystemId::Dart => is_in_yaml_dependencies(content, line_number),
-        // TODO(#118 follow-up): Gemfile has no delimited dependencies section —
-        // `gem "name"` calls are valid anywhere at the top level or inside
-        // `group ... do ... end` blocks, so there is no raw-text boundary to detect.
-        // `false` matches the pre-fix behavior (fallback completion disabled) rather
-        // than `true`: `fallback_completion` fires on every keystroke where the
-        // ecosystem's own completion is empty, using the *whole trimmed line* as the
-        // search query (not a token), so a permissive `true` here would fire a live
-        // registry search on unrelated text and insert results with unrelated syntax.
+        // Gemfile has no delimited dependencies section — `gem "name"` calls are
+        // valid anywhere at the top level or inside `group ... do ... end` blocks, so
+        // there is no raw-text boundary to detect. `false` disables fallback
+        // completion rather than enabling it unconditionally: `fallback_completion`
+        // fires on every keystroke where the ecosystem's own completion is empty,
+        // using the *whole trimmed line* as the search query (not a token), so a
+        // permissive `true` here would fire a live registry search on unrelated text
+        // and insert results with unrelated syntax.
         EcosystemId::Bundler => false,
-        // TODO(#118 follow-up): Package.swift dependencies are `.package(...)` calls
-        // matched anywhere in the file by the real parser (not confined to the
-        // `dependencies: [...]` array), so there is no reliable raw-text section
-        // boundary here either. See the Bundler arm above for why this is `false`.
+        // Package.swift dependencies are `.package(...)` calls matched anywhere in
+        // the file by the real parser (not confined to the `dependencies: [...]`
+        // array), so there is no reliable raw-text section boundary here either. See
+        // the Bundler arm above for why this is `false`.
         EcosystemId::Swift => false,
-        // TODO(#118 follow-up): Gradle spans five manifest formats (TOML version
-        // catalog, Groovy DSL, Kotlin DSL) with no raw-text section marker shared
-        // across all of them. See the Bundler arm above for why this is `false`.
+        // Gradle spans five manifest formats (TOML version catalog, Groovy DSL,
+        // Kotlin DSL) with no raw-text section marker shared across all of them. See
+        // the Bundler arm above for why this is `false`.
         EcosystemId::Gradle => false,
-        // TODO(#118 follow-up): NuGet spans three schemas: csproj/Directory.Packages
-        // .props nest PackageReference/PackageVersion in `<ItemGroup>`, while
-        // packages.config lists `<package>` elements directly under its root with no
-        // such wrapper. See the Bundler arm above for why this is `false`.
-        EcosystemId::NuGet => false,
+        // NuGet spans three schemas, all of which nest their dependency elements
+        // under a named tag: csproj/fsproj/vbproj and Directory.Packages.props wrap
+        // PackageReference/PackageVersion in `<ItemGroup>`, while packages.config
+        // lists `<package>` elements directly under `<packages>`. Unlike
+        // Bundler/Swift/Gradle above, both boundaries are cheap raw-text XML tags, so
+        // `is_in_xml_tag_section` (already used by the Maven arm) covers them.
+        EcosystemId::NuGet => {
+            is_in_xml_tag_section(content, line_number, "ItemGroup")
+                || is_in_xml_tag_section(content, line_number, "packages")
+        }
         EcosystemId::Deno => is_in_json_dependencies(content, line_number, &["imports"]),
         // A `uses:` step key can appear at any nesting depth in a workflow file
         // (`jobs.*.steps[].uses`, `jobs.<id>.uses`), so unlike the other YAML/TOML/
@@ -508,7 +640,7 @@ fn is_in_dependencies_section(
         // `deps-gitlab-ci` never supports `PackageName` completion at all (spec
         // NFR-002 — no cheap GitLab search endpoint), so the raw-text fallback this
         // function drives is never reached for it either. `false` matches the
-        // Bundler/Swift/Gradle/NuGet arms above.
+        // Bundler/Swift/Gradle arms above.
         EcosystemId::GitlabCi => false,
     }
 }
@@ -1164,6 +1296,11 @@ mod tests {
     /// Same as [`mock_cargo_state`], but for the `"pypi"` ecosystem.
     fn mock_pypi_state(registry: Arc<dyn deps_core::Registry>) -> ServerState {
         mock_ecosystem_state("pypi", "pyproject.toml", registry)
+    }
+
+    /// Same as [`mock_cargo_state`], but for the `"nuget"` ecosystem.
+    fn mock_nuget_state(registry: Arc<dyn deps_core::Registry>) -> ServerState {
+        mock_ecosystem_state("nuget", "csproj", registry)
     }
 
     #[tokio::test]
@@ -2073,8 +2210,10 @@ requests
     fn test_is_in_dependencies_section_no_raw_text_boundary_ecosystems() {
         // No existing raw-text section boundary: `false` preserves pre-fix behavior
         // (fallback completion disabled) rather than risking spurious registry
-        // searches on arbitrary lines. See the TODO comments in
-        // `is_in_dependencies_section` for the per-ecosystem rationale.
+        // searches on arbitrary lines. See the comments in `is_in_dependencies_section`
+        // for the per-ecosystem rationale. NuGet is covered separately below — unlike
+        // these three, it does have a raw-text section boundary (`<ItemGroup>`/
+        // `<packages>`).
         let content = "anything at all\n";
         assert!(!is_in_dependencies_section(
             content,
@@ -2083,7 +2222,37 @@ requests
         ));
         assert!(!is_in_dependencies_section(content, 0, EcosystemId::Swift));
         assert!(!is_in_dependencies_section(content, 0, EcosystemId::Gradle));
+    }
+
+    #[test]
+    fn test_is_in_dependencies_section_nuget_csproj_item_group() {
+        let content = "<Project>\n  <ItemGroup>\n    <PackageReference Include=\"Foo\" />\n  </ItemGroup>\n</Project>\n";
+        assert!(is_in_dependencies_section(content, 2, EcosystemId::NuGet));
         assert!(!is_in_dependencies_section(content, 0, EcosystemId::NuGet));
+    }
+
+    #[test]
+    fn test_is_in_dependencies_section_nuget_packages_config() {
+        let content = "<packages>\n  <package id=\"Foo\" version=\"1.0.0\" />\n</packages>\n";
+        assert!(is_in_dependencies_section(content, 1, EcosystemId::NuGet));
+        // The closing `</packages>` line itself is outside the section.
+        assert!(!is_in_dependencies_section(content, 2, EcosystemId::NuGet));
+    }
+
+    /// `Directory.Packages.props` reuses the same `<ItemGroup>` wrapper as
+    /// `PackageReference`, just with `PackageVersion` elements inside it.
+    #[test]
+    fn test_is_in_dependencies_section_nuget_directory_packages_props() {
+        let content = "<Project>\n  <ItemGroup>\n    <PackageVersion Include=\"Foo\" Version=\"1.0.0\" />\n  </ItemGroup>\n</Project>\n";
+        assert!(is_in_dependencies_section(content, 2, EcosystemId::NuGet));
+    }
+
+    /// A `<PropertyGroup>` (e.g. `<TargetFramework>`) is a real, common csproj section
+    /// that is not `<ItemGroup>`/`<packages>` — must not be mistaken for one.
+    #[test]
+    fn test_is_in_dependencies_section_nuget_outside_item_group() {
+        let content = "<Project>\n  <PropertyGroup>\n    <TargetFramework>net8.0</TargetFramework>\n  </PropertyGroup>\n</Project>\n";
+        assert!(!is_in_dependencies_section(content, 2, EcosystemId::NuGet));
     }
 
     #[test]
@@ -2847,6 +3016,137 @@ s
         assert_eq!(extract_prefix(line, 34, EcosystemId::Maven), "");
     }
 
+    /// #699: cursor mid-typing inside `PackageReference`'s `Include="..."` attribute
+    /// value must yield the bare package-name text, not the surrounding markup — a raw
+    /// `<PackageReference Include="Newt` prefix contains `=` and would otherwise be
+    /// rejected outright by `fallback_completion`'s `contains('=')` guard.
+    #[test]
+    fn test_extract_prefix_strips_leading_xml_attribute_for_nuget_include() {
+        let line = "    <PackageReference Include=\"Newt";
+        assert_eq!(
+            extract_prefix(line, line.chars().count() as u32, EcosystemId::NuGet),
+            "Newt"
+        );
+    }
+
+    /// `packages.config`'s `<package id="..."/>` uses a different attribute name than
+    /// `PackageReference`'s `Include=`, but must be recognized the same way.
+    #[test]
+    fn test_extract_prefix_strips_leading_xml_attribute_for_nuget_id() {
+        let line = "  <package id=\"Newt";
+        assert_eq!(
+            extract_prefix(line, line.chars().count() as u32, EcosystemId::NuGet),
+            "Newt"
+        );
+    }
+
+    /// Spacing around `=` (`Include = "..."`, as MSBuild allows) must not defeat the
+    /// attribute-name match.
+    #[test]
+    fn test_extract_prefix_strips_leading_xml_attribute_for_nuget_spaced_equals() {
+        let line = "<PackageReference Include = \"Newt";
+        assert_eq!(
+            extract_prefix(line, line.chars().count() as u32, EcosystemId::NuGet),
+            "Newt"
+        );
+    }
+
+    /// Single-quoted attribute values are valid XML too.
+    #[test]
+    fn test_extract_prefix_strips_leading_xml_attribute_for_nuget_single_quote() {
+        let line = "<PackageReference Include='Newt";
+        assert_eq!(
+            extract_prefix(line, line.chars().count() as u32, EcosystemId::NuGet),
+            "Newt"
+        );
+    }
+
+    /// Cursor inside a *different* attribute's value (`Version="1.0`, after `Include`
+    /// was already closed) must not be mistaken for the package-name attribute — an
+    /// empty prefix is rejected outright by `fallback_completion`'s empty-prefix
+    /// guard rather than firing a bogus search for `"1.0"`.
+    #[test]
+    fn test_extract_prefix_nuget_non_target_attribute_is_unchanged() {
+        let line = "<PackageReference Include=\"Foo\" Version=\"1.0";
+        assert_eq!(
+            extract_prefix(line, line.chars().count() as u32, EcosystemId::NuGet),
+            ""
+        );
+    }
+
+    /// impl-critic S3: `Include="..."` also appears on everyday MSBuild items that are
+    /// not NuGet package references at all (`<Compile Include="..`, source-file globs,
+    /// etc.) — the element name, not just the attribute name, must gate extraction, or
+    /// typing inside one of these fires a bogus (or worse, coincidentally real but
+    /// wrong) nuget.org search.
+    #[test]
+    fn test_extract_prefix_nuget_non_package_element_include_is_unchanged() {
+        let line = "<Compile Include=\"Mode";
+        assert_eq!(
+            extract_prefix(line, line.chars().count() as u32, EcosystemId::NuGet),
+            ""
+        );
+    }
+
+    /// Same as above for `<Using Include="..."/>` — a real, common `.csproj` item that
+    /// also happens to have an `Include=` attribute.
+    #[test]
+    fn test_extract_prefix_nuget_using_element_include_is_unchanged() {
+        let line = "<Using Include=\"Serilog";
+        assert_eq!(
+            extract_prefix(line, line.chars().count() as u32, EcosystemId::NuGet),
+            ""
+        );
+    }
+
+    /// #699 (code-review): typing the element name itself, before any attribute quote
+    /// has opened, must not be treated as a search prefix — there is no candidate
+    /// package-name text yet at that cursor position.
+    #[test]
+    fn test_extract_prefix_nuget_element_name_only_is_empty() {
+        let line = "<PackageReference ";
+        assert_eq!(
+            extract_prefix(line, line.chars().count() as u32, EcosystemId::NuGet),
+            ""
+        );
+    }
+
+    /// #699 (code-review): comment text or any other non-markup content inside an
+    /// `<ItemGroup>` must not reach the registry just because it lacks a literal `=`.
+    #[test]
+    fn test_extract_prefix_nuget_comment_text_is_empty() {
+        let line = "<!-- TODO fix";
+        assert_eq!(
+            extract_prefix(line, line.chars().count() as u32, EcosystemId::NuGet),
+            ""
+        );
+    }
+
+    /// #699 (code-review): a bare word with no markup at all — the `is_in_dependencies_
+    /// section` gate only requires *some* `<ItemGroup>` on the file, which can hold
+    /// non-package items (`<Compile>`/`<None>`/...) exclusively — must not reach the
+    /// registry either.
+    #[test]
+    fn test_extract_prefix_nuget_bare_word_is_empty() {
+        let line = "  Model";
+        assert_eq!(
+            extract_prefix(line, line.chars().count() as u32, EcosystemId::NuGet),
+            ""
+        );
+    }
+
+    /// A stray quote of the *other* type inside an unclosed value (impl-critic M6)
+    /// must not leak into the extracted text — a package id never contains a quote
+    /// character, so extraction stops at the first one of either kind.
+    #[test]
+    fn test_extract_prefix_nuget_mismatched_quote_does_not_leak() {
+        let line = "<PackageReference Include=\"Foo'";
+        assert_eq!(
+            extract_prefix(line, line.chars().count() as u32, EcosystemId::NuGet),
+            "Foo"
+        );
+    }
+
     /// #282 C1 regression guard: the primary completion path (`MavenEcosystem::
     /// detect_xml_context`) searches the registry for the bare tag value (`"gua"` for
     /// `<artifactId>gua`), not the raw line text. Before this fix, `fallback_completion`
@@ -2909,6 +3209,319 @@ s
             registry.captured_query.lock().unwrap().as_deref(),
             Some("gua")
         );
+    }
+
+    /// #699 (impl-critic S1): a direct end-to-end proof, through `fallback_completion`
+    /// itself, that typing a package name inside `PackageReference`'s `Include="..."`
+    /// attribute actually fires a registry search — before this fix, `is_in_dependencies_
+    /// section` correctly detected the `<ItemGroup>` section, but the raw
+    /// `<PackageReference Include="Newt` prefix still contained `=`, so `fallback_
+    /// completion`'s own guard silently rejected it before any search ever ran.
+    #[tokio::test]
+    async fn test_fallback_completion_nuget_query_matches_attribute_value() {
+        use deps_core::{Metadata, Registry};
+        use std::any::Any;
+        use std::sync::Mutex;
+
+        struct CapturingRegistry {
+            captured_query: Mutex<Option<String>>,
+        }
+        impl Registry for CapturingRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<
+                'a,
+                deps_core::Result<Vec<Box<dyn deps_core::Version>>>,
+            > {
+                Box::pin(async move { Ok(vec![]) })
+            }
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<
+                'a,
+                deps_core::Result<Option<Box<dyn deps_core::Version>>>,
+            > {
+                Box::pin(async move { Ok(None) })
+            }
+            fn search<'a>(
+                &'a self,
+                query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                *self.captured_query.lock().unwrap() = Some(query.to_string());
+                Box::pin(async move { Ok(vec![]) })
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let registry = Arc::new(CapturingRegistry {
+            captured_query: Mutex::new(None),
+        });
+        let state = mock_nuget_state(Arc::clone(&registry) as Arc<dyn Registry>);
+
+        let content = "<Project>\n  <ItemGroup>\n    <PackageReference Include=\"Newt\n";
+        let line = content.lines().nth(2).unwrap();
+        let position = Position::new(2, line.chars().count() as u32);
+        fallback_completion(&state, EcosystemId::NuGet, position, content).await;
+
+        assert_eq!(
+            registry.captured_query.lock().unwrap().as_deref(),
+            Some("Newt")
+        );
+    }
+
+    /// #699: typing inside a *non*-target attribute's value (`Version="1.0`, after
+    /// `Include` was already closed) must not reach the registry — `extract_prefix`
+    /// leaves the whole `=`-containing line untouched for this position (see
+    /// `test_extract_prefix_nuget_non_target_attribute_is_unchanged`), and
+    /// `fallback_completion`'s `contains('=')` guard rejects it before any search.
+    #[tokio::test]
+    async fn test_fallback_completion_nuget_non_target_attribute_value_does_not_search() {
+        use deps_core::{Metadata, Registry, Version};
+        use std::any::Any;
+
+        struct PanicsIfSearchedRegistry;
+        impl Registry for PanicsIfSearchedRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(None) })
+            }
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                panic!("non-target attribute-value typing must not reach registry search");
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let state = mock_nuget_state(Arc::new(PanicsIfSearchedRegistry));
+        let content =
+            "<ItemGroup>\n  <PackageReference Include=\"Foo\" Version=\"1.0\n</ItemGroup>\n";
+        let line = content.lines().nth(1).unwrap();
+        let position = Position::new(1, line.chars().count() as u32);
+
+        let items = fallback_completion(&state, EcosystemId::NuGet, position, content).await;
+        assert!(items.is_empty());
+    }
+
+    /// impl-critic S3: an `<ItemGroup>` in a real `.csproj` commonly holds non-package
+    /// MSBuild items (`<Compile Include="..`, source-file globs, etc.) that also carry
+    /// an `Include=` attribute. Typing inside one of these must not reach the registry
+    /// — this is a direct end-to-end regression guard for the bug the fix addressed
+    /// (`test_extract_prefix_nuget_non_package_element_include_is_unchanged` covers the
+    /// same case at the `extract_prefix` level).
+    #[tokio::test]
+    async fn test_fallback_completion_nuget_non_package_element_does_not_search() {
+        use deps_core::{Metadata, Registry, Version};
+        use std::any::Any;
+
+        struct PanicsIfSearchedRegistry;
+        impl Registry for PanicsIfSearchedRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(None) })
+            }
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                panic!("non-package-element attribute typing must not reach registry search");
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let state = mock_nuget_state(Arc::new(PanicsIfSearchedRegistry));
+        let content = "<ItemGroup>\n  <Compile Include=\"Mode\n</ItemGroup>\n";
+        let line = content.lines().nth(1).unwrap();
+        let position = Position::new(1, line.chars().count() as u32);
+
+        let items = fallback_completion(&state, EcosystemId::NuGet, position, content).await;
+        assert!(items.is_empty());
+    }
+
+    /// #699 (code-review): a bare word typed inside `<ItemGroup>` with no markup at
+    /// all on the line yet must NOT reach the registry — `is_in_dependencies_section`
+    /// only requires *some* `<ItemGroup>` on the file (which can hold non-package
+    /// items like `<Compile>`/`<None>` exclusively), so nothing about this position
+    /// establishes that a package name is actually being typed. Regression guard: an
+    /// earlier version of this fix returned the unmodified line here, which contains
+    /// no `=` and so slipped past `fallback_completion`'s only remaining guard,
+    /// firing a live registry search on arbitrary non-markup text.
+    #[tokio::test]
+    async fn test_fallback_completion_nuget_bare_line_in_item_group_does_not_search() {
+        use deps_core::{Metadata, Registry, Version};
+        use std::any::Any;
+
+        struct PanicsIfSearchedRegistry;
+        impl Registry for PanicsIfSearchedRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(None) })
+            }
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                panic!("bare non-markup text inside <ItemGroup> must not reach registry search");
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let state = mock_nuget_state(Arc::new(PanicsIfSearchedRegistry));
+        let content = "<ItemGroup>\n  Model\n</ItemGroup>\n";
+        let line = content.lines().nth(1).unwrap();
+        let position = Position::new(1, line.chars().count() as u32);
+
+        let items = fallback_completion(&state, EcosystemId::NuGet, position, content).await;
+        assert!(items.is_empty());
+    }
+
+    /// #699 (code-review): comment text inside `<ItemGroup>` must not reach the
+    /// registry either — same failure mode as the bare-word case above, just with
+    /// comment markup instead of a plain word.
+    #[tokio::test]
+    async fn test_fallback_completion_nuget_comment_text_does_not_search() {
+        use deps_core::{Metadata, Registry, Version};
+        use std::any::Any;
+
+        struct PanicsIfSearchedRegistry;
+        impl Registry for PanicsIfSearchedRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(None) })
+            }
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                panic!("comment text inside <ItemGroup> must not reach registry search");
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let state = mock_nuget_state(Arc::new(PanicsIfSearchedRegistry));
+        let content = "<ItemGroup>\n  <!-- TODO fix\n</ItemGroup>\n";
+        let line = content.lines().nth(1).unwrap();
+        let position = Position::new(1, line.chars().count() as u32);
+
+        let items = fallback_completion(&state, EcosystemId::NuGet, position, content).await;
+        assert!(items.is_empty());
+    }
+
+    /// #699 (code-review): typing the element name itself (`<PackageReference `, no
+    /// attribute quote opened yet) must not reach the registry either — there is no
+    /// candidate package-name text at that cursor position, and the primary
+    /// (non-fallback) completion path is the right place for tag/attribute-name
+    /// completion, not this raw-text search fallback.
+    #[tokio::test]
+    async fn test_fallback_completion_nuget_element_name_only_does_not_search() {
+        use deps_core::{Metadata, Registry, Version};
+        use std::any::Any;
+
+        struct PanicsIfSearchedRegistry;
+        impl Registry for PanicsIfSearchedRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(None) })
+            }
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                panic!("element-name-only typing must not reach registry search");
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let state = mock_nuget_state(Arc::new(PanicsIfSearchedRegistry));
+        let content = "<ItemGroup>\n  <PackageReference \n</ItemGroup>\n";
+        let line = content.lines().nth(1).unwrap();
+        let position = Position::new(1, line.chars().count() as u32);
+
+        let items = fallback_completion(&state, EcosystemId::NuGet, position, content).await;
+        assert!(items.is_empty());
     }
 
     /// #390 (C5, tester Gap 1 / critic): a direct end-to-end proof, through
