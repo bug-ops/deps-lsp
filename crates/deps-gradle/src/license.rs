@@ -28,6 +28,46 @@ use quick_xml::Reader;
 use quick_xml::events::Event;
 use std::sync::Arc;
 
+/// Maximum number of `<licenses><license><name>` entries [`parse_pom_licenses`] retains
+/// from a single POM (issue #690; raised from an initial 8 to 64 per impl-critic S2).
+/// Generously above any real-world POM's actual license count (dual-licensing is the
+/// practical ceiling) and, more importantly, above what
+/// `deps_core::licenses::evaluate`'s `license_policy` check needs: that function scans
+/// every entry in the returned `Vec` with no cap of its own, so an 8-entry retention cap
+/// could have silently hidden a policy violation carried by a real 9th+ license entry.
+/// `deps-core::lsp_helpers::hover`'s separate `MAX_LICENSE_ENTRIES_RENDERED` (8) only
+/// truncates hover *rendering* — it says nothing about how many entries diagnostics
+/// evaluate, so this constant must not be tied to it. CPU/memory cost on a hostile
+/// response is bounded independently by [`MAX_POM_LICENSE_BYTES_SCANNED`], not by this
+/// cap. Kept as a Gradle-crate-local constant rather than a shared `deps-core` export
+/// since no other ecosystem crate parses this shape yet (see this module's `pom_url` doc
+/// for the same "not worth a cross-crate helper yet" reasoning).
+const MAX_POM_LICENSE_ENTRIES: usize = 64;
+
+/// Hard cap, in bytes of `reader.buffer_position()`, on how far into a POM
+/// [`parse_pom_licenses`] will read (issue #690, impl-critic S1 — through three rounds of
+/// counterexamples). A cap on *retained* entries alone doesn't bound CPU, and every
+/// attempt to budget by counting a specific event shape instead (a `<name>` text node, a
+/// `<name>` `Event::Start`) turned out to be shape-dependent and bypassable: a truly empty
+/// `<name></name>` emits no `Event::Text`; a self-closing `<name/>` emits `Event::Empty`,
+/// never `Event::Start`; and a `<license>` with no `<name>` child at all — or a flood of
+/// unrelated junk elements — emits neither. Each of those consumed **zero** budget under a
+/// shape-keyed counter while quick-xml still walked the reader to EOF (measured: a 32 MiB
+/// flood of bare `<a/>` elements took ~117 ms with zero counted nodes). A byte-position
+/// bound sidesteps this entirely — it advances on *every* event regardless of what it is,
+/// so it cannot be starved by omitting one element shape. A real POM's `<licenses>` block
+/// (and everything preceding it) is realistically well under this bound; the reader simply
+/// stops handing back events once it's exhausted, degrading gracefully to whatever was
+/// found so far — acceptable for this best-effort secondary signal (see module docs).
+const MAX_POM_LICENSE_BYTES_SCANNED: usize = 1024 * 1024;
+
+/// Maximum raw byte length of a single `<license><name>` text node [`parse_pom_licenses`]
+/// allocates (issue #690). Mirrors `deps-core::licenses`'s private
+/// `MAX_POM_LICENSE_NAME_RAW_CHARS` (also 128, applied to the same POM-license-name shape
+/// during normalization) — an oversized entry is dropped by normalization further
+/// downstream regardless, so rejecting it here avoids allocating a `String` for it at all.
+const MAX_POM_LICENSE_NAME_RAW_CHARS: usize = 128;
+
 /// Maven Central's repository root. Mirrors `deps-maven`'s own (private)
 /// `MAVEN_REPO_BASE` — kept as an independent constant rather than a shared one so this
 /// crate does not need a new public export from `deps-maven` for a single string.
@@ -221,6 +261,15 @@ fn parse_pom(data: &[u8]) -> PomInfo {
     let mut parent_version = String::new();
 
     loop {
+        // Shape-independent budget (impl-critic S1, through three rounds of
+        // counterexamples that each defeated a shape-keyed counter): advances on every
+        // event regardless of what it is, so it cannot be starved by a document that
+        // simply omits the element type a narrower counter was watching for.
+        if licenses.len() >= MAX_POM_LICENSE_ENTRIES
+            || reader.buffer_position() as usize >= MAX_POM_LICENSE_BYTES_SCANNED
+        {
+            break;
+        }
         match reader.read_event() {
             Ok(Event::Start(ref e)) => match e.local_name().as_ref() {
                 "licenses" => in_licenses = true,
@@ -233,12 +282,15 @@ fn parse_pom(data: &[u8]) -> PomInfo {
                 _ => {}
             },
             Ok(Event::Text(ref e)) if in_name => {
-                let raw = e.trim().to_string();
-                let text = quick_xml::escape::unescape(&raw)
-                    .map(|c| c.into_owned())
-                    .unwrap_or(raw);
-                if !text.is_empty() {
-                    licenses.push(text);
+                let raw = e.trim();
+                if raw.len() <= MAX_POM_LICENSE_NAME_RAW_CHARS {
+                    let raw = raw.to_string();
+                    let text = quick_xml::escape::unescape(&raw)
+                        .map(|c| c.into_owned())
+                        .unwrap_or(raw);
+                    if !text.is_empty() {
+                        licenses.push(text);
+                    }
                 }
             }
             Ok(Event::Text(ref e)) if in_parent_group_id => {
@@ -284,6 +336,17 @@ fn parse_pom(data: &[u8]) -> PomInfo {
 #[cfg(test)]
 fn parse_pom_licenses(data: &[u8]) -> Vec<String> {
     parse_pom(data).licenses
+}
+
+/// Fuzz-only entry point for [`parse_pom_licenses`] (issue #691). Gated on the `fuzzing`
+/// Cargo feature (never enabled by this crate's own default set) so this stays out of the
+/// crate's public API surface in a normal build. This module itself stays unconditionally
+/// private (impl-critic M1) — only this one function is reachable externally, via the
+/// `#[doc(hidden)]` `pub use` re-export in `lib.rs`.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_parse_pom_licenses(data: &[u8]) {
+    let _ = parse_pom_licenses(data);
 }
 
 #[cfg(test)]
@@ -385,6 +448,93 @@ mod tests {
                 "EPL-2.0".to_string(),
                 "GPL-2.0-with-classpath-exception".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn parse_pom_licenses_caps_entry_count() {
+        let mut entries = String::new();
+        for i in 0..(MAX_POM_LICENSE_ENTRIES + 20) {
+            entries.push_str(&format!("<license><name>License-{i}</name></license>"));
+        }
+        let pom =
+            format!(r#"<?xml version="1.0"?><project><licenses>{entries}</licenses></project>"#);
+        let licenses = parse_pom_licenses(pom.as_bytes());
+        assert_eq!(licenses.len(), MAX_POM_LICENSE_ENTRIES);
+        let expected: Vec<String> = (0..MAX_POM_LICENSE_ENTRIES)
+            .map(|i| format!("License-{i}"))
+            .collect();
+        assert_eq!(licenses, expected);
+    }
+
+    /// Builds a synthetic POM whose `<licenses>` block is `entry` repeated past
+    /// [`MAX_POM_LICENSE_BYTES_SCANNED`], followed by one valid trailing `<license>` —
+    /// used to prove the byte budget bails out before ever reaching that trailing entry,
+    /// regardless of what `entry` looks like (impl-critic S1: three rounds of
+    /// shape-specific counters, each defeated by a different `entry` shape).
+    fn flood_pom(entry: &str) -> String {
+        let mut entries = String::new();
+        while entries.len() < MAX_POM_LICENSE_BYTES_SCANNED {
+            entries.push_str(entry);
+        }
+        entries.push_str("<license><name>Apache-2.0</name></license>");
+        format!(r#"<?xml version="1.0"?><project><licenses>{entries}</licenses></project>"#)
+    }
+
+    /// A `<name>` longer than `MAX_POM_LICENSE_NAME_RAW_CHARS` is skipped without being
+    /// retained, so a cap on retained entries alone never trips.
+    #[test]
+    fn parse_pom_licenses_byte_budget_stops_oversized_name_flood() {
+        let long_name = "a".repeat(MAX_POM_LICENSE_NAME_RAW_CHARS + 1);
+        let entry = format!("<license><name>{long_name}</name></license>");
+        assert!(parse_pom_licenses(flood_pom(&entry).as_bytes()).is_empty());
+    }
+
+    /// A truly empty `<name></name>` (no whitespace) emits no `Event::Text` under
+    /// quick-xml's `trim_text(true)`, so a budget keyed off text content never sees it.
+    #[test]
+    fn parse_pom_licenses_byte_budget_stops_empty_name_flood() {
+        assert!(
+            parse_pom_licenses(flood_pom("<license><name></name></license>").as_bytes()).is_empty()
+        );
+    }
+
+    /// A self-closing `<name/>` emits `Event::Empty`, never `Event::Start` — so a budget
+    /// keyed off `<name>` element entry never sees it either.
+    #[test]
+    fn parse_pom_licenses_byte_budget_stops_self_closing_name_flood() {
+        assert!(parse_pom_licenses(flood_pom("<license><name/></license>").as_bytes()).is_empty());
+    }
+
+    /// A `<license>` with no `<name>` child at all never enters the `in_name` state, so
+    /// any counter scoped to that state stays at zero for the whole document.
+    #[test]
+    fn parse_pom_licenses_byte_budget_stops_license_without_name_flood() {
+        assert!(parse_pom_licenses(flood_pom("<license></license>").as_bytes()).is_empty());
+    }
+
+    /// Impl-critic S1 (third round) — the sharpest counterexample: no
+    /// `<license>`/`<name>` element at all, just unrelated junk. Any counter keyed to a
+    /// specific tag shape advances zero times here while quick-xml still walks the whole
+    /// document to EOF (measured pre-fix: ~117 ms for a 32 MiB flood of this shape, worse
+    /// than #690's own ~63 ms baseline). Only a shape-independent byte bound catches it.
+    #[test]
+    fn parse_pom_licenses_byte_budget_stops_junk_element_flood() {
+        assert!(parse_pom_licenses(flood_pom("<a/>").as_bytes()).is_empty());
+    }
+
+    #[test]
+    fn parse_pom_licenses_skips_oversized_entry() {
+        let long_name = "a".repeat(MAX_POM_LICENSE_NAME_RAW_CHARS + 1);
+        let pom = format!(
+            r#"<?xml version="1.0"?><project><licenses>
+                <license><name>{long_name}</name></license>
+                <license><name>Apache-2.0</name></license>
+            </licenses></project>"#
+        );
+        assert_eq!(
+            parse_pom_licenses(pom.as_bytes()),
+            vec!["Apache-2.0".to_string()]
         );
     }
 

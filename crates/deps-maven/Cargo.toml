@@ -12,6 +12,12 @@ publish = true
 [lints]
 workspace = true
 
+[features]
+# Exposes `registry::fuzz_parse_metadata_xml` for the `fuzz/` cargo-fuzz workspace's
+# `registry_xml_parser` target (#691) — never enabled by this crate's own default feature
+# set, so `parse_metadata_xml` stays out of the normal public API surface.
+fuzzing = []
+
 [dependencies]
 bytes = { workspace = true }
 dashmap = { workspace = true }
