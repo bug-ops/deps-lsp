@@ -29,6 +29,31 @@ use std::path::Path;
 /// work per parse (CWE-400).
 pub const MAX_CONFIG_ANCESTOR_DEPTH: usize = 64;
 
+/// Ancestor directories of `start_dir`, inclusive, capped at [`MAX_CONFIG_ANCESTOR_DEPTH`].
+///
+/// Yields `start_dir` itself first, then each successive parent, stopping at whichever
+/// comes first: the filesystem root, or [`MAX_CONFIG_ANCESTOR_DEPTH`] directories visited.
+/// This is the single canonical replacement for the hand-written
+/// `while let Some(dir) = current { if depth >= MAX_CONFIG_ANCESTOR_DEPTH { break; } ... }`
+/// loop every ancestor-config-file walk in this workspace used to duplicate — the depth
+/// bound is enforced by the iterator itself, so a caller cannot forget it.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::fs_probe::config_ancestors;
+/// use std::path::Path;
+///
+/// let dirs: Vec<_> = config_ancestors(Path::new("/a/b/c")).collect();
+/// assert_eq!(
+///     dirs,
+///     vec![Path::new("/a/b/c"), Path::new("/a/b"), Path::new("/a"), Path::new("/")]
+/// );
+/// ```
+pub fn config_ancestors(start_dir: &Path) -> impl Iterator<Item = &Path> {
+    std::iter::successors(Some(start_dir), |d| d.parent()).take(MAX_CONFIG_ANCESTOR_DEPTH)
+}
+
 #[cfg(any(test, feature = "test-util"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
 

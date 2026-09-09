@@ -33,7 +33,6 @@ use crate::config::{
     AuthToken, ConfigFileCache, IndexTrust, RegistryIndex, RegistryIndexError, SourceReplacement,
 };
 use crate::types::{DependencySection, DependencySource, ParsedDependency};
-use deps_core::fs_probe::MAX_CONFIG_ANCESTOR_DEPTH;
 use deps_core::net_policy::RegistryAccessPolicy;
 use deps_core::{DepsError, Result};
 use std::any::Any;
@@ -600,7 +599,7 @@ fn span_to_range(content: &str, line_table: &LineOffsetTable, span: toml_span::S
 /// Result of [`discover_workspace`]'s merged ancestor walk.
 struct WorkspaceDiscovery {
     /// The workspace root, if any `[workspace]`-carrying `Cargo.toml` was found within
-    /// [`MAX_CONFIG_ANCESTOR_DEPTH`] — unchanged in meaning from the pre-1b
+    /// [`deps_core::fs_probe::MAX_CONFIG_ANCESTOR_DEPTH`] — unchanged in meaning from the pre-1b
     /// `find_workspace_root`, just capped.
     workspace_root: Option<PathBuf>,
     /// Every ancestor `.cargo/config.toml` found along the way, closest-first — independent
@@ -619,7 +618,8 @@ struct WorkspaceDiscovery {
 /// `~/projects/myrepo/`) is exactly what Cargo itself still consults, and #440 already
 /// shipped that behavior for the alias-resolution path — a naive merge that stopped both
 /// searches at the workspace root would silently regress it (critic N1). Both searches share
-/// [`MAX_CONFIG_ANCESTOR_DEPTH`] as their only stopping bound beyond the filesystem root.
+/// [`deps_core::fs_probe::MAX_CONFIG_ANCESTOR_DEPTH`] as their only stopping bound beyond the
+/// filesystem root.
 ///
 /// At most two `stat`s per ancestor directory: one for `.cargo/config.toml`'s existence,
 /// and — only while the workspace root is still unresolved — one for `Cargo.toml`'s
@@ -632,15 +632,15 @@ fn discover_workspace(doc_uri: &Uri) -> Result<WorkspaceDiscovery> {
 
     let mut workspace_root = None;
     let mut config_paths = Vec::new();
-    let mut current = path.parent();
-    let mut depth = 0usize;
 
-    while let Some(dir) = current {
-        if depth >= MAX_CONFIG_ANCESTOR_DEPTH {
-            break;
-        }
-        depth += 1;
+    let Some(start_dir) = path.parent() else {
+        return Ok(WorkspaceDiscovery {
+            workspace_root,
+            config_paths,
+        });
+    };
 
+    for dir in deps_core::fs_probe::config_ancestors(start_dir) {
         let config_candidate = dir.join(".cargo").join("config.toml");
         if deps_core::fs_probe::is_file(&config_candidate) {
             config_paths.push(config_candidate);
@@ -700,8 +700,6 @@ fn discover_workspace(doc_uri: &Uri) -> Result<WorkspaceDiscovery> {
                 }
             }
         }
-
-        current = dir.parent();
     }
 
     Ok(WorkspaceDiscovery {
@@ -742,6 +740,7 @@ impl deps_core::ParseResult for ParseResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::fs_probe::MAX_CONFIG_ANCESTOR_DEPTH;
 
     use std::assert_matches;
 

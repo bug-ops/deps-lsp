@@ -43,7 +43,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use deps_core::PackageName;
-use deps_core::fs_probe::MAX_CONFIG_ANCESTOR_DEPTH;
 use deps_core::net_policy::{
     HostClass, IndexUrlError, PolicyGate, RegistryAccessPolicy, redact_userinfo, validate_index_url,
 };
@@ -478,14 +477,7 @@ fn resolve_with_home(
     // FR-002: this ancestor walk is a deliberate superset of npm's own behavior (which reads
     // only the project-root `.npmrc`, not every ancestor) — chosen for monorepo ergonomics,
     // mirroring `deps-cargo`'s `.cargo/config.toml` discovery. Closest directory wins.
-    let mut current = Some(manifest_dir);
-    let mut depth = 0usize;
-    while let Some(dir) = current {
-        if depth >= MAX_CONFIG_ANCESTOR_DEPTH {
-            break;
-        }
-        depth += 1;
-
+    for dir in deps_core::fs_probe::config_ancestors(manifest_dir) {
         let candidate = dir.join(".npmrc");
         let is_user_tier_duplicate =
             std::fs::canonicalize(&candidate).ok().as_deref() == user_canonical.as_deref();
@@ -499,8 +491,6 @@ fn resolve_with_home(
                     .or_insert_with(|| raw.clone());
             }
         }
-
-        current = dir.parent();
     }
 
     if let Some(user_path) = user_npmrc_path.as_deref()
@@ -1115,6 +1105,48 @@ mod tests {
         assert_eq!(
             config.resolve_source_for(&pkg("express")),
             DependencySource::Registry
+        );
+    }
+
+    /// #757: the project-tier ancestor walk now runs on
+    /// `deps_core::fs_probe::config_ancestors` instead of a hand-written loop — verified here
+    /// by counting `stat` calls via `deps_core::fs_probe`, mirroring `deps-gradle`'s
+    /// `test_load_gradle_properties_stats_exactly_once_per_ancestor`. A real (empty) home
+    /// `.npmrc` is used so the user-tier dedup comparison (`canonicalize(candidate) ==
+    /// user_canonical`) never has both sides collapse to `None` and mask a missing per-ancestor
+    /// stat — that degenerate case only arises when no home tier is configured at all, which
+    /// is not the scenario under test here.
+    #[test]
+    fn test_resolve_with_home_stats_bounded_per_ancestor() {
+        use deps_core::fs_probe::MAX_CONFIG_ANCESTOR_DEPTH;
+
+        let root = tempfile::tempdir().unwrap();
+        let mut current = root.path().to_path_buf();
+        for i in 0..(MAX_CONFIG_ANCESTOR_DEPTH + 5) {
+            current = current.join(format!("d{i}"));
+        }
+        std::fs::create_dir_all(&current).unwrap();
+
+        let home_dir = tempfile::tempdir().unwrap();
+        std::fs::write(home_dir.path().join(".npmrc"), "").unwrap();
+
+        let cache = NpmConfigCache::new();
+        let policy = all_policy();
+        let (stats_before, _) = deps_core::fs_probe::snapshot();
+        let config = resolve_with_home(
+            &current,
+            &cache,
+            &policy,
+            Some(home_dir.path().to_path_buf()),
+        );
+        let (stats_after, _) = deps_core::fs_probe::snapshot();
+
+        assert!(config.resolved_registries().is_empty());
+        assert_eq!(
+            stats_after - stats_before,
+            MAX_CONFIG_ANCESTOR_DEPTH + 1,
+            "expected one stat per ancestor (capped at MAX_CONFIG_ANCESTOR_DEPTH) plus one \
+             for the user-tier `.npmrc`"
         );
     }
 

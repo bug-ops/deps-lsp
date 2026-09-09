@@ -47,7 +47,6 @@ use std::sync::atomic::AtomicBool;
 
 use base64::Engine;
 use deps_core::PackageName;
-use deps_core::fs_probe::MAX_CONFIG_ANCESTOR_DEPTH;
 use deps_core::net_policy::{
     IndexUrlError, PolicyGate, RegistryAccessPolicy, redact_userinfo, validate_index_url,
 };
@@ -1253,7 +1252,7 @@ fn user_profile_config_candidates(home: Option<&Path>) -> Vec<PathBuf> {
 fn discover_user_profile_config_with_home(home: Option<PathBuf>) -> Option<PathBuf> {
     user_profile_config_candidates(home.as_deref())
         .into_iter()
-        .find(|p| p.is_file())
+        .find(|p| deps_core::fs_probe::is_file(p))
 }
 
 /// Resolves the user-profile-tier `NuGet.Config` path once (FR-001) — call at
@@ -1360,17 +1359,11 @@ fn collect_config_ancestors(
 ) -> Vec<(ConfigTier, Arc<RawNuGetConfigFile>)> {
     let mut repo_ancestors: Vec<Arc<RawNuGetConfigFile>> = Vec::new();
     let mut repo_paths: Vec<PathBuf> = Vec::new();
-    let mut current: Option<&Path> = Some(manifest_dir);
-    let mut depth = 0usize;
-    while let Some(dir) = current {
-        if depth >= MAX_CONFIG_ANCESTOR_DEPTH {
-            break;
-        }
-        depth += 1;
 
+    for dir in deps_core::fs_probe::config_ancestors(manifest_dir) {
         for name in CONFIG_FILENAMES {
             let candidate: PathBuf = dir.join(name);
-            if candidate.is_file() {
+            if deps_core::fs_probe::is_file(&candidate) {
                 if let Some(parsed) = config_cache.get_or_parse(&candidate) {
                     repo_ancestors.push(parsed);
                     repo_paths.push(candidate);
@@ -1378,8 +1371,6 @@ fn collect_config_ancestors(
                 break;
             }
         }
-
-        current = dir.parent();
     }
 
     let user_profile_file: Option<Arc<RawNuGetConfigFile>> = user_profile_config.and_then(|upc| {
@@ -3649,5 +3640,41 @@ mod tests {
             source("Corp Feed", "https://b.example/v3/index.json", &policy),
         ];
         assert!(unique_overlap("Corp_x0020_Feed", &items, |s| s.key.as_str()).is_none());
+    }
+
+    // --- collect_config_ancestors walk (#757) ---
+
+    /// #757: `collect_config_ancestors`' repo-tier walk now runs on
+    /// `deps_core::fs_probe::config_ancestors` instead of a hand-written loop — verified by
+    /// counting `stat` calls via `deps_core::fs_probe`, mirroring `deps-gradle`'s
+    /// `test_load_gradle_properties_stats_exactly_once_per_ancestor`. Unlike the gradle/cargo/
+    /// npm sites, each ancestor probes up to `CONFIG_FILENAMES.len()` (see
+    /// [`CONFIG_FILENAMES`]) candidate names (`NuGet.Config`, `nuget.config`, `NuGet.config`)
+    /// before moving to the next directory, so with none of them present anywhere in the
+    /// synthetic chain the bound is `CONFIG_FILENAMES.len() * MAX_CONFIG_ANCESTOR_DEPTH`, not a
+    /// flat one-per-ancestor count.
+    #[test]
+    fn test_collect_config_ancestors_stats_bounded_per_ancestor() {
+        use deps_core::fs_probe::MAX_CONFIG_ANCESTOR_DEPTH;
+
+        let root = tempfile::tempdir().unwrap();
+        let mut current = root.path().to_path_buf();
+        for i in 0..(MAX_CONFIG_ANCESTOR_DEPTH + 5) {
+            current = current.join(format!("d{i}"));
+        }
+        std::fs::create_dir_all(&current).unwrap();
+
+        let cache = NuGetConfigCache::new();
+        let (stats_before, _) = deps_core::fs_probe::snapshot();
+        let ancestors = collect_config_ancestors(&current, &cache, None);
+        let (stats_after, _) = deps_core::fs_probe::snapshot();
+
+        assert!(ancestors.is_empty());
+        assert_eq!(
+            stats_after - stats_before,
+            CONFIG_FILENAMES.len() * MAX_CONFIG_ANCESTOR_DEPTH,
+            "expected CONFIG_FILENAMES.len() stats per ancestor for all \
+             MAX_CONFIG_ANCESTOR_DEPTH levels"
+        );
     }
 }
