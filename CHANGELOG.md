@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- `fuzz/` workspace: cargo-fuzz target for `Ecosystem::fallback_completion_prefix`/`fallback_completion_is_bare`, the raw-text scanners driving the parse-failure completion path, across all 14 ecosystems (resolves #740)
+- `fuzz/` workspace: cargo-fuzz target for `Ecosystem::fallback_completion_prefix`/`fallback_completion_is_bare`, the raw-text scanners driving the parse-failure completion path, across all 14 ecosystems (resolves #740) (#745)
 - `fuzz/` workspace: cargo-fuzz targets for the GitHub Actions/GitLab CI/Dart/pnpm YAML-parsing entry points (manifest and lock file), closing a coverage gap versus the existing XML/JSON fuzz targets (resolves #727) (#735)
 - **README**: editor setup snippets for Emacs (`eglot`, `lsp-mode`), Sublime Text LSP, Kate, and coc.nvim, each noting the add-on requirement alongside a primary language server (partial work on #712) (#717)
 - **deps-github-actions**: `action.yml`/`action.yaml` composite/Docker/JS action manifests (a repository root or `.github/actions/<name>/`) now get the same hover, diagnostics, SHA-pin quick fix, and code lens as workflow files (resolves #706) (#718)
