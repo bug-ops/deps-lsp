@@ -28,6 +28,10 @@ use tower_lsp_server::ls_types::{
 ///
 /// Delegates to the appropriate ecosystem implementation based on the document type.
 /// Falls back to text-based completion when TOML parsing fails (user is still typing).
+#[tracing::instrument(
+    skip(state, params, client, config),
+    fields(uri = ?params.text_document_position.text_document.uri, ecosystem = tracing::field::Empty)
+)]
 pub async fn handle_completion(
     state: Arc<ServerState>,
     params: CompletionParams,
@@ -124,6 +128,8 @@ pub async fn handle_completion(
         tracing::warn!("completion: document not found: {:?}", uri);
         return context_less_response();
     };
+
+    tracing::Span::current().record("ecosystem", ecosystem_kind.id());
 
     tracing::info!(
         "completion: ecosystem={}, has_parse_result={}",

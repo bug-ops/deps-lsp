@@ -26,6 +26,10 @@ pub const COMMAND_ID: &str = "deps-lsp.updateAllOutdated";
 /// `execute_update_all_outdated` requires, so the lens never renders a click target the
 /// command would then refuse); or every dependency is up to date / not safely editable
 /// (see `deps_core::lsp_helpers::collect_update_all_edits`).
+#[tracing::instrument(
+    skip(state, params, client, config),
+    fields(uri = ?params.text_document.uri, ecosystem = tracing::field::Empty)
+)]
 pub async fn handle_code_lens(
     state: Arc<ServerState>,
     params: CodeLensParams,
@@ -80,6 +84,8 @@ pub async fn handle_code_lens(
     else {
         return vec![];
     };
+
+    tracing::Span::current().record("ecosystem", ecosystem.id());
 
     let versions = VersionData::new(&cached_versions, &resolved_versions).with_offline(offline);
     let mut lenses = ecosystem

@@ -15,6 +15,10 @@ use tower_lsp_server::ls_types::{InlayHint, InlayHintParams};
 ///
 /// Returns version status hints for all registry dependencies in the document.
 /// Gracefully degrades by returning empty vec on any errors.
+#[tracing::instrument(
+    skip(state, params, config, client, full_config),
+    fields(uri = ?params.text_document.uri, ecosystem = tracing::field::Empty)
+)]
 pub async fn handle_inlay_hints(
     state: Arc<ServerState>,
     params: InlayHintParams,
@@ -76,6 +80,8 @@ pub async fn handle_inlay_hints(
     else {
         return vec![];
     };
+
+    tracing::Span::current().record("ecosystem", ecosystem.id());
 
     let ecosystem_config = EcosystemConfig {
         show_up_to_date_hints: true,

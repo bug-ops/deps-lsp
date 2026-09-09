@@ -1308,6 +1308,10 @@ impl HttpCache {
 
     /// `auth_id` (FR-014) is meaningful only under [`CacheTier::Pinned`] — every other tier
     /// ignores it (see [`Self::cache_key`]'s docs).
+    #[tracing::instrument(
+        skip(self, extra_headers, transport, auth_id),
+        fields(url = crate::net_policy::url_for_tracing(url), cache = tracing::field::Empty)
+    )]
     async fn get_cached_with_headers_via(
         &self,
         url: &str,
@@ -1334,6 +1338,10 @@ impl HttpCache {
         let cache_key = self.cache_key(url, transport.tier, auth_id);
 
         if !cache_enabled {
+            // Explicit, not left `Empty`: an empty `cache` field is indistinguishable from
+            // broken instrumentation (#756 S3) — this path bypasses the entry map
+            // entirely, so it is neither a hit nor a miss.
+            tracing::Span::current().record("cache", "disabled");
             return self
                 .transport_only_via(url, extra_headers, BodyLimit::DEFAULT, &transport.client)
                 .await;
@@ -1349,6 +1357,12 @@ impl HttpCache {
                 // this same cached body via the `Err` arm below, but only after a spurious
                 // `tracing::warn!` and a wasted request-builder allocation on every offline
                 // hover. Behavior is identical either way — this is purely to avoid that.
+                //
+                // The only branch below that is a genuine zero-network-request "hit" (#756
+                // S3) — every other branch that found a cache entry still issued a
+                // conditional (or full) request, so it gets its own, more accurate value
+                // rather than sharing this one.
+                tracing::Span::current().record("cache", "hit");
                 return Ok(cached.body);
             }
             match self
@@ -1361,8 +1375,19 @@ impl HttpCache {
                 )
                 .await
             {
-                Ok(Some(new_body)) => return Ok(new_body),
-                Ok(None) => return Ok(cached.body),
+                // The server confirmed the cached body is still current (304): a network
+                // round trip happened, but no body was re-transferred — distinct from both
+                // `hit` (no request at all) and `refreshed` (a full body re-fetch).
+                Ok(None) => {
+                    tracing::Span::current().record("cache", "revalidated");
+                    return Ok(cached.body);
+                }
+                // The entry existed but was stale: this cost a full re-fetch, the same as a
+                // `miss`, so it must not be reported as any flavor of "hit".
+                Ok(Some(new_body)) => {
+                    tracing::Span::current().record("cache", "refreshed");
+                    return Ok(new_body);
+                }
                 Err(e) => {
                     // FR-015/NFR-004: a 401/403 revalidation against an *authenticated*
                     // pinned-tier entry must evict rather than serve the possibly-revoked
@@ -1381,18 +1406,36 @@ impl HttpCache {
                             self.total_bytes
                                 .fetch_sub(old.body.len(), Ordering::Relaxed);
                         }
+                        tracing::Span::current().record("cache", "evicted");
+                        // #756 round 2 S1: never interpolate `e`'s `Display`/`Debug` here —
+                        // both embed the raw, unredacted `url` (`DepsError::HttpStatus`'s
+                        // `Display`; the wrapped `reqwest::Error` inside `RegistryError`
+                        // appends its own request URL too), defeating this span's own
+                        // `url_for_tracing`-redacted `url` field two lines below it.
+                        // `safe_tracing_summary` extracts only the safe (non-URL-bearing)
+                        // status code plus a coarse cause discriminant.
+                        let (status, cause) = e.safe_tracing_summary();
                         tracing::warn!(
-                            %e,
+                            status = ?status,
+                            cause,
                             "evicting authenticated cache entry after revalidation failure"
                         );
                         return Err(e);
                     }
-                    tracing::warn!("conditional request failed, using cache: {e}");
+                    tracing::Span::current().record("cache", "stale-fallback");
+                    // Same rationale as above: no `e` interpolation.
+                    let (status, cause) = e.safe_tracing_summary();
+                    tracing::warn!(
+                        status = ?status,
+                        cause,
+                        "conditional request failed, using cache"
+                    );
                     return Ok(cached.body);
                 }
             }
         }
 
+        tracing::Span::current().record("cache", "miss");
         self.fetch_and_store_with_headers(url, extra_headers, &transport.client, &cache_key)
             .await
     }
@@ -1491,7 +1534,15 @@ impl HttpCache {
     ) -> Result<Bytes> {
         self.ensure_online(url)?;
         ensure_https(url)?;
-        tracing::debug!(extra_headers = extra_headers.len(), "fetching fresh: {url}");
+        // #756 security follow-up (S-A): `url_for_tracing`, not the raw `url` — this is the
+        // direct callee of the now-hardened `get_cached_with_headers_via`, and at `debug`
+        // level, which is this project's own continuous-improvement convention
+        // (`RUST_LOG=debug`).
+        tracing::debug!(
+            extra_headers = extra_headers.len(),
+            "fetching fresh: {}",
+            crate::net_policy::url_for_tracing(url)
+        );
 
         let mut request = client.get(url);
         for (name, value) in extra_headers {
@@ -1550,6 +1601,10 @@ impl HttpCache {
     /// status, `DepsError::RegistryError` if the request fails, or
     /// `DepsError::ResponseTooLarge` if the response body exceeds the
     /// configured size cap.
+    #[tracing::instrument(
+        skip(self, body),
+        fields(url = crate::net_policy::url_for_tracing(url))
+    )]
     pub async fn post_json<T: Serialize + ?Sized>(&self, url: &str, body: &T) -> Result<Bytes> {
         self.ensure_online(url)?;
         ensure_https(url)?;
@@ -1665,6 +1720,10 @@ impl HttpCache {
     /// with its [`CacheTier`]. The name predates that type and is kept as-is to avoid
     /// churning every `get_transport_only*` call site for a naming collision that causes no
     /// actual ambiguity at the call sites themselves.
+    #[tracing::instrument(
+        skip(self, extra_headers, limit, client),
+        fields(url = crate::net_policy::url_for_tracing(url))
+    )]
     async fn transport_only_via(
         &self,
         url: &str,
@@ -2790,6 +2849,45 @@ mod tests {
         );
     }
 
+    /// #756 security follow-up S-A: the "fetching fresh: {url}" debug log in
+    /// `fetch_and_store_with_headers` — the direct callee `get_cached_with_headers_via`'s
+    /// `miss` branch delegates to — must never carry a token embedded in the URL's query
+    /// string. This is `debug`-level, the level this project's own continuous-improvement
+    /// convention runs at (`RUST_LOG=debug`), so it is not merely a theoretical exposure.
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    async fn test_fetch_and_store_fetching_fresh_log_redacts_query_string_token() {
+        let mut server = mockito::Server::new_async().await;
+        let url = format!("{}/pkg?token=super-secret-value", server.url());
+
+        let _m = server
+            .mock("GET", "/pkg")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "token".into(),
+                "super-secret-value".into(),
+            ))
+            .with_status(200)
+            .with_body("ok")
+            .create_async()
+            .await;
+
+        let cache = HttpCache::new();
+        let output =
+            crate::test_util::capture_tracing_output_async_at(tracing::Level::DEBUG, async {
+                let result: Bytes = cache
+                    .fetch_and_store_with_headers(&url, &[], &cache.baseline.client, &url)
+                    .await
+                    .unwrap();
+                assert_eq!(result.as_ref(), b"ok");
+            })
+            .await;
+
+        assert!(
+            !output.contains("super-secret-value"),
+            "leaked token via 'fetching fresh' debug log: {output:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_get_cached_with_headers_sends_extra_headers() {
         let mut server = mockito::Server::new_async().await;
@@ -2933,6 +3031,125 @@ mod tests {
         assert_eq!(result.as_ref(), b"stale but good");
         let cached = cache.entries.get(&url).unwrap();
         assert_eq!(cached.etag, Some("\"stale-etag\"".into()));
+    }
+
+    /// #756 round 2 S1 regression: the "conditional request failed, using cache" warn (fired
+    /// on exactly this stale-while-revalidate path) must never interpolate the `DepsError`
+    /// itself — `DepsError::HttpStatus`'s `Display` embeds the full, unredacted URL (including
+    /// the query string), which would defeat `url_for_tracing`'s redaction on this same span's
+    /// `url` field two lines above it. Reuses the mock/seeding shape of
+    /// `test_get_cached_non_2xx_on_refresh_preserves_stale_cache` with a token-bearing query
+    /// string, wrapped in a real tracing capture (an actual `warn!` event fires here, unlike
+    /// the offline-hit case covered by `test_get_cached_span_url_field_redacts_query_string_token`).
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    async fn test_get_cached_conditional_request_failure_does_not_leak_token_via_warn() {
+        let mut server = mockito::Server::new_async().await;
+        let url = format!("{}/pkg?token=super-secret-value", server.url());
+
+        let cache = HttpCache::new();
+        cache.entries.insert(
+            url.clone(),
+            CachedResponse {
+                body: Bytes::from_static(b"stale but good"),
+                etag: Some("\"stale-etag\"".into()),
+                last_modified: None,
+                fetched_at: Instant::now(),
+            },
+        );
+
+        let _m = server
+            .mock("GET", "/pkg")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "token".into(),
+                "super-secret-value".into(),
+            ))
+            .match_header("if-none-match", "\"stale-etag\"")
+            .with_status(503)
+            .with_body("<html>maintenance</html>")
+            .create_async()
+            .await;
+
+        let output = crate::test_util::capture_tracing_output_async(async {
+            let result: Bytes = cache.get_cached(&url).await.unwrap();
+            assert_eq!(result.as_ref(), b"stale but good");
+        })
+        .await;
+
+        assert!(
+            !output.contains("super-secret-value"),
+            "leaked token via warn! output: {output:?}"
+        );
+    }
+
+    /// #756 C1 regression: `get_cached_with_headers_via`'s `url` span field must never carry
+    /// a token embedded in the URL's query string — the same shape as an `.npmrc`-style
+    /// `${VAR}`-expanded `registry=` URL (see `deps-npm`'s `NpmRegistryIndex` security model).
+    /// The critic's exact repro was the span's own `url={...}` prefix on a captured log line,
+    /// so this enables `FmtSpan::NEW` to capture that prefix directly, at span-creation time
+    /// (before the function body runs), rather than relying on some other event firing inside
+    /// the span. Deliberately exercises the offline-hit branch — no `DepsError` is ever
+    /// constructed on that path — so this is isolated from that type's own (separate,
+    /// pre-existing) URL-embedding `Display` impl and tests the span field in isolation.
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    async fn test_get_cached_span_url_field_redacts_query_string_token() {
+        use tracing_subscriber::fmt::format::FmtSpan;
+
+        #[derive(Clone)]
+        struct TestWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for TestWriter {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TestWriter {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let url = "https://npm.internal/pkg?token=super-secret-value".to_string();
+        let cache = HttpCache::new();
+        cache.set_offline(true);
+        cache.entries.insert(
+            url.clone(),
+            CachedResponse {
+                body: Bytes::from_static(b"cached"),
+                etag: None,
+                last_modified: None,
+                fetched_at: Instant::now(),
+            },
+        );
+
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(TestWriter(std::sync::Arc::clone(&buf)))
+            .with_span_events(FmtSpan::NEW)
+            .without_time()
+            .with_target(false)
+            .finish();
+
+        let guard = tracing::subscriber::set_default(subscriber);
+        let result: Bytes = cache.get_cached(&url).await.unwrap();
+        drop(guard);
+
+        assert_eq!(result.as_ref(), b"cached");
+
+        let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            !output.contains("super-secret-value"),
+            "leaked token into span output: {output:?}"
+        );
+        assert!(
+            output.contains("https://npm.internal/pkg"),
+            "expected the redacted host+path in span output: {output:?}"
+        );
     }
 
     #[tokio::test]

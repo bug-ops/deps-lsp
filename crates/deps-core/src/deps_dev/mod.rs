@@ -410,6 +410,10 @@ impl DepsDevClient {
     /// One GET through the shared, transport-only, origin-pinned call site —
     /// no entry-map caching (this client's own memos own that), bounded by
     /// [`DEPS_DEV_CALL_TIMEOUT`].
+    #[tracing::instrument(
+        skip(self),
+        fields(url = crate::net_policy::url_for_tracing(url))
+    )]
     async fn get(&self, url: &str) -> Result<bytes::Bytes, DepsDevFetchError> {
         match tokio::time::timeout(
             DEPS_DEV_CALL_TIMEOUT,
@@ -460,8 +464,12 @@ impl DepsDevClient {
                 }
             },
             Err(DepsDevFetchError::NotFound) => return (None, DEPS_DEV_SUCCESS_TTL),
+            // #756: never interpolate `e`'s `Display` — see `DepsError::safe_tracing_summary`.
+            // Currently safe (deps.dev's base URL is a fixed, credential-free constant), but
+            // kept consistent with the same invariant applied to `Self::get` above.
             Err(DepsDevFetchError::Failed(e)) => {
-                tracing::debug!(error = %e, "deps.dev version fetch failed");
+                let (status, cause) = e.safe_tracing_summary();
+                tracing::debug!(status = ?status, cause, "deps.dev version fetch failed");
                 return (None, DEPS_DEV_ERROR_TTL);
             }
             Err(DepsDevFetchError::TimedOut) => {
@@ -537,8 +545,10 @@ impl DepsDevClient {
                 }
             },
             Err(DepsDevFetchError::NotFound) => (None, DEPS_DEV_SUCCESS_TTL),
+            // Same rationale as `Self::fetch`'s equivalent branch above.
             Err(DepsDevFetchError::Failed(e)) => {
-                tracing::debug!(error = %e, "deps.dev project fetch failed");
+                let (status, cause) = e.safe_tracing_summary();
+                tracing::debug!(status = ?status, cause, "deps.dev project fetch failed");
                 (None, DEPS_DEV_ERROR_TTL)
             }
             Err(DepsDevFetchError::TimedOut) => {
