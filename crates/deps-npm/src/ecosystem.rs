@@ -147,7 +147,7 @@ impl Ecosystem for NpmEcosystem {
     }
 
     fn lockfile_filenames(&self) -> &[&'static str] {
-        &["package-lock.json"]
+        &["package-lock.json", "pnpm-lock.yaml"]
     }
 
     fn watched_config_filenames(&self) -> &[&'static str] {
@@ -417,7 +417,10 @@ mod tests {
     fn test_ecosystem_lockfile_filenames() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = NpmEcosystem::new(cache);
-        assert_eq!(ecosystem.lockfile_filenames(), &["package-lock.json"]);
+        assert_eq!(
+            ecosystem.lockfile_filenames(),
+            &["package-lock.json", "pnpm-lock.yaml"]
+        );
     }
 
     #[test]
