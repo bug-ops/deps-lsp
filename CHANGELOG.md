@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: property tests (`proptest`) asserting the parser depth/expansion checkers and JSONC position recovery never panic on arbitrary input (#673)
 
 ### Fixed
+- **deps-core, deps-npm, deps-composer**: npm/Composer raw-text fallback completion no longer inserts a duplicate-quoted key-value pair when the cursor is already inside an open JSON key string (resolves #729) (#732)
 - **deps-core** + all 9 lock-file providers: lock-file parsing now runs on the blocking-thread pool via a shared `read_and_parse_lockfile` helper, no longer stalling the LSP request worker (resolves #723) (#730)
 - **deps-lsp**: NuGet/Maven raw-text fallback completion no longer inserts duplicate markup when the cursor is already inside an open attribute value or tag (resolves #724) (#728)
 - **deps-core, deps-npm, deps-dart**: an unquoted, numeric-looking YAML scalar (e.g. a bare `1.2` pnpm catalog range, or a two-component `version: 1.0` in `pubspec.lock`) is no longer misclassified as malformed/silently skipped, via a new shared `deps_core::yaml_scalar_string` helper (resolves #721) (#731)

@@ -320,6 +320,96 @@ pub fn strip_open_xml_attribute_value<'a>(
     ""
 }
 
+/// Counts the `"` characters in `prefix` that actually open or close a JSON string —
+/// skipping any `\"` escape sequence — and returns that count along with the byte
+/// index of the last such real quote, if any.
+///
+/// A `"` is escaped, and does not toggle string state, when it is preceded by an *odd*
+/// number of consecutive `\` characters immediately before it (an even count, zero
+/// included, means those backslashes are themselves pairwise-escaped, so the quote is
+/// real) — e.g. in `"a\"b"` the middle `"` is escaped (one preceding `\`), so the
+/// string is `a"b`, not two separate strings. A naive per-`"` count desyncs from real
+/// JSON open/close state on any key or value containing `\"` (#729 code-review: raw
+/// counting both over-counts, flipping a closed key+value pair to look "open", and
+/// under-counts the inverse, flipping a still-open key to look "closed").
+fn count_real_json_quotes(prefix: &str) -> (usize, Option<usize>) {
+    let mut backslash_run = 0usize;
+    let mut count = 0usize;
+    let mut last_real_quote = None;
+    for (idx, ch) in prefix.char_indices() {
+        match ch {
+            '\\' => backslash_run += 1,
+            '"' => {
+                if backslash_run.is_multiple_of(2) {
+                    count += 1;
+                    last_real_quote = Some(idx);
+                }
+                backslash_run = 0;
+            }
+            _ => backslash_run = 0,
+        }
+    }
+    (count, last_real_quote)
+}
+
+/// Classifies whether `prefix` (the trimmed line text up to the cursor) sits inside an
+/// open JSON string that is a dependency object's *key*.
+///
+/// Covers `package.json`'s `"expr` while the key is still being typed, and
+/// `composer.json`'s `require`/`require-dev` entries — distinguishing that from a
+/// closed key, an open value string, or plain unquoted text.
+///
+/// Uses quote parity — an odd count of real (see `count_real_json_quotes`) `"`
+/// characters means the cursor sits inside an open string literal — adapted for a JSON
+/// object key instead of an XML tag/attribute: the text immediately before the open
+/// string's opening quote decides key-vs-value: a `:` right before it
+/// (`"express": "^4`) means the open string is the *value*, not the key.
+///
+/// Returns `(text_after_the_open_quote, true)` only when the cursor is genuinely
+/// inside an open key string — the one case where a fallback-completion insert should
+/// be the bare candidate name rather than a full `"{name}": "^{latest}"` snippet, the
+/// same "already open" bare-insert shape as
+/// [`strip_leading_xml_tag`]'s `Some("artifactId")` case and
+/// [`strip_open_xml_attribute_value`]'s non-empty result. Every other shape returns
+/// `("", false)`:
+/// - Even quote count with at least one real `"` present means the cursor sits right
+///   after a fully-closed string (`"express"` with the cursor past both quotes) —
+///   quote parity alone cannot tell whether that position wants a new key, is
+///   mid-value, or something else, so this suppresses rather than guesses (#729 critic
+///   S1, matching Maven's "no safe bare text to offer here" discipline for a
+///   non-`artifactId` open tag).
+/// - Odd quote count whose open string's text is preceded by `:` means the cursor is
+///   inside an open *value* string, not the key — a bare package-name insert there
+///   would corrupt the version instead of completing the key (#729 critic S2).
+///
+/// Even quote count with *zero* real `"` present (plain unquoted text, or nothing
+/// typed yet) is the one exception: it returns `(prefix, false)` unchanged, since no
+/// quote has been opened at all and the normal full-pair insert is still correct
+/// there.
+#[must_use]
+pub fn strip_open_json_key(prefix: &str) -> (&str, bool) {
+    let (quote_count, last_quote) = count_real_json_quotes(prefix);
+    if quote_count == 0 {
+        return (prefix, false);
+    }
+    if quote_count.is_multiple_of(2) {
+        return ("", false);
+    }
+    // `quote_count` odd (so >= 1) guarantees `count_real_json_quotes` found one; `"`
+    // is a single-byte ASCII char, so `last_quote + 1` is always a char boundary.
+    #[allow(clippy::string_slice)]
+    let Some(last_quote) = last_quote else {
+        return ("", false);
+    };
+    #[allow(clippy::string_slice)]
+    let (before_quote, after_quote) = (&prefix[..last_quote], &prefix[last_quote + 1..]);
+    if before_quote.trim_end().ends_with(':') {
+        ("", false)
+    } else {
+        (after_quote, true)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -746,5 +836,73 @@ tokio
             ),
             "Foo"
         );
+    }
+
+    #[test]
+    fn test_strip_open_json_key_open_key_leading_quote() {
+        // package.json / composer.json: cursor sits before the closing quote while the
+        // key is still being typed, e.g. `    "expr` with the cursor right after "expr".
+        let prefix = "\"expr";
+        assert_eq!(strip_open_json_key(prefix), ("expr", true));
+    }
+
+    #[test]
+    fn test_strip_open_json_key_closed_key_is_suppressed_not_reopened() {
+        // #729 critic S1: cursor right after an already fully-closed key
+        // (`"express"`, quote parity even) is NOT an open string — a naive
+        // `ends_with('"')` check would misclassify this as open and bare-insert into
+        // it (`"express"express`, still invalid JSON). Quote parity correctly reports
+        // this as ambiguous instead, suppressing the item rather than guessing.
+        let prefix = "\"express\"";
+        assert_eq!(strip_open_json_key(prefix), ("", false));
+    }
+
+    #[test]
+    fn test_strip_open_json_key_open_value_string_is_suppressed_not_key() {
+        // #729 critic S2: cursor inside an open *value* string (`"express": "^4`, odd
+        // quote parity) must not be reported as an open key — a bare package-name
+        // insert there would corrupt the version string, not complete the key.
+        let prefix = "\"express\": \"^4";
+        assert_eq!(strip_open_json_key(prefix), ("", false));
+    }
+
+    #[test]
+    fn test_strip_open_json_key_open_key_after_prior_closed_entry_on_same_line() {
+        // A second key on the same line as an already-closed entry (`"express":
+        // "4.19.2", "look`) must still be recognized as an open key: the text right
+        // before its opening quote is `, `, not `:`, so quote parity correctly
+        // distinguishes it from the value-position case above.
+        let prefix = "\"express\": \"4.19.2\", \"look";
+        assert_eq!(strip_open_json_key(prefix), ("look", true));
+    }
+
+    #[test]
+    fn test_strip_open_json_key_no_quote_survives_reports_unchanged() {
+        // No `"` typed yet at all (e.g. the user deleted the key and is retyping bare
+        // text): nothing proves a string is already open, so the normal full-pair
+        // insert is still correct here (#729).
+        let prefix = "expr";
+        assert_eq!(strip_open_json_key(prefix), ("expr", false));
+    }
+
+    #[test]
+    fn test_strip_open_json_key_escaped_quote_in_closed_pair_is_not_open() {
+        // #729 code-review: a closed key containing one escaped quote, plus a closed
+        // value, plus trailing bare text with no opening quote yet. A naive raw `"`
+        // count sees 5 quote characters (odd) and wrongly reports this as an open key
+        // with a garbage prefix; the escape-aware count sees the real state (nothing
+        // open) and suppresses.
+        let prefix = "\"a\\\"b\": \"1\", lodash";
+        assert_eq!(strip_open_json_key(prefix), ("", false));
+    }
+
+    #[test]
+    fn test_strip_open_json_key_escaped_quote_inside_still_open_key() {
+        // Inverse of the above: an escaped quote inside a key that is genuinely still
+        // open. A naive raw count would see 2 quote characters (even) and wrongly
+        // suppress a valid completion; the escape-aware count correctly reports this
+        // as still open.
+        let prefix = "\"a\\\"b";
+        assert_eq!(strip_open_json_key(prefix), ("a\\\"b", true));
     }
 }
