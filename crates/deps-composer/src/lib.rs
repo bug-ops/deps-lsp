@@ -4,10 +4,12 @@
 //! for PHP projects.
 
 pub mod ecosystem;
+/// Version formatting and comparison for Composer (PHP semver-style ranges).
 pub mod formatter;
 pub mod lockfile;
 pub mod parser;
 pub mod registry;
+/// Domain types for Composer dependencies (parsed `composer.json` entries, Packagist versions).
 pub mod types;
 
 pub use ecosystem::ComposerEcosystem;

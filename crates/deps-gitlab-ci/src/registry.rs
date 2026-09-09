@@ -77,7 +77,9 @@ impl RateLimitGate {
 /// from the wrong repository.
 #[derive(Debug, Default)]
 pub struct TagIndex {
+    /// Maps a tag/release name to its resolved commit SHA.
     pub tag_to_sha: std::collections::HashMap<String, String>,
+    /// Maps a commit SHA back to the tag/release name that resolved to it.
     pub sha_to_tag: std::collections::HashMap<String, String>,
 }
 

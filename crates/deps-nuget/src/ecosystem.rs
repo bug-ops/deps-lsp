@@ -51,6 +51,7 @@ pub struct NuGetEcosystem {
 }
 
 impl NuGetEcosystem {
+    /// Creates a NuGet ecosystem instance with a default (unconfigured) parse context.
     pub fn new(cache: Arc<deps_core::HttpCache>) -> Self {
         Self::with_context(
             Arc::new(NuGetRegistry::new(cache)),

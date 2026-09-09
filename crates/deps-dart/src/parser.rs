@@ -7,13 +7,23 @@ use std::any::Any;
 use tower_lsp_server::ls_types::{Range, Uri};
 use yaml_rust2::{Yaml, YamlLoader};
 
+/// Result of parsing a `pubspec.yaml` file.
 #[derive(Debug, Clone)]
 pub struct DartParseResult {
+    /// Dependencies found across all sections.
     pub dependencies: Vec<DartDependency>,
+    /// The `environment: sdk:` constraint string, if declared.
     pub sdk_constraint: Option<String>,
+    /// URI of the manifest this result was parsed from.
     pub uri: Uri,
 }
 
+/// Parses a `pubspec.yaml` document into a [`DartParseResult`].
+///
+/// # Errors
+///
+/// Returns [`DepsError::ParseError`] if the YAML nesting depth or expanded
+/// size exceeds the configured limits, or if the content is not valid YAML.
 pub fn parse_pubspec_yaml(content: &str, doc_uri: &Uri) -> Result<DartParseResult> {
     if let Err(depth) =
         deps_core::check_yaml_nesting_depth(content, deps_core::MAX_YAML_NESTING_DEPTH)

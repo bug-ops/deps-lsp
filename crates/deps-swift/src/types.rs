@@ -114,7 +114,9 @@ deps_core::impl_metadata!(SwiftPackage {
 /// Result of parsing a Package.swift file.
 #[derive(Debug)]
 pub struct SwiftParseResult {
+    /// Dependencies found in the `Package.swift` manifest.
     pub dependencies: Vec<SwiftDependency>,
+    /// URI of the manifest this result was parsed from.
     pub uri: tower_lsp_server::ls_types::Uri,
 }
 

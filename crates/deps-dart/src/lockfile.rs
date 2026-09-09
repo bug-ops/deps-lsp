@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use tower_lsp_server::ls_types::Uri;
 use yaml_rust2::{Yaml, YamlLoader};
 
+/// [`LockFileProvider`] implementation for `pubspec.lock`.
 pub struct PubspecLockParser;
 
 impl PubspecLockParser {
@@ -36,6 +37,12 @@ impl LockFileProvider for PubspecLockParser {
     }
 }
 
+/// Parses a `pubspec.lock` file's resolved package versions.
+///
+/// # Errors
+///
+/// Returns [`DepsError::ParseError`] if the YAML nesting depth exceeds the
+/// configured limit or the content is not valid YAML.
 pub fn parse_pubspec_lock(content: &str) -> Result<ResolvedPackages> {
     if let Err(depth) =
         deps_core::check_yaml_nesting_depth(content, deps_core::MAX_YAML_NESTING_DEPTH)

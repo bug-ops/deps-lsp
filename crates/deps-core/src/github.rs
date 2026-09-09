@@ -326,6 +326,7 @@ impl GithubTagsClient {
 /// GitHub tags API response item.
 #[derive(Debug, Default, Deserialize)]
 pub struct GithubTag {
+    /// The tag name (e.g. `"v1.2.3"`).
     pub name: String,
     /// The tagged commit. Defaults when the field is absent so fixtures that omit it (or
     /// omit `commit.sha` within it) still deserialize — callers that need the SHA (e.g.
@@ -337,6 +338,7 @@ pub struct GithubTag {
 /// The `commit` object nested in a [`GithubTag`].
 #[derive(Debug, Default, Deserialize)]
 pub struct GithubTagCommit {
+    /// The full commit SHA the tag points at.
     #[serde(default)]
     pub sha: String,
 }

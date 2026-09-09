@@ -5,14 +5,20 @@ use tower_lsp_server::ls_types::Range;
 
 pub use deps_maven::MavenVersion as GradleVersion;
 
+/// A single dependency declaration parsed from a Gradle build script.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GradleDependency {
+    /// Maven `groupId`.
     pub group_id: String,
+    /// Maven `artifactId`.
     pub artifact_id: String,
     /// Canonical identifier: "{groupId}:{artifactId}"
     pub name: deps_core::PackageName,
+    /// Document range of the coordinate, for hover/diagnostic positioning.
     pub name_range: Range,
+    /// Version requirement, if the build script specifies one.
     pub version_req: Option<deps_core::VersionReq>,
+    /// Document range of the version string.
     pub version_range: Option<Range>,
     /// Gradle configuration (e.g. "implementation", "api", "testImplementation")
     pub configuration: String,

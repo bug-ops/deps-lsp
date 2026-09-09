@@ -14,9 +14,13 @@ use tower_lsp_server::ls_types::{Range, Uri};
 /// Result of parsing a Gemfile.
 #[derive(Debug, Clone)]
 pub struct BundlerParseResult {
+    /// Dependencies found in the `Gemfile`.
     pub dependencies: Vec<BundlerDependency>,
+    /// The `ruby` directive's version constraint, if declared.
     pub ruby_version: Option<String>,
+    /// The top-level `source` URL, if declared.
     pub source_url: Option<String>,
+    /// URI of the manifest this result was parsed from.
     pub uri: Uri,
 }
 

@@ -259,6 +259,8 @@ fn attach_publish_times(versions: &mut [MavenVersion], times: &HashMap<String, P
     }
 }
 
+/// Registry client implementing [`deps_core::Registry`] for Maven, resolving artifacts
+/// against Maven Central, Google Maven, and the Gradle Plugin Portal in turn.
 #[derive(Clone)]
 pub struct MavenCentralRegistry {
     cache: Arc<HttpCache>,
@@ -275,6 +277,7 @@ pub struct MavenCentralRegistry {
 }
 
 impl MavenCentralRegistry {
+    /// Creates a client backed by the given shared HTTP cache.
     pub fn new(cache: Arc<HttpCache>) -> Self {
         Self {
             cache,
@@ -368,6 +371,12 @@ impl MavenCentralRegistry {
         self.get_versions_typed_with(name, false).await
     }
 
+    /// Returns the version matching `req` exactly, or the latest stable/release version
+    /// when `req` is empty or `"*"`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if fetching or parsing the artifact's metadata fails.
     #[tracing::instrument(skip_all, fields(package = ?name, version = ?req), level = "debug")]
     pub async fn get_latest_matching_typed(
         &self,

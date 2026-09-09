@@ -1,8 +1,20 @@
+//! The `deps-lsp` binary crate: wires the 14 ecosystem crates into a running
+//! `tower-lsp-server` [`LanguageServer`](tower_lsp_server::LanguageServer)
+//! implementation.
+//!
+//! [`register_ecosystems`] registers every feature-enabled ecosystem crate
+//! against an [`EcosystemRegistry`], threading live-updatable settings
+//! ([`EcosystemRuntime`]) into the ones that need them. [`server::Backend`]
+//! is the `LanguageServer` implementation itself; `document` holds the
+//! per-document state machine driving hover/completion/diagnostics.
+
+/// Live configuration parsing and the config schema (`deny_unknown_fields`).
 pub mod config;
 pub mod document;
 pub mod file_watcher;
 pub mod handlers;
 pub mod progress;
+/// The `tower-lsp-server` [`LanguageServer`](tower_lsp_server::LanguageServer) implementation.
 pub mod server;
 
 #[cfg(test)]

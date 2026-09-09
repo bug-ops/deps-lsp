@@ -1,3 +1,6 @@
+//! Entry point for the `deps-lsp` binary: parses `--stdio`/`--version` flags,
+//! sets up `tracing` logging, and serves [`Backend`] over stdin/stdout.
+
 use deps_lsp::server::Backend;
 use std::env;
 use tower_lsp_server::{LspService, Server};

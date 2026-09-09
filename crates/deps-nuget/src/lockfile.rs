@@ -31,6 +31,7 @@ use tower_lsp_server::ls_types::Uri;
 /// exact-name search already tried.
 const MAX_WORKSPACE_DEPTH: usize = 5;
 
+/// [`LockFileProvider`] implementation for `packages.lock.json`.
 pub struct NuGetLockParser;
 
 impl NuGetLockParser {

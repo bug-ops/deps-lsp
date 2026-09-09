@@ -103,6 +103,10 @@ async fn warn_if_gitlab_instance_host_invalid(
     }
 }
 
+/// The `tower-lsp-server` [`LanguageServer`] implementation for `deps-lsp`.
+///
+/// Holds the LSP client handle, per-document [`ServerState`], the live
+/// [`DepsConfig`], and the client's negotiated capabilities.
 pub struct Backend {
     pub(crate) client: Client,
     state: Arc<ServerState>,
@@ -111,6 +115,7 @@ pub struct Backend {
 }
 
 impl Backend {
+    /// Creates a new backend bound to the given LSP client handle.
     pub fn new(client: Client) -> Self {
         Self {
             client,

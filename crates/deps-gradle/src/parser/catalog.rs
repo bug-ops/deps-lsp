@@ -9,6 +9,12 @@ use std::collections::HashMap;
 use toml_span::value::{Table, Value};
 use tower_lsp_server::ls_types::{Range, Uri};
 
+/// Parses a Gradle version catalog (`gradle/libs.versions.toml`) into a [`GradleParseResult`].
+///
+/// # Errors
+///
+/// Returns [`DepsError::ParseError`] if the TOML nesting depth exceeds the
+/// configured limit or the content is not valid TOML.
 pub fn parse_version_catalog(content: &str, uri: &Uri) -> Result<GradleParseResult> {
     if let Err(depth) =
         deps_core::check_toml_nesting_depth(content, deps_core::MAX_TOML_NESTING_DEPTH)

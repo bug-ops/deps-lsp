@@ -8,6 +8,7 @@ use deps_core::{
     ConcreteVersion, InvalidPackageName, PackageName, VersionReq, is_safe_maven_coordinate_segment,
 };
 
+/// [`EcosystemFormatter`](deps_core::lsp_helpers::EcosystemFormatter) implementation for Gradle.
 pub struct GradleFormatter;
 
 /// Unresolved Gradle variable reference (`$var`, `${var}`), or an explicit empty

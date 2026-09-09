@@ -131,9 +131,12 @@ pub(crate) fn build_dependency(
     }
 }
 
+/// Result of parsing a Gradle build script, settings file, or version catalog.
 #[derive(Debug)]
 pub struct GradleParseResult {
+    /// Dependencies found in the file.
     pub dependencies: Vec<GradleDependency>,
+    /// URI of the manifest this result was parsed from.
     pub uri: Uri,
 }
 
@@ -164,6 +167,14 @@ fn resolve_variable_ref(value: &str, properties: &HashMap<String, String>) -> Op
     }
 }
 
+/// Parses a Gradle file, dispatching to the catalog/settings/Kotlin-DSL/Groovy-DSL
+/// parser based on its filename, then resolves `$var`/`${var}` property references
+/// for build files.
+///
+/// # Errors
+///
+/// Returns an error if the file's dedicated parser fails (e.g. malformed TOML for
+/// a version catalog).
 pub fn parse_gradle(content: &str, uri: &Uri) -> Result<GradleParseResult> {
     let path = uri.path().to_string();
     let mut result = if path.ends_with("libs.versions.toml") {

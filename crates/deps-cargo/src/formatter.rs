@@ -29,6 +29,7 @@ impl RequirementMatcher for SemverMatcher {
     }
 }
 
+/// [`EcosystemFormatter`](deps_core::lsp_helpers::EcosystemFormatter) implementation for Cargo.
 pub struct CargoFormatter;
 
 impl PackageNaming for CargoFormatter {

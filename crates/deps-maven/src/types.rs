@@ -3,26 +3,40 @@
 use std::any::Any;
 use tower_lsp_server::ls_types::Range;
 
+/// A single `<dependency>` declaration parsed from a `pom.xml`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MavenDependency {
+    /// Maven `groupId`.
     pub group_id: String,
+    /// Maven `artifactId`.
     pub artifact_id: String,
     /// Canonical identifier: "{groupId}:{artifactId}"
     pub name: deps_core::PackageName,
+    /// Document range of the coordinate, for hover/diagnostic positioning.
     pub name_range: Range,
+    /// Version requirement, if the `pom.xml` specifies one.
     pub version_req: Option<deps_core::VersionReq>,
+    /// Document range of the version string.
     pub version_range: Option<Range>,
+    /// Maven dependency scope (`compile`, `test`, `runtime`, etc.).
     pub scope: MavenScope,
 }
 
+/// Maven dependency scope (the `<scope>` element).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum MavenScope {
+    /// Default scope: available in all classpaths, propagated to dependents.
     #[default]
     Compile,
+    /// Available only for test compilation and execution.
     Test,
+    /// Required at runtime but not for compilation.
     Runtime,
+    /// Expected to be provided by the JDK or a container at runtime.
     Provided,
+    /// System-path dependency (deprecated by Maven, but still declarable).
     System,
+    /// Imports the dependency management section of another POM (BOM).
     Import,
 }
 
@@ -41,8 +55,10 @@ impl std::str::FromStr for MavenScope {
     }
 }
 
+/// A single published version of a Maven artifact.
 #[derive(Debug, Clone)]
 pub struct MavenVersion {
+    /// The parsed version number.
     pub version: deps_core::ConcreteVersion,
     /// When this version was published, from the `repo1.maven.org` directory listing.
     ///
@@ -52,14 +68,20 @@ pub struct MavenVersion {
     pub published_at: Option<deps_core::PublishTime>,
 }
 
+/// Artifact metadata as returned by Maven Central's search API.
 #[derive(Debug, Clone)]
 pub struct ArtifactInfo {
+    /// Maven `groupId`.
     pub group_id: String,
+    /// Maven `artifactId`.
     pub artifact_id: String,
     /// "{groupId}:{artifactId}"
     pub name: deps_core::PackageName,
+    /// Short artifact description, if available.
     pub description: Option<String>,
+    /// Latest published version.
     pub latest_version: deps_core::ConcreteVersion,
+    /// Source repository URL, if known.
     pub repository: Option<String>,
 }
 

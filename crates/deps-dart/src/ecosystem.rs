@@ -12,12 +12,14 @@ use deps_core::{
 use crate::formatter::DartFormatter;
 use crate::registry::PubDevRegistry;
 
+/// [`Ecosystem`] implementation for Dart/Pub (`pubspec.yaml`).
 pub struct DartEcosystem {
     registry: Arc<PubDevRegistry>,
     formatter: DartFormatter,
 }
 
 impl DartEcosystem {
+    /// Creates a Dart ecosystem instance backed by the given shared HTTP cache.
     pub fn new(cache: Arc<deps_core::HttpCache>) -> Self {
         Self {
             registry: Arc::new(PubDevRegistry::new(cache)),

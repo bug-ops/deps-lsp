@@ -8,6 +8,7 @@ use deps_core::{
     ConcreteVersion, InvalidPackageName, PackageName, VersionReq, is_safe_maven_coordinate_segment,
 };
 
+/// [`EcosystemFormatter`](deps_core::lsp_helpers::EcosystemFormatter) implementation for Maven.
 pub struct MavenFormatter;
 
 /// Unexpanded property (missing from `<properties>`).

@@ -67,7 +67,7 @@ zeroize = "1.9"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
-missing_docs = "allow"
+missing_docs = "warn"
 missing_debug_implementations = "allow"
 unreachable_pub = "warn"
 

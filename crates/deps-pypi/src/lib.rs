@@ -104,13 +104,16 @@
 
 pub mod config;
 pub mod ecosystem;
+/// PyPI/pyproject.toml-specific error types.
 pub mod error;
+/// Version formatting and comparison for PyPI (PEP 440 specifiers).
 pub mod formatter;
 pub mod lockfile;
 pub mod name;
 pub mod parser;
 pub mod registry;
 mod search;
+/// Domain types for PyPI dependencies (parsed manifest entries, PyPI JSON API versions).
 pub mod types;
 
 // Re-export commonly used types

@@ -6,12 +6,15 @@ use tower_lsp_server::ls_types::{Range, Uri};
 /// A single `PackageReference` / `PackageVersion` / `package` entry from a manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NuGetDependency {
+    /// Package name.
     pub name: deps_core::PackageName,
+    /// Document range of the package name, for hover/diagnostic positioning.
     pub name_range: Range,
     /// Absent when the manifest omits an explicit version — central package management
     /// entries and unresolvable MSBuild property expressions (`$(...)`) both degrade to
     /// `None` rather than a bogus or unresolved-looking requirement.
     pub version_requirement: Option<deps_core::VersionReq>,
+    /// Document range of the version string.
     pub version_range: Option<Range>,
     /// Resolved against the manifest's `NuGet.Config` `<packageSources>`/
     /// `<packageSourceMapping>` (issue #523) by `NuGetEcosystem::parse_manifest`, after
@@ -53,7 +56,9 @@ impl deps_core::Dependency for NuGetDependency {
 /// `packages.config`).
 #[derive(Debug)]
 pub struct NuGetParseResult {
+    /// Dependencies found in the manifest.
     pub dependencies: Vec<NuGetDependency>,
+    /// URI of the manifest this result was parsed from.
     pub uri: Uri,
     /// Every routing chain this manifest's resolved `NuGet.Config` implies (issue #523) — one
     /// per distinct `<packageSourceMapping>` hop-set, or the single plain accumulated chain
@@ -86,6 +91,7 @@ deps_core::impl_parse_result!(
 /// ecosystems with a structural (non-keyword) prerelease convention.
 #[derive(Debug, Clone)]
 pub struct NuGetVersion {
+    /// The parsed version number.
     pub version: deps_core::ConcreteVersion,
     /// Publish timestamp, populated only when `Registry::get_versions_with` is called with
     /// freshness enabled and the version was covered by the registration-hive walk.
@@ -113,10 +119,15 @@ impl deps_core::Version for NuGetVersion {
 /// Package metadata from a NuGet search result.
 #[derive(Debug, Clone)]
 pub struct PackageInfo {
+    /// Package name.
     pub name: deps_core::PackageName,
+    /// Short package description.
     pub description: Option<String>,
+    /// Source repository URL.
     pub repository: Option<String>,
+    /// Documentation URL.
     pub documentation: Option<String>,
+    /// Latest published version.
     pub latest_version: deps_core::ConcreteVersion,
 }
 

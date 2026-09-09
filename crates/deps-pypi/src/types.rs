@@ -91,13 +91,22 @@ pub enum PypiDependencySection {
     /// PEP 621 runtime dependencies (`[project.dependencies]`)
     Dependencies,
     /// PEP 621 optional dependency group (`[project.optional-dependencies.{group}]`)
-    OptionalDependencies { group: String },
+    OptionalDependencies {
+        /// Name of the optional-dependency group.
+        group: String,
+    },
     /// PEP 735 dependency group (`[dependency-groups.{group}]`)
-    DependencyGroup { group: String },
+    DependencyGroup {
+        /// Name of the dependency group.
+        group: String,
+    },
     /// Poetry runtime dependencies (`[tool.poetry.dependencies]`)
     PoetryDependencies,
     /// Poetry dependency group (`[tool.poetry.group.{group}.dependencies]`)
-    PoetryGroup { group: String },
+    PoetryGroup {
+        /// Name of the Poetry dependency group.
+        group: String,
+    },
     /// A line in a `requirements.txt`- or `constraints.txt`-format file (pip's
     /// requirements file format). Both file kinds map to this single variant —
     /// nothing downstream distinguishes a constraint from a requirement.

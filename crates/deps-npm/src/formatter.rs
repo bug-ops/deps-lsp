@@ -41,6 +41,7 @@ fn is_url_friendly_segment(segment: &str) -> bool {
     })
 }
 
+/// [`EcosystemFormatter`](deps_core::lsp_helpers::EcosystemFormatter) implementation for npm.
 pub struct NpmFormatter;
 
 impl PackageNaming for NpmFormatter {

@@ -12,6 +12,8 @@ use deps_maven::MavenCentralRegistry;
 
 use crate::formatter::GradleFormatter;
 
+/// [`Ecosystem`] implementation for Gradle (`build.gradle`/`build.gradle.kts`), reusing
+/// Maven Central resolution via [`MavenCentralRegistry`].
 pub struct GradleEcosystem {
     registry: Arc<MavenCentralRegistry>,
     formatter: GradleFormatter,
@@ -26,6 +28,7 @@ pub struct GradleEcosystem {
 }
 
 impl GradleEcosystem {
+    /// Creates a Gradle ecosystem instance backed by the given shared HTTP cache.
     pub fn new(cache: Arc<deps_core::HttpCache>) -> Self {
         Self {
             registry: Arc::new(MavenCentralRegistry::new(Arc::clone(&cache))),

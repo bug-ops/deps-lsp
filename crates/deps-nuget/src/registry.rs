@@ -421,6 +421,8 @@ fn reject_dot_segment(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Registry client implementing [`deps_core::Registry`] for NuGet, resolving packages
+/// against nuget.org's V3 service index and any workspace-declared alternate feeds.
 #[derive(Clone)]
 pub struct NuGetRegistry {
     cache: Arc<HttpCache>,
@@ -464,6 +466,7 @@ pub struct NuGetRegistry {
 }
 
 impl NuGetRegistry {
+    /// Creates a client backed by the given shared HTTP cache, pointed at nuget.org.
     pub fn new(cache: Arc<HttpCache>) -> Self {
         Self::with_service_index_url(cache, NUGET_ORG_INDEX_URL.to_string())
     }

@@ -16,10 +16,14 @@ use std::any::Any;
 use std::collections::HashMap;
 use tower_lsp_server::ls_types::{Range, Uri};
 
+/// Result of parsing a `pom.xml` file.
 #[derive(Debug)]
 pub struct MavenParseResult {
+    /// Dependencies found across `<dependencies>` and `<dependencyManagement>`.
     pub dependencies: Vec<MavenDependency>,
+    /// The `<properties>` section, for resolving `${...}` version placeholders.
     pub properties: HashMap<String, String>,
+    /// URI of the manifest this result was parsed from.
     pub uri: Uri,
 }
 
@@ -48,6 +52,11 @@ struct DepAccum {
     scope: Option<String>,
 }
 
+/// Parses a `pom.xml` document into a [`MavenParseResult`].
+///
+/// # Errors
+///
+/// Returns an error if the content is not well-formed XML.
 pub fn parse_pom_xml(content: &str, doc_uri: &Uri) -> Result<MavenParseResult> {
     let line_table = LineOffsetTable::new(content);
     let mut dependencies = Vec::new();

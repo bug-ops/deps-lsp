@@ -31,11 +31,13 @@
 
 pub mod config;
 pub mod ecosystem;
+/// Version formatting and comparison for Cargo (SemVer caret ranges).
 pub mod formatter;
 pub mod lockfile;
 pub mod parser;
 pub mod registry;
 pub mod sparse;
+/// Domain types for Cargo dependencies (parsed `Cargo.toml` entries, crates.io versions).
 pub mod types;
 
 // Re-export commonly used types

@@ -1,3 +1,11 @@
+//! HTTP response cache shared by every ecosystem's registry client.
+//!
+//! Wraps outbound registry requests with RFC 7232 conditional-request
+//! validation (`ETag`/`If-None-Match`, `Last-Modified`/`If-Modified-Since`) so
+//! that unchanged registry data is served from a bounded in-memory cache
+//! instead of re-fetched. Entry count and total retained bytes are both
+//! capped to keep memory use predictable under long-running LSP sessions.
+
 use crate::error::{DepsError, Result};
 use crate::net_policy::{RegistryAccessPolicy, WorkspaceRegistryAccess};
 use bytes::{Bytes, BytesMut};
@@ -681,9 +689,13 @@ async fn read_body_capped(url: &str, mut response: Response, limit: BodyLimit) -
 /// ```
 #[derive(Debug, Clone)]
 pub struct CachedResponse {
+    /// Raw response body, shareable across consumers without copying.
     pub body: Bytes,
+    /// `ETag` header from the response, used for `If-None-Match` revalidation.
     pub etag: Option<String>,
+    /// `Last-Modified` header from the response, used for `If-Modified-Since` revalidation.
     pub last_modified: Option<String>,
+    /// Local time the response was fetched, used for TTL expiry checks.
     pub fetched_at: Instant,
 }
 

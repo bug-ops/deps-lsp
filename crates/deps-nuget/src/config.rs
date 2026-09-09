@@ -302,7 +302,9 @@ pub struct InvalidEntry {
 /// every comparison against it goes through `key_candidates`).
 #[derive(Debug, Clone)]
 pub struct PackageSourceEntry {
+    /// The declared `<add key>` name, case preserved.
     pub key: String,
+    /// The resolved feed URL, or why it was rejected.
     pub value: Result<NuGetFeedUrl, InvalidEntry>,
     /// Which tier's file last set [`Self::value`] (issue #561) — diagnostics/gating metadata
     /// only, see [`ConfigTier`]'s doc for the "never a credential gate" invariant.
@@ -321,6 +323,7 @@ pub struct PackageSourceEntry {
 /// disagree with.
 #[derive(Debug, Clone)]
 pub struct ResolvedHop {
+    /// The resolved feed URL for this hop.
     pub url: NuGetFeedUrl,
     /// The lowercased declared `<add key>` that supplied [`Self::auth`], or `None` when this
     /// hop carries no credential. Used (not the credential value) by
@@ -1127,6 +1130,7 @@ fn upsert_source(
 /// the two caches' working-set sizes comparable without inventing a second tuning knob.
 const WARNED_CAPACITY: usize = deps_core::DEFAULT_MAX_CACHED_FILES;
 
+/// Per-`NuGet.Config`-file-path memoization cache (see the module doc above).
 #[derive(Debug)]
 pub struct NuGetConfigCache {
     files: deps_core::MtimeFileCache<RawNuGetConfigFile>,

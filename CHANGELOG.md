@@ -64,6 +64,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-composer, deps-nuget**: extracted the duplicated lenient string-or-string-array JSON deserializer into a shared `deps_core::json_helpers::deserialize_string_or_string_array` helper (resolves #662) (#665)
 - **deps-core, deps-lsp**: documented NuGet's bare-version pin approximation and added a cross-ecosystem consistency test guarding `bare_requirement_policy` (resolves #669) (#674)
 - **workspace**: removed 18 unused dependencies across 11 crates and moved 3 test-only dependencies to `[dev-dependencies]` (touching a 12th crate, `deps-gitlab-ci`); added a `cargo machete` CI gate (resolves #670) (#675)
+- **workspace**: `missing_docs` lint raised from `allow` to `warn` in `[workspace.lints.rust]`; added the ~287 previously-missing `///`/`//!` doc comments across all 14 ecosystem crates plus `deps-core`/`deps-lsp` needed to make the flip clean (resolves #744) (#746)
 
 ### Dependencies
 - Bump `dirs` from 6 to 7.0.0, plus transitive `Cargo.lock` refresh (#659)
