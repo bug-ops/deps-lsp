@@ -227,8 +227,8 @@ impl Ecosystem for SwiftEcosystem {
         &'a self,
         name: &'a str,
         _version: &'a str,
-    ) -> Option<deps_core::ecosystem::BoxFuture<'a, Vec<String>>> {
-        Some(Box::pin(self.registry.get_license(name)))
+    ) -> deps_core::ecosystem::BoxFuture<'a, Vec<String>> {
+        Box::pin(self.registry.get_license(name))
     }
 
     /// GitHub's `license.spdx_id` is `licensee` detector output on the repo's default
