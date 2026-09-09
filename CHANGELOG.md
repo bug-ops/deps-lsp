@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `fuzz/` workspace: cargo-fuzz target for `Ecosystem::fallback_completion_prefix`/`fallback_completion_is_bare`, the raw-text scanners driving the parse-failure completion path, across all 14 ecosystems (resolves #740)
 - `fuzz/` workspace: cargo-fuzz targets for the GitHub Actions/GitLab CI/Dart/pnpm YAML-parsing entry points (manifest and lock file), closing a coverage gap versus the existing XML/JSON fuzz targets (resolves #727) (#735)
 - **README**: editor setup snippets for Emacs (`eglot`, `lsp-mode`), Sublime Text LSP, Kate, and coc.nvim, each noting the add-on requirement alongside a primary language server (partial work on #712) (#717)
 - **deps-github-actions**: `action.yml`/`action.yaml` composite/Docker/JS action manifests (a repository root or `.github/actions/<name>/`) now get the same hover, diagnostics, SHA-pin quick fix, and code lens as workflow files (resolves #706) (#718)
@@ -27,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **deps-pypi**: raw-text fallback completion no longer bare-inserts an unquoted package name into a `pyproject.toml` dependency array when no quote has been typed yet, producing invalid TOML (resolves #737) (#741)
+- **deps-lsp**: raw-text fallback completion now rejects a prefix longer than 200 characters (previously unbounded), reusing the same `is_valid_completion_prefix_len` guard every primary completion path already uses, and bounds the prefix/query values it logs (resolves #739) (#745)
 - **deps-pypi**: raw-text fallback completion no longer bare-inserts a package name right after an already-closed `pyproject.toml` TOML array value, via a shared escape-aware quote-parity check in `deps-core` (now the single implementation backing #732's `strip_open_json_key` too) — also fixes the same escaped-quote gap in Cargo's `extract_feature_prefix` (resolves #734, #733)
 - **deps-core, deps-npm, deps-composer**: npm/Composer raw-text fallback completion no longer inserts a duplicate-quoted key-value pair when the cursor is already inside an open JSON key string (resolves #729) (#732)
 - **deps-core** + all 9 lock-file providers: lock-file parsing now runs on the blocking-thread pool via a shared `read_and_parse_lockfile` helper, no longer stalling the LSP request worker (resolves #723) (#730)

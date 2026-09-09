@@ -798,7 +798,7 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     /// formats, or Swift's/Bundler's whole-file-scoped dependency calls).
     ///
     /// The caller applies its own ecosystem-agnostic guards to the returned prefix
-    /// (minimum length, no `=` character) before searching the registry — this method
+    /// (length 2-200 chars, no `=` character) before searching the registry — this method
     /// only answers "is there a prefix here, and what manifest-syntax wrapper does it
     /// need stripped", not "is this prefix worth searching for".
     ///
