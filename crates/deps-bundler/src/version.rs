@@ -77,7 +77,8 @@ fn cmp_digits(a: &str, b: &str) -> Ordering {
 /// shapes uniformly (#323).
 // `start`/`i` are byte offsets from a single-pass ASCII digit/alpha scan, so every run
 // boundary always sits at a char boundary.
-#[allow(clippy::string_slice)]
+// `bytes[i]` is guarded by the `i < bytes.len()` loop condition.
+#[allow(clippy::string_slice, clippy::indexing_slicing)]
 fn tokenize(version: &str) -> Vec<Token> {
     let normalized = version.replace('-', ".pre.");
     let bytes = normalized.as_bytes();
@@ -111,8 +112,9 @@ fn tokenize(version: &str) -> Vec<Token> {
 /// porting the pattern as a literal `Regex`: it finds the smallest index `i` such that the
 /// byte before `i` is a letter or `.` and every byte from `i` onward is `.`/`0`, matching
 /// Ruby's leftmost-match semantics for an anchored-at-end pattern.
-// `i` is a byte offset from a single-pass ASCII scan, always a char boundary.
-#[allow(clippy::string_slice)]
+// `i` is a byte offset from a single-pass ASCII scan, always a char boundary; `i` ranges
+// `1..bytes.len()` from the loop.
+#[allow(clippy::string_slice, clippy::indexing_slicing)]
 fn strip_trailing_padding(version: &str) -> &str {
     let bytes = version.as_bytes();
     for i in 1..bytes.len() {
@@ -133,8 +135,9 @@ fn strip_trailing_padding(version: &str) -> &str {
 /// second zero-padding run elsewhere in the string is left untouched). E.g.
 /// `"1.pre.0.beta1"` -> `"1.pre.beta1"`, so a padding zero segment right before a prerelease
 /// tag does not become its own token (#331).
-// `i`/`end` are byte offsets from a single-pass ASCII scan, always char boundaries.
-#[allow(clippy::string_slice)]
+// `i`/`end` are byte offsets from a single-pass ASCII scan, always char boundaries; `i`
+// ranges `0..bytes.len()` from the loop.
+#[allow(clippy::string_slice, clippy::indexing_slicing)]
 fn strip_padding_before_tag(version: &str) -> String {
     let bytes = version.as_bytes();
     for i in 0..bytes.len() {
@@ -208,6 +211,8 @@ fn canonical_segments(version: &str) -> Vec<Token> {
 /// // so it sorts below the release too, not above it.
 /// assert_eq!(compare_versions("1.0.0", "1.0.0-1"), Ordering::Greater);
 /// ```
+// `i < limit = lhs.len().min(rhs.len())`, and `limit <= len` on both sides.
+#[allow(clippy::indexing_slicing)]
 pub fn compare_versions(a: &str, b: &str) -> Ordering {
     let lhs = canonical_segments(a);
     let rhs = canonical_segments(b);
@@ -329,6 +334,10 @@ fn join_tokens(tokens: &[Token]) -> String {
 /// arbitrarily long digit run increments correctly instead of overflowing
 /// (#327 C3 — the same silent-drop failure class M8 removed from the
 /// tokenizer, previously reintroduced here via `parse::<u64>()`).
+// `i` is decremented only after the `i == 0` break, so `i < bytes.len()`. Every byte
+// written is an ASCII digit and the input was an ASCII digit run, so the buffer is always
+// valid UTF-8.
+#[allow(clippy::indexing_slicing, clippy::expect_used)]
 fn increment_digits(digits: &str) -> String {
     let mut bytes = digits.as_bytes().to_vec();
     let mut i = bytes.len();
@@ -351,6 +360,8 @@ fn increment_digits(digits: &str) -> String {
 /// Ports `Gem::Version#release`: the numeric prefix before the first
 /// prerelease tag, as a dot-joined string. A version with no prerelease tag
 /// is returned unchanged (re-joined from its own tokens).
+// `end` comes from `position(..).unwrap_or(tokens.len())`, so `end <= tokens.len()`.
+#[allow(clippy::indexing_slicing)]
 fn release_string(version: &str) -> String {
     let tokens = tokenize(version);
     let end = tokens
@@ -368,6 +379,8 @@ fn release_string(version: &str) -> String {
 /// new last segment — e.g. `bump_string("3.7.0")` is `"3.8"` and
 /// `bump_string("3.7")` is `"4"`. Returns `None` only if the requirement has
 /// no numeric segment to increment at all (a malformed requirement).
+// `end` comes from `position(..).unwrap_or(tokens.len())`, so `end <= tokens.len()`.
+#[allow(clippy::indexing_slicing)]
 fn bump_string(requirement: &str) -> Option<String> {
     let tokens = tokenize(requirement);
     let end = tokens
@@ -390,6 +403,9 @@ fn bump_string(requirement: &str) -> Option<String> {
 /// RubyGems install rather than the packaged source alone): a leading digit run, followed by
 /// zero or more dot-separated alphanumeric segments, with an optional hyphenated suffix that
 /// may itself have any number of further dot-separated segments.
+// Compile-time-constant pattern; a malformed literal is a build-visible programmer error,
+// not attacker-influenceable input.
+#[allow(clippy::expect_used)]
 static RUBYGEMS_VERSION_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^[0-9]+(?:\.[0-9a-zA-Z]+)*(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$")
         .expect("Invalid regex")

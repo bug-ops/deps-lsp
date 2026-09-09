@@ -384,8 +384,8 @@ fn satisfies_caret(version: &str, req: &str) -> bool {
         return true;
     }
 
-    if req_parts.len() >= 2 && ver_parts.len() >= 2 {
-        return req_parts[1] == ver_parts[1];
+    if let (Some(r), Some(v)) = (req_parts.get(1), ver_parts.get(1)) {
+        return r == v;
     }
 
     true

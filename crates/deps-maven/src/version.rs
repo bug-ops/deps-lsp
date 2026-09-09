@@ -300,8 +300,9 @@ enum QualToken<'a> {
 /// empty. Mirrors Maven's `ComparableVersion` tokenizer, which splits a
 /// qualifier on every alpha/digit transition, not just the trailing one.
 // `start`/`end` are byte offsets from a single-pass ASCII digit/non-digit scan, so run
-// boundaries are always char boundaries.
-#[allow(clippy::string_slice)]
+// boundaries are always char boundaries. `bytes[start]` is guarded by the `start <
+// bytes.len()` loop condition.
+#[allow(clippy::string_slice, clippy::indexing_slicing)]
 fn tokenize_qualifier(s: &str) -> Vec<QualToken<'_>> {
     let mut tokens = Vec::new();
     let bytes = s.as_bytes();

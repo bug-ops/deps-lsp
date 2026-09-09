@@ -192,17 +192,14 @@ fn find_key_range(key: &str, content: &str, line_table: &LineOffsetTable) -> Ran
     // Search for "key:" pattern in YAML content
     for (i, _) in content.match_indices(key) {
         let after = i + key.len();
-        if after < content.len() {
-            let next_char = content.as_bytes()[after];
-            if next_char == b':' {
-                // Verify this is at the start of a line (after optional whitespace)
-                let line_start = content[..i].rfind('\n').map_or(0, |p| p + 1);
-                let prefix = &content[line_start..i];
-                if prefix.chars().all(|c| c == ' ') {
-                    let start = line_table.byte_offset_to_position(content, i);
-                    let end = line_table.byte_offset_to_position(content, after);
-                    return Range::new(start, end);
-                }
+        if content.as_bytes().get(after) == Some(&b':') {
+            // Verify this is at the start of a line (after optional whitespace)
+            let line_start = content[..i].rfind('\n').map_or(0, |p| p + 1);
+            let prefix = &content[line_start..i];
+            if prefix.chars().all(|c| c == ' ') {
+                let start = line_table.byte_offset_to_position(content, i);
+                let end = line_table.byte_offset_to_position(content, after);
+                return Range::new(start, end);
             }
         }
     }

@@ -168,6 +168,9 @@ impl RequirementResolution for NuGetFormatter {
     /// (parsing fails) — without this guard, a malformed requirement string would make
     /// `satisfies`/`resolve_float` return `false` for every candidate, producing a false
     /// "unsatisfiable" verdict instead of correctly suppressing the check.
+    // `compile_requirement_unless`'s contract only invokes the build closure when the
+    // undecidable predicate returned `false`, i.e. parsing already succeeded.
+    #[allow(clippy::expect_used)]
     fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
         let requirement = requirement.as_str();
         if requirement.contains('*') {

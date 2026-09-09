@@ -135,11 +135,7 @@ pub fn parse_go_sum(content: &str) -> ResolvedPackages {
         // Parse: module_path version h1:hash
         // Valid go.sum lines must have at least 3 parts (module, version, hash)
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 3 {
-            let module_path = parts[0];
-            let version = parts[1];
-            let checksum = parts[2];
-
+        if let [module_path, version, checksum, ..] = parts.as_slice() {
             // Validate that the hash starts with 'h1:' (standard Go checksum format)
             // This filters out malformed lines
             if !checksum.starts_with("h1:") {

@@ -264,9 +264,12 @@ fn parse_goproxy(raw: &str, policy: &RegistryAccessPolicy) -> Result<GoProxyChai
 
     let mut remaining = raw;
     loop {
-        let (entry, trailing_sep, rest) = match remaining.find([',', '|']) {
-            Some(idx) => {
-                let sep = if remaining.as_bytes()[idx] == b'|' {
+        let (entry, trailing_sep, rest) = match remaining
+            .char_indices()
+            .find(|&(_, c)| c == ',' || c == '|')
+        {
+            Some((idx, c)) => {
+                let sep = if c == '|' {
                     ChainSeparator::AnyError
                 } else {
                     ChainSeparator::NotFoundOnly
@@ -495,6 +498,9 @@ impl GlobPattern {
 /// work as literals rather than a class terminator, range separator, or bare backslash). This
 /// also fixes a #568 side effect where `repo\[x` (a literal `[` per Go) was misparsed as an
 /// unterminated class.
+// `chars[i]` is guarded by `i < chars.len()` and `chars[j]` by `j < chars.len()`, both from
+// their enclosing loop conditions.
+#[allow(clippy::indexing_slicing)]
 fn compile_glob(pattern: &str) -> Option<Vec<GlobToken>> {
     let chars: Vec<char> = pattern.chars().collect();
     let mut tokens = Vec::with_capacity(chars.len());
@@ -584,6 +590,9 @@ fn compile_glob(pattern: &str) -> Option<Vec<GlobToken>> {
 /// left to escape is returned as a literal `\` of length 1 — the enclosing loop then reaches
 /// end-of-input without a closing `]`, which the caller's existing unterminated-class check
 /// already handles.
+// Both callers bound `j`: the class loop's `j < chars.len()` condition, and the range arm's
+// `chars.get(after_lo + 1).is_some_and(..)` guard.
+#[allow(clippy::indexing_slicing)]
 fn read_class_char(chars: &[char], j: usize) -> (char, usize) {
     if chars[j] == '\\'
         && let Some(&escaped) = chars.get(j + 1)
@@ -616,13 +625,16 @@ fn tokens_match(tokens: &[GlobToken], text: &[char]) -> bool {
             ti += 1;
             continue;
         }
-        if tokens.get(ti).is_some_and(|tok| tok.matches_char(text[si])) {
+        if tokens
+            .get(ti)
+            .is_some_and(|tok| text.get(si).is_some_and(|&c| tok.matches_char(c)))
+        {
             ti += 1;
             si += 1;
             continue;
         }
         match star {
-            Some((next_ti, star_si)) if text[star_si] != '/' => {
+            Some((next_ti, star_si)) if text.get(star_si).is_some_and(|&c| c != '/') => {
                 let new_si = star_si + 1;
                 star = Some((next_ti, new_si));
                 ti = next_ti;

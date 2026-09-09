@@ -181,11 +181,9 @@ impl MavenEcosystem {
         let lines: Vec<&str> = content.lines().collect();
         let line_idx = position.line as usize;
 
-        if line_idx >= lines.len() {
+        let Some(&line) = lines.get(line_idx) else {
             return ("", "", LspRange::default());
-        }
-
-        let line = lines[line_idx];
+        };
         let col_idx = deps_core::completion::utf16_to_byte_offset(line, position.character)
             .unwrap_or(line.len());
 

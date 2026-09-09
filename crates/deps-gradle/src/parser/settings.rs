@@ -10,6 +10,9 @@ use std::sync::LazyLock;
 use tower_lsp_server::ls_types::{Position, Range, Uri};
 
 /// Matches: id "plugin.id" version "1.0.0" (Groovy) or id("plugin.id") version "1.0.0" (Kotlin DSL)
+// Compile-time-constant pattern; a malformed literal is a build-visible programmer error,
+// not attacker-influenceable input.
+#[allow(clippy::expect_used)]
 static RE_PLUGIN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"id\s*\(?\s*['"]([^'"]+)['"]\s*\)?\s+version\s+['"]([^'"]+)['"]"#)
         .expect("RE_PLUGIN")

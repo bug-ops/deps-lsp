@@ -642,8 +642,10 @@ impl NuGetRegistry {
         policy: &Arc<RegistryAccessPolicy>,
         chain_auth_digest: u64,
     ) -> Self {
-        let mut fallback_chain: Vec<Arc<Self>> = chain.hops[1..]
+        let mut fallback_chain: Vec<Arc<Self>> = chain
+            .hops
             .iter()
+            .skip(1)
             .map(|hop| {
                 Arc::new(Self::with_base(
                     Arc::clone(&root.cache),
@@ -1124,7 +1126,7 @@ fn pick_latest_matching(versions: Vec<NuGetVersion>, req: &str) -> Option<NuGetV
             let idx = deps_core::select_latest_for_existence(&versions, |v| {
                 v as &dyn deps_core::Version
             })?;
-            Some(versions[idx].clone())
+            versions.get(idx).cloned()
         } else {
             None
         }

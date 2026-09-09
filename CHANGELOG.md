@@ -17,9 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `fuzz/` workspace: cargo-fuzz targets for the shared TOML/YAML/JSON depth checkers, JSONC position recovery, and the Bundler/Go/Swift/Gradle/PyPI parsers, plus a bounded (non-blocking) CI job running each nightly-toolchain (resolves #673)
 - **deps-core, deps-cargo, deps-npm, deps-pypi**: clippy restriction lints (`indexing_slicing`/`unwrap_used`/`expect_used`) plus deps-core's re-enabled `cast_*` truncation lints, as a regression gate against panic-DoS bugs in the request-path parsers (resolves #673, deps-lsp follow-up #676)
 - **deps-lsp**: clippy restriction lints (`indexing_slicing`/`unwrap_used`/`expect_used`/`string_slice`) enforced at the crate root (resolves #676; `string_slice` coverage for the rest of the workspace tracked in #680)
+- **deps-bundler, deps-composer, deps-dart, deps-deno, deps-github-actions, deps-gitlab-ci, deps-go, deps-gradle, deps-maven, deps-nuget, deps-swift**: clippy restriction lints (`indexing_slicing`/`unwrap_used`/`expect_used`) enforced at each crate root, completing workspace-wide coverage started in #673 (resolves #683) (#686)
 - **deps-core**: property tests (`proptest`) asserting the parser depth/expansion checkers and JSONC position recovery never panic on arbitrary input (#673)
 
 ### Fixed
+- **deps-gitlab-ci**: `GitlabInstanceHost`'s cached-host `RwLock` reads no longer panic on a poisoned lock, which previously bricked GitLab self-hosted-instance resolution for the rest of the session (found during #683's restriction-lint audit) (#686)
+- **deps-maven**: `find_date_time`'s date/time shape check no longer relies on its caller passing an exactly-16-byte window (found during #683's restriction-lint audit) (#686)
 - **deps-core, deps-maven**: `deps_core::completion::byte_to_utf16_offset` and `deps-maven`'s `text_range` no longer panic on a caller-supplied byte offset that lands mid-character — both now clamp via `floor_char_boundary`. `clippy::string_slice` is now enforced on every library/binary crate root in the workspace (deps-lsp already had it from #676) as a regression gate against this class of panic (resolves #680) (#684)
 - **deps-cargo**: sparse-index bearer token header value now zeroizes on drop instead of leaking a plaintext copy in an ordinary `String` (resolves #672) (#675)
 - **deps-pypi**: a PEP 508 requirement with a malformed package name or extras entry no longer panics the parser — rejected upfront by a grammar pre-check, with `catch_unwind` as a backstop (found via fuzzing, resolves #673)

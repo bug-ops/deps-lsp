@@ -21,45 +21,71 @@ pub struct BundlerParseResult {
 }
 
 // Regex patterns for Gemfile parsing
+// Compile-time-constant patterns; a malformed literal is a build-visible programmer error,
+// not attacker-influenceable input.
+#[allow(clippy::expect_used)]
 static GEM_PATTERN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"^\s*gem\s+['"]([^'"]+)['"]"#).expect("Invalid regex"));
 
+// Same guarantee as GEM_PATTERN above.
+#[allow(clippy::expect_used)]
 static VERSION_PATTERN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"['"]([~>=<!\d][^'"]*)['"]\s*(?:,|$)"#).expect("Invalid regex"));
 
+// Same guarantee as GEM_PATTERN above.
+#[allow(clippy::expect_used)]
 static SOURCE_PATTERN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"^\s*source\s+['"]([^'"]+)['"]\s*$"#).expect("Invalid regex"));
 
+// Same guarantee as GEM_PATTERN above.
+#[allow(clippy::expect_used)]
 static RUBY_VERSION_PATTERN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"^\s*ruby\s+['"]([^'"]+)['"]\s*$"#).expect("Invalid regex"));
 
+// Same guarantee as GEM_PATTERN above.
+#[allow(clippy::expect_used)]
 static GROUP_BLOCK_START: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*group\s+(.+?)\s+do\s*$").expect("Invalid regex"));
 
+// Same guarantee as GEM_PATTERN above.
+#[allow(clippy::expect_used)]
 static GROUP_BLOCK_END: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*end\s*$").expect("Invalid regex"));
 
+// Same guarantee as GEM_PATTERN above.
+#[allow(clippy::expect_used)]
 static GROUP_OPTION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"group:\s*(\[.+?\]|:\w+)").expect("Invalid regex"));
 
+// Same guarantee as GEM_PATTERN above.
+#[allow(clippy::expect_used)]
 static GIT_OPTION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"git:\s*['"]([^'"]+)['"]\s*"#).expect("Invalid regex"));
 
+// Same guarantee as GEM_PATTERN above.
+#[allow(clippy::expect_used)]
 static PATH_OPTION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"path:\s*['"]([^'"]+)['"]\s*"#).expect("Invalid regex"));
 
+// Same guarantee as GEM_PATTERN above.
+#[allow(clippy::expect_used)]
 static GITHUB_OPTION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"github:\s*['"]([^'"]+)['"]\s*"#).expect("Invalid regex"));
 
+// Same guarantee as GEM_PATTERN above.
+#[allow(clippy::expect_used)]
 static REQUIRE_OPTION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"require:\s*(false|['"][^'"]*['"]\s*)"#).expect("Invalid regex"));
 
+// Same guarantee as GEM_PATTERN above.
+#[allow(clippy::expect_used)]
 static PLATFORMS_OPTION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"platforms:\s*(\[.+?\]|:\w+)").expect("Invalid regex"));
 
 /// Parses a Gemfile and extracts all dependencies with positions.
 // The `caps.get(0).unwrap().end()` offset is a regex match end, always a char boundary.
-#[allow(clippy::string_slice)]
+// Group 1 is mandatory in `GEM_PATTERN` and group 0 always exists on a successful match.
+#[allow(clippy::string_slice, clippy::unwrap_used)]
 pub fn parse_gemfile(content: &str, doc_uri: &Uri) -> Result<BundlerParseResult> {
     let line_table = LineOffsetTable::new(content);
     let mut dependencies = Vec::new();
@@ -155,6 +181,8 @@ pub fn parse_gemfile(content: &str, doc_uri: &Uri) -> Result<BundlerParseResult>
     })
 }
 
+// Group 1 is mandatory in `VERSION_PATTERN`.
+#[allow(clippy::unwrap_used)]
 fn extract_version(
     line: &str,
     content: &str,
