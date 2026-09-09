@@ -122,9 +122,14 @@ fn classify_catalog_node(node: &Yaml) -> Result<Option<HashMap<String, CatalogVa
 }
 
 /// Classifies one catalog entry's leaf value.
+///
+/// Goes through [`deps_core::yaml_scalar_string`] rather than `Yaml::as_str` directly
+/// (issue #721): an unquoted, numeric-looking range (`react: 1.2`, parsed as
+/// `Yaml::Real`) is a valid pnpm catalog entry, and `as_str` alone would misclassify it
+/// as [`CatalogValue::Malformed`].
 fn classify_entry(value: &Yaml) -> CatalogValue {
-    match value.as_str() {
-        Some(range) => CatalogValue::Range(range.to_string()),
+    match deps_core::yaml_scalar_string(value) {
+        Some(range) => CatalogValue::Range(range),
         None => CatalogValue::Malformed,
     }
 }
@@ -890,6 +895,27 @@ mod tests {
             .unwrap();
         assert!(message.contains("react"));
         assert!(message.contains("not a version string"));
+    }
+
+    /// #721: an unquoted, numeric-looking catalog range (`react: 1.2`, parsed by
+    /// `yaml-rust2` as `Yaml::Real`, not `Yaml::String`) is valid YAML and a valid
+    /// pnpm catalog entry — it must resolve as a range, not be misclassified as
+    /// `MalformedEntry` the way a plain `Yaml::as_str()` read would.
+    #[test]
+    fn test_apply_unquoted_numeric_catalog_range_resolves() {
+        let root = tempfile::tempdir().unwrap();
+        workspace(root.path(), "catalog:\n  react: 1.2\n");
+        let cache = PnpmWorkspaceCache::new();
+        let config = load(Some(root.path()), &cache);
+
+        let mut deps = vec![dep("react", "catalog:")];
+        apply(&mut deps, config.as_deref());
+
+        assert_eq!(deps[0].version_req, Some("1.2".into()));
+        assert_matches!(
+            deps[0].catalog.as_ref().unwrap().outcome,
+            CatalogOutcome::Resolved(ref r) if r == "1.2"
+        );
     }
 
     #[test]

@@ -30,6 +30,7 @@ use deps_core::lockfile::{
     LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource,
     locate_lockfile_for_manifest, read_and_parse_lockfile,
 };
+use deps_core::yaml_scalar_string;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -377,21 +378,6 @@ fn resolve_pnpm_entry_name_and_version<'a>(
 /// `"1.2.3(react@18.2.0)"` -> `"1.2.3"` (spec 052 FR-004).
 fn strip_peer_suffix(version: &str) -> &str {
     version.split_once('(').map_or(version, |(base, _)| base)
-}
-
-/// Renders a scalar YAML node as a string regardless of whether pnpm wrote it quoted
-/// (`Yaml::String`) or bare (`Yaml::Real`/`Yaml::Integer`) — `yaml-rust2`'s `as_str` only
-/// matches `Yaml::String`, so an unquoted numeric-looking scalar (a bare `6.0` `lockfileVersion`,
-/// or a two-component `version: 1.0`) would otherwise be silently treated as absent. Shared by
-/// the `lockfileVersion` gate and the per-entry `version` field read, both of which face the
-/// same yaml-rust2 String/Real/Integer gotcha.
-fn yaml_scalar_string(node: &Yaml) -> Option<String> {
-    match node {
-        Yaml::String(s) => Some(s.clone()),
-        Yaml::Real(s) => Some(s.clone()),
-        Yaml::Integer(i) => Some(i.to_string()),
-        _ => None,
-    }
 }
 
 /// Extracts package name from lockfile key.

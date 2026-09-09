@@ -89,7 +89,7 @@ pub use parser::{
     DependencySource, LoadingState, MAX_JSON_NESTING_DEPTH, MAX_TOML_NESTING_DEPTH,
     MAX_YAML_EXPANDED_BYTES, MAX_YAML_NESTING_DEPTH, check_json_nesting_depth,
     check_toml_nesting_depth, check_yaml_expansion, check_yaml_nesting_depth,
-    json_depth_error_message, parse_json_checked,
+    json_depth_error_message, parse_json_checked, yaml_scalar_string,
 };
 pub use registry::{
     Deprecation, Metadata, Registry, RemovalStatus, Version, find_latest_stable,
