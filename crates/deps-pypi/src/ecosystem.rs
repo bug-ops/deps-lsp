@@ -400,12 +400,34 @@ impl Ecosystem for PypiEcosystem {
         Some(extract_prefix(line, position.character))
     }
 
+    fn fallback_completion_is_bare(&self, content: &str, position: Position) -> bool {
+        // A genuinely still-open quoted string — an odd, escape-aware real-quote count
+        // via `open_quoted_tail` (the same primitive `extract_prefix` uses below, so
+        // the two methods always agree on the same `content`/`position`) — means the
+        // opening quote already exists in the manifest: the bare package name is the
+        // correct insert there, same as today. Zero real quotes (nothing typed yet, or
+        // only an escaped `\"`) means nothing has opened a quote to insert into: e.g.
+        // `req` alone on its own line under `dependencies = [...]`.
+        // `completion_insert_text` must then supply both quotes itself, or the
+        // fallback insert produces an unquoted, invalid TOML array element (#737). An
+        // already-closed value (an even, non-zero count, e.g. `"pytest"`) also reports
+        // `false` here, but that state is unreachable in practice: `extract_prefix`
+        // already collapses it to an empty prefix, which the caller rejects before
+        // this method is ever invoked.
+        let Some(line) = deps_core::fallback_completion::line_at(content, position) else {
+            return false;
+        };
+        let raw = deps_core::fallback_completion::raw_prefix(line, position.character);
+        deps_core::fallback_completion::open_quoted_tail(raw).is_some()
+    }
+
     fn completion_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
-        // Both real PEP 621 shapes (`dependencies = [...]` and an
-        // `[project.optional-dependencies]` group) are TOML string-array elements, not
-        // a key=value table entry like Cargo's — the surrounding quotes already exist
-        // in the manifest (or the user is still typing them).
-        Some(metadata.name().to_string())
+        // Only reached when `fallback_completion_is_bare` reports no quote typed at
+        // all — see that method. Both real PEP 621 shapes (`dependencies = [...]` and
+        // an `[project.optional-dependencies]` group) are TOML string-array elements,
+        // not a key=value table entry like Cargo's, so the full insert here is the
+        // quoted array element itself rather than a `key = value` pair.
+        Some(format!("\"{}\"", metadata.name()))
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -533,6 +555,12 @@ fn is_dependencies_array_start(trimmed: &str) -> bool {
 /// function's pre-#734 no-op behavior on unquoted text, not the empty string
 /// `open_quoted_tail` returns for that count. Only a non-zero, even count (a genuinely
 /// closed value) suppresses the prefix.
+///
+/// Only tracks `"` (TOML basic strings), not `'` (TOML literal strings, e.g.
+/// `'requests'`) — deliberately out of scope: `crate::name::normalize`'s query never
+/// strips a `'`, so a prefix containing one never matches a real (apostrophe-free)
+/// PyPI project name, and the registry search that would drive a bare/wrapped insert
+/// never returns a result to insert in the first place.
 fn extract_prefix(line: &str, character: u32) -> &str {
     let prefix = deps_core::fallback_completion::raw_prefix(line, character);
     let (count, last_quote) = deps_core::fallback_completion::count_real_quotes(prefix);
@@ -2112,7 +2140,7 @@ dependencies = []
     }
 
     #[test]
-    fn test_completion_insert_text_bare_string() {
+    fn test_completion_insert_text_quotes_the_name() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = PypiEcosystem::new(cache);
         let meta = MockMetadata {
@@ -2121,14 +2149,14 @@ dependencies = []
         };
         assert_eq!(
             ecosystem.completion_insert_text(&meta),
-            Some("requests".to_string())
+            Some("\"requests\"".to_string())
         );
     }
 
     /// A dotted PyPI name (`zope.interface`) has no TOML-key-injection meaning once
-    /// the insert is a bare array-element string, unlike Cargo's key=value shape.
+    /// the insert is a quoted array-element string, unlike Cargo's key=value shape.
     #[test]
-    fn test_completion_insert_text_dotted_name_stays_bare_string() {
+    fn test_completion_insert_text_dotted_name_stays_quoted_string() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = PypiEcosystem::new(cache);
         let meta = MockMetadata {
@@ -2137,7 +2165,119 @@ dependencies = []
         };
         assert_eq!(
             ecosystem.completion_insert_text(&meta),
-            Some("zope.interface".to_string())
+            Some("\"zope.interface\"".to_string())
+        );
+    }
+
+    /// #737: zero quotes typed at all (`req` alone on its own line under
+    /// `dependencies = [...]`) must not be reported as bare — otherwise the fallback
+    /// path bare-inserts the unquoted name straight into the TOML array.
+    #[test]
+    fn test_fallback_completion_is_bare_false_with_no_quote_typed() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = PypiEcosystem::new(cache);
+        let content = "[project]\ndependencies = [\n    \"pytest\",\n    req\n]\n";
+        let line = content.lines().nth(3).unwrap();
+        let position = Position::new(3, line.chars().count() as u32);
+        assert!(!eco.fallback_completion_is_bare(content, position));
+    }
+
+    /// An already-open quote (`"req`, mid-typing) must still route to the bare insert
+    /// — this is the pre-#737 behavior and must not regress.
+    #[test]
+    fn test_fallback_completion_is_bare_true_with_open_quote() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = PypiEcosystem::new(cache);
+        let content = "[project]\ndependencies = [\n    \"req";
+        let line = content.lines().nth(2).unwrap();
+        let position = Position::new(2, line.chars().count() as u32);
+        assert!(eco.fallback_completion_is_bare(content, position));
+    }
+
+    /// Same two states as the primary PEP 621 `dependencies = [...]` array, exercised
+    /// against `[project.optional-dependencies]` instead — coverage gap flagged in
+    /// #737 validation: only the primary array branch was previously tested.
+    #[test]
+    fn test_fallback_completion_is_bare_false_with_no_quote_typed_optional_dependencies() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = PypiEcosystem::new(cache);
+        let content = "[project.optional-dependencies]\ndev = [\n    \"pytest\",\n    req\n]\n";
+        let line = content.lines().nth(3).unwrap();
+        let position = Position::new(3, line.chars().count() as u32);
+        assert!(!eco.fallback_completion_is_bare(content, position));
+    }
+
+    #[test]
+    fn test_fallback_completion_is_bare_true_with_open_quote_optional_dependencies() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = PypiEcosystem::new(cache);
+        let content = "[project.optional-dependencies]\ndev = [\n    \"req";
+        let line = content.lines().nth(2).unwrap();
+        let position = Position::new(2, line.chars().count() as u32);
+        assert!(eco.fallback_completion_is_bare(content, position));
+    }
+
+    /// #737 critic S1: a `\"` preceded by an odd backslash run is an *escaped* quote,
+    /// not a real one — `count_real_quotes`/`open_quoted_tail` correctly report zero
+    /// real quotes here, so this must still route through `completion_insert_text`
+    /// (quoted insert), not the bare path. A naive `.contains('"')` check would
+    /// wrongly report `true` since the literal `"` character is present in the text.
+    #[test]
+    fn test_fallback_completion_is_bare_false_with_only_escaped_quote() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = PypiEcosystem::new(cache);
+        let content = "[project]\ndependencies = [\n    \\\"req";
+        let line = content.lines().nth(2).unwrap();
+        let position = Position::new(2, line.chars().count() as u32);
+        assert!(!eco.fallback_completion_is_bare(content, position));
+    }
+
+    /// #737 validation gap: multiple entries on one line, cursor after a bare trailing
+    /// candidate following an already-CLOSED quoted entry
+    /// (`dependencies = ["pytest", req]`). A naive `.contains('"')` check on the raw
+    /// line prefix would wrongly report `true` — the prior entry's quotes still appear
+    /// in the prefix — routing to bare-insert and reproducing #737's exact corruption
+    /// in a different manifest shape. `open_quoted_tail`'s escape-aware parity check
+    /// correctly reports `false` (an even, non-zero quote count means no string is
+    /// currently open).
+    #[test]
+    fn test_fallback_completion_is_bare_false_with_multiple_deps_same_line() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = PypiEcosystem::new(cache);
+        let content = "[project]\ndependencies = [\"pytest\", req]\n";
+        let cursor = "dependencies = [\"pytest\", req";
+        let position = Position::new(1, cursor.chars().count() as u32);
+        assert!(!eco.fallback_completion_is_bare(content, position));
+    }
+
+    /// Same shape, with an escaped quote inside the prior closed entry — must not
+    /// misclassify the escape as a still-open string either.
+    #[test]
+    fn test_fallback_completion_is_bare_false_with_escaped_quote_in_prior_closed_entry_same_line() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = PypiEcosystem::new(cache);
+        let content = "[project]\ndependencies = [\"a\\\"b\", req]\n";
+        let cursor = "dependencies = [\"a\\\"b\", req";
+        let position = Position::new(1, cursor.chars().count() as u32);
+        assert!(!eco.fallback_completion_is_bare(content, position));
+    }
+
+    /// #737 critic S2: pins the trait default `fallback_bare_insert_text` (bare
+    /// `metadata.name()`) as the correct behavior for PyPI's open-quote case — PyPI has
+    /// no override, unlike Maven's `group:artifact` split, so this must not regress
+    /// silently if a future change adds one. Mirrors npm/Composer's own
+    /// `test_fallback_bare_insert_text_default_is_bare_name` (#729/#732).
+    #[test]
+    fn test_fallback_bare_insert_text_default_is_bare_name() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = PypiEcosystem::new(cache);
+        let meta = MockMetadata {
+            name: pkg("requests"),
+            latest_version: "2.31.0".into(),
+        };
+        assert_eq!(
+            eco.fallback_bare_insert_text(&meta),
+            Some("requests".to_string())
         );
     }
 }

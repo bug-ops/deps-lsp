@@ -848,8 +848,9 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
 
     /// Whether the prefix [`Self::fallback_completion_prefix`] just returned for this
     /// `content`/`position` sits inside manifest markup that can only safely hold the
-    /// bare candidate text — an already-open XML tag or attribute value — rather than
-    /// [`Self::completion_insert_text`]'s normal full snippet.
+    /// bare candidate text — an already-open XML tag/attribute value, JSON object key,
+    /// or TOML quoted string — rather than [`Self::completion_insert_text`]'s normal
+    /// full snippet.
     ///
     /// Inserting the full snippet where markup is already open would nest a duplicate
     /// copy of it (issue #724, the original NuGet report: `Include="Newt` accepting a
@@ -860,11 +861,12 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     /// when it returns `true`.
     ///
     /// Default `false`: correct for every ecosystem whose manifest syntax has no
-    /// concept of "already open" markup around a fallback-completion cursor (i.e. every
-    /// ecosystem but Maven and NuGet today). Not required, like
-    /// [`Self::fallback_completion_prefix`]: a missing override only means a future
-    /// XML-shaped ecosystem always gets the full-snippet insert, a feature gap rather
-    /// than #118's "silently wrong syntax" failure mode.
+    /// concept of "already open" markup around a fallback-completion cursor. Overridden
+    /// today by Maven/NuGet (XML tag/attribute), npm/Composer (JSON object key), and
+    /// PyPI (TOML quoted string). Not required, like [`Self::fallback_completion_prefix`]:
+    /// a missing override only means a future markup-shaped ecosystem always gets the
+    /// full-snippet insert, a feature gap rather than #118's "silently wrong syntax"
+    /// failure mode.
     fn fallback_completion_is_bare(&self, _content: &str, _position: Position) -> bool {
         false
     }
