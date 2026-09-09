@@ -320,23 +320,36 @@ pub fn strip_open_xml_attribute_value<'a>(
     ""
 }
 
-/// Counts the `"` characters in `prefix` that actually open or close a JSON string —
-/// skipping any `\"` escape sequence — and returns that count along with the byte
-/// index of the last such real quote, if any.
+/// Counts the `"` characters in `segment` that actually open or close a string —
+/// skipping any `\"` escape sequence — along with the byte index of the last such
+/// real quote, if any.
 ///
 /// A `"` is escaped, and does not toggle string state, when it is preceded by an *odd*
 /// number of consecutive `\` characters immediately before it (an even count, zero
 /// included, means those backslashes are themselves pairwise-escaped, so the quote is
 /// real) — e.g. in `"a\"b"` the middle `"` is escaped (one preceding `\`), so the
 /// string is `a"b`, not two separate strings. A naive per-`"` count desyncs from real
-/// JSON open/close state on any key or value containing `\"` (#729 code-review: raw
+/// open/close string state on any segment containing `\"` (#729 code-review, #733: raw
 /// counting both over-counts, flipping a closed key+value pair to look "open", and
 /// under-counts the inverse, flipping a still-open key to look "closed").
-fn count_real_json_quotes(prefix: &str) -> (usize, Option<usize>) {
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::fallback_completion::count_real_quotes;
+///
+/// // Two plain quotes, both real: last one is at byte index 7.
+/// assert_eq!(count_real_quotes("\"pytest\""), (2, Some(7)));
+/// // The middle quote is escaped (one preceding `\`), so it isn't counted: only the
+/// // opening quote (index 0) is real.
+/// assert_eq!(count_real_quotes("\"a\\\"b"), (1, Some(0)));
+/// ```
+#[must_use]
+pub fn count_real_quotes(segment: &str) -> (usize, Option<usize>) {
     let mut backslash_run = 0usize;
     let mut count = 0usize;
     let mut last_real_quote = None;
-    for (idx, ch) in prefix.char_indices() {
+    for (idx, ch) in segment.char_indices() {
         match ch {
             '\\' => backslash_run += 1,
             '"' => {
@@ -359,7 +372,7 @@ fn count_real_json_quotes(prefix: &str) -> (usize, Option<usize>) {
 /// `composer.json`'s `require`/`require-dev` entries — distinguishing that from a
 /// closed key, an open value string, or plain unquoted text.
 ///
-/// Uses quote parity — an odd count of real (see `count_real_json_quotes`) `"`
+/// Uses quote parity — an odd count of real (see [`count_real_quotes`]) `"`
 /// characters means the cursor sits inside an open string literal — adapted for a JSON
 /// object key instead of an XML tag/attribute: the text immediately before the open
 /// string's opening quote decides key-vs-value: a `:` right before it
@@ -388,14 +401,14 @@ fn count_real_json_quotes(prefix: &str) -> (usize, Option<usize>) {
 /// there.
 #[must_use]
 pub fn strip_open_json_key(prefix: &str) -> (&str, bool) {
-    let (quote_count, last_quote) = count_real_json_quotes(prefix);
+    let (quote_count, last_quote) = count_real_quotes(prefix);
     if quote_count == 0 {
         return (prefix, false);
     }
     if quote_count.is_multiple_of(2) {
         return ("", false);
     }
-    // `quote_count` odd (so >= 1) guarantees `count_real_json_quotes` found one; `"`
+    // `quote_count` odd (so >= 1) guarantees `count_real_quotes` found one; `"`
     // is a single-byte ASCII char, so `last_quote + 1` is always a char boundary.
     #[allow(clippy::string_slice)]
     let Some(last_quote) = last_quote else {
@@ -408,6 +421,45 @@ pub fn strip_open_json_key(prefix: &str) -> (&str, bool) {
     } else {
         (after_quote, true)
     }
+}
+
+/// Returns the tail of a genuinely still-open quoted string ending at the cursor, or
+/// `None` when there isn't one.
+///
+/// The tail is the text after the last real, escape-aware (see [`count_real_quotes`])
+/// opening `"` in `segment`, returned only when the cursor sits inside a genuinely
+/// still-open quoted string — an odd count of real `"` characters. Returns `None` when
+/// the string is already closed (an even, non-zero count) or no quote has been typed
+/// at all (zero count): in both cases there is no open string to extract a value from.
+///
+/// Shared by ecosystems whose raw-text fallback-completion prefix survives inside a
+/// quoted value (a JSON object key/value, a TOML string-array element) — used instead
+/// of an unconditional `trim_matches('"')`, which cannot distinguish a genuinely open
+/// string from an already-closed one and so cannot tell a caller when a bare insert at
+/// the cursor would corrupt the manifest rather than complete an open value (#734).
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::fallback_completion::open_quoted_tail;
+///
+/// // Still-open string: only the opening quote exists.
+/// assert_eq!(open_quoted_tail("\"flas"), Some("flas"));
+/// // Already-closed string: both quotes exist, nothing left to complete.
+/// assert_eq!(open_quoted_tail("\"pytest\""), None);
+/// // No quote typed yet.
+/// assert_eq!(open_quoted_tail("dependencies = ["), None);
+/// ```
+#[must_use]
+pub fn open_quoted_tail(segment: &str) -> Option<&str> {
+    let (count, last_quote) = count_real_quotes(segment);
+    if count.is_multiple_of(2) {
+        return None;
+    }
+    // `last_quote` is the byte index of a `"` char (from `char_indices`), and `"` is a
+    // single-byte ASCII char, so `last_quote + 1` is always a char boundary.
+    #[allow(clippy::string_slice)]
+    last_quote.map(|pos| &segment[pos + 1..])
 }
 
 #[cfg(test)]
@@ -904,5 +956,41 @@ tokio
         // as still open.
         let prefix = "\"a\\\"b";
         assert_eq!(strip_open_json_key(prefix), ("a\\\"b", true));
+    }
+
+    #[test]
+    fn test_open_quoted_tail_open_string_returns_tail() {
+        assert_eq!(open_quoted_tail("\"flas"), Some("flas"));
+    }
+
+    #[test]
+    fn test_open_quoted_tail_closed_string_is_none() {
+        assert_eq!(open_quoted_tail("\"pytest\""), None);
+    }
+
+    #[test]
+    fn test_open_quoted_tail_no_quote_is_none() {
+        assert_eq!(open_quoted_tail("dependencies = ["), None);
+    }
+
+    /// The escaped `\"` inside the value must not be counted as a real delimiter,
+    /// otherwise this would misclassify as closed (even count) instead of open.
+    #[test]
+    fn test_open_quoted_tail_skips_escaped_quote() {
+        assert_eq!(open_quoted_tail("\"a\\\"b"), Some("a\\\"b"));
+    }
+
+    /// A run of two backslashes before the quote is itself an escaped backslash, so
+    /// the quote after it is real and closes the string.
+    #[test]
+    fn test_open_quoted_tail_even_backslash_run_quote_is_real() {
+        assert_eq!(open_quoted_tail("\"a\\\\\""), None);
+    }
+
+    #[test]
+    fn test_count_real_quotes_skips_escaped_quote() {
+        let (count, last) = count_real_quotes("\"a\\\"b\"");
+        assert_eq!(count, 2);
+        assert_eq!(last, Some(5));
     }
 }
