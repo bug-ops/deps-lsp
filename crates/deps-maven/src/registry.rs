@@ -701,6 +701,16 @@ fn parse_metadata_xml(data: &[u8]) -> Result<(Vec<MavenVersion>, Option<String>)
     Ok((versions, release))
 }
 
+/// Fuzz-only entry point for [`parse_metadata_xml`], the `maven-metadata.xml` registry
+/// response parser (issue #691). Gated on the `fuzzing` Cargo feature (never enabled by
+/// this crate's own default set) so this stays out of the crate's public API surface in a
+/// normal build.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_parse_metadata_xml(data: &[u8]) {
+    let _ = parse_metadata_xml(data);
+}
+
 /// Parses a Maven Central directory listing (`repo1.maven.org/maven2/{g}/{a}/`) into a
 /// version → publish-time map.
 ///

@@ -16,6 +16,14 @@ pub mod types;
 
 pub use ecosystem::GradleEcosystem;
 pub use formatter::GradleFormatter;
+// `license` itself stays unconditionally private (impl-critic M1): only this one
+// fuzz-only wrapper is re-exported, and only under the non-default `fuzzing` feature
+// (issue #691, see this crate's Cargo.toml) — `fuzz/`'s `registry_xml_parser` target
+// reaches it as `deps_gradle::fuzz_parse_pom_licenses`; the crate's default public API is
+// unaffected.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub use license::fuzz_parse_pom_licenses;
 pub use parser::{GradleParseResult, parse_gradle};
 pub use types::{GradleDependency, GradleVersion};
 
