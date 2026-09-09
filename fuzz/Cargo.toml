@@ -58,6 +58,15 @@ path = "../crates/deps-dart"
 path = "../crates/deps-npm"
 features = ["fuzzing"]
 
+[dependencies.deps-cargo]
+path = "../crates/deps-cargo"
+
+[dependencies.deps-composer]
+path = "../crates/deps-composer"
+
+[dependencies.deps-deno]
+path = "../crates/deps-deno"
+
 [profile.release]
 debug = 1
 
@@ -176,6 +185,13 @@ bench = false
 [[bin]]
 name = "pnpm_catalog"
 path = "fuzz_targets/pnpm_catalog.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fallback_completion"
+path = "fuzz_targets/fallback_completion.rs"
 test = false
 doc = false
 bench = false

@@ -365,6 +365,7 @@ jobs:
           - dart_lockfile
           - pnpm_lockfile
           - pnpm_catalog
+          - fallback_completion
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
 

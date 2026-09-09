@@ -1431,6 +1431,19 @@ mod tests {
         assert!(is_valid_completion_prefix_len("日本"));
     }
 
+    /// M2 (critic, #739 follow-up): pins the upper-bound boundary from both sides, so a
+    /// regression from the inclusive `(2..=200)` to an exclusive `(2..200)` range would be
+    /// caught here (the 200-char case would start failing).
+    #[test]
+    fn test_is_valid_completion_prefix_len_200_chars_accepted() {
+        assert!(is_valid_completion_prefix_len(&"a".repeat(200)));
+    }
+
+    #[test]
+    fn test_is_valid_completion_prefix_len_201_chars_rejected() {
+        assert!(!is_valid_completion_prefix_len(&"a".repeat(201)));
+    }
+
     #[tokio::test]
     async fn test_complete_package_names_generic_one_char_cjk_prefix_empty() {
         // "日" is 1 char but 3 bytes — a byte-length guard would wrongly accept it.

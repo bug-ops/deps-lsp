@@ -5,7 +5,7 @@
 use crate::config::DepsConfig;
 use crate::document::{ServerState, ensure_document_loaded};
 use deps_core::EcosystemId;
-use deps_core::completion::COMPLETION_SEARCH_TIMEOUT;
+use deps_core::completion::{COMPLETION_SEARCH_TIMEOUT, is_valid_completion_prefix_len};
 use deps_core::{is_safe_package_name, is_safe_version_string, lsp_helpers::warn_rejected_value};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -228,8 +228,8 @@ pub async fn handle_completion(
 /// ecosystem's [`deps_core::Ecosystem::fallback_completion_prefix`] (issue #722) — the
 /// per-ecosystem section-boundary and manifest-syntax-stripping heuristics that used to
 /// live here now live with each ecosystem crate. This function only owns the two
-/// ecosystem-agnostic pieces: resolving the ecosystem, and the minimum-length/no-`=`
-/// guard on whatever prefix comes back.
+/// ecosystem-agnostic pieces: resolving the ecosystem, and the length (2-200 chars,
+/// [`is_valid_completion_prefix_len`])/no-`=` guard on whatever prefix comes back.
 ///
 /// The ecosystem lookup now happens *before* the section/prefix check (previously
 /// after) — same return value either way (empty vec), only log ordering changes.
@@ -261,11 +261,13 @@ async fn fallback_completion(
         return vec![];
     };
 
-    // If it looks like a package name (letters, no = sign, at least 2 chars).
-    // Count Unicode scalar values, not bytes: a single multi-byte character
-    // (e.g. one CJK character) must not satisfy the "at least 2 chars" intent.
-    if prefix.is_empty() || prefix.contains('=') || prefix.chars().count() < 2 {
-        tracing::info!("fallback_completion: prefix rejected (empty, contains =, or < 2 chars)");
+    // Shares the same 2-200 char guard every primary (parsed-AST) completion path
+    // uses (`is_valid_completion_prefix_len`), rather than hand-rolling only the
+    // lower half of it: an unbounded prefix here would flow straight into the
+    // tracing logs below and into `registry.search`'s outbound request/cache key
+    // (#739).
+    if prefix.contains('=') || !is_valid_completion_prefix_len(prefix) {
+        tracing::info!("fallback_completion: prefix rejected (contains =, or invalid length)");
         return vec![];
     }
 
@@ -280,7 +282,7 @@ async fn fallback_completion(
 
     tracing::info!(
         "fallback_completion: prefix = {:?}, bare = {}",
-        prefix,
+        deps_core::lsp_helpers::truncate_for_diagnostic(prefix, 64),
         bare
     );
 
@@ -301,7 +303,7 @@ async fn search_packages(
 ) -> Vec<CompletionItem> {
     tracing::info!(
         "search_packages: query={:?}, ecosystem={}",
-        query,
+        deps_core::lsp_helpers::truncate_for_diagnostic(query, 64),
         ecosystem.id()
     );
 
@@ -1144,6 +1146,130 @@ ser"
         let items =
             fallback_completion(&state, EcosystemId::Cargo, Position::new(1, 1), "unused").await;
         assert!(items.is_empty());
+    }
+
+    /// #739 regression: the fallback path used to hand-roll only the lower half of
+    /// [`is_valid_completion_prefix_len`]'s guard (`< 2 chars`), dropping its 200-char
+    /// upper bound entirely — an unbounded prefix (e.g. from one huge malformed
+    /// manifest line) would then flow into logging and into `registry.search`'s
+    /// outbound request/cache key. `search` panics here so the test fails loudly if
+    /// the upper bound regresses.
+    #[tokio::test]
+    async fn test_fallback_completion_rejects_prefix_over_200_chars() {
+        use deps_core::{Metadata, Registry, Version};
+        use std::any::Any;
+
+        struct PanicsIfSearchedRegistry;
+        impl Registry for PanicsIfSearchedRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(None) })
+            }
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                panic!("guard must short-circuit before reaching registry search");
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let long_prefix: &'static str = Box::leak("a".repeat(201).into_boxed_str());
+        let state = mock_cargo_state(Arc::new(PanicsIfSearchedRegistry), Some(long_prefix));
+        let items =
+            fallback_completion(&state, EcosystemId::Cargo, Position::new(0, 0), "unused").await;
+        assert!(items.is_empty());
+    }
+
+    /// M2 (critic, #739 follow-up): the 201-char rejection test above alone would still
+    /// pass if the guard regressed from the inclusive `(2..=200)` to an exclusive
+    /// `(2..200)` range — this pins the boundary from the other side, asserting a prefix
+    /// of exactly 200 chars is still accepted and reaches the registry.
+    #[tokio::test]
+    async fn test_fallback_completion_accepts_prefix_at_200_char_boundary() {
+        use deps_core::{Metadata, Registry, Version};
+        use std::any::Any;
+
+        struct MockMetadata {
+            name: deps_core::PackageName,
+            latest_version: deps_core::ConcreteVersion,
+        }
+        impl deps_core::Metadata for MockMetadata {
+            fn name(&self) -> &deps_core::PackageName {
+                &self.name
+            }
+            fn description(&self) -> Option<&str> {
+                None
+            }
+            fn repository(&self) -> Option<&str> {
+                None
+            }
+            fn documentation(&self) -> Option<&str> {
+                None
+            }
+            fn latest_version(&self) -> &deps_core::ConcreteVersion {
+                &self.latest_version
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        struct StubRegistry;
+        impl Registry for StubRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(None) })
+            }
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                Box::pin(async move {
+                    Ok(vec![Box::new(MockMetadata {
+                        name: deps_core::PackageName::new("serde"),
+                        latest_version: "1.0.0".into(),
+                    }) as Box<dyn Metadata>])
+                })
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let boundary_prefix: &'static str = Box::leak("a".repeat(200).into_boxed_str());
+        let state = mock_cargo_state(Arc::new(StubRegistry), Some(boundary_prefix));
+        let items =
+            fallback_completion(&state, EcosystemId::Cargo, Position::new(0, 0), "unused").await;
+        assert_eq!(items.len(), 1);
     }
 
     #[tokio::test]
