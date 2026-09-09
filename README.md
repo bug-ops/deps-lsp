@@ -42,7 +42,7 @@ A universal Language Server Protocol (LSP) server for dependency management acro
 | Swift | SPM | `Package.swift` | Supported |
 | PHP | Composer | `composer.json` | Supported |
 | C# | NuGet | `.csproj`, `.fsproj`, `.vbproj`, `Directory.Packages.props`, `packages.config` | Supported |
-| YAML | GitHub Actions | `.github/workflows/*.yml`, `*.yaml` | Supported |
+| YAML | GitHub Actions | `.github/workflows/*.yml`, `*.yaml`; `action.yml`, `action.yaml` | Supported |
 | YAML | GitLab CI/CD | `.gitlab-ci.yml`, `.gitlab/ci/*.yml`, `*.yaml` | Supported |
 
 > [!NOTE]
@@ -57,7 +57,7 @@ A universal Language Server Protocol (LSP) server for dependency management acro
 > - **Composer** — `require`/`require-dev` sections, Packagist v2 API with metadata de-minification, Composer-specific tilde semantics (`~1.2` = `>=1.2.0 <2.0.0`)
 > - **NuGet** — `PackageReference` (attribute and child-element form), Central Package Management (`Directory.Packages.props`), legacy `packages.config`, `packages.lock.json`; NuGet V3 registry (service index, flat container, search); private/custom feed resolution via `NuGet.Config`
 > - **Deno** — `imports` map only (`scopes`/`importMap` not yet supported); `jsr:` specifiers via the keyless JSR API, `npm:` specifiers reuse the existing npm registry client; no `deno.lock` support yet
-> - **GitHub Actions** — `uses:` steps and reusable-workflow calls across every job; tag, commit-SHA (optionally `# vX.Y.Z`-annotated), and branch pins via the GitHub tags API; release-age hint and cooldown diagnostic require `GITHUB_TOKEN` (partial coverage, like Swift); no lock file, no package-name search completion
+> - **GitHub Actions** — `uses:` steps and reusable-workflow calls across every job, plus composite/Docker/JS action manifests (`action.yml`/`action.yaml`, a repository root or `.github/actions/<name>/`); tag, commit-SHA (optionally `# vX.Y.Z`-annotated), and branch pins via the GitHub tags API; release-age hint and cooldown diagnostic require `GITHUB_TOKEN` (partial coverage, like Swift); no lock file, no package-name search completion
 > - **GitLab CI/CD** — `include: - project:` + `ref:` pins (GitLab repository-tags API) and `include: - component:` CI/CD Catalog pins (GitLab project-releases API, with SHA/exact-release/`~latest`/partial-semver resolution); self-hosted instances via `registries.gitlab_instance_host`; optional `GITLAB_TOKEN` sent only to that one configured host (or `gitlab.com` by default); no lock file, no package-name search completion
 
 ## Installation
@@ -120,7 +120,7 @@ cargo install deps-lsp --no-default-features --features "pypi"
 | `swift` | Swift | Package.swift | Yes |
 | `composer` | PHP | composer.json | Yes |
 | `nuget` | C# | .csproj, Directory.Packages.props, packages.config | Yes |
-| `github-actions` | YAML | .github/workflows/*.yml, *.yaml | Yes |
+| `github-actions` | YAML | .github/workflows/*.yml, *.yaml, action.yml, action.yaml | Yes |
 | `gitlab-ci` | YAML | .gitlab-ci.yml, .gitlab/ci/*.yml, *.yaml | Yes |
 
 ## Usage

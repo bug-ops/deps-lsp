@@ -54,7 +54,8 @@ fn is_registry_confirmed_tag(
 
 /// GitHub Actions ecosystem implementation.
 ///
-/// Provides LSP functionality for `.github/workflows/*.yml`/`*.yaml` files, including:
+/// Provides LSP functionality for `.github/workflows/*.yml`/`*.yaml` workflow files and
+/// `action.yml`/`action.yaml` composite action manifests (issue #706), including:
 /// - Dependency parsing with position tracking (see `parser` module docs for the pin
 ///   contract)
 /// - Version information from the GitHub tags API
@@ -89,13 +90,27 @@ impl Ecosystem for GithubActionsEcosystem {
         "GitHub Actions"
     }
 
+    /// `action.yml`/`action.yaml` (issue #706): a composite (or Docker/JS) action's
+    /// manifest, conventionally at a repository root or under `.github/actions/<name>/`.
+    /// [`crate::parser::parse_workflow_yaml`]'s `uses:` detection is key-driven, not
+    /// path-driven, so `runs.steps[].uses:` in such a file already parses identically to
+    /// a workflow step — this is a routing-only extension. Matched by exact basename (via
+    /// `deps_core::EcosystemRegistry::get_for_filename`), so it applies regardless of
+    /// which directory the file lives in, not just a repository root.
     fn manifest_filenames(&self) -> &[&'static str] {
-        &[]
+        &["action.yml", "action.yaml"]
     }
 
-    /// GHA declares no fixed filename or extension — it is routed solely by directory
-    /// path (D1): a `.github/workflows/*.yml`/`*.yaml` file, regardless of how many
-    /// ancestor directories precede `.github`.
+    /// GHA workflows are routed solely by directory path (D1): a
+    /// `.github/workflows/*.yml`/`*.yaml` file, regardless of how many ancestor
+    /// directories precede `.github`. No `.github/actions` entry is added here (issue
+    /// #706 review finding): `deps_core::ecosystem_registry::directory_pattern_matches`
+    /// only matches a file whose *immediate* containing directory's path ends with the
+    /// pattern, so `(".github/actions", ".yml")` would match a flat file sitting directly
+    /// in `.github/actions/` (a layout GitHub never treats as an action manifest) but
+    /// would **not** match the real, canonical `.github/actions/<name>/action.yml` — that
+    /// nested layout is already fully covered by the exact-basename
+    /// [`Self::manifest_filenames`] match, which applies regardless of directory depth.
     fn manifest_directory_patterns(&self) -> &[(&'static str, &'static str)] {
         &[
             (".github/workflows", ".yml"),
@@ -1132,19 +1147,45 @@ mod tests {
     }
 
     #[test]
-    fn test_manifest_routing_is_directory_pattern_only() {
+    fn test_manifest_routing_filenames_and_directory_patterns() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let eco = GithubActionsEcosystem::new(cache);
-        assert!(eco.manifest_filenames().is_empty());
+        assert_eq!(eco.manifest_filenames(), &["action.yml", "action.yaml"]);
         assert!(eco.manifest_patterns().is_empty());
         assert!(eco.manifest_extensions().is_empty());
         assert_eq!(
             eco.manifest_directory_patterns(),
             &[
                 (".github/workflows", ".yml"),
-                (".github/workflows", ".yaml")
+                (".github/workflows", ".yaml"),
             ]
         );
+    }
+
+    /// S3 (review finding): `test_manifest_routing_filenames_and_directory_patterns`
+    /// only asserts the raw lists, not actual `EcosystemRegistry` resolution — this test
+    /// exercises real routing so a `directory_pattern_matches`-style bug (S1, the
+    /// non-recursive `.github/actions` pattern that never matched the canonical nested
+    /// layout) would be caught here rather than only by manual live testing.
+    #[test]
+    fn test_action_yml_routes_via_registry_at_root_and_nested_under_github_actions() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let registry = deps_core::EcosystemRegistry::new();
+        registry.register(Arc::new(GithubActionsEcosystem::new(cache)));
+
+        for path in [
+            "/repo/action.yml",
+            "/repo/action.yaml",
+            "/repo/.github/actions/my-action/action.yml",
+            "/repo/.github/actions/my-action/action.yaml",
+            "/repo/deeply/nested/.github/actions/my-action/action.yml",
+        ] {
+            let uri = deps_core::test_util::test_uri(path);
+            let eco = registry
+                .get_for_uri(&uri)
+                .unwrap_or_else(|| panic!("expected {path} to route to an ecosystem"));
+            assert_eq!(eco.id(), "github-actions", "{path}");
+        }
     }
 
     #[test]
@@ -1624,5 +1665,107 @@ mod tests {
             edits.is_empty(),
             "a flow-mapping tag pin must be withheld, not corrupted: {edits:?}"
         );
+    }
+
+    // --- issue #706 review (S3): end-to-end coverage for an action.yml-routed document ---
+    //
+    // `test_manifest_routing_filenames_and_directory_patterns` and
+    // `test_action_yml_routes_via_registry_at_root_and_nested_under_github_actions` only
+    // cover routing; these exercise `generate_diagnostics`/`generate_hover` themselves
+    // against a document parsed from an `action.yml` URI, the same LSP entry points a
+    // real editor session drives.
+
+    #[tokio::test]
+    async fn test_generate_diagnostics_for_composite_action_yml_flags_tag_pin() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = GithubActionsEcosystem::new(cache);
+        let uri = deps_core::test_util::test_uri("/repo/.github/actions/my-action/action.yml");
+        let content = "name: My Action\n\
+             runs:\n\
+             \x20 using: composite\n\
+             \x20 steps:\n\
+             \x20   - uses: actions/checkout@v4\n";
+        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+        let (cached, resolved) = empty_versions();
+
+        let diagnostics = eco
+            .generate_diagnostics(
+                parse_result.as_ref(),
+                deps_core::VersionData::new(&cached, &resolved),
+                &uri,
+                deps_core::FreshnessSettings::default(),
+                deps_core::lsp_helpers::DiagnosticSeverities::default(),
+            )
+            .await;
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.code == Some(mutable_ref_pin_code())),
+            "a tag-pinned uses: step inside a composite action.yml must still get the \
+             mutable-ref-pin diagnostic: {diagnostics:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_hover_for_composite_action_yml_dependency() {
+        // Offline (mirrors `test_generate_hover_restores_footer_offline_for_tag_pin_with_warm_tag_index`):
+        // the shared hover helper otherwise drives a live registry fetch, which is
+        // irrelevant to what this test actually checks (routing/parsing produced a
+        // hoverable dependency) and would outlive the test as a leaked background task.
+        let cache = Arc::new(deps_core::HttpCache::new());
+        cache.set_offline(true);
+        let eco = GithubActionsEcosystem::new(cache);
+        let uri = deps_core::test_util::test_uri("/repo/action.yml");
+        let content = "name: My Action\n\
+             runs:\n\
+             \x20 using: composite\n\
+             \x20 steps:\n\
+             \x20   - uses: actions/checkout@v4\n";
+        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+        let name_position = deps_core::ParseResult::dependencies(parse_result.as_ref())[0]
+            .name_range()
+            .start;
+        let (cached, resolved) = empty_versions();
+
+        let hover = eco
+            .generate_hover(
+                parse_result.as_ref(),
+                name_position,
+                deps_core::VersionData::new(&cached, &resolved),
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
+
+        assert!(
+            hover.is_some(),
+            "hovering a uses: step inside a root-level action.yml must produce a hover"
+        );
+    }
+
+    /// Security audit finding (LOW): end-to-end confirmation that a stray, unrelated
+    /// `action.yml` (no top-level `runs:` key) degrades gracefully through the full
+    /// `generate_diagnostics` path — zero diagnostics, not a panic or a spurious fetch.
+    #[tokio::test]
+    async fn test_generate_diagnostics_for_non_action_yml_yields_nothing() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = GithubActionsEcosystem::new(cache);
+        let uri = deps_core::test_util::test_uri("/repo/tools/action.yml");
+        let content = "name: Not Actually a GitHub Action\nuses: internal/base-template@stable\n";
+        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+        assert!(parse_result.dependencies().is_empty());
+        let (cached, resolved) = empty_versions();
+
+        let diagnostics = eco
+            .generate_diagnostics(
+                parse_result.as_ref(),
+                deps_core::VersionData::new(&cached, &resolved),
+                &uri,
+                deps_core::FreshnessSettings::default(),
+                deps_core::lsp_helpers::DiagnosticSeverities::default(),
+            )
+            .await;
+
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 }

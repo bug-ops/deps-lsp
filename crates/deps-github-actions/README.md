@@ -9,8 +9,9 @@
 GitHub Actions workflow dependency support for deps-lsp.
 
 This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) workspace. It
-provides parsing and registry integration for `.github/workflows/*.yml`/`*.yaml` files and
-implements `deps_core::Ecosystem`.
+provides parsing and registry integration for `.github/workflows/*.yml`/`*.yaml` workflow
+files and `action.yml`/`action.yaml` composite/Docker/JS action manifests (a repository root
+or `.github/actions/<name>/`, issue #706), and implements `deps_core::Ecosystem`.
 
 ## Features
 

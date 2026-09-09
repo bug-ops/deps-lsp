@@ -587,6 +587,42 @@ mod tests {
         );
     }
 
+    /// CRITICAL regression (issue #706 review): GitHub Actions' `action.yml`/`action.yaml`
+    /// bare-basename routing and GitLab CI's `.gitlab/ci/*.yml` directory-pattern routing
+    /// can both match `.gitlab/ci/action.yml` — before `EcosystemRegistry::get_for_uri`'s
+    /// fix (deps-core), the basename match was checked first and always won, silently
+    /// routing a real GitLab CI file to `github-actions` (which would then, on top of
+    /// that, degrade it to zero dependencies since it lacks a top-level `runs:` key —
+    /// total, silent loss of hover/diagnostics/completions for the file). Exercises the
+    /// real production registry both real ecosystem crates are wired into, not a mock.
+    #[cfg(all(feature = "github-actions", feature = "gitlab-ci"))]
+    #[test]
+    fn test_gitlab_ci_directory_pattern_wins_over_github_actions_basename_match() {
+        let registry = Arc::new(EcosystemRegistry::new());
+        let cache = Arc::new(HttpCache::new());
+        register_ecosystems(&registry, Arc::clone(&cache), &test_runtime());
+
+        let uri = deps_core::test_util::test_uri("/repo/.gitlab/ci/action.yml");
+        assert_eq!(
+            registry.get_for_uri(&uri).map(|e| e.id()),
+            Some(deps_core::EcosystemId::GitlabCi.id()),
+            "a real .gitlab/ci/action.yml file must route to gitlab-ci, not github-actions"
+        );
+
+        // Non-conflicting action.yml locations must be unaffected.
+        let root_action = deps_core::test_util::test_uri("/repo/action.yml");
+        assert_eq!(
+            registry.get_for_uri(&root_action).map(|e| e.id()),
+            Some(deps_core::EcosystemId::GithubActions.id())
+        );
+        let nested_action =
+            deps_core::test_util::test_uri("/repo/.github/actions/my-action/action.yml");
+        assert_eq!(
+            registry.get_for_uri(&nested_action).map(|e| e.id()),
+            Some(deps_core::EcosystemId::GithubActions.id())
+        );
+    }
+
     /// Whether `formatter`'s own comparator (preferring
     /// [`deps_core::lsp_helpers::RequirementResolution::compile_requirement`], falling back to
     /// [`deps_core::lsp_helpers::RequirementResolution::version_satisfies_requirement`] when it

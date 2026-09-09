@@ -256,6 +256,20 @@ impl EcosystemRegistry {
     ///
     /// Extracts the filename from the URI path and looks up the ecosystem.
     ///
+    /// A bare-basename [`Ecosystem::manifest_filenames`] match and a
+    /// [`Ecosystem::manifest_directory_patterns`] match are both attempted, and when they
+    /// disagree — one registered ecosystem's basename rule and a *different* registered
+    /// ecosystem's directory-and-suffix rule both match the same path — the directory
+    /// pattern wins (issue #706 review finding, CRITICAL): it carries strictly more
+    /// path-specific signal than a bare basename that (by design, see
+    /// [`Ecosystem::manifest_filenames`]) matches anywhere in the tree. Concretely: GitHub
+    /// Actions' `action.yml`/`action.yaml` basename match and GitLab CI's
+    /// `.gitlab/ci/*.yml` directory pattern would otherwise silently race on
+    /// `.gitlab/ci/action.yml`, with the basename match winning purely because it was
+    /// checked first — routing a real GitLab CI file to the wrong ecosystem with no error.
+    /// When only one of the two matches, or both agree on the same ecosystem, that
+    /// ecosystem is returned as before.
+    ///
     /// # Arguments
     ///
     /// * `uri` - Document URI (file:///path/to/Cargo.toml)
@@ -281,10 +295,15 @@ impl EcosystemRegistry {
     pub fn get_for_uri(&self, uri: &Uri) -> Option<Arc<dyn Ecosystem>> {
         let path = uri.path().as_str();
         let filename = path.rsplit('/').next()?;
-        if let Some(ecosystem) = self.get_for_filename(filename) {
-            return Some(ecosystem);
+        let by_filename = self.get_for_filename(filename);
+        let by_directory = self.get_for_directory_pattern(path, filename);
+        match (by_filename, by_directory) {
+            (Some(by_filename), Some(by_directory)) if by_filename.id() != by_directory.id() => {
+                Some(by_directory)
+            }
+            (Some(by_filename), _) => Some(by_filename),
+            (None, by_directory) => by_directory,
         }
-        self.get_for_directory_pattern(path, filename)
     }
 
     /// Matches a file whose containing directory path (tail) and file suffix are
@@ -299,11 +318,20 @@ impl EcosystemRegistry {
     /// [`get_for_lockfile`](Self::get_for_lockfile)'s linear scan rather than
     /// building a dedicated map — the pattern count per ecosystem is tiny.
     ///
-    /// The scan is `DashMap`-iteration-order-dependent when two ecosystems' patterns
-    /// could both match the same path; today's registered patterns (PyPI's
-    /// `requirements`, GitHub Actions' `.github/workflows`) are disjoint, so this is
-    /// deterministic in practice, but a future third owner introducing an overlapping
-    /// pattern would need its own disambiguation, not silent first-match-wins.
+    /// The scan is `DashMap`-iteration-order-dependent when two ecosystems' *directory*
+    /// patterns could both match the same path; today's registered directory patterns
+    /// (PyPI's `requirements`, GitHub Actions' `.github/workflows`, GitLab CI's
+    /// `.gitlab/ci`) are disjoint from each other, so this is deterministic in practice,
+    /// but a future ecosystem introducing an overlapping *directory* pattern would need
+    /// its own disambiguation, not silent first-match-wins.
+    ///
+    /// A directory pattern from one ecosystem racing a *basename*
+    /// [`manifest_filenames`](Ecosystem::manifest_filenames) entry from a different
+    /// ecosystem (e.g. GitLab CI's `.gitlab/ci/*.yml` directory
+    /// pattern vs. GitHub Actions' `action.yml` basename, both matching
+    /// `.gitlab/ci/action.yml`) is a separate, resolved case — this function alone cannot
+    /// see the basename side of that conflict; [`get_for_uri`](Self::get_for_uri) resolves
+    /// it deterministically by preferring the more path-specific directory-pattern match.
     fn get_for_directory_pattern(&self, path: &str, filename: &str) -> Option<Arc<dyn Ecosystem>> {
         for entry in self.ecosystems.iter() {
             let ecosystem = entry.value();
@@ -730,9 +758,12 @@ mod tests {
         }
     }
 
-    // Mock ecosystem with basename patterns (mirrors PyPI's `requirements*.txt`)
+    // Mock ecosystem with basename patterns (mirrors PyPI's `requirements*.txt`) and,
+    // since issue #706's review, exact `manifest_filenames` too (mirrors GitHub Actions'
+    // `action.yml`/`action.yaml` alongside another ecosystem's directory pattern).
     struct MockPatternEcosystem {
         id: &'static str,
+        filenames: &'static [&'static str],
         patterns: &'static [&'static str],
         dir_patterns: &'static [(&'static str, &'static str)],
     }
@@ -749,7 +780,7 @@ mod tests {
         }
 
         fn manifest_filenames(&self) -> &[&'static str] {
-            &[]
+            self.filenames
         }
 
         fn manifest_patterns(&self) -> &[&'static str] {
@@ -795,6 +826,7 @@ mod tests {
         let registry = EcosystemRegistry::new();
         registry.register(Arc::new(MockPatternEcosystem {
             id: "pypi",
+            filenames: &[],
             patterns: &[
                 "requirements*.txt",
                 "*-requirements.txt",
@@ -813,6 +845,7 @@ mod tests {
         let registry = EcosystemRegistry::new();
         registry.register(Arc::new(MockPatternEcosystem {
             id: "github-actions",
+            filenames: &[],
             patterns: &[],
             dir_patterns: &[
                 (".github/workflows", ".yml"),
@@ -869,6 +902,75 @@ mod tests {
         }
     }
 
+    /// CRITICAL regression fixture (issue #706 review): a bare-basename `manifest_filenames`
+    /// entry from one ecosystem (`action.yml`/`action.yaml`, mirrors GitHub Actions'
+    /// composite-action manifest support) and a directory-and-suffix `manifest_directory_patterns`
+    /// entry from a *different* ecosystem (`.gitlab/ci/*.yml`, mirrors GitLab CI's
+    /// split-pipeline layout) that can both match the same real path
+    /// (`.gitlab/ci/action.yml`).
+    fn basename_vs_directory_conflict_registry() -> EcosystemRegistry {
+        let registry = EcosystemRegistry::new();
+        registry.register(Arc::new(MockPatternEcosystem {
+            id: "github-actions",
+            filenames: &["action.yml", "action.yaml"],
+            patterns: &[],
+            dir_patterns: &[
+                (".github/workflows", ".yml"),
+                (".github/workflows", ".yaml"),
+            ],
+        }));
+        registry.register(Arc::new(MockPatternEcosystem {
+            id: "gitlab-ci",
+            filenames: &[],
+            patterns: &[],
+            dir_patterns: &[(".gitlab/ci", ".yml"), (".gitlab/ci", ".yaml")],
+        }));
+        registry
+    }
+
+    #[test]
+    fn test_get_for_uri_directory_pattern_wins_over_different_ecosystems_basename_match() {
+        let registry = basename_vs_directory_conflict_registry();
+
+        // The conflict: `action.yml` matches github-actions' basename rule AND sits in a
+        // directory matching gitlab-ci's directory pattern. Before the fix,
+        // `get_for_filename` was consulted first and always won, silently routing this
+        // real GitLab CI file to the wrong ecosystem.
+        let uri = crate::test_util::test_uri("/repo/.gitlab/ci/action.yml");
+        assert_eq!(
+            registry.get_for_uri(&uri).map(|e| e.id()),
+            Some("gitlab-ci"),
+            "a directory-pattern match from a different ecosystem must win over a bare \
+             basename match"
+        );
+
+        // Non-conflicting cases must be unaffected by the precedence change.
+        let root_action = crate::test_util::test_uri("/repo/action.yml");
+        assert_eq!(
+            registry.get_for_uri(&root_action).map(|e| e.id()),
+            Some("github-actions"),
+            "a root-level action.yml with no competing directory-pattern match must still \
+             route by basename"
+        );
+
+        let nested_action =
+            crate::test_util::test_uri("/repo/.github/actions/my-action/action.yml");
+        assert_eq!(
+            registry.get_for_uri(&nested_action).map(|e| e.id()),
+            Some("github-actions"),
+            "action.yml nested under .github/actions/<name>/ (no directory pattern \
+             registered for that path) must still route by basename"
+        );
+
+        let workflow = crate::test_util::test_uri("/repo/.github/workflows/ci.yml");
+        assert_eq!(
+            registry.get_for_uri(&workflow).map(|e| e.id()),
+            Some("github-actions"),
+            "an ordinary workflow file (directory-pattern-only match, no basename match) \
+             must be unaffected"
+        );
+    }
+
     #[test]
     fn test_get_for_filename_pattern_matches_requirements_variants() {
         let registry = pypi_pattern_registry();
@@ -920,6 +1022,7 @@ mod tests {
         }));
         registry.register(Arc::new(MockPatternEcosystem {
             id: "pattern",
+            filenames: &[],
             patterns: &["requirements*.txt"],
             dir_patterns: &[],
         }));
@@ -940,6 +1043,7 @@ mod tests {
         }));
         registry.register(Arc::new(MockPatternEcosystem {
             id: "pattern",
+            filenames: &[],
             patterns: &["requirements*.txt"],
             dir_patterns: &[],
         }));
