@@ -81,6 +81,10 @@ pub(crate) fn document_dependency_count(state: &ServerState, uri: &Uri) -> usize
 }
 
 /// Handles diagnostic requests using trait-based delegation.
+#[tracing::instrument(
+    skip(state, config, client, full_config),
+    fields(uri = ?uri, ecosystem = tracing::field::Empty)
+)]
 pub async fn handle_diagnostics(
     state: Arc<ServerState>,
     uri: &Uri,
@@ -92,6 +96,13 @@ pub async fn handle_diagnostics(
     if !ensure_document_loaded(uri, Arc::clone(&state), client, Arc::clone(&full_config)).await {
         tracing::warn!("Could not load document for diagnostics: {:?}", uri);
         return vec![];
+    }
+
+    // Cheap: the document is already loaded at this point, so this is a single DashMap
+    // shard lookup, not a registry fetch — consistent with the other 6 handlers, which
+    // record `ecosystem` once it's known rather than force-resolving it early (#756).
+    if let Some(ecosystem_id) = state.with_document(uri, |doc| doc.ecosystem) {
+        tracing::Span::current().record("ecosystem", ecosystem_id.id());
     }
 
     // Snapshot before generating diagnostics (Copy value, no lock held across the call)

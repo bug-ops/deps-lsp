@@ -444,6 +444,7 @@ impl Backend {
 }
 
 impl LanguageServer for Backend {
+    #[tracing::instrument(skip(self, params))]
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
         tracing::info!("initializing deps-lsp server");
 
@@ -533,6 +534,7 @@ impl LanguageServer for Backend {
         })
     }
 
+    #[tracing::instrument(skip(self))]
     async fn initialized(&self, _: InitializedParams) {
         tracing::info!("deps-lsp server initialized");
         self.client
@@ -646,6 +648,7 @@ impl LanguageServer for Backend {
     /// re-fetch (`document::RefetchPolicy::AllDependencies`) since the routing changed, not
     /// the manifest content. A burst of config changes is coalesced into one debounced
     /// reparse (`ServerState::queue_reparse`) rather than firing once per notification.
+    #[tracing::instrument(skip(self, params))]
     async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
         if params.settings.is_null() {
             tracing::debug!(
@@ -789,11 +792,13 @@ impl LanguageServer for Backend {
         }
     }
 
+    #[tracing::instrument(skip(self))]
     fn shutdown(&self) -> impl std::future::Future<Output = Result<()>> + Send {
         tracing::info!("shutting down deps-lsp server");
         std::future::ready(Ok(()))
     }
 
+    #[tracing::instrument(skip(self, params), fields(uri = ?params.text_document.uri))]
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let uri = params.text_document.uri;
         let content = params.text_document.text;
@@ -810,6 +815,7 @@ impl LanguageServer for Backend {
         self.handle_open(uri, content, version).await;
     }
 
+    #[tracing::instrument(skip(self, params), fields(uri = ?params.text_document.uri))]
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri;
         let version = params.text_document.version;
@@ -827,6 +833,7 @@ impl LanguageServer for Backend {
         }
     }
 
+    #[tracing::instrument(skip(self, params), fields(uri = ?params.text_document.uri))]
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri;
         tracing::info!("document closed: {:?}", uri);
@@ -835,6 +842,7 @@ impl LanguageServer for Backend {
         self.state.cancel_background_task(&uri).await;
     }
 
+    #[tracing::instrument(skip(self, params), fields(count = params.changes.len()))]
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
         tracing::debug!("Received {} file change events", params.changes.len());
 
@@ -883,6 +891,10 @@ impl LanguageServer for Backend {
         }
     }
 
+    #[tracing::instrument(
+        skip(self, params),
+        fields(uri = ?params.text_document_position_params.text_document.uri)
+    )]
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
         Ok(hover::handle_hover(
             Arc::clone(&self.state),
@@ -893,6 +905,10 @@ impl LanguageServer for Backend {
         .await)
     }
 
+    #[tracing::instrument(
+        skip(self, params),
+        fields(uri = ?params.text_document_position.text_document.uri)
+    )]
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
         Ok(completion::handle_completion(
             Arc::clone(&self.state),
@@ -903,6 +919,7 @@ impl LanguageServer for Backend {
         .await)
     }
 
+    #[tracing::instrument(skip(self, params), fields(uri = ?params.text_document.uri))]
     async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
         // Clone config before async call to release lock early
         let inlay_config = { self.config.read().await.inlay_hints.clone() };
@@ -923,6 +940,7 @@ impl LanguageServer for Backend {
         Ok(Some(hints))
     }
 
+    #[tracing::instrument(skip(self, params), fields(uri = ?params.text_document.uri))]
     async fn code_action(
         &self,
         params: CodeActionParams,
@@ -943,6 +961,7 @@ impl LanguageServer for Backend {
         Ok(Some(actions))
     }
 
+    #[tracing::instrument(skip(self, params), fields(uri = ?params.text_document.uri))]
     async fn code_lens(&self, params: CodeLensParams) -> Result<Option<Vec<CodeLens>>> {
         let enabled = { self.config.read().await.code_lens.enabled };
         let lenses = code_lens::handle_code_lens(
@@ -956,6 +975,7 @@ impl LanguageServer for Backend {
         Ok(Some(lenses))
     }
 
+    #[tracing::instrument(skip(self, params), fields(uri = ?params.text_document.uri))]
     async fn document_link(&self, params: DocumentLinkParams) -> Result<Option<Vec<DocumentLink>>> {
         let links = document_link::handle_document_link(
             Arc::clone(&self.state),
@@ -967,6 +987,7 @@ impl LanguageServer for Backend {
         Ok(Some(links))
     }
 
+    #[tracing::instrument(skip(self, params), fields(uri = ?params.text_document.uri))]
     async fn diagnostic(
         &self,
         params: DocumentDiagnosticParams,
@@ -999,6 +1020,7 @@ impl LanguageServer for Backend {
         ))
     }
 
+    #[tracing::instrument(skip(self, params), fields(command = %params.command))]
     async fn execute_command(
         &self,
         params: ExecuteCommandParams,

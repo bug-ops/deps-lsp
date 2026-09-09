@@ -9,6 +9,10 @@ use tower_lsp_server::Client;
 use tower_lsp_server::ls_types::{Hover, HoverParams};
 
 /// Handles hover requests using trait-based delegation.
+#[tracing::instrument(
+    skip(state, params, client, config),
+    fields(uri = ?params.text_document_position_params.text_document.uri, ecosystem = tracing::field::Empty)
+)]
 pub async fn handle_hover(
     state: Arc<ServerState>,
     params: HoverParams,
@@ -67,6 +71,8 @@ pub async fn handle_hover(
             ))
         })
         .flatten()?;
+
+    tracing::Span::current().record("ecosystem", ecosystem_id.id());
 
     let mut versions = VersionData::new(&cached_versions, &resolved_versions)
         .with_resolved_version_candidates(&resolved_version_candidates)
