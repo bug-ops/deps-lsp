@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: property tests (`proptest`) asserting the parser depth/expansion checkers and JSONC position recovery never panic on arbitrary input (#673)
 
 ### Fixed
+- **deps-lsp**: NuGet/Maven raw-text fallback completion no longer inserts duplicate markup when the cursor is already inside an open attribute value or tag (resolves #724) (#728)
 - **deps-lsp**: NuGet raw-text fallback completion now actually fires inside `Include="..."`/`id="..."` on `PackageReference`/`PackageVersion`/`package` elements, instead of being permanently disabled; stale `TODO(#118 follow-up)` markers on the still-disabled Bundler/Swift/Gradle arms were rewritten to plain comments explaining the settled design decision (resolves #699)
 - **deps-core, deps-maven, deps-gradle**: Maven `groupId`/`artifactId` -> URL-path construction is now a single shared `deps_core::maven_coordinate_path` helper, closing a validation gap where an empty `.`-separated group component (e.g. `com..evil`) was rejected by `deps-gradle` but accepted by `deps-maven`, producing an empty path segment (resolves #702) (#715)
 - **deps-core, deps-maven**: `deps-maven`'s `maven-metadata.xml` registry-response parser now bounds retained version entries and bytes scanned, returning an error instead of silently truncating once a hostile/broken response exceeds the budget (resolves #698) (#715)
