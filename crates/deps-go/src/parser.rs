@@ -65,17 +65,30 @@ pub fn parse_go_mod_with_context(
     let mut module_path = None;
     let mut go_version = None;
 
+    // Compile-time-constant patterns; a malformed literal is a build-visible programmer
+    // error, not attacker-influenceable input.
+    #[allow(clippy::unwrap_used)]
     static MODULE_PATTERN: std::sync::LazyLock<Regex> =
         std::sync::LazyLock::new(|| Regex::new(r"^\s*module\s+(\S+)").unwrap());
+    // Same guarantee as MODULE_PATTERN above.
+    #[allow(clippy::unwrap_used)]
     static GO_PATTERN: std::sync::LazyLock<Regex> =
         std::sync::LazyLock::new(|| Regex::new(r"^\s*go\s+(\S+)").unwrap());
+    // Same guarantee as MODULE_PATTERN above.
+    #[allow(clippy::unwrap_used)]
     static REQUIRE_SINGLE: std::sync::LazyLock<Regex> =
         std::sync::LazyLock::new(|| Regex::new(r"^\s*require\s+(\S+)\s+(\S+)").unwrap());
+    // Same guarantee as MODULE_PATTERN above.
+    #[allow(clippy::unwrap_used)]
     static REQUIRE_BLOCK_START: std::sync::LazyLock<Regex> =
         std::sync::LazyLock::new(|| Regex::new(r"^\s*require\s*\(").unwrap());
+    // Same guarantee as MODULE_PATTERN above.
+    #[allow(clippy::unwrap_used)]
     static REPLACE_PATTERN: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
         Regex::new(r"^\s*replace\s+(\S+)\s+(?:(\S+)\s+)?=>\s+(\S+)\s+(\S+)").unwrap()
     });
+    // Same guarantee as MODULE_PATTERN above.
+    #[allow(clippy::unwrap_used)]
     static EXCLUDE_PATTERN: std::sync::LazyLock<Regex> =
         std::sync::LazyLock::new(|| Regex::new(r"^\s*exclude\s+(\S+)\s+(\S+)").unwrap());
 
@@ -133,7 +146,7 @@ pub fn parse_go_mod_with_context(
         }
 
         let line_end = line_offset + line.len();
-        let next_line_start = if line_end < content.len() && content.as_bytes()[line_end] == b'\n' {
+        let next_line_start = if content.as_bytes().get(line_end) == Some(&b'\n') {
             line_end + 1
         } else {
             line_end
@@ -192,20 +205,11 @@ fn parse_require_line(
     line_table: &LineOffsetTable,
 ) -> Option<GoDependency> {
     let parts: Vec<&str> = line.split_whitespace().collect();
-    if parts.is_empty() {
-        return None;
-    }
-
-    let (module_path, version) = if parts[0] == "require" {
-        if parts.len() < 3 {
-            return None;
-        }
-        (parts[1], parts[2])
-    } else {
-        if parts.len() < 2 {
-            return None;
-        }
-        (parts[0], parts[1])
+    let (module_path, version) = match parts.as_slice() {
+        ["require", module, version, ..] => (*module, *version),
+        ["require", ..] => return None,
+        [module, version, ..] => (*module, *version),
+        _ => return None,
     };
 
     let indirect = line.contains("// indirect");

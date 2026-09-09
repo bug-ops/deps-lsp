@@ -146,8 +146,11 @@ fn parse_versions_response(data: &[u8], _gem_name: &str) -> Result<Vec<BundlerVe
             platform: e.platform,
         };
         if let Some(&idx) = index_by_number.get(version.number.as_str()) {
-            if version.platform == "ruby" && versions[idx].platform != "ruby" {
-                versions[idx] = version;
+            if let Some(slot) = versions.get_mut(idx)
+                && version.platform == "ruby"
+                && slot.platform != "ruby"
+            {
+                *slot = version;
             }
         } else {
             index_by_number.insert(version.number.to_string(), versions.len());

@@ -472,9 +472,11 @@ fn build_component_dependency(
         );
         return None;
     }
-    let host_expr = segments[0];
-    let component_name = segments[segments.len() - 1];
-    let project_path = segments[1..segments.len() - 1].join("/");
+    let [host_expr, project_segments @ .., component_name] = segments.as_slice() else {
+        return None;
+    };
+    let (host_expr, component_name) = (*host_expr, *component_name);
+    let project_path = project_segments.join("/");
     if !is_valid_gitlab_coordinate(&project_path) || !is_valid_path_segment(component_name) {
         warn_rejected_value(
             "classify_component_value",

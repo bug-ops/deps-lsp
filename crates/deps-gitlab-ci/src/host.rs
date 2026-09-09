@@ -164,8 +164,9 @@ pub fn is_valid_gitlab_coordinate(s: &str) -> bool {
     if segments.len() < 2 || !segments.iter().all(|seg| is_valid_path_segment(seg)) {
         return false;
     }
-    let last = segments[segments.len() - 1];
-    !(last.ends_with(".git") || last.ends_with(".atom"))
+    segments
+        .last()
+        .is_some_and(|last| !(last.ends_with(".git") || last.ends_with(".atom")))
 }
 
 /// Whether `seg` alone is safe to splice into a URL path segment: non-empty,
@@ -289,7 +290,7 @@ impl GitlabInstanceHost {
         let Some(raw) = self
             .raw
             .read()
-            .expect("gitlab_instance_host raw lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
         else {
             return InstanceHostOutcome::Unset;
@@ -299,7 +300,7 @@ impl GitlabInstanceHost {
         if let Some((cached_raw, cached_policy, outcome)) = self
             .memo
             .read()
-            .expect("gitlab_instance_host memo lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             && *cached_raw == raw
             && *cached_policy == policy_now
@@ -322,7 +323,7 @@ impl GitlabInstanceHost {
         *self
             .memo
             .write()
-            .expect("gitlab_instance_host memo lock poisoned") =
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
             Some((raw, policy_now, outcome.clone()));
         outcome
     }

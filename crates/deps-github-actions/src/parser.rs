@@ -59,6 +59,8 @@ pub(crate) use deps_core::lsp_helpers::is_tag_shaped;
 /// rather than merely leaving it unpinned. This function has no notion of flow vs. block
 /// context itself; it just checks "would writing a comment here swallow real content",
 /// which is true in exactly the flow-style case and false for ordinary block-style lines.
+// `bytes[i - 1]` is guarded by the `i > 0` conjunct immediately before it.
+#[allow(clippy::indexing_slicing)]
 fn ref_is_last_token_on_line(rest_of_line: &str) -> bool {
     let bytes = rest_of_line.as_bytes();
     for (i, &b) in bytes.iter().enumerate() {
@@ -73,8 +75,9 @@ fn ref_is_last_token_on_line(rest_of_line: &str) -> bool {
 }
 
 // `i` is a byte index holding ASCII `b'#'`; `token_len` from `find(char::is_whitespace)` or
-// `.len()`. Both slice bounds are always char boundaries.
-#[allow(clippy::string_slice)]
+// `.len()`. Both slice bounds are always char boundaries. `bytes[i - 1]` is short-circuited
+// by the `i == 0 ||` conjunct, and `i` ranges `0..bytes.len()` from the loop.
+#[allow(clippy::string_slice, clippy::indexing_slicing)]
 fn extract_comment_tag(rest_of_line: &str) -> Option<(&str, usize)> {
     let bytes = rest_of_line.as_bytes();
     for i in 0..bytes.len() {

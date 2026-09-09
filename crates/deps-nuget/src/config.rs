@@ -495,6 +495,9 @@ impl PackageSourceMapping {
 /// Malformed sequences and lone surrogates are left literal rather than erroring — the raw
 /// candidate (see `key_candidates`) still covers them, so nothing is ever dropped, only
 /// possibly not perfectly reconstructed.
+// `chars[i]` is guarded by the `i < chars.len()` loop condition, and `chars[i+2..i+6]` by
+// the preceding `chars.get(i + 6) == Some(&'_')` check.
+#[allow(clippy::indexing_slicing)]
 fn decode_xml_name(raw: &str) -> String {
     let chars: Vec<char> = raw.chars().collect();
     let mut out = String::with_capacity(raw.len());
@@ -616,7 +619,9 @@ impl NuGetConfig {
         if hops.is_empty() {
             return no_source(package);
         }
-        if hops.len() == 1 && crate::registry::is_public_registry_url(hops[0].url.as_str()) {
+        if let [hop] = hops.as_slice()
+            && crate::registry::is_public_registry_url(hop.url.as_str())
+        {
             return DependencySource::Registry;
         }
         DependencySource::AlternateRegistry {
@@ -691,8 +696,8 @@ impl NuGetConfig {
         // (Microsoft's own canonical source-pinning pattern) resolves to plain `Registry`,
         // keeping OSV/deps.dev/hover-trust, rather than an `AlternateRegistry` chain whose
         // only hop happens to be the same URL.
-        if valid_hops.len() == 1
-            && crate::registry::is_public_registry_url(valid_hops[0].url.as_str())
+        if let [hop] = valid_hops.as_slice()
+            && crate::registry::is_public_registry_url(hop.url.as_str())
         {
             return DependencySource::Registry;
         }
@@ -735,8 +740,10 @@ impl NuGetConfig {
 
         if self.mapping.is_empty() {
             let valid_hops = self.valid_hops();
-            let is_public_only = valid_hops.len() == 1
-                && crate::registry::is_public_registry_url(valid_hops[0].url.as_str());
+            let is_public_only = matches!(
+                valid_hops.as_slice(),
+                [hop] if crate::registry::is_public_registry_url(hop.url.as_str())
+            );
             if !valid_hops.is_empty() && !is_public_only {
                 chains.push(NuGetSourceChain::chain(
                     valid_hops,
@@ -748,8 +755,10 @@ impl NuGetConfig {
                 let keys: Vec<&str> = group_keys.iter().map(String::as_str).collect();
                 let hops = self.hops_for_mapping_keys(&keys);
                 if hops.is_empty()
-                    || (hops.len() == 1
-                        && crate::registry::is_public_registry_url(hops[0].url.as_str()))
+                    || matches!(
+                        hops.as_slice(),
+                        [hop] if crate::registry::is_public_registry_url(hop.url.as_str())
+                    )
                 {
                     continue;
                 }

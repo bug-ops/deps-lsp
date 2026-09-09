@@ -113,6 +113,8 @@ pub struct ComposerVersion {
 /// `-alpha1`, already caught by the default heuristic): that field falls
 /// back to `version.clone()` when Packagist omits it, which would silently
 /// drop this coverage for any entry missing it (#327 M2).
+// The `while i + 1 < bytes.len()` loop condition covers both `bytes[i]` and `bytes[i + 1]`.
+#[allow(clippy::indexing_slicing)]
 fn has_short_stability_alias(s: &str) -> bool {
     let bytes = s.as_bytes();
     let mut i = 0;
@@ -167,8 +169,8 @@ fn has_short_stability_alias(s: &str) -> bool {
 /// algorithm, so including it here would only duplicate, not extend, coverage.
 // `lower[start..]` indexes `lower` (a lowercased copy of `s`), with `start` derived from a
 // previous ASCII `find` result plus `keyword.len()` (also ASCII), so it is always a char
-// boundary.
-#[allow(clippy::string_slice)]
+// boundary. `bytes[idx - 1]` is guarded by `idx > 0` and `bytes[idx - 2]` by `idx > 1`.
+#[allow(clippy::string_slice, clippy::indexing_slicing)]
 fn has_separatorless_stability_keyword(s: &str) -> bool {
     let lower = s.to_lowercase();
     let bytes = lower.as_bytes();

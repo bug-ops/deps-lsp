@@ -103,6 +103,9 @@ pub fn escape_version(version: &str) -> String {
 /// assert!(!is_pseudo_version("v1.2.3"));
 /// ```
 pub fn is_pseudo_version(version: &str) -> bool {
+    // Compile-time-constant pattern; a malformed literal is a build-visible programmer
+    // error, not attacker-influenceable input.
+    #[allow(clippy::unwrap_used)]
     static PSEUDO_REGEX: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
         Regex::new(r"^v[0-9]+\.(0\.0-|\d+\.\d+-([^+]*\.)?0\.)\d{14}-[A-Za-z0-9]+(\+.*)?$").unwrap()
     });
@@ -128,22 +131,17 @@ pub fn base_version_from_pseudo(pseudo: &str) -> Option<String> {
     }
 
     let parts: Vec<&str> = pseudo.split('-').collect();
-    if parts.len() < 3 {
+    let [version_part, pre_release_part, _, ..] = parts.as_slice() else {
         return None;
-    }
-
-    let version_part = parts[0];
-    let pre_release_part = parts[1];
+    };
 
     if pre_release_part.starts_with('0') {
         let semver = version_part.strip_prefix('v')?;
-        let mut components: Vec<u32> = semver.split('.').filter_map(|s| s.parse().ok()).collect();
-        if components.len() == 3 && components[2] > 0 {
-            components[2] -= 1;
-            return Some(format!(
-                "v{}.{}.{}",
-                components[0], components[1], components[2]
-            ));
+        let components: Vec<u32> = semver.split('.').filter_map(|s| s.parse().ok()).collect();
+        if let [major, minor, patch] = components.as_slice()
+            && *patch > 0
+        {
+            return Some(format!("v{major}.{minor}.{}", patch - 1));
         }
     }
 

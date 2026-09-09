@@ -20,6 +20,9 @@ impl GemfileLockParser {
 }
 
 // Regex for parsing gem specs: "    gemname (version)"
+// Compile-time-constant pattern; a malformed literal is a build-visible programmer error,
+// not attacker-influenceable input.
+#[allow(clippy::expect_used)]
 static GEM_SPEC_PATTERN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s{4}([a-zA-Z0-9_-]+)\s+\(([^)]+)\)").expect("Invalid regex"));
 

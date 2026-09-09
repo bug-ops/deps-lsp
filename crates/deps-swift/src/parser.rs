@@ -15,11 +15,16 @@ use tower_lsp_server::ls_types::{Range, Uri};
 // Regex patterns for various .package() call forms.
 // All use (?s) DOTALL flag to handle multiline calls.
 
+// Compile-time-constant patterns; a malformed literal is a build-visible programmer error,
+// not attacker-influenceable input.
+#[allow(clippy::expect_used)]
 static RE_URL_FROM: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?s)\.package\s*\(\s*url\s*:\s*"([^"]+)"\s*,\s*from\s*:\s*"([^"]+)"\s*\)"#)
         .expect("RE_URL_FROM")
 });
 
+// Same guarantee as RE_URL_FROM above.
+#[allow(clippy::expect_used)]
 static RE_URL_UP_TO_NEXT_MAJOR: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r#"(?s)\.package\s*\(\s*url\s*:\s*"([^"]+)"\s*,\s*\.upToNextMajor\s*\(\s*from\s*:\s*"([^"]+)"\s*\)\s*\)"#,
@@ -27,6 +32,8 @@ static RE_URL_UP_TO_NEXT_MAJOR: LazyLock<Regex> = LazyLock::new(|| {
     .expect("RE_URL_UP_TO_NEXT_MAJOR")
 });
 
+// Same guarantee as RE_URL_FROM above.
+#[allow(clippy::expect_used)]
 static RE_URL_UP_TO_NEXT_MINOR: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r#"(?s)\.package\s*\(\s*url\s*:\s*"([^"]+)"\s*,\s*\.upToNextMinor\s*\(\s*from\s*:\s*"([^"]+)"\s*\)\s*\)"#,
@@ -34,6 +41,8 @@ static RE_URL_UP_TO_NEXT_MINOR: LazyLock<Regex> = LazyLock::new(|| {
     .expect("RE_URL_UP_TO_NEXT_MINOR")
 });
 
+// Same guarantee as RE_URL_FROM above.
+#[allow(clippy::expect_used)]
 static RE_URL_EXACT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r#"(?s)\.package\s*\(\s*url\s*:\s*"([^"]+)"\s*,\s*\.exact\s*\(\s*"([^"]+)"\s*\)\s*\)"#,
@@ -41,6 +50,8 @@ static RE_URL_EXACT: LazyLock<Regex> = LazyLock::new(|| {
     .expect("RE_URL_EXACT")
 });
 
+// Same guarantee as RE_URL_FROM above.
+#[allow(clippy::expect_used)]
 static RE_URL_RANGE_HALF_OPEN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r#"(?s)\.package\s*\(\s*url\s*:\s*"([^"]+)"\s*,\s*"([^"]+)"\s*\.\.<\s*"([^"]+)"\s*\)"#,
@@ -48,6 +59,8 @@ static RE_URL_RANGE_HALF_OPEN: LazyLock<Regex> = LazyLock::new(|| {
     .expect("RE_URL_RANGE_HALF_OPEN")
 });
 
+// Same guarantee as RE_URL_FROM above.
+#[allow(clippy::expect_used)]
 static RE_URL_RANGE_CLOSED: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r#"(?s)\.package\s*\(\s*url\s*:\s*"([^"]+)"\s*,\s*"([^"]+)"\s*\.\.\.\s*"([^"]+)"\s*\)"#,
@@ -55,6 +68,8 @@ static RE_URL_RANGE_CLOSED: LazyLock<Regex> = LazyLock::new(|| {
     .expect("RE_URL_RANGE_CLOSED")
 });
 
+// Same guarantee as RE_URL_FROM above.
+#[allow(clippy::expect_used)]
 static RE_URL_BRANCH: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r#"(?s)\.package\s*\(\s*url\s*:\s*"([^"]+)"\s*,\s*\.branch\s*\(\s*"([^"]+)"\s*\)\s*\)"#,
@@ -62,6 +77,8 @@ static RE_URL_BRANCH: LazyLock<Regex> = LazyLock::new(|| {
     .expect("RE_URL_BRANCH")
 });
 
+// Same guarantee as RE_URL_FROM above.
+#[allow(clippy::expect_used)]
 static RE_URL_REVISION: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r#"(?s)\.package\s*\(\s*url\s*:\s*"([^"]+)"\s*,\s*\.revision\s*\(\s*"([^"]+)"\s*\)\s*\)"#,
@@ -69,6 +86,8 @@ static RE_URL_REVISION: LazyLock<Regex> = LazyLock::new(|| {
     .expect("RE_URL_REVISION")
 });
 
+// Same guarantee as RE_URL_FROM above.
+#[allow(clippy::expect_used)]
 static RE_PATH: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?s)\.package\s*\(\s*path\s*:\s*"([^"]+)"\s*\)"#).expect("RE_PATH")
 });
@@ -99,9 +118,8 @@ pub fn url_to_identity(url: &str) -> Option<String> {
 
     // Extract last two path segments (owner/repo)
     let parts: Vec<&str> = url.split('/').filter(|s| !s.is_empty()).collect();
-    if parts.len() >= 2 {
-        let owner = parts[parts.len() - 2];
-        let repo = parts[parts.len() - 1];
+    if let [.., owner, repo] = parts.as_slice() {
+        let (owner, repo) = (*owner, *repo);
         // Filter out protocol parts like "https:" or "github.com"
         if owner.contains(':') || owner.contains('.') {
             return None;
@@ -118,6 +136,9 @@ pub fn url_to_identity(url: &str) -> Option<String> {
 /// Handles:
 /// - `//` line comments (not inside string literals)
 /// - `/* ... */` block comments (not nested)
+// Every index is preceded by an `i < len` / `i + 1 < len` guard, and `result` is a
+// same-length copy of `bytes`.
+#[allow(clippy::indexing_slicing)]
 fn strip_comments(content: &str) -> String {
     let bytes = content.as_bytes();
     let len = bytes.len();
@@ -190,8 +211,10 @@ fn next_minor(major: &str, minor: &str) -> String {
 /// throughout so LSP positions are computed correctly.
 // Every capture-group slice below (`url.start()..url.end()`, etc.) uses regex match offsets,
 // always char boundaries; offsets taken on `stripped` are valid in `content` too because
-// `strip_comments` overwrites byte-for-byte (length- and boundary-preserving).
-#[allow(clippy::string_slice)]
+// `strip_comments` overwrites byte-for-byte (length- and boundary-preserving). Group 0
+// always exists on a successful match and every numbered group in these patterns is
+// mandatory (never `?`-optional), so `cap.get(N).unwrap()` is always `Some`.
+#[allow(clippy::string_slice, clippy::unwrap_used)]
 pub fn parse_package_swift(content: &str, uri: &Uri) -> Result<SwiftParseResult> {
     let stripped = strip_comments(content);
     let line_table = LineOffsetTable::new(content);

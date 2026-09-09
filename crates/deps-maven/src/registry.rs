@@ -130,9 +130,8 @@ fn repo_base_for_group(group_id: &str) -> &'static str {
 /// [`deps_core::is_dot_segment`]'s doc for the fetch-sink-vs-display-link scope split, #379).
 pub fn package_url(name: &str) -> String {
     let parts: Vec<&str> = name.splitn(2, ':').collect();
-    if parts.len() == 2 {
-        let group_id = parts[0];
-        let artifact_id = parts[1];
+    if let [group_id, artifact_id] = parts.as_slice() {
+        let (group_id, artifact_id) = (*group_id, *artifact_id);
         if is_google_group(group_id) {
             format!(
                 "https://maven.google.com/web/index.html#{}:{}",
@@ -312,6 +311,9 @@ impl MavenCentralRegistry {
             }
         }
 
+        // `urls.is_empty()` was checked and returned on above, so the loop ran at least once
+        // and `last_err` is `Some` here.
+        #[allow(clippy::expect_used)]
         let e = last_err.expect("urls is non-empty");
         tracing::warn!(package = %name, error = %e, "all metadata URLs failed");
         Err(e)
@@ -569,8 +571,12 @@ where
         }
         tokio::time::sleep(SEARCH_RETRY_DELAY).await;
     }
-    Err(last_err
-        .expect("SEARCH_ATTEMPT_TIMEOUTS is non-empty, so at least one attempt always runs"))
+    // `SEARCH_ATTEMPT_TIMEOUTS` is a compile-time non-empty array, so the loop above always
+    // runs at least once.
+    #[allow(clippy::expect_used)]
+    let e = last_err
+        .expect("SEARCH_ATTEMPT_TIMEOUTS is non-empty, so at least one attempt always runs");
+    Err(e)
 }
 
 /// Returns ordered list of maven-metadata.xml URLs to try for the given package.
@@ -782,8 +788,7 @@ fn find_date_time(line: &str) -> Option<&str> {
     if bytes.len() < window {
         return None;
     }
-    for start in 0..=(bytes.len() - window) {
-        let candidate = &bytes[start..start + window];
+    for (start, candidate) in bytes.windows(window).enumerate() {
         if is_date_time_shape(candidate) {
             return Some(&line[start..start + window]);
         }
@@ -792,23 +797,13 @@ fn find_date_time(line: &str) -> Option<&str> {
 }
 
 fn is_date_time_shape(b: &[u8]) -> bool {
-    let digit = u8::is_ascii_digit;
-    digit(&b[0])
-        && digit(&b[1])
-        && digit(&b[2])
-        && digit(&b[3])
-        && b[4] == b'-'
-        && digit(&b[5])
-        && digit(&b[6])
-        && b[7] == b'-'
-        && digit(&b[8])
-        && digit(&b[9])
-        && b[10] == b' '
-        && digit(&b[11])
-        && digit(&b[12])
-        && b[13] == b':'
-        && digit(&b[14])
-        && digit(&b[15])
+    matches!(
+        b,
+        [y1, y2, y3, y4, b'-', m1, m2, b'-', d1, d2, b' ', h1, h2, b':', n1, n2]
+            if [y1, y2, y3, y4, m1, m2, d1, d2, h1, h2, n1, n2]
+                .iter()
+                .all(|c| c.is_ascii_digit())
+    )
 }
 
 #[derive(Deserialize)]
