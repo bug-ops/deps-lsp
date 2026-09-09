@@ -135,6 +135,51 @@ jobs:
           grep -q 'feature "test-util"' <<<"$tree" && { echo "::error::deps-core's test-util feature is reachable from deps-lsp's non-dev dependency tree"; exit 1; }
           exit 0
 
+  semver:
+    name: Semver Check
+    needs: changes
+    # Advisory only (issue #755), mirroring the `fuzz` job's `continue-on-error` pattern
+    # below (#701) rather than the unconditional-and-silent anti-pattern #701 itself fixed:
+    # `cargo semver-checks check-release -p deps-core --all-features` currently fails
+    # locally with "unsupported rustdoc format v60" — a toolchain/rustdoc-JSON version
+    # mismatch between this workspace's pinned nightly and the `cargo-semver-checks`
+    # release used here, unrelated to any actual API break (tracked in #755; CI's own
+    # pinned toolchain may not hit this at all, so this job can still catch real breaks).
+    # PR/push runs stay non-blocking so a toolchain mismatch here never blocks a merge —
+    # not part of `ci-success`'s `needs` — but the weekly scheduled sweep hard-fails and
+    # files/updates a tracking issue, so a real regression is never silently lost.
+    if: github.event_name == 'schedule' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: ${{ github.event_name != 'schedule' }}
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+
+      - name: Check semver
+        uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239  # v2.9
+        with:
+          feature-group: all-features
+
+      - name: File or update tracking issue on scheduled failure
+        if: failure() && github.event_name == 'schedule'
+        run: |
+          title="semver: cargo-semver-checks failed in scheduled run"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          body="Scheduled semver-check run ${run_url} failed.
+
+          This job is part of the weekly regression sweep (\`.github/workflows/ci.yml\`, job \`semver\`), tracked by issue #755. See the run log for the semver-violation or build-failure detail — a failure here that also reproduces on a PR/push run's non-blocking check is a real breaking-change candidate, not the known rustdoc-format mismatch (issue #755)."
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --search "in:title \"${title}\"" --state open --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body" --label bug --label testing-infra
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   security:
     name: Security Audit
     needs: changes

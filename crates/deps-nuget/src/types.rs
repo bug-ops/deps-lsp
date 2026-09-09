@@ -4,6 +4,7 @@ use std::any::Any;
 use tower_lsp_server::ls_types::{Range, Uri};
 
 /// A single `PackageReference` / `PackageVersion` / `package` entry from a manifest.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NuGetDependency {
     /// Package name.
@@ -54,6 +55,7 @@ impl deps_core::Dependency for NuGetDependency {
 
 /// Parsed result of a single manifest file (`.csproj`, `Directory.Packages.props`,
 /// `packages.config`).
+#[non_exhaustive]
 #[derive(Debug)]
 pub struct NuGetParseResult {
     /// Dependencies found in the manifest.
@@ -89,6 +91,7 @@ deps_core::impl_parse_result!(
 /// .NET prerelease labels (`-rtm`, `-servicing.23`, `-CI-*`, `-final`, ...). This follows
 /// the same precedent as `deps-maven`'s and `deps-go`'s hand-written `Version` impls for
 /// ecosystems with a structural (non-keyword) prerelease convention.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct NuGetVersion {
     /// The parsed version number.

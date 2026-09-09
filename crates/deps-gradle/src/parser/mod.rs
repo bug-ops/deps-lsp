@@ -132,6 +132,7 @@ pub(crate) fn build_dependency(
 }
 
 /// Result of parsing a Gradle build script, settings file, or version catalog.
+#[non_exhaustive]
 #[derive(Debug)]
 pub struct GradleParseResult {
     /// Dependencies found in the file.

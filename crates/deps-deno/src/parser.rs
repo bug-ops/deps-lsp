@@ -25,6 +25,7 @@ use std::collections::HashSet;
 use tower_lsp_server::ls_types::{Range, Uri};
 
 /// Result of parsing a `deno.json`/`deno.jsonc` file.
+#[non_exhaustive]
 #[derive(Debug)]
 pub struct DenoParseResult {
     /// All dependencies found in the `imports` map.

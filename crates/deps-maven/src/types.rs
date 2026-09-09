@@ -4,6 +4,7 @@ use std::any::Any;
 use tower_lsp_server::ls_types::Range;
 
 /// A single `<dependency>` declaration parsed from a `pom.xml`.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MavenDependency {
     /// Maven `groupId`.
@@ -56,6 +57,7 @@ impl std::str::FromStr for MavenScope {
 }
 
 /// A single published version of a Maven artifact.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct MavenVersion {
     /// The parsed version number.
@@ -66,6 +68,39 @@ pub struct MavenVersion {
     /// Gradle Plugin Portal never carry a date, and the fetch is disabled by
     /// `freshness.enabled: false`) — this is graceful degradation, not an error.
     pub published_at: Option<deps_core::PublishTime>,
+}
+
+impl MavenVersion {
+    /// Constructs a `MavenVersion` from its two fields.
+    ///
+    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
+    /// this crate, so every other crate — including `deps-gradle`, which reuses this type
+    /// as `GradleVersion` — must go through this constructor instead.
+    ///
+    /// # Arguments
+    ///
+    /// * `version` - The parsed version number
+    /// * `published_at` - When this version was published, if the `repo1.maven.org`
+    ///   directory listing carried a date
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_maven::types::MavenVersion;
+    ///
+    /// let version = MavenVersion::new("3.2.0".into(), None);
+    /// assert_eq!(version.version.as_str(), "3.2.0");
+    /// ```
+    #[must_use]
+    pub fn new(
+        version: deps_core::ConcreteVersion,
+        published_at: Option<deps_core::PublishTime>,
+    ) -> Self {
+        Self {
+            version,
+            published_at,
+        }
+    }
 }
 
 /// Artifact metadata as returned by Maven Central's search API.

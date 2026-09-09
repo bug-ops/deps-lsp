@@ -166,7 +166,8 @@ impl Ecosystem for GithubActionsEcosystem {
                 .into(),
                 CompletionContext::PackageName { .. }
                 | CompletionContext::Feature { .. }
-                | CompletionContext::None => Completions::default(),
+                | CompletionContext::None
+                | _ => Completions::default(),
             }
         })
     }

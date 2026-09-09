@@ -23,6 +23,7 @@ mod test_utils;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+pub use deps_core::parser::DependencySource;
 pub use deps_core::{DepsError, EcosystemRegistry, HttpCache, Result};
 pub use server::Backend;
 
@@ -72,14 +73,13 @@ ecosystem!(
     deps_cargo,
     CargoEcosystem,
     [
+        CargoDependency,
+        CargoDependencySection,
+        CargoParseResult,
         CargoParser,
         CargoVersion,
         CrateInfo,
         CratesIoRegistry,
-        DependencySection,
-        DependencySource,
-        ParseResult,
-        ParsedDependency,
         parse_cargo_toml,
     ]
 );

@@ -12,6 +12,7 @@ use std::sync::LazyLock;
 use tower_lsp_server::ls_types::{Range, Uri};
 
 /// Result of parsing a Gemfile.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct BundlerParseResult {
     /// Dependencies found in the `Gemfile`.

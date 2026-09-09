@@ -32,7 +32,8 @@
 use crate::config::{
     AuthToken, ConfigFileCache, IndexTrust, RegistryIndex, RegistryIndexError, SourceReplacement,
 };
-use crate::types::{DependencySection, DependencySource, ParsedDependency};
+use crate::types::{CargoDependency, CargoDependencySection, DependencySource};
+use deps_core::fs_probe::MAX_CONFIG_ANCESTOR_DEPTH;
 use deps_core::net_policy::RegistryAccessPolicy;
 use deps_core::{DepsError, Result};
 use std::any::Any;
@@ -48,10 +49,11 @@ pub use deps_core::lsp_helpers::LineOffsetTable;
 ///
 /// Contains all extracted dependencies with their positions, plus optional
 /// workspace root information for resolving inherited dependencies.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
-pub struct ParseResult {
+pub struct CargoParseResult {
     /// All dependencies found in the file
-    pub dependencies: Vec<ParsedDependency>,
+    pub dependencies: Vec<CargoDependency>,
     /// Workspace root path if this is a workspace member
     pub workspace_root: Option<PathBuf>,
     /// Document URI
@@ -102,7 +104,7 @@ pub struct ParseResult {
 /// let result = parse_cargo_toml(toml, &url).unwrap();
 /// assert_eq!(result.dependencies.len(), 2);
 /// ```
-pub fn parse_cargo_toml(content: &str, doc_uri: &Uri) -> Result<ParseResult> {
+pub fn parse_cargo_toml(content: &str, doc_uri: &Uri) -> Result<CargoParseResult> {
     parse_cargo_toml_with_context(content, doc_uri, &CargoParseContext::default())
 }
 
@@ -148,7 +150,7 @@ pub fn parse_cargo_toml_with_context(
     content: &str,
     doc_uri: &Uri,
     ctx: &CargoParseContext,
-) -> Result<ParseResult> {
+) -> Result<CargoParseResult> {
     if let Err(depth) =
         deps_core::check_toml_nesting_depth(content, deps_core::MAX_TOML_NESTING_DEPTH)
     {
@@ -205,7 +207,7 @@ pub fn parse_cargo_toml_with_context(
             workspace_deps,
             content,
             &line_table,
-            DependencySection::WorkspaceDependencies,
+            CargoDependencySection::WorkspaceDependencies,
         ));
     }
 
@@ -214,7 +216,7 @@ pub fn parse_cargo_toml_with_context(
     let (resolved_registries, blocked_registries) =
         resolve_alternate_registries(&mut dependencies, &discovery.config_paths, ctx);
 
-    Ok(ParseResult {
+    Ok(CargoParseResult {
         dependencies,
         workspace_root: discovery.workspace_root,
         uri: doc_uri.clone(),
@@ -261,7 +263,7 @@ type AlternateRegistryResolution = (
 /// from is unconditional regardless, so the only new unconditional cost here is the (cheap,
 /// memoized) config resolution itself.
 fn resolve_alternate_registries(
-    dependencies: &mut [ParsedDependency],
+    dependencies: &mut [CargoDependency],
     workspace_config_paths: &[PathBuf],
     ctx: &CargoParseContext,
 ) -> AlternateRegistryResolution {
@@ -376,7 +378,7 @@ fn parse_dependency_kind_tables(
     table: &Table<'_>,
     content: &str,
     line_table: &LineOffsetTable,
-    dependencies: &mut Vec<ParsedDependency>,
+    dependencies: &mut Vec<CargoDependency>,
 ) {
     if let Some(deps_val) = get_val(table, "dependencies")
         && let Some(deps) = deps_val.as_table()
@@ -385,7 +387,7 @@ fn parse_dependency_kind_tables(
             deps,
             content,
             line_table,
-            DependencySection::Dependencies,
+            CargoDependencySection::Dependencies,
         ));
     }
 
@@ -396,7 +398,7 @@ fn parse_dependency_kind_tables(
             dev_deps,
             content,
             line_table,
-            DependencySection::DevDependencies,
+            CargoDependencySection::DevDependencies,
         ));
     }
 
@@ -407,7 +409,7 @@ fn parse_dependency_kind_tables(
             build_deps,
             content,
             line_table,
-            DependencySection::BuildDependencies,
+            CargoDependencySection::BuildDependencies,
         ));
     }
 }
@@ -417,15 +419,15 @@ fn parse_dependencies_section(
     table: &Table<'_>,
     content: &str,
     line_table: &LineOffsetTable,
-    section: DependencySection,
-) -> Vec<ParsedDependency> {
+    section: CargoDependencySection,
+) -> Vec<CargoDependency> {
     let mut deps = Vec::new();
 
     for (key, value) in table {
         let name = key.name.to_string();
         let name_range = span_to_range(content, line_table, key.span);
 
-        let mut dep = ParsedDependency {
+        let mut dep = CargoDependency {
             name: name.into(),
             name_range,
             version_req: None,
@@ -456,7 +458,7 @@ fn parse_dependencies_section(
 
 /// Parses a table (inline or full) dependency entry.
 fn parse_table_dependency(
-    dep: &mut ParsedDependency,
+    dep: &mut CargoDependency,
     table: &Table<'_>,
     content: &str,
     line_table: &LineOffsetTable,
@@ -712,7 +714,7 @@ fn discover_workspace(doc_uri: &Uri) -> Result<WorkspaceDiscovery> {
 pub struct CargoParser;
 
 // Implement new ParseResult trait for trait object support
-impl deps_core::ParseResult for ParseResult {
+impl deps_core::ParseResult for CargoParseResult {
     fn dependencies(&self) -> Vec<&dyn deps_core::Dependency> {
         self.dependencies
             .iter()
@@ -1042,7 +1044,7 @@ internal-crate = { version = "1.0", registry-index = "http://insecure.mycorp.com
         assert!(result.resolved_registries.is_empty());
     }
 
-    /// S3 (impl-critic): `ParseResult::blocked_registries` must actually be populated — for a
+    /// S3 (impl-critic): `CargoParseResult::blocked_registries` must actually be populated — for a
     /// literal `registry-index` URL blocked by the default `public_only` policy — carrying
     /// the dependency's own `name_range` and the raw declared value (so a diagnostic message
     /// can name it), not just leaving the dependency unresolved with no trace.
@@ -1324,15 +1326,15 @@ cc = "1.0"
 
         assert_matches!(
             result.dependencies[0].section,
-            DependencySection::Dependencies
+            CargoDependencySection::Dependencies
         );
         assert_matches!(
             result.dependencies[1].section,
-            DependencySection::DevDependencies
+            CargoDependencySection::DevDependencies
         );
         assert_matches!(
             result.dependencies[2].section,
-            DependencySection::BuildDependencies
+            CargoDependencySection::BuildDependencies
         );
     }
 
@@ -1346,7 +1348,7 @@ cc = "1.0"
         assert_eq!(dep.name, "libc");
         assert_eq!(dep.version_req, Some("0.2".into()));
         assert_eq!(dep.source, DependencySource::Registry);
-        assert_matches!(dep.section, DependencySection::Dependencies);
+        assert_matches!(dep.section, CargoDependencySection::Dependencies);
 
         // Position must point into the target table, not the (nonexistent) top-level one.
         assert_eq!(dep.name_range.start.line, 1);
@@ -1363,7 +1365,7 @@ cc = "1.0"
         let dep = &result.dependencies[0];
         assert_eq!(dep.name, "winapi");
         assert_eq!(dep.version_req, Some("0.3".into()));
-        assert_matches!(dep.section, DependencySection::DevDependencies);
+        assert_matches!(dep.section, CargoDependencySection::DevDependencies);
     }
 
     #[test]
@@ -1375,7 +1377,7 @@ cc = "1.0"
         let dep = &result.dependencies[0];
         assert_eq!(dep.name, "cc");
         assert_eq!(dep.version_req, Some("1.0".into()));
-        assert_matches!(dep.section, DependencySection::BuildDependencies);
+        assert_matches!(dep.section, CargoDependencySection::BuildDependencies);
     }
 
     #[test]
@@ -1401,7 +1403,7 @@ cc = "1.0"
             .iter()
             .find(|d| d.name == "serde")
             .unwrap();
-        assert_matches!(serde.section, DependencySection::Dependencies);
+        assert_matches!(serde.section, CargoDependencySection::Dependencies);
 
         let libc = result
             .dependencies
@@ -1410,17 +1412,17 @@ cc = "1.0"
             .unwrap();
         assert_eq!(libc.version_req, Some("0.2".into()));
         assert_eq!(libc.features, vec!["extra_traits"]);
-        assert_matches!(libc.section, DependencySection::Dependencies);
+        assert_matches!(libc.section, CargoDependencySection::Dependencies);
 
         let winapi = result
             .dependencies
             .iter()
             .find(|d| d.name == "winapi")
             .unwrap();
-        assert_matches!(winapi.section, DependencySection::DevDependencies);
+        assert_matches!(winapi.section, CargoDependencySection::DevDependencies);
 
         let cc = result.dependencies.iter().find(|d| d.name == "cc").unwrap();
-        assert_matches!(cc.section, DependencySection::BuildDependencies);
+        assert_matches!(cc.section, CargoDependencySection::BuildDependencies);
     }
 
     #[test]
@@ -1510,7 +1512,7 @@ tokio = { version = "1.0", features = ["full"] }
         assert_eq!(result.dependencies.len(), 2);
 
         for dep in &result.dependencies {
-            assert_matches!(dep.section, DependencySection::WorkspaceDependencies);
+            assert_matches!(dep.section, CargoDependencySection::WorkspaceDependencies);
         }
 
         let serde = result.dependencies.iter().find(|d| d.name == "serde");
@@ -1554,12 +1556,12 @@ tokio = "1.0"
         assert!(serde.is_some());
         assert_matches!(
             serde.unwrap().section,
-            DependencySection::WorkspaceDependencies
+            CargoDependencySection::WorkspaceDependencies
         );
 
         let tokio = result.dependencies.iter().find(|d| d.name == "tokio");
         assert!(tokio.is_some());
-        assert_matches!(tokio.unwrap().section, DependencySection::Dependencies);
+        assert_matches!(tokio.unwrap().section, CargoDependencySection::Dependencies);
     }
 
     #[test]

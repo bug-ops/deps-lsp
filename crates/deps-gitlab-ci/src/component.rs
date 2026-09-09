@@ -121,12 +121,7 @@ pub fn gitlab_version_req(raw: &str) -> Option<semver::VersionReq> {
 /// use deps_gitlab_ci::component::resolve_component_pin;
 /// use deps_gitlab_ci::GitlabCiVersion;
 ///
-/// let releases = vec![GitlabCiVersion {
-///     version: "1.2.0".into(),
-///     sha: "a".repeat(40),
-///     prerelease: false,
-///     published_at: None,
-/// }];
+/// let releases = vec![GitlabCiVersion::new("1.2.0".into(), "a".repeat(40), false, None)];
 /// let resolved = resolve_component_pin(&PinStyle::Tag, "1.2.0", &releases).unwrap();
 /// assert_eq!(resolved.version.as_str(), "1.2.0");
 /// ```

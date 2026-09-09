@@ -7,6 +7,7 @@ use tower_lsp_server::ls_types::Range;
 ///
 /// Package names use `owner/repo` format derived from the Git URL.
 /// Position tracking enables hover, completion, and inlay hints.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SwiftDependency {
     /// Package identity: owner/repo (e.g. "apple/swift-nio")
@@ -60,6 +61,7 @@ impl deps_core::ecosystem::Dependency for SwiftDependency {
 }
 
 /// Version information for a Swift package (GitHub tag).
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct SwiftVersion {
     /// Semver version string (v prefix stripped)
@@ -112,6 +114,7 @@ deps_core::impl_metadata!(SwiftPackage {
 });
 
 /// Result of parsing a Package.swift file.
+#[non_exhaustive]
 #[derive(Debug)]
 pub struct SwiftParseResult {
     /// Dependencies found in the `Package.swift` manifest.

@@ -6,6 +6,7 @@ use tower_lsp_server::ls_types::Range;
 pub use deps_maven::MavenVersion as GradleVersion;
 
 /// A single dependency declaration parsed from a Gradle build script.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GradleDependency {
     /// Maven `groupId`.
@@ -124,10 +125,7 @@ mod tests {
         use deps_core::Version;
 
         let published = deps_core::PublishTime::parse_rfc3339("2026-07-18T23:05:13Z").unwrap();
-        let version = GradleVersion {
-            version: "3.2.0".into(),
-            published_at: Some(published),
-        };
+        let version = GradleVersion::new("3.2.0".into(), Some(published));
 
         assert_eq!(version.published_at(), Some(published));
     }

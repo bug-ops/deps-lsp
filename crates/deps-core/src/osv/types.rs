@@ -36,14 +36,15 @@ use crate::lsp_helpers::is_safe_version_string;
 /// ```
 /// use deps_core::osv::ScanTarget;
 ///
-/// let target = ScanTarget {
-///     key: "time".to_string(),
-///     osv_name: "time".to_string(),
-///     version: "0.1.43".to_string(),
-///     display_version: "0.1.43".to_string(),
-/// };
+/// let target = ScanTarget::new(
+///     "time".to_string(),
+///     "time".to_string(),
+///     "0.1.43".to_string(),
+///     "0.1.43".to_string(),
+/// );
 /// assert_eq!(target.key, target.osv_name);
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanTarget {
     /// This project's internal lookup key — used to key [`VulnerabilityMap`].
@@ -61,11 +62,39 @@ pub struct ScanTarget {
     pub display_version: String,
 }
 
+impl ScanTarget {
+    /// Constructs a `ScanTarget` from its four fields.
+    ///
+    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
+    /// this crate, so every other crate must go through this constructor instead.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - This project's internal lookup key — used to key [`VulnerabilityMap`],
+    ///   **not** what gets sent to OSV
+    /// * `osv_name` - OSV's canonical package name for this ecosystem — sent on the wire,
+    ///   distinct from `key` because the two do not always round-trip (see [`Self::key`]'s docs)
+    /// * `version` - Concrete version rewritten to OSV's wire spelling
+    ///   (`EcosystemFormatter::osv_version`) — sent to OSV, never shown to the user
+    /// * `display_version` - The same version in the ecosystem's native spelling, for
+    ///   surfacing back to the user instead of `version`
+    #[must_use]
+    pub fn new(key: String, osv_name: String, version: String, display_version: String) -> Self {
+        Self {
+            key,
+            osv_name,
+            version,
+            display_version,
+        }
+    }
+}
+
 /// Severity bucket derived from an OSV advisory record.
 ///
 /// See `architecture.md` §6 for the precedence rules used to derive this
 /// from a raw record, and [`crate::osv::diagnostic_severity_for`] for the mapping to
 /// [`tower_lsp_server::ls_types::DiagnosticSeverity`].
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VulnSeverity {
     /// `database_specific.severity` or `ecosystem_specific.severity` reported `CRITICAL`.
@@ -106,18 +135,19 @@ pub enum VulnSeverity {
 /// ```
 /// use deps_core::osv::{Advisory, VulnSeverity};
 ///
-/// let advisory = Advisory {
-///     id: "RUSTSEC-2020-0071".to_string(),
-///     modified: "2023-01-01T00:00:00Z".to_string(),
-///     summary: Some("Potential segfault in the time crate".to_string()),
-///     aliases: vec!["CVE-2020-26235".to_string()],
-///     severity: VulnSeverity::High,
-///     cvss_vector: None,
-///     fixed_versions: vec!["0.2.23".to_string()],
-///     url: "https://osv.dev/vulnerability/RUSTSEC-2020-0071".to_string(),
-/// };
+/// let advisory = Advisory::new(
+///     "RUSTSEC-2020-0071".to_string(),
+///     "2023-01-01T00:00:00Z".to_string(),
+///     Some("Potential segfault in the time crate".to_string()),
+///     vec!["CVE-2020-26235".to_string()],
+///     VulnSeverity::High,
+///     None,
+///     vec!["0.2.23".to_string()],
+///     "https://osv.dev/vulnerability/RUSTSEC-2020-0071".to_string(),
+/// );
 /// assert_eq!(advisory.fixed_versions.last(), Some(&"0.2.23".to_string()));
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Advisory {
     /// Advisory identifier (e.g. `"RUSTSEC-2020-0071"`, `"GHSA-..."`).
@@ -138,6 +168,48 @@ pub struct Advisory {
     pub fixed_versions: Vec<String>,
     /// `https://osv.dev/vulnerability/{id}`.
     pub url: String,
+}
+
+impl Advisory {
+    /// Constructs an `Advisory` from its already-normalized fields.
+    ///
+    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
+    /// this crate, so every other crate (including test code) must go through this
+    /// constructor instead.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - Advisory identifier (e.g. `"RUSTSEC-2020-0071"`, `"GHSA-..."`)
+    /// * `modified` - RFC3339 last-modified timestamp — not the advisory's publish date
+    /// * `summary` - Human-readable one-line summary, if OSV provided one
+    /// * `aliases` - Alternate identifiers (CVE, GHSA, ...), not including `id` itself
+    /// * `severity` - Derived severity bucket
+    /// * `cvss_vector` - Raw CVSS vector string, shown verbatim in hover but never parsed
+    /// * `fixed_versions` - Every `fixed` event found in the record's ranges, ascending
+    /// * `url` - `https://osv.dev/vulnerability/{id}`
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        id: String,
+        modified: String,
+        summary: Option<String>,
+        aliases: Vec<String>,
+        severity: VulnSeverity,
+        cvss_vector: Option<String>,
+        fixed_versions: Vec<String>,
+        url: String,
+    ) -> Self {
+        Self {
+            id,
+            modified,
+            summary,
+            aliases,
+            severity,
+            cvss_vector,
+            fixed_versions,
+            url,
+        }
+    }
 }
 
 /// A list that may have been truncated when it was produced, paired with the
@@ -386,16 +458,16 @@ impl DependencyVulnerabilities {
     /// use std::sync::Arc;
     ///
     /// fn advisory(id: &str, fixed: &str) -> Arc<Advisory> {
-    ///     Arc::new(Advisory {
-    ///         id: id.to_string(),
-    ///         modified: "2023-01-01T00:00:00Z".to_string(),
-    ///         summary: None,
-    ///         aliases: vec![],
-    ///         severity: VulnSeverity::High,
-    ///         cvss_vector: None,
-    ///         fixed_versions: vec![fixed.to_string()],
-    ///         url: String::new(),
-    ///     })
+    ///     Arc::new(Advisory::new(
+    ///         id.to_string(),
+    ///         "2023-01-01T00:00:00Z".to_string(),
+    ///         None,
+    ///         vec![],
+    ///         VulnSeverity::High,
+    ///         None,
+    ///         vec![fixed.to_string()],
+    ///         String::new(),
+    ///     ))
     /// }
     ///
     /// let dv = DependencyVulnerabilities {

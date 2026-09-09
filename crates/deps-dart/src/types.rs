@@ -4,6 +4,7 @@ use std::any::Any;
 use tower_lsp_server::ls_types::Range;
 
 /// A single dependency declaration parsed from a `pubspec.yaml`.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DartDependency {
     /// Package name.
@@ -24,6 +25,7 @@ pub struct DartDependency {
 }
 
 /// Which `pubspec.yaml` top-level section a dependency was declared under.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum DependencySection {
     /// The `dependencies:` section.
@@ -38,6 +40,7 @@ pub enum DependencySection {
 pub use deps_core::parser::DependencySource;
 
 /// A single published version of a Dart/Pub package.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct DartVersion {
     /// The parsed version number.

@@ -19,6 +19,7 @@ use regex::Regex;
 use tower_lsp_server::ls_types::{Range, Uri};
 
 /// Result of parsing a go.mod file.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct GoParseResult {
     /// All dependencies found in the file

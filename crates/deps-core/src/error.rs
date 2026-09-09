@@ -37,6 +37,7 @@ fn http_status_message(status: u16, url: &str) -> String {
 ///     Ok(())
 /// }
 /// ```
+#[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum DepsError {
     /// A manifest or lockfile failed to parse.
@@ -284,6 +285,7 @@ impl DepsError {
 /// can distinguish a failure with a safe, user-actionable hint from an opaque one, without
 /// ever threading raw, potentially IP-bearing error text into the diagnostic (see
 /// [`DepsError::fetch_failure`]).
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FetchFailure {
     /// The fetch failed with a pre-vetted, safe-to-display hint (currently only produced

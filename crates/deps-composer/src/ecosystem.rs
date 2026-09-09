@@ -131,7 +131,7 @@ impl Ecosystem for ComposerEcosystem {
                         .await
                 }
                 CompletionContext::Feature { .. } => vec![],
-                CompletionContext::None => vec![],
+                CompletionContext::None | _ => vec![],
             }
             .into()
         })

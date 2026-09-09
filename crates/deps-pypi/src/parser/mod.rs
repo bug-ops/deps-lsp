@@ -386,6 +386,7 @@ pub struct RequirementRef {
 /// Parse result containing all dependencies from a Python dependency manifest.
 ///
 /// Stores dependencies and optional workspace information for LSP operations.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ParseResult {
     /// All dependencies found in the manifest

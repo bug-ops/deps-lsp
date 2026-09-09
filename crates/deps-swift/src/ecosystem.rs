@@ -209,7 +209,7 @@ impl Ecosystem for SwiftEcosystem {
                         .await
                 }
                 CompletionContext::Feature { .. } => vec![],
-                CompletionContext::None => vec![],
+                CompletionContext::None | _ => vec![],
             }
             .into()
         })

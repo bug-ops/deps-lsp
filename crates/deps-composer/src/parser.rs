@@ -16,6 +16,7 @@ use tower_lsp_server::ls_types::Uri;
 /// Result of parsing a composer.json file.
 ///
 /// Contains all non-platform dependencies found in the file with their positions.
+#[non_exhaustive]
 #[derive(Debug)]
 pub struct ComposerParseResult {
     /// Non-platform dependencies found in the manifest.
