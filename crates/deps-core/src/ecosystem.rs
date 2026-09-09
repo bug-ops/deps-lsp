@@ -317,14 +317,17 @@ impl Default for EcosystemConfig {
 
 /// How this ecosystem's license strings are sourced.
 ///
-/// Drives two ecosystem-specific license behaviors that used to be re-derived
+/// Drives three ecosystem-specific license behaviors that used to be re-derived
 /// independently at each consumer via a non-exhaustive `matches!`/`==` on
 /// [`EcosystemId`] instead of the sealed [`Ecosystem`] trait every other per-ecosystem
 /// capability goes through (issue #688): hover's "(detected)" qualifier, which only
-/// applies to [`Self::DetectedSpdx`], and whether
+/// applies to [`Self::DetectedSpdx`]; whether
 /// [`crate::licenses::resolve_license_entries`] must normalize free text to SPDX
 /// identifiers before hover displays it or a [`crate::licenses::LicensePolicy`]
-/// evaluates it, which only applies to [`Self::PomFreeText`].
+/// evaluates it, which only applies to [`Self::PomFreeText`]; and, via
+/// [`Self::requires_dedicated_fetch`] (issue #697), whether
+/// [`Ecosystem::fetch_license`] is a dedicated async fetch or a no-op because the
+/// license already arrived in the hot-path registry response.
 ///
 /// # Examples
 ///
@@ -336,19 +339,52 @@ impl Default for EcosystemConfig {
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LicenseSource {
-    /// Author-declared SPDX identifier(s) in registry metadata — the default for every
-    /// ecosystem that doesn't override [`Ecosystem::license_source`].
+    /// Author-declared SPDX identifier(s) already present in the hot-path registry
+    /// response — the default for every ecosystem that doesn't override
+    /// [`Ecosystem::license_source`], and the only variant for which
+    /// [`Self::requires_dedicated_fetch`] is `false`.
     #[default]
     RegistryDeclaredSpdx,
-    /// A detector's best-effort guess, not an author declaration: pub.dev's `/score`
-    /// endpoint (Dart) and GitHub's `license.spdx_id` (Swift) are both driven by a
-    /// license-detection heuristic run against repository content, rather than metadata
-    /// the package author explicitly declared to a registry.
+    /// Author-declared SPDX identifier(s) that require a dedicated fetch separate
+    /// from the hot-path registry response: JSR's package-metadata endpoint (Deno).
+    FetchedDeclaredSpdx,
+    /// A detector's best-effort guess, not an author declaration, that requires a
+    /// dedicated fetch: pub.dev's `/score` endpoint (Dart) and GitHub's
+    /// `license.spdx_id` (Swift) are both driven by a license-detection heuristic run
+    /// against repository content, rather than metadata the package author explicitly
+    /// declared to a registry.
     DetectedSpdx,
-    /// Maven POM `<licenses><license><name>` free text (Gradle) — never an SPDX
-    /// identifier, so it must be normalized via
+    /// Maven POM `<licenses><license><name>` free text (Gradle), fetched via a
+    /// dedicated request — never an SPDX identifier, so it must be normalized via
     /// [`crate::licenses::resolve_license_entries`] before display or policy evaluation.
     PomFreeText,
+}
+
+impl LicenseSource {
+    /// Whether this source requires [`Ecosystem::fetch_license`]'s dedicated async
+    /// fetch, as opposed to arriving for free in the hot-path registry response.
+    ///
+    /// This is the single answer to "is this a tier-3 license ecosystem" (issue #697):
+    /// capability and shape can no longer disagree, because both come from the same
+    /// [`Ecosystem::license_source`] call.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::LicenseSource;
+    ///
+    /// assert!(!LicenseSource::RegistryDeclaredSpdx.requires_dedicated_fetch());
+    /// assert!(LicenseSource::FetchedDeclaredSpdx.requires_dedicated_fetch());
+    /// assert!(LicenseSource::DetectedSpdx.requires_dedicated_fetch());
+    /// assert!(LicenseSource::PomFreeText.requires_dedicated_fetch());
+    /// ```
+    #[must_use]
+    pub const fn requires_dedicated_fetch(self) -> bool {
+        match self {
+            Self::RegistryDeclaredSpdx => false,
+            Self::FetchedDeclaredSpdx | Self::DetectedSpdx | Self::PomFreeText => true,
+        }
+    }
 }
 
 /// Main trait that all ecosystem implementations must implement.
@@ -764,33 +800,34 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     }
 
     /// Fetches `name`'s license at `version` from this ecosystem's own tier-3 license
-    /// source (issue #660/#688), for
+    /// source (issue #660/#688/#697), for
     /// `deps-lsp::document::lifecycle::run_license_prefetch`'s background pre-fetch —
     /// never called from the hover critical path directly, since it may perform network
     /// I/O.
     ///
-    /// Returns `None` when this ecosystem has no tier-3 license source of its own —
-    /// either its hot-path registry response already carries a license field, or
-    /// `deps_dev_system` (this crate's `deps_dev` module) covers it. `Some` for the four
-    /// ecosystems (Dart, Swift, Gradle, Deno) whose license needs a dedicated fetch. An
-    /// `async fn` body returns a lazy future that performs no I/O until polled, so a
-    /// caller may test capability alone (`fetch_license(name, version).is_some()`)
-    /// without triggering a fetch — `deps-lsp`'s `document::lifecycle::run_license_prefetch`
-    /// ecosystem gate relies on exactly this.
+    /// Only ever called when
+    /// <code>self.[license_source](Self::license_source)().[requires_dedicated_fetch](LicenseSource::requires_dedicated_fetch)()</code>
+    /// is `true`; the default implementation returns an already-resolved empty result
+    /// and is never actually awaited by a correctly gated caller. Overriding this
+    /// without also overriding [`Self::license_source`] to a variant whose
+    /// `requires_dedicated_fetch()` is `true` leaves the override dead code — nothing
+    /// automated cross-checks the two methods against each other, so keeping them in
+    /// sync for a new override is the implementor's responsibility.
     fn fetch_license<'a>(
         &'a self,
         _name: &'a str,
         _version: &'a str,
-    ) -> Option<BoxFuture<'a, Vec<String>>> {
-        None
+    ) -> BoxFuture<'a, Vec<String>> {
+        Box::pin(std::future::ready(Vec::new()))
     }
 
     /// How this ecosystem's license strings are sourced. See [`LicenseSource`].
     ///
     /// Default [`LicenseSource::RegistryDeclaredSpdx`] is correct for every ecosystem
-    /// whose license is an author-declared SPDX identifier from registry metadata —
-    /// every ecosystem except Dart/Swift (detector output) and Gradle (POM free text),
-    /// which override this.
+    /// whose license is an author-declared SPDX identifier already present in the
+    /// hot-path registry response. This is also the single answer to whether
+    /// [`Self::fetch_license`] is ever called for this ecosystem — see
+    /// [`LicenseSource::requires_dedicated_fetch`].
     fn license_source(&self) -> LicenseSource {
         LicenseSource::RegistryDeclaredSpdx
     }

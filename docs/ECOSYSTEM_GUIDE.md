@@ -670,12 +670,17 @@ background license pre-fetch keeps a higher floor.
 | Deno | JSR's per-version `license` field (`jsr:` specifiers only) | `**License**` |
 
 Which of these four "sources" a dependency's license is depends on the ecosystem
-crate's `Ecosystem::license_source()` (issue #688): `RegistryDeclaredSpdx`
-(author-declared, the default — every ecosystem above except Dart/Swift/Gradle),
-`DetectedSpdx` (Dart/Swift — a best-effort *detector*, not author-declared
-metadata, hence the `(detected)` qualifier), or `PomFreeText` (Gradle only —
-Maven POM `<license><name>` free text, e.g. `"The Apache Software License,
-Version 2.0"`, never an SPDX identifier). Gradle's free text is normalized once,
+crate's `Ecosystem::license_source()` (issue #688/#697): `RegistryDeclaredSpdx`
+(author-declared, arriving for free in the hot-path registry response — the
+default, every ecosystem above except Dart/Swift/Gradle/Deno), `FetchedDeclaredSpdx`
+(Deno only — author-declared, but via JSR's dedicated per-version fetch rather than
+the hot-path response), `DetectedSpdx` (Dart/Swift — a best-effort *detector*, not
+author-declared metadata, hence the `(detected)` qualifier), or `PomFreeText`
+(Gradle only — Maven POM `<license><name>` free text, e.g. `"The Apache Software
+License, Version 2.0"`, never an SPDX identifier). `LicenseSource::requires_dedicated_fetch()`
+is `true` for every variant except `RegistryDeclaredSpdx` — this is also the single
+gate `deps-lsp`'s tier-3 license pre-fetch uses to decide whether to call an
+ecosystem's `fetch_license` at all. Gradle's free text is normalized once,
 at the shared pre-fetch data boundary (issue #687), but hover and
 [License Policy Diagnostic](#license-policy-diagnostic-issue-661) below use two
 different views of that normalization

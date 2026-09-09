@@ -690,9 +690,9 @@ pub fn resolve_license_entries(
 ) -> (Vec<String>, bool) {
     match source {
         crate::LicenseSource::PomFreeText => normalize_pom_license_names_checked(raw),
-        crate::LicenseSource::RegistryDeclaredSpdx | crate::LicenseSource::DetectedSpdx => {
-            (raw.to_vec(), true)
-        }
+        crate::LicenseSource::RegistryDeclaredSpdx
+        | crate::LicenseSource::FetchedDeclaredSpdx
+        | crate::LicenseSource::DetectedSpdx => (raw.to_vec(), true),
     }
 }
 
@@ -792,9 +792,9 @@ pub fn resolve_license_entries_for_display(
             }
             resolved
         }
-        crate::LicenseSource::RegistryDeclaredSpdx | crate::LicenseSource::DetectedSpdx => {
-            raw.to_vec()
-        }
+        crate::LicenseSource::RegistryDeclaredSpdx
+        | crate::LicenseSource::FetchedDeclaredSpdx
+        | crate::LicenseSource::DetectedSpdx => raw.to_vec(),
     }
 }
 

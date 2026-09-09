@@ -170,17 +170,24 @@ impl Ecosystem for DenoEcosystem {
         &'a self,
         name: &'a str,
         version: &'a str,
-    ) -> Option<deps_core::ecosystem::BoxFuture<'a, Vec<String>>> {
+    ) -> deps_core::ecosystem::BoxFuture<'a, Vec<String>> {
         // Wrapped in an explicit `async move` block (rather than boxing the inner async
         // fn's future directly, as the other three tier-3 ecosystems' `fetch_license` do)
         // because `PackageName::new(name)` is a temporary: borrowing it outside an async
         // block that also performs the `.await` would only live to the end of this
         // statement, not for the lifetime of the returned, not-yet-polled future.
-        Some(Box::pin(async move {
+        Box::pin(async move {
             self.registry
                 .get_license(&deps_core::PackageName::new(name), version)
                 .await
-        }))
+        })
+    }
+
+    /// JSR's package-metadata endpoint returns an author-declared SPDX identifier, but
+    /// via a dedicated fetch separate from the hot-path registry response — see
+    /// [`deps_core::LicenseSource::FetchedDeclaredSpdx`].
+    fn license_source(&self) -> deps_core::LicenseSource {
+        deps_core::LicenseSource::FetchedDeclaredSpdx
     }
 }
 

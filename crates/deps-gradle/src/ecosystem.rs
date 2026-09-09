@@ -362,12 +362,12 @@ impl Ecosystem for GradleEcosystem {
         &'a self,
         name: &'a str,
         version: &'a str,
-    ) -> Option<deps_core::ecosystem::BoxFuture<'a, Vec<String>>> {
-        Some(Box::pin(crate::license::fetch_license(
+    ) -> deps_core::ecosystem::BoxFuture<'a, Vec<String>> {
+        Box::pin(crate::license::fetch_license(
             &self.http_cache,
             name,
             version,
-        )))
+        ))
     }
 
     /// Gradle's Maven Central POM `<licenses><license><name>` is free text, not an SPDX
