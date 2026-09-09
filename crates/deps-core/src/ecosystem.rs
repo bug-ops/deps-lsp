@@ -1002,7 +1002,7 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
 
     /// Fetches `name`'s license at `version` from this ecosystem's own tier-3 license
     /// source (issue #660/#688/#697), for
-    /// `deps-lsp::document::lifecycle::run_license_prefetch`'s background pre-fetch —
+    /// `deps-lsp::document::osv_scan::run_license_prefetch`'s background pre-fetch —
     /// never called from the hover critical path directly, since it may perform network
     /// I/O.
     ///

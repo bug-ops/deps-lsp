@@ -488,7 +488,7 @@ pub struct VersionData<'a> {
     /// cover and whose hot-path registry response carries no license field — Dart,
     /// Swift, Gradle, Deno (issue #660, spec 010 plan §1 tier 3), keyed by raw
     /// (unnormalized) package name. `None` by default. Populated from `DocumentState`'s
-    /// per-document pre-fetch cache (`document::lifecycle::run_license_prefetch` on
+    /// per-document pre-fetch cache (`document::osv_scan::run_license_prefetch` on
     /// document open/change — mirrors [`Self::vulnerabilities`]'s "populated by a
     /// background task, read synchronously here" shape) by `handlers/hover.rs` (deps-lsp)
     /// for hover, and by `handlers/diagnostics.rs`'s `textDocument/diagnostic` pull path
