@@ -1,6 +1,10 @@
 //! Manifest parsers for `.csproj`/`.fsproj`/`.vbproj`, `Directory.Packages.props`, and
 //! `packages.config`, with byte-accurate LSP position tracking.
 //!
+//! No element-count/scan-position bound is applied here (#698): the input is a local
+//! manifest already capped by `deps-lsp`'s `MAX_FILE_SIZE` (10 MB) read path, unlike a
+//! remote registry response.
+//!
 //! # Attribute byte spans
 //!
 //! NuGet carries its values in XML *attributes* (`Include="..."`, `Version="..."`), and
