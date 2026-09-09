@@ -27,8 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: property tests (`proptest`) asserting the parser depth/expansion checkers and JSONC position recovery never panic on arbitrary input (#673)
 
 ### Fixed
-- **deps-core**: manifest parsing now runs on the blocking-thread pool instead of the calling tokio worker, no longer stalling the LSP request worker on a large manifest (resolves #743)
-- **deps-core**: `LineOffsetTable::byte_offset_to_position` no longer rescans an ASCII line from its start on every call, fixing an O(n^2) slowdown on large single-line (minified) manifests (resolves #742)
+- **deps-core**: manifest parsing now runs on the blocking-thread pool instead of the calling tokio worker, no longer stalling the LSP request worker on a large manifest (resolves #743) (#747)
+- **deps-core**: `LineOffsetTable::byte_offset_to_position` no longer rescans an ASCII line from its start on every call, fixing an O(n^2) slowdown on large single-line (minified) manifests (resolves #742) (#747)
 - **deps-pypi**: raw-text fallback completion no longer bare-inserts an unquoted package name into a `pyproject.toml` dependency array when no quote has been typed yet, producing invalid TOML (resolves #737) (#741)
 - **deps-lsp**: raw-text fallback completion now rejects a prefix longer than 200 characters (previously unbounded), reusing the same `is_valid_completion_prefix_len` guard every primary completion path already uses, and bounds the prefix/query values it logs (resolves #739) (#745)
 - **deps-cargo**: raised `recursion_limit` to fix the nightly `-D warnings` fuzz-job build, which failed proving `Send` for `get_latest_matching_from`'s boxed future (same class of fix as deps-nuget in #696 and deps-swift in #673) (#745)
