@@ -298,6 +298,10 @@ impl GithubTagsClient {
     /// # Errors
     ///
     /// Propagates the underlying HTTP/cache error unchanged.
+    #[tracing::instrument(
+        skip(self),
+        fields(url = crate::net_policy::url_for_tracing(url))
+    )]
     pub async fn fetch_authenticated(&self, url: &str) -> Result<Bytes> {
         self.cache
             .get_cached_trusted_origin_with_headers(url, &self.trusted_origin, &self.headers())
@@ -314,6 +318,7 @@ impl GithubTagsClient {
     /// # Errors
     ///
     /// Propagates the underlying HTTP/cache error unchanged.
+    #[tracing::instrument(skip(self), fields(name = name, page = page))]
     pub async fn fetch_tags_page(&self, name: &str, page: u32) -> Result<Bytes> {
         let url = format!(
             "{}/repos/{name}/tags?per_page=100&page={page}",
@@ -681,6 +686,7 @@ impl ReleaseDatesCache {
     /// assert!(dates.is_empty());
     /// # }
     /// ```
+    #[tracing::instrument(skip(self, github), fields(name = name, ecosystem = ecosystem))]
     pub async fn fetch(
         &self,
         github: &GithubTagsClient,
@@ -724,7 +730,19 @@ impl ReleaseDatesCache {
         )
         .await;
         match &fetch_result {
-            Ok(Err(e)) => tracing::debug!(package = name, error = %e, "release dates fetch failed"),
+            // #756: never interpolate `e`'s `Display` — see `DepsError::safe_tracing_summary`.
+            // Same pattern-consistency fix as `cache.rs`/`osv/mod.rs` in this same function
+            // this diff already instruments — currently safe (GitHub auth flows via header,
+            // never the URL), but keeping the invariant uniform everywhere this diff touches.
+            Ok(Err(e)) => {
+                let (status, cause) = e.safe_tracing_summary();
+                tracing::debug!(
+                    package = name,
+                    status = ?status,
+                    cause,
+                    "release dates fetch failed"
+                );
+            }
             Err(_) => tracing::debug!(package = name, "release dates fetch timed out"),
             Ok(Ok(_)) => {}
         }

@@ -352,6 +352,10 @@ impl OsvClient {
     /// (network error, non-2xx, malformed JSON, or a result-count mismatch)
     /// the *entire* chunk degrades to [`SkipReason::QueryFailed`] rather than
     /// risking misattributing an advisory to the wrong dependency.
+    #[tracing::instrument(
+        skip(self, chunk, outcomes, truncated),
+        fields(url = tracing::field::Empty)
+    )]
     async fn resolve_chunk(
         &self,
         osv_eco: &'static str,
@@ -359,6 +363,9 @@ impl OsvClient {
         outcomes: &mut HashMap<String, ScanOutcome>,
         truncated: &mut Vec<ScanTarget>,
     ) {
+        let url = self.batch_url();
+        tracing::Span::current().record("url", crate::net_policy::url_for_tracing(&url));
+
         let queries: Vec<OsvQuery> = chunk
             .iter()
             .map(|t| OsvQuery {
@@ -371,10 +378,14 @@ impl OsvClient {
             .collect();
 
         let body = OsvBatchRequest { queries };
-        let response_bytes = match self.cache.post_json(&self.batch_url(), &body).await {
+        let response_bytes = match self.cache.post_json(&url, &body).await {
             Ok(b) => b,
             Err(e) => {
-                tracing::warn!(error = %e, "OSV batch query failed");
+                // #756: never interpolate `e`'s `Display` — it can embed the raw request
+                // URL (`DepsError::HttpStatus`/`RegistryError`; see
+                // `DepsError::safe_tracing_summary`'s docs).
+                let (status, cause) = e.safe_tracing_summary();
+                tracing::warn!(status = ?status, cause, "OSV batch query failed");
                 mark_chunk_failed(chunk, outcomes);
                 return;
             }
@@ -582,8 +593,10 @@ impl OsvClient {
     /// entry map would double-cache every fetched record there, competing
     /// with registry responses for its byte budget for no benefit (critique
     /// M2 — nothing ever reads that copy back).
+    #[tracing::instrument(skip(self), fields(url = tracing::field::Empty))]
     async fn fetch_single_record(&self, id: &str) -> Option<OsvVulnRecord> {
         let url = self.vuln_record_url(id);
+        tracing::Span::current().record("url", crate::net_policy::url_for_tracing(&url));
         match self.cache.get_transport_only(&url).await {
             Ok(bytes) => match crate::parser::parse_json_checked::<OsvVulnRecord>(&bytes) {
                 Ok(record) => Some(record),
@@ -592,18 +605,29 @@ impl OsvClient {
                     None
                 }
             },
+            // #756: never interpolate `e`'s `Display` — see `DepsError::safe_tracing_summary`.
             Err(e) => {
-                tracing::warn!(id, error = %e, "failed to fetch OSV vulnerability record");
+                let (status, cause) = e.safe_tracing_summary();
+                tracing::warn!(
+                    id,
+                    status = ?status,
+                    cause,
+                    "failed to fetch OSV vulnerability record"
+                );
                 None
             }
         }
     }
 
+    #[tracing::instrument(skip(self, target), fields(url = tracing::field::Empty))]
     async fn query_single(
         &self,
         osv_eco: &'static str,
         target: &ScanTarget,
     ) -> Option<OsvSingleQueryResponse> {
+        let url = self.single_query_url();
+        tracing::Span::current().record("url", crate::net_policy::url_for_tracing(&url));
+
         let body = OsvQuery {
             package: OsvPackage {
                 name: target.osv_name.clone(),
@@ -612,10 +636,17 @@ impl OsvClient {
             version: target.version.clone(),
         };
 
-        let bytes = match self.cache.post_json(&self.single_query_url(), &body).await {
+        let bytes = match self.cache.post_json(&url, &body).await {
             Ok(b) => b,
+            // #756: never interpolate `e`'s `Display` — see `DepsError::safe_tracing_summary`.
             Err(e) => {
-                tracing::warn!(dep = %target.key, error = %e, "OSV single-package requery failed");
+                let (status, cause) = e.safe_tracing_summary();
+                tracing::warn!(
+                    dep = %target.key,
+                    status = ?status,
+                    cause,
+                    "OSV single-package requery failed"
+                );
                 return None;
             }
         };

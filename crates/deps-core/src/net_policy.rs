@@ -526,6 +526,56 @@ fn redact_userinfo_unparseable(raw: &str) -> String {
     format!("{}***@{}", &raw[..authority_start], &authority[at + 1..])
 }
 
+/// Strips the query string, fragment, and any userinfo from `raw`, for attaching to a
+/// `tracing` span field or log line at an outbound-request chokepoint.
+///
+/// Unlike [`redact_userinfo`] (which preserves the query string), this additionally drops
+/// the query string and fragment outright: a chokepoint like
+/// `HttpCache::get_cached_with_headers_via` or
+/// [`crate::github::GithubTagsClient::fetch_authenticated`] serves every ecosystem's outbound
+/// requests, including a custom-registry URL built from an `.npmrc`-style `${VAR}`
+/// expansion (see `deps-npm`'s `NpmRegistryIndex` security model) — a token embedded in a
+/// query parameter (`?token=...`) is exactly as sensitive as one embedded in userinfo, and
+/// this chokepoint cannot assume any particular query-param naming convention is safe to
+/// keep.
+///
+/// A `raw` that fails to parse as a URL is not returned unredacted outright: this still
+/// applies [`redact_userinfo`]'s own textual fallback (redacting a `user:pass@`-shaped
+/// span if one is found) and still truncates at the first `?`/`#` character found anywhere
+/// in the string, the same as for a parseable URL. There is no placeholder substitution,
+/// though — an unparseable string containing neither an `@` nor a `?`/`#` is returned
+/// unchanged, since nothing in it looks like a userinfo or query component to strip. The
+/// outbound-request URLs this guards (built from `https://...` values, always with a
+/// scheme) are not expected to hit that residual case in practice.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::net_policy::url_for_tracing;
+///
+/// assert_eq!(
+///     url_for_tracing("https://npm.internal/pkg?token=super-secret-value"),
+///     "https://npm.internal/pkg"
+/// );
+/// assert_eq!(
+///     url_for_tracing("https://user:hunter2@registry.example/simple?token=x"),
+///     "https://***@registry.example/simple"
+/// );
+/// ```
+#[must_use]
+#[allow(
+    clippy::string_slice,
+    reason = "`end` comes from `find` of ASCII '?'/'#' bytes on the already-redacted \
+              string, so it always lands on a valid char boundary"
+)]
+pub fn url_for_tracing(raw: &str) -> String {
+    let without_userinfo = redact_userinfo(raw);
+    let end = without_userinfo
+        .find(['?', '#'])
+        .unwrap_or(without_userinfo.len());
+    without_userinfo[..end].to_string()
+}
+
 /// Whether `url`'s host is loopback (`127.0.0.1`, `localhost`, or `::1`) with an `http`
 /// scheme — the shape every `mockito::Server` binds to.
 ///
@@ -939,6 +989,66 @@ mod tests {
         assert_eq!(
             redact_userinfo("https://registry.example:99999/simple"),
             "https://registry.example:99999/simple"
+        );
+    }
+
+    /// #756 C1 regression: a `HttpCache`/`GithubTagsClient` outbound-request chokepoint must
+    /// never attach a token-bearing query string (e.g. an `.npmrc` `registry=` URL after
+    /// `${VAR}` expansion, `NpmRegistryIndex`'s security model) to a `tracing` span field —
+    /// exact repro from the finding.
+    #[test]
+    fn test_url_for_tracing_strips_query_string_token() {
+        let safe = url_for_tracing("https://npm.internal/pkg?token=super-secret-value");
+        assert!(!safe.contains("super-secret-value"));
+        assert_eq!(safe, "https://npm.internal/pkg");
+    }
+
+    #[test]
+    fn test_url_for_tracing_strips_fragment() {
+        assert_eq!(
+            url_for_tracing("https://registry.example/simple#token=x"),
+            "https://registry.example/simple"
+        );
+    }
+
+    #[test]
+    fn test_url_for_tracing_strips_both_userinfo_and_query() {
+        assert_eq!(
+            url_for_tracing("https://user:hunter2@registry.example/simple?token=x"),
+            "https://***@registry.example/simple"
+        );
+    }
+
+    #[test]
+    fn test_url_for_tracing_noop_for_plain_url() {
+        assert_eq!(
+            url_for_tracing("https://registry.example/simple"),
+            "https://registry.example/simple"
+        );
+    }
+
+    /// Doc-accuracy regression: an unparseable `raw` with no `@`/`?`/`#` at all is returned
+    /// unchanged — there is no placeholder substitution, unlike the doc comment used to
+    /// (inaccurately) claim. The outbound-request URLs this function actually guards always
+    /// have a scheme, so this residual case is not expected to matter in practice — it is
+    /// pinned here only so the doc comment's corrected wording stays honest.
+    #[test]
+    fn test_url_for_tracing_unparseable_with_no_redactable_shape_is_unchanged() {
+        assert_eq!(url_for_tracing("not-a-url-at-all"), "not-a-url-at-all");
+    }
+
+    /// Doc-accuracy companion: an unparseable `raw` still gets its `?`/`#`-delimited suffix
+    /// truncated, and any textually-detectable userinfo still redacted — the same two
+    /// operations a parseable URL gets, just without going through `url::Url::parse`.
+    #[test]
+    fn test_url_for_tracing_unparseable_still_truncates_query_and_redacts_userinfo() {
+        assert_eq!(
+            url_for_tracing("not-a-url?token=super-secret-value"),
+            "not-a-url"
+        );
+        assert_eq!(
+            url_for_tracing("user:hunter2@registry.example/simple?token=x"),
+            "***@registry.example/simple"
         );
     }
 

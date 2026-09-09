@@ -34,6 +34,7 @@ use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tower_lsp_server::Client;
 use tower_lsp_server::ls_types::{MessageType, Uri};
+use tracing::Instrument;
 
 /// Rejects document content larger than [`MAX_FILE_SIZE`].
 ///
@@ -128,18 +129,24 @@ pub async fn handle_document_open(
         )
     };
 
-    // Spawn background task to fetch versions
-    let task = tokio::spawn(run_document_open_background_task(
-        uri.clone(),
-        Arc::clone(&state),
-        Arc::clone(&ecosystem),
-        client.clone(),
-        cache_config,
-        vulnerabilities_enabled,
-        freshness_settings,
-        diagnostic_severities,
-        offline,
-    ));
+    // Spawn background task to fetch versions. Captured before `tokio::spawn` so this
+    // task's own span (and everything it spawns in turn) nests under whichever request
+    // span triggered this open, instead of opening as an unparented root span (#756 S1).
+    let span = tracing::Span::current();
+    let task = tokio::spawn(
+        run_document_open_background_task(
+            uri.clone(),
+            Arc::clone(&state),
+            Arc::clone(&ecosystem),
+            client.clone(),
+            cache_config,
+            vulnerabilities_enabled,
+            freshness_settings,
+            diagnostic_severities,
+            offline,
+        )
+        .instrument(span),
+    );
 
     Ok(task)
 }
@@ -214,12 +221,15 @@ async fn run_document_open_background_task(
     // registry fetch below rather than gating the inlay-hint refresh
     // that must happen immediately after it (critique S2).
     let osv_task = vulnerabilities_enabled.then(|| {
-        tokio::spawn(run_osv_scan_phase_a(
-            uri.clone(),
-            Arc::clone(&state),
-            Arc::clone(&ecosystem),
-            cache_config.fetch_timeout_secs,
-        ))
+        tokio::spawn(
+            run_osv_scan_phase_a(
+                uri.clone(),
+                Arc::clone(&state),
+                Arc::clone(&ecosystem),
+                cache_config.fetch_timeout_secs,
+            )
+            .instrument(tracing::Span::current()),
+        )
     });
 
     // Tier-3 license pre-fetch (issue #660), spawned concurrently with the registry
@@ -228,12 +238,15 @@ async fn run_document_open_background_task(
     // appear in the *first* publish after this open, not only whenever some later,
     // unrelated event happens to regenerate diagnostics. No-op for every ecosystem but
     // Dart/Swift/Gradle/Deno.
-    let license_task = tokio::spawn(run_license_prefetch(
-        uri.clone(),
-        Arc::clone(&state),
-        Arc::clone(&ecosystem),
-        cache_config.fetch_timeout_secs,
-    ));
+    let license_task = tokio::spawn(
+        run_license_prefetch(
+            uri.clone(),
+            Arc::clone(&state),
+            Arc::clone(&ecosystem),
+            cache_config.fetch_timeout_secs,
+        )
+        .instrument(tracing::Span::current()),
+    );
 
     // Collect dependency names+sources and the in-use-version map (§4.6) in one
     // pass while holding the reference (can't hold across await).
@@ -765,23 +778,30 @@ pub(crate) async fn handle_document_change_guarded(
         RefetchPolicy::AllDependencies => all_dependency_names,
     };
 
-    // Spawn background task to update diagnostics
-    let task = tokio::spawn(run_document_change_task(
-        uri,
-        state,
-        ecosystem,
-        client,
-        ChangeTaskConfig {
-            cache: cache_config,
-            vulnerabilities_enabled,
-            freshness: freshness_settings,
-            diagnostic_severities,
-            offline,
-            refetch,
-        },
-        needs_osv_rescan,
-        deps_to_fetch,
-    ));
+    // Spawn background task to update diagnostics. Captured before `tokio::spawn` so
+    // this task's own span (and everything it spawns in turn) nests under whichever
+    // request span triggered this change, instead of opening as an unparented root
+    // span (#756 S1).
+    let span = tracing::Span::current();
+    let task = tokio::spawn(
+        run_document_change_task(
+            uri,
+            state,
+            ecosystem,
+            client,
+            ChangeTaskConfig {
+                cache: cache_config,
+                vulnerabilities_enabled,
+                freshness: freshness_settings,
+                diagnostic_severities,
+                offline,
+                refetch,
+            },
+            needs_osv_rescan,
+            deps_to_fetch,
+        )
+        .instrument(span),
+    );
 
     Ok(Some(task))
 }
@@ -835,12 +855,15 @@ async fn run_document_change_task(
     // one's version changed — critique S1), spawned so it runs
     // concurrently with the registry fetch below.
     let osv_task = (config.vulnerabilities_enabled && needs_osv_rescan).then(|| {
-        tokio::spawn(run_osv_scan_phase_a(
-            uri.clone(),
-            Arc::clone(&state),
-            Arc::clone(&ecosystem),
-            config.cache.fetch_timeout_secs,
-        ))
+        tokio::spawn(
+            run_osv_scan_phase_a(
+                uri.clone(),
+                Arc::clone(&state),
+                Arc::clone(&ecosystem),
+                config.cache.fetch_timeout_secs,
+            )
+            .instrument(tracing::Span::current()),
+        )
     });
 
     // Tier-3 license pre-fetch (issue #660), re-run on the same trigger as the OSV
@@ -851,12 +874,15 @@ async fn run_document_change_task(
     // `osv_task`, so its commit lands before either of this function's diagnostics
     // publishes below, not after.
     let license_task = needs_osv_rescan.then(|| {
-        tokio::spawn(run_license_prefetch(
-            uri.clone(),
-            Arc::clone(&state),
-            Arc::clone(&ecosystem),
-            config.cache.fetch_timeout_secs,
-        ))
+        tokio::spawn(
+            run_license_prefetch(
+                uri.clone(),
+                Arc::clone(&state),
+                Arc::clone(&ecosystem),
+                config.cache.fetch_timeout_secs,
+            )
+            .instrument(tracing::Span::current()),
+        )
     });
 
     // Skip registry fetch if nothing new was added and no existing

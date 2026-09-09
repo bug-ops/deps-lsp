@@ -12,6 +12,10 @@ use tower_lsp_server::ls_types::{
 };
 
 /// Handles code action requests using trait-based delegation.
+#[tracing::instrument(
+    skip(state, params, client, config),
+    fields(uri = ?params.text_document.uri, ecosystem = tracing::field::Empty)
+)]
 pub async fn handle_code_actions(
     state: Arc<ServerState>,
     params: CodeActionParams,
@@ -64,6 +68,8 @@ pub async fn handle_code_actions(
     else {
         return vec![];
     };
+
+    tracing::Span::current().record("ecosystem", ecosystem_id.id());
 
     let mut actions = ecosystem
         .generate_code_actions(

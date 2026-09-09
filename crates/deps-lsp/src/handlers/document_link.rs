@@ -13,6 +13,10 @@ use tower_lsp_server::Client;
 use tower_lsp_server::ls_types::{DocumentLink, DocumentLinkParams};
 
 /// Handles `textDocument/documentLink` requests using trait-based delegation.
+#[tracing::instrument(
+    skip(state, params, client, config),
+    fields(uri = ?params.text_document.uri, ecosystem = tracing::field::Empty)
+)]
 pub async fn handle_document_link(
     state: Arc<ServerState>,
     params: DocumentLinkParams,
@@ -41,6 +45,8 @@ pub async fn handle_document_link(
     else {
         return vec![];
     };
+
+    tracing::Span::current().record("ecosystem", ecosystem.id());
 
     ecosystem.generate_document_links(parse_result.as_ref(), uri)
 }

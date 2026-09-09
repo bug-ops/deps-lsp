@@ -275,6 +275,31 @@ impl DepsError {
     pub const fn is_offline(&self) -> bool {
         matches!(self, Self::Offline { .. })
     }
+
+    /// A URL-free summary of this error, safe to attach to a `tracing` field or log line at
+    /// an outbound-request chokepoint — never this error's own `Display`/`Debug`, several of
+    /// which embed the full, unredacted request URL ([`Self::HttpStatus`], [`Self::Offline`],
+    /// the wrapped `reqwest::Error` inside [`Self::RegistryError`]; see
+    /// `crate::net_policy::url_for_tracing`'s docs for why that matters).
+    ///
+    /// Returns the HTTP status code when this is [`Self::HttpStatus`], plus a coarse,
+    /// URL-free cause discriminant for every variant — so a routine transport
+    /// failure/timeout still carries some triage signal instead of collapsing to `status =
+    /// None` with nothing else.
+    #[must_use]
+    pub(crate) const fn safe_tracing_summary(&self) -> (Option<u16>, &'static str) {
+        match self {
+            Self::HttpStatus { status, .. } => (Some(*status), "http-status"),
+            Self::RegistryError { .. } => (None, "transport"),
+            Self::CacheError(_) => (None, "cache"),
+            Self::Offline { .. } => (None, "offline"),
+            Self::ResponseTooLarge { .. } => (None, "response-too-large"),
+            Self::RateLimited { .. } => (None, "rate-limited"),
+            Self::ApiResponse { .. } => (None, "api-response"),
+            Self::PackageNotFound { .. } => (None, "not-found"),
+            _ => (None, "other"),
+        }
+    }
 }
 
 /// Outcome of a registry fetch attempt for one dependency, as recorded in
@@ -328,6 +353,64 @@ mod tests {
     fn test_error_display() {
         let error = DepsError::CacheError("test error".into());
         assert_eq!(error.to_string(), "cache error: test error");
+    }
+
+    /// #756 code-review finding: `safe_tracing_summary` must never derive its output from
+    /// `self`'s own `Display`/`Debug` (both embed the raw, unredacted request URL for several
+    /// variants) — pinning the exact `(status, cause)` pairs for every variant a `HttpCache`/
+    /// `OsvClient` call site can actually produce, so a routine transport failure still
+    /// carries triage signal (`cause`) instead of collapsing to `(None, "other")`.
+    #[test]
+    fn test_safe_tracing_summary_covers_every_reachable_variant() {
+        assert_eq!(
+            DepsError::HttpStatus {
+                url: "https://example.com/pkg?token=secret".into(),
+                status: 503,
+            }
+            .safe_tracing_summary(),
+            (Some(503), "http-status")
+        );
+        assert_eq!(
+            DepsError::RegistryError {
+                package: "https://example.com/pkg?token=secret".into(),
+                source: reqwest::Client::new().get("not a url").build().unwrap_err(),
+            }
+            .safe_tracing_summary(),
+            (None, "transport")
+        );
+        assert_eq!(
+            DepsError::CacheError("poisoned lock".into()).safe_tracing_summary(),
+            (None, "cache")
+        );
+        assert_eq!(
+            DepsError::Offline {
+                url: "https://example.com/pkg?token=secret".into(),
+            }
+            .safe_tracing_summary(),
+            (None, "offline")
+        );
+        assert_eq!(
+            DepsError::ResponseTooLarge {
+                url: "https://example.com/pkg?token=secret".into(),
+                limit: 1024,
+            }
+            .safe_tracing_summary(),
+            (None, "response-too-large")
+        );
+    }
+
+    /// A `(status, cause)` pair must never itself carry the URL — the whole point of this
+    /// method — even when the source error's own `Display` would have.
+    #[test]
+    fn test_safe_tracing_summary_output_never_contains_the_url() {
+        let error = DepsError::HttpStatus {
+            url: "https://npm.internal/pkg?token=super-secret-value".into(),
+            status: 503,
+        };
+        let (status, cause) = error.safe_tracing_summary();
+        assert_eq!(status, Some(503));
+        assert!(!cause.contains("super-secret-value"));
+        assert!(!cause.contains("npm.internal"));
     }
 
     #[test]
