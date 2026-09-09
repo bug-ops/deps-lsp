@@ -213,6 +213,15 @@ fn parse_pnpm_workspace(content: &str) -> PnpmWorkspaceConfig {
     }
 }
 
+/// Fuzz-only entry point for [`parse_pnpm_workspace`], the `pnpm-workspace.yaml` catalog
+/// parser (issue #727). Gated on the `fuzzing` Cargo feature (never enabled by this crate's
+/// own default set) so this stays out of the crate's public API surface in a normal build.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_parse_pnpm_workspace(content: &str) {
+    let _ = parse_pnpm_workspace(content);
+}
+
 /// Per-path memoization of `pnpm-workspace.yaml` parses, invalidated by mtime.
 ///
 /// The pnpm catalog analogue of [`crate::config::NpmConfigCache`], reusing the same

@@ -1,0 +1,5 @@
+catalog:
+  react: ^18.2.0
+catalogs:
+  react17:
+    react: ^17.0.2

@@ -1,0 +1,4 @@
+include:
+  - component: $CI_SERVER_FQDN/org/proj/comp@1.0
+  - project: org/proj
+    ref: v2.0.0

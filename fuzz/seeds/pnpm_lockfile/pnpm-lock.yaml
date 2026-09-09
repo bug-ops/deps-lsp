@@ -1,0 +1,23 @@
+lockfileVersion: '9.0'
+importers:
+  .:
+    dependencies:
+      lodash:
+        specifier: ^4.17.21
+        version: 4.17.21
+      my-lodash:
+        specifier: npm:lodash@^4.17.0
+        version: lodash@4.17.21
+    devDependencies:
+      typescript:
+        specifier: ^5.4.0
+        version: 5.4.0
+    optionalDependencies:
+      fsevents:
+        specifier: ^2.3.3
+        version: 2.3.3(patch_hash=abc123)
+  packages/local-sibling:
+    dependencies:
+      shared-lib:
+        specifier: workspace:*
+        version: link:../shared-lib

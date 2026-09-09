@@ -1,0 +1,23 @@
+packages:
+  http:
+    dependency: "direct main"
+    description:
+      name: http
+      url: "https://pub.dev"
+    source: hosted
+    version: "1.2.0"
+  my_pkg:
+    dependency: "direct main"
+    description:
+      url: "https://github.com/user/repo.git"
+      resolved-ref: abc123
+    source: git
+    version: "0.1.0"
+  local_pkg:
+    dependency: "direct main"
+    description:
+      path: "../local_pkg"
+    source: path
+    version: "0.1.0"
+sdks:
+  dart: ">=3.0.0 <4.0.0"

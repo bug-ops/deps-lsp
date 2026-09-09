@@ -1,0 +1,5 @@
+include:
+  - component: gitlab.com/org/proj/comp@1.0.0
+  - component: gitlab.com/org/proj/other@~latest
+  - template: Security/SAST.gitlab-ci.yml
+  - remote: https://example.com/ci-template.yml

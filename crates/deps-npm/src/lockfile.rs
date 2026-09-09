@@ -351,6 +351,15 @@ fn parse_pnpm_lock_yaml(content: &str) -> Result<ResolvedPackages> {
     Ok(packages)
 }
 
+/// Fuzz-only entry point for [`parse_pnpm_lock_yaml`], the `pnpm-lock.yaml` CPU-bound parser
+/// (issue #727). Gated on the `fuzzing` Cargo feature (never enabled by this crate's own
+/// default set) so this stays out of the crate's public API surface in a normal build.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_parse_pnpm_lock_yaml(content: &str) {
+    let _ = parse_pnpm_lock_yaml(content);
+}
+
 /// Resolves one importer dependency entry's real package name and plain version, handling
 /// pnpm's `name@version` alias-resolution form.
 ///

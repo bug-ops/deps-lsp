@@ -1,3 +1,11 @@
+// `build_dynamic_component_pin_action`'s boxed-future coercion nests through several layers
+// of `tokio::join!`/`MaybeDone` combinators; rustc's default recursion limit is occasionally
+// insufficient to prove the resulting `Send` bound and downgrades a previously-silent
+// trait-solver retry into `recursion_depth_exceeding_limit`, which the fuzz CI job's
+// `-D warnings` nightly build turns into a hard error (rust-lang/rust#159228). Same fix as
+// deps-swift (#673) and deps-nuget.
+#![recursion_limit = "256"]
+
 //! GitLab CI/CD ecosystem support for deps-lsp.
 //!
 //! Provides LSP features for `.gitlab-ci.yml` and `.gitlab/ci/*.yml`/`*.yaml` files.

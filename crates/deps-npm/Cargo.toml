@@ -27,6 +27,13 @@ workspace = true
 # dependency, or a release build of that crate would compile in the http carve-out too.
 test-util = ["deps-core/test-util"]
 
+# Exposes `lockfile::fuzz_parse_pnpm_lock_yaml` and `catalog::fuzz_parse_pnpm_workspace` for
+# the `fuzz/` cargo-fuzz workspace's `pnpm_lockfile`/`pnpm_catalog` targets (#727) — mirrors
+# `deps-gradle`/`deps-maven`'s own `fuzzing` feature (see their Cargo.toml comments). Never
+# enabled by this crate's own default feature set, so these wrappers stay out of the normal
+# public API surface.
+fuzzing = []
+
 [dependencies]
 dashmap = { workspace = true }
 deps-core = { workspace = true }

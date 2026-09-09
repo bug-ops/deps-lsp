@@ -1,0 +1,7 @@
+include:
+  - project: org/proj
+    ref: v1.2.3
+  - project: org/other
+    ref: a1b2c3d4e5a1b2c3d4e5a1b2c3d4e5a1b2c3d4e5
+  - project: org/branch-tracker
+    ref: main
