@@ -68,8 +68,8 @@ jobs:
       - name: Check formatting
         run: cargo +nightly fmt --all -- --check
 
-  check:
-    name: Check
+  clippy:
+    name: Clippy
     needs: changes
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
@@ -80,11 +80,27 @@ jobs:
       - uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3  # v1
         with:
           components: clippy
+          cache-extra-identifier: clippy
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  doc-and-hygiene:
+    name: Doc + Hygiene
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+
+      - uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3  # v1
+        with:
+          cache-extra-identifier: doc-hygiene
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install cargo-machete
         uses: taiki-e/install-action@7b8d4719ee4aaa279bdf55df38dacb9ebfe12a6c  # v2
@@ -139,7 +155,7 @@ jobs:
 
   test:
     name: Test (${{ matrix.os }}${{ matrix.rust != 'stable' && format(' / {0}', matrix.rust) || '' }})
-    needs: [changes, fmt, check]
+    needs: changes
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
@@ -171,7 +187,7 @@ jobs:
 
   cross-check:
     name: Cross-compile Check (${{ matrix.target }})
-    needs: [changes, fmt]
+    needs: changes
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
@@ -213,7 +229,7 @@ jobs:
 
   coverage:
     name: Code Coverage
-    needs: [changes, fmt, check]
+    needs: changes
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -248,7 +264,7 @@ jobs:
 
   msrv:
     name: Check MSRV
-    needs: [changes, fmt, check]
+    needs: changes
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -272,7 +288,7 @@ jobs:
 
   wasm:
     name: WASM Build (Zed Extension)
-    needs: [changes, fmt, check]
+    needs: changes
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -299,7 +315,7 @@ jobs:
 
   benchmark:
     name: Check Benchmarks
-    needs: [changes, fmt, check]
+    needs: changes
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -315,7 +331,7 @@ jobs:
 
   fuzz:
     name: Fuzz (bounded)
-    needs: [changes, fmt, check]
+    needs: changes
     # Deliberately not in `ci-success`'s `needs` (#673): a bounded regression run, not a
     # merge gate — a flaky/slow nightly toolchain or libFuzzer environment issue here must
     # never block an otherwise-green PR (fuzzing did find a real bug during development —
@@ -456,7 +472,8 @@ jobs:
       [
         changes,
         fmt,
-        check,
+        clippy,
+        doc-and-hygiene,
         security,
         test,
         cross-check,
@@ -487,7 +504,8 @@ jobs:
 
           failed=0
           check_job "${{ needs.fmt.result }}" "fmt" || failed=1
-          check_job "${{ needs.check.result }}" "check" || failed=1
+          check_job "${{ needs.clippy.result }}" "clippy" || failed=1
+          check_job "${{ needs.doc-and-hygiene.result }}" "doc-and-hygiene" || failed=1
           check_job "${{ needs.security.result }}" "security" || failed=1
           check_job "${{ needs.test.result }}" "test" || failed=1
           check_job "${{ needs.cross-check.result }}" "cross-check" || failed=1

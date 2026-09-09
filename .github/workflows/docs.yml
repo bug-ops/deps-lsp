@@ -7,10 +7,6 @@ on:
       - '**/*.rs'
       - '**/Cargo.toml'
       - '.github/workflows/docs.yml'
-  pull_request:
-    paths:
-      - '**/*.rs'
-      - '**/Cargo.toml'
 
 permissions:
   contents: write

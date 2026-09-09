@@ -67,6 +67,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-lsp**: documented NuGet's bare-version pin approximation and added a cross-ecosystem consistency test guarding `bare_requirement_policy` (resolves #669) (#674)
 - **workspace**: removed 18 unused dependencies across 11 crates and moved 3 test-only dependencies to `[dev-dependencies]` (touching a 12th crate, `deps-gitlab-ci`); added a `cargo machete` CI gate (resolves #670) (#675)
 - **workspace**: `missing_docs` lint raised from `allow` to `warn` in `[workspace.lints.rust]`; added the ~287 previously-missing `///`/`//!` doc comments across all 14 ecosystem crates plus `deps-core`/`deps-lsp` needed to make the flip clean (resolves #744) (#746)
+- **workspace**: split CI's `check` job into parallel `clippy`/`doc-and-hygiene` jobs, decoupled `test`/`coverage`/`msrv`/`wasm`/`benchmark`/`fuzz`/`cross-check` from the `fmt`+`check` gate so they start immediately, and restricted `docs.yml`'s doc build to `main`-branch pushes since the PR-time rustdoc gate is now covered by `doc-and-hygiene` (resolves #750, #751, #752) (#762)
 
 ### Dependencies
 - Bump `dirs` from 6 to 7.0.0, plus transitive `Cargo.lock` refresh (#659)
