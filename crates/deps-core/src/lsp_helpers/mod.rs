@@ -1175,6 +1175,50 @@ pub fn is_safe_maven_coordinate_segment(segment: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
 }
 
+/// Builds the Maven repository URL path (`"group/path/segments/artifact"`) for a
+/// `groupId`/`artifactId` coordinate pair, or `None` if either fails validation.
+///
+/// The single shared home for `groupId:artifactId` -> URL-path construction (#702):
+/// validates `group_id` and `artifact_id` as whole strings via
+/// [`is_safe_maven_coordinate_segment`] (preserving its 128-byte total-length cap per
+/// segment) *and* validates every `.`-separated component of `group_id` individually,
+/// rejecting an empty component outright. The whole-string check alone is not enough —
+/// it permits internal `.` characters, so a naive `group_id.replace('.', "/")` on a
+/// coordinate like `"com..evil"` would produce the empty path segment `"com//evil"`; the
+/// per-component check closes that gap without dropping the whole-string length bound a
+/// pure per-segment `split('.')` validation would lose (a 10-segment, 128-byte-each group
+/// would otherwise pass at 1280 bytes total).
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::maven_coordinate_path;
+///
+/// assert_eq!(
+///     maven_coordinate_path("com.example", "artifact").as_deref(),
+///     Some("com/example/artifact")
+/// );
+/// assert_eq!(
+///     maven_coordinate_path("junit", "junit").as_deref(),
+///     Some("junit/junit")
+/// );
+/// assert_eq!(maven_coordinate_path("com..evil", "artifact"), None);
+/// ```
+pub fn maven_coordinate_path(group_id: &str, artifact_id: &str) -> Option<String> {
+    if !is_safe_maven_coordinate_segment(group_id) || !is_safe_maven_coordinate_segment(artifact_id)
+    {
+        return None;
+    }
+    let group_segments: Vec<&str> = group_id.split('.').collect();
+    if group_segments
+        .iter()
+        .any(|segment| !is_safe_maven_coordinate_segment(segment))
+    {
+        return None;
+    }
+    Some(format!("{}/{artifact_id}", group_segments.join("/")))
+}
+
 /// Whether `url` is safe to embed as a Swift Package Manager repository URL in a
 /// Package.swift [`TextEdit`] or completion item.
 ///

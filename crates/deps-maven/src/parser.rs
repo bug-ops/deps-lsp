@@ -2,6 +2,10 @@
 //!
 //! Uses quick-xml SAX reader to parse Maven POM files.
 //! Tracks byte positions for LSP range computation.
+//!
+//! No element-count/scan-position bound is applied here (#698): the input is a local
+//! manifest already capped by `deps-lsp`'s `MAX_FILE_SIZE` (10 MB) read path, unlike
+//! `deps-maven::registry::parse_metadata_xml`'s remote, unbounded-by-default input.
 
 use crate::types::{MavenDependency, MavenScope};
 use deps_core::lsp_helpers::LineOffsetTable;

@@ -8,8 +8,8 @@ use crate::version::compare_versions;
 use bytes::Bytes;
 use dashmap::DashMap;
 use deps_core::{
-    DepsError, HttpCache, PublishTime, Result, is_safe_maven_coordinate_segment,
-    lsp_helpers::warn_rejected_value,
+    DepsError, HttpCache, PublishTime, Result, lsp_helpers::warn_rejected_value,
+    maven_coordinate_path,
 };
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
@@ -588,10 +588,10 @@ where
 /// found") only for a malformed `groupId:artifactId` pair with no `:` separator.
 ///
 /// Returns `Err(DepsError::PackageNotFound)` — mirroring `deps-dart`'s `reject_dot_segment`
-/// (#349) — when either coordinate segment fails [`is_safe_maven_coordinate_segment`]: a
-/// `groupId`/`artifactId` containing `../` (or other path-breakout characters) must never
-/// reach the `.`→`/` replace and URL construction below, since `group_path`/`artifact_id`
-/// are interpolated into the request URL unescaped. Propagating this as an error (rather
+/// (#349) — when [`maven_coordinate_path`] rejects the coordinate: a `groupId`/`artifactId`
+/// containing `../` (or other path-breakout characters, or an empty `.`-separated group
+/// component, #702) must never reach the URL construction below, since the resulting path
+/// is interpolated into the request URL unescaped. Propagating this as an error (rather
 /// than folding it into the empty-URL-list case) keeps it distinguishable from a genuine
 /// 404, so hover correctly renders nothing for a rejected coordinate instead of a broken
 /// "package not found" section (#366).
@@ -599,38 +599,26 @@ fn metadata_urls(name: &str) -> Result<Vec<String>> {
     let Some((group_id, artifact_id)) = name.split_once(':') else {
         return Ok(vec![]);
     };
-    if !is_safe_maven_coordinate_segment(group_id) {
+    let Some(coordinate_path) = maven_coordinate_path(group_id, artifact_id) else {
         warn_rejected_value(
-            "is_safe_maven_coordinate_segment",
-            "maven metadata URL groupId",
-            group_id,
+            "maven_coordinate_path",
+            "maven metadata URL groupId:artifactId",
+            name,
         );
         return Err(DepsError::PackageNotFound {
             package: name.to_string(),
             registry: REGISTRY,
         });
-    }
-    if !is_safe_maven_coordinate_segment(artifact_id) {
-        warn_rejected_value(
-            "is_safe_maven_coordinate_segment",
-            "maven metadata URL artifactId",
-            artifact_id,
-        );
-        return Err(DepsError::PackageNotFound {
-            package: name.to_string(),
-            registry: REGISTRY,
-        });
-    }
-    let group_path = group_id.replace('.', "/");
+    };
     let primary_base = repo_base_for_group(group_id);
-    let primary = format!("{primary_base}/{group_path}/{artifact_id}/maven-metadata.xml");
+    let primary = format!("{primary_base}/{coordinate_path}/maven-metadata.xml");
 
     Ok(if is_google_group(group_id) {
         vec![primary]
     } else {
         vec![
             primary,
-            format!("{GRADLE_PLUGIN_PORTAL_BASE}/{group_path}/{artifact_id}/maven-metadata.xml"),
+            format!("{GRADLE_PLUGIN_PORTAL_BASE}/{coordinate_path}/maven-metadata.xml"),
         ]
     })
 }
@@ -643,10 +631,16 @@ fn metadata_urls(name: &str) -> Result<Vec<String>> {
 ///
 /// # Errors
 ///
-/// Returns `DepsError::CacheError` if the XML is malformed. A truncated `versions` list from
-/// silently stopping at the parse error, rather than surfacing it, would itself be a source
-/// of the same "real version missing from `available`" false-positive class this PR's
-/// diagnostic guards against elsewhere.
+/// Returns `DepsError::CacheError` if the XML is malformed, or if the document exceeds
+/// [`deps_core::xml_bounds::MAX_METADATA_VERSIONS`]/[`deps_core::xml_bounds::MAX_METADATA_BYTES_SCANNED`]
+/// (#698). A truncated `versions` list — whether from silently stopping at a parse error or
+/// from silently breaking out of the scan loop once the budget is exhausted, rather than
+/// surfacing either as an error — would itself be a source of the same "real version missing
+/// from `available`" false-positive class this PR's diagnostic guards against elsewhere; a
+/// legitimate `maven-metadata.xml` never approaches either bound (real Maven Central
+/// artifacts top out around 3-4k versions), so hitting it only ever means a hostile or
+/// broken response, which must degrade to "no versions" via `Err`, never a plausible-looking
+/// partial list.
 fn parse_metadata_xml(data: &[u8]) -> Result<(Vec<MavenVersion>, Option<String>)> {
     let mut reader = Reader::from_reader(data);
     let mut versions = Vec::new();
@@ -657,6 +651,11 @@ fn parse_metadata_xml(data: &[u8]) -> Result<(Vec<MavenVersion>, Option<String>)
     let mut buf = Vec::new();
 
     loop {
+        if deps_core::xml_bounds::exhausted(versions.len(), reader.buffer_position()) {
+            return Err(DepsError::CacheError(
+                "maven-metadata.xml exceeded the version scan budget".to_string(),
+            ));
+        }
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => match e.name().as_ref() {
                 "versions" => in_versions = true,
@@ -1092,6 +1091,45 @@ mod tests {
         assert!(metadata_urls("bad").unwrap().is_empty());
     }
 
+    /// #702: an empty `.`-separated groupId component (`com..evil`) must be rejected, not
+    /// collapsed into an empty path segment (`com//evil`) by a naive `.replace('.', "/")`.
+    #[test]
+    fn test_metadata_urls_rejects_empty_group_component() {
+        assert_rejected_as_not_found(metadata_urls("com..evil:artifact"));
+    }
+
+    /// #702: an all-dot groupId (`...`) splits into only empty components and must be
+    /// rejected — it is not caught by the whole-string dot-segment check alone, since `...`
+    /// is neither exactly `.` nor `..`.
+    #[test]
+    fn test_metadata_urls_rejects_all_dot_group() {
+        assert_rejected_as_not_found(metadata_urls("...:artifact"));
+    }
+
+    /// #702/M3: the shared helper must keep the existing 128-byte whole-string length cap,
+    /// not just per-component validation — a multi-segment groupId whose *total* length
+    /// exceeds 128 bytes must still be rejected even though each individual segment is
+    /// short enough to pass on its own.
+    #[test]
+    fn test_metadata_urls_rejects_over_length_multi_segment_group() {
+        let long_group = std::iter::repeat_n("a".repeat(20), 10)
+            .collect::<Vec<_>>()
+            .join(".");
+        assert!(long_group.len() > 128);
+        assert_rejected_as_not_found(metadata_urls(&format!("{long_group}:artifact")));
+    }
+
+    /// #702: a dotless groupId (`junit`) is a normal, valid case — it splits to a single
+    /// segment and must resolve exactly as before.
+    #[test]
+    fn test_metadata_urls_accepts_dotless_group() {
+        let urls = metadata_urls("junit:junit").unwrap();
+        assert_eq!(
+            urls[0],
+            "https://repo1.maven.org/maven2/junit/junit/maven-metadata.xml"
+        );
+    }
+
     /// #366: a rejected coordinate must surface specifically as `PackageNotFound`, not
     /// merely *some* error — `DepsError::is_not_found()` (checked by
     /// `deps-lsp/src/document/lifecycle.rs`) is what keeps the diagnostic classified as
@@ -1298,6 +1336,22 @@ mod tests {
         let xml = b"<metadata><versioning><versions><version>1.0.0</version></versions></wrong></metadata>";
         let result = parse_metadata_xml(xml);
         assert!(result.is_err());
+    }
+
+    /// #698: a `maven-metadata.xml` flooded with more `<version>` entries than
+    /// `MAX_METADATA_VERSIONS` must return `Err`, not a truncated `Ok` list — a silent
+    /// truncation here would reintroduce exactly the "real version missing from
+    /// `available`" false-positive class this function's own doc explains it returns
+    /// `Err` to avoid.
+    #[test]
+    fn test_parse_metadata_xml_exceeding_version_cap_returns_error() {
+        let mut xml = String::from("<metadata><versioning><versions>");
+        for i in 0..=deps_core::xml_bounds::MAX_METADATA_VERSIONS {
+            xml.push_str(&format!("<version>1.0.{i}</version>"));
+        }
+        xml.push_str("</versions></versioning></metadata>");
+        let result = parse_metadata_xml(xml.as_bytes());
+        assert!(result.is_err(), "expected Err, got {result:?}");
     }
 
     #[test]

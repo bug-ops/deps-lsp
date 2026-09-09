@@ -264,15 +264,21 @@ pub fn evaluate(license: &[String], policy: &LicensePolicy) -> Option<LicenseVio
     None
 }
 
-/// Maximum length of a raw free-text `<license><name>` value considered for
-/// normalization — mirrors `deps-core::lsp_helpers::hover`'s `MAX_LICENSE_ID_CHARS`
-/// (issue #660/#661 critic security P2 precedent). The longest [`KNOWN_POM_LICENSE_NAMES`]
-/// key is under 60 characters, so this rejects no real match; it exists purely to stop
-/// [`collapse_whitespace`]'s `split_whitespace().collect::<Vec<_>>().join(...)` from
+/// Maximum length of a raw free-text `<license><name>` value considered for normalization.
+///
+/// Mirrors `deps-core::lsp_helpers::hover`'s `MAX_LICENSE_ID_CHARS` (issue #660/#661
+/// critic security P2 precedent). The longest `KNOWN_POM_LICENSE_NAMES` key is under 60
+/// characters, so this rejects no real match; it exists purely to stop
+/// `collapse_whitespace`'s `split_whitespace().collect::<Vec<_>>().join(...)` from
 /// re-allocating a large token vector for an oversized, whitespace-dense value on every
 /// diagnostics pass (issue #679 security P2: an unbounded `<name>` gave ~10x memory
 /// amplification per dependency).
-const MAX_POM_LICENSE_NAME_RAW_CHARS: usize = 128;
+///
+/// `pub` (#702, L1) so `deps-gradle::license`'s POM-parsing loop — which caps the raw
+/// `<license><name>` text node it allocates *before* it ever reaches this module's
+/// normalization step — shares this exact bound instead of redeclaring its own copy of
+/// the literal `128`.
+pub const MAX_POM_LICENSE_NAME_RAW_CHARS: usize = 128;
 
 /// Known Maven Central POM `<license><name>` free-text variants mapped to their
 /// canonical SPDX identifier(s) (issue #679).

@@ -23,7 +23,7 @@
 //! `<licenses>` block is empty, bounded by [`MAX_POM_FETCHES`] so a pathological (or
 //! adversarial) parent chain can't turn one hover request into an unbounded fetch chain.
 
-use deps_core::{HttpCache, is_safe_maven_coordinate_segment};
+use deps_core::{HttpCache, MAX_POM_LICENSE_NAME_RAW_CHARS, is_safe_maven_coordinate_segment};
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use std::sync::Arc;
@@ -61,13 +61,6 @@ const MAX_POM_LICENSE_ENTRIES: usize = 64;
 /// found so far — acceptable for this best-effort secondary signal (see module docs).
 const MAX_POM_LICENSE_BYTES_SCANNED: usize = 1024 * 1024;
 
-/// Maximum raw byte length of a single `<license><name>` text node [`parse_pom_licenses`]
-/// allocates (issue #690). Mirrors `deps-core::licenses`'s private
-/// `MAX_POM_LICENSE_NAME_RAW_CHARS` (also 128, applied to the same POM-license-name shape
-/// during normalization) — an oversized entry is dropped by normalization further
-/// downstream regardless, so rejecting it here avoids allocating a `String` for it at all.
-const MAX_POM_LICENSE_NAME_RAW_CHARS: usize = 128;
-
 /// Maven Central's repository root. Mirrors `deps-maven`'s own (private)
 /// `MAVEN_REPO_BASE` — kept as an independent constant rather than a shared one so this
 /// crate does not need a new public export from `deps-maven` for a single string.
@@ -96,37 +89,17 @@ const MAVEN_REPO_BASE: &str = "https://repo1.maven.org/maven2";
 /// injection *and* the exact-dot-segment case in one already-audited helper, so no
 /// separate encoding step is needed.
 ///
-/// DRY nit (round 3 finding #7, left as a doc note rather than an extraction — see
-/// below for why): this re-derives the same `groupId:artifactId` -> URL-path
-/// construction `deps-maven::registry::metadata_urls` already implements for the
-/// identical coordinate/host shape, with genuinely diverging per-segment validation
-/// granularity between the two, not just a cosmetic difference — `metadata_urls`
-/// validates the *whole* (unsplit) `group_id` string against
-/// [`is_safe_maven_coordinate_segment`] (which permits internal `.` characters) and
-/// only then blindly `.replace('.', "/")`s it, so a group of `"com..evil"` passes that
-/// check and produces an empty path segment (`"com//evil"`) — degrading to a harmless
-/// 404, not a traversal, but still a latent looseness this function's per-split-segment
-/// validation (each `group.split('.')` component checked individually, rejecting an
-/// empty one outright) does not share. A shared helper would need to pick one of the
-/// two behaviors as authoritative for both crates, which is more than a pure
-/// code-motion refactor and out of this fix's scope — flagging for a dedicated
-/// fast-follow rather than changing `deps-maven`'s hot registry path as a drive-by here.
+/// The `groupId:artifactId` -> URL-path construction itself is shared with
+/// `deps-maven::registry::metadata_urls` via [`deps_core::maven_coordinate_path`] (#702) —
+/// this function only adds the `version`/`.pom` filename suffix on top.
 fn pom_url(base: &str, coordinate: &str, version: &str) -> Option<String> {
     let (group, artifact) = coordinate.split_once(':')?;
-    if !is_safe_maven_coordinate_segment(artifact) || !is_safe_maven_coordinate_segment(version) {
+    if !is_safe_maven_coordinate_segment(version) {
         return None;
     }
-    let group_segments: Vec<&str> = group.split('.').collect();
-    if group_segments.is_empty()
-        || group_segments
-            .iter()
-            .any(|s| !is_safe_maven_coordinate_segment(s))
-    {
-        return None;
-    }
-    let group_path = group_segments.join("/");
+    let coordinate_path = deps_core::maven_coordinate_path(group, artifact)?;
     Some(format!(
-        "{base}/{group_path}/{artifact}/{version}/{artifact}-{version}.pom"
+        "{base}/{coordinate_path}/{version}/{artifact}-{version}.pom"
     ))
 }
 

@@ -846,6 +846,10 @@ enum ConfigSection {
 /// XML document degrades to an all-default (empty) [`RawNuGetConfigFile`] rather than
 /// propagating a parse error — a syntactically broken config must not crash the LSP or block
 /// every other manifest's resolution.
+///
+/// No element-count/scan-position bound is applied here (#698): the input is a local
+/// `NuGet.Config` already capped by `get_or_parse`'s `MAX_CACHED_FILE_BYTES` (8 MiB) read
+/// path, unlike a remote registry response.
 fn parse_nuget_config_raw(content: &str) -> RawNuGetConfigFile {
     let mut out = RawNuGetConfigFile::default();
     let mut reader = Reader::from_str(content);

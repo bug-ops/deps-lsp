@@ -47,6 +47,7 @@ pub mod secret;
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_util;
 pub mod version_matcher;
+pub mod xml_bounds;
 
 // Re-export commonly used types
 pub use cache::{BodyLimit, CachedResponse, HttpCache};
@@ -62,8 +63,8 @@ pub use freshness::{
 pub use json_ast::{JsonAst, JsonSection, find_last_prop};
 pub use json_helpers::string_valued_entries;
 pub use licenses::{
-    LicensePolicy, LicenseViolation, ViolationReason, evaluate as evaluate_license_policy,
-    resolve_license_entries,
+    LicensePolicy, LicenseViolation, MAX_POM_LICENSE_NAME_RAW_CHARS, ViolationReason,
+    evaluate as evaluate_license_policy, resolve_license_entries,
 };
 pub use lockfile::{
     LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource, read_lockfile_content,
@@ -78,8 +79,8 @@ pub use lsp_helpers::{
     generate_code_lenses as lsp_generate_code_lenses, generate_hover as lsp_generate_hover,
     generate_inlay_hints as lsp_generate_inlay_hints, is_dot_segment,
     is_safe_maven_coordinate_segment, is_safe_package_name, is_safe_registry_url,
-    is_safe_version_string, is_same_major_minor, position_in_range, requirement_is_unsatisfiable,
-    warn_rejected_value,
+    is_safe_version_string, is_same_major_minor, maven_coordinate_path, position_in_range,
+    requirement_is_unsatisfiable, warn_rejected_value,
 };
 pub use mtime_cache::{DEFAULT_MAX_CACHED_FILES, MAX_CACHED_FILE_BYTES, MtimeFileCache};
 pub use package::{ConcreteVersion, InvalidPackageName, PackageName, VersionReq};
