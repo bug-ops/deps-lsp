@@ -428,7 +428,21 @@ jobs:
       - uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3  # v1
         with:
           channel: nightly
-          cache-target: fuzz-${{ matrix.target }}
+          # `target-dirs`/`cache-target` compose the cached path as `<target-dirs>/<cache-target>`
+          # (relative to the repo root). `fuzz/` is its own nested workspace (see `fuzz/Cargo.toml`),
+          # and `cargo fuzz run` always builds against an explicit host target, landing at
+          # `fuzz/target/x86_64-unknown-linux-gnu/release/<target>` — not the root `target/` this
+          # action defaults to. A prior revision set `cache-target: fuzz-${{ matrix.target }}`,
+          # which never matched any real directory (cargo doesn't create per-fuzz-target profile
+          # subdirectories), so the cache silently never saved or restored on any run.
+          # Deliberately one shared key across all 17 legs, not per-leg: they compile the same
+          # dependency tree (only the final target binary differs), so a per-leg key would only
+          # ever cache one leg's own dependency compilation for itself. `actions/cache` save is a
+          # no-op (not a failure) when a key already exists, so concurrent legs finishing the
+          # first-ever save race harmlessly — whichever leg finishes first seeds the shared cache
+          # for every leg on the next run.
+          target-dirs: fuzz/target/x86_64-unknown-linux-gnu
+          cache-target: release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
