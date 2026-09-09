@@ -77,7 +77,11 @@ pub fn parse_pubspec_lock(content: &str) -> Result<ResolvedPackages> {
             let Some(name) = name_yaml.as_str() else {
                 continue;
             };
-            let Some(version) = entry["version"].as_str() else {
+            // #721: goes through `yaml_scalar_string` rather than `as_str` directly —
+            // an unquoted, numeric-looking version (`version: 1.0`, parsed as
+            // `Yaml::Real`) is valid pubspec.lock syntax, and `as_str` alone would
+            // silently skip the entry via this `continue`.
+            let Some(version) = deps_core::yaml_scalar_string(&entry["version"]) else {
                 continue;
             };
 
@@ -161,6 +165,27 @@ packages:
         assert_eq!(packages.len(), 2);
         assert_eq!(packages.get_version("http"), Some("1.2.0"));
         assert_eq!(packages.get_version("provider"), Some("6.1.2"));
+    }
+
+    /// #721: an unquoted, numeric-looking version (`version: 1.0`, parsed by
+    /// `yaml-rust2` as `Yaml::Real`, not `Yaml::String`) is valid YAML — the entry
+    /// must still be read, not silently skipped via the `continue` guard a plain
+    /// `Yaml::as_str()` read would hit.
+    #[test]
+    fn test_parse_unquoted_numeric_version() {
+        let lock = r#"
+packages:
+  http:
+    dependency: "direct main"
+    description:
+      name: http
+      url: "https://pub.dev"
+    source: hosted
+    version: 1.0
+"#;
+        let packages = parse_pubspec_lock(lock).unwrap();
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages.get_version("http"), Some("1.0"));
     }
 
     #[test]

@@ -350,6 +350,12 @@ impl Ecosystem for GradleEcosystem {
         })
     }
 
+    fn completion_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
+        let name = metadata.name();
+        let latest = metadata.latest_version().as_str();
+        Some(format!("implementation(\"{name}:{latest}\")"))
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -717,5 +723,54 @@ mod tests {
         let uri = deps_core::test_util::test_uri("/project/build.gradle");
         let result = eco.parse_manifest(content, &uri).await.unwrap();
         assert_eq!(result.dependencies().len(), 1);
+    }
+
+    /// Gradle spans five manifest formats (TOML version catalog, Groovy DSL, Kotlin
+    /// DSL) with no raw-text section marker shared across all of them — no override,
+    /// unreachable in practice.
+    #[test]
+    fn test_fallback_completion_prefix_default_none() {
+        let eco = GradleEcosystem::new(make_cache());
+        assert!(
+            eco.fallback_completion_prefix("anything at all\n", Position::new(0, 0))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_completion_insert_text() {
+        let eco = GradleEcosystem::new(make_cache());
+        struct MockMetadata {
+            name: deps_core::PackageName,
+            latest_version: deps_core::ConcreteVersion,
+        }
+        impl deps_core::Metadata for MockMetadata {
+            fn name(&self) -> &deps_core::PackageName {
+                &self.name
+            }
+            fn description(&self) -> Option<&str> {
+                None
+            }
+            fn repository(&self) -> Option<&str> {
+                None
+            }
+            fn documentation(&self) -> Option<&str> {
+                None
+            }
+            fn latest_version(&self) -> &deps_core::ConcreteVersion {
+                &self.latest_version
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("org.apache.commons:commons-lang3"),
+            latest_version: "3.14.0".into(),
+        };
+        assert_eq!(
+            eco.completion_insert_text(&meta),
+            Some("implementation(\"org.apache.commons:commons-lang3:3.14.0\")".to_string())
+        );
     }
 }

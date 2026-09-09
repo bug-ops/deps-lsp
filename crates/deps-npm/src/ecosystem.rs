@@ -284,9 +284,56 @@ impl Ecosystem for NpmEcosystem {
         })
     }
 
+    fn fallback_completion_prefix<'a>(
+        &self,
+        content: &'a str,
+        position: Position,
+    ) -> Option<&'a str> {
+        let line = deps_core::fallback_completion::line_at(content, position)?;
+        if !is_in_dependencies_section(content, position.line as usize) {
+            return None;
+        }
+        Some(extract_prefix(line, position.character))
+    }
+
+    fn completion_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
+        let name = metadata.name();
+        let latest = metadata.latest_version().as_str();
+        Some(format!("\"{name}\": \"^{latest}\""))
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
+}
+
+/// npm's `package.json` dependency-like section keys.
+const DEPENDENCY_KEYS: &[&str] = &[
+    "dependencies",
+    "devDependencies",
+    "peerDependencies",
+    "optionalDependencies",
+];
+
+/// Checks if `line_number` of `content` is inside one of npm's dependency-like
+/// sections, for `deps-lsp`'s raw-text fallback completion (parse-failure path).
+fn is_in_dependencies_section(content: &str, line_number: usize) -> bool {
+    deps_core::fallback_completion::is_in_json_dependencies(content, line_number, DEPENDENCY_KEYS)
+}
+
+/// Extracts the fallback-completion prefix on `line` up to `character`, stripping a
+/// surviving JSON-string quote on either side: a leading `"` when the cursor sits
+/// before the closing quote of a still-typed key, or a trailing `"` when the cursor
+/// sits right after a closing quote (e.g. an editor auto-closed it).
+///
+/// Known gap (#729, still open): the surviving quote proves the key's own quotes are
+/// already open — the same shape as NuGet's open-attribute case — but
+/// [`NpmEcosystem`] has no `fallback_completion_is_bare` override, so
+/// `completion_insert_text`'s full `"{name}": "^{latest}"` pair can still be inserted
+/// into that already-open string, producing invalid JSON. Out of scope for #724/#728
+/// (npm wasn't in the original report).
+fn extract_prefix(line: &str, character: u32) -> &str {
+    deps_core::fallback_completion::raw_prefix(line, character).trim_matches('"')
 }
 
 /// Renders the `**Catalog**` hover line for `dep`, or `None` for a non-catalog dependency.
@@ -1344,6 +1391,86 @@ mod tests {
         assert_eq!(
             diagnostics[0].severity,
             Some(tower_lsp_server::ls_types::DiagnosticSeverity::WARNING)
+        );
+    }
+
+    /// Composition regression guard (#390/#282 bug class): proves `line_at` +
+    /// `is_in_json_dependencies` + quote-stripping compose correctly through the real
+    /// trait method on realistic multi-line content.
+    #[test]
+    fn test_fallback_completion_prefix_multi_line_composition() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = NpmEcosystem::new(cache);
+        let content = "{\n  \"name\": \"test\",\n  \"dependencies\": {\n    \"expr";
+        let line = content.lines().nth(3).unwrap();
+        let position = Position::new(3, line.chars().count() as u32);
+        assert_eq!(
+            ecosystem.fallback_completion_prefix(content, position),
+            Some("expr")
+        );
+    }
+
+    #[test]
+    fn test_is_in_dependencies_section_basic() {
+        let content = "{\n  \"name\": \"test\",\n  \"dependencies\": {\n    \"express\"\n  }\n}";
+        assert!(is_in_dependencies_section(content, 3));
+        assert!(!is_in_dependencies_section(content, 1));
+    }
+
+    #[test]
+    fn test_is_in_dependencies_section_dev_deps() {
+        let content = "{\n  \"devDependencies\": {\n    \"jest\": \"^29.0.0\"\n  }\n}";
+        assert!(is_in_dependencies_section(content, 2));
+    }
+
+    #[test]
+    fn test_extract_prefix_strips_leading_quote() {
+        let line = "    \"expr";
+        assert_eq!(extract_prefix(line, line.len() as u32), "expr");
+    }
+
+    #[test]
+    fn test_extract_prefix_strips_trailing_quote() {
+        let line = "    \"express\"";
+        assert_eq!(extract_prefix(line, line.len() as u32), "express");
+    }
+
+    struct MockMetadata {
+        name: deps_core::PackageName,
+        latest_version: deps_core::ConcreteVersion,
+    }
+    impl deps_core::Metadata for MockMetadata {
+        fn name(&self) -> &deps_core::PackageName {
+            &self.name
+        }
+        fn description(&self) -> Option<&str> {
+            None
+        }
+        fn repository(&self) -> Option<&str> {
+            None
+        }
+        fn documentation(&self) -> Option<&str> {
+            None
+        }
+        fn latest_version(&self) -> &deps_core::ConcreteVersion {
+            &self.latest_version
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    #[test]
+    fn test_completion_insert_text() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = NpmEcosystem::new(cache);
+        let meta = MockMetadata {
+            name: pkg("express"),
+            latest_version: "4.18.2".into(),
+        };
+        assert_eq!(
+            ecosystem.completion_insert_text(&meta),
+            Some("\"express\": \"^4.18.2\"".to_string())
         );
     }
 }

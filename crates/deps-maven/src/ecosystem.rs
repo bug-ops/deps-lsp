@@ -312,9 +312,118 @@ impl Ecosystem for MavenEcosystem {
         })
     }
 
+    fn fallback_completion_prefix<'a>(
+        &self,
+        content: &'a str,
+        position: Position,
+    ) -> Option<&'a str> {
+        let line = deps_core::fallback_completion::line_at(content, position)?;
+        if !is_in_dependencies_section(content, position.line as usize) {
+            return None;
+        }
+        let (prefix, tag) = extract_prefix(line, position.character);
+        // The cursor sits inside some *other* already-open Maven tag (`groupId`,
+        // `version`, or an unrecognized element) — this raw-text fallback has no safe
+        // text to offer at that position (a `groupId` completion is a different search
+        // than the combined `group:artifact` query this prefix feeds), and the full
+        // snippet `completion_insert_text` builds would be exactly as wrong-context as
+        // inserting the bare artifact id would be (#724/#728). `None` here suppresses
+        // the completion item entirely and, since the caller treats "no prefix" as
+        // "nothing completable," also skips the registry search.
+        if matches!(tag, Some(name) if name != "artifactId") {
+            return None;
+        }
+        Some(prefix)
+    }
+
+    fn fallback_completion_is_bare(&self, content: &str, position: Position) -> bool {
+        let Some(line) = deps_core::fallback_completion::line_at(content, position) else {
+            return false;
+        };
+        extract_prefix(line, position.character).1 == Some("artifactId")
+    }
+
+    fn fallback_bare_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
+        // Cursor is already inside an open `<artifactId>gua` tag's content (see
+        // `fallback_completion_is_bare`): only the bare artifact id belongs at that
+        // position, matching the primary AST-anchored path's bare artifact-id
+        // `textEdit` (`MavenEcosystem::detect_xml_context`) — inserting the full
+        // `<groupId>...<artifactId>...<version>...` snippet here would nest it inside
+        // the tag already open around the cursor (#724).
+        let artifact_id = metadata
+            .name()
+            .as_str()
+            .split_once(':')
+            .map_or(metadata.name().as_str(), |(_, artifact_id)| artifact_id);
+        if !is_safe_maven_coordinate_segment(artifact_id) {
+            warn_rejected_value(
+                "is_safe_maven_coordinate_segment",
+                "maven package name completion item",
+                artifact_id,
+            );
+            return None;
+        }
+        Some(artifact_id.to_string())
+    }
+
+    fn completion_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
+        let name = metadata.name();
+        let latest = metadata.latest_version().as_str();
+        // The predicate rejects `:` by design, so it must validate each half of the
+        // coordinate after splitting, never the joined `name`.
+        let (group_id, artifact_id) = match name.as_str().split_once(':') {
+            Some((group_id, artifact_id)) => (Some(group_id), artifact_id),
+            None => (None, name.as_str()),
+        };
+        if !is_safe_maven_coordinate_segment(artifact_id) {
+            warn_rejected_value(
+                "is_safe_maven_coordinate_segment",
+                "maven package name completion item",
+                artifact_id,
+            );
+            return None;
+        }
+        if let Some(g) = group_id
+            && !is_safe_maven_coordinate_segment(g)
+        {
+            warn_rejected_value(
+                "is_safe_maven_coordinate_segment",
+                "maven package name completion item",
+                g,
+            );
+            return None;
+        }
+        Some(group_id.map_or_else(
+            || format!("<artifactId>{artifact_id}</artifactId><version>{latest}</version>"),
+            |group_id| {
+                format!(
+                    "<groupId>{group_id}</groupId><artifactId>{artifact_id}</artifactId><version>{latest}</version>"
+                )
+            },
+        ))
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
+}
+
+/// Checks if `line_number` of `content` is inside pom.xml's `<dependencies>` element,
+/// for `deps-lsp`'s raw-text fallback completion (parse-failure path).
+fn is_in_dependencies_section(content: &str, line_number: usize) -> bool {
+    deps_core::fallback_completion::is_in_xml_tag_section(content, line_number, "dependencies")
+}
+
+/// Extracts the fallback-completion prefix on `line` up to `character`, stripping the
+/// surrounding XML tag (`<artifactId>gua` -> `gua`) so the extracted text matches what
+/// [`MavenEcosystem::detect_xml_context`] would search for at the same cursor position,
+/// together with the name of the tag whose content the cursor sits inside, when there
+/// is one — used by [`MavenEcosystem::fallback_completion_is_bare`] and
+/// [`MavenEcosystem::fallback_completion_prefix`]'s suppression check (#724/#728).
+fn extract_prefix(line: &str, character: u32) -> (&str, Option<&str>) {
+    deps_core::fallback_completion::strip_leading_xml_tag(
+        deps_core::fallback_completion::raw_prefix(line, character),
+    )
 }
 
 #[cfg(test)]
@@ -857,5 +966,223 @@ mod tests {
 
         let result = eco.parse_manifest(xml, &uri).await.unwrap();
         assert_eq!(result.dependencies().len(), 1);
+    }
+
+    /// Composition regression guard (#390/#282 bug class, mirrors the deleted
+    /// `deps-lsp` end-to-end test `test_fallback_completion_maven_query_matches_tag_value`):
+    /// proves `line_at` + `is_in_xml_tag_section` + `strip_leading_xml_tag` compose
+    /// correctly through the real trait method on realistic multi-line pom.xml
+    /// content.
+    #[test]
+    fn test_fallback_completion_prefix_multi_line_composition() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = MavenEcosystem::new(cache);
+        let content = "<dependencies>\n  <dependency>\n    <artifactId>gua";
+        let line = content.lines().nth(2).unwrap();
+        let position = Position::new(2, line.chars().count() as u32);
+        assert_eq!(
+            eco.fallback_completion_prefix(content, position),
+            Some("gua")
+        );
+    }
+
+    /// #724/#728: an open `<groupId>org.apa` tag (not `artifactId`) must suppress the
+    /// completion entirely — neither the bare artifact id nor the full snippet is a
+    /// safe insert at that position — which this trait method achieves by returning
+    /// `None`, the same value it returns for "no completable position at all" (the
+    /// caller's registry search is skipped either way).
+    #[test]
+    fn test_fallback_completion_prefix_other_open_tag_is_suppressed() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = MavenEcosystem::new(cache);
+        let content = "<dependencies>\n  <dependency>\n    <groupId>org.apa";
+        let line = content.lines().nth(2).unwrap();
+        let position = Position::new(2, line.chars().count() as u32);
+        assert_eq!(eco.fallback_completion_prefix(content, position), None);
+    }
+
+    #[test]
+    fn test_fallback_completion_is_bare_inside_open_artifact_id_tag() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = MavenEcosystem::new(cache);
+        let content = "<dependencies>\n  <dependency>\n    <artifactId>gua";
+        let line = content.lines().nth(2).unwrap();
+        let position = Position::new(2, line.chars().count() as u32);
+        assert!(eco.fallback_completion_is_bare(content, position));
+    }
+
+    #[test]
+    fn test_fallback_completion_is_bare_false_with_no_open_tag() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = MavenEcosystem::new(cache);
+        let content = "<dependencies>\n  <dependency>\n    gua";
+        let line = content.lines().nth(2).unwrap();
+        let position = Position::new(2, line.chars().count() as u32);
+        assert!(!eco.fallback_completion_is_bare(content, position));
+    }
+
+    #[test]
+    fn test_fallback_bare_insert_text_inserts_artifact_id_only() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = MavenEcosystem::new(cache);
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("org.apache.commons:commons-lang3"),
+            latest_version: "3.14.0".into(),
+        };
+        assert_eq!(
+            eco.fallback_bare_insert_text(&meta),
+            Some("commons-lang3".to_string())
+        );
+    }
+
+    #[test]
+    fn test_fallback_bare_insert_text_rejects_xml_breakout_artifact_id() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = MavenEcosystem::new(cache);
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new(
+                "org.apache.commons:commons</artifactId><parent><groupId>evil",
+            ),
+            latest_version: "3.14.0".into(),
+        };
+        assert!(eco.fallback_bare_insert_text(&meta).is_none());
+    }
+
+    #[test]
+    fn test_is_in_dependencies_section_basic() {
+        let content = "\n<project>\n  <dependencies>\n    <dependency></dependency>\n  </dependencies>\n</project>\n";
+        assert!(is_in_dependencies_section(content, 3));
+        assert!(!is_in_dependencies_section(content, 1));
+    }
+
+    #[test]
+    fn test_is_in_dependencies_section_no_false_positive_on_longer_tag_name() {
+        let content = "\n<project>\n  <dependencyManagement>\n    <dependencies>\n      <dependency></dependency>\n    </dependencies>\n  </dependencyManagement>\n</project>\n";
+        // Line 2 opens `<dependencyManagement>`, not `<dependencies>` — must not match.
+        assert!(!is_in_dependencies_section(content, 2));
+        // Line 4 is genuinely inside the nested `<dependencies>` block.
+        assert!(is_in_dependencies_section(content, 4));
+    }
+
+    #[test]
+    fn test_extract_prefix_strips_leading_xml_tag() {
+        // Cursor right after "gua" in `<artifactId>gua`.
+        assert_eq!(
+            extract_prefix("  <artifactId>gua", 17),
+            ("gua", Some("artifactId"))
+        );
+    }
+
+    /// Diverges from a first-`>`-based strip whenever more than one tag precedes the
+    /// cursor on a line — mirrored by `test_detect_xml_context_compact_multi_tag_line_
+    /// matches_completion_extractor` using the identical line/cursor position.
+    #[test]
+    fn test_extract_prefix_strips_last_tag_not_first() {
+        let line = "    <dependency><groupId>com.google.guava</groupId><artifactId>gua";
+        assert_eq!(extract_prefix(line, 66), ("gua", Some("artifactId")));
+    }
+
+    /// Cursor right after a fully closed tag must yield an empty prefix, matching
+    /// `detect_xml_context`'s own "no context" outcome for the same position —
+    /// mirrored by `test_detect_xml_context_after_closed_tag_yields_no_context` using
+    /// the identical line/cursor position.
+    #[test]
+    fn test_extract_prefix_after_closed_tag_is_empty() {
+        let line = "    <artifactId>guava</artifactId>";
+        assert_eq!(extract_prefix(line, 34), ("", None));
+    }
+
+    struct MockMetadata {
+        name: deps_core::PackageName,
+        latest_version: deps_core::ConcreteVersion,
+    }
+    impl deps_core::Metadata for MockMetadata {
+        fn name(&self) -> &deps_core::PackageName {
+            &self.name
+        }
+        fn description(&self) -> Option<&str> {
+            None
+        }
+        fn repository(&self) -> Option<&str> {
+            None
+        }
+        fn documentation(&self) -> Option<&str> {
+            None
+        }
+        fn latest_version(&self) -> &deps_core::ConcreteVersion {
+            &self.latest_version
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    #[test]
+    fn test_completion_insert_text_group_artifact() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = MavenEcosystem::new(cache);
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("org.apache.commons:commons-lang3"),
+            latest_version: "3.14.0".into(),
+        };
+        assert_eq!(
+            eco.completion_insert_text(&meta),
+            Some(
+                "<groupId>org.apache.commons</groupId><artifactId>commons-lang3</artifactId>\
+                 <version>3.14.0</version>"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_completion_insert_text_no_colon() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = MavenEcosystem::new(cache);
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("commons-lang3"),
+            latest_version: "3.14.0".into(),
+        };
+        assert_eq!(
+            eco.completion_insert_text(&meta),
+            Some("<artifactId>commons-lang3</artifactId><version>3.14.0</version>".to_string())
+        );
+    }
+
+    /// S1: the identical breakout `build_field_completion` guards against must also be
+    /// rejected on this fallback-search path, not just the primary XML-context path.
+    #[test]
+    fn test_completion_insert_text_rejects_xml_breakout_artifact_id() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = MavenEcosystem::new(cache);
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new(
+                "org.apache.commons:commons</artifactId><parent><groupId>evil",
+            ),
+            latest_version: "3.14.0".into(),
+        };
+        assert!(eco.completion_insert_text(&meta).is_none());
+    }
+
+    #[test]
+    fn test_completion_insert_text_rejects_xml_breakout_group_id() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = MavenEcosystem::new(cache);
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("org.evil</groupId><parent>:commons-lang3"),
+            latest_version: "3.14.0".into(),
+        };
+        assert!(eco.completion_insert_text(&meta).is_none());
+    }
+
+    #[test]
+    fn test_completion_insert_text_no_colon_rejects_xml_breakout() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = MavenEcosystem::new(cache);
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("commons</artifactId><parent>"),
+            latest_version: "3.14.0".into(),
+        };
+        assert!(eco.completion_insert_text(&meta).is_none());
     }
 }

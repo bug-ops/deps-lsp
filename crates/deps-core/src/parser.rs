@@ -487,6 +487,36 @@ fn skip_yaml_string(bytes: &[u8], mut i: usize, quote: u8) -> usize {
     i
 }
 
+/// Renders a scalar YAML node as a string regardless of whether it was quoted or bare.
+///
+/// Covers `Yaml::String` (quoted) and `Yaml::Real`/`Yaml::Integer` (bare) —
+/// `yaml-rust2`'s `as_str` only matches `Yaml::String`, so an unquoted
+/// numeric-looking scalar (a bare `1.2` version range, or a two-component `version:
+/// 1.0`) would otherwise be silently treated as absent. Shared by every ecosystem
+/// that reads a YAML manifest/lockfile field that may legitimately be
+/// numeric-looking but unquoted (issue #721).
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::yaml_scalar_string;
+/// use yaml_rust2::Yaml;
+///
+/// assert_eq!(yaml_scalar_string(&Yaml::String("1.2.3".into())), Some("1.2.3".to_string()));
+/// assert_eq!(yaml_scalar_string(&Yaml::Real("1.2".into())), Some("1.2".to_string()));
+/// assert_eq!(yaml_scalar_string(&Yaml::Integer(6)), Some("6".to_string()));
+/// assert_eq!(yaml_scalar_string(&Yaml::Boolean(true)), None);
+/// ```
+#[must_use]
+pub fn yaml_scalar_string(node: &yaml_rust2::Yaml) -> Option<String> {
+    match node {
+        yaml_rust2::Yaml::String(s) => Some(s.clone()),
+        yaml_rust2::Yaml::Real(s) => Some(s.clone()),
+        yaml_rust2::Yaml::Integer(i) => Some(i.to_string()),
+        _ => None,
+    }
+}
+
 /// Fixed per-node byte floor [`check_yaml_expansion`] charges for every
 /// `Yaml` node, on top of any heap content (e.g. a scalar's string bytes) it
 /// owns.

@@ -388,9 +388,136 @@ impl Ecosystem for PypiEcosystem {
             .collect()
     }
 
+    fn fallback_completion_prefix<'a>(
+        &self,
+        content: &'a str,
+        position: Position,
+    ) -> Option<&'a str> {
+        let line = deps_core::fallback_completion::line_at(content, position)?;
+        if !is_in_dependencies_section(content, position.line as usize) {
+            return None;
+        }
+        Some(extract_prefix(line, position.character))
+    }
+
+    fn completion_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
+        // Both real PEP 621 shapes (`dependencies = [...]` and an
+        // `[project.optional-dependencies]` group) are TOML string-array elements, not
+        // a key=value table entry like Cargo's — the surrounding quotes already exist
+        // in the manifest (or the user is still typing them).
+        Some(metadata.name().to_string())
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
+}
+
+/// Checks if `line_number` of `content` is inside a PyPI dependencies-like section:
+/// either a real TOML section header (`[project.optional-dependencies]`) or PEP 621's
+/// `dependencies = [...]` array under `[project]`, for `deps-lsp`'s raw-text fallback
+/// completion (parse-failure path).
+fn is_in_dependencies_section(content: &str, line_number: usize) -> bool {
+    deps_core::fallback_completion::is_in_toml_dependencies(content, line_number)
+        || is_in_pypi_project_dependencies_array(content, line_number)
+}
+
+/// Checks if a line is inside PEP 621's `dependencies = [...]` array under the
+/// `[project]` table.
+///
+/// Unlike `[dependencies]`/`[project.optional-dependencies]`, PEP 621's primary
+/// dependency list is a *value* (an array assigned to the `dependencies` key), not a
+/// section header — no real `pyproject.toml` ever writes a literal
+/// `[project.dependencies]` header — so it needs its own bracket-depth scan rather
+/// than [`deps_core::fallback_completion::is_in_toml_dependencies`]'s header-string
+/// match.
+///
+/// The bracket-depth counter has no string awareness, so an unbalanced `[` inside a
+/// still-typed extras spec (`"uvicorn[stan`) or a comment would otherwise desync it
+/// permanently. TOML forbids a table header inside an array value, so a bare `[...]`
+/// header line (checked on every line, not just outside the array) is used as an
+/// unambiguous resync point regardless of the counter's state.
+fn is_in_pypi_project_dependencies_array(content: &str, line_number: usize) -> bool {
+    let mut in_project = false;
+    let mut in_array = false;
+    let mut depth: i32 = 0;
+
+    for (i, line) in content.lines().enumerate() {
+        if i > line_number {
+            break;
+        }
+        let trimmed = strip_trailing_toml_comment(line.trim());
+
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_array = false;
+            in_project = trimmed == "[project]";
+            continue;
+        }
+
+        if !in_array && in_project && is_dependencies_array_start(trimmed) {
+            in_array = true;
+            depth = 0;
+        }
+
+        if in_array {
+            if i == line_number {
+                return true;
+            }
+            for ch in trimmed.chars() {
+                match ch {
+                    '[' => depth += 1,
+                    ']' => depth -= 1,
+                    _ => {}
+                }
+            }
+            if depth <= 0 {
+                in_array = false;
+            }
+        }
+    }
+
+    false
+}
+
+/// Strips a trailing TOML comment (`# ...`) from `line`, ignoring a `#` that appears
+/// inside a quoted string.
+///
+/// Naive like this module's other hand-rolled raw-text scanners: does not handle a
+/// `\"` escape inside a double-quoted string, which would end the string one
+/// character too early. Good enough for the fallback-completion heuristic this feeds.
+fn strip_trailing_toml_comment(line: &str) -> &str {
+    let mut in_string: Option<char> = None;
+    for (idx, ch) in line.char_indices() {
+        match in_string {
+            Some(quote) if ch == quote => in_string = None,
+            Some(_) => {}
+            None if ch == '"' || ch == '\'' => in_string = Some(ch),
+            // `idx` comes from `char_indices`, so it is always a char boundary.
+            #[allow(clippy::string_slice)]
+            None if ch == '#' => return line[..idx].trim_end(),
+            None => {}
+        }
+    }
+    line
+}
+
+/// Whether `trimmed` opens the `dependencies = [...]` array (`dependencies = [` or
+/// the single-line `dependencies = [...]`), used by
+/// [`is_in_pypi_project_dependencies_array`].
+fn is_dependencies_array_start(trimmed: &str) -> bool {
+    trimmed
+        .strip_prefix("dependencies")
+        .map(str::trim_start)
+        .and_then(|rest| rest.strip_prefix('='))
+        .is_some_and(|rest| rest.trim_start().starts_with('['))
+}
+
+/// Extracts the fallback-completion prefix on `line` up to `character`, stripping a
+/// surviving quote on either side — PyPI's dependency entries are TOML string-array
+/// elements (`"pytes`), a different quoting shape from JSON-quoted keys, but still
+/// need the surviving quote stripped before it reaches the registry search.
+fn extract_prefix(line: &str, character: u32) -> &str {
+    deps_core::fallback_completion::raw_prefix(line, character).trim_matches('"')
 }
 
 /// Whether `target` is safe to resolve into a clickable `DocumentLink`.
@@ -1767,5 +1894,197 @@ dependencies = []
             .downcast_ref::<crate::parser::ParseResult>()
             .unwrap();
         assert!(downcast.resolved_chains.is_empty());
+    }
+
+    /// Composition regression guard (#390 C5 bug class, mirrors the deleted
+    /// `deps-lsp` end-to-end test
+    /// `test_fallback_completion_pypi_project_array_query_has_no_leaked_quote`):
+    /// proves `line_at` + `is_in_pypi_project_dependencies_array` + quote-stripping
+    /// compose correctly through the real trait method on realistic multi-line
+    /// `pyproject.toml` content — the primitives were each individually correct in
+    /// isolation but their composition was the actual #390 bug.
+    #[test]
+    fn test_fallback_completion_prefix_multi_line_composition_project_array() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = PypiEcosystem::new(cache);
+        let content = "[project]\nname = \"myapp\"\nversion = \"0.1.0\"\ndependencies = [\n    \"requests>=2.31.0\",\n    \"flas";
+        let line = content.lines().nth(5).unwrap();
+        let position = Position::new(5, line.chars().count() as u32);
+        assert_eq!(
+            eco.fallback_completion_prefix(content, position),
+            Some("flas")
+        );
+    }
+
+    /// Same composition, `[project.optional-dependencies]`'s real section-header
+    /// shape rather than the headerless primary `dependencies = [...]` array.
+    #[test]
+    fn test_fallback_completion_prefix_multi_line_composition_optional_dependencies() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = PypiEcosystem::new(cache);
+        let content = "[project.optional-dependencies]\ndev = [\n    \"pytest\",\n    \"flas";
+        let line = content.lines().nth(3).unwrap();
+        let position = Position::new(3, line.chars().count() as u32);
+        assert_eq!(
+            eco.fallback_completion_prefix(content, position),
+            Some("flas")
+        );
+    }
+
+    #[test]
+    fn test_is_in_dependencies_section_optional_dependencies_header() {
+        let content = "\n[project.optional-dependencies]\nrequests\n";
+        assert!(is_in_dependencies_section(content, 2));
+    }
+
+    /// Real PEP 621 files never write a literal `[project.dependencies]` header — the
+    /// primary dependency list is a `dependencies = [...]` array under `[project]`.
+    #[test]
+    fn test_is_in_dependencies_section_project_array_no_literal_header() {
+        let content = "[project]\nname = \"myapp\"\nversion = \"0.1.0\"\ndependencies = [\n    \"requests>=2.31.0\",\n    \"flas\n]\n";
+        // Unterminated entry line ("flas), mid-array.
+        assert!(is_in_dependencies_section(content, 5));
+        // A completed entry line.
+        assert!(is_in_dependencies_section(content, 4));
+        // Unrelated `[project]` keys must not be treated as inside the array.
+        assert!(!is_in_dependencies_section(content, 1));
+        assert!(!is_in_dependencies_section(content, 2));
+        // The `[project]` header line itself is not "inside" the array.
+        assert!(!is_in_dependencies_section(content, 0));
+    }
+
+    #[test]
+    fn test_is_in_dependencies_section_project_array_single_line() {
+        let content = "[project]\ndependencies = [\"requests>=2.0.0\"]\n";
+        assert!(is_in_dependencies_section(content, 1));
+    }
+
+    /// A `dependencies = [...]` array under a table other than `[project]` (e.g. an
+    /// optional-dependencies group using the same key name) must not be picked up by
+    /// the `[project]`-scoped array scan.
+    #[test]
+    fn test_is_in_dependencies_section_project_array_scoped_to_project_table() {
+        let content = "[tool.other]\ndependencies = [\n    \"foo\n]\n";
+        assert!(!is_in_dependencies_section(content, 2));
+    }
+
+    /// An unbalanced `[` inside a still-typed extras spec (`"uvicorn[stan`, common
+    /// real syntax like `celery[redis]`) must not permanently desync the
+    /// bracket-depth counter. A later, real table header is an unambiguous resync
+    /// point (TOML forbids a header inside an array), so lines under it must not be
+    /// misreported as still inside the dependencies array.
+    #[test]
+    fn test_is_in_dependencies_section_project_array_resyncs_after_unbalanced_extras_bracket() {
+        let content = "[project]\ndependencies = [\n    \"uvicorn[stan\n]\n\n[tool.pytest.ini_options]\naddopts = \"-v\"\n";
+        // Mid-typing the extras spec: still correctly inside the array.
+        assert!(is_in_dependencies_section(content, 2));
+        // A line under the unrelated later table must not be swept in by the
+        // desynced counter.
+        assert!(!is_in_dependencies_section(content, 6));
+    }
+
+    /// A `#` comment containing `[` inside the array (e.g. `# pinned per [PEP 621`)
+    /// must not be counted as a real bracket — the comment is stripped before depth
+    /// tracking, so the array still closes at its real `]`.
+    #[test]
+    fn test_is_in_dependencies_section_project_array_ignores_bracket_in_comment() {
+        let content = "[project]\ndependencies = [\n    \"requests>=2.0.0\",  # pinned per [PEP 621\n    \"flas\n]\nrequires-python = \">=3.9\"\n";
+        // Still inside the array on the unterminated entry.
+        assert!(is_in_dependencies_section(content, 3));
+        // The array has closed by the time an unrelated `[project]` key follows.
+        assert!(!is_in_dependencies_section(content, 5));
+    }
+
+    /// A trailing comment on the `[project]` header itself (ordinary TOML) must not
+    /// make the whole array-detection scan inert.
+    #[test]
+    fn test_is_in_dependencies_section_project_header_with_trailing_comment() {
+        let content = "[project]  # main metadata\ndependencies = [\n    \"flas\n]\n";
+        assert!(is_in_dependencies_section(content, 2));
+    }
+
+    /// A commented non-`[project]` header must correctly clear `in_project` (fixed for
+    /// free by comment stripping) — a later table's own `dependencies = [...]` array
+    /// must not be mistaken for PEP 621's.
+    #[test]
+    fn test_is_in_dependencies_section_project_state_cleared_by_commented_other_header() {
+        let content = "[project]\nname = \"x\"\n\n[tool.hatch.envs.default] # test env\ndependencies = [\n    \"other\n]\n";
+        assert!(!is_in_dependencies_section(content, 5));
+    }
+
+    #[test]
+    fn test_extract_prefix_strips_leading_quote() {
+        let line = "    \"flas";
+        assert_eq!(extract_prefix(line, line.len() as u32), "flas");
+    }
+
+    #[test]
+    fn test_extract_prefix_strips_trailing_quote() {
+        let line = "    \"pytest\"";
+        assert_eq!(extract_prefix(line, line.len() as u32), "pytest");
+    }
+
+    #[test]
+    fn test_is_in_dependencies_section_and_extract_prefix_optional_dependencies_group() {
+        let content = "[project.optional-dependencies]\ndev = [\n    \"pytest\",\n    \"flas\n]\n";
+        assert!(is_in_dependencies_section(content, 3));
+
+        let line = content.lines().nth(3).unwrap();
+        assert_eq!(extract_prefix(line, line.len() as u32), "flas");
+    }
+
+    struct MockMetadata {
+        name: deps_core::PackageName,
+        latest_version: deps_core::ConcreteVersion,
+    }
+    impl deps_core::Metadata for MockMetadata {
+        fn name(&self) -> &deps_core::PackageName {
+            &self.name
+        }
+        fn description(&self) -> Option<&str> {
+            None
+        }
+        fn repository(&self) -> Option<&str> {
+            None
+        }
+        fn documentation(&self) -> Option<&str> {
+            None
+        }
+        fn latest_version(&self) -> &deps_core::ConcreteVersion {
+            &self.latest_version
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    #[test]
+    fn test_completion_insert_text_bare_string() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = PypiEcosystem::new(cache);
+        let meta = MockMetadata {
+            name: pkg("requests"),
+            latest_version: "2.31.0".into(),
+        };
+        assert_eq!(
+            ecosystem.completion_insert_text(&meta),
+            Some("requests".to_string())
+        );
+    }
+
+    /// A dotted PyPI name (`zope.interface`) has no TOML-key-injection meaning once
+    /// the insert is a bare array-element string, unlike Cargo's key=value shape.
+    #[test]
+    fn test_completion_insert_text_dotted_name_stays_bare_string() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = PypiEcosystem::new(cache);
+        let meta = MockMetadata {
+            name: pkg("zope.interface"),
+            latest_version: "6.1".into(),
+        };
+        assert_eq!(
+            ecosystem.completion_insert_text(&meta),
+            Some("zope.interface".to_string())
+        );
     }
 }

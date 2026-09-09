@@ -4083,6 +4083,12 @@ mod tests {
             ) -> BoxFuture<'a, Completions> {
                 Box::pin(async move { Completions::default() })
             }
+            fn completion_insert_text(
+                &self,
+                _metadata: &dyn deps_core::Metadata,
+            ) -> Option<String> {
+                unimplemented!()
+            }
             fn as_any(&self) -> &dyn Any {
                 self
             }
