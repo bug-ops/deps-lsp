@@ -159,6 +159,46 @@ impl Ecosystem for DenoEcosystem {
         })
     }
 
+    fn fallback_completion_prefix<'a>(
+        &self,
+        content: &'a str,
+        position: Position,
+    ) -> Option<&'a str> {
+        let line = deps_core::fallback_completion::line_at(content, position)?;
+        if !is_in_dependencies_section(content, position.line as usize) {
+            return None;
+        }
+        // No quote strip, unlike npm/Composer: the completable text at a
+        // package-name position in `deno.json` is the JSON *value* (the
+        // `jsr:`/`npm:` specifier string), not the *key* (the import alias) — the
+        // raw line-start-to-cursor text is always preceded by the alias key, colon
+        // and opening quote in real JSON (`"@std/fs": "jsr:@std/f`), so this can
+        // never coincide with a bare `jsr:`/`npm:` prefix; `DenoRegistry::search`
+        // always takes its scheme-less `None => Ok(vec![])` arm for this path, so
+        // the fallback query is effectively a no-op here rather than a source of
+        // garbage results — the primary `detect_completion_context`-based path
+        // does the real work.
+        Some(extract_prefix(line, position.character))
+    }
+
+    fn completion_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
+        let name = metadata.name();
+        let latest = metadata.latest_version().as_str();
+        // D11: the alias key is conventionally the bare name (scheme stripped); the
+        // value is the full scheme-qualified specifier.
+        let bare = name
+            .as_str()
+            .split_once(':')
+            .map_or(name.as_str(), |(_, rest)| rest);
+        // N5: an empty `latest` (a JSR search hit with no `latestVersion`) must not
+        // insert a dangling `@^` with nothing after it.
+        if latest.is_empty() {
+            Some(format!("\"{bare}\": \"{name}\""))
+        } else {
+            Some(format!("\"{bare}\": \"{name}@^{latest}\""))
+        }
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -189,6 +229,18 @@ impl Ecosystem for DenoEcosystem {
     fn license_source(&self) -> deps_core::LicenseSource {
         deps_core::LicenseSource::FetchedDeclaredSpdx
     }
+}
+
+/// Checks if `line_number` of `content` is inside deno.json's `imports` mapping, for
+/// `deps-lsp`'s raw-text fallback completion (parse-failure path).
+fn is_in_dependencies_section(content: &str, line_number: usize) -> bool {
+    deps_core::fallback_completion::is_in_json_dependencies(content, line_number, &["imports"])
+}
+
+/// Extracts the fallback-completion prefix on `line` up to `character` — no quote
+/// strip (see [`DenoEcosystem::fallback_completion_prefix`]'s doc for why).
+fn extract_prefix(line: &str, character: u32) -> &str {
+    deps_core::fallback_completion::raw_prefix(line, character)
 }
 
 #[cfg(test)]
@@ -308,5 +360,97 @@ mod tests {
             )
             .await;
         assert!(results.is_empty());
+    }
+
+    /// Composition regression guard (#390/#282 bug class): proves `line_at` +
+    /// `is_in_json_dependencies` compose correctly through the real trait method on
+    /// realistic multi-line content — no quote strip, unlike npm/Composer (see
+    /// `DenoEcosystem::fallback_completion_prefix`'s doc for why).
+    #[test]
+    fn test_fallback_completion_prefix_multi_line_composition() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = DenoEcosystem::new(cache);
+        let content = "{\n  \"name\": \"test\",\n  \"imports\": {\n    \"@std/fs\": \"jsr:@std/f";
+        let line = content.lines().nth(3).unwrap();
+        let position = Position::new(3, line.chars().count() as u32);
+        assert_eq!(
+            ecosystem.fallback_completion_prefix(content, position),
+            Some("\"@std/fs\": \"jsr:@std/f")
+        );
+    }
+
+    #[test]
+    fn test_is_in_dependencies_section_imports() {
+        let content = "{\n  \"name\": \"test\",\n  \"imports\": {\n    \"@std/fs\": \"jsr:@std/fs@^1.0\"\n  }\n}";
+        assert!(is_in_dependencies_section(content, 3));
+        assert!(!is_in_dependencies_section(content, 1));
+    }
+
+    struct MockMetadata {
+        name: deps_core::PackageName,
+        latest_version: deps_core::ConcreteVersion,
+    }
+    impl deps_core::Metadata for MockMetadata {
+        fn name(&self) -> &deps_core::PackageName {
+            &self.name
+        }
+        fn description(&self) -> Option<&str> {
+            None
+        }
+        fn repository(&self) -> Option<&str> {
+            None
+        }
+        fn documentation(&self) -> Option<&str> {
+            None
+        }
+        fn latest_version(&self) -> &deps_core::ConcreteVersion {
+            &self.latest_version
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    #[test]
+    fn test_completion_insert_text_strips_scheme_for_alias_key() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = DenoEcosystem::new(cache);
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("jsr:@std/fs"),
+            latest_version: "1.0.24".into(),
+        };
+        assert_eq!(
+            ecosystem.completion_insert_text(&meta),
+            Some("\"@std/fs\": \"jsr:@std/fs@^1.0.24\"".to_string())
+        );
+    }
+
+    #[test]
+    fn test_completion_insert_text_npm_scheme() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = DenoEcosystem::new(cache);
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("npm:react"),
+            latest_version: "18.3.1".into(),
+        };
+        assert_eq!(
+            ecosystem.completion_insert_text(&meta),
+            Some("\"react\": \"npm:react@^18.3.1\"".to_string())
+        );
+    }
+
+    /// N5: a JSR search hit lacking `latestVersion` must not insert a dangling `@^`.
+    #[test]
+    fn test_completion_insert_text_empty_latest_omits_version_clause() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = DenoEcosystem::new(cache);
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("jsr:@std/fs"),
+            latest_version: "".into(),
+        };
+        assert_eq!(
+            ecosystem.completion_insert_text(&meta),
+            Some("\"@std/fs\": \"jsr:@std/fs\"".to_string())
+        );
     }
 }

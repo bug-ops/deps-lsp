@@ -384,6 +384,42 @@ impl Ecosystem for GithubActionsEcosystem {
         })
     }
 
+    fn fallback_completion_prefix<'a>(
+        &self,
+        content: &'a str,
+        position: Position,
+    ) -> Option<&'a str> {
+        let line = deps_core::fallback_completion::line_at(content, position)?;
+        if !is_in_dependencies_section(content, position.line as usize) {
+            return None;
+        }
+        Some(extract_prefix(line, position.character))
+    }
+
+    fn completion_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
+        let name = metadata.name();
+        let latest = metadata.latest_version().as_str();
+        // `search()` always returns `Ok(vec![])` (MVP scope — see this ecosystem's
+        // registry docs), so this is unreachable in practice today; it exists only to
+        // keep the trait implementation total and to behave correctly if
+        // package-name search is ever added. The shape check is a plain `contains('/')`
+        // rather than the stricter `crate::is_valid_github_identity`, matching this
+        // path's pre-existing (pre-#722) behavior exactly.
+        if !name.as_str().contains('/') {
+            deps_core::lsp_helpers::warn_rejected_value(
+                "owner/repo shape",
+                "github actions package name completion item",
+                name.as_str(),
+            );
+            return None;
+        }
+        if latest.is_empty() {
+            Some(name.to_string())
+        } else {
+            Some(format!("{name}@{latest}"))
+        }
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -406,6 +442,28 @@ impl Ecosystem for GithubActionsEcosystem {
             plural: "actions",
         }
     }
+}
+
+/// Whether line `line_number` of `content` is a workflow `uses:` step key (`uses:
+/// owner/repo@ref` or, as a sequence item, `- uses: owner/repo@ref`), for
+/// `deps-lsp`'s raw-text fallback completion (parse-failure path).
+///
+/// A `uses:` step key can appear at any nesting depth in a workflow file
+/// (`jobs.*.steps[].uses`, `jobs.<id>.uses`), so unlike TOML/JSON/other-YAML
+/// ecosystems there is no enclosing section header to track — the target line itself
+/// is the only signal needed.
+fn is_in_dependencies_section(content: &str, line_number: usize) -> bool {
+    content
+        .lines()
+        .nth(line_number)
+        .map(str::trim_start)
+        .is_some_and(|trimmed| trimmed.starts_with("uses:") || trimmed.starts_with("- uses:"))
+}
+
+/// Extracts the fallback-completion prefix on `line` up to `character` — a bare
+/// `owner/repo@ref` (or partial) specifier, with no manifest-syntax wrapper to strip.
+fn extract_prefix(line: &str, character: u32) -> &str {
+    deps_core::fallback_completion::raw_prefix(line, character)
 }
 
 /// Inserts a `**Resolved**: `tag` (`sha…`)` line immediately after the shared hover's
@@ -1767,5 +1825,86 @@ mod tests {
             .await;
 
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    /// Composition regression guard (#390/#282 bug class): proves `line_at` +
+    /// the `uses:` step-key detection compose correctly through the real trait
+    /// method on realistic multi-line workflow content.
+    #[test]
+    fn test_fallback_completion_prefix_multi_line_composition() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = GithubActionsEcosystem::new(cache);
+        let content = "jobs:\n  build:\n    steps:\n      - uses: actions/check";
+        let line = content.lines().nth(3).unwrap();
+        let position = Position::new(3, line.chars().count() as u32);
+        // Raw trim only, no manifest-syntax stripping — matches this ecosystem's
+        // "no override" prefix shape (see `extract_prefix`'s doc).
+        assert_eq!(
+            eco.fallback_completion_prefix(content, position),
+            Some("- uses: actions/check")
+        );
+    }
+
+    #[test]
+    fn test_is_in_dependencies_section_uses_line() {
+        let content = "jobs:\n  build:\n    steps:\n      - uses: actions/checkout@v4\n";
+        assert!(is_in_dependencies_section(content, 3));
+        assert!(!is_in_dependencies_section(content, 0));
+    }
+
+    #[test]
+    fn test_is_in_dependencies_section_composite_action_uses() {
+        let content = "runs:\n  using: composite\n  steps:\n    - uses: actions/setup-node@v4\n";
+        assert!(is_in_dependencies_section(content, 3));
+    }
+
+    struct MockMetadata {
+        name: deps_core::PackageName,
+        latest_version: deps_core::ConcreteVersion,
+    }
+    impl deps_core::Metadata for MockMetadata {
+        fn name(&self) -> &deps_core::PackageName {
+            &self.name
+        }
+        fn description(&self) -> Option<&str> {
+            None
+        }
+        fn repository(&self) -> Option<&str> {
+            None
+        }
+        fn documentation(&self) -> Option<&str> {
+            None
+        }
+        fn latest_version(&self) -> &deps_core::ConcreteVersion {
+            &self.latest_version
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    #[test]
+    fn test_completion_insert_text() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = GithubActionsEcosystem::new(cache);
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("actions/checkout"),
+            latest_version: "v4.1.1".into(),
+        };
+        assert_eq!(
+            eco.completion_insert_text(&meta),
+            Some("actions/checkout@v4.1.1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_completion_insert_text_rejects_non_owner_repo_shape() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = GithubActionsEcosystem::new(cache);
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("checkout"),
+            latest_version: "v4.1.1".into(),
+        };
+        assert!(eco.completion_insert_text(&meta).is_none());
     }
 }

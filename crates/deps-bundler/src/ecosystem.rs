@@ -133,6 +133,12 @@ impl Ecosystem for BundlerEcosystem {
         })
     }
 
+    fn completion_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
+        let name = metadata.name();
+        let latest = metadata.latest_version().as_str();
+        Some(format!("gem \"{name}\", \"~> {latest}\""))
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -258,5 +264,56 @@ gem 'rails', '~> 7.0'";
 
         let result = ecosystem.parse_manifest(gemfile, &uri).await.unwrap();
         assert_eq!(result.dependencies().len(), 1);
+    }
+
+    /// A Gemfile has no delimited dependencies section — `gem "name"` calls are valid
+    /// anywhere — so there is no raw-text boundary to detect: no override.
+    #[test]
+    fn test_fallback_completion_prefix_default_none() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = BundlerEcosystem::new(cache);
+        assert!(
+            ecosystem
+                .fallback_completion_prefix("anything at all\n", Position::new(0, 0))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_completion_insert_text() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = BundlerEcosystem::new(cache);
+        struct MockMetadata {
+            name: deps_core::PackageName,
+            latest_version: deps_core::ConcreteVersion,
+        }
+        impl deps_core::Metadata for MockMetadata {
+            fn name(&self) -> &deps_core::PackageName {
+                &self.name
+            }
+            fn description(&self) -> Option<&str> {
+                None
+            }
+            fn repository(&self) -> Option<&str> {
+                None
+            }
+            fn documentation(&self) -> Option<&str> {
+                None
+            }
+            fn latest_version(&self) -> &deps_core::ConcreteVersion {
+                &self.latest_version
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("rails"),
+            latest_version: "7.1.3".into(),
+        };
+        assert_eq!(
+            ecosystem.completion_insert_text(&meta),
+            Some("gem \"rails\", \"~> 7.1.3\"".to_string())
+        );
     }
 }

@@ -295,9 +295,43 @@ impl Ecosystem for CargoEcosystem {
         })
     }
 
+    fn fallback_completion_prefix<'a>(
+        &self,
+        content: &'a str,
+        position: Position,
+    ) -> Option<&'a str> {
+        let line = deps_core::fallback_completion::line_at(content, position)?;
+        if !is_in_dependencies_section(content, position.line as usize) {
+            return None;
+        }
+        Some(extract_prefix(line, position.character))
+    }
+
+    fn completion_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
+        let name = metadata.name();
+        let latest = metadata.latest_version().as_str();
+        // The key is quoted, not bare: a bare TOML key containing `.` (allowed by
+        // `is_safe_package_name` for Cargo crate names) expands into a nested table
+        // instead of a dependency entry — quoting closes that dotted-key injection.
+        Some(format!("\"{name}\" = \"{latest}\""))
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
+}
+
+/// Checks if `line_number` of `content` is inside a Cargo `[dependencies]`-like
+/// section, for `deps-lsp`'s raw-text fallback completion (parse-failure path).
+fn is_in_dependencies_section(content: &str, line_number: usize) -> bool {
+    deps_core::fallback_completion::is_in_toml_dependencies(content, line_number)
+}
+
+/// Extracts the fallback-completion prefix on `line` up to `character` — a bare TOML
+/// key, with no manifest-syntax wrapper to strip (unlike PyPI's TOML array-element or
+/// npm's JSON-key shapes).
+fn extract_prefix(line: &str, character: u32) -> &str {
+    deps_core::fallback_completion::raw_prefix(line, character)
 }
 
 #[cfg(test)]
@@ -1048,5 +1082,108 @@ mod tests {
         } else {
             panic!("Expected tooltip for loading state");
         }
+    }
+
+    /// Composition regression guard (#390/#282 bug class): proves `line_at` +
+    /// `is_in_toml_dependencies` + `raw_prefix` compose correctly through the real
+    /// trait method on realistic multi-line content, not just each primitive in
+    /// isolation.
+    #[test]
+    fn test_fallback_completion_prefix_multi_line_composition() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = CargoEcosystem::new(cache);
+        let content = "[package]\nname = \"test\"\n\n[dependencies]\nser";
+        let line = content.lines().nth(4).unwrap();
+        let position = Position::new(4, line.chars().count() as u32);
+        assert_eq!(
+            ecosystem.fallback_completion_prefix(content, position),
+            Some("ser")
+        );
+    }
+
+    #[test]
+    fn test_is_in_dependencies_section_basic() {
+        let content = "\n[dependencies]\nserde\n";
+        assert!(is_in_dependencies_section(content, 2));
+        assert!(!is_in_dependencies_section(content, 0));
+    }
+
+    #[test]
+    fn test_is_in_dependencies_section_wrong_section() {
+        let content = "\n[package]\nname = \"test\"\n\n[profile.release]\nopt-level = 3\n";
+        assert!(!is_in_dependencies_section(content, 2));
+        assert!(!is_in_dependencies_section(content, 5));
+    }
+
+    #[test]
+    fn test_extract_prefix_cursor_beyond_line() {
+        let line = "serde";
+        assert_eq!(extract_prefix(line, 100), "serde");
+    }
+
+    #[test]
+    fn test_extract_prefix_leaves_quotes_unstripped() {
+        // Cargo keys are typed unquoted, so a leading `"` should never appear in
+        // practice, but the strip must stay scoped: unlike PyPI's TOML array-element
+        // shape, Cargo does not strip surrounding quotes.
+        let line = "\"expr";
+        assert_eq!(extract_prefix(line, line.len() as u32), "\"expr");
+    }
+
+    struct MockMetadata {
+        name: deps_core::PackageName,
+        latest_version: deps_core::ConcreteVersion,
+    }
+    impl deps_core::Metadata for MockMetadata {
+        fn name(&self) -> &deps_core::PackageName {
+            &self.name
+        }
+        fn description(&self) -> Option<&str> {
+            None
+        }
+        fn repository(&self) -> Option<&str> {
+            None
+        }
+        fn documentation(&self) -> Option<&str> {
+            None
+        }
+        fn latest_version(&self) -> &deps_core::ConcreteVersion {
+            &self.latest_version
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    #[test]
+    fn test_completion_insert_text_quotes_key_and_version() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = CargoEcosystem::new(cache);
+        let meta = MockMetadata {
+            name: pkg("serde"),
+            latest_version: "1.0.214".into(),
+        };
+        assert_eq!(
+            ecosystem.completion_insert_text(&meta),
+            Some("\"serde\" = \"1.0.214\"".to_string())
+        );
+    }
+
+    /// S1: a bare TOML key containing `.` (legal — real crate names can use it)
+    /// expands into a nested table instead of a dependency entry
+    /// (`serde.path = "vendor"` parses as `serde = { path = "vendor" }`). Quoting the
+    /// key keeps the dotted name a single dependency entry.
+    #[test]
+    fn test_completion_insert_text_dotted_name_quotes_toml_key() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = CargoEcosystem::new(cache);
+        let meta = MockMetadata {
+            name: pkg("some.crate"),
+            latest_version: "6.1".into(),
+        };
+        assert_eq!(
+            ecosystem.completion_insert_text(&meta),
+            Some("\"some.crate\" = \"6.1\"".to_string())
+        );
     }
 }

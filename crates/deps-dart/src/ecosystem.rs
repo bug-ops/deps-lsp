@@ -123,6 +123,27 @@ impl Ecosystem for DartEcosystem {
         })
     }
 
+    fn fallback_completion_prefix<'a>(
+        &self,
+        content: &'a str,
+        position: Position,
+    ) -> Option<&'a str> {
+        let line = deps_core::fallback_completion::line_at(content, position)?;
+        if !is_in_dependencies_section(content, position.line as usize) {
+            return None;
+        }
+        Some(extract_prefix(line, position.character))
+    }
+
+    fn completion_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
+        let name = metadata.name();
+        let latest = metadata.latest_version().as_str();
+        // The key is quoted: an unquoted YAML plain scalar can't start with `@`
+        // (allowed by `is_safe_package_name` for npm/Deno-shaped names), which would
+        // otherwise emit invalid YAML instead of a dependency entry.
+        Some(format!("\"{name}\": ^{latest}"))
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -144,6 +165,47 @@ impl Ecosystem for DartEcosystem {
     fn license_source(&self) -> deps_core::LicenseSource {
         deps_core::LicenseSource::DetectedSpdx
     }
+}
+
+/// pubspec.yaml's top-level (unindented) dependency-like keys.
+const SECTION_KEYS: &[&str] = &[
+    "dependencies:",
+    "dev_dependencies:",
+    "dependency_overrides:",
+];
+
+/// Checks if `line_number` of `content` is inside a pubspec.yaml dependency section.
+///
+/// Dart's `dependencies`, `dev_dependencies`, and `dependency_overrides` keys are
+/// top-level (unindented) YAML mappings; their entries stay part of the section until
+/// the next unindented key starts a new one. For `deps-lsp`'s raw-text fallback
+/// completion (parse-failure path).
+fn is_in_dependencies_section(content: &str, line_number: usize) -> bool {
+    let mut in_dependencies = false;
+
+    for (i, line) in content.lines().enumerate() {
+        if i > line_number {
+            break;
+        }
+
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        // Top-level (unindented) key: starts a new section, or leaves the current one.
+        if trimmed.len() == line.len() {
+            in_dependencies = SECTION_KEYS.iter().any(|key| trimmed.starts_with(key));
+        }
+    }
+
+    in_dependencies
+}
+
+/// Extracts the fallback-completion prefix on `line` up to `character` — a bare YAML
+/// key, with no manifest-syntax wrapper to strip.
+fn extract_prefix(line: &str, character: u32) -> &str {
+    deps_core::fallback_completion::raw_prefix(line, character)
 }
 
 #[cfg(test)]
@@ -262,5 +324,76 @@ mod tests {
 
         let result = eco.parse_manifest(yaml, &uri).await.unwrap();
         assert_eq!(result.dependencies().len(), 1);
+    }
+
+    /// Composition regression guard (#390/#282 bug class): proves `line_at` +
+    /// `is_in_dependencies_section`'s top-level-key scan compose correctly through
+    /// the real trait method on realistic multi-line `pubspec.yaml` content.
+    #[test]
+    fn test_fallback_completion_prefix_multi_line_composition() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = DartEcosystem::new(cache);
+        let content = "name: myapp\ndependencies:\n  pa";
+        let line = content.lines().nth(2).unwrap();
+        let position = Position::new(2, line.chars().count() as u32);
+        assert_eq!(
+            eco.fallback_completion_prefix(content, position),
+            Some("pa")
+        );
+    }
+
+    #[test]
+    fn test_is_in_dependencies_section_basic() {
+        let content =
+            "name: myapp\ndependencies:\n  http: ^1.0.0\nenvironment:\n  sdk: '>=3.0.0'\n";
+        assert!(is_in_dependencies_section(content, 2));
+        assert!(!is_in_dependencies_section(content, 4));
+    }
+
+    /// A column-0 `#` comment inside a section must not read as a new top-level key
+    /// and reset `in_dependencies` to false.
+    #[test]
+    fn test_is_in_dependencies_section_column_zero_comment() {
+        let content = "name: myapp\ndependencies:\n# a comment\n  http: ^1.0.0\n";
+        assert!(is_in_dependencies_section(content, 2));
+        assert!(is_in_dependencies_section(content, 3));
+    }
+
+    #[test]
+    fn test_completion_insert_text() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = DartEcosystem::new(cache);
+        struct MockMetadata {
+            name: deps_core::PackageName,
+            latest_version: deps_core::ConcreteVersion,
+        }
+        impl deps_core::Metadata for MockMetadata {
+            fn name(&self) -> &deps_core::PackageName {
+                &self.name
+            }
+            fn description(&self) -> Option<&str> {
+                None
+            }
+            fn repository(&self) -> Option<&str> {
+                None
+            }
+            fn documentation(&self) -> Option<&str> {
+                None
+            }
+            fn latest_version(&self) -> &deps_core::ConcreteVersion {
+                &self.latest_version
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("path"),
+            latest_version: "1.9.0".into(),
+        };
+        assert_eq!(
+            eco.completion_insert_text(&meta),
+            Some("\"path\": ^1.9.0".to_string())
+        );
     }
 }

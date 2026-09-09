@@ -137,9 +137,74 @@ impl Ecosystem for ComposerEcosystem {
         })
     }
 
+    fn fallback_completion_prefix<'a>(
+        &self,
+        content: &'a str,
+        position: Position,
+    ) -> Option<&'a str> {
+        let line = deps_core::fallback_completion::line_at(content, position)?;
+        if !is_in_dependencies_section(content, position.line as usize) {
+            return None;
+        }
+        let (prefix, _) = extract_prefix(line, position.character);
+        // A closed key or an open value string (see `extract_prefix`) both come back
+        // as an empty prefix — there is no safe text to offer at that position, so
+        // this suppresses the completion entirely (`None`, same as "no completable
+        // position at all") rather than relying on the caller's own `prefix.is_empty()`
+        // guard (#729).
+        if prefix.is_empty() {
+            return None;
+        }
+        Some(prefix)
+    }
+
+    fn fallback_completion_is_bare(&self, content: &str, position: Position) -> bool {
+        let Some(line) = deps_core::fallback_completion::line_at(content, position) else {
+            return false;
+        };
+        extract_prefix(line, position.character).1
+    }
+
+    fn completion_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
+        let name = metadata.name();
+        let latest = metadata.latest_version().as_str();
+        Some(format!("\"{name}\": \"^{latest}\""))
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
+}
+
+/// Composer's `composer.json` dependency-like section keys.
+const DEPENDENCY_KEYS: &[&str] = &["require", "require-dev"];
+
+/// Checks if `line_number` of `content` is inside one of Composer's dependency-like
+/// sections, for `deps-lsp`'s raw-text fallback completion (parse-failure path).
+fn is_in_dependencies_section(content: &str, line_number: usize) -> bool {
+    deps_core::fallback_completion::is_in_json_dependencies(content, line_number, DEPENDENCY_KEYS)
+}
+
+/// Extracts the fallback-completion prefix on `line` up to `character`, together with
+/// whether the cursor sits inside a genuinely still-open key string (see
+/// [`deps_core::fallback_completion::strip_open_json_key`]) — used by both
+/// [`ComposerEcosystem::fallback_completion_prefix`] and
+/// [`ComposerEcosystem::fallback_completion_is_bare`].
+///
+/// A surviving `"` proves the key's own quotes are already open around the cursor —
+/// the same shape as NuGet's open-attribute case — so
+/// [`ComposerEcosystem::completion_insert_text`]'s full `"{name}": "^{latest}"` pair
+/// would duplicate that quote and produce invalid JSON if inserted there.
+/// `strip_open_json_key` only reports an open key when quote parity (escape-aware)
+/// proves the string is genuinely still open and precedes a key position, not a closed
+/// key or an open value; the closed/ambiguous/value cases return an empty prefix,
+/// which `deps-lsp`'s fallback-completion caller's `prefix.is_empty()` guard rejects
+/// before any registry search fires — suppressing rather than guessing, matching
+/// Maven's non-`artifactId`-tag discipline (#729).
+fn extract_prefix(line: &str, character: u32) -> (&str, bool) {
+    deps_core::fallback_completion::strip_open_json_key(deps_core::fallback_completion::raw_prefix(
+        line, character,
+    ))
 }
 
 #[cfg(test)]
@@ -282,5 +347,135 @@ mod tests {
             )
             .await;
         assert!(completions.items.is_empty());
+    }
+
+    /// Composition regression guard (#390/#282 bug class): proves `line_at` +
+    /// `is_in_json_dependencies` + quote-stripping compose correctly through the real
+    /// trait method on realistic multi-line content.
+    #[test]
+    fn test_fallback_completion_prefix_multi_line_composition() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = ComposerEcosystem::new(cache);
+        let content = "{\n  \"require\": {\n    \"monolog/mono";
+        let line = content.lines().nth(2).unwrap();
+        let position = Position::new(2, line.chars().count() as u32);
+        assert_eq!(
+            ecosystem.fallback_completion_prefix(content, position),
+            Some("monolog/mono")
+        );
+    }
+
+    #[test]
+    fn test_is_in_dependencies_section_basic() {
+        let content = "{\n  \"require\": {\n    \"monolog/monolog\": \"^2.0\"\n  },\n  \"scripts\": {\n    \"test\": \"phpunit\"\n  }\n}";
+        assert!(is_in_dependencies_section(content, 2));
+        assert!(!is_in_dependencies_section(content, 5));
+    }
+
+    #[test]
+    fn test_extract_prefix_strips_quotes() {
+        let line = "    \"monolog/mono";
+        assert_eq!(
+            extract_prefix(line, line.len() as u32),
+            ("monolog/mono", true)
+        );
+    }
+
+    #[test]
+    fn test_extract_prefix_closed_key_is_suppressed_not_reopened() {
+        // #729 critic S1: cursor right after an already fully-closed key (quote
+        // parity even) is NOT an open string — bare-inserting there would duplicate
+        // the closed key's quote. Suppressed instead of guessed.
+        let line = "    \"monolog/monolog\"";
+        assert_eq!(extract_prefix(line, line.len() as u32), ("", false));
+    }
+
+    /// #729: a closed key (`"monolog/monolog"`, cursor past both quotes) must
+    /// suppress the completion entirely — the same "no safe text to offer" outcome as
+    /// Maven's non-`artifactId` open tag — which this trait method achieves by
+    /// returning `None`, same as "no completable position at all".
+    #[test]
+    fn test_fallback_completion_prefix_closed_key_is_suppressed() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = ComposerEcosystem::new(cache);
+        let content = "{\n  \"require\": {\n    \"monolog/monolog\"";
+        let line = content.lines().nth(2).unwrap();
+        let position = Position::new(2, line.chars().count() as u32);
+        assert_eq!(eco.fallback_completion_prefix(content, position), None);
+    }
+
+    #[test]
+    fn test_fallback_completion_is_bare_inside_open_key() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = ComposerEcosystem::new(cache);
+        let content = "{\n  \"require\": {\n    \"monolog/mono";
+        let line = content.lines().nth(2).unwrap();
+        let position = Position::new(2, line.chars().count() as u32);
+        assert!(eco.fallback_completion_is_bare(content, position));
+    }
+
+    #[test]
+    fn test_fallback_completion_is_bare_false_with_no_open_key() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = ComposerEcosystem::new(cache);
+        let content = "{\n  \"require\": {\n    monolog";
+        let line = content.lines().nth(2).unwrap();
+        let position = Position::new(2, line.chars().count() as u32);
+        assert!(!eco.fallback_completion_is_bare(content, position));
+    }
+
+    /// #729: `ComposerEcosystem` has no `fallback_bare_insert_text` override — the
+    /// default (bare `metadata.name()`) is exactly right here.
+    #[test]
+    fn test_fallback_bare_insert_text_default_is_bare_name() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = ComposerEcosystem::new(cache);
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("monolog/monolog"),
+            latest_version: "3.5.0".into(),
+        };
+        assert_eq!(
+            eco.fallback_bare_insert_text(&meta),
+            Some("monolog/monolog".to_string())
+        );
+    }
+
+    struct MockMetadata {
+        name: deps_core::PackageName,
+        latest_version: deps_core::ConcreteVersion,
+    }
+    impl deps_core::Metadata for MockMetadata {
+        fn name(&self) -> &deps_core::PackageName {
+            &self.name
+        }
+        fn description(&self) -> Option<&str> {
+            None
+        }
+        fn repository(&self) -> Option<&str> {
+            None
+        }
+        fn documentation(&self) -> Option<&str> {
+            None
+        }
+        fn latest_version(&self) -> &deps_core::ConcreteVersion {
+            &self.latest_version
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    #[test]
+    fn test_completion_insert_text() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = ComposerEcosystem::new(cache);
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("monolog/monolog"),
+            latest_version: "3.5.0".into(),
+        };
+        assert_eq!(
+            ecosystem.completion_insert_text(&meta),
+            Some("\"monolog/monolog\": \"^3.5.0\"".to_string())
+        );
     }
 }

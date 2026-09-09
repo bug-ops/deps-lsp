@@ -284,9 +284,80 @@ impl Ecosystem for NpmEcosystem {
         })
     }
 
+    fn fallback_completion_prefix<'a>(
+        &self,
+        content: &'a str,
+        position: Position,
+    ) -> Option<&'a str> {
+        let line = deps_core::fallback_completion::line_at(content, position)?;
+        if !is_in_dependencies_section(content, position.line as usize) {
+            return None;
+        }
+        let (prefix, _) = extract_prefix(line, position.character);
+        // A closed key or an open value string (see `extract_prefix`) both come back
+        // as an empty prefix — there is no safe text to offer at that position, so
+        // this suppresses the completion entirely (`None`, same as "no completable
+        // position at all") rather than relying on the caller's own `prefix.is_empty()`
+        // guard (#729).
+        if prefix.is_empty() {
+            return None;
+        }
+        Some(prefix)
+    }
+
+    fn fallback_completion_is_bare(&self, content: &str, position: Position) -> bool {
+        let Some(line) = deps_core::fallback_completion::line_at(content, position) else {
+            return false;
+        };
+        extract_prefix(line, position.character).1
+    }
+
+    fn completion_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
+        let name = metadata.name();
+        let latest = metadata.latest_version().as_str();
+        Some(format!("\"{name}\": \"^{latest}\""))
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
+}
+
+/// npm's `package.json` dependency-like section keys.
+const DEPENDENCY_KEYS: &[&str] = &[
+    "dependencies",
+    "devDependencies",
+    "peerDependencies",
+    "optionalDependencies",
+];
+
+/// Checks if `line_number` of `content` is inside one of npm's dependency-like
+/// sections, for `deps-lsp`'s raw-text fallback completion (parse-failure path).
+fn is_in_dependencies_section(content: &str, line_number: usize) -> bool {
+    deps_core::fallback_completion::is_in_json_dependencies(content, line_number, DEPENDENCY_KEYS)
+}
+
+/// Extracts the fallback-completion prefix on `line` up to `character`, together with
+/// whether the cursor sits inside a genuinely still-open key string (see
+/// [`deps_core::fallback_completion::strip_open_json_key`]) — used by both
+/// [`NpmEcosystem::fallback_completion_prefix`] and
+/// [`NpmEcosystem::fallback_completion_is_bare`].
+///
+/// A surviving `"` (leading, when the cursor sits before the closing quote of a
+/// still-typed key, or trailing, when it sits right after one) proves the key's own
+/// quotes are already open around the cursor — the same shape as NuGet's
+/// open-attribute case — so [`NpmEcosystem::completion_insert_text`]'s full
+/// `"{name}": "^{latest}"` pair would duplicate that quote and produce invalid JSON if
+/// inserted there. `strip_open_json_key` only reports an open key when quote parity
+/// (escape-aware) proves the string is genuinely still open and precedes a key
+/// position, not a closed key or an open value; the closed/ambiguous/value cases
+/// return an empty prefix, which `deps-lsp`'s fallback-completion caller's
+/// `prefix.is_empty()` guard rejects before any registry search fires — suppressing
+/// rather than guessing, matching Maven's non-`artifactId`-tag discipline (#729).
+fn extract_prefix(line: &str, character: u32) -> (&str, bool) {
+    deps_core::fallback_completion::strip_open_json_key(deps_core::fallback_completion::raw_prefix(
+        line, character,
+    ))
 }
 
 /// Renders the `**Catalog**` hover line for `dep`, or `None` for a non-catalog dependency.
@@ -1344,6 +1415,140 @@ mod tests {
         assert_eq!(
             diagnostics[0].severity,
             Some(tower_lsp_server::ls_types::DiagnosticSeverity::WARNING)
+        );
+    }
+
+    /// Composition regression guard (#390/#282 bug class): proves `line_at` +
+    /// `is_in_json_dependencies` + quote-stripping compose correctly through the real
+    /// trait method on realistic multi-line content.
+    #[test]
+    fn test_fallback_completion_prefix_multi_line_composition() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = NpmEcosystem::new(cache);
+        let content = "{\n  \"name\": \"test\",\n  \"dependencies\": {\n    \"expr";
+        let line = content.lines().nth(3).unwrap();
+        let position = Position::new(3, line.chars().count() as u32);
+        assert_eq!(
+            ecosystem.fallback_completion_prefix(content, position),
+            Some("expr")
+        );
+    }
+
+    #[test]
+    fn test_is_in_dependencies_section_basic() {
+        let content = "{\n  \"name\": \"test\",\n  \"dependencies\": {\n    \"express\"\n  }\n}";
+        assert!(is_in_dependencies_section(content, 3));
+        assert!(!is_in_dependencies_section(content, 1));
+    }
+
+    #[test]
+    fn test_is_in_dependencies_section_dev_deps() {
+        let content = "{\n  \"devDependencies\": {\n    \"jest\": \"^29.0.0\"\n  }\n}";
+        assert!(is_in_dependencies_section(content, 2));
+    }
+
+    #[test]
+    fn test_extract_prefix_strips_leading_quote() {
+        let line = "    \"expr";
+        assert_eq!(extract_prefix(line, line.len() as u32), ("expr", true));
+    }
+
+    #[test]
+    fn test_extract_prefix_closed_key_is_suppressed_not_reopened() {
+        // #729 critic S1: cursor right after an already fully-closed key (quote
+        // parity even) is NOT an open string — bare-inserting there would duplicate
+        // the closed key's quote (`"express"express`). Suppressed instead of guessed.
+        let line = "    \"express\"";
+        assert_eq!(extract_prefix(line, line.len() as u32), ("", false));
+    }
+
+    /// #729: a closed key (`"express"`, cursor past both quotes) must suppress the
+    /// completion entirely — the same "no safe text to offer" outcome as Maven's
+    /// non-`artifactId` open tag — which this trait method achieves by returning
+    /// `None`, same as "no completable position at all".
+    #[test]
+    fn test_fallback_completion_prefix_closed_key_is_suppressed() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = NpmEcosystem::new(cache);
+        let content = "{\n  \"dependencies\": {\n    \"express\"";
+        let line = content.lines().nth(2).unwrap();
+        let position = Position::new(2, line.chars().count() as u32);
+        assert_eq!(eco.fallback_completion_prefix(content, position), None);
+    }
+
+    #[test]
+    fn test_fallback_completion_is_bare_inside_open_key() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = NpmEcosystem::new(cache);
+        let content = "{\n  \"dependencies\": {\n    \"expr";
+        let line = content.lines().nth(2).unwrap();
+        let position = Position::new(2, line.chars().count() as u32);
+        assert!(eco.fallback_completion_is_bare(content, position));
+    }
+
+    #[test]
+    fn test_fallback_completion_is_bare_false_with_no_open_key() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = NpmEcosystem::new(cache);
+        let content = "{\n  \"dependencies\": {\n    expr";
+        let line = content.lines().nth(2).unwrap();
+        let position = Position::new(2, line.chars().count() as u32);
+        assert!(!eco.fallback_completion_is_bare(content, position));
+    }
+
+    /// #729: `NpmEcosystem` has no `fallback_bare_insert_text` override — the default
+    /// (bare `metadata.name()`) is exactly right here, since npm's open-key case has
+    /// no group/artifact split the way Maven's does.
+    #[test]
+    fn test_fallback_bare_insert_text_default_is_bare_name() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = NpmEcosystem::new(cache);
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("express"),
+            latest_version: "4.19.2".into(),
+        };
+        assert_eq!(
+            eco.fallback_bare_insert_text(&meta),
+            Some("express".to_string())
+        );
+    }
+
+    struct MockMetadata {
+        name: deps_core::PackageName,
+        latest_version: deps_core::ConcreteVersion,
+    }
+    impl deps_core::Metadata for MockMetadata {
+        fn name(&self) -> &deps_core::PackageName {
+            &self.name
+        }
+        fn description(&self) -> Option<&str> {
+            None
+        }
+        fn repository(&self) -> Option<&str> {
+            None
+        }
+        fn documentation(&self) -> Option<&str> {
+            None
+        }
+        fn latest_version(&self) -> &deps_core::ConcreteVersion {
+            &self.latest_version
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    #[test]
+    fn test_completion_insert_text() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = NpmEcosystem::new(cache);
+        let meta = MockMetadata {
+            name: pkg("express"),
+            latest_version: "4.18.2".into(),
+        };
+        assert_eq!(
+            ecosystem.completion_insert_text(&meta),
+            Some("\"express\": \"^4.18.2\"".to_string())
         );
     }
 }
