@@ -338,15 +338,18 @@ fn parse_pom_licenses(data: &[u8]) -> Vec<String> {
     parse_pom(data).licenses
 }
 
-/// Fuzz-only entry point for [`parse_pom_licenses`] (issue #691). Gated on the `fuzzing`
-/// Cargo feature (never enabled by this crate's own default set) so this stays out of the
+/// Fuzz-only entry point for [`parse_pom`] (issue #691). Gated on the `fuzzing` Cargo
+/// feature (never enabled by this crate's own default set) so this stays out of the
 /// crate's public API surface in a normal build. This module itself stays unconditionally
 /// private (impl-critic M1) — only this one function is reachable externally, via the
-/// `#[doc(hidden)]` `pub use` re-export in `lib.rs`.
+/// `#[doc(hidden)]` `pub use` re-export in `lib.rs`. Targets `parse_pom` directly (not the
+/// test-only `parse_pom_licenses` wrapper, added by #692's parent-POM traversal) so
+/// fuzzing continues to exercise the real production parser, including its `<parent>`
+/// coordinate extraction.
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub fn fuzz_parse_pom_licenses(data: &[u8]) {
-    let _ = parse_pom_licenses(data);
+    let _ = parse_pom(data);
 }
 
 #[cfg(test)]
