@@ -336,9 +336,9 @@ enum OpenMarkupContext {
 /// surviving quote proves the value's own quotes are already open, the same shape as
 /// NuGet's attribute case) — `create_package_completion_item`'s npm/Composer arm can
 /// still insert a full `"{name}": "^{latest}"` pair into that already-open string,
-/// producing invalid JSON. Tracked as a known follow-up gap (critic S2 on #724), out of
-/// scope for #724 itself (npm/Composer weren't in the original report); PyPI is exempt
-/// since its arm already inserts a bare string.
+/// producing invalid JSON. Tracked as a known follow-up gap (critic S2 on #724, filed as
+/// #729), out of scope for #724 itself (npm/Composer weren't in the original report);
+/// PyPI is exempt since its arm already inserts a bare string.
 ///
 /// For XML manifests (`pom.xml`) an opening tag survives on the left instead (cursor
 /// inside `<artifactId>gua`) — stripped so the extracted text matches what the
@@ -360,8 +360,8 @@ fn extract_prefix(
     );
     let prefix = line.get(..prefix_end).unwrap_or(line).trim();
     if uses_json_quoted_keys(ecosystem_kind) || uses_toml_string_array_values(ecosystem_kind) {
-        // Known gap for npm/Composer specifically (tracked in a follow-up issue, not
-        // #724 itself — see this function's doc comment): the trimmed `"` proves the
+        // Known gap for npm/Composer specifically (tracked as #729, not #724 itself —
+        // see this function's doc comment): the trimmed `"` proves the
         // value's own quotes are already open, the same shape as NuGet's attribute
         // case, but this always reports `None` rather than a dedicated context.
         (prefix.trim_matches('"'), OpenMarkupContext::None)
