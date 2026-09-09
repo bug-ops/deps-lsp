@@ -428,23 +428,26 @@ jobs:
       - uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3  # v1
         with:
           channel: nightly
-          # `target-dirs`/`cache-target` compose the cached path as `<target-dirs>/<cache-target>`
-          # (relative to the repo root). `fuzz/` is its own nested workspace (see `fuzz/Cargo.toml`),
-          # and `cargo fuzz run` always builds against an explicit host target, landing at
-          # `fuzz/target/x86_64-unknown-linux-gnu/release/<target>` — not the root `target/` this
-          # action defaults to. A prior revision set `cache-target: fuzz-${{ matrix.target }}`,
-          # which never matched any real directory (cargo doesn't create per-fuzz-target profile
-          # subdirectories), so the cache silently never saved or restored on any run.
-          # Deliberately one shared key across all 17 legs, not per-leg: they compile the same
-          # dependency tree (only the final target binary differs), so a per-leg key would only
-          # ever cache one leg's own dependency compilation for itself. `actions/cache` save is a
-          # no-op (not a failure) when a key already exists, so concurrent legs finishing the
-          # first-ever save race harmlessly — whichever leg finishes first seeds the shared cache
-          # for every leg on the next run.
-          target-dirs: fuzz/target/x86_64-unknown-linux-gnu
-          cache-target: release
+          cache: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # `moonrepo/setup-rust`'s own caching (`cache-target`/`target-dirs`) saves/restores the
+      # raw `target/` directory verbatim, but its pre-save `cargo cache --autoclean` step
+      # deletes the extracted registry `src/` checkouts (keeping only the compressed `.crate`
+      # archives) to shrink the cache. On restore, cargo has to re-extract every dependency's
+      # source with a fresh mtime, which invalidates the mtime-based fingerprint checks in the
+      # restored `target/` dir and cascades into a full rebuild of the entire dependency graph
+      # (verified empirically: even foundational, unchanged crates like `proc-macro2` were
+      # recompiled after a confirmed cache hit and successful restore). `Swatinem/rust-cache`
+      # is the standard tool for this exact scenario — nested Cargo workspaces via
+      # `workspaces:`, one shared cache across matrix legs via `shared-key:` (they compile the
+      # same dependency tree; only the final fuzz-target binary differs) — and specifically
+      # designed to avoid the mtime-invalidation trap above.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+        with:
+          workspaces: fuzz -> target
+          shared-key: fuzz
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
