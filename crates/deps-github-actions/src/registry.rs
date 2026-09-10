@@ -1048,6 +1048,32 @@ mod tests {
         assert_eq!(registry.select_latest_matching(&versions, &req), Some(0));
     }
 
+    // #784: exercises the non-wildcard `semver::VersionReq` branch of
+    // `select_latest_matching` (above) — the wildcard/existence-ladder branch is already
+    // proven by `test_select_latest_matching_wildcard_uses_existence_ladder` above.
+    deps_core::registry_conformance! {
+        mod github_actions_registry_conformance;
+        build: mock_registry("http://127.0.0.1:1", false);
+        select_latest_matching: {
+            versions: vec![
+                Box::new(GithubActionsVersion {
+                    version: "v2.0.0".into(),
+                    sha: "a".repeat(40),
+                    prerelease: false,
+                    published_at: None,
+                }),
+                Box::new(GithubActionsVersion {
+                    version: "v1.0.0".into(),
+                    sha: "a".repeat(40),
+                    prerelease: false,
+                    published_at: None,
+                }),
+            ];
+            req: "^1.0.0";
+            expected_index: 1;
+        };
+    }
+
     #[test]
     fn test_evict_in_flight_never_evicts_held_lock() {
         // Deterministic, not probabilistic (critic M4): every entry but one is held

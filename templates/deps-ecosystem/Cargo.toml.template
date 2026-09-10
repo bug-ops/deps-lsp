@@ -11,8 +11,11 @@ license.workspace = true
 repository.workspace = true
 description = "{ECOSYSTEM_DISPLAY} support for deps-lsp"
 
+[lints]
+workspace = true
+
 [dependencies]
-deps-core = { path = "../deps-core" }
+deps-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -22,4 +25,11 @@ tracing = { workspace = true }
 urlencoding = { workspace = true }
 
 [dev-dependencies]
+# Required for `deps_core::conformance` (and its `formatter_conformance!`/etc. macros) to be
+# compiled in this crate's own tests — without `test-util`, that module is cfg-gated out.
+deps-core = { workspace = true, features = ["test-util"] }
+# `registry.rs.template`'s `test_get_versions` is `#[tokio::test]`; the `[dependencies]`
+# `tokio` line above carries no `macros`/`rt-multi-thread` features, so a scaffolded crate's
+# own tests cannot build without also declaring them here.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-test = { workspace = true }

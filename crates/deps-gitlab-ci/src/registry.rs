@@ -1034,4 +1034,17 @@ mod tests {
             .unwrap();
         assert_eq!(versions[idx].version_string().as_str(), "2.0.0");
     }
+
+    // #784: reuses the `version()` fixture from the tilde-semantics tests above — those
+    // already pin the exact matched version, this proves the method is actually overridden
+    // rather than silently inheriting the trait's `None` default.
+    deps_core::registry_conformance! {
+        mod gitlab_ci_registry_conformance;
+        build: GitlabCiRegistry::new(test_client());
+        select_latest_matching: {
+            versions: vec![version("1.3.0", false), version("1.2.5", false)];
+            req: "1.2";
+            expected_index: 1;
+        };
+    }
 }

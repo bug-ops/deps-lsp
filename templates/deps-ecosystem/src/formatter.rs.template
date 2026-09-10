@@ -1,35 +1,63 @@
-use deps_core::lsp_helpers::EcosystemFormatter;
+use deps_core::lsp_helpers::{
+    DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
+    RequirementResolution, SourcePolicy,
+};
+use deps_core::{ConcreteVersion, PackageName};
 
+/// [`EcosystemFormatter`](deps_core::lsp_helpers::EcosystemFormatter) implementation for
+/// {ECOSYSTEM_DISPLAY}.
+///
+/// `EcosystemFormatter` is a blanket impl over seven concern traits (see its own doc) — never
+/// `impl EcosystemFormatter for {ECOSYSTEM_PASCAL}Formatter` directly. Implement only the
+/// concern trait that owns the behavior you need to customize; every trait below with an
+/// empty body is relying entirely on that trait's own defaults.
 pub struct {ECOSYSTEM_PASCAL}Formatter;
 
-impl EcosystemFormatter for {ECOSYSTEM_PASCAL}Formatter {
-    fn format_version_for_text_edit(&self, version: &str) -> String {
+impl PackageNaming for {ECOSYSTEM_PASCAL}Formatter {}
+
+impl PackageRendering for {ECOSYSTEM_PASCAL}Formatter {
+    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
         // TODO: Format version according to ecosystem conventions
-        format!("\"{}\"", version)
+        version.as_str().to_string()
     }
 
-    fn package_url(&self, name: &str) -> String {
-        // TODO: Return package URL for this ecosystem
-        format!("https://example.com/packages/{}", name)
+    fn package_url(&self, name: &PackageName) -> String {
+        // TODO: Return the real package URL for this ecosystem's registry. `encode` guards
+        // the markdown-link-destination hazards (newline, percent, control chars, brackets
+        // and parens) that `formatter_conformance!`'s unconditional hostile-input check
+        // asserts against.
+        format!(
+            "https://example.com/packages/{}",
+            urlencoding::encode(name.as_str())
+        )
     }
 }
+
+impl RequirementResolution for {ECOSYSTEM_PASCAL}Formatter {}
+
+impl DiagnosticMessages for {ECOSYSTEM_PASCAL}Formatter {}
+
+impl DiagnosticPolicy for {ECOSYSTEM_PASCAL}Formatter {}
+
+impl SourcePolicy for {ECOSYSTEM_PASCAL}Formatter {}
+
+impl OsvNaming for {ECOSYSTEM_PASCAL}Formatter {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_format_version() {
-        let formatter = {ECOSYSTEM_PASCAL}Formatter;
-        assert_eq!(
-            formatter.format_version_for_text_edit("1.0.0"),
-            "\"1.0.0\""
-        );
-    }
-
-    #[test]
-    fn test_package_url() {
-        let formatter = {ECOSYSTEM_PASCAL}Formatter;
-        assert!(formatter.package_url("test-pkg").contains("test-pkg"));
+    // Exact-value `EcosystemFormatter` conformance (see `deps_core::conformance`'s doc) —
+    // replaces hand-written `test_format_version`/`test_package_url` tests. Add
+    // `accepts:`/`rejects:`/`version_roundtrip:`/`hostile_package_url_expected:` arms here
+    // as this formatter grows real `validate_package_name`/`version_satisfies_requirement`
+    // overrides — see `deps-cargo`'s or `deps-github-actions`'s `formatter.rs` for examples.
+    deps_core::formatter_conformance! {
+        mod {ECOSYSTEM_SNAKE}_formatter_conformance;
+        build: {ECOSYSTEM_PASCAL}Formatter;
+        package_url: {
+            "test-pkg" => "https://example.com/packages/test-pkg",
+        };
+        format_version: [ "1.0.0" => "1.0.0" ];
     }
 }
