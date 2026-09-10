@@ -31,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: new `deps_core::conformance` module (behind `test-util`) with 5 macros generating the exact-value per-crate conformance test family every ecosystem crate previously hand-copied; `deps-cargo` migrated as the Wave 1 pilot, with the remaining 13 crates tracked as follow-up work (partial work on #758) (#776)
 
 ### Fixed
+- **deps-core**: corrected a stale doc-comment reference to a nonexistent item in `in_use_version.rs` (resolves #773) (#779)
 - **deps-core, deps-cargo, deps-npm, deps-pypi, deps-go, deps-nuget, deps-maven**: `DepsError`'s `Display`/`Debug` and several ecosystem-crate warn/debug log lines no longer embed a workspace-declared registry URL's raw query string, closing a credential-exfiltration path via `window/showMessage` and `tracing` logs (resolves #767) (#775)
 - **deps-gradle**: version catalog/DSL completion no longer miscounts an escaped quote, via a generalized, quote-character-parameterized `deps-core` quote-parity helper (resolves #738) (#771)
 - **Breaking (pre-1.0, public API)**: **deps-core**: fixed 16 broken rustdoc intra-doc links invisible to the default CI rustdoc gate, renaming the public `in_use_version` function to `resolve_in_use_version` to resolve a function/module name ambiguity (resolves #765) (#772)
