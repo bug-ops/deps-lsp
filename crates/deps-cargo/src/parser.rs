@@ -376,9 +376,9 @@ fn resolve_alternate_registries(
             // not a config-file alias name — it may itself be a URL carrying `user:pass@`
             // credentials or a query-string credential (e.g. `RegistryIndexError::UserInfoPresent`
             // fell through to alias resolution). Redact before logging (see
-            // `deps_core::net_policy::url_for_tracing`, not `redact_userinfo` alone, which
+            // `deps_core::net_policy::RedactedUrl`, not `redact_userinfo` alone, which
             // preserves the query string — #767 follow-up).
-            let redacted = deps_core::net_policy::url_for_tracing(alias);
+            let redacted = deps_core::net_policy::RedactedUrl::new(alias);
             tracing::warn!(
                 alias = %redacted,
                 "registry alias did not resolve via the .cargo/config.toml \
@@ -1176,7 +1176,7 @@ internal-crate = { version = "1.0", registry-index = "https://169.254.169.254/in
     /// treated as a possible `.cargo/config.toml` alias name). When that "alias" then fails
     /// to resolve too, the unresolved-alias `tracing::warn!` must never log the raw,
     /// credential-bearing value — it must be redacted first (see
-    /// `deps_core::net_policy::url_for_tracing`, not `redact_userinfo` alone, which preserves
+    /// `deps_core::net_policy::RedactedUrl`, not `redact_userinfo` alone, which preserves
     /// the query string — a code-review follow-up on #767, matching the #529 precedent
     /// already applied to `validate_index_url`'s own error `Display`), and this covers both
     /// a userinfo credential and a query-string one in the same value.

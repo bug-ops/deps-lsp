@@ -48,7 +48,7 @@ use std::sync::atomic::AtomicBool;
 use base64::Engine;
 use deps_core::PackageName;
 use deps_core::net_policy::{
-    IndexUrlError, PolicyGate, RegistryAccessPolicy, url_for_tracing, validate_index_url,
+    IndexUrlError, PolicyGate, RedactedUrl, RegistryAccessPolicy, validate_index_url,
 };
 use deps_core::parser::DependencySource;
 use quick_xml::Reader;
@@ -73,7 +73,7 @@ const NO_SOURCES_CONFIGURED_SENTINEL: &str = "<clear/> removed every NuGet packa
 pub enum NuGetFeedUrlError {
     /// The value did not parse as a URL at all.
     #[error("not a valid URL: {0}")]
-    InvalidUrl(String),
+    InvalidUrl(RedactedUrl),
     /// The URL's scheme is not `https`.
     #[error("registry feed must use https, got scheme {0:?}")]
     NotHttps(String),
@@ -112,14 +112,17 @@ pub enum NuGetFeedUrlError {
 impl From<IndexUrlError> for NuGetFeedUrlError {
     fn from(error: IndexUrlError) -> Self {
         match error {
-            IndexUrlError::InvalidUrl(raw) => Self::InvalidUrl(raw),
+            // `RedactedUrl::new` is idempotent for already-redacted text, so re-wrapping
+            // `IndexUrlError::InvalidUrl`'s own (already `url_for_tracing`'d) payload here is
+            // a no-op, not a double redaction.
+            IndexUrlError::InvalidUrl(raw) => Self::InvalidUrl(raw.into()),
             IndexUrlError::NotHttps(scheme) => Self::NotHttps(scheme),
             IndexUrlError::UserInfoPresent => Self::UserInfoPresent,
             IndexUrlError::BlockedHost { class } => Self::BlockedHost { class },
             // `IndexUrlError` is `#[non_exhaustive]` (issue #769): a variant added upstream
             // and not yet mapped here still surfaces, carrying its own message, rather than
             // failing to compile.
-            other => Self::InvalidUrl(other.to_string()),
+            other => Self::InvalidUrl(other.to_string().into()),
         }
     }
 }
@@ -302,7 +305,7 @@ pub struct InvalidEntry {
     /// The raw value, as written (or the source's resolved URL if it was invalidated only
     /// after passing URL validation, e.g. disabled/credentialed), with any embedded userinfo
     /// redacted.
-    pub raw: String,
+    pub raw: RedactedUrl,
     /// Why it was rejected.
     pub reason: NuGetFeedUrlError,
 }
@@ -711,7 +714,7 @@ impl NuGetConfig {
             let raw = self
                 .sources
                 .iter()
-                .find_map(|s| s.value.as_ref().err().map(|e| e.raw.clone()))
+                .find_map(|s| s.value.as_ref().err().map(|e| e.raw.to_string()))
                 .unwrap_or_else(|| NO_SOURCES_CONFIGURED_SENTINEL.to_string());
             return DependencySource::CustomRegistry { url: raw };
         }
@@ -1074,12 +1077,12 @@ fn resolve_source_entry(add: &RawSourceAdd, policy: &RegistryAccessPolicy) -> In
             "skipping NuGet V2 (protocolVersion=\"2\") package source; only V3 feeds are supported"
         );
         return Err(InvalidEntry {
-            raw: url_for_tracing(&add.value),
+            raw: RedactedUrl::new(&add.value),
             reason: NuGetFeedUrlError::UnsupportedProtocolVersion("2".to_string()),
         });
     }
     if !add.value.contains("://") {
-        let redacted = url_for_tracing(&add.value);
+        let redacted = RedactedUrl::new(&add.value);
         tracing::debug!(
             key = %add.key,
             value = %redacted,
@@ -1091,10 +1094,10 @@ fn resolve_source_entry(add: &RawSourceAdd, policy: &RegistryAccessPolicy) -> In
         });
     }
     NuGetFeedUrl::new(&add.value, policy).map_err(|reason| {
-        // #767 S2a: `url_for_tracing`, not `redact_userinfo` alone — `raw` also lands in
+        // #767 S2a: `RedactedUrl`, not `redact_userinfo` alone — `raw` also lands in
         // `InvalidEntry::raw`, which can surface as `DependencySource::CustomRegistry`'s
         // hover/diagnostics text, so a query-string credential must be stripped too.
-        let redacted = url_for_tracing(&add.value);
+        let redacted = RedactedUrl::new(&add.value);
         tracing::warn!(key = %add.key, raw = %redacted, %reason, "NuGet package source failed validation");
         InvalidEntry {
             raw: redacted,
@@ -1743,7 +1746,7 @@ fn fail_closed(
     config_fingerprint: u64,
 ) {
     let raw = match &entry.value {
-        Ok(url) => url.as_str().to_string(),
+        Ok(url) => RedactedUrl::new(url.as_str()),
         Err(invalid) => invalid.raw.clone(),
     };
 
@@ -2016,7 +2019,7 @@ mod tests {
         PackageSourceEntry {
             key: key.to_string(),
             value: NuGetFeedUrl::new(url, policy).map_err(|reason| InvalidEntry {
-                raw: url.to_string(),
+                raw: RedactedUrl::new(url),
                 reason,
             }),
             tier: ConfigTier::Repo,
@@ -2250,6 +2253,50 @@ mod tests {
         let config = resolve(dir.path(), &cache, &policy);
 
         assert!(config.resolved_chains().is_empty());
+    }
+
+    /// #801 follow-up (critic S3): `fail_closed`'s `Ok(url) => RedactedUrl::new(url.as_str())`
+    /// arm redacts a credentialed source's own URL, not just an already-invalid one — a
+    /// validated `NuGetFeedUrl` can still carry a query-string credential (e.g. `?ApiKey=...`),
+    /// since `validate_index_url` only rejects userinfo. With `<clear/>` present (no implicit
+    /// public fallback) and the only declared source dropped for carrying credentials, the
+    /// fail-closed `DependencySource::CustomRegistry` must name the host but never the
+    /// query-string secret. Mirrors `deps-npm`/`deps-pypi`'s `!raw.contains(secret)` style.
+    #[test]
+    fn test_credentialed_source_query_string_credential_redacted_in_custom_registry_url() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(
+            dir.path(),
+            r#"<configuration>
+                <packageSources>
+                    <clear />
+                    <add key="CorpFeed" value="https://feed.example/v3/index.json?ApiKey=super-secret-value" />
+                </packageSources>
+                <packageSourceCredentials>
+                    <CorpFeed>
+                        <add key="Username" value="user" />
+                        <add key="ClearTextPassword" value="pass" />
+                    </CorpFeed>
+                </packageSourceCredentials>
+            </configuration>"#,
+        );
+        let cache = NuGetConfigCache::new();
+        let policy = all_policy();
+        let config = resolve(dir.path(), &cache, &policy);
+
+        let DependencySource::CustomRegistry { url } =
+            config.resolve_source_for(&pkg("Any.Package"))
+        else {
+            panic!("expected CustomRegistry");
+        };
+        assert!(
+            url.contains("feed.example"),
+            "host should survive redaction: {url}"
+        );
+        assert!(
+            !url.contains("super-secret-value"),
+            "leaked credential: {url}"
+        );
     }
 
     // --- packageSourceMapping (C2/R1/R3) ---

@@ -14,8 +14,8 @@
 //!   carrying `username()`/`password()` outright (FR-006/FR-011) — there is no expansion step
 //!   for PyPI config (unlike npm's `${VAR}`), so [`InvalidEntry::raw`] and every
 //!   `tracing::warn!` here name the as-written value with any embedded userinfo and query
-//!   string/fragment stripped first (see `url_for_tracing`) — the raw value is otherwise
-//!   preserved so a warning or a
+//!   string/fragment stripped first (see [`deps_core::net_policy::RedactedUrl`]) — the raw
+//!   value is otherwise preserved so a warning or a
 //!   [`DependencySource::CustomRegistry`] naming an unresolved primary/named source still shows
 //!   the user what they actually typed, minus the credential.
 //! - **FR-005's resolution order is the load-bearing security invariant of this whole
@@ -34,9 +34,7 @@
 
 use std::collections::HashMap;
 
-use deps_core::net_policy::{
-    PolicyGate, RegistryAccessPolicy, url_for_tracing, validate_index_url,
-};
+use deps_core::net_policy::{PolicyGate, RedactedUrl, RegistryAccessPolicy, validate_index_url};
 use deps_core::parser::DependencySource;
 
 /// Why a candidate index URL failed [`PypiIndexUrl::new`]'s validation.
@@ -100,9 +98,10 @@ impl std::fmt::Display for PypiIndexUrl {
 /// well-formed-but-non-https/userinfo-bearing value.
 ///
 /// Carries the raw value as written, **with any embedded userinfo and query string/fragment
-/// redacted** (M1 fix, extended by #767 S2a — see [`deps_core::net_policy::url_for_tracing`]),
-/// so [`PypiIndexConfig::resolve_source_for`] can build [`DependencySource::CustomRegistry`]
-/// for an explicit primary/named source, or log a warning naming what the user wrote for a
+/// redacted** (M1 fix, extended by #767 S2a, structurally enforced by #789's
+/// [`deps_core::net_policy::RedactedUrl`]), so [`PypiIndexConfig::resolve_source_for`] can
+/// build [`DependencySource::CustomRegistry`] for an explicit primary/named source, or log a
+/// warning naming what the user wrote for a
 /// dropped extra, without ever holding or surfacing the credential itself: a
 /// `CustomRegistry.url` can reach hover/diagnostics text, and a `UserInfoPresent` rejection is
 /// exactly the case where `raw` would otherwise still contain `user:pass@` (a query-string
@@ -115,13 +114,13 @@ impl std::fmt::Display for PypiIndexUrl {
 pub struct InvalidEntry {
     /// The raw index value, as written in the source file, with any `user:pass@`/`user@`
     /// userinfo component and any query string/fragment stripped.
-    pub raw: String,
+    pub raw: RedactedUrl,
     /// Why it was rejected.
     pub reason: PypiIndexUrlError,
 }
 
 /// Validates and normalizes one raw index value, logging a `tracing::warn!` naming the raw
-/// value (redacted — see [`deps_core::net_policy::url_for_tracing`]) on failure. `pub(crate)`:
+/// value (redacted — see [`deps_core::net_policy::RedactedUrl`]) on failure. `pub(crate)`:
 /// every parser
 /// surface (`requirements.rs`, `pyproject.rs`) that discovers a candidate index value calls
 /// this before handing the result to a [`PypiIndexConfig`] setter.
@@ -130,11 +129,11 @@ pub(crate) fn resolve_entry(
     policy: &RegistryAccessPolicy,
 ) -> Result<PypiIndexUrl, InvalidEntry> {
     PypiIndexUrl::new(raw, policy).map_err(|reason| {
-        // #767 S2a: `url_for_tracing`, not `redact_userinfo` alone — this value is also
+        // #767 S2a: `RedactedUrl`, not `redact_userinfo` alone — this value is also
         // stored in `InvalidEntry::raw`, which can surface as `DependencySource::CustomRegistry`'s
         // hover/diagnostics text, so a query-string credential must be stripped too, not just
         // userinfo. Host and path still survive, so hover stays identifiable.
-        let redacted = url_for_tracing(raw);
+        let redacted = RedactedUrl::new(raw);
         tracing::warn!(raw = %redacted, %reason, "PyPI index URL failed validation");
         InvalidEntry {
             raw: redacted,
@@ -277,12 +276,16 @@ impl PypiIndexConfig {
     /// deterministic and discoverable instead.
     pub(crate) fn set_primary_resolved(&mut self, result: Result<PypiIndexUrl, InvalidEntry>) {
         if self.primary.is_some() {
+            // `Ok(url)` is a *validated* index, but `PypiIndexUrl::new` only rejects
+            // userinfo, not a query string/fragment — a legitimate token embedded as
+            // `?token=...` survives validation and must still be redacted here, the same
+            // way `deps-nuget`'s `fail_closed` redacts its own already-valid `Ok` arm.
             let raw = match &result {
-                Ok(url) => url.as_str(),
-                Err(invalid) => invalid.raw.as_str(),
+                Ok(url) => RedactedUrl::new(url.as_str()),
+                Err(invalid) => invalid.raw.clone(),
             };
             tracing::warn!(
-                raw,
+                raw = %raw,
                 "multiple primary-priority index sources declared; keeping the first, \
                  ignoring this one"
             );
@@ -381,7 +384,7 @@ impl PypiIndexConfig {
                     mirrors_crates_io: false,
                 },
                 Some(Err(invalid)) => DependencySource::CustomRegistry {
-                    url: invalid.raw.clone(),
+                    url: invalid.raw.to_string(),
                 },
                 None => DependencySource::CustomRegistry {
                     url: name.to_string(),
@@ -399,7 +402,7 @@ impl PypiIndexConfig {
                 }
             }
             Some(Err(invalid)) => DependencySource::CustomRegistry {
-                url: invalid.raw.clone(),
+                url: invalid.raw.to_string(),
             },
             None => match self.case_b_chain() {
                 Some(chain) if !chain.hops.is_empty() => DependencySource::AlternateRegistry {
@@ -579,6 +582,35 @@ mod tests {
         assert_eq!(chains.len(), 1);
         assert_eq!(chains[0].hops.len(), 1);
         assert_eq!(chains[0].hops[0].as_str(), "https://first.example/simple");
+    }
+
+    /// Code-review follow-up (#801): `set_primary_resolved`'s `Ok` arm logged the second,
+    /// dropped source's URL unredacted — `PypiIndexUrl::new`/`validate_index_url` only reject
+    /// userinfo, not a query string/fragment, so a legitimate token embedded as `?token=...`
+    /// survives validation and previously leaked into the "multiple primary-priority index
+    /// sources" `tracing::warn!` line verbatim. Mirrors `deps-nuget`'s
+    /// `test_credentialed_source_query_string_credential_redacted_in_custom_registry_url`.
+    #[test]
+    fn test_set_primary_resolved_redacts_query_string_credential_in_dropped_source_log() {
+        let policy = all_policy();
+        let mut config = PypiIndexConfig::new();
+        config.set_primary_resolved(resolve_entry("https://first.example/simple", &policy));
+
+        let log = deps_core::test_util::capture_tracing_output(|| {
+            config.set_primary_resolved(resolve_entry(
+                "https://pypi.example/simple?token=super-secret-value",
+                &policy,
+            ));
+        });
+
+        assert!(
+            log.contains("pypi.example"),
+            "host should survive redaction: {log:?}"
+        );
+        assert!(
+            !log.contains("super-secret-value"),
+            "leaked credential into tracing output: {log:?}"
+        );
     }
 
     /// FR-005(a): primary + extras — no implicit public hop appended.
@@ -798,17 +830,17 @@ mod tests {
                 resolve_entry("https://user:hunter2@pypi.example/simple", &policy).unwrap_err();
             assert_matches!(invalid.reason, PypiIndexUrlError::UserInfoPresent);
             assert!(
-                !invalid.raw.contains("hunter2"),
+                !invalid.raw.as_ref().contains("hunter2"),
                 "InvalidEntry::raw leaked the credential: {}",
                 invalid.raw
             );
             assert!(
-                !invalid.raw.contains("user:"),
+                !invalid.raw.as_ref().contains("user:"),
                 "InvalidEntry::raw leaked the username: {}",
                 invalid.raw
             );
             assert!(
-                invalid.raw.contains("pypi.example"),
+                invalid.raw.as_ref().contains("pypi.example"),
                 "host should survive redaction"
             );
         });
@@ -833,12 +865,12 @@ mod tests {
             .unwrap_err();
             assert_matches!(invalid.reason, PypiIndexUrlError::BlockedHost { .. });
             assert!(
-                !invalid.raw.contains("super-secret-value"),
+                !invalid.raw.as_ref().contains("super-secret-value"),
                 "InvalidEntry::raw leaked the credential: {}",
                 invalid.raw
             );
             assert!(
-                invalid.raw.contains("pypi.example"),
+                invalid.raw.as_ref().contains("pypi.example"),
                 "host should survive redaction"
             );
         });
@@ -884,7 +916,7 @@ mod tests {
                 .unwrap_err();
             assert_matches!(invalid.reason, PypiIndexUrlError::InvalidUrl(_));
             assert!(
-                !invalid.raw.contains("hunter2"),
+                !invalid.raw.as_ref().contains("hunter2"),
                 "InvalidEntry::raw leaked the credential: {}",
                 invalid.raw
             );

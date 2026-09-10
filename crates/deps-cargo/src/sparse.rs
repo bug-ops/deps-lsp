@@ -30,7 +30,7 @@
 use crate::config::{AuthToken, IndexTrust, RegistryIndex};
 use crate::types::CargoVersion;
 use deps_core::{
-    DepsError, HttpCache, Result, lsp_helpers::warn_rejected_value, net_policy::url_for_tracing,
+    DepsError, HttpCache, Result, lsp_helpers::warn_rejected_value, net_policy::RedactedUrl,
 };
 use semver::{Version, VersionReq};
 use serde::Deserialize;
@@ -389,9 +389,9 @@ impl SparseIndexClient {
             (None, IndexTrust::Trusted) => self.cache.get_cached(url).await,
             (None, IndexTrust::WorkspaceDeclared) => self.cache.get_cached_workspace(url).await,
             (Some(_), IndexTrust::WorkspaceDeclared) => {
-                let safe_base_url = url_for_tracing(&self.base_url);
+                let safe_base_url = RedactedUrl::new(&self.base_url);
                 tracing::error!(
-                    url = safe_base_url,
+                    url = %safe_base_url,
                     "refusing to attach a credential to a workspace-declared registry index request"
                 );
                 Err(DepsError::CacheError(format!(
