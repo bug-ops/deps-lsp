@@ -438,6 +438,28 @@ mod tests {
         no_lockfile_support: true;
     }
 
+    // #784: `build_arc:` (not `build:`) against the real `Ecosystem::registry()` wiring —
+    // `GradleEcosystem` reuses `deps_maven::MavenCentralRegistry` unchanged (#233), so a
+    // `build:` fixture constructing that type directly would only duplicate
+    // `deps-maven/src/registry.rs`'s own `test_select_latest_matching_not_default_none`
+    // and prove nothing gradle-specific; this proves the type Gradle's `registry()` hands
+    // back actually overrides the method. `req: "*"` (rather than an exact-string pin) also
+    // exercises the wildcard/existence-ladder branch both LSP fetch call sites
+    // (`deps-lsp/src/document/fetch.rs`, `deps-core/src/lsp_helpers/hover.rs`) actually take,
+    // instead of a branch production code never reaches.
+    deps_core::registry_conformance! {
+        mod gradle_registry_conformance;
+        build_arc: GradleEcosystem::new(make_cache()).registry();
+        select_latest_matching: {
+            versions: vec![
+                Box::new(deps_maven::MavenVersion::new("3.2.0".into())),
+                Box::new(deps_maven::MavenVersion::new("3.1.0".into())),
+            ];
+            req: "*";
+            expected_index: 0;
+        };
+    }
+
     // #758: the shared completion-prefix-length guard
     // (`deps_core::completion::complete_package_names_generic`), replacing
     // test_complete_package_names_short_prefix — also closes the missing max-length case

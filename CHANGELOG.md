@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **deps-core, deps-deno, deps-gradle, deps-github-actions, deps-gitlab-ci**: `registry_conformance!` macro proving `Registry::select_latest_matching` is actually overridden, invoked for all four ecosystems named in #784 (resolves #784) (#787)
+- **templates**: `deps-ecosystem` formatter template fixed to compile against the current `PackageRendering`/`EcosystemFormatter` API and use `formatter_conformance!` (resolves #785) (#787)
 - **workspace**: CI gained a `semver` job (`obi1kenobi/cargo-semver-checks-action`, advisory pending a local rustdoc-format toolchain mismatch, hard-gated on the weekly scheduled sweep) flagging accidental public-API breaks; adds `#[non_exhaustive]` to the highest-churn public error/dependency/version types — `deps-core`'s `DepsError`/`FetchFailure`/`RemovalStatus`/`VulnSeverity`/`ProvenanceStatus`/`CompletionContext`/`LicensePolicy`/`SupplyChainTrustSignal`/`ScanTarget`/`Advisory` and every ecosystem crate's `*Dependency`/`*Version`/`*ParseResult`/`*DependencySection` — as a first incremental pass, not a full API-stability audit (resolves #755) (#768)
 - **deps-lsp, deps-core**: `tracing::instrument` spans on the LSP request handlers and the shared registry HTTP/cache layer, correlating each request with one parent span instead of only leaf-level ecosystem spans (resolves #756) (#766)
 - `fuzz/` workspace: cargo-fuzz target for `Ecosystem::fallback_completion_prefix`/`fallback_completion_is_bare`, the raw-text scanners driving the parse-failure completion path, across all 14 ecosystems (resolves #740) (#745)

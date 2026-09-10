@@ -8,10 +8,12 @@
 //! Every ecosystem crate historically hand-copied the same family of tests — "does
 //! `Ecosystem::id()` match", "does `package_url` produce this exact link", "does locating a
 //! lock file work in the same directory", "does a too-short completion prefix return no
-//! results", "does JSON nesting beyond the shared depth cap get rejected" — with no structural
-//! link between the copies, so a fix or a new edge case applied to one crate's copy routinely
-//! never reached the other thirteen. This module is the single implementation of each family;
-//! the five `#[macro_export]`ed macros below only generate `#[test] fn` scaffolding around the
+//! results", "does JSON nesting beyond the shared depth cap get rejected", "does a registry
+//! actually override `select_latest_matching` instead of inheriting the trait's `None`
+//! default" — with no structural link between the copies, so a fix or a new edge case applied
+//! to one crate's copy routinely never reached the other thirteen. This module is the single
+//! implementation of each family;
+//! the six `#[macro_export]`ed macros below only generate `#[test] fn` scaffolding around the
 //! plain `assert_*` functions here, so a fix to an assertion fixes every ecosystem invoking it
 //! at once.
 //!
@@ -571,6 +573,35 @@ pub fn assert_json_nesting_over_max_depth_rejected<T, E>(
     assert!(
         parse(json.as_bytes()).is_err(),
         "nesting beyond the maximum allowed depth must be rejected"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// Macro 6: `registry_conformance!` — a [`crate::Registry`] actually overrides
+// [`crate::Registry::select_latest_matching`] rather than inheriting its `None` default.
+// ---------------------------------------------------------------------------------------
+
+/// Asserts `registry.select_latest_matching(versions, &VersionReq::new(req))` equals
+/// `Some(expected_index)`.
+///
+/// `expected_index` is `usize`, not `Option<usize>`, so the trait's `None` default is
+/// inexpressible by construction here — a registry that never overrides
+/// [`crate::Registry::select_latest_matching`] fails this assertion rather than passing it
+/// vacuously (#784).
+///
+/// `versions` must be newest-first (the same ordering [`crate::Registry::get_versions`]
+/// returns) — `expected_index` indexes this slice as given, not re-sorted.
+pub fn assert_select_latest_matching_overridden(
+    registry: &dyn crate::Registry,
+    versions: &[Box<dyn crate::Version>],
+    req: &str,
+    expected_index: usize,
+) {
+    let req = crate::VersionReq::new(req);
+    assert_eq!(
+        registry.select_latest_matching(versions, &req),
+        Some(expected_index),
+        "select_latest_matching({req:?}) index mismatch"
     );
 }
 
@@ -1203,6 +1234,143 @@ macro_rules! json_depth_conformance {
             #[test]
             fn json_nesting_over_max_depth_rejected() {
                 json_nesting_over_max_depth_rejected_impl();
+            }
+        }
+    };
+}
+
+/// Generates a `select_latest_matching_not_default_none` conformance test for a
+/// [`crate::Registry`] implementation (#758 macro 6, #784).
+///
+/// [`crate::Registry::select_latest_matching`] defaults to `None` so that test doubles
+/// which never resolve a "latest" compile unchanged; a real registry reachable from the LSP
+/// fetch path must override it. This macro proves that override actually fires for at least
+/// one non-wildcard requirement, rather than silently inheriting the default.
+///
+/// **Known limitation** (mirrors [`ecosystem_conformance!`]'s and
+/// [`completion_guard_conformance!`]'s doc on what a directly-constructed fixture cannot
+/// prove): this constructs the registry type directly via `build:`/`build_arc:`, so it
+/// proves that *type* overrides the method — not that the owning
+/// [`Ecosystem::registry()`](crate::Ecosystem::registry) actually wires that type into the
+/// LSP fetch path. Where that wiring is itself the risk (a registry type shared across
+/// crates via a facade), invoke with `build_arc:` against the real `Ecosystem::registry()`
+/// call instead of `build:` against the type directly.
+///
+/// Two mutually exclusive forms, chosen by which keyword introduces the fixture:
+/// - `build:` — `$build` must be an **owned, concrete** registry type (uniform with every
+///   other macro's `build:` arm). `&Arc<dyn Registry>` does not unsize-coerce to
+///   `&dyn Registry`, so a `build:` expression that yields an `Arc` is a compile error, not
+///   a runtime failure — use `build_arc:` instead for that shape.
+/// - `build_arc:` — `$build` must yield `Arc<dyn Registry>` (typically
+///   `SomeEcosystem::new(..).registry()`); the macro dereferences it before asserting. Use
+///   this to prove the wiring path itself, e.g. when the registry type is defined in a
+///   different crate than the ecosystem invoking this macro and a `build:` fixture would
+///   only duplicate that other crate's own conformance test.
+///
+/// `versions` must be an explicit `Vec<Box<dyn Version>>` — the annotation is load-bearing:
+/// it lets a bare `vec![Box::new(..), ..]` coerce each element without the call site
+/// importing [`crate::Version`] itself.
+///
+/// Must be invoked inside your own `#[cfg(test)] mod tests { ... }` — see
+/// [`ecosystem_conformance!`]'s doc for why this macro does not emit its own `#[cfg(test)]`,
+/// and for why each assertion is a plain `_impl` fn called by a thin `#[test]` wrapper.
+///
+/// # Examples
+///
+/// `build:` against an owned, concrete registry. Wrapped in an explicit `mod example` — see
+/// [`ecosystem_conformance!`]'s doc for why:
+///
+/// ```
+/// mod example {
+/// # use std::any::Any;
+/// # struct FakeVersion { version: deps_core::ConcreteVersion }
+/// # deps_core::impl_version!(FakeVersion {
+/// #     version: version,
+/// #     status: |_: &FakeVersion| deps_core::RemovalStatus::Available,
+/// # });
+/// # struct FakeRegistry;
+/// # impl deps_core::Registry for FakeRegistry {
+/// #     fn get_versions<'a>(&'a self, _name: &'a deps_core::PackageName)
+/// #         -> std::pin::Pin<Box<dyn std::future::Future<Output = deps_core::Result<Vec<Box<dyn deps_core::Version>>>> + Send + 'a>> {
+/// #         Box::pin(async move { Ok(vec![]) })
+/// #     }
+/// #     fn get_latest_matching<'a>(&'a self, _name: &'a deps_core::PackageName, _req: &'a deps_core::VersionReq)
+/// #         -> std::pin::Pin<Box<dyn std::future::Future<Output = deps_core::Result<Option<Box<dyn deps_core::Version>>>> + Send + 'a>> {
+/// #         Box::pin(async move { Ok(None) })
+/// #     }
+/// #     fn search<'a>(&'a self, _query: &'a str, _limit: usize)
+/// #         -> std::pin::Pin<Box<dyn std::future::Future<Output = deps_core::Result<Vec<Box<dyn deps_core::Metadata>>>> + Send + 'a>> {
+/// #         Box::pin(async move { Ok(vec![]) })
+/// #     }
+/// #     fn select_latest_matching(&self, versions: &[Box<dyn deps_core::Version>], req: &deps_core::VersionReq) -> Option<usize> {
+/// #         let req = req.as_str();
+/// #         versions.iter().position(|v| v.version_string().as_str() == req)
+/// #     }
+/// #     fn as_any(&self) -> &dyn Any { self }
+/// # }
+/// deps_core::registry_conformance! {
+///     mod fake_registry_conformance;
+///     build: FakeRegistry;
+///     select_latest_matching: {
+///         versions: vec![
+///             Box::new(FakeVersion { version: "2.0.0".into() }),
+///             Box::new(FakeVersion { version: "1.0.0".into() }),
+///         ];
+///         req: "1.0.0";
+///         expected_index: 1;
+///     };
+/// }
+/// }
+/// ```
+#[macro_export]
+macro_rules! registry_conformance {
+    (
+        mod $mod_name:ident;
+        build: $build:expr;
+        select_latest_matching: {
+            versions: $versions:expr;
+            req: $req:literal;
+            expected_index: $expected:literal;
+        } $(;)?
+    ) => {
+        mod $mod_name {
+            use super::*;
+
+            fn select_latest_matching_not_default_none_impl() {
+                let registry = $build;
+                let versions: ::std::vec::Vec<::std::boxed::Box<dyn $crate::Version>> = $versions;
+                $crate::conformance::assert_select_latest_matching_overridden(
+                    &registry, &versions, $req, $expected,
+                );
+            }
+            #[test]
+            fn select_latest_matching_not_default_none() {
+                select_latest_matching_not_default_none_impl();
+            }
+        }
+    };
+    (
+        mod $mod_name:ident;
+        build_arc: $build:expr;
+        select_latest_matching: {
+            versions: $versions:expr;
+            req: $req:literal;
+            expected_index: $expected:literal;
+        } $(;)?
+    ) => {
+        mod $mod_name {
+            use super::*;
+
+            fn select_latest_matching_not_default_none_impl() {
+                let registry: ::std::sync::Arc<dyn $crate::Registry> = $build;
+                let versions: ::std::vec::Vec<::std::boxed::Box<dyn $crate::Version>> = $versions;
+                $crate::conformance::assert_select_latest_matching_overridden(
+                    &*registry, &versions, $req, $expected,
+                );
+            }
+            #[test]
+            fn select_latest_matching_not_default_none() {
+                select_latest_matching_not_default_none_impl();
             }
         }
     };

@@ -751,6 +751,25 @@ mod tests {
         wrap: |nested: &str| format!(r#"{{"versions": {{}}, "extra": {nested}}}"#);
     }
 
+    // #784: `DenoRegistry::select_latest_matching` (above, `select_latest_matching`)
+    // delegates entirely to npm's implementation, which is downcast-free — this
+    // `JsrVersion` fixture only survives that delegation for that reason. If
+    // `deps_npm::NpmRegistry::select_latest_matching` (`deps-npm/src/registry.rs:925-953`)
+    // ever downcasts to a concrete npm version type, this test starts failing with a bare
+    // `None` from what otherwise looks like a valid fixture — the fix is in npm, not here.
+    deps_core::registry_conformance! {
+        mod deno_registry_conformance;
+        build: DenoRegistry::new(Arc::new(HttpCache::new()));
+        select_latest_matching: {
+            versions: vec![
+                Box::new(JsrVersion::new("2.0.0".into(), false)),
+                Box::new(JsrVersion::new("1.0.0".into(), false)),
+            ];
+            req: "^1.0.0";
+            expected_index: 1;
+        };
+    }
+
     #[test]
     fn test_parse_search_response_prefixes_name_with_scheme_and_maps_github_repo() {
         let json = r#"{
