@@ -690,37 +690,13 @@ mod tests {
             // Hostile-input safety for the `package_url` *display* sink
             // (`lsp_helpers::hover`'s `# [{name}]({url})`, destination written raw — see
             // `HOSTILE_DISPLAY_LINK_PAYLOAD`'s doc for the full sink/hazard rationale, #758
-            // security-review). Every character that can break out of a markdown
-            // `[label](destination)` link is checked, not just newline/autolink/percent.
-            let hostile_name =
-                deps_core::PackageName::new(deps_core::conformance::HOSTILE_DISPLAY_LINK_PAYLOAD);
-            let url = ecosystem.formatter().package_url(&hostile_name);
-            assert!(
-                url.is_empty() || url::Url::parse(&url).is_ok(),
-                "{id:?}: package_url produced an unparsable non-empty URL: {url:?}"
+            // security-review). Shared with `formatter_conformance!`'s own unconditional
+            // per-crate check (#782 gap 1) — see `conformance::assert_package_url_hostile_input_safe`'s
+            // doc for why both layers call the same implementation.
+            deps_core::conformance::assert_package_url_hostile_input_safe(
+                ecosystem.formatter(),
+                &format!("{id:?}"),
             );
-            if !url.is_empty() {
-                for hazard in ['\n', '<', '>', '(', ')', '[', ']', '`'] {
-                    assert!(
-                        !url.contains(hazard),
-                        "{id:?}: package_url leaked a literal {hazard:?} — a markdown \
-                         `[label](destination)` link-destination breakout character: {url:?}"
-                    );
-                }
-                assert!(
-                    !url.chars().any(char::is_control),
-                    "{id:?}: package_url leaked a raw control character: {url:?}"
-                );
-                assert!(
-                    !url.contains('\u{202e}'),
-                    "{id:?}: package_url leaked a raw U+202E right-to-left override \
-                     (display-spoofing): {url:?}"
-                );
-                assert!(
-                    url.contains("%25"),
-                    "{id:?}: package_url did not encode the payload's literal '%' as %25: {url:?}"
-                );
-            }
 
             let metadata = deps_core::test_util::MockMetadata::new("conformance-probe", "1.0.0");
             let _ = ecosystem.completion_insert_text(&metadata);

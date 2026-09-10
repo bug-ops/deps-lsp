@@ -79,7 +79,6 @@ insta = { workspace = true, features = ["json"] }
 mockito = { workspace = true }
 tempfile = { workspace = true }
 tokio-test = { workspace = true }
-url = { workspace = true }
 
 [[bench]]
 name = "lsp_handlers"

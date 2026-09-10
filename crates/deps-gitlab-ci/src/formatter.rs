@@ -358,6 +358,8 @@ mod tests {
         };
         accepts: [ "org/proj", "gitlab.com/org/proj/comp" ];
         rejects: [ "no-slash" ];
+        format_version: [ "1.0.0" => "1.0.0" ];
+        hostile_package_url_expected: "";
     }
 
     #[test]

@@ -1191,7 +1191,8 @@ mod tests {
     // #758: exact-value `Ecosystem` conformance, replacing
     // test_ecosystem_id_and_display_name and test_as_any. `lockfile_filenames()` is
     // omitted — GHA workflows have no lock file concept (no `LockFileProvider` impl in
-    // this crate). No `completion_guard_conformance!`/`json_depth_conformance!` for this
+    // this crate); `no_lockfile_support: true;` below asserts that contract explicitly
+    // (#782 gap 2). No `completion_guard_conformance!`/`json_depth_conformance!` for this
     // crate: GHA never performs package-name search completion
     // (`CompletionContext::PackageName` always yields `Completions::default()` — versions
     // resolve via the tags API only), and its tags-response parsing goes through the
@@ -1207,6 +1208,7 @@ mod tests {
         id: "github-actions";
         display_name: "GitHub Actions";
         manifest_filenames: &["action.yml", "action.yaml"];
+        no_lockfile_support: true;
     }
 
     #[test]
