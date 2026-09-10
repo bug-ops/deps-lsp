@@ -230,26 +230,29 @@ impl Ecosystem for NuGetEcosystem {
         &self.formatter
     }
 
-    fn generate_completions<'a>(
+    fn complete_package_name<'a>(
         &'a self,
-        parse_result: &'a dyn ParseResultTrait,
-        position: Position,
-        content: &'a str,
-        freshness: deps_core::FreshnessSettings,
+        _request: deps_core::completion::CompletionRequest<'a>,
+        prefix: String,
+        range: Range,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
+        Box::pin(async move { self.complete_package_names(&prefix, range).await.into() })
+    }
+
+    fn complete_version<'a>(
+        &'a self,
+        request: deps_core::completion::CompletionRequest<'a>,
+        _package_name: deps_core::PackageName,
+        prefix: String,
     ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
         Box::pin(async move {
-            use deps_core::completion::{CompletionContext, detect_completion_context};
-
-            match detect_completion_context(parse_result, position, content) {
-                CompletionContext::PackageName { prefix, range } => {
-                    self.complete_package_names(&prefix, range).await
-                }
-                CompletionContext::Version { prefix, .. } => {
-                    self.complete_versions(parse_result, position, &prefix, freshness)
-                        .await
-                }
-                CompletionContext::Feature { .. } | CompletionContext::None | _ => vec![],
-            }
+            self.complete_versions(
+                request.parse_result,
+                request.position,
+                &prefix,
+                request.freshness,
+            )
+            .await
             .into()
         })
     }
@@ -1850,5 +1853,100 @@ mod tests {
             eco.completion_insert_text(&meta),
             Some("<PackageReference Include=\"Newtonsoft.Json\" Version=\"13.0.3\" />".to_string())
         );
+    }
+
+    // --- #793 characterization: `generate_completions` dispatch, pinned before the
+    // wildcard-match refactor moves the match into `deps-core`.
+
+    #[tokio::test]
+    async fn test_generate_completions_package_name_context_below_length_guard_is_empty() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = NuGetEcosystem::new(cache);
+        // "F" is below `is_valid_completion_prefix_len`'s 2-char minimum — deterministic
+        // without touching api.nuget.org.
+        let content = "F";
+        let dep = NuGetDependency {
+            name: "F".into(),
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 1)),
+            version_requirement: None,
+            version_range: None,
+            source: DependencySource::Registry,
+        };
+        let parse_result = NuGetParseResult {
+            dependencies: vec![dep],
+            uri: deps_core::test_util::test_uri("/test/App.csproj"),
+            resolved_chains: Vec::new(),
+            dependency_truncation: None,
+        };
+        let position = Position::new(0, 1);
+        let freshness = deps_core::FreshnessSettings::default();
+
+        let context =
+            deps_core::completion::detect_completion_context(&parse_result, position, content);
+        let deps_core::completion::CompletionContext::PackageName { prefix, range } = context
+        else {
+            panic!("expected PackageName context, got {context:?}");
+        };
+        let direct = eco.complete_package_names(&prefix, range).await;
+        let via_dispatch = eco
+            .generate_completions(&parse_result, position, content, freshness)
+            .await;
+        assert_eq!(via_dispatch.items, direct);
+        assert!(direct.is_empty());
+    }
+
+    /// Mirrors `test_complete_versions_gate_blocks_unresolvable_source`: an unresolvable
+    /// `CustomRegistry` source must never reach api.nuget.org — the `.expect(0)` mock fails
+    /// the test if that endpoint is hit at all.
+    #[tokio::test]
+    async fn test_generate_completions_version_context_gate_blocks_unresolvable_source() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        let _index_mock = server
+            .mock("GET", "/index.json")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let registry = NuGetRegistry::with_service_index_url(
+            Arc::new(deps_core::HttpCache::new()),
+            format!("{base}/index.json"),
+        );
+        let eco = NuGetEcosystem::with_registry(registry);
+
+        let dep = dep_with_source(
+            "privatepkg",
+            DependencySource::CustomRegistry {
+                url: "https://feed.mycorp.example/v3/index.json".to_string(),
+            },
+            0,
+        );
+        let parse_result = NuGetParseResult {
+            dependencies: vec![dep],
+            uri: deps_core::test_util::test_uri("/test/App.csproj"),
+            resolved_chains: Vec::new(),
+            dependency_truncation: None,
+        };
+        let content = "";
+        // Character 1, not 0: `dep_with_source`'s `name_range` is the zero-width
+        // `(line,0)-(line,0)`, which `detect_completion_context` would otherwise match
+        // exactly at character 0 before ever reaching `version_range`.
+        let position = Position::new(0, 1);
+        let freshness = deps_core::FreshnessSettings::default();
+
+        let context =
+            deps_core::completion::detect_completion_context(&parse_result, position, content);
+        let deps_core::completion::CompletionContext::Version { prefix, .. } = context else {
+            panic!("expected Version context, got {context:?}");
+        };
+        let direct = eco
+            .complete_versions(&parse_result, position, &prefix, freshness)
+            .await;
+        let via_dispatch = eco
+            .generate_completions(&parse_result, position, content, freshness)
+            .await;
+        assert_eq!(via_dispatch.items, direct);
+        assert!(direct.is_empty());
+        _index_mock.assert_async().await;
     }
 }

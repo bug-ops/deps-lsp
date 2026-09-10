@@ -342,6 +342,12 @@ impl Ecosystem for GradleEcosystem {
         &self.formatter
     }
 
+    /// This is a full override, not the shared [`Ecosystem::generate_completions`] default
+    /// dispatch: Gradle routes on its own `(&'static str, value, range)` DSL/catalog context
+    /// (`Self::detect_completion_context`), which has no
+    /// [`deps_core::completion::CompletionContext`] representation. Opting out of the shared
+    /// dispatch means this ecosystem takes on #793's wildcard-match obligation itself; see
+    /// `deps_core::Ecosystem::generate_completions`'s doc.
     fn generate_completions<'a>(
         &'a self,
         parse_result: &'a dyn ParseResultTrait,
@@ -361,7 +367,14 @@ impl Ecosystem for GradleEcosystem {
                             || d.name_range().start.line == position.line
                     });
                     if let Some(dep) = dep {
-                        self.complete_versions(dep.name(), value, freshness).await
+                        let request = deps_core::completion::CompletionRequest::new(
+                            parse_result,
+                            position,
+                            freshness,
+                        );
+                        self.complete_version(request, dep.name().clone(), value.to_string())
+                            .await
+                            .items
                     } else {
                         vec![]
                     }
@@ -370,6 +383,22 @@ impl Ecosystem for GradleEcosystem {
                 _ => vec![],
             }
             .into()
+        })
+    }
+
+    /// Required by [`Ecosystem`]; called only from this crate's own
+    /// [`Self::generate_completions`] override (Gradle does not use the shared default
+    /// dispatch — see that method's doc), for the `"version"` DSL/catalog context.
+    fn complete_version<'a>(
+        &'a self,
+        request: deps_core::completion::CompletionRequest<'a>,
+        package_name: deps_core::PackageName,
+        prefix: String,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
+        Box::pin(async move {
+            self.complete_versions(&package_name, &prefix, request.freshness)
+                .await
+                .into()
         })
     }
 
@@ -887,5 +916,57 @@ mod tests {
             eco.completion_insert_text(&meta),
             Some("implementation(\"org.apache.commons:commons-lang3:3.14.0\")".to_string())
         );
+    }
+
+    // --- #793 characterization: `GradleEcosystem::generate_completions` keeps its own
+    // full override (string-typed DSL/catalog context, out of #793's scope — see the plan),
+    // but the "version" arm's body moves into the new required `complete_version` hook.
+    // This pins the arm's observable output before that move.
+
+    /// Deterministic, CI-enforced counterpart to the network-gated test below:
+    /// `detect_completion_context` (the raw-text DSL scanner) recognizes a `"version"`
+    /// context from the coordinate string's shape alone, independent of the surrounding
+    /// `dependencies { }` block the parser requires — so a coordinate outside that block
+    /// still resolves `ctx_type == "version"` while `parse_result.dependencies()` stays
+    /// empty, and the arm must fail closed to `Completions::default()` without ever calling
+    /// the registry.
+    #[tokio::test]
+    async fn test_generate_completions_version_context_no_dependency_at_position_returns_empty() {
+        let eco = GradleEcosystem::new(make_cache());
+        let content = "implementation(\"junit:junit:4.13.2\")\n";
+        let uri = deps_core::test_util::test_uri("/project/build.gradle.kts");
+        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+        assert!(parse_result.dependencies().is_empty());
+
+        let result = eco
+            .generate_completions(
+                parse_result.as_ref(),
+                Position::new(0, 31),
+                content,
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
+        assert_eq!(result, Completions::default());
+    }
+
+    // `complete_versions` has no offline guard for an already-well-formed package name, so
+    // the "happy path" needs live Maven Central access, mirroring `deps_maven`'s equivalent
+    // characterization test.
+    #[tokio::test]
+    #[ignore] // Requires network access
+    async fn test_generate_completions_version_arm_dispatches_by_position() {
+        let eco = GradleEcosystem::new(make_cache());
+        let content = "dependencies {\n    implementation(\"junit:junit:4.13.2\")\n}\n";
+        let uri = deps_core::test_util::test_uri("/project/build.gradle.kts");
+        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+        let dep = &parse_result.dependencies()[0];
+        let position = dep.version_range().unwrap().start;
+        let freshness = deps_core::FreshnessSettings::default();
+
+        let direct = eco.complete_versions(dep.name(), "", freshness).await;
+        let via_dispatch = eco
+            .generate_completions(parse_result.as_ref(), position, content, freshness)
+            .await;
+        assert_eq!(via_dispatch.items, direct);
     }
 }

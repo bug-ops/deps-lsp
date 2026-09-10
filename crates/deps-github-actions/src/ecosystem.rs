@@ -141,34 +141,26 @@ impl Ecosystem for GithubActionsEcosystem {
         &self.formatter
     }
 
-    fn generate_completions<'a>(
+    // No override for `complete_package_name`: GitHub Actions has no package-name search
+    // endpoint (a workflow only ever references an already-known `owner/repo` action), so
+    // the inherited default (`Completions::default()`) is correct — see M3 (#793).
+
+    fn complete_version<'a>(
         &'a self,
-        parse_result: &'a dyn ParseResultTrait,
-        position: Position,
-        content: &'a str,
-        freshness: deps_core::FreshnessSettings,
+        request: deps_core::completion::CompletionRequest<'a>,
+        package_name: deps_core::PackageName,
+        prefix: String,
     ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
         Box::pin(async move {
-            use deps_core::completion::{CompletionContext, detect_completion_context};
-
-            match detect_completion_context(parse_result, position, content) {
-                CompletionContext::Version {
-                    package_name,
-                    prefix,
-                } => deps_core::completion::complete_versions_generic(
-                    self.registry.as_ref(),
-                    &package_name,
-                    &prefix,
-                    &[],
-                    freshness,
-                )
-                .await
-                .into(),
-                CompletionContext::PackageName { .. }
-                | CompletionContext::Feature { .. }
-                | CompletionContext::None
-                | _ => Completions::default(),
-            }
+            deps_core::completion::complete_versions_generic(
+                self.registry.as_ref(),
+                &package_name,
+                &prefix,
+                &[],
+                request.freshness,
+            )
+            .await
+            .into()
         })
     }
 
@@ -1905,5 +1897,95 @@ mod tests {
             latest_version: "v4.1.1".into(),
         };
         assert!(eco.completion_insert_text(&meta).is_none());
+    }
+
+    // --- #793 characterization: `generate_completions` dispatch, pinned before the
+    // wildcard-match refactor. GitHub Actions serves only `Version` (no package-name
+    // search); `PackageName`/`Feature`/`None` must all return an untouched `Completions::default()`.
+
+    #[tokio::test]
+    async fn test_generate_completions_package_name_context_returns_empty_non_incomplete() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = GithubActionsEcosystem::new(cache);
+        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+        let content = "steps:\n  - uses: actions/checkout@v4\n";
+        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+        let position = parse_result.dependencies()[0].name_range().start;
+
+        let result = eco
+            .generate_completions(
+                parse_result.as_ref(),
+                position,
+                content,
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
+        assert_eq!(result, Completions::default());
+    }
+
+    /// Drives a real (mocked) network fetch through `GithubActionsRegistry`, mirroring
+    /// `test_generate_hover_restores_footer_online_for_bare_major_tag_with_empty_live_list`'s
+    /// `for_test` setup, so this proves `generate_completions`'s `Version` arm actually
+    /// threads the resolved `package_name`/`prefix` through to
+    /// `complete_versions_generic` rather than just checking an empty degenerate case.
+    #[tokio::test]
+    async fn test_generate_completions_version_context_dispatches_to_registry() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/repos/actions/checkout/tags")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(format!(
+                r#"[{{"name": "v4.1.1", "commit": {{"sha": "{}"}}}}]"#,
+                "a".repeat(40)
+            ))
+            .create_async()
+            .await;
+
+        let registry = crate::registry::GithubActionsRegistry::for_test(
+            Arc::new(deps_core::HttpCache::new()),
+            server.url(),
+            false,
+        );
+        let formatter = GithubActionsFormatter::new(registry.tag_index());
+        let eco = GithubActionsEcosystem {
+            registry: Arc::new(registry),
+            formatter,
+        };
+
+        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+        let content = "steps:\n  - uses: actions/checkout@v4\n";
+        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+        let position = parse_result.dependencies()[0]
+            .version_range()
+            .unwrap()
+            .start;
+        let freshness = deps_core::FreshnessSettings::default();
+
+        let context = deps_core::completion::detect_completion_context(
+            parse_result.as_ref(),
+            position,
+            content,
+        );
+        let deps_core::completion::CompletionContext::Version {
+            package_name,
+            prefix,
+        } = context
+        else {
+            panic!("expected Version context, got {context:?}");
+        };
+        let direct = deps_core::completion::complete_versions_generic(
+            eco.registry.as_ref(),
+            &package_name,
+            &prefix,
+            &[],
+            freshness,
+        )
+        .await;
+        let via_dispatch = eco
+            .generate_completions(parse_result.as_ref(), position, content, freshness)
+            .await;
+        assert_eq!(via_dispatch.items, direct);
+        assert!(!direct.is_empty());
     }
 }

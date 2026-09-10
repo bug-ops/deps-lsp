@@ -10,35 +10,11 @@
 //! # Architecture
 //!
 //! The completion system uses trait objects (`dyn Dependency`, `dyn ParseResult`,
-//! `dyn Version`, `dyn Metadata`) to work generically across ecosystems.
-//!
-//! # Examples
-//!
-//! ```no_run
-//! use deps_core::completion::{detect_completion_context, CompletionContext};
-//! use tower_lsp_server::ls_types::Position;
-//!
-//! // In your ecosystem's generate_completions implementation:
-//! async fn generate_completions(
-//!     parse_result: &dyn deps_core::ParseResult,
-//!     position: Position,
-//!     content: &str,
-//! ) -> Vec<tower_lsp_server::ls_types::CompletionItem> {
-//!     let context = detect_completion_context(parse_result, position, content);
-//!
-//!     match context {
-//!         CompletionContext::PackageName { prefix, range } => {
-//!             // Search registry and build completions, replacing `range`
-//!             vec![]
-//!         }
-//!         CompletionContext::Version { package_name, prefix } => {
-//!             // Fetch versions and build completions
-//!             vec![]
-//!         }
-//!         _ => vec![],
-//!     }
-//! }
-//! ```
+//! `dyn Version`, `dyn Metadata`) to work generically across ecosystems. See
+//! [`crate::Ecosystem::generate_completions`]'s trait doc for the canonical example of how
+//! an ecosystem plugs into this module's [`CompletionRequest`]/[`CompletionContext`]
+//! machinery via [`crate::Ecosystem::complete_package_name`],
+//! [`crate::Ecosystem::complete_version`], [`crate::Ecosystem::complete_feature`].
 
 use crate::lsp_helpers::{escape_markdown, is_safe_version_string, warn_rejected_value};
 use crate::{
@@ -126,16 +102,61 @@ impl From<Vec<CompletionItem>> for Completions {
     }
 }
 
+/// Bundles the request-scoped inputs [`crate::Ecosystem`]'s completion hooks need.
+///
+/// Covers `complete_package_name`/`complete_version`/`complete_feature`, so a future input
+/// costs one field here instead of a signature break across every ecosystem crate — mirrors
+/// [`crate::lsp_helpers::VersionData`]'s identical rationale for the hover/diagnostics
+/// family.
+///
+/// `#[non_exhaustive]`: a struct literal only works inside this crate — construct via
+/// [`Self::new`].
+#[non_exhaustive]
+#[derive(Clone, Copy)]
+pub struct CompletionRequest<'a> {
+    /// The manifest's parsed dependencies — used by a hook that re-derives its own
+    /// dependency lookup instead of trusting the context's bare `package_name`/`prefix`
+    /// (e.g. cursor-position-based version resolution, issue #593).
+    pub parse_result: &'a dyn ParseResult,
+    /// Cursor position the completion request fired at.
+    pub position: Position,
+    /// Freshness display settings, threaded through to
+    /// [`complete_versions_generic`] and friends.
+    pub freshness: FreshnessSettings,
+}
+
+impl<'a> CompletionRequest<'a> {
+    /// Constructs a `CompletionRequest` from its fields.
+    ///
+    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
+    /// this crate, so every ecosystem crate goes through this constructor instead.
+    #[must_use]
+    pub const fn new(
+        parse_result: &'a dyn ParseResult,
+        position: Position,
+        freshness: FreshnessSettings,
+    ) -> Self {
+        Self {
+            parse_result,
+            position,
+            freshness,
+        }
+    }
+}
+
 /// Context for completion request based on cursor position.
 ///
 /// This enum represents what type of completion is appropriate at the
 /// current cursor location within a manifest file.
 ///
-/// `#[non_exhaustive]`: adding a new variant requires reviewing every ecosystem's
-/// `generate_completions` match arm. Every existing arm currently wildcards a new,
-/// unrecognized variant to the same behavior as [`Self::None`] (no completions) rather
-/// than failing to compile — so a new variant will silently produce no completions
-/// everywhere until each ecosystem crate is updated to handle it explicitly.
+/// `#[non_exhaustive]`: still blocks out-of-crate construction and forces a wildcard on the
+/// one remaining downstream match (`deps-deno`'s test, a binding catch-all rather than a
+/// contentful arm). The exhaustive dispatch match itself lives in
+/// [`crate::Ecosystem::generate_completions`]'s default implementation, inside this crate —
+/// so `#[non_exhaustive]` does not apply there, and adding a variant is a compile error in
+/// that one place instead of a silent no-op downstream (issue #793). An ecosystem that
+/// overrides `generate_completions` wholesale (`deps-maven`, `deps-gradle`) opts out of that
+/// guarantee and takes the obligation on itself.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompletionContext {

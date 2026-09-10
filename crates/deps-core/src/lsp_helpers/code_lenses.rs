@@ -1171,6 +1171,15 @@ mod tests {
                 {
                     unimplemented!()
                 }
+                fn complete_version<'a>(
+                    &'a self,
+                    _request: crate::completion::CompletionRequest<'a>,
+                    _package_name: crate::PackageName,
+                    _prefix: String,
+                ) -> crate::ecosystem::BoxFuture<'a, crate::completion::Completions>
+                {
+                    unimplemented!()
+                }
                 fn completion_insert_text(
                     &self,
                     _metadata: &dyn crate::Metadata,

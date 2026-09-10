@@ -2,8 +2,10 @@
 
 use std::any::Any;
 use std::sync::Arc;
+#[cfg(test)]
+use tower_lsp_server::ls_types::Position;
 use tower_lsp_server::ls_types::{
-    CompletionItem, CompletionTextEdit, Position, Range as LspRange, TextEdit, Uri,
+    CompletionItem, CompletionTextEdit, Range as LspRange, TextEdit, Uri,
 };
 
 use deps_core::{
@@ -180,38 +182,33 @@ impl Ecosystem for SwiftEcosystem {
         &self.formatter
     }
 
-    fn generate_completions<'a>(
+    fn complete_package_name<'a>(
         &'a self,
-        parse_result: &'a dyn ParseResultTrait,
-        position: Position,
-        content: &'a str,
-        freshness: deps_core::FreshnessSettings,
+        _request: deps_core::completion::CompletionRequest<'a>,
+        prefix: String,
+        range: LspRange,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
+        // The completion context only fires with the cursor inside an existing
+        // dependency's url: "..." literal (see module docs), so `range` (the
+        // dependency's `name_range()`, computed by `detect_completion_context`)
+        // is already the exact span the completion must replace.
+        Box::pin(async move {
+            self.complete_package_urls(strip_github_prefix(&prefix), Some(range))
+                .await
+                .into()
+        })
+    }
+
+    fn complete_version<'a>(
+        &'a self,
+        request: deps_core::completion::CompletionRequest<'a>,
+        package_name: deps_core::PackageName,
+        prefix: String,
     ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
         Box::pin(async move {
-            use deps_core::completion::{CompletionContext, detect_completion_context};
-
-            let context = detect_completion_context(parse_result, position, content);
-
-            match context {
-                CompletionContext::PackageName { prefix, range } => {
-                    // The completion context only fires with the cursor inside an existing
-                    // dependency's url: "..." literal (see module docs), so `range` (the
-                    // dependency's `name_range()`, computed by `detect_completion_context`)
-                    // is already the exact span the completion must replace.
-                    self.complete_package_urls(strip_github_prefix(&prefix), Some(range))
-                        .await
-                }
-                CompletionContext::Version {
-                    package_name,
-                    prefix,
-                } => {
-                    self.complete_versions(&package_name, &prefix, freshness)
-                        .await
-                }
-                CompletionContext::Feature { .. } => vec![],
-                CompletionContext::None | _ => vec![],
-            }
-            .into()
+            self.complete_versions(&package_name, &prefix, request.freshness)
+                .await
+                .into()
         })
     }
 
@@ -544,5 +541,129 @@ mod tests {
             latest_version: "2.62.0".into(),
         };
         assert!(eco.completion_insert_text(&meta).is_none());
+    }
+
+    // --- #793 characterization: `generate_completions` dispatch, pinned before the
+    // wildcard-match refactor.
+
+    /// #793 S1/M8: pins that the `PackageName` arm strips the `https://github.com/` scheme
+    /// off the raw prefix *before* the length guard runs — a migration that dropped or
+    /// reordered `strip_github_prefix` would turn this deterministic empty result into a
+    /// (still deterministic, but wrong) non-empty one, or vice versa.
+    #[tokio::test]
+    async fn test_generate_completions_package_name_context_strips_github_prefix_before_dispatch() {
+        // `let x = "https://github.com/a"` — name_range spans the quoted content
+        // (excluding quotes), byte-for-byte (ASCII, so UTF-16 offsets equal byte offsets).
+        let content = "let x = \"https://github.com/a\"";
+        let name_range = LspRange::new(Position::new(0, 9), Position::new(0, 29));
+        let dep = crate::types::SwiftDependency {
+            name: "unresolved/a".into(),
+            name_range,
+            version_req: None,
+            version_range: None,
+            version_literal: None,
+            url: "https://github.com/a".to_string(),
+            source: deps_core::parser::DependencySource::Registry,
+        };
+        let uri = deps_core::test_util::test_uri("/test/Package.swift");
+        let parse_result = crate::types::SwiftParseResult {
+            dependencies: vec![dep],
+            uri,
+            dependency_truncation: None,
+        };
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = SwiftEcosystem::new(cache);
+
+        // Cursor right after "a" — inside the name range, one prefix character past the
+        // stripped scheme, below `is_valid_completion_prefix_len`'s 2-char minimum.
+        let result = eco
+            .generate_completions(
+                &parse_result,
+                Position::new(0, 29),
+                content,
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
+        assert_eq!(result, Completions::default());
+    }
+
+    /// #793 S1: the `Feature` and `None` contexts (swift has no feature-flag syntax) must
+    /// still fall through to an untouched empty result.
+    #[tokio::test]
+    async fn test_generate_completions_none_context_returns_empty() {
+        let uri = deps_core::test_util::test_uri("/test/Package.swift");
+        let parse_result = crate::types::SwiftParseResult {
+            dependencies: vec![],
+            uri,
+            dependency_truncation: None,
+        };
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = SwiftEcosystem::new(cache);
+
+        let result = eco
+            .generate_completions(
+                &parse_result,
+                Position::new(0, 0),
+                "",
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
+        assert_eq!(result, Completions::default());
+    }
+
+    /// #793 S1 gap (flagged in review): the `Version` context had zero coverage —
+    /// `complete_versions` has no offline guard and `SwiftRegistry` has no test-mockable
+    /// constructor (unlike `deps_github_actions::registry::GithubActionsRegistry::
+    /// for_test`), so this needs live GitHub API access. `#[ignore]`d rather than routed
+    /// through an "unknown package" 404 (this crate's own convention, see
+    /// `registry::tests::test_fetch_real_versions`) — an unauthenticated GitHub API call has
+    /// a much tighter rate limit than crates.io/pub.dev/rubygems.org, so this crate never
+    /// runs one un-ignored.
+    #[tokio::test]
+    #[ignore] // Requires network access
+    async fn test_generate_completions_version_context_dispatches_to_registry() {
+        let name_range = LspRange::new(Position::new(0, 9), Position::new(0, 40));
+        let dep = crate::types::SwiftDependency {
+            name: "apple/swift-nio".into(),
+            name_range,
+            version_req: Some("1.0.0".into()),
+            version_range: Some(LspRange::new(Position::new(1, 0), Position::new(1, 5))),
+            version_literal: None,
+            url: "https://github.com/apple/swift-nio".to_string(),
+            source: deps_core::parser::DependencySource::Registry,
+        };
+        let uri = deps_core::test_util::test_uri("/test/Package.swift");
+        let parse_result = crate::types::SwiftParseResult {
+            dependencies: vec![dep],
+            uri,
+            dependency_truncation: None,
+        };
+        let content = "let x = \"https://github.com/apple/swift-nio\"\n2.0.0";
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = SwiftEcosystem::new(cache);
+        let freshness = deps_core::FreshnessSettings::default();
+        let position = Position::new(1, 3);
+
+        let context =
+            deps_core::completion::detect_completion_context(&parse_result, position, content);
+        let deps_core::completion::CompletionContext::Version {
+            package_name,
+            prefix,
+        } = context
+        else {
+            panic!("expected Version context, got {context:?}");
+        };
+        let direct = eco
+            .complete_versions(&package_name, &prefix, freshness)
+            .await;
+        let via_dispatch = eco
+            .generate_completions(&parse_result, position, content, freshness)
+            .await;
+        // Route equivalence, not a specific live-data assertion: the point is that
+        // `generate_completions`'s `Version` arm threads the same `package_name`/`prefix`
+        // to the same `complete_versions` call the pre-#793 match did — not what GitHub's
+        // API happens to return for `apple/swift-nio` today (a real GitHub API round trip,
+        // subject to its own rate limiting).
+        assert_eq!(via_dispatch.items, direct);
     }
 }

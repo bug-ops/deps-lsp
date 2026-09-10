@@ -1816,6 +1816,14 @@ mod tests {
             ) -> BoxFuture<'a, Completions> {
                 Box::pin(async move { Completions::default() })
             }
+            fn complete_version<'a>(
+                &'a self,
+                _request: deps_core::completion::CompletionRequest<'a>,
+                _package_name: deps_core::PackageName,
+                _prefix: String,
+            ) -> BoxFuture<'a, Completions> {
+                unimplemented!()
+            }
             fn completion_insert_text(
                 &self,
                 _metadata: &dyn deps_core::Metadata,

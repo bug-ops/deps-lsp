@@ -1915,11 +1915,11 @@ Create the main ecosystem implementation in `ecosystem.rs`:
 
 use std::any::Any;
 use std::sync::Arc;
-use tower_lsp_server::ls_types::{Position, Uri};
+use tower_lsp_server::ls_types::{Range, Uri};
 
 use deps_core::{
-    Ecosystem, HttpCache, ParseResult as ParseResultTrait, Registry, Result,
-    completion::Completions,
+    Ecosystem, HttpCache, PackageName, ParseResult as ParseResultTrait, Registry, Result,
+    completion::{Completions, CompletionRequest, complete_package_names_generic, complete_versions_generic},
     ecosystem::BoxFuture,
     lockfile::LockFileProvider,
     lsp_helpers::EcosystemFormatter,
@@ -1990,21 +1990,52 @@ impl Ecosystem for {Ecosystem}Ecosystem {
         &self.formatter
     }
 
-    // generate_inlay_hints, generate_hover, generate_code_actions, generate_diagnostics
-    // all have default implementations in the Ecosystem trait that delegate to lsp_helpers.
-    // Override only if custom behavior is needed.
+    // generate_inlay_hints, generate_hover, generate_code_actions, generate_diagnostics,
+    // generate_completions all have default implementations in the Ecosystem trait that
+    // delegate to lsp_helpers / dispatch to the complete_* hooks below. Override only if
+    // custom behavior is needed (issue #793: generate_completions's default is the
+    // exhaustive match over CompletionContext — do NOT hand-write that match again in a
+    // new ecosystem crate; implement the three hooks it dispatches to instead).
 
-    fn generate_completions<'a>(
+    // Required — every ecosystem serves version completion, and this is the one hook with
+    // no default. `request.parse_result`/`request.position`/`request.freshness` are
+    // available for a hook that re-derives its own dependency lookup instead of trusting
+    // `package_name`/`prefix` (cursor-position-based routing, issue #593).
+    fn complete_version<'a>(
         &'a self,
-        _parse_result: &'a dyn ParseResultTrait,
-        _position: Position,
-        _content: &'a str,
+        request: CompletionRequest<'a>,
+        package_name: PackageName,
+        prefix: String,
     ) -> BoxFuture<'a, Completions> {
-        // `is_incomplete` should stay `false` unless this ecosystem serves
-        // completions from a capped/unranked index (see PyPI below) —
-        // `Vec<CompletionItem>::into()` covers the common exhaustive-results case.
-        Box::pin(async move { Vec::new().into() })
+        Box::pin(async move {
+            complete_versions_generic(self.registry.as_ref(), &package_name, &prefix, &[], request.freshness)
+                .await
+                .into()
+        })
     }
+
+    // Optional — default is `Completions::default()` (no package-name search), correct
+    // for an ecosystem with no package-name index. Override to search a registry:
+    //
+    // fn complete_package_name<'a>(
+    //     &'a self,
+    //     _request: CompletionRequest<'a>,
+    //     prefix: String,
+    //     range: Range,
+    // ) -> BoxFuture<'a, Completions> {
+    //     Box::pin(async move {
+    //         complete_package_names_generic(self.registry.as_ref(), &prefix, 20, range)
+    //             .await
+    //             .into()
+    //     })
+    // }
+    //
+    // `is_incomplete` should stay `false` unless this ecosystem serves completions from a
+    // capped/unranked index (see PyPI's `complete_package_name` override, which returns
+    // `Completions::new(items).with_incomplete(true)`).
+
+    // Optional — default is `Completions::default()` (no feature-flag concept). Override
+    // only for a manifest format with a feature/flag array (e.g. Cargo, Go).
 
     // Raw-text fallback completion (parse-failure path, issue #722): override
     // `fallback_completion_prefix` only if this manifest format has a cheap raw-text

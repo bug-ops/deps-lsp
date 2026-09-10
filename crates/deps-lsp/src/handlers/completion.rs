@@ -495,6 +495,14 @@ mod tests {
         ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::completion::Completions> {
             Box::pin(async move { unimplemented!() })
         }
+        fn complete_version<'a>(
+            &'a self,
+            _request: deps_core::completion::CompletionRequest<'a>,
+            _package_name: deps_core::PackageName,
+            _prefix: String,
+        ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::completion::Completions> {
+            unimplemented!()
+        }
         fn fallback_completion_prefix<'a>(
             &self,
             _content: &'a str,
@@ -699,6 +707,14 @@ mod tests {
                 _freshness: deps_core::FreshnessSettings,
             ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
                 Box::pin(async move { unimplemented!() })
+            }
+            fn complete_version<'a>(
+                &'a self,
+                _request: deps_core::completion::CompletionRequest<'a>,
+                _package_name: deps_core::PackageName,
+                _prefix: String,
+            ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
+                unimplemented!()
             }
             fn completion_insert_text(
                 &self,
@@ -986,6 +1002,15 @@ mod tests {
                     }]
                     .into()
                 })
+            }
+            fn complete_version<'a>(
+                &'a self,
+                _request: deps_core::completion::CompletionRequest<'a>,
+                _package_name: deps_core::PackageName,
+                _prefix: String,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::completion::Completions>
+            {
+                unimplemented!()
             }
             fn completion_insert_text(
                 &self,
@@ -1940,6 +1965,15 @@ ser"
                     deps_core::completion::Completions::default()
                 })
             }
+            fn complete_version<'a>(
+                &'a self,
+                _request: deps_core::completion::CompletionRequest<'a>,
+                _package_name: deps_core::PackageName,
+                _prefix: String,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::completion::Completions>
+            {
+                unimplemented!()
+            }
             fn completion_insert_text(
                 &self,
                 _metadata: &dyn deps_core::Metadata,
@@ -2120,6 +2154,14 @@ ser"
                     vec![]
                 };
                 Box::pin(async move { Completions::new(items).with_incomplete(true) })
+            }
+            fn complete_version<'a>(
+                &'a self,
+                _request: deps_core::completion::CompletionRequest<'a>,
+                _package_name: deps_core::PackageName,
+                _prefix: String,
+            ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
+                unimplemented!()
             }
             fn completion_insert_text(
                 &self,

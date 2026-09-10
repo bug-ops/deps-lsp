@@ -2,7 +2,9 @@
 
 use std::any::Any;
 use std::sync::Arc;
-use tower_lsp_server::ls_types::{CompletionItem, Position, Range, Uri};
+#[cfg(test)]
+use tower_lsp_server::ls_types::Position;
+use tower_lsp_server::ls_types::{CompletionItem, Range, Uri};
 
 use deps_core::{
     Ecosystem, ParseResult as ParseResultTrait, Registry, Result, completion::Completions,
@@ -104,32 +106,25 @@ impl Ecosystem for BundlerEcosystem {
         &self.formatter
     }
 
-    fn generate_completions<'a>(
+    fn complete_package_name<'a>(
         &'a self,
-        parse_result: &'a dyn ParseResultTrait,
-        position: Position,
-        content: &'a str,
-        freshness: deps_core::FreshnessSettings,
+        _request: deps_core::completion::CompletionRequest<'a>,
+        prefix: String,
+        range: Range,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
+        Box::pin(async move { self.complete_package_names(&prefix, range).await.into() })
+    }
+
+    fn complete_version<'a>(
+        &'a self,
+        request: deps_core::completion::CompletionRequest<'a>,
+        package_name: deps_core::PackageName,
+        prefix: String,
     ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
         Box::pin(async move {
-            use deps_core::completion::{CompletionContext, detect_completion_context};
-
-            let context = detect_completion_context(parse_result, position, content);
-
-            match context {
-                CompletionContext::PackageName { prefix, range } => {
-                    self.complete_package_names(&prefix, range).await
-                }
-                CompletionContext::Version {
-                    package_name,
-                    prefix,
-                } => {
-                    self.complete_versions(&package_name, &prefix, freshness)
-                        .await
-                }
-                CompletionContext::Feature { .. } | CompletionContext::None | _ => vec![],
-            }
-            .into()
+            self.complete_versions(&package_name, &prefix, request.freshness)
+                .await
+                .into()
         })
     }
 
@@ -283,5 +278,137 @@ gem 'rails', '~> 7.0'";
             ecosystem.completion_insert_text(&meta),
             Some("gem \"rails\", \"~> 7.1.3\"".to_string())
         );
+    }
+
+    // --- #793 characterization: `generate_completions` dispatch, pinned before the
+    // wildcard-match refactor.
+
+    #[tokio::test]
+    async fn test_generate_completions_package_name_context_below_length_guard_is_empty() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = BundlerEcosystem::new(cache);
+        let content = "gem 'r'";
+        let uri = deps_core::test_util::test_uri("/test/Gemfile");
+        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+        let position = parse_result.dependencies()[0].name_range().end;
+        let freshness = deps_core::FreshnessSettings::default();
+
+        let context = deps_core::completion::detect_completion_context(
+            parse_result.as_ref(),
+            position,
+            content,
+        );
+        let deps_core::completion::CompletionContext::PackageName { prefix, range } = context
+        else {
+            panic!("expected PackageName context, got {context:?}");
+        };
+        let direct = ecosystem.complete_package_names(&prefix, range).await;
+        let via_dispatch = ecosystem
+            .generate_completions(parse_result.as_ref(), position, content, freshness)
+            .await;
+        assert_eq!(via_dispatch.items, direct);
+        assert!(direct.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_generate_completions_none_context_returns_empty() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = BundlerEcosystem::new(cache);
+        let content = "source \"https://rubygems.org\"\n";
+        let uri = deps_core::test_util::test_uri("/test/Gemfile");
+        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+        let result = ecosystem
+            .generate_completions(
+                parse_result.as_ref(),
+                Position::new(0, 0),
+                content,
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
+        assert_eq!(result, Completions::default());
+    }
+
+    /// CI-enforced (not `#[ignore]`d) counterpart to the happy-path test below, closing the
+    /// gap that RubyGems has no offline mock seam: an unknown package name still round-trips
+    /// through the real registry (mirroring `deps_cargo::ecosystem::tests::
+    /// test_complete_versions_unknown_package`'s identical convention), and its 404 fails
+    /// closed to an empty result — deterministic in outcome, if not in the absence of a
+    /// network call, and exercises the same dispatch path (`package_name`/`prefix` threaded
+    /// from the resolved `Version` context to `complete_versions`) the ignored test below
+    /// leaves uncovered in an ordinary CI run.
+    #[tokio::test]
+    async fn test_generate_completions_version_context_unknown_package_is_empty() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = BundlerEcosystem::new(cache);
+        let content = "gem \"this-gem-does-not-exist-12345\", \"~> 1.0\"";
+        let uri = deps_core::test_util::test_uri("/test/Gemfile");
+        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+        let position = parse_result.dependencies()[0]
+            .version_range()
+            .unwrap()
+            .start;
+        let freshness = deps_core::FreshnessSettings::default();
+
+        let context = deps_core::completion::detect_completion_context(
+            parse_result.as_ref(),
+            position,
+            content,
+        );
+        let deps_core::completion::CompletionContext::Version {
+            package_name,
+            prefix,
+        } = context
+        else {
+            panic!("expected Version context, got {context:?}");
+        };
+        let direct = ecosystem
+            .complete_versions(&package_name, &prefix, freshness)
+            .await;
+        let via_dispatch = ecosystem
+            .generate_completions(parse_result.as_ref(), position, content, freshness)
+            .await;
+        assert_eq!(via_dispatch.items, direct);
+        assert!(direct.is_empty());
+    }
+
+    /// #793 S1: pins that a `Version` context threads `package_name`/`prefix` through to
+    /// `complete_versions` — requires live network for a real, non-empty result (RubyGems
+    /// has no offline test seam here), mirroring this codebase's existing convention for
+    /// completion tests that need a genuine registry round-trip (e.g.
+    /// `deps_cargo::ecosystem::tests::test_complete_versions_real`).
+    #[tokio::test]
+    #[ignore] // Requires network access
+    async fn test_generate_completions_version_context_dispatches_to_registry() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = BundlerEcosystem::new(cache);
+        let content = "gem \"rails\", \"~> 7.0\"";
+        let uri = deps_core::test_util::test_uri("/test/Gemfile");
+        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+        let position = parse_result.dependencies()[0]
+            .version_range()
+            .unwrap()
+            .start;
+        let freshness = deps_core::FreshnessSettings::default();
+
+        let context = deps_core::completion::detect_completion_context(
+            parse_result.as_ref(),
+            position,
+            content,
+        );
+        let deps_core::completion::CompletionContext::Version {
+            package_name,
+            prefix,
+        } = context
+        else {
+            panic!("expected Version context, got {context:?}");
+        };
+        let direct = ecosystem
+            .complete_versions(&package_name, &prefix, freshness)
+            .await;
+        let via_dispatch = ecosystem
+            .generate_completions(parse_result.as_ref(), position, content, freshness)
+            .await;
+        assert_eq!(via_dispatch.items, direct);
+        assert!(!direct.is_empty());
     }
 }

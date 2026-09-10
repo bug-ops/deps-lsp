@@ -276,45 +276,49 @@ impl Ecosystem for PypiEcosystem {
         &self.formatter
     }
 
-    fn generate_completions<'a>(
+    /// Warms the package-name search index lazily on the first completion request in this
+    /// manifest, not just on a package-name completion — so a version completion (or any
+    /// other completion in the file) usually has the index ready before the user starts
+    /// typing a new package name. Cheap to call unconditionally: a no-op once the index is
+    /// ready or while a prior failed build is within backoff. Must run for *every* context
+    /// (including `None`), which is why this is `prepare_completions` rather than folded
+    /// into `complete_package_name` alone.
+    fn prepare_completions(&self) {
+        self.registry.warm_search_index();
+    }
+
+    /// Serves unranked, alphabetically-truncated prefix matches from `PypiRegistry::search`'s
+    /// local index (issue #419): the client must re-query as the user keeps typing rather
+    /// than filter its existing (possibly cold-start-empty) list — so this is the one
+    /// context that reports `is_incomplete: true`, regardless of whether it currently has
+    /// any items (#427).
+    fn complete_package_name<'a>(
         &'a self,
-        parse_result: &'a dyn ParseResultTrait,
-        position: Position,
-        content: &'a str,
-        freshness: deps_core::FreshnessSettings,
+        _request: deps_core::completion::CompletionRequest<'a>,
+        prefix: String,
+        range: Range,
     ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
         Box::pin(async move {
-            use deps_core::completion::{CompletionContext, detect_completion_context};
+            Completions::new(self.complete_package_names(&prefix, range).await)
+                .with_incomplete(true)
+        })
+    }
 
-            // Warms the package-name search index lazily on the first completion
-            // request in this manifest, not just on a package-name completion —
-            // so a version completion (or any other completion in the file)
-            // usually has the index ready before the user starts typing a new
-            // package name. Cheap to call unconditionally: a no-op once the
-            // index is ready or while a prior failed build is within backoff.
-            self.registry.warm_search_index();
-
-            let context = detect_completion_context(parse_result, position, content);
-
-            match context {
-                // Serves unranked, alphabetically-truncated prefix matches from
-                // `PypiRegistry::search`'s local index (issue #419): the client must
-                // re-query as the user keeps typing rather than filter its existing
-                // (possibly cold-start-empty) list — so this is the one context that
-                // reports `is_incomplete: true`, regardless of whether it currently
-                // has any items (#427).
-                CompletionContext::PackageName { prefix, range } => {
-                    Completions::new(self.complete_package_names(&prefix, range).await)
-                        .with_incomplete(true)
-                }
-                CompletionContext::Version { prefix, .. } => self
-                    .complete_versions(parse_result, position, &prefix, freshness)
-                    .await
-                    .into(),
-                CompletionContext::Feature { .. } | CompletionContext::None | _ => {
-                    Completions::default()
-                }
-            }
+    fn complete_version<'a>(
+        &'a self,
+        request: deps_core::completion::CompletionRequest<'a>,
+        _package_name: deps_core::PackageName,
+        prefix: String,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
+        Box::pin(async move {
+            self.complete_versions(
+                request.parse_result,
+                request.position,
+                &prefix,
+                request.freshness,
+            )
+            .await
+            .into()
         })
     }
 
