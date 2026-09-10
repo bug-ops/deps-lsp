@@ -1244,6 +1244,37 @@ message is shown verbatim, which is the useful part), just not an automated rena
 | Composer | Yes, with replace action | `abandoned` (bare `true`, or a string naming a successor package) |
 | Cargo, Go, PyPI, Bundler, Dart, Maven, Gradle, Swift, NuGet, Deno | Not yet | No registry-native package-level deprecation signal wired up yet (tracked as fast-follows; Dart's `isDiscontinued`/`replacedBy` and PyPI's PEP 792 `project-status` already exist on the wire and are the best next targets) |
 
+### Dependency-Count Ceiling Diagnostic (issue #796)
+
+**All 14 ecosystems.** A manifest may declare far more dependency entries than any real
+project has — an adversarial or malformed file with hundreds of thousands of declarations
+would otherwise drive both server memory and outbound registry request volume linearly with
+a number the manifest's author controls. Each ecosystem's own parser threads a shared
+`deps_core::DependencyBudget` through its dependency-collecting loop(s), so the concrete
+per-document dependency list it retains — the thing that stays resident in memory for the
+life of the open document — never grows past `MAX_DEPENDENCIES_PER_DOCUMENT` (5000) in the
+first place, rather than being truncated after an oversized list was already built and kept
+around. `deps_core::ecosystem::parse_manifest_blocking` (the single chokepoint every
+ecosystem's parse result flows through before reaching `deps-lsp`) applies
+`deps_core::dependency_cap`'s view-level cap as a belt-and-braces backstop on top, so hover,
+completion, diagnostics, inlay hints, code lens, and the registry fetch fan-out all only
+ever see the capped subset even if some ecosystem parser were ever added without wiring in
+the budget itself. The largest real-world manifests sit in the low hundreds of dependencies,
+so this leaves generous headroom for any legitimate project.
+
+When a manifest exceeds the ceiling, only the first 5000 declared dependencies are tracked
+and checked against the registry; the rest are silently untracked (parsing itself is not
+rejected, unlike the unrelated 10MB file-size limit). An `INFORMATION`-severity diagnostic
+is published at the top of the file naming the limit and the manifest's true dependency
+count:
+
+```
+manifest declares 12000 dependencies, exceeding deps-lsp's per-document limit of 5000; only the first 5000 are tracked, fetched, and checked against the registry
+```
+
+This limit is hardcoded, not configurable — the same "security limit, not a user
+preference" reasoning as the 10MB file-size cap.
+
 ### Mutable-Ref-Pin Diagnostic (issue #473, #634)
 
 **GitHub Actions and GitLab CI/CD.** A dependency or include pinned to a mutable ref can silently

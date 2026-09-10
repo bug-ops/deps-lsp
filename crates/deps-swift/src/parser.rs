@@ -237,6 +237,9 @@ pub fn parse_package_swift(content: &str, uri: &Uri) -> Result<SwiftParseResult>
     // Since stripping only replaces with spaces (same byte length), offsets match.
 
     let mut matched_ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    // Shared across all 9 pin-form passes below (#796) — the ceiling is per-document, not
+    // per-form.
+    let mut budget = deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
 
     // Track which byte ranges have already been matched to avoid double-parsing
     let is_already_matched = |start: usize, end: usize, matched: &[std::ops::Range<usize>]| {
@@ -264,6 +267,10 @@ pub fn parse_package_swift(content: &str, uri: &Uri) -> Result<SwiftParseResult>
         let major = parts.first().copied().unwrap_or("0");
         let version_req = format!(">={ver_str}, <{}.0.0", next_major(major));
 
+        if !budget.allow() {
+            matched_ranges.push(full.start()..full.end());
+            continue;
+        }
         dependencies.push(SwiftDependency {
             name: identity.into(),
             name_range: make_range(url.start(), url.end()),
@@ -298,6 +305,10 @@ pub fn parse_package_swift(content: &str, uri: &Uri) -> Result<SwiftParseResult>
         let minor = parts.get(1).copied().unwrap_or("0");
         let version_req = format!(">={ver_str}, <{}", next_minor(major, minor));
 
+        if !budget.allow() {
+            matched_ranges.push(full.start()..full.end());
+            continue;
+        }
         dependencies.push(SwiftDependency {
             name: identity.into(),
             name_range: make_range(url.start(), url.end()),
@@ -329,6 +340,10 @@ pub fn parse_package_swift(content: &str, uri: &Uri) -> Result<SwiftParseResult>
 
         let version_req = format!("={ver_str}");
 
+        if !budget.allow() {
+            matched_ranges.push(full.start()..full.end());
+            continue;
+        }
         dependencies.push(SwiftDependency {
             name: identity.into(),
             name_range: make_range(url.start(), url.end()),
@@ -362,6 +377,10 @@ pub fn parse_package_swift(content: &str, uri: &Uri) -> Result<SwiftParseResult>
 
         let version_req = format!(">={lower_str}, <{upper_str}");
 
+        if !budget.allow() {
+            matched_ranges.push(full.start()..full.end());
+            continue;
+        }
         dependencies.push(SwiftDependency {
             name: identity.into(),
             name_range: make_range(url.start(), url.end()),
@@ -401,6 +420,10 @@ pub fn parse_package_swift(content: &str, uri: &Uri) -> Result<SwiftParseResult>
 
         let version_req = format!(">={lower_str}, <={upper_str}");
 
+        if !budget.allow() {
+            matched_ranges.push(full.start()..full.end());
+            continue;
+        }
         dependencies.push(SwiftDependency {
             name: identity.into(),
             name_range: make_range(url.start(), url.end()),
@@ -435,6 +458,10 @@ pub fn parse_package_swift(content: &str, uri: &Uri) -> Result<SwiftParseResult>
 
         let version_req = format!(">={ver_str}, <{}.0.0", next_major(ver_str));
 
+        if !budget.allow() {
+            matched_ranges.push(full.start()..full.end());
+            continue;
+        }
         dependencies.push(SwiftDependency {
             name: identity.into(),
             name_range: make_range(url.start(), url.end()),
@@ -461,6 +488,10 @@ pub fn parse_package_swift(content: &str, uri: &Uri) -> Result<SwiftParseResult>
 
         let identity = url_to_identity(url_str).unwrap_or_else(|| url_str.to_string());
 
+        if !budget.allow() {
+            matched_ranges.push(full.start()..full.end());
+            continue;
+        }
         dependencies.push(SwiftDependency {
             name: identity.into(),
             name_range: make_range(url.start(), url.end()),
@@ -490,6 +521,10 @@ pub fn parse_package_swift(content: &str, uri: &Uri) -> Result<SwiftParseResult>
 
         let identity = url_to_identity(url_str).unwrap_or_else(|| url_str.to_string());
 
+        if !budget.allow() {
+            matched_ranges.push(full.start()..full.end());
+            continue;
+        }
         dependencies.push(SwiftDependency {
             name: identity.into(),
             name_range: make_range(url.start(), url.end()),
@@ -520,6 +555,10 @@ pub fn parse_package_swift(content: &str, uri: &Uri) -> Result<SwiftParseResult>
             .unwrap_or(path_str)
             .to_string();
 
+        if !budget.allow() {
+            matched_ranges.push(full.start()..full.end());
+            continue;
+        }
         dependencies.push(SwiftDependency {
             name: name.into(),
             name_range: make_range(path.start(), path.end()),
@@ -537,6 +576,7 @@ pub fn parse_package_swift(content: &str, uri: &Uri) -> Result<SwiftParseResult>
     Ok(SwiftParseResult {
         dependencies,
         uri: uri.clone(),
+        dependency_truncation: budget.truncation(),
     })
 }
 

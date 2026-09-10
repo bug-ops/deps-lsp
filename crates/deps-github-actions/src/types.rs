@@ -130,6 +130,10 @@ pub struct GithubActionsParseResult {
     pub dependencies: Vec<GithubActionsDependency>,
     /// URI of the parsed workflow file.
     pub uri: Uri,
+    /// `Some((kept, total))` once the manifest declared more dependencies than
+    /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
+    /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
+    pub dependency_truncation: Option<(usize, usize)>,
 }
 
 deps_core::impl_parse_result!(
@@ -137,6 +141,7 @@ deps_core::impl_parse_result!(
     GithubActionsDependency {
         dependencies: dependencies,
         uri: uri,
+        dependency_truncation: dependency_truncation,
     }
 );
 
@@ -229,6 +234,7 @@ mod tests {
                 is_last_on_line: true,
             }],
             uri,
+            dependency_truncation: None,
         };
         assert_eq!(result.dependencies().len(), 1);
         assert!(result.uri().path().as_str().ends_with("ci.yml"));

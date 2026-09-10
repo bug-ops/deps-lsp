@@ -32,6 +32,10 @@ pub struct ComposerParseResult {
     /// interest in stability filtering (e.g. a future manifest-summary feature) is not forced
     /// to depend on that ranking.
     pub minimum_stability: Option<String>,
+    /// `Some((kept, total))` once the manifest declared more dependencies than
+    /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
+    /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
+    pub dependency_truncation: Option<(usize, usize)>,
 }
 
 deps_core::impl_parse_result!(
@@ -39,6 +43,7 @@ deps_core::impl_parse_result!(
     ComposerDependency {
         dependencies: dependencies,
         uri: uri,
+        dependency_truncation: dependency_truncation,
     }
 );
 
@@ -118,6 +123,9 @@ pub fn parse_composer_json(content: &str, uri: &Uri) -> Result<ComposerParseResu
         );
     }
     let mut dependencies = Vec::new();
+    // Shared across every section below (#796) — the ceiling is per-document, not
+    // per-section.
+    let mut budget = deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
 
     // Parse each section, reading each entry's position directly from the AST (#613) — the
     // AST's own `Object::properties` only ever lists a given object's *direct* children, so a
@@ -138,6 +146,7 @@ pub fn parse_composer_json(content: &str, uri: &Uri) -> Result<ComposerParseResu
                 section,
                 positions.as_ref(),
                 &line_table,
+                &mut budget,
             ));
         }
     }
@@ -151,6 +160,7 @@ pub fn parse_composer_json(content: &str, uri: &Uri) -> Result<ComposerParseResu
         dependencies,
         uri: uri.clone(),
         minimum_stability,
+        dependency_truncation: budget.truncation(),
     })
 }
 
@@ -166,6 +176,7 @@ fn parse_section(
     section: ComposerSection,
     positions: Option<&JsonSection<'_>>,
     line_table: &LineOffsetTable,
+    budget: &mut deps_core::DependencyBudget,
 ) -> Vec<ComposerDependency> {
     let mut result = Vec::new();
 
@@ -175,6 +186,9 @@ fn parse_section(
     // npm's #619).
     for (name, version_req) in string_valued_entries(deps) {
         if is_platform_package(name) {
+            continue;
+        }
+        if !budget.allow() {
             continue;
         }
 
@@ -681,7 +695,15 @@ mod tests {
         let content = r#"{"require": {"vendor/pkg": "^1.0"}}"#;
         let line_table = LineOffsetTable::new(content);
 
-        let result = parse_section(content, &deps, ComposerSection::Require, None, &line_table);
+        let mut budget = deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
+        let result = parse_section(
+            content,
+            &deps,
+            ComposerSection::Require,
+            None,
+            &line_table,
+            &mut budget,
+        );
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].name, "vendor/pkg");

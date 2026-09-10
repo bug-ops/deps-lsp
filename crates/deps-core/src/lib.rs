@@ -48,6 +48,9 @@ pub mod completion;
 /// identically to [`test_util`].
 #[cfg(any(test, feature = "test-util"))]
 pub mod conformance;
+/// Per-document ceiling on tracked dependencies, enforced by
+/// [`ecosystem::parse_manifest_blocking`] for all 14 ecosystems (#796).
+pub mod dependency_cap;
 pub mod deps_dev;
 /// The [`ecosystem::Ecosystem`] trait: the sealed extension point every package
 /// ecosystem crate implements to plug into the LSP server.
@@ -85,6 +88,7 @@ pub mod xml_bounds;
 
 // Re-export commonly used types
 pub use cache::{BodyLimit, CachedResponse, HttpCache};
+pub use dependency_cap::{DependencyBudget, MAX_DEPENDENCIES_PER_DOCUMENT};
 pub use deps_dev::{DepsDevClient, ProvenanceStatus, ScorecardSummary, SupplyChainTrustSignal};
 pub use ecosystem::{
     Dependency, Ecosystem, EcosystemConfig, EcosystemId, LicenseSource, ParseResult,

@@ -34,6 +34,10 @@ pub struct GoParseResult {
     /// 034), ready for `GoRegistry::register_chain`. Empty when `$GOENV` declares no
     /// override (US-005).
     pub resolved_chains: Vec<GoProxyChain>,
+    /// `Some((kept, total))` once the manifest declared more dependencies than
+    /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
+    /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
+    pub dependency_truncation: Option<(usize, usize)>,
 }
 
 /// Parses a go.mod file and extracts all dependencies with positions, using a fresh, default
@@ -100,6 +104,7 @@ pub fn parse_go_mod_with_context(
 
     let mut in_require_block = false;
     let mut line_offset = 0;
+    let mut budget = deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
 
     for line in content.lines() {
         let line_without_comment = strip_line_comment(line);
@@ -127,6 +132,7 @@ pub fn parse_go_mod_with_context(
 
         if (in_require_block || REQUIRE_SINGLE.is_match(line_trimmed))
             && let Some(dep) = parse_require_line(line, line_offset, content, &line_table)
+            && budget.allow()
         {
             dependencies.push(dep);
         }
@@ -136,6 +142,7 @@ pub fn parse_go_mod_with_context(
             let version = caps.get(2).map(|m| m.as_str());
             if let Some(dep) =
                 parse_replace_line(line, line_offset, module, version, content, &line_table)
+                && budget.allow()
             {
                 dependencies.push(dep);
             }
@@ -146,6 +153,7 @@ pub fn parse_go_mod_with_context(
             let version = &caps[2];
             if let Some(dep) =
                 parse_exclude_line(line, line_offset, module, version, content, &line_table)
+                && budget.allow()
             {
                 dependencies.push(dep);
             }
@@ -178,6 +186,7 @@ pub fn parse_go_mod_with_context(
         go_version,
         uri: doc_uri.clone(),
         resolved_chains: go_config.resolved_chains(),
+        dependency_truncation: budget.truncation(),
     })
 }
 
@@ -323,6 +332,7 @@ deps_core::impl_parse_result!(
     GoDependency {
         dependencies: dependencies,
         uri: uri,
+        dependency_truncation: dependency_truncation,
     }
 );
 

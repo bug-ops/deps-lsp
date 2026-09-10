@@ -138,6 +138,10 @@ pub struct GradleParseResult {
     pub dependencies: Vec<GradleDependency>,
     /// URI of the manifest this result was parsed from.
     pub uri: Uri,
+    /// `Some((kept, total))` once the manifest declared more dependencies than
+    /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
+    /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
+    pub dependency_truncation: Option<(usize, usize)>,
 }
 
 /// Resolves `$var` and `${var}` references in dependency versions using the given properties map.
@@ -189,6 +193,7 @@ pub fn parse_gradle(content: &str, uri: &Uri) -> Result<GradleParseResult> {
         return Ok(GradleParseResult {
             dependencies: vec![],
             uri: uri.clone(),
+            dependency_truncation: None,
         });
     };
 
@@ -210,6 +215,7 @@ deps_core::impl_parse_result!(
     GradleDependency {
         dependencies: dependencies,
         uri: uri,
+        dependency_truncation: dependency_truncation,
     }
 );
 

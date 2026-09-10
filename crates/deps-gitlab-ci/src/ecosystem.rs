@@ -1120,6 +1120,7 @@ mod tests {
             ],
             routes: vec![],
             uri,
+            dependency_truncation: None,
         };
 
         let diagnostics = unresolved_host_diagnostics(&parse_result);
@@ -1816,6 +1817,7 @@ mod tests {
             dependencies: vec![dep],
             routes: vec![],
             uri: uri.clone(),
+            dependency_truncation: None,
         };
         (registry, formatter, parse_result, uri, range.start)
     }

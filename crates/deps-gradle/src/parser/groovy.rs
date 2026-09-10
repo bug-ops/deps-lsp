@@ -87,6 +87,7 @@ fn extract_matches(
     has_version: bool,
     matched_positions: &mut Vec<usize>,
     dependencies: &mut Vec<GradleDependency>,
+    budget: &mut deps_core::DependencyBudget,
 ) {
     for caps in re.captures_iter(line) {
         let config = caps.get(1).map_or("", |m| m.as_str());
@@ -99,6 +100,9 @@ fn extract_matches(
         }
         matched_positions.push(start);
 
+        if !budget.allow() {
+            continue;
+        }
         dependencies.push(build_dependency(&caps, line, line_u32, has_version, config));
     }
 }
@@ -117,6 +121,7 @@ pub fn parse_groovy_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
     let mut brace_depth: i32 = 0;
     let mut in_dependencies_block = false;
     let mut deps_brace_depth: i32 = 0;
+    let mut budget = deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
 
     for (line_idx, line) in content.lines().enumerate() {
         let trimmed = line.trim();
@@ -154,6 +159,7 @@ pub fn parse_groovy_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
             true,
             &mut matched_positions,
             &mut dependencies,
+            &mut budget,
         );
 
         // Pattern 2: without parens and with version
@@ -164,6 +170,7 @@ pub fn parse_groovy_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
             true,
             &mut matched_positions,
             &mut dependencies,
+            &mut budget,
         );
 
         // Pattern 3: with parens, no version
@@ -174,6 +181,7 @@ pub fn parse_groovy_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
             false,
             &mut matched_positions,
             &mut dependencies,
+            &mut budget,
         );
 
         // Pattern 4: without parens, no version
@@ -184,6 +192,7 @@ pub fn parse_groovy_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
             false,
             &mut matched_positions,
             &mut dependencies,
+            &mut budget,
         );
 
         // Pattern 5: platform()/enforcedPlatform()-wrapped BOM coordinate, with parens, with version
@@ -194,6 +203,7 @@ pub fn parse_groovy_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
             true,
             &mut matched_positions,
             &mut dependencies,
+            &mut budget,
         );
 
         // Pattern 6: same, without parens around the configuration call
@@ -204,6 +214,7 @@ pub fn parse_groovy_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
             true,
             &mut matched_positions,
             &mut dependencies,
+            &mut budget,
         );
 
         // Pattern 7: platform()/enforcedPlatform()-wrapped BOM coordinate, with parens, no version
@@ -214,6 +225,7 @@ pub fn parse_groovy_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
             false,
             &mut matched_positions,
             &mut dependencies,
+            &mut budget,
         );
 
         // Pattern 8: same, without parens around the configuration call
@@ -224,12 +236,14 @@ pub fn parse_groovy_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
             false,
             &mut matched_positions,
             &mut dependencies,
+            &mut budget,
         );
     }
 
     Ok(GradleParseResult {
         dependencies,
         uri: uri.clone(),
+        dependency_truncation: budget.truncation(),
     })
 }
 

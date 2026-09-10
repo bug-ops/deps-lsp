@@ -57,6 +57,7 @@ pub fn parse_kotlin_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
     let mut brace_depth: i32 = 0;
     let mut in_dependencies_block = false;
     let mut deps_brace_depth: i32 = 0;
+    let mut budget = deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
 
     for (line_idx, line) in content.lines().enumerate() {
         let trimmed = line.trim();
@@ -93,6 +94,9 @@ pub fn parse_kotlin_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
             if !is_dependency_configuration(config) {
                 continue;
             }
+            if !budget.allow() {
+                continue;
+            }
             dependencies.push(build_dependency(&caps, line, line_u32, true, config));
         }
 
@@ -116,6 +120,9 @@ pub fn parse_kotlin_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
             if already_matched.contains(&match_start) {
                 continue;
             }
+            if !budget.allow() {
+                continue;
+            }
             dependencies.push(build_dependency(&caps, line, line_u32, false, config));
         }
 
@@ -133,6 +140,9 @@ pub fn parse_kotlin_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
             if !is_dependency_configuration(config) {
                 continue;
             }
+            if !budget.allow() {
+                continue;
+            }
             dependencies.push(build_dependency(&caps, line, line_u32, true, config));
         }
 
@@ -145,6 +155,9 @@ pub fn parse_kotlin_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
             if already_matched_platform.contains(&match_start) {
                 continue;
             }
+            if !budget.allow() {
+                continue;
+            }
             dependencies.push(build_dependency(&caps, line, line_u32, false, config));
         }
     }
@@ -152,6 +165,7 @@ pub fn parse_kotlin_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
     Ok(GradleParseResult {
         dependencies,
         uri: uri.clone(),
+        dependency_truncation: budget.truncation(),
     })
 }
 

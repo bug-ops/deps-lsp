@@ -654,6 +654,7 @@ mod tests {
             dependencies: vec![other, target],
             uri: deps_core::test_util::test_uri("/test/App.csproj"),
             resolved_chains: Vec::new(),
+            dependency_truncation: None,
         };
 
         let results = eco
@@ -680,6 +681,7 @@ mod tests {
             dependencies: vec![dep],
             uri: deps_core::test_util::test_uri("/test/App.csproj"),
             resolved_chains: Vec::new(),
+            dependency_truncation: None,
         };
 
         let results = eco
@@ -724,6 +726,7 @@ mod tests {
             dependencies: vec![dep],
             uri: deps_core::test_util::test_uri("/test/App.csproj"),
             resolved_chains: Vec::new(),
+            dependency_truncation: None,
         };
 
         let results = eco
@@ -772,6 +775,7 @@ mod tests {
             dependencies: vec![dep],
             uri: deps_core::test_util::test_uri("/test/App.csproj"),
             resolved_chains: Vec::new(),
+            dependency_truncation: None,
         };
 
         let results = eco
@@ -858,6 +862,7 @@ mod tests {
             dependencies: vec![dep],
             uri: deps_core::test_util::test_uri("/test/App.csproj"),
             resolved_chains: Vec::new(),
+            dependency_truncation: None,
         };
 
         let results = eco
@@ -908,6 +913,7 @@ mod tests {
             dependencies: vec![registry_dep, alternate_dep],
             uri: deps_core::test_util::test_uri("/test/App.csproj"),
             resolved_chains: Vec::new(),
+            dependency_truncation: None,
         };
 
         // The alternate occurrence resolves deterministically without network: its index was

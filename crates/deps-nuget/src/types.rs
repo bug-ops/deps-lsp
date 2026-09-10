@@ -47,6 +47,9 @@ pub struct NuGetParseResult {
     /// `NuGetEcosystem::parse_manifest`; empty when nothing is registrable (no config, or
     /// every dependency resolves to plain `Registry`/a fail-closed `CustomRegistry`).
     pub resolved_chains: Vec<crate::config::NuGetSourceChain>,
+    /// `Some((kept, total))` once the manifest declared more dependencies than
+    /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796).
+    pub dependency_truncation: Option<(usize, usize)>,
 }
 
 deps_core::impl_parse_result!(
@@ -54,6 +57,7 @@ deps_core::impl_parse_result!(
     NuGetDependency {
         dependencies: dependencies,
         uri: uri,
+        dependency_truncation: dependency_truncation,
     }
 );
 
@@ -230,6 +234,7 @@ mod tests {
             dependencies: vec![test_dep()],
             uri: deps_core::test_util::test_uri("/test/App.csproj"),
             resolved_chains: Vec::new(),
+            dependency_truncation: None,
         };
 
         assert_eq!(result.dependencies().len(), 1);

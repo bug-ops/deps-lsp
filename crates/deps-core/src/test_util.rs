@@ -452,3 +452,89 @@ pub async fn capture_tracing_output_async_at(
     drop(guard);
     String::from_utf8(writer.0.lock().unwrap().clone()).expect("tracing output is valid utf8")
 }
+
+/// Minimal [`crate::Dependency`] fixture used by [`stub_parse_result_with_dependencies`] —
+/// only carries a name, since dependency-count-ceiling tests (#796) don't need version
+/// requirements, ranges, or a real source.
+struct StubDependency {
+    name: crate::PackageName,
+}
+
+impl crate::Dependency for StubDependency {
+    fn name(&self) -> &crate::PackageName {
+        &self.name
+    }
+
+    fn name_range(&self) -> tower_lsp_server::ls_types::Range {
+        tower_lsp_server::ls_types::Range::default()
+    }
+
+    fn version_requirement(&self) -> Option<&crate::VersionReq> {
+        None
+    }
+
+    fn version_range(&self) -> Option<tower_lsp_server::ls_types::Range> {
+        None
+    }
+
+    fn source(&self) -> crate::parser::DependencySource {
+        crate::parser::DependencySource::Registry
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// Minimal [`crate::ParseResult`] fixture built by [`stub_parse_result_with_dependencies`].
+struct StubParseResult {
+    dependencies: Vec<StubDependency>,
+    uri: Uri,
+}
+
+impl crate::ParseResult for StubParseResult {
+    fn dependencies(&self) -> Vec<&dyn crate::Dependency> {
+        self.dependencies
+            .iter()
+            .map(|d| d as &dyn crate::Dependency)
+            .collect()
+    }
+
+    fn workspace_root(&self) -> Option<&std::path::Path> {
+        None
+    }
+
+    fn uri(&self) -> &Uri {
+        &self.uri
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// Builds a [`crate::ParseResult`] fixture with `count` synthetic dependencies.
+///
+/// Names them `"dep-0"`, `"dep-1"`, ... — for tests exercising dependency-count-ceiling
+/// logic (#796) without needing a real ecosystem crate's parser.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::ParseResult;
+/// use deps_core::test_util::stub_parse_result_with_dependencies;
+///
+/// let parsed = stub_parse_result_with_dependencies(3);
+/// assert_eq!(parsed.dependencies().len(), 3);
+/// ```
+#[must_use]
+pub fn stub_parse_result_with_dependencies(count: usize) -> Box<dyn crate::ParseResult> {
+    Box::new(StubParseResult {
+        dependencies: (0..count)
+            .map(|i| StubDependency {
+                name: crate::PackageName::new(format!("dep-{i}")),
+            })
+            .collect(),
+        uri: test_uri("/project/manifest.toml"),
+    })
+}

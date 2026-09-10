@@ -77,6 +77,10 @@ pub struct CargoParseResult {
     /// [`Self::blocked_registries`]'s trait override as an informational diagnostic, so the
     /// block never degrades silently.
     pub blocked_registries: Vec<(Range, deps_core::net_policy::HostClass, String)>,
+    /// `Some((kept, total))` once the manifest declared more dependencies than
+    /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
+    /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
+    pub dependency_truncation: Option<(usize, usize)>,
 }
 
 /// Parses a Cargo.toml file and extracts all dependencies with positions.
@@ -203,13 +207,22 @@ pub fn parse_cargo_toml_with_context(
 
     let line_table = LineOffsetTable::new(content);
     let mut dependencies = Vec::new();
+    // Shared across every section/target/workspace-deps table below (#796) — the ceiling
+    // is per-document, not per-section, so one budget bounds all of them together.
+    let mut budget = deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
 
     let root_table = doc.as_table().ok_or_else(|| DepsError::ParseError {
         file_type: "Cargo.toml".into(),
         source: Box::new(std::io::Error::other("root is not a table")),
     })?;
 
-    parse_dependency_kind_tables(root_table, content, &line_table, &mut dependencies);
+    parse_dependency_kind_tables(
+        root_table,
+        content,
+        &line_table,
+        &mut dependencies,
+        &mut budget,
+    );
 
     // Parse target-specific dependency tables: [target.<cfg-expr-or-triple>.dependencies],
     // .dev-dependencies, .build-dependencies (#392). Each entry under [target] is keyed by a
@@ -225,6 +238,7 @@ pub fn parse_cargo_toml_with_context(
                     content,
                     &line_table,
                     &mut dependencies,
+                    &mut budget,
                 );
             }
         }
@@ -241,6 +255,7 @@ pub fn parse_cargo_toml_with_context(
             content,
             &line_table,
             CargoDependencySection::WorkspaceDependencies,
+            &mut budget,
         ));
     }
 
@@ -255,6 +270,7 @@ pub fn parse_cargo_toml_with_context(
         uri: doc_uri.clone(),
         blocked_registries,
         resolved_registries,
+        dependency_truncation: budget.truncation(),
     })
 }
 
@@ -414,6 +430,7 @@ fn parse_dependency_kind_tables(
     content: &str,
     line_table: &LineOffsetTable,
     dependencies: &mut Vec<CargoDependency>,
+    budget: &mut deps_core::DependencyBudget,
 ) {
     if let Some(deps_val) = get_val(table, "dependencies")
         && let Some(deps) = deps_val.as_table()
@@ -423,6 +440,7 @@ fn parse_dependency_kind_tables(
             content,
             line_table,
             CargoDependencySection::Dependencies,
+            budget,
         ));
     }
 
@@ -434,6 +452,7 @@ fn parse_dependency_kind_tables(
             content,
             line_table,
             CargoDependencySection::DevDependencies,
+            budget,
         ));
     }
 
@@ -445,20 +464,30 @@ fn parse_dependency_kind_tables(
             content,
             line_table,
             CargoDependencySection::BuildDependencies,
+            budget,
         ));
     }
 }
 
 /// Parses a single dependency section (dependencies, dev-dependencies, or build-dependencies).
+///
+/// `budget` is checked first in the loop body, before any per-entry work (#796): once
+/// exhausted, an entry beyond the cap is neither range-computed nor allocated into a
+/// `CargoDependency`, not merely dropped after being built.
 fn parse_dependencies_section(
     table: &Table<'_>,
     content: &str,
     line_table: &LineOffsetTable,
     section: CargoDependencySection,
+    budget: &mut deps_core::DependencyBudget,
 ) -> Vec<CargoDependency> {
     let mut deps = Vec::new();
 
     for (key, value) in table {
+        if !budget.allow() {
+            continue;
+        }
+
         let name = key.name.to_string();
         let name_range = span_to_range(content, line_table, key.span);
 
@@ -774,6 +803,10 @@ impl deps_core::ParseResult for CargoParseResult {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn dependency_truncation(&self) -> Option<(usize, usize)> {
+        self.dependency_truncation
     }
 }
 

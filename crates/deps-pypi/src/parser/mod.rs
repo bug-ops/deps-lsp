@@ -407,6 +407,10 @@ pub struct ParseResult {
     /// per-document resolution and the long-lived, shared `PypiRegistry` router meet (see
     /// `PypiEcosystem::parse_manifest`). Empty for a file with no such declaration (US-004).
     pub resolved_chains: Vec<crate::config::ResolvedChain>,
+    /// `Some((kept, total))` once the manifest declared more dependencies than
+    /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
+    /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
+    pub dependency_truncation: Option<(usize, usize)>,
 }
 
 deps_core::impl_parse_result!(
@@ -415,6 +419,7 @@ deps_core::impl_parse_result!(
         dependencies: dependencies,
         uri: uri,
         workspace_root: workspace_root,
+        dependency_truncation: dependency_truncation,
     }
 );
 
