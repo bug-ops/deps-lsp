@@ -411,12 +411,19 @@ pub enum IndexUrlError {
 /// # Examples
 ///
 /// ```
-/// use deps_core::net_policy::{PolicyGate, RegistryAccessPolicy, WorkspaceRegistryAccess, validate_index_url};
+/// use deps_core::net_policy::{
+///     PolicyGate, RegistryAccessPolicy, WorkspaceRegistryAccess, validate_index_url,
+/// };
 ///
 /// let policy = RegistryAccessPolicy::new(WorkspaceRegistryAccess::Off);
 /// assert!(
-///     validate_index_url("https://index.mycorp.dev", "https://index.mycorp.dev", "cargo", PolicyGate::Skip)
-///         .is_ok()
+///     validate_index_url(
+///         "https://index.mycorp.dev",
+///         "https://index.mycorp.dev",
+///         "cargo",
+///         PolicyGate::Skip
+///     )
+///     .is_ok()
 /// );
 /// assert!(
 ///     validate_index_url(
@@ -511,8 +518,15 @@ pub fn redact_userinfo(raw: &str) -> String {
 /// span with `***@`. A `raw` with no `://` at all (e.g. a schemeless `user:pass@host` literal,
 /// which fails `Url::parse` for lacking a scheme rather than for any userinfo-related reason —
 /// #536 C2) is treated the same way, scanning from the very start of `raw` instead of skipping
-/// a scheme. Returns `raw` unchanged only when no `@` is found in the searched span — nothing
-/// looks like a userinfo component to redact.
+/// a scheme. Returns `raw` unchanged when no `@` is found in the searched span (nothing looks
+/// like a userinfo component to redact) or when the `@` is the very first character of the
+/// authority — an *empty* userinfo component carries no credential to hide, and treating it as
+/// one is a false positive: a scheme-less, non-URL value that merely starts with `@` (e.g. an
+/// npm-scoped package name like `@types/node`, passed through this same redaction path by
+/// callers that don't know in advance whether a value is a URL) would otherwise be mangled
+/// into `***@types/node` (code-review follow-up on #767, root-causing what M1's `redact_if_url`
+/// had worked around locally in `deps_core::error`). This mirrors the parseable path just
+/// above, which already special-cases an empty `username()`/`password()` as a no-op.
 // All indices (`authority_start`, `host_boundary`, `at`) come from `find`/`rfind` of ASCII
 // tokens (`"://"`, `/`, `?`, `#`, `@`), so every slice bound is always a char boundary.
 #[allow(clippy::string_slice)]
@@ -523,6 +537,9 @@ fn redact_userinfo_unparseable(raw: &str) -> String {
     let Some(at) = authority[..host_boundary].rfind('@') else {
         return raw.to_string();
     };
+    if at == 0 {
+        return raw.to_string();
+    }
     format!("{}***@{}", &raw[..authority_start], &authority[at + 1..])
 }
 
@@ -590,25 +607,32 @@ fn is_loopback_url(url: &url::Url) -> bool {
 /// is [`PolicyGate::Enforce`] — a host the live [`RegistryAccessPolicy`] allows.
 ///
 /// `candidate` is the string actually parsed (e.g. `deps-npm`'s already `${VAR}`-expanded
-/// value); `raw_for_log` is what an error payload and the blocked-host `tracing::warn!`
-/// name instead — the pre-expansion `.npmrc` value for `deps-npm`, or the same string as
-/// `candidate` for `deps-cargo`/`deps-pypi` (neither has an expansion step). This split
-/// keeps an environment variable's expanded value out of any log line or error a caller
-/// might surface in a diagnostic. `ecosystem` is carried on the blocked-host warning only,
-/// to tell `deps-cargo`/`deps-npm`/`deps-pypi` call sites apart in the logs.
+/// value); `raw_for_log` is what an error payload and the blocked-host `tracing::warn!` name
+/// instead — the pre-expansion `.npmrc` value for `deps-npm`, or the same string as
+/// `candidate` for every other caller (none of which has an expansion step). Preferring the
+/// pre-expansion value over the live one for `deps-npm` still matters even though both are
+/// redacted identically below (defense in depth against a credential elsewhere in the URL,
+/// e.g. a path segment, that this function's redaction does not strip — see
+/// [`url_for_tracing`]'s own doc) — but both are always redacted the same way here: an
+/// earlier revision tried to log `raw_for_log` more permissively when it was known to be a
+/// pre-expansion literal, on the theory that a literal can only ever spell a placeholder like
+/// `${VAR}`, never a real secret. That assumption doesn't hold — a hostile `.npmrc`/config
+/// file can write a credential directly into the raw value with no expansion involved at all
+/// (#767 S2b) — so `raw_for_log` is *always* redacted via [`url_for_tracing`] regardless of
+/// its provenance. `ecosystem` is carried on the blocked-host warning only, to tell call
+/// sites apart in the logs.
 ///
 /// The check order — parse, then https, then userinfo, then the policy gate — is
 /// load-bearing: userinfo is rejected *before* the policy gate runs, which is what lets a
-/// caller safely log `raw_for_log` unredacted on a [`IndexUrlError::BlockedHost`] warning,
-/// since a userinfo-bearing candidate can never reach that point. Do not reorder.
+/// caller safely log `raw_for_log` on a [`IndexUrlError::BlockedHost`] warning without a
+/// separate userinfo-redaction step, since a userinfo-bearing candidate can never reach that
+/// point. Do not reorder.
 ///
 /// [`IndexUrlError::InvalidUrl`] is the one variant this invariant can't cover — `candidate`
 /// failed to parse *before* any userinfo check could run, so `raw_for_log` might still carry
 /// one (S1 finding: an otherwise-valid `user:pass@host` URL can fail to parse for an unrelated
-/// reason, e.g. an invalid port). [`redact_userinfo`] is applied to `raw_for_log` before it is
-/// wrapped in [`IndexUrlError::InvalidUrl`], so every caller — `deps-cargo`, `deps-npm`,
-/// `deps-pypi` — gets this for free, whether or not it separately redacts its own `raw` before
-/// logging.
+/// reason, e.g. an invalid port). [`url_for_tracing`] strips userinfo as well as the query
+/// string/fragment, so this is covered by the same call as the query-string redaction above.
 ///
 /// # Errors
 ///
@@ -642,7 +666,7 @@ pub fn validate_index_url(
     gate: PolicyGate<'_>,
 ) -> Result<url::Url, IndexUrlError> {
     let url = url::Url::parse(candidate)
-        .map_err(|_| IndexUrlError::InvalidUrl(redact_userinfo(raw_for_log)))?;
+        .map_err(|_| IndexUrlError::InvalidUrl(url_for_tracing(raw_for_log)))?;
     let is_https = url.scheme() == "https";
     #[cfg(any(test, feature = "test-util"))]
     let is_https = is_https || is_loopback_url(&url);
@@ -656,7 +680,7 @@ pub fn validate_index_url(
         let class = classify_host(&url);
         if !policy.get().allows(class) {
             tracing::warn!(
-                url = raw_for_log,
+                url = url_for_tracing(raw_for_log),
                 ?class,
                 ecosystem,
                 "workspace-declared registry index host blocked by registries.workspace_registries policy"
@@ -945,6 +969,22 @@ mod tests {
         );
     }
 
+    /// #767: every caller (including `deps-npm`'s pre-expansion `.npmrc` value) must have
+    /// its blocked-host log redacted the same way — S2b found that a "literal" value is not
+    /// actually safe to log verbatim, since a hostile config file can write a credential
+    /// directly into it with no expansion step involved at all.
+    #[cfg(feature = "test-util")]
+    #[test]
+    fn test_validate_index_url_blocked_host_log_redacts_query_string() {
+        let policy = RegistryAccessPolicy::new(WorkspaceRegistryAccess::Off);
+        let raw = "https://169.254.169.254/?ApiKey=super-secret-value";
+        let log = crate::test_util::capture_tracing_output(|| {
+            let result = validate_index_url(raw, raw, "cargo", PolicyGate::Enforce(&policy));
+            assert_matches!(result, Err(IndexUrlError::BlockedHost { .. }));
+        });
+        assert!(!log.contains("super-secret-value"), "log: {log}");
+    }
+
     #[test]
     fn test_redact_userinfo_noop_cases() {
         assert_eq!(
@@ -990,6 +1030,25 @@ mod tests {
             redact_userinfo("https://registry.example:99999/simple"),
             "https://registry.example:99999/simple"
         );
+    }
+
+    /// Code-review follow-up on #767 (root-causing what `deps_core::error`'s `redact_if_url`
+    /// had worked around locally): a scheme-less value that merely *starts* with `@` (an
+    /// empty userinfo component) must not be mangled — there is no credential before the `@`
+    /// to hide. An npm-scoped package name is the reproduced real-world example.
+    #[test]
+    fn test_redact_userinfo_leading_at_with_no_scheme_is_noop() {
+        assert_eq!(redact_userinfo("@types/node"), "@types/node");
+        assert_eq!(redact_userinfo("@angular/core"), "@angular/core");
+    }
+
+    /// Companion: a *non-empty* userinfo component before the same shape must still be
+    /// redacted — this fix must not weaken the S1/#536 protection it sits next to.
+    #[test]
+    fn test_redact_userinfo_non_empty_userinfo_before_scoped_looking_path_still_redacted() {
+        let redacted = redact_userinfo("user:hunter2@types/node");
+        assert!(!redacted.contains("hunter2"));
+        assert_eq!(redacted, "***@types/node");
     }
 
     /// #756 C1 regression: a `HttpCache`/`GithubTagsClient` outbound-request chokepoint must
@@ -1065,5 +1124,32 @@ mod tests {
         };
         assert!(!redacted.contains("hunter2"), "redacted: {redacted}");
         assert!(!err.to_string().contains("hunter2"), "Display: {err}");
+    }
+
+    /// #767 S2/S2b: `IndexUrlError::InvalidUrl` used to be built from `redact_userinfo`
+    /// alone, which deliberately preserves the query string — every caller could leak a
+    /// query-string credential through this error's payload/`Display`, reaching e.g.
+    /// `deps-cargo`'s `%error` logs and a user-visible `deps-nuget` `DepsError::ParseError`.
+    /// A `raw_for_log` value's provenance (a live URL vs. `deps-npm`'s pre-expansion
+    /// `.npmrc` literal) does not change this: a literal value can carry a real credential
+    /// too, written directly with no expansion involved, so this is asserted for both.
+    #[test]
+    fn test_validate_index_url_invalid_url_redacts_query_string() {
+        let raw = "https://user:hunter2@registry.example:99999/simple?token=super-secret-value";
+        for ecosystem in ["cargo", "npm"] {
+            let err = validate_index_url(raw, raw, ecosystem, PolicyGate::Skip).unwrap_err();
+            let IndexUrlError::InvalidUrl(redacted) = &err else {
+                panic!("expected InvalidUrl, got {err:?}");
+            };
+            assert!(!redacted.contains("hunter2"), "redacted: {redacted}");
+            assert!(
+                !redacted.contains("super-secret-value"),
+                "redacted: {redacted}"
+            );
+            assert!(
+                !err.to_string().contains("super-secret-value"),
+                "Display: {err}"
+            );
+        }
     }
 }

@@ -29,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: property tests (`proptest`) asserting the parser depth/expansion checkers and JSONC position recovery never panic on arbitrary input (#673)
 
 ### Fixed
+- **deps-core, deps-cargo, deps-maven**: `DepsError`'s `Display` (`RegistryError`/`HttpStatus`/`Offline`/`ResponseTooLarge`) and the `net_policy`/`deps-cargo`/`deps-maven` blocked-host and fallback-fetch log lines no longer embed a workspace-declared registry URL's raw query string, closing a credential-exfiltration path via `window/showMessage` and `tracing` logs (resolves #767)
 - **deps-core**: manifest parsing now runs on the blocking-thread pool instead of the calling tokio worker, no longer stalling the LSP request worker on a large manifest (resolves #743) (#747)
 - **deps-core**: `LineOffsetTable::byte_offset_to_position` no longer rescans an ASCII line from its start on every call, fixing an O(n^2) slowdown on large single-line (minified) manifests (resolves #742) (#747)
 - **deps-pypi**: raw-text fallback completion no longer bare-inserts an unquoted package name into a `pyproject.toml` dependency array when no quote has been typed yet, producing invalid TOML (resolves #737) (#741)
