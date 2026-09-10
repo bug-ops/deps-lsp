@@ -185,29 +185,29 @@ impl Ecosystem for NpmEcosystem {
         &self.formatter
     }
 
-    fn generate_completions<'a>(
+    fn complete_package_name<'a>(
         &'a self,
-        parse_result: &'a dyn ParseResultTrait,
-        position: Position,
-        content: &'a str,
-        freshness: deps_core::FreshnessSettings,
+        _request: deps_core::completion::CompletionRequest<'a>,
+        prefix: String,
+        range: Range,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
+        Box::pin(async move { self.complete_package_names(&prefix, range).await.into() })
+    }
+
+    fn complete_version<'a>(
+        &'a self,
+        request: deps_core::completion::CompletionRequest<'a>,
+        _package_name: deps_core::PackageName,
+        prefix: String,
     ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
         Box::pin(async move {
-            use deps_core::completion::{CompletionContext, detect_completion_context};
-
-            let context = detect_completion_context(parse_result, position, content);
-
-            match context {
-                CompletionContext::PackageName { prefix, range } => {
-                    self.complete_package_names(&prefix, range).await
-                }
-                CompletionContext::Version { prefix, .. } => {
-                    self.complete_versions(parse_result, position, &prefix, freshness)
-                        .await
-                }
-                CompletionContext::Feature { .. } => vec![],
-                CompletionContext::None | _ => vec![],
-            }
+            self.complete_versions(
+                request.parse_result,
+                request.position,
+                &prefix,
+                request.freshness,
+            )
+            .await
             .into()
         })
     }

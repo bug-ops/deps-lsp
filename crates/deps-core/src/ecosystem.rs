@@ -645,12 +645,11 @@ impl LicenseSource {
 ///
 ///     fn formatter(&self) -> &dyn EcosystemFormatter { &self.formatter }
 ///
-///     fn generate_completions<'a>(
+///     fn complete_version<'a>(
 ///         &'a self,
-///         _parse_result: &'a dyn ParseResult,
-///         _position: Position,
-///         _content: &'a str,
-///         _freshness: deps_core::FreshnessSettings,
+///         _request: deps_core::completion::CompletionRequest<'a>,
+///         _package_name: deps_core::PackageName,
+///         _prefix: String,
 ///     ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
 ///         Box::pin(async move { Completions::default() })
 ///     }
@@ -978,9 +977,32 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
         })
     }
 
+    /// Lifecycle hook run synchronously, once per [`Self::generate_completions`] call,
+    /// before context detection — for setup that must happen regardless of which
+    /// [`crate::completion::CompletionContext`] the request turns out to be (e.g. warming a
+    /// local search index that a later `PackageName` completion in the *same* manifest will
+    /// want ready, even though this specific call might resolve to a different context).
+    ///
+    /// Must return immediately: it runs inside the async dispatch before any `.await`, so
+    /// any real work (an index rebuild, a network warm-up) must be spawned rather than
+    /// awaited here — never block the dispatch. Default no-op; the sole override today is
+    /// `deps-pypi`'s `warm_search_index()`.
+    fn prepare_completions(&self) {}
+
     /// Generate completions for a position.
     ///
-    /// Provides autocomplete suggestions for package names and versions.
+    /// Provides autocomplete suggestions for package names, versions, and features by
+    /// detecting the [`crate::completion::CompletionContext`] at `position` and dispatching
+    /// to the matching hook — [`Self::complete_package_name`], [`Self::complete_version`], or
+    /// [`Self::complete_feature`].
+    ///
+    /// The exhaustive `match` over [`crate::completion::CompletionContext`] lives here, in
+    /// the crate that defines the enum, so `#[non_exhaustive]` does not apply and a new
+    /// variant is a compile error in this one place instead of a silent no-op downstream
+    /// (issue #793). An ecosystem that overrides this default opts out of that guarantee and
+    /// takes the obligation on itself — `deps-maven` and `deps-gradle` do, because they route
+    /// on their own XML/Groovy context type instead of
+    /// [`crate::completion::CompletionContext`].
     ///
     /// `freshness.enabled` gates whether version completion items carry a
     /// relative-age `label_details` suffix (issue #145); implementations that
@@ -999,7 +1021,86 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
         position: Position,
         content: &'a str,
         freshness: crate::FreshnessSettings,
+    ) -> BoxFuture<'a, Completions> {
+        Box::pin(async move {
+            self.prepare_completions();
+            let request =
+                crate::completion::CompletionRequest::new(parse_result, position, freshness);
+            // Exhaustive on purpose (#793): no wildcard arm, so a new
+            // `CompletionContext` variant is a compile error right here.
+            match crate::completion::detect_completion_context(parse_result, position, content) {
+                crate::completion::CompletionContext::PackageName { prefix, range } => {
+                    self.complete_package_name(request, prefix, range).await
+                }
+                crate::completion::CompletionContext::Version {
+                    package_name,
+                    prefix,
+                } => self.complete_version(request, package_name, prefix).await,
+                crate::completion::CompletionContext::Feature {
+                    package_name,
+                    prefix,
+                } => self.complete_feature(request, package_name, prefix).await,
+                crate::completion::CompletionContext::None => Completions::default(),
+            }
+        })
+    }
+
+    /// Completion hook for a [`crate::completion::CompletionContext::PackageName`]
+    /// context — called only by [`Self::generate_completions`]'s default dispatch.
+    ///
+    /// `_request` is unused by most implementations (a package-name search is driven purely
+    /// by `prefix`/`range`), but kept uniform with [`Self::complete_version`]/
+    /// [`Self::complete_feature`] rather than dropped per-hook — a future input costs one
+    /// field on [`crate::completion::CompletionRequest`] instead of a signature break on only
+    /// the hooks that happen to need it today.
+    ///
+    /// Default: no package-name search (`Completions::default()`) — correct for an ecosystem
+    /// with no package-name index (`deps-github-actions`, `deps-gitlab-ci`). Says nothing
+    /// about an ecosystem that overrides [`Self::generate_completions`] wholesale
+    /// (`deps-maven`, `deps-gradle`) and so never calls this hook at all — both actually do
+    /// serve package-name completion (`groupId`/`artifactId`, a Gradle coordinate), just not
+    /// through this method.
+    fn complete_package_name<'a>(
+        &'a self,
+        _request: crate::completion::CompletionRequest<'a>,
+        _prefix: String,
+        _range: tower_lsp_server::ls_types::Range,
+    ) -> BoxFuture<'a, Completions> {
+        Box::pin(std::future::ready(Completions::default()))
+    }
+
+    /// Completion hook for a [`crate::completion::CompletionContext::Version`] context —
+    /// called only by [`Self::generate_completions`]'s default dispatch.
+    ///
+    /// Required: every ecosystem serves version completion (the one property this method
+    /// preserves from before #793 — requiredness is orthogonal to the wildcard-match bug
+    /// class itself, which is fixed by the dispatch match's *location*, not by which hook is
+    /// required). `package_name`/`prefix` come from the resolved context; several
+    /// implementations ignore them and instead re-derive the dependency at
+    /// `request.position` from `request.parse_result` (cursor-position-based routing, issue
+    /// #593) — deliberate divergence between ecosystems, not a mistake to unify, since the
+    /// two lookups can disagree (see `deps-cargo`'s position-based migration history).
+    fn complete_version<'a>(
+        &'a self,
+        request: crate::completion::CompletionRequest<'a>,
+        package_name: crate::PackageName,
+        prefix: String,
     ) -> BoxFuture<'a, Completions>;
+
+    /// Completion hook for a [`crate::completion::CompletionContext::Feature`] context —
+    /// called only by [`Self::generate_completions`]'s default dispatch.
+    ///
+    /// Default: no feature completion (`Completions::default()`) — correct for every
+    /// ecosystem without a feature-flag concept. Overridden today by `deps-cargo` and
+    /// `deps-go`.
+    fn complete_feature<'a>(
+        &'a self,
+        _request: crate::completion::CompletionRequest<'a>,
+        _package_name: crate::PackageName,
+        _prefix: String,
+    ) -> BoxFuture<'a, Completions> {
+        Box::pin(std::future::ready(Completions::default()))
+    }
 
     /// Raw-text search prefix at `position` for `deps-lsp`'s fallback (parse-failure)
     /// completion path, used when the manifest failed to parse (typically mid-edit) so
@@ -1461,6 +1562,15 @@ mod tests {
             _position: Position,
             _content: &'a str,
             _freshness: crate::FreshnessSettings,
+        ) -> BoxFuture<'a, crate::completion::Completions> {
+            unimplemented!()
+        }
+
+        fn complete_version<'a>(
+            &'a self,
+            _request: crate::completion::CompletionRequest<'a>,
+            _package_name: crate::PackageName,
+            _prefix: String,
         ) -> BoxFuture<'a, crate::completion::Completions> {
             unimplemented!()
         }

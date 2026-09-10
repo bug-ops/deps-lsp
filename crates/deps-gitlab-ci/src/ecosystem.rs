@@ -239,6 +239,11 @@ impl Ecosystem for GitlabCiEcosystem {
         &self.formatter
     }
 
+    // No override for `complete_package_name`: GitLab CI has no package-name search
+    // endpoint (spec NFR-002 — an include only ever references an already-known
+    // project/component path), so the inherited default (`Completions::default()`) is
+    // correct — see M3 (#793).
+
     /// Version completions only, resolved through the source-aware
     /// [`deps_core::completion::complete_versions_generic_from`] (spec §7a.1) — the
     /// source-unaware default would return nothing, since this crate's `Registry` never
@@ -246,37 +251,27 @@ impl Ecosystem for GitlabCiEcosystem {
     /// not by name: a `project:` and a `component:` include of the same project can share
     /// one `PackageName` (spec §3.1's documented residual collision), and a by-name lookup
     /// would risk picking the wrong one's source.
-    fn generate_completions<'a>(
+    fn complete_version<'a>(
         &'a self,
-        parse_result: &'a dyn ParseResultTrait,
-        position: Position,
-        content: &'a str,
-        freshness: deps_core::FreshnessSettings,
+        request: deps_core::completion::CompletionRequest<'a>,
+        _package_name: deps_core::PackageName,
+        prefix: String,
     ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
         Box::pin(async move {
-            use deps_core::completion::{
-                CompletionContext, complete_versions_generic_from, detect_completion_context,
-            };
-
-            let CompletionContext::Version { prefix, .. } =
-                detect_completion_context(parse_result, position, content)
-            else {
-                return Completions::default();
-            };
-            let Some(dep) = parse_result.dependencies().into_iter().find(|d| {
+            let Some(dep) = request.parse_result.dependencies().into_iter().find(|d| {
                 d.version_range()
-                    .is_some_and(|r| deps_core::position_in_range(position, r))
+                    .is_some_and(|r| deps_core::position_in_range(request.position, r))
             }) else {
                 return Completions::default();
             };
 
-            complete_versions_generic_from(
+            deps_core::completion::complete_versions_generic_from(
                 self.registry.as_ref(),
                 dep.name(),
                 &dep.source(),
                 &prefix,
                 &[],
-                freshness,
+                request.freshness,
             )
             .await
             .into()
@@ -2473,5 +2468,144 @@ mod tests {
             eco.completion_insert_text(&meta),
             Some("my-component@1.2.3".to_string())
         );
+    }
+
+    // --- #793 characterization: `generate_completions` dispatch, pinned before the
+    // wildcard-match refactor so the migration cannot silently change which context
+    // reaches which behavior. GitLab CI serves only `Version` (no package-name search,
+    // spec NFR-002); the other two contexts must return an untouched `Completions::default()`.
+
+    /// A minimal, fully literal `GitlabCiDependency` for dispatch tests — bypasses the real
+    /// YAML parser so `name_range`/`version_range`/`source` are exactly what the test wants,
+    /// with no risk of a real parse resolving `source` to a live, network-reachable host.
+    fn dispatch_test_dep(
+        name_range: tower_lsp_server::ls_types::Range,
+        version_range: tower_lsp_server::ls_types::Range,
+        source: deps_core::parser::DependencySource,
+    ) -> crate::types::GitlabCiDependency {
+        crate::types::GitlabCiDependency {
+            name: "org/proj".into(),
+            name_range,
+            version_req: Some("1.0.0".into()),
+            version_range: Some(version_range),
+            version_literal: None,
+            source,
+            is_plain_scalar: true,
+            kind: IncludeKind::Project,
+            host: HostRef::Unresolved("$CI_SERVER_FQDN".to_string()),
+            pin: Some(PinStyle::Tag),
+            project_path: "org/proj".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_generate_completions_package_name_context_returns_empty_non_incomplete() {
+        let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+        let name_range =
+            tower_lsp_server::ls_types::Range::new(Position::new(1, 4), Position::new(1, 12));
+        let version_range =
+            tower_lsp_server::ls_types::Range::new(Position::new(2, 9), Position::new(2, 15));
+        let dep = dispatch_test_dep(
+            name_range,
+            version_range,
+            deps_core::parser::DependencySource::CustomRegistry {
+                url: "https://gitlab.example".into(),
+            },
+        );
+        let parse_result = crate::types::GitlabCiParseResult {
+            dependencies: vec![dep],
+            routes: vec![],
+            uri,
+        };
+        let content = "include:\n  - project: org/proj\n    ref: v1.0.0\n";
+        let cache = Arc::new(HttpCache::new());
+        let eco = GitlabCiEcosystem::new(cache);
+
+        let result = eco
+            .generate_completions(
+                &parse_result,
+                name_range.start,
+                content,
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
+        assert_eq!(result, Completions::default());
+    }
+
+    #[tokio::test]
+    async fn test_generate_completions_version_context_no_dependency_at_position_returns_empty() {
+        let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+        let name_range =
+            tower_lsp_server::ls_types::Range::new(Position::new(1, 4), Position::new(1, 12));
+        let version_range =
+            tower_lsp_server::ls_types::Range::new(Position::new(2, 9), Position::new(2, 15));
+        let dep = dispatch_test_dep(
+            name_range,
+            version_range,
+            deps_core::parser::DependencySource::CustomRegistry {
+                url: "https://gitlab.example".into(),
+            },
+        );
+        let parse_result = crate::types::GitlabCiParseResult {
+            dependencies: vec![dep],
+            routes: vec![],
+            uri,
+        };
+        let content = "include:\n  - project: org/proj\n    ref: v1.0.0\n";
+        let cache = Arc::new(HttpCache::new());
+        let eco = GitlabCiEcosystem::new(cache);
+
+        // Line 0 falls outside every dependency's name/version range.
+        let result = eco
+            .generate_completions(
+                &parse_result,
+                Position::new(0, 0),
+                content,
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
+        assert_eq!(result, Completions::default());
+    }
+
+    /// The dependency *is* found at `position`, but its source (`CustomRegistry`, an
+    /// unresolved host) fails closed inside `GitlabCiRegistry::get_versions_from` before any
+    /// network call — deterministic, and pins that `generate_completions` still threads the
+    /// found dependency's own `name`/`source` into `complete_versions_generic_from` rather
+    /// than, say, skipping the lookup or using a different dependency's source.
+    #[tokio::test]
+    async fn test_generate_completions_version_context_dispatches_by_dependency_source() {
+        let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+        let name_range =
+            tower_lsp_server::ls_types::Range::new(Position::new(1, 4), Position::new(1, 12));
+        let version_range =
+            tower_lsp_server::ls_types::Range::new(Position::new(2, 9), Position::new(2, 15));
+        let source = deps_core::parser::DependencySource::CustomRegistry {
+            url: "https://gitlab.example".into(),
+        };
+        let dep = dispatch_test_dep(name_range, version_range, source.clone());
+        let parse_result = crate::types::GitlabCiParseResult {
+            dependencies: vec![dep],
+            routes: vec![],
+            uri,
+        };
+        let content = "include:\n  - project: org/proj\n    ref: v1.0.0\n";
+        let cache = Arc::new(HttpCache::new());
+        let eco = GitlabCiEcosystem::new(cache);
+        let freshness = deps_core::FreshnessSettings::default();
+
+        let via_dispatch = eco
+            .generate_completions(&parse_result, Position::new(2, 13), content, freshness)
+            .await;
+        let direct = deps_core::completion::complete_versions_generic_from(
+            eco.registry.as_ref(),
+            &deps_core::PackageName::new("org/proj"),
+            &source,
+            "v1.0",
+            &[],
+            freshness,
+        )
+        .await;
+        assert_eq!(via_dispatch.items, direct);
+        assert!(!via_dispatch.is_incomplete);
     }
 }

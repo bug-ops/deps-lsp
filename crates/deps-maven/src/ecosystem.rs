@@ -268,6 +268,14 @@ impl Ecosystem for MavenEcosystem {
         &self.formatter
     }
 
+    /// This is a full override, not the shared [`Ecosystem::generate_completions`] default
+    /// dispatch: Maven routes on its own `(&'static str, value, range)` XML context
+    /// (`Self::detect_xml_context`), which has no
+    /// [`deps_core::completion::CompletionContext`] representation — `groupId`/`artifactId`
+    /// are two independent completable fields with no counterpart in that enum. Opting out
+    /// of the shared dispatch means this ecosystem takes on #793's wildcard-match obligation
+    /// itself; see
+    /// `deps_core::Ecosystem::generate_completions`'s doc.
     fn generate_completions<'a>(
         &'a self,
         parse_result: &'a dyn ParseResultTrait,
@@ -287,7 +295,14 @@ impl Ecosystem for MavenEcosystem {
                             || d.name_range().start.line == position.line
                     });
                     if let Some(dep) = dep {
-                        self.complete_versions(dep.name(), value, freshness).await
+                        let request = deps_core::completion::CompletionRequest::new(
+                            parse_result,
+                            position,
+                            freshness,
+                        );
+                        self.complete_version(request, dep.name().clone(), value.to_string())
+                            .await
+                            .items
                     } else {
                         vec![]
                     }
@@ -311,6 +326,22 @@ impl Ecosystem for MavenEcosystem {
                 _ => vec![],
             }
             .into()
+        })
+    }
+
+    /// Required by [`Ecosystem`]; called only from this crate's own
+    /// [`Self::generate_completions`] override (Maven does not use the shared default
+    /// dispatch — see that method's doc), for the `"version"` XML context.
+    fn complete_version<'a>(
+        &'a self,
+        request: deps_core::completion::CompletionRequest<'a>,
+        package_name: deps_core::PackageName,
+        prefix: String,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
+        Box::pin(async move {
+            self.complete_versions(&package_name, &prefix, request.freshness)
+                .await
+                .into()
         })
     }
 
@@ -1159,5 +1190,66 @@ mod tests {
             latest_version: "3.14.0".into(),
         };
         assert!(eco.completion_insert_text(&meta).is_none());
+    }
+
+    // --- #793 characterization: `MavenEcosystem::generate_completions` keeps its own
+    // full override (string-typed XML context, out of #793's scope — see the plan), but the
+    // "version" arm's body moves into the new required `complete_version` hook. This pins
+    // the arm's observable output before that move.
+
+    /// Deterministic, CI-enforced counterpart to the network-gated test below: a
+    /// `<version>` tag with no enclosing `<dependency>` still resolves to a `"version"` XML
+    /// context (`detect_xml_context` is dependency-blind), but no parsed dependency's
+    /// name/version range covers this position — the arm must fail closed to
+    /// `Completions::default()` without ever calling the registry.
+    #[tokio::test]
+    async fn test_generate_completions_version_context_no_dependency_at_position_returns_empty() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = MavenEcosystem::new(cache);
+        let xml = "<project>\n  <version>1.0.0</version>\n</project>";
+        let uri = deps_core::test_util::test_uri("/test/pom.xml");
+        let parse_result = eco.parse_manifest(xml, &uri).await.unwrap();
+        assert!(parse_result.dependencies().is_empty());
+
+        let result = eco
+            .generate_completions(
+                parse_result.as_ref(),
+                Position::new(1, 13),
+                xml,
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
+        assert_eq!(result, Completions::default());
+    }
+
+    // `complete_versions` has no offline guard for an already-well-formed package name, so
+    // the "happy path" needs live Maven Central access, mirroring this codebase's existing
+    // convention for such tests (e.g. `deps_maven::registry::tests`'s own `#[ignore]`d
+    // network tests).
+    #[tokio::test]
+    #[ignore] // Requires network access
+    async fn test_generate_completions_version_arm_dispatches_by_position() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = MavenEcosystem::new(cache);
+        let xml = r"<project>
+  <dependencies>
+    <dependency>
+      <groupId>junit</groupId>
+      <artifactId>junit</artifactId>
+      <version>4.13.2</version>
+    </dependency>
+  </dependencies>
+</project>";
+        let uri = deps_core::test_util::test_uri("/test/pom.xml");
+        let parse_result = eco.parse_manifest(xml, &uri).await.unwrap();
+        let dep = &parse_result.dependencies()[0];
+        let position = dep.version_range().unwrap().start;
+        let freshness = deps_core::FreshnessSettings::default();
+
+        let direct = eco.complete_versions(dep.name(), "", freshness).await;
+        let via_dispatch = eco
+            .generate_completions(parse_result.as_ref(), position, xml, freshness)
+            .await;
+        assert_eq!(via_dispatch.items, direct);
     }
 }

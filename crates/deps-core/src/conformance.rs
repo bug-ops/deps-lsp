@@ -689,7 +689,7 @@ pub fn assert_select_latest_matching_overridden(
 /// #         -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Box<dyn deps_core::ParseResult>>> {
 /// #         unimplemented!()
 /// #     }
-/// #     fn generate_completions<'a>(&'a self, _parse_result: &'a dyn deps_core::ParseResult, _position: tower_lsp_server::ls_types::Position, _content: &'a str, _freshness: deps_core::FreshnessSettings)
+/// #     fn complete_version<'a>(&'a self, _request: deps_core::completion::CompletionRequest<'a>, _package_name: deps_core::PackageName, _prefix: String)
 /// #         -> deps_core::ecosystem::BoxFuture<'a, deps_core::completion::Completions> {
 /// #         unimplemented!()
 /// #     }

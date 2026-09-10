@@ -703,6 +703,15 @@ mod tests {
             Box::pin(async move { Completions::default() })
         }
 
+        fn complete_version<'a>(
+            &'a self,
+            _request: crate::completion::CompletionRequest<'a>,
+            _package_name: crate::PackageName,
+            _prefix: String,
+        ) -> crate::ecosystem::BoxFuture<'a, Completions> {
+            unimplemented!()
+        }
+
         fn completion_insert_text(&self, _metadata: &dyn crate::Metadata) -> Option<String> {
             unimplemented!()
         }
@@ -766,6 +775,15 @@ mod tests {
             _freshness: crate::FreshnessSettings,
         ) -> crate::ecosystem::BoxFuture<'a, Completions> {
             Box::pin(async move { Completions::default() })
+        }
+
+        fn complete_version<'a>(
+            &'a self,
+            _request: crate::completion::CompletionRequest<'a>,
+            _package_name: crate::PackageName,
+            _prefix: String,
+        ) -> crate::ecosystem::BoxFuture<'a, Completions> {
+            unimplemented!()
         }
 
         fn completion_insert_text(&self, _metadata: &dyn crate::Metadata) -> Option<String> {
@@ -838,6 +856,15 @@ mod tests {
             _freshness: crate::FreshnessSettings,
         ) -> crate::ecosystem::BoxFuture<'a, Completions> {
             Box::pin(async move { Completions::default() })
+        }
+
+        fn complete_version<'a>(
+            &'a self,
+            _request: crate::completion::CompletionRequest<'a>,
+            _package_name: crate::PackageName,
+            _prefix: String,
+        ) -> crate::ecosystem::BoxFuture<'a, Completions> {
+            unimplemented!()
         }
 
         fn completion_insert_text(&self, _metadata: &dyn crate::Metadata) -> Option<String> {

@@ -262,36 +262,43 @@ impl Ecosystem for CargoEcosystem {
         &self.formatter
     }
 
-    fn generate_completions<'a>(
+    fn complete_package_name<'a>(
         &'a self,
-        parse_result: &'a dyn ParseResultTrait,
-        position: Position,
-        content: &'a str,
-        freshness: deps_core::FreshnessSettings,
+        _request: deps_core::completion::CompletionRequest<'a>,
+        prefix: String,
+        range: Range,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
+        Box::pin(async move { self.complete_package_names(&prefix, range).await.into() })
+    }
+
+    fn complete_version<'a>(
+        &'a self,
+        request: deps_core::completion::CompletionRequest<'a>,
+        _package_name: deps_core::PackageName,
+        prefix: String,
     ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
         Box::pin(async move {
-            use deps_core::completion::{CompletionContext, detect_completion_context};
-
-            let context = detect_completion_context(parse_result, position, content);
-
-            match context {
-                CompletionContext::PackageName { prefix, range } => {
-                    self.complete_package_names(&prefix, range).await
-                }
-                CompletionContext::Version { prefix, .. } => {
-                    self.complete_versions(parse_result, position, &prefix, freshness)
-                        .await
-                }
-                CompletionContext::Feature {
-                    package_name,
-                    prefix,
-                } => {
-                    self.complete_features(parse_result, &package_name, &prefix)
-                        .await
-                }
-                CompletionContext::None | _ => vec![],
-            }
+            self.complete_versions(
+                request.parse_result,
+                request.position,
+                &prefix,
+                request.freshness,
+            )
+            .await
             .into()
+        })
+    }
+
+    fn complete_feature<'a>(
+        &'a self,
+        request: deps_core::completion::CompletionRequest<'a>,
+        package_name: deps_core::PackageName,
+        prefix: String,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
+        Box::pin(async move {
+            self.complete_features(request.parse_result, &package_name, &prefix)
+                .await
+                .into()
         })
     }
 
@@ -1106,5 +1113,120 @@ mod tests {
             ecosystem.completion_insert_text(&meta),
             Some("\"some.crate\" = \"6.1\"".to_string())
         );
+    }
+
+    // --- #793 characterization: `generate_completions` dispatch, pinned before the
+    // wildcard-match refactor moves the match into `deps-core`. Each test drives the real
+    // `detect_completion_context` on the same inputs used to call `generate_completions`, so
+    // the assertion is a genuine route-equivalence check against the crate's own inherent
+    // `complete_*` method rather than a re-implementation of the match.
+
+    #[tokio::test]
+    async fn test_generate_completions_package_name_context_below_length_guard_is_empty() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = CargoEcosystem::new(cache);
+        // A 1-char prefix ("s") is below `is_valid_completion_prefix_len`'s 2-char minimum —
+        // deterministic without touching crates.io.
+        let content = "s";
+        let parse_result = MockParseResult {
+            dependencies: vec![mock_dependency("s", None, 0, 0)],
+        };
+        let position = Position::new(0, 1);
+        let freshness = deps_core::FreshnessSettings::default();
+
+        let context =
+            deps_core::completion::detect_completion_context(&parse_result, position, content);
+        let deps_core::completion::CompletionContext::PackageName { prefix, range } = context
+        else {
+            panic!("expected PackageName context, got {context:?}");
+        };
+        let direct = ecosystem.complete_package_names(&prefix, range).await;
+        let via_dispatch = ecosystem
+            .generate_completions(&parse_result, position, content, freshness)
+            .await;
+        assert_eq!(via_dispatch.items, direct);
+        assert!(direct.is_empty());
+    }
+
+    /// Mirrors `test_complete_versions_same_name_different_sources_routes_by_position`: an
+    /// unregistered `AlternateRegistry` index fails closed (`CargoRegistry::alternate_client`
+    /// returns `None`) before any network call, so this is deterministic.
+    #[tokio::test]
+    async fn test_generate_completions_version_context_dispatches_by_position() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = CargoEcosystem::new(cache);
+
+        // Distinct name/version lines: `detect_completion_context` checks `name_range`
+        // before `version_range`, and `mock_dependency` on a single shared line would put
+        // both ranges on line 0, letting the name range shadow the version one.
+        let mut dep = mock_dependency("shared-name", Some("1.0"), 0, 1);
+        dep.source = DependencySource::AlternateRegistry {
+            index: "https://index.mycorp.dev/never-registered".into(),
+            mirrors_crates_io: false,
+        };
+        let position = dep.version_range.unwrap().start;
+        let parse_result = MockParseResult {
+            dependencies: vec![dep],
+        };
+        let content = "";
+        let freshness = deps_core::FreshnessSettings::default();
+
+        let context =
+            deps_core::completion::detect_completion_context(&parse_result, position, content);
+        let deps_core::completion::CompletionContext::Version { prefix, .. } = context else {
+            panic!("expected Version context, got {context:?}");
+        };
+        let direct = ecosystem
+            .complete_versions(&parse_result, position, &prefix, freshness)
+            .await;
+        let via_dispatch = ecosystem
+            .generate_completions(&parse_result, position, content, freshness)
+            .await;
+        assert_eq!(via_dispatch.items, direct);
+        assert!(direct.is_empty());
+    }
+
+    /// Mirrors `test_complete_features_ambiguous_source_offers_nothing`: two same-named
+    /// dependencies resolving to different sources deterministically offer no feature
+    /// completions, with no network call.
+    #[tokio::test]
+    async fn test_generate_completions_feature_context_dispatches_by_name() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = CargoEcosystem::new(cache);
+
+        let mut registry_dep = mock_dependency("shared-name", Some("1.0"), 0, 0);
+        registry_dep.source = DependencySource::Registry;
+        let mut alternate_dep = mock_dependency("shared-name", Some("1.0"), 1, 1);
+        alternate_dep.source = DependencySource::AlternateRegistry {
+            index: "https://index.mycorp.dev".into(),
+            mirrors_crates_io: false,
+        };
+        // A distinct line so this doesn't fall inside `alternate_dep`'s own name/version
+        // range (both on line 1) and get misdetected as `PackageName`/`Version`.
+        alternate_dep.features_range = Some(Range::new(Position::new(2, 0), Position::new(2, 5)));
+        let position = Position::new(2, 2);
+        let parse_result = MockParseResult {
+            dependencies: vec![registry_dep, alternate_dep],
+        };
+        let content = "";
+        let freshness = deps_core::FreshnessSettings::default();
+
+        let context =
+            deps_core::completion::detect_completion_context(&parse_result, position, content);
+        let deps_core::completion::CompletionContext::Feature {
+            package_name,
+            prefix,
+        } = context
+        else {
+            panic!("expected Feature context, got {context:?}");
+        };
+        let direct = ecosystem
+            .complete_features(&parse_result, &package_name, &prefix)
+            .await;
+        let via_dispatch = ecosystem
+            .generate_completions(&parse_result, position, content, freshness)
+            .await;
+        assert_eq!(via_dispatch.items, direct);
+        assert!(direct.is_empty());
     }
 }
