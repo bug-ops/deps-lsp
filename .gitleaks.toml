@@ -1,0 +1,7 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "actions/cache cache keys are not credentials"
+paths = ['''\.github/workflows/.*\.ya?ml''']
+regexes = ['''key:\s*cargo-[a-z0-9-]+''']
