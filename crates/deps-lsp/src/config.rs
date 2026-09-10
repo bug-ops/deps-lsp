@@ -30,6 +30,7 @@ use tower_lsp_server::ls_types::DiagnosticSeverity;
 /// in an otherwise-unrelated blob (e.g. a client that flattens its whole settings tree)
 /// would deserialize successfully and reset every unrecognized section to its default —
 /// issue #227 C2.
+#[non_exhaustive]
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct DepsConfig {
@@ -84,14 +85,13 @@ pub struct DepsConfig {
 /// ```
 /// use deps_lsp::config::InlayHintsConfig;
 ///
-/// let config = InlayHintsConfig {
-///     enabled: true,
-///     up_to_date_text: "OK".into(),
-///     needs_update_text: "UPDATE {}".into(),
-/// };
+/// let config = InlayHintsConfig::new()
+///     .with_up_to_date_text("OK")
+///     .with_needs_update_text("UPDATE {}");
 ///
 /// assert_eq!(config.up_to_date_text, "OK");
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone, Deserialize)]
 pub struct InlayHintsConfig {
     /// Whether inlay hints are shown at all.
@@ -107,11 +107,53 @@ pub struct InlayHintsConfig {
 
 impl Default for InlayHintsConfig {
     fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl InlayHintsConfig {
+    /// Builds the default configuration (mirrors [`Self::default`]).
+    ///
+    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
+    /// this crate, so every other crate must chain the `with_*` setters onto this
+    /// constructor instead.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_lsp::config::InlayHintsConfig;
+    ///
+    /// let config = InlayHintsConfig::new();
+    /// assert!(config.enabled);
+    /// ```
+    #[must_use]
+    pub fn new() -> Self {
         Self {
             enabled: true,
             up_to_date_text: default_up_to_date(),
             needs_update_text: default_needs_update(),
         }
+    }
+
+    /// Overrides [`Self::enabled`]. See [`Self::new`].
+    #[must_use]
+    pub const fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
+    /// Overrides [`Self::up_to_date_text`]. See [`Self::new`].
+    #[must_use]
+    pub fn with_up_to_date_text(mut self, up_to_date_text: impl Into<String>) -> Self {
+        self.up_to_date_text = up_to_date_text.into();
+        self
+    }
+
+    /// Overrides [`Self::needs_update_text`]. See [`Self::new`].
+    #[must_use]
+    pub fn with_needs_update_text(mut self, needs_update_text: impl Into<String>) -> Self {
+        self.needs_update_text = needs_update_text.into();
+        self
     }
 }
 
@@ -136,19 +178,19 @@ impl Default for InlayHintsConfig {
 /// use deps_lsp::config::DiagnosticsConfig;
 /// use tower_lsp_server::ls_types::DiagnosticSeverity;
 ///
-/// let config = DiagnosticsConfig {
-///     outdated_severity: DiagnosticSeverity::INFORMATION,
-///     unknown_severity: DiagnosticSeverity::ERROR,
-///     yanked_severity: DiagnosticSeverity::ERROR,
-///     unsatisfiable_severity: DiagnosticSeverity::ERROR,
-///     deprecated_severity: DiagnosticSeverity::ERROR,
-///     mutable_ref_pin_severity: DiagnosticSeverity::ERROR,
-///     mutable_ref_pin_enabled: true,
-///     vulnerabilities_enabled: true,
-/// };
+/// let config = DiagnosticsConfig::new()
+///     .with_outdated_severity(DiagnosticSeverity::INFORMATION)
+///     .with_unknown_severity(DiagnosticSeverity::ERROR)
+///     .with_yanked_severity(DiagnosticSeverity::ERROR)
+///     .with_unsatisfiable_severity(DiagnosticSeverity::ERROR)
+///     .with_deprecated_severity(DiagnosticSeverity::ERROR)
+///     .with_mutable_ref_pin_severity(DiagnosticSeverity::ERROR)
+///     .with_mutable_ref_pin_enabled(true)
+///     .with_vulnerabilities_enabled(true);
 ///
 /// assert_eq!(config.unknown_severity, DiagnosticSeverity::ERROR);
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone, Deserialize)]
 pub struct DiagnosticsConfig {
     /// Severity for a dependency with a newer version available.
@@ -198,6 +240,28 @@ pub struct DiagnosticsConfig {
 
 impl Default for DiagnosticsConfig {
     fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DiagnosticsConfig {
+    /// Builds the default configuration (mirrors [`Self::default`]).
+    ///
+    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
+    /// this crate, so every other crate must chain the `with_*` setters onto this
+    /// constructor instead.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_lsp::config::DiagnosticsConfig;
+    /// use tower_lsp_server::ls_types::DiagnosticSeverity;
+    ///
+    /// let config = DiagnosticsConfig::new();
+    /// assert_eq!(config.outdated_severity, DiagnosticSeverity::HINT);
+    /// ```
+    #[must_use]
+    pub const fn new() -> Self {
         Self {
             outdated_severity: default_outdated_severity(),
             unknown_severity: default_unknown_severity(),
@@ -209,9 +273,72 @@ impl Default for DiagnosticsConfig {
             vulnerabilities_enabled: true,
         }
     }
-}
 
-impl DiagnosticsConfig {
+    /// Overrides [`Self::outdated_severity`]. See [`Self::new`].
+    #[must_use]
+    pub const fn with_outdated_severity(mut self, outdated_severity: DiagnosticSeverity) -> Self {
+        self.outdated_severity = outdated_severity;
+        self
+    }
+
+    /// Overrides [`Self::unknown_severity`]. See [`Self::new`].
+    #[must_use]
+    pub const fn with_unknown_severity(mut self, unknown_severity: DiagnosticSeverity) -> Self {
+        self.unknown_severity = unknown_severity;
+        self
+    }
+
+    /// Overrides [`Self::yanked_severity`]. See [`Self::new`].
+    #[must_use]
+    pub const fn with_yanked_severity(mut self, yanked_severity: DiagnosticSeverity) -> Self {
+        self.yanked_severity = yanked_severity;
+        self
+    }
+
+    /// Overrides [`Self::unsatisfiable_severity`]. See [`Self::new`].
+    #[must_use]
+    pub const fn with_unsatisfiable_severity(
+        mut self,
+        unsatisfiable_severity: DiagnosticSeverity,
+    ) -> Self {
+        self.unsatisfiable_severity = unsatisfiable_severity;
+        self
+    }
+
+    /// Overrides [`Self::deprecated_severity`]. See [`Self::new`].
+    #[must_use]
+    pub const fn with_deprecated_severity(
+        mut self,
+        deprecated_severity: DiagnosticSeverity,
+    ) -> Self {
+        self.deprecated_severity = deprecated_severity;
+        self
+    }
+
+    /// Overrides [`Self::mutable_ref_pin_severity`]. See [`Self::new`].
+    #[must_use]
+    pub const fn with_mutable_ref_pin_severity(
+        mut self,
+        mutable_ref_pin_severity: DiagnosticSeverity,
+    ) -> Self {
+        self.mutable_ref_pin_severity = mutable_ref_pin_severity;
+        self
+    }
+
+    /// Overrides [`Self::mutable_ref_pin_enabled`]. See [`Self::new`].
+    #[must_use]
+    pub const fn with_mutable_ref_pin_enabled(mut self, mutable_ref_pin_enabled: bool) -> Self {
+        self.mutable_ref_pin_enabled = mutable_ref_pin_enabled;
+        self
+    }
+
+    /// Overrides [`Self::vulnerabilities_enabled`]. See [`Self::new`].
+    #[must_use]
+    pub const fn with_vulnerabilities_enabled(mut self, vulnerabilities_enabled: bool) -> Self {
+        self.vulnerabilities_enabled = vulnerabilities_enabled;
+        self
+    }
+
     /// Converts this LSP-facing config into the `deps-core` DTO threaded
     /// through `Ecosystem::generate_diagnostics`.
     ///
@@ -259,14 +386,13 @@ impl DiagnosticsConfig {
 /// ```
 /// use deps_lsp::config::CacheConfig;
 ///
-/// let config = CacheConfig {
-///     enabled: true,
-///     fetch_timeout_secs: 5,
-///     max_concurrent_fetches: 20,
-/// };
+/// let config = CacheConfig::new()
+///     .with_fetch_timeout_secs(5)
+///     .with_max_concurrent_fetches(20);
 ///
 /// assert_eq!(config.fetch_timeout_secs, 5);
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone, Deserialize)]
 pub struct CacheConfig {
     /// Whether `deps_core::cache::HttpCache`'s entry map is used at all (issue #482):
@@ -302,11 +428,61 @@ pub struct CacheConfig {
 
 impl Default for CacheConfig {
     fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CacheConfig {
+    /// Builds the default configuration (mirrors [`Self::default`]).
+    ///
+    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
+    /// this crate, so every other crate must chain the `with_*` setters onto this
+    /// constructor instead.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_lsp::config::CacheConfig;
+    ///
+    /// let config = CacheConfig::new();
+    /// assert!(config.enabled);
+    /// ```
+    #[must_use]
+    pub const fn new() -> Self {
         Self {
             enabled: true,
             fetch_timeout_secs: default_fetch_timeout_secs(),
             max_concurrent_fetches: default_max_concurrent_fetches(),
         }
+    }
+
+    /// Overrides [`Self::enabled`]. See [`Self::new`].
+    #[must_use]
+    pub const fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
+    /// Overrides [`Self::fetch_timeout_secs`]. See [`Self::new`]. Not clamped to the
+    /// bounds `deserialize_fetch_timeout` enforces — that validation only guards
+    /// untrusted LSP-client input, not construction from trusted Rust code.
+    #[must_use]
+    pub const fn with_fetch_timeout_secs(mut self, fetch_timeout_secs: u64) -> Self {
+        self.fetch_timeout_secs = fetch_timeout_secs;
+        self
+    }
+
+    /// Overrides [`Self::max_concurrent_fetches`]. See [`Self::new`]. Not clamped to the
+    /// `>= 1` floor `deserialize_max_concurrent` enforces on untrusted LSP-client input —
+    /// unlike [`Self::with_fetch_timeout_secs`], this value is also relied on internally as
+    /// a divisor (`handlers::diagnostics::loading_ceiling`) and as `futures::StreamExt::
+    /// buffer_unordered`'s concurrency limit (`document::fetch`), so a `0` constructed
+    /// through this setter depends on `loading_ceiling`'s own defensive `.max(1)`
+    /// re-guard rather than on this setter enforcing the floor itself.
+    #[must_use]
+    pub const fn with_max_concurrent_fetches(mut self, max_concurrent_fetches: usize) -> Self {
+        self.max_concurrent_fetches = max_concurrent_fetches;
+        self
     }
 }
 
@@ -319,6 +495,7 @@ impl Default for CacheConfig {
 /// - `enabled`: `true`
 /// - `fallback_to_hints`: `true`
 /// - `loading_text`: `"⏳"`
+#[non_exhaustive]
 #[derive(Debug, Clone, Deserialize)]
 pub struct LoadingIndicatorConfig {
     /// Enable loading indicators (default: true)
@@ -492,13 +669,11 @@ where
 /// ```
 /// use deps_lsp::config::ColdStartConfig;
 ///
-/// let config = ColdStartConfig {
-///     enabled: true,
-///     rate_limit_ms: 200,
-/// };
+/// let config = ColdStartConfig::new().with_rate_limit_ms(200);
 ///
 /// assert_eq!(config.rate_limit_ms, 200);
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone, Deserialize)]
 pub struct ColdStartConfig {
     /// Whether cold-start disk loading is enabled at all.
@@ -511,10 +686,45 @@ pub struct ColdStartConfig {
 
 impl Default for ColdStartConfig {
     fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ColdStartConfig {
+    /// Builds the default configuration (mirrors [`Self::default`]).
+    ///
+    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
+    /// this crate, so every other crate must chain the `with_*` setters onto this
+    /// constructor instead.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_lsp::config::ColdStartConfig;
+    ///
+    /// let config = ColdStartConfig::new();
+    /// assert!(config.enabled);
+    /// ```
+    #[must_use]
+    pub const fn new() -> Self {
         Self {
             enabled: true,
             rate_limit_ms: default_rate_limit_ms(),
         }
+    }
+
+    /// Overrides [`Self::enabled`]. See [`Self::new`].
+    #[must_use]
+    pub const fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
+    /// Overrides [`Self::rate_limit_ms`]. See [`Self::new`].
+    #[must_use]
+    pub const fn with_rate_limit_ms(mut self, rate_limit_ms: u64) -> Self {
+        self.rate_limit_ms = rate_limit_ms;
+        self
     }
 }
 
@@ -536,6 +746,7 @@ const fn default_rate_limit_ms() -> u64 {
 /// let config = CodeLensConfig::default();
 /// assert!(config.enabled);
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone, Deserialize)]
 pub struct CodeLensConfig {
     /// Whether the "Update N outdated dependencies" code lens is shown at all.
@@ -569,13 +780,11 @@ impl Default for CodeLensConfig {
 /// ```
 /// use deps_lsp::config::FreshnessConfig;
 ///
-/// let config = FreshnessConfig {
-///     enabled: true,
-///     cooldown_secs: 3600,
-/// };
+/// let config = FreshnessConfig::new().with_cooldown_secs(3600);
 ///
 /// assert_eq!(config.cooldown_secs, 3600);
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone, Deserialize)]
 pub struct FreshnessConfig {
     /// Whether the release-cooldown freshness signal is enabled at all.
@@ -591,14 +800,49 @@ pub struct FreshnessConfig {
 
 impl Default for FreshnessConfig {
     fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FreshnessConfig {
+    /// Builds the default configuration (mirrors [`Self::default`]).
+    ///
+    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
+    /// this crate, so every other crate must chain the `with_*` setters onto this
+    /// constructor instead.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_lsp::config::FreshnessConfig;
+    ///
+    /// let config = FreshnessConfig::new();
+    /// assert!(config.enabled);
+    /// ```
+    #[must_use]
+    pub const fn new() -> Self {
         Self {
             enabled: true,
             cooldown_secs: default_cooldown_secs(),
         }
     }
-}
 
-impl FreshnessConfig {
+    /// Overrides [`Self::enabled`]. See [`Self::new`].
+    #[must_use]
+    pub const fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
+    /// Overrides [`Self::cooldown_secs`]. See [`Self::new`]. Not clamped to the bounds
+    /// `deserialize_cooldown_secs` enforces — that validation only guards untrusted
+    /// LSP-client input, not construction from trusted Rust code.
+    #[must_use]
+    pub const fn with_cooldown_secs(mut self, cooldown_secs: u64) -> Self {
+        self.cooldown_secs = cooldown_secs;
+        self
+    }
+
     /// Converts this LSP-facing config into the `deps-core` DTO threaded
     /// through `Ecosystem::generate_hover`/`generate_diagnostics`.
     ///
@@ -645,6 +889,7 @@ const fn default_cooldown_secs() -> u64 {
 /// let config = SupplyChainConfig::default();
 /// assert!(config.enabled);
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone, Deserialize)]
 pub struct SupplyChainConfig {
     /// Whether supply-chain trust signals (OpenSSF Scorecard/SLSA provenance) are fetched.
@@ -709,6 +954,7 @@ where
 /// let config = RegistriesConfig::default();
 /// assert_eq!(config.workspace_registries, WorkspaceRegistriesSetting::PublicOnly);
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct RegistriesConfig {
     /// Whether workspace-declared registry hosts (e.g. a manifest's own custom index
@@ -767,6 +1013,7 @@ pub struct RegistriesConfig {
 /// let setting: WorkspaceRegistriesSetting = serde_json::from_str("\"off\"").unwrap();
 /// assert_eq!(setting, WorkspaceRegistriesSetting::Off);
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceRegistriesSetting {
@@ -822,6 +1069,7 @@ impl WorkspaceRegistriesSetting {
 /// let config = NetworkConfig::default();
 /// assert!(!config.offline);
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct NetworkConfig {
     /// When `true`, blocks every *new* outbound registry/OSV/GitHub-tags request
@@ -860,6 +1108,7 @@ pub struct NetworkConfig {
 /// let config = LicensePolicyConfig::default();
 /// assert!(config.to_policy().is_empty());
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct LicensePolicyConfig {
     /// SPDX identifiers a dependency's license must include at least one of, when non-empty.
@@ -871,6 +1120,47 @@ pub struct LicensePolicyConfig {
 }
 
 impl LicensePolicyConfig {
+    /// Builds an empty allow/deny policy (mirrors [`Self::default`]).
+    ///
+    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
+    /// this crate, so every other crate must chain the `with_*` setters onto this
+    /// constructor instead.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_lsp::config::LicensePolicyConfig;
+    ///
+    /// let config = LicensePolicyConfig::new();
+    /// assert!(config.allow.is_empty());
+    /// ```
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            allow: Vec::new(),
+            deny: Vec::new(),
+        }
+    }
+
+    /// Overrides [`Self::allow`]. See [`Self::new`]. Takes `Vec<String>` rather than
+    /// `impl Into<String>` — this field is a list, not a single string — mirroring
+    /// `deps_core::ResolvedPackage::with_dependencies`'s existing precedent for a `Vec<String>`
+    /// field, not this module's single-`String`-field setters (e.g.
+    /// [`InlayHintsConfig::with_up_to_date_text`]).
+    #[must_use]
+    pub fn with_allow(mut self, allow: Vec<String>) -> Self {
+        self.allow = allow;
+        self
+    }
+
+    /// Overrides [`Self::deny`]. See [`Self::new`] and [`Self::with_allow`]'s note on this
+    /// setter's parameter type.
+    #[must_use]
+    pub fn with_deny(mut self, deny: Vec<String>) -> Self {
+        self.deny = deny;
+        self
+    }
+
     /// Converts this LSP-facing config into the `deps-core` policy threaded through
     /// [`deps_core::licenses::evaluate`].
     ///
@@ -883,10 +1173,9 @@ impl LicensePolicyConfig {
     /// ```
     /// use deps_lsp::config::LicensePolicyConfig;
     ///
-    /// let config = LicensePolicyConfig {
-    ///     allow: vec!["MIT".to_string()],
-    ///     deny: vec!["GPL-3.0".to_string()],
-    /// };
+    /// let config = LicensePolicyConfig::new()
+    ///     .with_allow(vec!["MIT".to_string()])
+    ///     .with_deny(vec!["GPL-3.0".to_string()]);
     /// let policy = config.to_policy();
     /// assert_eq!(policy.allow, vec!["MIT".to_string()]);
     /// ```
@@ -1187,6 +1476,12 @@ mod tests {
     }
 
     #[test]
+    fn test_inlay_hints_config_with_enabled() {
+        let config = InlayHintsConfig::new().with_enabled(false);
+        assert!(!config.enabled);
+    }
+
+    #[test]
     fn test_inlay_hints_config_deserialization() {
         let json = r#"{
             "enabled": false,
@@ -1300,6 +1595,12 @@ mod tests {
     }
 
     #[test]
+    fn test_cache_config_with_enabled() {
+        let config = CacheConfig::new().with_enabled(false);
+        assert!(!config.enabled);
+    }
+
+    #[test]
     fn test_cache_config_defaults() {
         let config = CacheConfig::default();
         assert!(config.enabled);
@@ -1373,6 +1674,12 @@ mod tests {
         // All fields should use defaults
         assert!(config.inlay_hints.enabled);
         assert!(config.cache.enabled);
+    }
+
+    #[test]
+    fn test_cold_start_config_with_enabled() {
+        let config = ColdStartConfig::new().with_enabled(false);
+        assert!(!config.enabled);
     }
 
     #[test]
@@ -1588,6 +1895,12 @@ mod tests {
         // `enabled: false` if SupplyChainConfig ever switched to a derived Default.
         let config = DepsConfig::default();
         assert!(config.supply_chain.enabled);
+    }
+
+    #[test]
+    fn test_freshness_config_with_enabled() {
+        let config = FreshnessConfig::new().with_enabled(false);
+        assert!(!config.enabled);
     }
 
     #[test]
