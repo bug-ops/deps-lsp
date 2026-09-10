@@ -318,21 +318,71 @@ fn redirect_policy(guard: AddrGuard) -> reqwest::redirect::Policy {
 
 /// Redirect policy for a [`HttpCache::transport_for_origin`]-scoped client.
 ///
-/// Stops any hop whose URL no longer starts with `trusted_origin` — for a caller (e.g.
-/// NuGet's registration-hive paging) that already validated the *initial* request URL
-/// against a trusted prefix and needs that guarantee to hold through a redirect too. This
-/// alone also covers a downgrade to plain `http://`: every current caller passes an
-/// `https://`-prefixed `trusted_origin`, so an `http://` target already fails the prefix
-/// check — a separate scheme check (as [`redirect_policy`] has, for its no-trusted-prefix
-/// case) would be dead code here.
-fn trusted_origin_redirect_policy(trusted_origin: String) -> reqwest::redirect::Policy {
+/// Stops any hop unless [`crate::net_policy::is_trusted_prefix`] accepts it against
+/// `trusted_origin`, parsed once at [`Transport`] construction — origin equality (scheme,
+/// host, and port must match exactly) **and** the hop's path lying at or under
+/// `trusted_origin`'s own path, at a proper path-segment boundary.
+///
+/// Origin equality is the issue #795 fix: the pre-#795 behavior
+/// (`attempt.url().as_str().starts_with(&trusted_origin)`, a raw string-prefix test) is
+/// satisfied by `https://gitlab.mycorp.dev.evil.com/...`, `https://gitlab.mycorp.dev-evil.com/...`,
+/// and `https://gitlab.mycorp.dev@evil.com/...` alike, even though only the last of those
+/// three actually shares a host with `evil.com` — `Url::origin()` ignores userinfo and
+/// matches scheme+host+port exactly, closing all three shapes at once. This also still
+/// covers a downgrade to plain `http://`: an `http://` hop's origin can never equal an
+/// `https://`-scheme trusted origin, which every current caller passes — a separate scheme
+/// check (as [`redirect_policy`] has, for its no-trusted-origin case) would be dead code
+/// here.
+///
+/// The path-segment-boundary check is **not** subsumed by origin equality, and deliberately
+/// kept: a caller (NuGet's registration-hive/flat-container paging, or `deps-cargo`'s sparse
+/// index, whose `RegistryIndex::as_str()` carries no trailing-slash guarantee either way —
+/// issue #795 S1) pins to a specific *path* on a registry host that also serves other,
+/// less-trusted paths, not merely to the host itself. A plain `str::starts_with` on the raw
+/// path (this function's pre-S1-fix shape) is itself vulnerable to the same class of bug one
+/// level down: a trusted path of `/cargo/index` would wrongly accept the same-origin sibling
+/// `/cargo/index-public/steal` or `/cargo/indexEVIL`, since both start with the trusted
+/// string textually. [`crate::net_policy::is_trusted_prefix`] requires a hop's path to equal
+/// the trusted path or continue immediately after a `/` following it, closing that
+/// regardless of whether `trusted_origin`'s own path happens to end in `/`.
+///
+/// A `trusted_origin` that fails to parse matches no hop — every redirect is stopped
+/// (fail-closed) rather than treated as "no restriction" — logged once at construction time
+/// via `tracing::warn!` rather than silently, since a caller-side bug producing an
+/// unparseable `trusted_origin` would otherwise present only as every redirect on that
+/// transport mysteriously failing. This is reachable today: `deps-nuget`'s Public tier builds
+/// `trusted_prefix` from a service-index `@id` string that is never `Url`-validated (that
+/// validation only runs for [`crate::net_policy::validate_index_url`]'s
+/// `NuGetRegistryTier::WorkspaceDeclared` path), so a malformed `@id` reaches this parse.
+fn trusted_origin_redirect_policy(trusted_origin: &str) -> reqwest::redirect::Policy {
+    let trusted = match Url::parse(trusted_origin) {
+        Ok(url) => Some(url),
+        Err(error) => {
+            tracing::warn!(
+                trusted_origin = crate::net_policy::url_for_tracing(trusted_origin),
+                %error,
+                "trusted_origin failed to parse; every redirect hop on this transport will be rejected"
+            );
+            None
+        }
+    };
     reqwest::redirect::Policy::custom(move |attempt| {
-        if attempt.url().as_str().starts_with(&trusted_origin) {
+        if is_trusted_origin(attempt.url(), trusted.as_ref()) {
             reqwest::redirect::Policy::default().redirect(attempt)
         } else {
             attempt.stop()
         }
     })
+}
+
+/// The origin-and-path decision [`trusted_origin_redirect_policy`]'s closure makes on every
+/// redirect hop, extracted as a pure function so the bypass shapes from issue #795 can be
+/// regression-tested directly against it — `reqwest::redirect::Attempt`'s fields are private
+/// outside the `reqwest` crate, so the closure itself cannot be unit-tested without going
+/// through a real HTTP round trip. Delegates to [`crate::net_policy::is_trusted_prefix`],
+/// shared with `deps-nuget`'s registration-hive page `@id` pre-check (issue #795 S2).
+fn is_trusted_origin(hop_url: &Url, trusted: Option<&Url>) -> bool {
+    trusted.is_some_and(|t| crate::net_policy::is_trusted_prefix(hop_url, t))
 }
 
 /// Error returned by [`BlockedAddrResolver`] when a DNS resolution cannot be trusted for
@@ -588,7 +638,7 @@ impl Transport {
     fn origin_pinned(trusted_origin: &str) -> Self {
         Self {
             client: build_client_inner(
-                trusted_origin_redirect_policy(trusted_origin.to_string()),
+                trusted_origin_redirect_policy(trusted_origin),
                 BlockedAddrResolver::new(AddrGuard::Baseline),
             ),
             tier: CacheTier::Baseline,
@@ -613,7 +663,7 @@ impl Transport {
         let snapshot = policy.get();
         Self {
             client: build_client_inner(
-                trusted_origin_redirect_policy(trusted_origin.to_string()),
+                trusted_origin_redirect_policy(trusted_origin),
                 BlockedAddrResolver::new(AddrGuard::WorkspaceDeclared(snapshot)),
             ),
             tier: CacheTier::Pinned {
@@ -1097,8 +1147,9 @@ impl HttpCache {
             .await
     }
 
-    /// Like [`Self::get_cached`], but additionally stops any redirect hop whose target no
-    /// longer starts with `trusted_origin` (e.g. `https://api.nuget.org/v3/registration5-gz/`).
+    /// Like [`Self::get_cached`], but additionally stops any redirect hop that does not match
+    /// `trusted_origin` via [`crate::net_policy::is_trusted_prefix`] (origin equality plus a
+    /// path-segment-boundary prefix check, e.g. against `https://api.nuget.org/v3/registration5-gz/`).
     ///
     /// For a caller that already validated the *initial* request URL against a trusted
     /// prefix (NuGet's registration-hive paging validates `page.id` this way) and needs
@@ -1752,7 +1803,8 @@ impl HttpCache {
     }
 
     /// Same as [`Self::get_transport_only_with_headers_limited`], but additionally
-    /// stops any redirect hop whose target no longer starts with `trusted_origin`
+    /// stops any redirect hop that does not match `trusted_origin` via
+    /// [`crate::net_policy::is_trusted_prefix`]
     /// (see [`Self::get_cached_trusted_origin`], which applies the identical policy
     /// to the entry-cached path). For a caller carrying a materially larger
     /// [`BodyLimit`] than [`BodyLimit::DEFAULT`] — the bigger the budget, the more
@@ -2444,6 +2496,110 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.as_ref(), b"trusted data");
+    }
+
+    /// Issue #795: a raw `str::starts_with` prefix test (the pre-fix behavior) is satisfied
+    /// by a subdomain-suffix bypass — `gitlab.mycorp.dev.evil.com` starts with
+    /// `https://gitlab.mycorp.dev` as a string, even though its actual host is
+    /// `gitlab.mycorp.dev.evil.com`, entirely under attacker control. Parsed-origin equality
+    /// must reject it.
+    #[test]
+    fn test_is_trusted_origin_rejects_subdomain_suffix_bypass() {
+        let trusted = Url::parse("https://gitlab.mycorp.dev").unwrap();
+        let hop = Url::parse("https://gitlab.mycorp.dev.evil.com/steal").unwrap();
+        assert!(!is_trusted_origin(&hop, Some(&trusted)));
+    }
+
+    /// Issue #795: a userinfo bypass — `https://gitlab.mycorp.dev@evil.com/...` also starts
+    /// with the trusted origin as a string, but its host is `evil.com`; `gitlab.mycorp.dev`
+    /// is merely a (discarded) username. `Url::origin()` ignores userinfo entirely, so this
+    /// must be rejected.
+    #[test]
+    fn test_is_trusted_origin_rejects_userinfo_bypass() {
+        let trusted = Url::parse("https://gitlab.mycorp.dev").unwrap();
+        let hop = Url::parse("https://gitlab.mycorp.dev@evil.com/steal").unwrap();
+        assert!(!is_trusted_origin(&hop, Some(&trusted)));
+    }
+
+    /// Issue #795: a hyphen-suffix bypass — `gitlab.mycorp.dev-evil.com` again starts with
+    /// the trusted origin as a string while being an entirely distinct, attacker-controlled
+    /// host.
+    #[test]
+    fn test_is_trusted_origin_rejects_hyphen_suffix_bypass() {
+        let trusted = Url::parse("https://gitlab.mycorp.dev").unwrap();
+        let hop = Url::parse("https://gitlab.mycorp.dev-evil.com/steal").unwrap();
+        assert!(!is_trusted_origin(&hop, Some(&trusted)));
+    }
+
+    /// Companion to the three bypass-rejection tests above: the legitimate same-origin case
+    /// (a different path, same scheme/host/port) must still be accepted.
+    #[test]
+    fn test_is_trusted_origin_accepts_exact_origin_match() {
+        let trusted = Url::parse("https://gitlab.mycorp.dev").unwrap();
+        let hop = Url::parse("https://gitlab.mycorp.dev/api/v4/x").unwrap();
+        assert!(is_trusted_origin(&hop, Some(&trusted)));
+    }
+
+    /// A `trusted_origin` that fails to parse must fail closed — every hop is rejected,
+    /// never treated as "no restriction".
+    #[test]
+    fn test_is_trusted_origin_rejects_when_trusted_origin_unparseable() {
+        let hop = Url::parse("https://gitlab.mycorp.dev/api/v4/x").unwrap();
+        assert!(!is_trusted_origin(&hop, None));
+    }
+
+    /// Path-prefix scoping (NuGet's registration-hive/flat-container pinning) must survive
+    /// the #795 origin-equality fix: same origin, but a hop outside the trusted path, is
+    /// still rejected — this is what `test_get_cached_trusted_origin_rejects_sibling_path_prefix`
+    /// exercises end-to-end; this is the same property pinned at the unit level.
+    #[test]
+    fn test_is_trusted_origin_rejects_same_origin_sibling_path() {
+        let trusted = Url::parse("https://registry.example/v3/registration5-gz/").unwrap();
+        let hop = Url::parse("https://registry.example/v3/registration5-gzX/evil").unwrap();
+        assert!(!is_trusted_origin(&hop, Some(&trusted)));
+    }
+
+    /// Companion: same origin, hop path under the trusted path prefix, is still accepted.
+    #[test]
+    fn test_is_trusted_origin_accepts_same_origin_nested_path() {
+        let trusted = Url::parse("https://registry.example/v3/registration5-gz/").unwrap();
+        let hop =
+            Url::parse("https://registry.example/v3/registration5-gz/serde/page1.json").unwrap();
+        assert!(is_trusted_origin(&hop, Some(&trusted)));
+    }
+
+    /// Issue #795 S1: unlike the two trailing-slash tests above (which, with a trailing `/`
+    /// already present in the trusted path, would have passed even under the pre-S1-fix raw
+    /// `str::starts_with` check — they do not actually exercise the segment-boundary fix),
+    /// `RegistryIndex::as_str()` (`deps-cargo`'s sparse-index trusted origin) carries **no**
+    /// trailing-slash guarantee. This reproduces that exact shape and the critic's repro: a
+    /// same-origin sibling whose path merely shares a textual prefix must still be rejected.
+    #[test]
+    fn test_is_trusted_origin_rejects_same_origin_sibling_path_no_trailing_slash() {
+        let trusted = Url::parse("https://artifacts.corp/cargo/index").unwrap();
+        for sibling in [
+            "https://artifacts.corp/cargo/index-public/steal",
+            "https://artifacts.corp/cargo/indexEVIL",
+            "https://artifacts.corp/cargo/index.evil/x",
+        ] {
+            let hop = Url::parse(sibling).unwrap();
+            assert!(
+                !is_trusted_origin(&hop, Some(&trusted)),
+                "expected {sibling} to be rejected"
+            );
+        }
+    }
+
+    /// Companion: the trusted path itself, and a proper child path, are still accepted when
+    /// the trusted path carries no trailing slash — the real `deps-cargo` request shape
+    /// (`sparse_index_url` appends `/{crate_path}` to the trimmed base).
+    #[test]
+    fn test_is_trusted_origin_accepts_self_and_child_no_trailing_slash() {
+        let trusted = Url::parse("https://artifacts.corp/cargo/index").unwrap();
+        let itself = Url::parse("https://artifacts.corp/cargo/index").unwrap();
+        let child = Url::parse("https://artifacts.corp/cargo/index/se/rd/serde").unwrap();
+        assert!(is_trusted_origin(&itself, Some(&trusted)));
+        assert!(is_trusted_origin(&child, Some(&trusted)));
     }
 
     // Proves every hop is re-checked, not just the first: a same-origin hop is followed,
