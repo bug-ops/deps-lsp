@@ -254,10 +254,10 @@ async fn test_end_to_end_parse_register_and_fetch() {
     // `All` policy: this test exercises the parse -> register -> fetch pipeline, not
     // #443's policy gate (covered separately) — a mockito loopback URL is otherwise
     // blocked under the default `PublicOnly` policy.
-    let ctx = deps_cargo::parser::CargoParseContext {
-        policy: Arc::new(test_policy()),
-        config_cache: Arc::new(ConfigFileCache::new()),
-    };
+    let ctx = deps_cargo::parser::CargoParseContext::new(
+        Arc::new(test_policy()),
+        Arc::new(ConfigFileCache::new()),
+    );
     let parse_result =
         deps_cargo::parser::parse_cargo_toml_with_context(manifest_content, &uri, &ctx).unwrap();
 

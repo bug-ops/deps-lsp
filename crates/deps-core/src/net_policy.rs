@@ -27,6 +27,9 @@ use std::sync::atomic::{AtomicU8, Ordering};
 /// `BlockedAddrResolver` (a `reqwest::dns::Resolve` implementation, fail-closed on lookup
 /// errors, wired into every client via `build_guarded_client`) — see [`classify_addr`], its
 /// counterpart for already-resolved addresses.
+// Exhaustive: security-sensitive SSRF classification — a new host class landing in a
+// wildcard arm at any consuming match site would silently fall through as unclassified
+// instead of failing to compile (issue #769).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostClass {
     /// `127.0.0.0/8`, `::1`, `localhost`, `*.localhost`.
@@ -255,6 +258,9 @@ pub fn classify_host(url: &url::Url) -> HostClass {
 /// Applied **only** to workspace-provenance URLs (a `Cargo.toml`/`.cargo/config.toml` value
 /// found inside the opened workspace) — a `$CARGO_HOME`-provenance index is the user's own
 /// trusted configuration and is never policy-checked, under any variant here.
+// Exhaustive: security-sensitive gate for registry fetches — a new variant landing in a
+// wildcard arm would silently pick an unintended access level instead of failing to
+// compile (issue #769).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum WorkspaceRegistryAccess {
     /// Block every workspace-declared index — the only complete boundary. Also blocks the
@@ -381,6 +387,7 @@ impl Default for RegistryAccessPolicy {
 /// let err = validate_index_url("not a url", "not a url", "cargo", PolicyGate::Skip).unwrap_err();
 /// assert_eq!(err, IndexUrlError::InvalidUrl("not a url".to_string()));
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum IndexUrlError {
     /// The value did not parse as a URL at all.
@@ -428,6 +435,9 @@ pub enum IndexUrlError {
 ///     .is_err()
 /// );
 /// ```
+// Exhaustive: closed 2-variant Skip/Enforce gate — a third state would change the calling
+// convention at every `validate_index_url` call site, not slot into an existing wildcard
+// arm (issue #769).
 #[derive(Debug, Clone, Copy)]
 pub enum PolicyGate<'a> {
     /// Skip the policy check entirely — the candidate's provenance is already trusted (e.g.

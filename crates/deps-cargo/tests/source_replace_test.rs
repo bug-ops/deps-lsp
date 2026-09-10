@@ -56,10 +56,7 @@ async fn test_mirrored_workspace_plain_deps_carry_mirrors_crates_io_and_resolve_
     let manifest_content = "[dependencies]\nserde = \"1.0\"\ntokio = \"1.0\"\n";
     let uri = write_manifest(root.path(), manifest_content);
 
-    let ctx = CargoParseContext {
-        policy: Arc::new(test_policy()),
-        config_cache: Arc::new(ConfigFileCache::new()),
-    };
+    let ctx = CargoParseContext::new(Arc::new(test_policy()), Arc::new(ConfigFileCache::new()));
     let result =
         deps_cargo::parser::parse_cargo_toml_with_context(manifest_content, &uri, &ctx).unwrap();
 
@@ -122,10 +119,7 @@ async fn test_mirrored_dependency_fetch_hits_mirror_not_crates_io() {
     let manifest_content = "[dependencies]\nserde = \"1.0\"\n";
     let uri = write_manifest(root.path(), manifest_content);
 
-    let ctx = CargoParseContext {
-        policy: Arc::new(test_policy()),
-        config_cache: Arc::new(ConfigFileCache::new()),
-    };
+    let ctx = CargoParseContext::new(Arc::new(test_policy()), Arc::new(ConfigFileCache::new()));
     let result =
         deps_cargo::parser::parse_cargo_toml_with_context(manifest_content, &uri, &ctx).unwrap();
 

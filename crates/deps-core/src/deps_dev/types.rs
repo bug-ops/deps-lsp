@@ -90,6 +90,10 @@ pub enum ProvenanceStatus {
 
 /// The hover-facing OpenSSF Scorecard summary for a package's linked source
 /// repository.
+///
+/// Output-only: constructed internally by [`crate::deps_dev`]'s own deps.dev response
+/// parsing, never by external code — no constructor is provided.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScorecardSummary {
     /// deps.dev's `scorecard.overallScore`, already validated to be a finite

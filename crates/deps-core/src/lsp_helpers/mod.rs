@@ -79,6 +79,7 @@ pub const HOVER_RECENT_VERSIONS: usize = 8;
 /// only by a yanked version" check can gate its own package-level-deprecation suppression
 /// on `AdvisoryDeprecated` specifically, never on a genuine `Yanked` finding — mirroring
 /// [`VersionData::outcomes`]'s D5 gate for the #263 in-use-version check (see #437).
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageVersions {
     /// Latest usable version for this package.
@@ -102,6 +103,52 @@ pub struct PackageVersions {
 }
 
 impl PackageVersions {
+    /// Constructs a `PackageVersions` from its two required fields, with [`Self::yanked`] and
+    /// [`Self::published_at`] left empty/`None` — chain [`Self::with_yanked`] and/or
+    /// [`Self::with_published_at`] to attach them.
+    ///
+    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
+    /// this crate, so every other crate (including test code) must go through this
+    /// constructor instead.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::{ConcreteVersion, PackageVersions};
+    /// use std::sync::Arc;
+    ///
+    /// let versions = PackageVersions::new(
+    ///     ConcreteVersion::new("2.0.0"),
+    ///     Arc::from(vec![ConcreteVersion::new("2.0.0"), ConcreteVersion::new("1.0.0")]),
+    /// );
+    /// assert_eq!(versions.latest, "2.0.0");
+    /// assert_eq!(versions.available.len(), 2);
+    /// assert!(versions.yanked.is_empty());
+    /// ```
+    #[must_use]
+    pub fn new(latest: ConcreteVersion, available: Arc<[ConcreteVersion]>) -> Self {
+        Self {
+            latest,
+            available,
+            yanked: Arc::from(Vec::new()),
+            published_at: None,
+        }
+    }
+
+    /// Attaches the registry's yanked/deprecated-version findings. See [`Self::yanked`].
+    #[must_use]
+    pub fn with_yanked(mut self, yanked: Arc<[(ConcreteVersion, RemovalStatus)]>) -> Self {
+        self.yanked = yanked;
+        self
+    }
+
+    /// Attaches when `latest` was published. See [`Self::published_at`].
+    #[must_use]
+    pub const fn with_published_at(mut self, published_at: crate::freshness::PublishTime) -> Self {
+        self.published_at = Some(published_at);
+        self
+    }
+
     /// Builds a `PackageVersions` from only the "latest" version string, with `available`
     /// populated as the single-element list `[latest]`.
     ///
@@ -169,6 +216,7 @@ impl PackageVersions {
 /// entries for the same normalized name together and compares their [`RemovalStatus`], and on
 /// the didChange path a surviving deprecation can coexist with a later fetch failure. A single
 /// enum variant per package could not express that overlap.
+#[non_exhaustive]
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DependencyOutcome {
     /// The version found yanked (the in-use version, or `latest` when only `latest` itself is
@@ -427,6 +475,7 @@ impl DependencyOutcomes {
 /// assert_eq!(versions.cached.get("serde").map(|v| v.latest.as_str()), Some("1.0.214"));
 /// assert_eq!(versions.resolved.get("serde").map(ConcreteVersion::as_str), Some("1.0.200"));
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy)]
 pub struct VersionData<'a> {
     /// Latest known versions and full version lists from the registry, keyed by package name.
@@ -1039,6 +1088,9 @@ pub fn is_same_major_minor(v1: &str, v2: &str) -> bool {
 /// `UpToDate`, since an unresolved requirement (e.g. a dangling Gradle version-catalog
 /// `version.ref` alias, or an unexpanded Maven `${property}`) must not render an "up to
 /// date" badge that was never actually verified.
+// Exhaustive: closed 3-way satisfies-check answer — a wildcard arm at any consuming match
+// site would silently render the wrong label for a new variant instead of failing to
+// compile (issue #769).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequirementStatus {
     /// The latest version satisfies the declared requirement.

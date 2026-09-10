@@ -105,6 +105,10 @@ impl std::fmt::Display for PypiIndexUrl {
 /// credential itself: a `CustomRegistry.url` can reach hover/diagnostics text, and a
 /// `UserInfoPresent` rejection is exactly the case where `raw` would otherwise still contain
 /// `user:pass@`.
+///
+/// Output-only: constructed internally by this module's own `resolve_entry`, never by
+/// external code — no constructor is provided.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct InvalidEntry {
     /// The raw index value, as written in the source file, with any `user:pass@`/`user@`
@@ -136,6 +140,10 @@ pub(crate) fn resolve_entry(
 /// One fully-resolved, ready-to-register routing chain — produced by
 /// [`PypiIndexConfig::resolved_chains`], consumed by
 /// `PypiRegistry::register_chain`/`register_named_source`.
+///
+/// Output-only: constructed internally by [`PypiIndexConfig::resolved_chains`], never by
+/// external code — no constructor is provided.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ResolvedChain {
     /// Composite identity — becomes both the router's `alternates` map key and the

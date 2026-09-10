@@ -90,6 +90,7 @@ impl std::fmt::Display for AuthToken {
 /// entry (see the module-level docs), not a runtime branch on this enum. A future change
 /// that starts branching on this to decide whether to attach a credential reintroduces the
 /// exact vulnerability class this design closed.
+// Exhaustive: closed 2-variant CargoHome/Workspace split (issue #769).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provenance {
     /// Resolved from `$CARGO_HOME/config.toml` or a `CARGO_REGISTRIES_*` environment
@@ -109,6 +110,8 @@ pub enum Provenance {
 /// protecting the auth boundary; adding a policy branch on it would make that sentence false
 /// and invite a future reader to add an auth branch too. Two small enums, one invariant
 /// each.
+// Exhaustive: security-sensitive Trusted/WorkspaceDeclared split — a wildcard arm would
+// silently trust workspace-declared input (issue #769).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IndexTrust {
     /// `$CARGO_HOME/config.toml` or a `CARGO_REGISTRIES_*` environment variable — the
@@ -256,6 +259,10 @@ impl std::fmt::Display for RegistryIndex {
 }
 
 /// One resolved `[registries.<name>]` entry.
+///
+/// Output-only: constructed internally by this module's own resolution logic, never by
+/// external code — no constructor is provided.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ResolvedRegistryEntry {
     /// The validated, fetchable index URL.
@@ -302,6 +309,7 @@ impl CargoConfig {
 
 /// Where a `[source.crates-io] replace-with` chain resolved to, for plain (`Registry`-sourced)
 /// dependencies (spec FR-005/FR-006/FR-007).
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub enum SourceReplacement {
     /// No `[source]` override applies — no `[source.crates-io]` table, a `directory`/

@@ -101,7 +101,7 @@ pub enum CargoDependencySection {
 ///
 /// let mut features = HashMap::new();
 /// features.insert("derive".into(), vec!["serde_derive".into()]);
-/// let version = CargoVersion::new("1.0.214".into(), false, features, None);
+/// let version = CargoVersion::new("1.0.214".into(), false).with_features(features);
 ///
 /// assert!(!version.yanked);
 /// assert!(version.features.contains_key("derive"));
@@ -124,7 +124,9 @@ pub struct CargoVersion {
 }
 
 impl CargoVersion {
-    /// Constructs a `CargoVersion` from its four fields.
+    /// Constructs a `CargoVersion` from its required fields, with [`Self::features`] left
+    /// empty and [`Self::published_at`] left `None` — chain [`Self::with_features`] and/or
+    /// [`Self::with_published_at`] to attach them.
     ///
     /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
     /// this crate, so every other crate must go through this constructor instead.
@@ -133,21 +135,37 @@ impl CargoVersion {
     ///
     /// * `num` - The parsed version number
     /// * `yanked` - Whether this version has been yanked from crates.io
-    /// * `features` - Available feature flags mapped to the other features/deps they enable
-    /// * `published_at` - Publish timestamp, if the sparse index entry carried one
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_cargo::types::CargoVersion;
+    ///
+    /// let version = CargoVersion::new("1.0.214".into(), false);
+    /// assert!(!version.yanked);
+    /// ```
     #[must_use]
-    pub fn new(
-        num: deps_core::ConcreteVersion,
-        yanked: bool,
-        features: HashMap<String, Vec<String>>,
-        published_at: Option<deps_core::PublishTime>,
-    ) -> Self {
+    pub fn new(num: deps_core::ConcreteVersion, yanked: bool) -> Self {
         Self {
             num,
             yanked,
-            features,
-            published_at,
+            features: HashMap::new(),
+            published_at: None,
         }
+    }
+
+    /// Attaches the available feature flags. See [`Self::features`].
+    #[must_use]
+    pub fn with_features(mut self, features: HashMap<String, Vec<String>>) -> Self {
+        self.features = features;
+        self
+    }
+
+    /// Attaches the publish timestamp. See [`Self::published_at`].
+    #[must_use]
+    pub const fn with_published_at(mut self, published_at: deps_core::PublishTime) -> Self {
+        self.published_at = Some(published_at);
+        self
     }
 }
 
@@ -161,16 +179,14 @@ impl CargoVersion {
 /// ```
 /// use deps_cargo::types::CrateInfo;
 ///
-/// let info = CrateInfo {
-///     name: deps_core::PackageName::new("serde"),
-///     description: Some("A serialization framework".into()),
-///     repository: Some("https://github.com/serde-rs/serde".into()),
-///     documentation: Some("https://docs.rs/serde".into()),
-///     max_version: "1.0.214".into(),
-/// };
+/// let info = CrateInfo::new(deps_core::PackageName::new("serde"), "1.0.214".into())
+///     .with_description("A serialization framework")
+///     .with_repository("https://github.com/serde-rs/serde")
+///     .with_documentation("https://docs.rs/serde");
 ///
 /// assert_eq!(info.name, "serde");
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct CrateInfo {
     /// Crate name.
@@ -183,6 +199,58 @@ pub struct CrateInfo {
     pub documentation: Option<String>,
     /// Latest (highest) published version.
     pub max_version: deps_core::ConcreteVersion,
+}
+
+impl CrateInfo {
+    /// Constructs a `CrateInfo` from its required fields, with [`Self::description`],
+    /// [`Self::repository`], and [`Self::documentation`] left `None` — chain the
+    /// corresponding `with_*` setters to attach them.
+    ///
+    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
+    /// this crate, so every other crate must go through this constructor instead.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_cargo::types::CrateInfo;
+    ///
+    /// let info = CrateInfo::new(deps_core::PackageName::new("serde"), "1.0.214".into());
+    /// assert_eq!(info.name, "serde");
+    /// ```
+    #[must_use]
+    pub const fn new(
+        name: deps_core::PackageName,
+        max_version: deps_core::ConcreteVersion,
+    ) -> Self {
+        Self {
+            name,
+            description: None,
+            repository: None,
+            documentation: None,
+            max_version,
+        }
+    }
+
+    /// Attaches a short crate description. See [`Self::description`].
+    #[must_use]
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// Attaches the source repository URL. See [`Self::repository`].
+    #[must_use]
+    pub fn with_repository(mut self, repository: impl Into<String>) -> Self {
+        self.repository = Some(repository.into());
+        self
+    }
+
+    /// Attaches the documentation URL. See [`Self::documentation`].
+    #[must_use]
+    pub fn with_documentation(mut self, documentation: impl Into<String>) -> Self {
+        self.documentation = Some(documentation.into());
+        self
+    }
 }
 
 // Trait implementations for deps-core integration

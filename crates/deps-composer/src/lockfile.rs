@@ -115,12 +115,11 @@ fn parse_composer_lock(content: String) -> Result<ResolvedPackages> {
             },
         );
 
-        packages.insert(ResolvedPackage {
-            name: pkg.name.to_lowercase(),
-            version: pkg.version,
+        packages.insert(ResolvedPackage::new(
+            pkg.name.to_lowercase(),
+            pkg.version,
             source,
-            dependencies: Vec::new(),
-        });
+        ));
     }
 
     Ok(packages)

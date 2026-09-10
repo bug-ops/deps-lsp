@@ -1797,16 +1797,15 @@ mod tests {
         impl OsvNaming for IdentityFormatter {}
 
         fn advisory(id: &str, fixed_versions: &[&str]) -> Arc<Advisory> {
-            Arc::new(Advisory::new(
-                id.to_string(),
-                "2023-01-01T00:00:00Z".to_string(),
-                None,
-                vec![],
-                VulnSeverity::High,
-                None,
-                fixed_versions.iter().map(ToString::to_string).collect(),
-                String::new(),
-            ))
+            Arc::new(
+                Advisory::new(
+                    id.to_string(),
+                    "2023-01-01T00:00:00Z".to_string(),
+                    VulnSeverity::High,
+                    String::new(),
+                )
+                .with_fixed_versions(fixed_versions.iter().map(ToString::to_string).collect()),
+            )
         }
 
         fn dv(
@@ -1814,11 +1813,8 @@ mod tests {
             upgrade_status: UpgradeStatus,
         ) -> DependencyVulnerabilities {
             let total = advisories.len();
-            DependencyVulnerabilities {
-                advisories: Capped::new(advisories, total),
-                upgrade_status,
-                fix_target_status: UpgradeStatus::NotChecked,
-            }
+            DependencyVulnerabilities::new(Capped::new(advisories, total))
+                .with_upgrade_status(upgrade_status)
         }
 
         #[test]

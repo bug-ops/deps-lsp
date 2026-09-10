@@ -357,6 +357,12 @@ pub trait Dependency: Send + Sync {
 }
 
 /// Configuration for LSP inlay hints feature.
+///
+/// Since this type is `#[non_exhaustive]`, `deps-lsp`'s `handlers/inlay_hints.rs` builds one
+/// via [`Self::new`] plus a `with_*` chain rather than a struct literal — adding a field here
+/// no longer forces that call site to update at compile time. A new field must be wired into
+/// it by hand, or it silently keeps [`Self::new`]'s default forever.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct EcosystemConfig {
     /// Whether to show inlay hints for up-to-date dependencies
@@ -378,6 +384,27 @@ pub struct EcosystemConfig {
 
 impl Default for EcosystemConfig {
     fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EcosystemConfig {
+    /// Builds the default configuration (mirrors [`Self::default`]).
+    ///
+    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
+    /// this crate, so every other crate must chain the `with_*` setters onto this
+    /// constructor instead.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::EcosystemConfig;
+    ///
+    /// let config = EcosystemConfig::new().with_offline(true);
+    /// assert!(config.offline);
+    /// ```
+    #[must_use]
+    pub fn new() -> Self {
         Self {
             show_up_to_date_hints: true,
             up_to_date_text: "✅".to_string(),
@@ -386,6 +413,48 @@ impl Default for EcosystemConfig {
             show_loading_hints: true,
             offline: false,
         }
+    }
+
+    /// Overrides [`Self::show_up_to_date_hints`]. See [`Self::new`].
+    #[must_use]
+    pub const fn with_show_up_to_date_hints(mut self, show_up_to_date_hints: bool) -> Self {
+        self.show_up_to_date_hints = show_up_to_date_hints;
+        self
+    }
+
+    /// Overrides [`Self::up_to_date_text`]. See [`Self::new`].
+    #[must_use]
+    pub fn with_up_to_date_text(mut self, up_to_date_text: impl Into<String>) -> Self {
+        self.up_to_date_text = up_to_date_text.into();
+        self
+    }
+
+    /// Overrides [`Self::needs_update_text`]. See [`Self::new`].
+    #[must_use]
+    pub fn with_needs_update_text(mut self, needs_update_text: impl Into<String>) -> Self {
+        self.needs_update_text = needs_update_text.into();
+        self
+    }
+
+    /// Overrides [`Self::loading_text`]. See [`Self::new`].
+    #[must_use]
+    pub fn with_loading_text(mut self, loading_text: impl Into<String>) -> Self {
+        self.loading_text = loading_text.into();
+        self
+    }
+
+    /// Overrides [`Self::show_loading_hints`]. See [`Self::new`].
+    #[must_use]
+    pub const fn with_show_loading_hints(mut self, show_loading_hints: bool) -> Self {
+        self.show_loading_hints = show_loading_hints;
+        self
+    }
+
+    /// Overrides [`Self::offline`]. See [`Self::new`].
+    #[must_use]
+    pub const fn with_offline(mut self, offline: bool) -> Self {
+        self.offline = offline;
+        self
     }
 }
 
@@ -411,6 +480,7 @@ impl Default for EcosystemConfig {
 /// assert_eq!(LicenseSource::default(), LicenseSource::RegistryDeclaredSpdx);
 /// assert_ne!(LicenseSource::PomFreeText, LicenseSource::DetectedSpdx);
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LicenseSource {
     /// Author-declared SPDX identifier(s) already present in the hot-path registry

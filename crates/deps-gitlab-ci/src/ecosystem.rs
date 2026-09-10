@@ -1581,10 +1581,8 @@ mod tests {
                 deps_core::VersionData::new(&cached, &resolved),
                 &uri,
                 deps_core::FreshnessSettings::default(),
-                deps_core::lsp_helpers::DiagnosticSeverities {
-                    mutable_ref_pin_enabled: false,
-                    ..Default::default()
-                },
+                deps_core::lsp_helpers::DiagnosticSeverities::new()
+                    .with_mutable_ref_pin_enabled(false),
             )
             .await;
 
@@ -2274,12 +2272,7 @@ mod tests {
             vec!["1.2.0".into(), "1.2.5".into(), "1.3.0".into()];
         cached.insert(
             name,
-            deps_core::PackageVersions {
-                latest: "1.3.0".into(),
-                available: std::sync::Arc::from(available),
-                yanked: std::sync::Arc::from(Vec::new()),
-                published_at: None,
-            },
+            deps_core::PackageVersions::new("1.3.0".into(), std::sync::Arc::from(available)),
         );
         let resolved = std::collections::HashMap::new();
         let versions = deps_core::VersionData::new(&cached, &resolved);
@@ -2319,12 +2312,7 @@ mod tests {
         let available: Vec<deps_core::ConcreteVersion> = vec!["1.0.0".into(), "2.0.0".into()];
         cached.insert(
             name,
-            deps_core::PackageVersions {
-                latest: "2.0.0".into(),
-                available: std::sync::Arc::from(available),
-                yanked: std::sync::Arc::from(Vec::new()),
-                published_at: None,
-            },
+            deps_core::PackageVersions::new("2.0.0".into(), std::sync::Arc::from(available)),
         );
         let resolved = std::collections::HashMap::new();
         let versions = deps_core::VersionData::new(&cached, &resolved);
@@ -2368,12 +2356,7 @@ mod tests {
         let available: Vec<deps_core::ConcreteVersion> = vec!["1.2.0".into(), "v1.2.0".into()];
         cached.insert(
             name,
-            deps_core::PackageVersions {
-                latest: "v1.2.0".into(),
-                available: std::sync::Arc::from(available),
-                yanked: std::sync::Arc::from(Vec::new()),
-                published_at: None,
-            },
+            deps_core::PackageVersions::new("v1.2.0".into(), std::sync::Arc::from(available)),
         );
         let resolved = std::collections::HashMap::new();
         let versions = deps_core::VersionData::new(&cached, &resolved);

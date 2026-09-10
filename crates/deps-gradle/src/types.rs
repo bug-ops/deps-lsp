@@ -125,7 +125,7 @@ mod tests {
         use deps_core::Version;
 
         let published = deps_core::PublishTime::parse_rfc3339("2026-07-18T23:05:13Z").unwrap();
-        let version = GradleVersion::new("3.2.0".into(), Some(published));
+        let version = GradleVersion::new("3.2.0".into()).with_published_at(published);
 
         assert_eq!(version.published_at(), Some(published));
     }

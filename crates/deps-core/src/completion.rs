@@ -79,6 +79,7 @@ pub const COMPLETION_SEARCH_TIMEOUT: Duration = Duration::from_secs(2);
 /// position, or any other exhaustive context in the same manifest correctly reports
 /// `is_incomplete: false` instead of inheriting the worst case across the whole
 /// ecosystem (#427).
+#[non_exhaustive]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Completions {
     /// The completion items for this call.
@@ -87,13 +88,41 @@ pub struct Completions {
     pub is_incomplete: bool,
 }
 
-impl From<Vec<CompletionItem>> for Completions {
-    /// Wraps an always-exhaustive result set, i.e. `is_incomplete: false`.
-    fn from(items: Vec<CompletionItem>) -> Self {
+impl Completions {
+    /// Constructs a `Completions` from its items, with [`Self::is_incomplete`] left `false` —
+    /// chain [`Self::with_incomplete`] to mark it truncated.
+    ///
+    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
+    /// this crate, so every other crate must go through this constructor instead.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::completion::Completions;
+    ///
+    /// let completions = Completions::new(vec![]).with_incomplete(true);
+    /// assert!(completions.is_incomplete);
+    /// ```
+    #[must_use]
+    pub fn new(items: Vec<CompletionItem>) -> Self {
         Self {
             items,
             is_incomplete: false,
         }
+    }
+
+    /// Overrides [`Self::is_incomplete`]. See [`Self::new`].
+    #[must_use]
+    pub const fn with_incomplete(mut self, is_incomplete: bool) -> Self {
+        self.is_incomplete = is_incomplete;
+        self
+    }
+}
+
+impl From<Vec<CompletionItem>> for Completions {
+    /// Wraps an always-exhaustive result set, i.e. `is_incomplete: false`.
+    fn from(items: Vec<CompletionItem>) -> Self {
+        Self::new(items)
     }
 }
 
@@ -675,6 +704,7 @@ pub fn build_version_completion(
 /// Display metadata for a single version in LSP responses.
 ///
 /// Captures common formatting logic shared between completion items and code actions.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct VersionDisplayItem {
     /// Raw version string (e.g., "1.0.0")
@@ -697,6 +727,11 @@ pub struct VersionDisplayItem {
 
 impl VersionDisplayItem {
     /// Creates a display item from version metadata.
+    ///
+    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
+    /// this crate, so every other crate must go through this constructor instead. Already
+    /// covers every field, so no `with_*` setters are needed on top of it.
+    #[must_use]
     pub fn new(
         version: &dyn Version,
         package_name: &PackageName,

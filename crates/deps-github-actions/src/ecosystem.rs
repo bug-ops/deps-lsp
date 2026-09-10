@@ -924,12 +924,7 @@ mod tests {
         let mut cached = HashMap::new();
         cached.insert(
             deps_core::PackageName::new("actions/checkout"),
-            deps_core::PackageVersions {
-                latest: "v4".into(),
-                available: Arc::from(vec!["v4".into(), "v3".into()]),
-                yanked: Arc::from(Vec::new()),
-                published_at: None,
-            },
+            deps_core::PackageVersions::new("v4".into(), Arc::from(vec!["v4".into(), "v3".into()])),
         );
         let resolved = HashMap::new();
 
@@ -970,10 +965,8 @@ mod tests {
         let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
         let cached = HashMap::new();
         let resolved = HashMap::new();
-        let severities = deps_core::lsp_helpers::DiagnosticSeverities {
-            mutable_ref_pin: DiagnosticSeverity::ERROR,
-            ..deps_core::lsp_helpers::DiagnosticSeverities::default()
-        };
+        let severities = deps_core::lsp_helpers::DiagnosticSeverities::new()
+            .with_mutable_ref_pin(DiagnosticSeverity::ERROR);
 
         let diagnostics = eco
             .generate_diagnostics(
@@ -1003,10 +996,8 @@ mod tests {
         let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
         let cached = HashMap::new();
         let resolved = HashMap::new();
-        let severities = deps_core::lsp_helpers::DiagnosticSeverities {
-            mutable_ref_pin_enabled: false,
-            ..deps_core::lsp_helpers::DiagnosticSeverities::default()
-        };
+        let severities =
+            deps_core::lsp_helpers::DiagnosticSeverities::new().with_mutable_ref_pin_enabled(false);
 
         let diagnostics = eco
             .generate_diagnostics(

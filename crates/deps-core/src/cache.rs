@@ -677,16 +677,12 @@ async fn read_body_capped(url: &str, mut response: Response, limit: BodyLimit) -
 /// use bytes::Bytes;
 /// use std::time::Instant;
 ///
-/// let response = CachedResponse {
-///     body: Bytes::from("response data"),
-///     etag: Some("\"abc123\"".into()),
-///     last_modified: None,
-///     fetched_at: Instant::now(),
-/// };
+/// let response = CachedResponse::new(Bytes::from("response data")).with_etag("\"abc123\"");
 ///
 /// // Clone is cheap - only increments reference count
 /// let cloned = response.clone();
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct CachedResponse {
     /// Raw response body, shareable across consumers without copying.
@@ -697,6 +693,57 @@ pub struct CachedResponse {
     pub last_modified: Option<String>,
     /// Local time the response was fetched, used for TTL expiry checks.
     pub fetched_at: Instant,
+}
+
+impl CachedResponse {
+    /// Constructs a `CachedResponse` for `body`, fetched now, with [`Self::etag`] and
+    /// [`Self::last_modified`] left `None` — chain [`Self::with_etag`] and/or
+    /// [`Self::with_last_modified`] to attach them.
+    ///
+    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
+    /// this crate, so every other crate must go through this constructor instead.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::cache::CachedResponse;
+    /// use bytes::Bytes;
+    ///
+    /// let response = CachedResponse::new(Bytes::from("response data")).with_etag("\"abc123\"");
+    /// assert_eq!(response.etag.as_deref(), Some("\"abc123\""));
+    /// ```
+    #[must_use]
+    pub fn new(body: Bytes) -> Self {
+        Self {
+            body,
+            etag: None,
+            last_modified: None,
+            fetched_at: Instant::now(),
+        }
+    }
+
+    /// Attaches the response's `ETag` header. See [`Self::etag`].
+    #[must_use]
+    pub fn with_etag(mut self, etag: impl Into<String>) -> Self {
+        self.etag = Some(etag.into());
+        self
+    }
+
+    /// Attaches the response's `Last-Modified` header. See [`Self::last_modified`].
+    #[must_use]
+    pub fn with_last_modified(mut self, last_modified: impl Into<String>) -> Self {
+        self.last_modified = Some(last_modified.into());
+        self
+    }
+
+    /// Overrides when the response was fetched — otherwise [`Self::new`] stamps
+    /// [`Instant::now`]. Lets external code (tests, benches) construct a backdated entry to
+    /// exercise TTL-expiry behavior, the one thing a direct struct literal used to allow.
+    #[must_use]
+    pub const fn with_fetched_at(mut self, fetched_at: Instant) -> Self {
+        self.fetched_at = fetched_at;
+        self
+    }
 }
 
 /// HTTP cache with ETag and Last-Modified validation.

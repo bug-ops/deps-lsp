@@ -138,13 +138,12 @@ pub enum VulnSeverity {
 /// let advisory = Advisory::new(
 ///     "RUSTSEC-2020-0071".to_string(),
 ///     "2023-01-01T00:00:00Z".to_string(),
-///     Some("Potential segfault in the time crate".to_string()),
-///     vec!["CVE-2020-26235".to_string()],
 ///     VulnSeverity::High,
-///     None,
-///     vec!["0.2.23".to_string()],
 ///     "https://osv.dev/vulnerability/RUSTSEC-2020-0071".to_string(),
-/// );
+/// )
+/// .with_summary("Potential segfault in the time crate".to_string())
+/// .with_aliases(vec!["CVE-2020-26235".to_string()])
+/// .with_fixed_versions(vec!["0.2.23".to_string()]);
 /// assert_eq!(advisory.fixed_versions.last(), Some(&"0.2.23".to_string()));
 /// ```
 #[non_exhaustive]
@@ -171,7 +170,9 @@ pub struct Advisory {
 }
 
 impl Advisory {
-    /// Constructs an `Advisory` from its already-normalized fields.
+    /// Constructs an `Advisory` from its required fields, with [`Self::summary`],
+    /// [`Self::aliases`], [`Self::cvss_vector`], and [`Self::fixed_versions`] left
+    /// empty/`None` — chain the corresponding `with_*` setters to attach them.
     ///
     /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
     /// this crate, so every other crate (including test code) must go through this
@@ -181,34 +182,63 @@ impl Advisory {
     ///
     /// * `id` - Advisory identifier (e.g. `"RUSTSEC-2020-0071"`, `"GHSA-..."`)
     /// * `modified` - RFC3339 last-modified timestamp — not the advisory's publish date
-    /// * `summary` - Human-readable one-line summary, if OSV provided one
-    /// * `aliases` - Alternate identifiers (CVE, GHSA, ...), not including `id` itself
     /// * `severity` - Derived severity bucket
-    /// * `cvss_vector` - Raw CVSS vector string, shown verbatim in hover but never parsed
-    /// * `fixed_versions` - Every `fixed` event found in the record's ranges, ascending
     /// * `url` - `https://osv.dev/vulnerability/{id}`
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::osv::{Advisory, VulnSeverity};
+    ///
+    /// let advisory = Advisory::new(
+    ///     "RUSTSEC-2020-0071".to_string(),
+    ///     "2023-01-01T00:00:00Z".to_string(),
+    ///     VulnSeverity::High,
+    ///     "https://osv.dev/vulnerability/RUSTSEC-2020-0071".to_string(),
+    /// )
+    /// .with_fixed_versions(vec!["0.2.23".to_string()]);
+    /// assert_eq!(advisory.fixed_versions.last(), Some(&"0.2.23".to_string()));
+    /// ```
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        id: String,
-        modified: String,
-        summary: Option<String>,
-        aliases: Vec<String>,
-        severity: VulnSeverity,
-        cvss_vector: Option<String>,
-        fixed_versions: Vec<String>,
-        url: String,
-    ) -> Self {
+    pub fn new(id: String, modified: String, severity: VulnSeverity, url: String) -> Self {
         Self {
             id,
             modified,
-            summary,
-            aliases,
+            summary: None,
+            aliases: Vec::new(),
             severity,
-            cvss_vector,
-            fixed_versions,
+            cvss_vector: None,
+            fixed_versions: Vec::new(),
             url,
         }
+    }
+
+    /// Attaches a human-readable one-line summary. See [`Self::summary`].
+    #[must_use]
+    pub fn with_summary(mut self, summary: impl Into<String>) -> Self {
+        self.summary = Some(summary.into());
+        self
+    }
+
+    /// Attaches alternate identifiers (CVE, GHSA, ...). See [`Self::aliases`].
+    #[must_use]
+    pub fn with_aliases(mut self, aliases: Vec<String>) -> Self {
+        self.aliases = aliases;
+        self
+    }
+
+    /// Attaches the raw CVSS vector string. See [`Self::cvss_vector`].
+    #[must_use]
+    pub fn with_cvss_vector(mut self, cvss_vector: impl Into<String>) -> Self {
+        self.cvss_vector = Some(cvss_vector.into());
+        self
+    }
+
+    /// Attaches the `fixed` events found in the record's ranges. See [`Self::fixed_versions`].
+    #[must_use]
+    pub fn with_fixed_versions(mut self, fixed_versions: Vec<String>) -> Self {
+        self.fixed_versions = fixed_versions;
+        self
     }
 }
 
@@ -325,6 +355,7 @@ mod capped_tests {
 /// registry's "latest" candidate ([`DependencyVulnerabilities::upgrade_status`]) and the
 /// independently-verified fix target F ([`DependencyVulnerabilities::fix_target_status`]) —
 /// see the latter's doc for why F needs its own verification result distinct from latest's.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpgradeStatus {
     /// Phase B has not run for this dependency (phase A found nothing, or
@@ -351,6 +382,7 @@ pub enum UpgradeStatus {
 }
 
 /// Vulnerability data for one dependency that OSV reported as non-clean.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct DependencyVulnerabilities {
     /// Advisories fetched in full, capped at [`crate::osv::ADVISORY_DISPLAY_CAP`] (invariant 3
@@ -381,12 +413,59 @@ pub struct DependencyVulnerabilities {
     pub fix_target_status: UpgradeStatus,
 }
 
+impl DependencyVulnerabilities {
+    /// Constructs a `DependencyVulnerabilities` from its fetched advisories, with
+    /// [`Self::upgrade_status`] and [`Self::fix_target_status`] both left at
+    /// [`UpgradeStatus::NotChecked`] — chain [`Self::with_upgrade_status`] and/or
+    /// [`Self::with_fix_target_status`] to attach phase B results.
+    ///
+    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
+    /// this crate, so every other crate (including test code) must go through this
+    /// constructor instead.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::osv::{Capped, DependencyVulnerabilities};
+    ///
+    /// let dv = DependencyVulnerabilities::new(Capped::new(vec![], 0));
+    /// assert!(dv.advisories.items().is_empty());
+    /// ```
+    #[must_use]
+    pub const fn new(advisories: Capped<Arc<Advisory>>) -> Self {
+        Self {
+            advisories,
+            upgrade_status: UpgradeStatus::NotChecked,
+            fix_target_status: UpgradeStatus::NotChecked,
+        }
+    }
+
+    /// Attaches phase B's "latest" check result. See [`Self::upgrade_status`].
+    #[must_use]
+    pub fn with_upgrade_status(mut self, upgrade_status: UpgradeStatus) -> Self {
+        self.upgrade_status = upgrade_status;
+        self
+    }
+
+    /// Attaches the independent verification of the recommended fix target. See
+    /// [`Self::fix_target_status`].
+    #[must_use]
+    pub fn with_fix_target_status(mut self, fix_target_status: UpgradeStatus) -> Self {
+        self.fix_target_status = fix_target_status;
+        self
+    }
+}
+
 /// A single upgrade target recommended by [`DependencyVulnerabilities::recommended_fix`].
 ///
 /// `version` is in OSV's version namespace (see
 /// [`crate::lsp_helpers::OsvNaming::osv_version_to_native`] for the
 /// conversion callers must apply before using it in a manifest edit or a
 /// registry lookup).
+///
+/// Output-only: constructed internally by [`DependencyVulnerabilities::recommended_fix`],
+/// never by external code — no constructor is provided.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FixRecommendation {
     /// The highest [`Advisory::fixed_versions`] entry across the advisories
@@ -458,23 +537,18 @@ impl DependencyVulnerabilities {
     /// use std::sync::Arc;
     ///
     /// fn advisory(id: &str, fixed: &str) -> Arc<Advisory> {
-    ///     Arc::new(Advisory::new(
-    ///         id.to_string(),
-    ///         "2023-01-01T00:00:00Z".to_string(),
-    ///         None,
-    ///         vec![],
-    ///         VulnSeverity::High,
-    ///         None,
-    ///         vec![fixed.to_string()],
-    ///         String::new(),
-    ///     ))
+    ///     Arc::new(
+    ///         Advisory::new(
+    ///             id.to_string(),
+    ///             "2023-01-01T00:00:00Z".to_string(),
+    ///             VulnSeverity::High,
+    ///             String::new(),
+    ///         )
+    ///         .with_fixed_versions(vec![fixed.to_string()]),
+    ///     )
     /// }
     ///
-    /// let dv = DependencyVulnerabilities {
-    ///     advisories: Capped::new(vec![advisory("RUSTSEC-1", "1.2.0")], 1),
-    ///     upgrade_status: UpgradeStatus::NotChecked,
-    ///     fix_target_status: UpgradeStatus::NotChecked,
-    /// };
+    /// let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory("RUSTSEC-1", "1.2.0")], 1));
     ///
     /// let fix = dv.recommended_fix().unwrap();
     /// assert_eq!(fix.version, "1.2.0");
@@ -529,6 +603,7 @@ impl DependencyVulnerabilities {
 /// input to [`crate::osv::OsvClient::scan`] gets an entry, and every filtered-out or
 /// failed path must declare itself as one of these reasons rather than
 /// silently vanishing from the map (`architecture.md` §6, §8 invariant 0).
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkipReason {
     /// `dep.source()` was not [`crate::parser::DependencySource::Registry`] (§3 step 0).
@@ -567,6 +642,8 @@ impl SkipReason {
 /// The three variants are mutually exclusive and collectively exhaustive for
 /// every dependency passed to [`crate::osv::OsvClient::scan`] — see `architecture.md` §6 for
 /// why this must never collapse back to `Option<DependencyVulnerabilities>`.
+// Exhaustive: deliberate trichotomy per the doc above — a new "no data" case becomes a new
+// `SkipReason` variant, never a 4th `ScanOutcome` variant (issue #769).
 #[derive(Debug, Clone)]
 pub enum ScanOutcome {
     /// Never queried, or the query could not be resolved — say nothing about it.

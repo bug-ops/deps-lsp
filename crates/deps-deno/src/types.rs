@@ -67,7 +67,7 @@ pub enum DenoDependencySection {
 /// ```
 /// use deps_deno::types::JsrVersion;
 ///
-/// let version = JsrVersion::new("1.0.24".into(), false, None);
+/// let version = JsrVersion::new("1.0.24".into(), false);
 ///
 /// assert!(!version.yanked);
 /// ```
@@ -83,7 +83,8 @@ pub struct JsrVersion {
 }
 
 impl JsrVersion {
-    /// Constructs a `JsrVersion` from its three fields.
+    /// Constructs a `JsrVersion` from its required fields, with [`Self::published_at`] left
+    /// `None` — chain [`Self::with_published_at`] to attach it.
     ///
     /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
     /// this crate, so every other crate must go through this constructor instead.
@@ -92,19 +93,29 @@ impl JsrVersion {
     ///
     /// * `version` - The version string (e.g. `"1.0.24"`)
     /// * `yanked` - Whether JSR marked this specific version as yanked
-    /// * `published_at` - When this version was published, parsed from `meta.json`'s
-    ///   `createdAt`
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_deno::types::JsrVersion;
+    ///
+    /// let version = JsrVersion::new("1.0.24".into(), false);
+    /// assert!(!version.yanked);
+    /// ```
     #[must_use]
-    pub fn new(
-        version: deps_core::ConcreteVersion,
-        yanked: bool,
-        published_at: Option<deps_core::PublishTime>,
-    ) -> Self {
+    pub const fn new(version: deps_core::ConcreteVersion, yanked: bool) -> Self {
         Self {
             version,
             yanked,
-            published_at,
+            published_at: None,
         }
+    }
+
+    /// Attaches when this version was published. See [`Self::published_at`].
+    #[must_use]
+    pub const fn with_published_at(mut self, published_at: deps_core::PublishTime) -> Self {
+        self.published_at = Some(published_at);
+        self
     }
 }
 
@@ -131,16 +142,13 @@ deps_core::impl_version!(JsrVersion {
 /// ```
 /// use deps_deno::types::JsrPackage;
 ///
-/// let pkg = JsrPackage {
-///     name: "jsr:@std/fs".into(),
-///     description: Some("File system utilities".into()),
-///     repository: Some("https://github.com/denoland/std".into()),
-///     documentation: None,
-///     latest_version: "1.0.24".into(),
-/// };
+/// let pkg = JsrPackage::new("jsr:@std/fs".into(), "1.0.24".into())
+///     .with_description("File system utilities")
+///     .with_repository("https://github.com/denoland/std");
 ///
 /// assert_eq!(pkg.name, "jsr:@std/fs");
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct JsrPackage {
     /// Scheme-qualified package name (`"jsr:@scope/pkg"`).
@@ -154,6 +162,58 @@ pub struct JsrPackage {
     pub documentation: Option<String>,
     /// Latest published version string.
     pub latest_version: deps_core::ConcreteVersion,
+}
+
+impl JsrPackage {
+    /// Constructs a `JsrPackage` from its required fields, with [`Self::description`],
+    /// [`Self::repository`], and [`Self::documentation`] left `None` — chain the
+    /// corresponding `with_*` setters to attach them.
+    ///
+    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
+    /// this crate, so every other crate must go through this constructor instead.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_deno::types::JsrPackage;
+    ///
+    /// let pkg = JsrPackage::new("jsr:@std/fs".into(), "1.0.24".into());
+    /// assert_eq!(pkg.name, "jsr:@std/fs");
+    /// ```
+    #[must_use]
+    pub const fn new(
+        name: deps_core::PackageName,
+        latest_version: deps_core::ConcreteVersion,
+    ) -> Self {
+        Self {
+            name,
+            description: None,
+            repository: None,
+            documentation: None,
+            latest_version,
+        }
+    }
+
+    /// Attaches the package description. See [`Self::description`].
+    #[must_use]
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// Attaches the repository URL. See [`Self::repository`].
+    #[must_use]
+    pub fn with_repository(mut self, repository: impl Into<String>) -> Self {
+        self.repository = Some(repository.into());
+        self
+    }
+
+    /// Attaches the documentation URL. See [`Self::documentation`].
+    #[must_use]
+    pub fn with_documentation(mut self, documentation: impl Into<String>) -> Self {
+        self.documentation = Some(documentation.into());
+        self
+    }
 }
 
 deps_core::impl_metadata!(JsrPackage {

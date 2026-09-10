@@ -119,7 +119,7 @@ pub use deps_core::parser::DependencySource as PypiDependencySource;
 /// ```
 /// use deps_pypi::types::PypiVersion;
 ///
-/// let version = PypiVersion::new("2.28.2".into(), false, None);
+/// let version = PypiVersion::new("2.28.2".into(), false);
 ///
 /// assert!(!version.yanked);
 /// assert!(!version.is_prerelease());
@@ -140,7 +140,8 @@ pub struct PypiVersion {
 }
 
 impl PypiVersion {
-    /// Constructs a `PypiVersion` from its three fields.
+    /// Constructs a `PypiVersion` from its required fields, with [`Self::published_at`]
+    /// left `None` — chain [`Self::with_published_at`] to attach it.
     ///
     /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
     /// this crate, so every other crate must go through this constructor instead.
@@ -149,19 +150,30 @@ impl PypiVersion {
     ///
     /// * `version` - Version string (PEP 440 compliant)
     /// * `yanked` - Whether this version has been yanked from PyPI
-    /// * `published_at` - Earliest `upload-time` across this version's release files, if any
-    ///   parsed successfully
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_pypi::types::PypiVersion;
+    ///
+    /// let version = PypiVersion::new("2.28.2".into(), false);
+    /// assert!(!version.yanked);
+    /// ```
     #[must_use]
-    pub fn new(
-        version: deps_core::ConcreteVersion,
-        yanked: bool,
-        published_at: Option<deps_core::PublishTime>,
-    ) -> Self {
+    pub const fn new(version: deps_core::ConcreteVersion, yanked: bool) -> Self {
         Self {
             version,
             yanked,
-            published_at,
+            published_at: None,
         }
+    }
+
+    /// Attaches the earliest `upload-time` across this version's release files. See
+    /// [`Self::published_at`].
+    #[must_use]
+    pub const fn with_published_at(mut self, published_at: deps_core::PublishTime) -> Self {
+        self.published_at = Some(published_at);
+        self
     }
 
     /// Check if this version is a prerelease (alpha, beta, rc).
@@ -173,10 +185,10 @@ impl PypiVersion {
     /// ```
     /// use deps_pypi::types::PypiVersion;
     ///
-    /// let stable = PypiVersion::new("1.0.0".into(), false, None);
-    /// let alpha = PypiVersion::new("1.0.0a1".into(), false, None);
-    /// let beta = PypiVersion::new("1.0.0b2".into(), false, None);
-    /// let rc = PypiVersion::new("1.0.0rc1".into(), false, None);
+    /// let stable = PypiVersion::new("1.0.0".into(), false);
+    /// let alpha = PypiVersion::new("1.0.0a1".into(), false);
+    /// let beta = PypiVersion::new("1.0.0b2".into(), false);
+    /// let rc = PypiVersion::new("1.0.0rc1".into(), false);
     ///
     /// assert!(!stable.is_prerelease());
     /// assert!(alpha.is_prerelease());
@@ -227,18 +239,16 @@ deps_core::impl_version!(PypiVersion {
 /// ```
 /// use deps_pypi::types::PypiPackage;
 ///
-/// let pkg = PypiPackage {
-///     name: deps_core::PackageName::new("requests"),
-///     summary: Some("Python HTTP for Humans.".into()),
-///     project_urls: vec![
+/// let pkg = PypiPackage::new(deps_core::PackageName::new("requests"), "2.28.2".into())
+///     .with_summary("Python HTTP for Humans.")
+///     .with_project_urls(vec![
 ///         ("Homepage".into(), "https://requests.readthedocs.io".into()),
 ///         ("Repository".into(), "https://github.com/psf/requests".into()),
-///     ],
-///     latest_version: "2.28.2".into(),
-/// };
+///     ]);
 ///
 /// assert_eq!(pkg.name, "requests");
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct PypiPackage {
     /// Package name (canonical form)
@@ -249,6 +259,51 @@ pub struct PypiPackage {
     pub project_urls: Vec<(String, String)>,
     /// Latest stable version
     pub latest_version: deps_core::ConcreteVersion,
+}
+
+impl PypiPackage {
+    /// Constructs a `PypiPackage` from its required fields, with [`Self::summary`] left
+    /// `None` and [`Self::project_urls`] left empty — chain [`Self::with_summary`] and/or
+    /// [`Self::with_project_urls`] to attach them.
+    ///
+    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
+    /// this crate, so every other crate must go through this constructor instead.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_pypi::types::PypiPackage;
+    ///
+    /// let pkg = PypiPackage::new(deps_core::PackageName::new("requests"), "2.28.2".into());
+    /// assert_eq!(pkg.name, "requests");
+    /// ```
+    #[must_use]
+    pub const fn new(
+        name: deps_core::PackageName,
+        latest_version: deps_core::ConcreteVersion,
+    ) -> Self {
+        Self {
+            name,
+            summary: None,
+            project_urls: Vec::new(),
+            latest_version,
+        }
+    }
+
+    /// Attaches a short package summary/description. See [`Self::summary`].
+    #[must_use]
+    pub fn with_summary(mut self, summary: impl Into<String>) -> Self {
+        self.summary = Some(summary.into());
+        self
+    }
+
+    /// Attaches project URLs (homepage, repository, documentation, etc.). See
+    /// [`Self::project_urls`].
+    #[must_use]
+    pub fn with_project_urls(mut self, project_urls: Vec<(String, String)>) -> Self {
+        self.project_urls = project_urls;
+        self
+    }
 }
 
 // Implement deps_core traits

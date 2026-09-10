@@ -89,6 +89,11 @@ impl RateLimitGate {
 /// the shared `deps_core::collect_update_all_edits`/hover machinery — which never itself
 /// drives a live registry fetch — can seed a repository's entry directly via
 /// [`GithubActionsRegistry::tag_index`].
+///
+/// No constructor beyond [`Default`] is provided: a caller builds one via
+/// `TagIndex::default()` and populates it by mutating [`Self::tag_to_sha`]/
+/// [`Self::sha_to_tag`] directly, which `#[non_exhaustive]` does not restrict.
+#[non_exhaustive]
 #[derive(Debug, Default)]
 pub struct TagIndex {
     /// Tag text (as published) -> the commit SHA it points at.

@@ -72,6 +72,7 @@ impl BundlerVersion {
 }
 
 /// Gem metadata from rubygems.org.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct GemInfo {
     /// Gem name.
@@ -92,6 +93,90 @@ pub struct GemInfo {
     pub authors: Option<String>,
     /// Total download count reported by rubygems.org.
     pub downloads: u64,
+}
+
+impl GemInfo {
+    /// Constructs a `GemInfo` from its required fields, with every other field left at its
+    /// empty/default value — chain the corresponding `with_*` setters to attach them.
+    ///
+    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
+    /// this crate, so every other crate must go through this constructor instead.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_bundler::types::GemInfo;
+    ///
+    /// let gem = GemInfo::new(deps_core::PackageName::new("rails"), "7.1.0".into())
+    ///     .with_info("Full-stack web application framework")
+    ///     .with_downloads(500_000_000);
+    ///
+    /// assert_eq!(gem.name, "rails");
+    /// assert_eq!(gem.downloads, 500_000_000);
+    /// ```
+    #[must_use]
+    pub const fn new(name: deps_core::PackageName, version: deps_core::ConcreteVersion) -> Self {
+        Self {
+            name,
+            info: None,
+            homepage_uri: None,
+            source_code_uri: None,
+            documentation_uri: None,
+            version,
+            licenses: Vec::new(),
+            authors: None,
+            downloads: 0,
+        }
+    }
+
+    /// Attaches a short gem description. See [`Self::info`].
+    #[must_use]
+    pub fn with_info(mut self, info: impl Into<String>) -> Self {
+        self.info = Some(info.into());
+        self
+    }
+
+    /// Attaches the homepage URL. See [`Self::homepage_uri`].
+    #[must_use]
+    pub fn with_homepage_uri(mut self, homepage_uri: impl Into<String>) -> Self {
+        self.homepage_uri = Some(homepage_uri.into());
+        self
+    }
+
+    /// Attaches the source repository URL. See [`Self::source_code_uri`].
+    #[must_use]
+    pub fn with_source_code_uri(mut self, source_code_uri: impl Into<String>) -> Self {
+        self.source_code_uri = Some(source_code_uri.into());
+        self
+    }
+
+    /// Attaches the documentation URL. See [`Self::documentation_uri`].
+    #[must_use]
+    pub fn with_documentation_uri(mut self, documentation_uri: impl Into<String>) -> Self {
+        self.documentation_uri = Some(documentation_uri.into());
+        self
+    }
+
+    /// Attaches the SPDX license identifiers declared for this gem. See [`Self::licenses`].
+    #[must_use]
+    pub fn with_licenses(mut self, licenses: Vec<String>) -> Self {
+        self.licenses = licenses;
+        self
+    }
+
+    /// Attaches the author names. See [`Self::authors`].
+    #[must_use]
+    pub fn with_authors(mut self, authors: impl Into<String>) -> Self {
+        self.authors = Some(authors.into());
+        self
+    }
+
+    /// Attaches the total download count. See [`Self::downloads`].
+    #[must_use]
+    pub const fn with_downloads(mut self, downloads: u64) -> Self {
+        self.downloads = downloads;
+        self
+    }
 }
 
 // Trait implementations for deps-core integration

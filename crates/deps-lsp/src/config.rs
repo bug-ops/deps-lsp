@@ -232,15 +232,14 @@ impl DiagnosticsConfig {
     /// ```
     #[must_use]
     pub const fn to_severities(&self) -> deps_core::DiagnosticSeverities {
-        deps_core::DiagnosticSeverities {
-            outdated: self.outdated_severity,
-            unknown: self.unknown_severity,
-            yanked: self.yanked_severity,
-            unsatisfiable: self.unsatisfiable_severity,
-            deprecated: self.deprecated_severity,
-            mutable_ref_pin: self.mutable_ref_pin_severity,
-            mutable_ref_pin_enabled: self.mutable_ref_pin_enabled,
-        }
+        deps_core::DiagnosticSeverities::new()
+            .with_outdated(self.outdated_severity)
+            .with_unknown(self.unknown_severity)
+            .with_yanked(self.yanked_severity)
+            .with_unsatisfiable(self.unsatisfiable_severity)
+            .with_deprecated(self.deprecated_severity)
+            .with_mutable_ref_pin(self.mutable_ref_pin_severity)
+            .with_mutable_ref_pin_enabled(self.mutable_ref_pin_enabled)
     }
 }
 

@@ -171,12 +171,10 @@ fn parse_pypi_lock(content: String) -> Result<ResolvedPackages> {
 
         // Normalize name for consistent lookup (PEP 503: case/`_`/`.`-insensitive)
         let normalized_name = crate::name::normalize(name);
-        packages.insert(ResolvedPackage {
-            name: normalized_name,
-            version: version.to_string(),
-            source,
-            dependencies,
-        });
+        packages.insert(
+            ResolvedPackage::new(normalized_name, version.to_string(), source)
+                .with_dependencies(dependencies),
+        );
     }
 
     Ok(packages)

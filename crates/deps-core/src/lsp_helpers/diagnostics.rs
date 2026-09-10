@@ -90,6 +90,11 @@ pub const DEPRECATED_DIAGNOSTIC_CODE: &str = "deprecated-package";
 /// Threaded from `DiagnosticsConfig` (`deps-lsp`) through
 /// [`crate::Ecosystem::generate_diagnostics`] into [`generate_diagnostics_from_cache`].
 ///
+/// Since this type is `#[non_exhaustive]`, `deps_lsp::config::DiagnosticsConfig::to_severities`
+/// builds one via [`Self::new`] plus a `with_*` chain rather than a struct literal — adding a
+/// field here no longer forces that mapping to update at compile time. A new field must be
+/// wired into `to_severities` by hand, or it silently keeps [`Self::new`]'s default forever.
+///
 /// # Examples
 ///
 /// ```
@@ -105,6 +110,7 @@ pub const DEPRECATED_DIAGNOSTIC_CODE: &str = "deprecated-package";
 /// assert_eq!(severities.mutable_ref_pin, DiagnosticSeverity::HINT);
 /// assert!(severities.mutable_ref_pin_enabled);
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiagnosticSeverities {
     /// Severity for a dependency with a newer version available.
@@ -137,6 +143,30 @@ pub struct DiagnosticSeverities {
 
 impl Default for DiagnosticSeverities {
     fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DiagnosticSeverities {
+    /// Builds the default severity set (mirrors [`Self::default`], as an inherent `const fn`
+    /// usable in const context — the `Default` trait itself cannot be `const` on stable Rust).
+    ///
+    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal (including
+    /// functional-update syntax, e.g. `DiagnosticSeverities { outdated: X, ..Default::default() }`)
+    /// only works inside this crate, so every other crate must chain the `with_*` setters onto
+    /// this constructor instead.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::DiagnosticSeverities;
+    /// use tower_lsp_server::ls_types::DiagnosticSeverity;
+    ///
+    /// let severities = DiagnosticSeverities::new().with_outdated(DiagnosticSeverity::ERROR);
+    /// assert_eq!(severities.outdated, DiagnosticSeverity::ERROR);
+    /// ```
+    #[must_use]
+    pub const fn new() -> Self {
         Self {
             outdated: DiagnosticSeverity::HINT,
             unknown: DiagnosticSeverity::WARNING,
@@ -146,6 +176,56 @@ impl Default for DiagnosticSeverities {
             mutable_ref_pin: DiagnosticSeverity::HINT,
             mutable_ref_pin_enabled: true,
         }
+    }
+
+    /// Overrides [`Self::outdated`]. See [`Self::new`] for the baseline every other
+    /// field keeps unless also overridden.
+    #[must_use]
+    pub const fn with_outdated(mut self, outdated: DiagnosticSeverity) -> Self {
+        self.outdated = outdated;
+        self
+    }
+
+    /// Overrides [`Self::unknown`]. See [`Self::with_outdated`].
+    #[must_use]
+    pub const fn with_unknown(mut self, unknown: DiagnosticSeverity) -> Self {
+        self.unknown = unknown;
+        self
+    }
+
+    /// Overrides [`Self::yanked`]. See [`Self::with_outdated`].
+    #[must_use]
+    pub const fn with_yanked(mut self, yanked: DiagnosticSeverity) -> Self {
+        self.yanked = yanked;
+        self
+    }
+
+    /// Overrides [`Self::unsatisfiable`]. See [`Self::with_outdated`].
+    #[must_use]
+    pub const fn with_unsatisfiable(mut self, unsatisfiable: DiagnosticSeverity) -> Self {
+        self.unsatisfiable = unsatisfiable;
+        self
+    }
+
+    /// Overrides [`Self::deprecated`]. See [`Self::with_outdated`].
+    #[must_use]
+    pub const fn with_deprecated(mut self, deprecated: DiagnosticSeverity) -> Self {
+        self.deprecated = deprecated;
+        self
+    }
+
+    /// Overrides [`Self::mutable_ref_pin`]. See [`Self::with_outdated`].
+    #[must_use]
+    pub const fn with_mutable_ref_pin(mut self, mutable_ref_pin: DiagnosticSeverity) -> Self {
+        self.mutable_ref_pin = mutable_ref_pin;
+        self
+    }
+
+    /// Overrides [`Self::mutable_ref_pin_enabled`]. See [`Self::with_outdated`].
+    #[must_use]
+    pub const fn with_mutable_ref_pin_enabled(mut self, mutable_ref_pin_enabled: bool) -> Self {
+        self.mutable_ref_pin_enabled = mutable_ref_pin_enabled;
+        self
     }
 }
 

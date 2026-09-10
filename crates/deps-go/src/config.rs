@@ -109,6 +109,7 @@ impl std::fmt::Display for GoProxyUrl {
 
 /// One `GOPROXY` chain entry (FR-002): either a validated proxy URL, or one of the two
 /// sentinel values `go help goproxy` defines.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GoProxyHop {
     /// A validated, fetchable proxy host.
@@ -128,6 +129,10 @@ pub enum GoProxyHop {
 /// [`GoEnvConfig::resolve_source_for`] can build a
 /// [`DependencySource::CustomRegistry`] when every hop in a chain is invalid, or log a warning
 /// naming a dropped hop, without ever holding or surfacing the credential itself.
+///
+/// Output-only: constructed internally by this module's own `parse_hop`, never by external
+/// code — no constructor is provided.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct InvalidEntry {
     /// The raw `GOPROXY` hop value, as written in `$GOENV`, with any `user:pass@`/`user@`
@@ -162,6 +167,7 @@ fn parse_hop(raw: &str, policy: &RegistryAccessPolicy) -> Result<GoProxyHop, Inv
 /// semantics — this crate's `,`-and-`|`-both-fall-through-on-not-found first cut collapsed
 /// that distinction; see [`GoRegistry::get_versions_chained`](crate::registry::GoRegistry)
 /// (registry.rs) for where this is consulted.
+// Exhaustive: fallback rule fixed by Go's `,`/`|` GOPROXY separator grammar (issue #769).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChainSeparator {
     /// `,`: fall through to the next hop only on an explicit not-found response (`404`/`410`)
@@ -186,6 +192,10 @@ impl ChainSeparator {
 
 /// One fully-resolved, ready-to-register `GOPROXY` chain — produced by
 /// [`GoEnvConfig::goproxy_chain`], consumed by `GoRegistry::register_chain`.
+///
+/// Output-only: constructed internally by [`GoEnvConfig::goproxy_chain`], never by external
+/// code — no constructor is provided.
+#[non_exhaustive]
 #[derive(Debug, Clone, Default)]
 pub struct GoProxyChain {
     /// Opaque, composite identity — becomes both the router's `alternates` map key and the
@@ -861,6 +871,7 @@ impl GoEnvCache {
 }
 
 /// Owned by `GoEcosystem`, shared across every document it parses.
+#[non_exhaustive]
 #[derive(Debug, Clone, Default)]
 pub struct GoParseContext {
     /// Gates every `GOPROXY`-declared [`GoProxyUrl`] this parse constructs.
@@ -874,6 +885,40 @@ pub struct GoParseContext {
     /// path. `None` — the [`Default`] value — means "no `$GOENV` file", the same hermetic,
     /// zero-host-read behavior [`crate::parser::parse_go_mod`]'s doc already promises.
     pub goenv_path: Option<PathBuf>,
+}
+
+impl GoParseContext {
+    /// Constructs a `GoParseContext` from its three fields.
+    ///
+    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
+    /// this crate, so every other crate must go through this constructor instead.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::net_policy::RegistryAccessPolicy;
+    /// use deps_go::config::{GoEnvCache, GoParseContext};
+    /// use std::sync::Arc;
+    ///
+    /// let ctx = GoParseContext::new(
+    ///     Arc::new(RegistryAccessPolicy::default()),
+    ///     Arc::new(GoEnvCache::new()),
+    ///     None,
+    /// );
+    /// assert!(ctx.goenv_path.is_none());
+    /// ```
+    #[must_use]
+    pub const fn new(
+        policy: Arc<RegistryAccessPolicy>,
+        config_cache: Arc<GoEnvCache>,
+        goenv_path: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            policy,
+            config_cache,
+            goenv_path,
+        }
+    }
 }
 
 /// Resolves `$GOENV`'s path (FR-001).

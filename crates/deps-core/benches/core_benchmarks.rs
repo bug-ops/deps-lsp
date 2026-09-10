@@ -16,7 +16,6 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use deps_core::cache::{CachedResponse, HttpCache};
 use std::hint::black_box;
 use std::sync::Arc;
-use std::time::Instant;
 
 /// Benchmark cache lookup operations.
 ///
@@ -28,12 +27,8 @@ fn bench_cache_lookup(c: &mut Criterion) {
     let url = "https://index.crates.io/se/rd/serde";
 
     // Pre-populate cache
-    let response = CachedResponse {
-        body: Bytes::from_static(&[1, 2, 3, 4, 5]),
-        etag: Some("\"abc123\"".into()),
-        last_modified: None,
-        fetched_at: Instant::now(),
-    };
+    let response =
+        CachedResponse::new(Bytes::from_static(&[1, 2, 3, 4, 5])).with_etag("\"abc123\"");
 
     cache.insert_for_bench(url.to_string(), response);
 
@@ -52,26 +47,14 @@ fn bench_cache_lookup(c: &mut Criterion) {
 fn bench_cache_insert(c: &mut Criterion) {
     let mut group = c.benchmark_group("cache_insert");
 
-    let response_small = CachedResponse {
-        body: Bytes::from(vec![0u8; 100]),
-        etag: Some("\"small\"".into()),
-        last_modified: None,
-        fetched_at: Instant::now(),
-    };
+    let response_small = CachedResponse::new(Bytes::from(vec![0u8; 100])).with_etag("\"small\"");
 
-    let response_medium = CachedResponse {
-        body: Bytes::from(vec![0u8; 10_000]),
-        etag: Some("\"medium\"".into()),
-        last_modified: Some("Thu, 01 Jan 2024 00:00:00 GMT".into()),
-        fetched_at: Instant::now(),
-    };
+    let response_medium = CachedResponse::new(Bytes::from(vec![0u8; 10_000]))
+        .with_etag("\"medium\"")
+        .with_last_modified("Thu, 01 Jan 2024 00:00:00 GMT");
 
-    let response_large = CachedResponse {
-        body: Bytes::from(vec![0u8; 1_000_000]),
-        etag: Some("\"large\"".into()),
-        last_modified: None,
-        fetched_at: Instant::now(),
-    };
+    let response_large =
+        CachedResponse::new(Bytes::from(vec![0u8; 1_000_000])).with_etag("\"large\"");
 
     group.bench_function("insert_small_100B", |b| {
         let cache = HttpCache::new();
@@ -149,12 +132,8 @@ fn bench_concurrent_access(c: &mut Criterion) {
     // Pre-populate cache with 100 entries
     let cache = StdArc::new(HttpCache::new());
     for i in 0..100 {
-        let response = CachedResponse {
-            body: Bytes::from(vec![i as u8; 100]),
-            etag: Some(format!("\"etag-{i}\"")),
-            last_modified: None,
-            fetched_at: Instant::now(),
-        };
+        let response =
+            CachedResponse::new(Bytes::from(vec![i as u8; 100])).with_etag(format!("\"etag-{i}\""));
         cache.insert_for_bench(format!("https://url-{i}"), response);
     }
 
@@ -187,24 +166,16 @@ fn bench_cache_eviction(c: &mut Criterion) {
 
     // Pre-populate to near capacity (MAX_CACHE_ENTRIES = 1000)
     for i in 0..990 {
-        let response = CachedResponse {
-            body: Bytes::from(vec![i as u8; 100]),
-            etag: Some(format!("\"etag-{i}\"")),
-            last_modified: None,
-            fetched_at: Instant::now(),
-        };
+        let response =
+            CachedResponse::new(Bytes::from(vec![i as u8; 100])).with_etag(format!("\"etag-{i}\""));
         cache.insert_for_bench(format!("https://url-{i}"), response);
     }
 
     c.bench_function("cache_eviction_trigger", |b| {
         let mut i = 990;
         b.iter(|| {
-            let response = CachedResponse {
-                body: Bytes::from(vec![i as u8; 100]),
-                etag: Some(format!("\"etag-{i}\"")),
-                last_modified: None,
-                fetched_at: Instant::now(),
-            };
+            let response = CachedResponse::new(Bytes::from(vec![i as u8; 100]))
+                .with_etag(format!("\"etag-{i}\""));
             cache.insert_for_bench(format!("https://url-{i}"), response);
             i += 1;
         });

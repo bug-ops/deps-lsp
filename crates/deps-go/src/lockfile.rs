@@ -145,15 +145,14 @@ pub fn parse_go_sum(content: &str) -> ResolvedPackages {
 
             // Always insert/overwrite (last occurrence wins)
             // Go.sum files have older versions first, newer versions appended later
-            packages.insert(ResolvedPackage {
-                name: module_path.to_string(),
-                version: version.to_string(),
-                source: ResolvedSource::Registry {
+            packages.insert(ResolvedPackage::new(
+                module_path.to_string(),
+                version.to_string(),
+                ResolvedSource::Registry {
                     url: "https://proxy.golang.org".to_string(),
                     checksum: checksum.to_string(),
                 },
-                dependencies: vec![],
-            });
+            ));
         }
     }
 

@@ -2119,12 +2119,7 @@ ser"
                 } else {
                     vec![]
                 };
-                Box::pin(async move {
-                    Completions {
-                        items,
-                        is_incomplete: true,
-                    }
-                })
+                Box::pin(async move { Completions::new(items).with_incomplete(true) })
             }
             fn completion_insert_text(
                 &self,

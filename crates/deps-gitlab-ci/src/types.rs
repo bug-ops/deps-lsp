@@ -6,6 +6,7 @@ use tower_lsp_server::ls_types::{Range, Uri};
 use crate::host::GitlabHost;
 
 /// Which `include:` form a dependency came from.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IncludeKind {
     /// `include: - project: org/proj` + `ref:`.
@@ -37,6 +38,7 @@ impl IncludeKind {
 
 /// Which GitLab REST endpoint a [`crate::registry::GitlabCiRegistry`] route resolves
 /// against.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EndpointKind {
     /// `GET /projects/:id/repository/tags` — backs [`IncludeKind::Project`].
@@ -58,6 +60,7 @@ impl EndpointKind {
 }
 
 /// A dependency's resolved (or not-yet-resolvable) host.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostRef {
     /// A validated, policy-gated host — from a `component:` prefix, or from
@@ -78,6 +81,10 @@ pub enum HostRef {
 
 /// The `(host, endpoint)` pair a dependency resolves against, registered at parse time
 /// under an opaque routing key carried in `DependencySource::AlternateRegistry.index`.
+///
+/// Output-only: constructed internally by this crate's own parser, never by external code —
+/// no constructor is provided.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitlabRoute {
     /// Normalized, ASCII-serialized origin (`https://{host}`).
@@ -87,6 +94,7 @@ pub struct GitlabRoute {
 }
 
 /// How a pin (a `project:` ref, or a `component:` version) is classified.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PinStyle {
     /// A 40-character commit SHA.
@@ -192,7 +200,8 @@ pub struct GitlabCiVersion {
 }
 
 impl GitlabCiVersion {
-    /// Constructs a `GitlabCiVersion` from its four fields.
+    /// Constructs a `GitlabCiVersion` from its required fields, with [`Self::published_at`]
+    /// left `None` — chain [`Self::with_published_at`] to attach it.
     ///
     /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
     /// this crate, so every other crate must go through this constructor instead.
@@ -203,30 +212,30 @@ impl GitlabCiVersion {
     ///   as-is
     /// * `sha` - The commit SHA this tag/release points at
     /// * `prerelease` - Whether the semver `pre` component is non-empty
-    /// * `published_at` - `Some(released_at)` for the releases endpoint; `None` for tags
-    ///   (see [`Self::published_at`]'s docs for why)
     ///
     /// # Examples
     ///
     /// ```
     /// use deps_gitlab_ci::GitlabCiVersion;
     ///
-    /// let version = GitlabCiVersion::new("1.2.0".into(), "a".repeat(40), false, None);
+    /// let version = GitlabCiVersion::new("1.2.0".into(), "a".repeat(40), false);
     /// assert_eq!(version.version.as_str(), "1.2.0");
     /// ```
     #[must_use]
-    pub fn new(
-        version: deps_core::ConcreteVersion,
-        sha: String,
-        prerelease: bool,
-        published_at: Option<deps_core::PublishTime>,
-    ) -> Self {
+    pub const fn new(version: deps_core::ConcreteVersion, sha: String, prerelease: bool) -> Self {
         Self {
             version,
             sha,
             prerelease,
-            published_at,
+            published_at: None,
         }
+    }
+
+    /// Attaches `Some(released_at)` for the releases endpoint. See [`Self::published_at`].
+    #[must_use]
+    pub const fn with_published_at(mut self, published_at: deps_core::PublishTime) -> Self {
+        self.published_at = Some(published_at);
+        self
     }
 }
 

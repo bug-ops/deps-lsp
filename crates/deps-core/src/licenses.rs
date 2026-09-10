@@ -163,6 +163,7 @@ impl LicensePolicy {
 }
 
 /// Why a dependency's license violates a [`LicensePolicy`].
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViolationReason {
     /// The license matches an entry on the policy's deny-list. Deny always
@@ -186,6 +187,10 @@ impl fmt::Display for ViolationReason {
 
 /// A policy violation for one dependency, ready to render as an LSP
 /// diagnostic (issue #661 FR-007).
+///
+/// Output-only: constructed internally by [`evaluate`], never by external code — no
+/// constructor is provided.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LicenseViolation {
     /// The specific declared license that triggered the violation, for

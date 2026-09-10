@@ -14,6 +14,7 @@
 use std::ops::Range;
 
 /// The two registries a Deno `imports` value can point at.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scheme {
     /// `jsr:` — routed to the JSR registry.
@@ -107,6 +108,10 @@ pub fn is_dot_prefixed(segment: &str) -> bool {
 
 /// A parsed Deno import specifier value, with byte ranges relative to the *value* string
 /// (excluding the surrounding JSON quotes).
+///
+/// Output-only: constructed internally by this module's own parser, never by external code —
+/// no constructor is provided.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedSpecifier {
     /// Which registry this specifier routes to.

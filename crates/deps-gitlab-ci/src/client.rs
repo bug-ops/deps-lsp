@@ -96,6 +96,11 @@ pub fn gitlab_rate_limit_error() -> DepsError {
 }
 
 /// GitLab tags API response item (`GET /projects/:id/repository/tags`).
+///
+/// Output-only, like its siblings [`GitlabRelease`]/[`GitlabCommit`] below: constructed by
+/// this crate's own `serde` deserialization, never by external code — no constructor is
+/// provided.
+#[non_exhaustive]
 #[derive(Debug, Default, Deserialize)]
 pub struct GitlabTag {
     /// The tag name (e.g. `"v1.2.3"`).
@@ -106,6 +111,7 @@ pub struct GitlabTag {
 }
 
 /// GitLab releases API response item (`GET /projects/:id/releases`).
+#[non_exhaustive]
 #[derive(Debug, Default, Deserialize)]
 pub struct GitlabRelease {
     /// The release's associated tag name.
@@ -119,6 +125,7 @@ pub struct GitlabRelease {
 }
 
 /// The `commit` object nested in a [`GitlabTag`]/[`GitlabRelease`].
+#[non_exhaustive]
 #[derive(Debug, Default, Deserialize)]
 pub struct GitlabCommit {
     /// The full commit SHA the tag/release points at.
