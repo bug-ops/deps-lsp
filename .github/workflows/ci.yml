@@ -285,8 +285,16 @@ jobs:
         # Plain `cargo test` via `cross`, not `cargo nextest`: the default cross-rs
         # container image for this target does not ship `cargo-nextest`, and a custom
         # image isn't worth it for a narrow, single-leg regression check.
+        #
+        # `--test-threads=1`: several tests assert on `deps_core::fs_probe`'s global
+        # stat/read counters (e.g. deps-gradle's
+        # test_load_gradle_properties_stats_exactly_once_per_ancestor), which are safe
+        # under nextest's per-test-process isolation (what every other job uses) but not
+        # under plain `cargo test`'s single shared process, where a concurrently running
+        # test can bump the same counters mid-assertion. Single-threaded here avoids that
+        # without touching the tests themselves.
         if: matrix.run_tests
-        run: cross test --workspace --target ${{ matrix.target }}
+        run: cross test --workspace --target ${{ matrix.target }} -- --test-threads=1
 
   coverage:
     name: Code Coverage
