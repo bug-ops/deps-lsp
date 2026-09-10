@@ -9,7 +9,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use deps_core::{
     DepsError, HttpCache, PublishTime, Result, lsp_helpers::warn_rejected_value,
-    maven_coordinate_path, net_policy::url_for_tracing,
+    maven_coordinate_path, net_policy::RedactedUrl,
 };
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
@@ -310,7 +310,7 @@ impl MavenCentralRegistry {
                 Err(e) => {
                     tracing::debug!(
                         package = %name,
-                        url = url_for_tracing(url),
+                        url = %RedactedUrl::new(url),
                         error = %e,
                         "metadata fetch failed, trying next"
                     );
@@ -338,7 +338,7 @@ impl MavenCentralRegistry {
             Ok(data) => parse_publish_times(&data),
             Err(e) => {
                 tracing::debug!(
-                    url = url_for_tracing(base),
+                    url = %RedactedUrl::new(base),
                     error = %e,
                     "listing fetch failed, publish times unavailable"
                 );
@@ -2364,7 +2364,7 @@ mod tests {
     /// #767: the "listing fetch failed" debug log embedded the raw `base` URL directly
     /// (`url = %base`), leaking a query-string credential the same way #756 S-A's "fetching
     /// fresh" log did in `deps-core::cache` — now redacted via
-    /// [`deps_core::net_policy::url_for_tracing`]. Mirrors
+    /// [`deps_core::net_policy::RedactedUrl`]. Mirrors
     /// `deps_core::cache::tests::test_fetch_and_store_fetching_fresh_log_redacts_query_string_token`'s
     /// pattern.
     #[tokio::test]

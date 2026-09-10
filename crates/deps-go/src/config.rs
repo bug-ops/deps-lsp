@@ -15,8 +15,8 @@
 //! - **No credential-shaped value is ever parsed** (FR-014/NFR-001). [`GoProxyUrl::new`]
 //!   rejects any URL carrying `username()`/`password()` outright — there is no `${VAR}`
 //!   expansion step for `$GOENV` (unlike npm's `.npmrc`), so [`InvalidEntry::raw`] and every
-//!   `tracing::warn!` here name the as-written value with any embedded userinfo redacted first
-//!   (see [`deps_core::net_policy::redact_userinfo`]).
+//!   `tracing::warn!` here name the as-written value with any embedded userinfo (and, via
+//!   [`deps_core::net_policy::RedactedUrl`], query string/fragment) redacted first.
 //! - **FR-009's per-hop fail-closed rule is the load-bearing security invariant.** An invalid
 //!   `GOPROXY` hop is dropped when other valid hops remain; only when every hop is invalid does
 //!   the whole chain fail closed to [`deps_core::parser::DependencySource::CustomRegistry`].
@@ -33,7 +33,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use deps_core::net_policy::{
-    PolicyGate, RegistryAccessPolicy, redact_userinfo, url_for_tracing, validate_index_url,
+    PolicyGate, RedactedUrl, RegistryAccessPolicy, redact_userinfo, url_for_tracing,
+    validate_index_url,
 };
 use deps_core::parser::DependencySource;
 
@@ -142,14 +143,14 @@ pub enum GoProxyHop {
 pub struct InvalidEntry {
     /// The raw `GOPROXY` hop value, as written in `$GOENV`, with any `user:pass@`/`user@`
     /// userinfo component and any query string/fragment stripped.
-    pub raw: String,
+    pub raw: RedactedUrl,
     /// Why it was rejected.
     pub reason: GoProxyUrlError,
 }
 
 /// Parses and validates one `,`-or-`|`-separated `GOPROXY` chain entry (FR-002), logging a
 /// `tracing::warn!` naming the raw value (redacted — see
-/// [`deps_core::net_policy::url_for_tracing`]) on failure.
+/// [`deps_core::net_policy::RedactedUrl`]) on failure.
 fn parse_hop(raw: &str, policy: &RegistryAccessPolicy) -> Result<GoProxyHop, InvalidEntry> {
     match raw {
         "direct" => Ok(GoProxyHop::Direct),
@@ -157,7 +158,7 @@ fn parse_hop(raw: &str, policy: &RegistryAccessPolicy) -> Result<GoProxyHop, Inv
         _ => GoProxyUrl::new(raw, policy)
             .map(GoProxyHop::Url)
             .map_err(|reason| {
-                let redacted = url_for_tracing(raw);
+                let redacted = RedactedUrl::new(raw);
                 tracing::warn!(raw = %redacted, %reason, "GOPROXY hop failed validation");
                 InvalidEntry {
                     raw: redacted,
@@ -331,10 +332,10 @@ fn parse_goproxy(raw: &str, policy: &RegistryAccessPolicy) -> Result<GoProxyChai
 
     if hops.is_empty() {
         Err(first_invalid.unwrap_or_else(|| {
-            let redacted = url_for_tracing(raw);
+            let redacted = RedactedUrl::new(raw);
             InvalidEntry {
-                raw: redacted.clone(),
-                reason: GoProxyUrlError::InvalidUrl(redacted),
+                reason: GoProxyUrlError::InvalidUrl(redacted.to_string()),
+                raw: redacted,
             }
         }))
     } else {
@@ -744,7 +745,7 @@ impl GoEnvConfig {
                 mirrors_crates_io: false,
             },
             Some(Err(invalid)) => DependencySource::CustomRegistry {
-                url: invalid.raw.clone(),
+                url: invalid.raw.to_string(),
             },
         }
     }
@@ -805,7 +806,7 @@ struct RawGoEnv {
     /// [`GoEnvCache`]'s memoization, mirroring `deps_npm::config::NpmConfigCache`'s identical
     /// shape exactly — precedent-consistent, not a regression to fix (spec 034 security
     /// review, F4). Never logged or transmitted as-is (FR-014); only
-    /// [`deps_core::net_policy::url_for_tracing`]'d output (userinfo and query
+    /// [`deps_core::net_policy::RedactedUrl`]'d output (userinfo and query
     /// string/fragment stripped — #767) ever leaves this module.
     goproxy: Option<String>,
     goprivate: Option<String>,

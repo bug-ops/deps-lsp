@@ -26,7 +26,7 @@
 //!   fix, mirroring `deps-pypi`'s own M1, extended by #767 S2b). No `${VAR}` expansion is
 //!   needed for this case — a hostile `.npmrc` can write the credential straight into the raw
 //!   value — so `resolve_entry` redacts it (see
-//!   [`deps_core::net_policy::url_for_tracing`]) before it ever reaches a `tracing::warn!`
+//!   [`deps_core::net_policy::RedactedUrl`]) before it ever reaches a `tracing::warn!`
 //!   call or [`InvalidEntry::raw`], which [`NpmConfig::resolve_source_for`] can surface as
 //!   [`DependencySource::CustomRegistry`]'s `url` in hover/diagnostics text.
 //! - **Internal-network reachability (SSRF-adjacent).** [`NpmRegistryIndex::new`] requires a
@@ -45,7 +45,7 @@ use std::sync::Arc;
 
 use deps_core::PackageName;
 use deps_core::net_policy::{
-    HostClass, IndexUrlError, PolicyGate, RegistryAccessPolicy, url_for_tracing, validate_index_url,
+    HostClass, IndexUrlError, PolicyGate, RedactedUrl, RegistryAccessPolicy, validate_index_url,
 };
 use deps_core::parser::DependencySource;
 
@@ -56,7 +56,7 @@ use deps_core::parser::DependencySource;
 pub enum NpmRegistryIndexError {
     /// The value did not parse as a URL at all.
     #[error("not a valid URL: {0}")]
-    InvalidUrl(String),
+    InvalidUrl(RedactedUrl),
     /// The URL's scheme is not `https` (the sole carve-out is a `cfg(test)`/`test-util`-only
     /// `http` loopback host — see [`NpmRegistryIndex::new`]).
     #[error("registry index must use https, got scheme {0:?}")]
@@ -81,14 +81,17 @@ pub enum NpmRegistryIndexError {
 impl From<IndexUrlError> for NpmRegistryIndexError {
     fn from(error: IndexUrlError) -> Self {
         match error {
-            IndexUrlError::InvalidUrl(raw) => Self::InvalidUrl(raw),
+            // `RedactedUrl::new` is idempotent for already-redacted text, so re-wrapping
+            // `IndexUrlError::InvalidUrl`'s own (already `url_for_tracing`'d) payload here is
+            // a no-op, not a double redaction.
+            IndexUrlError::InvalidUrl(raw) => Self::InvalidUrl(raw.into()),
             IndexUrlError::NotHttps(scheme) => Self::NotHttps(scheme),
             IndexUrlError::UserInfoPresent => Self::UserInfoPresent,
             IndexUrlError::BlockedHost { class } => Self::BlockedHost { class },
             // `IndexUrlError` is `#[non_exhaustive]` (issue #769): a variant added upstream
             // and not yet mapped here still surfaces, carrying its own message, rather than
             // failing to compile.
-            other => Self::InvalidUrl(other.to_string()),
+            other => Self::InvalidUrl(other.to_string().into()),
         }
     }
 }
@@ -177,7 +180,7 @@ impl std::fmt::Display for NpmRegistryIndex {
 ///
 /// Invalid URL, non-https, an undefined `${VAR}`, or policy-blocked. Carries the raw value
 /// as written (never the expanded form, and with any literal userinfo/query string
-/// redacted — see [`deps_core::net_policy::url_for_tracing`]) so
+/// redacted — see [`deps_core::net_policy::RedactedUrl`]) so
 /// [`NpmConfig::resolve_source_for`] can build [`DependencySource::CustomRegistry`] and so a
 /// warning can name what the user actually wrote, never an expanded-but-rejected value that
 /// could leak an environment variable's contents into the log, and never a literal credential
@@ -189,7 +192,7 @@ impl std::fmt::Display for NpmRegistryIndex {
 #[derive(Debug, Clone)]
 pub struct InvalidEntry {
     /// The raw `.npmrc` value, unexpanded, with any literal userinfo/query string redacted.
-    pub raw: String,
+    pub raw: RedactedUrl,
     /// Why it was rejected.
     pub reason: NpmRegistryIndexError,
 }
@@ -255,7 +258,7 @@ fn source_from_result(result: &Result<NpmRegistryIndex, InvalidEntry>) -> Depend
             mirrors_crates_io: false,
         },
         Err(invalid) => DependencySource::CustomRegistry {
-            url: invalid.raw.clone(),
+            url: invalid.raw.to_string(),
         },
     }
 }
@@ -366,7 +369,8 @@ fn expand_env_vars_with(
 /// value either way (an expanded-but-rejected value must never leak an environment
 /// variable's contents into the log), with any literal `user:pass@`/`user@` userinfo and any
 /// query string/fragment written directly in that raw value stripped first (M1 fix, extended
-/// by #767 S2a/S2b — see [`deps_core::net_policy::url_for_tracing`]) — a hostile `.npmrc` can
+/// by #767 S2a/S2b, structurally enforced by #789's [`deps_core::net_policy::RedactedUrl`]) —
+/// a hostile `.npmrc` can
 /// write a credential straight into `registry=`/`@scope:registry=` with no `${VAR}` expansion
 /// involved, whether as userinfo or as a query parameter.
 fn resolve_entry(
@@ -375,7 +379,7 @@ fn resolve_entry(
 ) -> Result<NpmRegistryIndex, InvalidEntry> {
     match expand_env_vars(raw) {
         Ok(expanded) => NpmRegistryIndex::new_for_log(&expanded, raw, policy).map_err(|reason| {
-            let redacted = url_for_tracing(raw);
+            let redacted = RedactedUrl::new(raw);
             tracing::warn!(raw = %redacted, %reason, "npm registry index failed validation");
             InvalidEntry {
                 raw: redacted,
@@ -383,7 +387,7 @@ fn resolve_entry(
             }
         }),
         Err(var) => {
-            let redacted = url_for_tracing(raw);
+            let redacted = RedactedUrl::new(raw);
             tracing::warn!(
                 raw = %redacted,
                 var,
@@ -802,7 +806,7 @@ mod tests {
                 ..
             })
         );
-        assert_eq!(result.unwrap_err().raw, "${UNDEFINED_VAR}");
+        assert_eq!(result.unwrap_err().raw.to_string(), "${UNDEFINED_VAR}");
     }
 
     /// S-1 regression: a rejected entry's error must report the raw `${VAR}`-referencing
@@ -871,7 +875,7 @@ mod tests {
 
         assert_eq!(
             err,
-            NpmRegistryIndexError::InvalidUrl(raw_placeholder.to_string())
+            NpmRegistryIndexError::InvalidUrl(raw_placeholder.into())
         );
         assert!(!err.to_string().contains("super-secret-value"));
     }
@@ -886,17 +890,17 @@ mod tests {
             let invalid = resolve_entry("https://user:hunter2@npm.example/", &policy).unwrap_err();
             assert_matches!(invalid.reason, NpmRegistryIndexError::UserInfoPresent);
             assert!(
-                !invalid.raw.contains("hunter2"),
+                !invalid.raw.as_ref().contains("hunter2"),
                 "InvalidEntry::raw leaked the credential: {}",
                 invalid.raw
             );
             assert!(
-                !invalid.raw.contains("user:"),
+                !invalid.raw.as_ref().contains("user:"),
                 "InvalidEntry::raw leaked the username: {}",
                 invalid.raw
             );
             assert!(
-                invalid.raw.contains("npm.example"),
+                invalid.raw.as_ref().contains("npm.example"),
                 "host should survive redaction"
             );
         });
@@ -921,12 +925,12 @@ mod tests {
             .unwrap_err();
             assert_matches!(invalid.reason, NpmRegistryIndexError::BlockedHost { .. });
             assert!(
-                !invalid.raw.contains("super-secret-value"),
+                !invalid.raw.as_ref().contains("super-secret-value"),
                 "InvalidEntry::raw leaked the credential: {}",
                 invalid.raw
             );
             assert!(
-                invalid.raw.contains("npm.example"),
+                invalid.raw.as_ref().contains("npm.example"),
                 "host should survive redaction"
             );
         });
@@ -949,7 +953,7 @@ mod tests {
                 resolve_entry("https://user:hunter2@npm.example:99999/", &policy).unwrap_err();
             assert_matches!(invalid.reason, NpmRegistryIndexError::InvalidUrl(_));
             assert!(
-                !invalid.raw.contains("hunter2"),
+                !invalid.raw.as_ref().contains("hunter2"),
                 "InvalidEntry::raw leaked the credential: {}",
                 invalid.raw
             );

@@ -889,7 +889,7 @@ impl NuGetRegistry {
         let trusted = url::Url::parse(trusted_prefix)
             .inspect_err(|error| {
                 tracing::warn!(
-                    trusted_prefix = deps_core::net_policy::url_for_tracing(trusted_prefix),
+                    trusted_prefix = %deps_core::net_policy::RedactedUrl::new(trusted_prefix),
                     %error,
                     "registration trusted_prefix failed to parse; every external registration \
                      page will be skipped for this package"
