@@ -40,6 +40,7 @@ pub use server::Backend;
 ///
 /// Bundled into one struct (issue #561, M3) rather than growing that function's arity again
 /// for each new cross-ecosystem live flag.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct EcosystemRuntime {
     /// Gates every workspace-declared registry index host (spec #443,
@@ -55,6 +56,45 @@ pub struct EcosystemRuntime {
     /// un-`cfg`'d — see `deps_gitlab_ci::host::GitlabInstanceHost`'s docs for why host
     /// validation lives in that crate instead, applied on read.
     pub gitlab_instance_host: Arc<std::sync::RwLock<Option<String>>>,
+}
+
+impl EcosystemRuntime {
+    /// Constructs the runtime from its three live-updatable settings handles.
+    ///
+    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
+    /// this crate, so every other crate — including anything embedding [`register_ecosystems`],
+    /// this lib's advertised entry point — must use this constructor instead. Unlike this
+    /// crate's config-DTO builders (e.g. [`config::InlayHintsConfig::new`]), all three fields
+    /// are required here: none has a sensible default, so there is no accompanying `with_*`
+    /// chain — a future field can still add one without breaking this signature.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::net_policy::RegistryAccessPolicy;
+    /// use deps_lsp::EcosystemRuntime;
+    /// use std::sync::atomic::AtomicBool;
+    /// use std::sync::{Arc, RwLock};
+    ///
+    /// let runtime = EcosystemRuntime::new(
+    ///     Arc::new(RegistryAccessPolicy::default()),
+    ///     Arc::new(AtomicBool::new(false)),
+    ///     Arc::new(RwLock::new(None)),
+    /// );
+    /// assert!(!runtime.nuget_user_profile_sources.load(std::sync::atomic::Ordering::Relaxed));
+    /// ```
+    #[must_use]
+    pub fn new(
+        policy: Arc<deps_core::net_policy::RegistryAccessPolicy>,
+        nuget_user_profile_sources: Arc<AtomicBool>,
+        gitlab_instance_host: Arc<std::sync::RwLock<Option<String>>>,
+    ) -> Self {
+        Self {
+            policy,
+            nuget_user_profile_sources,
+            gitlab_instance_host,
+        }
+    }
 }
 
 /// Declares an ecosystem: re-exports types and registers at runtime.
@@ -456,11 +496,11 @@ mod tests {
     use super::*;
 
     fn test_runtime() -> EcosystemRuntime {
-        EcosystemRuntime {
-            policy: Arc::new(deps_core::net_policy::RegistryAccessPolicy::default()),
-            nuget_user_profile_sources: Arc::new(AtomicBool::new(false)),
-            gitlab_instance_host: Arc::new(std::sync::RwLock::new(None)),
-        }
+        EcosystemRuntime::new(
+            Arc::new(deps_core::net_policy::RegistryAccessPolicy::default()),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(std::sync::RwLock::new(None)),
+        )
     }
 
     /// Smoke test: `register_ecosystems` must not panic under any feature combination.

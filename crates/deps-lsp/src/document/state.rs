@@ -701,11 +701,11 @@ impl ServerState {
         let workspace_registry_ecosystems = crate::register_ecosystems(
             &ecosystem_registry,
             Arc::clone(&cache),
-            &crate::EcosystemRuntime {
-                policy: Arc::clone(&registry_policy),
-                nuget_user_profile_sources: Arc::clone(&nuget_user_profile_sources),
-                gitlab_instance_host: Arc::clone(&gitlab_instance_host),
-            },
+            &crate::EcosystemRuntime::new(
+                Arc::clone(&registry_policy),
+                Arc::clone(&nuget_user_profile_sources),
+                Arc::clone(&gitlab_instance_host),
+            ),
         );
 
         // Default interval, live-updated by `set_min_interval` once `initialize`/
