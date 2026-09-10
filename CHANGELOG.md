@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **deps-core**: `RedactedUrl` structural chokepoint and `SanitizedRegistryError` wrapper for outbound-URL redaction in error/log output, migrated across every `deps-core`-internal call site (partial work on #789) (#800)
+- **deps-core**: regression test pinning `SanitizedRegistryError`'s source-chain redaction for this project's current client config (#789) (#800)
 - **deps-core, deps-deno, deps-gradle, deps-github-actions, deps-gitlab-ci**: `registry_conformance!` macro proving `Registry::select_latest_matching` is actually overridden, invoked for all four ecosystems named in #784 (resolves #784) (#787)
 - **templates**: `deps-ecosystem` formatter template fixed to compile against the current `PackageRendering`/`EcosystemFormatter` API and use `formatter_conformance!` (resolves #785) (#787)
 - **workspace**: CI gained a `semver` job (`obi1kenobi/cargo-semver-checks-action`, advisory pending a local rustdoc-format toolchain mismatch, hard-gated on the weekly scheduled sweep) flagging accidental public-API breaks; adds `#[non_exhaustive]` to the highest-churn public error/dependency/version types — `deps-core`'s `DepsError`/`FetchFailure`/`RemovalStatus`/`VulnSeverity`/`ProvenanceStatus`/`CompletionContext`/`LicensePolicy`/`SupplyChainTrustSignal`/`ScanTarget`/`Advisory` and every ecosystem crate's `*Dependency`/`*Version`/`*ParseResult`/`*DependencySection` — as a first incremental pass, not a full API-stability audit (resolves #755) (#768)
@@ -74,6 +76,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-deno**: extracted `deps-deno`'s scope-aware `@scope/pkg` name-boundary parser into a shared `deps_core::package::npm_style_name_boundary` helper, reused by the `deps-npm` alias fix above instead of a per-crate reimplementation (#657)
 
 ### Changed
+- **Breaking (pre-1.0, public API)**: **deps-core**: `DepsError::RegistryError.source` is now `SanitizedRegistryError` (was `reqwest::Error`); `RegistryError.package`/`HttpStatus.url`/`Offline.url`/`ResponseTooLarge.url` are now `RedactedUrl` (was `String`) (#789) (#800)
 - **deps-core, deps-lsp, all 14 ecosystem crates**: `Ecosystem::id()` is now derived from a new required, exhaustively-typed `ecosystem_id()` method instead of a runtime string parse (resolves #791) (#798)
 - **deps-core, deps-bundler, deps-composer, deps-dart, deps-github-actions, deps-gitlab-ci, deps-go, deps-gradle, deps-maven, deps-npm, deps-nuget, deps-pypi, deps-swift**: migrated hand-written `Dependency`/`ParseResult` impls to the shared `impl_dependency!`/`impl_parse_result!` macros where they were byte-identical drop-ins (resolves #792) (#798)
 - **deps-gradle, deps-core**: POM license scan's byte-budget guard now shares a new `deps-core::xml_bounds::exhausted_with` instead of a private lossy `as usize` cast — hardens the fail-closed conversion for a 32-bit target (no behavior change on the 64-bit targets this project builds for) (resolves #725) (#771)

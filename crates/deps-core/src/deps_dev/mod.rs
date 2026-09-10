@@ -412,7 +412,7 @@ impl DepsDevClient {
     /// [`DEPS_DEV_CALL_TIMEOUT`].
     #[tracing::instrument(
         skip(self),
-        fields(url = crate::net_policy::url_for_tracing(url))
+        fields(url = %crate::net_policy::RedactedUrl::new(url))
     )]
     async fn get(&self, url: &str) -> Result<bytes::Bytes, DepsDevFetchError> {
         match tokio::time::timeout(

@@ -300,7 +300,7 @@ impl GithubTagsClient {
     /// Propagates the underlying HTTP/cache error unchanged.
     #[tracing::instrument(
         skip(self),
-        fields(url = crate::net_policy::url_for_tracing(url))
+        fields(url = %crate::net_policy::RedactedUrl::new(url))
     )]
     pub async fn fetch_authenticated(&self, url: &str) -> Result<Bytes> {
         self.cache

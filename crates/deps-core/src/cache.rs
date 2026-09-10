@@ -7,7 +7,7 @@
 //! capped to keep memory use predictable under long-running LSP sessions.
 
 use crate::error::{DepsError, Result};
-use crate::net_policy::{RegistryAccessPolicy, WorkspaceRegistryAccess};
+use crate::net_policy::{RedactedUrl, RegistryAccessPolicy, WorkspaceRegistryAccess};
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use reqwest::{Client, Response, StatusCode, Url, header};
@@ -171,7 +171,7 @@ fn ensure_https(url: &str) -> Result<()> {
     }
     Err(DepsError::CacheError(format!(
         "URL must use HTTPS: {}",
-        crate::net_policy::url_for_tracing(url)
+        RedactedUrl::new(url)
     )))
 }
 
@@ -700,13 +700,13 @@ async fn read_body_capped(url: &str, mut response: Response, limit: BodyLimit) -
         .chunk()
         .await
         .map_err(|e| DepsError::RegistryError {
-            package: url.to_string(),
-            source: e.without_url(),
+            package: RedactedUrl::new(url),
+            source: e.into(),
         })?
     {
         if body.len() + chunk.len() > limit {
             return Err(DepsError::ResponseTooLarge {
-                url: url.to_string(),
+                url: RedactedUrl::new(url),
                 limit,
             });
         }
@@ -968,7 +968,7 @@ impl HttpCache {
     fn ensure_online(&self, url: &str) -> Result<()> {
         if self.is_offline() {
             return Err(DepsError::Offline {
-                url: url.to_string(),
+                url: RedactedUrl::new(url),
             });
         }
         Ok(())
@@ -1415,7 +1415,7 @@ impl HttpCache {
     /// ignores it (see [`Self::cache_key`]'s docs).
     #[tracing::instrument(
         skip(self, extra_headers, transport, auth_id),
-        fields(url = crate::net_policy::url_for_tracing(url), cache = tracing::field::Empty)
+        fields(url = %RedactedUrl::new(url), cache = tracing::field::Empty)
     )]
     async fn get_cached_with_headers_via(
         &self,
@@ -1516,7 +1516,7 @@ impl HttpCache {
                         // both embed the raw, unredacted `url` (`DepsError::HttpStatus`'s
                         // `Display`; the wrapped `reqwest::Error` inside `RegistryError`
                         // appends its own request URL too), defeating this span's own
-                        // `url_for_tracing`-redacted `url` field two lines below it.
+                        // `RedactedUrl`-redacted `url` field two lines below it.
                         // `safe_tracing_summary` extracts only the safe (non-URL-bearing)
                         // status code plus a coarse cause discriminant.
                         let (status, cause) = e.safe_tracing_summary();
@@ -1578,8 +1578,8 @@ impl HttpCache {
         }
 
         let response = request.send().await.map_err(|e| DepsError::RegistryError {
-            package: url.to_string(),
-            source: e.without_url(),
+            package: RedactedUrl::new(url),
+            source: e.into(),
         })?;
 
         if response.status() == StatusCode::NOT_MODIFIED {
@@ -1588,7 +1588,7 @@ impl HttpCache {
 
         if !response.status().is_success() {
             return Err(DepsError::HttpStatus {
-                url: url.to_string(),
+                url: RedactedUrl::new(url),
                 status: response.status().as_u16(),
             });
         }
@@ -1639,14 +1639,14 @@ impl HttpCache {
     ) -> Result<Bytes> {
         self.ensure_online(url)?;
         ensure_https(url)?;
-        // #756 security follow-up (S-A): `url_for_tracing`, not the raw `url` — this is the
+        // #756 security follow-up (S-A): `RedactedUrl`, not the raw `url` — this is the
         // direct callee of the now-hardened `get_cached_with_headers_via`, and at `debug`
         // level, which is this project's own continuous-improvement convention
         // (`RUST_LOG=debug`).
         tracing::debug!(
             extra_headers = extra_headers.len(),
             "fetching fresh: {}",
-            crate::net_policy::url_for_tracing(url)
+            RedactedUrl::new(url)
         );
 
         let mut request = client.get(url);
@@ -1655,13 +1655,13 @@ impl HttpCache {
         }
 
         let response = request.send().await.map_err(|e| DepsError::RegistryError {
-            package: url.to_string(),
-            source: e.without_url(),
+            package: RedactedUrl::new(url),
+            source: e.into(),
         })?;
 
         if !response.status().is_success() {
             return Err(DepsError::HttpStatus {
-                url: url.to_string(),
+                url: RedactedUrl::new(url),
                 status: response.status().as_u16(),
             });
         }
@@ -1708,7 +1708,7 @@ impl HttpCache {
     /// configured size cap.
     #[tracing::instrument(
         skip(self, body),
-        fields(url = crate::net_policy::url_for_tracing(url))
+        fields(url = %RedactedUrl::new(url))
     )]
     pub async fn post_json<T: Serialize + Sync + ?Sized>(
         &self,
@@ -1726,13 +1726,13 @@ impl HttpCache {
             .send()
             .await
             .map_err(|e| DepsError::RegistryError {
-                package: url.to_string(),
-                source: e.without_url(),
+                package: RedactedUrl::new(url),
+                source: e.into(),
             })?;
 
         if !response.status().is_success() {
             return Err(DepsError::HttpStatus {
-                url: url.to_string(),
+                url: RedactedUrl::new(url),
                 status: response.status().as_u16(),
             });
         }
@@ -1832,7 +1832,7 @@ impl HttpCache {
     /// actual ambiguity at the call sites themselves.
     #[tracing::instrument(
         skip(self, extra_headers, limit, client),
-        fields(url = crate::net_policy::url_for_tracing(url))
+        fields(url = %RedactedUrl::new(url))
     )]
     async fn transport_only_via(
         &self,
@@ -1850,13 +1850,13 @@ impl HttpCache {
         }
 
         let response = request.send().await.map_err(|e| DepsError::RegistryError {
-            package: url.to_string(),
-            source: e.without_url(),
+            package: RedactedUrl::new(url),
+            source: e.into(),
         })?;
 
         if !response.status().is_success() {
             return Err(DepsError::HttpStatus {
-                url: url.to_string(),
+                url: RedactedUrl::new(url),
                 status: response.status().as_u16(),
             });
         }
@@ -3114,12 +3114,14 @@ mod tests {
         );
     }
 
-    /// #767 S3: proves `.without_url()` actually strips the URL from the wrapped
-    /// `reqwest::Error`'s own `Display`, not just that `RegistryError::package` is
-    /// redacted — a genuine transport-level error (connection refused on a closed
-    /// loopback port, so `.url()` is populated the way a builder-only error like
-    /// `Client::get("not a url").build().unwrap_err()` never is) is required to exercise
-    /// this: reverting all 5 `.without_url()` call sites in this file must fail this test.
+    /// #767 S3 / #789: proves `SanitizedRegistryError`'s `From<reqwest::Error>` actually
+    /// strips the URL from the wrapped `reqwest::Error`'s own `Display`, not just that
+    /// `RegistryError::package` is redacted — a genuine transport-level error (connection
+    /// refused on a closed loopback port, so `.url()` is populated the way a builder-only
+    /// error like `Client::get("not a url").build().unwrap_err()` never is) is required to
+    /// exercise this: reverting any of the 5 `source: e.into()` call sites in this file back
+    /// to a bare `reqwest::Error` must fail to compile, and reverting
+    /// `SanitizedRegistryError::from`'s `.without_url()` call must fail this test.
     #[tokio::test]
     async fn test_registry_error_source_redacts_url_on_real_transport_error() {
         // Bind then immediately drop a loopback listener: nothing accepts connections on
@@ -3289,7 +3291,7 @@ mod tests {
     /// #756 round 2 S1 regression: the "conditional request failed, using cache" warn (fired
     /// on exactly this stale-while-revalidate path) must never interpolate the `DepsError`
     /// itself — `DepsError::HttpStatus`'s `Display` embeds the full, unredacted URL (including
-    /// the query string), which would defeat `url_for_tracing`'s redaction on this same span's
+    /// the query string), which would defeat `RedactedUrl`'s redaction on this same span's
     /// `url` field two lines above it. Reuses the mock/seeding shape of
     /// `test_get_cached_non_2xx_on_refresh_preserves_stale_cache` with a token-bearing query
     /// string, wrapped in a real tracing capture (an actual `warn!` event fires here, unlike
@@ -3833,7 +3835,9 @@ mod tests {
 
         let result: Result<Bytes> = cache.get_cached(&url).await;
         match result {
-            Err(DepsError::Offline { url: blocked }) => assert_eq!(blocked, url),
+            Err(DepsError::Offline { url: blocked }) => {
+                assert_eq!(blocked, RedactedUrl::new(&url));
+            }
             other => panic!("expected Offline, got {other:?}"),
         }
         mock.assert_async().await;

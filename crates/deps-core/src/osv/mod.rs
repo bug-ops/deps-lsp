@@ -364,7 +364,10 @@ impl OsvClient {
         truncated: &mut Vec<ScanTarget>,
     ) {
         let url = self.batch_url();
-        tracing::Span::current().record("url", crate::net_policy::url_for_tracing(&url));
+        tracing::Span::current().record(
+            "url",
+            tracing::field::display(crate::net_policy::RedactedUrl::new(&url)),
+        );
 
         let queries: Vec<OsvQuery> = chunk
             .iter()
@@ -596,7 +599,10 @@ impl OsvClient {
     #[tracing::instrument(skip(self), fields(url = tracing::field::Empty))]
     async fn fetch_single_record(&self, id: &str) -> Option<OsvVulnRecord> {
         let url = self.vuln_record_url(id);
-        tracing::Span::current().record("url", crate::net_policy::url_for_tracing(&url));
+        tracing::Span::current().record(
+            "url",
+            tracing::field::display(crate::net_policy::RedactedUrl::new(&url)),
+        );
         match self.cache.get_transport_only(&url).await {
             Ok(bytes) => match crate::parser::parse_json_checked::<OsvVulnRecord>(&bytes) {
                 Ok(record) => Some(record),
@@ -626,7 +632,10 @@ impl OsvClient {
         target: &ScanTarget,
     ) -> Option<OsvSingleQueryResponse> {
         let url = self.single_query_url();
-        tracing::Span::current().record("url", crate::net_policy::url_for_tracing(&url));
+        tracing::Span::current().record(
+            "url",
+            tracing::field::display(crate::net_policy::RedactedUrl::new(&url)),
+        );
 
         let body = OsvQuery {
             package: OsvPackage {
