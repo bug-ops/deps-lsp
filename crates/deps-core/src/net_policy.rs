@@ -659,6 +659,84 @@ pub fn url_for_tracing(raw: &str) -> String {
     without_userinfo[..end].to_string()
 }
 
+/// A URL-bearing value that has already been redacted for safe inclusion in error or log
+/// output — the structural chokepoint for outbound-URL redaction (issue #789).
+///
+/// Eagerly redacted at construction: [`Self::new`] applies [`url_for_tracing`]'s rules
+/// immediately and retains only the resulting text, so the raw value passed in is never
+/// stored, not even transiently. The only public read surface — [`Display`](std::fmt::Display),
+/// [`AsRef<str>`], and a [`Debug`](std::fmt::Debug) impl that forwards to the redacted text —
+/// is therefore always safe to log: there is no `expose_url()`-style escape hatch, because
+/// nothing raw remains to expose. A caller that legitimately needs the raw URL (e.g. to
+/// actually issue the HTTP request) keeps working with its own `String`/`reqwest::Url`,
+/// entirely independent of any `RedactedUrl` built from the same source for error/log
+/// purposes.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::net_policy::RedactedUrl;
+///
+/// let redacted = RedactedUrl::new("https://npm.internal/pkg?token=super-secret-value");
+/// assert_eq!(redacted.to_string(), "https://npm.internal/pkg");
+///
+/// let redacted = RedactedUrl::new("https://user:hunter2@registry.example/simple");
+/// assert_eq!(redacted.to_string(), "https://***@registry.example/simple");
+/// ```
+///
+/// `PartialEq`/`Eq`/`Hash` compare the *redacted* text, not the original input: two distinct
+/// URLs differing only by a stripped component (query string, fragment, or userinfo) compare
+/// equal here even though they were different requests — e.g. `?token=a` and `?token=b`
+/// against the same path both redact to the same value. This is intentional for this type's
+/// own purpose (deduplicating/comparing error variants in tests, `deps_core::error`'s own
+/// `assert_eq!` usage), but makes `RedactedUrl` unsuitable as a cache key or any other context
+/// that needs to distinguish the underlying raw URLs — use the raw `String`/`reqwest::Url`
+/// value for that instead.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct RedactedUrl(String);
+
+impl RedactedUrl {
+    /// Redacts `raw` immediately via [`url_for_tracing`], retaining only the resulting text.
+    #[must_use]
+    pub fn new(raw: &str) -> Self {
+        Self(url_for_tracing(raw))
+    }
+}
+
+impl From<&str> for RedactedUrl {
+    fn from(raw: &str) -> Self {
+        Self::new(raw)
+    }
+}
+
+impl From<String> for RedactedUrl {
+    fn from(raw: String) -> Self {
+        Self::new(&raw)
+    }
+}
+
+impl std::fmt::Display for RedactedUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::fmt::Debug for RedactedUrl {
+    /// Forwards to the redacted text's own `Debug` (a quoted string), not a struct-wrapper
+    /// rendering — so a `RedactedUrl` embedded in a hand-written `Debug` impl (see
+    /// `deps_core::error::DepsError`) reads identically to the plain `String` field it
+    /// replaces.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.0, f)
+    }
+}
+
+impl AsRef<str> for RedactedUrl {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
 /// Whether `url`'s host is loopback (`127.0.0.1`, `localhost`, or `::1`) with an `http`
 /// scheme — the shape every `mockito::Server` binds to.
 ///
@@ -746,7 +824,7 @@ pub fn validate_index_url(
         let class = classify_host(&url);
         if !policy.get().allows(class) {
             tracing::warn!(
-                url = url_for_tracing(raw_for_log),
+                url = %RedactedUrl::new(raw_for_log),
                 ?class,
                 ecosystem,
                 "workspace-declared registry index host blocked by registries.workspace_registries policy"
@@ -1138,6 +1216,52 @@ mod tests {
             assert_matches!(result, Err(IndexUrlError::BlockedHost { .. }));
         });
         assert!(!log.contains("super-secret-value"), "log: {log}");
+    }
+
+    /// FR-003: `RedactedUrl::new` must match `url_for_tracing`'s output byte-for-byte for
+    /// every input this module's own regression suite already pins.
+    #[test]
+    fn test_redacted_url_matches_url_for_tracing_byte_for_byte() {
+        let inputs = [
+            "https://npm.internal/pkg?token=super-secret-value",
+            "https://user:hunter2@registry.example/simple?token=x",
+            "https://registry.example/simple",
+            "not-a-url-at-all",
+            "@types/node",
+        ];
+        for raw in inputs {
+            assert_eq!(RedactedUrl::new(raw).to_string(), url_for_tracing(raw));
+        }
+    }
+
+    /// NFR-004: the only public read surface (`Display`/`AsRef<str>`) returns redacted text
+    /// only, for a known-sensitive input — there is no accessor that could return `raw`.
+    #[test]
+    fn test_redacted_url_display_and_as_ref_never_expose_raw_credential() {
+        let raw = "https://user:hunter2@registry.example/simple?token=super-secret-value";
+        let redacted = RedactedUrl::new(raw);
+        assert!(!redacted.to_string().contains("hunter2"));
+        assert!(!redacted.to_string().contains("super-secret-value"));
+        assert!(!redacted.as_ref().contains("hunter2"));
+        assert!(!redacted.as_ref().contains("super-secret-value"));
+        assert_eq!(redacted.to_string(), "https://***@registry.example/simple");
+    }
+
+    /// `Debug` forwards to the redacted text's own quoted-string rendering, not a
+    /// struct-wrapper form, and must never expose the raw credential either.
+    #[test]
+    fn test_redacted_url_debug_forwards_to_inner_string_and_redacts() {
+        let redacted = RedactedUrl::new("https://user:hunter2@registry.example/simple");
+        assert_eq!(
+            format!("{redacted:?}"),
+            "\"https://***@registry.example/simple\""
+        );
+    }
+
+    /// The scoped-package-name no-op (#767 M1) must hold through `RedactedUrl` too.
+    #[test]
+    fn test_redacted_url_noop_for_scoped_package_name() {
+        assert_eq!(RedactedUrl::new("@types/node").to_string(), "@types/node");
     }
 
     #[test]

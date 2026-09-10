@@ -1689,7 +1689,7 @@ mod tests {
                 calls.fetch_add(1, Ordering::SeqCst);
                 async {
                     Err(DepsError::HttpStatus {
-                        url: MAVEN_SEARCH_BASE.to_string(),
+                        url: MAVEN_SEARCH_BASE.into(),
                         status: 400,
                     })
                 }
@@ -1713,7 +1713,7 @@ mod tests {
                 async move {
                     if n == 0 {
                         Err(DepsError::HttpStatus {
-                            url: MAVEN_SEARCH_BASE.to_string(),
+                            url: MAVEN_SEARCH_BASE.into(),
                             status: 503,
                         })
                     } else {

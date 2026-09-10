@@ -2672,7 +2672,7 @@ mod tests {
             {
                 Box::pin(async move {
                     Err(deps_core::error::DepsError::HttpStatus {
-                        url: format!("https://example.com/{name}"),
+                        url: format!("https://example.com/{name}").into(),
                         status: 404,
                     })
                 })
@@ -2686,7 +2686,7 @@ mod tests {
             {
                 Box::pin(async move {
                     Err(deps_core::error::DepsError::HttpStatus {
-                        url: format!("https://example.com/{name}"),
+                        url: format!("https://example.com/{name}").into(),
                         status: 404,
                     })
                 })
