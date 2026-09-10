@@ -677,6 +677,8 @@ impl deps_core::Registry for CargoRegistry {
 mod tests {
     use super::*;
     use crate::config::IndexTrust;
+    use crate::ecosystem::CargoEcosystem;
+    use deps_core::Ecosystem;
     use deps_core::net_policy::RegistryAccessPolicy;
     use std::assert_matches;
     use std::collections::HashMap;
@@ -790,28 +792,36 @@ mod tests {
         let _cloned = registry;
     }
 
-    #[test]
-    fn test_select_latest_matching_not_default_none() {
-        use deps_core::{Registry, VersionReq};
-
-        let cache = Arc::new(HttpCache::new());
-        let registry = CratesIoRegistry::new(cache);
-        let versions: Vec<Box<dyn deps_core::Version>> = vec![
-            Box::new(CargoVersion {
-                num: "2.0.0".into(),
-                yanked: true,
-                features: HashMap::new(),
-                published_at: None,
-            }),
-            Box::new(CargoVersion {
-                num: "1.0.0".into(),
-                yanked: false,
-                features: HashMap::new(),
-                published_at: None,
-            }),
-        ];
-        let req = VersionReq::new("*");
-        assert_eq!(registry.select_latest_matching(&versions, &req), Some(1));
+    // #794 impl-critic S1: `build_arc:` against the real `Ecosystem::registry()` wiring, not
+    // `build:` against `CratesIoRegistry` directly — `CargoEcosystem::registry()` actually
+    // returns `Arc<CargoRegistry>` (a separate `Registry` impl that dispatches to
+    // `CratesIoRegistry` internally, see `registry.rs`'s `CargoRegistry` router), which has
+    // its own `select_latest_matching` override delegating to the same
+    // `select_latest_matching_impl`. A `build:` fixture on `CratesIoRegistry` alone would
+    // stay green even if `CargoRegistry`'s own override were deleted — exactly the failure
+    // mode #794 exists to close for the flagship ecosystem. Mirrors
+    // `deps-gradle/src/ecosystem.rs`'s identical `build_arc:` rationale.
+    deps_core::registry_conformance! {
+        mod cargo_registry_conformance;
+        build_arc: CargoEcosystem::new(Arc::new(HttpCache::new())).registry();
+        select_latest_matching: {
+            versions: vec![
+                Box::new(CargoVersion {
+                    num: "2.0.0".into(),
+                    yanked: true,
+                    features: HashMap::new(),
+                    published_at: None,
+                }),
+                Box::new(CargoVersion {
+                    num: "1.0.0".into(),
+                    yanked: false,
+                    features: HashMap::new(),
+                    published_at: None,
+                }),
+            ];
+            req: "*";
+            expected_index: 1;
+        };
     }
 
     #[test]

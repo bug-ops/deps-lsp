@@ -478,6 +478,38 @@ mod tests {
         no_lockfile_support: true;
     }
 
+    // #794: `complete_package_names_for_field` (defined above in `impl MavenEcosystem`)
+    // guards on the exact same `is_valid_completion_prefix_len` predicate
+    // `complete_package_names_generic` uses internally, before calling
+    // `registry.search_typed` — this proves that shared guard predicate behaves correctly,
+    // mirroring every other ecosystem's `completion_guard_conformance!` invocation (see
+    // that macro's doc for why the substitute closure calls `complete_package_names_generic`
+    // directly rather than through Maven's own field-completion wiring).
+    //
+    // Wiring the substitute closure through the real `complete_package_names_for_field`
+    // instead (#794 impl-critic minor) is not feasible without a production change: that
+    // method is `&self`-based over `self.registry: Arc<MavenCentralRegistry>` (a concrete
+    // type, calling its inherent `search_typed`, not the `Registry` trait's `search`), while
+    // this macro's `complete:` closure only ever receives a substituted `&dyn Registry` — the
+    // fixture registry can't be threaded into `self.registry`'s concrete type without
+    // widening that field to `Arc<dyn Registry>`, out of scope for this test-only change.
+    deps_core::completion_guard_conformance! {
+        mod maven_completion_guard_conformance;
+        complete: |registry: &dyn deps_core::Registry, prefix: String| -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Vec<CompletionItem>> + Send + '_>,
+        > {
+            Box::pin(async move {
+                deps_core::completion::complete_package_names_generic(
+                    registry,
+                    &prefix,
+                    20,
+                    tower_lsp_server::ls_types::Range::default(),
+                )
+                .await
+            })
+        };
+    }
+
     struct NoopParseResult;
     impl deps_core::ParseResult for NoopParseResult {
         fn dependencies(&self) -> Vec<&dyn deps_core::Dependency> {

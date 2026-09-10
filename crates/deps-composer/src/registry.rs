@@ -1327,37 +1327,44 @@ mod tests {
         assert!(parse_package_metadata("monolog/monolog", deeply_nested.as_bytes()).is_err());
     }
 
-    #[test]
-    fn test_select_latest_matching_not_default_none() {
-        // Regression for #347's mixed case: the newest version is abandoned, an older
-        // version is clean. Composer has no npm-style ranking preference for a
-        // non-abandoned version over a newer abandoned one (unlike deps-npm's #338
-        // NFR-002) — `abandoned` is advisory, not a hard removal from resolution, so
-        // the newest version resolves as latest regardless of its abandoned flag.
-        use deps_core::{Registry, VersionReq};
-
-        let cache = Arc::new(HttpCache::new());
-        let registry = PackagistRegistry::new(cache);
-        let versions: Vec<Box<dyn deps_core::Version>> = vec![
-            Box::new(ComposerVersion {
-                version: "2.0.0".into(),
-                version_normalized: "2.0.0.0".into(),
-                abandoned: true,
-                deprecation: None,
-                published_at: None,
-                license: vec![],
-            }),
-            Box::new(ComposerVersion {
-                version: "1.0.0".into(),
-                version_normalized: "1.0.0.0".into(),
-                abandoned: false,
-                deprecation: None,
-                published_at: None,
-                license: vec![],
-            }),
-        ];
-        let req = VersionReq::new("*");
-        assert_eq!(registry.select_latest_matching(&versions, &req), Some(0));
+    // Regression for #347's mixed case: the newest version is abandoned, an older
+    // version is clean. Composer has no npm-style ranking preference for a
+    // non-abandoned version over a newer abandoned one (unlike deps-npm's #338
+    // NFR-002) — `abandoned` is advisory, not a hard removal from resolution, so
+    // the newest version resolves as latest regardless of its abandoned flag.
+    //
+    // #794 impl-critic minor: `expected_index: 0` here is not swapped to a non-zero
+    // index like `deps-maven`'s equivalent fixture was, because `versions` must stay
+    // newest-first (the real `get_versions` contract this ladder trusts, see
+    // `select_latest_for_existence_composer`'s `.unwrap_or(0)` fallback) — reordering it
+    // so the abandoned version isn't at index 0 would stop reproducing #347 (whose whole
+    // point is "the newest, which is abandoned, must still win") and become an artificial
+    // scenario rather than a real one.
+    deps_core::registry_conformance! {
+        mod composer_registry_conformance;
+        build: PackagistRegistry::new(Arc::new(HttpCache::new()));
+        select_latest_matching: {
+            versions: vec![
+                Box::new(ComposerVersion {
+                    version: "2.0.0".into(),
+                    version_normalized: "2.0.0.0".into(),
+                    abandoned: true,
+                    deprecation: None,
+                    published_at: None,
+                    license: vec![],
+                }),
+                Box::new(ComposerVersion {
+                    version: "1.0.0".into(),
+                    version_normalized: "1.0.0.0".into(),
+                    abandoned: false,
+                    deprecation: None,
+                    published_at: None,
+                    license: vec![],
+                }),
+            ];
+            req: "*";
+            expected_index: 0;
+        };
     }
 
     #[test]

@@ -1920,16 +1920,14 @@ mod tests {
         assert_eq!(registry.service_index_url, NUGET_ORG_INDEX_URL);
     }
 
-    #[test]
-    fn test_select_latest_matching_not_default_none() {
-        use deps_core::{Registry, VersionReq};
-
-        let cache = Arc::new(HttpCache::new());
-        let registry = NuGetRegistry::new(cache);
-        let versions: Vec<Box<dyn deps_core::Version>> =
-            vec![Box::new(v("1.1.0-rc.1")), Box::new(v("1.0.0"))];
-        let req = VersionReq::new("*");
-        assert_eq!(registry.select_latest_matching(&versions, &req), Some(1));
+    deps_core::registry_conformance! {
+        mod nuget_registry_conformance;
+        build: NuGetRegistry::new(Arc::new(HttpCache::new()));
+        select_latest_matching: {
+            versions: vec![Box::new(v("1.1.0-rc.1")), Box::new(v("1.0.0"))];
+            req: "*";
+            expected_index: 1;
+        };
     }
 
     /// Regression for #423: the trait impl's `select_latest_matching` must rescue a

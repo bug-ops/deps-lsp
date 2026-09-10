@@ -1743,28 +1743,32 @@ mod tests {
         assert!(registry.as_any().is::<MavenCentralRegistry>());
     }
 
-    #[test]
-    fn test_select_latest_matching_not_default_none() {
-        use deps_core::{Registry, VersionReq};
-
-        // `select_latest_matching`'s contract is "index 0 of a `get_versions`-shaped list
-        // is latest" — `get_versions_typed` is what puts the right entry at index 0 (via
-        // `move_release_to_front`), not `select_latest_matching` itself, so this fixture
-        // reflects an already-correctly-ordered list rather than an unordered one.
-        let cache = Arc::new(HttpCache::new());
-        let registry = MavenCentralRegistry::new(cache);
-        let versions: Vec<Box<dyn deps_core::Version>> = vec![
-            Box::new(MavenVersion {
-                version: "1.0.0".into(),
-                published_at: None,
-            }),
-            Box::new(MavenVersion {
-                version: "2.0.0-SNAPSHOT".into(),
-                published_at: None,
-            }),
-        ];
-        let req = VersionReq::new("*");
-        assert_eq!(registry.select_latest_matching(&versions, &req), Some(0));
+    // `select_latest_matching`'s contract is "index 0 of a `get_versions`-shaped list
+    // is latest" — `get_versions_typed` is what puts the right entry at index 0 (via
+    // `move_release_to_front`), not `select_latest_matching` itself. #794 impl-critic
+    // minor: index 0 here is the front-loaded `<release>` *prerelease* (the #340 shape —
+    // `<release>` names the most recently deployed artifact, not necessarily the newest
+    // stable one), so a genuine scan past it to the stable entry at index 1 is required;
+    // an override that vacuously returned `Some(0)` regardless of input would fail this
+    // (unlike an all-stable fixture, where such a stub is indistinguishable from the real
+    // logic).
+    deps_core::registry_conformance! {
+        mod maven_registry_conformance;
+        build: MavenCentralRegistry::new(Arc::new(HttpCache::new()));
+        select_latest_matching: {
+            versions: vec![
+                Box::new(MavenVersion {
+                    version: "2.0.0-SNAPSHOT".into(),
+                    published_at: None,
+                }),
+                Box::new(MavenVersion {
+                    version: "1.0.0".into(),
+                    published_at: None,
+                }),
+            ];
+            req: "*";
+            expected_index: 1;
+        };
     }
 
     #[test]
