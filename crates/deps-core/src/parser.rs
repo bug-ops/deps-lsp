@@ -1685,14 +1685,26 @@ dev_dependencies:
 
     #[test]
     fn test_check_yaml_expansion_at_production_boundary() {
-        // N=14 (16,907,046 bytes charged) stays under the byte budget,
-        // N=15 (33,815,273 bytes) crosses it — empirically verified against
-        // the real `MAX_YAML_EXPANDED_BYTES`, not assumed.
+        // The doubling chain's charged bytes at level N are a function of
+        // `YAML_NODE_OVERHEAD_BYTES` (`size_of::<yaml_rust2::Yaml>()`), which
+        // is platform-dependent (narrower `Vec`/`String`/`BTreeMap` fields on
+        // a 32-bit target shrink `Yaml` itself), so the level that crosses
+        // `MAX_YAML_EXPANDED_BYTES` shifts by platform. Find the real
+        // boundary empirically on whatever target this runs on, instead of
+        // hardcoding a 64-bit-specific N, so the exact-edge property this
+        // test checks — the guard trips right at the budget, not with a huge
+        // slack margin in either direction — holds on every target.
+        let boundary = (1..=25)
+            .find(|&n| check_yaml_expansion(&doubling_chain(n), MAX_YAML_EXPANDED_BYTES).is_err())
+            .expect("doubling chain must cross MAX_YAML_EXPANDED_BYTES well within 25 levels");
+
         assert_eq!(
-            check_yaml_expansion(&doubling_chain(14), MAX_YAML_EXPANDED_BYTES),
-            Ok(())
+            check_yaml_expansion(&doubling_chain(boundary - 1), MAX_YAML_EXPANDED_BYTES),
+            Ok(()),
+            "level {} (just before the boundary) should stay under budget",
+            boundary - 1
         );
-        assert!(check_yaml_expansion(&doubling_chain(15), MAX_YAML_EXPANDED_BYTES).is_err());
+        assert!(check_yaml_expansion(&doubling_chain(boundary), MAX_YAML_EXPANDED_BYTES).is_err());
     }
 
     #[test]
