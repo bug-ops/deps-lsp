@@ -60,12 +60,10 @@ pub struct NpmDependency {
     pub package: Option<deps_core::PackageName>,
 }
 
-// Implemented by hand rather than via `deps_core::impl_dependency!`: the macro's `source:
-// $source:expr` arm substitutes the expression into a generated `fn source(&self)` body, but
-// macro hygiene ties a `self` token written at the call site to the call site's own scope
-// (module-level, not a method), not to the generated function's `&self` parameter — so
-// `self.source.clone()` cannot be passed through the macro at all. Mirrors `deps-cargo`'s
-// identical direct `impl deps_core::Dependency for CargoDependency`.
+// Implemented by hand rather than via `deps_core::impl_dependency!`: `name()` resolves to
+// `package.as_ref().unwrap_or(&self.name)` (the `npm:` alias, falling back to the JSON key),
+// not a bare field — the macro only supports a direct field access for `name`. Mirrors
+// `deps-cargo`'s identical direct `impl deps_core::Dependency for CargoDependency`.
 impl deps_core::Dependency for NpmDependency {
     /// Returns the registry lookup name: [`Self::package`] when this dependency was
     /// aliased via an `npm:` value, otherwise the JSON key.

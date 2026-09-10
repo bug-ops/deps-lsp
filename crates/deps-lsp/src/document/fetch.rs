@@ -6,7 +6,7 @@ use super::diff::{
     drop_cache_for_forced_refetch, merge_deprecations_after_fetch,
     merge_no_comparable_versions_after_fetch,
 };
-use super::resolved::{RefetchPolicy, collect_in_use_versions, resolve_ecosystem_id};
+use super::resolved::{RefetchPolicy, collect_in_use_versions};
 use super::state::ServerState;
 use crate::progress::{ProgressSender, RegistryProgress};
 use deps_core::ConcreteVersion;
@@ -818,7 +818,7 @@ pub(crate) async fn fetch_registry_versions_for_change(
                         resolved_versions,
                         resolved_version_candidates,
                         ecosystem.formatter(),
-                        resolve_ecosystem_id(ecosystem),
+                        ecosystem.ecosystem_id(),
                     ),
                     composer_minimum_stability(pr),
                     dep_sources,

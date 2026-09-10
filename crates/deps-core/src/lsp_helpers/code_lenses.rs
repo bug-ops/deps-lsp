@@ -1138,8 +1138,8 @@ mod tests {
             struct DefaultEcosystem;
             impl crate::ecosystem::private::Sealed for DefaultEcosystem {}
             impl crate::Ecosystem for DefaultEcosystem {
-                fn id(&self) -> &'static str {
-                    "default"
+                fn ecosystem_id(&self) -> crate::EcosystemId {
+                    crate::EcosystemId::Cargo
                 }
                 fn display_name(&self) -> &'static str {
                     "Default"

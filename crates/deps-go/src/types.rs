@@ -132,38 +132,13 @@ impl GoMetadata {
     }
 }
 
-// NOTE: Cannot use deps_core::impl_dependency! macro because we need to provide custom
-// features() implementation (Go modules don't have features like Cargo).
-// The macro would provide features() but we need to override it anyway.
-impl deps_core::ecosystem::Dependency for GoDependency {
-    fn name(&self) -> &deps_core::PackageName {
-        &self.module_path
-    }
-
-    fn name_range(&self) -> Range {
-        self.module_path_range
-    }
-
-    fn version_requirement(&self) -> Option<&deps_core::VersionReq> {
-        self.version.as_ref()
-    }
-
-    fn version_range(&self) -> Option<Range> {
-        self.version_range
-    }
-
-    fn source(&self) -> DependencySource {
-        self.source.clone()
-    }
-
-    fn features(&self) -> &[String] {
-        &[]
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
+deps_core::impl_dependency!(GoDependency {
+    name: module_path,
+    name_range: module_path_range,
+    version: version,
+    version_range: version_range,
+    source: source,
+});
 
 // NOTE: Cannot use impl_version! macro because GoVersion has custom is_prerelease() logic.
 // Go considers pseudo-versions as pre-releases, and has special handling for +incompatible suffix.

@@ -2,7 +2,6 @@
 //! phase A/B execution, license pre-fetch, and fix-target
 //! verification.
 
-use super::resolved::resolve_ecosystem_id;
 use super::state::ServerState;
 use deps_core::ConcreteVersion;
 use deps_core::Ecosystem;
@@ -193,7 +192,7 @@ pub(crate) async fn run_osv_scan_phase_a(
     ecosystem: Arc<dyn Ecosystem>,
     fetch_timeout_secs: u64,
 ) -> Option<OsvScanResult> {
-    let ecosystem_id = resolve_ecosystem_id(ecosystem.as_ref());
+    let ecosystem_id = ecosystem.ecosystem_id();
 
     let (content_snapshot, targets, mut vulnerabilities, raw_name_by_key) = {
         let doc = state.get_document(&uri)?;
@@ -313,7 +312,7 @@ pub(crate) async fn run_license_prefetch(
     ecosystem: Arc<dyn Ecosystem>,
     fetch_timeout_secs: u64,
 ) {
-    let ecosystem_id = resolve_ecosystem_id(ecosystem.as_ref());
+    let ecosystem_id = ecosystem.ecosystem_id();
     if !ecosystem.license_source().requires_dedicated_fetch() {
         return;
     }

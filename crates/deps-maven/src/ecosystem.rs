@@ -233,8 +233,8 @@ impl MavenEcosystem {
 impl deps_core::ecosystem::private::Sealed for MavenEcosystem {}
 
 impl Ecosystem for MavenEcosystem {
-    fn id(&self) -> &'static str {
-        "maven"
+    fn ecosystem_id(&self) -> deps_core::EcosystemId {
+        deps_core::EcosystemId::Maven
     }
 
     fn display_name(&self) -> &'static str {

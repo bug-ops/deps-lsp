@@ -568,7 +568,8 @@ The codebase uses a trait-based architecture with the `Ecosystem` trait providin
 ```rust
 // Each ecosystem implements the Ecosystem trait
 pub trait Ecosystem: Send + Sync {
-    fn id(&self) -> &'static str;
+    fn ecosystem_id(&self) -> EcosystemId;
+    fn id(&self) -> &'static str { self.ecosystem_id().id() } // derived by default
     fn display_name(&self) -> &'static str;
     fn matches_uri(&self, uri: &Uri) -> bool;
     fn registry(&self) -> Arc<dyn Registry>;

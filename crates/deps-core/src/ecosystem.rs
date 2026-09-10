@@ -609,7 +609,7 @@ impl LicenseSource {
 /// impl deps_core::ecosystem::private::Sealed for MyEcosystem {}
 ///
 /// impl Ecosystem for MyEcosystem {
-///     fn id(&self) -> &'static str { "my-ecosystem" }
+///     fn ecosystem_id(&self) -> deps_core::EcosystemId { deps_core::EcosystemId::Cargo }
 ///     fn display_name(&self) -> &'static str { "My Ecosystem" }
 ///     fn manifest_filenames(&self) -> &[&'static str] { &["my-manifest.toml"] }
 ///
@@ -643,10 +643,26 @@ impl LicenseSource {
 /// }
 /// ```
 pub trait Ecosystem: Send + Sync + private::Sealed {
+    /// Exhaustively typed ecosystem identity.
+    ///
+    /// Every implementor lives in this sealed trait's own workspace, so the enum is
+    /// authoritative for identity and [`Self::id`] is derived from it rather than
+    /// independently authored — a typo or rename here is a compile error instead of a
+    /// runtime mismatch between [`EcosystemId::ALL`] and this ecosystem's registration.
+    fn ecosystem_id(&self) -> EcosystemId;
+
     /// Unique identifier (e.g., "cargo", "npm", "pypi")
     ///
-    /// This identifier is used for ecosystem registration and routing.
-    fn id(&self) -> &'static str;
+    /// This identifier is used for ecosystem registration and routing. The default
+    /// implementation derives it from [`Self::ecosystem_id`], so an implementor that leaves
+    /// `id()` at its default can no longer author a mismatched string independently — but
+    /// `id()` remains a provided (overridable) method, so this guarantee holds only for that
+    /// default, not for an implementor that overrides `id()` directly (as some test doubles
+    /// deliberately do). Code needing the two to agree should verify it explicitly, e.g. via
+    /// [`crate::conformance::assert_ecosystem_id`].
+    fn id(&self) -> &'static str {
+        self.ecosystem_id().id()
+    }
 
     /// Human-readable name (e.g., "Cargo (Rust)", "npm (JavaScript)")
     ///
@@ -1343,6 +1359,10 @@ mod tests {
     impl Ecosystem for StubEcosystem {
         fn id(&self) -> &'static str {
             "stub"
+        }
+
+        fn ecosystem_id(&self) -> EcosystemId {
+            EcosystemId::Cargo
         }
 
         fn display_name(&self) -> &'static str {

@@ -748,7 +748,10 @@ fn discover_workspace(doc_uri: &Uri) -> Result<WorkspaceDiscovery> {
 /// Parser for Cargo.toml manifests implementing the deps-core traits.
 pub struct CargoParser;
 
-// Implement new ParseResult trait for trait object support
+// Implemented by hand rather than via `deps_core::impl_parse_result!`: `blocked_registries()`
+// is overridden with real data (`self.blocked_registries.clone()`) — per
+// `deps_core::ParseResult::blocked_registries`'s own doc, `deps-cargo` is the only ecosystem
+// that overrides this today, so the macro has no field for it.
 impl deps_core::ParseResult for CargoParseResult {
     fn dependencies(&self) -> Vec<&dyn deps_core::Dependency> {
         self.dependencies

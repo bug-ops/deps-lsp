@@ -141,8 +141,8 @@ impl SwiftEcosystem {
 impl deps_core::ecosystem::private::Sealed for SwiftEcosystem {}
 
 impl Ecosystem for SwiftEcosystem {
-    fn id(&self) -> &'static str {
-        "swift"
+    fn ecosystem_id(&self) -> deps_core::EcosystemId {
+        deps_core::EcosystemId::Swift
     }
 
     fn display_name(&self) -> &'static str {

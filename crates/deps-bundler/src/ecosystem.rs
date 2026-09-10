@@ -65,8 +65,8 @@ impl BundlerEcosystem {
 impl deps_core::ecosystem::private::Sealed for BundlerEcosystem {}
 
 impl Ecosystem for BundlerEcosystem {
-    fn id(&self) -> &'static str {
-        "bundler"
+    fn ecosystem_id(&self) -> deps_core::EcosystemId {
+        deps_core::EcosystemId::Bundler
     }
 
     fn display_name(&self) -> &'static str {

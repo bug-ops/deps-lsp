@@ -98,8 +98,8 @@ impl DenoEcosystem {
 impl deps_core::ecosystem::private::Sealed for DenoEcosystem {}
 
 impl Ecosystem for DenoEcosystem {
-    fn id(&self) -> &'static str {
-        "deno"
+    fn ecosystem_id(&self) -> deps_core::EcosystemId {
+        deps_core::EcosystemId::Deno
     }
 
     fn display_name(&self) -> &'static str {

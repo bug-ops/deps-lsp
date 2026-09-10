@@ -11,7 +11,6 @@ pub mod settings;
 use crate::types::GradleDependency;
 use deps_core::Result;
 use regex::Captures;
-use std::any::Any;
 use std::collections::HashMap;
 use tower_lsp_server::ls_types::{Position, Range, Uri};
 
@@ -206,26 +205,13 @@ pub fn parse_gradle(content: &str, uri: &Uri) -> Result<GradleParseResult> {
     Ok(result)
 }
 
-impl deps_core::ParseResult for GradleParseResult {
-    fn dependencies(&self) -> Vec<&dyn deps_core::Dependency> {
-        self.dependencies
-            .iter()
-            .map(|d| d as &dyn deps_core::Dependency)
-            .collect()
+deps_core::impl_parse_result!(
+    GradleParseResult,
+    GradleDependency {
+        dependencies: dependencies,
+        uri: uri,
     }
-
-    fn workspace_root(&self) -> Option<&std::path::Path> {
-        None
-    }
-
-    fn uri(&self) -> &Uri {
-        &self.uri
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
+);
 
 /// Returns the number of UTF-16 code units in `s`.
 pub(crate) fn utf16_len(s: &str) -> usize {

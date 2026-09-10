@@ -215,8 +215,8 @@ impl CargoEcosystem {
 impl deps_core::ecosystem::private::Sealed for CargoEcosystem {}
 
 impl Ecosystem for CargoEcosystem {
-    fn id(&self) -> &'static str {
-        "cargo"
+    fn ecosystem_id(&self) -> deps_core::EcosystemId {
+        deps_core::EcosystemId::Cargo
     }
 
     fn display_name(&self) -> &'static str {

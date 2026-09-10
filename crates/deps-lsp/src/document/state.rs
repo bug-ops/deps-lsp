@@ -2191,8 +2191,9 @@ mod tests {
 
     /// Same regression as above, but through `new_from_parse_result` with a real
     /// `ParseResult` for one of the previously-misclassified ecosystems (maven).
-    /// Parses `"maven"` explicitly first, mirroring the parse-then-construct
-    /// sequence `document::resolved::resolve_ecosystem_id` performs in production.
+    /// Parses `"maven"` explicitly first, mirroring the string-based lookup
+    /// `ServerState::ecosystem_registry` performs before `Ecosystem::ecosystem_id`
+    /// resolves the typed identity in production.
     #[cfg(feature = "maven")]
     #[test]
     fn test_document_state_new_from_parse_result_maven_not_misclassified_as_cargo() {

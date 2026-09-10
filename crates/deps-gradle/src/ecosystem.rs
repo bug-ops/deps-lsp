@@ -301,8 +301,8 @@ fn detect_dsl_context<'a>(
 impl deps_core::ecosystem::private::Sealed for GradleEcosystem {}
 
 impl Ecosystem for GradleEcosystem {
-    fn id(&self) -> &'static str {
-        "gradle"
+    fn ecosystem_id(&self) -> deps_core::EcosystemId {
+        deps_core::EcosystemId::Gradle
     }
 
     fn display_name(&self) -> &'static str {

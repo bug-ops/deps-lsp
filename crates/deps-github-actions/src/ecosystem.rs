@@ -82,8 +82,8 @@ impl GithubActionsEcosystem {
 impl deps_core::ecosystem::private::Sealed for GithubActionsEcosystem {}
 
 impl Ecosystem for GithubActionsEcosystem {
-    fn id(&self) -> &'static str {
-        "github-actions"
+    fn ecosystem_id(&self) -> deps_core::EcosystemId {
+        deps_core::EcosystemId::GithubActions
     }
 
     fn display_name(&self) -> &'static str {

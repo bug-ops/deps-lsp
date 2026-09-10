@@ -561,32 +561,6 @@ mod tests {
         );
     }
 
-    /// Regression guard for issue #118: `EcosystemId`'s string literals (`deps-core`)
-    /// are hand-duplicated from each ecosystem crate's own `Ecosystem::id()`, with
-    /// nothing linking them at compile time. This proves every id actually registered
-    /// by `register_ecosystems` round-trips through `EcosystemId::from_str`/`id()` — so a
-    /// future rename fails this test instead of panicking at document-open time (see the
-    /// `.expect()` in `document::resolved::resolve_ecosystem_id`).
-    ///
-    /// The reverse direction — every `EcosystemId` variant resolves back to a registered
-    /// ecosystem — moved to [`test_ecosystem_id_all_registered`] (#758): driven by
-    /// [`deps_core::EcosystemId::ALL`] instead of this hand-written, drift-prone 14-line list,
-    /// so an ecosystem declared in the enum but never wired into `register_ecosystems` fails
-    /// closed rather than silently passing an empty loop here.
-    #[test]
-    fn test_ecosystem_id_matches_registered_ecosystems() {
-        let registry = Arc::new(EcosystemRegistry::new());
-        let cache = Arc::new(HttpCache::new());
-        register_ecosystems(&registry, Arc::clone(&cache), &test_runtime());
-
-        for id in registry.ecosystem_ids() {
-            let parsed: deps_core::EcosystemId = id.parse().unwrap_or_else(|_| {
-                panic!("registered ecosystem id {id:?} has no matching EcosystemId variant")
-            });
-            assert_eq!(parsed.id(), id);
-        }
-    }
-
     /// Layer 1a (#758): completeness — every [`deps_core::EcosystemId::ALL`] variant must
     /// actually be registered by [`register_ecosystems`]. Driven by `ALL` itself, not
     /// `registry.ecosystem_ids()`, so an ecosystem declared in the enum but never wired in

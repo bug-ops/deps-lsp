@@ -10,7 +10,6 @@ use deps_core::json_ast::{JsonAst, JsonSection};
 use deps_core::json_helpers::string_valued_entries;
 use deps_core::lsp_helpers::LineOffsetTable;
 use serde_json::Value;
-use std::any::Any;
 use tower_lsp_server::ls_types::Uri;
 
 /// Result of parsing a composer.json file.
@@ -35,26 +34,13 @@ pub struct ComposerParseResult {
     pub minimum_stability: Option<String>,
 }
 
-impl deps_core::ParseResult for ComposerParseResult {
-    fn dependencies(&self) -> Vec<&dyn deps_core::Dependency> {
-        self.dependencies
-            .iter()
-            .map(|d| d as &dyn deps_core::Dependency)
-            .collect()
+deps_core::impl_parse_result!(
+    ComposerParseResult,
+    ComposerDependency {
+        dependencies: dependencies,
+        uri: uri,
     }
-
-    fn workspace_root(&self) -> Option<&std::path::Path> {
-        None
-    }
-
-    fn uri(&self) -> &Uri {
-        &self.uri
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
+);
 
 /// Returns true if the package is a platform requirement (not a Packagist package).
 ///

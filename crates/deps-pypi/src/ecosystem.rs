@@ -191,8 +191,8 @@ impl PypiEcosystem {
 impl deps_core::ecosystem::private::Sealed for PypiEcosystem {}
 
 impl Ecosystem for PypiEcosystem {
-    fn id(&self) -> &'static str {
-        "pypi"
+    fn ecosystem_id(&self) -> deps_core::EcosystemId {
+        deps_core::EcosystemId::Pypi
     }
 
     fn display_name(&self) -> &'static str {

@@ -49,7 +49,7 @@ pub struct MyEcosystem {
 }
 
 impl Ecosystem for MyEcosystem {
-    fn id(&self) -> &'static str { "my-ecosystem" }
+    fn ecosystem_id(&self) -> deps_core::EcosystemId { deps_core::EcosystemId::Cargo }
     fn display_name(&self) -> &'static str { "My Ecosystem" }
 
     fn matches_uri(&self, uri: &Uri) -> bool {

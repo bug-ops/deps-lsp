@@ -57,8 +57,8 @@ impl DartEcosystem {
 impl deps_core::ecosystem::private::Sealed for DartEcosystem {}
 
 impl Ecosystem for DartEcosystem {
-    fn id(&self) -> &'static str {
-        "dart"
+    fn ecosystem_id(&self) -> deps_core::EcosystemId {
+        deps_core::EcosystemId::Dart
     }
 
     fn display_name(&self) -> &'static str {

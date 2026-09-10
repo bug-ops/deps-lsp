@@ -152,35 +152,14 @@ pub struct GitlabCiDependency {
     pub project_path: String,
 }
 
-impl deps_core::ecosystem::Dependency for GitlabCiDependency {
-    fn name(&self) -> &deps_core::PackageName {
-        &self.name
-    }
-
-    fn name_range(&self) -> Range {
-        self.name_range
-    }
-
-    fn version_requirement(&self) -> Option<&deps_core::VersionReq> {
-        self.version_req.as_ref()
-    }
-
-    fn version_range(&self) -> Option<Range> {
-        self.version_range
-    }
-
-    fn source(&self) -> DependencySource {
-        self.source.clone()
-    }
-
-    fn version_literal(&self) -> Option<&str> {
-        self.version_literal.as_deref()
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-}
+deps_core::impl_dependency!(GitlabCiDependency {
+    name: name,
+    name_range: name_range,
+    version: version_req,
+    version_range: version_range,
+    source: source,
+    version_literal: version_literal,
+});
 
 /// Version information for a GitLab CI dependency: a repository tag (`project:`) or a
 /// project release (`component:`).
@@ -263,26 +242,13 @@ pub struct GitlabCiParseResult {
     pub uri: Uri,
 }
 
-impl deps_core::ParseResult for GitlabCiParseResult {
-    fn dependencies(&self) -> Vec<&dyn deps_core::Dependency> {
-        self.dependencies
-            .iter()
-            .map(|d| d as &dyn deps_core::Dependency)
-            .collect()
+deps_core::impl_parse_result!(
+    GitlabCiParseResult,
+    GitlabCiDependency {
+        dependencies: dependencies,
+        uri: uri,
     }
-
-    fn workspace_root(&self) -> Option<&std::path::Path> {
-        None
-    }
-
-    fn uri(&self) -> &Uri {
-        &self.uri
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-}
+);
 
 #[cfg(test)]
 mod tests {
