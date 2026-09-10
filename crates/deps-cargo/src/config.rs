@@ -41,7 +41,7 @@ use std::sync::Arc;
 use toml_span::value::Table;
 
 use deps_core::net_policy::{
-    HostClass, PolicyGate, RegistryAccessPolicy, redact_userinfo, validate_index_url,
+    HostClass, PolicyGate, RegistryAccessPolicy, url_for_tracing, validate_index_url,
 };
 use deps_core::{DEFAULT_MAX_CACHED_FILES, MtimeFileCache};
 
@@ -752,9 +752,10 @@ fn resolve_registries(
             let names: Vec<&str> = aliases.iter().map(|s| s.as_str()).collect();
             // Same as `resolve_alternate_registries`' unresolved-alias WARN (#536): `alias`
             // here is a raw manifest `registry-index`/`registry` value, not a config-file
-            // alias name, so it may itself carry `user:pass@` userinfo — redact each entry
-            // before logging.
-            let redacted: Vec<String> = names.iter().map(|name| redact_userinfo(name)).collect();
+            // alias name, so it may itself carry `user:pass@` userinfo or a query-string
+            // credential — redact each entry before logging (`url_for_tracing`, not
+            // `redact_userinfo` alone, which preserves the query string — #767 follow-up).
+            let redacted: Vec<String> = names.iter().map(|name| url_for_tracing(name)).collect();
             tracing::warn!(
                 aliases = ?redacted,
                 "two aliases derive the same CARGO_REGISTRIES_*_INDEX/_TOKEN environment \

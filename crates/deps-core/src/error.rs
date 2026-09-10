@@ -1,15 +1,55 @@
 use thiserror::Error;
 
+use crate::net_policy::url_for_tracing;
+
 /// Reconstructs the "{status} {reason}" text `reqwest::StatusCode`'s `Display`
 /// produces, since `HttpStatus` stores a bare `u16` for structural matching
 /// and loses the canonical reason phrase otherwise.
+///
+/// `url` is passed through [`url_for_tracing`] before interpolation — this is the only
+/// place `HttpStatus`'s `Display` text is built, so it is the single point that must
+/// redact the query string/fragment/userinfo a workspace-declared registry URL can carry
+/// (see #767).
 fn http_status_message(status: u16, url: &str) -> String {
+    let url = url_for_tracing(url);
     let reason = reqwest::StatusCode::from_u16(status)
         .ok()
         .and_then(|s| s.canonical_reason());
     reason.map_or_else(
         || format!("HTTP {status} for {url}"),
         |reason| format!("HTTP {status} {reason} for {url}"),
+    )
+}
+
+/// Builds [`DepsError::RegistryError`]'s `Display` text with `package` redacted via
+/// [`url_for_tracing`] (#767).
+///
+/// [`DepsError::RegistryError`]'s `package` field is documented as a package name, but
+/// several `deps-core::cache` call sites populate it with a URL instead, so it must still be
+/// redacted. [`url_for_tracing`] is a no-op for an actual package name (including an
+/// npm-scoped one like `@types/node`, which an earlier revision of this function mangled into
+/// `***@types/node` before [`crate::net_policy::redact_userinfo`]'s empty-userinfo false
+/// positive was fixed at the root — #767 M1/code-review follow-up).
+fn registry_error_message(package: &str, source: &reqwest::Error) -> String {
+    format!(
+        "registry request failed for {}: {source}",
+        url_for_tracing(package)
+    )
+}
+
+/// Redacts `url` for [`DepsError::ResponseTooLarge`]'s `Display` text (#767).
+fn response_too_large_message(url: &str, limit: usize) -> String {
+    format!(
+        "response body for {} exceeds {limit} byte limit",
+        url_for_tracing(url)
+    )
+}
+
+/// Redacts `url` for [`DepsError::Offline`]'s `Display` text (#767).
+fn offline_message(url: &str) -> String {
+    format!(
+        "offline: request to {} was blocked by network.offline",
+        url_for_tracing(url)
     )
 }
 
@@ -38,7 +78,7 @@ fn http_status_message(status: u16, url: &str) -> String {
 /// }
 /// ```
 #[non_exhaustive]
-#[derive(Error, Debug)]
+#[derive(Error)]
 pub enum DepsError {
     /// A manifest or lockfile failed to parse.
     #[error("failed to parse {file_type}: {source}")]
@@ -51,7 +91,7 @@ pub enum DepsError {
     },
 
     /// A registry HTTP request failed at the transport layer.
-    #[error("registry request failed for {package}: {source}")]
+    #[error("{}", registry_error_message(package, source))]
     RegistryError {
         /// Name of the package the request was for.
         package: String,
@@ -105,7 +145,7 @@ pub enum DepsError {
     },
 
     /// A response body exceeded the configured size cap and was rejected before full download.
-    #[error("response body for {url} exceeds {limit} byte limit")]
+    #[error("{}", response_too_large_message(url, *limit))]
     ResponseTooLarge {
         /// URL the oversized response came from.
         url: String,
@@ -144,7 +184,7 @@ pub enum DepsError {
     /// Returned by `deps_core::cache::HttpCache`'s 4 send sites (issue #483) when
     /// `network.offline` is set, instead of attempting the request. `url` is the request
     /// that was blocked, for diagnostic/logging purposes.
-    #[error("offline: request to {url} was blocked by network.offline")]
+    #[error("{}", offline_message(url))]
     Offline {
         /// The request URL that was blocked.
         url: String,
@@ -163,6 +203,77 @@ pub enum DepsError {
          to a less-trusted index"
     )]
     ChainResolutionHalted,
+}
+
+/// Hand-written, not derived: a derived `Debug` would print `HttpStatus.url`,
+/// `Offline.url`, `ResponseTooLarge.url`, and `RegistryError.package` raw and
+/// unredacted, reopening the exact leak this module's `Display` impls close (#767
+/// code-review follow-up) — any `tracing::warn!(?err, ...)`/`{err:?}` call site, a common
+/// and arguably more idiomatic alternative to `%err`, would bypass the hand-written
+/// `Display` text entirely and reintroduce the raw URL/query string. Every field is still
+/// shown (this is not a summary), only the four URL-shaped ones go through the same
+/// redaction their `Display` counterpart uses.
+impl std::fmt::Debug for DepsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ParseError { file_type, source } => f
+                .debug_struct("ParseError")
+                .field("file_type", file_type)
+                .field("source", source)
+                .finish(),
+            Self::RegistryError { package, source } => f
+                .debug_struct("RegistryError")
+                .field("package", &url_for_tracing(package))
+                .field("source", source)
+                .finish(),
+            Self::CacheError(message) => f.debug_tuple("CacheError").field(message).finish(),
+            Self::RateLimited { message } => f
+                .debug_struct("RateLimited")
+                .field("message", message)
+                .finish(),
+            Self::PackageNotFound { package, registry } => f
+                .debug_struct("PackageNotFound")
+                .field("package", package)
+                .field("registry", registry)
+                .finish(),
+            Self::HttpStatus { url, status } => f
+                .debug_struct("HttpStatus")
+                .field("url", &url_for_tracing(url))
+                .field("status", status)
+                .finish(),
+            Self::ApiResponse {
+                package,
+                registry,
+                source,
+            } => f
+                .debug_struct("ApiResponse")
+                .field("package", package)
+                .field("registry", registry)
+                .field("source", source)
+                .finish(),
+            Self::ResponseTooLarge { url, limit } => f
+                .debug_struct("ResponseTooLarge")
+                .field("url", &url_for_tracing(url))
+                .field("limit", limit)
+                .finish(),
+            Self::InvalidVersionReq(req) => f.debug_tuple("InvalidVersionReq").field(req).finish(),
+            Self::Io(source) => f.debug_tuple("Io").field(source).finish(),
+            Self::Json(source) => f.debug_tuple("Json").field(source).finish(),
+            Self::UnsupportedEcosystem(ecosystem) => f
+                .debug_tuple("UnsupportedEcosystem")
+                .field(ecosystem)
+                .finish(),
+            Self::AmbiguousEcosystem(path) => {
+                f.debug_tuple("AmbiguousEcosystem").field(path).finish()
+            }
+            Self::InvalidUri(uri) => f.debug_tuple("InvalidUri").field(uri).finish(),
+            Self::Offline { url } => f
+                .debug_struct("Offline")
+                .field("url", &url_for_tracing(url))
+                .finish(),
+            Self::ChainResolutionHalted => f.write_str("ChainResolutionHalted"),
+        }
+    }
 }
 
 impl DepsError {
@@ -277,10 +388,14 @@ impl DepsError {
     }
 
     /// A URL-free summary of this error, safe to attach to a `tracing` field or log line at
-    /// an outbound-request chokepoint — never this error's own `Display`/`Debug`, several of
-    /// which embed the full, unredacted request URL ([`Self::HttpStatus`], [`Self::Offline`],
-    /// the wrapped `reqwest::Error` inside [`Self::RegistryError`]; see
-    /// `crate::net_policy::url_for_tracing`'s docs for why that matters).
+    /// an outbound-request chokepoint. [`Self::HttpStatus`], [`Self::Offline`],
+    /// [`Self::ResponseTooLarge`], and [`Self::RegistryError`]'s own `Display` now redact
+    /// their URL via [`url_for_tracing`] (#767), but this summary deliberately still never
+    /// derives from `self`'s `Display`/`Debug`: the wrapped `reqwest::Error` inside
+    /// [`Self::RegistryError`] can still re-embed the raw URL through its own `Display`
+    /// unless a caller separately applied `reqwest::Error::without_url()` at construction,
+    /// and a future variant added here should not be able to reintroduce a leak just by
+    /// being included in a `{self}` interpolation.
     ///
     /// Returns the HTTP status code when this is [`Self::HttpStatus`], plus a coarse,
     /// URL-free cause discriminant for every variant — so a routine transport
@@ -423,6 +538,138 @@ mod tests {
             error.to_string(),
             "response body for https://example.com/data exceeds 33554432 byte limit"
         );
+    }
+
+    /// #767: `HttpStatus`'s `Display` is surfaced verbatim through `window/showMessage`
+    /// (`deps-lsp`'s fetch-failure toast), so a query-string credential (e.g. an `.npmrc`
+    /// `?_authToken=...` value after `${VAR}` expansion) must never reach it.
+    #[test]
+    fn test_http_status_display_redacts_query_string() {
+        let error = DepsError::HttpStatus {
+            url: "https://npm.internal/pkg?_authToken=super-secret-value".into(),
+            status: 503,
+        };
+        let message = error.to_string();
+        assert!(
+            !message.contains("super-secret-value"),
+            "message: {message}"
+        );
+        assert_eq!(
+            message,
+            "HTTP 503 Service Unavailable for https://npm.internal/pkg"
+        );
+    }
+
+    /// #767 companion for [`DepsError::RegistryError`], whose `package` field is frequently
+    /// populated with a raw URL rather than a package name (`deps-core::cache`'s
+    /// `read_body_capped`/`get_cached_with_headers_via`/`post_json`/`get_cached_bytes`).
+    #[test]
+    fn test_registry_error_display_redacts_query_string() {
+        let error = DepsError::RegistryError {
+            package: "https://npm.internal/pkg?_authToken=super-secret-value".into(),
+            source: reqwest::Client::new().get("not a url").build().unwrap_err(),
+        };
+        let message = error.to_string();
+        assert!(
+            !message.contains("super-secret-value"),
+            "message: {message}"
+        );
+        assert!(message.starts_with("registry request failed for https://npm.internal/pkg:"));
+    }
+
+    /// #767 M1: `RegistryError::package` is documented as a package name, and an npm-scoped
+    /// name (leading `@`, no scheme) must never be mangled by the URL redaction meant for
+    /// call sites that populate this field with a URL instead — reproduced false positive:
+    /// `url_for_tracing`'s unparseable-URL fallback previously misread `@types/node` as
+    /// `user@host`-shaped userinfo and rendered `***@types/node`.
+    #[test]
+    fn test_registry_error_display_does_not_mangle_scoped_package_name() {
+        let error = DepsError::RegistryError {
+            package: "@types/node".into(),
+            source: reqwest::Client::new().get("not a url").build().unwrap_err(),
+        };
+        let message = error.to_string();
+        assert!(
+            message.starts_with("registry request failed for @types/node:"),
+            "message: {message}"
+        );
+    }
+
+    /// #767: `Offline`'s `Display` also embeds the blocked request URL — same redaction
+    /// applies.
+    #[test]
+    fn test_offline_display_redacts_query_string() {
+        let error = DepsError::Offline {
+            url: "https://npm.internal/pkg?_authToken=super-secret-value".into(),
+        };
+        let message = error.to_string();
+        assert!(
+            !message.contains("super-secret-value"),
+            "message: {message}"
+        );
+    }
+
+    /// #767: `ResponseTooLarge`'s `Display` also embeds the source URL — same redaction
+    /// applies.
+    #[test]
+    fn test_response_too_large_display_redacts_query_string() {
+        let error = DepsError::ResponseTooLarge {
+            url: "https://npm.internal/pkg?_authToken=super-secret-value".into(),
+            limit: 1024,
+        };
+        let message = error.to_string();
+        assert!(
+            !message.contains("super-secret-value"),
+            "message: {message}"
+        );
+    }
+
+    /// Code-review follow-up on #767: `DepsError` derives `Debug` no longer — a derived
+    /// impl would print `HttpStatus.url`/`Offline.url`/`ResponseTooLarge.url`/
+    /// `RegistryError.package` raw, so any `tracing::warn!(?err, ...)`/`{err:?}` call site
+    /// (a common, arguably more idiomatic alternative to `%err`) would bypass every
+    /// hand-written `Display` redaction above and reintroduce the leak. Covers all four
+    /// URL-shaped variants via `{:?}`.
+    #[test]
+    fn test_debug_redacts_query_string_for_every_url_bearing_variant() {
+        let credential_bearing = [
+            DepsError::HttpStatus {
+                url: "https://npm.internal/pkg?_authToken=super-secret-value".into(),
+                status: 503,
+            },
+            DepsError::Offline {
+                url: "https://npm.internal/pkg?_authToken=super-secret-value".into(),
+            },
+            DepsError::ResponseTooLarge {
+                url: "https://npm.internal/pkg?_authToken=super-secret-value".into(),
+                limit: 1024,
+            },
+            DepsError::RegistryError {
+                package: "https://npm.internal/pkg?_authToken=super-secret-value".into(),
+                source: reqwest::Client::new().get("not a url").build().unwrap_err(),
+            },
+        ];
+        for error in credential_bearing {
+            let debug = format!("{error:?}");
+            assert!(
+                !debug.contains("super-secret-value"),
+                "Debug leaked the credential for {error}: {debug}"
+            );
+        }
+    }
+
+    /// `Debug` must still show every field for the ordinary, non-URL-bearing variants —
+    /// this is a redaction fix, not a summary, so field values unrelated to a URL must
+    /// come through unchanged.
+    #[test]
+    fn test_debug_still_shows_non_url_fields() {
+        let error = DepsError::PackageNotFound {
+            package: "left-pad".into(),
+            registry: "npm",
+        };
+        let debug = format!("{error:?}");
+        assert!(debug.contains("left-pad"), "debug: {debug}");
+        assert!(debug.contains("npm"), "debug: {debug}");
     }
 
     #[test]
