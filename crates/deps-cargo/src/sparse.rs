@@ -29,7 +29,9 @@
 
 use crate::config::{AuthToken, IndexTrust, RegistryIndex};
 use crate::types::CargoVersion;
-use deps_core::{DepsError, HttpCache, Result, lsp_helpers::warn_rejected_value};
+use deps_core::{
+    DepsError, HttpCache, Result, lsp_helpers::warn_rejected_value, net_policy::url_for_tracing,
+};
 use semver::{Version, VersionReq};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -387,13 +389,13 @@ impl SparseIndexClient {
             (None, IndexTrust::Trusted) => self.cache.get_cached(url).await,
             (None, IndexTrust::WorkspaceDeclared) => self.cache.get_cached_workspace(url).await,
             (Some(_), IndexTrust::WorkspaceDeclared) => {
+                let safe_base_url = url_for_tracing(&self.base_url);
                 tracing::error!(
-                    url = %self.base_url,
+                    url = safe_base_url,
                     "refusing to attach a credential to a workspace-declared registry index request"
                 );
                 Err(DepsError::CacheError(format!(
-                    "refusing authenticated request to workspace-declared index {}",
-                    self.base_url
+                    "refusing authenticated request to workspace-declared index {safe_base_url}"
                 )))
             }
         }
@@ -825,6 +827,28 @@ mod tests {
         let err = client.get_versions("serde").await.unwrap_err();
         assert_matches!(err, DepsError::CacheError(_));
         mock.assert_async().await;
+    }
+
+    /// #767: the fail-closed `(Some(_), WorkspaceDeclared)` arm's `tracing::error!` and
+    /// `DepsError::CacheError` message both used to embed `base_url` raw — a query-string
+    /// credential in a workspace-declared index URL would have leaked into both.
+    #[tokio::test]
+    async fn test_fetch_refuses_authenticated_workspace_declared_request_redacts_query_string() {
+        let server = mockito::Server::new_async().await;
+        let base = format!("{}/?token=super-secret-value", server.url());
+        let client = SparseIndexClient::with_auth(
+            test_workspace_index(&base),
+            Arc::new(HttpCache::new()),
+            Some(AuthToken::new("secret-token".to_string())),
+            "workspace index",
+        );
+
+        let output = deps_core::test_util::capture_tracing_output_async(async {
+            let err = client.get_versions("serde").await.unwrap_err();
+            assert!(!err.to_string().contains("super-secret-value"), "{err}");
+        })
+        .await;
+        assert!(!output.contains("super-secret-value"), "output: {output}");
     }
 
     // Issue #455, test-plan item 9 (C2 routing): a successful `(None, WorkspaceDeclared)` fetch

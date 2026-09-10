@@ -14,7 +14,7 @@ use crate::{
 
 use super::{
     EcosystemFormatter, HOVER_RECENT_VERSIONS, VersionData, escape_markdown, in_use_version,
-    markdown_code_span, position_in_range,
+    markdown_code_span, position_in_range, resolve_in_use_version,
 };
 use crate::github::normalize_tag;
 
@@ -335,21 +335,21 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     // PyPI — the version list itself never carries license for these, live-verified).
     // Latest-version license only ever comes from the native list — deps.dev's
     // version-level call only ever targets the *resolved* version
-    // (`spawn_trust_signal_fetch`'s `in_use_version` argument), so a deps.dev-routed
+    // (`spawn_trust_signal_fetch`'s `resolve_in_use_version` argument), so a deps.dev-routed
     // ecosystem's latest license degrades to "(unavailable)", the graceful-degradation
     // edge case spec 010 §6 explicitly sanctions rather than a second network call.
     //
-    // The native-list lookup keys on `in_use_version` (the same helper
+    // The native-list lookup keys on `resolve_in_use_version` (the same helper
     // `spawn_trust_signal_fetch` already uses above), not the weaker `resolved`
-    // variable the `**Current**`/`**Requirement**` line uses — `in_use_version` adds
+    // variable the `**Current**`/`**Requirement**` line uses — `resolve_in_use_version` adds
     // a `concrete_pin_version` fallback for an exact manifest pin with no lock file
     // (e.g. a `composer.json` `"3.0.0"` dependency with no `composer.lock`), which
     // `resolved` alone doesn't have. Falls back to `resolved` when no ecosystem is
-    // set (`in_use_version` requires one) — a handful of test fixtures only
+    // set (`resolve_in_use_version` requires one) — a handful of test fixtures only
     // (impl-critic review M1: keeps this lookup as least as capable as the
     // deps.dev-routed ecosystems', not just consistent with the Current line).
     let in_use_version_str: Option<String> = versions.ecosystem.and_then(|ecosystem| {
-        in_use_version(
+        resolve_in_use_version(
             dep,
             normalized_name.as_str(),
             versions.resolved,
@@ -543,7 +543,7 @@ fn spawn_trust_signal_fetch(
         if versions.offline || !formatter.source_is_public_registry_content(dep_source) {
             return None;
         }
-        let version = in_use_version(
+        let version = resolve_in_use_version(
             dep,
             normalized_name,
             versions.resolved,
@@ -560,7 +560,7 @@ fn spawn_trust_signal_fetch(
 }
 
 /// Appends the hover header: the dependency name, linked to its registry page when
-/// `url` (from [`EcosystemFormatter::package_url`]) is present.
+/// `url` (from [`crate::lsp_helpers::PackageRendering::package_url`]) is present.
 fn push_header_hover_section(markdown: &mut String, dep: &dyn Dependency, url: Option<&str>) {
     use std::fmt::Write as _;
 
@@ -579,7 +579,7 @@ fn push_header_hover_section(markdown: &mut String, dep: &dyn Dependency, url: O
 
 /// Appends the hover "Current"/"Requirement" line. `resolved` — already selecting
 /// between an ecosystem's resolved manifest requirement and the lockfile-resolved
-/// version, per [`EcosystemFormatter::manifest_requirement_is_resolved_version`] —
+/// version, per [`crate::lsp_helpers::RequirementResolution::manifest_requirement_is_resolved_version`] —
 /// wins over the bare manifest requirement when present.
 fn push_current_or_requirement_hover_section(
     markdown: &mut String,
@@ -1337,7 +1337,7 @@ mod tests {
     /// resolution renders no `**Current**` line (`resolved` stays `None` —
     /// `resolve_occurrence_version` has nothing to match against an empty
     /// `resolved_versions` map), but the license must still be found via the same
-    /// `in_use_version` concrete-pin fallback `spawn_trust_signal_fetch` already
+    /// `resolve_in_use_version` concrete-pin fallback `spawn_trust_signal_fetch` already
     /// uses for the deps.dev path — the native-list lookup must be at least as
     /// capable, not silently weaker just because it reused the `resolved` variable.
     #[tokio::test]
@@ -1712,7 +1712,7 @@ mod tests {
     /// Review round 3 regression: for a deps.dev-routed ecosystem, `available_versions[idx]`
     /// entries never carry license (that trait method's default is empty — only the
     /// native-list ecosystems like Composer override it), so the "latest == resolved"
-    /// shortcut MUST use the same `in_use_version`-derived key the resolved-license
+    /// shortcut MUST use the same `resolve_in_use_version`-derived key the resolved-license
     /// lookup itself used, not the weaker bare `resolved`. An earlier draft compared
     /// the shortcut against `resolved` (which stays `None` here — no lock-file entry
     /// matches an exact `=4.19.2` pin) while the lookup used `in_use_version_str`
@@ -1744,7 +1744,7 @@ mod tests {
         };
         // No lock-file entries: `versions.resolved` stays empty, so the bare
         // `resolved` variable used for the `**Current**` line has no match — only
-        // `in_use_version`'s `concrete_pin_version` fallback resolves the pin.
+        // `resolve_in_use_version`'s `concrete_pin_version` fallback resolves the pin.
         let registry = MockRegistryWithVersions {
             versions: vec![MockVersionWithAge {
                 version: "4.19.2".into(),

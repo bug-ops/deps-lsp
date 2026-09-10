@@ -41,7 +41,7 @@ pub use git_ref::{
     match_v_prefix_style,
 };
 pub use hover::{CMD_DOT_FOOTER, generate_hover};
-pub use in_use_version::{concrete_pin_version, in_use_version, is_full_semver_shape};
+pub use in_use_version::{concrete_pin_version, is_full_semver_shape, resolve_in_use_version};
 pub use inlay_hints::generate_inlay_hints;
 
 /// Maximum number of recent versions hover's "Recent versions" section renders.
@@ -485,7 +485,7 @@ pub struct VersionData<'a> {
     /// Every lock-file-resolved version for a package name, when more than one is retained
     /// (issue #649) — additive alongside [`Self::resolved`], which stays the single
     /// collapsed value for the common case. `None` by default (most call sites have no such
-    /// map); [`crate::lsp_helpers::in_use_version`] and [`crate::osv::vulnerability_keys`]
+    /// map); [`crate::lsp_helpers::resolve_in_use_version`] and [`crate::osv::vulnerability_keys`]
     /// consult it to disambiguate two manifest occurrences of one resolved name (e.g. a
     /// Cargo `package = "..."` rename pinning an older major) by each occurrence's own
     /// `version_requirement()`, falling back to [`Self::resolved`] when a name has at most
@@ -1449,7 +1449,7 @@ pub fn warn_rejected_value(gate: &str, context: &str, value: &str) {
     );
 }
 
-/// Builds a single-entry [`WorkspaceEdit::changes`] map replacing `range` in `uri`
+/// Builds a single-entry [`tower_lsp_server::ls_types::WorkspaceEdit::changes`] map replacing `range` in `uri`
 /// with `new_text`.
 ///
 /// Shared by every quickfix/refactor code action in `code_actions` that edits exactly

@@ -16,7 +16,7 @@ use super::{
 /// re-parsing the action's title.
 struct VulnerabilityFixAction {
     /// `fix.version`, converted to this ecosystem's namespace via
-    /// [`EcosystemFormatter::osv_version_to_native`].
+    /// [`crate::lsp_helpers::OsvNaming::osv_version_to_native`].
     version_native: String,
     /// The formatted edit text this action's own `TextEdit` writes — the exact
     /// value `action.edit` carries, kept alongside it so callers (the REFACTOR-loop
@@ -84,7 +84,7 @@ fn fix_target_is_verified(
 /// against OSV (#462) — see [`fix_target_is_verified`].
 ///
 /// Registry-independent by construction (FR-007, mirroring the rule already
-/// enforced in [`generate_diagnostics_from_cache`]): computed entirely from
+/// enforced in [`crate::lsp_helpers::generate_diagnostics_from_cache`]): computed entirely from
 /// `versions.vulnerabilities` and `version_req` (the caller's already-fetched
 /// `dep.version_requirement()`), never from a registry fetch — a *registry*
 /// outage still never hides this action. It is not OSV-independent, though:
@@ -249,7 +249,7 @@ struct UnsatisfiableFixAction {
 /// `versions` snapshot and the dependency's declared requirement, before any registry
 /// fetch, so a registry outage never hides it (the same FR-007 rationale). Gated by
 /// [`requirement_is_unsatisfiable`] evaluated against the identical inputs
-/// [`generate_diagnostics_from_cache`] uses, so this action can never appear without —
+/// [`crate::lsp_helpers::generate_diagnostics_from_cache`] uses, so this action can never appear without —
 /// or be missing despite — the diagnostic it resolves.
 ///
 /// Targets `versions.cached[..].latest`, the **cached** value, not a freshly fetched one:
@@ -339,7 +339,7 @@ fn build_unsatisfiable_fix_action(
 }
 
 /// Builds the "Replace with X" package-rename quickfix for `dep` (issue #205), if this
-/// ecosystem opts in via [`EcosystemFormatter::supports_package_rename`] and a
+/// ecosystem opts in via [`crate::lsp_helpers::DiagnosticPolicy::supports_package_rename`] and a
 /// registry-supplied replacement name is on record.
 ///
 /// **Composer-only in Phase 1** — see `EcosystemFormatter::supports_package_rename`'s

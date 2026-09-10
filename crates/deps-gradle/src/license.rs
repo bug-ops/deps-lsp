@@ -23,6 +23,7 @@
 //! `<licenses>` block is empty, bounded by [`MAX_POM_FETCHES`] so a pathological (or
 //! adversarial) parent chain can't turn one hover request into an unbounded fetch chain.
 
+use deps_core::xml_bounds::exhausted_with;
 use deps_core::{HttpCache, MAX_POM_LICENSE_NAME_RAW_CHARS, is_safe_maven_coordinate_segment};
 use quick_xml::Reader;
 use quick_xml::events::Event;
@@ -238,9 +239,12 @@ fn parse_pom(data: &[u8]) -> PomInfo {
         // counterexamples that each defeated a shape-keyed counter): advances on every
         // event regardless of what it is, so it cannot be starved by a document that
         // simply omits the element type a narrower counter was watching for.
-        if licenses.len() >= MAX_POM_LICENSE_ENTRIES
-            || reader.buffer_position() as usize >= MAX_POM_LICENSE_BYTES_SCANNED
-        {
+        if exhausted_with(
+            licenses.len(),
+            reader.buffer_position(),
+            MAX_POM_LICENSE_ENTRIES,
+            MAX_POM_LICENSE_BYTES_SCANNED,
+        ) {
             break;
         }
         match reader.read_event() {

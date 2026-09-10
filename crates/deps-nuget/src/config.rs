@@ -48,7 +48,7 @@ use std::sync::atomic::AtomicBool;
 use base64::Engine;
 use deps_core::PackageName;
 use deps_core::net_policy::{
-    IndexUrlError, PolicyGate, RegistryAccessPolicy, redact_userinfo, validate_index_url,
+    IndexUrlError, PolicyGate, RegistryAccessPolicy, url_for_tracing, validate_index_url,
 };
 use deps_core::parser::DependencySource;
 use quick_xml::Reader;
@@ -1074,23 +1074,27 @@ fn resolve_source_entry(add: &RawSourceAdd, policy: &RegistryAccessPolicy) -> In
             "skipping NuGet V2 (protocolVersion=\"2\") package source; only V3 feeds are supported"
         );
         return Err(InvalidEntry {
-            raw: redact_userinfo(&add.value),
+            raw: url_for_tracing(&add.value),
             reason: NuGetFeedUrlError::UnsupportedProtocolVersion("2".to_string()),
         });
     }
     if !add.value.contains("://") {
+        let redacted = url_for_tracing(&add.value);
         tracing::debug!(
             key = %add.key,
-            value = %add.value,
+            value = %redacted,
             "skipping local/UNC NuGet package source; only V3 http(s) feeds are supported"
         );
         return Err(InvalidEntry {
-            raw: redact_userinfo(&add.value),
+            raw: redacted,
             reason: NuGetFeedUrlError::LocalFeedUnsupported,
         });
     }
     NuGetFeedUrl::new(&add.value, policy).map_err(|reason| {
-        let redacted = redact_userinfo(&add.value);
+        // #767 S2a: `url_for_tracing`, not `redact_userinfo` alone — `raw` also lands in
+        // `InvalidEntry::raw`, which can surface as `DependencySource::CustomRegistry`'s
+        // hover/diagnostics text, so a query-string credential must be stripped too.
+        let redacted = url_for_tracing(&add.value);
         tracing::warn!(key = %add.key, raw = %redacted, %reason, "NuGet package source failed validation");
         InvalidEntry {
             raw: redacted,
@@ -2467,6 +2471,30 @@ mod tests {
         let config = resolve(dir.path(), &cache, &policy);
 
         assert!(config.resolved_chains().is_empty());
+    }
+
+    /// #767 S2a: `resolve_source_entry`'s failure path used to build `InvalidEntry::raw` and
+    /// its `tracing::warn!` line from `redact_userinfo` alone, which preserves the query
+    /// string — a blocked-host source with no userinfo at all could still leak a
+    /// query-string credential through both.
+    #[test]
+    fn test_source_entry_blocked_host_log_redacts_query_string() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(
+            dir.path(),
+            r#"<configuration><packageSources>
+                <add key="Blocked" value="https://169.254.169.254/v3/index.json?ApiKey=super-secret-value" />
+            </packageSources></configuration>"#,
+        );
+        let cache = NuGetConfigCache::new();
+        let policy = RegistryAccessPolicy::new(WorkspaceRegistryAccess::PublicOnly);
+        let log = deps_core::test_util::capture_tracing_output(|| {
+            let _config = resolve(dir.path(), &cache, &policy);
+        });
+        assert!(
+            !log.contains("super-secret-value"),
+            "tracing output leaked the credential: {log:?}"
+        );
     }
 
     // --- chain key invariant ---

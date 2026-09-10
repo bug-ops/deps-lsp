@@ -138,7 +138,7 @@ impl PypiParser {
                 content,
                 &line_table,
                 &ctx,
-            )?);
+            ));
         }
 
         // Parse PEP 621 format
@@ -148,13 +148,13 @@ impl PypiParser {
                 content,
                 &line_table,
                 &ctx,
-            )?);
+            ));
             dependencies.extend(self.parse_pep621_optional_dependencies(
                 project,
                 content,
                 &line_table,
                 &ctx,
-            )?);
+            ));
         }
 
         // Parse PEP 735 dependency-groups format
@@ -164,20 +164,15 @@ impl PypiParser {
                 content,
                 &line_table,
                 &ctx,
-            )?);
+            ));
         }
 
         // Parse Poetry format
         if let Some(tool_table) = get_table(root_table, "tool")
             && let Some(poetry) = get_table(tool_table, "poetry")
         {
-            dependencies.extend(self.parse_poetry_dependencies(
-                poetry,
-                content,
-                &line_table,
-                &ctx,
-            )?);
-            dependencies.extend(self.parse_poetry_groups(poetry, content, &line_table, &ctx)?);
+            dependencies.extend(self.parse_poetry_dependencies(poetry, content, &line_table, &ctx));
+            dependencies.extend(self.parse_poetry_groups(poetry, content, &line_table, &ctx));
         }
 
         Ok(ParseResult {
@@ -190,19 +185,22 @@ impl PypiParser {
     }
 
     /// Parse PEP 517/518 `[build-system]` requires array.
+    ///
+    /// Always succeeds: a malformed individual requirement is logged and skipped rather
+    /// than propagated.
     fn parse_build_system_requires(
         &self,
         build_system: &Table<'_>,
         content: &str,
         line_table: &LineOffsetTable,
         ctx: &IndexContext<'_>,
-    ) -> Result<Vec<PypiDependency>> {
+    ) -> Vec<PypiDependency> {
         let Some(requires_val) = build_system.get("requires") else {
-            return Ok(Vec::new());
+            return Vec::new();
         };
 
         let Some(requires_array) = requires_val.as_array() else {
-            return Ok(Vec::new());
+            return Vec::new();
         };
 
         let mut dependencies = Vec::new();
@@ -231,23 +229,26 @@ impl PypiParser {
             }
         }
 
-        Ok(dependencies)
+        dependencies
     }
 
     /// Parse PEP 621 `[project.dependencies]` array.
+    ///
+    /// Always succeeds: a malformed individual requirement is logged and skipped rather
+    /// than propagated.
     fn parse_pep621_dependencies(
         &self,
         project: &Table<'_>,
         content: &str,
         line_table: &LineOffsetTable,
         ctx: &IndexContext<'_>,
-    ) -> Result<Vec<PypiDependency>> {
+    ) -> Vec<PypiDependency> {
         let Some(deps_val) = project.get("dependencies") else {
-            return Ok(Vec::new());
+            return Vec::new();
         };
 
         let Some(deps_array) = deps_val.as_array() else {
-            return Ok(Vec::new());
+            return Vec::new();
         };
 
         let mut dependencies = Vec::new();
@@ -276,23 +277,26 @@ impl PypiParser {
             }
         }
 
-        Ok(dependencies)
+        dependencies
     }
 
     /// Parse PEP 621 `[project.optional-dependencies]` tables.
+    ///
+    /// Always succeeds: a malformed individual requirement is logged and skipped rather
+    /// than propagated.
     fn parse_pep621_optional_dependencies(
         &self,
         project: &Table<'_>,
         content: &str,
         line_table: &LineOffsetTable,
         ctx: &IndexContext<'_>,
-    ) -> Result<Vec<PypiDependency>> {
+    ) -> Vec<PypiDependency> {
         let Some(opt_deps_val) = project.get("optional-dependencies") else {
-            return Ok(Vec::new());
+            return Vec::new();
         };
 
         let Some(opt_deps_table) = opt_deps_val.as_table() else {
-            return Ok(Vec::new());
+            return Vec::new();
         };
 
         let mut dependencies = Vec::new();
@@ -327,7 +331,7 @@ impl PypiParser {
             }
         }
 
-        Ok(dependencies)
+        dependencies
     }
 
     /// Parse PEP 735 `[dependency-groups]` tables.
@@ -339,13 +343,16 @@ impl PypiParser {
     /// dev = ["pytest>=8.0", "mypy>=1.0"]
     /// test = ["pytest>=8.0", "pytest-cov>=4.0"]
     /// ```
+    ///
+    /// Always succeeds: a malformed individual requirement is logged and skipped rather
+    /// than propagated.
     fn parse_dependency_groups(
         &self,
         dep_groups: &Table<'_>,
         content: &str,
         line_table: &LineOffsetTable,
         ctx: &IndexContext<'_>,
-    ) -> Result<Vec<PypiDependency>> {
+    ) -> Vec<PypiDependency> {
         let mut dependencies = Vec::new();
 
         for (group_key, group_val) in dep_groups {
@@ -379,23 +386,26 @@ impl PypiParser {
             }
         }
 
-        Ok(dependencies)
+        dependencies
     }
 
     /// Parse Poetry `[tool.poetry.dependencies]` table.
+    ///
+    /// Always succeeds: a malformed individual dependency is logged and skipped rather
+    /// than propagated.
     fn parse_poetry_dependencies(
         &self,
         poetry: &Table<'_>,
         content: &str,
         line_table: &LineOffsetTable,
         ctx: &IndexContext<'_>,
-    ) -> Result<Vec<PypiDependency>> {
+    ) -> Vec<PypiDependency> {
         let Some(deps_val) = poetry.get("dependencies") else {
-            return Ok(Vec::new());
+            return Vec::new();
         };
 
         let Some(deps_table) = deps_val.as_table() else {
-            return Ok(Vec::new());
+            return Vec::new();
         };
 
         let mut dependencies = Vec::new();
@@ -427,23 +437,26 @@ impl PypiParser {
             }
         }
 
-        Ok(dependencies)
+        dependencies
     }
 
     /// Parse Poetry `[tool.poetry.group.*.dependencies]` tables.
+    ///
+    /// Always succeeds: a malformed individual dependency is logged and skipped rather
+    /// than propagated.
     fn parse_poetry_groups(
         &self,
         poetry: &Table<'_>,
         content: &str,
         line_table: &LineOffsetTable,
         ctx: &IndexContext<'_>,
-    ) -> Result<Vec<PypiDependency>> {
+    ) -> Vec<PypiDependency> {
         let Some(group_val) = poetry.get("group") else {
-            return Ok(Vec::new());
+            return Vec::new();
         };
 
         let Some(groups_table) = group_val.as_table() else {
-            return Ok(Vec::new());
+            return Vec::new();
         };
 
         let mut dependencies = Vec::new();
@@ -480,7 +493,7 @@ impl PypiParser {
             }
         }
 
-        Ok(dependencies)
+        dependencies
     }
 
     /// Parse a Poetry dependency (can be string or table).

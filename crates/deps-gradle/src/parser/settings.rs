@@ -57,6 +57,11 @@ fn find_plugin_version_range(line: &str, line_idx: u32, version: &str) -> Range 
 }
 
 /// Parses `pluginManagement { plugins { ... } }` blocks from settings.gradle / settings.gradle.kts.
+///
+/// # Errors
+///
+/// Infallible by construction: unrecognized lines are skipped rather than erroring.
+/// Returns [`Result`] only to match the shared parser signature every ecosystem implements.
 pub fn parse_settings(content: &str, uri: &Uri) -> Result<GradleParseResult> {
     let mut dependencies = Vec::new();
     let mut brace_depth: i32 = 0;

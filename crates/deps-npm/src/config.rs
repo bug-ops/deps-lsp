@@ -21,11 +21,12 @@
 //!   in this module for an `_authToken`/`_auth`/`_password`/`_authIdent`/`always-auth`/
 //!   `//host/:_*` value to land in even accidentally. This is a structural guarantee, not a
 //!   runtime filter — verified by this module's own NFR-001 test.
-//! - **A literal `user:pass@`/`user@` written directly in a `registry=`/`@scope:registry=`
-//!   value is redacted before it can leak** (M1 fix, mirroring `deps-pypi`'s own M1). No
-//!   `${VAR}` expansion is needed for this case — a hostile `.npmrc` can write the credential
-//!   straight into the raw value — so `resolve_entry` redacts it (see
-//!   [`deps_core::net_policy::redact_userinfo`]) before it ever reaches a `tracing::warn!`
+//! - **A literal `user:pass@`/`user@` userinfo component or query-string credential written
+//!   directly in a `registry=`/`@scope:registry=` value is redacted before it can leak** (M1
+//!   fix, mirroring `deps-pypi`'s own M1, extended by #767 S2b). No `${VAR}` expansion is
+//!   needed for this case — a hostile `.npmrc` can write the credential straight into the raw
+//!   value — so `resolve_entry` redacts it (see
+//!   [`deps_core::net_policy::url_for_tracing`]) before it ever reaches a `tracing::warn!`
 //!   call or [`InvalidEntry::raw`], which [`NpmConfig::resolve_source_for`] can surface as
 //!   [`DependencySource::CustomRegistry`]'s `url` in hover/diagnostics text.
 //! - **Internal-network reachability (SSRF-adjacent).** [`NpmRegistryIndex::new`] requires a
@@ -44,7 +45,7 @@ use std::sync::Arc;
 
 use deps_core::PackageName;
 use deps_core::net_policy::{
-    HostClass, IndexUrlError, PolicyGate, RegistryAccessPolicy, redact_userinfo, validate_index_url,
+    HostClass, IndexUrlError, PolicyGate, RegistryAccessPolicy, url_for_tracing, validate_index_url,
 };
 use deps_core::parser::DependencySource;
 
@@ -141,6 +142,13 @@ impl NpmRegistryIndex {
     /// alongside the original raw one, so a rejected candidate built from `${SOME_TOKEN}`
     /// never leaks that token's expanded value into a log line or an
     /// [`NpmRegistryIndexError::InvalidUrl`] payload — see this module's security-model doc.
+    /// `raw_for_log` is always redacted the same way regardless of which caller it came from
+    /// (`validate_index_url` applies `url_for_tracing` unconditionally) — an earlier revision
+    /// tried to log the pre-expansion form more permissively, on the theory that it could only
+    /// ever spell a placeholder like `${VAR}`, never a real secret, but that assumption does
+    /// not hold: a hostile `.npmrc` can write a credential directly into the raw value with no
+    /// expansion involved at all (#767 S2b, matching this module's own M1 threat-model note
+    /// above about literal userinfo).
     fn new_for_log(
         expanded: &str,
         raw_for_log: &str,
@@ -168,18 +176,19 @@ impl std::fmt::Display for NpmRegistryIndex {
 /// A `registry=`/`@scope:registry=` entry that was present in `.npmrc` but unusable.
 ///
 /// Invalid URL, non-https, an undefined `${VAR}`, or policy-blocked. Carries the raw value
-/// as written (never the expanded form, and with any literal userinfo redacted — see
-/// [`deps_core::net_policy::redact_userinfo`]) so [`NpmConfig::resolve_source_for`] can build
-/// [`DependencySource::CustomRegistry`] and so a warning can name what the user actually
-/// wrote, never an expanded-but-rejected value that could leak an environment variable's
-/// contents into the log, and never a literal credential the user wrote directly in `.npmrc`.
+/// as written (never the expanded form, and with any literal userinfo/query string
+/// redacted — see [`deps_core::net_policy::url_for_tracing`]) so
+/// [`NpmConfig::resolve_source_for`] can build [`DependencySource::CustomRegistry`] and so a
+/// warning can name what the user actually wrote, never an expanded-but-rejected value that
+/// could leak an environment variable's contents into the log, and never a literal credential
+/// the user wrote directly in `.npmrc`.
 ///
 /// Output-only: constructed internally by this module's own resolution logic, never by
 /// external code — no constructor is provided.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct InvalidEntry {
-    /// The raw `.npmrc` value, unexpanded, with any literal userinfo redacted.
+    /// The raw `.npmrc` value, unexpanded, with any literal userinfo/query string redacted.
     pub raw: String,
     /// Why it was rejected.
     pub reason: NpmRegistryIndexError,
@@ -355,17 +364,18 @@ fn expand_env_vars_with(
 /// Expands and validates one raw `.npmrc` value, producing the [`NpmConfig`] entry FR-006's
 /// fail-closed state needs on failure — a `tracing::warn!` naming the **raw**, unexpanded
 /// value either way (an expanded-but-rejected value must never leak an environment
-/// variable's contents into the log), with any literal `user:pass@`/`user@` userinfo written
-/// directly in that raw value redacted first (M1 fix — see
-/// [`deps_core::net_policy::redact_userinfo`]) — a hostile `.npmrc` can write a credential
-/// straight into `registry=`/`@scope:registry=` with no `${VAR}` expansion involved.
+/// variable's contents into the log), with any literal `user:pass@`/`user@` userinfo and any
+/// query string/fragment written directly in that raw value stripped first (M1 fix, extended
+/// by #767 S2a/S2b — see [`deps_core::net_policy::url_for_tracing`]) — a hostile `.npmrc` can
+/// write a credential straight into `registry=`/`@scope:registry=` with no `${VAR}` expansion
+/// involved, whether as userinfo or as a query parameter.
 fn resolve_entry(
     raw: &str,
     policy: &RegistryAccessPolicy,
 ) -> Result<NpmRegistryIndex, InvalidEntry> {
     match expand_env_vars(raw) {
         Ok(expanded) => NpmRegistryIndex::new_for_log(&expanded, raw, policy).map_err(|reason| {
-            let redacted = redact_userinfo(raw);
+            let redacted = url_for_tracing(raw);
             tracing::warn!(raw = %redacted, %reason, "npm registry index failed validation");
             InvalidEntry {
                 raw: redacted,
@@ -373,7 +383,7 @@ fn resolve_entry(
             }
         }),
         Err(var) => {
-            let redacted = redact_userinfo(raw);
+            let redacted = url_for_tracing(raw);
             tracing::warn!(
                 raw = %redacted,
                 var,
@@ -830,6 +840,26 @@ mod tests {
         );
     }
 
+    /// #767 S1: `NpmRegistryIndex::new` (unlike `resolve_entry`) has no separate
+    /// pre-expansion form — `raw` is a live value — but the blocked-host `tracing::warn!`
+    /// redacts it the same way regardless (#767 S2b dropped the distinction entirely: every
+    /// caller's `raw_for_log` is always redacted).
+    #[test]
+    fn test_new_blocked_host_log_redacts_query_string() {
+        let raw = "https://127.0.0.1:9999/?token=super-secret-value";
+        let policy = public_only_policy();
+
+        let log = deps_core::test_util::capture_tracing_output(|| {
+            let err = NpmRegistryIndex::new(raw, &policy).unwrap_err();
+            assert_matches!(err, NpmRegistryIndexError::BlockedHost { .. });
+        });
+
+        assert!(
+            !log.contains("super-secret-value"),
+            "leaked query-string credential into tracing output: {log:?}"
+        );
+    }
+
     #[test]
     fn test_new_for_log_invalid_url_reports_raw_not_expanded() {
         let expanded_secret = "not a valid url but contains super-secret-value";
@@ -872,6 +902,36 @@ mod tests {
         });
         assert!(
             !log.contains("hunter2"),
+            "tracing output leaked the credential: {log:?}"
+        );
+    }
+
+    /// #767 S2b: a literal query-string credential written directly in `.npmrc` (no `${VAR}`
+    /// expansion involved) must never reach `resolve_entry`'s `tracing::warn!` line or
+    /// `InvalidEntry::raw` unredacted — the same threat this module's own security-model doc
+    /// already covers for literal userinfo.
+    #[test]
+    fn test_resolve_entry_redacts_literal_query_string_from_raw_and_log() {
+        let policy = off_policy();
+        let log = deps_core::test_util::capture_tracing_output(|| {
+            let invalid = resolve_entry(
+                "https://npm.example/?_authToken=super-secret-value",
+                &policy,
+            )
+            .unwrap_err();
+            assert_matches!(invalid.reason, NpmRegistryIndexError::BlockedHost { .. });
+            assert!(
+                !invalid.raw.contains("super-secret-value"),
+                "InvalidEntry::raw leaked the credential: {}",
+                invalid.raw
+            );
+            assert!(
+                invalid.raw.contains("npm.example"),
+                "host should survive redaction"
+            );
+        });
+        assert!(
+            !log.contains("super-secret-value"),
             "tracing output leaked the credential: {log:?}"
         );
     }

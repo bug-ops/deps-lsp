@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use deps_core::net_policy::{
-    PolicyGate, RegistryAccessPolicy, redact_userinfo, validate_index_url,
+    PolicyGate, RegistryAccessPolicy, redact_userinfo, url_for_tracing, validate_index_url,
 };
 use deps_core::parser::DependencySource;
 
@@ -87,8 +87,12 @@ impl GoProxyUrl {
         // different — and likely 404ing — request than intended), so it is rejected here
         // rather than joined incorrectly. `InvalidUrl` is the closest existing
         // `GoProxyUrlError` variant (no `deps-core` change for a Go-only validation rule).
+        //
+        // `url_for_tracing`, not `redact_userinfo` alone (#767 S2a): this is exactly the
+        // rejection a query-string-bearing `raw` hits, so the payload built here is the one
+        // place the offending query string itself would otherwise still be visible.
         if url.query().is_some() || url.fragment().is_some() {
-            return Err(GoProxyUrlError::InvalidUrl(redact_userinfo(raw)));
+            return Err(GoProxyUrlError::InvalidUrl(url_for_tracing(raw)));
         }
         let normalized = url.as_str().trim_end_matches('/').to_string();
         Ok(Self { normalized })
@@ -125,7 +129,8 @@ pub enum GoProxyHop {
 
 /// A present-but-unusable `GOPROXY` hop — an invalid URL or a policy-blocked host (FR-009).
 ///
-/// Carries the raw value as written, **with any embedded userinfo redacted**, so
+/// Carries the raw value as written, **with any embedded userinfo and query string/fragment
+/// redacted** (#767 S2a extends the original userinfo-only redaction), so
 /// [`GoEnvConfig::resolve_source_for`] can build a
 /// [`DependencySource::CustomRegistry`] when every hop in a chain is invalid, or log a warning
 /// naming a dropped hop, without ever holding or surfacing the credential itself.
@@ -136,14 +141,15 @@ pub enum GoProxyHop {
 #[derive(Debug, Clone)]
 pub struct InvalidEntry {
     /// The raw `GOPROXY` hop value, as written in `$GOENV`, with any `user:pass@`/`user@`
-    /// userinfo component stripped.
+    /// userinfo component and any query string/fragment stripped.
     pub raw: String,
     /// Why it was rejected.
     pub reason: GoProxyUrlError,
 }
 
 /// Parses and validates one `,`-or-`|`-separated `GOPROXY` chain entry (FR-002), logging a
-/// `tracing::warn!` naming the raw value (userinfo redacted) on failure.
+/// `tracing::warn!` naming the raw value (redacted — see
+/// [`deps_core::net_policy::url_for_tracing`]) on failure.
 fn parse_hop(raw: &str, policy: &RegistryAccessPolicy) -> Result<GoProxyHop, InvalidEntry> {
     match raw {
         "direct" => Ok(GoProxyHop::Direct),
@@ -151,7 +157,7 @@ fn parse_hop(raw: &str, policy: &RegistryAccessPolicy) -> Result<GoProxyHop, Inv
         _ => GoProxyUrl::new(raw, policy)
             .map(GoProxyHop::Url)
             .map_err(|reason| {
-                let redacted = redact_userinfo(raw);
+                let redacted = url_for_tracing(raw);
                 tracing::warn!(raw = %redacted, %reason, "GOPROXY hop failed validation");
                 InvalidEntry {
                     raw: redacted,
@@ -324,9 +330,12 @@ fn parse_goproxy(raw: &str, policy: &RegistryAccessPolicy) -> Result<GoProxyChai
     }
 
     if hops.is_empty() {
-        Err(first_invalid.unwrap_or_else(|| InvalidEntry {
-            raw: redact_userinfo(raw),
-            reason: GoProxyUrlError::InvalidUrl(redact_userinfo(raw)),
+        Err(first_invalid.unwrap_or_else(|| {
+            let redacted = url_for_tracing(raw);
+            InvalidEntry {
+                raw: redacted.clone(),
+                reason: GoProxyUrlError::InvalidUrl(redacted),
+            }
         }))
     } else {
         Ok(GoProxyChain::keyed(hops, separators))
@@ -795,8 +804,9 @@ struct RawGoEnv {
     /// [`GoProxyUrl::new`] rejects it per-hop. Retained for the process lifetime by
     /// [`GoEnvCache`]'s memoization, mirroring `deps_npm::config::NpmConfigCache`'s identical
     /// shape exactly — precedent-consistent, not a regression to fix (spec 034 security
-    /// review, F4). Never logged or transmitted as-is (FR-014); only [`redact_userinfo`]'d
-    /// output ever leaves this module.
+    /// review, F4). Never logged or transmitted as-is (FR-014); only
+    /// [`deps_core::net_policy::url_for_tracing`]'d output (userinfo and query
+    /// string/fragment stripped — #767) ever leaves this module.
     goproxy: Option<String>,
     goprivate: Option<String>,
     /// Memoizes [`GlobPattern::new`]'s compilation of `goprivate` (and thus any `tracing::warn!`
@@ -1054,6 +1064,30 @@ mod tests {
         assert_matches!(
             GoProxyUrl::new("https://goproxy.mycorp.example/#frag", &all_policy()),
             Err(GoProxyUrlError::InvalidUrl(_))
+        );
+    }
+
+    /// #767 S2a: the query-string-rejection arm's own `InvalidUrl` payload used to be built
+    /// from `redact_userinfo` alone, which preserves the query string — exactly the value
+    /// that triggered this rejection in the first place, so it leaked verbatim into the
+    /// error `Display` and (via `parse_hop`) into `InvalidEntry::raw`/a `tracing::warn!` line.
+    #[test]
+    fn test_proxy_url_rejects_query_string_without_leaking_it() {
+        let err = GoProxyUrl::new(
+            "https://goproxy.mycorp.example/?token=super-secret-value",
+            &all_policy(),
+        )
+        .unwrap_err();
+        let GoProxyUrlError::InvalidUrl(redacted) = &err else {
+            panic!("expected InvalidUrl, got {err:?}");
+        };
+        assert!(
+            !redacted.contains("super-secret-value"),
+            "redacted: {redacted}"
+        );
+        assert!(
+            !err.to_string().contains("super-secret-value"),
+            "Display: {err}"
         );
     }
 

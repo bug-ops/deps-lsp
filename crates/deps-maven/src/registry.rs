@@ -9,7 +9,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use deps_core::{
     DepsError, HttpCache, PublishTime, Result, lsp_helpers::warn_rejected_value,
-    maven_coordinate_path,
+    maven_coordinate_path, net_policy::url_for_tracing,
 };
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
@@ -308,7 +308,12 @@ impl MavenCentralRegistry {
                     return Ok((versions, release, base));
                 }
                 Err(e) => {
-                    tracing::debug!(package = %name, url = %url, error = %e, "metadata fetch failed, trying next");
+                    tracing::debug!(
+                        package = %name,
+                        url = url_for_tracing(url),
+                        error = %e,
+                        "metadata fetch failed, trying next"
+                    );
                     last_err = Some(e);
                 }
             }
@@ -332,7 +337,11 @@ impl MavenCentralRegistry {
         match self.cache.get_cached(base).await {
             Ok(data) => parse_publish_times(&data),
             Err(e) => {
-                tracing::debug!(url = %base, error = %e, "listing fetch failed, publish times unavailable");
+                tracing::debug!(
+                    url = url_for_tracing(base),
+                    error = %e,
+                    "listing fetch failed, publish times unavailable"
+                );
                 HashMap::new()
             }
         }
@@ -347,6 +356,10 @@ impl MavenCentralRegistry {
     /// caching in [`HttpCache`], so an unconditional fetch would retry forever) and the
     /// Gradle Plugin Portal's listing has no date column (a wasted fetch+parse on every
     /// call). Both degrade to zero extra requests here rather than one doomed one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if fetching or parsing the artifact's metadata fails.
     #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
     pub async fn get_versions_typed_with(
         &self,
@@ -367,6 +380,10 @@ impl MavenCentralRegistry {
     ///
     /// Delegates to [`Self::get_versions_typed_with`] with freshness disabled so the two
     /// paths cannot drift apart.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::get_versions_typed_with`].
     pub async fn get_versions_typed(&self, name: &str) -> Result<Vec<MavenVersion>> {
         self.get_versions_typed_with(name, false).await
     }
@@ -2345,6 +2362,42 @@ mod tests {
         let times = registry.fetch_publish_times(&url).await;
 
         assert!(times.is_empty());
+    }
+
+    // --- #767: fallback-loop log redaction ---
+
+    /// #767: the "listing fetch failed" debug log embedded the raw `base` URL directly
+    /// (`url = %base`), leaking a query-string credential the same way #756 S-A's "fetching
+    /// fresh" log did in `deps-core::cache` — now redacted via
+    /// [`deps_core::net_policy::url_for_tracing`]. Mirrors
+    /// `deps_core::cache::tests::test_fetch_and_store_fetching_fresh_log_redacts_query_string_token`'s
+    /// pattern.
+    #[tokio::test]
+    async fn test_fetch_publish_times_failure_log_redacts_url_query_string() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/org/example/widget/")
+            .match_query(mockito::Matcher::Any)
+            .with_status(500)
+            .create_async()
+            .await;
+
+        let registry = MavenCentralRegistry::new(Arc::new(HttpCache::new()));
+        let url = format!(
+            "{}/org/example/widget/?ApiKey=super-secret-value",
+            server.url()
+        );
+
+        let output =
+            deps_core::test_util::capture_tracing_output_async_at(tracing::Level::DEBUG, async {
+                registry.fetch_publish_times(&url).await;
+            })
+            .await;
+
+        assert!(
+            !output.contains("super-secret-value"),
+            "leaked query-string credential via 'listing fetch failed' debug log: {output:?}"
+        );
     }
 
     // --- get_versions_typed_with: end-to-end gating and degradation on the metadata path ---

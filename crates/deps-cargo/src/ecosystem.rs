@@ -342,6 +342,51 @@ mod tests {
     use std::collections::HashMap;
     use tower_lsp_server::ls_types::{InlayHintLabel, Position, Range};
 
+    // #758: exact-value `Ecosystem` conformance, replacing the hand-written
+    // test_ecosystem_id/test_ecosystem_display_name/test_ecosystem_manifest_filenames/
+    // test_ecosystem_lockfile_filenames/test_as_any family. Does not replace registry.rs's
+    // own test_registry_creation, which constructs `CratesIoRegistry` directly — a different
+    // type from `Ecosystem::registry()`'s `Arc<dyn Registry>` return value.
+    deps_core::ecosystem_conformance! {
+        mod cargo_ecosystem_conformance;
+        build: CargoEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        ty: CargoEcosystem;
+        id: "cargo";
+        display_name: "Cargo (Rust)";
+        manifest_filenames: &["Cargo.toml"];
+        lockfile_filenames: &["Cargo.lock"];
+    }
+
+    // #758: the shared completion-prefix-length guard
+    // (`deps_core::completion::complete_package_names_generic`), replacing
+    // test_complete_package_names_minimum_prefix/test_complete_package_names_max_length.
+    // The mock registry the macro supplies stands in for `CargoEcosystem`'s own
+    // `self.registry` here, so this calls the exact shared guard `complete_package_names`
+    // delegates to (`formatter.rs`'s `CargoEcosystem::complete_package_names`,
+    // `deps_core::completion::complete_package_names_generic`), with the same `limit: 20` —
+    // without it, an always-offline real registry couldn't distinguish "the guard rejected
+    // this prefix" from "the network call failed" (#758 impl-critic M1).
+    deps_core::completion_guard_conformance! {
+        mod cargo_completion_guard_conformance;
+        complete: |registry: &dyn deps_core::Registry, prefix: String| -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Vec<tower_lsp_server::ls_types::CompletionItem>> + Send + '_>,
+        > {
+            // Boxed, lifetime-parameterized future: `complete_package_names_generic`'s
+            // `impl Future` borrows `registry` across the `.await`, which a plain `Fn(..) ->
+            // Fut` associated type can't express per-call (see
+            // `deps_core::conformance::assert_completion_guard`'s doc).
+            Box::pin(async move {
+                deps_core::completion::complete_package_names_generic(
+                    registry,
+                    &prefix,
+                    20,
+                    Range::default(),
+                )
+                .await
+            })
+        };
+    }
+
     fn pkg(s: &str) -> deps_core::PackageName {
         deps_core::PackageName::new(s)
     }
@@ -410,34 +455,6 @@ mod tests {
         MockParseResult {
             dependencies: vec![],
         }
-    }
-
-    #[test]
-    fn test_ecosystem_id() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = CargoEcosystem::new(cache);
-        assert_eq!(ecosystem.id(), "cargo");
-    }
-
-    #[test]
-    fn test_ecosystem_display_name() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = CargoEcosystem::new(cache);
-        assert_eq!(ecosystem.display_name(), "Cargo (Rust)");
-    }
-
-    #[test]
-    fn test_ecosystem_manifest_filenames() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = CargoEcosystem::new(cache);
-        assert_eq!(ecosystem.manifest_filenames(), &["Cargo.toml"]);
-    }
-
-    #[test]
-    fn test_ecosystem_lockfile_filenames() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = CargoEcosystem::new(cache);
-        assert_eq!(ecosystem.lockfile_filenames(), &["Cargo.lock"]);
     }
 
     #[test]
@@ -615,16 +632,6 @@ mod tests {
         assert_eq!(hints.len(), 1);
     }
 
-    #[test]
-    fn test_as_any() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = CargoEcosystem::new(cache);
-
-        // Verify we can downcast
-        let any = ecosystem.as_any();
-        assert!(any.is::<CargoEcosystem>());
-    }
-
     #[tokio::test]
     async fn test_package_name_completion_context_has_real_range() {
         // Regression test for #232: the textEdit range for a package-name completion
@@ -651,22 +658,6 @@ mod tests {
             }
             other => panic!("Expected PackageName context, got {other:?}"),
         }
-    }
-
-    #[tokio::test]
-    async fn test_complete_package_names_minimum_prefix() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = CargoEcosystem::new(cache);
-
-        // Less than 2 characters should return empty
-        let results = ecosystem
-            .complete_package_names("s", Range::default())
-            .await;
-        assert!(results.is_empty());
-
-        // Empty prefix should return empty
-        let results = ecosystem.complete_package_names("", Range::default()).await;
-        assert!(results.is_empty());
     }
 
     #[tokio::test]
@@ -923,27 +914,6 @@ mod tests {
             .complete_package_names("tokio-ut", Range::default())
             .await;
         // Should not panic or error
-        assert!(results.is_empty() || !results.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_complete_package_names_max_length() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = CargoEcosystem::new(cache);
-
-        // Prefix longer than 200 chars should return empty (security)
-        let long_prefix = "a".repeat(201);
-        let results = ecosystem
-            .complete_package_names(&long_prefix, Range::default())
-            .await;
-        assert!(results.is_empty());
-
-        // Exactly 100 chars should work
-        let max_prefix = "a".repeat(100);
-        let results = ecosystem
-            .complete_package_names(&max_prefix, Range::default())
-            .await;
-        // Should not panic, but may return empty (no matches)
         assert!(results.is_empty() || !results.is_empty());
     }
 

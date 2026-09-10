@@ -69,7 +69,7 @@ const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 /// Ceiling every [`BodyLimit`] is clamped to at construction, so no caller can weaken
 /// the size guard [`read_body_capped`] enforces past this value.
 ///
-/// 128 MiB comfortably covers the largest known caller ([`crate`][deps-pypi]'s PyPI
+/// 128 MiB comfortably covers the largest known caller (`deps-pypi`'s PyPI
 /// Simple API full index, ~43 MB decompressed today, capped at 96 MiB for organic
 /// growth) while still bounding the pathological case.
 const ABSOLUTE_MAX_RESPONSE_BYTES: usize = 128 * 1024 * 1024;
@@ -169,7 +169,10 @@ fn ensure_https(url: &str) -> Result<()> {
     if is_loopback_host(url) {
         return Ok(());
     }
-    Err(DepsError::CacheError(format!("URL must use HTTPS: {url}")))
+    Err(DepsError::CacheError(format!(
+        "URL must use HTTPS: {}",
+        crate::net_policy::url_for_tracing(url)
+    )))
 }
 
 /// True when a redirect hop moves from an `https` origin to a plain `http` one.
@@ -648,7 +651,7 @@ async fn read_body_capped(url: &str, mut response: Response, limit: BodyLimit) -
         .await
         .map_err(|e| DepsError::RegistryError {
             package: url.to_string(),
-            source: e,
+            source: e.without_url(),
         })?
     {
         if body.len() + chunk.len() > limit {
@@ -1283,6 +1286,10 @@ impl HttpCache {
     /// current sole caller (a fixed `Accept` header), but directly load-bearing for any
     /// future auth-wiring work: reach for [`Self::get_cached_trusted_origin_with_headers`]
     /// instead if a header ever needs to stay pinned to one origin.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::get_cached`].
     pub async fn get_cached_workspace_with_headers(
         &self,
         url: &str,
@@ -1521,7 +1528,7 @@ impl HttpCache {
 
         let response = request.send().await.map_err(|e| DepsError::RegistryError {
             package: url.to_string(),
-            source: e,
+            source: e.without_url(),
         })?;
 
         if response.status() == StatusCode::NOT_MODIFIED {
@@ -1598,7 +1605,7 @@ impl HttpCache {
 
         let response = request.send().await.map_err(|e| DepsError::RegistryError {
             package: url.to_string(),
-            source: e,
+            source: e.without_url(),
         })?;
 
         if !response.status().is_success() {
@@ -1652,7 +1659,11 @@ impl HttpCache {
         skip(self, body),
         fields(url = crate::net_policy::url_for_tracing(url))
     )]
-    pub async fn post_json<T: Serialize + ?Sized>(&self, url: &str, body: &T) -> Result<Bytes> {
+    pub async fn post_json<T: Serialize + Sync + ?Sized>(
+        &self,
+        url: &str,
+        body: &T,
+    ) -> Result<Bytes> {
         self.ensure_online(url)?;
         ensure_https(url)?;
 
@@ -1665,7 +1676,7 @@ impl HttpCache {
             .await
             .map_err(|e| DepsError::RegistryError {
                 package: url.to_string(),
-                source: e,
+                source: e.without_url(),
             })?;
 
         if !response.status().is_success() {
@@ -1788,7 +1799,7 @@ impl HttpCache {
 
         let response = request.send().await.map_err(|e| DepsError::RegistryError {
             package: url.to_string(),
-            source: e,
+            source: e.without_url(),
         })?;
 
         if !response.status().is_success() {
@@ -1960,6 +1971,18 @@ mod tests {
     #[test]
     fn test_ensure_https_rejects_non_loopback_http() {
         assert!(ensure_https("http://example.com").is_err());
+    }
+
+    /// #767 M2: `ensure_https`'s `CacheError` used to bake the raw rejected URL in
+    /// verbatim, the same message-level leak class fixed in `deps-cargo::sparse`'s
+    /// fail-closed log on the same `window/showMessage` path.
+    #[test]
+    fn test_ensure_https_rejection_message_redacts_query_string() {
+        let err = ensure_https("http://example.com/pkg?token=super-secret-value").unwrap_err();
+        assert!(
+            !err.to_string().contains("super-secret-value"),
+            "err: {err}"
+        );
     }
 
     // `http://example.com` alone would still pass under a regressed, substring-based
@@ -2932,6 +2955,33 @@ mod tests {
         assert!(
             !output.contains("super-secret-value"),
             "leaked token via 'fetching fresh' debug log: {output:?}"
+        );
+    }
+
+    /// #767 S3: proves `.without_url()` actually strips the URL from the wrapped
+    /// `reqwest::Error`'s own `Display`, not just that `RegistryError::package` is
+    /// redacted — a genuine transport-level error (connection refused on a closed
+    /// loopback port, so `.url()` is populated the way a builder-only error like
+    /// `Client::get("not a url").build().unwrap_err()` never is) is required to exercise
+    /// this: reverting all 5 `.without_url()` call sites in this file must fail this test.
+    #[tokio::test]
+    async fn test_registry_error_source_redacts_url_on_real_transport_error() {
+        // Bind then immediately drop a loopback listener: nothing accepts connections on
+        // this port afterward, so a request to it fails fast with connection-refused
+        // instead of hanging or needing a real unreachable host.
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let url = format!("http://127.0.0.1:{port}/pkg?token=super-secret-value");
+
+        let cache = HttpCache::new();
+        let err = cache.get_cached(&url).await.unwrap_err();
+
+        assert_matches!(err, DepsError::RegistryError { .. });
+        assert!(
+            !err.to_string().contains("super-secret-value"),
+            "err: {err}"
         );
     }
 

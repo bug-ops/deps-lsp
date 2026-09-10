@@ -42,6 +42,11 @@ pub struct GoParseResult {
 /// No live `$GOENV` policy handle — every dependency resolves to plain
 /// [`deps_core::parser::DependencySource::Registry`], byte-identical to pre-#519 behavior.
 /// Production parsing goes through [`parse_go_mod_with_context`] instead.
+///
+/// # Errors
+///
+/// Infallible by construction: unrecognized lines are skipped rather than erroring.
+/// Returns [`Result`] only to match the shared parser signature every ecosystem implements.
 pub fn parse_go_mod(content: &str, doc_uri: &Uri) -> Result<GoParseResult> {
     parse_go_mod_with_context(content, doc_uri, &GoParseContext::default())
 }

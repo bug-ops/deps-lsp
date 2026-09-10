@@ -107,6 +107,10 @@ fn extract_matches(
 ///
 /// Always succeeds: unrecognized lines are simply skipped. Returns [`Result`]
 /// only to match the shared parser signature every ecosystem implements.
+///
+/// # Errors
+///
+/// Infallible by construction: this function never returns `Err`.
 pub fn parse_groovy_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
     let mut dependencies = Vec::new();
 

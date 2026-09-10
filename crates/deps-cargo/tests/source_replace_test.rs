@@ -271,7 +271,7 @@ fn test_mirror_distinct_pinned_versions_produce_distinct_vulnerability_keys() {
         uri: deps_core::test_util::test_uri("/test/Cargo.toml"),
     };
 
-    // No lockfile-resolved versions; `in_use_version` falls back to the manifest
+    // No lockfile-resolved versions; `resolve_in_use_version` falls back to the manifest
     // requirement, which is already concrete (`=X.Y.Z`) for both occurrences.
     let resolved: HashMap<PackageName, ConcreteVersion> = HashMap::new();
     let formatter = CargoFormatter;

@@ -463,40 +463,15 @@ mod tests {
         }
     }
 
+    /// Smoke test: `register_ecosystems` must not panic under any feature combination.
+    /// Per-ecosystem "is it actually registered" coverage moved to
+    /// [`test_ecosystem_id_all_registered`] (#758) — driven by
+    /// [`deps_core::EcosystemId::ALL`] instead of this hand-written, drift-prone 14-line list.
     #[test]
     fn test_register_ecosystems() {
         let registry = Arc::new(EcosystemRegistry::new());
         let cache = Arc::new(HttpCache::new());
         register_ecosystems(&registry, Arc::clone(&cache), &test_runtime());
-
-        #[cfg(feature = "cargo")]
-        assert!(registry.get("cargo").is_some());
-        #[cfg(feature = "npm")]
-        assert!(registry.get("npm").is_some());
-        #[cfg(feature = "pypi")]
-        assert!(registry.get("pypi").is_some());
-        #[cfg(feature = "go")]
-        assert!(registry.get("go").is_some());
-        #[cfg(feature = "bundler")]
-        assert!(registry.get("bundler").is_some());
-        #[cfg(feature = "dart")]
-        assert!(registry.get("dart").is_some());
-        #[cfg(feature = "maven")]
-        assert!(registry.get("maven").is_some());
-        #[cfg(feature = "gradle")]
-        assert!(registry.get("gradle").is_some());
-        #[cfg(feature = "swift")]
-        assert!(registry.get("swift").is_some());
-        #[cfg(feature = "composer")]
-        assert!(registry.get("composer").is_some());
-        #[cfg(feature = "nuget")]
-        assert!(registry.get("nuget").is_some());
-        #[cfg(feature = "deno")]
-        assert!(registry.get("deno").is_some());
-        #[cfg(feature = "github-actions")]
-        assert!(registry.get("github-actions").is_some());
-        #[cfg(feature = "gitlab-ci")]
-        assert!(registry.get("gitlab-ci").is_some());
     }
 
     /// Issue #592 security M1: every id `register_ecosystems` returns must actually be a
@@ -549,10 +524,15 @@ mod tests {
     /// Regression guard for issue #118: `EcosystemId`'s string literals (`deps-core`)
     /// are hand-duplicated from each ecosystem crate's own `Ecosystem::id()`, with
     /// nothing linking them at compile time. This proves every id actually registered
-    /// by `register_ecosystems` round-trips through `EcosystemId::from_str`/`id()`,
-    /// and that every `EcosystemId` variant resolves back to a registered ecosystem —
-    /// so a future rename fails this test instead of panicking at document-open time
-    /// (see the `.expect()` in `document::resolved::resolve_ecosystem_id`).
+    /// by `register_ecosystems` round-trips through `EcosystemId::from_str`/`id()` — so a
+    /// future rename fails this test instead of panicking at document-open time (see the
+    /// `.expect()` in `document::resolved::resolve_ecosystem_id`).
+    ///
+    /// The reverse direction — every `EcosystemId` variant resolves back to a registered
+    /// ecosystem — moved to [`test_ecosystem_id_all_registered`] (#758): driven by
+    /// [`deps_core::EcosystemId::ALL`] instead of this hand-written, drift-prone 14-line list,
+    /// so an ecosystem declared in the enum but never wired into `register_ecosystems` fails
+    /// closed rather than silently passing an empty loop here.
     #[test]
     fn test_ecosystem_id_matches_registered_ecosystems() {
         let registry = Arc::new(EcosystemRegistry::new());
@@ -565,47 +545,146 @@ mod tests {
             });
             assert_eq!(parsed.id(), id);
         }
+    }
 
-        #[cfg(feature = "cargo")]
-        assert!(registry.get(deps_core::EcosystemId::Cargo.id()).is_some());
-        #[cfg(feature = "npm")]
-        assert!(registry.get(deps_core::EcosystemId::Npm.id()).is_some());
-        #[cfg(feature = "pypi")]
-        assert!(registry.get(deps_core::EcosystemId::Pypi.id()).is_some());
-        #[cfg(feature = "go")]
-        assert!(registry.get(deps_core::EcosystemId::Go.id()).is_some());
-        #[cfg(feature = "bundler")]
-        assert!(registry.get(deps_core::EcosystemId::Bundler.id()).is_some());
-        #[cfg(feature = "dart")]
-        assert!(registry.get(deps_core::EcosystemId::Dart.id()).is_some());
-        #[cfg(feature = "maven")]
-        assert!(registry.get(deps_core::EcosystemId::Maven.id()).is_some());
-        #[cfg(feature = "gradle")]
-        assert!(registry.get(deps_core::EcosystemId::Gradle.id()).is_some());
-        #[cfg(feature = "swift")]
-        assert!(registry.get(deps_core::EcosystemId::Swift.id()).is_some());
-        #[cfg(feature = "composer")]
-        assert!(
-            registry
-                .get(deps_core::EcosystemId::Composer.id())
-                .is_some()
-        );
-        #[cfg(feature = "nuget")]
-        assert!(registry.get(deps_core::EcosystemId::NuGet.id()).is_some());
-        #[cfg(feature = "deno")]
-        assert!(registry.get(deps_core::EcosystemId::Deno.id()).is_some());
-        #[cfg(feature = "github-actions")]
-        assert!(
-            registry
-                .get(deps_core::EcosystemId::GithubActions.id())
-                .is_some()
-        );
-        #[cfg(feature = "gitlab-ci")]
-        assert!(
-            registry
-                .get(deps_core::EcosystemId::GitlabCi.id())
-                .is_some()
-        );
+    /// Layer 1a (#758): completeness — every [`deps_core::EcosystemId::ALL`] variant must
+    /// actually be registered by [`register_ecosystems`]. Driven by `ALL` itself, not
+    /// `registry.ecosystem_ids()`, so an ecosystem declared in the enum but never wired in
+    /// fails this test instead of silently vanishing from coverage.
+    ///
+    /// Gated on every ecosystem feature at once: `ALL` always lists 14 variants regardless of
+    /// which features are enabled for this build, so this specific claim — "all 14 are
+    /// present" — is only meaningful, and only makes sense to check, in an all-features build.
+    /// The per-ecosystem invariants that don't depend on all 14 being present live in the
+    /// ungated [`test_registered_ecosystems_universal_invariants`] instead (#758 impl-critic
+    /// S2): unlike this completeness check, those must keep working under any feature subset,
+    /// the way the two hand-written per-feature lists this pair replaces used to.
+    #[cfg(all(
+        feature = "cargo",
+        feature = "npm",
+        feature = "pypi",
+        feature = "go",
+        feature = "bundler",
+        feature = "dart",
+        feature = "maven",
+        feature = "gradle",
+        feature = "swift",
+        feature = "composer",
+        feature = "nuget",
+        feature = "deno",
+        feature = "github-actions",
+        feature = "gitlab-ci"
+    ))]
+    #[test]
+    fn test_ecosystem_id_all_registered() {
+        let registry = Arc::new(EcosystemRegistry::new());
+        let cache = Arc::new(HttpCache::new());
+        register_ecosystems(&registry, Arc::clone(&cache), &test_runtime());
+
+        for id in deps_core::EcosystemId::ALL {
+            assert!(
+                registry.get(id.id()).is_some(),
+                "{id:?} is in EcosystemId::ALL but was not registered by register_ecosystems"
+            );
+        }
+    }
+
+    /// Layer 1b (#758): universal, offline invariants every ecosystem this build actually
+    /// registers must satisfy. Deliberately **ungated** — unlike
+    /// [`test_ecosystem_id_all_registered`]'s completeness claim, none of these invariants
+    /// depend on all 14 ecosystems being present, so this iterates whatever
+    /// `registry.ecosystem_ids()` this build's feature set produced (#758 impl-critic S2):
+    /// under `--no-default-features --features npm`, it still covers `npm` alone; under the
+    /// default (all 14) build, it covers all 14, same as before the split.
+    ///
+    /// Per ecosystem: id round-trip; `display_name()` non-empty and unique across the set; at
+    /// least one routing surface non-empty; `lockfile_filenames().is_empty() ==
+    /// lockfile_provider().is_none()`; `package_url` hostile-input safety (display sink only —
+    /// see `deps_core::conformance`'s doc for the display-vs-fetch sink split; does **not**
+    /// prove the URL is non-degenerate, that is `formatter_conformance!`'s job per ecosystem);
+    /// `completion_insert_text` does not panic.
+    #[test]
+    fn test_registered_ecosystems_universal_invariants() {
+        let registry = Arc::new(EcosystemRegistry::new());
+        let cache = Arc::new(HttpCache::new());
+        register_ecosystems(&registry, Arc::clone(&cache), &test_runtime());
+
+        let mut display_names = std::collections::HashSet::new();
+
+        for id in registry.ecosystem_ids() {
+            let ecosystem = registry
+                .get(id)
+                .unwrap_or_else(|| panic!("{id:?} came from registry.ecosystem_ids() itself"));
+
+            let parsed_id: deps_core::EcosystemId = id.parse().unwrap_or_else(|_| {
+                panic!("{id:?} has no matching EcosystemId variant (see issue #118)")
+            });
+            assert_eq!(
+                parsed_id.id(),
+                id,
+                "{id:?}: EcosystemId round-trip mismatch"
+            );
+            assert_eq!(ecosystem.id(), id, "{id:?}: Ecosystem::id() mismatch");
+
+            let display_name = ecosystem.display_name();
+            assert!(!display_name.is_empty(), "{id:?} has an empty display_name");
+            assert!(
+                display_names.insert(display_name),
+                "{id:?}'s display_name {display_name:?} collides with another ecosystem's"
+            );
+
+            assert!(
+                !ecosystem.manifest_filenames().is_empty()
+                    || !ecosystem.manifest_patterns().is_empty()
+                    || !ecosystem.manifest_extensions().is_empty()
+                    || !ecosystem.manifest_directory_patterns().is_empty(),
+                "{id:?} has no routing surface at all (manifest_filenames/patterns/extensions/directory_patterns)"
+            );
+
+            assert_eq!(
+                ecosystem.lockfile_filenames().is_empty(),
+                ecosystem.lockfile_provider().is_none(),
+                "{id:?}: lockfile_filenames()/lockfile_provider() disagree on whether a lock file format exists"
+            );
+
+            // Hostile-input safety for the `package_url` *display* sink
+            // (`lsp_helpers::hover`'s `# [{name}]({url})`, destination written raw — see
+            // `HOSTILE_DISPLAY_LINK_PAYLOAD`'s doc for the full sink/hazard rationale, #758
+            // security-review). Every character that can break out of a markdown
+            // `[label](destination)` link is checked, not just newline/autolink/percent.
+            let hostile_name =
+                deps_core::PackageName::new(deps_core::conformance::HOSTILE_DISPLAY_LINK_PAYLOAD);
+            let url = ecosystem.formatter().package_url(&hostile_name);
+            assert!(
+                url.is_empty() || url::Url::parse(&url).is_ok(),
+                "{id:?}: package_url produced an unparsable non-empty URL: {url:?}"
+            );
+            if !url.is_empty() {
+                for hazard in ['\n', '<', '>', '(', ')', '[', ']', '`'] {
+                    assert!(
+                        !url.contains(hazard),
+                        "{id:?}: package_url leaked a literal {hazard:?} — a markdown \
+                         `[label](destination)` link-destination breakout character: {url:?}"
+                    );
+                }
+                assert!(
+                    !url.chars().any(char::is_control),
+                    "{id:?}: package_url leaked a raw control character: {url:?}"
+                );
+                assert!(
+                    !url.contains('\u{202e}'),
+                    "{id:?}: package_url leaked a raw U+202E right-to-left override \
+                     (display-spoofing): {url:?}"
+                );
+                assert!(
+                    url.contains("%25"),
+                    "{id:?}: package_url did not encode the payload's literal '%' as %25: {url:?}"
+                );
+            }
+
+            let metadata = deps_core::test_util::MockMetadata::new("conformance-probe", "1.0.0");
+            let _ = ecosystem.completion_insert_text(&metadata);
+        }
     }
 
     /// CRITICAL regression (issue #706 review): GitHub Actions' `action.yml`/`action.yaml`

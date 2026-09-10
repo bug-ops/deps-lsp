@@ -378,7 +378,7 @@ pub struct ResolvedPackages {
 /// falling back to a lexicographic compare when both (or neither) parse.
 ///
 /// Shared by [`best_package`] and the per-occurrence candidate selection in
-/// [`crate::lsp_helpers::in_use_version`] (issue #649) so a lock file entry with a
+/// [`crate::lsp_helpers::resolve_in_use_version`] (issue #649) so a lock file entry with a
 /// non-semver version string is never ordered by two diverging policies depending on which
 /// caller is asking.
 pub(crate) fn compare_lockfile_versions(a: &str, b: &str) -> std::cmp::Ordering {

@@ -78,7 +78,7 @@ const DEPS_DEV_BODY_LIMIT: usize = 1024 * 1024;
 /// Key for [`DepsDevClient`]'s version-level memo.
 ///
 /// A typed struct, not a `\0`-joined string: `name` comes from a manifest
-/// and `version` from `in_use_version` (whose lockfile `ConcreteVersion`
+/// and `version` from `resolve_in_use_version` (whose lockfile `ConcreteVersion`
 /// branch is never charset-validated), so a joined-string key could let
 /// `("a\0b", "c")` and `("a", "b\0c")` collide and serve another package's
 /// trust signal. A derived `Hash`/`Eq` over four fields cannot collide by

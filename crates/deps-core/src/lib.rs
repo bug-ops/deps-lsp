@@ -42,6 +42,12 @@
 /// HTTP response cache with `ETag`/`Last-Modified` conditional-request validation.
 pub mod cache;
 pub mod completion;
+/// Shared `#[macro_export]`ed conformance-test scaffolding (#758).
+///
+/// Ecosystem crates invoke these macros instead of hand-copying the same test family. Gated
+/// identically to [`test_util`].
+#[cfg(any(test, feature = "test-util"))]
+pub mod conformance;
 pub mod deps_dev;
 /// The [`ecosystem::Ecosystem`] trait: the sealed extension point every package
 /// ecosystem crate implements to plug into the LSP server.

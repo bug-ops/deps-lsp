@@ -358,9 +358,11 @@ fn resolve_alternate_registries(
         } else {
             // `alias` here is the raw `registry-index`/`registry` value from the manifest,
             // not a config-file alias name — it may itself be a URL carrying `user:pass@`
-            // credentials (e.g. `RegistryIndexError::UserInfoPresent` fell through to alias
-            // resolution). Redact before logging (see `deps_core::net_policy::redact_userinfo`).
-            let redacted = deps_core::net_policy::redact_userinfo(alias);
+            // credentials or a query-string credential (e.g. `RegistryIndexError::UserInfoPresent`
+            // fell through to alias resolution). Redact before logging (see
+            // `deps_core::net_policy::url_for_tracing`, not `redact_userinfo` alone, which
+            // preserves the query string — #767 follow-up).
+            let redacted = deps_core::net_policy::url_for_tracing(alias);
             tracing::warn!(
                 alias = %redacted,
                 "registry alias did not resolve via the .cargo/config.toml \
@@ -1138,12 +1140,14 @@ internal-crate = { version = "1.0", registry-index = "https://169.254.169.254/in
     /// treated as a possible `.cargo/config.toml` alias name). When that "alias" then fails
     /// to resolve too, the unresolved-alias `tracing::warn!` must never log the raw,
     /// credential-bearing value — it must be redacted first (see
-    /// `deps_core::net_policy::redact_userinfo`), matching the #529 precedent already applied
-    /// to `validate_index_url`'s own error `Display`.
+    /// `deps_core::net_policy::url_for_tracing`, not `redact_userinfo` alone, which preserves
+    /// the query string — a code-review follow-up on #767, matching the #529 precedent
+    /// already applied to `validate_index_url`'s own error `Display`), and this covers both
+    /// a userinfo credential and a query-string one in the same value.
     #[test]
     fn test_parse_registry_index_userinfo_alias_fallback_redacts_credential_in_log() {
         let toml = r#"[dependencies]
-internal-crate = { version = "1.0", registry-index = "sparse+https://user:hunter2@index.crates.io/" }"#;
+internal-crate = { version = "1.0", registry-index = "sparse+https://user:hunter2@index.crates.io/?token=super-secret-value" }"#;
 
         let log = deps_core::test_util::capture_tracing_output(|| {
             let result = parse_cargo_toml(toml, &test_url()).unwrap();
@@ -1152,7 +1156,7 @@ internal-crate = { version = "1.0", registry-index = "sparse+https://user:hunter
                 matches!(
                     &result.dependencies[0].source,
                     DependencySource::CustomRegistry { url }
-                        if url == "sparse+https://user:hunter2@index.crates.io/"
+                        if url == "sparse+https://user:hunter2@index.crates.io/?token=super-secret-value"
                 ),
                 "a userinfo-bearing index that fails alias resolution must stay unresolved"
             );
@@ -1167,6 +1171,10 @@ internal-crate = { version = "1.0", registry-index = "sparse+https://user:hunter
             "tracing output leaked the username: {log:?}"
         );
         assert!(
+            !log.contains("super-secret-value"),
+            "tracing output leaked the query-string credential: {log:?}"
+        );
+        assert!(
             log.contains("index.crates.io"),
             "host should survive redaction: {log:?}"
         );
@@ -1178,12 +1186,13 @@ internal-crate = { version = "1.0", registry-index = "sparse+https://user:hunter
     /// resolution and trip `resolve_registries`' env-collision `tracing::warn!`
     /// (`config.rs`), which logs the full raw value list. That WARN is a second call site
     /// (distinct from the unresolved-alias WARN covered above) that must also redact each
-    /// entry before logging.
+    /// entry before logging — a query-string credential included, not just userinfo (a
+    /// code-review follow-up on #767: `redact_userinfo` alone preserves the query string).
     #[test]
     fn test_parse_registry_index_env_collision_redacts_credential_in_log() {
         let toml = r#"[dependencies]
-a = { version = "1.0", registry-index = "sparse+https://user:hunter2@index.mycorp.dev/" }
-b = { version = "1.0", registry-index = "sparse+https://USER:hunter2@index.mycorp.dev/" }"#;
+a = { version = "1.0", registry-index = "sparse+https://user:hunter2@index.mycorp.dev/?token=super-secret-value" }
+b = { version = "1.0", registry-index = "sparse+https://USER:hunter2@index.mycorp.dev/?token=super-secret-value" }"#;
 
         let log = deps_core::test_util::capture_tracing_output(|| {
             let result = parse_cargo_toml(toml, &test_url()).unwrap();
@@ -1201,6 +1210,10 @@ b = { version = "1.0", registry-index = "sparse+https://USER:hunter2@index.mycor
         assert!(
             !log.to_lowercase().contains("user:"),
             "tracing output leaked the username: {log:?}"
+        );
+        assert!(
+            !log.contains("super-secret-value"),
+            "tracing output leaked the query-string credential: {log:?}"
         );
         assert!(
             log.contains("index.mycorp.dev"),

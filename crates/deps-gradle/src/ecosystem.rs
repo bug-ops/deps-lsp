@@ -131,14 +131,33 @@ fn byte_range(line: &str, line_idx: u32, start_byte: usize, end_byte: usize) -> 
 /// (e.g. treating a cursor inside `module`'s still-open value as "version" context,
 /// because "version" appears earlier on the line and the combined quote count happens
 /// to be odd).
+// Kept as its own escape-aware loop rather than calling
+// `deps_core::fallback_completion::count_real_quotes`/`find_closing_quote`: this needs
+// an `in_string` toggle interleaved with comma-boundary tracking in a *single* forward
+// pass (a comma's own `!in_string` guard depends on the running parity at that exact
+// position), which the shared helpers — built to answer "count/find real quotes over
+// the whole segment" — don't expose mid-scan. Keeps the same backslash-run escape rule
+// as those helpers (see `count_real_quotes`'s doc comment) so the two can't disagree on
+// a line containing `\"` (#738 follow-up); a future change to that rule must be mirrored
+// here too.
 fn current_field_start(before_cursor: &str) -> usize {
     let mut in_string = false;
+    let mut backslash_run = 0usize;
     let mut field_start = 0;
     for (i, c) in before_cursor.char_indices() {
         match c {
-            '"' => in_string = !in_string,
-            ',' if !in_string => field_start = i + 1,
-            _ => {}
+            '\\' => backslash_run += 1,
+            '"' => {
+                if backslash_run.is_multiple_of(2) {
+                    in_string = !in_string;
+                }
+                backslash_run = 0;
+            }
+            ',' if !in_string => {
+                field_start = i + 1;
+                backslash_run = 0;
+            }
+            _ => backslash_run = 0,
         }
     }
     field_start
@@ -170,13 +189,14 @@ fn detect_catalog_context<'a>(
     if let Some(rel_eq_pos) = field.rfind("version")
         && let after = &field[rel_eq_pos..]
         && after.contains('=')
-        // An odd quote count means the cursor sits inside an unclosed string opened by
-        // the LAST quote in `after` — i.e. `rfind` below is genuinely the opening quote.
+        // An odd, escape-aware (see `count_real_quotes`) quote count means the cursor
+        // sits inside an unclosed string opened by the last *real* quote in `after`.
         // With an even count (string already closed, or no quote at all before cursor)
         // the cursor is past this `version = "..."` entirely (e.g. a trailing comment on
         // the same line), and this is not the right completion context.
-        && after.chars().filter(|&c| c == '"').count() % 2 == 1
-        && let Some(quote_start) = after.rfind('"')
+        && let (quote_count, Some(quote_start)) =
+            deps_core::fallback_completion::count_real_quotes(after)
+        && !quote_count.is_multiple_of(2)
     {
         let value_start = field_start + rel_eq_pos + quote_start + 1;
         if value_start <= cursor {
@@ -188,8 +208,9 @@ fn detect_catalog_context<'a>(
     if let Some(rel_eq_pos) = field.rfind("module")
         && let after = &field[rel_eq_pos..]
         && after.contains('=')
-        && after.chars().filter(|&c| c == '"').count() % 2 == 1
-        && let Some(quote_start) = after.rfind('"')
+        && let (quote_count, Some(quote_start)) =
+            deps_core::fallback_completion::count_real_quotes(after)
+        && !quote_count.is_multiple_of(2)
     {
         let value_start = field_start + rel_eq_pos + quote_start + 1;
         if value_start <= cursor {
@@ -197,10 +218,10 @@ fn detect_catalog_context<'a>(
             // unclosed string doesn't swallow unrelated trailing line content into the
             // replace range (mirrors `MavenEcosystem::detect_xml_context`'s equivalent
             // no-closing-tag fallback).
-            let value_end = line[value_start..]
-                .find('"')
-                .map_or(cursor, |rel| value_start + rel)
-                .max(cursor);
+            let value_end =
+                deps_core::fallback_completion::find_closing_quote(&line[value_start..], '"')
+                    .map_or(cursor, |rel| value_start + rel)
+                    .max(cursor);
             let range = byte_range(line, line_idx, value_start, value_end);
             return ("package", &line[value_start..cursor], range);
         }
@@ -225,26 +246,24 @@ fn detect_dsl_context<'a>(
     line_idx: u32,
 ) -> (&'static str, &'a str, Range) {
     let cursor = col_idx.min(line.len());
-    let in_string = before_cursor
-        .chars()
-        .filter(|&c| c == '"' || c == '\'')
-        .count()
-        % 2
-        == 1;
-    if !in_string {
-        return ("", "", Range::default());
-    }
-
-    let colon_count = before_cursor.chars().filter(|&c| c == ':').count();
     let quote_char = if before_cursor.contains('"') {
         '"'
     } else {
         '\''
     };
-
-    let Some(open_pos) = before_cursor.rfind(quote_char) else {
+    // Escape-aware (see `count_real_quotes_with`) odd-parity check on the chosen quote
+    // character: an even count means the cursor sits past a closed string, or none was
+    // opened at all on this line (#738).
+    let (quote_count, last_real_quote) =
+        deps_core::fallback_completion::count_real_quotes_with(before_cursor, quote_char);
+    if quote_count.is_multiple_of(2) {
+        return ("", "", Range::default());
+    }
+    let Some(open_pos) = last_real_quote else {
         return ("", "", Range::default());
     };
+
+    let colon_count = before_cursor.chars().filter(|&c| c == ':').count();
 
     match colon_count {
         0 | 1 => {
@@ -255,7 +274,8 @@ fn detect_dsl_context<'a>(
             // content (mirrors `MavenEcosystem::detect_xml_context`'s no-closing-tag
             // fallback).
             let rest = &line[open_pos + 1..];
-            let closing_quote_rel = rest.find(quote_char);
+            let closing_quote_rel =
+                deps_core::fallback_completion::find_closing_quote(rest, quote_char);
             let scan_limit_rel = closing_quote_rel.unwrap_or(cursor - (open_pos + 1));
             let end_rel = rest[..scan_limit_rel]
                 .char_indices()
@@ -516,6 +536,44 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_catalog_context_version_closed_value_with_escaped_quote_stays_closed() {
+        // version = "a\"b" | — cursor past a properly closed value that contains an
+        // escaped quote. A naive raw `"` count sees 3 quote characters (odd, "still
+        // open") and wrongly reports a "version" context whose value is the trailing
+        // space; the escape-aware count correctly sees 2 real quotes (even, closed) and
+        // reports no completion context at all (#738 follow-up).
+        let line = "version = \"a\\\"b\" ";
+        let col = line.len();
+        let before = &line[..col];
+        let (t, v, range) = detect_catalog_context(before, line, col, 0);
+        assert_eq!(t, "");
+        assert_eq!(v, "");
+        assert_eq!(range, Range::default());
+    }
+
+    #[test]
+    fn test_detect_catalog_context_module_escaped_quote_does_not_close_string() {
+        // module = "com.example\"extra:lib — an escaped quote inside the still-open
+        // value must not be miscounted as closing the string (#738): a naive raw `"`
+        // count sees 2 quote characters (even, "closed") while the escape-aware count
+        // correctly sees 1 real quote (odd, still open).
+        let line = "module = \"com.example\\\"extra:lib";
+        let col = line.len();
+        let before = &line[..col];
+        let (t, v, range) = detect_catalog_context(before, line, col, 0);
+        assert_eq!(t, "package");
+        let value_start = line.find('"').unwrap() + 1;
+        assert_eq!(v, &line[value_start..col]);
+        assert_eq!(
+            range,
+            Range::new(
+                Position::new(0, value_start as u32),
+                Position::new(0, col as u32)
+            )
+        );
+    }
+
+    #[test]
     fn test_detect_dsl_context_package_cursor_mid() {
         // implementation("junit|:junit:4.13.2")
         let line = r#"implementation("junit:junit:4.13.2")"#;
@@ -549,6 +607,51 @@ mod tests {
             Range::new(Position::new(0, 16), Position::new(0, 21))
         );
         assert_eq!(&line[16..21], "junit");
+    }
+
+    #[test]
+    fn test_detect_dsl_context_escaped_quote_in_earlier_group_does_not_block_completion() {
+        // implementation "a\"b", "com.foo:ba — the escaped quote inside the first,
+        // already-closed string argument must not desync the quote-parity check and
+        // suppress completion on the second, still-open string (#738). A naive raw `"`
+        // count sees 4 quote characters total (even, "no open string") and reports no
+        // completion context at all.
+        let line = "implementation \"a\\\"b\", \"com.foo:ba";
+        let col = line.len();
+        let before = &line[..col];
+        let (t, v, _range) = detect_dsl_context(before, line, col, 0);
+        assert_eq!(t, "package");
+        assert_eq!(v, "com.foo:ba");
+    }
+
+    #[test]
+    fn test_detect_dsl_context_apostrophe_inside_double_quoted_package_name() {
+        // implementation "com.o'reilly:li — an apostrophe inside a double-quoted
+        // string must not be mistaken for a single-quote delimiter (#738).
+        let line = r#"implementation "com.o'reilly:li"#;
+        let col = line.len();
+        let before = &line[..col];
+        let (t, v, _range) = detect_dsl_context(before, line, col, 0);
+        assert_eq!(t, "package");
+        assert_eq!(v, "com.o'reilly:li");
+    }
+
+    #[test]
+    fn test_detect_dsl_context_mixed_quote_types_on_one_line_no_completion() {
+        // exclude module: "x"; implementation 'com.baz:qu — a completed double-quoted
+        // string earlier on the line, followed by a still-open single-quoted string.
+        // `quote_char` picks '"' (the line contains one), whose own parity is even
+        // (closed), so this deliberately reports "no completion context" instead of
+        // guessing at the unrelated single-quoted string — accepted limitation, not a
+        // regression from this fix: a line mixing both quote styles picks one quote
+        // character for the whole line, not per-field.
+        let line = r#"exclude module: "x"; implementation 'com.baz:qu"#;
+        let col = line.len();
+        let before = &line[..col];
+        let (t, v, range) = detect_dsl_context(before, line, col, 0);
+        assert_eq!(t, "");
+        assert_eq!(v, "");
+        assert_eq!(range, Range::default());
     }
 
     #[test]

@@ -13,8 +13,9 @@
 //! - **No credential-shaped value is ever parsed.** [`PypiIndexUrl::new`] rejects any URL
 //!   carrying `username()`/`password()` outright (FR-006/FR-011) — there is no expansion step
 //!   for PyPI config (unlike npm's `${VAR}`), so [`InvalidEntry::raw`] and every
-//!   `tracing::warn!` here name the as-written value with any embedded userinfo stripped first
-//!   (see `redact_userinfo`) — the raw value is otherwise preserved so a warning or a
+//!   `tracing::warn!` here name the as-written value with any embedded userinfo and query
+//!   string/fragment stripped first (see `url_for_tracing`) — the raw value is otherwise
+//!   preserved so a warning or a
 //!   [`DependencySource::CustomRegistry`] naming an unresolved primary/named source still shows
 //!   the user what they actually typed, minus the credential.
 //! - **FR-005's resolution order is the load-bearing security invariant of this whole
@@ -34,7 +35,7 @@
 use std::collections::HashMap;
 
 use deps_core::net_policy::{
-    PolicyGate, RegistryAccessPolicy, redact_userinfo, validate_index_url,
+    PolicyGate, RegistryAccessPolicy, url_for_tracing, validate_index_url,
 };
 use deps_core::parser::DependencySource;
 
@@ -98,13 +99,14 @@ impl std::fmt::Display for PypiIndexUrl {
 /// A present-but-unusable index entry — an invalid URL, a policy-blocked host, or a
 /// well-formed-but-non-https/userinfo-bearing value.
 ///
-/// Carries the raw value as written, **with any embedded userinfo redacted** (M1 fix — see
-/// [`deps_core::net_policy::redact_userinfo`]), so [`PypiIndexConfig::resolve_source_for`] can build
-/// [`DependencySource::CustomRegistry`] for an explicit primary/named source, or log a warning
-/// naming what the user wrote for a dropped extra, without ever holding or surfacing the
-/// credential itself: a `CustomRegistry.url` can reach hover/diagnostics text, and a
-/// `UserInfoPresent` rejection is exactly the case where `raw` would otherwise still contain
-/// `user:pass@`.
+/// Carries the raw value as written, **with any embedded userinfo and query string/fragment
+/// redacted** (M1 fix, extended by #767 S2a — see [`deps_core::net_policy::url_for_tracing`]),
+/// so [`PypiIndexConfig::resolve_source_for`] can build [`DependencySource::CustomRegistry`]
+/// for an explicit primary/named source, or log a warning naming what the user wrote for a
+/// dropped extra, without ever holding or surfacing the credential itself: a
+/// `CustomRegistry.url` can reach hover/diagnostics text, and a `UserInfoPresent` rejection is
+/// exactly the case where `raw` would otherwise still contain `user:pass@` (a query-string
+/// credential can reach the same field via any other rejection reason).
 ///
 /// Output-only: constructed internally by this module's own `resolve_entry`, never by
 /// external code — no constructor is provided.
@@ -112,15 +114,15 @@ impl std::fmt::Display for PypiIndexUrl {
 #[derive(Debug, Clone)]
 pub struct InvalidEntry {
     /// The raw index value, as written in the source file, with any `user:pass@`/`user@`
-    /// userinfo component stripped.
+    /// userinfo component and any query string/fragment stripped.
     pub raw: String,
     /// Why it was rejected.
     pub reason: PypiIndexUrlError,
 }
 
 /// Validates and normalizes one raw index value, logging a `tracing::warn!` naming the raw
-/// value (userinfo redacted — see [`deps_core::net_policy::redact_userinfo`]) on failure.
-/// `pub(crate)`: every parser
+/// value (redacted — see [`deps_core::net_policy::url_for_tracing`]) on failure. `pub(crate)`:
+/// every parser
 /// surface (`requirements.rs`, `pyproject.rs`) that discovers a candidate index value calls
 /// this before handing the result to a [`PypiIndexConfig`] setter.
 pub(crate) fn resolve_entry(
@@ -128,7 +130,11 @@ pub(crate) fn resolve_entry(
     policy: &RegistryAccessPolicy,
 ) -> Result<PypiIndexUrl, InvalidEntry> {
     PypiIndexUrl::new(raw, policy).map_err(|reason| {
-        let redacted = redact_userinfo(raw);
+        // #767 S2a: `url_for_tracing`, not `redact_userinfo` alone — this value is also
+        // stored in `InvalidEntry::raw`, which can surface as `DependencySource::CustomRegistry`'s
+        // hover/diagnostics text, so a query-string credential must be stripped too, not just
+        // userinfo. Host and path still survive, so hover stays identifiable.
+        let redacted = url_for_tracing(raw);
         tracing::warn!(raw = %redacted, %reason, "PyPI index URL failed validation");
         InvalidEntry {
             raw: redacted,
@@ -444,7 +450,7 @@ impl PypiIndexConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deps_core::net_policy::WorkspaceRegistryAccess;
+    use deps_core::net_policy::{WorkspaceRegistryAccess, redact_userinfo};
     use std::assert_matches;
 
     fn all_policy() -> RegistryAccessPolicy {
@@ -808,6 +814,36 @@ mod tests {
         });
         assert!(
             !log.contains("hunter2"),
+            "tracing output leaked the credential: {log:?}"
+        );
+    }
+
+    /// #767 S2a: `InvalidEntry::raw` and its `tracing::warn!` line used to be built from
+    /// `redact_userinfo` alone, which preserves the query string — a rejected entry with no
+    /// userinfo at all (blocked host here) could still leak a query-string credential through
+    /// both. `url_for_tracing` fixes this while keeping the host/path identifiable.
+    #[test]
+    fn test_resolve_entry_redacts_query_string_from_raw_and_log() {
+        let policy = off_policy();
+        let log = deps_core::test_util::capture_tracing_output(|| {
+            let invalid = resolve_entry(
+                "https://pypi.example/simple?token=super-secret-value",
+                &policy,
+            )
+            .unwrap_err();
+            assert_matches!(invalid.reason, PypiIndexUrlError::BlockedHost { .. });
+            assert!(
+                !invalid.raw.contains("super-secret-value"),
+                "InvalidEntry::raw leaked the credential: {}",
+                invalid.raw
+            );
+            assert!(
+                invalid.raw.contains("pypi.example"),
+                "host should survive redaction"
+            );
+        });
+        assert!(
+            !log.contains("super-secret-value"),
             "tracing output leaked the credential: {log:?}"
         );
     }

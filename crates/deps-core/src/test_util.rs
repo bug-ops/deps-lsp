@@ -57,6 +57,71 @@ pub fn test_uri(unix_path: &str) -> Uri {
     Uri::from_file_path(path).expect("test_uri: fixture path must be a valid file URI")
 }
 
+/// Minimal [`crate::Metadata`] fixture for tests that only care about a package's name and
+/// latest version — e.g. exercising [`crate::Ecosystem::completion_insert_text`].
+///
+/// Intended to replace the ~25-line `impl Metadata for MockMetadata` block hand-copied
+/// inside individual test bodies (`deps-go`, `deps-gitlab-ci`) — those two crates are not
+/// yet migrated to this fixture, tracked as follow-up work (#758). Every [`crate::Metadata`]
+/// field beyond [`Self::new`]'s two arguments is `None`.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::Metadata;
+/// use deps_core::test_util::MockMetadata;
+///
+/// let meta = MockMetadata::new("serde", "1.0.214");
+/// assert_eq!(meta.name().as_str(), "serde");
+/// assert_eq!(meta.latest_version().as_str(), "1.0.214");
+/// assert_eq!(meta.description(), None);
+/// ```
+pub struct MockMetadata {
+    name: crate::PackageName,
+    latest_version: crate::ConcreteVersion,
+}
+
+impl MockMetadata {
+    /// Builds a fixture reporting `name` and `latest_version`; every other
+    /// [`crate::Metadata`] field defaults to `None`.
+    #[must_use]
+    pub fn new(
+        name: impl Into<crate::PackageName>,
+        latest_version: impl Into<crate::ConcreteVersion>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            latest_version: latest_version.into(),
+        }
+    }
+}
+
+impl crate::Metadata for MockMetadata {
+    fn name(&self) -> &crate::PackageName {
+        &self.name
+    }
+
+    fn description(&self) -> Option<&str> {
+        None
+    }
+
+    fn repository(&self) -> Option<&str> {
+        None
+    }
+
+    fn documentation(&self) -> Option<&str> {
+        None
+    }
+
+    fn latest_version(&self) -> &crate::ConcreteVersion {
+        &self.latest_version
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 /// Canonical adversarial identifier values for the recurring dot-segment /
 /// unvalidated-URL-sink defect class (#337, #341, #349, #357, #361).
 ///
