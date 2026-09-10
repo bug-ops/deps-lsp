@@ -35,6 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: `deps_core::conformance` gained a `package_url` hostile-input-safety check (now generated unconditionally by `formatter_conformance!` for all 14 ecosystem crates) and a `no_lockfile_support`/`format_version` optional macro arm, closing design gaps found while reviewing #781 (resolves #782) (#786)
 
 ### Fixed
+- **deps-core, deps-gitlab-ci, deps-cargo, deps-nuget**: fixed origin-pinning redirect policy to compare parsed URL origins/paths instead of raw string prefixes, closing a credential-leak bypass (#795)
 - **deps-core**: corrected a stale doc-comment reference to a nonexistent item in `in_use_version.rs` (resolves #773) (#779)
 - **deps-core, deps-cargo, deps-npm, deps-pypi, deps-go, deps-nuget, deps-maven**: `DepsError`'s `Display`/`Debug` and several ecosystem-crate warn/debug log lines no longer embed a workspace-declared registry URL's raw query string, closing a credential-exfiltration path via `window/showMessage` and `tracing` logs (resolves #767) (#775)
 - **deps-gradle**: version catalog/DSL completion no longer miscounts an escaped quote, via a generalized, quote-character-parameterized `deps-core` quote-parity helper (resolves #738) (#771)

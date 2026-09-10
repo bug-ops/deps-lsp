@@ -252,6 +252,62 @@ pub fn classify_host(url: &url::Url) -> HostClass {
     }
 }
 
+/// Whether `candidate` is trusted against `trusted`: they share an [`url::Url::origin`], and
+/// `candidate`'s path lies at or under `trusted`'s path at a proper path-segment boundary.
+///
+/// The origin-and-path pin shared by [`crate::cache::HttpCache`]'s trusted-origin request
+/// family (redirect-hop confinement) and `deps-nuget`'s registration-hive page `@id`
+/// pre-check — centralized here (issue #795 S1/S2) because both independently needed the
+/// same fix for the same class of bug: a raw `str::starts_with` test — on the full URL
+/// string, or even on the path alone — is satisfied by a same-origin *sibling* whose path
+/// merely shares a textual prefix. A trusted path of `/cargo/index` must reject
+/// `/cargo/indexEVIL`, `/cargo/index-public/steal`, and `/cargo/index.evil/x` alike, while
+/// still accepting `/cargo/index` itself and `/cargo/index/se/rd/serde`. Comparing origins
+/// structurally (not textually) closes the analogous host-level bypass this same function
+/// also guards against — see [`classify_host`]'s sibling concerns and issue #795's own
+/// bypass shapes (`<host>.evil.com`, `<host>@evil.com`, `<host>-evil.com`).
+///
+/// Correct regardless of whether `trusted`'s path happens to already end in `/`: `/cargo/index`
+/// and `/cargo/index/` are treated identically as the trust boundary.
+///
+/// Assumes a special URL scheme (`http`/`https`): for any other scheme, [`url::Url::origin`]
+/// returns a fresh opaque origin per parse that never compares equal to another, even a
+/// re-parse of the identical string, so this fails closed (rejects everything) rather than
+/// silently trusting one.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::net_policy::is_trusted_prefix;
+/// use url::Url;
+///
+/// let trusted = Url::parse("https://artifacts.corp/cargo/index").unwrap();
+/// let sibling = Url::parse("https://artifacts.corp/cargo/indexEVIL/steal").unwrap();
+/// let nested = Url::parse("https://artifacts.corp/cargo/index/se/rd/serde").unwrap();
+/// let off_host = Url::parse("https://artifacts.corp.evil.com/cargo/index").unwrap();
+///
+/// assert!(!is_trusted_prefix(&sibling, &trusted));
+/// assert!(is_trusted_prefix(&nested, &trusted));
+/// assert!(!is_trusted_prefix(&off_host, &trusted));
+/// ```
+#[must_use]
+pub fn is_trusted_prefix(candidate: &url::Url, trusted: &url::Url) -> bool {
+    candidate.origin() == trusted.origin() && path_under_prefix(candidate.path(), trusted.path())
+}
+
+/// Whether `path` equals `prefix`, or continues immediately after a `/` following it —
+/// [`is_trusted_prefix`]'s path-segment-boundary check, extracted so both branches (exact
+/// match and proper-child match) are independently readable. A trailing `/` on `prefix` is
+/// normalized away first, so a caller-supplied trusted path is compared identically whether
+/// or not it happens to end in one.
+fn path_under_prefix(path: &str, prefix: &str) -> bool {
+    let prefix = prefix.trim_end_matches('/');
+    path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
 /// The user-facing policy governing whether a workspace-declared registry index is ever
 /// fetched at all.
 ///
@@ -709,6 +765,95 @@ mod tests {
 
     fn host_class(url: &str) -> HostClass {
         classify_host(&url::Url::parse(url).unwrap())
+    }
+
+    fn trusted_prefix(candidate: &str, trusted: &str) -> bool {
+        is_trusted_prefix(
+            &url::Url::parse(candidate).unwrap(),
+            &url::Url::parse(trusted).unwrap(),
+        )
+    }
+
+    /// Issue #795 S1: a trusted path with no trailing slash (the real `deps-cargo` sparse
+    /// index shape, `RegistryIndex::as_str()`) must still reject a same-origin sibling whose
+    /// path merely shares a textual prefix — the exact repro the critic supplied.
+    #[test]
+    fn test_is_trusted_prefix_rejects_sibling_path_no_trailing_slash() {
+        let trusted = "https://artifacts.corp/cargo/index";
+        assert!(!trusted_prefix(
+            "https://artifacts.corp/cargo/index-public/steal",
+            trusted
+        ));
+        assert!(!trusted_prefix(
+            "https://artifacts.corp/cargo/indexEVIL",
+            trusted
+        ));
+        assert!(!trusted_prefix(
+            "https://artifacts.corp/cargo/index.evil/x",
+            trusted
+        ));
+    }
+
+    /// Companion: the trusted path itself and a proper child path are still accepted when
+    /// the trusted path has no trailing slash.
+    #[test]
+    fn test_is_trusted_prefix_accepts_self_and_child_no_trailing_slash() {
+        let trusted = "https://artifacts.corp/cargo/index";
+        assert!(trusted_prefix(
+            "https://artifacts.corp/cargo/index",
+            trusted
+        ));
+        assert!(trusted_prefix(
+            "https://artifacts.corp/cargo/index/se/rd/serde",
+            trusted
+        ));
+    }
+
+    /// A trusted path *with* a trailing slash must behave identically to the no-trailing-
+    /// slash form above — the trailing slash is normalized away, not load-bearing.
+    #[test]
+    fn test_is_trusted_prefix_trailing_slash_equivalent_to_no_trailing_slash() {
+        let trusted = "https://artifacts.corp/cargo/index/";
+        assert!(!trusted_prefix(
+            "https://artifacts.corp/cargo/indexEVIL",
+            trusted
+        ));
+        assert!(trusted_prefix(
+            "https://artifacts.corp/cargo/index/se/rd/serde",
+            trusted
+        ));
+    }
+
+    /// A trusted path with more than one trailing slash must still trust its legitimate
+    /// single-slash children — `trim_end_matches` (not a single `strip_suffix`) is required
+    /// to fully normalize the prefix before comparison.
+    #[test]
+    fn test_is_trusted_prefix_doubled_trailing_slash_still_trusts_children() {
+        let trusted = "https://artifacts.corp/v3-flatcontainer//";
+        assert!(trusted_prefix(
+            "https://artifacts.corp/v3-flatcontainer/serde/index.json",
+            trusted
+        ));
+    }
+
+    /// Origin mismatch is rejected even when the path would otherwise match — the
+    /// origin-equality half of this check, independent of the path half.
+    #[test]
+    fn test_is_trusted_prefix_rejects_origin_mismatch() {
+        assert!(!trusted_prefix(
+            "https://artifacts.corp.evil.com/cargo/index",
+            "https://artifacts.corp/cargo/index"
+        ));
+    }
+
+    /// A root-path trusted origin (`/`) trusts every path on that origin — the shape every
+    /// non-NuGet caller (`deps-pypi`, `deps_dev`, `deps-gitlab-ci`) uses.
+    #[test]
+    fn test_is_trusted_prefix_root_path_trusts_everything_on_origin() {
+        assert!(trusted_prefix(
+            "https://registry.example/anything/at/all",
+            "https://registry.example/"
+        ));
     }
 
     #[test]

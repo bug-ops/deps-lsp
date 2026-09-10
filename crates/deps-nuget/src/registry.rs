@@ -10,7 +10,7 @@ use crate::config::{NuGetAuth, NuGetSourceChain, ResolvedHop};
 use crate::types::{NuGetVersion, PackageInfo};
 use crate::version::compare_versions;
 use dashmap::DashMap;
-use deps_core::net_policy::{PolicyGate, RegistryAccessPolicy};
+use deps_core::net_policy::{PolicyGate, RegistryAccessPolicy, is_trusted_prefix};
 use deps_core::parser::DependencySource;
 use deps_core::{
     DepsError, FreshnessSettings, HOVER_RECENT_VERSIONS, HttpCache, PublishTime, Result,
@@ -75,12 +75,15 @@ fn chain_auth_digest(hops: &[ResolvedHop]) -> u64 {
 }
 
 /// `Url::parse(s).ok().map(|u| u.origin().ascii_serialization() + "/")` (issue #561, §3.1/M1)
-/// — the sole comparison helper for C1's origin-binding rule, used at both comparison points in
-/// [`NuGetRegistry::fetch`]. Normalization-immune (host case, default port, IDN) — a plain
-/// string `starts_with` against a feed-supplied, un-reparsed value is not sufficient, and would
-/// not defeat a suffix trick like `https://pkgs.dev.azure.com.evil.test/`. A parse failure on
-/// either side is `None`, which [`NuGetRegistry::fetch`] treats as a mismatch — fail closed,
-/// unauthenticated, never an error.
+/// — derives a normalized origin string (always carrying a root `/` path) for
+/// [`NuGetRegistry::declared_origin`] and other origin-only contexts. Normalization-immune
+/// (host case, default port, IDN) — a plain string `starts_with` against a feed-supplied,
+/// un-reparsed value is not sufficient, and would not defeat a suffix trick like
+/// `https://pkgs.dev.azure.com.evil.test/`. [`NuGetRegistry::fetch`]'s own origin-binding
+/// decision no longer compares these strings directly — it re-parses `declared_origin` and
+/// checks [`is_trusted_prefix`] instead (issue #795 S2 follow-up), the same predicate every
+/// other origin/prefix-trust decision in this codebase uses. A parse failure here is `None`,
+/// which callers treat as a mismatch — fail closed, never an error.
 fn origin_of(s: &str) -> Option<String> {
     url::Url::parse(s)
         .ok()
@@ -534,8 +537,12 @@ impl NuGetRegistry {
     /// Dispatches to:
     /// 1. The authenticated, origin-pinned transport — iff [`Self::auth`] is `Some` **and**
     ///    both `url`'s origin and `trusted_prefix`'s origin equal [`Self::declared_origin`]
-    ///    (C1, §3.1). A parse failure on either side of that comparison is a mismatch, never an
-    ///    error — fails closed to arm 2/3, unauthenticated.
+    ///    (C1, §3.1), checked via the same [`is_trusted_prefix`] predicate the redirect-hop and
+    ///    registration-page pre-checks use (issue #795 S2 follow-up) — `declared_origin` always
+    ///    carries a root `/` path (see [`origin_of`]), so the check reduces to plain origin
+    ///    equality here, keeping this decision and the redirect/page-trust decisions from being
+    ///    able to silently disagree. A parse failure on either side of that comparison is a
+    ///    mismatch, never an error — fails closed to arm 2/3, unauthenticated.
     /// 2. The unauthenticated, origin-pinned workspace transport (#562) — when [`Self::tier`]
     ///    is [`NuGetRegistryTier::WorkspaceDeclared`] and arm 1 declined.
     /// 3. Today's public `get_cached_trusted_origin` path — otherwise, byte-identical to spec
@@ -545,9 +552,10 @@ impl NuGetRegistry {
     ///
     /// Whatever the underlying `HttpCache` fetch returns.
     async fn fetch(&self, url: &str, trusted_prefix: &str) -> Result<bytes::Bytes> {
-        let declared = self.declared_origin.as_str();
-        let can_authenticate = origin_of(url).as_deref() == Some(declared)
-            && origin_of(trusted_prefix).as_deref() == Some(declared);
+        let can_authenticate = url::Url::parse(&self.declared_origin).is_ok_and(|declared| {
+            url::Url::parse(url).is_ok_and(|u| is_trusted_prefix(&u, &declared))
+                && url::Url::parse(trusted_prefix).is_ok_and(|t| is_trusted_prefix(&t, &declared))
+        });
 
         if let Some(auth) = self.auth.as_ref()
             && can_authenticate
@@ -851,6 +859,14 @@ impl NuGetRegistry {
     /// Never fails the caller: a malformed index, an unreachable page, or a page `@id`
     /// outside `trusted_prefix` all degrade to fewer (or zero) entries in the returned
     /// [`RegistrationEnrichment`].
+    ///
+    /// `trusted_prefix` itself is never `Url`-validated ahead of this call for the default
+    /// Public tier (only [`NuGetRegistryTier::WorkspaceDeclared`] runs
+    /// [`deps_core::net_policy::validate_index_url`]), so a feed-supplied `registrations_base_url`
+    /// that fails to parse here is a deliberate fail-closed trade-off: every external page is
+    /// skipped rather than trusted on an unparsed prefix, at the cost of silently losing
+    /// registration-hive enrichment for an otherwise-tolerable feed quirk — logged via
+    /// `tracing::warn!` below so the loss is observable instead of a silent hover-content gap.
     async fn registration_enrichment_from_index(
         &self,
         index_body: &[u8],
@@ -860,6 +876,26 @@ impl NuGetRegistry {
         let Ok(index) = deps_core::parse_json_checked::<RegistrationIndex>(index_body) else {
             return enrichment;
         };
+
+        // Parsed once, reused for every page `@id` below (issue #795 S2): a `page.id` outside
+        // `trusted_prefix` is checked via `is_trusted_prefix` (origin equality plus a
+        // path-segment-boundary prefix match), not a raw `str::starts_with` — the same fix
+        // `trusted_origin_redirect_policy` needed, since a raw prefix test on `page.id` would
+        // let a same-origin sibling page (e.g. `{trusted_prefix}EVIL/...`) slip past this
+        // pre-check even though `Self::fetch`'s own redirect-hop transport would still stop
+        // it downstream. `None` (fail-closed) trusts no external page, but — unlike returning
+        // early here — still lets inline `page.items` entries accumulate below, since those
+        // are part of the already-trusted index body itself and need no `page.id` check.
+        let trusted = url::Url::parse(trusted_prefix)
+            .inspect_err(|error| {
+                tracing::warn!(
+                    trusted_prefix = deps_core::net_policy::url_for_tracing(trusted_prefix),
+                    %error,
+                    "registration trusted_prefix failed to parse; every external registration \
+                     page will be skipped for this package"
+                );
+            })
+            .ok();
 
         let mut collected = 0usize;
         let mut external_fetches = 0usize;
@@ -878,7 +914,10 @@ impl NuGetRegistry {
                     // trusted — the feed chooses `@id` values. `Self::fetch`'s underlying
                     // transport additionally stops any redirect that would otherwise escape
                     // `trusted_prefix` after this initial check passes (S2/M2).
-                    if !page.id.starts_with(trusted_prefix) {
+                    let is_trusted = trusted.as_ref().is_some_and(|trusted| {
+                        url::Url::parse(&page.id).is_ok_and(|id| is_trusted_prefix(&id, trusted))
+                    });
+                    if !is_trusted {
                         continue;
                     }
                     if external_fetches >= MAX_EXTERNAL_PAGE_FETCHES {
