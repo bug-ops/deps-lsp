@@ -229,36 +229,14 @@ mod tests {
         assert!(!formatter.manifest_requirement_is_resolved_version(&retract_dep));
     }
 
-    #[test]
-    fn test_format_version_for_text_edit() {
-        let formatter = GoFormatter;
-
-        // Standard semantic version
-        assert_eq!(
-            formatter.format_version_for_text_edit(&ConcreteVersion::new("v1.2.3")),
-            "v1.2.3"
-        );
-
-        // Pseudo-version
-        assert_eq!(
-            formatter.format_version_for_text_edit(&ConcreteVersion::new(
-                "v0.0.0-20191109021931-daa7c04131f5"
-            )),
-            "v0.0.0-20191109021931-daa7c04131f5"
-        );
-
-        // Version with +incompatible
-        assert_eq!(
-            formatter.format_version_for_text_edit(&ConcreteVersion::new("v2.0.0+incompatible")),
-            "v2.0.0+incompatible"
-        );
-    }
-
     // #758: exact-value `EcosystemFormatter` conformance, replacing test_package_url,
     // test_validate_package_name_accepts_valid_module_path, test_validate_package_name_rejects_empty,
     // test_validate_package_name_rejects_dot_segment, test_version_satisfies_requirement_exact_match,
     // test_version_satisfies_requirement_pseudo_version, test_version_satisfies_requirement_incompatible,
     // test_version_does_not_satisfy_requirement, and test_version_satisfies_requirement_prefix_scenarios.
+    // `format_version:` below (#782) replaces test_format_version_for_text_edit, including its
+    // pseudo-version and +incompatible cases — folded in rather than left as a separate hand-written
+    // test, per #758's own "no hand-copy" rationale.
     // test_validate_package_name_rejects_too_long below stays hand-written: it asserts on a
     // computed (`.repeat(n)`) length, which doesn't fit the macro's `literal`-only list.
     deps_core::formatter_conformance! {
@@ -291,6 +269,11 @@ mod tests {
             "v1.2.3", "v1.2" => true,
             "v1.2.30", "v1.2.3" => false,
             "v1.2.3.1", "v1.2.3" => true
+        ];
+        format_version: [
+            "v1.2.3" => "v1.2.3",
+            "v0.0.0-20191109021931-daa7c04131f5" => "v0.0.0-20191109021931-daa7c04131f5",
+            "v2.0.0+incompatible" => "v2.0.0+incompatible"
         ];
     }
 

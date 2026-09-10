@@ -225,6 +225,8 @@ mod tests {
             "jsr:std", "jsr:@std", "jsr:@a/..", "jsr:@../x", "jsr:@./x", "jsr:@a/.hidden",
             "npm:node_modules", "https://example.com",
         ];
+        format_version: [ "1.2.3" => "1.2.3" ];
+        hostile_package_url_expected: "";
     }
 
     #[test]

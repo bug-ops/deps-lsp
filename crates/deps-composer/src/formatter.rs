@@ -615,6 +615,7 @@ mod tests {
             "vendor/-pkg",
             "vendor name/pkg"
         ];
+        format_version: [ "1.2.3" => "1.2.3" ];
     }
 
     #[test]

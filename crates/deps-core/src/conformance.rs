@@ -20,14 +20,18 @@
 //! its `[dev-dependencies]`.
 //!
 //! This module does **not** duplicate [`crate::EcosystemId`]'s universal, offline invariants
-//! (id round-trip, non-empty `display_name`/routing surface, the `package_url`
-//! hostile-input-safety check, `completion_insert_text` not panicking) — those are Layer 1, in
-//! `deps-lsp`'s own test suite: an all-features-gated completeness check that every
-//! [`crate::EcosystemId::ALL`] variant is actually registered, plus an *ungated* per-ecosystem
-//! invariants loop over whatever that build's `registry.ecosystem_ids()` produced, so it keeps
-//! working under any feature subset. What lives here is Layer 2: **exact**, per-crate values (a
-//! crate's specific manifest filename, its specific `package_url` output, its specific naming
-//! grammar) that only that one crate can supply.
+//! (id round-trip, non-empty `display_name`/routing surface, `completion_insert_text` not
+//! panicking) — those are Layer 1, in `deps-lsp`'s own test suite: an all-features-gated
+//! completeness check that every [`crate::EcosystemId::ALL`] variant is actually registered,
+//! plus an *ungated* per-ecosystem invariants loop over whatever that build's
+//! `registry.ecosystem_ids()` produced, so it keeps working under any feature subset. What lives
+//! here is Layer 2: **exact**, per-crate values (a crate's specific manifest filename, its
+//! specific `package_url` output, its specific naming grammar) that only that one crate can
+//! supply. The one exception (#782 gap 1) is `package_url`'s hostile-input-safety check itself
+//! (`assert_package_url_hostile_input_safe`): both layers call the same shared implementation,
+//! Layer 1 across every *registered* ecosystem at once and Layer 2 (via
+//! `formatter_conformance!`, unconditionally) per crate — so a regression is reachable from
+//! `cargo nextest run -p <crate>` alone, not only a full workspace run.
 //!
 //! [`crate::conformance::HOSTILE_DISPLAY_LINK_PAYLOAD`] is a fixture for
 //! [`crate::lsp_helpers::PackageRendering::package_url`]
@@ -115,9 +119,129 @@ pub fn assert_registry_returns_arc(eco: &dyn Ecosystem) {
     let _registry = eco.registry();
 }
 
+/// Asserts an ecosystem declares no lock file support at all (#782 gap 2).
+///
+/// Both [`Ecosystem::lockfile_filenames`] is empty and [`Ecosystem::lockfile_provider`] is
+/// `None`. Strictly stronger than the cross-check `deps-lsp`'s
+/// `test_registered_ecosystems_universal_invariants` runs across every *registered* ecosystem —
+/// that check only asserts the two *agree* (`lockfile_filenames().is_empty() ==
+/// lockfile_provider().is_none()`), true for a lockfile-*having* ecosystem too, whereas this
+/// asserts both are specifically absent. This is the per-crate, `cargo nextest run -p
+/// <crate>`-reachable implementation of that stronger, lockfile-less-specific invariant,
+/// replacing the `test_lockfile_filenames_empty`/`test_lockfile_provider_none` pair
+/// `deps-maven`/`deps-gradle` used to hand-copy.
+pub fn assert_no_lockfile_support(eco: &dyn Ecosystem) {
+    assert!(
+        eco.lockfile_filenames().is_empty(),
+        "Ecosystem::lockfile_filenames() must be empty for a lockfile-less ecosystem"
+    );
+    assert!(
+        eco.lockfile_provider().is_none(),
+        "Ecosystem::lockfile_provider() must be None for a lockfile-less ecosystem"
+    );
+}
+
 // ---------------------------------------------------------------------------------------
 // Macro 2: `formatter_conformance!` — exact `EcosystemFormatter` values.
 // ---------------------------------------------------------------------------------------
+
+/// `formatter.package_url(HOSTILE_DISPLAY_LINK_PAYLOAD)` — the shared call both
+/// [`assert_package_url_hostile_input_safe`] and [`assert_package_url_hostile_input_expected`]
+/// build on (#782 code-review cleanup 2), so the fixture name/lookup can't drift between them.
+fn hostile_package_url(formatter: &dyn EcosystemFormatter) -> String {
+    let hostile_name = PackageName::new(HOSTILE_DISPLAY_LINK_PAYLOAD);
+    formatter.package_url(&hostile_name)
+}
+
+/// Asserts `formatter.package_url(HOSTILE_DISPLAY_LINK_PAYLOAD)` is safe (#782 gap 1).
+///
+/// Safe for the markdown `# [{name}]({url})` hover-heading link sink: either empty, or a
+/// parseable URL free of every character that could break out of a `[label](destination)`
+/// link, free of any raw control character or raw U+202E right-to-left override, and with any
+/// literal `%` in the input percent-encoded as `%25` in the output.
+///
+/// Identical to the check `deps-lsp`'s own `test_registered_ecosystems_universal_invariants`
+/// (Layer 1) runs for every *registered* ecosystem at once — this is the single shared
+/// implementation both layers call, so a fix to the check applies to both without drifting
+/// apart. Layer 1 additionally proves every [`crate::EcosystemId::ALL`] variant is actually
+/// wired into the running server; this function alone proves nothing about registration, only
+/// that a given formatter's `package_url` is safe for this payload — which is why
+/// `formatter_conformance!` (Layer 2) calls it unconditionally for every ecosystem crate,
+/// catching a regression with `cargo nextest run -p <crate>` alone rather than only a full
+/// workspace run.
+///
+/// **Vacuous for a formatter that fails closed to `""` for this payload** (#782 critic M2): the
+/// early return below means such a formatter passes this check no matter *why* `package_url`
+/// returned empty — a future refactor that stops rejecting the hostile name here would not be
+/// caught. [`assert_package_url_hostile_input_expected`] (paired with `formatter_conformance!`'s
+/// optional `hostile_package_url_expected` arm) closes that for the crates it actually applies
+/// to, pinning the exact value instead of merely accepting emptiness.
+pub fn assert_package_url_hostile_input_safe(formatter: &dyn EcosystemFormatter, context: &str) {
+    let url = hostile_package_url(formatter);
+    assert!(
+        url.is_empty() || url::Url::parse(&url).is_ok(),
+        "{context}: package_url produced an unparsable non-empty URL: {url:?}"
+    );
+    if url.is_empty() {
+        return;
+    }
+    for hazard in ['\n', '<', '>', '(', ')', '[', ']', '`'] {
+        assert!(
+            !url.contains(hazard),
+            "{context}: package_url leaked a literal {hazard:?} — a markdown \
+             `[label](destination)` link-destination breakout character: {url:?}"
+        );
+    }
+    assert!(
+        !url.chars().any(char::is_control),
+        "{context}: package_url leaked a raw control character: {url:?}"
+    );
+    assert!(
+        !url.contains('\u{202e}'),
+        "{context}: package_url leaked a raw U+202E right-to-left override \
+         (display-spoofing): {url:?}"
+    );
+    assert!(
+        url.contains("%25"),
+        "{context}: package_url did not encode the payload's literal '%' as %25: {url:?}"
+    );
+}
+
+/// Asserts `formatter.package_url(HOSTILE_DISPLAY_LINK_PAYLOAD)` equals `expected` exactly
+/// (#782 critic M2).
+///
+/// Pairs with [`assert_package_url_hostile_input_safe`]/`formatter_conformance!`'s
+/// unconditional check, which returns early (accepting) once `package_url` is empty — that
+/// early return makes the unconditional check vacuous for a formatter that always fails closed
+/// to `""` for this payload, proving nothing about *why* it is empty. Use this (via the
+/// optional `hostile_package_url_expected` arm) for exactly those formatters, to pin the actual
+/// value rather than merely tolerate emptiness.
+pub fn assert_package_url_hostile_input_expected(
+    formatter: &dyn EcosystemFormatter,
+    expected: &str,
+    context: &str,
+) {
+    let url = hostile_package_url(formatter);
+    assert_eq!(
+        url, expected,
+        "{context}: package_url(HOSTILE_DISPLAY_LINK_PAYLOAD) mismatch"
+    );
+}
+
+/// Asserts `formatter.format_version_for_text_edit(version)` equals `expected` (#782 coverage
+/// gap).
+///
+/// Closes the `test_format_version` family for ecosystems that had no coverage of this method
+/// at all (deps-composer, deps-deno, deps-github-actions, deps-gitlab-ci), and for deps-go,
+/// folds in the one case (deps-go's pre-existing, now-deleted hand-written test) that was
+/// covering it without going through this macro.
+pub fn assert_format_version(formatter: &dyn EcosystemFormatter, version: &str, expected: &str) {
+    assert_eq!(
+        formatter.format_version_for_text_edit(&ConcreteVersion::new(version)),
+        expected,
+        "format_version_for_text_edit({version:?}) mismatch"
+    );
+}
 
 /// Asserts `formatter.package_url(name)` equals `expected`.
 pub fn assert_package_url(formatter: &dyn EcosystemFormatter, name: &str, expected: &str) {
@@ -459,7 +583,12 @@ pub fn assert_json_nesting_over_max_depth_rejected<T, E>(
 /// Replaces per-crate `test_ecosystem_id`/`test_ecosystem_display_name`/
 /// `test_ecosystem_manifest_filenames`/`test_ecosystem_lockfile_filenames`/`test_as_any`/
 /// `test_registry_creation`-shaped tests. `lockfile_filenames` is omitted for an ecosystem
-/// with no lock file format.
+/// with no lock file format; pair that omission with `no_lockfile_support: true;` (#782 gap
+/// 2) to also assert [`Ecosystem::lockfile_provider`] agrees — replacing the
+/// `test_lockfile_filenames_empty`/`test_lockfile_provider_none` pair `deps-maven`/
+/// `deps-gradle` used to hand-copy. Supplying both `lockfile_filenames` and
+/// `no_lockfile_support: true;` on the same invocation is a compile error — the two are
+/// mutually exclusive by construction.
 ///
 /// Must be invoked inside your own `#[cfg(test)] mod tests { ... }` — this macro does not
 /// emit its own `#[cfg(test)]` (a doctest is not compiled with `--cfg test`, so a
@@ -534,6 +663,27 @@ pub fn assert_json_nesting_over_max_depth_rejected<T, E>(
 /// ```
 #[macro_export]
 macro_rules! ecosystem_conformance {
+    // Rejects the mutually-exclusive combination at compile time (#782 code-review cleanup 1):
+    // an ecosystem cannot both list lock file names and declare it has no lock file support.
+    // Tried first — `macro_rules!` matches arms in order — so this only intercepts the one
+    // invalid combination; every other invocation (0 or 1 of the two fields) falls through
+    // to the real arm below unchanged.
+    (
+        mod $mod_name:ident;
+        build: $build:expr;
+        ty: $ty:ty;
+        id: $id:expr;
+        display_name: $display_name:expr;
+        manifest_filenames: $manifest_filenames:expr;
+        lockfile_filenames: $lockfile_filenames:expr;
+        no_lockfile_support: $no_lockfile_support:literal;
+    ) => {
+        compile_error!(
+            "ecosystem_conformance!: `lockfile_filenames` and `no_lockfile_support` are \
+             mutually exclusive — an ecosystem cannot both have lock file names and declare \
+             it has no lock file support; supply at most one of the two"
+        );
+    };
     (
         mod $mod_name:ident;
         build: $build:expr;
@@ -542,6 +692,7 @@ macro_rules! ecosystem_conformance {
         display_name: $display_name:expr;
         manifest_filenames: $manifest_filenames:expr;
         $(lockfile_filenames: $lockfile_filenames:expr;)?
+        $(no_lockfile_support: $no_lockfile_support:literal;)?
     ) => {
         mod $mod_name {
             use super::*;
@@ -588,6 +739,27 @@ macro_rules! ecosystem_conformance {
                 }
             )?
 
+            $(
+                // `$no_lockfile_support` must be the literal `true` — `false` would silently
+                // generate this assertion anyway if left unchecked (`macro_rules` can only
+                // gate on the arm's *presence*, not inspect a captured literal's value), so a
+                // `const` context `assert!` rejects anything else at compile time, in every
+                // profile (unlike `debug_assert!`, which release builds strip) (#782 critic M1).
+                const _: () = assert!(
+                    $no_lockfile_support,
+                    "no_lockfile_support only accepts `true` — omit the field entirely for a \
+                     lockfile-having ecosystem, never write `no_lockfile_support: false;`",
+                );
+
+                fn ecosystem_has_no_lockfile_support_impl() {
+                    $crate::conformance::assert_no_lockfile_support(&($build));
+                }
+                #[test]
+                fn ecosystem_has_no_lockfile_support() {
+                    ecosystem_has_no_lockfile_support_impl();
+                }
+            )?
+
             fn ecosystem_as_any_downcasts_impl() {
                 $crate::conformance::assert_as_any_downcasts::<$ty>(&($build));
             }
@@ -608,10 +780,19 @@ macro_rules! ecosystem_conformance {
 }
 
 /// Generates exact-value conformance tests for an [`EcosystemFormatter`] implementation
-/// (#758 macro 2). `accepts`/`rejects`/`version_roundtrip` are optional.
+/// (#758 macro 2).
 ///
-/// Does **not** test hostile-input safety — that is Layer 1's job
-/// (`deps-lsp`'s `EcosystemId::ALL` loop), universally, for every ecosystem at once.
+/// `accepts`/`rejects`/`version_roundtrip`/`format_version`/`hostile_package_url_expected` are
+/// optional. Unconditionally also generates a `package_url` hostile-input-safety test (#782 gap 1),
+/// via [`assert_package_url_hostile_input_safe`] — the same check Layer 1 (`deps-lsp`'s
+/// `EcosystemId::ALL` loop) runs universally across every *registered* ecosystem at once, but
+/// reachable here with `cargo nextest run -p <crate>` alone, without needing a full workspace
+/// run. This holds for every ecosystem crate invoking this macro today (proven by Layer 1
+/// already passing for all of them), so adding it is not a per-crate opt-in. That unconditional
+/// check is vacuous for a formatter that fails closed to a fixed (typically empty) result for
+/// the hostile payload (#782 critic M2) — set `hostile_package_url_expected: "<value>";` to
+/// additionally pin the exact value for such a formatter, via
+/// [`assert_package_url_hostile_input_expected`].
 ///
 /// Must be invoked inside your own `#[cfg(test)] mod tests { ... }` — see
 /// [`ecosystem_conformance!`]'s doc for why this macro does not emit its own `#[cfg(test)]`.
@@ -626,7 +807,14 @@ macro_rules! ecosystem_conformance {
 /// # impl deps_core::lsp_helpers::PackageNaming for Fake {}
 /// # impl deps_core::lsp_helpers::PackageRendering for Fake {
 /// #     fn format_version_for_text_edit(&self, v: &deps_core::ConcreteVersion) -> String { v.as_str().to_string() }
-/// #     fn package_url(&self, name: &deps_core::PackageName) -> String { format!("https://example.com/{name}") }
+/// #     fn package_url(&self, name: &deps_core::PackageName) -> String {
+/// #         // Percent-encoded (`urlencoding::encode`, the same idiom every real ecosystem's
+/// #         // `package_url` uses) so this toy formatter also passes the hostile-input-safety
+/// #         // test the macro generates unconditionally below (#782 gap 1) — a naive
+/// #         // `format!("https://example.com/{name}")` would leak the payload's raw hazard
+/// #         // characters straight into the URL.
+/// #         format!("https://example.com/{}", urlencoding::encode(name.as_str()))
+/// #     }
 /// # }
 /// # impl deps_core::lsp_helpers::RequirementResolution for Fake {}
 /// # impl deps_core::lsp_helpers::DiagnosticMessages for Fake {}
@@ -649,6 +837,8 @@ macro_rules! formatter_conformance {
         $(accepts: [ $($accept_name:literal),+ $(,)? ];)?
         $(rejects: [ $($reject_name:literal),+ $(,)? ];)?
         $(version_roundtrip: [ $($version:literal, $requirement:literal => $roundtrip_expected:literal),+ $(,)? ];)?
+        $(format_version: [ $($fv_version:literal => $fv_expected:literal),+ $(,)? ];)?
+        $(hostile_package_url_expected: $hostile_expected:literal;)?
     ) => {
         mod $mod_name {
             use super::*;
@@ -664,6 +854,45 @@ macro_rules! formatter_conformance {
             fn formatter_package_url_matches() {
                 formatter_package_url_matches_impl();
             }
+
+            // Unconditional (#782 gap 1) — see this macro's doc for why every invocation
+            // gets this test regardless of whether `package_url` is even reachable for a
+            // hostile name.
+            fn formatter_package_url_hostile_input_safe_impl() {
+                $crate::conformance::assert_package_url_hostile_input_safe(
+                    &($build), stringify!($mod_name),
+                );
+            }
+            #[test]
+            fn formatter_package_url_hostile_input_safe() {
+                formatter_package_url_hostile_input_safe_impl();
+            }
+
+            $(
+                // #782 critic M2: pins the exact value for a formatter whose `package_url`
+                // fails closed to a fixed result (typically `""`) for the hostile payload —
+                // the unconditional check above alone is vacuous for such a formatter, since
+                // it accepts any empty result without proving *why* it is empty.
+                fn formatter_package_url_hostile_input_expected_impl() {
+                    $crate::conformance::assert_package_url_hostile_input_expected(
+                        &($build), $hostile_expected, stringify!($mod_name),
+                    );
+                }
+                #[test]
+                fn formatter_package_url_hostile_input_expected() {
+                    formatter_package_url_hostile_input_expected_impl();
+                }
+            )?
+
+            $(
+                fn formatter_format_version_matches_impl() {
+                    $( $crate::conformance::assert_format_version(&($build), $fv_version, $fv_expected); )+
+                }
+                #[test]
+                fn formatter_format_version_matches() {
+                    formatter_format_version_matches_impl();
+                }
+            )?
 
             $(
                 fn formatter_validate_package_name_accepts_impl() {
@@ -849,6 +1078,17 @@ macro_rules! lockfile_conformance {
 /// rejected this prefix" apart from "the network call failed/returned nothing" — an
 /// always-offline or always-failing registry can't distinguish the two.
 ///
+/// **Known limitation (#782 gap 3):** every real call site's `complete` closure re-invokes
+/// [`crate::completion::complete_package_names_generic`] (or an equivalent) directly, inline
+/// in the test — it does not call through the ecosystem's own production `generate_completions`
+/// wiring. This macro therefore proves the shared generic guard itself behaves correctly, but
+/// cannot detect a production bug where an ecosystem's real completion path fails to route
+/// through that guard at all (wiring drift between the tested closure and the actual runtime
+/// call graph is invisible here). No fix is applied for this: threading a real
+/// `generate_completions`-shaped entry point through this macro generically, across ecosystems
+/// with different `ParseResult`/position/content parameters, is not additive — it would need a
+/// broader macro redesign, tracked separately rather than attempted here.
+///
 /// Must be invoked inside your own `#[cfg(test)] mod tests { ... }` — see
 /// [`ecosystem_conformance!`]'s doc for why this macro does not emit its own `#[cfg(test)]`.
 ///
@@ -902,6 +1142,18 @@ macro_rules! completion_guard_conformance {
 /// `parse` is the ecosystem's own response parser; `wrap` embeds a nested-array fragment of
 /// a given depth into a payload shape `parse` recognizes (e.g. as an `"extra"` field next to
 /// the real, minimal response body).
+///
+/// **Known imprecision (#782 gap 5):** [`assert_json_nesting_at_max_depth_accepted`]/
+/// [`assert_json_nesting_over_max_depth_rejected`] size the embedded *fragment* to exactly
+/// [`crate::MAX_JSON_NESTING_DEPTH`] / `MAX_JSON_NESTING_DEPTH + 1` array levels — but `wrap`
+/// typically nests that fragment inside at least one more JSON container (an object field,
+/// as in the example below), so the *final* payload's absolute nesting depth as seen by
+/// `parse` is one or more levels deeper than the fragment alone. This macro is therefore not
+/// independently boundary-tight at the wrapped payload's true edge; it exercises "near the
+/// cap", not "at exactly `MAX_JSON_NESTING_DEPTH`/`+ 1` in the payload `parse` receives". No
+/// fix is applied: the cap itself is exact-boundary-tested directly (unwrapped) in
+/// `deps-core/src/parser.rs`, so duplicating that precision here per-ecosystem would be
+/// redundant rather than additive.
 ///
 /// Must be invoked inside your own `#[cfg(test)] mod tests { ... }` — see
 /// [`ecosystem_conformance!`]'s doc for why this macro does not emit its own `#[cfg(test)]`.

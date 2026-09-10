@@ -664,6 +664,8 @@ mod tests {
         rejects: [
             "", ".", "..", "no-slash", "owner/repo/extra", "../../etc/passwd", "owner/..",
         ];
+        format_version: [ "v4.2.0" => "v4.2.0" ];
+        hostile_package_url_expected: "";
     }
 
     #[test]

@@ -419,8 +419,9 @@ mod tests {
 
     // #758: exact-value `Ecosystem` conformance, replacing test_ecosystem_id,
     // test_ecosystem_display_name, test_manifest_filenames, and test_as_any. Gradle has no
-    // lock file format, so `lockfile_filenames` is omitted here; `test_lockfile_filenames_empty`/
-    // `test_lockfile_provider_none` below stay hand-written to pin that contract explicitly.
+    // lock file format, so `lockfile_filenames` is omitted here; `no_lockfile_support: true;`
+    // (#782 gap 2) replaces the hand-copied test_lockfile_filenames_empty/
+    // test_lockfile_provider_none pair below.
     deps_core::ecosystem_conformance! {
         mod gradle_ecosystem_conformance;
         build: GradleEcosystem::new(make_cache());
@@ -434,18 +435,7 @@ mod tests {
             "settings.gradle.kts",
             "settings.gradle",
         ];
-    }
-
-    #[test]
-    fn test_lockfile_filenames_empty() {
-        let eco = GradleEcosystem::new(make_cache());
-        assert!(eco.lockfile_filenames().is_empty());
-    }
-
-    #[test]
-    fn test_lockfile_provider_none() {
-        let eco = GradleEcosystem::new(make_cache());
-        assert!(eco.lockfile_provider().is_none());
+        no_lockfile_support: true;
     }
 
     // #758: the shared completion-prefix-length guard

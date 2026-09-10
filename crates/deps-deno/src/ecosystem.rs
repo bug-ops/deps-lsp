@@ -250,9 +250,9 @@ mod tests {
     // #758: exact-value `Ecosystem` conformance, replacing test_ecosystem_id/
     // test_ecosystem_display_name/test_ecosystem_manifest_filenames/test_as_any.
     // `lockfile_filenames` is omitted — deno.lock resolved-version parsing is a documented
-    // MVP gap (D9), not yet a `LockFileProvider` impl in this crate; that specific
-    // absence-of-both-halves invariant stays covered by test_ecosystem_no_lockfile_support
-    // below, which the macro doesn't replace.
+    // MVP gap (D9), not yet a `LockFileProvider` impl in this crate; `no_lockfile_support:
+    // true;` (#782 gap 2) replaces the hand-written test_ecosystem_no_lockfile_support that
+    // used to cover that absence-of-both-halves invariant.
     deps_core::ecosystem_conformance! {
         mod deno_ecosystem_conformance;
         build: DenoEcosystem::new(Arc::new(deps_core::HttpCache::new()));
@@ -260,6 +260,7 @@ mod tests {
         id: "deno";
         display_name: "Deno (JSR/npm)";
         manifest_filenames: &["deno.json", "deno.jsonc"];
+        no_lockfile_support: true;
     }
 
     // #758: the shared completion-prefix-length guard, replacing
@@ -279,14 +280,6 @@ mod tests {
                 .await
             })
         };
-    }
-
-    #[test]
-    fn test_ecosystem_no_lockfile_support() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = DenoEcosystem::new(cache);
-        assert!(ecosystem.lockfile_filenames().is_empty());
-        assert!(ecosystem.lockfile_provider().is_none());
     }
 
     #[tokio::test]

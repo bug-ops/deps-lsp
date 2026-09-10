@@ -282,26 +282,10 @@ mod tests {
         ];
     }
 
-    /// #758: `package_url`'s hostile-input safety is generically covered for every
-    /// ecosystem by Layer 1 (`deps-lsp`'s `test_registered_ecosystems_universal_invariants`,
-    /// which calls `formatter().package_url()` with this exact fixture) — this per-crate
-    /// test exists only so a regression here is caught by `cargo nextest run -p deps-maven`
-    /// alone, without needing the whole-workspace `deps-lsp` suite.
-    #[test]
-    fn test_package_url_hostile_display_link_payload_is_safe() {
-        let f = MavenFormatter;
-        let url = f.package_url(&PackageName::new(
-            deps_core::conformance::HOSTILE_DISPLAY_LINK_PAYLOAD,
-        ));
-        for hazard in ['\n', '<', '>', '(', ')', '[', ']', '`'] {
-            assert!(!url.contains(hazard), "leaked {hazard:?} in {url:?}");
-        }
-        assert!(
-            !url.chars().any(char::is_control),
-            "leaked control char in {url:?}"
-        );
-        assert!(!url.contains('\u{202e}'), "leaked RTL override in {url:?}");
-    }
+    // #782 gap 1: the former hand-written test_package_url_hostile_display_link_payload_is_safe
+    // is now generated unconditionally by `formatter_conformance!` above
+    // (`formatter_package_url_hostile_input_safe`), reachable by `cargo nextest run -p
+    // deps-maven` alone, same as before.
 
     #[test]
     fn test_normalize_is_identity() {

@@ -1029,7 +1029,8 @@ mod tests {
 
     // #758: exact-value `Ecosystem` conformance, replacing test_ecosystem_id_and_display_name
     // and test_as_any. `lockfile_filenames()` is omitted — GitLab CI pipelines have no lock
-    // file concept (no `LockFileProvider` impl in this crate). No
+    // file concept (no `LockFileProvider` impl in this crate); `no_lockfile_support: true;`
+    // below asserts that contract explicitly (#782 gap 2). No
     // `completion_guard_conformance!`/`json_depth_conformance!` for this crate:
     // `generate_completions` above only ever handles `CompletionContext::Version` (no
     // package-name search endpoint, spec NFR-002), and `client::parse_gitlab_page`
@@ -1046,6 +1047,7 @@ mod tests {
         id: "gitlab-ci";
         display_name: "GitLab CI/CD";
         manifest_filenames: &[".gitlab-ci.yml"];
+        no_lockfile_support: true;
     }
 
     #[test]
