@@ -29,7 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: property tests (`proptest`) asserting the parser depth/expansion checkers and JSONC position recovery never panic on arbitrary input (#673)
 - **deps-core**: `EcosystemId::ALL`, generated from the same `macro_rules!` variant list backing `id()`/`FromStr`, so a new ecosystem can no longer be added to some of the three but not all (partial work on #758) (#776)
 - **deps-core**: new `deps_core::conformance` module (behind `test-util`) with 5 macros generating the exact-value per-crate conformance test family every ecosystem crate previously hand-copied; `deps-cargo` migrated as the Wave 1 pilot, with the remaining 13 crates tracked as follow-up work (partial work on #758) (#776)
-- **deps-npm, deps-pypi, deps-go, deps-bundler, deps-dart, deps-maven, deps-composer, deps-gradle, deps-swift, deps-nuget, deps-github-actions, deps-gitlab-ci, deps-deno**: migrated the remaining 13 ecosystem crates to `deps_core::conformance`'s shared macros, completing the trait-conformance test consolidation started in #776 (resolves #758)
+- **deps-npm, deps-pypi, deps-go, deps-bundler, deps-dart, deps-maven, deps-composer, deps-gradle, deps-swift, deps-nuget, deps-github-actions, deps-gitlab-ci, deps-deno**: migrated the remaining 13 ecosystem crates to `deps_core::conformance`'s shared macros, completing the trait-conformance test consolidation started in #776 (resolves #758) (#781)
 
 ### Fixed
 - **deps-core**: corrected a stale doc-comment reference to a nonexistent item in `in_use_version.rs` (resolves #773) (#779)
