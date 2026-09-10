@@ -71,9 +71,23 @@ pub const HOSTILE_DISPLAY_LINK_PAYLOAD: &str = "evil\n<https://evil%zz.example>)
 // Macro 1: `ecosystem_conformance!` — exact `Ecosystem` identity values.
 // ---------------------------------------------------------------------------------------
 
-/// Asserts [`Ecosystem::id`] equals `expected`.
+/// Asserts [`Ecosystem::id`] equals `expected`, and that [`Ecosystem::ecosystem_id`] agrees
+/// with it.
+///
+/// [`Ecosystem::id`] is a *provided* method with a default derived from
+/// [`Ecosystem::ecosystem_id`] — but, being provided, it stays overridable, so nothing else
+/// forces the two to stay in sync for an implementor that overrides `id()` directly. Without
+/// this second assertion, a crate could pass `expected` here via a compensating `id()`
+/// override while its `ecosystem_id()` names the wrong variant — silently wrong for every
+/// caller that branches on `ecosystem_id()` (`osv_ecosystem()`, `DocumentState`
+/// classification, formatter context) instead of the string.
 pub fn assert_ecosystem_id(eco: &dyn Ecosystem, expected: &str) {
     assert_eq!(eco.id(), expected, "Ecosystem::id() mismatch");
+    assert_eq!(
+        eco.ecosystem_id().id(),
+        eco.id(),
+        "Ecosystem::ecosystem_id() disagrees with Ecosystem::id()"
+    );
 }
 
 /// Asserts [`Ecosystem::display_name`] equals `expected`.
@@ -666,6 +680,7 @@ pub fn assert_select_latest_matching_overridden(
 /// # impl deps_core::ecosystem::private::Sealed for Fake {}
 /// # impl deps_core::Ecosystem for Fake {
 /// #     fn id(&self) -> &'static str { "fake" }
+/// #     fn ecosystem_id(&self) -> deps_core::EcosystemId { deps_core::EcosystemId::Cargo }
 /// #     fn display_name(&self) -> &'static str { "Fake" }
 /// #     fn manifest_filenames(&self) -> &[&'static str] { &["fake.toml"] }
 /// #     fn registry(&self) -> Arc<dyn deps_core::Registry> { self.registry.clone() }

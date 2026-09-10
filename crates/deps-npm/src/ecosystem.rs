@@ -134,8 +134,8 @@ impl NpmEcosystem {
 impl deps_core::ecosystem::private::Sealed for NpmEcosystem {}
 
 impl Ecosystem for NpmEcosystem {
-    fn id(&self) -> &'static str {
-        "npm"
+    fn ecosystem_id(&self) -> deps_core::EcosystemId {
+        deps_core::EcosystemId::Npm
     }
 
     fn display_name(&self) -> &'static str {

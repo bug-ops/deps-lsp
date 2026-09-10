@@ -127,8 +127,8 @@ pub(crate) mod blocking_ecosystem {
     }
     impl Sealed for BlockingEcosystem {}
     impl Ecosystem for BlockingEcosystem {
-        fn id(&self) -> &'static str {
-            "cargo"
+        fn ecosystem_id(&self) -> deps_core::EcosystemId {
+            deps_core::EcosystemId::Cargo
         }
         fn display_name(&self) -> &'static str {
             "cargo"

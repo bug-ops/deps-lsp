@@ -68,8 +68,8 @@ impl ComposerEcosystem {
 impl deps_core::ecosystem::private::Sealed for ComposerEcosystem {}
 
 impl Ecosystem for ComposerEcosystem {
-    fn id(&self) -> &'static str {
-        "composer"
+    fn ecosystem_id(&self) -> deps_core::EcosystemId {
+        deps_core::EcosystemId::Composer
     }
 
     fn display_name(&self) -> &'static str {

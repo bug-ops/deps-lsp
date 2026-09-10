@@ -24,34 +24,13 @@ pub struct NuGetDependency {
     pub source: deps_core::parser::DependencySource,
 }
 
-// Hand-written, not `impl_dependency!`: the macro's `source: $source:expr` arm substitutes
-// the expression into a generated `fn source(&self)` body, so `self.source.clone()` cannot be
-// passed through it — see `deps-npm/src/types.rs`'s identical precedent/comment.
-impl deps_core::Dependency for NuGetDependency {
-    fn name(&self) -> &deps_core::PackageName {
-        &self.name
-    }
-
-    fn name_range(&self) -> Range {
-        self.name_range
-    }
-
-    fn version_requirement(&self) -> Option<&deps_core::VersionReq> {
-        self.version_requirement.as_ref()
-    }
-
-    fn version_range(&self) -> Option<Range> {
-        self.version_range
-    }
-
-    fn source(&self) -> deps_core::parser::DependencySource {
-        self.source.clone()
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
+deps_core::impl_dependency!(NuGetDependency {
+    name: name,
+    name_range: name_range,
+    version: version_requirement,
+    version_range: version_range,
+    source: source,
+});
 
 /// Parsed result of a single manifest file (`.csproj`, `Directory.Packages.props`,
 /// `packages.config`).

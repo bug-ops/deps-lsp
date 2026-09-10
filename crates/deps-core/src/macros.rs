@@ -11,7 +11,21 @@
 /// * `name_range` - Field name for the name range (`Range`)
 /// * `version` - Field name for version requirement (`Option<VersionReq>`)
 /// * `version_range` - Field name for version range (`Option<Range>`)
-/// * `source` - Optional: expression for dependency source (defaults to `Registry`)
+/// * `source` - Optional: field name for dependency source (`DependencySource`), cloned
+///   (defaults to the constant `DependencySource::Registry` when omitted). A *field name*
+///   rather than an arbitrary expression: a `$source:expr` fragment can express the same
+///   thing as a closure (`impl_version!`'s `status`/`prerelease` arguments use exactly that
+///   pattern), but a closure returning a *borrow* out of `self` (as `source()`'s caller-side
+///   equivalent would need for, e.g., a non-cloning accessor) hits a real lifetime footgun —
+///   the closure's return type can't name a lifetime tied to its `&self` parameter without
+///   HRTB ceremony the call sites here shouldn't have to write. A bare field identifier,
+///   substituted into the generated method's own `self.$field`, sidesteps that entirely and
+///   keeps every call site a one-line field name — the same reasoning that makes `name`,
+///   `name_range`, `version` and `version_range` above plain idents rather than expressions.
+/// * `version_literal` - Optional, requires `source` to also be given (fields are matched in
+///   this exact order — `version_literal` alone, or before `source`, matches no arm): field
+///   name for [`Dependency::version_literal`](crate::ecosystem::Dependency::version_literal)
+///   (`Option<String>`), read via `.as_deref()` (defaults to the trait's `None` when omitted)
 ///
 /// # Examples
 ///
@@ -40,20 +54,38 @@ macro_rules! impl_dependency {
         version: $version:ident,
         version_range: $version_range:ident $(,)?
     }) => {
-        $crate::impl_dependency!($type {
-            name: $name,
-            name_range: $name_range,
-            version: $version,
-            version_range: $version_range,
-            source: $crate::parser::DependencySource::Registry,
-        });
+        impl $crate::ecosystem::Dependency for $type {
+            fn name(&self) -> &$crate::PackageName {
+                &self.$name
+            }
+
+            fn name_range(&self) -> ::tower_lsp_server::ls_types::Range {
+                self.$name_range
+            }
+
+            fn version_requirement(&self) -> Option<&$crate::VersionReq> {
+                self.$version.as_ref()
+            }
+
+            fn version_range(&self) -> Option<::tower_lsp_server::ls_types::Range> {
+                self.$version_range
+            }
+
+            fn source(&self) -> $crate::parser::DependencySource {
+                $crate::parser::DependencySource::Registry
+            }
+
+            fn as_any(&self) -> &dyn ::std::any::Any {
+                self
+            }
+        }
     };
     ($type:ty {
         name: $name:ident,
         name_range: $name_range:ident,
         version: $version:ident,
         version_range: $version_range:ident,
-        source: $source:expr $(,)?
+        source: $source:ident $(,)?
     }) => {
         impl $crate::ecosystem::Dependency for $type {
             fn name(&self) -> &$crate::PackageName {
@@ -73,7 +105,45 @@ macro_rules! impl_dependency {
             }
 
             fn source(&self) -> $crate::parser::DependencySource {
-                $source
+                self.$source.clone()
+            }
+
+            fn as_any(&self) -> &dyn ::std::any::Any {
+                self
+            }
+        }
+    };
+    ($type:ty {
+        name: $name:ident,
+        name_range: $name_range:ident,
+        version: $version:ident,
+        version_range: $version_range:ident,
+        source: $source:ident,
+        version_literal: $version_literal:ident $(,)?
+    }) => {
+        impl $crate::ecosystem::Dependency for $type {
+            fn name(&self) -> &$crate::PackageName {
+                &self.$name
+            }
+
+            fn name_range(&self) -> ::tower_lsp_server::ls_types::Range {
+                self.$name_range
+            }
+
+            fn version_requirement(&self) -> Option<&$crate::VersionReq> {
+                self.$version.as_ref()
+            }
+
+            fn version_range(&self) -> Option<::tower_lsp_server::ls_types::Range> {
+                self.$version_range
+            }
+
+            fn source(&self) -> $crate::parser::DependencySource {
+                self.$source.clone()
+            }
+
+            fn version_literal(&self) -> Option<&str> {
+                self.$version_literal.as_deref()
             }
 
             fn as_any(&self) -> &dyn ::std::any::Any {
@@ -505,6 +575,16 @@ mod tests {
     }
 
     #[derive(Debug, Clone)]
+    struct TestDependencyWithSource {
+        name: crate::PackageName,
+        name_range: Range,
+        version_req: Option<crate::VersionReq>,
+        version_range: Option<Range>,
+        source: crate::parser::DependencySource,
+        version_literal: Option<String>,
+    }
+
+    #[derive(Debug, Clone)]
     struct TestVersion {
         version: ConcreteVersion,
         yanked: bool,
@@ -551,6 +631,15 @@ mod tests {
         name_range: name_range,
         version: version_req,
         version_range: version_range,
+    });
+
+    impl_dependency!(TestDependencyWithSource {
+        name: name,
+        name_range: name_range,
+        version: version_req,
+        version_range: version_range,
+        source: source,
+        version_literal: version_literal,
     });
 
     impl_version!(TestVersion {
@@ -619,6 +708,33 @@ mod tests {
             Some("1.0.0")
         );
         assert!(dep.as_any().is::<TestDependency>());
+        assert!(matches!(
+            dep.source(),
+            crate::parser::DependencySource::Registry
+        ));
+    }
+
+    #[test]
+    fn test_impl_dependency_macro_with_source_and_version_literal() {
+        use crate::ecosystem::Dependency;
+
+        let dep = TestDependencyWithSource {
+            name: "test-pkg".into(),
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 8)),
+            version_req: Some("1.0.0".into()),
+            version_range: Some(Range::new(Position::new(0, 10), Position::new(0, 15))),
+            source: crate::parser::DependencySource::Git {
+                url: "https://example.com/repo.git".into(),
+                rev: None,
+            },
+            version_literal: Some("v1.0.0".into()),
+        };
+
+        assert!(matches!(
+            dep.source(),
+            crate::parser::DependencySource::Git { .. }
+        ));
+        assert_eq!(dep.version_literal(), Some("v1.0.0"));
     }
 
     #[test]

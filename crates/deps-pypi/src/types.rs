@@ -308,6 +308,10 @@ impl PypiPackage {
 
 // Implement deps_core traits
 
+// Implemented by hand rather than via `deps_core::impl_dependency!`: `features()` returns
+// real extras data (`&self.extras`, not the trait's empty default) and `markers()`/
+// `markers_range()` are overridden too — none of these are expressible through the macro's
+// fixed field set.
 impl deps_core::Dependency for PypiDependency {
     fn name(&self) -> &deps_core::PackageName {
         &self.name

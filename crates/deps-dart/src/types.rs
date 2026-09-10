@@ -1,6 +1,5 @@
 //! Domain types for Dart/Pub dependencies.
 
-use std::any::Any;
 use tower_lsp_server::ls_types::Range;
 
 /// A single dependency declaration parsed from a `pubspec.yaml`.
@@ -143,35 +142,13 @@ impl PackageInfo {
 
 // deps-core trait implementations
 
-impl deps_core::Dependency for DartDependency {
-    fn name(&self) -> &deps_core::PackageName {
-        &self.name
-    }
-
-    fn name_range(&self) -> Range {
-        self.name_range
-    }
-
-    fn version_requirement(&self) -> Option<&deps_core::VersionReq> {
-        self.version_req.as_ref()
-    }
-
-    fn version_range(&self) -> Option<Range> {
-        self.version_range
-    }
-
-    fn source(&self) -> deps_core::parser::DependencySource {
-        self.source.clone()
-    }
-
-    fn features(&self) -> &[String] {
-        &[]
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
+deps_core::impl_dependency!(DartDependency {
+    name: name,
+    name_range: name_range,
+    version: version_req,
+    version_range: version_range,
+    source: source,
+});
 
 #[cfg(test)]
 mod tests {

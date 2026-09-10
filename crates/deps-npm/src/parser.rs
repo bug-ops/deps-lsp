@@ -10,7 +10,6 @@ use deps_core::json_ast::{JsonAst, JsonSection};
 use deps_core::json_helpers::string_valued_entries;
 use deps_core::lsp_helpers::LineOffsetTable;
 use serde_json::Value;
-use std::any::Any;
 use tower_lsp_server::ls_types::Uri;
 
 /// Result of parsing a package.json file.
@@ -31,26 +30,13 @@ pub struct NpmParseResult {
     pub resolved_registries: Vec<NpmRegistryIndex>,
 }
 
-impl deps_core::ParseResult for NpmParseResult {
-    fn dependencies(&self) -> Vec<&dyn deps_core::Dependency> {
-        self.dependencies
-            .iter()
-            .map(|d| d as &dyn deps_core::Dependency)
-            .collect()
+deps_core::impl_parse_result!(
+    NpmParseResult,
+    NpmDependency {
+        dependencies: dependencies,
+        uri: uri,
     }
-
-    fn workspace_root(&self) -> Option<&std::path::Path> {
-        None
-    }
-
-    fn uri(&self) -> &Uri {
-        &self.uri
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
+);
 
 /// Parses a package.json file and extracts all dependencies with positions.
 ///

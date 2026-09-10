@@ -255,6 +255,12 @@ impl CrateInfo {
 
 // Trait implementations for deps-core integration
 
+// Implemented by hand rather than via `deps_core::impl_dependency!`: `name()` resolves to
+// `package.as_ref().unwrap_or(&self.name)` (the `package = "..."` rename, falling back to the
+// TOML table key), not a bare field, and `features()`/`features_range()` return real parsed
+// data rather than the trait's empty/`None` defaults — neither is expressible through the
+// macro's fixed field set. Mirrors `deps-npm`'s identical direct
+// `impl deps_core::Dependency for NpmDependency`.
 impl deps_core::Dependency for CargoDependency {
     /// Returns the registry lookup name: [`Self::package`] when this dependency was
     /// renamed via `package = "..."`, otherwise the TOML table key.

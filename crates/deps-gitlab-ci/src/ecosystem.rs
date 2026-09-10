@@ -167,8 +167,8 @@ impl GitlabCiEcosystem {
 impl deps_core::ecosystem::private::Sealed for GitlabCiEcosystem {}
 
 impl Ecosystem for GitlabCiEcosystem {
-    fn id(&self) -> &'static str {
-        "gitlab-ci"
+    fn ecosystem_id(&self) -> deps_core::EcosystemId {
+        deps_core::EcosystemId::GitlabCi
     }
 
     fn display_name(&self) -> &'static str {

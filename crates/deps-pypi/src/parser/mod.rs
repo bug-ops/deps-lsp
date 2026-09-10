@@ -17,7 +17,6 @@ use crate::error::{PypiError, Result};
 use crate::types::{PypiDependency, PypiDependencySection, PypiDependencySource};
 use deps_core::lsp_helpers::LineOffsetTable;
 use pep508_rs::{MarkerTree, Requirement, VersionOrUrl};
-use std::any::Any;
 use std::str::FromStr;
 use tower_lsp_server::ls_types::{Position, Range, Uri};
 
@@ -410,26 +409,14 @@ pub struct ParseResult {
     pub resolved_chains: Vec<crate::config::ResolvedChain>,
 }
 
-impl deps_core::ParseResult for ParseResult {
-    fn dependencies(&self) -> Vec<&dyn deps_core::Dependency> {
-        self.dependencies
-            .iter()
-            .map(|d| d as &dyn deps_core::Dependency)
-            .collect()
+deps_core::impl_parse_result!(
+    ParseResult,
+    PypiDependency {
+        dependencies: dependencies,
+        uri: uri,
+        workspace_root: workspace_root,
     }
-
-    fn workspace_root(&self) -> Option<&std::path::Path> {
-        self.workspace_root.as_deref()
-    }
-
-    fn uri(&self) -> &Uri {
-        &self.uri
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
+);
 
 /// Parser for Python dependency manifests.
 ///

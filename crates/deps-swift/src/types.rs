@@ -30,35 +30,14 @@ pub struct SwiftDependency {
     pub source: DependencySource,
 }
 
-impl deps_core::ecosystem::Dependency for SwiftDependency {
-    fn name(&self) -> &deps_core::PackageName {
-        &self.name
-    }
-
-    fn name_range(&self) -> tower_lsp_server::ls_types::Range {
-        self.name_range
-    }
-
-    fn version_requirement(&self) -> Option<&deps_core::VersionReq> {
-        self.version_req.as_ref()
-    }
-
-    fn version_range(&self) -> Option<tower_lsp_server::ls_types::Range> {
-        self.version_range
-    }
-
-    fn source(&self) -> DependencySource {
-        self.source.clone()
-    }
-
-    fn version_literal(&self) -> Option<&str> {
-        self.version_literal.as_deref()
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-}
+deps_core::impl_dependency!(SwiftDependency {
+    name: name,
+    name_range: name_range,
+    version: version_req,
+    version_range: version_range,
+    source: source,
+    version_literal: version_literal,
+});
 
 /// Version information for a Swift package (GitHub tag).
 #[non_exhaustive]
@@ -181,26 +160,13 @@ pub struct SwiftParseResult {
     pub uri: tower_lsp_server::ls_types::Uri,
 }
 
-impl deps_core::ParseResult for SwiftParseResult {
-    fn dependencies(&self) -> Vec<&dyn deps_core::Dependency> {
-        self.dependencies
-            .iter()
-            .map(|d| d as &dyn deps_core::Dependency)
-            .collect()
+deps_core::impl_parse_result!(
+    SwiftParseResult,
+    SwiftDependency {
+        dependencies: dependencies,
+        uri: uri,
     }
-
-    fn workspace_root(&self) -> Option<&std::path::Path> {
-        None
-    }
-
-    fn uri(&self) -> &tower_lsp_server::ls_types::Uri {
-        &self.uri
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-}
+);
 
 #[cfg(test)]
 mod tests {

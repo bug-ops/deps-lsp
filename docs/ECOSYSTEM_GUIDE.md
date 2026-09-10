@@ -1920,8 +1920,8 @@ impl {Ecosystem}Ecosystem {
 impl deps_core::ecosystem::private::Sealed for {Ecosystem}Ecosystem {}
 
 impl Ecosystem for {Ecosystem}Ecosystem {
-    fn id(&self) -> &'static str {
-        "{ecosystem_id}"
+    fn ecosystem_id(&self) -> deps_core::EcosystemId {
+        deps_core::EcosystemId::{Ecosystem}
     }
 
     fn display_name(&self) -> &'static str {
@@ -2210,6 +2210,10 @@ Before submitting a PR for a new ecosystem:
 - [ ] Every public type prefixed with `<Ecosystem>` (`NpmDependency`, not `Dependency`) — see
       Step 3
 - [ ] Types implementing `Dependency` and `Version` traits (with `source()` method)
+- [ ] A new variant added to `deps_core::EcosystemId` (`crates/deps-core/src/ecosystem.rs`'s
+      `ecosystem_ids!` invocation) — `Ecosystem::ecosystem_id()` returns this variant, and
+      every existing exhaustive `match` on `EcosystemId` across the workspace must be updated
+      to handle it
 - [ ] Parser with accurate position tracking for names AND versions
 - [ ] Lock file parser implementing `LockFileProvider` trait (`locate_lockfile` + `parse_lockfile`)
 - [ ] Formatter implementing `PackageRendering` (`format_version_for_text_edit` + `package_url`)

@@ -7,7 +7,6 @@ use crate::types::{BundlerDependency, DependencyGroup, DependencySource};
 use deps_core::Result;
 use deps_core::lsp_helpers::LineOffsetTable;
 use regex::Regex;
-use std::any::Any;
 use std::sync::LazyLock;
 use tower_lsp_server::ls_types::{Range, Uri};
 
@@ -315,26 +314,13 @@ fn extract_require(line: &str) -> Option<String> {
 /// Parser for Gemfile manifests.
 pub struct BundlerParser;
 
-impl deps_core::ParseResult for BundlerParseResult {
-    fn dependencies(&self) -> Vec<&dyn deps_core::Dependency> {
-        self.dependencies
-            .iter()
-            .map(|d| d as &dyn deps_core::Dependency)
-            .collect()
+deps_core::impl_parse_result!(
+    BundlerParseResult,
+    BundlerDependency {
+        dependencies: dependencies,
+        uri: uri,
     }
-
-    fn workspace_root(&self) -> Option<&std::path::Path> {
-        None
-    }
-
-    fn uri(&self) -> &Uri {
-        &self.uri
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
+);
 
 #[cfg(test)]
 mod tests {

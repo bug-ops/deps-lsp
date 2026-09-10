@@ -650,8 +650,15 @@ mod tests {
     impl crate::ecosystem::private::Sealed for MockEcosystem {}
 
     impl Ecosystem for MockEcosystem {
+        // Routing tests below assert on `self.id`, an arbitrary test label (e.g. "test",
+        // "exact") that is not always a real `EcosystemId` variant, so `id()` stays an
+        // explicit override rather than deriving from `ecosystem_id()`.
         fn id(&self) -> &'static str {
             self.id
+        }
+
+        fn ecosystem_id(&self) -> crate::EcosystemId {
+            crate::EcosystemId::Cargo
         }
 
         fn display_name(&self) -> &'static str {
@@ -719,6 +726,10 @@ mod tests {
             self.id
         }
 
+        fn ecosystem_id(&self) -> crate::EcosystemId {
+            crate::EcosystemId::Cargo
+        }
+
         fn display_name(&self) -> &'static str {
             self.id
         }
@@ -781,6 +792,10 @@ mod tests {
     impl Ecosystem for MockPatternEcosystem {
         fn id(&self) -> &'static str {
             self.id
+        }
+
+        fn ecosystem_id(&self) -> crate::EcosystemId {
+            crate::EcosystemId::Cargo
         }
 
         fn display_name(&self) -> &'static str {

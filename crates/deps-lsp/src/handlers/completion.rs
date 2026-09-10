@@ -450,7 +450,7 @@ mod tests {
     /// syntax — per-ecosystem section/prefix/insert-text syntax is now covered
     /// directly in each owning ecosystem crate (issue #722).
     struct MockEcosystem {
-        id: &'static str,
+        ecosystem_id: deps_core::EcosystemId,
         registry: Arc<dyn deps_core::Registry>,
         /// Canned return value for `fallback_completion_prefix`, ignoring
         /// `content`/`position` entirely.
@@ -463,11 +463,11 @@ mod tests {
     }
     impl deps_core::ecosystem::private::Sealed for MockEcosystem {}
     impl deps_core::Ecosystem for MockEcosystem {
-        fn id(&self) -> &'static str {
-            self.id
+        fn ecosystem_id(&self) -> deps_core::EcosystemId {
+            self.ecosystem_id
         }
         fn display_name(&self) -> &'static str {
-            self.id
+            self.ecosystem_id.id()
         }
         fn manifest_filenames(&self) -> &[&'static str] {
             &["Cargo.toml"]
@@ -528,14 +528,14 @@ mod tests {
         Some(metadata.name().to_string())
     }
 
-    /// Builds a [`MockEcosystem`] with `id`, routing registry search through
+    /// Builds a [`MockEcosystem`] with `ecosystem_id`, routing registry search through
     /// `registry`, using [`default_insert_text`].
     fn mock_ecosystem(
-        id: &'static str,
+        ecosystem_id: deps_core::EcosystemId,
         registry: Arc<dyn deps_core::Registry>,
     ) -> Arc<dyn deps_core::Ecosystem> {
         Arc::new(MockEcosystem {
-            id,
+            ecosystem_id,
             registry,
             fallback_prefix: None,
             insert_text: default_insert_text,
@@ -553,7 +553,7 @@ mod tests {
     ) -> ServerState {
         let state = ServerState::new();
         state.ecosystem_registry.register(Arc::new(MockEcosystem {
-            id: "cargo",
+            ecosystem_id: deps_core::EcosystemId::Cargo,
             registry,
             fallback_prefix,
             insert_text: default_insert_text,
@@ -665,8 +665,8 @@ mod tests {
         struct IncompleteEcosystem;
         impl Sealed for IncompleteEcosystem {}
         impl Ecosystem for IncompleteEcosystem {
-            fn id(&self) -> &'static str {
-                "cargo"
+            fn ecosystem_id(&self) -> deps_core::EcosystemId {
+                deps_core::EcosystemId::Cargo
             }
             fn display_name(&self) -> &'static str {
                 "cargo"
@@ -943,8 +943,8 @@ mod tests {
         struct FreshnessEchoEcosystem;
         impl Sealed for FreshnessEchoEcosystem {}
         impl Ecosystem for FreshnessEchoEcosystem {
-            fn id(&self) -> &'static str {
-                "cargo"
+            fn ecosystem_id(&self) -> deps_core::EcosystemId {
+                deps_core::EcosystemId::Cargo
             }
             fn display_name(&self) -> &'static str {
                 "cargo"
@@ -1438,7 +1438,7 @@ ser"
 
         let state = ServerState::new();
         state.ecosystem_registry.register(Arc::new(MockEcosystem {
-            id: "cargo",
+            ecosystem_id: deps_core::EcosystemId::Cargo,
             registry: Arc::new(StubRegistry),
             fallback_prefix: Some("gua"),
             insert_text: |_| panic!("bare=true must not call completion_insert_text"),
@@ -1537,7 +1537,7 @@ ser"
             latest_version: "1.0.0\", git = \"https://evil".into(),
         };
         let ecosystem = MockEcosystem {
-            id: "cargo",
+            ecosystem_id: deps_core::EcosystemId::Cargo,
             registry: Arc::new(NoopRegistry),
             fallback_prefix: None,
             insert_text: |_| panic!("gate must reject before completion_insert_text runs"),
@@ -1584,7 +1584,7 @@ ser"
             latest_version: "9.9.9".into(),
         };
         let ecosystem = MockEcosystem {
-            id: "cargo",
+            ecosystem_id: deps_core::EcosystemId::Cargo,
             registry: Arc::new(NoopRegistry),
             fallback_prefix: None,
             insert_text: |_| panic!("gate must reject before completion_insert_text runs"),
@@ -1695,7 +1695,7 @@ ser"
             }
         }
 
-        let ecosystem = mock_ecosystem("npm", Arc::new(FastRegistry));
+        let ecosystem = mock_ecosystem(deps_core::EcosystemId::Npm, Arc::new(FastRegistry));
         let items = search_packages(ecosystem.as_ref(), "express", false).await;
 
         assert_eq!(items.len(), 1);
@@ -1758,7 +1758,7 @@ ser"
         }
 
         let ecosystem = Arc::new(MockEcosystem {
-            id: "cargo",
+            ecosystem_id: deps_core::EcosystemId::Cargo,
             registry: Arc::new(TwoResultRegistry),
             fallback_prefix: None,
             insert_text: |metadata| {
@@ -1793,7 +1793,7 @@ ser"
             latest_version: "33.0.0".into(),
         };
         let ecosystem = MockEcosystem {
-            id: "maven",
+            ecosystem_id: deps_core::EcosystemId::Maven,
             registry: Arc::new(NoopRegistry),
             fallback_prefix: None,
             insert_text: |_| panic!("bare=true must not call completion_insert_text"),
@@ -1852,7 +1852,7 @@ ser"
             }
         }
 
-        let ecosystem = mock_ecosystem("npm", Arc::new(SlowRegistry));
+        let ecosystem = mock_ecosystem(deps_core::EcosystemId::Npm, Arc::new(SlowRegistry));
         let items = search_packages(ecosystem.as_ref(), "expr", false).await;
 
         assert!(
@@ -1902,8 +1902,8 @@ ser"
         struct SlowEcosystem;
         impl deps_core::ecosystem::private::Sealed for SlowEcosystem {}
         impl Ecosystem for SlowEcosystem {
-            fn id(&self) -> &'static str {
-                "cargo"
+            fn ecosystem_id(&self) -> deps_core::EcosystemId {
+                deps_core::EcosystemId::Cargo
             }
             fn display_name(&self) -> &'static str {
                 "Cargo (slow mock)"
@@ -2081,8 +2081,8 @@ ser"
         }
         impl Sealed for IncompleteEcosystem {}
         impl Ecosystem for IncompleteEcosystem {
-            fn id(&self) -> &'static str {
-                "cargo"
+            fn ecosystem_id(&self) -> deps_core::EcosystemId {
+                deps_core::EcosystemId::Cargo
             }
             fn display_name(&self) -> &'static str {
                 "cargo"

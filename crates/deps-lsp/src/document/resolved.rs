@@ -11,19 +11,6 @@ use deps_core::lsp_helpers::resolve_in_use_version;
 use std::collections::HashMap;
 use tower_lsp_server::ls_types::Uri;
 
-/// Resolves the typed `EcosystemId` for an ecosystem trait object.
-///
-/// `ecosystem.id()` always originates from a statically registered ecosystem
-/// (see `crate::register_ecosystems`), so parsing it back to `EcosystemId` can
-/// only fail on an internal registration bug, not on user input.
-#[allow(clippy::expect_used)] // safe per the invariant documented above
-pub(crate) fn resolve_ecosystem_id(ecosystem: &dyn Ecosystem) -> EcosystemId {
-    ecosystem
-        .id()
-        .parse()
-        .expect("ecosystem.id() must be a registered EcosystemId")
-}
-
 /// Whether a reparse should only re-fetch what `DependencyDiff` calls for, or force a
 /// full re-fetch of every dependency regardless of diff (issue #592).
 ///

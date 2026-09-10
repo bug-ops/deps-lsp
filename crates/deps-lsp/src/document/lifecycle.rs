@@ -15,7 +15,7 @@ use super::osv_scan::{
 };
 use super::resolved::{
     RefetchPolicy, cached_versions_from_lockfile, collect_in_use_versions, dependency_version_map,
-    load_resolved_versions, resolve_ecosystem_id,
+    load_resolved_versions,
 };
 use super::state::{DocumentState, ServerState};
 use crate::config::DepsConfig;
@@ -112,10 +112,10 @@ pub async fn handle_document_open(
 
     // Create document state (parse_result may be None)
     let mut doc_state = if let Some(pr) = parse_result {
-        DocumentState::new_from_parse_result(resolve_ecosystem_id(&*ecosystem), content, pr)
+        DocumentState::new_from_parse_result(ecosystem.ecosystem_id(), content, pr)
     } else {
         tracing::debug!("Failed to parse manifest, storing document without parse result");
-        DocumentState::new_without_parse_result(resolve_ecosystem_id(&*ecosystem), content)
+        DocumentState::new_without_parse_result(ecosystem.ecosystem_id(), content)
     };
     doc_state.set_version(version);
 
@@ -292,7 +292,7 @@ async fn run_document_open_background_task(
             &resolved_versions,
             &resolved_version_candidates,
             ecosystem.formatter(),
-            resolve_ecosystem_id(ecosystem.as_ref()),
+            ecosystem.ecosystem_id(),
         );
         let minimum_stability = composer_minimum_stability(parse_result);
         (dep_sources, in_use, minimum_stability, collided_names)
@@ -448,7 +448,7 @@ async fn run_document_open_background_task(
     if let Some(osv_task) = osv_task {
         match osv_task.await {
             Ok(Some(phase_a_result)) => {
-                let ecosystem_id = resolve_ecosystem_id(ecosystem.as_ref());
+                let ecosystem_id = ecosystem.ecosystem_id();
                 run_osv_phase_b_and_commit(
                     &uri,
                     &state,
@@ -585,10 +585,10 @@ fn commit_parsed_document(
     }
 
     let mut doc_state = if let Some(pr) = parse_result {
-        DocumentState::new_from_parse_result(resolve_ecosystem_id(ecosystem), content, pr)
+        DocumentState::new_from_parse_result(ecosystem.ecosystem_id(), content, pr)
     } else {
         tracing::debug!("Failed to parse manifest, storing document without parse result");
-        DocumentState::new_without_parse_result(resolve_ecosystem_id(ecosystem), content)
+        DocumentState::new_without_parse_result(ecosystem.ecosystem_id(), content)
     };
     doc_state.set_version(version);
 
@@ -1034,7 +1034,7 @@ async fn await_and_commit_osv_phase_b(
     };
     match osv_task.await {
         Ok(Some(phase_a_result)) => {
-            let ecosystem_id = resolve_ecosystem_id(ecosystem);
+            let ecosystem_id = ecosystem.ecosystem_id();
             run_osv_phase_b_and_commit(
                 uri,
                 state,
@@ -1634,8 +1634,8 @@ mod tests {
         }
         impl Sealed for SlowFetchEcosystem {}
         impl Ecosystem for SlowFetchEcosystem {
-            fn id(&self) -> &'static str {
-                "cargo"
+            fn ecosystem_id(&self) -> deps_core::EcosystemId {
+                deps_core::EcosystemId::Cargo
             }
             fn display_name(&self) -> &'static str {
                 "cargo"

@@ -1,6 +1,5 @@
 //! Domain types for Gradle dependencies.
 
-use std::any::Any;
 use tower_lsp_server::ls_types::Range;
 
 pub use deps_maven::MavenVersion as GradleVersion;
@@ -25,35 +24,12 @@ pub struct GradleDependency {
     pub configuration: String,
 }
 
-impl deps_core::Dependency for GradleDependency {
-    fn name(&self) -> &deps_core::PackageName {
-        &self.name
-    }
-
-    fn name_range(&self) -> Range {
-        self.name_range
-    }
-
-    fn version_requirement(&self) -> Option<&deps_core::VersionReq> {
-        self.version_req.as_ref()
-    }
-
-    fn version_range(&self) -> Option<Range> {
-        self.version_range
-    }
-
-    fn source(&self) -> deps_core::parser::DependencySource {
-        deps_core::parser::DependencySource::Registry
-    }
-
-    fn features(&self) -> &[String] {
-        &[]
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
+deps_core::impl_dependency!(GradleDependency {
+    name: name,
+    name_range: name_range,
+    version: version_req,
+    version_range: version_range,
+});
 
 #[cfg(test)]
 mod tests {

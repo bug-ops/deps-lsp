@@ -127,8 +127,8 @@ impl GoEcosystem {
 impl deps_core::ecosystem::private::Sealed for GoEcosystem {}
 
 impl Ecosystem for GoEcosystem {
-    fn id(&self) -> &'static str {
-        "go"
+    fn ecosystem_id(&self) -> deps_core::EcosystemId {
+        deps_core::EcosystemId::Go
     }
 
     fn display_name(&self) -> &'static str {

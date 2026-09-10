@@ -3,7 +3,6 @@
 use crate::types::{DartDependency, DependencySection, DependencySource};
 use deps_core::lsp_helpers::LineOffsetTable;
 use deps_core::{DepsError, Result};
-use std::any::Any;
 use tower_lsp_server::ls_types::{Range, Uri};
 use yaml_rust2::{Yaml, YamlLoader};
 
@@ -242,26 +241,13 @@ fn find_value_range_after_key(
     None
 }
 
-impl deps_core::ParseResult for DartParseResult {
-    fn dependencies(&self) -> Vec<&dyn deps_core::Dependency> {
-        self.dependencies
-            .iter()
-            .map(|d| d as &dyn deps_core::Dependency)
-            .collect()
+deps_core::impl_parse_result!(
+    DartParseResult,
+    DartDependency {
+        dependencies: dependencies,
+        uri: uri,
     }
-
-    fn workspace_root(&self) -> Option<&std::path::Path> {
-        None
-    }
-
-    fn uri(&self) -> &Uri {
-        &self.uri
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
+);
 
 #[cfg(test)]
 // Fixtures are single-line ASCII literals with hand-computed byte offsets.

@@ -154,8 +154,8 @@ impl NuGetEcosystem {
 impl deps_core::ecosystem::private::Sealed for NuGetEcosystem {}
 
 impl Ecosystem for NuGetEcosystem {
-    fn id(&self) -> &'static str {
-        "nuget"
+    fn ecosystem_id(&self) -> deps_core::EcosystemId {
+        deps_core::EcosystemId::NuGet
     }
 
     fn display_name(&self) -> &'static str {
