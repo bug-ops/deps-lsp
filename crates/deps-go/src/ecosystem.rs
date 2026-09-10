@@ -357,6 +357,15 @@ mod tests {
         lockfile_filenames: &["go.sum"];
     }
 
+    // #794: no `completion_guard_conformance!` for this crate — `complete_package_names`
+    // above unconditionally returns `vec![]` (Go has no centralized module-search API, so
+    // users type the full module path), never calling `registry.search` or
+    // `is_valid_completion_prefix_len` at all. The macro's fixture asserts a valid-length
+    // prefix against an always-has-a-result registry comes back non-empty, which cannot
+    // hold for a completion path that is unconditionally empty by design — mirrors
+    // `deps_github_actions`/`deps_gitlab_ci`'s identical N/A for the same reason (no
+    // package-name search endpoint).
+
     #[test]
     fn test_generate_inlay_hints_up_to_date() {
         let cache = Arc::new(deps_core::HttpCache::new());

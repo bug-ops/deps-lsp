@@ -821,26 +821,25 @@ mod tests {
         assert!(registry.as_any().is::<PubDevRegistry>());
     }
 
-    #[test]
-    fn test_select_latest_matching_not_default_none() {
-        use deps_core::{Registry, VersionReq};
-
-        let cache = Arc::new(HttpCache::new());
-        let registry = PubDevRegistry::new(cache);
-        let versions: Vec<Box<dyn deps_core::Version>> = vec![
-            Box::new(DartVersion {
-                version: "2.0.0".into(),
-                retracted: true,
-                published_at: None,
-            }),
-            Box::new(DartVersion {
-                version: "1.0.0".into(),
-                retracted: false,
-                published_at: None,
-            }),
-        ];
-        let req = VersionReq::new("*");
-        assert_eq!(registry.select_latest_matching(&versions, &req), Some(1));
+    deps_core::registry_conformance! {
+        mod dart_registry_conformance;
+        build: PubDevRegistry::new(Arc::new(HttpCache::new()));
+        select_latest_matching: {
+            versions: vec![
+                Box::new(DartVersion {
+                    version: "2.0.0".into(),
+                    retracted: true,
+                    published_at: None,
+                }),
+                Box::new(DartVersion {
+                    version: "1.0.0".into(),
+                    retracted: false,
+                    published_at: None,
+                }),
+            ];
+            req: "*";
+            expected_index: 1;
+        };
     }
 
     #[test]

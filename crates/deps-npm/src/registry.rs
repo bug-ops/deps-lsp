@@ -1439,28 +1439,27 @@ mod tests {
         assert!(!version.deprecated);
     }
 
-    #[test]
-    fn test_select_latest_matching_not_default_none() {
-        use deps_core::{Registry, VersionReq};
-
-        let cache = Arc::new(HttpCache::new());
-        let registry = NpmRegistry::new(cache);
-        let versions: Vec<Box<dyn deps_core::Version>> = vec![
-            Box::new(NpmVersion {
-                version: "2.0.0".into(),
-                deprecated: true,
-                deprecation: None,
-                published_at: None,
-            }),
-            Box::new(NpmVersion {
-                version: "1.0.0".into(),
-                deprecated: false,
-                deprecation: None,
-                published_at: None,
-            }),
-        ];
-        let req = VersionReq::new("*");
-        assert_eq!(registry.select_latest_matching(&versions, &req), Some(1));
+    deps_core::registry_conformance! {
+        mod npm_registry_conformance;
+        build: NpmRegistry::new(Arc::new(HttpCache::new()));
+        select_latest_matching: {
+            versions: vec![
+                Box::new(NpmVersion {
+                    version: "2.0.0".into(),
+                    deprecated: true,
+                    deprecation: None,
+                    published_at: None,
+                }),
+                Box::new(NpmVersion {
+                    version: "1.0.0".into(),
+                    deprecated: false,
+                    deprecation: None,
+                    published_at: None,
+                }),
+            ];
+            req: "*";
+            expected_index: 1;
+        };
     }
 
     /// #338: every version is deprecated, but the wildcard existence/latest-for-display

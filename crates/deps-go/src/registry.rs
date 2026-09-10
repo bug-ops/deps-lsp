@@ -1473,28 +1473,27 @@ mod tests {
         assert_eq!(fallback_pick.as_deref(), Some("v1.0.0"));
     }
 
-    #[test]
-    fn test_select_latest_matching_not_default_none() {
-        use deps_core::{Registry, VersionReq};
-
-        let cache = Arc::new(HttpCache::new());
-        let registry = GoRegistry::new(cache);
-        let versions: Vec<Box<dyn deps_core::Version>> = vec![
-            Box::new(GoVersion {
-                version: "v2.0.0".into(),
-                published_at: None,
-                is_pseudo: false,
-                retracted: true,
-            }),
-            Box::new(GoVersion {
-                version: "v1.0.0".into(),
-                published_at: None,
-                is_pseudo: false,
-                retracted: false,
-            }),
-        ];
-        let req = VersionReq::new("*");
-        assert_eq!(registry.select_latest_matching(&versions, &req), Some(1));
+    deps_core::registry_conformance! {
+        mod go_registry_conformance;
+        build: GoRegistry::new(Arc::new(HttpCache::new()));
+        select_latest_matching: {
+            versions: vec![
+                Box::new(GoVersion {
+                    version: "v2.0.0".into(),
+                    published_at: None,
+                    is_pseudo: false,
+                    retracted: true,
+                }),
+                Box::new(GoVersion {
+                    version: "v1.0.0".into(),
+                    published_at: None,
+                    is_pseudo: false,
+                    retracted: false,
+                }),
+            ];
+            req: "*";
+            expected_index: 1;
+        };
     }
 
     /// #364 regression guard: Go deliberately does NOT adopt the shared existence-check

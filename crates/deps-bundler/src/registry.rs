@@ -924,30 +924,29 @@ mod tests {
         assert_eq!(default_platform(), "ruby");
     }
 
-    #[test]
-    fn test_select_latest_matching_not_default_none() {
-        use deps_core::{Registry, VersionReq};
-
-        let cache = Arc::new(HttpCache::new());
-        let registry = RubyGemsRegistry::new(cache);
-        let versions: Vec<Box<dyn deps_core::Version>> = vec![
-            Box::new(BundlerVersion {
-                number: "2.0.0".into(),
-                prerelease: false,
-                yanked: true,
-                published_at: None,
-                platform: "ruby".into(),
-            }),
-            Box::new(BundlerVersion {
-                number: "1.0.0".into(),
-                prerelease: false,
-                yanked: false,
-                published_at: None,
-                platform: "ruby".into(),
-            }),
-        ];
-        let req = VersionReq::new("*");
-        assert_eq!(registry.select_latest_matching(&versions, &req), Some(1));
+    deps_core::registry_conformance! {
+        mod bundler_registry_conformance;
+        build: RubyGemsRegistry::new(Arc::new(HttpCache::new()));
+        select_latest_matching: {
+            versions: vec![
+                Box::new(BundlerVersion {
+                    number: "2.0.0".into(),
+                    prerelease: false,
+                    yanked: true,
+                    published_at: None,
+                    platform: "ruby".into(),
+                }),
+                Box::new(BundlerVersion {
+                    number: "1.0.0".into(),
+                    prerelease: false,
+                    yanked: false,
+                    published_at: None,
+                    platform: "ruby".into(),
+                }),
+            ];
+            req: "*";
+            expected_index: 1;
+        };
     }
 
     #[tokio::test]
