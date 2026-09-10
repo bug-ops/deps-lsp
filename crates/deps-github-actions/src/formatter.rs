@@ -633,17 +633,6 @@ mod tests {
     }
 
     #[test]
-    fn test_package_url_valid_and_invalid() {
-        let fmt = formatter();
-        assert_eq!(
-            fmt.package_url(&PackageName::new("actions/checkout")),
-            "https://github.com/actions/checkout"
-        );
-        assert_eq!(fmt.package_url(&PackageName::new("no-slash")), "");
-        assert_eq!(fmt.package_url(&PackageName::new("owner/..")), "");
-    }
-
-    #[test]
     fn test_normalize_package_name() {
         let fmt = formatter();
         assert_eq!(
@@ -652,53 +641,29 @@ mod tests {
         );
     }
 
-    // --- #544: validate_package_name override ---
-
-    #[test]
-    fn test_validate_package_name_accepts_owner_repo() {
-        let fmt = formatter();
-        assert!(fmt.validate_package_name("actions/checkout").is_ok());
-    }
-
-    /// A local composite action's `name` is its raw `./`-prefixed `uses:` value
-    /// (`crate::parser`'s `ParsedUses::Path` arm), never an `owner/repo` coordinate — it
-    /// must not be flagged as an invalid package name.
-    #[test]
-    fn test_validate_package_name_accepts_local_path_action() {
-        let fmt = formatter();
-        assert!(fmt.validate_package_name("./local-action").is_ok());
-        assert!(fmt.validate_package_name("./nested/local-action").is_ok());
-    }
-
-    /// A Docker image reference's `name` is its raw `docker://`-prefixed `uses:` value
-    /// (`crate::parser`'s `ParsedUses::Docker` arm) — same rationale as the local-path
-    /// case above.
-    #[test]
-    fn test_validate_package_name_accepts_docker_ref() {
-        let fmt = formatter();
-        assert!(fmt.validate_package_name("docker://alpine:3.18").is_ok());
-    }
-
-    /// A structurally invalid GitHub Actions reference must be reported as an invalid
-    /// package name, not forwarded to the registry lookup that produces the misleading
-    /// generic "Registry lookup failed" diagnostic.
-    #[test]
-    fn test_validate_package_name_rejects_malformed_names() {
-        let fmt = formatter();
-        for name in [
-            "",
-            ".",
-            "..",
-            "no-slash",
-            "owner/repo/extra",
-            "../../etc/passwd",
-            "owner/..",
-        ] {
-            assert!(
-                fmt.validate_package_name(name).is_err(),
-                "expected {name:?} to be rejected"
-            );
-        }
+    // #758: exact-value `EcosystemFormatter` conformance, replacing
+    // test_package_url_valid_and_invalid, test_validate_package_name_accepts_owner_repo,
+    // test_validate_package_name_accepts_local_path_action,
+    // test_validate_package_name_accepts_docker_ref, and
+    // test_validate_package_name_rejects_malformed_names (#544/#722). No
+    // `version_roundtrip` — this formatter has no `version_satisfies_requirement`
+    // override, only `is_requirement_up_to_date`/`requirement_is_unresolved`, which stay
+    // hand-written below.
+    deps_core::formatter_conformance! {
+        mod github_actions_formatter_conformance;
+        build: formatter();
+        package_url: {
+            "actions/checkout" => "https://github.com/actions/checkout",
+            "no-slash" => "",
+            "owner/.." => "",
+        };
+        accepts: [
+            "actions/checkout", "./local-action", "./nested/local-action",
+            "docker://alpine:3.18",
+        ];
+        rejects: [
+            "", ".", "..", "no-slash", "owner/repo/extra", "../../etc/passwd", "owner/..",
+        ];
     }
 
     #[test]

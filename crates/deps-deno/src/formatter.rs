@@ -198,44 +198,33 @@ mod tests {
 
     use deps_core::test_util::capture_tracing_output;
 
-    #[test]
-    fn test_package_url_jsr() {
-        let formatter = DenoFormatter;
-        assert_eq!(
-            formatter.package_url(&PackageName::new("jsr:@std/fs")),
-            "https://jsr.io/@std/fs"
-        );
-    }
-
-    #[test]
-    fn test_package_url_npm() {
-        let formatter = DenoFormatter;
-        assert_eq!(
-            formatter.package_url(&PackageName::new("npm:react")),
-            "https://www.npmjs.com/package/react"
-        );
-    }
-
-    #[test]
-    fn test_package_url_npm_scoped() {
-        let formatter = DenoFormatter;
-        assert_eq!(
-            formatter.package_url(&PackageName::new("npm:@types/node")),
-            "https://www.npmjs.com/package/@types/node"
-        );
-    }
-
-    #[test]
-    fn test_package_url_unroutable_scheme_is_empty() {
-        let formatter = DenoFormatter;
-        assert_eq!(formatter.package_url(&PackageName::new("unknown:x")), "");
-    }
-
-    #[test]
-    fn test_package_url_jsr_unscoped_is_empty() {
-        // `split_scoped` fails for a `jsr:` specifier missing the `@scope/` prefix.
-        let formatter = DenoFormatter;
-        assert_eq!(formatter.package_url(&PackageName::new("jsr:std")), "");
+    // #758: exact-value `EcosystemFormatter` conformance, replacing test_package_url_jsr/
+    // test_package_url_npm/test_package_url_npm_scoped/
+    // test_package_url_unroutable_scheme_is_empty/test_package_url_jsr_unscoped_is_empty
+    // and the accepts/rejects halves of test_validate_package_name_jsr_requires_scope/
+    // test_validate_package_name_jsr_rejects_dot_segments/
+    // test_validate_package_name_npm_delegates_to_npm_rules/
+    // test_validate_package_name_rejects_unknown_scheme. Does not replace the
+    // capture_tracing_output-based warn-log tests below (different assertion surface), or
+    // the non-literal test_validate_package_name_jsr_rejects_overlong_segment (`.repeat`
+    // boundary), both of which stay hand-written. No `version_roundtrip` — this formatter
+    // has no `version_satisfies_requirement` override, only `compile_requirement`, whose
+    // matcher is exercised directly by the hand-written tests below.
+    deps_core::formatter_conformance! {
+        mod deno_formatter_conformance;
+        build: DenoFormatter;
+        package_url: {
+            "jsr:@std/fs" => "https://jsr.io/@std/fs",
+            "npm:react" => "https://www.npmjs.com/package/react",
+            "npm:@types/node" => "https://www.npmjs.com/package/@types/node",
+            "unknown:x" => "",
+            "jsr:std" => "",
+        };
+        accepts: [ "jsr:@std/fs", "npm:react", "npm:@types/node" ];
+        rejects: [
+            "jsr:std", "jsr:@std", "jsr:@a/..", "jsr:@../x", "jsr:@./x", "jsr:@a/.hidden",
+            "npm:node_modules", "https://example.com",
+        ];
     }
 
     #[test]
@@ -283,25 +272,6 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_package_name_jsr_requires_scope() {
-        let formatter = DenoFormatter;
-        assert!(formatter.validate_package_name("jsr:@std/fs").is_ok());
-        assert!(formatter.validate_package_name("jsr:std").is_err());
-        assert!(formatter.validate_package_name("jsr:@std").is_err());
-    }
-
-    #[test]
-    fn test_validate_package_name_jsr_rejects_dot_segments() {
-        // S-L1: without this, `jsr:@a/..` builds a URL that path-normalizes away from
-        // `jsr.io`'s intended `/@scope/pkg` shape.
-        let formatter = DenoFormatter;
-        assert!(formatter.validate_package_name("jsr:@a/..").is_err());
-        assert!(formatter.validate_package_name("jsr:@../x").is_err());
-        assert!(formatter.validate_package_name("jsr:@./x").is_err());
-        assert!(formatter.validate_package_name("jsr:@a/.hidden").is_err());
-    }
-
-    #[test]
     fn test_validate_package_name_jsr_rejects_overlong_segment() {
         let formatter = DenoFormatter;
         let too_long = "a".repeat(65);
@@ -320,25 +290,6 @@ mod tests {
             formatter
                 .validate_package_name(&format!("jsr:@{max_len}/pkg"))
                 .is_ok()
-        );
-    }
-
-    #[test]
-    fn test_validate_package_name_npm_delegates_to_npm_rules() {
-        let formatter = DenoFormatter;
-        assert!(formatter.validate_package_name("npm:react").is_ok());
-        assert!(formatter.validate_package_name("npm:@types/node").is_ok());
-        // npm rejects a reserved name.
-        assert!(formatter.validate_package_name("npm:node_modules").is_err());
-    }
-
-    #[test]
-    fn test_validate_package_name_rejects_unknown_scheme() {
-        let formatter = DenoFormatter;
-        assert!(
-            formatter
-                .validate_package_name("https://example.com")
-                .is_err()
         );
     }
 

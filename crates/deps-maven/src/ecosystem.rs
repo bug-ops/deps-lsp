@@ -432,25 +432,18 @@ fn extract_prefix(line: &str, character: u32) -> (&str, Option<&str>) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_ecosystem_id() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = MavenEcosystem::new(cache);
-        assert_eq!(eco.id(), "maven");
-    }
-
-    #[test]
-    fn test_ecosystem_display_name() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = MavenEcosystem::new(cache);
-        assert_eq!(eco.display_name(), "Maven (JVM)");
-    }
-
-    #[test]
-    fn test_manifest_filenames() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = MavenEcosystem::new(cache);
-        assert_eq!(eco.manifest_filenames(), &["pom.xml"]);
+    // #758: exact-value `Ecosystem` conformance, replacing the hand-written
+    // test_ecosystem_id/test_ecosystem_display_name/test_manifest_filenames/test_as_any
+    // family. Maven has no lock file format, so `lockfile_filenames` is omitted here;
+    // `test_lockfile_filenames`/`test_lockfile_provider_none` below stay hand-written to
+    // pin that "no lock file support" contract explicitly.
+    deps_core::ecosystem_conformance! {
+        mod maven_ecosystem_conformance;
+        build: MavenEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        ty: MavenEcosystem;
+        id: "maven";
+        display_name: "Maven (JVM)";
+        manifest_filenames: &["pom.xml"];
     }
 
     #[test]
@@ -465,13 +458,6 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let eco = MavenEcosystem::new(cache);
         assert!(eco.lockfile_provider().is_none());
-    }
-
-    #[test]
-    fn test_as_any() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = MavenEcosystem::new(cache);
-        assert!(eco.as_any().is::<MavenEcosystem>());
     }
 
     struct NoopParseResult;

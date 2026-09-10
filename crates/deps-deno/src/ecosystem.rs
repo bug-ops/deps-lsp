@@ -247,25 +247,38 @@ fn extract_prefix(line: &str, character: u32) -> &str {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_ecosystem_id() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = DenoEcosystem::new(cache);
-        assert_eq!(ecosystem.id(), "deno");
+    // #758: exact-value `Ecosystem` conformance, replacing test_ecosystem_id/
+    // test_ecosystem_display_name/test_ecosystem_manifest_filenames/test_as_any.
+    // `lockfile_filenames` is omitted — deno.lock resolved-version parsing is a documented
+    // MVP gap (D9), not yet a `LockFileProvider` impl in this crate; that specific
+    // absence-of-both-halves invariant stays covered by test_ecosystem_no_lockfile_support
+    // below, which the macro doesn't replace.
+    deps_core::ecosystem_conformance! {
+        mod deno_ecosystem_conformance;
+        build: DenoEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        ty: DenoEcosystem;
+        id: "deno";
+        display_name: "Deno (JSR/npm)";
+        manifest_filenames: &["deno.json", "deno.jsonc"];
     }
 
-    #[test]
-    fn test_ecosystem_display_name() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = DenoEcosystem::new(cache);
-        assert_eq!(ecosystem.display_name(), "Deno (JSR/npm)");
-    }
-
-    #[test]
-    fn test_ecosystem_manifest_filenames() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = DenoEcosystem::new(cache);
-        assert_eq!(ecosystem.manifest_filenames(), &["deno.json", "deno.jsonc"]);
+    // #758: the shared completion-prefix-length guard, replacing
+    // test_complete_package_names_minimum_prefix (which only checked a 1-character prefix).
+    deps_core::completion_guard_conformance! {
+        mod deno_completion_guard_conformance;
+        complete: |registry: &dyn deps_core::Registry, prefix: String| -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Vec<tower_lsp_server::ls_types::CompletionItem>> + Send + '_>,
+        > {
+            Box::pin(async move {
+                deps_core::completion::complete_package_names_generic(
+                    registry,
+                    &prefix,
+                    20,
+                    Range::default(),
+                )
+                .await
+            })
+        };
     }
 
     #[test]
@@ -274,13 +287,6 @@ mod tests {
         let ecosystem = DenoEcosystem::new(cache);
         assert!(ecosystem.lockfile_filenames().is_empty());
         assert!(ecosystem.lockfile_provider().is_none());
-    }
-
-    #[test]
-    fn test_as_any() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = DenoEcosystem::new(cache);
-        assert!(ecosystem.as_any().is::<DenoEcosystem>());
     }
 
     #[tokio::test]
@@ -307,14 +313,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_registry_returns_arc() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = DenoEcosystem::new(cache);
-        let registry = ecosystem.registry();
-        assert!(Arc::strong_count(&registry) >= 1);
-    }
-
-    #[tokio::test]
     async fn test_generate_completions_no_context() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = DenoEcosystem::new(cache);
@@ -334,17 +332,6 @@ mod tests {
             .await;
 
         assert!(completions.items.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_complete_package_names_minimum_prefix() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = DenoEcosystem::new(cache);
-
-        let results = ecosystem
-            .complete_package_names("j", Range::default())
-            .await;
-        assert!(results.is_empty());
     }
 
     #[tokio::test]

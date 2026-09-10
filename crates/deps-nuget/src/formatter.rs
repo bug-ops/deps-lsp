@@ -236,34 +236,32 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_package_url() {
-        let f = NuGetFormatter;
-        assert_eq!(
-            f.package_url(&PackageName::new("Newtonsoft.Json")),
-            "https://www.nuget.org/packages/Newtonsoft.Json"
-        );
-    }
-
-    #[test]
-    fn test_version_satisfies_exact_pin() {
-        let f = NuGetFormatter;
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "[1.0.0]"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.0.1"), "[1.0.0]"));
-    }
-
-    #[test]
-    fn test_version_satisfies_bare_floor() {
-        let f = NuGetFormatter;
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), "1.0.0"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("0.9.0"), "1.0.0"));
-    }
-
-    #[test]
-    fn test_version_satisfies_floating() {
-        let f = NuGetFormatter;
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.1.5"), "1.1.*"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.2.0"), "1.1.*"));
+    // #758: exact-value `EcosystemFormatter` conformance, replacing
+    // test_package_url/test_version_satisfies_exact_pin/test_version_satisfies_bare_floor/
+    // test_version_satisfies_floating and the accepts/rejects halves of
+    // test_validate_package_name_accepts_valid_names/
+    // test_validate_package_name_accepts_underscore_as_word_character/
+    // test_validate_package_name_accepts_unresolved_msbuild_property/
+    // test_validate_package_name_rejects_invalid_names. Does not cover
+    // `is_requirement_up_to_date` (a distinct method from `version_satisfies_requirement`) or
+    // the non-literal `test_validate_package_name_rejects_too_long`, which stay hand-written.
+    deps_core::formatter_conformance! {
+        mod nuget_formatter_conformance;
+        build: NuGetFormatter;
+        package_url: { "Newtonsoft.Json" => "https://www.nuget.org/packages/Newtonsoft.Json" };
+        accepts: [
+            "Newtonsoft.Json", "Microsoft.Extensions.Logging", "moq",
+            "_foo", "foo__bar", "_", "foo_bar", "$(MyPackageId)",
+        ];
+        rejects: [ "", ".Json", "Json.", "New..Json", "New Json", "日本語" ];
+        version_roundtrip: [
+            "1.0.0", "[1.0.0]" => true,
+            "1.0.1", "[1.0.0]" => false,
+            "2.0.0", "1.0.0" => true,
+            "0.9.0", "1.0.0" => false,
+            "1.1.5", "1.1.*" => true,
+            "1.2.0", "1.1.*" => false
+        ];
     }
 
     #[test]
@@ -490,54 +488,6 @@ mod tests {
         let f = NuGetFormatter;
         assert!(!f.requirement_is_unresolved(&VersionReq::new("13.0.3")));
         assert!(!f.requirement_is_unresolved(&VersionReq::new("[1.0,2.0)")));
-    }
-
-    #[test]
-    fn test_validate_package_name_accepts_valid_names() {
-        let f = NuGetFormatter;
-        for name in ["Newtonsoft.Json", "Microsoft.Extensions.Logging", "moq"] {
-            assert!(
-                f.validate_package_name(name).is_ok(),
-                "expected {name:?} to be accepted"
-            );
-        }
-    }
-
-    /// #402: a structurally invalid NuGet package ID must be reported as an invalid package
-    /// name, not forwarded to the registry lookup that produces the misleading generic
-    /// diagnostic.
-    #[test]
-    fn test_validate_package_name_rejects_invalid_names() {
-        let f = NuGetFormatter;
-        for name in ["", ".Json", "Json.", "New..Json", "New Json", "日本語"] {
-            assert!(
-                f.validate_package_name(name).is_err(),
-                "expected {name:?} to be rejected"
-            );
-        }
-    }
-
-    /// #402 critique M1: `_` is a `\w` character in NuGet's real `PackageIdValidator.IdRegex`,
-    /// not a separator, so a leading/doubled/bare underscore is accepted (confirmed live:
-    /// nuget.org publishes a package with id `_`).
-    #[test]
-    fn test_validate_package_name_accepts_underscore_as_word_character() {
-        let f = NuGetFormatter;
-        for name in ["_foo", "foo__bar", "_", "foo_bar"] {
-            assert!(
-                f.validate_package_name(name).is_ok(),
-                "expected {name:?} to be accepted"
-            );
-        }
-    }
-
-    /// #402 critique M2: an unexpanded MSBuild property reference in `Include` (e.g.
-    /// `<PackageReference Include="$(MyPackageId)" />`) is not yet a concrete package id and
-    /// must not be flagged as an invalid package name.
-    #[test]
-    fn test_validate_package_name_accepts_unresolved_msbuild_property() {
-        let f = NuGetFormatter;
-        assert!(f.validate_package_name("$(MyPackageId)").is_ok());
     }
 
     #[test]

@@ -592,13 +592,29 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_package_url() {
-        let f = ComposerFormatter;
-        assert_eq!(
-            f.package_url(&PackageName::new("symfony/console")),
-            "https://packagist.org/packages/symfony/console"
-        );
+    // #758: exact-value `package_url`/`validate_package_name` conformance, replacing
+    // test_package_url, test_validate_package_name_accepts_valid_names, and
+    // test_validate_package_name_rejects_invalid_names. `version_satisfies_requirement`'s
+    // own tests stay hand-written below: Composer's tilde/caret/range/OR/`v`-prefix
+    // semantics are extensively documented, historically-regression-driven behavior (#424,
+    // #534, ...), not simple redundant literal lists.
+    deps_core::formatter_conformance! {
+        mod composer_formatter_conformance;
+        build: ComposerFormatter;
+        package_url: {
+            "symfony/console" => "https://packagist.org/packages/symfony/console",
+        };
+        accepts: ["symfony/console", "vendor.name/pkg-name", "a/b"];
+        rejects: [
+            "",
+            "symfony",
+            "symfony/console/extra",
+            "/console",
+            "symfony/",
+            "-vendor/pkg",
+            "vendor/-pkg",
+            "vendor name/pkg"
+        ];
     }
 
     #[test]
@@ -1082,40 +1098,6 @@ mod tests {
                 .is_none()
         );
         assert!(f.compile_requirement(&VersionReq::new("2.0@dev")).is_none());
-    }
-
-    #[test]
-    fn test_validate_package_name_accepts_valid_names() {
-        let f = ComposerFormatter;
-        for name in ["symfony/console", "vendor.name/pkg-name", "a/b"] {
-            assert!(
-                f.validate_package_name(name).is_ok(),
-                "expected {name:?} to be accepted"
-            );
-        }
-    }
-
-    /// #402: a structurally invalid Composer coordinate must be reported as an invalid
-    /// package name, not forwarded to the registry lookup that produces the misleading
-    /// generic diagnostic.
-    #[test]
-    fn test_validate_package_name_rejects_invalid_names() {
-        let f = ComposerFormatter;
-        for name in [
-            "",
-            "symfony",
-            "symfony/console/extra",
-            "/console",
-            "symfony/",
-            "-vendor/pkg",
-            "vendor/-pkg",
-            "vendor name/pkg",
-        ] {
-            assert!(
-                f.validate_package_name(name).is_err(),
-                "expected {name:?} to be rejected"
-            );
-        }
     }
 
     // --- #205 package-level deprecation ---

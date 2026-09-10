@@ -243,90 +243,64 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_package_url() {
-        let f = MavenFormatter;
-        assert_eq!(
-            f.package_url(&PackageName::new("org.apache.commons:commons-lang3")),
-            "https://central.sonatype.com/artifact/org.apache.commons/commons-lang3"
-        );
+    // #758: exact-value `EcosystemFormatter` conformance, replacing test_package_url,
+    // test_version_satisfies, test_version_satisfies_range, test_version_satisfies_maven_property,
+    // test_validate_package_name_accepts_valid_coordinate,
+    // test_validate_package_name_rejects_invalid_group_id,
+    // test_validate_package_name_rejects_invalid_artifact_id,
+    // test_validate_package_name_rejects_missing_colon, and
+    // test_validate_package_name_accepts_unresolved_property. The unresolved-`${property}`
+    // acceptance (impl-critic S2: valid Maven, not a malformed coordinate) and the
+    // `${property}`-requirement always-satisfied cases both fit this macro's literal lists.
+    deps_core::formatter_conformance! {
+        mod maven_formatter_conformance;
+        build: MavenFormatter;
+        package_url: {
+            "org.apache.commons:commons-lang3" => "https://central.sonatype.com/artifact/org.apache.commons/commons-lang3",
+        };
+        accepts: [
+            "org.apache.commons:commons-lang3",
+            "${project.groupId}:my-module",
+            "org.example:${artifact.name}",
+        ];
+        rejects: [
+            "commons</artifactId><parent>:commons-lang3",
+            "org.apache.commons:..",
+            "org.apache.commons",
+        ];
+        version_roundtrip: [
+            "3.14.0", "3.14.0" => true,
+            "3.14.0", "3.13.0" => false,
+            "3.14.0", "3.14.1" => false,
+            "1.5.0", "[1.0,2.0)" => true,
+            "2.0.0", "[1.0,2.0)" => false,
+            "1.0.0", "[1.0.0]" => true,
+            "1.0.1", "[1.0.0]" => false,
+            "7.1.1", "${woodstoxVersion}" => true,
+            "2.0.17", "${slf4j.version}" => true,
+            "1.0.0", "${project.version}" => true
+        ];
     }
 
+    /// #758: `package_url`'s hostile-input safety is generically covered for every
+    /// ecosystem by Layer 1 (`deps-lsp`'s `test_registered_ecosystems_universal_invariants`,
+    /// which calls `formatter().package_url()` with this exact fixture) — this per-crate
+    /// test exists only so a regression here is caught by `cargo nextest run -p deps-maven`
+    /// alone, without needing the whole-workspace `deps-lsp` suite.
     #[test]
-    fn test_version_satisfies() {
+    fn test_package_url_hostile_display_link_payload_is_safe() {
         let f = MavenFormatter;
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("3.14.0"), "3.14.0"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("3.14.0"), "3.13.0"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("3.14.0"), "3.14.1"));
-    }
-
-    #[test]
-    fn test_version_satisfies_range() {
-        let f = MavenFormatter;
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), "[1.0,2.0)"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), "[1.0,2.0)"));
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "[1.0.0]"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.0.1"), "[1.0.0]"));
-    }
-
-    #[test]
-    fn test_version_satisfies_maven_property() {
-        let f = MavenFormatter;
+        let url = f.package_url(&PackageName::new(
+            deps_core::conformance::HOSTILE_DISPLAY_LINK_PAYLOAD,
+        ));
+        for hazard in ['\n', '<', '>', '(', ')', '[', ']', '`'] {
+            assert!(!url.contains(hazard), "leaked {hazard:?} in {url:?}");
+        }
         assert!(
-            f.version_satisfies_requirement(&ConcreteVersion::new("7.1.1"), "${woodstoxVersion}")
+            !url.chars().any(char::is_control),
+            "leaked control char in {url:?}"
         );
-        assert!(
-            f.version_satisfies_requirement(&ConcreteVersion::new("2.0.17"), "${slf4j.version}")
-        );
-        assert!(
-            f.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "${project.version}")
-        );
-    }
-
-    #[test]
-    fn test_validate_package_name_accepts_valid_coordinate() {
-        let f = MavenFormatter;
-        assert!(
-            f.validate_package_name("org.apache.commons:commons-lang3")
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn test_validate_package_name_rejects_invalid_group_id() {
-        let f = MavenFormatter;
-        assert!(
-            f.validate_package_name("commons</artifactId><parent>:commons-lang3")
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn test_validate_package_name_rejects_invalid_artifact_id() {
-        let f = MavenFormatter;
-        assert!(f.validate_package_name("org.apache.commons:..").is_err());
-    }
-
-    #[test]
-    fn test_validate_package_name_rejects_missing_colon() {
-        let f = MavenFormatter;
-        assert!(f.validate_package_name("org.apache.commons").is_err());
-    }
-
-    /// Impl-critic S2: an unresolved `${property}` groupId/artifactId (e.g. a
-    /// multi-module POM's `<groupId>${project.groupId}</groupId>`) is valid Maven, not a
-    /// malformed coordinate — must be treated as undecidable (`Ok`), not rejected.
-    #[test]
-    fn test_validate_package_name_accepts_unresolved_property() {
-        let f = MavenFormatter;
-        assert!(
-            f.validate_package_name("${project.groupId}:my-module")
-                .is_ok()
-        );
-        assert!(
-            f.validate_package_name("org.example:${artifact.name}")
-                .is_ok()
-        );
+        assert!(!url.contains('\u{202e}'), "leaked RTL override in {url:?}");
     }
 
     #[test]

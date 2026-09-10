@@ -364,23 +364,35 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_package_url() {
-        let f = GradleFormatter;
-        assert_eq!(
-            f.package_url(&PackageName::new(
-                "org.springframework.boot:spring-boot-starter"
-            )),
-            "https://central.sonatype.com/artifact/org.springframework.boot/spring-boot-starter"
-        );
-    }
-
-    #[test]
-    fn test_version_satisfies() {
-        let f = GradleFormatter;
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("3.2.0"), "3.2.0"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("3.2.0"), "3.1.0"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("3.2.0"), "3.2.1"));
+    // #758: exact-value `EcosystemFormatter` conformance, replacing test_package_url,
+    // test_version_satisfies, test_validate_package_name_accepts_valid_coordinate,
+    // test_validate_package_name_rejects_missing_colon, test_validate_package_name_rejects_invalid_group,
+    // test_validate_package_name_rejects_invalid_artifact, and
+    // test_validate_package_name_accepts_unresolved_variable. Every other
+    // version_satisfies_requirement/compile_requirement test below stays hand-written:
+    // Gradle's dynamic-prefix/range/strict-marker/snapshot rich-version semantics are
+    // extensively documented, regression-driven behavior, not simple redundant literal lists.
+    deps_core::formatter_conformance! {
+        mod gradle_formatter_conformance;
+        build: GradleFormatter;
+        package_url: {
+            "org.springframework.boot:spring-boot-starter" => "https://central.sonatype.com/artifact/org.springframework.boot/spring-boot-starter",
+        };
+        accepts: [
+            "com.google.guava:guava",
+            "$group:guava",
+            "com.google.guava:${name}",
+        ];
+        rejects: [
+            "com.google.guava",
+            "com</group>:guava",
+            "com.google.guava:..",
+        ];
+        version_roundtrip: [
+            "3.2.0", "3.2.0" => true,
+            "3.2.0", "3.1.0" => false,
+            "3.2.0", "3.2.1" => false
+        ];
     }
 
     #[test]
@@ -497,40 +509,6 @@ mod tests {
     fn test_version_satisfies_unresolved_compound_variable() {
         let f = GradleFormatter;
         assert!(f.version_satisfies_requirement(&ConcreteVersion::new("3.14.0"), "1.0.0-$suffix"));
-    }
-
-    #[test]
-    fn test_validate_package_name_accepts_valid_coordinate() {
-        let f = GradleFormatter;
-        assert!(f.validate_package_name("com.google.guava:guava").is_ok());
-    }
-
-    #[test]
-    fn test_validate_package_name_rejects_missing_colon() {
-        let f = GradleFormatter;
-        assert!(f.validate_package_name("com.google.guava").is_err());
-    }
-
-    #[test]
-    fn test_validate_package_name_rejects_invalid_group() {
-        let f = GradleFormatter;
-        assert!(f.validate_package_name("com</group>:guava").is_err());
-    }
-
-    #[test]
-    fn test_validate_package_name_rejects_invalid_artifact() {
-        let f = GradleFormatter;
-        assert!(f.validate_package_name("com.google.guava:..").is_err());
-    }
-
-    /// Gradle's own `is_unresolved` (unresolved `$var`/`${var}` or catalog-alias
-    /// placeholder) is valid Gradle syntax, not a malformed coordinate — must be
-    /// accepted, mirroring Maven's `${property}` treatment.
-    #[test]
-    fn test_validate_package_name_accepts_unresolved_variable() {
-        let f = GradleFormatter;
-        assert!(f.validate_package_name("$group:guava").is_ok());
-        assert!(f.validate_package_name("com.google.guava:${name}").is_ok());
     }
 
     #[test]

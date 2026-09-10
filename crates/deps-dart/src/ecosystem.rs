@@ -214,39 +214,37 @@ fn extract_prefix(line: &str, character: u32) -> &str {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_ecosystem_id() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = DartEcosystem::new(cache);
-        assert_eq!(eco.id(), "dart");
+    // #758: exact-value `Ecosystem` conformance, replacing the hand-written
+    // test_ecosystem_id/test_ecosystem_display_name/test_ecosystem_manifest_filenames/
+    // test_ecosystem_lockfile_filenames/test_as_any family.
+    deps_core::ecosystem_conformance! {
+        mod dart_ecosystem_conformance;
+        build: DartEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        ty: DartEcosystem;
+        id: "dart";
+        display_name: "Dart (Pub)";
+        manifest_filenames: &["pubspec.yaml"];
+        lockfile_filenames: &["pubspec.lock"];
     }
 
-    #[test]
-    fn test_ecosystem_display_name() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = DartEcosystem::new(cache);
-        assert_eq!(eco.display_name(), "Dart (Pub)");
-    }
-
-    #[test]
-    fn test_ecosystem_manifest_filenames() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = DartEcosystem::new(cache);
-        assert_eq!(eco.manifest_filenames(), &["pubspec.yaml"]);
-    }
-
-    #[test]
-    fn test_ecosystem_lockfile_filenames() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = DartEcosystem::new(cache);
-        assert_eq!(eco.lockfile_filenames(), &["pubspec.lock"]);
-    }
-
-    #[test]
-    fn test_as_any() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = DartEcosystem::new(cache);
-        assert!(eco.as_any().is::<DartEcosystem>());
+    // #758: the shared completion-prefix-length guard
+    // (`deps_core::completion::complete_package_names_generic`), replacing
+    // test_complete_package_names_min_prefix/test_complete_package_names_max_length.
+    deps_core::completion_guard_conformance! {
+        mod dart_completion_guard_conformance;
+        complete: |registry: &dyn deps_core::Registry, prefix: String| -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Vec<tower_lsp_server::ls_types::CompletionItem>> + Send + '_>,
+        > {
+            Box::pin(async move {
+                deps_core::completion::complete_package_names_generic(
+                    registry,
+                    &prefix,
+                    20,
+                    Range::default(),
+                )
+                .await
+            })
+        };
     }
 
     #[tokio::test]
@@ -275,34 +273,6 @@ mod tests {
             }
             other => panic!("Expected PackageName context, got {other:?}"),
         }
-    }
-
-    #[tokio::test]
-    async fn test_complete_package_names_min_prefix() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = DartEcosystem::new(cache);
-        assert!(
-            eco.complete_package_names("h", Range::default())
-                .await
-                .is_empty()
-        );
-        assert!(
-            eco.complete_package_names("", Range::default())
-                .await
-                .is_empty()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_complete_package_names_max_length() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = DartEcosystem::new(cache);
-        let long = "a".repeat(201);
-        assert!(
-            eco.complete_package_names(&long, Range::default())
-                .await
-                .is_empty()
-        );
     }
 
     #[tokio::test]

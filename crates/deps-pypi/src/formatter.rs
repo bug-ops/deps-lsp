@@ -337,52 +337,29 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_package_url() {
-        let formatter = PypiFormatter;
-        assert_eq!(
-            formatter.package_url(&PackageName::new("requests")),
-            "https://pypi.org/project/requests"
-        );
-        assert_eq!(
-            formatter.package_url(&PackageName::new("django")),
-            "https://pypi.org/project/django"
-        );
-    }
-
-    #[test]
-    fn test_version_satisfies_pep440() {
-        let formatter = PypiFormatter;
-
-        assert!(
-            formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), ">=1.0,<2")
-        );
-        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("2.28.0"), ">=2.0"));
-        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "==1.0.0"));
-        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.0"), "~=1.2.0"));
-
-        assert!(
-            !formatter.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), ">=1.0,<2")
-        );
-        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("0.9.0"), ">=1.0"));
-    }
-
-    #[test]
-    fn test_version_satisfies_invalid_version() {
-        let formatter = PypiFormatter;
-        assert!(
-            !formatter
-                .version_satisfies_requirement(&ConcreteVersion::new("not-a-version"), ">=1.0")
-        );
-    }
-
-    #[test]
-    fn test_version_satisfies_invalid_specifier() {
-        let formatter = PypiFormatter;
-        assert!(
-            !formatter
-                .version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "not-a-specifier")
-        );
+    // #758: exact-value `EcosystemFormatter` conformance, replacing test_package_url,
+    // test_validate_package_name_accepts_valid_names, test_validate_package_name_rejects_invalid_names,
+    // test_version_satisfies_pep440, test_version_satisfies_invalid_version, and
+    // test_version_satisfies_invalid_specifier.
+    deps_core::formatter_conformance! {
+        mod pypi_formatter_conformance;
+        build: PypiFormatter;
+        package_url: {
+            "requests" => "https://pypi.org/project/requests",
+            "django" => "https://pypi.org/project/django",
+        };
+        accepts: ["zope.interface", "Django", "a", "my-package_1.0"];
+        rejects: ["---", "-x", "x-", "a b", ""];
+        version_roundtrip: [
+            "1.2.3", ">=1.0,<2" => true,
+            "2.28.0", ">=2.0" => true,
+            "1.0.0", "==1.0.0" => true,
+            "1.2.0", "~=1.2.0" => true,
+            "2.0.0", ">=1.0,<2" => false,
+            "0.9.0", ">=1.0" => false,
+            "not-a-version", ">=1.0" => false,
+            "1.0.0", "not-a-specifier" => false
+        ];
     }
 
     #[test]
@@ -486,25 +463,6 @@ mod tests {
             formatter.normalize_package_name(&PackageName::new("numpy")),
             "numpy"
         );
-    }
-
-    #[test]
-    fn test_validate_package_name_accepts_valid_names() {
-        let formatter = PypiFormatter;
-        assert!(formatter.validate_package_name("zope.interface").is_ok());
-        assert!(formatter.validate_package_name("Django").is_ok());
-        assert!(formatter.validate_package_name("a").is_ok());
-        assert!(formatter.validate_package_name("my-package_1.0").is_ok());
-    }
-
-    #[test]
-    fn test_validate_package_name_rejects_invalid_names() {
-        let formatter = PypiFormatter;
-        assert!(formatter.validate_package_name("---").is_err());
-        assert!(formatter.validate_package_name("-x").is_err());
-        assert!(formatter.validate_package_name("x-").is_err());
-        assert!(formatter.validate_package_name("a b").is_err());
-        assert!(formatter.validate_package_name("").is_err());
     }
 
     #[test]

@@ -591,20 +591,6 @@ version = 1
         assert!(resolved.is_empty());
     }
 
-    #[tokio::test]
-    async fn test_parse_malformed_toml() {
-        let lockfile_content = "not valid toml {{{";
-
-        let temp_dir = tempfile::tempdir().unwrap();
-        let lockfile_path = temp_dir.path().join("poetry.lock");
-        std::fs::write(&lockfile_path, lockfile_content).unwrap();
-
-        let parser = PypiLockParser;
-        let result = parser.parse_lockfile(&lockfile_path).await;
-
-        assert!(result.is_err());
-    }
-
     #[test]
     fn test_locate_lockfile_poetry_priority() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -645,17 +631,20 @@ version = 1
         assert_eq!(located.unwrap(), uv_lock);
     }
 
-    #[test]
-    fn test_locate_lockfile_not_found() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let manifest_path = temp_dir.path().join("pyproject.toml");
-        std::fs::write(&manifest_path, "[project]\nname = \"test\"").unwrap();
-
-        let manifest_uri = Uri::from_file_path(&manifest_path).unwrap();
-        let parser = PypiLockParser;
-
-        let located = parser.locate_lockfile(&manifest_uri);
-        assert!(located.is_none());
+    // #758: shared `LockFileProvider` conformance, replacing test_locate_lockfile_not_found,
+    // test_is_lockfile_stale_not_modified/_modified/_deleted, and test_parse_malformed_toml.
+    // test_locate_lockfile_poetry_priority/test_locate_lockfile_uv_fallback stay hand-written:
+    // they exercise the poetry-over-uv precedence when both lock files coexist, a scenario the
+    // macro's per-filename loop doesn't cover.
+    deps_core::lockfile_conformance! {
+        mod pypi_lockfile_conformance;
+        build: PypiLockParser;
+        manifest: "pyproject.toml" => "[project]\nname = \"test\"";
+        lockfiles: [
+            "poetry.lock" => "# poetry.lock",
+            "uv.lock" => "# uv.lock",
+        ];
+        malformed: "not valid toml {{{";
     }
 
     #[tokio::test]
@@ -685,49 +674,5 @@ name = "missing-version"
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved.get_version("valid-package"), Some("1.0.0"));
         assert!(resolved.get("missing-version").is_none());
-    }
-
-    #[test]
-    fn test_is_lockfile_stale_not_modified() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let lockfile_path = temp_dir.path().join("poetry.lock");
-        std::fs::write(&lockfile_path, "version = 1").unwrap();
-
-        let mtime = std::fs::metadata(&lockfile_path)
-            .unwrap()
-            .modified()
-            .unwrap();
-        let parser = PypiLockParser;
-
-        assert!(
-            !parser.is_lockfile_stale(&lockfile_path, mtime),
-            "Lock file should not be stale when mtime matches"
-        );
-    }
-
-    #[test]
-    fn test_is_lockfile_stale_modified() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let lockfile_path = temp_dir.path().join("poetry.lock");
-        std::fs::write(&lockfile_path, "version = 1").unwrap();
-
-        let old_time = std::time::UNIX_EPOCH;
-        let parser = PypiLockParser;
-
-        assert!(
-            parser.is_lockfile_stale(&lockfile_path, old_time),
-            "Lock file should be stale when last_modified is old"
-        );
-    }
-
-    #[test]
-    fn test_is_lockfile_stale_deleted() {
-        let parser = PypiLockParser;
-        let non_existent = std::path::Path::new("/nonexistent/poetry.lock");
-
-        assert!(
-            parser.is_lockfile_stale(non_existent, std::time::SystemTime::now()),
-            "Non-existent lock file should be considered stale"
-        );
     }
 }

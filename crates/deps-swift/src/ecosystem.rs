@@ -402,33 +402,16 @@ mod tests {
         assert_eq!(strip_github_prefix("htt"), "htt");
     }
 
-    #[test]
-    fn test_ecosystem_id() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = SwiftEcosystem::new(cache);
-        assert_eq!(eco.id(), "swift");
-    }
-
-    #[test]
-    fn test_ecosystem_display_name() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = SwiftEcosystem::new(cache);
-        assert_eq!(eco.display_name(), "Swift (SPM)");
-    }
-
-    #[test]
-    fn test_manifest_filenames() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = SwiftEcosystem::new(cache);
-        assert_eq!(eco.manifest_filenames(), &["Package.swift"]);
-        assert_eq!(eco.lockfile_filenames(), &["Package.resolved"]);
-    }
-
-    #[test]
-    fn test_as_any() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = SwiftEcosystem::new(cache);
-        assert!(eco.as_any().is::<SwiftEcosystem>());
+    // #758: exact-value `Ecosystem` conformance, replacing test_ecosystem_id,
+    // test_ecosystem_display_name, test_manifest_filenames, and test_as_any.
+    deps_core::ecosystem_conformance! {
+        mod swift_ecosystem_conformance;
+        build: SwiftEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        ty: SwiftEcosystem;
+        id: "swift";
+        display_name: "Swift (SPM)";
+        manifest_filenames: &["Package.swift"];
+        lockfile_filenames: &["Package.resolved"];
     }
 
     #[test]

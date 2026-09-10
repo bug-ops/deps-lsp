@@ -395,14 +395,10 @@ mod tests {
         assert!(!url.contains(']'));
     }
 
-    #[test]
-    fn test_gem_url_encodes_newline_autolink_and_percent() {
-        let url = gem_url("evil\n<https://evil%zz.example>");
-        assert!(!url.contains('\n'));
-        assert!(!url.contains('<'));
-        assert!(!url.contains('>'));
-        assert!(url.contains("%25"));
-    }
+    // #758: this hostile newline/autolink/percent payload case is now covered universally by
+    // deps-lsp's `test_registered_ecosystems_universal_invariants` (Layer 1), via
+    // `deps_core::conformance::HOSTILE_DISPLAY_LINK_PAYLOAD` — this crate's own copy is
+    // redundant and has been removed.
 
     #[test]
     fn test_gem_url_empty_name() {
@@ -638,6 +634,17 @@ mod tests {
         let json = r"[]";
         let results = parse_search_response(json.as_bytes()).unwrap();
         assert!(results.is_empty());
+    }
+
+    // #758: the shared JSON-nesting-depth cap — deps-bundler had no prior nesting-depth test.
+    // Targets `parse_gem_info` (a single JSON object response) rather than
+    // `parse_search_response` (a top-level array): wrapping a nested fragment inside an array
+    // element would add an extra array-nesting level ahead of the fragment itself, shifting
+    // the accept/reject boundary by one relative to every other crate's identical macro call.
+    deps_core::json_depth_conformance! {
+        mod bundler_json_depth_conformance;
+        parse: |bytes: &[u8]| parse_gem_info(bytes);
+        wrap: |nested: &str| format!(r#"{{"name": "test", "version": "1.0.0", "extra": {nested}}}"#);
     }
 
     #[test]

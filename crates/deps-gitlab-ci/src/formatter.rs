@@ -344,25 +344,20 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_validate_package_name_accepts_bare_and_host_qualified() {
-        let fmt = formatter();
-        assert!(fmt.validate_package_name("org/proj").is_ok());
-        assert!(
-            fmt.validate_package_name("gitlab.com/org/proj/comp")
-                .is_ok()
-        );
-        assert!(fmt.validate_package_name("no-slash").is_err());
-    }
-
-    #[test]
-    fn test_package_url() {
-        let fmt = formatter();
-        assert_eq!(
-            fmt.package_url(&PackageName::new("gitlab.com/org/proj")),
-            "https://gitlab.com/org/proj"
-        );
-        assert_eq!(fmt.package_url(&PackageName::new("no-slash")), "");
+    // #758: exact-value `EcosystemFormatter` conformance, replacing
+    // test_validate_package_name_accepts_bare_and_host_qualified and test_package_url. No
+    // `version_roundtrip` — this formatter has no `version_satisfies_requirement`
+    // override, only `is_requirement_up_to_date`/`requirement_status_for`, which stay
+    // hand-written below.
+    deps_core::formatter_conformance! {
+        mod gitlab_ci_formatter_conformance;
+        build: formatter();
+        package_url: {
+            "gitlab.com/org/proj" => "https://gitlab.com/org/proj",
+            "no-slash" => "",
+        };
+        accepts: [ "org/proj", "gitlab.com/org/proj/comp" ];
+        rejects: [ "no-slash" ];
     }
 
     #[test]

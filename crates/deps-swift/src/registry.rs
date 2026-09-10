@@ -481,6 +481,14 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // #758: the shared JSON-nesting-depth cap — this crate had no such coverage for
+    // `parse_search_response` before (issue named deps-swift as missing it).
+    deps_core::json_depth_conformance! {
+        mod swift_json_depth_conformance;
+        parse: |bytes: &[u8]| parse_search_response(bytes);
+        wrap: |nested: &str| format!(r#"{{"items": [], "extra": {nested}}}"#);
+    }
+
     #[test]
     fn test_parse_tags_v_prefix_stripped() {
         let json = r#"[{"name": "v1.2.3"}, {"name": "v0.9.0"}]"#;

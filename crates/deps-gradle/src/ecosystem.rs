@@ -417,26 +417,23 @@ mod tests {
         Arc::new(deps_core::HttpCache::new())
     }
 
-    #[test]
-    fn test_ecosystem_id() {
-        let eco = GradleEcosystem::new(make_cache());
-        assert_eq!(eco.id(), "gradle");
-    }
-
-    #[test]
-    fn test_ecosystem_display_name() {
-        let eco = GradleEcosystem::new(make_cache());
-        assert_eq!(eco.display_name(), "Gradle (JVM)");
-    }
-
-    #[test]
-    fn test_manifest_filenames() {
-        let eco = GradleEcosystem::new(make_cache());
-        assert!(eco.manifest_filenames().contains(&"libs.versions.toml"));
-        assert!(eco.manifest_filenames().contains(&"build.gradle.kts"));
-        assert!(eco.manifest_filenames().contains(&"build.gradle"));
-        assert!(eco.manifest_filenames().contains(&"settings.gradle.kts"));
-        assert!(eco.manifest_filenames().contains(&"settings.gradle"));
+    // #758: exact-value `Ecosystem` conformance, replacing test_ecosystem_id,
+    // test_ecosystem_display_name, test_manifest_filenames, and test_as_any. Gradle has no
+    // lock file format, so `lockfile_filenames` is omitted here; `test_lockfile_filenames_empty`/
+    // `test_lockfile_provider_none` below stay hand-written to pin that contract explicitly.
+    deps_core::ecosystem_conformance! {
+        mod gradle_ecosystem_conformance;
+        build: GradleEcosystem::new(make_cache());
+        ty: GradleEcosystem;
+        id: "gradle";
+        display_name: "Gradle (JVM)";
+        manifest_filenames: &[
+            "libs.versions.toml",
+            "build.gradle.kts",
+            "build.gradle",
+            "settings.gradle.kts",
+            "settings.gradle",
+        ];
     }
 
     #[test]
@@ -451,25 +448,25 @@ mod tests {
         assert!(eco.lockfile_provider().is_none());
     }
 
-    #[test]
-    fn test_as_any() {
-        let eco = GradleEcosystem::new(make_cache());
-        assert!(eco.as_any().is::<GradleEcosystem>());
-    }
-
-    #[tokio::test]
-    async fn test_complete_package_names_short_prefix() {
-        let eco = GradleEcosystem::new(make_cache());
-        assert!(
-            eco.complete_package_names("a", Range::default())
+    // #758: the shared completion-prefix-length guard
+    // (`deps_core::completion::complete_package_names_generic`), replacing
+    // test_complete_package_names_short_prefix — also closes the missing max-length case
+    // (issue #758 named deps-gradle as missing this).
+    deps_core::completion_guard_conformance! {
+        mod gradle_completion_guard_conformance;
+        complete: |registry: &dyn deps_core::Registry, prefix: String| -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Vec<CompletionItem>> + Send + '_>,
+        > {
+            Box::pin(async move {
+                deps_core::completion::complete_package_names_generic(
+                    registry,
+                    &prefix,
+                    20,
+                    Range::default(),
+                )
                 .await
-                .is_empty()
-        );
-        assert!(
-            eco.complete_package_names("", Range::default())
-                .await
-                .is_empty()
-        );
+            })
+        };
     }
 
     #[tokio::test]

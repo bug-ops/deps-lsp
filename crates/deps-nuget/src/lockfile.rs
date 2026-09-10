@@ -327,18 +327,17 @@ mod tests {
         assert_eq!(resolved.len(), 0);
     }
 
-    #[test]
-    fn test_locate_lockfile() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let manifest_path = temp_dir.path().join("App.csproj");
-        let lock_path = temp_dir.path().join("packages.lock.json");
-        std::fs::write(&manifest_path, "<Project></Project>").unwrap();
-        std::fs::write(&lock_path, "{}").unwrap();
-
-        let manifest_uri = Uri::from_file_path(&manifest_path).unwrap();
-        let parser = NuGetLockParser;
-        let located = parser.locate_lockfile(&manifest_uri);
-        assert_eq!(located, Some(lock_path));
+    // #758: `LockFileProvider` conformance — exact-name location/staleness/malformed-parse
+    // behavior, replacing test_locate_lockfile and adding the previously-missing
+    // is_lockfile_stale_* family (NuGetLockParser has no stale override, only the shared
+    // default). Does not cover the multi-project (`packages.<project>.lock.json`) fallback
+    // below, which is unique to this crate.
+    deps_core::lockfile_conformance! {
+        mod nuget_lockfile_conformance;
+        build: NuGetLockParser;
+        manifest: "App.csproj" => "<Project></Project>";
+        lockfiles: [ "packages.lock.json" => "{}" ];
+        malformed: "not valid json";
     }
 
     // --- locate_lockfile: multi-project fallback (D3, #451) ---
@@ -426,17 +425,6 @@ mod tests {
         let manifest_uri = Uri::from_file_path(&manifest_path).unwrap();
         let parser = NuGetLockParser;
         assert_eq!(parser.locate_lockfile(&manifest_uri), Some(lock_path));
-    }
-
-    #[test]
-    fn test_locate_lockfile_no_match_returns_none() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let manifest_path = temp_dir.path().join("MyApp.csproj");
-        std::fs::write(&manifest_path, "<Project></Project>").unwrap();
-
-        let manifest_uri = Uri::from_file_path(&manifest_path).unwrap();
-        let parser = NuGetLockParser;
-        assert_eq!(parser.locate_lockfile(&manifest_uri), None);
     }
 
     #[test]

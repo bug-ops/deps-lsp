@@ -779,22 +779,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_parse_malformed_package_lock() {
-        let lockfile_content = "not valid json {{{";
-
-        let temp_dir = tempfile::tempdir().unwrap();
-        let lockfile_path = temp_dir.path().join("package-lock.json");
-        tokio::fs::write(&lockfile_path, lockfile_content)
-            .await
-            .unwrap();
-
-        let parser = NpmLockParser;
-        let result = parser.parse_lockfile(&lockfile_path).await;
-
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
     async fn test_nesting_at_max_depth_accepted() {
         let depth = deps_core::MAX_JSON_NESTING_DEPTH;
         let content = format!(
@@ -826,21 +810,24 @@ mod tests {
         assert!(parser.parse_lockfile(&lockfile_path).await.is_err());
     }
 
-    #[test]
-    fn test_locate_lockfile_same_directory() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let manifest_path = temp_dir.path().join("package.json");
-        let lock_path = temp_dir.path().join("package-lock.json");
-
-        std::fs::write(&manifest_path, r#"{"name": "test"}"#).unwrap();
-        std::fs::write(&lock_path, r#"{"lockfileVersion": 3}"#).unwrap();
-
-        let manifest_uri = Uri::from_file_path(&manifest_path).unwrap();
-        let parser = NpmLockParser;
-
-        let located = parser.locate_lockfile(&manifest_uri);
-        assert!(located.is_some());
-        assert_eq!(located.unwrap(), lock_path);
+    // #758: shared `LockFileProvider` conformance, replacing test_locate_lockfile_same_directory,
+    // test_locate_lockfile_not_found, test_is_lockfile_stale_not_modified/_modified/_deleted/
+    // _future_time, and test_parse_malformed_package_lock. test_locate_lockfile_workspace_root,
+    // test_locate_lockfile_prefers_package_lock_json_over_pnpm,
+    // test_locate_lockfile_falls_back_to_pnpm_when_no_package_lock, and
+    // test_parse_pnpm_lock_malformed_yaml_is_parse_error stay hand-written: the macro's
+    // malformed-content check only exercises LOCKFILES[0] (package-lock.json's JSON parser), so
+    // pnpm-lock.yaml's own (YAML) malformed-parsing path needs its own test, and the
+    // multi-lockfile precedence/ancestor-search scenarios aren't covered by the macro either.
+    deps_core::lockfile_conformance! {
+        mod npm_lockfile_conformance;
+        build: NpmLockParser;
+        manifest: "package.json" => "{\"name\": \"test\"}";
+        lockfiles: [
+            "package-lock.json" => "{\"lockfileVersion\": 3}",
+            "pnpm-lock.yaml" => "lockfileVersion: '9.0'\n",
+        ];
+        malformed: "not valid json {{{";
     }
 
     #[test]
@@ -860,79 +847,6 @@ mod tests {
         let located = parser.locate_lockfile(&manifest_uri);
         assert!(located.is_some());
         assert_eq!(located.unwrap(), workspace_lock);
-    }
-
-    #[test]
-    fn test_locate_lockfile_not_found() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let manifest_path = temp_dir.path().join("package.json");
-        std::fs::write(&manifest_path, r#"{"name": "test"}"#).unwrap();
-
-        let manifest_uri = Uri::from_file_path(&manifest_path).unwrap();
-        let parser = NpmLockParser;
-
-        let located = parser.locate_lockfile(&manifest_uri);
-        assert!(located.is_none());
-    }
-
-    #[test]
-    fn test_is_lockfile_stale_not_modified() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let lockfile_path = temp_dir.path().join("package-lock.json");
-        std::fs::write(&lockfile_path, r#"{"lockfileVersion": 3}"#).unwrap();
-
-        let mtime = std::fs::metadata(&lockfile_path)
-            .unwrap()
-            .modified()
-            .unwrap();
-        let parser = NpmLockParser;
-
-        assert!(
-            !parser.is_lockfile_stale(&lockfile_path, mtime),
-            "Lock file should not be stale when mtime matches"
-        );
-    }
-
-    #[test]
-    fn test_is_lockfile_stale_modified() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let lockfile_path = temp_dir.path().join("package-lock.json");
-        std::fs::write(&lockfile_path, r#"{"lockfileVersion": 3}"#).unwrap();
-
-        let old_time = std::time::UNIX_EPOCH;
-        let parser = NpmLockParser;
-
-        assert!(
-            parser.is_lockfile_stale(&lockfile_path, old_time),
-            "Lock file should be stale when last_modified is old"
-        );
-    }
-
-    #[test]
-    fn test_is_lockfile_stale_deleted() {
-        let parser = NpmLockParser;
-        let non_existent = std::path::Path::new("/nonexistent/package-lock.json");
-
-        assert!(
-            parser.is_lockfile_stale(non_existent, std::time::SystemTime::now()),
-            "Non-existent lock file should be considered stale"
-        );
-    }
-
-    #[test]
-    fn test_is_lockfile_stale_future_time() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let lockfile_path = temp_dir.path().join("package-lock.json");
-        std::fs::write(&lockfile_path, r#"{"lockfileVersion": 3}"#).unwrap();
-
-        // Use a time far in the future
-        let future_time = std::time::SystemTime::now() + std::time::Duration::from_hours(24);
-        let parser = NpmLockParser;
-
-        assert!(
-            !parser.is_lockfile_stale(&lockfile_path, future_time),
-            "Lock file should not be stale when last_modified is in the future"
-        );
     }
 
     // --- pnpm-lock.yaml (spec 052) ---

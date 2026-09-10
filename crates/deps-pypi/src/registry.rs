@@ -1170,16 +1170,10 @@ mod tests {
         assert!(!url.contains(']'));
     }
 
-    #[test]
-    fn test_package_url_encodes_newline_autolink_and_percent() {
-        let url = package_url("evil\n<https://evil%zz.example>");
-        assert!(!url.contains('\n'));
-        assert!(!url.contains('<'));
-        assert!(!url.contains('>'));
-        // The literal '%' from the payload must itself be encoded (to %25), or a
-        // browser/renderer double-decode could smuggle a raw byte back in.
-        assert!(url.contains("%25"));
-    }
+    // #758: this hostile newline/autolink/percent payload case is now covered universally by
+    // deps-lsp's `test_registered_ecosystems_universal_invariants` (Layer 1), via
+    // `deps_core::conformance::HOSTILE_DISPLAY_LINK_PAYLOAD` — this crate's own copy is
+    // redundant and has been removed.
 
     #[test]
     fn test_package_url_empty_name() {
@@ -1225,26 +1219,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_parse_simple_api_response_nesting_at_max_depth_accepted() {
-        let depth = deps_core::MAX_JSON_NESTING_DEPTH;
-        let json = format!(
-            r#"{{"versions": [], "files": [], "extra": {}1{}}}"#,
-            "[".repeat(depth - 1),
-            "]".repeat(depth - 1)
-        );
-        assert!(parse_simple_api_response("pkg", json.as_bytes()).is_ok());
-    }
-
-    #[test]
-    fn test_parse_simple_api_response_nesting_over_max_depth_rejected() {
-        let depth = deps_core::MAX_JSON_NESTING_DEPTH + 1;
-        let json = format!(
-            r#"{{"versions": [], "files": [], "extra": {}1{}}}"#,
-            "[".repeat(depth),
-            "]".repeat(depth)
-        );
-        assert!(parse_simple_api_response("pkg", json.as_bytes()).is_err());
+    // #758: the shared JSON-nesting-depth cap, replacing
+    // test_parse_simple_api_response_nesting_at_max_depth_accepted/_over_max_depth_rejected.
+    deps_core::json_depth_conformance! {
+        mod pypi_simple_api_json_depth_conformance;
+        parse: |bytes: &[u8]| parse_simple_api_response("pkg", bytes);
+        wrap: |nested: &str| format!(r#"{{"versions": [], "files": [], "extra": {nested}}}"#);
     }
 
     #[test]
@@ -1700,26 +1680,12 @@ mod tests {
         assert_eq!(pkg.project_urls.len(), 2);
     }
 
-    #[test]
-    fn test_parse_package_info_nesting_at_max_depth_accepted() {
-        let depth = deps_core::MAX_JSON_NESTING_DEPTH;
-        let json = format!(
-            r#"{{"info": {{"name": "pkg", "version": "1.0.0"}}, "extra": {}1{}}}"#,
-            "[".repeat(depth - 1),
-            "]".repeat(depth - 1)
-        );
-        assert!(parse_package_info("pkg", json.as_bytes()).is_ok());
-    }
-
-    #[test]
-    fn test_parse_package_info_nesting_over_max_depth_rejected() {
-        let depth = deps_core::MAX_JSON_NESTING_DEPTH + 1;
-        let json = format!(
-            r#"{{"info": {{"name": "pkg", "version": "1.0.0"}}, "extra": {}1{}}}"#,
-            "[".repeat(depth),
-            "]".repeat(depth)
-        );
-        assert!(parse_package_info("pkg", json.as_bytes()).is_err());
+    // #758: the shared JSON-nesting-depth cap, replacing
+    // test_parse_package_info_nesting_at_max_depth_accepted/_over_max_depth_rejected.
+    deps_core::json_depth_conformance! {
+        mod pypi_package_info_json_depth_conformance;
+        parse: |bytes: &[u8]| parse_package_info("pkg", bytes);
+        wrap: |nested: &str| format!(r#"{{"info": {{"name": "pkg", "version": "1.0.0"}}, "extra": {nested}}}"#);
     }
 
     #[test]
