@@ -282,6 +282,8 @@ pub fn strip_open_xml_attribute_value<'a>(
             // here too (not just on a closing quote) so `before_quote` below never
             // spans back across a *previous* element's tail.
             segment_start = idx + ch.len_utf8();
+            // char-boundary safe: `segment_start` is `idx + ch.len_utf8()` set
+            // immediately above, always a char boundary.
             #[allow(clippy::string_slice)]
             let rest = &prefix[segment_start..];
             element = rest
@@ -478,12 +480,11 @@ pub fn strip_open_json_key(prefix: &str) -> (&str, bool) {
     if quote_count.is_multiple_of(2) {
         return ("", false);
     }
-    // `quote_count` odd (so >= 1) guarantees `count_real_quotes` found one; `"`
-    // is a single-byte ASCII char, so `last_quote + 1` is always a char boundary.
-    #[allow(clippy::string_slice)]
     let Some(last_quote) = last_quote else {
         return ("", false);
     };
+    // `quote_count` odd (so >= 1) guarantees `count_real_quotes` found one; `"`
+    // is a single-byte ASCII char, so `last_quote + 1` is always a char boundary.
     #[allow(clippy::string_slice)]
     let (before_quote, after_quote) = (&prefix[..last_quote], &prefix[last_quote + 1..]);
     if before_quote.trim_end().ends_with(':') {

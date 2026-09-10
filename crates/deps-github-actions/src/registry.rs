@@ -305,6 +305,12 @@ impl GithubActionsRegistry {
     /// concurrent callers for the same repository on a cold cache issue one request, not
     /// N (S2) — and short-circuits locally, without touching the network, once the
     /// rate-limit gate has been tripped by an earlier 403 (critic C1).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `name` is not a valid `owner/repo` string, the rate-limit gate
+    /// is tripped, or the GitHub tags API request fails (including a 403 from quota
+    /// exhaustion).
     #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
     pub async fn get_versions(&self, name: &str) -> Result<Vec<GithubActionsVersion>> {
         validate_owner_repo(name)?;
@@ -357,6 +363,11 @@ impl GithubActionsRegistry {
     /// repository, not treated as a workspace-wide outage), so the gate never becomes
     /// tripped while a token is present. Left unfixed rather than adding a check that
     /// would never fire in the tokened case it targets.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::get_versions`] — the release-dates fetch is infallible and never
+    /// contributes an error.
     #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
     pub async fn get_versions_with_release_dates(
         &self,
@@ -373,6 +384,11 @@ impl GithubActionsRegistry {
     }
 
     /// Finds the latest version satisfying the given semver requirement.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::get_versions`]. An unparseable `req_str` is not an error: it
+    /// resolves to `Ok(None)`.
     #[tracing::instrument(skip_all, fields(package = ?name, version = ?req_str), level = "debug")]
     pub async fn get_latest_matching(
         &self,

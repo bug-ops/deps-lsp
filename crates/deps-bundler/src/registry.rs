@@ -56,6 +56,11 @@ impl RubyGemsRegistry {
     }
 
     /// Fetches all versions for a gem.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or the response body is not valid JSON
+    /// matching rubygems.org's `versions.json` shape.
     #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
     pub async fn get_versions(&self, name: &str) -> Result<Vec<BundlerVersion>> {
         let url = versions_url(name);
@@ -64,6 +69,10 @@ impl RubyGemsRegistry {
     }
 
     /// Finds the latest version matching the given requirement.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::get_versions`].
     #[tracing::instrument(skip_all, fields(package = ?name, version = ?req_str), level = "debug")]
     pub async fn get_latest_matching(
         &self,
@@ -77,6 +86,11 @@ impl RubyGemsRegistry {
     }
 
     /// Searches for gems by name/keywords.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or the response body is not valid JSON
+    /// matching rubygems.org's `search.json` shape.
     #[tracing::instrument(skip_all, fields(query = ?query), level = "debug")]
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<GemInfo>> {
         let url = format!(
@@ -90,6 +104,11 @@ impl RubyGemsRegistry {
     }
 
     /// Gets detailed gem information.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or the response body is not valid JSON
+    /// matching rubygems.org's `gems/{name}.json` shape.
     #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
     pub async fn get_gem_info(&self, name: &str) -> Result<GemInfo> {
         let url = gem_info_url(name);

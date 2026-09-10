@@ -175,6 +175,49 @@ impl OsvNaming for CargoFormatter {}
 mod tests {
     use super::*;
 
+    // #758: exact-value `EcosystemFormatter` conformance, replacing test_package_url,
+    // test_validate_package_name_rejects_empty, test_validate_package_name_rejects_non_ascii,
+    // test_validate_package_name_rejects_disallowed_punctuation,
+    // test_validate_package_name_rejects_leading_digit_or_hyphen,
+    // test_validate_package_name_accepts_leading_underscore, and
+    // test_version_satisfies_requirement. The remaining validate_package_name tests below stay
+    // hand-written: they assert on `InvalidPackageName::reason()`'s exact text, or on a
+    // computed (`.repeat(n)`) boundary-length name — neither fits a `literal`-only macro list.
+    deps_core::formatter_conformance! {
+        mod cargo_formatter_conformance;
+        build: CargoFormatter;
+        package_url: {
+            "serde" => "https://crates.io/crates/serde",
+            "tokio" => "https://crates.io/crates/tokio",
+            "tokio-util" => "https://crates.io/crates/tokio-util",
+            "serde-json" => "https://crates.io/crates/serde-json",
+            "" => "https://crates.io/crates/",
+        };
+        // "_private" — a leading underscore is explicitly allowed, unlike a leading digit
+        // or "-" (see the `rejects:` list below).
+        accepts: ["serde", "tokio-util", "my_crate", "a", "_private"];
+        rejects: [
+            "",
+            // #382 repro: a non-ASCII crate name must be reported as an invalid package
+            // name, not silently forwarded to the registry as an "Unknown package".
+            "日本語",
+            // crates.io's first-character rule: a digit or "-" can never lead a real crate
+            // name — same "falls through to Unknown package" bug shape as #382, on a
+            // different invalid-name form.
+            "1abc", "9serde", "-abc",
+            "serde.rs", "serde/util", "serde@1.0", "serde util"
+        ];
+        version_roundtrip: [
+            "1.2.3", "1.2.3" => true,
+            "1.2.3", "^1.2" => true,
+            "1.2.3", "~1.2" => true,
+            "1.2.3", "1" => true,
+            "1.2.3", "1.2" => true,
+            "1.2.3", "2.0.0" => false,
+            "1.2.3", "1.3" => false
+        ];
+    }
+
     #[test]
     fn test_source_is_public_registry_content_plain_registry() {
         let formatter = CargoFormatter;
@@ -238,87 +281,14 @@ mod tests {
         );
     }
 
+    /// Boundary pair for `MAX_NAME_LENGTH`: exactly 64 chars accepted, 65 rejected.
+    /// Computed (`.repeat(n)`) lengths, so this doesn't fit the `formatter_conformance!`
+    /// macro's `literal`-only accepts/rejects lists above.
     #[test]
-    fn test_package_url() {
+    fn test_validate_package_name_length_boundary() {
         let formatter = CargoFormatter;
-        assert_eq!(
-            formatter.package_url(&PackageName::new("serde")),
-            "https://crates.io/crates/serde"
-        );
-        assert_eq!(
-            formatter.package_url(&PackageName::new("tokio-util")),
-            "https://crates.io/crates/tokio-util"
-        );
-    }
-
-    #[test]
-    fn test_validate_package_name_accepts_valid_names() {
-        let formatter = CargoFormatter;
-        for name in [
-            "serde",
-            "tokio-util",
-            "my_crate",
-            "a",
-            "a".repeat(64).as_str(),
-        ] {
-            assert!(
-                formatter.validate_package_name(name).is_ok(),
-                "expected {name:?} to be accepted"
-            );
-        }
-    }
-
-    #[test]
-    fn test_validate_package_name_rejects_empty() {
-        let formatter = CargoFormatter;
-        assert!(formatter.validate_package_name("").is_err());
-    }
-
-    #[test]
-    fn test_validate_package_name_rejects_too_long() {
-        let formatter = CargoFormatter;
-        let too_long = "a".repeat(65);
-        assert!(formatter.validate_package_name(&too_long).is_err());
-    }
-
-    /// #382 repro: a non-ASCII crate name must be reported as an invalid package
-    /// name, not silently forwarded to the registry as an "Unknown package".
-    #[test]
-    fn test_validate_package_name_rejects_non_ascii() {
-        let formatter = CargoFormatter;
-        assert!(formatter.validate_package_name("日本語").is_err());
-    }
-
-    #[test]
-    fn test_validate_package_name_rejects_disallowed_punctuation() {
-        let formatter = CargoFormatter;
-        for name in ["serde.rs", "serde/util", "serde@1.0", "serde util"] {
-            assert!(
-                formatter.validate_package_name(name).is_err(),
-                "expected {name:?} to be rejected"
-            );
-        }
-    }
-
-    /// crates.io's first-character rule: a digit or `-` can never lead a real
-    /// crate name — same "falls through to Unknown package" bug shape as #382,
-    /// on a different invalid-name form.
-    #[test]
-    fn test_validate_package_name_rejects_leading_digit_or_hyphen() {
-        let formatter = CargoFormatter;
-        for name in ["1abc", "9serde", "-abc"] {
-            assert!(
-                formatter.validate_package_name(name).is_err(),
-                "expected {name:?} to be rejected"
-            );
-        }
-    }
-
-    /// A leading underscore is explicitly allowed, unlike a leading digit or `-`.
-    #[test]
-    fn test_validate_package_name_accepts_leading_underscore() {
-        let formatter = CargoFormatter;
-        assert!(formatter.validate_package_name("_private").is_ok());
+        assert!(formatter.validate_package_name(&"a".repeat(64)).is_ok());
+        assert!(formatter.validate_package_name(&"a".repeat(65)).is_err());
     }
 
     /// The charset check must run before the length check: a non-ASCII name whose
@@ -377,20 +347,6 @@ mod tests {
         let formatter = CargoFormatter;
         assert_eq!(formatter.yanked_message(), "This version has been yanked");
         assert_eq!(formatter.yanked_label(), "*(yanked)*");
-    }
-
-    #[test]
-    fn test_version_satisfies_requirement() {
-        let formatter = CargoFormatter;
-
-        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "1.2.3"));
-        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "^1.2"));
-        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "~1.2"));
-        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "1"));
-        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "1.2"));
-
-        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "2.0.0"));
-        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "1.3"));
     }
 
     #[test]

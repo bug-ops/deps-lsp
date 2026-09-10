@@ -88,6 +88,11 @@ static PLATFORMS_OPTION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"platforms:\s*(\[.+?\]|:\w+)").expect("Invalid regex"));
 
 /// Parses a Gemfile and extracts all dependencies with positions.
+///
+/// # Errors
+///
+/// Currently infallible: malformed or unrecognized lines are skipped rather than
+/// erroring. Returns `Result` for interface consistency with other ecosystem parsers.
 // The `caps.get(0).unwrap().end()` offset is a regex match end, always a char boundary.
 // Group 1 is mandatory in `GEM_PATTERN` and group 0 always exists on a successful match.
 #[allow(clippy::string_slice, clippy::unwrap_used)]

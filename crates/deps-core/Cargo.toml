@@ -24,11 +24,14 @@ workspace = true
 # the shared chokepoint `deps-cargo`/`deps-npm`/`deps-pypi` all validate their
 # registry/index URLs through. It also exposes `fs_probe::snapshot()`, the
 # stat/read call counters `MtimeFileCache` consumers assert against in their
-# own tests. This feature is publicly enablable by any downstream Cargo.toml
-# (this crate has `publish = true`), so it must never be enabled in a
-# shipped/release build — see `cache::ensure_https` and
-# `net_policy::validate_index_url` for the full contract.
-test-util = ["dep:tracing-subscriber"]
+# own tests. Also exposes `conformance`'s macro-generated fixtures (#758), which
+# need `tempfile` as a non-dev dependency for the same reason `test_util` needs
+# `tracing-subscriber` as one: a downstream crate's own `#[cfg(test)]` build sees
+# deps-core only through its regular (non-dev) dependency edge. This feature is
+# publicly enablable by any downstream Cargo.toml (this crate has `publish =
+# true`), so it must never be enabled in a shipped/release build — see
+# `cache::ensure_https` and `net_policy::validate_index_url` for the full contract.
+test-util = ["dep:tracing-subscriber", "dep:tempfile"]
 
 [dependencies]
 bytes = { workspace = true }
@@ -39,6 +42,7 @@ reqwest = { workspace = true, features = ["json", "gzip"] }
 semver = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tempfile = { workspace = true, optional = true }
 thiserror = { workspace = true }
 time = { workspace = true, features = ["std", "parsing"] }
 tokio = { workspace = true, features = ["sync", "time", "fs", "net"] }

@@ -87,6 +87,11 @@ impl RegistryProgress {
     /// never sends `begin`/`end` for. This is an accepted trade-off: no `begin`
     /// means spec-compliant clients show no UI for it, so the only cost is a
     /// harmless dangling token client-side.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `window/workDoneProgress/create` request to the client
+    /// fails or is rejected.
     pub async fn start(
         client: Client,
         uri: &str,

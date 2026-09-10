@@ -240,6 +240,21 @@ mod tests {
 
     use std::assert_matches;
 
+    // #758: shared `LockFileProvider` conformance, replacing test_locate_lockfile_same_directory,
+    // test_locate_lockfile_not_found, test_is_lockfile_stale_not_modified/_modified/_deleted/
+    // _future_time, and test_parse_malformed_cargo_lock. test_locate_lockfile_workspace_root
+    // stays hand-written: it exercises the ancestor-directory search, a scenario this macro
+    // doesn't cover.
+    deps_core::lockfile_conformance! {
+        mod cargo_lockfile_conformance;
+        build: CargoLockParser;
+        manifest: "Cargo.toml" => "[package]\nname = \"test\"";
+        lockfiles: [
+            "Cargo.lock" => "version = 4",
+        ];
+        malformed: "not valid toml {{{";
+    }
+
     #[test]
     fn test_parse_cargo_source_registry() {
         let source = parse_cargo_source(Some(
@@ -451,37 +466,6 @@ version = 4
         assert!(resolved.is_empty());
     }
 
-    #[tokio::test]
-    async fn test_parse_malformed_cargo_lock() {
-        let lockfile_content = "not valid toml {{{";
-
-        let temp_dir = tempfile::tempdir().unwrap();
-        let lockfile_path = temp_dir.path().join("Cargo.lock");
-        std::fs::write(&lockfile_path, lockfile_content).unwrap();
-
-        let parser = CargoLockParser;
-        let result = parser.parse_lockfile(&lockfile_path).await;
-
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_locate_lockfile_same_directory() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let manifest_path = temp_dir.path().join("Cargo.toml");
-        let lock_path = temp_dir.path().join("Cargo.lock");
-
-        std::fs::write(&manifest_path, "[package]\nname = \"test\"").unwrap();
-        std::fs::write(&lock_path, "version = 4").unwrap();
-
-        let manifest_uri = Uri::from_file_path(&manifest_path).unwrap();
-        let parser = CargoLockParser;
-
-        let located = parser.locate_lockfile(&manifest_uri);
-        assert!(located.is_some());
-        assert_eq!(located.unwrap(), lock_path);
-    }
-
     #[test]
     fn test_locate_lockfile_workspace_root() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -499,78 +483,5 @@ version = 4
         let located = parser.locate_lockfile(&manifest_uri);
         assert!(located.is_some());
         assert_eq!(located.unwrap(), workspace_lock);
-    }
-
-    #[test]
-    fn test_locate_lockfile_not_found() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let manifest_path = temp_dir.path().join("Cargo.toml");
-        std::fs::write(&manifest_path, "[package]\nname = \"test\"").unwrap();
-
-        let manifest_uri = Uri::from_file_path(&manifest_path).unwrap();
-        let parser = CargoLockParser;
-
-        let located = parser.locate_lockfile(&manifest_uri);
-        assert!(located.is_none());
-    }
-
-    #[test]
-    fn test_is_lockfile_stale_not_modified() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let lockfile_path = temp_dir.path().join("Cargo.lock");
-        std::fs::write(&lockfile_path, "version = 4").unwrap();
-
-        let mtime = std::fs::metadata(&lockfile_path)
-            .unwrap()
-            .modified()
-            .unwrap();
-        let parser = CargoLockParser;
-
-        assert!(
-            !parser.is_lockfile_stale(&lockfile_path, mtime),
-            "Lock file should not be stale when mtime matches"
-        );
-    }
-
-    #[test]
-    fn test_is_lockfile_stale_modified() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let lockfile_path = temp_dir.path().join("Cargo.lock");
-        std::fs::write(&lockfile_path, "version = 4").unwrap();
-
-        let old_time = std::time::UNIX_EPOCH;
-        let parser = CargoLockParser;
-
-        assert!(
-            parser.is_lockfile_stale(&lockfile_path, old_time),
-            "Lock file should be stale when last_modified is old"
-        );
-    }
-
-    #[test]
-    fn test_is_lockfile_stale_deleted() {
-        let parser = CargoLockParser;
-        let non_existent = std::path::Path::new("/nonexistent/Cargo.lock");
-
-        assert!(
-            parser.is_lockfile_stale(non_existent, std::time::SystemTime::now()),
-            "Non-existent lock file should be considered stale"
-        );
-    }
-
-    #[test]
-    fn test_is_lockfile_stale_future_time() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let lockfile_path = temp_dir.path().join("Cargo.lock");
-        std::fs::write(&lockfile_path, "version = 4").unwrap();
-
-        // Use a time far in the future
-        let future_time = std::time::SystemTime::now() + std::time::Duration::from_hours(24);
-        let parser = CargoLockParser;
-
-        assert!(
-            !parser.is_lockfile_stale(&lockfile_path, future_time),
-            "Lock file should not be stale when last_modified is in the future"
-        );
     }
 }
