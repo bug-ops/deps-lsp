@@ -31,7 +31,7 @@ enum BareRequirementPolicy {
 
 /// Ecosystems whose *bare* (no explicit pin marker) version requirement is
 /// unconditionally a range under that ecosystem's own default semantics —
-/// Cargo's implicit caret. For these, [`is_concrete_version`] requires an
+/// Cargo's implicit caret. For these, [`concrete_pin_version`] requires an
 /// explicit `=`/`==` (or an exact-bracket wrap) before treating a requirement
 /// as concrete; a bare `"1.2.3"` alone is not enough evidence (critique C2).
 /// Cargo is the sole member of this group: every other ecosystem with an
@@ -207,7 +207,7 @@ pub fn is_full_semver_shape(s: &str) -> bool {
 /// character, and starting with a digit (after an optional `v`/`V` prefix,
 /// e.g. Go's `v1.9.1`).
 ///
-/// Deliberately conservative — see [`is_concrete_version`]'s doc for why a
+/// Deliberately conservative — see [`concrete_pin_version`]'s doc for why a
 /// false positive here is worse than a false negative.
 fn looks_like_a_single_version(s: &str) -> bool {
     if s.is_empty() {
@@ -303,16 +303,16 @@ fn is_concrete_version(requirement: &str, ecosystem: EcosystemId) -> bool {
 /// Picks the lock-file-resolved candidate that best matches one dependency occurrence's own
 /// version requirement (FR-001/FR-002), among a name's multiple retained lock-file entries.
 ///
-/// Filters `candidates` down to those [`EcosystemFormatter::version_satisfies_requirement`]
+/// Filters `candidates` down to those [`crate::lsp_helpers::RequirementResolution::version_satisfies_requirement`]
 /// accepts, then returns the highest-semver entry among that satisfying subset — falling back
 /// to [`crate::lockfile`]'s lexicographic tiebreak for non-parseable versions
 /// ([`crate::lockfile::compare_lockfile_versions`]), the same ordering a single-candidate
 /// collapse already uses, so this never diverges from it. Returns `None` when nothing
 /// satisfies the requirement (FR-003) — the caller must not then substitute an arbitrary
 /// non-matching entry.
-/// Prefers [`RequirementResolution::compile_requirement`]'s precise, ecosystem-native
+/// Prefers [`crate::lsp_helpers::RequirementResolution::compile_requirement`]'s precise, ecosystem-native
 /// comparator (e.g. `deps-cargo`'s real `semver::VersionReq` range semantics) over
-/// [`RequirementResolution::version_satisfies_requirement`]'s looser heuristic — critical
+/// [`crate::lsp_helpers::RequirementResolution::version_satisfies_requirement`]'s looser heuristic — critical
 /// here specifically because that heuristic's plain/partial-requirement branch requires
 /// *minor-version equality* (`is_same_major_minor`), so a caret-range requirement like
 /// Cargo's `"2.4"` (meaning `>=2.4.0, <3.0.0`) would wrongly reject a `2.9.4` candidate,
@@ -356,7 +356,7 @@ fn best_candidate_for_requirement<'a>(
 /// requirement (FR-003) — that last case intentionally does not substitute the collapsed
 /// value, since it would be an arbitrary, possibly wrong, non-matching entry.
 ///
-/// Shared by [`in_use_version`] and the resolved-version lookups in
+/// Shared by [`resolve_in_use_version`] and the resolved-version lookups in
 /// [`super::hover::generate_hover`] and [`super::inlay_hints::generate_inlay_hints`] so all
 /// three surfaces (hover, inlay hints, OSV target selection) apply the identical
 /// per-occurrence disambiguation policy (US-001/US-002).
@@ -411,7 +411,7 @@ pub(crate) fn resolve_occurrence_version<'a>(
 /// ```
 /// use deps_core::lsp_helpers::{
 ///     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
-///     RequirementResolution, SourcePolicy, in_use_version,
+///     RequirementResolution, SourcePolicy, resolve_in_use_version,
 /// };
 /// use deps_core::{ConcreteVersion, Dependency, EcosystemId, PackageName, VersionReq};
 /// use std::any::Any;
@@ -469,11 +469,11 @@ pub(crate) fn resolve_occurrence_version<'a>(
 /// // No lock file, but the requirement is already an exact pin — falls
 /// // back to it, stripped of its `=` marker.
 /// assert_eq!(
-///     in_use_version(&dep, "time", &resolved_versions, None, &SimpleFormatter, EcosystemId::Cargo),
+///     resolve_in_use_version(&dep, "time", &resolved_versions, None, &SimpleFormatter, EcosystemId::Cargo),
 ///     Some("0.1.43".to_string())
 /// );
 /// ```
-pub fn in_use_version(
+pub fn resolve_in_use_version(
     dep: &dyn Dependency,
     normalized_name: &str,
     resolved_versions: &HashMap<PackageName, ConcreteVersion>,
@@ -924,7 +924,7 @@ mod tests {
             ],
         );
 
-        let renamed_result = in_use_version(
+        let renamed_result = resolve_in_use_version(
             &renamed_old_major,
             "serde",
             &resolved_versions,
@@ -932,7 +932,7 @@ mod tests {
             &crate::lsp_helpers::test_support::MockFormatter,
             EcosystemId::Cargo,
         );
-        let plain_result = in_use_version(
+        let plain_result = resolve_in_use_version(
             &plain_current_major,
             "serde",
             &resolved_versions,
@@ -970,7 +970,7 @@ mod tests {
             ],
         );
 
-        let result = in_use_version(
+        let result = resolve_in_use_version(
             &dep,
             "serde",
             &resolved_versions,
@@ -1006,7 +1006,7 @@ mod tests {
             ],
         );
 
-        let result = in_use_version(
+        let result = resolve_in_use_version(
             &dep,
             "serde",
             &resolved_versions,
@@ -1041,7 +1041,7 @@ mod tests {
             vec![ConcreteVersion::from("1.0.219")],
         );
 
-        let with_candidates = in_use_version(
+        let with_candidates = resolve_in_use_version(
             &dep,
             "serde",
             &resolved_versions,
@@ -1049,7 +1049,7 @@ mod tests {
             &crate::lsp_helpers::test_support::MockFormatter,
             EcosystemId::Cargo,
         );
-        let without_candidates = in_use_version(
+        let without_candidates = resolve_in_use_version(
             &dep,
             "serde",
             &resolved_versions,
@@ -1160,7 +1160,7 @@ mod tests {
             ],
         );
 
-        let result = in_use_version(
+        let result = resolve_in_use_version(
             &dep,
             "pkg",
             &resolved_versions,
@@ -1190,7 +1190,7 @@ mod tests {
             name_range: tower_lsp_server::ls_types::Range::default(),
         };
 
-        let result = in_use_version(
+        let result = resolve_in_use_version(
             &dep,
             "express",
             &HashMap::new(),
@@ -1216,7 +1216,7 @@ mod tests {
             name_range: tower_lsp_server::ls_types::Range::default(),
         };
 
-        let result = in_use_version(
+        let result = resolve_in_use_version(
             &dep,
             "monolog/monolog",
             &HashMap::new(),
@@ -1243,7 +1243,7 @@ mod tests {
             name_range: tower_lsp_server::ls_types::Range::default(),
         };
 
-        let result = in_use_version(
+        let result = resolve_in_use_version(
             &dep,
             "serde",
             &HashMap::new(),
@@ -1272,7 +1272,7 @@ mod tests {
             name_range: tower_lsp_server::ls_types::Range::default(),
         };
 
-        let result = in_use_version(
+        let result = resolve_in_use_version(
             &dep,
             "express",
             &HashMap::new(),
@@ -1308,7 +1308,7 @@ mod tests {
             name_range: tower_lsp_server::ls_types::Range::default(),
         };
 
-        let result = in_use_version(
+        let result = resolve_in_use_version(
             &dep,
             "newtonsoft.json",
             &HashMap::new(),

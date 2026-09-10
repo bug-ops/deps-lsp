@@ -12,14 +12,28 @@ use crate::{
     registry::Metadata,
 };
 
-/// Sealing mechanism restricting [`Ecosystem`] implementations to this workspace.
+/// Soft-sealing mechanism for [`Ecosystem`], shared by every ecosystem crate in this
+/// workspace (`deps-cargo`, `deps-npm`, ...) — each implements [`private::Sealed`] for
+/// its own ecosystem type.
+///
+/// Rust's privacy system has no "visible to this workspace, not beyond" level: `pub(crate)`
+/// would restrict `Sealed` to `deps-core` alone, breaking every sibling ecosystem crate's
+/// `impl Sealed for ...`, since each of those is a separate compilation unit. Making this
+/// module `pub` is therefore required, not a mistake — but it means [`private::Sealed`] is
+/// technically nameable, and implementable, from any crate that depends on `deps-core`, not
+/// only from within this workspace. `#[doc(hidden)]` keeps it out of generated public docs to
+/// avoid inviting that. There is no compiler-enforced wall against it: this is a documented
+/// contract enforced by code review, not a hard guarantee, and [`Ecosystem`]'s default
+/// methods may gain new required behavior without that counting as a breaking change for an
+/// external implementor who ignored this notice.
+#[doc(hidden)]
 pub mod private {
-    /// Marker trait that only crates inside this workspace can implement.
+    /// Marker trait every ecosystem crate in this workspace implements for its own
+    /// ecosystem type, per [`super::private`]'s module doc.
     ///
     /// [`Ecosystem`](super::Ecosystem) requires `Self: Sealed`, which is how the
     /// trait stays extensible (new default methods can be added without
-    /// breaking downstream implementors) while still forbidding external
-    /// crates from implementing it.
+    /// breaking in-workspace implementors).
     pub trait Sealed {}
 }
 
@@ -472,6 +486,18 @@ impl LicenseSource {
 /// This trait uses `Box<dyn Trait>` instead of associated types to allow
 /// runtime polymorphism and dynamic ecosystem registration.
 ///
+/// # Sealing
+///
+/// This trait requires `Self: private::Sealed`, making it sealed in the sense described
+/// on that module's doc: a documented contract enforced by code review, not a
+/// compiler-enforced wall. Every sibling ecosystem crate in this workspace (`deps-cargo`,
+/// `deps-npm`, ...) implements [`private::Sealed`] for its own ecosystem type, which requires
+/// `private` to be `pub`; Rust has no visibility level that admits sibling crates while
+/// excluding a truly external one, so this guarantee cannot be enforced any harder than that
+/// without inverting the crate's whole multi-crate extension-point architecture. See
+/// [`private::Sealed`]'s own doc for the full reasoning, and the `impl private::Sealed`
+/// line in the example below for what implementing it in practice looks like.
+///
 /// # Examples
 ///
 /// ```no_run
@@ -502,6 +528,11 @@ impl LicenseSource {
 ///     formatter: MyFormatter,
 /// }
 ///
+/// // Real in-workspace ecosystem crates implement `Sealed` exactly like this. This line
+/// // compiling here, out-of-crate, is not a bug: as the `# Sealing` section above explains,
+/// // `private::Sealed` is a documented contract, not a compiler-enforced wall — Rust has no
+/// // visibility level that admits sibling workspace crates while excluding a truly external
+/// // one, so any crate that names this path can technically do the same.
 /// impl deps_core::ecosystem::private::Sealed for MyEcosystem {}
 ///
 /// impl Ecosystem for MyEcosystem {

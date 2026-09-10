@@ -724,7 +724,7 @@ pub fn vulnerability_keys(
     formatter: &dyn crate::lsp_helpers::EcosystemFormatter,
     ecosystem: crate::EcosystemId,
 ) -> HashMap<tower_lsp_server::ls_types::Range, String> {
-    use crate::lsp_helpers::in_use_version;
+    use crate::lsp_helpers::resolve_in_use_version;
 
     let deps = parse_result.dependencies();
 
@@ -744,7 +744,7 @@ pub fn vulnerability_keys(
         .map(|dep| {
             let name = formatter.normalize_package_name(dep.name());
             let signature = if formatter.source_is_public_registry_content(&dep.source()) {
-                match in_use_version(
+                match resolve_in_use_version(
                     *dep,
                     &name,
                     resolved,

@@ -1914,7 +1914,9 @@ impl {Ecosystem}Ecosystem {
     }
 }
 
-// Required sealed trait impl — prevents external implementations
+// Required sealed trait impl — a documented contract (code review, not the compiler)
+// restricting `Ecosystem` implementations to crates in this workspace; see
+// `deps_core::ecosystem::private`'s doc for why Rust cannot enforce this any harder.
 impl deps_core::ecosystem::private::Sealed for {Ecosystem}Ecosystem {}
 
 impl Ecosystem for {Ecosystem}Ecosystem {
@@ -2182,7 +2184,8 @@ Before submitting a PR for a new ecosystem:
 - [ ] Lock file parser implementing `LockFileProvider` trait (`locate_lockfile` + `parse_lockfile`)
 - [ ] Formatter implementing `EcosystemFormatter` trait (`format_version_for_text_edit` + `package_url`)
 - [ ] Registry client implementing `deps_core::Registry` trait with BoxFuture signatures
-- [ ] Ecosystem impl with `impl deps_core::ecosystem::private::Sealed` block
+- [ ] Ecosystem impl with `impl deps_core::ecosystem::private::Sealed` block (the workspace's
+      documented-contract sealing convention, not a compiler-enforced restriction)
 - [ ] `completion_insert_text` implemented (required, no default — issue #722); override
       `fallback_completion_prefix` too if this manifest format has a raw-text
       dependencies-section boundary to detect, reusing `deps_core::fallback_completion`'s

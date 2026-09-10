@@ -31,6 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - **deps-core, deps-cargo, deps-npm, deps-pypi, deps-go, deps-nuget, deps-maven**: `DepsError`'s `Display`/`Debug` and several ecosystem-crate warn/debug log lines no longer embed a workspace-declared registry URL's raw query string, closing a credential-exfiltration path via `window/showMessage` and `tracing` logs (resolves #767) (#775)
 - **deps-gradle**: version catalog/DSL completion no longer miscounts an escaped quote, via a generalized, quote-character-parameterized `deps-core` quote-parity helper (resolves #738) (#771)
+- **Breaking (pre-1.0, public API)**: **deps-core**: fixed 16 broken rustdoc intra-doc links invisible to the default CI rustdoc gate, renaming the public `in_use_version` function to `resolve_in_use_version` to resolve a function/module name ambiguity (resolves #765) (#772)
+- **deps-core**: corrected the `Ecosystem` sealed-trait docs, which overclaimed that implementation is restricted to this workspace when it is a documented contract, not a compiler-enforced one (resolves #770) (#772)
 - **deps-core**: manifest parsing now runs on the blocking-thread pool instead of the calling tokio worker, no longer stalling the LSP request worker on a large manifest (resolves #743) (#747)
 - **deps-core**: `LineOffsetTable::byte_offset_to_position` no longer rescans an ASCII line from its start on every call, fixing an O(n^2) slowdown on large single-line (minified) manifests (resolves #742) (#747)
 - **deps-pypi**: raw-text fallback completion no longer bare-inserts an unquoted package name into a `pyproject.toml` dependency array when no quote has been typed yet, producing invalid TOML (resolves #737) (#741)

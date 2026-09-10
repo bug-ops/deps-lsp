@@ -69,7 +69,7 @@ const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 /// Ceiling every [`BodyLimit`] is clamped to at construction, so no caller can weaken
 /// the size guard [`read_body_capped`] enforces past this value.
 ///
-/// 128 MiB comfortably covers the largest known caller ([`crate`][deps-pypi]'s PyPI
+/// 128 MiB comfortably covers the largest known caller (`deps-pypi`'s PyPI
 /// Simple API full index, ~43 MB decompressed today, capped at 96 MiB for organic
 /// growth) while still bounding the pathological case.
 const ABSOLUTE_MAX_RESPONSE_BYTES: usize = 128 * 1024 * 1024;

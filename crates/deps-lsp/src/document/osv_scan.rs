@@ -8,7 +8,7 @@ use deps_core::ConcreteVersion;
 use deps_core::Ecosystem;
 use deps_core::EcosystemId;
 use deps_core::PackageName;
-use deps_core::lsp_helpers::in_use_version;
+use deps_core::lsp_helpers::resolve_in_use_version;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -108,7 +108,7 @@ fn build_scan_targets(
         // to OSV (excludes/replaces fall through to the lockfile lookup below
         // like any other ecosystem, since their `version_requirement()` is
         // not an in-use version — see `manifest_requirement_is_resolved_version`).
-        let version = in_use_version(
+        let version = resolve_in_use_version(
             dep,
             &normalized_name,
             resolved_versions,
@@ -293,7 +293,7 @@ pub(crate) async fn run_osv_scan_phase_a(
 /// all — it reflects pana's detection on whatever pub.dev last scored, not necessarily
 /// the resolved version. Swift's `get_license` calls GitHub's `GET /repos/{owner}/{repo}`,
 /// which reflects the repository's *default branch*, not the resolved version's tag.
-/// `in_use_version` below is still required as a *gate* for all four (no version
+/// `resolve_in_use_version` below is still required as a *gate* for all four (no version
 /// resolved means nothing to look up), but for Dart/Swift it does not pin which
 /// version's license is actually returned.
 ///
@@ -332,7 +332,7 @@ pub(crate) async fn run_license_prefetch(
             .filter(|d| formatter.source_is_public_registry_content(&d.source()))
             .filter_map(|d| {
                 let normalized = formatter.normalize_package_name(d.name());
-                let version = in_use_version(
+                let version = resolve_in_use_version(
                     d,
                     normalized.as_str(),
                     &doc.resolved_versions,
@@ -1339,7 +1339,7 @@ mod tests {
 
         /// #667 follow-up (impl-critic): before this reclassification, a Deno `jsr:`
         /// dependency's bare requirement always failed the version gate under
-        /// `AlwaysRange` (`in_use_version` always `None`), so `DenoFormatter::
+        /// `AlwaysRange` (`resolve_in_use_version` always `None`), so `DenoFormatter::
         /// osv_package_name`'s `_ => None` arm for `jsr:` never actually ran in a live
         /// scan. Now that Deno is `ConcreteIfFullVersion`, a bare-full-version-pinned
         /// `jsr:` dependency passes the version gate and correctness rests entirely on
@@ -1586,7 +1586,7 @@ mod tests {
             );
         }
 
-        // `collect_in_use_versions` (§4.6) reuses the same `in_use_version`
+        // `collect_in_use_versions` (§4.6) reuses the same `resolve_in_use_version`
         // ladder as `build_scan_targets` above, plus its own step-0 filter —
         // these tests exercise that reuse directly.
 
