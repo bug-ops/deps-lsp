@@ -197,63 +197,25 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_parse_malformed_lock() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let lock_path = temp_dir.path().join("composer.lock");
-        tokio::fs::write(&lock_path, "not json").await.unwrap();
-
-        let parser = ComposerLockParser;
-        let result = parser.parse_lockfile(&lock_path).await;
-        assert!(result.is_err());
+    // #758: shared `LockFileProvider` conformance, replacing test_locate_lockfile and
+    // test_parse_malformed_lock — also closes a real gap: this crate had no
+    // is_lockfile_stale_* coverage at all before.
+    deps_core::lockfile_conformance! {
+        mod composer_lockfile_conformance;
+        build: ComposerLockParser;
+        manifest: "composer.json" => r#"{"name": "test/project"}"#;
+        lockfiles: [
+            "composer.lock" => r#"{"packages": [], "packages-dev": []}"#,
+        ];
+        malformed: "not json";
     }
 
-    #[tokio::test]
-    async fn test_nesting_at_max_depth_accepted() {
-        let depth = deps_core::MAX_JSON_NESTING_DEPTH;
-        let content = format!(
-            r#"{{"packages": [], "extra": {}1{}}}"#,
-            "[".repeat(depth - 1),
-            "]".repeat(depth - 1)
-        );
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("composer.lock");
-        tokio::fs::write(&path, &content).await.unwrap();
-
-        let parser = ComposerLockParser;
-        assert!(parser.parse_lockfile(&path).await.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_nesting_over_max_depth_rejected() {
-        let depth = deps_core::MAX_JSON_NESTING_DEPTH + 1;
-        let content = format!(
-            r#"{{"packages": [], "extra": {}1{}}}"#,
-            "[".repeat(depth),
-            "]".repeat(depth)
-        );
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("composer.lock");
-        tokio::fs::write(&path, &content).await.unwrap();
-
-        let parser = ComposerLockParser;
-        assert!(parser.parse_lockfile(&path).await.is_err());
-    }
-
-    #[test]
-    fn test_locate_lockfile() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let manifest_path = temp_dir.path().join("composer.json");
-        let lock_path = temp_dir.path().join("composer.lock");
-
-        std::fs::write(&manifest_path, r#"{"name": "test/project"}"#).unwrap();
-        std::fs::write(&lock_path, r#"{"packages": [], "packages-dev": []}"#).unwrap();
-
-        let manifest_uri = Uri::from_file_path(&manifest_path).unwrap();
-        let parser = ComposerLockParser;
-
-        let located = parser.locate_lockfile(&manifest_uri);
-        assert!(located.is_some());
-        assert_eq!(located.unwrap(), lock_path);
+    // #758: the shared JSON-nesting-depth cap, replacing test_nesting_at_max_depth_accepted/
+    // test_nesting_over_max_depth_rejected — `parse_composer_lock` takes an owned `String`,
+    // not `&[u8]`, so the closure re-owns the bytes via `String::from_utf8_lossy` first.
+    deps_core::json_depth_conformance! {
+        mod composer_lockfile_json_depth_conformance;
+        parse: |bytes: &[u8]| parse_composer_lock(String::from_utf8_lossy(bytes).into_owned());
+        wrap: |nested: &str| format!(r#"{{"packages": [], "extra": {nested}}}"#);
     }
 }

@@ -995,15 +995,11 @@ mod tests {
         assert!(!url.contains(']'));
     }
 
-    #[test]
-    fn test_package_url_encodes_newline_autolink_and_percent() {
-        let url = package_url("evil\n<https://evil%zz.example>");
-        assert!(!url.contains('\n'));
-        assert!(!url.contains('<'));
-        assert!(!url.contains('>'));
-        assert!(url.contains("%25"));
-    }
-
+    // #758: the plain (unscoped) newline/autolink/percent hostile-payload case is now covered
+    // universally by deps-lsp's `test_registered_ecosystems_universal_invariants` (Layer 1),
+    // via `deps_core::conformance::HOSTILE_DISPLAY_LINK_PAYLOAD` — this crate's own copy of
+    // that case is redundant. The scoped-name variant below stays: Layer 1 only exercises a
+    // plain name, not `@scope/pkg`'s split-and-reassemble path.
     #[test]
     fn test_package_url_scoped_encodes_newline_and_percent() {
         let url = package_url("@evil\n<%/pkg");
@@ -1245,26 +1241,12 @@ mod tests {
         assert_eq!(packages[0].description, None);
     }
 
-    #[test]
-    fn test_parse_search_response_nesting_at_max_depth_accepted() {
-        let depth = deps_core::MAX_JSON_NESTING_DEPTH;
-        let json = format!(
-            r#"{{"objects": [], "extra": {}1{}}}"#,
-            "[".repeat(depth - 1),
-            "]".repeat(depth - 1)
-        );
-        assert!(parse_search_response(json.as_bytes()).is_ok());
-    }
-
-    #[test]
-    fn test_parse_search_response_nesting_over_max_depth_rejected() {
-        let depth = deps_core::MAX_JSON_NESTING_DEPTH + 1;
-        let json = format!(
-            r#"{{"objects": [], "extra": {}1{}}}"#,
-            "[".repeat(depth),
-            "]".repeat(depth)
-        );
-        assert!(parse_search_response(json.as_bytes()).is_err());
+    // #758: the shared JSON-nesting-depth cap, replacing
+    // test_parse_search_response_nesting_at_max_depth_accepted/_over_max_depth_rejected.
+    deps_core::json_depth_conformance! {
+        mod npm_json_depth_conformance;
+        parse: |bytes: &[u8]| parse_search_response(bytes);
+        wrap: |nested: &str| format!(r#"{{"objects": [], "extra": {nested}}}"#);
     }
 
     #[test]

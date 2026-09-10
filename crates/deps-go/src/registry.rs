@@ -981,26 +981,12 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_parse_version_info_nesting_at_max_depth_accepted() {
-        let depth = deps_core::MAX_JSON_NESTING_DEPTH;
-        let json = format!(
-            r#"{{"Version": "v1.0.0", "Time": "2024-01-01T00:00:00Z", "extra": {}1{}}}"#,
-            "[".repeat(depth - 1),
-            "]".repeat(depth - 1)
-        );
-        assert!(parse_version_info("github.com/gin-gonic/gin", json.as_bytes()).is_ok());
-    }
-
-    #[test]
-    fn test_parse_version_info_nesting_over_max_depth_rejected() {
-        let depth = deps_core::MAX_JSON_NESTING_DEPTH + 1;
-        let json = format!(
-            r#"{{"Version": "v1.0.0", "Time": "2024-01-01T00:00:00Z", "extra": {}1{}}}"#,
-            "[".repeat(depth),
-            "]".repeat(depth)
-        );
-        assert!(parse_version_info("github.com/gin-gonic/gin", json.as_bytes()).is_err());
+    // #758: the shared JSON-nesting-depth cap, replacing
+    // test_parse_version_info_nesting_at_max_depth_accepted/_over_max_depth_rejected.
+    deps_core::json_depth_conformance! {
+        mod go_json_depth_conformance;
+        parse: |bytes: &[u8]| parse_version_info("github.com/gin-gonic/gin", bytes);
+        wrap: |nested: &str| format!(r#"{{"Version": "v1.0.0", "Time": "2024-01-01T00:00:00Z", "extra": {nested}}}"#);
     }
 
     #[test]
@@ -1068,14 +1054,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_package_url_encodes_newline_autolink_and_percent() {
-        let url = package_url("github.com/evil\n<https://evil%zz.example>");
-        assert!(!url.contains('\n'));
-        assert!(!url.contains('<'));
-        assert!(!url.contains('>'));
-        assert!(url.contains("%25"));
-    }
+    // #758: this hostile newline/autolink/percent payload case is now covered universally by
+    // deps-lsp's `test_registered_ecosystems_universal_invariants` (Layer 1), via
+    // `deps_core::conformance::HOSTILE_DISPLAY_LINK_PAYLOAD` — this crate's own copy is
+    // redundant and has been removed.
 
     #[test]
     fn test_package_url_empty_module_path() {

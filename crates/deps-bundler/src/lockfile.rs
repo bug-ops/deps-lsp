@@ -272,34 +272,16 @@ BUNDLED WITH
         assert!(packages.is_empty());
     }
 
-    #[test]
-    fn test_locate_lockfile_same_directory() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let manifest_path = temp_dir.path().join("Gemfile");
-        let lock_path = temp_dir.path().join("Gemfile.lock");
-
-        std::fs::write(&manifest_path, "source 'https://rubygems.org'").unwrap();
-        std::fs::write(&lock_path, "GEM\n  specs:\n").unwrap();
-
-        let manifest_uri = Uri::from_file_path(&manifest_path).unwrap();
-        let parser = GemfileLockParser;
-
-        let located = parser.locate_lockfile(&manifest_uri);
-        assert!(located.is_some());
-        assert_eq!(located.unwrap(), lock_path);
-    }
-
-    #[test]
-    fn test_locate_lockfile_not_found() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let manifest_path = temp_dir.path().join("Gemfile");
-        std::fs::write(&manifest_path, "source 'https://rubygems.org'").unwrap();
-
-        let manifest_uri = Uri::from_file_path(&manifest_path).unwrap();
-        let parser = GemfileLockParser;
-
-        let located = parser.locate_lockfile(&manifest_uri);
-        assert!(located.is_none());
+    // #758: shared `LockFileProvider` conformance, replacing test_locate_lockfile_same_directory,
+    // test_locate_lockfile_not_found, and test_is_lockfile_stale_not_modified/_modified.
+    deps_core::lockfile_conformance! {
+        mod bundler_lockfile_conformance;
+        build: GemfileLockParser;
+        manifest: "Gemfile" => "source 'https://rubygems.org'";
+        lockfiles: [
+            "Gemfile.lock" => "GEM\n  remote: https://rubygems.org/\n  specs:\n    rails (7.0.8)\n",
+        ];
+        malformed: "not a valid gemfile.lock !!!";
     }
 
     #[tokio::test]
@@ -325,38 +307,5 @@ BUNDLED WITH
 
         assert_eq!(packages.len(), 1);
         assert_eq!(packages.get_version("rails"), Some("7.0.8"));
-    }
-
-    #[test]
-    fn test_is_lockfile_stale_not_modified() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let lockfile_path = temp_dir.path().join("Gemfile.lock");
-        std::fs::write(&lockfile_path, "GEM\n  specs:\n").unwrap();
-
-        let mtime = std::fs::metadata(&lockfile_path)
-            .unwrap()
-            .modified()
-            .unwrap();
-        let parser = GemfileLockParser;
-
-        assert!(
-            !parser.is_lockfile_stale(&lockfile_path, mtime),
-            "Lock file should not be stale when mtime matches"
-        );
-    }
-
-    #[test]
-    fn test_is_lockfile_stale_modified() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let lockfile_path = temp_dir.path().join("Gemfile.lock");
-        std::fs::write(&lockfile_path, "GEM\n  specs:\n").unwrap();
-
-        let old_time = std::time::UNIX_EPOCH;
-        let parser = GemfileLockParser;
-
-        assert!(
-            parser.is_lockfile_stale(&lockfile_path, old_time),
-            "Lock file should be stale when last_modified is old"
-        );
     }
 }

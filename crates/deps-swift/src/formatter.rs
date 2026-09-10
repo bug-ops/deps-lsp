@@ -176,21 +176,54 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_package_url() {
-        let fmt = SwiftFormatter;
-        assert_eq!(
-            fmt.package_url(&PackageName::new("apple/swift-nio")),
-            "https://github.com/apple/swift-nio"
-        );
+    // #758: exact-value `EcosystemFormatter` conformance, replacing test_package_url,
+    // test_package_url_invalid_returns_empty, test_package_url_rejects_dot_segment,
+    // test_validate_package_name_accepts_owner_repo,
+    // test_validate_package_name_accepts_bare_name_for_path_dependencies,
+    // test_validate_package_name_rejects_malformed_names, test_version_satisfies,
+    // test_version_satisfies_invalid_version_returns_false, and
+    // test_version_satisfies_invalid_requirement_returns_false. `test_version_satisfies_up_to_next_major_range`/
+    // `_minor_range`/`_closed_range`/`_prerelease` stay hand-written: they document SPM's
+    // `upToNextMajor`/`upToNextMinor`/closed-range syntax translation, not simple literal
+    // roundtrips.
+    deps_core::formatter_conformance! {
+        mod swift_formatter_conformance;
+        build: SwiftFormatter;
+        package_url: {
+            "apple/swift-nio" => "https://github.com/apple/swift-nio",
+            "../../etc/passwd" => "",
+            "no-slash" => "",
+            "owner/repo/extra" => "",
+            "apple/.." => "",
+            "apple/." => "",
+            "../repo" => "",
+        };
+        accepts: ["apple/swift-nio", "MyLib", "my-package", "LocalPackage", "no-slash"];
+        rejects: ["", ".", "..", "owner/repo/extra", "../../etc/passwd", "apple/.."];
+        version_roundtrip: [
+            "2.62.0", ">=2.0.0, <3.0.0" => true,
+            "3.0.0", ">=2.0.0, <3.0.0" => false,
+            "1.4.2", "=1.4.2" => true,
+            "1.4.3", "=1.4.2" => false,
+            "not-a-version", ">=1.0.0" => false,
+            "1.0.0", "not-a-req" => false
+        ];
     }
 
+    /// #758: `package_url`'s hostile-input safety is generically covered for every
+    /// ecosystem by Layer 1 (`deps-lsp`'s `test_registered_ecosystems_universal_invariants`,
+    /// which calls `formatter().package_url()` with this exact fixture) — this per-crate
+    /// test pins Swift's specific fail-closed-to-empty-string behavior for the same input,
+    /// catchable by `cargo nextest run -p deps-swift` alone.
     #[test]
-    fn test_package_url_invalid_returns_empty() {
+    fn test_package_url_hostile_display_link_payload_returns_empty() {
         let fmt = SwiftFormatter;
-        assert_eq!(fmt.package_url(&PackageName::new("../../etc/passwd")), "");
-        assert_eq!(fmt.package_url(&PackageName::new("no-slash")), "");
-        assert_eq!(fmt.package_url(&PackageName::new("owner/repo/extra")), "");
+        assert_eq!(
+            fmt.package_url(&PackageName::new(
+                deps_core::conformance::HOSTILE_DISPLAY_LINK_PAYLOAD
+            )),
+            ""
+        );
     }
 
     #[test]
@@ -225,37 +258,12 @@ mod tests {
     }
 
     #[test]
-    fn test_package_url_rejects_dot_segment() {
-        // Regression for #357 M1: `is_valid_owner_repo` now shares
-        // `crate::is_valid_github_identity` with `registry::validate_owner_repo`, so a
-        // `..`/`.` repo or owner segment is rejected here too, not just on the
-        // credential-bearing fetch path.
-        let fmt = SwiftFormatter;
-        assert_eq!(fmt.package_url(&PackageName::new("apple/..")), "");
-        assert_eq!(fmt.package_url(&PackageName::new("apple/.")), "");
-        assert_eq!(fmt.package_url(&PackageName::new("../repo")), "");
-    }
-
-    #[test]
     fn test_normalize_package_name() {
         let fmt = SwiftFormatter;
         assert_eq!(
             fmt.normalize_package_name(&PackageName::new("Apple/Swift-NIO")),
             "apple/swift-nio"
         );
-    }
-
-    #[test]
-    fn test_version_satisfies() {
-        let fmt = SwiftFormatter;
-        assert!(
-            fmt.version_satisfies_requirement(&ConcreteVersion::new("2.62.0"), ">=2.0.0, <3.0.0")
-        );
-        assert!(
-            !fmt.version_satisfies_requirement(&ConcreteVersion::new("3.0.0"), ">=2.0.0, <3.0.0")
-        );
-        assert!(fmt.version_satisfies_requirement(&ConcreteVersion::new("1.4.2"), "=1.4.2"));
-        assert!(!fmt.version_satisfies_requirement(&ConcreteVersion::new("1.4.3"), "=1.4.2"));
     }
 
     #[test]
@@ -308,20 +316,6 @@ mod tests {
         assert!(
             !fmt.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), ">=1.0.0, <=1.9.9")
         );
-    }
-
-    #[test]
-    fn test_version_satisfies_invalid_version_returns_false() {
-        let fmt = SwiftFormatter;
-        assert!(
-            !fmt.version_satisfies_requirement(&ConcreteVersion::new("not-a-version"), ">=1.0.0")
-        );
-    }
-
-    #[test]
-    fn test_version_satisfies_invalid_requirement_returns_false() {
-        let fmt = SwiftFormatter;
-        assert!(!fmt.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "not-a-req"));
     }
 
     fn dep_with_url(name: &str, url: &str) -> SwiftDependency {
@@ -454,48 +448,5 @@ mod tests {
             matcher.matches(&ConcreteVersion::new("not-a-version")),
             None
         );
-    }
-
-    #[test]
-    fn test_validate_package_name_accepts_owner_repo() {
-        let fmt = SwiftFormatter;
-        assert!(fmt.validate_package_name("apple/swift-nio").is_ok());
-    }
-
-    /// #402 critique C1: a `.package(path:)` dependency's name is the target directory's
-    /// basename (see `deps_swift::parser`'s `RE_PATH` arm), never an `owner/repo` GitHub
-    /// coordinate — it must not be flagged as an invalid package name.
-    #[test]
-    fn test_validate_package_name_accepts_bare_name_for_path_dependencies() {
-        let fmt = SwiftFormatter;
-        for name in ["MyLib", "my-package", "LocalPackage", "no-slash"] {
-            assert!(
-                fmt.validate_package_name(name).is_ok(),
-                "expected {name:?} to be accepted"
-            );
-        }
-    }
-
-    /// #402: a structurally invalid Swift package name must be reported as an invalid
-    /// package name, not forwarded to the registry lookup that produces the misleading
-    /// generic "Registry lookup failed" diagnostic. Only multi-segment shapes are still
-    /// checked against `owner/repo` — a bare name has no `/` to validate the shape of (see
-    /// `test_validate_package_name_accepts_bare_name_for_path_dependencies`).
-    #[test]
-    fn test_validate_package_name_rejects_malformed_names() {
-        let fmt = SwiftFormatter;
-        for name in [
-            "",
-            ".",
-            "..",
-            "owner/repo/extra",
-            "../../etc/passwd",
-            "apple/..",
-        ] {
-            assert!(
-                fmt.validate_package_name(name).is_err(),
-                "expected {name:?} to be rejected"
-            );
-        }
     }
 }

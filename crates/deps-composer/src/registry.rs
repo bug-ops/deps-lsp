@@ -712,14 +712,15 @@ mod tests {
         assert!(!url.contains(']'));
     }
 
-    #[test]
-    fn test_package_url_encodes_newline_autolink_and_percent() {
-        let url = package_url("evil\n<%>/pkg");
-        assert!(!url.contains('\n'));
-        assert!(!url.contains('<'));
-        assert!(!url.contains('>'));
-        assert!(url.contains("%25"));
-    }
+    // #758: the generic newline/autolink/percent hostile-payload check this test used to
+    // provide is now covered for every ecosystem by Layer 1 (`deps-lsp`'s
+    // `test_registered_ecosystems_universal_invariants`), which calls this exact function
+    // through `ComposerFormatter::package_url`. `test_package_url_encodes_malicious_segments`
+    // above stays hand-written: the shared hostile fixture also contains a `/` (from its
+    // embedded `https://`), so it exercises this function's `vendor/package` split branch
+    // too — the hand-written test just asserts general bracket-safety properties rather
+    // than pinning an exact encoded string, which is why it stays separate from
+    // `formatter_conformance!`'s literal `package_url` pair list.
 
     #[test]
     fn test_package_url_empty_name() {
@@ -1134,26 +1135,12 @@ mod tests {
         assert_eq!(pkg.latest_version, "6.0.0");
     }
 
-    #[test]
-    fn test_parse_search_response_nesting_at_max_depth_accepted() {
-        let depth = deps_core::MAX_JSON_NESTING_DEPTH;
-        let json = format!(
-            r#"{{"results": [], "extra": {}1{}}}"#,
-            "[".repeat(depth - 1),
-            "]".repeat(depth - 1)
-        );
-        assert!(parse_search_response(json.as_bytes()).is_ok());
-    }
-
-    #[test]
-    fn test_parse_search_response_nesting_over_max_depth_rejected() {
-        let depth = deps_core::MAX_JSON_NESTING_DEPTH + 1;
-        let json = format!(
-            r#"{{"results": [], "extra": {}1{}}}"#,
-            "[".repeat(depth),
-            "]".repeat(depth)
-        );
-        assert!(parse_search_response(json.as_bytes()).is_err());
+    // #758: the shared JSON-nesting-depth cap, replacing
+    // test_parse_search_response_nesting_at_max_depth_accepted/_over_max_depth_rejected.
+    deps_core::json_depth_conformance! {
+        mod composer_json_depth_conformance;
+        parse: |bytes: &[u8]| parse_search_response(bytes);
+        wrap: |nested: &str| format!(r#"{{"results": [], "extra": {nested}}}"#);
     }
 
     #[test]

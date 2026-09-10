@@ -114,20 +114,21 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_package_url() {
-        let f = DartFormatter;
-        assert_eq!(
-            f.package_url(&PackageName::new("provider")),
-            "https://pub.dev/packages/provider"
-        );
-    }
-
-    #[test]
-    fn test_version_satisfies() {
-        let f = DartFormatter;
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), "^1.0.0"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), "^1.0.0"));
+    // #758: exact-value `EcosystemFormatter` conformance, replacing test_package_url,
+    // test_validate_package_name_accepts_valid_names, test_validate_package_name_rejects_invalid_names,
+    // and test_version_satisfies.
+    deps_core::formatter_conformance! {
+        mod dart_formatter_conformance;
+        build: DartFormatter;
+        package_url: {
+            "provider" => "https://pub.dev/packages/provider",
+        };
+        accepts: ["provider", "flutter_bloc", "_private", "path9"];
+        rejects: ["", "9path", "my-package", "my package", "日本語"];
+        version_roundtrip: [
+            "1.5.0", "^1.0.0" => true,
+            "2.0.0", "^1.0.0" => false
+        ];
     }
 
     #[test]
@@ -162,30 +163,5 @@ mod tests {
             matcher.matches(&ConcreteVersion::new("1.14.0")),
             Some(false)
         );
-    }
-
-    #[test]
-    fn test_validate_package_name_accepts_valid_names() {
-        let f = DartFormatter;
-        for name in ["provider", "flutter_bloc", "_private", "path9"] {
-            assert!(
-                f.validate_package_name(name).is_ok(),
-                "expected {name:?} to be accepted"
-            );
-        }
-    }
-
-    /// #402: a structurally invalid Dart package name must be reported as an invalid package
-    /// name, not forwarded to the registry lookup that produces the misleading generic
-    /// diagnostic.
-    #[test]
-    fn test_validate_package_name_rejects_invalid_names() {
-        let f = DartFormatter;
-        for name in ["", "9path", "my-package", "my package", "日本語"] {
-            assert!(
-                f.validate_package_name(name).is_err(),
-                "expected {name:?} to be rejected"
-            );
-        }
     }
 }

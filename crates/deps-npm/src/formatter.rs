@@ -238,87 +238,63 @@ mod tests {
         assert_eq!(f.deprecated_label(), "*(deprecated)*");
     }
 
-    #[test]
-    fn test_validate_package_name_accepts_hostile_but_legitimate_names() {
-        let formatter = NpmFormatter;
-        let long_but_valid = "a".repeat(214);
-
-        for name in [
-            "@types/node",
-            "@scope/_private",
-            "@scope/.config",
-            "lodash.debounce",
-            "c8",
-            "-",
-            "a",
-            long_but_valid.as_str(),
+    // #758: exact-value `EcosystemFormatter` conformance, replacing test_package_url,
+    // test_validate_package_name_accepts_hostile_but_legitimate_names,
+    // test_validate_package_name_rejects_invalid_names, test_validate_package_name_does_not_reject_star,
+    // test_validate_package_name_rejects_disallowed_char_inside_scope,
+    // test_validate_package_name_rejects_disallowed_char_inside_name_with_valid_scope, and
+    // test_version_satisfies_requirement. test_validate_package_name_length_boundary below stays
+    // hand-written: it asserts on a computed (`.repeat(n)`) boundary-length name, which doesn't
+    // fit the macro's `literal`-only accepts/rejects lists.
+    deps_core::formatter_conformance! {
+        mod npm_formatter_conformance;
+        build: NpmFormatter;
+        package_url: {
+            "react" => "https://www.npmjs.com/package/react",
+            "@types/node" => "https://www.npmjs.com/package/@types/node",
+        };
+        accepts: [
+            "@types/node", "@scope/_private", "@scope/.config", "lodash.debounce", "c8", "-", "a",
             "MyLegacyPackage",
-        ] {
-            assert!(
-                formatter.validate_package_name(name).is_ok(),
-                "expected {name:?} to be accepted"
-            );
-        }
+            // npm's encodeURIComponent leaves `!'()*-._~` untouched, so `*` is a legitimate
+            // (if unusual) character in a package name.
+            "weird*name"
+        ];
+        rejects: [
+            "", "node_modules", "NODE_MODULES", "favicon.ico", "foo/bar", "a\\b", ".hidden",
+            "_private", "@scope", "@/pkg", "@scope/", "@scope/pkg/extra",
+            // Structurally well-formed `@scope/name` (single '/', both segments non-empty),
+            // but the scope segment itself contains a space, outside npm's unreserved set.
+            "@sco pe/valid-pkg",
+            // Same, but the disallowed character is in the name segment while the scope is
+            // well-formed — the asymmetric case in the other direction.
+            "@valid-scope/pkg name"
+        ];
+        version_roundtrip: [
+            "1.2.3", "1.2.3" => true,
+            "1.2.3", "1" => true,
+            "1.2.3", "1.2" => true,
+            "1.2.3", "^1.2" => true,
+            "1.2.3", "^1.0" => true,
+            "1.5.0", "^1.2.3" => true,
+            "10.1.3", "^10.1.3" => true,
+            "10.2.0", "^10.1.3" => true,
+            "1.2.3", "~1.2" => true,
+            "1.2.5", "~1.2" => true,
+            "1.2.3", "2.0.0" => false,
+            "1.2.3", "1.3" => false,
+            "2.0.0", "^1.2.3" => false
+        ];
     }
 
+    /// Boundary pair for `MAX_NAME_LENGTH`: exactly 214 chars accepted, 215 rejected.
+    /// Computed (`.repeat(n)`) lengths, so this doesn't fit `formatter_conformance!`'s
+    /// `literal`-only accepts/rejects lists above.
     #[test]
-    fn test_validate_package_name_rejects_invalid_names() {
+    fn test_validate_package_name_length_boundary() {
         let formatter = NpmFormatter;
-        let too_long = "a".repeat(215);
-
-        for name in [
-            "",
-            "node_modules",
-            "NODE_MODULES",
-            "favicon.ico",
-            "foo/bar",
-            "a\\b",
-            ".hidden",
-            "_private",
-            too_long.as_str(),
-            "@scope",
-            "@/pkg",
-            "@scope/",
-            "@scope/pkg/extra",
-        ] {
-            assert!(
-                formatter.validate_package_name(name).is_err(),
-                "expected {name:?} to be rejected"
-            );
-        }
-    }
-
-    #[test]
-    fn test_validate_package_name_does_not_reject_star() {
-        // npm's encodeURIComponent leaves `!'()*-._~` untouched, so `*` is a
-        // legitimate (if unusual) character in a package name.
-        let formatter = NpmFormatter;
-        assert!(formatter.validate_package_name("weird*name").is_ok());
-    }
-
-    #[test]
-    fn test_validate_package_name_rejects_disallowed_char_inside_scope() {
-        // Structurally well-formed `@scope/name` (single '/', both segments
-        // non-empty), but the scope segment itself contains a space, which is
-        // outside npm's unreserved character set.
-        let formatter = NpmFormatter;
-        assert!(
-            formatter
-                .validate_package_name("@sco pe/valid-pkg")
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn test_validate_package_name_rejects_disallowed_char_inside_name_with_valid_scope() {
-        // Same, but the disallowed character is in the name segment while the
-        // scope is well-formed — the asymmetric case in the other direction.
-        let formatter = NpmFormatter;
-        assert!(
-            formatter
-                .validate_package_name("@valid-scope/pkg name")
-                .is_err()
-        );
+        assert!(formatter.validate_package_name(&"a".repeat(214)).is_ok());
+        assert!(formatter.validate_package_name(&"a".repeat(215)).is_err());
     }
 
     /// FR-009 (M7): `can_resolve_source` accepts `Registry` and `AlternateRegistry`, rejects
@@ -373,19 +349,6 @@ mod tests {
     }
 
     #[test]
-    fn test_package_url() {
-        let formatter = NpmFormatter;
-        assert_eq!(
-            formatter.package_url(&PackageName::new("react")),
-            "https://www.npmjs.com/package/react"
-        );
-        assert_eq!(
-            formatter.package_url(&PackageName::new("@types/node")),
-            "https://www.npmjs.com/package/@types/node"
-        );
-    }
-
-    #[test]
     fn test_default_normalize_is_identity() {
         let formatter = NpmFormatter;
         assert_eq!(
@@ -403,38 +366,6 @@ mod tests {
         let formatter = NpmFormatter;
         assert_eq!(formatter.yanked_message(), "This version is deprecated");
         assert_eq!(formatter.yanked_label(), "*(deprecated)*");
-    }
-
-    #[test]
-    fn test_version_satisfies_requirement() {
-        let formatter = NpmFormatter;
-
-        // Exact match
-        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "1.2.3"));
-
-        // Partial versions
-        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "1"));
-        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "1.2"));
-
-        // Caret - allows any version with same major (for major > 0)
-        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "^1.2"));
-        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "^1.0"));
-        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), "^1.2.3"));
-        assert!(
-            formatter.version_satisfies_requirement(&ConcreteVersion::new("10.1.3"), "^10.1.3")
-        ); // Same version
-        assert!(
-            formatter.version_satisfies_requirement(&ConcreteVersion::new("10.2.0"), "^10.1.3")
-        ); // Higher minor
-
-        // Tilde - allows patch changes
-        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "~1.2"));
-        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.5"), "~1.2"));
-
-        // Should not match
-        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "2.0.0"));
-        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "1.3"));
-        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), "^1.2.3")); // Different major
     }
 
     #[test]

@@ -336,32 +336,19 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_ecosystem_id() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = GoEcosystem::new(cache);
-        assert_eq!(ecosystem.id(), "go");
-    }
-
-    #[test]
-    fn test_ecosystem_display_name() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = GoEcosystem::new(cache);
-        assert_eq!(ecosystem.display_name(), "Go Modules");
-    }
-
-    #[test]
-    fn test_ecosystem_manifest_filenames() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = GoEcosystem::new(cache);
-        assert_eq!(ecosystem.manifest_filenames(), &["go.mod"]);
-    }
-
-    #[test]
-    fn test_ecosystem_lockfile_filenames() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = GoEcosystem::new(cache);
-        assert_eq!(ecosystem.lockfile_filenames(), &["go.sum"]);
+    // #758: exact-value `Ecosystem` conformance, replacing the hand-written
+    // test_ecosystem_id/test_ecosystem_display_name/test_ecosystem_manifest_filenames/
+    // test_ecosystem_lockfile_filenames/test_as_any family. test_registry_returns_trait_object
+    // stays hand-written below: it also asserts the concrete `GoRegistry` downcast, stronger
+    // than the macro's plain smoke check.
+    deps_core::ecosystem_conformance! {
+        mod go_ecosystem_conformance;
+        build: GoEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        ty: GoEcosystem;
+        id: "go";
+        display_name: "Go Modules";
+        manifest_filenames: &["go.mod"];
+        lockfile_filenames: &["go.sum"];
     }
 
     #[test]
@@ -509,16 +496,6 @@ mod tests {
         ));
 
         assert_eq!(hints.len(), 0);
-    }
-
-    #[test]
-    fn test_as_any() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = GoEcosystem::new(cache);
-
-        // Verify we can downcast
-        let any = ecosystem.as_any();
-        assert!(any.is::<GoEcosystem>());
     }
 
     #[tokio::test]

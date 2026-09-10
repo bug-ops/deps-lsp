@@ -1392,14 +1392,14 @@ mod tests {
         assert!(!url.contains(']'));
     }
 
-    #[test]
-    fn test_package_url_encodes_newline_autolink_and_percent() {
-        let url = package_url("evil\n<https://evil%zz.example>");
-        assert!(!url.contains('\n'));
-        assert!(!url.contains('<'));
-        assert!(!url.contains('>'));
-        assert!(url.contains("%25"));
-    }
+    // #758: `test_package_url_encodes_newline_autolink_and_percent` (narrower
+    // newline/autolink/percent subset) was removed here — `NuGetFormatter::package_url`
+    // delegates straight to this crate's own `package_url`, so it's already exercised with
+    // the full `deps_core::conformance::HOSTILE_DISPLAY_LINK_PAYLOAD` by `deps-lsp`'s
+    // Layer-1 `EcosystemId::ALL` loop (`crates/deps-lsp/src/lib.rs`), unlike
+    // `deps-deno`'s same-named test (kept — see that crate's handoff note: deno's
+    // `jsr_package_url` two-arg function is not reachable through
+    // `Ecosystem::formatter().package_url()`, so Layer-1 never exercises it).
 
     #[test]
     fn test_package_url_empty_name() {
@@ -1732,6 +1732,15 @@ mod tests {
         let results = parse_search_response(data, 1).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "A");
+    }
+
+    // #758: the shared JSON-nesting-depth cap, replacing the missing
+    // test_search_response_nesting_at/over_max_depth family for NuGet's SearchQueryService
+    // response parsing.
+    deps_core::json_depth_conformance! {
+        mod nuget_search_response_json_depth_conformance;
+        parse: |bytes: &[u8]| parse_search_response(bytes, 20);
+        wrap: |nested: &str| format!(r#"{{"data": [], "extra": {nested}}}"#);
     }
 
     fn v(s: &str) -> NuGetVersion {

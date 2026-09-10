@@ -280,47 +280,26 @@ mod tests {
         assert_matches!(pkg.source, ResolvedSource::Path { .. });
     }
 
-    #[tokio::test]
-    async fn test_invalid_json_returns_error() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("Package.resolved");
-        tokio::fs::write(&path, b"not valid json").await.unwrap();
-
-        let parser = SwiftLockParser;
-        let result = parser.parse_lockfile(&path).await;
-        assert!(result.is_err());
+    // #758: shared `LockFileProvider` conformance, replacing test_invalid_json_returns_error
+    // — also closes a real gap: this crate had no `locate_lockfile`/`is_lockfile_stale_*`
+    // coverage at all before.
+    deps_core::lockfile_conformance! {
+        mod swift_lockfile_conformance;
+        build: SwiftLockParser;
+        manifest: "Package.swift" => "// empty";
+        lockfiles: [
+            "Package.resolved" => r#"{"version": 2, "pins": []}"#,
+        ];
+        malformed: "not valid json";
     }
 
-    #[tokio::test]
-    async fn test_nesting_at_max_depth_accepted() {
-        let depth = deps_core::MAX_JSON_NESTING_DEPTH;
-        let content = format!(
-            r#"{{"version": 1, "extra": {}1{}}}"#,
-            "[".repeat(depth - 1),
-            "]".repeat(depth - 1)
-        );
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("Package.resolved");
-        tokio::fs::write(&path, &content).await.unwrap();
-
-        let parser = SwiftLockParser;
-        assert!(parser.parse_lockfile(&path).await.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_nesting_over_max_depth_rejected() {
-        let depth = deps_core::MAX_JSON_NESTING_DEPTH + 1;
-        let content = format!(
-            r#"{{"version": 1, "extra": {}1{}}}"#,
-            "[".repeat(depth),
-            "]".repeat(depth)
-        );
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("Package.resolved");
-        tokio::fs::write(&path, &content).await.unwrap();
-
-        let parser = SwiftLockParser;
-        assert!(parser.parse_lockfile(&path).await.is_err());
+    // #758: the shared JSON-nesting-depth cap, replacing test_nesting_at_max_depth_accepted/
+    // test_nesting_over_max_depth_rejected — `parse_package_resolved` takes an owned
+    // `String`, not `&[u8]`, so the closure re-owns the bytes via `String::from_utf8_lossy`.
+    deps_core::json_depth_conformance! {
+        mod swift_lockfile_json_depth_conformance;
+        parse: |bytes: &[u8]| parse_package_resolved(String::from_utf8_lossy(bytes).into_owned());
+        wrap: |nested: &str| format!(r#"{{"version": 1, "extra": {nested}}}"#);
     }
 
     #[tokio::test]

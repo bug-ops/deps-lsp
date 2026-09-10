@@ -615,11 +615,39 @@ mod tests {
         deps_core::PackageName::new(s)
     }
 
-    #[test]
-    fn test_ecosystem_id() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = PypiEcosystem::new(cache);
-        assert_eq!(ecosystem.id(), "pypi");
+    // #758: exact-value `Ecosystem` conformance, replacing the hand-written
+    // test_ecosystem_id/test_ecosystem_display_name/test_ecosystem_manifest_filenames/
+    // test_ecosystem_lockfile_filenames/test_as_any/test_registry_returns_arc family.
+    // test_ecosystem_manifest_patterns below stays hand-written: `manifest_patterns()` isn't
+    // part of the macro's exact-value set.
+    deps_core::ecosystem_conformance! {
+        mod pypi_ecosystem_conformance;
+        build: PypiEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        ty: PypiEcosystem;
+        id: "pypi";
+        display_name: "PyPI (Python)";
+        manifest_filenames: &["pyproject.toml"];
+        lockfile_filenames: &["poetry.lock", "uv.lock"];
+    }
+
+    // #758: the shared completion-prefix-length guard
+    // (`deps_core::completion::complete_package_names_generic`), replacing
+    // test_complete_package_names_minimum_prefix/test_complete_package_names_max_length.
+    deps_core::completion_guard_conformance! {
+        mod pypi_completion_guard_conformance;
+        complete: |registry: &dyn deps_core::Registry, prefix: String| -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Vec<tower_lsp_server::ls_types::CompletionItem>> + Send + '_>,
+        > {
+            Box::pin(async move {
+                deps_core::completion::complete_package_names_generic(
+                    registry,
+                    &prefix,
+                    20,
+                    Range::default(),
+                )
+                .await
+            })
+        };
     }
 
     #[test]
@@ -807,36 +835,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_ecosystem_display_name() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = PypiEcosystem::new(cache);
-        assert_eq!(ecosystem.display_name(), "PyPI (Python)");
-    }
-
-    #[test]
-    fn test_ecosystem_manifest_filenames() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = PypiEcosystem::new(cache);
-        assert_eq!(ecosystem.manifest_filenames(), &["pyproject.toml"]);
-    }
-
-    #[test]
-    fn test_ecosystem_lockfile_filenames() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = PypiEcosystem::new(cache);
-        assert_eq!(ecosystem.lockfile_filenames(), &["poetry.lock", "uv.lock"]);
-    }
-
-    #[test]
-    fn test_as_any() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = PypiEcosystem::new(cache);
-
-        let any = ecosystem.as_any();
-        assert!(any.is::<PypiEcosystem>());
-    }
-
     #[tokio::test]
     async fn test_package_name_completion_context_has_real_range() {
         // Regression test for #232: the textEdit range for a package-name completion
@@ -897,22 +895,6 @@ mod tests {
             "PackageName context must report is_incomplete: true, even with zero \
              items on a cold-start index"
         );
-    }
-
-    #[tokio::test]
-    async fn test_complete_package_names_minimum_prefix() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = PypiEcosystem::new(cache);
-
-        // Less than 2 characters should return empty
-        let results = ecosystem
-            .complete_package_names("d", Range::default())
-            .await;
-        assert!(results.is_empty());
-
-        // Empty prefix should return empty
-        let results = ecosystem.complete_package_names("", Range::default()).await;
-        assert!(results.is_empty());
     }
 
     /// Builds a `PypiEcosystem` whose registry's search index is pointed at a
@@ -1368,27 +1350,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_complete_package_names_max_length() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = PypiEcosystem::new(cache);
-
-        // Prefix longer than 200 chars should return empty (security)
-        let long_prefix = "a".repeat(201);
-        let results = ecosystem
-            .complete_package_names(&long_prefix, Range::default())
-            .await;
-        assert!(results.is_empty());
-
-        // Exactly 100 chars should work
-        let max_prefix = "a".repeat(100);
-        let results = ecosystem
-            .complete_package_names(&max_prefix, Range::default())
-            .await;
-        // Should not panic, but may return empty (no matches)
-        assert!(results.is_empty() || !results.is_empty());
-    }
-
-    #[tokio::test]
     #[ignore] // Requires network access
     async fn test_complete_versions_limit_20() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1466,15 +1427,6 @@ dependencies = []
 
         let parse_result = result.unwrap();
         assert!(parse_result.dependencies().is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_registry_returns_arc() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = PypiEcosystem::new(cache);
-
-        let registry = ecosystem.registry();
-        assert!(Arc::strong_count(&registry) >= 1);
     }
 
     #[tokio::test]

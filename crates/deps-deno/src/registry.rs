@@ -742,26 +742,13 @@ mod tests {
         assert_eq!(versions[0].version, "1.0.0");
     }
 
-    #[test]
-    fn test_parse_meta_json_nesting_at_max_depth_accepted() {
-        let depth = deps_core::MAX_JSON_NESTING_DEPTH;
-        let json = format!(
-            r#"{{"versions": {{}}, "extra": {}1{}}}"#,
-            "[".repeat(depth - 1),
-            "]".repeat(depth - 1)
-        );
-        assert!(parse_meta_json(json.as_bytes()).is_ok());
-    }
-
-    #[test]
-    fn test_parse_meta_json_nesting_over_max_depth_rejected() {
-        let depth = deps_core::MAX_JSON_NESTING_DEPTH + 1;
-        let json = format!(
-            r#"{{"versions": {{}}, "extra": {}1{}}}"#,
-            "[".repeat(depth),
-            "]".repeat(depth)
-        );
-        assert!(parse_meta_json(json.as_bytes()).is_err());
+    // #758: the shared JSON-nesting-depth cap, replacing
+    // test_parse_meta_json_nesting_at_max_depth_accepted/
+    // test_parse_meta_json_nesting_over_max_depth_rejected.
+    deps_core::json_depth_conformance! {
+        mod deno_meta_json_depth_conformance;
+        parse: |bytes: &[u8]| parse_meta_json(bytes);
+        wrap: |nested: &str| format!(r#"{{"versions": {{}}, "extra": {nested}}}"#);
     }
 
     #[test]
@@ -792,26 +779,13 @@ mod tests {
         assert_eq!(packages[0].latest_version, "1.0.24");
     }
 
-    #[test]
-    fn test_parse_search_response_nesting_at_max_depth_accepted() {
-        let depth = deps_core::MAX_JSON_NESTING_DEPTH;
-        let json = format!(
-            r#"{{"items": [], "extra": {}1{}}}"#,
-            "[".repeat(depth - 1),
-            "]".repeat(depth - 1)
-        );
-        assert!(parse_search_response(json.as_bytes()).is_ok());
-    }
-
-    #[test]
-    fn test_parse_search_response_nesting_over_max_depth_rejected() {
-        let depth = deps_core::MAX_JSON_NESTING_DEPTH + 1;
-        let json = format!(
-            r#"{{"items": [], "extra": {}1{}}}"#,
-            "[".repeat(depth),
-            "]".repeat(depth)
-        );
-        assert!(parse_search_response(json.as_bytes()).is_err());
+    // #758: the shared JSON-nesting-depth cap, replacing
+    // test_parse_search_response_nesting_at_max_depth_accepted/
+    // test_parse_search_response_nesting_over_max_depth_rejected.
+    deps_core::json_depth_conformance! {
+        mod deno_search_response_json_depth_conformance;
+        parse: |bytes: &[u8]| parse_search_response(bytes);
+        wrap: |nested: &str| format!(r#"{{"items": [], "extra": {nested}}}"#);
     }
 
     #[test]

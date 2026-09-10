@@ -254,123 +254,44 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_package_url() {
-        let formatter = GoFormatter;
-
-        // Standard package
-        assert_eq!(
-            formatter.package_url(&PackageName::new("github.com/gin-gonic/gin")),
-            "https://pkg.go.dev/github.com/gin-gonic/gin"
-        );
-
-        // Package with version path
-        assert_eq!(
-            formatter.package_url(&PackageName::new("github.com/go-redis/redis/v8")),
-            "https://pkg.go.dev/github.com/go-redis/redis/v8"
-        );
-
-        // Standard library package
-        assert_eq!(
-            formatter.package_url(&PackageName::new("fmt")),
-            "https://pkg.go.dev/fmt"
-        );
-
-        // Package with @ character (should be URL encoded)
-        assert_eq!(
-            formatter.package_url(&PackageName::new("github.com/user@org/package")),
-            "https://pkg.go.dev/github.com/user%40org/package"
-        );
-
-        // Package with space (should be URL encoded)
-        assert_eq!(
-            formatter.package_url(&PackageName::new("github.com/user/pkg name")),
-            "https://pkg.go.dev/github.com/user/pkg%20name"
-        );
-    }
-
-    #[test]
-    fn test_version_satisfies_requirement_exact_match() {
-        let formatter = GoFormatter;
-
-        // Exact version match
-        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("v1.2.3"), "v1.2.3"));
-        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("v0.1.0"), "v0.1.0"));
-    }
-
-    #[test]
-    fn test_version_satisfies_requirement_pseudo_version() {
-        let formatter = GoFormatter;
-
-        // Pseudo-version prefix match
-        assert!(formatter.version_satisfies_requirement(
-            &ConcreteVersion::new("v0.0.0-20191109021931-daa7c04131f5"),
-            "v0.0.0"
-        ));
-
-        // Full pseudo-version match
-        assert!(formatter.version_satisfies_requirement(
-            &ConcreteVersion::new("v0.0.0-20191109021931-daa7c04131f5"),
-            "v0.0.0-20191109021931-daa7c04131f5"
-        ));
-    }
-
-    #[test]
-    fn test_version_satisfies_requirement_incompatible() {
-        let formatter = GoFormatter;
-
-        // +incompatible suffix handling
-        assert!(
-            formatter.version_satisfies_requirement(
-                &ConcreteVersion::new("v2.0.0+incompatible"),
-                "v2.0.0"
-            )
-        );
-
-        // Exact match with +incompatible
-        assert!(formatter.version_satisfies_requirement(
-            &ConcreteVersion::new("v2.0.0+incompatible"),
-            "v2.0.0+incompatible"
-        ));
-    }
-
-    #[test]
-    fn test_version_does_not_satisfy_requirement() {
-        let formatter = GoFormatter;
-
-        // Different versions
-        assert!(
-            !formatter.version_satisfies_requirement(&ConcreteVersion::new("v1.2.3"), "v1.2.4")
-        );
-        assert!(
-            !formatter.version_satisfies_requirement(&ConcreteVersion::new("v2.0.0"), "v1.0.0")
-        );
-
-        // Partial match that doesn't start with requirement
-        assert!(
-            !formatter.version_satisfies_requirement(&ConcreteVersion::new("v1.2.3"), "v1.2.3.4")
-        );
-    }
-
-    #[test]
-    fn test_version_satisfies_requirement_prefix_scenarios() {
-        let formatter = GoFormatter;
-
-        // Version is prefix of requirement (should NOT match)
-        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("v1.2"), "v1.2.3"));
-
-        // Requirement is prefix of version with dot boundary (should match)
-        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("v1.2.3"), "v1.2"));
-
-        // False positive prevention: v1.2.30 should NOT match v1.2.3
-        assert!(
-            !formatter.version_satisfies_requirement(&ConcreteVersion::new("v1.2.30"), "v1.2.3")
-        );
-
-        // But v1.2.3.1 SHOULD match v1.2.3 (if it has dot boundary)
-        assert!(
-            formatter.version_satisfies_requirement(&ConcreteVersion::new("v1.2.3.1"), "v1.2.3")
-        );
+    // #758: exact-value `EcosystemFormatter` conformance, replacing test_package_url,
+    // test_validate_package_name_accepts_valid_module_path, test_validate_package_name_rejects_empty,
+    // test_validate_package_name_rejects_dot_segment, test_version_satisfies_requirement_exact_match,
+    // test_version_satisfies_requirement_pseudo_version, test_version_satisfies_requirement_incompatible,
+    // test_version_does_not_satisfy_requirement, and test_version_satisfies_requirement_prefix_scenarios.
+    // test_validate_package_name_rejects_too_long below stays hand-written: it asserts on a
+    // computed (`.repeat(n)`) length, which doesn't fit the macro's `literal`-only list.
+    deps_core::formatter_conformance! {
+        mod go_formatter_conformance;
+        build: GoFormatter;
+        package_url: {
+            "github.com/gin-gonic/gin" => "https://pkg.go.dev/github.com/gin-gonic/gin",
+            "github.com/go-redis/redis/v8" => "https://pkg.go.dev/github.com/go-redis/redis/v8",
+            "fmt" => "https://pkg.go.dev/fmt",
+            "github.com/user@org/package" => "https://pkg.go.dev/github.com/user%40org/package",
+            "github.com/user/pkg name" => "https://pkg.go.dev/github.com/user/pkg%20name",
+        };
+        accepts: [
+            "github.com/gin-gonic/gin", "golang.org/x/mod"
+        ];
+        rejects: [
+            "", "github.com/user/..", "./evil"
+        ];
+        version_roundtrip: [
+            "v1.2.3", "v1.2.3" => true,
+            "v0.1.0", "v0.1.0" => true,
+            "v0.0.0-20191109021931-daa7c04131f5", "v0.0.0" => true,
+            "v0.0.0-20191109021931-daa7c04131f5", "v0.0.0-20191109021931-daa7c04131f5" => true,
+            "v2.0.0+incompatible", "v2.0.0" => true,
+            "v2.0.0+incompatible", "v2.0.0+incompatible" => true,
+            "v1.2.3", "v1.2.4" => false,
+            "v2.0.0", "v1.0.0" => false,
+            "v1.2.3", "v1.2.3.4" => false,
+            "v1.2", "v1.2.3" => false,
+            "v1.2.3", "v1.2" => true,
+            "v1.2.30", "v1.2.3" => false,
+            "v1.2.3.1", "v1.2.3" => true
+        ];
     }
 
     #[test]
@@ -459,36 +380,6 @@ mod tests {
             matcher.matches(&ConcreteVersion::new("v2.0.0+incompatible")),
             Some(true)
         );
-    }
-
-    #[test]
-    fn test_validate_package_name_accepts_valid_module_path() {
-        let formatter = GoFormatter;
-        assert!(
-            formatter
-                .validate_package_name("github.com/gin-gonic/gin")
-                .is_ok()
-        );
-        assert!(formatter.validate_package_name("golang.org/x/mod").is_ok());
-    }
-
-    #[test]
-    fn test_validate_package_name_rejects_empty() {
-        let formatter = GoFormatter;
-        assert!(formatter.validate_package_name("").is_err());
-    }
-
-    /// #402: a `.`/`..` module path segment must be reported as an invalid package name,
-    /// not forwarded to the registry lookup that produces the misleading generic diagnostic.
-    #[test]
-    fn test_validate_package_name_rejects_dot_segment() {
-        let formatter = GoFormatter;
-        assert!(
-            formatter
-                .validate_package_name("github.com/user/..")
-                .is_err()
-        );
-        assert!(formatter.validate_package_name("./evil").is_err());
     }
 
     /// FR-012 (spec 034): `can_resolve_source` accepts `Registry`/`AlternateRegistry`,

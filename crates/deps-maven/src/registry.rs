@@ -1072,14 +1072,19 @@ mod tests {
         assert!(!url.contains(']'));
     }
 
-    #[test]
-    fn test_package_url_encodes_newline_autolink_and_percent() {
-        let url = package_url("evil\n<%:pkg>");
-        assert!(!url.contains('\n'));
-        assert!(!url.contains('<'));
-        assert!(!url.contains('>'));
-        assert!(url.contains("%25"));
-    }
+    // #758: the generic newline/autolink/percent hostile-payload check this test used to
+    // provide is now covered for every ecosystem by Layer 1 (`deps-lsp`'s
+    // `test_registered_ecosystems_universal_invariants`) and, at the per-crate level, by
+    // `formatter.rs`'s `test_package_url_hostile_display_link_payload_is_safe` (which
+    // exercises this exact `package_url` function through `MavenFormatter::package_url`).
+    // `test_package_url_encodes_malicious_group_and_artifact`/`_google_...` above stay
+    // hand-written: the shared hostile fixture does contain a `:` (from its embedded
+    // `https://`), so it exercises this function's `groupId:artifactId` split branch too —
+    // but its `groupId` half never matches a `GOOGLE_PREFIXES` entry, so it never reaches
+    // the Google-routing branch `_google_encodes_malicious_group_and_artifact` covers. Both
+    // hand-written tests also assert general bracket-safety properties rather than pinning
+    // an exact encoded string, which is why they stay separate from
+    // `formatter_conformance!`'s literal `package_url` pair list.
 
     #[test]
     fn test_metadata_urls_central_has_two_urls() {
@@ -1398,26 +1403,12 @@ mod tests {
         assert_eq!(results[0].latest_version, "3.14.0");
     }
 
-    #[test]
-    fn test_parse_search_response_nesting_at_max_depth_accepted() {
-        let depth = deps_core::MAX_JSON_NESTING_DEPTH;
-        let json = format!(
-            r#"{{"response": {{"docs": []}}, "extra": {}1{}}}"#,
-            "[".repeat(depth - 1),
-            "]".repeat(depth - 1)
-        );
-        assert!(parse_search_response(json.as_bytes(), 10).is_ok());
-    }
-
-    #[test]
-    fn test_parse_search_response_nesting_over_max_depth_rejected() {
-        let depth = deps_core::MAX_JSON_NESTING_DEPTH + 1;
-        let json = format!(
-            r#"{{"response": {{"docs": []}}, "extra": {}1{}}}"#,
-            "[".repeat(depth),
-            "]".repeat(depth)
-        );
-        assert!(parse_search_response(json.as_bytes(), 10).is_err());
+    // #758: the shared JSON-nesting-depth cap, replacing
+    // test_parse_search_response_nesting_at_max_depth_accepted/_over_max_depth_rejected.
+    deps_core::json_depth_conformance! {
+        mod maven_json_depth_conformance;
+        parse: |bytes: &[u8]| parse_search_response(bytes, 10);
+        wrap: |nested: &str| format!(r#"{{"response": {{"docs": []}}, "extra": {nested}}}"#);
     }
 
     /// Manual live probe against the real endpoint (#274) — NOT deterministic

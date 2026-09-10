@@ -469,41 +469,48 @@ mod tests {
     use super::*;
     use crate::types::NuGetDependency;
 
-    #[test]
-    fn test_ecosystem_id() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = NuGetEcosystem::new(cache);
-        assert_eq!(eco.id(), "nuget");
+    // #758: exact-value `Ecosystem` conformance, replacing the hand-written
+    // test_ecosystem_id/test_ecosystem_display_name/test_lockfile_filenames/test_as_any
+    // family. `manifest_extensions()` (csproj/fsproj/vbproj) has no macro parameter, so it
+    // stays covered by `test_manifest_extensions` below. Does not replace
+    // `test_lockfile_provider_some`, which asserts `lockfile_provider()` specifically, not
+    // anything `ecosystem_conformance!` covers.
+    deps_core::ecosystem_conformance! {
+        mod nuget_ecosystem_conformance;
+        build: NuGetEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        ty: NuGetEcosystem;
+        id: "nuget";
+        display_name: "NuGet (.NET)";
+        manifest_filenames: &["Directory.Packages.props", "packages.config"];
+        lockfile_filenames: &["packages.lock.json", "packages.*.lock.json"];
+    }
+
+    // #758: the shared completion-prefix-length guard, replacing
+    // test_complete_package_names_min_prefix (which only checked the empty-prefix case).
+    deps_core::completion_guard_conformance! {
+        mod nuget_completion_guard_conformance;
+        complete: |registry: &dyn deps_core::Registry, prefix: String| -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Vec<tower_lsp_server::ls_types::CompletionItem>> + Send + '_>,
+        > {
+            Box::pin(async move {
+                deps_core::completion::complete_package_names_generic(
+                    registry,
+                    &prefix,
+                    20,
+                    Range::default(),
+                )
+                .await
+            })
+        };
     }
 
     #[test]
-    fn test_ecosystem_display_name() {
+    fn test_manifest_extensions() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let eco = NuGetEcosystem::new(cache);
-        assert_eq!(eco.display_name(), "NuGet (.NET)");
-    }
-
-    #[test]
-    fn test_manifest_filenames_and_extensions() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = NuGetEcosystem::new(cache);
-        assert_eq!(
-            eco.manifest_filenames(),
-            &["Directory.Packages.props", "packages.config"]
-        );
         assert_eq!(
             eco.manifest_extensions(),
             &[".csproj", ".fsproj", ".vbproj"]
-        );
-    }
-
-    #[test]
-    fn test_lockfile_filenames() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = NuGetEcosystem::new(cache);
-        assert_eq!(
-            eco.lockfile_filenames(),
-            &["packages.lock.json", "packages.*.lock.json"]
         );
     }
 
@@ -512,13 +519,6 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let eco = NuGetEcosystem::new(cache);
         assert!(eco.lockfile_provider().is_some());
-    }
-
-    #[test]
-    fn test_as_any() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = NuGetEcosystem::new(cache);
-        assert!(eco.as_any().is::<NuGetEcosystem>());
     }
 
     #[tokio::test]
@@ -605,17 +605,6 @@ mod tests {
 
         let result = eco.parse_manifest(content, &uri).await;
         assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_complete_package_names_min_prefix() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = NuGetEcosystem::new(cache);
-        assert!(
-            eco.complete_package_names("", Range::default())
-                .await
-                .is_empty()
-        );
     }
 
     // --- complete_versions: position-based dependency lookup + can_resolve_source gate (issue #593) ---

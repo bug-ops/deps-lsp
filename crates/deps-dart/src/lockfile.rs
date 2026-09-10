@@ -320,33 +320,17 @@ packages:
         assert_eq!(packages.get_version("http"), Some("1.2.0"));
     }
 
-    #[test]
-    fn test_locate_lockfile() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let manifest_path = temp_dir.path().join("pubspec.yaml");
-        let lock_path = temp_dir.path().join("pubspec.lock");
-
-        std::fs::write(&manifest_path, "name: test").unwrap();
-        std::fs::write(&lock_path, "packages:\n").unwrap();
-
-        let manifest_uri = Uri::from_file_path(&manifest_path).unwrap();
-        let parser = PubspecLockParser;
-
-        let located = parser.locate_lockfile(&manifest_uri);
-        assert!(located.is_some());
-        assert_eq!(located.unwrap(), lock_path);
-    }
-
-    #[test]
-    fn test_locate_lockfile_not_found() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let manifest_path = temp_dir.path().join("pubspec.yaml");
-        std::fs::write(&manifest_path, "name: test").unwrap();
-
-        let manifest_uri = Uri::from_file_path(&manifest_path).unwrap();
-        let parser = PubspecLockParser;
-
-        assert!(parser.locate_lockfile(&manifest_uri).is_none());
+    // #758: shared `LockFileProvider` conformance, replacing test_locate_lockfile and
+    // test_locate_lockfile_not_found — deps-dart had no prior `is_lockfile_stale` coverage at
+    // all, so this also adds that.
+    deps_core::lockfile_conformance! {
+        mod dart_lockfile_conformance;
+        build: PubspecLockParser;
+        manifest: "pubspec.yaml" => "name: test";
+        lockfiles: [
+            "pubspec.lock" => "packages:\n",
+        ];
+        malformed: "not valid yaml: [[[";
     }
 
     #[tokio::test]

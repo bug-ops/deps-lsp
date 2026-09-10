@@ -337,21 +337,18 @@ golang.org/x/sync v0.5.0/go.mod h1:RxMgew5V=
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_locate_lockfile_same_directory() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let manifest_path = temp_dir.path().join("go.mod");
-        let lock_path = temp_dir.path().join("go.sum");
-
-        std::fs::write(&manifest_path, "module test").unwrap();
-        std::fs::write(&lock_path, "").unwrap();
-
-        let manifest_uri = Uri::from_file_path(&manifest_path).unwrap();
-        let parser = GoSumParser;
-
-        let located = parser.locate_lockfile(&manifest_uri);
-        assert!(located.is_some());
-        assert_eq!(located.unwrap(), lock_path);
+    // #758: shared `LockFileProvider` conformance, replacing test_locate_lockfile_same_directory,
+    // test_locate_lockfile_not_found, and test_is_lockfile_stale_not_modified/_modified/_deleted/
+    // _future_time. test_locate_lockfile_workspace_root stays hand-written: it exercises the
+    // ancestor-directory search, a scenario this macro doesn't cover.
+    deps_core::lockfile_conformance! {
+        mod go_lockfile_conformance;
+        build: GoSumParser;
+        manifest: "go.mod" => "module test";
+        lockfiles: [
+            "go.sum" => "github.com/gin-gonic/gin v1.9.1 h1:hash=",
+        ];
+        malformed: "not valid go.sum content !!!";
     }
 
     #[test]
@@ -371,79 +368,6 @@ golang.org/x/sync v0.5.0/go.mod h1:RxMgew5V=
         let located = parser.locate_lockfile(&manifest_uri);
         assert!(located.is_some());
         assert_eq!(located.unwrap(), workspace_lock);
-    }
-
-    #[test]
-    fn test_locate_lockfile_not_found() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let manifest_path = temp_dir.path().join("go.mod");
-        std::fs::write(&manifest_path, "module test").unwrap();
-
-        let manifest_uri = Uri::from_file_path(&manifest_path).unwrap();
-        let parser = GoSumParser;
-
-        let located = parser.locate_lockfile(&manifest_uri);
-        assert!(located.is_none());
-    }
-
-    #[test]
-    fn test_is_lockfile_stale_not_modified() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let lockfile_path = temp_dir.path().join("go.sum");
-        std::fs::write(&lockfile_path, "").unwrap();
-
-        let mtime = std::fs::metadata(&lockfile_path)
-            .unwrap()
-            .modified()
-            .unwrap();
-        let parser = GoSumParser;
-
-        assert!(
-            !parser.is_lockfile_stale(&lockfile_path, mtime),
-            "Lock file should not be stale when mtime matches"
-        );
-    }
-
-    #[test]
-    fn test_is_lockfile_stale_modified() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let lockfile_path = temp_dir.path().join("go.sum");
-        std::fs::write(&lockfile_path, "").unwrap();
-
-        let old_time = std::time::UNIX_EPOCH;
-        let parser = GoSumParser;
-
-        assert!(
-            parser.is_lockfile_stale(&lockfile_path, old_time),
-            "Lock file should be stale when last_modified is old"
-        );
-    }
-
-    #[test]
-    fn test_is_lockfile_stale_deleted() {
-        let parser = GoSumParser;
-        let non_existent = std::path::Path::new("/nonexistent/go.sum");
-
-        assert!(
-            parser.is_lockfile_stale(non_existent, std::time::SystemTime::now()),
-            "Non-existent lock file should be considered stale"
-        );
-    }
-
-    #[test]
-    fn test_is_lockfile_stale_future_time() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let lockfile_path = temp_dir.path().join("go.sum");
-        std::fs::write(&lockfile_path, "").unwrap();
-
-        // Use a time far in the future
-        let future_time = std::time::SystemTime::now() + std::time::Duration::from_hours(24);
-        let parser = GoSumParser;
-
-        assert!(
-            !parser.is_lockfile_stale(&lockfile_path, future_time),
-            "Lock file should not be stale when last_modified is in the future"
-        );
     }
 
     #[test]

@@ -236,82 +236,42 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_package_url() {
-        let formatter = BundlerFormatter;
-        assert_eq!(
-            formatter.package_url(&PackageName::new("rails")),
-            "https://rubygems.org/gems/rails"
-        );
-        assert_eq!(
-            formatter.package_url(&PackageName::new("nokogiri")),
-            "https://rubygems.org/gems/nokogiri"
-        );
-    }
-
-    #[test]
-    fn test_pessimistic_operator() {
-        let formatter = BundlerFormatter;
-
-        // ~> 7.0 means >= 7.0, < 8.0
-        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("7.0.8"), "~> 7.0"));
-        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("7.0.0"), "~> 7.0"));
-        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("7.9.9"), "~> 7.0"));
-        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("8.0.0"), "~> 7.0"));
-        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("6.9.9"), "~> 7.0"));
-
-        // ~> 1.0.5 means >= 1.0.5, < 1.1.0
-        assert!(
-            formatter.version_satisfies_requirement(&ConcreteVersion::new("1.0.5"), "~> 1.0.5")
-        );
-        assert!(
-            formatter.version_satisfies_requirement(&ConcreteVersion::new("1.0.9"), "~> 1.0.5")
-        );
-        assert!(
-            !formatter.version_satisfies_requirement(&ConcreteVersion::new("1.1.0"), "~> 1.0.5")
-        );
-        assert!(
-            !formatter.version_satisfies_requirement(&ConcreteVersion::new("1.0.4"), "~> 1.0.5")
-        );
-    }
-
-    #[test]
-    fn test_comparison_operators() {
-        let formatter = BundlerFormatter;
-
-        // >= operator
-        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), ">= 1.1"));
-        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.1.0"), ">= 1.1"));
-        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), ">= 1.1"));
-
-        // > operator
-        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), "> 1.0"));
-        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "> 1.0"));
-
-        // <= operator
-        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "<= 1.0"));
-        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("1.1.0"), "<= 1.0"));
-
-        // < operator
-        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("0.9.0"), "< 1.0"));
-        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "< 1.0"));
-    }
-
-    #[test]
-    fn test_exact_match() {
-        let formatter = BundlerFormatter;
-
-        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "= 1.0.0"));
-        assert!(
-            !formatter.version_satisfies_requirement(&ConcreteVersion::new("1.0.1"), "= 1.0.0")
-        );
-
-        assert!(
-            formatter.version_satisfies_requirement(&ConcreteVersion::new("1.0.1"), "!= 1.0.0")
-        );
-        assert!(
-            !formatter.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "!= 1.0.0")
-        );
+    // #758: exact-value `EcosystemFormatter` conformance, replacing test_package_url,
+    // test_validate_package_name_accepts_valid_names, test_validate_package_name_rejects_invalid_names,
+    // test_pessimistic_operator, test_comparison_operators, and test_exact_match.
+    deps_core::formatter_conformance! {
+        mod bundler_formatter_conformance;
+        build: BundlerFormatter;
+        package_url: {
+            "rails" => "https://rubygems.org/gems/rails",
+            "nokogiri" => "https://rubygems.org/gems/nokogiri",
+        };
+        accepts: ["rails", "rspec-rails", "nokogiri", "activesupport.rb"];
+        rejects: ["", "123", "rails util", "rails/util", "日本語"];
+        version_roundtrip: [
+            "7.0.8", "~> 7.0" => true,
+            "7.0.0", "~> 7.0" => true,
+            "7.9.9", "~> 7.0" => true,
+            "8.0.0", "~> 7.0" => false,
+            "6.9.9", "~> 7.0" => false,
+            "1.0.5", "~> 1.0.5" => true,
+            "1.0.9", "~> 1.0.5" => true,
+            "1.1.0", "~> 1.0.5" => false,
+            "1.0.4", "~> 1.0.5" => false,
+            "1.5.0", ">= 1.1" => true,
+            "1.1.0", ">= 1.1" => true,
+            "1.0.0", ">= 1.1" => false,
+            "2.0.0", "> 1.0" => true,
+            "1.0.0", "> 1.0" => false,
+            "1.0.0", "<= 1.0" => true,
+            "1.1.0", "<= 1.0" => false,
+            "0.9.0", "< 1.0" => true,
+            "1.0.0", "< 1.0" => false,
+            "1.0.0", "= 1.0.0" => true,
+            "1.0.1", "= 1.0.0" => false,
+            "1.0.1", "!= 1.0.0" => true,
+            "1.0.0", "!= 1.0.0" => false
+        ];
     }
 
     #[test]
@@ -575,30 +535,6 @@ mod tests {
             &VersionReq::new("7.2.0"),
             &available,
         ));
-    }
-
-    #[test]
-    fn test_validate_package_name_accepts_valid_names() {
-        let formatter = BundlerFormatter;
-        for name in ["rails", "rspec-rails", "nokogiri", "activesupport.rb"] {
-            assert!(
-                formatter.validate_package_name(name).is_ok(),
-                "expected {name:?} to be accepted"
-            );
-        }
-    }
-
-    /// #402: a structurally invalid gem name must be reported as an invalid package name, not
-    /// forwarded to the registry lookup that produces the misleading generic diagnostic.
-    #[test]
-    fn test_validate_package_name_rejects_invalid_names() {
-        let formatter = BundlerFormatter;
-        for name in ["", "123", "rails util", "rails/util", "日本語"] {
-            assert!(
-                formatter.validate_package_name(name).is_err(),
-                "expected {name:?} to be rejected"
-            );
-        }
     }
 
     /// #402 critique M4: a name that fails both checks (no ASCII letter at all, and a

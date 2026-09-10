@@ -477,14 +477,10 @@ mod tests {
         assert!(!url.contains(']'));
     }
 
-    #[test]
-    fn test_package_url_encodes_newline_autolink_and_percent() {
-        let url = package_url("evil\n<https://evil%zz.example>");
-        assert!(!url.contains('\n'));
-        assert!(!url.contains('<'));
-        assert!(!url.contains('>'));
-        assert!(url.contains("%25"));
-    }
+    // #758: this hostile newline/autolink/percent payload case is now covered universally by
+    // deps-lsp's `test_registered_ecosystems_universal_invariants` (Layer 1), via
+    // `deps_core::conformance::HOSTILE_DISPLAY_LINK_PAYLOAD` — this crate's own copy is
+    // redundant and has been removed.
 
     #[test]
     fn test_package_url_empty_name() {
@@ -612,6 +608,13 @@ mod tests {
         assert_eq!(info.name, "minimal");
         assert_eq!(info.version, "0.1.0");
         assert!(info.description.is_none());
+    }
+
+    // #758: the shared JSON-nesting-depth cap — deps-dart had no prior nesting-depth test.
+    deps_core::json_depth_conformance! {
+        mod dart_json_depth_conformance;
+        parse: |bytes: &[u8]| parse_package_info(bytes);
+        wrap: |nested: &str| format!(r#"{{"name": "test", "latest": {{"version": "0.1.0"}}, "versions": [], "extra": {nested}}}"#);
     }
 
     #[test]

@@ -213,25 +213,37 @@ mod tests {
     use deps_core::{EcosystemConfig, VersionData};
     use std::collections::HashMap;
 
-    #[test]
-    fn test_ecosystem_id() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = ComposerEcosystem::new(cache);
-        assert_eq!(ecosystem.id(), "composer");
+    // #758: exact-value `Ecosystem` conformance, replacing test_ecosystem_id,
+    // test_ecosystem_manifest_filenames, and test_ecosystem_lockfile_filenames. Also closes
+    // a real gap: this crate had no `test_as_any`/registry-smoke-test equivalent before.
+    deps_core::ecosystem_conformance! {
+        mod composer_ecosystem_conformance;
+        build: ComposerEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        ty: ComposerEcosystem;
+        id: "composer";
+        display_name: "Composer (PHP)";
+        manifest_filenames: &["composer.json"];
+        lockfile_filenames: &["composer.lock"];
     }
 
-    #[test]
-    fn test_ecosystem_manifest_filenames() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = ComposerEcosystem::new(cache);
-        assert_eq!(ecosystem.manifest_filenames(), &["composer.json"]);
-    }
-
-    #[test]
-    fn test_ecosystem_lockfile_filenames() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = ComposerEcosystem::new(cache);
-        assert_eq!(ecosystem.lockfile_filenames(), &["composer.lock"]);
+    // #758: the shared completion-prefix-length guard
+    // (`deps_core::completion::complete_package_names_generic`), replacing
+    // test_complete_package_names_short_prefix — also closes the missing max-length case.
+    deps_core::completion_guard_conformance! {
+        mod composer_completion_guard_conformance;
+        complete: |registry: &dyn deps_core::Registry, prefix: String| -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Vec<tower_lsp_server::ls_types::CompletionItem>> + Send + '_>,
+        > {
+            Box::pin(async move {
+                deps_core::completion::complete_package_names_generic(
+                    registry,
+                    &prefix,
+                    20,
+                    Range::default(),
+                )
+                .await
+            })
+        };
     }
 
     #[test]
@@ -291,17 +303,6 @@ mod tests {
             }
             other => panic!("Expected PackageName context, got {other:?}"),
         }
-    }
-
-    #[tokio::test]
-    async fn test_complete_package_names_short_prefix() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = ComposerEcosystem::new(cache);
-
-        let results = ecosystem
-            .complete_package_names("s", Range::default())
-            .await;
-        assert!(results.is_empty());
     }
 
     #[tokio::test]

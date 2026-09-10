@@ -1188,19 +1188,31 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_ecosystem_id_and_display_name() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = GithubActionsEcosystem::new(cache);
-        assert_eq!(eco.id(), "github-actions");
-        assert_eq!(eco.display_name(), "GitHub Actions");
+    // #758: exact-value `Ecosystem` conformance, replacing
+    // test_ecosystem_id_and_display_name and test_as_any. `lockfile_filenames()` is
+    // omitted — GHA workflows have no lock file concept (no `LockFileProvider` impl in
+    // this crate). No `completion_guard_conformance!`/`json_depth_conformance!` for this
+    // crate: GHA never performs package-name search completion
+    // (`CompletionContext::PackageName` always yields `Completions::default()` — versions
+    // resolve via the tags API only), and its tags-response parsing goes through the
+    // shared, already depth-capped `deps_core::github::parse_tags_page`, which fails open
+    // to `Ok(vec![])` rather than `Err` on excess nesting (a deliberate malformed-page
+    // tolerance) — `json_depth_conformance!`'s over-depth-rejected assertion does not hold
+    // for that call site, and the underlying cap itself is already covered by deps-core's
+    // own `parser`/`github` test suites.
+    deps_core::ecosystem_conformance! {
+        mod github_actions_ecosystem_conformance;
+        build: GithubActionsEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        ty: GithubActionsEcosystem;
+        id: "github-actions";
+        display_name: "GitHub Actions";
+        manifest_filenames: &["action.yml", "action.yaml"];
     }
 
     #[test]
     fn test_manifest_routing_filenames_and_directory_patterns() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let eco = GithubActionsEcosystem::new(cache);
-        assert_eq!(eco.manifest_filenames(), &["action.yml", "action.yaml"]);
         assert!(eco.manifest_patterns().is_empty());
         assert!(eco.manifest_extensions().is_empty());
         assert_eq!(
@@ -1236,13 +1248,6 @@ mod tests {
                 .unwrap_or_else(|| panic!("expected {path} to route to an ecosystem"));
             assert_eq!(eco.id(), "github-actions", "{path}");
         }
-    }
-
-    #[test]
-    fn test_as_any() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = GithubActionsEcosystem::new(cache);
-        assert!(eco.as_any().is::<GithubActionsEcosystem>());
     }
 
     #[tokio::test]

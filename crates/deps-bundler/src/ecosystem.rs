@@ -148,40 +148,37 @@ impl Ecosystem for BundlerEcosystem {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_ecosystem_id() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = BundlerEcosystem::new(cache);
-        assert_eq!(ecosystem.id(), "bundler");
+    // #758: exact-value `Ecosystem` conformance, replacing the hand-written
+    // test_ecosystem_id/test_ecosystem_display_name/test_ecosystem_manifest_filenames/
+    // test_ecosystem_lockfile_filenames/test_as_any family.
+    deps_core::ecosystem_conformance! {
+        mod bundler_ecosystem_conformance;
+        build: BundlerEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        ty: BundlerEcosystem;
+        id: "bundler";
+        display_name: "Bundler (Ruby)";
+        manifest_filenames: &["Gemfile"];
+        lockfile_filenames: &["Gemfile.lock"];
     }
 
-    #[test]
-    fn test_ecosystem_display_name() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = BundlerEcosystem::new(cache);
-        assert_eq!(ecosystem.display_name(), "Bundler (Ruby)");
-    }
-
-    #[test]
-    fn test_ecosystem_manifest_filenames() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = BundlerEcosystem::new(cache);
-        assert_eq!(ecosystem.manifest_filenames(), &["Gemfile"]);
-    }
-
-    #[test]
-    fn test_ecosystem_lockfile_filenames() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = BundlerEcosystem::new(cache);
-        assert_eq!(ecosystem.lockfile_filenames(), &["Gemfile.lock"]);
-    }
-
-    #[test]
-    fn test_as_any() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = BundlerEcosystem::new(cache);
-        let any = ecosystem.as_any();
-        assert!(any.is::<BundlerEcosystem>());
+    // #758: the shared completion-prefix-length guard
+    // (`deps_core::completion::complete_package_names_generic`), replacing
+    // test_complete_package_names_minimum_prefix/test_complete_package_names_max_length.
+    deps_core::completion_guard_conformance! {
+        mod bundler_completion_guard_conformance;
+        complete: |registry: &dyn deps_core::Registry, prefix: String| -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Vec<tower_lsp_server::ls_types::CompletionItem>> + Send + '_>,
+        > {
+            Box::pin(async move {
+                deps_core::completion::complete_package_names_generic(
+                    registry,
+                    &prefix,
+                    20,
+                    Range::default(),
+                )
+                .await
+            })
+        };
     }
 
     #[tokio::test]
@@ -210,35 +207,6 @@ mod tests {
             }
             other => panic!("Expected PackageName context, got {other:?}"),
         }
-    }
-
-    #[tokio::test]
-    async fn test_complete_package_names_minimum_prefix() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = BundlerEcosystem::new(cache);
-
-        // Less than 2 characters should return empty
-        let results = ecosystem
-            .complete_package_names("r", Range::default())
-            .await;
-        assert!(results.is_empty());
-
-        // Empty prefix should return empty
-        let results = ecosystem.complete_package_names("", Range::default()).await;
-        assert!(results.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_complete_package_names_max_length() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = BundlerEcosystem::new(cache);
-
-        // Prefix longer than 200 chars should return empty
-        let long_prefix = "a".repeat(201);
-        let results = ecosystem
-            .complete_package_names(&long_prefix, Range::default())
-            .await;
-        assert!(results.is_empty());
     }
 
     #[tokio::test]

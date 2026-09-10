@@ -1027,32 +1027,37 @@ mod tests {
     use crate::types::EndpointKind;
     use dashmap::DashMap;
 
-    #[test]
-    fn test_ecosystem_id_and_display_name() {
-        let cache = Arc::new(HttpCache::new());
-        let eco = GitlabCiEcosystem::new(cache);
-        assert_eq!(eco.id(), "gitlab-ci");
-        assert_eq!(eco.display_name(), "GitLab CI/CD");
+    // #758: exact-value `Ecosystem` conformance, replacing test_ecosystem_id_and_display_name
+    // and test_as_any. `lockfile_filenames()` is omitted — GitLab CI pipelines have no lock
+    // file concept (no `LockFileProvider` impl in this crate). No
+    // `completion_guard_conformance!`/`json_depth_conformance!` for this crate:
+    // `generate_completions` above only ever handles `CompletionContext::Version` (no
+    // package-name search endpoint, spec NFR-002), and `client::parse_gitlab_page`
+    // (backing both tags and releases parsing) is already depth-capped via
+    // `deps_core::parser::parse_json_checked`, but fails open to `Ok(vec![])` rather than
+    // `Err` on excess nesting (mirrors `deps_github_actions::parse_tags_page`'s identical,
+    // deliberate malformed-page tolerance) — `json_depth_conformance!`'s
+    // over-depth-rejected assertion does not hold for that call site, and the underlying
+    // cap itself is already covered by deps-core's own `parser` test suite.
+    deps_core::ecosystem_conformance! {
+        mod gitlab_ci_ecosystem_conformance;
+        build: GitlabCiEcosystem::new(Arc::new(HttpCache::new()));
+        ty: GitlabCiEcosystem;
+        id: "gitlab-ci";
+        display_name: "GitLab CI/CD";
+        manifest_filenames: &[".gitlab-ci.yml"];
     }
 
     #[test]
     fn test_manifest_routing() {
         let cache = Arc::new(HttpCache::new());
         let eco = GitlabCiEcosystem::new(cache);
-        assert_eq!(eco.manifest_filenames(), &[".gitlab-ci.yml"]);
         assert_eq!(
             eco.manifest_directory_patterns(),
             &[(".gitlab/ci", ".yml"), (".gitlab/ci", ".yaml")]
         );
         assert!(eco.manifest_patterns().is_empty());
         assert!(eco.manifest_extensions().is_empty());
-    }
-
-    #[test]
-    fn test_as_any() {
-        let cache = Arc::new(HttpCache::new());
-        let eco = GitlabCiEcosystem::new(cache);
-        assert!(eco.as_any().is::<GitlabCiEcosystem>());
     }
 
     #[tokio::test]
