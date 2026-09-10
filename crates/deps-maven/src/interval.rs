@@ -20,6 +20,7 @@ use crate::version::compare_versions_for_range;
 use std::cmp::Ordering;
 
 /// A single parsed bracket interval, e.g. `[1.0,2.0)` or `[1.0]`.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VersionRange {
     /// `[1.0]` — matches only that exact version.
@@ -58,6 +59,8 @@ pub enum VersionRange {
 /// `AllowReversed` adds Gradle's reversed-bracket exclusive notation on top:
 /// a leading `]` or trailing `[` is also accepted as an exclusive bound
 /// (`]1.2,1.5]`, `[1.1,2.0[`).
+// Exhaustive: 2-variant grammar selector (Standard/AllowReversed) fixed by `parse_interval`'s
+// call sites (issue #769).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BracketStyle {
     /// Maven's grammar: `[`/`]` inclusive, `(`/`)` exclusive only.

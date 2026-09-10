@@ -469,14 +469,7 @@ mod tests {
         let mut cached_versions = HashMap::new();
         cached_versions.insert("serde".into(), PackageVersions::latest_only("1.0.214"));
 
-        let config = EcosystemConfig {
-            loading_text: "⏳".to_string(),
-            show_loading_hints: true,
-            offline: false,
-            show_up_to_date_hints: true,
-            up_to_date_text: "✅".to_string(),
-            needs_update_text: "❌ {}".to_string(),
-        };
+        let config = EcosystemConfig::default();
 
         // Lock file has the latest version
         let mut resolved_versions = HashMap::new();
@@ -507,14 +500,7 @@ mod tests {
         let mut cached_versions = HashMap::new();
         cached_versions.insert("serde".into(), PackageVersions::latest_only("1.0.214"));
 
-        let config = EcosystemConfig {
-            loading_text: "⏳".to_string(),
-            show_loading_hints: true,
-            offline: false,
-            show_up_to_date_hints: true,
-            up_to_date_text: "✅".to_string(),
-            needs_update_text: "❌ {}".to_string(),
-        };
+        let config = EcosystemConfig::default();
 
         // Lock file has the latest version
         let mut resolved_versions = HashMap::new();
@@ -545,14 +531,7 @@ mod tests {
         let mut cached_versions = HashMap::new();
         cached_versions.insert("serde".into(), PackageVersions::latest_only("1.0.214"));
 
-        let config = EcosystemConfig {
-            loading_text: "⏳".to_string(),
-            show_loading_hints: true,
-            offline: false,
-            show_up_to_date_hints: true,
-            up_to_date_text: "✅".to_string(),
-            needs_update_text: "❌ {}".to_string(),
-        };
+        let config = EcosystemConfig::default();
 
         let resolved_versions = HashMap::new();
         let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
@@ -581,14 +560,7 @@ mod tests {
         let mut cached_versions = HashMap::new();
         cached_versions.insert("serde".into(), PackageVersions::latest_only("1.0.214"));
 
-        let config = EcosystemConfig {
-            loading_text: "⏳".to_string(),
-            show_loading_hints: true,
-            offline: false,
-            show_up_to_date_hints: false,
-            up_to_date_text: "✅".to_string(),
-            needs_update_text: "❌ {}".to_string(),
-        };
+        let config = EcosystemConfig::default().with_show_up_to_date_hints(false);
 
         // Lock file has the latest version - but show_up_to_date_hints is false
         let mut resolved_versions = HashMap::new();
@@ -618,14 +590,7 @@ mod tests {
         let mut cached_versions = HashMap::new();
         cached_versions.insert("serde".into(), PackageVersions::latest_only("1.0.214"));
 
-        let config = EcosystemConfig {
-            loading_text: "⏳".to_string(),
-            show_loading_hints: true,
-            offline: false,
-            show_up_to_date_hints: true,
-            up_to_date_text: "✅".to_string(),
-            needs_update_text: "❌ {}".to_string(),
-        };
+        let config = EcosystemConfig::default();
 
         let resolved_versions = HashMap::new();
         let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
@@ -653,14 +618,7 @@ mod tests {
         let mut cached_versions = HashMap::new();
         cached_versions.insert("serde".into(), PackageVersions::latest_only("1.0.214"));
 
-        let config = EcosystemConfig {
-            loading_text: "⏳".to_string(),
-            show_loading_hints: true,
-            offline: false,
-            show_up_to_date_hints: true,
-            up_to_date_text: "✅".to_string(),
-            needs_update_text: "❌ {}".to_string(),
-        };
+        let config = EcosystemConfig::default();
 
         // Should not panic, should return update hint
         let resolved_versions = HashMap::new();
@@ -1023,14 +981,7 @@ mod tests {
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
 
-        let config = EcosystemConfig {
-            loading_text: "⏳".to_string(),
-            show_loading_hints: true,
-            offline: false,
-            show_up_to_date_hints: true,
-            up_to_date_text: "✅".to_string(),
-            needs_update_text: "❌ {}".to_string(),
-        };
+        let config = EcosystemConfig::default();
 
         let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
             &parse_result,

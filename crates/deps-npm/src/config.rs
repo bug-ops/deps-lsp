@@ -51,6 +51,7 @@ use deps_core::parser::DependencySource;
 
 /// Why a candidate `registry=`/`@scope:registry=` value failed [`NpmRegistryIndex::new`]'s
 /// validation, or why expansion of a `${VAR}` placeholder inside it failed (FR-007).
+#[non_exhaustive]
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum NpmRegistryIndexError {
     /// The value did not parse as a URL at all.
@@ -84,6 +85,10 @@ impl From<IndexUrlError> for NpmRegistryIndexError {
             IndexUrlError::NotHttps(scheme) => Self::NotHttps(scheme),
             IndexUrlError::UserInfoPresent => Self::UserInfoPresent,
             IndexUrlError::BlockedHost { class } => Self::BlockedHost { class },
+            // `IndexUrlError` is `#[non_exhaustive]` (issue #769): a variant added upstream
+            // and not yet mapped here still surfaces, carrying its own message, rather than
+            // failing to compile.
+            other => Self::InvalidUrl(other.to_string()),
         }
     }
 }
@@ -177,6 +182,10 @@ impl std::fmt::Display for NpmRegistryIndex {
 /// warning can name what the user actually wrote, never an expanded-but-rejected value that
 /// could leak an environment variable's contents into the log, and never a literal credential
 /// the user wrote directly in `.npmrc`.
+///
+/// Output-only: constructed internally by this module's own resolution logic, never by
+/// external code — no constructor is provided.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct InvalidEntry {
     /// The raw `.npmrc` value, unexpanded, with any literal userinfo/query string redacted.
@@ -428,6 +437,7 @@ impl NpmConfigCache {
 
 /// Owned by `NpmEcosystem`, shared across every document it parses — the npm analogue of
 /// `deps_cargo::parser::CargoParseContext`.
+#[non_exhaustive]
 #[derive(Debug, Clone, Default)]
 pub struct NpmParseContext {
     /// Gates every workspace-declared [`NpmRegistryIndex`] this parse constructs.
@@ -438,6 +448,41 @@ pub struct NpmParseContext {
     /// Memoizes each distinct `pnpm-workspace.yaml` file's parsed catalogs across every parse
     /// that reads it (spec 046, NFR-001).
     pub workspace_cache: Arc<crate::catalog::PnpmWorkspaceCache>,
+}
+
+impl NpmParseContext {
+    /// Constructs an `NpmParseContext` from its three required fields.
+    ///
+    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
+    /// this crate, so every other crate must go through this constructor instead.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::net_policy::RegistryAccessPolicy;
+    /// use deps_npm::catalog::PnpmWorkspaceCache;
+    /// use deps_npm::config::{NpmConfigCache, NpmParseContext};
+    /// use std::sync::Arc;
+    ///
+    /// let ctx = NpmParseContext::new(
+    ///     Arc::new(RegistryAccessPolicy::default()),
+    ///     Arc::new(NpmConfigCache::new()),
+    ///     Arc::new(PnpmWorkspaceCache::new()),
+    /// );
+    /// assert!(Arc::strong_count(&ctx.policy) >= 1);
+    /// ```
+    #[must_use]
+    pub const fn new(
+        policy: Arc<RegistryAccessPolicy>,
+        config_cache: Arc<NpmConfigCache>,
+        workspace_cache: Arc<crate::catalog::PnpmWorkspaceCache>,
+    ) -> Self {
+        Self {
+            policy,
+            config_cache,
+            workspace_cache,
+        }
+    }
 }
 
 /// Resolves `manifest_dir`'s `.npmrc` hierarchy (project tier, ancestor-walked, plus the

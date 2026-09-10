@@ -641,15 +641,11 @@ async fn fetch_and_classify_package(
                 .map(|lic| (name.clone(), lic.clone()));
 
             resolved.map(|(latest, _, published_at, _, _)| {
-                (
-                    name.clone(),
-                    PackageVersions {
-                        latest,
-                        available,
-                        yanked: yanked_list,
-                        published_at,
-                    },
-                )
+                let mut versions = PackageVersions::new(latest, available).with_yanked(yanked_list);
+                if let Some(published_at) = published_at {
+                    versions = versions.with_published_at(published_at);
+                }
+                (name.clone(), versions)
             })
         }
         Ok(Err(e)) => {

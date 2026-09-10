@@ -26,6 +26,7 @@ pub struct GoDependency {
 }
 
 /// Go module directive types.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GoDirective {
     /// Direct dependency in require block
@@ -59,6 +60,7 @@ pub struct GoVersion {
 }
 
 /// Package metadata from proxy.golang.org.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct GoMetadata {
     /// Module path
@@ -71,6 +73,63 @@ pub struct GoMetadata {
     pub repository: Option<String>,
     /// Documentation URL (pkg.go.dev)
     pub documentation: Option<String>,
+}
+
+impl GoMetadata {
+    /// Constructs a `GoMetadata` from its required fields, with [`Self::description`],
+    /// [`Self::repository`], and [`Self::documentation`] left `None` — chain the
+    /// corresponding `with_*` setters to attach them.
+    ///
+    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
+    /// this crate, so every other crate must go through this constructor instead.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_go::types::GoMetadata;
+    ///
+    /// let metadata = GoMetadata::new(
+    ///     deps_core::PackageName::new("github.com/gin-gonic/gin"),
+    ///     "v1.9.1".into(),
+    /// )
+    /// .with_repository("https://github.com/gin-gonic/gin");
+    ///
+    /// assert_eq!(metadata.module_path, "github.com/gin-gonic/gin");
+    /// ```
+    #[must_use]
+    pub const fn new(
+        module_path: deps_core::PackageName,
+        latest_version: deps_core::ConcreteVersion,
+    ) -> Self {
+        Self {
+            module_path,
+            latest_version,
+            description: None,
+            repository: None,
+            documentation: None,
+        }
+    }
+
+    /// Attaches the description. See [`Self::description`].
+    #[must_use]
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// Attaches the repository URL. See [`Self::repository`].
+    #[must_use]
+    pub fn with_repository(mut self, repository: impl Into<String>) -> Self {
+        self.repository = Some(repository.into());
+        self
+    }
+
+    /// Attaches the documentation URL. See [`Self::documentation`].
+    #[must_use]
+    pub fn with_documentation(mut self, documentation: impl Into<String>) -> Self {
+        self.documentation = Some(documentation.into());
+        self
+    }
 }
 
 // NOTE: Cannot use deps_core::impl_dependency! macro because we need to provide custom

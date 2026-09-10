@@ -19,6 +19,9 @@ pub const PIN_ALL_TO_SHA_COMMAND_ID: &str = "deps-lsp.pinAllToSha";
 /// Singular/plural noun for an ecosystem's bulk "Pin N {noun} to commit SHA" lens title,
 /// consulted by [`build_pin_all_to_sha_lens`] — see
 /// [`crate::Ecosystem::pin_all_to_sha_noun`].
+// Exhaustive: closed singular/plural pair — every ecosystem implementing
+// `pin_all_to_sha_noun` constructs this by literal, and a third field would need a new
+// concept entirely, not an extension of this one (issue #769).
 #[derive(Debug, Clone, Copy)]
 pub struct PinNoun {
     /// Singular form, e.g. `"action"`.

@@ -237,14 +237,7 @@ spring-boot = { module = "org.springframework.boot:spring-boot-starter", version
         "dangling version.ref must not produce a 'Newer version available' diagnostic, got: {diagnostics:?}"
     );
 
-    let config = EcosystemConfig {
-        show_up_to_date_hints: true,
-        up_to_date_text: "✅".to_string(),
-        needs_update_text: "❌ {}".to_string(),
-        loading_text: "⏳".to_string(),
-        show_loading_hints: true,
-        offline: false,
-    };
+    let config = EcosystemConfig::default();
 
     let hints = generate_inlay_hints(
         &parse_result,

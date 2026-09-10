@@ -120,6 +120,7 @@ impl deps_core::Version for NuGetVersion {
 }
 
 /// Package metadata from a NuGet search result.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct PackageInfo {
     /// Package name.
@@ -132,6 +133,60 @@ pub struct PackageInfo {
     pub documentation: Option<String>,
     /// Latest published version.
     pub latest_version: deps_core::ConcreteVersion,
+}
+
+impl PackageInfo {
+    /// Constructs a `PackageInfo` from its required fields, with [`Self::description`],
+    /// [`Self::repository`], and [`Self::documentation`] left `None` — chain the
+    /// corresponding `with_*` setters to attach them.
+    ///
+    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
+    /// this crate, so every other crate must go through this constructor instead.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_nuget::types::PackageInfo;
+    ///
+    /// let info = PackageInfo::new(deps_core::PackageName::new("Newtonsoft.Json"), "13.0.3".into())
+    ///     .with_description("Popular high-performance JSON framework for .NET");
+    ///
+    /// assert_eq!(info.name, "Newtonsoft.Json");
+    /// ```
+    #[must_use]
+    pub const fn new(
+        name: deps_core::PackageName,
+        latest_version: deps_core::ConcreteVersion,
+    ) -> Self {
+        Self {
+            name,
+            description: None,
+            repository: None,
+            documentation: None,
+            latest_version,
+        }
+    }
+
+    /// Attaches a short package description. See [`Self::description`].
+    #[must_use]
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// Attaches the source repository URL. See [`Self::repository`].
+    #[must_use]
+    pub fn with_repository(mut self, repository: impl Into<String>) -> Self {
+        self.repository = Some(repository.into());
+        self
+    }
+
+    /// Attaches the documentation URL. See [`Self::documentation`].
+    #[must_use]
+    pub fn with_documentation(mut self, documentation: impl Into<String>) -> Self {
+        self.documentation = Some(documentation.into());
+        self
+    }
 }
 
 deps_core::impl_metadata!(PackageInfo {

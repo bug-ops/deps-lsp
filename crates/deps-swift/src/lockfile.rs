@@ -117,15 +117,14 @@ fn parse_package_resolved(content: String) -> Result<ResolvedPackages> {
                         .strip_prefix(['v', 'V'])
                         .unwrap_or(&version)
                         .to_string();
-                    packages.insert(ResolvedPackage {
+                    packages.insert(ResolvedPackage::new(
                         name,
                         version,
-                        source: ResolvedSource::Git {
+                        ResolvedSource::Git {
                             url: pin.repository_url,
                             rev: pin.state.revision.unwrap_or_default(),
                         },
-                        dependencies: vec![],
-                    });
+                    ));
                 }
             }
         }
@@ -156,12 +155,7 @@ fn parse_package_resolved(content: String) -> Result<ResolvedPackages> {
                             rev: pin.state.revision.unwrap_or_default(),
                         }
                     };
-                    packages.insert(ResolvedPackage {
-                        name,
-                        version,
-                        source,
-                        dependencies: vec![],
-                    });
+                    packages.insert(ResolvedPackage::new(name, version, source));
                 }
             }
         }

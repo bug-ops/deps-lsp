@@ -190,12 +190,9 @@ fn parse_package_lock_json_content(content: String) -> Result<ResolvedPackages> 
         // Extract dependency names
         let dependencies: Vec<String> = entry.dependencies.keys().cloned().collect();
 
-        packages.insert(ResolvedPackage {
-            name,
-            version: version.clone(),
-            source,
-            dependencies,
-        });
+        packages.insert(
+            ResolvedPackage::new(name, version.clone(), source).with_dependencies(dependencies),
+        );
     }
 
     Ok(packages)
@@ -335,15 +332,14 @@ fn parse_pnpm_lock_yaml(content: &str) -> Result<ResolvedPackages> {
                     continue;
                 }
 
-                packages.insert(ResolvedPackage {
-                    name: name.to_string(),
-                    version: version.to_string(),
-                    source: ResolvedSource::Registry {
+                packages.insert(ResolvedPackage::new(
+                    name.to_string(),
+                    version.to_string(),
+                    ResolvedSource::Registry {
                         url: String::new(),
                         checksum: String::new(),
                     },
-                    dependencies: Vec::new(),
-                });
+                ));
             }
         }
     }

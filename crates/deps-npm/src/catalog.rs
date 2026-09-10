@@ -54,6 +54,7 @@ use crate::types::NpmDependency;
 const DEFAULT_CATALOG_KEY: &str = "default";
 
 /// Why a `pnpm-workspace.yaml`, once found, cannot resolve any catalog specifier at all.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigDefect {
     /// The file could not be parsed as YAML, exceeded a nesting/expansion guard, or a
@@ -288,6 +289,7 @@ impl<'a> CatalogSpecifier<'a> {
 ///
 /// Every variant but [`Self::Resolved`] means [`deps_core::Dependency::version_requirement`]
 /// is `None` for that dependency (see the module's totality invariant).
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CatalogOutcome {
     /// Resolved to the given semver range, fed into the ordinary registry/hover/diagnostic
@@ -327,6 +329,10 @@ pub enum CatalogOutcome {
 /// Where a catalog-referencing dependency's resolution came from, and what happened.
 ///
 /// Stored on [`NpmDependency::catalog`], `None` for every non-catalog dependency.
+///
+/// Output-only: constructed internally by this module's own catalog resolution, never by
+/// external code — no constructor is provided.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatalogOrigin {
     /// The raw `catalog:...` text as written in the manifest (e.g. `"catalog:react17"`).

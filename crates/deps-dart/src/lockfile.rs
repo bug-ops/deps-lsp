@@ -131,12 +131,7 @@ pub fn parse_pubspec_lock(content: &str) -> Result<ResolvedPackages> {
             // Remove surrounding quotes from version if present
             let version = version.trim_matches('"').to_string();
 
-            packages.insert(ResolvedPackage {
-                name: name.to_string(),
-                version,
-                source,
-                dependencies: vec![],
-            });
+            packages.insert(ResolvedPackage::new(name.to_string(), version, source));
         }
     }
 

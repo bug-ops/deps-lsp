@@ -24,6 +24,7 @@ pub struct MavenDependency {
 }
 
 /// Maven dependency scope (the `<scope>` element).
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum MavenScope {
     /// Default scope: available in all classpaths, propagated to dependents.
@@ -71,7 +72,8 @@ pub struct MavenVersion {
 }
 
 impl MavenVersion {
-    /// Constructs a `MavenVersion` from its two fields.
+    /// Constructs a `MavenVersion` from its required field, with [`Self::published_at`]
+    /// left `None` — chain [`Self::with_published_at`] to attach it.
     ///
     /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
     /// this crate, so every other crate — including `deps-gradle`, which reuses this type
@@ -80,30 +82,33 @@ impl MavenVersion {
     /// # Arguments
     ///
     /// * `version` - The parsed version number
-    /// * `published_at` - When this version was published, if the `repo1.maven.org`
-    ///   directory listing carried a date
     ///
     /// # Examples
     ///
     /// ```
     /// use deps_maven::types::MavenVersion;
     ///
-    /// let version = MavenVersion::new("3.2.0".into(), None);
+    /// let version = MavenVersion::new("3.2.0".into());
     /// assert_eq!(version.version.as_str(), "3.2.0");
     /// ```
     #[must_use]
-    pub fn new(
-        version: deps_core::ConcreteVersion,
-        published_at: Option<deps_core::PublishTime>,
-    ) -> Self {
+    pub const fn new(version: deps_core::ConcreteVersion) -> Self {
         Self {
             version,
-            published_at,
+            published_at: None,
         }
+    }
+
+    /// Attaches the publish timestamp. See [`Self::published_at`].
+    #[must_use]
+    pub const fn with_published_at(mut self, published_at: deps_core::PublishTime) -> Self {
+        self.published_at = Some(published_at);
+        self
     }
 }
 
 /// Artifact metadata as returned by Maven Central's search API.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ArtifactInfo {
     /// Maven `groupId`.
@@ -118,6 +123,62 @@ pub struct ArtifactInfo {
     pub latest_version: deps_core::ConcreteVersion,
     /// Source repository URL, if known.
     pub repository: Option<String>,
+}
+
+impl ArtifactInfo {
+    /// Constructs an `ArtifactInfo` from its required fields, with [`Self::description`] and
+    /// [`Self::repository`] left `None` — chain [`Self::with_description`] and/or
+    /// [`Self::with_repository`] to attach them.
+    ///
+    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
+    /// this crate, so every other crate must go through this constructor instead.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_maven::types::ArtifactInfo;
+    ///
+    /// let info = ArtifactInfo::new(
+    ///     "com.google.guava".into(),
+    ///     "guava".into(),
+    ///     deps_core::PackageName::new("com.google.guava:guava"),
+    ///     "33.0.0-jre".into(),
+    /// )
+    /// .with_description("Google core libraries for Java")
+    /// .with_repository("https://github.com/google/guava");
+    ///
+    /// assert_eq!(info.group_id, "com.google.guava");
+    /// ```
+    #[must_use]
+    pub const fn new(
+        group_id: String,
+        artifact_id: String,
+        name: deps_core::PackageName,
+        latest_version: deps_core::ConcreteVersion,
+    ) -> Self {
+        Self {
+            group_id,
+            artifact_id,
+            name,
+            description: None,
+            latest_version,
+            repository: None,
+        }
+    }
+
+    /// Attaches a short artifact description. See [`Self::description`].
+    #[must_use]
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// Attaches the source repository URL. See [`Self::repository`].
+    #[must_use]
+    pub fn with_repository(mut self, repository: impl Into<String>) -> Self {
+        self.repository = Some(repository.into());
+        self
+    }
 }
 
 // deps-core trait implementations

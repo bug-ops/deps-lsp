@@ -133,7 +133,7 @@ pub enum NpmDependencySection {
 /// ```
 /// use deps_npm::types::NpmVersion;
 ///
-/// let version = NpmVersion::new("4.18.2".into(), false, None, None);
+/// let version = NpmVersion::new("4.18.2".into(), false);
 ///
 /// assert!(!version.deprecated);
 /// ```
@@ -160,7 +160,9 @@ pub struct NpmVersion {
 }
 
 impl NpmVersion {
-    /// Constructs an `NpmVersion` from its four fields.
+    /// Constructs an `NpmVersion` from its required fields, with [`Self::deprecation`] and
+    /// [`Self::published_at`] left `None` — chain [`Self::with_deprecation`] and/or
+    /// [`Self::with_published_at`] to attach them.
     ///
     /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
     /// this crate, so every other crate must go through this constructor instead.
@@ -169,23 +171,37 @@ impl NpmVersion {
     ///
     /// * `version` - The parsed version number
     /// * `deprecated` - Whether the packument marks this version as deprecated
-    /// * `deprecation` - Package-level deprecation payload, if `deprecated` carries a
-    ///   non-empty free-text reason
-    /// * `published_at` - Publish timestamp, populated only when requested with freshness
-    ///   enabled
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_npm::types::NpmVersion;
+    ///
+    /// let version = NpmVersion::new("4.18.2".into(), false);
+    /// assert!(!version.deprecated);
+    /// ```
     #[must_use]
-    pub fn new(
-        version: deps_core::ConcreteVersion,
-        deprecated: bool,
-        deprecation: Option<deps_core::Deprecation>,
-        published_at: Option<deps_core::PublishTime>,
-    ) -> Self {
+    pub const fn new(version: deps_core::ConcreteVersion, deprecated: bool) -> Self {
         Self {
             version,
             deprecated,
-            deprecation,
-            published_at,
+            deprecation: None,
+            published_at: None,
         }
+    }
+
+    /// Attaches the package-level deprecation payload. See [`Self::deprecation`].
+    #[must_use]
+    pub fn with_deprecation(mut self, deprecation: deps_core::Deprecation) -> Self {
+        self.deprecation = Some(deprecation);
+        self
+    }
+
+    /// Attaches the publish timestamp. See [`Self::published_at`].
+    #[must_use]
+    pub const fn with_published_at(mut self, published_at: deps_core::PublishTime) -> Self {
+        self.published_at = Some(published_at);
+        self
     }
 }
 
@@ -214,16 +230,14 @@ deps_core::impl_version!(NpmVersion {
 /// ```
 /// use deps_npm::types::NpmPackage;
 ///
-/// let pkg = NpmPackage {
-///     name: deps_core::PackageName::new("express"),
-///     description: Some("Fast, unopinionated, minimalist web framework".into()),
-///     homepage: Some("http://expressjs.com/".into()),
-///     repository: Some("expressjs/express".into()),
-///     latest_version: "4.18.2".into(),
-/// };
+/// let pkg = NpmPackage::new(deps_core::PackageName::new("express"), "4.18.2".into())
+///     .with_description("Fast, unopinionated, minimalist web framework")
+///     .with_homepage("http://expressjs.com/")
+///     .with_repository("expressjs/express");
 ///
 /// assert_eq!(pkg.name, "express");
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct NpmPackage {
     /// Package name.
@@ -236,6 +250,58 @@ pub struct NpmPackage {
     pub repository: Option<String>,
     /// Latest published version.
     pub latest_version: deps_core::ConcreteVersion,
+}
+
+impl NpmPackage {
+    /// Constructs an `NpmPackage` from its required fields, with [`Self::description`],
+    /// [`Self::homepage`], and [`Self::repository`] left `None` — chain the corresponding
+    /// `with_*` setters to attach them.
+    ///
+    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
+    /// this crate, so every other crate must go through this constructor instead.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_npm::types::NpmPackage;
+    ///
+    /// let pkg = NpmPackage::new(deps_core::PackageName::new("express"), "4.18.2".into());
+    /// assert_eq!(pkg.name, "express");
+    /// ```
+    #[must_use]
+    pub const fn new(
+        name: deps_core::PackageName,
+        latest_version: deps_core::ConcreteVersion,
+    ) -> Self {
+        Self {
+            name,
+            description: None,
+            homepage: None,
+            repository: None,
+            latest_version,
+        }
+    }
+
+    /// Attaches a short package description. See [`Self::description`].
+    #[must_use]
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// Attaches the homepage URL. See [`Self::homepage`].
+    #[must_use]
+    pub fn with_homepage(mut self, homepage: impl Into<String>) -> Self {
+        self.homepage = Some(homepage.into());
+        self
+    }
+
+    /// Attaches the source repository URL. See [`Self::repository`].
+    #[must_use]
+    pub fn with_repository(mut self, repository: impl Into<String>) -> Self {
+        self.repository = Some(repository.into());
+        self
+    }
 }
 
 // Use macro to implement PackageMetadata and Metadata traits

@@ -115,6 +115,7 @@ pub fn parse_cargo_toml(content: &str, doc_uri: &Uri) -> Result<CargoParseResult
 /// together so [`crate::ecosystem::CargoEcosystem::with_context`] has one thing to hold and
 /// pass through the sync parser (plan-1b §1.6), shared across every document this ecosystem
 /// parses.
+#[non_exhaustive]
 #[derive(Clone)]
 pub struct CargoParseContext {
     /// Gates every `IndexTrust::WorkspaceDeclared` [`RegistryIndex`] this parse constructs.
@@ -126,9 +127,42 @@ pub struct CargoParseContext {
 
 impl Default for CargoParseContext {
     fn default() -> Self {
+        Self::new(
+            Arc::new(RegistryAccessPolicy::default()),
+            Arc::new(ConfigFileCache::new()),
+        )
+    }
+}
+
+impl CargoParseContext {
+    /// Constructs a `CargoParseContext` from its two required fields.
+    ///
+    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
+    /// this crate, so every other crate (including integration tests) must go through this
+    /// constructor instead.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_cargo::config::ConfigFileCache;
+    /// use deps_cargo::parser::CargoParseContext;
+    /// use deps_core::net_policy::RegistryAccessPolicy;
+    /// use std::sync::Arc;
+    ///
+    /// let ctx = CargoParseContext::new(
+    ///     Arc::new(RegistryAccessPolicy::default()),
+    ///     Arc::new(ConfigFileCache::new()),
+    /// );
+    /// assert!(Arc::strong_count(&ctx.policy) >= 1);
+    /// ```
+    #[must_use]
+    pub const fn new(
+        policy: Arc<RegistryAccessPolicy>,
+        config_cache: Arc<ConfigFileCache>,
+    ) -> Self {
         Self {
-            policy: Arc::new(RegistryAccessPolicy::default()),
-            config_cache: Arc::new(ConfigFileCache::new()),
+            policy,
+            config_cache,
         }
     }
 }

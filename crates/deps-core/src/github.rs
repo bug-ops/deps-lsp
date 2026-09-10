@@ -329,6 +329,10 @@ impl GithubTagsClient {
 }
 
 /// GitHub tags API response item.
+///
+/// Output-only: constructed by this crate's own `serde` deserialization, never by external
+/// code — no constructor is provided.
+#[non_exhaustive]
 #[derive(Debug, Default, Deserialize)]
 pub struct GithubTag {
     /// The tag name (e.g. `"v1.2.3"`).
@@ -341,6 +345,10 @@ pub struct GithubTag {
 }
 
 /// The `commit` object nested in a [`GithubTag`].
+///
+/// Output-only: constructed by this crate's own `serde` deserialization, never by external
+/// code — no constructor is provided.
+#[non_exhaustive]
 #[derive(Debug, Default, Deserialize)]
 pub struct GithubTagCommit {
     /// The full commit SHA the tag points at.

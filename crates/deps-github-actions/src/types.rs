@@ -8,6 +8,7 @@ use tower_lsp_server::ls_types::{Range, Uri};
 /// `None` on [`GithubActionsDependency::pin`] (rather than a fourth variant here) covers
 /// every non-resolvable form (`./local`, `docker://…`, a reusable-workflow call, or a bare
 /// `uses: owner/repo` with no `@` at all) — those have no ref to classify.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PinStyle {
     /// A tag ref, e.g. `@v4` or `@v4.2.0`.

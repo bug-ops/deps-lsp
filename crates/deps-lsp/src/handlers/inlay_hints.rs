@@ -83,14 +83,12 @@ pub async fn handle_inlay_hints(
 
     tracing::Span::current().record("ecosystem", ecosystem.id());
 
-    let ecosystem_config = EcosystemConfig {
-        show_up_to_date_hints: true,
-        up_to_date_text: config.up_to_date_text.clone(),
-        needs_update_text: config.needs_update_text.clone(),
-        loading_text: loading_config.loading_text,
-        show_loading_hints: loading_config.enabled && loading_config.fallback_to_hints,
-        offline,
-    };
+    let ecosystem_config = EcosystemConfig::default()
+        .with_up_to_date_text(config.up_to_date_text.clone())
+        .with_needs_update_text(config.needs_update_text.clone())
+        .with_loading_text(loading_config.loading_text)
+        .with_show_loading_hints(loading_config.enabled && loading_config.fallback_to_hints)
+        .with_offline(offline);
 
     ecosystem
         .generate_inlay_hints(

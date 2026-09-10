@@ -488,12 +488,10 @@ serde = "1.0.0"
             // and fire the mutually-exclusive WARNING instead of this outdated HINT/ERROR.
             cached.insert(
                 "serde".into(),
-                deps_core::PackageVersions {
-                    latest: "2.0.0".into(),
-                    available: std::sync::Arc::from(vec!["2.0.0".into(), "1.0.0".into()]),
-                    yanked: std::sync::Arc::from(Vec::new()),
-                    published_at: None,
-                },
+                deps_core::PackageVersions::new(
+                    "2.0.0".into(),
+                    std::sync::Arc::from(vec!["2.0.0".into(), "1.0.0".into()]),
+                ),
             );
             doc_state.update_cached_versions(cached);
             state.update_document(uri.clone(), doc_state);
@@ -529,12 +527,10 @@ serde = "1.0.0"
             // just "2.0.0".
             cached.insert(
                 "serde".into(),
-                deps_core::PackageVersions {
-                    latest: "2.0.0".into(),
-                    available: std::sync::Arc::from(vec!["2.0.0".into(), "1.0.0".into()]),
-                    yanked: std::sync::Arc::from(Vec::new()),
-                    published_at: None,
-                },
+                deps_core::PackageVersions::new(
+                    "2.0.0".into(),
+                    std::sync::Arc::from(vec!["2.0.0".into(), "1.0.0".into()]),
+                ),
             );
             doc_state.update_cached_versions(cached);
             state.update_document(uri.clone(), doc_state);
@@ -567,12 +563,10 @@ serde = "1.0.0"
             let mut cached = HashMap::new();
             cached.insert(
                 "serde".into(),
-                deps_core::PackageVersions {
-                    latest: "1.0.214".into(),
-                    available: std::sync::Arc::from(vec!["1.0.214".into(), "1.0.213".into()]),
-                    yanked: std::sync::Arc::from(Vec::new()),
-                    published_at: None,
-                },
+                deps_core::PackageVersions::new(
+                    "1.0.214".into(),
+                    std::sync::Arc::from(vec!["1.0.214".into(), "1.0.213".into()]),
+                ),
             );
             doc_state.update_cached_versions(cached);
             state.update_document(uri.clone(), doc_state);
@@ -693,12 +687,10 @@ serde = "1.0.0"
             let mut cached = std::collections::HashMap::new();
             cached.insert(
                 "serde".into(),
-                deps_core::PackageVersions {
-                    latest: "2.0.0".into(),
-                    available: std::sync::Arc::from(vec!["2.0.0".into(), "1.0.0".into()]),
-                    yanked: std::sync::Arc::from(Vec::new()),
-                    published_at: None,
-                },
+                deps_core::PackageVersions::new(
+                    "2.0.0".into(),
+                    std::sync::Arc::from(vec!["2.0.0".into(), "1.0.0".into()]),
+                ),
             );
             doc_state.update_cached_versions(cached);
             doc_state.set_loading();
@@ -849,12 +841,10 @@ serde = "1.0.0"
             let mut cached = std::collections::HashMap::new();
             cached.insert(
                 "serde".into(),
-                deps_core::PackageVersions {
-                    latest: "1.0.214".into(),
-                    available: std::sync::Arc::from(vec!["1.0.214".into(), "1.0.213".into()]),
-                    yanked: std::sync::Arc::from(Vec::new()),
-                    published_at: None,
-                },
+                deps_core::PackageVersions::new(
+                    "1.0.214".into(),
+                    std::sync::Arc::from(vec!["1.0.214".into(), "1.0.213".into()]),
+                ),
             );
             doc_state.update_cached_versions(cached);
             state.update_document(uri.clone(), doc_state);
@@ -933,25 +923,21 @@ serde = "1.0.0"
             let mut cached = std::collections::HashMap::new();
             cached.insert(
                 "serde".into(),
-                deps_core::PackageVersions {
-                    latest: "1.0.214".into(),
-                    available: std::sync::Arc::from(vec!["1.0.214".into()]),
-                    yanked: std::sync::Arc::from(Vec::new()),
-                    published_at: None,
-                },
+                deps_core::PackageVersions::new(
+                    "1.0.214".into(),
+                    std::sync::Arc::from(vec!["1.0.214".into()]),
+                ),
             );
             cached.insert(
                 "tokio".into(),
-                deps_core::PackageVersions {
-                    latest: "2.0.0".into(),
+                deps_core::PackageVersions::new(
+                    "2.0.0".into(),
                     // Includes an older version satisfying "1.0" (^1.0) so this dependency
                     // is genuinely outdated-but-satisfiable, not unsatisfiable — an
                     // available list containing only `latest` would make every requirement
                     // that latest doesn't itself satisfy look unsatisfiable.
-                    available: std::sync::Arc::from(vec!["2.0.0".into(), "1.5.0".into()]),
-                    yanked: std::sync::Arc::from(Vec::new()),
-                    published_at: None,
-                },
+                    std::sync::Arc::from(vec!["2.0.0".into(), "1.5.0".into()]),
+                ),
             );
             doc_state.update_cached_versions(cached);
             state.update_document(uri.clone(), doc_state);
@@ -996,15 +982,14 @@ serde = "1.0.0"
             let mut cached = std::collections::HashMap::new();
             cached.insert(
                 "serde".into(),
-                deps_core::PackageVersions {
-                    latest: "1.0.214".into(),
-                    available: std::sync::Arc::from(vec!["1.0.214".into(), "1.0.213".into()]),
-                    yanked: std::sync::Arc::from(vec![(
-                        "1.0.213".into(),
-                        deps_core::RemovalStatus::Yanked,
-                    )]),
-                    published_at: None,
-                },
+                deps_core::PackageVersions::new(
+                    "1.0.214".into(),
+                    std::sync::Arc::from(vec!["1.0.214".into(), "1.0.213".into()]),
+                )
+                .with_yanked(std::sync::Arc::from(vec![(
+                    "1.0.213".into(),
+                    deps_core::RemovalStatus::Yanked,
+                )])),
             );
             doc_state.update_cached_versions(cached);
             state.update_document(uri.clone(), doc_state);
@@ -1086,16 +1071,10 @@ serde = "1.0.0"
             let mut cached = std::collections::HashMap::new();
             cached.insert(
                 "left-pad".into(),
-                deps_core::PackageVersions {
-                    latest: "1.0.2".into(),
-                    available: std::sync::Arc::from(vec![
-                        "1.0.2".into(),
-                        "1.0.1".into(),
-                        "1.0.0".into(),
-                    ]),
-                    yanked: std::sync::Arc::from(Vec::new()),
-                    published_at: None,
-                },
+                deps_core::PackageVersions::new(
+                    "1.0.2".into(),
+                    std::sync::Arc::from(vec!["1.0.2".into(), "1.0.1".into(), "1.0.0".into()]),
+                ),
             );
             doc_state.update_cached_versions(cached);
 
@@ -1160,17 +1139,16 @@ serde = "1.0.0"
             let mut cached = std::collections::HashMap::new();
             cached.insert(
                 "old-pkg".into(),
-                deps_core::PackageVersions {
-                    // The pin is satisfiable only by a flagged version — pre-#436, this
-                    // exact shape fired the #247 "yanked" diagnostic.
-                    latest: "1.0.1".into(),
-                    available: std::sync::Arc::from(vec!["1.0.1".into()]),
-                    yanked: std::sync::Arc::from(vec![(
-                        "1.0.1".into(),
-                        deps_core::RemovalStatus::AdvisoryDeprecated,
-                    )]),
-                    published_at: None,
-                },
+                // The pin is satisfiable only by a flagged version — pre-#436, this
+                // exact shape fired the #247 "yanked" diagnostic.
+                deps_core::PackageVersions::new(
+                    "1.0.1".into(),
+                    std::sync::Arc::from(vec!["1.0.1".into()]),
+                )
+                .with_yanked(std::sync::Arc::from(vec![(
+                    "1.0.1".into(),
+                    deps_core::RemovalStatus::AdvisoryDeprecated,
+                )])),
             );
             doc_state.update_cached_versions(cached);
             // No `resolved_versions`/`yanked_versions` — the #263 in-use-version path has
@@ -1222,17 +1200,16 @@ serde = "1.0.0"
             let mut cached = std::collections::HashMap::new();
             cached.insert(
                 "npm:lodash".into(),
-                deps_core::PackageVersions {
-                    // The pin is satisfiable only by a flagged version — for `package.json`
-                    // this exact shape used to fire the #247 "yanked" diagnostic pre-#436.
-                    latest: "4.17.20".into(),
-                    available: std::sync::Arc::from(vec!["4.17.20".into()]),
-                    yanked: std::sync::Arc::from(vec![(
-                        "4.17.20".into(),
-                        deps_core::RemovalStatus::AdvisoryDeprecated,
-                    )]),
-                    published_at: None,
-                },
+                // The pin is satisfiable only by a flagged version — for `package.json`
+                // this exact shape used to fire the #247 "yanked" diagnostic pre-#436.
+                deps_core::PackageVersions::new(
+                    "4.17.20".into(),
+                    std::sync::Arc::from(vec!["4.17.20".into()]),
+                )
+                .with_yanked(std::sync::Arc::from(vec![(
+                    "4.17.20".into(),
+                    deps_core::RemovalStatus::AdvisoryDeprecated,
+                )])),
             );
             doc_state.update_cached_versions(cached);
             // No `resolved_versions`/`yanked_versions` — isolates this assertion to the #247
@@ -1273,15 +1250,14 @@ serde = "1.0.0"
             let mut cached = std::collections::HashMap::new();
             cached.insert(
                 "jsr:@std/fs".into(),
-                deps_core::PackageVersions {
-                    latest: "1.0.1".into(),
-                    available: std::sync::Arc::from(vec!["1.0.1".into(), "1.0.0".into()]),
-                    yanked: std::sync::Arc::from(vec![(
-                        "1.0.0".into(),
-                        deps_core::RemovalStatus::Yanked,
-                    )]),
-                    published_at: None,
-                },
+                deps_core::PackageVersions::new(
+                    "1.0.1".into(),
+                    std::sync::Arc::from(vec!["1.0.1".into(), "1.0.0".into()]),
+                )
+                .with_yanked(std::sync::Arc::from(vec![(
+                    "1.0.0".into(),
+                    deps_core::RemovalStatus::Yanked,
+                )])),
             );
             doc_state.update_cached_versions(cached);
             state.update_document(uri.clone(), doc_state);
@@ -1330,17 +1306,16 @@ serde = "1.0.0"
             let mut cached = std::collections::HashMap::new();
             cached.insert(
                 "jsr:@std/fs".into(),
-                deps_core::PackageVersions {
-                    // Every version matching "^1.0.0" is yanked — the concrete #454 bug
-                    // scenario, which previously produced zero diagnostic signal.
-                    latest: "1.0.1".into(),
-                    available: std::sync::Arc::from(vec!["1.0.1".into(), "1.0.0".into()]),
-                    yanked: std::sync::Arc::from(vec![
-                        ("1.0.1".into(), deps_core::RemovalStatus::Yanked),
-                        ("1.0.0".into(), deps_core::RemovalStatus::Yanked),
-                    ]),
-                    published_at: None,
-                },
+                // Every version matching "^1.0.0" is yanked — the concrete #454 bug
+                // scenario, which previously produced zero diagnostic signal.
+                deps_core::PackageVersions::new(
+                    "1.0.1".into(),
+                    std::sync::Arc::from(vec!["1.0.1".into(), "1.0.0".into()]),
+                )
+                .with_yanked(std::sync::Arc::from(vec![
+                    ("1.0.1".into(), deps_core::RemovalStatus::Yanked),
+                    ("1.0.0".into(), deps_core::RemovalStatus::Yanked),
+                ])),
             );
             doc_state.update_cached_versions(cached);
             // No `resolved_versions`/`yanked_versions` — isolates this assertion to the #247

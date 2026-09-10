@@ -303,10 +303,10 @@ impl Ecosystem for PypiEcosystem {
                 // (possibly cold-start-empty) list — so this is the one context that
                 // reports `is_incomplete: true`, regardless of whether it currently
                 // has any items (#427).
-                CompletionContext::PackageName { prefix, range } => Completions {
-                    items: self.complete_package_names(&prefix, range).await,
-                    is_incomplete: true,
-                },
+                CompletionContext::PackageName { prefix, range } => {
+                    Completions::new(self.complete_package_names(&prefix, range).await)
+                        .with_incomplete(true)
+                }
                 CompletionContext::Version { prefix, .. } => self
                     .complete_versions(parse_result, position, &prefix, freshness)
                     .await

@@ -19,6 +19,14 @@
 //! - **Traits**: `Registry`, `Version`, `Metadata`, `Ecosystem`, `ParseResult`
 //! - **HTTP Cache**: Shared caching layer with ETag/Last-Modified validation
 //! - **Error Types**: Unified error handling across all ecosystems
+//!
+//! # API stability (issue #769)
+//!
+//! Most public structs and enums here are `#[non_exhaustive]` so a new field or variant
+//! never breaks a downstream ecosystem crate's exhaustive match or struct literal; a type
+//! with no `pub` fields is deliberately left exhaustive instead, since `#[non_exhaustive]`
+//! would be a semantic no-op for it — an external crate can't literal-construct or
+//! destructure it either way.
 
 // #673: re-enable the three cast-safety pedantic lints the workspace allows by default
 // (`Cargo.toml`'s `[workspace.lints.clippy]`), specifically for this crate — deps-core

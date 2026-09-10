@@ -75,6 +75,11 @@ impl RateLimitGate {
 /// can textually collide with an unrelated `project:` include's own name, and a
 /// `PackageName`-only key would let the two share one entry — resolving a quickfix's SHA
 /// from the wrong repository.
+///
+/// No constructor beyond [`Default`] is provided: a caller builds one via
+/// `TagIndex::default()` and populates it by mutating [`Self::tag_to_sha`]/
+/// [`Self::sha_to_tag`] directly, which `#[non_exhaustive]` does not restrict.
+#[non_exhaustive]
 #[derive(Debug, Default)]
 pub struct TagIndex {
     /// Maps a tag/release name to its resolved commit SHA.

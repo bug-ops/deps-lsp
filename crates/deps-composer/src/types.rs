@@ -71,14 +71,7 @@ pub enum ComposerSection {
 /// ```
 /// use deps_composer::types::ComposerVersion;
 ///
-/// let version = ComposerVersion::new(
-///     "6.0.0".into(),
-///     "6.0.0.0".into(),
-///     false,
-///     None,
-///     None,
-///     vec![],
-/// );
+/// let version = ComposerVersion::new("6.0.0".into(), "6.0.0.0".into(), false);
 ///
 /// assert!(!version.abandoned);
 /// ```
@@ -113,7 +106,10 @@ pub struct ComposerVersion {
 }
 
 impl ComposerVersion {
-    /// Constructs a `ComposerVersion` from its six fields.
+    /// Constructs a `ComposerVersion` from its required fields, with [`Self::deprecation`],
+    /// [`Self::published_at`], and [`Self::license`] left empty/`None` — chain
+    /// [`Self::with_deprecation`], [`Self::with_published_at`], and/or [`Self::with_license`]
+    /// to attach them.
     ///
     /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
     /// this crate, so every other crate must go through this constructor instead.
@@ -124,26 +120,50 @@ impl ComposerVersion {
     /// * `version_normalized` - Packagist's normalized 4-part version string (e.g.
     ///   `"6.0.0.0"`)
     /// * `abandoned` - Whether Packagist marks this package/version as abandoned
-    /// * `deprecation` - Package-level deprecation payload derived from `abandoned`, if any
-    /// * `published_at` - Publish timestamp from the p2 entry's own `time` field
-    /// * `license` - SPDX license identifier(s) from the p2 entry's `license` field
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_composer::types::ComposerVersion;
+    ///
+    /// let version = ComposerVersion::new("6.0.0".into(), "6.0.0.0".into(), false);
+    /// assert!(!version.abandoned);
+    /// ```
     #[must_use]
-    pub fn new(
+    pub const fn new(
         version: deps_core::ConcreteVersion,
         version_normalized: String,
         abandoned: bool,
-        deprecation: Option<deps_core::Deprecation>,
-        published_at: Option<deps_core::PublishTime>,
-        license: Vec<String>,
     ) -> Self {
         Self {
             version,
             version_normalized,
             abandoned,
-            deprecation,
-            published_at,
-            license,
+            deprecation: None,
+            published_at: None,
+            license: Vec::new(),
         }
+    }
+
+    /// Attaches the package-level deprecation payload. See [`Self::deprecation`].
+    #[must_use]
+    pub fn with_deprecation(mut self, deprecation: deps_core::Deprecation) -> Self {
+        self.deprecation = Some(deprecation);
+        self
+    }
+
+    /// Attaches the publish timestamp. See [`Self::published_at`].
+    #[must_use]
+    pub const fn with_published_at(mut self, published_at: deps_core::PublishTime) -> Self {
+        self.published_at = Some(published_at);
+        self
+    }
+
+    /// Attaches the SPDX license identifier(s). See [`Self::license`].
+    #[must_use]
+    pub fn with_license(mut self, license: Vec<String>) -> Self {
+        self.license = license;
+        self
     }
 }
 
@@ -288,16 +308,14 @@ deps_core::impl_version!(ComposerVersion {
 /// ```
 /// use deps_composer::types::ComposerPackage;
 ///
-/// let pkg = ComposerPackage {
-///     name: deps_core::PackageName::new("symfony/console"),
-///     description: Some("Symfony Console Component".into()),
-///     repository: Some("https://github.com/symfony/console".into()),
-///     homepage: Some("https://packagist.org/packages/symfony/console".into()),
-///     latest_version: "6.0.0".into(),
-/// };
+/// let pkg = ComposerPackage::new(deps_core::PackageName::new("symfony/console"), "6.0.0".into())
+///     .with_description("Symfony Console Component")
+///     .with_repository("https://github.com/symfony/console")
+///     .with_homepage("https://packagist.org/packages/symfony/console");
 ///
 /// assert_eq!(pkg.name, "symfony/console");
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ComposerPackage {
     /// Package name (`vendor/package`).
@@ -310,6 +328,61 @@ pub struct ComposerPackage {
     pub homepage: Option<String>,
     /// Latest published version.
     pub latest_version: deps_core::ConcreteVersion,
+}
+
+impl ComposerPackage {
+    /// Constructs a `ComposerPackage` from its required fields, with [`Self::description`],
+    /// [`Self::repository`], and [`Self::homepage`] left `None` — chain the corresponding
+    /// `with_*` setters to attach them.
+    ///
+    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
+    /// this crate, so every other crate must go through this constructor instead.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_composer::types::ComposerPackage;
+    ///
+    /// let pkg = ComposerPackage::new(
+    ///     deps_core::PackageName::new("symfony/console"),
+    ///     "6.0.0".into(),
+    /// );
+    /// assert_eq!(pkg.name, "symfony/console");
+    /// ```
+    #[must_use]
+    pub const fn new(
+        name: deps_core::PackageName,
+        latest_version: deps_core::ConcreteVersion,
+    ) -> Self {
+        Self {
+            name,
+            description: None,
+            repository: None,
+            homepage: None,
+            latest_version,
+        }
+    }
+
+    /// Attaches a short package description. See [`Self::description`].
+    #[must_use]
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// Attaches the source repository URL. See [`Self::repository`].
+    #[must_use]
+    pub fn with_repository(mut self, repository: impl Into<String>) -> Self {
+        self.repository = Some(repository.into());
+        self
+    }
+
+    /// Attaches the homepage URL. See [`Self::homepage`].
+    #[must_use]
+    pub fn with_homepage(mut self, homepage: impl Into<String>) -> Self {
+        self.homepage = Some(homepage.into());
+        self
+    }
 }
 
 deps_core::impl_metadata!(ComposerPackage {

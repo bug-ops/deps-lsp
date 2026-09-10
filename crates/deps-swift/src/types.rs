@@ -91,6 +91,7 @@ deps_core::impl_version!(SwiftVersion {
 });
 
 /// Package metadata from GitHub API.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct SwiftPackage {
     /// owner/repo identity
@@ -103,6 +104,63 @@ pub struct SwiftPackage {
     pub homepage: Option<String>,
     /// Latest semver tag
     pub latest_version: deps_core::ConcreteVersion,
+}
+
+impl SwiftPackage {
+    /// Constructs a `SwiftPackage` from its required fields, with [`Self::description`],
+    /// [`Self::repository`], and [`Self::homepage`] left `None` — chain the corresponding
+    /// `with_*` setters to attach them.
+    ///
+    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
+    /// this crate, so every other crate must go through this constructor instead.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_swift::types::SwiftPackage;
+    ///
+    /// let pkg = SwiftPackage::new(
+    ///     deps_core::PackageName::new("apple/swift-algorithms"),
+    ///     "1.2.0".into(),
+    /// )
+    /// .with_description("Commonly used sequence and collection algorithms");
+    ///
+    /// assert_eq!(pkg.name, "apple/swift-algorithms");
+    /// ```
+    #[must_use]
+    pub const fn new(
+        name: deps_core::PackageName,
+        latest_version: deps_core::ConcreteVersion,
+    ) -> Self {
+        Self {
+            name,
+            description: None,
+            repository: None,
+            homepage: None,
+            latest_version,
+        }
+    }
+
+    /// Attaches the GitHub repo description. See [`Self::description`].
+    #[must_use]
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// Attaches the GitHub repository URL. See [`Self::repository`].
+    #[must_use]
+    pub fn with_repository(mut self, repository: impl Into<String>) -> Self {
+        self.repository = Some(repository.into());
+        self
+    }
+
+    /// Attaches the homepage URL. See [`Self::homepage`].
+    #[must_use]
+    pub fn with_homepage(mut self, homepage: impl Into<String>) -> Self {
+        self.homepage = Some(homepage.into());
+        self
+    }
 }
 
 deps_core::impl_metadata!(SwiftPackage {

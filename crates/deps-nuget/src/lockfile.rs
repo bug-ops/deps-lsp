@@ -160,10 +160,10 @@ fn parse_packages_lock_json(content: String) -> Result<ResolvedPackages> {
             .into_iter()
             .max_by(|a, b| crate::version::compare_versions(&a.0, &b.0));
         if let Some((version, content_hash)) = best {
-            packages.insert(ResolvedPackage {
+            packages.insert(ResolvedPackage::new(
                 name,
                 version,
-                source: ResolvedSource::Registry {
+                ResolvedSource::Registry {
                     // Informational only — nothing in `deps-lsp`/`deps-core::lsp_helpers`
                     // reads `ResolvedSource`, and this path makes no network request, so
                     // it never routes a lockfile-resolved version against a private feed
@@ -172,8 +172,7 @@ fn parse_packages_lock_json(content: String) -> Result<ResolvedPackages> {
                     url: crate::registry::NUGET_ORG_INDEX_URL.into(),
                     checksum: content_hash.unwrap_or_default(),
                 },
-                dependencies: vec![],
-            });
+            ));
         }
     }
 

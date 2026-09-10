@@ -548,25 +548,23 @@ serde = "1.0.0"
             let mut vulnerabilities = VulnerabilityMap::new();
             vulnerabilities.insert(
                 "serde".to_string(),
-                ScanOutcome::Vulnerable(DependencyVulnerabilities {
-                    advisories: Capped::new(
-                        vec![Arc::new(Advisory::new(
-                            "RUSTSEC-2020-0071".to_string(),
-                            "2023-01-01T00:00:00Z".to_string(),
-                            None,
-                            vec![],
-                            VulnSeverity::High,
-                            None,
-                            vec!["1.0.5".to_string()],
-                            String::new(),
-                        ))],
+                ScanOutcome::Vulnerable(
+                    DependencyVulnerabilities::new(Capped::new(
+                        vec![Arc::new(
+                            Advisory::new(
+                                "RUSTSEC-2020-0071".to_string(),
+                                "2023-01-01T00:00:00Z".to_string(),
+                                VulnSeverity::High,
+                                String::new(),
+                            )
+                            .with_fixed_versions(vec!["1.0.5".to_string()]),
+                        )],
                         1,
-                    ),
-                    fix_target_status: UpgradeStatus::CandidateClean {
+                    ))
+                    .with_fix_target_status(UpgradeStatus::CandidateClean {
                         version: "1.0.5".to_string(),
-                    },
-                    upgrade_status: UpgradeStatus::NotChecked,
-                }),
+                    }),
+                ),
             );
             doc_state.vulnerabilities = vulnerabilities;
             state.update_document(uri.clone(), doc_state);
@@ -717,25 +715,23 @@ serde = "1.0.0"
             let mut vulnerabilities = VulnerabilityMap::new();
             vulnerabilities.insert(
                 "vapor/vapor".to_string(),
-                ScanOutcome::Vulnerable(DependencyVulnerabilities {
-                    advisories: Capped::new(
-                        vec![Arc::new(Advisory::new(
-                            "GHSA-test-0001".to_string(),
-                            "2023-01-01T00:00:00Z".to_string(),
-                            None,
-                            vec![],
-                            VulnSeverity::High,
-                            None,
-                            vec!["4.50.1".to_string()],
-                            String::new(),
-                        ))],
+                ScanOutcome::Vulnerable(
+                    DependencyVulnerabilities::new(Capped::new(
+                        vec![Arc::new(
+                            Advisory::new(
+                                "GHSA-test-0001".to_string(),
+                                "2023-01-01T00:00:00Z".to_string(),
+                                VulnSeverity::High,
+                                String::new(),
+                            )
+                            .with_fixed_versions(vec!["4.50.1".to_string()]),
+                        )],
                         1,
-                    ),
-                    fix_target_status: UpgradeStatus::CandidateClean {
+                    ))
+                    .with_fix_target_status(UpgradeStatus::CandidateClean {
                         version: "4.50.1".to_string(),
-                    },
-                    upgrade_status: UpgradeStatus::NotChecked,
-                }),
+                    }),
+                ),
             );
             doc_state.vulnerabilities = vulnerabilities;
             state.update_document(uri.clone(), doc_state);

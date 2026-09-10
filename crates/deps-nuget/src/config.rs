@@ -68,6 +68,7 @@ const NO_SOURCES_CONFIGURED_SENTINEL: &str = "<clear/> removed every NuGet packa
 
 /// Why a candidate `<add value="...">` failed validation, or why it was dropped as
 /// disabled/credentialed/unsupported.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum NuGetFeedUrlError {
     /// The value did not parse as a URL at all.
@@ -115,6 +116,10 @@ impl From<IndexUrlError> for NuGetFeedUrlError {
             IndexUrlError::NotHttps(scheme) => Self::NotHttps(scheme),
             IndexUrlError::UserInfoPresent => Self::UserInfoPresent,
             IndexUrlError::BlockedHost { class } => Self::BlockedHost { class },
+            // `IndexUrlError` is `#[non_exhaustive]` (issue #769): a variant added upstream
+            // and not yet mapped here still surfaces, carrying its own message, rather than
+            // failing to compile.
+            other => Self::InvalidUrl(other.to_string()),
         }
     }
 }
@@ -176,6 +181,7 @@ impl std::fmt::Display for NuGetFeedUrl {
 /// is **not** consulted by the credential-binding logic in [`resolve_with_context`] (see that function's
 /// docs, §C2) — only by the [`resolve_with_context`] accumulation loop's own gate (which contribution half
 /// applies) and by `tracing::debug!` output.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConfigTier {
     /// A user-profile-tier `NuGet.Config` (issue #561, FR-001) — not something a cloned
@@ -287,6 +293,10 @@ impl std::fmt::Display for RedactedSecret {
 
 /// A present-but-unusable `<add>` entry — an invalid URL, a policy-blocked host, a
 /// disabled/credentialed source, or an unsupported protocol/local-feed value.
+///
+/// Output-only: constructed internally by this module's own resolution logic, never by
+/// external code — no constructor is provided.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct InvalidEntry {
     /// The raw value, as written (or the source's resolved URL if it was invalidated only
@@ -299,6 +309,10 @@ pub struct InvalidEntry {
 
 /// One resolved `<packageSources>` entry, keyed by its declared `key` (case preserved, but
 /// every comparison against it goes through `key_candidates`).
+///
+/// Output-only: constructed internally by this module's own resolution logic, never by
+/// external code — no constructor is provided.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct PackageSourceEntry {
     /// The declared `<add key>` name, case preserved.
@@ -320,6 +334,10 @@ pub struct PackageSourceEntry {
 /// through `NuGetConfig::valid_hops`/`NuGetConfig::hops_for_mapping_keys`) necessarily agree on
 /// each hop's credential data — there is no second, independently-maintained argument for it to
 /// disagree with.
+///
+/// Output-only: constructed internally by this module's own resolution logic, never by
+/// external code — no constructor is provided.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ResolvedHop {
     /// The resolved feed URL for this hop.
@@ -355,6 +373,10 @@ impl ResolvedHop {
 
 /// One fully-resolved routing chain, produced by [`NuGetConfig::resolved_chains`], consumed by
 /// `NuGetRegistry::register_chain`. Mirrors `deps_pypi::config::ResolvedChain` exactly.
+///
+/// Output-only: constructed internally by [`NuGetConfig::resolved_chains`], never by external
+/// code — no constructor is provided.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct NuGetSourceChain {
     /// Opaque, hashed identity produced by [`deps_core::hash_routing_key`] (`"nuget-chain"`)
@@ -1191,6 +1213,7 @@ impl NuGetConfigCache {
 }
 
 /// Owned by `NuGetEcosystem`, shared across every document it parses.
+#[non_exhaustive]
 #[derive(Debug, Clone, Default)]
 pub struct NuGetParseContext {
     /// Gates every workspace-declared [`NuGetFeedUrl`] this parse constructs.

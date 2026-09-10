@@ -263,6 +263,7 @@ pub fn locate_lockfile_for_manifest(
 ///
 /// Contains the exact version and source information for a dependency
 /// as resolved by the package manager.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedPackage {
     /// Package name
@@ -275,9 +276,50 @@ pub struct ResolvedPackage {
     pub dependencies: Vec<String>,
 }
 
+impl ResolvedPackage {
+    /// Constructs a `ResolvedPackage` from its three required fields, with
+    /// [`Self::dependencies`] left empty — chain [`Self::with_dependencies`] to attach them.
+    ///
+    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
+    /// this crate, so every other crate must go through this constructor instead.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lockfile::{ResolvedPackage, ResolvedSource};
+    ///
+    /// let package = ResolvedPackage::new(
+    ///     "serde".to_string(),
+    ///     "1.0.195".to_string(),
+    ///     ResolvedSource::Registry {
+    ///         url: "https://github.com/rust-lang/crates.io-index".into(),
+    ///         checksum: "abc123".into(),
+    ///     },
+    /// );
+    /// assert!(package.dependencies.is_empty());
+    /// ```
+    #[must_use]
+    pub fn new(name: String, version: String, source: ResolvedSource) -> Self {
+        Self {
+            name,
+            version,
+            source,
+            dependencies: Vec::new(),
+        }
+    }
+
+    /// Attaches this package's own dependencies. See [`Self::dependencies`].
+    #[must_use]
+    pub fn with_dependencies(mut self, dependencies: Vec<String>) -> Self {
+        self.dependencies = dependencies;
+        self
+    }
+}
+
 /// Source of a resolved dependency.
 ///
 /// Indicates where the package was downloaded from or how it was resolved.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolvedSource {
     /// From a registry with optional checksum
@@ -312,15 +354,17 @@ pub enum ResolvedSource {
 /// use deps_core::lockfile::{ResolvedPackages, ResolvedPackage, ResolvedSource};
 ///
 /// let mut packages = ResolvedPackages::new();
-/// packages.insert(ResolvedPackage {
-///     name: "serde".into(),
-///     version: "1.0.195".into(),
-///     source: ResolvedSource::Registry {
-///         url: "https://github.com/rust-lang/crates.io-index".into(),
-///         checksum: "abc123".into(),
-///     },
-///     dependencies: vec!["serde_derive".into()],
-/// });
+/// packages.insert(
+///     ResolvedPackage::new(
+///         "serde".into(),
+///         "1.0.195".into(),
+///         ResolvedSource::Registry {
+///             url: "https://github.com/rust-lang/crates.io-index".into(),
+///             checksum: "abc123".into(),
+///         },
+///     )
+///     .with_dependencies(vec!["serde_derive".into()]),
+/// );
 ///
 /// assert_eq!(packages.get_version("serde"), Some("1.0.195"));
 /// assert_eq!(packages.len(), 1);

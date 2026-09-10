@@ -56,6 +56,7 @@ pub struct DartVersion {
 }
 
 /// Package metadata as returned by the pub.dev API.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct PackageInfo {
     /// Package name.
@@ -72,6 +73,72 @@ pub struct PackageInfo {
     pub version: deps_core::ConcreteVersion,
     /// SPDX license identifier, if declared.
     pub license: Option<String>,
+}
+
+impl PackageInfo {
+    /// Constructs a `PackageInfo` from its required fields, with every other field left
+    /// `None` — chain the corresponding `with_*` setters to attach them.
+    ///
+    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
+    /// this crate, so every other crate must go through this constructor instead.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_dart::types::PackageInfo;
+    ///
+    /// let info = PackageInfo::new(deps_core::PackageName::new("provider"), "6.1.1".into())
+    ///     .with_description("A wrapper around InheritedWidget");
+    ///
+    /// assert_eq!(info.name, "provider");
+    /// ```
+    #[must_use]
+    pub const fn new(name: deps_core::PackageName, version: deps_core::ConcreteVersion) -> Self {
+        Self {
+            name,
+            description: None,
+            homepage: None,
+            repository: None,
+            documentation: None,
+            version,
+            license: None,
+        }
+    }
+
+    /// Attaches a short package description. See [`Self::description`].
+    #[must_use]
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// Attaches the homepage URL. See [`Self::homepage`].
+    #[must_use]
+    pub fn with_homepage(mut self, homepage: impl Into<String>) -> Self {
+        self.homepage = Some(homepage.into());
+        self
+    }
+
+    /// Attaches the source repository URL. See [`Self::repository`].
+    #[must_use]
+    pub fn with_repository(mut self, repository: impl Into<String>) -> Self {
+        self.repository = Some(repository.into());
+        self
+    }
+
+    /// Attaches the documentation URL. See [`Self::documentation`].
+    #[must_use]
+    pub fn with_documentation(mut self, documentation: impl Into<String>) -> Self {
+        self.documentation = Some(documentation.into());
+        self
+    }
+
+    /// Attaches the SPDX license identifier. See [`Self::license`].
+    #[must_use]
+    pub fn with_license(mut self, license: impl Into<String>) -> Self {
+        self.license = Some(license.into());
+        self
+    }
 }
 
 // deps-core trait implementations

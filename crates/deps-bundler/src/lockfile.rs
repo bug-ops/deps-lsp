@@ -143,12 +143,7 @@ pub fn parse_gemfile_lock(content: &str) -> Result<ResolvedPackages> {
             let name = caps[1].to_string();
             let version = caps[2].to_string();
 
-            packages.insert(ResolvedPackage {
-                name,
-                version,
-                source: current_source.clone(),
-                dependencies: vec![],
-            });
+            packages.insert(ResolvedPackage::new(name, version, current_source.clone()));
         }
     }
 

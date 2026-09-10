@@ -154,12 +154,10 @@ fn parse_cargo_lock(content: String) -> Result<ResolvedPackages> {
         // Parse dependencies array (optional)
         let dependencies = parse_cargo_dependencies_from_table(table);
 
-        packages.insert(ResolvedPackage {
-            name: name.to_string(),
-            version: version.to_string(),
-            source,
-            dependencies,
-        });
+        packages.insert(
+            ResolvedPackage::new(name.to_string(), version.to_string(), source)
+                .with_dependencies(dependencies),
+        );
     }
 
     Ok(packages)

@@ -24,23 +24,23 @@ use std::sync::Arc;
 
 use deps_core::VersionData;
 use deps_core::osv::{
-    Advisory, Capped, DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity,
-    VulnerabilityMap,
+    Advisory, Capped, DependencyVulnerabilities, ScanOutcome, VulnSeverity, VulnerabilityMap,
 };
 
 use super::ServerState;
 
 fn sample_advisory() -> Arc<Advisory> {
-    Arc::new(Advisory::new(
-        "GHSA-xxxx-yyyy-zzzz".to_string(),
-        "2023-01-01T00:00:00Z".to_string(),
-        Some("Example vulnerability for snapshot testing".to_string()),
-        vec!["CVE-2023-00000".to_string()],
-        VulnSeverity::High,
-        None,
-        vec!["9.9.9".to_string()],
-        "https://osv.dev/vulnerability/GHSA-xxxx-yyyy-zzzz".to_string(),
-    ))
+    Arc::new(
+        Advisory::new(
+            "GHSA-xxxx-yyyy-zzzz".to_string(),
+            "2023-01-01T00:00:00Z".to_string(),
+            VulnSeverity::High,
+            "https://osv.dev/vulnerability/GHSA-xxxx-yyyy-zzzz".to_string(),
+        )
+        .with_summary("Example vulnerability for snapshot testing".to_string())
+        .with_aliases(vec!["CVE-2023-00000".to_string()])
+        .with_fixed_versions(vec!["9.9.9".to_string()]),
+    )
 }
 
 /// Runs the shared scenario for one ecosystem: parse `content`, flag the
@@ -75,11 +75,10 @@ async fn diagnostics_snapshot_for(
     let mut vulnerabilities = VulnerabilityMap::new();
     vulnerabilities.insert(
         normalized_key,
-        ScanOutcome::Vulnerable(DependencyVulnerabilities {
-            advisories: Capped::new(vec![sample_advisory()], 6),
-            fix_target_status: UpgradeStatus::NotChecked,
-            upgrade_status: UpgradeStatus::NotChecked,
-        }),
+        ScanOutcome::Vulnerable(DependencyVulnerabilities::new(Capped::new(
+            vec![sample_advisory()],
+            6,
+        ))),
     );
 
     let cached = HashMap::new();

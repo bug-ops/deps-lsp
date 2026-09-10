@@ -327,10 +327,10 @@ pub fn register_ecosystems(
 
     #[cfg(feature = "cargo")]
     {
-        let context = deps_cargo::parser::CargoParseContext {
-            policy: Arc::clone(&policy),
-            config_cache: Arc::new(deps_cargo::config::ConfigFileCache::new()),
-        };
+        let context = deps_cargo::parser::CargoParseContext::new(
+            Arc::clone(&policy),
+            Arc::new(deps_cargo::config::ConfigFileCache::new()),
+        );
         registry.register(Arc::new(CargoEcosystem::with_context(
             Arc::clone(&cache),
             context,
@@ -340,11 +340,11 @@ pub fn register_ecosystems(
 
     #[cfg(all(feature = "npm", feature = "deno"))]
     {
-        let npm_context = deps_npm::config::NpmParseContext {
-            policy: Arc::clone(&policy),
-            config_cache: Arc::new(deps_npm::config::NpmConfigCache::new()),
-            workspace_cache: Arc::new(deps_npm::catalog::PnpmWorkspaceCache::new()),
-        };
+        let npm_context = deps_npm::config::NpmParseContext::new(
+            Arc::clone(&policy),
+            Arc::new(deps_npm::config::NpmConfigCache::new()),
+            Arc::new(deps_npm::catalog::PnpmWorkspaceCache::new()),
+        );
         let npm_registry = Arc::new(NpmRegistry::new(Arc::clone(&cache)));
         registry.register(Arc::new(NpmEcosystem::with_context(
             Arc::clone(&npm_registry),
@@ -365,11 +365,11 @@ pub fn register_ecosystems(
     // `didChangeConfiguration` update.
     #[cfg(all(feature = "npm", not(feature = "deno")))]
     {
-        let npm_context = deps_npm::config::NpmParseContext {
-            policy: Arc::clone(&policy),
-            config_cache: Arc::new(deps_npm::config::NpmConfigCache::new()),
-            workspace_cache: Arc::new(deps_npm::catalog::PnpmWorkspaceCache::new()),
-        };
+        let npm_context = deps_npm::config::NpmParseContext::new(
+            Arc::clone(&policy),
+            Arc::new(deps_npm::config::NpmConfigCache::new()),
+            Arc::new(deps_npm::catalog::PnpmWorkspaceCache::new()),
+        );
         registry.register(Arc::new(NpmEcosystem::with_context(
             Arc::new(NpmRegistry::new(Arc::clone(&cache))),
             npm_context,
@@ -398,11 +398,11 @@ pub fn register_ecosystems(
     // see a live `initialize`/`didChangeConfiguration` update.
     #[cfg(feature = "go")]
     {
-        let go_context = deps_go::config::GoParseContext {
-            policy: Arc::clone(&policy),
-            config_cache: Arc::new(deps_go::config::GoEnvCache::new()),
-            goenv_path: deps_go::config::goenv_path(),
-        };
+        let go_context = deps_go::config::GoParseContext::new(
+            Arc::clone(&policy),
+            Arc::new(deps_go::config::GoEnvCache::new()),
+            deps_go::config::goenv_path(),
+        );
         registry.register(Arc::new(GoEcosystem::with_context(
             Arc::new(GoRegistry::new(Arc::clone(&cache))),
             go_context,

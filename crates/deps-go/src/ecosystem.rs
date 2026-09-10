@@ -385,14 +385,7 @@ mod tests {
             PackageVersions::latest_only("v1.9.1"),
         );
 
-        let config = EcosystemConfig {
-            loading_text: "⏳".to_string(),
-            show_loading_hints: true,
-            offline: false,
-            show_up_to_date_hints: true,
-            up_to_date_text: "✅".to_string(),
-            needs_update_text: "❌ {}".to_string(),
-        };
+        let config = EcosystemConfig::default();
 
         // Lock file has the latest version
         let mut resolved_versions = HashMap::new();
@@ -432,14 +425,7 @@ mod tests {
             PackageVersions::latest_only("v1.9.1"),
         );
 
-        let config = EcosystemConfig {
-            loading_text: "⏳".to_string(),
-            show_loading_hints: true,
-            offline: false,
-            show_up_to_date_hints: true,
-            up_to_date_text: "✅".to_string(),
-            needs_update_text: "❌ {}".to_string(),
-        };
+        let config = EcosystemConfig::default();
 
         let resolved_versions = HashMap::new();
         let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
@@ -477,14 +463,7 @@ mod tests {
             PackageVersions::latest_only("v1.9.1"),
         );
 
-        let config = EcosystemConfig {
-            loading_text: "⏳".to_string(),
-            show_loading_hints: true,
-            offline: false,
-            show_up_to_date_hints: false,
-            up_to_date_text: "✅".to_string(),
-            needs_update_text: "❌ {}".to_string(),
-        };
+        let config = EcosystemConfig::default().with_show_up_to_date_hints(false);
 
         // Lock file has the latest version - but show_up_to_date_hints is false
         let mut resolved_versions = HashMap::new();
@@ -519,14 +498,7 @@ mod tests {
             PackageVersions::latest_only("v1.9.1"),
         );
 
-        let config = EcosystemConfig {
-            loading_text: "⏳".to_string(),
-            show_loading_hints: true,
-            offline: false,
-            show_up_to_date_hints: true,
-            up_to_date_text: "✅".to_string(),
-            needs_update_text: "❌ {}".to_string(),
-        };
+        let config = EcosystemConfig::default();
 
         let resolved_versions = HashMap::new();
         let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(

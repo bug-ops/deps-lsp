@@ -372,6 +372,10 @@ fn looks_like_valid_pep508_name(name: &str) -> bool {
 /// Surfaced as a `textDocument/documentLink` so it can be ctrl/cmd-clicked
 /// open. Only produced by [`PypiParser::parse_requirements`] —
 /// `pyproject.toml` has no equivalent file-to-file reference.
+///
+/// Output-only: constructed internally by `parser::requirements`, never by external code —
+/// no constructor is provided.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct RequirementRef {
     /// Source range of the referenced path text on the option line.
