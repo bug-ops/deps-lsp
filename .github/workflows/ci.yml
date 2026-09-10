@@ -249,6 +249,15 @@ jobs:
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
             use_cross_tool: true
+          - os: ubuntu-latest
+            # 32-bit leg: gives `#[cfg(target_pointer_width = "32")]` fail-closed guards
+            # (e.g. crates/deps-core/src/xml_bounds.rs) a real 32-bit target to build
+            # and test against, since every other leg here is 64-bit. i686 binaries run
+            # natively on the x86_64 runner under `cross`'s musl container (no QEMU
+            # needed), so this leg alone also runs its test suite, not just a build.
+            target: i686-unknown-linux-musl
+            use_cross_tool: true
+            run_tests: true
 
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
@@ -271,6 +280,21 @@ jobs:
       - name: Build for cross-compile target (musl via cross)
         if: matrix.use_cross_tool
         run: cross build --workspace --target ${{ matrix.target }}
+
+      - name: Run tests for cross-compile target (exercises pointer-width guards)
+        # Plain `cargo test` via `cross`, not `cargo nextest`: the default cross-rs
+        # container image for this target does not ship `cargo-nextest`, and a custom
+        # image isn't worth it for a narrow, single-leg regression check.
+        #
+        # `--test-threads=1`: several tests assert on `deps_core::fs_probe`'s global
+        # stat/read counters (e.g. deps-gradle's
+        # test_load_gradle_properties_stats_exactly_once_per_ancestor), which are safe
+        # under nextest's per-test-process isolation (what every other job uses) but not
+        # under plain `cargo test`'s single shared process, where a concurrently running
+        # test can bump the same counters mid-assertion. Single-threaded here avoids that
+        # without touching the tests themselves.
+        if: matrix.run_tests
+        run: cross test --workspace --target ${{ matrix.target }} -- --test-threads=1
 
   coverage:
     name: Code Coverage

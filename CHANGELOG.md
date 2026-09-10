@@ -104,6 +104,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking (pre-1.0, public API)**: **workspace**: extends the `#[non_exhaustive]` API-stability pass to `deps-core`'s remaining public LSP/registry/version DTOs and every ecosystem crate's registry response types, growth-prone enums, and `*ParseContext` types, reworking several multi-arg `Foo::new` constructors into required-fields-only constructors with `with_*` setters along the way (resolves #769) (#777)
 - **Breaking (pre-1.0, public API)**: **deps-lsp**: extends the `#[non_exhaustive]` API-stability pass to `deps-lsp`'s own public config DTOs (`DepsConfig` and its 11 section structs), `WorkspaceRegistriesSetting`, and `EcosystemRuntime`, adding `new()`/`with_*` builders to the six config structs with prior external struct-literal construction (resolves #778) (#780)
 
+- **CI**: `cross-check` matrix gained an `i686-unknown-linux-musl` leg that builds and runs the test suite so `#[cfg(target_pointer_width = "32")]` code gets real coverage on a 32-bit target (resolves #790) (#803)
+- **workspace**: added `.gitleaks.toml` allowlisting `actions/cache` cache-key lines in `.github/workflows/*.yml` that `gitleaks`'s `generic-api-key` rule otherwise false-positives on (resolves #797) (#803)
+
 ### Dependencies
 - Bump `dirs` from 6 to 7.0.0, plus transitive `Cargo.lock` refresh (#659)
 
