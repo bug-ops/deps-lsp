@@ -74,6 +74,7 @@ status: moc
 | 050 | [[050-cargo-renamed-dependency-lockfile-resolution/spec\|Per-occurrence lockfile version resolution for renamed/aliased dependencies]] | specify | shipped — bug, P1 (PR #653, issue #649) |
 | 051 | [[051-disk-persistent-registry-cache/spec\|Disk-persistent registry cache]] | specify | research/parity, P3, 9 open `[NEEDS CLARIFICATION]` items |
 | 052 | [[052-pnpm-lockfile-provider/spec\|pnpm-lock.yaml lock file provider (npm ecosystem)]] | specify | ready — enhancement/cross-ecosystem, P3, 0 open `[NEEDS CLARIFICATION]` items, issue #709 (scoped to pnpm-lock.yaml only) |
+| 053 | [[053-ecosystem-sealing-inversion-decision-record/spec\|Ecosystem sealing inversion decision record]] | specify | research/decision-record, P4, shipped — won't-do, spec is the artifact (issue #774 to be closed referencing this spec) |
 
 ## Completed Specs
 
