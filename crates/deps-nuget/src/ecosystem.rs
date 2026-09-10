@@ -1876,6 +1876,7 @@ mod tests {
             dependencies: vec![dep],
             uri: deps_core::test_util::test_uri("/test/App.csproj"),
             resolved_chains: Vec::new(),
+            dependency_truncation: None,
         };
         let position = Position::new(0, 1);
         let freshness = deps_core::FreshnessSettings::default();
@@ -1924,6 +1925,7 @@ mod tests {
             dependencies: vec![dep],
             uri: deps_core::test_util::test_uri("/test/App.csproj"),
             resolved_chains: Vec::new(),
+            dependency_truncation: None,
         };
         let content = "";
         // Character 1, not 0: `dep_with_source`'s `name_range` is the zero-width

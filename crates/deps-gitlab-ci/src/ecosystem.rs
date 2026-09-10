@@ -2516,6 +2516,7 @@ mod tests {
             dependencies: vec![dep],
             routes: vec![],
             uri,
+            dependency_truncation: None,
         };
         let content = "include:\n  - project: org/proj\n    ref: v1.0.0\n";
         let cache = Arc::new(HttpCache::new());
@@ -2550,6 +2551,7 @@ mod tests {
             dependencies: vec![dep],
             routes: vec![],
             uri,
+            dependency_truncation: None,
         };
         let content = "include:\n  - project: org/proj\n    ref: v1.0.0\n";
         let cache = Arc::new(HttpCache::new());
@@ -2587,6 +2589,7 @@ mod tests {
             dependencies: vec![dep],
             routes: vec![],
             uri,
+            dependency_truncation: None,
         };
         let content = "include:\n  - project: org/proj\n    ref: v1.0.0\n";
         let cache = Arc::new(HttpCache::new());

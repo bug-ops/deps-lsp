@@ -569,6 +569,7 @@ mod tests {
         let parse_result = crate::types::SwiftParseResult {
             dependencies: vec![dep],
             uri,
+            dependency_truncation: None,
         };
         let cache = Arc::new(deps_core::HttpCache::new());
         let eco = SwiftEcosystem::new(cache);
@@ -594,6 +595,7 @@ mod tests {
         let parse_result = crate::types::SwiftParseResult {
             dependencies: vec![],
             uri,
+            dependency_truncation: None,
         };
         let cache = Arc::new(deps_core::HttpCache::new());
         let eco = SwiftEcosystem::new(cache);
@@ -634,6 +636,7 @@ mod tests {
         let parse_result = crate::types::SwiftParseResult {
             dependencies: vec![dep],
             uri,
+            dependency_truncation: None,
         };
         let content = "let x = \"https://github.com/apple/swift-nio\"\n2.0.0";
         let cache = Arc::new(deps_core::HttpCache::new());
