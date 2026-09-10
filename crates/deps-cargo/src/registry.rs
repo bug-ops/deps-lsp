@@ -110,6 +110,10 @@ impl CratesIoRegistry {
     /// drop it if crates.io ever gains its own publish-time enrichment (issue #588 critic
     /// M10) — today this is a pure pass-through, identical to [`Self::get_versions`], since
     /// crates.io's sparse index carries no such enrichment yet.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::get_versions`].
     #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
     pub async fn get_versions_with(
         &self,
@@ -752,42 +756,18 @@ mod tests {
         assert_eq!(results[0].repository, None);
     }
 
-    #[test]
-    fn test_parse_search_response_nesting_at_max_depth_accepted() {
-        let depth = deps_core::MAX_JSON_NESTING_DEPTH;
-        let json = format!(
-            r#"{{"crates": [], "extra": {}1{}}}"#,
-            "[".repeat(depth - 1),
-            "]".repeat(depth - 1)
-        );
-        assert!(parse_search_response(json.as_bytes()).is_ok());
+    // #758: the shared JSON-nesting-depth cap, replacing
+    // test_parse_search_response_nesting_at_max_depth_accepted/_over_max_depth_rejected.
+    deps_core::json_depth_conformance! {
+        mod cargo_json_depth_conformance;
+        parse: |bytes: &[u8]| parse_search_response(bytes);
+        wrap: |nested: &str| format!(r#"{{"crates": [], "extra": {nested}}}"#);
     }
 
-    #[test]
-    fn test_parse_search_response_nesting_over_max_depth_rejected() {
-        let depth = deps_core::MAX_JSON_NESTING_DEPTH + 1;
-        let json = format!(
-            r#"{{"crates": [], "extra": {}1{}}}"#,
-            "[".repeat(depth),
-            "]".repeat(depth)
-        );
-        assert!(parse_search_response(json.as_bytes()).is_err());
-    }
-
-    #[test]
-    fn test_crate_url() {
-        assert_eq!(crate_url("serde"), "https://crates.io/crates/serde");
-        assert_eq!(crate_url("tokio"), "https://crates.io/crates/tokio");
-    }
-
-    #[test]
-    fn test_crate_url_with_hyphens() {
-        assert_eq!(
-            crate_url("serde-json"),
-            "https://crates.io/crates/serde-json"
-        );
-    }
-
+    // #758: exact package_url() values (which crate_url() backs) are pinned by
+    // formatter.rs's `formatter_conformance!` invocation; newline/autolink/percent safety is
+    // Layer 1's job (deps-lsp's EcosystemId::ALL loop). test_crate_url_encodes_malicious_name
+    // below stays hand-written: it checks markdown-link-bracket escaping, which neither covers.
     #[test]
     fn test_crate_url_encodes_malicious_name() {
         let url = crate_url("evil](https://evil.example)[pkg");
@@ -795,20 +775,6 @@ mod tests {
         assert!(!url.contains(')'));
         assert!(!url.contains('['));
         assert!(!url.contains(']'));
-    }
-
-    #[test]
-    fn test_crate_url_encodes_newline_autolink_and_percent() {
-        let url = crate_url("evil\n<https://evil%zz.example>");
-        assert!(!url.contains('\n'));
-        assert!(!url.contains('<'));
-        assert!(!url.contains('>'));
-        assert!(url.contains("%25"));
-    }
-
-    #[test]
-    fn test_crate_url_empty_name() {
-        assert_eq!(crate_url(""), "https://crates.io/crates/");
     }
 
     #[tokio::test]

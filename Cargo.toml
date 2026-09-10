@@ -88,7 +88,6 @@ string_slice = "warn"
 module_name_repetitions = "allow"
 similar_names = "allow"
 too_many_lines = "allow"
-missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 must_use_candidate = "allow"
 single_match_else = "allow"
@@ -102,7 +101,6 @@ cargo_common_metadata = "allow"
 
 # Nursery lints that are too pedantic
 option_if_let_else = "allow"
-future_not_send = "allow"
 redundant_pub_crate = "allow"
 
 # Pattern-matching lints - allow for now
@@ -130,8 +128,13 @@ explicit_iter_loop = "allow"
 redundant_closure_for_method_calls = "allow"
 match_wildcard_for_single_variants = "allow"
 
-# Function lints - allow for now
+# Function lints - permanent decision, not up for incremental enablement
 missing_const_for_fn = "allow"
+# `unnecessary_wraps` (function lint): the deps-pypi hits (#759) are gone, but
+# `deps-lsp/src/handlers/completion.rs`'s `default_insert_text` test helper still
+# trips it — its `Option<String>` return is a fixed `fn` pointer signature shared
+# with closures that do return `None`, not something the lint's suggested unwrap
+# can see. Left allowed.
 unnecessary_wraps = "allow"
 
 # HashMap generics - too noisy for internal APIs
@@ -153,8 +156,13 @@ derive_partial_eq_without_eq = "allow"
 used_underscore_binding = "allow"
 ignore_without_reason = "allow"
 
-# API design lints that need review
+# API design lint - permanent decision, not up for incremental enablement: `unused_self`
+# fires on trait-method implementations that must match a shared signature (e.g.
+# `Registry`/`Ecosystem` methods some impls don't need `self` for), which is unfixable
+# without breaking the trait contract.
 unused_self = "allow"
+# API design lint that needs review - unlike `unused_self` above, no trait-contract
+# constraint forces every hit here; each occurrence needs individual triage.
 unused_async = "allow"
 
 # Pattern matching lints

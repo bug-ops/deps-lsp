@@ -105,85 +105,106 @@ pub async fn parse_manifest_blocking(
     })?
 }
 
-/// Canonical, exhaustive identifier for every package ecosystem the workspace supports.
-///
-/// [`Ecosystem::id`] returns a `&'static str` for registry lookups and document
-/// storage, but any code that needs to *branch* on ecosystem identity should match on
-/// this enum instead of re-deriving its own partial match over that string: an
-/// unhandled variant here is a compile error, while an unhandled string is a silent
-/// runtime bug (see the fix for issue #118, where two call sites silently mishandled
-/// ecosystems missing from an incomplete string match).
-///
-/// Deliberately **not** `#[non_exhaustive]`: adding a new ecosystem must force every
-/// exhaustive `match` on this type across the workspace to be updated at compile time.
-///
-/// # Examples
-///
-/// ```
-/// use deps_core::EcosystemId;
-///
-/// let id: EcosystemId = "npm".parse().unwrap();
-/// assert_eq!(id, EcosystemId::Npm);
-/// assert_eq!(id.id(), "npm");
-/// assert_eq!(id.to_string(), "npm");
-///
-/// assert!("unknown".parse::<EcosystemId>().is_err());
-/// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum EcosystemId {
+/// Defines [`EcosystemId`] together with [`EcosystemId::ALL`], [`EcosystemId::id`] and its
+/// [`std::str::FromStr`] impl from one variant list, so the four can never drift apart
+/// (#758) — a 15th ecosystem is added in exactly this one place or the workspace does not
+/// compile. `macro_rules!` is textual-order scoped, so this definition must precede its
+/// invocation below.
+macro_rules! ecosystem_ids {
+    ( $( $(#[$vmeta:meta])* $variant:ident => $id:literal ),+ $(,)? ) => {
+        /// Canonical, exhaustive identifier for every package ecosystem the workspace supports.
+        ///
+        /// [`Ecosystem::id`] returns a `&'static str` for registry lookups and document
+        /// storage, but any code that needs to *branch* on ecosystem identity should match on
+        /// this enum instead of re-deriving its own partial match over that string: an
+        /// unhandled variant here is a compile error, while an unhandled string is a silent
+        /// runtime bug (see the fix for issue #118, where two call sites silently mishandled
+        /// ecosystems missing from an incomplete string match).
+        ///
+        /// Deliberately **not** `#[non_exhaustive]`: adding a new ecosystem must force every
+        /// exhaustive `match` on this type across the workspace to be updated at compile time.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// use deps_core::EcosystemId;
+        ///
+        /// let id: EcosystemId = "npm".parse().unwrap();
+        /// assert_eq!(id, EcosystemId::Npm);
+        /// assert_eq!(id.id(), "npm");
+        /// assert_eq!(id.to_string(), "npm");
+        ///
+        /// assert!("unknown".parse::<EcosystemId>().is_err());
+        /// ```
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum EcosystemId {
+            $( $(#[$vmeta])* $variant, )+
+        }
+
+        impl EcosystemId {
+            /// Every [`EcosystemId`] variant, in declaration order.
+            ///
+            /// Generated from the same list as [`Self::id`] and this type's
+            /// [`std::str::FromStr`] impl, so none of the three can silently drift out of
+            /// sync with the enum's variants (#758) — a forgotten 15th variant here is a
+            /// missing-match compile error, not a silently incomplete set.
+            pub const ALL: &'static [Self] = &[ $( Self::$variant ),+ ];
+
+            /// Returns the canonical string identifier, matching [`Ecosystem::id`] for the
+            /// corresponding ecosystem implementation.
+            #[must_use]
+            pub const fn id(self) -> &'static str {
+                match self {
+                    $( Self::$variant => $id, )+
+                }
+            }
+        }
+
+        impl std::str::FromStr for EcosystemId {
+            type Err = crate::error::DepsError;
+
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                match s {
+                    $( $id => Ok(Self::$variant), )+
+                    _ => Err(crate::error::DepsError::UnsupportedEcosystem(s.to_string())),
+                }
+            }
+        }
+    };
+}
+
+ecosystem_ids! {
     /// Rust Cargo ecosystem (`Cargo.toml`).
-    Cargo,
+    Cargo => "cargo",
     /// JavaScript/TypeScript npm ecosystem (`package.json`).
-    Npm,
+    Npm => "npm",
     /// Python PyPI ecosystem (`pyproject.toml`).
-    Pypi,
+    Pypi => "pypi",
     /// Go modules ecosystem (`go.mod`).
-    Go,
+    Go => "go",
     /// Ruby Bundler ecosystem (`Gemfile`).
-    Bundler,
+    Bundler => "bundler",
     /// Dart/Flutter pub ecosystem (`pubspec.yaml`).
-    Dart,
+    Dart => "dart",
     /// Java/Kotlin Maven ecosystem (`pom.xml`).
-    Maven,
+    Maven => "maven",
     /// PHP Composer ecosystem (`composer.json`).
-    Composer,
+    Composer => "composer",
     /// Java/Kotlin Gradle ecosystem (`build.gradle`, `build.gradle.kts`, version catalogs).
-    Gradle,
+    Gradle => "gradle",
     /// Swift Package Manager ecosystem (`Package.swift`).
-    Swift,
+    Swift => "swift",
     /// .NET NuGet ecosystem (`.csproj`/`.fsproj`/`.vbproj`, `Directory.Packages.props`, `packages.config`).
-    NuGet,
+    NuGet => "nuget",
     /// Deno ecosystem (`deno.json`/`deno.jsonc`), mixing `jsr:` and `npm:` specifiers.
-    Deno,
+    Deno => "deno",
     /// GitHub Actions ecosystem (`.github/workflows/*.yml`/`*.yaml`).
-    GithubActions,
+    GithubActions => "github-actions",
     /// GitLab CI/CD ecosystem (`.gitlab-ci.yml`, `.gitlab/ci/*.yml`/`*.yaml`).
-    GitlabCi,
+    GitlabCi => "gitlab-ci",
 }
 
 impl EcosystemId {
-    /// Returns the canonical string identifier, matching [`Ecosystem::id`] for the
-    /// corresponding ecosystem implementation.
-    #[must_use]
-    pub const fn id(self) -> &'static str {
-        match self {
-            Self::Cargo => "cargo",
-            Self::Npm => "npm",
-            Self::Pypi => "pypi",
-            Self::Go => "go",
-            Self::Bundler => "bundler",
-            Self::Dart => "dart",
-            Self::Maven => "maven",
-            Self::Composer => "composer",
-            Self::Gradle => "gradle",
-            Self::Swift => "swift",
-            Self::NuGet => "nuget",
-            Self::Deno => "deno",
-            Self::GithubActions => "github-actions",
-            Self::GitlabCi => "gitlab-ci",
-        }
-    }
-
     /// OSV.dev `package.ecosystem` value for this ecosystem, or `None` if
     /// OSV has no equivalent.
     ///
@@ -192,6 +213,12 @@ impl EcosystemId {
     /// zero-results ecosystem in OSV queries. Every arm below was verified
     /// live against `https://api.osv.dev` (each returned real advisories for
     /// a known-vulnerable version) — see `architecture.md` §2.
+    ///
+    /// Hand-written rather than generated by the `ecosystem_ids!` macro: this mapping is not 1:1
+    /// (`Npm | Deno` both map to `"npm"`, `Maven | Gradle` both map to `"Maven"`, `GitlabCi`
+    /// maps to `None`), so folding it into the shared list would need per-arm escape
+    /// hatches that cost more than they save — and match exhaustiveness already forces
+    /// this `match` to be updated for a new variant, which is the property that matters.
     ///
     /// # Examples
     ///
@@ -225,30 +252,6 @@ impl EcosystemId {
 impl std::fmt::Display for EcosystemId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.id())
-    }
-}
-
-impl std::str::FromStr for EcosystemId {
-    type Err = crate::error::DepsError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "cargo" => Ok(Self::Cargo),
-            "npm" => Ok(Self::Npm),
-            "pypi" => Ok(Self::Pypi),
-            "go" => Ok(Self::Go),
-            "bundler" => Ok(Self::Bundler),
-            "dart" => Ok(Self::Dart),
-            "maven" => Ok(Self::Maven),
-            "composer" => Ok(Self::Composer),
-            "gradle" => Ok(Self::Gradle),
-            "swift" => Ok(Self::Swift),
-            "nuget" => Ok(Self::NuGet),
-            "deno" => Ok(Self::Deno),
-            "github-actions" => Ok(Self::GithubActions),
-            "gitlab-ci" => Ok(Self::GitlabCi),
-            _ => Err(crate::error::DepsError::UnsupportedEcosystem(s.to_string())),
-        }
     }
 }
 

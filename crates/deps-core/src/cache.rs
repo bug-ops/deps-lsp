@@ -1239,6 +1239,10 @@ impl HttpCache {
     /// current sole caller (a fixed `Accept` header), but directly load-bearing for any
     /// future auth-wiring work: reach for [`Self::get_cached_trusted_origin_with_headers`]
     /// instead if a header ever needs to stay pinned to one origin.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::get_cached`].
     pub async fn get_cached_workspace_with_headers(
         &self,
         url: &str,
@@ -1608,7 +1612,11 @@ impl HttpCache {
         skip(self, body),
         fields(url = crate::net_policy::url_for_tracing(url))
     )]
-    pub async fn post_json<T: Serialize + ?Sized>(&self, url: &str, body: &T) -> Result<Bytes> {
+    pub async fn post_json<T: Serialize + Sync + ?Sized>(
+        &self,
+        url: &str,
+        body: &T,
+    ) -> Result<Bytes> {
         self.ensure_online(url)?;
         ensure_https(url)?;
 

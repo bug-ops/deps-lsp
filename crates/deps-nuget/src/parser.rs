@@ -42,12 +42,20 @@ use crate::types::NuGetParseResult;
 /// (`<Version>1.0</Version>`). Central package management entries (no `Version` attribute
 /// or child) are emitted with `version_requirement: None` so hover/completion on the name
 /// still works.
+///
+/// # Errors
+///
+/// Returns a [`DepsError::ParseError`] if `content` is not well-formed XML.
 pub fn parse_project_file(content: &str, doc_uri: &Uri) -> Result<NuGetParseResult> {
     parse_reference_elements(content, doc_uri, "PackageReference")
 }
 
 /// Parses a `Directory.Packages.props` central package management file, extracting
 /// `PackageVersion` entries.
+///
+/// # Errors
+///
+/// Same as [`parse_project_file`].
 pub fn parse_directory_packages_props(content: &str, doc_uri: &Uri) -> Result<NuGetParseResult> {
     parse_reference_elements(content, doc_uri, "PackageVersion")
 }
@@ -58,6 +66,10 @@ pub fn parse_directory_packages_props(content: &str, doc_uri: &Uri) -> Result<Nu
 /// semantics of a bare `PackageReference` `Version="..."`. That difference is normalized at
 /// parse time into a bracketed exact range (`"1.0.0"` → `"[1.0.0]"`) so the existing interval
 /// parser (`crate::version::satisfies`) handles it with no new formatter state.
+///
+/// # Errors
+///
+/// Same as [`parse_project_file`].
 pub fn parse_packages_config(content: &str, doc_uri: &Uri) -> Result<NuGetParseResult> {
     let line_table = LineOffsetTable::new(content);
     let mut reader = Reader::from_str(content);

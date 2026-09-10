@@ -209,6 +209,11 @@ fn next_minor(major: &str, minor: &str) -> String {
 ///
 /// Uses regex matching after stripping comments. Byte offsets are preserved
 /// throughout so LSP positions are computed correctly.
+///
+/// # Errors
+///
+/// Infallible by construction: unrecognized lines are skipped rather than erroring.
+/// Returns [`Result`] only to match the shared parser signature every ecosystem implements.
 // Every capture-group slice below (`url.start()..url.end()`, etc.) uses regex match offsets,
 // always char boundaries; offsets taken on `stripped` are valid in `content` too because
 // `strip_comments` overwrites byte-for-byte (length- and boundary-preserving). Group 0

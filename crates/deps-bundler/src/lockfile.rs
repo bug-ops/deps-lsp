@@ -60,6 +60,12 @@ impl LockFileProvider for GemfileLockParser {
 }
 
 /// Parses Gemfile.lock content and extracts resolved packages.
+///
+/// # Errors
+///
+/// Currently infallible: malformed or unrecognized lines are skipped rather than
+/// erroring. Returns `Result` for interface consistency with other `LockFileProvider`
+/// implementations.
 pub fn parse_gemfile_lock(content: &str) -> Result<ResolvedPackages> {
     let mut packages = ResolvedPackages::new();
     let mut current_section = Section::None;

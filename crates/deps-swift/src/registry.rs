@@ -46,6 +46,11 @@ impl SwiftRegistry {
     /// Follows GitHub tags pagination up to `MAX_TAG_PAGES` pages, stopping
     /// as soon as a page comes back with fewer than 100 entries (no further
     /// pages exist).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `name` is not a valid `owner/repo` string or the GitHub tags
+    /// API request fails (including a rate-limit or not-found response).
     #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
     pub async fn get_versions(&self, name: &str) -> Result<Vec<SwiftVersion>> {
         validate_owner_repo(name)?;
@@ -76,6 +81,11 @@ impl SwiftRegistry {
     /// so it can never perturb `get_versions`'s error propagation. This removes one
     /// round trip out of the tag-pagination loop's `P+1`, not half the latency (#223
     /// R7), and on a memo hit the join costs nothing at all.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::get_versions`] — the release-dates fetch is infallible and never
+    /// contributes an error.
     #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
     pub async fn get_versions_with_release_dates(&self, name: &str) -> Result<Vec<SwiftVersion>> {
         let (versions, dates) = tokio::join!(self.get_versions(name), self.release_dates(name));
@@ -117,6 +127,11 @@ impl SwiftRegistry {
     }
 
     /// Finds the latest version satisfying the given semver requirement.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::get_versions`]. An unparseable `req_str` is not an error: it
+    /// resolves to `Ok(None)`.
     #[tracing::instrument(skip_all, fields(package = ?name, version = ?req_str), level = "debug")]
     pub async fn get_latest_matching(
         &self,
@@ -142,6 +157,11 @@ impl SwiftRegistry {
     ///
     /// Returns up to `limit` results. `latest_version` is left empty to avoid
     /// N+1 API calls per search result.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the GitHub search API request fails or the response body is
+    /// not valid JSON matching the expected repository-search shape.
     #[tracing::instrument(skip_all, fields(query = ?query), level = "debug")]
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<SwiftPackage>> {
         let url = format!(

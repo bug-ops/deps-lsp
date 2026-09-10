@@ -1071,6 +1071,10 @@ pub fn search_url(base: &str, query: &str, limit: usize) -> String {
 }
 
 /// Parses a flat-container `index.json` response into descending-sorted versions.
+///
+/// # Errors
+///
+/// Returns an error if `data` is not valid JSON matching the flat-container index shape.
 pub fn parse_flat_container(data: &[u8]) -> Result<Vec<NuGetVersion>> {
     let parsed: FlatContainerIndex = deps_core::parse_json_checked(data)?;
 

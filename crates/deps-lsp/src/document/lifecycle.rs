@@ -67,6 +67,12 @@ fn check_content_size(content: &str, uri: &Uri) -> Result<()> {
 ///
 /// Parses manifest using the ecosystem's parser, creates document state,
 /// and spawns a background task to fetch version information from the registry.
+///
+/// # Errors
+///
+/// Returns an error if no ecosystem handler matches `uri`, or if `content` exceeds
+/// the configured maximum manifest size. A manifest-parse failure is not an error
+/// here: the document is stored without a parse result instead.
 #[tracing::instrument(
     skip_all,
     fields(uri = ?uri, ecosystem = tracing::field::Empty, doc_version = ?version)
@@ -644,6 +650,12 @@ fn commit_parsed_document(
 ///
 /// Re-parses manifest when document content changes and spawns a debounced
 /// task to update diagnostics and request inlay hint refresh.
+///
+/// # Errors
+///
+/// Returns an error if no ecosystem handler matches `uri`, or if `content` exceeds
+/// the configured maximum manifest size. A manifest-parse failure is not an error
+/// here: the document is stored without a parse result instead.
 #[tracing::instrument(skip_all, fields(uri = ?uri, doc_version = ?version))]
 pub async fn handle_document_change(
     uri: Uri,

@@ -356,6 +356,10 @@ impl MavenCentralRegistry {
     /// caching in [`HttpCache`], so an unconditional fetch would retry forever) and the
     /// Gradle Plugin Portal's listing has no date column (a wasted fetch+parse on every
     /// call). Both degrade to zero extra requests here rather than one doomed one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if fetching or parsing the artifact's metadata fails.
     #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
     pub async fn get_versions_typed_with(
         &self,
@@ -376,6 +380,10 @@ impl MavenCentralRegistry {
     ///
     /// Delegates to [`Self::get_versions_typed_with`] with freshness disabled so the two
     /// paths cannot drift apart.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::get_versions_typed_with`].
     pub async fn get_versions_typed(&self, name: &str) -> Result<Vec<MavenVersion>> {
         self.get_versions_typed_with(name, false).await
     }
