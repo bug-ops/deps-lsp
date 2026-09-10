@@ -241,7 +241,7 @@ fn looks_like_a_single_version(s: &str) -> bool {
 /// against a real registry version string (`"4.9.0"`) would never match. A
 /// *bare* requirement (no marker) is returned verbatim, and is accepted only
 /// for ecosystems where a bare version is not itself a range by default
-/// (critique C2) — see `bare_version_is_a_range`.
+/// (critique C2) — see `bare_requirement_policy`.
 ///
 /// # Examples
 ///
