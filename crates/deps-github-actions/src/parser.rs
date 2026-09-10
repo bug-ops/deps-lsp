@@ -580,6 +580,7 @@ pub fn parse_workflow_yaml(content: &str, uri: &Uri) -> Result<GithubActionsPars
         return Ok(GithubActionsParseResult {
             dependencies: Vec::new(),
             uri: uri.clone(),
+            dependency_truncation: None,
         });
     }
 
@@ -597,20 +598,27 @@ pub fn parse_workflow_yaml(content: &str, uri: &Uri) -> Result<GithubActionsPars
         return Ok(GithubActionsParseResult {
             dependencies: Vec::new(),
             uri: uri.clone(),
+            dependency_truncation: None,
         });
     }
 
     let line_table = LineOffsetTable::new(content);
     let char_offsets = CharOffsets::new(content);
+    // #796: checked before `build_dependency` (the expensive step — SHA/tag resolution
+    // setup, range computation) rather than after, so a `uses:` step beyond the ceiling
+    // never reaches it.
+    let mut budget = deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
     let dependencies = receiver
         .candidates
         .into_iter()
+        .filter(|_| budget.allow())
         .filter_map(|candidate| build_dependency(content, &line_table, &char_offsets, candidate))
         .collect();
 
     Ok(GithubActionsParseResult {
         dependencies,
         uri: uri.clone(),
+        dependency_truncation: budget.truncation(),
     })
 }
 

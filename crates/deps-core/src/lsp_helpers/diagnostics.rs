@@ -619,6 +619,7 @@ pub fn generate_diagnostics_from_cache(
     // (#478/#485's whole point) just because #479's collapse kicked in.
     let mut fetch_failed: Vec<FetchFailureEntry> = Vec::new();
 
+    dependency_ceiling_notice(&mut diagnostics, parse_result);
     offline_notice(&mut diagnostics, versions, &deps);
     blocked_registry_diagnostics(&mut diagnostics, parse_result);
 
@@ -785,6 +786,38 @@ struct FetchFailureEntry {
 struct YankedOnlyPrior {
     deprecation_found: bool,
     in_use_yanked_emitted: bool,
+}
+
+/// Dependency-count-ceiling notice (#796).
+///
+/// Not part of the R0-R8 per-dependency pipeline below: a manifest whose dependency
+/// count exceeded `deps-lsp`'s per-document ceiling
+/// ([`crate::dependency_cap::MAX_DEPENDENCIES_PER_DOCUMENT`]) already had
+/// `ParseResult::dependencies` truncated by `ecosystem::parse_manifest_blocking` before
+/// this function ever saw it — every rule below only evaluates the retained subset. This
+/// surfaces that truncation instead of leaving it silent, using the same file-level
+/// `Position(0,0)` placement as [`offline_notice`], and runs first so it precedes every
+/// other diagnostic in the returned `Vec`.
+///
+/// Reads: `parse_result.dependency_truncation()`.
+/// Emits: at most one [`DiagnosticSeverity::INFORMATION`].
+fn dependency_ceiling_notice(diagnostics: &mut Vec<Diagnostic>, parse_result: &dyn ParseResult) {
+    if let Some((kept, total)) = parse_result.dependency_truncation() {
+        diagnostics.push(Diagnostic {
+            range: Range {
+                start: Position::new(0, 0),
+                end: Position::new(0, 0),
+            },
+            severity: Some(DiagnosticSeverity::INFORMATION),
+            message: format!(
+                "manifest declares {total} dependencies, exceeding deps-lsp's per-document \
+                 limit of {kept}; only the first {kept} are tracked, fetched, and checked \
+                 against the registry"
+            ),
+            source: Some("deps-lsp".into()),
+            ..Default::default()
+        });
+    }
 }
 
 /// R0 — file-level "offline" notice (#483 S2/I2).
@@ -1636,6 +1669,80 @@ mod tests {
         assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
         assert!(diagnostics[0].message.contains("Unknown package"));
         assert!(diagnostics[0].message.contains("unknown-pkg"));
+    }
+
+    /// #796: a manifest whose dependency count was truncated by
+    /// `deps_core::dependency_cap::cap_dependencies` gets one file-level informational
+    /// diagnostic naming the ceiling, and `generate_diagnostics_from_cache` only ever
+    /// evaluates the retained (capped) subset.
+    #[test]
+    fn test_generate_diagnostics_from_cache_reports_dependency_ceiling_truncation() {
+        let formatter = MockFormatter;
+        let inner = crate::test_util::stub_parse_result_with_dependencies(12);
+        let parse_result = crate::dependency_cap::cap_dependencies(inner, 10);
+
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+
+        let diagnostics = generate_diagnostics_from_cache(
+            parse_result.as_ref(),
+            VersionData::new(&cached_versions, &resolved_versions),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert_eq!(
+            parse_result.dependencies().len(),
+            10,
+            "generate_diagnostics_from_cache must only ever see the capped 10 dependencies"
+        );
+
+        let ceiling_diagnostics: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.severity == Some(DiagnosticSeverity::INFORMATION))
+            .filter(|d| {
+                d.message
+                    .contains("exceeding deps-lsp's per-document limit")
+            })
+            .collect();
+        assert_eq!(
+            ceiling_diagnostics.len(),
+            1,
+            "expected exactly one dependency-ceiling diagnostic, got: {diagnostics:?}"
+        );
+        assert!(ceiling_diagnostics[0].message.contains("12"));
+        assert!(ceiling_diagnostics[0].message.contains("10"));
+    }
+
+    /// A document under the ceiling must never get a ceiling notice.
+    #[test]
+    fn test_generate_diagnostics_from_cache_no_ceiling_notice_under_the_limit() {
+        let formatter = MockFormatter;
+        let inner = crate::test_util::stub_parse_result_with_dependencies(3);
+        let parse_result = crate::dependency_cap::cap_dependencies(inner, 10);
+
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+
+        let diagnostics = generate_diagnostics_from_cache(
+            parse_result.as_ref(),
+            VersionData::new(&cached_versions, &resolved_versions),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert!(
+            !diagnostics.iter().any(|d| d
+                .message
+                .contains("exceeding deps-lsp's per-document limit")),
+            "a document under the ceiling must get no ceiling notice, got: {diagnostics:?}"
+        );
     }
 
     /// Regression for #550: a package whose registry fetch succeeded but produced zero

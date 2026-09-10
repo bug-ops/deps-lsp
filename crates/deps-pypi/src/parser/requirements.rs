@@ -153,6 +153,7 @@ impl PypiParser {
         let mut document_links = Vec::new();
         let mut strong_signal = false;
         let mut failed_lines: usize = 0;
+        let mut budget = deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
 
         let mut lines = content.lines().enumerate().peekable();
         while let Some((line_idx, raw_line)) = lines.next() {
@@ -257,6 +258,10 @@ impl PypiParser {
                 continue;
             }
 
+            if !budget.allow() {
+                continue;
+            }
+
             let abs_end = abs_start + req_text.len();
             match self.parse_pep508_requirement(
                 req_text,
@@ -334,6 +339,7 @@ impl PypiParser {
             } else {
                 Vec::new()
             },
+            dependency_truncation: if keep { budget.truncation() } else { None },
         })
     }
 }

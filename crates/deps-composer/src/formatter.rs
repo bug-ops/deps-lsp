@@ -1236,6 +1236,7 @@ mod tests {
             dependencies: vec![corrupted_dep],
             uri: uri.clone(),
             minimum_stability: None,
+            dependency_truncation: None,
         };
         let actions = deps_core::lsp_helpers::generate_code_actions(
             &corrupted_result,

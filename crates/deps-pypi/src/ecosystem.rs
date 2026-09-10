@@ -1171,6 +1171,7 @@ mod tests {
             uri: deps_core::test_util::test_uri("/test/requirements.txt"),
             document_links: Vec::new(),
             resolved_chains: Vec::new(),
+            dependency_truncation: None,
         }
     }
 
@@ -1316,6 +1317,7 @@ mod tests {
             uri: deps_core::test_util::test_uri("/test/requirements.txt"),
             document_links: Vec::new(),
             resolved_chains: Vec::new(),
+            dependency_truncation: None,
         };
 
         // The alternate occurrence resolves deterministically without network: its chain was

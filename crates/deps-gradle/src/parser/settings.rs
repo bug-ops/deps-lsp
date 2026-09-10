@@ -69,6 +69,7 @@ pub fn parse_settings(content: &str, uri: &Uri) -> Result<GradleParseResult> {
     let mut pm_depth: i32 = 0;
     let mut in_plugins = false;
     let mut plugins_depth: i32 = 0;
+    let mut budget = deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
 
     for (line_idx, line) in content.lines().enumerate() {
         let trimmed = line.trim();
@@ -114,6 +115,9 @@ pub fn parse_settings(content: &str, uri: &Uri) -> Result<GradleParseResult> {
         let line_u32 = line_idx as u32;
 
         for caps in RE_PLUGIN.captures_iter(line) {
+            if !budget.allow() {
+                continue;
+            }
             let plugin_id = caps.get(1).map_or("", |m| m.as_str()).to_string();
             let version = caps.get(2).map_or("", |m| m.as_str()).trim().to_string();
 
@@ -139,6 +143,7 @@ pub fn parse_settings(content: &str, uri: &Uri) -> Result<GradleParseResult> {
     Ok(GradleParseResult {
         dependencies,
         uri: uri.clone(),
+        dependency_truncation: budget.truncation(),
     })
 }
 

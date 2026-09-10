@@ -16,6 +16,10 @@ pub struct DartParseResult {
     pub sdk_constraint: Option<String>,
     /// URI of the manifest this result was parsed from.
     pub uri: Uri,
+    /// `Some((kept, total))` once the manifest declared more dependencies than
+    /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
+    /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
+    pub dependency_truncation: Option<(usize, usize)>,
 }
 
 /// Parses a `pubspec.yaml` document into a [`DartParseResult`].
@@ -51,6 +55,7 @@ pub fn parse_pubspec_yaml(content: &str, doc_uri: &Uri) -> Result<DartParseResul
     let line_table = LineOffsetTable::new(content);
     let mut dependencies = Vec::new();
     let mut sdk_constraint = None;
+    let mut budget = deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
 
     let docs = YamlLoader::load_from_str(content).map_err(|e| DepsError::ParseError {
         file_type: "pubspec.yaml".into(),
@@ -64,6 +69,7 @@ pub fn parse_pubspec_yaml(content: &str, doc_uri: &Uri) -> Result<DartParseResul
                 dependencies,
                 sdk_constraint,
                 uri: doc_uri.clone(),
+                dependency_truncation: budget.truncation(),
             });
         }
     };
@@ -87,6 +93,9 @@ pub fn parse_pubspec_yaml(content: &str, doc_uri: &Uri) -> Result<DartParseResul
         if let Yaml::Hash(map) = &doc[*key] {
             for (name_yaml, value) in map {
                 if let Some(name) = name_yaml.as_str() {
+                    if !budget.allow() {
+                        continue;
+                    }
                     let (name_range, version_req, version_range, source, git_path) =
                         parse_dependency_entry(name, value, content, &line_table);
 
@@ -108,6 +117,7 @@ pub fn parse_pubspec_yaml(content: &str, doc_uri: &Uri) -> Result<DartParseResul
         dependencies,
         sdk_constraint,
         uri: doc_uri.clone(),
+        dependency_truncation: budget.truncation(),
     })
 }
 
@@ -246,6 +256,7 @@ deps_core::impl_parse_result!(
     DartDependency {
         dependencies: dependencies,
         uri: uri,
+        dependency_truncation: dependency_truncation,
     }
 );
 

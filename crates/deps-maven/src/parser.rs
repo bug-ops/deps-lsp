@@ -25,6 +25,10 @@ pub struct MavenParseResult {
     pub properties: HashMap<String, String>,
     /// URI of the manifest this result was parsed from.
     pub uri: Uri,
+    /// `Some((kept, total))` once the manifest declared more dependencies than
+    /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
+    /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
+    pub dependency_truncation: Option<(usize, usize)>,
 }
 
 /// Context stack element for SAX parsing.
@@ -70,6 +74,7 @@ pub fn parse_pom_xml(content: &str, doc_uri: &Uri) -> Result<MavenParseResult> {
     let mut current_tag: Option<String> = None;
     let mut current_prop_key: Option<String> = None;
     let mut root_tag: Option<String> = None;
+    let mut budget = deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
 
     loop {
         let pos = reader.buffer_position();
@@ -184,6 +189,7 @@ pub fn parse_pom_xml(content: &str, doc_uri: &Uri) -> Result<MavenParseResult> {
                         if let Some(dep) = current_dep.take()
                             && let Some(maven_dep) =
                                 finalize_dep(dep, content, &line_table, &properties)
+                            && budget.allow()
                         {
                             dependencies.push(maven_dep);
                         }
@@ -210,6 +216,7 @@ pub fn parse_pom_xml(content: &str, doc_uri: &Uri) -> Result<MavenParseResult> {
         dependencies,
         properties,
         uri: doc_uri.clone(),
+        dependency_truncation: budget.truncation(),
     })
 }
 
@@ -332,6 +339,7 @@ deps_core::impl_parse_result!(
     MavenDependency {
         dependencies: dependencies,
         uri: uri,
+        dependency_truncation: dependency_truncation,
     }
 );
 

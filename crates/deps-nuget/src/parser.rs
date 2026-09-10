@@ -76,6 +76,7 @@ pub fn parse_packages_config(content: &str, doc_uri: &Uri) -> Result<NuGetParseR
     reader.config_mut().trim_text(true);
 
     let mut dependencies = Vec::new();
+    let mut budget = deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
 
     loop {
         let event = reader.read_event().map_err(|e| DepsError::ParseError {
@@ -85,7 +86,9 @@ pub fn parse_packages_config(content: &str, doc_uri: &Uri) -> Result<NuGetParseR
 
         match event {
             Event::Empty(ref e) | Event::Start(ref e) if e.local_name().as_ref() == "package" => {
-                if let Some(dep) = parse_package_element(content, &line_table, e) {
+                if let Some(dep) = parse_package_element(content, &line_table, e)
+                    && budget.allow()
+                {
                     dependencies.push(dep);
                 }
             }
@@ -98,6 +101,7 @@ pub fn parse_packages_config(content: &str, doc_uri: &Uri) -> Result<NuGetParseR
         dependencies,
         uri: doc_uri.clone(),
         resolved_chains: Vec::new(),
+        dependency_truncation: budget.truncation(),
     })
 }
 
@@ -170,6 +174,7 @@ fn parse_reference_elements(
     let mut dependencies = Vec::new();
     let mut current: Option<DepAccum> = None;
     let mut in_version_child = false;
+    let mut budget = deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
 
     loop {
         let text_pos = reader.buffer_position();
@@ -183,6 +188,7 @@ fn parse_reference_elements(
                 if e.local_name().as_ref() == tag_name
                     && let Some(dep) =
                         finalize_dep(content, &line_table, accum_from_attrs(content, e))
+                    && budget.allow()
                 {
                     dependencies.push(dep);
                 }
@@ -208,6 +214,7 @@ fn parse_reference_elements(
                 } else if local.as_ref() == tag_name
                     && let Some(accum) = current.take()
                     && let Some(dep) = finalize_dep(content, &line_table, accum)
+                    && budget.allow()
                 {
                     dependencies.push(dep);
                 }
@@ -221,6 +228,7 @@ fn parse_reference_elements(
         dependencies,
         uri: doc_uri.clone(),
         resolved_chains: Vec::new(),
+        dependency_truncation: budget.truncation(),
     })
 }
 

@@ -28,6 +28,10 @@ pub struct NpmParseResult {
     /// the long-lived shared router meet. Empty for a workspace declaring no `.npmrc`
     /// (NFR-005: zero regression).
     pub resolved_registries: Vec<NpmRegistryIndex>,
+    /// `Some((kept, total))` once the manifest declared more dependencies than
+    /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
+    /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
+    pub dependency_truncation: Option<(usize, usize)>,
 }
 
 deps_core::impl_parse_result!(
@@ -35,6 +39,7 @@ deps_core::impl_parse_result!(
     NpmDependency {
         dependencies: dependencies,
         uri: uri,
+        dependency_truncation: dependency_truncation,
     }
 );
 
@@ -100,6 +105,9 @@ pub fn parse_package_json_with_context(
     }
 
     let mut dependencies = Vec::new();
+    // Shared across every section below (#796) — the ceiling is per-document, not
+    // per-section.
+    let mut budget = deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
 
     // Parse each dependency section, reading each entry's position directly from the AST
     // (#613) — the AST's own `Object::properties` only ever lists a given object's *direct*
@@ -125,6 +133,7 @@ pub fn parse_package_json_with_context(
                 section,
                 positions.as_ref(),
                 &line_table,
+                &mut budget,
             ));
         }
     }
@@ -184,6 +193,7 @@ pub fn parse_package_json_with_context(
         dependencies,
         uri: uri.clone(),
         resolved_registries: npm_config.resolved_registries(),
+        dependency_truncation: budget.truncation(),
     })
 }
 
@@ -199,6 +209,7 @@ fn parse_dependency_section(
     section: NpmDependencySection,
     positions: Option<&JsonSection<'_>>,
     line_table: &LineOffsetTable,
+    budget: &mut deps_core::DependencyBudget,
 ) -> Vec<NpmDependency> {
     let mut result = Vec::new();
 
@@ -206,6 +217,10 @@ fn parse_dependency_section(
     // declaration — `string_valued_entries` skips it rather than fabricating an entry with no
     // `version_req` that would still be queried against the registry (#619).
     for (name, version_req) in string_valued_entries(deps) {
+        if !budget.allow() {
+            continue;
+        }
+
         let (name_range, version_range) = positions
             .and_then(|s| s.position(name, content, line_table))
             .unwrap_or_default();
@@ -1524,12 +1539,14 @@ mod tests {
         let content = r#"{"dependencies": {"express": "^4.18.2"}}"#;
         let line_table = LineOffsetTable::new(content);
 
+        let mut budget = deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
         let result = parse_dependency_section(
             content,
             &deps,
             NpmDependencySection::Dependencies,
             None,
             &line_table,
+            &mut budget,
         );
 
         assert_eq!(result.len(), 1);

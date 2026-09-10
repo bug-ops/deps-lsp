@@ -482,6 +482,10 @@ macro_rules! impl_metadata {
 /// * `dependencies` - Field name for dependencies vec (`Vec<DepType>`)
 /// * `uri` - Field name for document URI (`Url`)
 /// * `workspace_root` - Optional: field name for workspace root (`Option<PathBuf>`)
+/// * `dependency_truncation` - Optional: field name for the `Option<(usize, usize)>`
+///   [`ecosystem::ParseResult::dependency_truncation`](crate::ecosystem::ParseResult::dependency_truncation)
+///   override (#796) — omit when the parser has no [`crate::DependencyBudget`] wired in yet
+///   (the trait default `None` applies).
 ///
 /// # Examples
 ///
@@ -491,6 +495,7 @@ macro_rules! impl_metadata {
 /// pub struct MyParseResult {
 ///     pub dependencies: Vec<MyDependency>,
 ///     pub uri: Uri,
+///     pub dependency_truncation: Option<(usize, usize)>,
 /// }
 ///
 /// impl_parse_result!(MyParseResult, MyDependency {
@@ -498,11 +503,12 @@ macro_rules! impl_metadata {
 ///     uri: uri,
 /// });
 ///
-/// // With workspace root:
+/// // With workspace root and/or dependency-truncation tracking:
 /// impl_parse_result!(MyParseResult, MyDependency {
 ///     dependencies: dependencies,
 ///     uri: uri,
 ///     workspace_root: workspace_root,
+///     dependency_truncation: dependency_truncation,
 /// });
 /// ```
 #[macro_export]
@@ -555,6 +561,67 @@ macro_rules! impl_parse_result {
 
             fn as_any(&self) -> &dyn ::std::any::Any {
                 self
+            }
+        }
+    };
+    ($type:ty, $dep_type:ty {
+        dependencies: $dependencies:ident,
+        uri: $uri:ident,
+        dependency_truncation: $dependency_truncation:ident $(,)?
+    }) => {
+        impl $crate::ecosystem::ParseResult for $type {
+            fn dependencies(&self) -> Vec<&dyn $crate::ecosystem::Dependency> {
+                self.$dependencies
+                    .iter()
+                    .map(|d| d as &dyn $crate::ecosystem::Dependency)
+                    .collect()
+            }
+
+            fn workspace_root(&self) -> Option<&::std::path::Path> {
+                None
+            }
+
+            fn uri(&self) -> &::tower_lsp_server::ls_types::Uri {
+                &self.$uri
+            }
+
+            fn as_any(&self) -> &dyn ::std::any::Any {
+                self
+            }
+
+            fn dependency_truncation(&self) -> Option<(usize, usize)> {
+                self.$dependency_truncation
+            }
+        }
+    };
+    ($type:ty, $dep_type:ty {
+        dependencies: $dependencies:ident,
+        uri: $uri:ident,
+        workspace_root: $workspace_root:ident,
+        dependency_truncation: $dependency_truncation:ident $(,)?
+    }) => {
+        impl $crate::ecosystem::ParseResult for $type {
+            fn dependencies(&self) -> Vec<&dyn $crate::ecosystem::Dependency> {
+                self.$dependencies
+                    .iter()
+                    .map(|d| d as &dyn $crate::ecosystem::Dependency)
+                    .collect()
+            }
+
+            fn workspace_root(&self) -> Option<&::std::path::Path> {
+                self.$workspace_root.as_deref()
+            }
+
+            fn uri(&self) -> &::tower_lsp_server::ls_types::Uri {
+                &self.$uri
+            }
+
+            fn as_any(&self) -> &dyn ::std::any::Any {
+                self
+            }
+
+            fn dependency_truncation(&self) -> Option<(usize, usize)> {
+                self.$dependency_truncation
             }
         }
     };

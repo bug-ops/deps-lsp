@@ -57,10 +57,15 @@ pub fn parse_version_catalog(content: &str, uri: &Uri) -> Result<GradleParseResu
         return Ok(GradleParseResult {
             dependencies,
             uri: uri.clone(),
+            dependency_truncation: None,
         });
     };
 
+    let mut budget = deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
     for item in libs_table.values() {
+        if !budget.allow() {
+            continue;
+        }
         let Some(dep) = parse_library_entry(item, content, &line_table, &version_refs) else {
             continue;
         };
@@ -70,6 +75,7 @@ pub fn parse_version_catalog(content: &str, uri: &Uri) -> Result<GradleParseResu
     Ok(GradleParseResult {
         dependencies,
         uri: uri.clone(),
+        dependency_truncation: budget.truncation(),
     })
 }
 

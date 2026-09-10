@@ -22,6 +22,10 @@ pub struct BundlerParseResult {
     pub source_url: Option<String>,
     /// URI of the manifest this result was parsed from.
     pub uri: Uri,
+    /// `Some((kept, total))` once the manifest declared more dependencies than
+    /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
+    /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
+    pub dependency_truncation: Option<(usize, usize)>,
 }
 
 // Regex patterns for Gemfile parsing
@@ -101,6 +105,7 @@ pub fn parse_gemfile(content: &str, doc_uri: &Uri) -> Result<BundlerParseResult>
     let mut ruby_version = None;
     let mut source_url = None;
     let mut current_group: Option<DependencyGroup> = None;
+    let mut budget = deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
 
     for (line_idx, line) in content.lines().enumerate() {
         let Some(line_start) = line_table.line_start(line_idx) else {
@@ -135,6 +140,10 @@ pub fn parse_gemfile(content: &str, doc_uri: &Uri) -> Result<BundlerParseResult>
 
         // Check for gem declaration
         if let Some(caps) = GEM_PATTERN.captures(line) {
+            if !budget.allow() {
+                continue;
+            }
+
             let name = caps[1].to_string();
 
             // Find name position in line
@@ -187,6 +196,7 @@ pub fn parse_gemfile(content: &str, doc_uri: &Uri) -> Result<BundlerParseResult>
         ruby_version,
         source_url,
         uri: doc_uri.clone(),
+        dependency_truncation: budget.truncation(),
     })
 }
 
@@ -319,6 +329,7 @@ deps_core::impl_parse_result!(
     BundlerDependency {
         dependencies: dependencies,
         uri: uri,
+        dependency_truncation: dependency_truncation,
     }
 );
 

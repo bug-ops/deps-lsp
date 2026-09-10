@@ -96,6 +96,9 @@ impl PypiParser {
 
         let line_table = LineOffsetTable::new(content);
         let mut dependencies = Vec::new();
+        // Shared across every section below (#796) — the ceiling is per-document, not
+        // per-section.
+        let mut budget = deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
 
         let root_table = match doc.as_table() {
             Some(t) => t,
@@ -106,6 +109,7 @@ impl PypiParser {
                     uri: uri.clone(),
                     document_links: Vec::new(),
                     resolved_chains: Vec::new(),
+                    dependency_truncation: budget.truncation(),
                 });
             }
         };
@@ -138,6 +142,7 @@ impl PypiParser {
                 content,
                 &line_table,
                 &ctx,
+                &mut budget,
             ));
         }
 
@@ -148,12 +153,14 @@ impl PypiParser {
                 content,
                 &line_table,
                 &ctx,
+                &mut budget,
             ));
             dependencies.extend(self.parse_pep621_optional_dependencies(
                 project,
                 content,
                 &line_table,
                 &ctx,
+                &mut budget,
             ));
         }
 
@@ -164,6 +171,7 @@ impl PypiParser {
                 content,
                 &line_table,
                 &ctx,
+                &mut budget,
             ));
         }
 
@@ -171,8 +179,20 @@ impl PypiParser {
         if let Some(tool_table) = get_table(root_table, "tool")
             && let Some(poetry) = get_table(tool_table, "poetry")
         {
-            dependencies.extend(self.parse_poetry_dependencies(poetry, content, &line_table, &ctx));
-            dependencies.extend(self.parse_poetry_groups(poetry, content, &line_table, &ctx));
+            dependencies.extend(self.parse_poetry_dependencies(
+                poetry,
+                content,
+                &line_table,
+                &ctx,
+                &mut budget,
+            ));
+            dependencies.extend(self.parse_poetry_groups(
+                poetry,
+                content,
+                &line_table,
+                &ctx,
+                &mut budget,
+            ));
         }
 
         Ok(ParseResult {
@@ -181,6 +201,7 @@ impl PypiParser {
             uri: uri.clone(),
             document_links: Vec::new(),
             resolved_chains: config.resolved_chains(),
+            dependency_truncation: budget.truncation(),
         })
     }
 
@@ -194,6 +215,7 @@ impl PypiParser {
         content: &str,
         line_table: &LineOffsetTable,
         ctx: &IndexContext<'_>,
+        budget: &mut deps_core::DependencyBudget,
     ) -> Vec<PypiDependency> {
         let Some(requires_val) = build_system.get("requires") else {
             return Vec::new();
@@ -206,6 +228,9 @@ impl PypiParser {
         let mut dependencies = Vec::new();
 
         for value in requires_array {
+            if !budget.allow() {
+                continue;
+            }
             if let Some(dep_str) = value.as_str() {
                 match self.parse_pep508_requirement(
                     dep_str,
@@ -242,6 +267,7 @@ impl PypiParser {
         content: &str,
         line_table: &LineOffsetTable,
         ctx: &IndexContext<'_>,
+        budget: &mut deps_core::DependencyBudget,
     ) -> Vec<PypiDependency> {
         let Some(deps_val) = project.get("dependencies") else {
             return Vec::new();
@@ -254,6 +280,9 @@ impl PypiParser {
         let mut dependencies = Vec::new();
 
         for value in deps_array {
+            if !budget.allow() {
+                continue;
+            }
             if let Some(dep_str) = value.as_str() {
                 match self.parse_pep508_requirement(
                     dep_str,
@@ -290,6 +319,7 @@ impl PypiParser {
         content: &str,
         line_table: &LineOffsetTable,
         ctx: &IndexContext<'_>,
+        budget: &mut deps_core::DependencyBudget,
     ) -> Vec<PypiDependency> {
         let Some(opt_deps_val) = project.get("optional-dependencies") else {
             return Vec::new();
@@ -304,6 +334,9 @@ impl PypiParser {
         for (group_key, group_val) in opt_deps_table {
             if let Some(group_array) = group_val.as_array() {
                 for value in group_array {
+                    if !budget.allow() {
+                        continue;
+                    }
                     if let Some(dep_str) = value.as_str() {
                         match self.parse_pep508_requirement(
                             dep_str,
@@ -352,12 +385,16 @@ impl PypiParser {
         content: &str,
         line_table: &LineOffsetTable,
         ctx: &IndexContext<'_>,
+        budget: &mut deps_core::DependencyBudget,
     ) -> Vec<PypiDependency> {
         let mut dependencies = Vec::new();
 
         for (group_key, group_val) in dep_groups {
             if let Some(group_array) = group_val.as_array() {
                 for value in group_array {
+                    if !budget.allow() {
+                        continue;
+                    }
                     if let Some(dep_str) = value.as_str() {
                         match self.parse_pep508_requirement(
                             dep_str,
@@ -399,6 +436,7 @@ impl PypiParser {
         content: &str,
         line_table: &LineOffsetTable,
         ctx: &IndexContext<'_>,
+        budget: &mut deps_core::DependencyBudget,
     ) -> Vec<PypiDependency> {
         let Some(deps_val) = poetry.get("dependencies") else {
             return Vec::new();
@@ -414,6 +452,9 @@ impl PypiParser {
             let name = &name_key.name;
             // Skip Python version constraint
             if name == "python" {
+                continue;
+            }
+            if !budget.allow() {
                 continue;
             }
 
@@ -450,6 +491,7 @@ impl PypiParser {
         content: &str,
         line_table: &LineOffsetTable,
         ctx: &IndexContext<'_>,
+        budget: &mut deps_core::DependencyBudget,
     ) -> Vec<PypiDependency> {
         let Some(group_val) = poetry.get("group") else {
             return Vec::new();
@@ -468,6 +510,9 @@ impl PypiParser {
                 && let Some(deps_table) = deps_val.as_table()
             {
                 for (name_key, value) in deps_table {
+                    if !budget.allow() {
+                        continue;
+                    }
                     let name = &name_key.name;
                     let position = span_start(content, line_table, name_key.span);
 

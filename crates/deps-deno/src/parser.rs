@@ -32,6 +32,9 @@ pub struct DenoParseResult {
     pub dependencies: Vec<DenoDependency>,
     /// Document URI.
     pub uri: Uri,
+    /// `Some((kept, total))` once the manifest declared more dependencies than
+    /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796).
+    pub dependency_truncation: Option<(usize, usize)>,
 }
 
 deps_core::impl_parse_result!(
@@ -39,6 +42,7 @@ deps_core::impl_parse_result!(
     DenoDependency {
         dependencies: dependencies,
         uri: uri,
+        dependency_truncation: dependency_truncation,
     }
 );
 
@@ -92,17 +96,25 @@ pub fn parse_deno_json(content: &str, uri: &Uri) -> Result<DenoParseResult> {
 
     let line_table = LineOffsetTable::new(content);
     let mut dependencies = Vec::new();
+    let mut budget = deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
 
     if let Some(Value::Object(root)) = ast.value
         && let Some(imports_prop) = find_last_prop(&root, "imports")
         && let Value::Object(imports) = &imports_prop.value
     {
-        collect_imports(imports, content, &line_table, &mut dependencies);
+        collect_imports(
+            imports,
+            content,
+            &line_table,
+            &mut dependencies,
+            &mut budget,
+        );
     }
 
     Ok(DenoParseResult {
         dependencies,
         uri: uri.clone(),
+        dependency_truncation: budget.truncation(),
     })
 }
 
@@ -161,6 +173,7 @@ fn collect_imports(
     content: &str,
     line_table: &LineOffsetTable,
     out: &mut Vec<DenoDependency>,
+    budget: &mut deps_core::DependencyBudget,
 ) {
     let mut seen_aliases = HashSet::new();
     let mut collected = Vec::new();
@@ -175,6 +188,9 @@ fn collect_imports(
         let Value::StringLit(value_lit) = &prop.value else {
             continue;
         };
+        if !budget.allow() {
+            continue;
+        }
         if let Some(dep) = build_dependency(value_lit, content, line_table) {
             collected.push(dep);
         }

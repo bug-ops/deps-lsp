@@ -240,6 +240,10 @@ pub struct GitlabCiParseResult {
     pub routes: Vec<(String, GitlabRoute)>,
     /// URI of the parsed file.
     pub uri: Uri,
+    /// `Some((kept, total))` once the manifest declared more dependencies than
+    /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
+    /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
+    pub dependency_truncation: Option<(usize, usize)>,
 }
 
 deps_core::impl_parse_result!(
@@ -247,6 +251,7 @@ deps_core::impl_parse_result!(
     GitlabCiDependency {
         dependencies: dependencies,
         uri: uri,
+        dependency_truncation: dependency_truncation,
     }
 );
 
@@ -330,6 +335,7 @@ mod tests {
             )],
             routes: vec![],
             uri,
+            dependency_truncation: None,
         };
         assert_eq!(result.dependencies().len(), 1);
         assert!(result.uri().path().as_str().ends_with(".gitlab-ci.yml"));

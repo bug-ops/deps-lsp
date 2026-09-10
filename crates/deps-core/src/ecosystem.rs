@@ -95,14 +95,22 @@ pub async fn parse_manifest_blocking(
     let owned_content = content.to_owned();
     let owned_uri = uri.clone();
     let handle = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking(move || {
+    let parsed = tokio::task::spawn_blocking(move || {
         handle.block_on(ecosystem.parse_manifest(&owned_content, &owned_uri))
     })
     .await
     .map_err(|e| crate::error::DepsError::ParseError {
         file_type: format!("manifest at {uri:?}"),
         source: Box::new(std::io::Error::other(e)),
-    })?
+    })??;
+
+    // Single chokepoint for #796: every ecosystem's parse result is capped here, once,
+    // rather than each ecosystem crate's own parser bounding its dependency count
+    // independently.
+    Ok(crate::dependency_cap::cap_dependencies(
+        parsed,
+        crate::dependency_cap::MAX_DEPENDENCIES_PER_DOCUMENT,
+    ))
 }
 
 /// Defines [`EcosystemId`] together with [`EcosystemId::ALL`], [`EcosystemId::id`] and its
@@ -293,6 +301,18 @@ pub trait ParseResult: Send + Sync {
 
     /// Downcast to concrete type for ecosystem-specific operations
     fn as_any(&self) -> &dyn Any;
+
+    /// Dependency-count ceiling info (#796): `Some((kept, total))` once this document's
+    /// dependency count was truncated to [`crate::dependency_cap::MAX_DEPENDENCIES_PER_DOCUMENT`]
+    /// by [`parse_manifest_blocking`], `None` otherwise.
+    ///
+    /// The default (and every concrete ecosystem parser) returns `None` — only the
+    /// wrapper [`parse_manifest_blocking`] installs when truncating overrides it, so this
+    /// needs no per-ecosystem implementation. Read by
+    /// `deps_core::lsp_helpers::diagnostics`' truncation notice.
+    fn dependency_truncation(&self) -> Option<(usize, usize)> {
+        None
+    }
 }
 
 /// Generic dependency trait.
@@ -1323,15 +1343,47 @@ mod tests {
         assert_eq!(dep.features(), &[] as &[String]);
     }
 
+    /// Minimal [`Dependency`] repeated `dep_count` times by [`StubParseResult`] (#796
+    /// `parse_manifest_blocking` capping test) — identical instances are fine here since
+    /// only the *count* `parse_manifest_blocking` sees is under test, not per-dependency
+    /// identity.
+    struct StubDep;
+
+    impl Dependency for StubDep {
+        fn name(&self) -> &crate::PackageName {
+            static NAME: std::sync::LazyLock<crate::PackageName> =
+                std::sync::LazyLock::new(|| crate::PackageName::new("stub-dep"));
+            &NAME
+        }
+        fn name_range(&self) -> tower_lsp_server::ls_types::Range {
+            tower_lsp_server::ls_types::Range::default()
+        }
+        fn version_requirement(&self) -> Option<&crate::VersionReq> {
+            None
+        }
+        fn version_range(&self) -> Option<tower_lsp_server::ls_types::Range> {
+            None
+        }
+        fn source(&self) -> crate::parser::DependencySource {
+            crate::parser::DependencySource::Registry
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
     /// Minimal [`ParseResult`] returned by [`StubEcosystem::parse_manifest`] below —
-    /// only [`parse_manifest_blocking`] tests need it, so it carries nothing beyond a URI.
+    /// only [`parse_manifest_blocking`] tests need it, so it carries nothing beyond a URI
+    /// and a synthetic dependency count.
     struct StubParseResult {
         uri: Uri,
+        dep_count: usize,
     }
 
     impl ParseResult for StubParseResult {
         fn dependencies(&self) -> Vec<&dyn Dependency> {
-            Vec::new()
+            static STUB_DEP: StubDep = StubDep;
+            vec![&STUB_DEP as &dyn Dependency; self.dep_count]
         }
 
         fn workspace_root(&self) -> Option<&std::path::Path> {
@@ -1352,6 +1404,9 @@ mod tests {
     struct StubEcosystem {
         calling_thread: std::thread::ThreadId,
         should_panic: bool,
+        /// Dependency count [`StubParseResult`] reports — `0` for every test except
+        /// [`test_parse_manifest_blocking_caps_dependencies_over_the_ceiling`] (#796).
+        dep_count: usize,
     }
 
     impl private::Sealed for StubEcosystem {}
@@ -1385,7 +1440,10 @@ mod tests {
                     self.calling_thread,
                     "parse must run on the blocking pool, not the calling thread"
                 );
-                Ok(Box::new(StubParseResult { uri: uri.clone() }) as Box<dyn ParseResult>)
+                Ok(Box::new(StubParseResult {
+                    uri: uri.clone(),
+                    dep_count: self.dep_count,
+                }) as Box<dyn ParseResult>)
             })
         }
 
@@ -1424,6 +1482,7 @@ mod tests {
         let ecosystem: Arc<dyn Ecosystem> = Arc::new(StubEcosystem {
             calling_thread: std::thread::current().id(),
             should_panic: false,
+            dep_count: 0,
         });
         let uri = crate::test_util::test_uri("/test/manifest.toml");
 
@@ -1431,6 +1490,36 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(parsed.uri(), &uri);
+    }
+
+    /// #796: `parse_manifest_blocking` is the single chokepoint every ecosystem's parse
+    /// result flows through — proves it actually applies
+    /// `dependency_cap::cap_dependencies`, not just that the wrapper type behaves
+    /// correctly in isolation (covered by `dependency_cap`'s own tests).
+    #[tokio::test]
+    async fn test_parse_manifest_blocking_caps_dependencies_over_the_ceiling() {
+        let ecosystem: Arc<dyn Ecosystem> = Arc::new(StubEcosystem {
+            calling_thread: std::thread::current().id(),
+            should_panic: false,
+            dep_count: crate::dependency_cap::MAX_DEPENDENCIES_PER_DOCUMENT + 1,
+        });
+        let uri = crate::test_util::test_uri("/test/manifest.toml");
+
+        let parsed = parse_manifest_blocking(&ecosystem, "content", &uri)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            parsed.dependencies().len(),
+            crate::dependency_cap::MAX_DEPENDENCIES_PER_DOCUMENT
+        );
+        assert_eq!(
+            parsed.dependency_truncation(),
+            Some((
+                crate::dependency_cap::MAX_DEPENDENCIES_PER_DOCUMENT,
+                crate::dependency_cap::MAX_DEPENDENCIES_PER_DOCUMENT + 1
+            ))
+        );
     }
 
     /// A panicking `parse_manifest` must surface as `Err(DepsError::ParseError)` with the
@@ -1441,6 +1530,7 @@ mod tests {
         let ecosystem: Arc<dyn Ecosystem> = Arc::new(StubEcosystem {
             calling_thread: std::thread::current().id(),
             should_panic: true,
+            dep_count: 0,
         });
         let uri = crate::test_util::test_uri("/test/manifest.toml");
 

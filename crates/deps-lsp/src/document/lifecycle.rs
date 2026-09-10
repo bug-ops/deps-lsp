@@ -1224,6 +1224,117 @@ mod tests {
     use deps_core::RemovalStatus;
     use std::time::Duration;
 
+    /// #796: the dependency-count ceiling applies through the full `deps-lsp`
+    /// document-open pipeline for a real ecosystem parser (Cargo), not just the
+    /// `deps-core` wrapper in isolation (`deps_core::dependency_cap`'s own tests) —
+    /// `DocumentState` only ever tracks the capped subset, and the informational ceiling
+    /// diagnostic is published alongside it.
+    #[cfg(feature = "cargo")]
+    #[tokio::test]
+    async fn test_document_over_dependency_ceiling_is_capped_and_reports_a_diagnostic() {
+        let state = Arc::new(ServerState::new());
+        let uri = deps_core::test_util::test_uri("/test/over-ceiling/Cargo.toml");
+
+        let cap = deps_core::MAX_DEPENDENCIES_PER_DOCUMENT;
+        let mut content = String::from("[dependencies]\n");
+        for i in 0..=cap {
+            content.push_str(&format!("dep-{i} = \"1.0.0\"\n"));
+        }
+
+        let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+        let parse_result = deps_core::parse_manifest_blocking(&ecosystem, &content, &uri)
+            .await
+            .unwrap();
+        assert_eq!(
+            parse_result.dependencies().len(),
+            cap,
+            "a manifest declaring cap + 1 dependencies must be truncated to the cap"
+        );
+
+        let doc_state =
+            DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+        state.update_document(uri.clone(), doc_state);
+
+        let diags = diagnostics::generate_diagnostics_internal(
+            Arc::clone(&state),
+            &uri,
+            deps_core::FreshnessSettings::default(),
+            deps_core::DiagnosticSeverities::default(),
+            false,
+            diagnostics::loading_ceiling(
+                crate::config::CacheConfig::default().fetch_timeout_secs,
+                cap,
+                crate::config::CacheConfig::default().max_concurrent_fetches,
+            ),
+        )
+        .await;
+
+        assert!(
+            diags.iter().any(|d| d
+                .message
+                .contains("exceeding deps-lsp's per-document limit")),
+            "expected the dependency-ceiling informational diagnostic, got: {diags:?}"
+        );
+    }
+
+    /// #796 (impl-critic M3): a manifest declaring exactly the ceiling — not `cap + 1` —
+    /// through a real ecosystem parser (Cargo) must be parsed in full, untruncated, with no
+    /// ceiling diagnostic. Companion to the over-ceiling test above; the `== cap` boundary
+    /// was previously covered only by `deps_core::dependency_cap`'s stub-based unit test,
+    /// never through a real parser's own dependency-collecting loop.
+    #[cfg(feature = "cargo")]
+    #[tokio::test]
+    async fn test_document_at_exactly_the_dependency_ceiling_is_not_truncated() {
+        let state = Arc::new(ServerState::new());
+        let uri = deps_core::test_util::test_uri("/test/at-ceiling/Cargo.toml");
+
+        let cap = deps_core::MAX_DEPENDENCIES_PER_DOCUMENT;
+        let mut content = String::from("[dependencies]\n");
+        for i in 0..cap {
+            content.push_str(&format!("dep-{i} = \"1.0.0\"\n"));
+        }
+
+        let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+        let parse_result = deps_core::parse_manifest_blocking(&ecosystem, &content, &uri)
+            .await
+            .unwrap();
+        assert_eq!(
+            parse_result.dependencies().len(),
+            cap,
+            "a manifest declaring exactly the cap must not lose any dependency"
+        );
+        assert_eq!(
+            parse_result.dependency_truncation(),
+            None,
+            "a manifest declaring exactly the cap must not be reported as truncated"
+        );
+
+        let doc_state =
+            DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+        state.update_document(uri.clone(), doc_state);
+
+        let diags = diagnostics::generate_diagnostics_internal(
+            Arc::clone(&state),
+            &uri,
+            deps_core::FreshnessSettings::default(),
+            deps_core::DiagnosticSeverities::default(),
+            false,
+            diagnostics::loading_ceiling(
+                crate::config::CacheConfig::default().fetch_timeout_secs,
+                cap,
+                crate::config::CacheConfig::default().max_concurrent_fetches,
+            ),
+        )
+        .await;
+
+        assert!(
+            !diags.iter().any(|d| d
+                .message
+                .contains("exceeding deps-lsp's per-document limit")),
+            "a manifest at exactly the ceiling must get no ceiling diagnostic, got: {diags:?}"
+        );
+    }
+
     /// Issue #592: `RefetchPolicy::AllDependencies`'s cache-drop mechanism, and the
     /// residual risk it accepts (forced-refetch-then-total-failure must render "Registry
     /// lookup failed", never "Unknown package").

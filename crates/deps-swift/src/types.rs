@@ -158,6 +158,10 @@ pub struct SwiftParseResult {
     pub dependencies: Vec<SwiftDependency>,
     /// URI of the manifest this result was parsed from.
     pub uri: tower_lsp_server::ls_types::Uri,
+    /// `Some((kept, total))` once the manifest declared more dependencies than
+    /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
+    /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
+    pub dependency_truncation: Option<(usize, usize)>,
 }
 
 deps_core::impl_parse_result!(
@@ -165,6 +169,7 @@ deps_core::impl_parse_result!(
     SwiftDependency {
         dependencies: dependencies,
         uri: uri,
+        dependency_truncation: dependency_truncation,
     }
 );
 

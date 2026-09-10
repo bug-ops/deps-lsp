@@ -624,6 +624,7 @@ pub fn parse_gitlab_ci_yaml(
             dependencies: Vec::new(),
             routes: Vec::new(),
             uri: uri.clone(),
+            dependency_truncation: None,
         });
     }
 
@@ -633,8 +634,15 @@ pub fn parse_gitlab_ci_yaml(
     let mut seen_route_keys = HashSet::new();
     let mut routes = Vec::new();
     let mut dependencies = Vec::new();
+    // #796: checked before `build_dependency` (the expensive step — policy/host
+    // resolution, range computation) rather than after, so an entry beyond the ceiling
+    // never reaches it.
+    let mut budget = deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
 
     for entry in receiver.entries {
+        if !budget.allow() {
+            continue;
+        }
         let Some((dep, route)) = build_dependency(
             content,
             &line_table,
@@ -658,6 +666,7 @@ pub fn parse_gitlab_ci_yaml(
         dependencies,
         routes,
         uri: uri.clone(),
+        dependency_truncation: budget.truncation(),
     })
 }
 
