@@ -344,7 +344,9 @@ mod tests {
 
     // #758: exact-value `Ecosystem` conformance, replacing the hand-written
     // test_ecosystem_id/test_ecosystem_display_name/test_ecosystem_manifest_filenames/
-    // test_ecosystem_lockfile_filenames/test_as_any/test_registry_creation family.
+    // test_ecosystem_lockfile_filenames/test_as_any family. Does not replace registry.rs's
+    // own test_registry_creation, which constructs `CratesIoRegistry` directly — a different
+    // type from `Ecosystem::registry()`'s `Arc<dyn Registry>` return value.
     deps_core::ecosystem_conformance! {
         mod cargo_ecosystem_conformance;
         build: CargoEcosystem::new(Arc::new(deps_core::HttpCache::new()));
