@@ -34,6 +34,36 @@ enum MavenNameField {
     ArtifactId,
 }
 
+/// Which manifest position a Maven completion request resolved to, or none.
+///
+/// A crate-local, non-`&'static str` replacement for the hand-rolled tag-name return of
+/// [`MavenEcosystem::detect_xml_context`] (issue #819, same bug class as #793/#118): the
+/// dispatch match in [`Ecosystem::generate_completions`]'s override for this crate must be
+/// exhaustive over this enum, so adding a new completable tag forces a compile error at the
+/// match instead of silently falling through a `_ => vec![]` wildcard. `Version` does map
+/// conceptually to [`deps_core::completion::CompletionContext::Version`] — the reason this
+/// crate keeps its own full override rather than the shared dispatch isn't a missing
+/// concept, it's the detection *source*: `detect_xml_context` scans the manifest's raw text
+/// for `<version>`/`<artifactId>`/`<groupId>` tags directly, independent of
+/// `parse_result.dependencies()` (deliberately dependency-blind, see
+/// `test_generate_completions_version_context_no_dependency_at_position_returns_empty`
+/// below), whereas [`deps_core::completion::detect_completion_context`] derives its context
+/// from parsed-AST dependency ranges. `ArtifactId`/`GroupId` genuinely have no counterpart —
+/// a pom.xml coordinate splits `groupId`/`artifactId` across two separate tags, unlike
+/// `CompletionContext::PackageName`'s single combined name (see that method's default-impl
+/// doc).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MavenXmlContext {
+    /// Cursor is inside a `<version>` tag's value.
+    Version,
+    /// Cursor is inside an `<artifactId>` tag's value.
+    ArtifactId,
+    /// Cursor is inside a `<groupId>` tag's value.
+    GroupId,
+    /// Cursor is not inside any completable tag.
+    None,
+}
+
 /// Builds a completion item for one field of a Maven coordinate.
 ///
 /// Reuses [`deps_core::completion::build_package_completion`] for documentation/detail
@@ -158,13 +188,13 @@ impl MavenEcosystem {
 
     /// Detects Maven XML completion context at the given position.
     ///
-    /// Returns `(context_type, value, value_range)` where `context_type` is "version",
-    /// "artifactId", "groupId", or empty string for no completion; `value` is the
-    /// already-typed prefix up to the cursor, used as the search query; `value_range` spans
-    /// the *entire* existing tag value (opening tag to closing tag, not just up to the
-    /// cursor) and is the range a completion's `text_edit` must replace so the whole value
-    /// is overwritten instead of leaving trailing characters behind — it is meaningless when
-    /// `context_type` is empty.
+    /// Returns `(context_type, value, value_range)` where `context_type` is a
+    /// [`MavenXmlContext`]; `value` is the already-typed prefix up to the cursor, used as
+    /// the search query; `value_range` spans the *entire* existing tag value (opening tag
+    /// to closing tag, not just up to the cursor) and is the range a completion's
+    /// `text_edit` must replace so the whole value is overwritten instead of leaving
+    /// trailing characters behind — it is meaningless when `context_type` is
+    /// [`MavenXmlContext::None`].
     ///
     /// `position.character` is a UTF-16 code unit offset (LSP spec) and is converted to a
     /// byte offset once via [`deps_core::completion::utf16_to_byte_offset`] before any
@@ -179,12 +209,12 @@ impl MavenEcosystem {
         content: &'a str,
         position: Position,
         parse_result: &dyn ParseResultTrait,
-    ) -> (&'static str, &'a str, LspRange) {
+    ) -> (MavenXmlContext, &'a str, LspRange) {
         let lines: Vec<&str> = content.lines().collect();
         let line_idx = position.line as usize;
 
         let Some(&line) = lines.get(line_idx) else {
-            return ("", "", LspRange::default());
+            return (MavenXmlContext::None, "", LspRange::default());
         };
         let col_idx = deps_core::completion::utf16_to_byte_offset(line, position.character)
             .unwrap_or(line.len());
@@ -194,7 +224,11 @@ impl MavenEcosystem {
         let before_cursor = &line[..col_idx];
 
         // Check if we're inside a known element by looking for the most recent opening tag
-        for tag in &["version", "artifactId", "groupId"] {
+        for (tag, ctx) in [
+            ("version", MavenXmlContext::Version),
+            ("artifactId", MavenXmlContext::ArtifactId),
+            ("groupId", MavenXmlContext::GroupId),
+        ] {
             let open = format!("<{tag}>");
             if let Some(start) = before_cursor.rfind(&open) {
                 let value_start = start + open.len();
@@ -221,12 +255,12 @@ impl MavenEcosystem {
                             character: deps_core::completion::byte_to_utf16_offset(line, value_end),
                         },
                     };
-                    return (tag, value, value_range);
+                    return (ctx, value, value_range);
                 }
             }
         }
 
-        ("", "", LspRange::default())
+        (MavenXmlContext::None, "", LspRange::default())
     }
 }
 
@@ -269,13 +303,13 @@ impl Ecosystem for MavenEcosystem {
     }
 
     /// This is a full override, not the shared [`Ecosystem::generate_completions`] default
-    /// dispatch: Maven routes on its own `(&'static str, value, range)` XML context
-    /// (`Self::detect_xml_context`), which has no
-    /// [`deps_core::completion::CompletionContext`] representation — `groupId`/`artifactId`
-    /// are two independent completable fields with no counterpart in that enum. Opting out
-    /// of the shared dispatch means this ecosystem takes on #793's wildcard-match obligation
-    /// itself; see
-    /// `deps_core::Ecosystem::generate_completions`'s doc.
+    /// dispatch: Maven routes on its own `MavenXmlContext` (`Self::detect_xml_context`),
+    /// detected from raw manifest text rather than
+    /// [`deps_core::completion::detect_completion_context`]'s parsed-AST dependency ranges
+    /// (see `MavenXmlContext`'s doc for why that source difference, plus `groupId`/
+    /// `artifactId` having no counterpart at all, is why this crate can't reuse the shared
+    /// dispatch). Opting out of it means this ecosystem takes on #793's wildcard-match
+    /// obligation itself; see `deps_core::Ecosystem::generate_completions`'s doc.
     fn generate_completions<'a>(
         &'a self,
         parse_result: &'a dyn ParseResultTrait,
@@ -287,8 +321,10 @@ impl Ecosystem for MavenEcosystem {
             let (ctx_type, value, value_range) =
                 Self::detect_xml_context(content, position, parse_result);
 
+            // Exhaustive on purpose (#819, same bug class as #793): no wildcard arm, so a
+            // new `MavenXmlContext` variant is a compile error right here.
             match ctx_type {
-                "version" => {
+                MavenXmlContext::Version => {
                     let dep = parse_result.dependencies().into_iter().find(|d| {
                         d.version_range()
                             .is_some_and(|r| position_in_range(position, r))
@@ -307,7 +343,7 @@ impl Ecosystem for MavenEcosystem {
                         vec![]
                     }
                 }
-                "artifactId" => {
+                MavenXmlContext::ArtifactId => {
                     self.complete_package_names_for_field(
                         value,
                         MavenNameField::ArtifactId,
@@ -315,7 +351,7 @@ impl Ecosystem for MavenEcosystem {
                     )
                     .await
                 }
-                "groupId" => {
+                MavenXmlContext::GroupId => {
                     self.complete_package_names_for_field(
                         value,
                         MavenNameField::GroupId,
@@ -323,7 +359,7 @@ impl Ecosystem for MavenEcosystem {
                     )
                     .await
                 }
-                _ => vec![],
+                MavenXmlContext::None => vec![],
             }
             .into()
         })
@@ -530,12 +566,12 @@ mod tests {
         Position { line, character }
     }
 
-    fn xml_context(line_content: &str, col: u32) -> (&'static str, String) {
+    fn xml_context(line_content: &str, col: u32) -> (MavenXmlContext, String) {
         let (t, v, _range) = xml_context_with_range(line_content, col);
         (t, v)
     }
 
-    fn xml_context_with_range(line_content: &str, col: u32) -> (&'static str, String, LspRange) {
+    fn xml_context_with_range(line_content: &str, col: u32) -> (MavenXmlContext, String, LspRange) {
         let content = format!("    {line_content}\n");
         let col_in_content = col + 4; // 4 spaces indent
         let (t, v, range) = MavenEcosystem::detect_xml_context(
@@ -552,7 +588,7 @@ mod tests {
         let line = "<version>4.13.2</version>";
         // col 0..8 is "<version", col 9 is '4'
         let (t, v) = xml_context(line, 9); // col at value_start
-        assert_eq!(t, "version");
+        assert_eq!(t, MavenXmlContext::Version);
         assert_eq!(v, "");
     }
 
@@ -561,7 +597,7 @@ mod tests {
         // <version>4.1|3.2</version>
         let line = "<version>4.13.2</version>";
         let (t, v) = xml_context(line, 12); // "4.1" = 3 chars after value_start (9)
-        assert_eq!(t, "version");
+        assert_eq!(t, MavenXmlContext::Version);
         assert_eq!(v, "4.1");
     }
 
@@ -570,7 +606,7 @@ mod tests {
         // <version>4.13.2|</version>
         let line = "<version>4.13.2</version>";
         let (t, v) = xml_context(line, 15); // value_start=9, end=15
-        assert_eq!(t, "version");
+        assert_eq!(t, MavenXmlContext::Version);
         assert_eq!(v, "4.13.2");
     }
 
@@ -579,7 +615,7 @@ mod tests {
         // <version>|</version>
         let line = "<version></version>";
         let (t, v) = xml_context(line, 9);
-        assert_eq!(t, "version");
+        assert_eq!(t, MavenXmlContext::Version);
         assert_eq!(v, "");
     }
 
@@ -588,7 +624,7 @@ mod tests {
         // <artifactId>jun|it</artifactId>
         let line = "<artifactId>junit</artifactId>";
         let (t, v) = xml_context(line, 15); // value_start=12, cursor at 15 = "jun"
-        assert_eq!(t, "artifactId");
+        assert_eq!(t, MavenXmlContext::ArtifactId);
         assert_eq!(v, "jun");
     }
 
@@ -606,7 +642,7 @@ mod tests {
         // right after "gua", with an earlier `<groupId>...</groupId>` on the same line.
         let line = "<dependency><groupId>com.google.guava</groupId><artifactId>gua";
         let (t, v) = xml_context(line, u32::try_from(line.len()).unwrap());
-        assert_eq!(t, "artifactId");
+        assert_eq!(t, MavenXmlContext::ArtifactId);
         assert_eq!(v, "gua");
     }
 
@@ -619,7 +655,7 @@ mod tests {
     fn test_detect_xml_context_after_closed_tag_yields_no_context() {
         let line = "<artifactId>guava</artifactId>";
         let (t, v) = xml_context(line, u32::try_from(line.len()).unwrap());
-        assert_eq!(t, "");
+        assert_eq!(t, MavenXmlContext::None);
         assert_eq!(v, "");
     }
 
@@ -631,7 +667,7 @@ mod tests {
         // trailing characters behind (issue #218a).
         let line = "<artifactId>junit</artifactId>";
         let (t, v, range) = xml_context_with_range(line, 15);
-        assert_eq!(t, "artifactId");
+        assert_eq!(t, MavenXmlContext::ArtifactId);
         assert_eq!(v, "jun");
         // value_start = 4 (indent) + 12 ("<artifactId>") = 16; value_end = 16 + "junit".len() = 21
         assert_eq!(range.start, Position::new(0, 16));
@@ -643,7 +679,7 @@ mod tests {
         // <groupId>org.apache.comm|ons</groupId>
         let line = "<groupId>org.apache.commons</groupId>";
         let (t, v, range) = xml_context_with_range(line, 24);
-        assert_eq!(t, "groupId");
+        assert_eq!(t, MavenXmlContext::GroupId);
         assert_eq!(v, "org.apache.comm");
         // value_start = 4 (indent) + 9 ("<groupId>") = 13; value_end = 13 + "org.apache.commons".len() = 31
         assert_eq!(range.start, Position::new(0, 13));
@@ -656,7 +692,7 @@ mod tests {
         // surrogate pair (2 code units); cursor placed right after it via UTF-16 units.
         let line = "<artifactId>🎉lib</artifactId>";
         let (t, v, range) = xml_context_with_range(line, 14); // value_start=12 + 2 (🎉)
-        assert_eq!(t, "artifactId");
+        assert_eq!(t, MavenXmlContext::ArtifactId);
         assert_eq!(v, "🎉");
         assert_eq!(range.start, Position::new(0, 16)); // 4 (indent) + 12
         assert_eq!(range.end, Position::new(0, 21)); // 16 + "🎉lib".len() in UTF-16 units (2+3)
@@ -669,7 +705,7 @@ mod tests {
         // rest of the line, since there is no proof of where the value actually ends.
         let line = "<artifactId>junit";
         let (t, v, range) = xml_context_with_range(line, 15);
-        assert_eq!(t, "artifactId");
+        assert_eq!(t, MavenXmlContext::ArtifactId);
         assert_eq!(v, "jun");
         assert_eq!(range.start, Position::new(0, 16)); // 4 (indent) + 12
         assert_eq!(range.end, Position::new(0, 19)); // falls back to cursor: 4 + 15
@@ -682,7 +718,7 @@ mod tests {
         // stop at the cursor, not extend into unrelated trailing content.
         let line = "<artifactId>ju    <!-- todo -->";
         let (t, v, range) = xml_context_with_range(line, 14);
-        assert_eq!(t, "artifactId");
+        assert_eq!(t, MavenXmlContext::ArtifactId);
         assert_eq!(v, "ju");
         assert_eq!(range.start, Position::new(0, 16)); // 4 (indent) + 12
         assert_eq!(range.end, Position::new(0, 18)); // 4 + 14 — does not reach the comment
@@ -697,7 +733,7 @@ mod tests {
         let line = "<artifactId>ju</artifactId>";
         let cursor_col = 15u32; // indented cursor position
         let (t, v, range) = xml_context_with_range(line, 15);
-        assert_eq!(t, "artifactId");
+        assert_eq!(t, MavenXmlContext::ArtifactId);
         assert_eq!(v, "ju<");
         let cursor = Position::new(0, cursor_col + 4);
         assert!(
@@ -713,7 +749,7 @@ mod tests {
         // value's start.
         let line = "<version></version>";
         let (t, v, range) = xml_context_with_range(line, 9);
-        assert_eq!(t, "version");
+        assert_eq!(t, MavenXmlContext::Version);
         assert_eq!(v, "");
         assert_eq!(range.start, range.end);
         assert_eq!(range.start, Position::new(0, 13)); // 4 (indent) + "<version>".len()
@@ -725,7 +761,7 @@ mod tests {
         // though the typed prefix is empty.
         let line = "<version>4.13.2</version>";
         let (t, v, range) = xml_context_with_range(line, 9);
-        assert_eq!(t, "version");
+        assert_eq!(t, MavenXmlContext::Version);
         assert_eq!(v, "");
         assert_eq!(range.start, Position::new(0, 13)); // 4 (indent) + "<version>".len()
         assert_eq!(range.end, Position::new(0, 19)); // 13 + "4.13.2".len()
@@ -739,7 +775,7 @@ mod tests {
         // this used to panic on the byte/UTF-16 mismatch).
         let line = "<artifactId>café-lib</artifactId>";
         let (t, v, range) = xml_context_with_range(line, 16);
-        assert_eq!(t, "artifactId");
+        assert_eq!(t, MavenXmlContext::ArtifactId);
         assert_eq!(v, "café");
 
         // value_start (UTF-16 units) = 4 (indent) + "<artifactId>".len() = 16
@@ -1225,15 +1261,15 @@ mod tests {
     }
 
     // --- #793 characterization: `MavenEcosystem::generate_completions` keeps its own
-    // full override (string-typed XML context, out of #793's scope — see the plan), but the
-    // "version" arm's body moves into the new required `complete_version` hook. This pins
-    // the arm's observable output before that move.
+    // full override (crate-local `MavenXmlContext`-typed XML context, out of #793's scope —
+    // see the plan), but the "version" arm's body moves into the new required
+    // `complete_version` hook. This pins the arm's observable output before that move.
 
     /// Deterministic, CI-enforced counterpart to the network-gated test below: a
-    /// `<version>` tag with no enclosing `<dependency>` still resolves to a `"version"` XML
-    /// context (`detect_xml_context` is dependency-blind), but no parsed dependency's
-    /// name/version range covers this position — the arm must fail closed to
-    /// `Completions::default()` without ever calling the registry.
+    /// `<version>` tag with no enclosing `<dependency>` still resolves to a
+    /// [`MavenXmlContext::Version`] context (`detect_xml_context` is dependency-blind), but
+    /// no parsed dependency's name/version range covers this position — the arm must fail
+    /// closed to `Completions::default()` without ever calling the registry.
     #[tokio::test]
     async fn test_generate_completions_version_context_no_dependency_at_position_returns_empty() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1247,6 +1283,39 @@ mod tests {
             .generate_completions(
                 parse_result.as_ref(),
                 Position::new(1, 13),
+                xml,
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
+        assert_eq!(result, Completions::default());
+    }
+
+    /// #819 characterization: a cursor outside every completable tag resolves to
+    /// [`MavenXmlContext::None`], which is now a named, non-wildcard match arm in
+    /// `generate_completions` rather than a catch-all `_ => vec![]` — this exercises that
+    /// arm end-to-end through the public `generate_completions` entry point, not just the
+    /// lower-level `detect_xml_context` unit tests above. Note this pins the arm's
+    /// *observable output* (identical before and after #819 — `Completions::default()`
+    /// either way); the actual #819 guarantee is compile-time (a new `MavenXmlContext`
+    /// variant is a compile error at the match in `generate_completions`), which no
+    /// runtime test can exercise.
+    #[tokio::test]
+    async fn test_generate_completions_none_context_returns_empty() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = MavenEcosystem::new(cache);
+        let xml = "<project>\n  <name>demo</name>\n</project>";
+        let uri = deps_core::test_util::test_uri("/test/pom.xml");
+        let parse_result = eco.parse_manifest(xml, &uri).await.unwrap();
+
+        // Cursor sits inside `<name>`, a tag `detect_xml_context` does not recognize.
+        let (ctx, _, _) =
+            MavenEcosystem::detect_xml_context(xml, Position::new(1, 8), parse_result.as_ref());
+        assert_eq!(ctx, MavenXmlContext::None);
+
+        let result = eco
+            .generate_completions(
+                parse_result.as_ref(),
+                Position::new(1, 8),
                 xml,
                 deps_core::FreshnessSettings::default(),
             )
