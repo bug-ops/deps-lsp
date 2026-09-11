@@ -11,7 +11,7 @@ use crate::types::{NpmPackage, NpmVersion};
 use dashmap::DashMap;
 use deps_core::{
     DepsError, HOVER_RECENT_VERSIONS, HttpCache, PublishTime, Result, is_dot_segment,
-    lsp_helpers::warn_rejected_value, parser::DependencySource,
+    lsp_helpers::warn_rejected_value, net_policy::RedactedUrl, parser::DependencySource,
 };
 use serde::Deserialize;
 use std::any::Any;
@@ -302,7 +302,7 @@ impl NpmRegistry {
         if let dashmap::mapref::entry::Entry::Vacant(slot) = self.alternates.entry(key.clone()) {
             if at_capacity {
                 tracing::warn!(
-                    index = %key,
+                    index = %RedactedUrl::new(&key),
                     cap = MAX_ALTERNATE_REGISTRIES,
                     "npm alternate registry cap reached; not registering a new index"
                 );
@@ -2678,6 +2678,35 @@ mod tests {
         registry.register_alternate(overflow.clone());
         assert_eq!(registry.alternates.len(), MAX_ALTERNATE_REGISTRIES);
         assert!(registry.alternate_client(overflow.as_str()).is_none());
+    }
+
+    // Issue #824: `validate_index_url` rejects userinfo but preserves the query string, so
+    // a validated `NpmRegistryIndex` can still carry `?_authToken=...`. The cap-reached warn
+    // must log through `RedactedUrl`, not the raw index string.
+    #[test]
+    fn test_register_alternate_redacts_query_credential_on_cap_reached() {
+        let cache = Arc::new(HttpCache::new());
+        let registry = NpmRegistry::new(cache);
+
+        for i in 0..MAX_ALTERNATE_REGISTRIES {
+            let index = alternate_index(&format!("https://registry-{i}.example"));
+            registry.register_alternate(index);
+        }
+
+        let overflow = alternate_index("https://overflow.example/?_authToken=SUPERSECRET_TOKEN");
+        let log = deps_core::test_util::capture_tracing_output(|| {
+            registry.register_alternate(overflow);
+        });
+
+        assert!(
+            log.contains("npm alternate registry cap reached"),
+            "log: {log}"
+        );
+        assert!(!log.contains("SUPERSECRET_TOKEN"), "log: {log}");
+        assert!(
+            log.contains("overflow.example"),
+            "redaction must not remove the non-secret host: {log}"
+        );
     }
 
     /// M2: `NpmRegistry` is `Clone` and `deps-lsp` hands a clone to `deps-deno`'s

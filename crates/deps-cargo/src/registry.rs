@@ -28,7 +28,7 @@ use crate::config::{AuthToken, RegistryIndex};
 use crate::sparse::SparseIndexClient;
 use crate::types::{CargoVersion, CrateInfo};
 use deps_core::parser::DependencySource;
-use deps_core::{DepsError, HttpCache, PackageName, Result};
+use deps_core::{DepsError, HttpCache, PackageName, Result, net_policy::RedactedUrl};
 use semver::{Version, VersionReq};
 use serde::Deserialize;
 use std::any::Any;
@@ -453,7 +453,7 @@ impl CargoRegistry {
         let at_capacity = self.alternates.len() >= MAX_ALTERNATE_REGISTRIES;
         let key = index.as_str().to_string();
         let incoming_trust = index.trust();
-        let index_display = index.to_string();
+        let index_display = RedactedUrl::new(index.as_str());
 
         match self.alternates.entry(key) {
             dashmap::mapref::entry::Entry::Occupied(mut slot) => {
@@ -1150,6 +1150,58 @@ mod tests {
             registry
                 .alternate_client("https://overflow.example/")
                 .is_none()
+        );
+    }
+
+    // Issue #824: `validate_index_url` rejects userinfo but preserves the query string, so
+    // a validated index can still carry `?api_key=...`. The trust-fold warn (line ~464) must
+    // log through `RedactedUrl`, not the raw `index.to_string()`.
+    #[tokio::test]
+    async fn test_cargo_registry_register_alternate_redacts_query_credential_on_trust_fold() {
+        let cache = Arc::new(HttpCache::new());
+        let registry = CargoRegistry::new(cache);
+        let url = "https://index.mycorp.dev/?api_key=SUPERSECRET_TOKEN";
+
+        let log = deps_core::test_util::capture_tracing_output(|| {
+            registry.register_alternate(
+                test_index_with_trust(url, IndexTrust::Trusted),
+                Some(AuthToken::new("token".to_string())),
+            );
+            registry.register_alternate(
+                test_index_with_trust(url, IndexTrust::WorkspaceDeclared),
+                None,
+            );
+        });
+
+        assert!(log.contains("re-registration folds"), "log: {log}");
+        assert!(!log.contains("SUPERSECRET_TOKEN"), "log: {log}");
+        assert!(
+            log.contains("index.mycorp.dev"),
+            "redaction must not remove the non-secret host: {log}"
+        );
+    }
+
+    // Issue #824: same query-string credential leak, but on the alternate-registry-cap warn
+    // path (line ~479).
+    #[tokio::test]
+    async fn test_cargo_registry_register_alternate_redacts_query_credential_on_cap_reached() {
+        let cache = Arc::new(HttpCache::new());
+        let registry = CargoRegistry::new(cache);
+        for i in 0..MAX_ALTERNATE_REGISTRIES {
+            let index = test_index(&format!("https://index{i}.example"));
+            registry.register_alternate(index, None);
+        }
+
+        let overflow = test_index("https://overflow.example/?api_key=SUPERSECRET_TOKEN");
+        let log = deps_core::test_util::capture_tracing_output(|| {
+            registry.register_alternate(overflow, None);
+        });
+
+        assert!(log.contains("alternate registry cap reached"), "log: {log}");
+        assert!(!log.contains("SUPERSECRET_TOKEN"), "log: {log}");
+        assert!(
+            log.contains("overflow.example"),
+            "redaction must not remove the non-secret host: {log}"
         );
     }
 }
