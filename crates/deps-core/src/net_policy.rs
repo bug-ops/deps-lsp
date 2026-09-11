@@ -650,27 +650,38 @@ fn find_credential_at(region: &str) -> Option<usize> {
     found
 }
 
-/// Whether `segment` contains a `:` that is not a Windows drive-letter colon and not a bracketed
-/// IPv6 literal's own colon (or its immediately-following port separator, via
-/// [`skip_bracketed_host`]) — [`find_credential_at`]'s shape check. A bare `segment.contains(':')`
-/// would mistake `file:///C:/Users/x@corp/project`'s drive letter for evidence of a credential
-/// (S2 finding): once `@`-delimited segments can span past a `/`, the `C:` in a `file:///C:/...`
-/// path sits in the same segment as a later, unrelated `@`. It would likewise mistake
-/// `[::1]:8443/pkg@1.0.0`'s own address/port colons for a credential (code review Finding 2) for
-/// the same reason — an ordinary bracketed-IPv6 registry host ends up in the same segment as a
-/// completely unrelated trailing `@version`.
+/// Whether `segment` contains a `:` that is not a Windows drive-letter colon, not a bracketed
+/// IPv6 literal's own colon ([`bracket_host_shape_end`]), and not a `host:port`-shaped port
+/// separator ([`is_port_like`]) — [`find_credential_at`]'s shape check. A bare
+/// `segment.contains(':')` would mistake `file:///C:/Users/x@corp/project`'s drive letter for
+/// evidence of a credential (S2 finding): once `@`-delimited segments can span past a `/`, the
+/// `C:` in a `file:///C:/...` path sits in the same segment as a later, unrelated `@`. It would
+/// likewise mistake `[::1]:8443/pkg@1.0.0`'s own address/port colons for a credential (code
+/// review Finding 2) for the same reason — an ordinary bracketed-IPv6 registry host ends up in
+/// the same segment as a completely unrelated trailing `@version`.
 ///
-/// A bracket found anywhere in `segment` (not just at its start) is skipped over — together with
-/// its immediately-following port-separator `:`, unconditionally, matching
-/// [`redact_colon_credential`]'s own bracket-adjacent carve-out exactly (regardless of whether
-/// what follows the bracket looks like a valid port) — before the scan for a real credential
-/// colon continues past it. An unclosed bracket makes this return `false` immediately: there is
-/// no credential-shaped `:` left to find past an opening `[` with no matching `]`.
+/// A bracket found anywhere in `segment` — not just at its start — has its IPv6-shaped span
+/// skipped over first (#860, D1); only its *immediately*-following port-separator `:` (nothing
+/// else in the segment) is then checked by [`is_port_like`] rather than being exempted
+/// unconditionally regardless of what follows it. Deliberately scoped this narrowly (impl-critic
+/// S1): an earlier revision applied [`is_port_like`] to *every* colon in the segment, not just a
+/// bracket-adjacent one, which silently exempted an ordinary ≤5-digit value having nothing to do
+/// with any bracket (`c:/user:12345/x@evil` used to redact on `main`, since any non-drive-letter
+/// colon there is already accepted as an over-redaction false positive — see this function's own
+/// top-level doc comment — and stopped redacting once every colon got the port exemption).
+///
+/// The "immediately-following" colon only earns that exemption when [`bracket_host_shape_end`]
+/// actually advanced past a real closing `]` (code review finding): an earlier revision granted
+/// it whenever a bracket was merely *attempted*, even one that never closed, so a stray `[`
+/// immediately followed by a colon (`[:12345`) was wrongly treated as if it opened a genuine
+/// IPv6 host and had its own next colon exempted as a "port" — this scanner's contract is that
+/// only a real bracket licenses that carve-out, an ordinary (non-bracket) colon gets none.
 // `bracket`/`colon` come from `find`/`starts_with` of ASCII `[`/`]`/`:` bytes, so every slice
 // bound is always a char boundary.
 #[allow(clippy::string_slice)]
 fn segment_has_credential_colon(segment: &str) -> bool {
     let mut cursor = 0;
+    let mut bracket_adjacent = false;
     while cursor < segment.len() {
         let remaining = &segment[cursor..];
 
@@ -680,49 +691,89 @@ fn segment_has_credential_colon(segment: &str) -> bool {
                     return true;
                 }
                 cursor += colon + 1;
+                bracket_adjacent = false;
                 continue;
             }
-            let Some(after) = skip_bracketed_host(segment, cursor + bracket) else {
-                return false;
-            };
-            cursor = after;
+            let shape_end = bracket_host_shape_end(remaining, bracket);
+            // code review: only a genuinely *closed* bracket (`shape_end` past more than just
+            // the `[` itself) licenses the `is_port_like` exemption below on the colon that
+            // follows — an earlier revision set this unconditionally, so a stray unclosed `[`
+            // (e.g. `[:12345`) got treated as if it opened a real IPv6 host and its own
+            // immediately-following colon was wrongly exempted as a "port", when it should have
+            // been evaluated as an entirely ordinary (unexempted) colon instead.
+            bracket_adjacent = shape_end > bracket + 1;
+            cursor += shape_end;
             continue;
         }
 
         let Some(colon) = remaining.find(':') else {
             return false;
         };
-        if !colon_is_drive_letter(segment, cursor + colon) {
-            return true;
+        let colon_is_bracket_adjacent = bracket_adjacent && colon == 0;
+        bracket_adjacent = false;
+
+        if colon_is_drive_letter(segment, cursor + colon) {
+            cursor += colon + 1;
+            continue;
         }
-        cursor += colon + 1;
+        if colon_is_bracket_adjacent {
+            let value_start = colon + 1;
+            let value_end = remaining[value_start..]
+                .find(['/', '?', '#'])
+                .map_or(remaining.len(), |i| value_start + i);
+            if is_port_like(&remaining[value_start..value_end]) {
+                cursor += value_end.max(colon + 1);
+                continue;
+            }
+        }
+        return true;
     }
     false
 }
 
-/// Returns the byte offset in `text` just past the `]` that closes the bracketed IPv6 literal
-/// opened at `text[open] == '['`, or `None` if it is never closed. The single arbitrary-offset
-/// bracket-closing rule [`segment_has_credential_colon`] and [`bounded_has_credential_colon`]
-/// both build on (via [`skip_bracketed_host`]), and [`redact_colon_credential`] uses directly —
-/// that third site keeps its own `bracket_adjacent`/unclosed-bracket handling distinct from the
-/// other two rather than sharing one (see its own doc comment for why).
-// `open` and the returned offset are ASCII '['/']' byte indices from `find`, so every slice
-// bound is always a char boundary.
-#[allow(clippy::string_slice)]
-fn bracketed_host_end(text: &str, open: usize) -> Option<usize> {
-    text[open..].find(']').map(|end| open + end + 1)
-}
-
-/// [`bracketed_host_end`] plus its immediately-following `:` port separator, consumed
-/// unconditionally regardless of what follows it — the shared bracket-adjacent carve-out
-/// [`segment_has_credential_colon`] and [`bounded_has_credential_colon`] both need. `None` when
-/// the bracket is unclosed; each of the two callers picks its own fallback for that case (they
-/// need different unclosed-bracket behavior — see their own doc comments) rather than sharing
-/// one here.
-#[allow(clippy::string_slice)]
-fn skip_bracketed_host(text: &str, open: usize) -> Option<usize> {
-    let end = bracketed_host_end(text, open)?;
-    Some(end + usize::from(text[end..].starts_with(':')))
+/// Byte offset in `text` just past the bracketed-IPv6-host *shape* opened at `text[open] ==
+/// '['`, recognized independent of whether it ever closes with a `]` — the single carve-out
+/// [`segment_has_credential_colon`], [`bounded_has_credential_colon`], and
+/// [`redact_colon_credential`] all share (#860, D1), replacing what used to be three
+/// independently-evolving implementations of the same rule (one of them, `redact_colon_credential`'s,
+/// anchored to the scan's starting cursor rather than recognizing a bracket anywhere ahead of it).
+///
+/// An IPv6 literal's alphabet is exactly hex digits, `:`, and `.` (an embedded IPv4 tail) — the
+/// explicit IPv6-shape gate that tells "this bracket really opens an IPv6 host" apart from a
+/// stray `[` that merely sits elsewhere in the string (e.g. an npm dist-tag-shaped path
+/// segment): this scans forward from `open + 1` while a byte stays in that alphabet, stopping
+/// only at a `]` — the *only* thing this function ever treats as confirming the span was really
+/// an IPv6 host literal rather than some other bracket-adjacent text. **Skips nothing at all**
+/// (returns `open + 1`, past the bracket alone) when the alphabet run ends without ever finding
+/// a `]` — an impl-critic finding (C3): an earlier revision skipped as far as the alphabet run
+/// went even when it never closed, which is exactly what let an unclosed literal's own
+/// pseudo-colons swallow a *real* credential colon sitting right after the disqualifying byte
+/// (`[::1:glpat-SECRET` — no `]` anywhere — used to skip past `[::1:` as if it were a closed
+/// host, treating the credential's own `:` as part of the address and leaking `glpat-SECRET`
+/// untouched). Only ever crediting a *genuinely closed* bracket keeps every colon inside an
+/// unclosed one visible to the caller's own ordinary colon scan instead.
+///
+/// Deliberately does **not** also consume an immediately-following `:port` separator, unlike an
+/// earlier revision's unconditional skip: that unconditional skip is exactly what let
+/// `[::1]:glpat-SECRET` pass through unredacted (#860's own issue body) — *nothing* after a
+/// closing bracket's colon was ever inspected. Every caller now runs that colon back through its
+/// own ordinary [`is_port_like`]-gated logic once this span is skipped, so a real port
+/// (`[::1]:8443`) stays exempt while anything else (`[::1]:glpat-SECRET`, or the previously
+/// accepted `[::1]:abc`/`[::1]:notaport` collisions) is treated exactly like any other
+/// non-bracket credential-shaped colon and gets redacted.
+// `open`/`i` are ASCII byte offsets (`[`, `]`, hex digits, `:`, `.` are all single-byte ASCII),
+// so every slice bound derived from this function's return value is always a char boundary.
+fn bracket_host_shape_end(text: &str, open: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut i = open + 1;
+    while let Some(byte) = bytes.get(i) {
+        match byte {
+            b']' => return i + 1,
+            b':' | b'.' | b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F' => i += 1,
+            _ => break,
+        }
+    }
+    open + 1
 }
 
 /// Whether the `:` at byte offset `colon` in `text` is a Windows drive-letter colon: a single
@@ -781,23 +832,24 @@ fn is_port_like(value: &str) -> bool {
 /// credential followed by an incidental port-shaped suffix is not missed just because the very
 /// last colon in `bounded` happens to look like a port.
 ///
-/// A `bounded` starting with a bracketed IPv6 literal (`[::1]:8443`) has that bracket and its
-/// immediately-following port-separator `:` stripped *unconditionally* (via
-/// [`skip_bracketed_host`]) before the port check above — matching [`redact_colon_credential`]'s
-/// own bracket-adjacent carve-out, regardless of whether what follows looks like a valid port —
-/// rather than just [`is_port_like`]'s digits-only check: `is_port_like` alone would leave
-/// `[::1]:notaport` still "containing a `:`" (the address literal's own colons) and wrongly
-/// trigger the widened scan even for the well-formed port case (`[::1]:8443/pkg@1.0.0` — code
-/// review Finding 2). This also incidentally fixes a malformed port's over-redaction (previously
-/// accepted as M3) rather than merely documenting it. An unclosed bracket leaves `bounded`
-/// untouched — distinct from [`segment_has_credential_colon`]'s "return `false`" on the same
-/// case, since this function still needs to check the rest of `bounded` for an unrelated `:`.
-// `colon` comes from `rfind` of an ASCII `:` byte, so every slice bound is always a char
-// boundary.
+/// A `bounded` starting with a bracketed IPv6 literal (`[::1]:8443`) has only that bracket's own
+/// IPv6-shaped span stripped first (#860, D1, [`bracket_host_shape_end`]) — a colon immediately
+/// following it (the `]:port` separator) is left in place for the trailing `rfind`/[`is_port_like`]
+/// check below to evaluate on its own merits, exactly like any other colon in `bounded`, rather
+/// than being exempted unconditionally regardless of what follows it: a well-formed port
+/// (`[::1]:8443`) still strips away cleanly (`is_port_like` accepts it), while anything else
+/// (`[::1]:notaport`, `[::1]:glpat-SECRET`) now correctly reads as evidence a credential may be
+/// present, instead of being silently exempted just for sitting next to a bracket. An unclosed
+/// bracket leaves the rest of `bounded` for the same trailing check to evaluate, rather than
+/// returning early — distinct from [`segment_has_credential_colon`]'s "return `false`" on the
+/// same case, since this function's contract is "does `bounded` contain a credential-shaped
+/// colon at all", not "identify a specific one".
+// `bracket_host_shape_end`'s return and `colon` (from `rfind` of an ASCII `:` byte) are always
+// char-boundary-safe byte offsets, so every slice bound below is always a char boundary.
 #[allow(clippy::string_slice)]
 fn bounded_has_credential_colon(bounded: &str) -> bool {
     let bounded = if bounded.starts_with('[') {
-        skip_bracketed_host(bounded, 0).map_or(bounded, |end| &bounded[end..])
+        &bounded[bracket_host_shape_end(bounded, 0)..]
     } else {
         bounded
     };
@@ -843,16 +895,15 @@ enum RegionKind {
 /// [`bounded_has_credential_colon`] finds evidence a credential straddles the boundary (#826).
 /// [`RegionKind::OpaquePath`] skips straight to the shared tail. The shared tail:
 /// [`find_credential_at`] on the whole `region`, masking with `***@` on `Some`, falling through
-/// to [`redact_colon_credential`] on `None` (#810/#818) — except `OpaquePath` returns `raw`
-/// unchanged instead of widening when `region` already contains *some* `@` that isn't
-/// credential-shaped (see "Coverage per `RegionKind`" below, class S3).
+/// unconditionally to [`redact_colon_credential`] on `None` (#810/#818) for *both* kinds — see
+/// "Coverage per `RegionKind`" below, class S3/#857, for why `OpaquePath` no longer special-cases
+/// this fallthrough.
 ///
 /// # Coverage per `RegionKind`
 ///
-/// Every carve-out below is shared by both kinds *except* the three marked `Authority`-only —
-/// each is a class PR #845 fixed on the `Authority` side only. All three are tracked under the
-/// parent issue #856, with `OpaquePath`-side follow-ups filed rather than fixed here — #846 is a
-/// zero-behavior-delta refactor, not a fix for any of them:
+/// Every carve-out below is shared by both kinds *except* the two marked `Authority`-only —
+/// each is a class PR #845 fixed on the `Authority` side only, tracked under the parent issue
+/// #856, with `OpaquePath`-side follow-ups filed rather than fixed here:
 ///
 /// - Username-only userinfo with no password (`ghp_TOKEN@github.com`) — **`Authority` only**
 ///   (C1). The bounded `@` pass never shape-checks, so a bare username redacts correctly; the
@@ -863,21 +914,29 @@ enum RegionKind {
 ///   `OpaquePath` only has [`find_credential_at`]'s last-*credential-shaped*-`@`-wins, so
 ///   `c:/user:pa@ss@evil` → `c:***@ss@evil` (the password tail `ss` survives). See #859 (S5) for
 ///   a fix sketch.
-/// - `None if region.contains('@')` — **`OpaquePath` only**: any unrelated `@` anywhere in an
-///   opaque-path region disables the [`redact_colon_credential`] fallback entirely
-///   (`c:/user@host/token:glpat-SECRET` passes through unredacted). Pre-existing on `main`, kept
-///   here for zero-delta; see #857 (S3), blocked by #860 (D1 — converging
-///   [`redact_colon_credential`]'s anchored bracket carve-out with the other two sites' scan).
+///
+/// `OpaquePath` used to additionally disable the [`redact_colon_credential`] fallback outright
+/// (first for *any* `@` in the region, later — #857's own first pass — narrowed to only a
+/// bracketed-IPv6-host shape) rather than sharing this fallthrough with `Authority`. Removed
+/// entirely (impl-critic C1): a differential probe over the bracket/colon input space showed
+/// every case the guard was meant to protect (`c:/[::1]:8443/pkg@1.0.0`,
+/// `c:/[2001:db8::1]:443/pkg@1.0.0`) already comes back byte-identical from
+/// [`redact_colon_credential`] alone — #860's fix already makes that scanner safe for a genuine
+/// bracket shape — while the guard itself, not requiring an `@` to relate to the bracket at all,
+/// opened brand-new leaks the *pre-#857* code never had (`c:/[]/token:glpat-SECRET`,
+/// `file:///home/u/pkg[1]/gitlab-ci-token:JOBTOKEN` — any bracket shape anywhere in the value
+/// silently disabled redaction of a completely unrelated credential elsewhere in it).
 ///
 /// Shared by both kinds:
 /// - A leading empty-userinfo `@` (`@types/node`) never short-circuits — both fall through past
 ///   it rather than returning early (code-review Finding 1).
 /// - A drive-letter colon (`C:\`, `c:/`) is never credential-shaped ([`colon_is_drive_letter`]).
-/// - A bracketed IPv6 literal's own colon, and its immediately-following port separator, are
-///   never credential-shaped ([`skip_bracketed_host`] / [`bracketed_host_end`]).
+/// - A bracketed IPv6 literal's own colon is never credential-shaped
+///   ([`bracket_host_shape_end`]); its immediately-following port separator, once reached, is
+///   evaluated by the exact same [`is_port_like`] rule as any other colon (#860, D1).
 /// - A `host:port` suffix (1-5 ASCII digits) is never credential-shaped ([`is_port_like`]).
 /// - A colon-separated credential with no `@` at all falls through to
-///   [`redact_colon_credential`] (subject to the `OpaquePath`-only guard above).
+///   [`redact_colon_credential`] unconditionally.
 // `start` is an ASCII byte offset (`find("://")`/`find(':')` on `raw`), so `region` always
 // starts on a char boundary; every further offset (`host_boundary`, `at`) comes from `find`/
 // `rfind` of ASCII tokens on `region`, so every slice bound stays a char boundary throughout.
@@ -899,7 +958,6 @@ fn redact_credential(raw: &str, start: usize, kind: RegionKind) -> String {
 
     match find_credential_at(region) {
         Some(at) => mask_at(at),
-        None if kind == RegionKind::OpaquePath && region.contains('@') => raw.to_string(),
         None => redact_colon_credential(raw, start, region),
     }
 }
@@ -917,9 +975,14 @@ fn redact_credential(raw: &str, start: usize, kind: RegionKind) -> String {
 /// in this order:
 /// - a Windows drive letter (`C:\Users\x\.npmrc`, `c:/packages/feed`) — a single ASCII letter
 ///   followed by `:` and then `\` or `/`;
-/// - a colon immediately following a bracketed IPv6 literal (`[::1]:8443`, `[::1]:abc`) — this
-///   is always a host:port separator, regardless of what follows, since an IPv6 host is never
-///   itself a credential;
+/// - a bracketed IPv6 literal (`[::1]`, closed or not — [`bracket_host_shape_end`]) found
+///   anywhere ahead of the next colon is skipped as a unit first (#860, D1: this used to be
+///   anchored to the very start of the current scan window, which is what let a bracket sitting
+///   a few bytes in, e.g. `x/[::1]:glpat-SECRET`, be missed and its own internal `::` colon
+///   mistaken for the credential separator instead); its own `]:port` separator, once reached,
+///   is then just another colon subject to the very next rule rather than an unconditional
+///   exemption — so `[::1]:8443` still strips away as a plain port, but `[::1]:glpat-SECRET` no
+///   longer does;
 /// - no colon found in the searched span at all;
 /// - a `host:port` pair, where the value side (up to the next `/`, `?`, `#`, or end) is 1-5
 ///   ASCII digits;
@@ -941,20 +1004,33 @@ fn redact_credential(raw: &str, start: usize, kind: RegionKind) -> String {
 /// This intentionally produces some false positives on non-credential colon pairs — a Maven
 /// coordinate (`com.google.guava:guava` → `com.google.guava:***`), an npm alias spec
 /// (`mvn:group:artifact:1.0` → `mvn:***`), an RFC 3339 timestamp (`2026-09-11T08:40:19Z` →
-/// `2026-09-11T08:***`), or a path segment that happens to contain a colon
-/// (`https://[:::1]/v1/items:search` → `.../items:***`) — accepted because this function only
-/// ever feeds a `tracing` line, a user-visible error message, or a redacted-URL type, never a
-/// value used for further parsing or comparison. Two shape collisions are accepted as
-/// documented limitations rather than fixed: a bracket-adjacent colon is *never* redacted
-/// regardless of what follows it (needed to keep `[::1]:abc` unchanged), so
-/// `[::1]:glpat-SECRET` is indistinguishable from it and stays unredacted; and a ≤5-digit
-/// credential collides with the `host:port` carve-out (`oauth2:12345` stays unredacted).
+/// `2026-09-11T08:***`), a path segment that happens to contain a colon
+/// (`https://[:::1]/v1/items:search` → `.../items:***`), or — since #860 closed the
+/// bracket-adjacent collision this used to document as accepted — a malformed IPv6 port
+/// (`[::1]:notaport` → `[::1]:***`) or a genuinely ambiguous bracket-adjacent value
+/// (`[::1]:abc` → `[::1]:***`) — accepted because this function only ever feeds a `tracing`
+/// line, a user-visible error message, or a redacted-URL type, never a value used for further
+/// parsing or comparison, and over-redacting a non-credential is always the safer failure mode
+/// than under-redacting a real one. One shape collision remains a documented limitation: a
+/// ≤5-digit credential collides with the `host:port` carve-out (`oauth2:12345` stays
+/// unredacted).
 // All indices come from `find` of ASCII tokens (`:`, `]`, `/`, `?`, `#`) or byte-level ASCII
 // checks, so every slice bound is always a char boundary. `cursor` only ever advances (every
 // branch below adds at least 1 to it before looping), so the scan is guaranteed to terminate.
 #[allow(clippy::string_slice)]
 fn redact_colon_credential(raw: &str, authority_start: usize, authority: &str) -> String {
     let mut cursor = 0;
+    // impl-critic R3: sticky for the rest of the scan once any bracket span has been skipped —
+    // not reset per colon like an earlier revision's `bracket_adjacent`/`colon_is_bracket_adjacent`
+    // pairing (C2), and not a proxy check on `value` itself (the `value.contains(']')`
+    // generalization that same revision added). Both prior forms are narrower than the real
+    // ambiguity: once a `[` has been seen anywhere in `authority`, every judgment this function
+    // makes about where a "value" safely ends is suspect for the rest of the scan (a fuzz-found
+    // counterexample, `[/::1/x]:abc/user:SECRET`, still leaked under the value-contains-`]`
+    // check — the orphaned `]` had moved one path segment further away from the colon it was
+    // meant to flag). A single sticky flag closes that whole family at once, at the cost of
+    // over-redacting more of the tail once any bracket has appeared — the safe direction.
+    let mut bracket_seen = false;
     loop {
         let remaining = &authority[cursor..];
 
@@ -967,24 +1043,30 @@ fn redact_colon_credential(raw: &str, authority_start: usize, authority: &str) -
             continue;
         }
 
-        // TODO(#860): this bracket carve-out stays anchored at the very start of `remaining`
-        // (unlike the arbitrary-offset `skip_bracketed_host` scan that
-        // `segment_has_credential_colon`/`bounded_has_credential_colon` use) — converging the
-        // two would turn today's over-redaction of `x/[::1]:glpat-SECRET` into a silent no-op
-        // (D1, blocks #857).
-        let (scan_start, bracket_adjacent) = if remaining.starts_with('[') {
-            bracketed_host_end(remaining, 0).map_or((0, false), |end| (end, true))
-        } else {
-            (0, false)
-        };
+        let next_colon = remaining.find(':');
+        if let Some(bracket) = remaining.find('[') {
+            // A bracket ahead of the next colon (#860, D1: not just one anchored at the very
+            // start of `remaining`) opens an IPv6-host span that must be skipped as a unit
+            // before any colon inside it — including its own `]:port` separator — can be
+            // evaluated as a possible credential separator by the checks below.
+            if next_colon.is_none_or(|colon| bracket < colon) {
+                cursor += bracket_host_shape_end(remaining, bracket);
+                // Deliberately unconditional, unlike `segment_has_credential_colon`'s own
+                // `bracket_adjacent` flag (which requires a genuinely *closed* bracket before
+                // granting its `is_port_like` exemption — a code review fix): `bracket_seen`
+                // grants no exemption here, it only ever widens how much gets masked once a
+                // redaction is already forced, so treating even an unclosed/stray `[` as reason
+                // for extra caution is the safe direction, not a bug — R3's own counterexample
+                // (`[/::1]:abc/user:SECRET`) is exactly an *unclosed* bracket, so requiring
+                // closure here would silently reopen that leak.
+                bracket_seen = true;
+                continue;
+            }
+        }
 
-        let Some(colon) = remaining[scan_start..].find(':').map(|i| i + scan_start) else {
+        let Some(colon) = next_colon else {
             return raw.to_string();
         };
-        if bracket_adjacent && colon == scan_start {
-            cursor += colon + 1;
-            continue;
-        }
 
         let value_start = colon + 1;
         let value_end = remaining[value_start..]
@@ -992,17 +1074,29 @@ fn redact_colon_credential(raw: &str, authority_start: usize, authority: &str) -
             .map_or(remaining.len(), |i| value_start + i);
         let value = &remaining[value_start..value_end];
 
-        let is_port = is_port_like(value);
-        if value.is_empty() || is_port {
+        if value.is_empty() || is_port_like(value) {
             cursor += value_end.max(colon + 1);
             continue;
         }
+
+        // impl-critic C2/R3: a value redacted anywhere downstream of a bracket is shape-identical
+        // to a real credential purely because of #860's own carve-out convergence, not because it
+        // is actually known to *be* one — so the usual `/`/`?`/`#` value boundary cannot be
+        // trusted to end the mask: `[::1]:abc/user:glpat-SECRET` must not stop masking at `abc`
+        // and reveal the genuine `user:glpat-SECRET` credential sitting right after it in the
+        // unredacted tail. Masking through to the end of `authority` once any bracket has been
+        // seen is the safe direction — it can only ever over-redact, never leak.
+        let end = if bracket_seen {
+            remaining.len()
+        } else {
+            value_end
+        };
 
         return format!(
             "{}{}:***{}",
             &raw[..authority_start],
             &authority[..cursor + colon],
-            &authority[cursor + value_end..]
+            &authority[cursor + end..]
         );
     }
 }
@@ -1798,14 +1892,15 @@ mod tests {
         assert_eq!(url_for_tracing(r"C:\x:hunter2"), r"C:\x:***");
     }
 
-    /// Documented limitations (impl-critic questions, accepted as-is): a bracket-adjacent
-    /// colon is *never* redacted regardless of what follows it (required to keep `[::1]:abc`
-    /// unchanged), so a credential in that exact position is shape-indistinguishable from a
-    /// real port and stays unredacted; and a credential that happens to be 1-5 ASCII digits
-    /// collides with the `host:port` carve-out.
+    /// Documented limitation (impl-critic question, accepted as-is): a credential that happens
+    /// to be 1-5 ASCII digits collides with the `host:port` carve-out. The sibling
+    /// bracket-adjacent collision this test used to also document (`[::1]:glpat-SECRET` staying
+    /// unredacted because a bracket-adjacent colon was never redacted regardless of what
+    /// followed it) is fixed by #860 — see
+    /// `test_redact_userinfo_bracket_adjacent_non_port_value_is_redacted` for its replacement
+    /// coverage.
     #[test]
     fn test_url_for_tracing_colon_credential_documented_collisions() {
-        assert_eq!(url_for_tracing("[::1]:glpat-SECRET"), "[::1]:glpat-SECRET");
         assert_eq!(url_for_tracing("oauth2:12345"), "oauth2:12345");
     }
 
@@ -1841,7 +1936,11 @@ mod tests {
     }
 
     /// #810 carve-outs: none of these colon-bearing values are credentials, so the
-    /// colon-credential fallback must leave every one of them byte-for-byte unchanged.
+    /// colon-credential fallback must leave every one of them byte-for-byte unchanged. Note
+    /// `[::1]:abc` is deliberately *not* in this list any more — #860 stopped exempting a
+    /// bracket-adjacent colon unconditionally, so a non-numeric value there (indistinguishable
+    /// in shape from a real credential like `glpat-SECRET`) is now redacted instead; see
+    /// `test_redact_userinfo_bracket_adjacent_non_port_value_is_redacted`.
     #[test]
     fn test_url_for_tracing_colon_credential_false_positive_carve_outs() {
         let unchanged = [
@@ -1851,7 +1950,6 @@ mod tests {
             "https://gitlab.corp:8443/api/v4",
             "https://host:99999/x",
             "[::1]:8443",
-            "[::1]:abc",
             "https://[::1]:8443/x",
             "https://[:::1]:8443/x",
             "c:/packages/feed",
@@ -2278,6 +2376,183 @@ mod tests {
         assert_eq!(redacted, "***@[::1]:8443/pkg");
     }
 
+    /// #860 D1: `redact_colon_credential`'s bracket carve-out used to be anchored to the very
+    /// start of its scan window, so a bracket sitting a few bytes in (not at cursor 0) was
+    /// invisible to it — its own internal pseudo-colon (`::1`'s second `:`) was then mistaken
+    /// for the credential separator instead of the real one further down. This is the exact
+    /// enumeration example from #860's issue body.
+    #[test]
+    fn test_redact_userinfo_bracket_not_at_scan_start_is_still_recognized() {
+        let redacted = redact_userinfo("x/[::1]:glpat-SECRET");
+        assert!(!redacted.contains("glpat-SECRET"), "redacted={redacted:?}");
+        assert_eq!(redacted, "x/[::1]:***");
+    }
+
+    /// #860 (security-reviewer follow-up on the #846 refactor): a closing bracket's `:port`
+    /// separator used to be exempted unconditionally, regardless of what followed it, which is
+    /// exactly what let a real credential sitting in that position pass through completely
+    /// unredacted — `glpat-SECRET` is shape-identical to a malformed port and was never even
+    /// inspected. Fixed by routing that colon through the same `is_port_like` check every other
+    /// colon in this scanner already gets.
+    #[test]
+    fn test_redact_userinfo_bracket_adjacent_non_port_value_is_redacted() {
+        let redacted = redact_userinfo("[::1]:glpat-SECRET");
+        assert!(!redacted.contains("glpat-SECRET"), "redacted={redacted:?}");
+        assert_eq!(redacted, "[::1]:***");
+    }
+
+    /// #860 companion: a doubled/nested opening bracket (`[[::1]...`) must not let the outer,
+    /// non-IPv6-shaped `[` mask the real bracketed host that follows it — the IPv6-shape gate
+    /// ([`bracket_host_shape_end`]) recognizes the inner `[::1]` on its own once the outer
+    /// stray `[` is skipped as a 1-byte non-match.
+    #[test]
+    fn test_redact_userinfo_doubled_bracket_prefix_is_still_redacted() {
+        let redacted = redact_userinfo("[[::1]:glpat-SECRET");
+        assert!(!redacted.contains("glpat-SECRET"), "redacted={redacted:?}");
+        assert_eq!(redacted, "[[::1]:***");
+    }
+
+    /// #860 (security-reviewer follow-up): an *unclosed* bracket must not let its own internal
+    /// pseudo-colons (`::1`) be mistaken for the real credential separator that follows it —
+    /// before this fix, the scan treated the unclosed `[` as if there were no bracket at all,
+    /// found `::1`'s own colon first, and masked at the wrong position, leaving the real
+    /// `user:hunter2` credential to leak through in the tail
+    /// (`redact_userinfo("[::1/user:hunter2@evil")` used to return `"[:***/user:hunter2@evil"`).
+    #[test]
+    fn test_redact_userinfo_unclosed_bracket_does_not_leak_later_credential() {
+        assert_eq!(redact_userinfo("[::1/user:hunter2@evil"), "***@evil");
+    }
+
+    /// impl-critic C3: a bracket with *no closing `]` anywhere in the string* must never let its
+    /// own pseudo-colons be treated as a closed IPv6 host's colons — an earlier revision's
+    /// `bracket_host_shape_end` skipped as far as the alphabet run went even when it never
+    /// closed, so `[::1:glpat-SECRET` (no `]` at all) skipped straight past the real credential's
+    /// own colon and left it completely unredacted. Fixed: only a genuinely closed bracket is
+    /// ever credited as a host shape; an unclosed one skips nothing, leaving every colon in it
+    /// (including the credential's own) visible to the ordinary scan.
+    #[test]
+    fn test_redact_userinfo_bracket_with_no_closing_bracket_anywhere_is_still_redacted() {
+        assert_eq!(redact_userinfo("[::1:glpat-SECRET"), "[:***");
+    }
+
+    /// impl-critic C2: redacting a bracket-adjacent non-port value is forced (#860 — it is
+    /// shape-identical to a real credential), but the mask must extend to the end of the region,
+    /// not just to the next `/`/`?`/`#` — otherwise a genuine credential sitting past that
+    /// boundary leaks through the unredacted tail. Before this fix,
+    /// `[::1]:abc/user:glpat-SECRET` returned `"[::1]:***/user:glpat-SECRET"` (the real
+    /// credential fully exposed); it must now be masked away entirely, not just the ambiguous
+    /// `abc`.
+    #[test]
+    fn test_redact_userinfo_bracket_adjacent_false_positive_does_not_leak_later_credential() {
+        let redacted = redact_userinfo("[::1]:abc/user:glpat-SECRET");
+        assert!(!redacted.contains("glpat-SECRET"), "redacted={redacted:?}");
+        assert_eq!(redacted, "[::1]:***");
+    }
+
+    /// Differential-fuzz find, a generalization of C2: a `/` immediately after `[` disqualifies
+    /// it as a real IPv6 shape (correctly — no legitimate host bracket ever looks like `[/...`),
+    /// so the bracket skip is only 1 byte and the very next colon (inside the stray `::1]`) is
+    /// *not* the colon immediately following it. An earlier fix tried a narrower `value`-based
+    /// proxy for this (`value.contains(']')`) and was itself found leaking one segment further
+    /// out (`[/::1/x]:abc/user:SECRET`) — replaced by the sticky "any bracket seen in this scan"
+    /// flag (impl-critic R3), which closes the whole family at once: once *any* `[` has appeared
+    /// anywhere in the string being scanned, every redaction from that point on masks through to
+    /// the end of the region rather than stopping at the next `/`/`?`/`#`.
+    #[test]
+    fn test_redact_userinfo_orphaned_close_bracket_in_value_does_not_leak_later_credential() {
+        assert_eq!(redact_userinfo("[/::1]:abc/user:glpat-SECRET"), "[/:***");
+    }
+
+    /// R3 companion: the fuzz-found counterexample that broke the narrower `value.contains(']')`
+    /// proxy — moving the orphaned `]` one path segment further away from the colon it was meant
+    /// to flag reopened the leak under that check, but the sticky "bracket seen anywhere" flag
+    /// catches it regardless of how far downstream the ambiguous colon sits.
+    #[test]
+    fn test_redact_userinfo_sticky_bracket_seen_catches_farther_orphaned_bracket() {
+        assert_eq!(redact_userinfo("[/::1/x]:abc/user:glpat-SECRET"), "[/:***");
+    }
+
+    /// code review: `segment_has_credential_colon`'s `is_port_like` exemption must only ever be
+    /// granted to a colon immediately following a *genuinely closed* bracket — an earlier
+    /// revision granted it whenever a bracket was merely attempted, closed or not, so a stray
+    /// unclosed `[` immediately followed by a colon (`[:12345`) wrongly earned the same
+    /// port-shape exemption a real `[::1]:8443` host would. This is a contract/robustness fix,
+    /// not an independently exploitable path today — `redact_colon_credential`'s own fallback
+    /// scan (unbounded by `@`, unlike `segment_has_credential_colon`'s) always includes the `@`
+    /// itself in the span it checks against `is_port_like`, and `@` is never an ASCII digit, so
+    /// the fallback already catches whatever this exemption might wrongly wave through; this
+    /// pins that the input the reviewer named stays safely redacted regardless.
+    #[test]
+    fn test_redact_userinfo_unclosed_bracket_before_port_like_value_is_not_exempted() {
+        assert_eq!(redact_userinfo("c:/[:12345@evil"), "c:***@evil");
+    }
+
+    /// Companion to the fix above, disambiguating a lookalike case: `"[:12345"` on its own (no
+    /// `@`, no scheme) never reaches `segment_has_credential_colon` at all — with no `@`,
+    /// `bounded_has_credential_colon` short-circuits straight to `redact_colon_credential`, whose
+    /// *general* `is_port_like` check (applying to every colon uniformly, #810, unrelated to
+    /// bracket-adjacency) exempts `"12345"` on its own merits. This is the same pre-existing,
+    /// already-documented ≤5-digit collision `test_url_for_tracing_colon_credential_documented_collisions`
+    /// already pins for `"oauth2:12345"` — a stray unclosed bracket changes nothing about it, so
+    /// this staying a no-op is *not* evidence of the bracket_adjacent bug (which requires an `@`
+    /// to even be reachable) and is not something to "fix" here without reopening that
+    /// documented, accepted collision for every other colon in the codebase.
+    #[test]
+    fn test_redact_userinfo_bare_unclosed_bracket_digit_gap_is_documented_collision() {
+        assert_eq!(redact_userinfo("[:12345"), "[:12345");
+    }
+
+    /// #857: `redact_userinfo_opaque_path`'s guard used to disable the `redact_colon_credential`
+    /// fallback (#810) for *any* unrelated `@` anywhere in the opaque-path region, even one with
+    /// nothing to do with the actual credential — an ordinary directory name (`user@host`) here
+    /// completely hid a real, unrelated `token:glpat-SECRET` credential later in the same path.
+    /// Fixed by removing the guard entirely (impl-critic C1): #860's fix already makes
+    /// `redact_colon_credential` safe for the one case (a genuine bracket shape) the guard was
+    /// meant to protect — see `test_redact_userinfo_opaque_path_bracket_host_stays_noop_without_guard`
+    /// — so a separate guard was only ever a source of new leaks, never a needed protection.
+    #[test]
+    fn test_redact_userinfo_opaque_path_unrelated_at_does_not_hide_later_credential() {
+        assert_eq!(
+            redact_userinfo("c:/user@host/token:glpat-SECRET"),
+            "c:/user@host/token:***"
+        );
+    }
+
+    /// #857 companion with a realistic GitLab CI job-token shape and a `file://` scheme.
+    #[test]
+    fn test_redact_userinfo_opaque_path_unrelated_at_gitlab_ci_token_is_redacted() {
+        let redacted = redact_userinfo("file:///home/u@corp/gitlab-ci-token:JOBTOKEN");
+        assert!(!redacted.contains("JOBTOKEN"), "redacted={redacted:?}");
+        assert_eq!(redacted, "file:///home/u@corp/gitlab-ci-token:***");
+    }
+
+    /// #857 companion (impl-critic C1): with the `OpaquePath` guard removed entirely, the
+    /// bracket-adjacent no-op case it used to exist for must still hold on `redact_colon_credential`'s
+    /// own merits alone — an ordinary bracketed-IPv6 host with a well-formed port, followed by an
+    /// unrelated `@version` segment, stays a no-op exactly like its
+    /// `test_redact_userinfo_bracketed_ipv6_well_formed_port_is_noop` sibling (which already pins
+    /// this same input).
+    #[test]
+    fn test_redact_userinfo_opaque_path_bracket_host_stays_noop_without_guard() {
+        assert_eq!(
+            redact_userinfo("c:/[::1]:8443/pkg@1.0.0"),
+            "c:/[::1]:8443/pkg@1.0.0"
+        );
+    }
+
+    /// impl-critic C1 (second_order_effects, the new leak the removed guard introduced): a
+    /// bracket shape *anywhere* in an opaque-path value — even one with nothing to do with the
+    /// real credential — used to disable redaction of that credential entirely under the old
+    /// narrowed guard, since the guard required only a bracket shape's presence, not any
+    /// relation to the `@` or the credential itself.
+    #[test]
+    fn test_redact_userinfo_opaque_path_unrelated_bracket_does_not_hide_credential() {
+        assert_eq!(
+            redact_userinfo("c:/[]/token:glpat-SECRET"),
+            "c:/[]/token:***"
+        );
+    }
+
     /// impl-critic S3/S4 (completeness_check, then second_order_effects): a password whose
     /// prefix before the `/`/`?`/`#` delimiter is 1-5 ASCII digits collides with the `host:port`
     /// carve-out and passes through unredacted — a deliberate, documented trade-off (S4), not a
@@ -2341,19 +2616,20 @@ mod tests {
         }
     }
 
-    /// impl-critic M3 (completeness_check), resolved as a side effect of code-review Finding 2:
-    /// an IPv6 host with a malformed (non-numeric) port used to be over-redacted, because
-    /// `bounded_has_credential_colon` saw `[::1]` itself as containing further `:`s (no
-    /// bracket-adjacent carve-out) and triggered the widened scan. Now that
-    /// `bounded_has_credential_colon` strips a leading bracket and its port-separator colon
-    /// unconditionally — matching `redact_colon_credential`'s own bracket-adjacent carve-out,
-    /// which never redacts that colon regardless of what follows it either — this stays a no-op
-    /// like the well-formed-port case, not just the previously-accepted over-redaction.
+    /// impl-critic M3 (completeness_check) history: an IPv6 host with a malformed (non-numeric)
+    /// port used to be over-redacted (no bracket-adjacent carve-out at all), then a later
+    /// revision made it a no-op by exempting any bracket-adjacent colon unconditionally. #860
+    /// closes that unconditional exemption — a non-numeric value right after a bracket's `]:`
+    /// is shape-indistinguishable from a real credential (`[::1]:notaport` vs.
+    /// `[::1]:glpat-SECRET`), so `bounded_has_credential_colon` now correctly treats it as
+    /// evidence of a possible credential and widens into the `@`-masking path (not the
+    /// colon-masking path — `notaport`'s own non-exemption is what routes this through
+    /// `find_credential_at` and `mask_at` instead of `redact_colon_credential`).
     #[test]
-    fn test_redact_userinfo_unparseable_ipv6_malformed_port_is_noop() {
+    fn test_redact_userinfo_unparseable_ipv6_malformed_port_is_redacted() {
         assert_eq!(
             redact_userinfo("https://[::1]:notaport/x@y"),
-            "https://[::1]:notaport/x@y"
+            "https://***@y"
         );
     }
 

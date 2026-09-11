@@ -16,8 +16,8 @@
 //! the sentinel fixed, so the property can be asserted exactly; the fuzzer only varies an
 //! alphanumeric-only tail appended after the structural part. A tail containing
 //! `:`/`/`/`@`/`[`/`]`/`?`/`#` could otherwise corrupt the very structure each template is built
-//! to exercise, or drift a template onto one of `net_policy.rs`'s documented accepted false
-//! negatives (a bracket-adjacent colon, a ≤5-digit-prefixed value) — this target intentionally
+//! to exercise, or drift a template onto the one remaining documented accepted false negative (a
+//! ≤5-digit-prefixed value colliding with the `host:port` carve-out) — this target intentionally
 //! avoids both a corrupted structure and re-fuzzing an already-accepted gap; it fuzzes only the
 //! part outside either concern.
 //!
@@ -25,6 +25,17 @@
 //! `RegionKind::OpaquePath` has two known, tracked leak classes (S4 `#858`, S5 `#859`) that
 //! would make this invariant red on day one for a gap this target isn't meant to prove; those
 //! are pinned instead as `#[ignore]`d regression tests in `net_policy.rs`.
+//!
+//! (c) a credential is never left unredacted across the bracket/colon delimiter space #860/#857
+//!     rewrote — for *both* `RegionKind`s, since #857 removed `OpaquePath`'s special-cased
+//!     guard entirely. This is the differential-fuzz coverage #860's own issue body named as a
+//!     precondition for merging (an impl-critic review found the initial implementation skipped
+//!     it and, empirically, net-increased leakage over `main`): the fuzzed "decoration" here is
+//!     drawn from `[`/`]`/`/` only (never `:`, so it can only add bracket/slash noise around a
+//!     scanner-controlled, always-present colon — never inject an uncontrolled one that could
+//!     itself swallow the sentinel through the general, pre-existing "mask stops at the next
+//!     path separator" limitation every colon-based match in this file has, in or out of a
+//!     bracket, and which is out of scope for #860/#857 to fix).
 
 #![no_main]
 
@@ -52,6 +63,18 @@ fn tail_from(data: &[u8]) -> String {
         .map(|&b| b as char)
         .collect();
     tail.replace(SENTINEL, "")
+}
+
+/// Bracket/slash-only "decoration" for invariant (c) — see this file's own module doc comment
+/// for why `:` is deliberately excluded from this alphabet (it must never be the fuzzer, rather
+/// than a fixed template literal, that introduces the one colon each template's assertion
+/// depends on).
+fn bracket_decoration(data: &[u8]) -> String {
+    data.iter()
+        .filter(|b| matches!(b, b'[' | b']' | b'/'))
+        .take(8)
+        .map(|&b| b as char)
+        .collect()
 }
 
 fuzz_target!(|data: &[u8]| {
@@ -88,12 +111,40 @@ fuzz_target!(|data: &[u8]| {
         // no-`@` fallback directly (the #810 class) via `find_credential_at` returning `None`.
         format!("oauth2:{SENTINEL}{tail}"),
         // A bracketed IPv6 literal starts the bounded authority, with a real credential past a
-        // `?` boundary: reaches `bounded_has_credential_colon`'s own `skip_bracketed_host` call,
-        // then `find_credential_at` -> `segment_has_credential_colon`'s `skip_bracketed_host`
-        // call too.
+        // `?` boundary: reaches `bounded_has_credential_colon`'s own `bracket_host_shape_end`
+        // call, then `find_credential_at` -> `segment_has_credential_colon`'s
+        // `bracket_host_shape_end` call too.
         format!("[::1]:8443:extra?user:{SENTINEL}@host{tail}"),
     ];
     for input in variants {
+        let redacted = redact_userinfo(&input);
+        assert!(
+            !redacted.contains(SENTINEL),
+            "credential leaked: input={input:?} output={redacted:?}"
+        );
+    }
+
+    // Invariant (c): every colon in each template below is a fixed literal, never
+    // fuzzer-derived — only the bracket/slash decoration around them varies.
+    let deco = bracket_decoration(data);
+    let bracket_variants = [
+        // C3: an unclosed bracket must never swallow the real credential's own colon, no matter
+        // how much bracket/slash noise precedes or interrupts it.
+        format!("{deco}[::1:{SENTINEL}"),
+        format!("[::1{deco}:{SENTINEL}"),
+        format!("x/{deco}[::1:{SENTINEL}"),
+        // C2: a bracket-adjacent non-port value is forced to redact (#860) but must mask through
+        // to the end of the region, never leaving a later, genuine credential exposed in the
+        // unredacted tail.
+        format!("[::1]:abc/user:{SENTINEL}"),
+        format!("[{deco}::1]:abc/user:{SENTINEL}"),
+        // C1: a bracket shape with nothing to do with the credential must never disable
+        // redaction of an unrelated, real credential elsewhere in an `OpaquePath` value.
+        format!("c:/{deco}[]/token:{SENTINEL}"),
+        format!("c:/[0]{deco}/token:{SENTINEL}"),
+        format!("file:///home/u{deco}[x]/gitlab-ci-token:{SENTINEL}"),
+    ];
+    for input in bracket_variants {
         let redacted = redact_userinfo(&input);
         assert!(
             !redacted.contains(SENTINEL),

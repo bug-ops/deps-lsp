@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - `fuzz/redact_userinfo`: fixed a false-positive crash where the fuzzer-controlled host/port tail could coincidentally reproduce the sentinel literal, tripping the leak assertion outside any credential; no `net_policy` behavior change (#864)
+- **deps-core**: `net_policy`'s bracketed-IPv6-host carve-out no longer silently exempts a credential sitting next to a `[...]` host literal (resolves #860)
+- **deps-core**: `redact_userinfo`'s opaque-path fallback no longer disables credential redaction for an unrelated `@` elsewhere in the value (resolves #857)
 
 ## [0.14.0] - 2026-09-11
 
