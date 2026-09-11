@@ -190,8 +190,11 @@ jobs:
     permissions:
       contents: read
       issues: write
+      pull-requests: write
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+        with:
+          fetch-depth: 0
 
       - name: Install cargo-deny
         uses: taiki-e/install-action@5724fe4561a201b0d36bddf13177e3557b43787b  # cargo-deny
@@ -199,24 +202,23 @@ jobs:
       - name: Run cargo-deny
         run: cargo deny check
 
-      - name: Install gitleaks
-        # gitleaks/gitleaks-action requires a paid GITLEAKS_LICENSE for organization-owned
-        # repos (bug-ops is an org, not a personal account) even though this repo is public
-        # — see the action's README "Do I need a free license key?" section. taiki-e/install-
-        # action has no gitleaks manifest either, so the CLI is fetched directly from the
-        # pinned release and checksum-verified instead.
-        run: |
-          curl -sSLO https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
-          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  gitleaks_8.30.1_linux_x64.tar.gz" | sha256sum -c -
-          tar -xzf gitleaks_8.30.1_linux_x64.tar.gz gitleaks
-          sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
-
       - name: Run gitleaks
-        # `dir` scans the checked-out tree rather than git history, since the checkout step
-        # above is a shallow, single-commit clone (no fetch-depth: 0). Picks up
-        # .gitleaks.toml (#803) from the repo root automatically per gitleaks' config
-        # precedence (target-path/.gitleaks.toml), no --config flag needed.
-        run: gitleaks dir . --no-banner --redact
+        # bug-ops is a personal account, not an organization (verified via `gh api
+        # users/bug-ops --jq '{login, type, name}'` -> "type": "User"), so
+        # gitleaks-action's GITLEAKS_LICENSE requirement (free, but org-account-only)
+        # does not apply here — per the action's README, "If you are scanning repos that
+        # belong to a personal account, then no license key is required." Auto-discovers
+        # .gitleaks.toml (#803) from the repo root, same precedence as the bare CLI, so
+        # no extra config flag is needed. Requires `fetch-depth: 0` above: `Scan()` always
+        # runs `git log --no-merges --first-parent <base>^..<head>`, which needs history
+        # beyond the default shallow checkout. `pull-requests: write` above is required
+        # too: `ScanPullRequest()`'s commit-listing call isn't wrapped in try/catch and
+        # 403s without it. GITLEAKS_VERSION pins the scanner explicitly — the action
+        # otherwise defaults to an older hardcoded version.
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e  # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_VERSION: 8.30.1
 
   test:
     name: Test (${{ matrix.os }}${{ matrix.rust != 'stable' && format(' / {0}', matrix.rust) || '' }})
