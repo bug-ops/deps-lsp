@@ -310,6 +310,11 @@ pub fn assert_locate_lockfile_not_found(
     manifest_name: &str,
     manifest_content: &str,
 ) {
+    // Held per `fs_probe::snapshot_guard`'s doc: `locate_lockfile` transitively touches
+    // fs_probe (via `locate_lockfile_for_manifest`'s `fs_probe::is_file` checks), and this
+    // helper is macro-expanded into every ecosystem crate's `lockfile.rs`, some of which
+    // (deps-cargo, deps-npm, deps-nuget) share a test binary with a diffing test.
+    let _guard = crate::fs_probe::snapshot_guard();
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let manifest_path = temp_dir.path().join(manifest_name);
     std::fs::write(&manifest_path, manifest_content).expect("write manifest");
@@ -329,6 +334,8 @@ pub fn assert_locate_lockfile_same_directory(
     lock_name: &str,
     lock_content: &str,
 ) {
+    // See the comment in `assert_locate_lockfile_not_found` on why this guard is needed here.
+    let _guard = crate::fs_probe::snapshot_guard();
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let manifest_path = temp_dir.path().join(manifest_name);
     let lock_path = temp_dir.path().join(lock_name);
@@ -417,6 +424,11 @@ pub async fn assert_parse_malformed_lockfile_does_not_panic(
     lock_name: &str,
     malformed_content: &str,
 ) {
+    // See the comment in `assert_locate_lockfile_not_found` on why this guard is needed here
+    // — `parse_lockfile` routes through `read_and_parse_lockfile`'s `fs_probe::metadata`/
+    // `read_to_string_capped` calls. Async (this helper runs under `#[tokio::test]`), so the
+    // async guard variant.
+    let _guard = crate::fs_probe::snapshot_guard_async().await;
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let lockfile_path = temp_dir.path().join(lock_name);
     std::fs::write(&lockfile_path, malformed_content).expect("write malformed lockfile");

@@ -405,6 +405,10 @@ mod tests {
 
         #[tokio::test]
         async fn test_unknown_package_uses_configured_severity() {
+            // Held per `deps_core::fs_probe::snapshot_guard`'s doc: `ecosystem.parse_manifest`
+            // (cargo/npm) transitively touches fs_probe, and this test runs in the same binary as
+            // `document/loader.rs`'s diffing test.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
             let config = DiagnosticsConfig {
@@ -435,6 +439,8 @@ serde = "1.0.0"
 
         #[tokio::test]
         async fn test_unknown_package_default_severity_unchanged() {
+            // See the comment in `test_unknown_package_uses_configured_severity` on why this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
             let config = DiagnosticsConfig::default();
@@ -462,6 +468,8 @@ serde = "1.0.0"
 
         #[tokio::test]
         async fn test_outdated_dependency_uses_configured_severity() {
+            // See the comment in `test_unknown_package_uses_configured_severity` on why this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
             let config = DiagnosticsConfig {
@@ -506,6 +514,8 @@ serde = "1.0.0"
 
         #[tokio::test]
         async fn test_outdated_dependency_default_severity_unchanged() {
+            // See the comment in `test_unknown_package_uses_configured_severity` on why this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
             let config = DiagnosticsConfig::default();
@@ -544,6 +554,8 @@ serde = "1.0.0"
 
         #[tokio::test]
         async fn test_unsatisfiable_requirement_uses_configured_severity() {
+            // See the comment in `test_unknown_package_uses_configured_severity` on why this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
             let config = DiagnosticsConfig {
@@ -591,6 +603,8 @@ serde = "1.0.0"
         /// actually reads the document's real dependency count rather than e.g. always `0`.
         #[tokio::test]
         async fn test_document_dependency_count_reflects_real_dependency_count() {
+            // See the comment in `test_unknown_package_uses_configured_severity` on why this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
@@ -627,6 +641,8 @@ serde = "1.0.0"
 
         #[tokio::test]
         async fn test_handle_diagnostics() {
+            // See the comment in `test_unknown_package_uses_configured_severity` on why this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
             let config = DiagnosticsConfig::default();
@@ -672,6 +688,8 @@ serde = "1.0.0"
         /// panicked without reaching `set_loaded`/`set_failed`).
         #[tokio::test]
         async fn test_generate_diagnostics_internal_falls_through_after_loading_ceiling_exceeded() {
+            // See the comment in `test_unknown_package_uses_configured_severity` on why this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
 
@@ -732,6 +750,8 @@ serde = "1.0.0"
         #[tokio::test]
         async fn test_generate_diagnostics_internal_ceiling_exceeded_seeds_not_attempted_instead_of_unknown_package()
          {
+            // See the comment in `test_unknown_package_uses_configured_severity` on why this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
 
@@ -787,6 +807,8 @@ serde = "1.0.0"
         /// loading.
         #[tokio::test]
         async fn test_generate_diagnostics_internal_still_suppressed_within_loading_ceiling() {
+            // See the comment in `test_unknown_package_uses_configured_severity` on why this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
 
@@ -825,6 +847,8 @@ serde = "1.0.0"
         /// (not just the pure `requirement_is_unsatisfiable` function).
         #[tokio::test]
         async fn test_handle_diagnostics_unsatisfiable_requirement_yields_one_warning() {
+            // See the comment in `test_unknown_package_uses_configured_severity` on why this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
             let config = DiagnosticsConfig::default();
@@ -872,6 +896,8 @@ serde = "1.0.0"
         #[tokio::test]
         async fn test_handle_diagnostics_unsatisfiable_requirement_empty_available_yields_nothing()
         {
+            // See the comment in `test_unknown_package_uses_configured_severity` on why this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
             let config = DiagnosticsConfig::default();
@@ -907,6 +933,8 @@ serde = "1.0.0"
         /// must still get its usual "Newer version available" HINT.
         #[tokio::test]
         async fn test_handle_diagnostics_unsatisfiable_and_outdated_side_by_side() {
+            // See the comment in `test_unknown_package_uses_configured_severity` on why this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
             let config = DiagnosticsConfig::default();
@@ -966,6 +994,8 @@ serde = "1.0.0"
         /// `requirement_matches_only_yanked` function.
         #[tokio::test]
         async fn test_handle_diagnostics_yanked_only_match_yields_one_warning() {
+            // See the comment in `test_unknown_package_uses_configured_severity` on why this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
             let config = DiagnosticsConfig::default();
@@ -1018,6 +1048,8 @@ serde = "1.0.0"
 
         #[tokio::test]
         async fn test_handle_diagnostics() {
+            // See the comment in `test_unknown_package_uses_configured_severity` on why this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
             let uri = deps_core::test_util::test_uri("/test/package.json");
             let config = DiagnosticsConfig::default();
@@ -1054,6 +1086,8 @@ serde = "1.0.0"
         /// silently killed had npm's first #436 pass gone unrevised.
         #[tokio::test]
         async fn test_handle_diagnostics_in_use_version_yanked_still_fires_post_436() {
+            // See the comment in `test_unknown_package_uses_configured_severity` on why this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
             let uri = deps_core::test_util::test_uri("/test/package.json");
             let config = DiagnosticsConfig::default();
@@ -1120,6 +1154,8 @@ serde = "1.0.0"
         #[tokio::test]
         async fn test_handle_diagnostics_manifest_requirement_yanked_stays_suppressed_for_exact_pin()
          {
+            // See the comment in `test_unknown_package_uses_configured_severity` on why this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
             let uri = deps_core::test_util::test_uri("/test/package.json");
             let config = DiagnosticsConfig::default();
@@ -1389,6 +1425,8 @@ dependencies = ["requests>=2.0.0"]
             uri: &Uri,
             content: &str,
         ) -> Box<dyn ParseResult> {
+            // See the comment in `test_unknown_package_uses_configured_severity` on why this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             state
                 .ecosystem_registry
                 .get("cargo")

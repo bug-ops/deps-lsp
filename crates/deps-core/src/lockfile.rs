@@ -697,6 +697,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_lockfile_content_success() {
+        // Held per `fs_probe::snapshot_guard`'s doc: `read_lockfile_content` transitively
+        // touches fs_probe, and this test runs in the same binary as other modules' (e.g.
+        // `mtime_cache`'s) diffing tests.
+        let _guard = fs_probe::snapshot_guard_async().await;
         let temp_dir = tempfile::tempdir().unwrap();
         let lock_path = temp_dir.path().join("Cargo.lock");
         std::fs::write(&lock_path, "version = 4").unwrap();
@@ -716,6 +720,9 @@ mod tests {
     /// content is otherwise perfectly valid `String` content for the success path to return.
     #[tokio::test]
     async fn test_read_lockfile_content_rejects_oversized_file() {
+        // See the comment in `test_read_lockfile_content_success` on why this guard is
+        // needed here.
+        let _guard = fs_probe::snapshot_guard_async().await;
         let temp_dir = tempfile::tempdir().unwrap();
         let lock_path = temp_dir.path().join("Cargo.lock");
         let file = std::fs::File::create(&lock_path).unwrap();
@@ -739,6 +746,9 @@ mod tests {
     /// own doc warns about (a FIFO would block the read indefinitely).
     #[tokio::test]
     async fn test_read_lockfile_content_rejects_non_regular_file() {
+        // See the comment in `test_read_lockfile_content_success` on why this guard is
+        // needed here.
+        let _guard = fs_probe::snapshot_guard_async().await;
         let temp_dir = tempfile::tempdir().unwrap();
         let lock_path = temp_dir.path().join("Cargo.lock");
         std::fs::create_dir(&lock_path).unwrap();
@@ -757,6 +767,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_lockfile_content_missing_file_wraps_error() {
+        // See the comment in `test_read_lockfile_content_success` on why this guard is
+        // needed here.
+        let _guard = fs_probe::snapshot_guard_async().await;
         let temp_dir = tempfile::tempdir().unwrap();
         let lock_path = temp_dir.path().join("Cargo.lock");
 
@@ -780,6 +793,9 @@ mod tests {
     /// with the panic message preserved in `source` (tokio's `JoinError: Display` carries it).
     #[tokio::test]
     async fn test_read_and_parse_lockfile_panic_in_parse_becomes_parse_error() {
+        // See the comment in `test_read_lockfile_content_success` on why this guard is
+        // needed here.
+        let _guard = fs_probe::snapshot_guard_async().await;
         let temp_dir = tempfile::tempdir().unwrap();
         let lock_path = temp_dir.path().join("Cargo.lock");
         std::fs::write(&lock_path, "version = 4").unwrap();
@@ -807,6 +823,9 @@ mod tests {
     /// CPU-bound parsing no longer executes on the tokio worker driving the LSP request.
     #[tokio::test]
     async fn test_read_and_parse_lockfile_runs_parse_off_calling_thread() {
+        // See the comment in `test_read_lockfile_content_success` on why this guard is
+        // needed here.
+        let _guard = fs_probe::snapshot_guard_async().await;
         let temp_dir = tempfile::tempdir().unwrap();
         let lock_path = temp_dir.path().join("Cargo.lock");
         std::fs::write(&lock_path, "version = 4").unwrap();
@@ -1081,6 +1100,10 @@ mod tests {
 
     #[test]
     fn test_locate_lockfile_for_manifest_same_directory() {
+        // Held per `fs_probe::snapshot_guard`'s doc: `locate_lockfile_for_manifest`
+        // transitively touches fs_probe (via `fs_probe::is_file`), and this test runs in the
+        // same binary as other modules' (e.g. `mtime_cache`'s) diffing tests.
+        let _guard = fs_probe::snapshot_guard();
         let temp_dir = tempfile::tempdir().unwrap();
         let manifest_path = temp_dir.path().join("Cargo.toml");
         let lock_path = temp_dir.path().join("Cargo.lock");
@@ -1097,6 +1120,9 @@ mod tests {
 
     #[test]
     fn test_locate_lockfile_for_manifest_workspace_root() {
+        // See the comment in `test_locate_lockfile_for_manifest_same_directory` on why this
+        // guard is needed here.
+        let _guard = fs_probe::snapshot_guard();
         let temp_dir = tempfile::tempdir().unwrap();
         let workspace_lock = temp_dir.path().join("Cargo.lock");
         let member_dir = temp_dir.path().join("crates").join("member");
@@ -1119,6 +1145,9 @@ mod tests {
     /// regular file, unlike the plain `Path::exists()` this locator used before the fix.
     #[test]
     fn test_locate_lockfile_for_manifest_skips_non_regular_file() {
+        // See the comment in `test_locate_lockfile_for_manifest_same_directory` on why this
+        // guard is needed here.
+        let _guard = fs_probe::snapshot_guard();
         let temp_dir = tempfile::tempdir().unwrap();
         let manifest_path = temp_dir.path().join("Cargo.toml");
         let lock_path = temp_dir.path().join("Cargo.lock");
@@ -1137,6 +1166,9 @@ mod tests {
 
     #[test]
     fn test_locate_lockfile_for_manifest_not_found() {
+        // See the comment in `test_locate_lockfile_for_manifest_same_directory` on why this
+        // guard is needed here.
+        let _guard = fs_probe::snapshot_guard();
         let temp_dir = tempfile::tempdir().unwrap();
         let manifest_path = temp_dir.path().join("Cargo.toml");
         std::fs::write(&manifest_path, "[package]\nname = \"test\"").unwrap();
@@ -1149,6 +1181,9 @@ mod tests {
 
     #[test]
     fn test_locate_lockfile_for_manifest_multiple_names() {
+        // See the comment in `test_locate_lockfile_for_manifest_same_directory` on why this
+        // guard is needed here.
+        let _guard = fs_probe::snapshot_guard();
         let temp_dir = tempfile::tempdir().unwrap();
         let manifest_path = temp_dir.path().join("pyproject.toml");
         let uv_lock = temp_dir.path().join("uv.lock");
@@ -1213,6 +1248,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_or_parse_cache_hit_does_not_reparse() {
+        // Held per `fs_probe::snapshot_guard`'s doc: the stub provider's `parse_lockfile`
+        // calls `read_lockfile_content`, which transitively touches fs_probe.
+        let _guard = fs_probe::snapshot_guard_async().await;
         let temp_dir = tempfile::tempdir().unwrap();
         let lock_path = temp_dir.path().join("test.lock");
         std::fs::write(&lock_path, "1.0.0").unwrap();
@@ -1230,6 +1268,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_or_parse_reparses_when_mtime_advances() {
+        // See the comment in `test_get_or_parse_cache_hit_does_not_reparse` on why this
+        // guard is needed here.
+        let _guard = fs_probe::snapshot_guard_async().await;
         let temp_dir = tempfile::tempdir().unwrap();
         let lock_path = temp_dir.path().join("test.lock");
         std::fs::write(&lock_path, "1.0.0").unwrap();
@@ -1336,6 +1377,9 @@ mod tests {
     /// describes. This test would have failed on that code.
     #[tokio::test]
     async fn test_get_or_parse_detects_rewrite_during_parse() {
+        // See the comment in `test_get_or_parse_cache_hit_does_not_reparse` on why this
+        // guard is needed here.
+        let _guard = fs_probe::snapshot_guard_async().await;
         let temp_dir = tempfile::tempdir().unwrap();
         let lock_path = temp_dir.path().join("test.lock");
         std::fs::write(&lock_path, "1.0.0").unwrap();
@@ -1358,6 +1402,9 @@ mod tests {
 
     #[test]
     fn test_locate_lockfile_for_manifest_first_match_wins() {
+        // See the comment in `test_locate_lockfile_for_manifest_same_directory` on why this
+        // guard is needed here.
+        let _guard = fs_probe::snapshot_guard();
         let temp_dir = tempfile::tempdir().unwrap();
         let manifest_path = temp_dir.path().join("pyproject.toml");
         let poetry_lock = temp_dir.path().join("poetry.lock");

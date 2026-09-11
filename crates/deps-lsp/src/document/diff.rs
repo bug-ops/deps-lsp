@@ -285,6 +285,10 @@ mod tests {
 
         #[tokio::test]
         async fn test_preserve_cached_versions_on_change() {
+            // Held per `deps_core::fs_probe::snapshot_guard`'s doc: `ecosystem.parse_manifest` (cargo)
+            // transitively touches fs_probe, and this test runs in the same binary as
+            // `document/loader.rs`'s diffing test.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
 
@@ -375,6 +379,8 @@ tokio = "1.0"
         /// and `run_document_change_task`'s repopulation of the candidates map.
         #[tokio::test]
         async fn test_preserve_cache_carries_resolved_version_candidates_across_edit() {
+            // See the comment in `test_preserve_cached_versions_on_change` on why this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
 
@@ -430,6 +436,8 @@ serde_old = { package = "serde", version = "0.9" }
 
         #[tokio::test]
         async fn test_preserve_cache_carries_vulnerabilities_across_edit() {
+            // See the comment in `test_preserve_cached_versions_on_change` on why this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             use deps_core::osv::{ScanOutcome, VulnerabilityMap};
 
             let state = Arc::new(ServerState::new());
@@ -479,6 +487,8 @@ time = "0.1.43"
 
         #[tokio::test]
         async fn test_preserve_cache_carries_yanked_versions_across_edit() {
+            // See the comment in `test_preserve_cached_versions_on_change` on why this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
 
@@ -530,6 +540,8 @@ time = "0.1.43"
 
         #[tokio::test]
         async fn test_preserve_cache_carries_deprecations_across_edit() {
+            // See the comment in `test_preserve_cached_versions_on_change` on why this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
 
@@ -587,6 +599,8 @@ time = "0.1.43"
 
         #[tokio::test]
         async fn test_deprecations_pruned_on_dependency_removal_by_normalized_name() {
+            // See the comment in `test_preserve_cached_versions_on_change` on why this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
 
@@ -660,6 +674,8 @@ serde = "1.0"
         /// a name no longer in the manifest.
         #[tokio::test]
         async fn test_resolved_version_candidates_pruned_on_dependency_removal() {
+            // See the comment in `test_preserve_cached_versions_on_change` on why this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
 
@@ -721,6 +737,8 @@ serde_old = { package = "serde", version = "0.9" }
         /// `diff.version_changed`-triggered prune in `handle_document_change`.
         #[tokio::test]
         async fn test_deprecations_survive_version_change_unlike_yanked_versions() {
+            // See the comment in `test_preserve_cached_versions_on_change` on why this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
 
@@ -794,6 +812,8 @@ time = "0.1.43"
         /// leave the deprecation finding untouched.
         #[tokio::test]
         async fn test_fetch_failed_and_yanked_cleared_but_deprecation_survives_version_change() {
+            // See the comment in `test_preserve_cached_versions_on_change` on why this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
 
@@ -1113,6 +1133,8 @@ time = "0.1.43"
 
         #[tokio::test]
         async fn test_yanked_versions_pruned_on_dependency_removal_by_normalized_name() {
+            // See the comment in `test_preserve_cached_versions_on_change` on why this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
 
@@ -1179,6 +1201,8 @@ serde = "1.0"
 
         #[tokio::test]
         async fn test_yanked_versions_pruned_on_version_change_by_normalized_name() {
+            // See the comment in `test_preserve_cached_versions_on_change` on why this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             // Security F1 / impl-critic S1 (false positive direction):
             // editing a dependency from a yanked pin to a safe one, with no
             // lock file, must not leave the stale yanked diagnostic
@@ -1262,6 +1286,8 @@ time = "=0.1.44"
 
         #[tokio::test]
         async fn test_fetch_failed_pruned_on_dependency_removal_by_normalized_name() {
+            // See the comment in `test_preserve_cached_versions_on_change` on why this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             // Mirrors `test_yanked_versions_pruned_on_dependency_removal_by_normalized_name`
             // for `fetch_failed` (#267): a stale fetch-error marker for a
             // dependency the user has since deleted must not linger.
@@ -1368,6 +1394,8 @@ serde = "1.0"
 
         #[tokio::test]
         async fn test_preserve_cache_yanked_versions_stale_after_lockfile_only_change() {
+            // See the comment in `test_preserve_cached_versions_on_change` on why this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             // R3 (accepted, not fixed): the yanked map is computed during the
             // registry fetch. A didChange that adds no dependencies skips the
             // fetch entirely, so `preserve_cache` carries the *old* yanked
@@ -1427,6 +1455,8 @@ time = "0.1.43"
 
         #[tokio::test]
         async fn test_first_open_has_empty_cache() {
+            // See the comment in `test_preserve_cached_versions_on_change` on why this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
 
@@ -1454,6 +1484,8 @@ serde = "1.0"
 
         #[tokio::test]
         async fn test_preserve_cache_on_parse_failure() {
+            // See the comment in `test_preserve_cached_versions_on_change` on why this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
 
@@ -1607,6 +1639,8 @@ serde = "1.0"
 
         #[tokio::test]
         async fn test_dependency_version_map_tracks_both_occurrences_of_duplicate_name() {
+            // See the comment in `test_preserve_cached_versions_on_change` on why this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             // Regression guard for #394: `time` appears under both
             // `[dependencies]` and `[dev-dependencies]` with different
             // requirements. A name-keyed `HashMap<PackageName, Option<VersionReq>>`
@@ -1646,6 +1680,8 @@ time = "0.1.44"
 
         #[tokio::test]
         async fn test_dependency_diff_detects_edit_to_first_occurrence_of_duplicate_name() {
+            // See the comment in `test_preserve_cached_versions_on_change` on why this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             // Regression guard for #394: editing the *first* (`[dependencies]`)
             // occurrence of a duplicated name, while the second
             // (`[dev-dependencies]`) occurrence stays unchanged, must still
@@ -1699,6 +1735,8 @@ time = "0.1.44"
 
         #[tokio::test]
         async fn test_dependency_diff_detects_edit_to_second_occurrence_of_duplicate_name() {
+            // See the comment in `test_preserve_cached_versions_on_change` on why this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             // Mirrors the previous test in the opposite direction: editing
             // the *second* (`[dev-dependencies]`) occurrence, with the first
             // (`[dependencies]`) occurrence unchanged, must also be detected
@@ -1749,6 +1787,8 @@ time = "0.1.60"
 
         #[tokio::test]
         async fn test_dependency_diff_detects_edit_to_duplicate_name_across_target_blocks() {
+            // See the comment in `test_preserve_cached_versions_on_change` on why this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             // #394's own headline reproduction: `time` declared under two
             // different `[target.'cfg(...)'.dependencies]` blocks (reachable
             // since #396's target-table parsing fix), pinned to different
@@ -1813,6 +1853,8 @@ time = "0.1.50"
 
         #[tokio::test]
         async fn test_cache_pruned_on_dependency_removal() {
+            // See the comment in `test_preserve_cached_versions_on_change` on why this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
 

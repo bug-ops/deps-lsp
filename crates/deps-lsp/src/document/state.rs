@@ -2265,6 +2265,10 @@ mod tests {
 
         #[test]
         fn test_document_state_new_from_parse_result() {
+            // Held per `deps_core::fs_probe::snapshot_guard`'s doc: `ecosystem.parse_manifest`
+            // transitively touches fs_probe, and this test runs in the same binary as
+            // `document/loader.rs`'s diffing test.
+            let _guard = deps_core::fs_probe::snapshot_guard();
             let state = ServerState::new();
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
@@ -2346,6 +2350,8 @@ mod tests {
         /// carries a cheap `Arc` clone of the *same* parse result rather than losing it.
         #[test]
         fn test_document_state_clone_preserves_parse_result() {
+            // See the comment in `test_document_state_new_from_parse_result` on why this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard();
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
             let ecosystem = ServerState::new().ecosystem_registry.get("cargo").unwrap();
             let content = "[dependencies]\nserde = \"1.0\"\n".to_string();

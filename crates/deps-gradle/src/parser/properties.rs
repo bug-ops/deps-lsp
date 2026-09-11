@@ -146,6 +146,12 @@ mod tests {
         let padding = "#".repeat(deps_core::MAX_CACHED_FILE_BYTES as usize);
         std::fs::write(&props_file, format!("key=value\n{padding}\n")).unwrap();
 
+        // Held even though this test does not itself diff a snapshot: it still calls
+        // `load_gradle_properties`, which bumps the same process-global fs_probe counters
+        // `test_load_gradle_properties_stats_exactly_once_per_ancestor` diffs elsewhere in
+        // this module — without the guard here, a concurrently running `cargo test` thread
+        // could corrupt that test's count mid-diff.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let result = load_gradle_properties(dir.path());
 
         assert!(
@@ -171,6 +177,9 @@ mod tests {
 
         std::fs::write(root.path().join("gradle.properties"), "beyondCap=true\n").unwrap();
 
+        // See the comment in `test_load_gradle_properties_rejects_oversized_file` on why a
+        // non-diffing test still needs this guard.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let result = load_gradle_properties(&current);
 
         assert!(
@@ -197,6 +206,9 @@ mod tests {
 
         std::fs::write(root.path().join("gradle.properties"), "atCap=true\n").unwrap();
 
+        // See the comment in `test_load_gradle_properties_rejects_oversized_file` on why a
+        // non-diffing test still needs this guard.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let result = load_gradle_properties(&current);
 
         assert_eq!(
@@ -221,6 +233,7 @@ mod tests {
         }
         std::fs::create_dir_all(&current).unwrap();
 
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let (stats_before, _) = deps_core::fs_probe::snapshot();
         let result = load_gradle_properties(&current);
         let (stats_after, _) = deps_core::fs_probe::snapshot();

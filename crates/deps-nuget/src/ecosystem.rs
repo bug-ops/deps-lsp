@@ -528,6 +528,11 @@ mod tests {
     async fn test_package_name_completion_context_has_real_range() {
         // Regression test for #232: the textEdit range for a package-name completion
         // must be the real name token span, not the (0,0)-(0,0) placeholder.
+        //
+        // Held per `fs_probe::snapshot_guard`'s doc: `parse_manifest` calls
+        // `config::resolve_with_context` directly, and every such test in this file must
+        // hold it.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let cache = Arc::new(deps_core::HttpCache::new());
         let eco = NuGetEcosystem::new(cache);
         let content = "<Project>\n  <ItemGroup>\n    <PackageReference Include=\"Foo\" Version=\"1.0.0\" />\n  </ItemGroup>\n</Project>";
@@ -557,6 +562,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_manifest_csproj() {
+        // See the comment in `test_package_name_completion_context_has_real_range` on why
+        // this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let cache = Arc::new(deps_core::HttpCache::new());
         let eco = NuGetEcosystem::new(cache);
         let uri = deps_core::test_util::test_uri("/test/App.csproj");
@@ -568,6 +576,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_manifest_fsproj_routes_as_project_file() {
+        // See the comment in `test_package_name_completion_context_has_real_range` on why
+        // this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let cache = Arc::new(deps_core::HttpCache::new());
         let eco = NuGetEcosystem::new(cache);
         let uri = deps_core::test_util::test_uri("/test/App.fsproj");
@@ -579,6 +590,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_manifest_directory_packages_props() {
+        // See the comment in `test_package_name_completion_context_has_real_range` on why
+        // this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let cache = Arc::new(deps_core::HttpCache::new());
         let eco = NuGetEcosystem::new(cache);
         let uri = deps_core::test_util::test_uri("/test/Directory.Packages.props");
@@ -590,6 +604,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_manifest_packages_config() {
+        // See the comment in `test_package_name_completion_context_has_real_range` on why
+        // this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let cache = Arc::new(deps_core::HttpCache::new());
         let eco = NuGetEcosystem::new(cache);
         let uri = deps_core::test_util::test_uri("/test/packages.config");
@@ -601,6 +618,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_manifest_invalid_xml_errors() {
+        // See the comment in `test_package_name_completion_context_has_real_range` on why
+        // this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let cache = Arc::new(deps_core::HttpCache::new());
         let eco = NuGetEcosystem::new(cache);
         let uri = deps_core::test_util::test_uri("/test/App.csproj");
@@ -952,6 +972,10 @@ mod tests {
         use deps_core::{EcosystemConfig, LoadingState, PackageVersions};
         use tower_lsp_server::ls_types::InlayHintLabel;
 
+        // See the comment in `test_package_name_completion_context_has_real_range` on why
+        // this guard is needed here — held for this shared helper's `parse_manifest` call so
+        // every one of its five callers is covered without repeating the guard per-caller.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let parse_result = eco.parse_manifest(content, uri).await.unwrap();
         let mut cached = std::collections::HashMap::new();
         cached.insert(
@@ -1042,6 +1066,10 @@ mod tests {
         use deps_core::PackageVersions;
         use deps_core::lsp_helpers::VersionData;
 
+        // See the comment in `test_package_name_completion_context_has_real_range` on why
+        // this guard is needed here — held for this shared helper's `parse_manifest` call so
+        // every one of its callers is covered without repeating the guard per-caller.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let parse_result = eco.parse_manifest(content, uri).await.unwrap();
         let mut cached = std::collections::HashMap::new();
         cached.insert(
@@ -1145,6 +1173,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_generate_hover_marks_unlisted_recent_version() {
+        // See the comment in `test_package_name_completion_context_has_real_range` on why
+        // this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let mut server = mockito::Server::new_async().await;
         let base = server.url();
 
@@ -1219,6 +1250,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_generate_hover_degrades_gracefully_when_registration_fetch_fails() {
+        // See the comment in `test_package_name_completion_context_has_real_range` on why
+        // this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let mut server = mockito::Server::new_async().await;
         let base = server.url();
 
@@ -1279,6 +1313,9 @@ mod tests {
     /// mocks fail the test if either endpoint is hit.
     #[tokio::test]
     async fn test_generate_hover_skips_unlisted_fetch_when_no_dependency_at_position() {
+        // See the comment in `test_package_name_completion_context_has_real_range` on why
+        // this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let mut server = mockito::Server::new_async().await;
         let base = server.url();
 
@@ -1329,6 +1366,9 @@ mod tests {
     /// call path, not just at `NuGetConfig`'s own unit-test level.
     #[tokio::test]
     async fn test_private_feed_clear_resolves_zero_requests_to_public_registry() {
+        // See the comment in `test_package_name_completion_context_has_real_range` on why
+        // this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let mut server = mockito::Server::new_async().await;
         let base = server.url();
 
@@ -1416,6 +1456,9 @@ mod tests {
     /// to. The `.expect(0)` mock fails the test if that endpoint is ever hit.
     #[tokio::test]
     async fn test_generate_hover_skips_unlisted_fetch_for_private_feed_dependency() {
+        // See the comment in `test_package_name_completion_context_has_real_range` on why
+        // this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let mut server = mockito::Server::new_async().await;
         let base = server.url();
 
@@ -1500,6 +1543,9 @@ mod tests {
     /// alternate feeds.
     #[tokio::test]
     async fn test_generate_hover_marks_unlisted_for_alternate_registry_dependency() {
+        // See the comment in `test_package_name_completion_context_has_real_range` on why
+        // this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let mut server = mockito::Server::new_async().await;
         let base = server.url();
 

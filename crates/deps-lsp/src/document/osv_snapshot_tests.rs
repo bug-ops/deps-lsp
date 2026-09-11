@@ -51,6 +51,10 @@ async fn diagnostics_snapshot_for(
     manifest_filename: &str,
     content: &str,
 ) -> String {
+    // Held per `deps_core::fs_probe::snapshot_guard`'s doc: called for every ecosystem
+    // (including cargo/npm/nuget/gradle, which transitively touch fs_probe), and this
+    // shared helper runs in the same binary as `document/loader.rs`'s diffing test.
+    let _guard = deps_core::fs_probe::snapshot_guard_async().await;
     let state = ServerState::new();
     let uri = deps_core::test_util::test_uri(&format!("/test/{manifest_filename}"));
     let ecosystem = state

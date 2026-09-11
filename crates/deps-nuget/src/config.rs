@@ -2073,6 +2073,9 @@ mod tests {
 
     #[test]
     fn test_single_alternate_source_no_clear_appends_implicit_public_fallback() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let dir = tempfile::tempdir().unwrap();
         write_config(
             dir.path(),
@@ -2094,6 +2097,9 @@ mod tests {
 
     #[test]
     fn test_clear_suppresses_implicit_public_fallback() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let dir = tempfile::tempdir().unwrap();
         write_config(
             dir.path(),
@@ -2115,6 +2121,9 @@ mod tests {
     /// `CustomRegistry`, never a fall-through to plain `Registry`.
     #[test]
     fn test_clear_with_nothing_readded_is_explicit_fail_closed() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let dir = tempfile::tempdir().unwrap();
         write_config(
             dir.path(),
@@ -2138,6 +2147,9 @@ mod tests {
     /// of its own, must never resurrect the implicit `nuget.org` hop (the #248 bug class).
     #[test]
     fn test_c1_root_clear_survives_leaf_without_clear() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         let leaf = root.path().join("src").join("App");
         std::fs::create_dir_all(&leaf).unwrap();
@@ -2176,6 +2188,9 @@ mod tests {
     /// direction) — sticky-`cleared` is not a one-way ratchet against the leaf itself.
     #[test]
     fn test_leaf_clear_wipes_ancestor_source() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         let leaf = root.path().join("src").join("App");
         std::fs::create_dir_all(&leaf).unwrap();
@@ -2206,6 +2221,9 @@ mod tests {
 
     #[test]
     fn test_disabled_source_case_insensitive_key_match() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let dir = tempfile::tempdir().unwrap();
         write_config(
             dir.path(),
@@ -2231,6 +2249,9 @@ mod tests {
 
     #[test]
     fn test_credentialed_source_dropped_with_decoded_name_match() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let dir = tempfile::tempdir().unwrap();
         write_config(
             dir.path(),
@@ -2301,6 +2322,9 @@ mod tests {
 
     #[test]
     fn test_mapping_unmatched_package_fails_closed() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let dir = tempfile::tempdir().unwrap();
         write_config(
             dir.path(),
@@ -2329,6 +2353,9 @@ mod tests {
 
     #[test]
     fn test_mapping_matched_private_pattern_never_falls_back_to_public() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let dir = tempfile::tempdir().unwrap();
         write_config(
             dir.path(),
@@ -2369,6 +2396,9 @@ mod tests {
     /// normalized URL, not by key name) resolves to plain `Registry` — keeping OSV/deps.dev.
     #[test]
     fn test_mapping_public_only_pattern_resolves_to_plain_registry() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let dir = tempfile::tempdir().unwrap();
         write_config(
             dir.path(),
@@ -2398,6 +2428,9 @@ mod tests {
     /// real public registry — identification is by normalized URL, never by key.
     #[test]
     fn test_mapping_source_named_nuget_org_but_different_url_is_not_public() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let dir = tempfile::tempdir().unwrap();
         write_config(
             dir.path(),
@@ -2427,6 +2460,9 @@ mod tests {
     /// `MyCompany.Internal` to CorpFeed — "nearest file wins" would leak it to nuget.org.
     #[test]
     fn test_r1_mapping_merges_across_ancestor_and_leaf_not_nearest_wins() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         let leaf = root.path().join("src").join("App");
         std::fs::create_dir_all(&leaf).unwrap();
@@ -2484,6 +2520,9 @@ mod tests {
 
     #[test]
     fn test_protocol_version_2_rejected() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let dir = tempfile::tempdir().unwrap();
         write_config(
             dir.path(),
@@ -2504,6 +2543,9 @@ mod tests {
 
     #[test]
     fn test_local_feed_path_rejected() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let dir = tempfile::tempdir().unwrap();
         write_config(
             dir.path(),
@@ -2524,6 +2566,9 @@ mod tests {
     /// query-string credential through both.
     #[test]
     fn test_source_entry_blocked_host_log_redacts_query_string() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let dir = tempfile::tempdir().unwrap();
         write_config(
             dir.path(),
@@ -2546,6 +2591,9 @@ mod tests {
 
     #[test]
     fn test_resolve_source_for_and_resolved_chains_agree_on_key() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let dir = tempfile::tempdir().unwrap();
         write_config(
             dir.path(),
@@ -2569,6 +2617,10 @@ mod tests {
 
     #[test]
     fn test_config_cache_reparses_after_mtime_change() {
+        // Held per `deps_core::fs_probe::snapshot_guard`'s doc: `NuGetConfigCache::get_or_parse`
+        // transitively touches fs_probe, and this test runs in the same binary as this
+        // file's own diffing test.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("NuGet.Config");
         std::fs::write(
@@ -2602,6 +2654,9 @@ mod tests {
 
     #[test]
     fn test_resolve_with_no_config_anywhere_is_default() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let dir = tempfile::tempdir().unwrap();
         let cache = NuGetConfigCache::new();
         let policy = all_policy();
@@ -2634,6 +2689,9 @@ mod tests {
 
     #[test]
     fn test_h1_malformed_config_file_resolves_as_if_absent() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let dir = tempfile::tempdir().unwrap();
         write_config(
             dir.path(),
@@ -2656,6 +2714,9 @@ mod tests {
 
     #[test]
     fn test_s2_self_closing_credentials_section_does_not_swallow_later_elements() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let dir = tempfile::tempdir().unwrap();
         write_config(
             dir.path(),
@@ -2678,6 +2739,9 @@ mod tests {
 
     #[test]
     fn test_s2_self_closing_sources_section_does_not_latch() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let dir = tempfile::tempdir().unwrap();
         write_config(
             dir.path(),
@@ -2710,6 +2774,9 @@ mod tests {
 
     #[test]
     fn test_s1_mapping_undeclared_nuget_org_key_falls_back_to_real_public_source() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let dir = tempfile::tempdir().unwrap();
         write_config(
             dir.path(),
@@ -2747,6 +2814,9 @@ mod tests {
 
     #[test]
     fn test_s1_mapping_undeclared_key_other_than_nuget_org_still_fails_closed() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let dir = tempfile::tempdir().unwrap();
         write_config(
             dir.path(),
@@ -2774,6 +2844,9 @@ mod tests {
 
     #[test]
     fn test_s4_remove_excludes_previously_declared_source() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let dir = tempfile::tempdir().unwrap();
         write_config(
             dir.path(),
@@ -2795,6 +2868,9 @@ mod tests {
 
     #[test]
     fn test_s4_remove_across_ancestor_files() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         let leaf = root.path().join("src").join("App");
         std::fs::create_dir_all(&leaf).unwrap();
@@ -2826,6 +2902,9 @@ mod tests {
     /// removed public source staying reachable).
     #[test]
     fn test_s4_remove_nuget_org_suppresses_implicit_fallback() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let dir = tempfile::tempdir().unwrap();
         write_config(
             dir.path(),
@@ -2850,6 +2929,9 @@ mod tests {
     /// not silently degrade to plain `Registry` the way "nothing declared at all" does.
     #[test]
     fn test_s4_remove_nuget_org_alone_fails_closed() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let dir = tempfile::tempdir().unwrap();
         write_config(
             dir.path(),
@@ -2872,6 +2954,9 @@ mod tests {
 
     #[test]
     fn test_m2_explicit_clear_plus_nuget_org_add_resolves_to_plain_registry() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let dir = tempfile::tempdir().unwrap();
         write_config(
             dir.path(),
@@ -2944,6 +3029,9 @@ mod tests {
     /// source or to plain `Registry`.
     #[test]
     fn test_r4_mapping_winning_pattern_resolves_only_to_disabled_source() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let dir = tempfile::tempdir().unwrap();
         write_config(
             dir.path(),
@@ -2978,6 +3066,9 @@ mod tests {
 
     #[test]
     fn test_upsert_source_dedupes_across_xml_encoded_key_variants() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         let leaf = root.path().join("src").join("App");
         std::fs::create_dir_all(&leaf).unwrap();
@@ -3050,6 +3141,9 @@ mod tests {
     /// declares gets the credential attached.
     #[test]
     fn test_c2_exact_url_match_attaches_credential() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         let repo = root.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
@@ -3078,6 +3172,9 @@ mod tests {
     /// condition (3) is full-URL equality, not origin equality.
     #[test]
     fn test_c2_same_origin_different_path_fails_closed() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         let repo = root.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
@@ -3117,6 +3214,9 @@ mod tests {
     /// merely "unauthenticated", per condition (0)).
     #[test]
     fn test_c2_condition_0_suppressed_key_fails_closed_not_machine_disabled() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         let repo = root.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
@@ -3245,6 +3345,9 @@ mod tests {
     /// `HasCredentials`.
     #[test]
     fn test_dpapi_encrypted_password_rejected_distinctly() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         let repo = root.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
@@ -3305,6 +3408,9 @@ mod tests {
     /// credentials the exact same URL.
     #[test]
     fn test_repo_tier_credential_always_fails_closed_even_with_matching_user_profile() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         let repo = root.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
@@ -3339,6 +3445,9 @@ mod tests {
     /// with no other observable signal anywhere (no hover `Latest`, no diagnostic).
     #[test]
     fn test_fail_closed_logs_warning_with_key_and_reason() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         let repo = root.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
@@ -3389,6 +3498,9 @@ mod tests {
     /// the two are no longer byte-identical in the log.
     #[test]
     fn test_fail_closed_repo_tier_and_c2_causes_are_distinguishable() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         let repo = root.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
@@ -3428,6 +3540,9 @@ mod tests {
     /// `did_change` re-parse against unchanged `NuGet.Config` content).
     #[test]
     fn test_fail_closed_warning_debounced_across_repeat_resolves() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         let repo = root.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
@@ -3512,6 +3627,9 @@ mod tests {
     /// its absence at a level that would hide it either way.
     #[test]
     fn test_disabled_source_fails_closed_at_debug_level_not_warn() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         let repo = root.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
@@ -3564,6 +3682,9 @@ mod tests {
     /// `fail_closed` incorrectly emitted a second `debug!`).
     #[test]
     fn test_dpapi_encrypted_password_does_not_double_log() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         let repo = root.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
@@ -3610,6 +3731,9 @@ mod tests {
     /// blocks, a repo entry resolving to the real public index.
     #[test]
     fn test_public_index_carve_out_never_blocks_or_authenticates() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         let repo = root.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
@@ -3649,6 +3773,9 @@ mod tests {
     /// `valid_hops`/routing to a run with no user-profile file at all.
     #[test]
     fn test_flag_off_user_profile_routing_directives_have_zero_effect() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         let repo = root.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
@@ -3698,6 +3825,9 @@ mod tests {
     /// declaring it) becomes an `AlternateRegistry` routing hop.
     #[test]
     fn test_flag_on_user_profile_only_source_becomes_routing_hop() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         let repo = root.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
@@ -3761,6 +3891,7 @@ mod tests {
         std::fs::create_dir_all(&current).unwrap();
 
         let cache = NuGetConfigCache::new();
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let (stats_before, _) = deps_core::fs_probe::snapshot();
         let ancestors = collect_config_ancestors(&current, &cache, None);
         let (stats_after, _) = deps_core::fs_probe::snapshot();

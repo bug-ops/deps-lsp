@@ -1319,6 +1319,9 @@ token = "secret-token"
 
     #[test]
     fn test_resolve_workspace_wins_over_cargo_home() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join(".cargo")).unwrap();
         std::fs::write(
@@ -1362,6 +1365,9 @@ token = "secret-token"
     /// unauthenticated, which looks like success.
     #[test]
     fn test_resolve_home_nested_project_does_not_lose_cargo_home_token() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(home.path().join(".cargo")).unwrap();
         let cargo_home_config = home.path().join(".cargo/config.toml");
@@ -1399,6 +1405,9 @@ token = "secret-token"
 
     #[test]
     fn test_resolve_falls_back_to_cargo_home_when_no_workspace_entry() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let cargo_home = tempfile::tempdir().unwrap();
         std::fs::write(
             cargo_home.path().join("config.toml"),
@@ -1425,6 +1434,9 @@ token = "secret-token"
 
     #[test]
     fn test_resolve_unconfigured_alias_stays_unresolved() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let aliases: HashSet<String> = std::iter::once("unknown".to_string()).collect();
         let cache = ConfigFileCache::new();
         let policy = all_policy();
@@ -1434,6 +1446,9 @@ token = "secret-token"
 
     #[test]
     fn test_resolve_env_var_index_override() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let aliases: HashSet<String> = std::iter::once("env-only-corp".to_string()).collect();
         let env = |name: &str| match name {
             "CARGO_REGISTRIES_ENV_ONLY_CORP_INDEX" => {
@@ -1456,6 +1471,9 @@ token = "secret-token"
     /// skipped for env resolution, not have one arbitrarily win.
     #[test]
     fn test_resolve_env_var_name_collision_disables_both() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let aliases: HashSet<String> = ["my-corp".to_string(), "my_corp".to_string()]
             .into_iter()
             .collect();
@@ -1476,6 +1494,9 @@ token = "secret-token"
     /// `resolve` end-to-end rather than only at the raw-parse unit level.
     #[test]
     fn test_resolve_env_token_never_attaches_to_workspace_shadowed_alias() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join(".cargo")).unwrap();
         std::fs::write(
@@ -1550,6 +1571,9 @@ token = "secret-token"
 
     #[test]
     fn test_config_file_cache_hit_reuses_parsed_arc_without_reparsing() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(
@@ -1583,6 +1607,9 @@ token = "secret-token"
         .unwrap();
 
         let cache = ConfigFileCache::new();
+        // Acquired before the priming call too: that warm-up still does one real stat/read
+        // through fs_probe, which must not race a sibling test's own measured window either.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         // Prime the cache — the first call is necessarily a miss (one stat, one read).
         cache.get_or_parse_workspace(&path).unwrap();
 
@@ -1611,6 +1638,9 @@ token = "secret-token"
     /// parse.
     #[test]
     fn test_resolve_new_alias_resolves_without_config_file_change() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join(".cargo")).unwrap();
         std::fs::write(
@@ -1644,6 +1674,9 @@ token = "secret-token"
     /// no cache invalidation of its own — the policy is not part of the cache at all.
     #[test]
     fn test_resolve_policy_change_takes_effect_with_no_cache_invalidation() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join(".cargo")).unwrap();
         std::fs::write(
@@ -1679,6 +1712,9 @@ token = "secret-token"
 
     #[test]
     fn test_source_chain_single_hop_to_sparse() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         let path = write_config(
             root.path(),
@@ -1701,6 +1737,9 @@ token = "secret-token"
 
     #[test]
     fn test_source_chain_two_hops() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         let path = write_config(
             root.path(),
@@ -1718,6 +1757,9 @@ token = "secret-token"
 
     #[test]
     fn test_source_chain_directory_falls_back_to_none() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         let path = write_config(
             root.path(),
@@ -1734,6 +1776,9 @@ token = "secret-token"
 
     #[test]
     fn test_source_chain_local_registry_falls_back_to_none() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         let path = write_config(
             root.path(),
@@ -1750,6 +1795,9 @@ token = "secret-token"
 
     #[test]
     fn test_source_chain_bare_https_git_index_falls_back_to_none() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         let path = write_config(
             root.path(),
@@ -1766,6 +1814,9 @@ token = "secret-token"
 
     #[test]
     fn test_source_chain_self_referential_stops() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         let path = write_config(
             root.path(),
@@ -1781,6 +1832,9 @@ token = "secret-token"
 
     #[test]
     fn test_source_chain_three_cycle_stops() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         let path = write_config(
             root.path(),
@@ -1798,6 +1852,9 @@ token = "secret-token"
 
     #[test]
     fn test_source_chain_seventeen_hops_exceeds_bound() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         let mut toml = String::from("[source.crates-io]\nreplace-with = \"hop0\"\n");
         for i in 0..16 {
@@ -1819,6 +1876,9 @@ token = "secret-token"
 
     #[test]
     fn test_source_chain_terminal_blocked_by_policy() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         let path = write_config(
             root.path(),
@@ -1837,6 +1897,9 @@ token = "secret-token"
     /// a `[source]` entry, must still resolve.
     #[test]
     fn test_source_chain_stage_one_registries_crossover() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         let path = write_config(
             root.path(),
@@ -1863,6 +1926,9 @@ token = "secret-token"
     /// regardless of the explicit definition; this must resolve the mirror, not `None`.
     #[test]
     fn test_source_chain_replace_with_wins_over_explicit_kind_on_same_table() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         let path = write_config(
             root.path(),
@@ -1892,6 +1958,9 @@ token = "secret-token"
     /// target, not the table's own (differently-hosted) sparse registry.
     #[test]
     fn test_source_chain_replace_with_wins_over_own_sparse_registry() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         let path = write_config(
             root.path(),
@@ -1923,6 +1992,9 @@ token = "secret-token"
     /// never let a `$CARGO_HOME` credential ride along.
     #[test]
     fn test_source_chain_coupled_trust_trap_workspace_crossover_never_carries_cargo_home_token() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         let workspace_path = write_config(
             root.path(),
@@ -1962,6 +2034,9 @@ token = "secret-token"
     /// terminal `[registries]` entry's token is legitimately attached.
     #[test]
     fn test_source_chain_fully_trusted_chain_attaches_cargo_home_token() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let cargo_home = tempfile::tempdir().unwrap();
         std::fs::write(
             cargo_home.path().join("config.toml"),
@@ -1993,6 +2068,9 @@ token = "secret-token"
 
     #[test]
     fn test_source_chain_no_source_section_resolves_none() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         let path = write_config(
             root.path(),

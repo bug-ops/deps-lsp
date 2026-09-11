@@ -907,6 +907,11 @@ mod tests {
     /// dependency, and leaves a scoped dependency with its own `@scope:registry` entry alone.
     #[test]
     fn test_parse_with_context_top_level_override_and_scope_override_coexist() {
+        // Held per `deps_core::fs_probe::snapshot_guard`'s doc: `parse_package_json_with_context`
+        // transitively touches fs_probe (via `config::resolve`, unconditionally for any absolute
+        // `file:` manifest_dir), and this test runs in the same binary as
+        // `deps-npm/src/config.rs`'s diffing test.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         std::fs::write(
             root.path().join(".npmrc"),
@@ -954,6 +959,9 @@ mod tests {
     /// disclosing the private name.
     #[test]
     fn test_parse_with_context_npm_alias_routes_by_real_package_name() {
+        // See the comment in `test_parse_with_context_top_level_override_and_scope_override_coexist`
+        // on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         std::fs::write(
             root.path().join(".npmrc"),
@@ -984,6 +992,9 @@ mod tests {
     /// registry).
     #[test]
     fn test_parse_with_context_invalid_scope_registry_fails_closed() {
+        // See the comment in `test_parse_with_context_top_level_override_and_scope_override_coexist`
+        // on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         std::fs::write(
             root.path().join(".npmrc"),
@@ -1010,6 +1021,9 @@ mod tests {
     /// dependency resolves to the plain public registry.
     #[test]
     fn test_parse_with_context_no_npmrc_resolves_to_public_registry() {
+        // See the comment in `test_parse_with_context_top_level_override_and_scope_override_coexist`
+        // on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         let manifest_path = root.path().join("package.json");
         let uri = Uri::from_file_path(&manifest_path).unwrap();
@@ -1028,6 +1042,9 @@ mod tests {
     /// closed to `CustomRegistry`, same shape as an invalid URL.
     #[test]
     fn test_parse_with_context_policy_blocked_registry_fails_closed() {
+        // See the comment in `test_parse_with_context_top_level_override_and_scope_override_coexist`
+        // on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         std::fs::write(
             root.path().join(".npmrc"),
@@ -1160,6 +1177,9 @@ mod tests {
 
     #[test]
     fn test_parse_with_context_default_catalog_resolves_end_to_end() {
+        // See the comment in `test_parse_with_context_top_level_override_and_scope_override_coexist`
+        // on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         std::fs::write(
             root.path().join("pnpm-workspace.yaml"),
@@ -1184,6 +1204,9 @@ mod tests {
     /// not override `version_literal()` — if that ever changes, this test must fail.
     #[test]
     fn test_resolved_catalog_dependency_blocks_update_all_rewrite() {
+        // See the comment in `test_parse_with_context_top_level_override_and_scope_override_coexist`
+        // on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         std::fs::write(
             root.path().join("pnpm-workspace.yaml"),
@@ -1221,6 +1244,10 @@ mod tests {
 
     #[test]
     fn test_parse_with_context_no_catalog_dependency_skips_workspace_lookup() {
+        // `config::resolve` still runs unconditionally for this test's absolute `file:` URI even
+        // though the catalog gate itself is skipped — see the comment in
+        // `test_parse_with_context_top_level_override_and_scope_override_coexist`.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         // FR-008/NFR-002: no `catalog:`-prefixed value anywhere in the manifest, so the
         // gate never fires — a bogus/nonexistent workspace path must not affect the result.
         let uri = deps_core::test_util::test_uri("/nonexistent/path/package.json");
