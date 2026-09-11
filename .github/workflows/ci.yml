@@ -184,7 +184,10 @@ jobs:
   security:
     name: Security Audit
     needs: changes
-    if: needs.changes.outputs.rust == 'true' || github.event_name == 'schedule'
+    # gitleaks scans the whole checked-out tree regardless of which paths changed, so a
+    # workflow-only PR (like the one that wired gitleaks in) needs to trigger this job too,
+    # not just rust changes — otherwise the step can merge without ever having run.
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true' || github.event_name == 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
