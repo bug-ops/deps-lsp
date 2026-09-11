@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **deps-core**: document tower-lsp-server/deps-core version coupling; re-export `tower_lsp_server` from `deps-core` (#832)
+- **deps-core**: document tower-lsp-server/deps-core version coupling; re-export `tower_lsp_server` from `deps-core` (resolves #832) (#839)
 - **deps-core**: `RedactedUrl` structural chokepoint and `SanitizedRegistryError` wrapper for outbound-URL redaction in error/log output, migrated across every `deps-core`-internal call site (partial work on #789) (#800)
 - **deps-core**: regression test pinning `SanitizedRegistryError`'s source-chain redaction for this project's current client config (#789) (#800)
 - **deps-core, deps-deno, deps-gradle, deps-github-actions, deps-gitlab-ci**: `registry_conformance!` macro proving `Registry::select_latest_matching` is actually overridden, invoked for all four ecosystems named in #784 (resolves #784) (#787)
