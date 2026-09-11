@@ -86,7 +86,7 @@ pub async fn handle_document_open(
     config: Arc<RwLock<DepsConfig>>,
 ) -> Result<JoinHandle<()>> {
     // Find appropriate ecosystem for this URI
-    let ecosystem = match state.ecosystem_registry.get_for_uri(&uri) {
+    let ecosystem = match state.ecosystem_registry.for_uri(&uri) {
         Some(e) => e,
         None => {
             tracing::debug!("No ecosystem handler for {:?}", uri);
@@ -733,7 +733,7 @@ pub(crate) async fn handle_document_change_guarded(
     config: Arc<RwLock<DepsConfig>>,
 ) -> Result<Option<JoinHandle<()>>> {
     // Find appropriate ecosystem for this URI
-    let ecosystem = match state.ecosystem_registry.get_for_uri(&uri) {
+    let ecosystem = match state.ecosystem_registry.for_uri(&uri) {
         Some(e) => e,
         None => {
             tracing::debug!("No ecosystem handler for {:?}", uri);
@@ -1181,7 +1181,7 @@ pub async fn ensure_document_loaded(
     }
 
     // Check if we support this file type
-    if state.ecosystem_registry.get_for_uri(uri).is_none() {
+    if state.ecosystem_registry.for_uri(uri).is_none() {
         tracing::debug!("Unsupported file type: {:?}", uri);
         return false;
     }
@@ -1985,7 +1985,7 @@ mod tests {
     fn test_ecosystem_registry_unknown_file() {
         let state = ServerState::new();
         let unknown_uri = deps_core::test_util::test_uri("/test/unknown.txt");
-        assert!(state.ecosystem_registry.get_for_uri(&unknown_uri).is_none());
+        assert!(state.ecosystem_registry.for_uri(&unknown_uri).is_none());
     }
 
     #[test]
@@ -2092,7 +2092,7 @@ anyhow = "1.0"
 
         // Verify ecosystem registry correctly identifies unsupported files
         assert!(
-            state.ecosystem_registry.get_for_uri(&uri).is_none(),
+            state.ecosystem_registry.for_uri(&uri).is_none(),
             "README.md should not have an ecosystem handler"
         );
 
@@ -2125,7 +2125,7 @@ anyhow = "1.0"
         fn test_ecosystem_registry_lookup() {
             let state = ServerState::new();
             let cargo_uri = deps_core::test_util::test_uri("/test/Cargo.toml");
-            assert!(state.ecosystem_registry.get_for_uri(&cargo_uri).is_some());
+            assert!(state.ecosystem_registry.for_uri(&cargo_uri).is_some());
         }
 
         #[tokio::test]
@@ -2142,7 +2142,7 @@ serde = "1.0"
 
             let ecosystem = state
                 .ecosystem_registry
-                .get_for_uri(&uri)
+                .for_uri(&uri)
                 .expect("Cargo ecosystem not found");
 
             let parse_result = ecosystem.parse_manifest(content, &uri).await;
@@ -2173,7 +2173,7 @@ serde = "1.0"
 
             let ecosystem = state
                 .ecosystem_registry
-                .get_for_uri(&uri)
+                .for_uri(&uri)
                 .expect("Cargo ecosystem not found");
 
             // Try to parse (will fail)
@@ -2221,7 +2221,7 @@ serde = "1.0""#;
             // Pre-populate state with document
             let ecosystem = state
                 .ecosystem_registry
-                .get_for_uri(&uri)
+                .for_uri(&uri)
                 .expect("Cargo ecosystem");
             let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
             let doc_state = DocumentState::new_from_parse_result(
@@ -2276,7 +2276,7 @@ serde = "1.0"
             let state = Arc::new(ServerState::new());
             let ecosystem = state
                 .ecosystem_registry
-                .get_for_uri(&uri)
+                .for_uri(&uri)
                 .expect("Cargo ecosystem");
             let parse_result = ecosystem.parse_manifest(&loaded_content, &uri).await;
             assert!(parse_result.is_ok(), "Should parse successfully");
@@ -2296,7 +2296,7 @@ serde = "1.0""#;
 
             let ecosystem = state
                 .ecosystem_registry
-                .get_for_uri(&uri)
+                .for_uri(&uri)
                 .expect("Cargo ecosystem");
 
             // Parse twice to simulate idempotent loads
@@ -2593,7 +2593,7 @@ tokio = "1.0"
         fn test_ecosystem_registry_lookup() {
             let state = ServerState::new();
             let npm_uri = deps_core::test_util::test_uri("/test/package.json");
-            assert!(state.ecosystem_registry.get_for_uri(&npm_uri).is_some());
+            assert!(state.ecosystem_registry.for_uri(&npm_uri).is_some());
         }
 
         #[tokio::test]
@@ -2607,7 +2607,7 @@ tokio = "1.0"
 
             let ecosystem = state
                 .ecosystem_registry
-                .get_for_uri(&uri)
+                .for_uri(&uri)
                 .expect("npm ecosystem not found");
 
             let parse_result = ecosystem.parse_manifest(content, &uri).await;
@@ -2816,7 +2816,7 @@ tokio = "1.0"
         fn test_ecosystem_registry_lookup() {
             let state = ServerState::new();
             let go_uri = deps_core::test_util::test_uri("/test/go.mod");
-            assert!(state.ecosystem_registry.get_for_uri(&go_uri).is_some());
+            assert!(state.ecosystem_registry.for_uri(&go_uri).is_some());
         }
 
         #[tokio::test]
@@ -2832,7 +2832,7 @@ require github.com/gorilla/mux v1.8.0
 
             let ecosystem = state
                 .ecosystem_registry
-                .get_for_uri(&uri)
+                .for_uri(&uri)
                 .expect("go ecosystem not found");
 
             let parse_result = ecosystem.parse_manifest(content, &uri).await;

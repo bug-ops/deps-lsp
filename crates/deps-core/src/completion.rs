@@ -35,7 +35,7 @@ use tower_lsp_server::ls_types::{
 /// (`crates/deps-lsp/src/handlers/completion.rs`).
 ///
 /// A registry-backed completion path that retries internally on failure (e.g.
-/// `deps-maven`'s `search_typed`, #274) must size its own total retry budget to
+/// `deps-maven`'s `search`, #274) must size its own total retry budget to
 /// exceed this constant: finishing sooner with an empty/error result is
 /// indistinguishable, at the call site, from a query that legitimately has no
 /// matches, and triggers a wasted (and, for a struggling registry, likely to also

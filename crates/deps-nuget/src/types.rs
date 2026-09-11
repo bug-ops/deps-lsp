@@ -1,7 +1,7 @@
 //! Domain types for NuGet/.NET project dependencies.
 
 use std::any::Any;
-use tower_lsp_server::ls_types::{Range, Uri};
+use tower_lsp_server::ls_types::Range;
 
 /// A single `PackageReference` / `PackageVersion` / `package` entry from a manifest.
 #[non_exhaustive]
@@ -31,35 +31,6 @@ deps_core::impl_dependency!(NuGetDependency {
     version_range: version_range,
     source: source,
 });
-
-/// Parsed result of a single manifest file (`.csproj`, `Directory.Packages.props`,
-/// `packages.config`).
-#[non_exhaustive]
-#[derive(Debug)]
-pub struct NuGetParseResult {
-    /// Dependencies found in the manifest.
-    pub dependencies: Vec<NuGetDependency>,
-    /// URI of the manifest this result was parsed from.
-    pub uri: Uri,
-    /// Every routing chain this manifest's resolved `NuGet.Config` implies (issue #523) — one
-    /// per distinct `<packageSourceMapping>` hop-set, or the single plain accumulated chain
-    /// when no mapping is declared. Registered against the shared `NuGetRegistry` by
-    /// `NuGetEcosystem::parse_manifest`; empty when nothing is registrable (no config, or
-    /// every dependency resolves to plain `Registry`/a fail-closed `CustomRegistry`).
-    pub resolved_chains: Vec<crate::config::NuGetSourceChain>,
-    /// `Some((kept, total))` once the manifest declared more dependencies than
-    /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796).
-    pub dependency_truncation: Option<(usize, usize)>,
-}
-
-deps_core::impl_parse_result!(
-    NuGetParseResult,
-    NuGetDependency {
-        dependencies: dependencies,
-        uri: uri,
-        dependency_truncation: dependency_truncation,
-    }
-);
 
 /// A single version of a package, as returned by the NuGet flat-container endpoint.
 ///
@@ -224,22 +195,6 @@ mod tests {
         };
         assert!(dep.version_requirement().is_none());
         assert!(dep.version_range().is_none());
-    }
-
-    #[test]
-    fn test_parse_result_trait() {
-        use deps_core::ParseResult;
-
-        let result = NuGetParseResult {
-            dependencies: vec![test_dep()],
-            uri: deps_core::test_util::test_uri("/test/App.csproj"),
-            resolved_chains: Vec::new(),
-            dependency_truncation: None,
-        };
-
-        assert_eq!(result.dependencies().len(), 1);
-        assert!(result.workspace_root().is_none());
-        assert!(result.as_any().is::<NuGetParseResult>());
     }
 
     #[test]

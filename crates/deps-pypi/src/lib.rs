@@ -127,11 +127,11 @@ pub mod types;
 // Re-export commonly used types
 pub use config::{PypiIndexConfig, PypiIndexUrl};
 pub use ecosystem::PypiEcosystem;
-pub use error::{PypiError, Result};
+pub use error::{Pep508ParseError, PypiError, Result};
 pub use formatter::PypiFormatter;
 pub use lockfile::PypiLockParser;
 pub use parser::PypiParser;
-pub use registry::PypiRegistry;
+pub use registry::{PypiRegistry, package_url};
 pub use types::{
     PypiDependency, PypiDependencySection, PypiDependencySource, PypiPackage, PypiVersion,
 };

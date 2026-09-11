@@ -184,7 +184,7 @@ fn compound_stability_flag_rank(req_str: &str) -> Option<u8> {
 ///    computing the pinned version's own rank, matching the pre-#424 "allow any prerelease"
 ///    behavior for this case exactly.
 /// 3. `manifest_minimum` — the manifest's own `minimum-stability` field, when the caller has
-///    one (`select_latest_matching_for_manifest`/`get_latest_matching_for_manifest`).
+///    one (`select_latest_matching_with_context`/`get_latest_matching_with_context`).
 /// 4. [`crate::formatter::COMPOSER_STABLE_RANK`] — Composer's `minimum-stability: stable`
 ///    default, unchanged from #421/#422 for every caller with no manifest context.
 pub(crate) fn effective_minimum_stability_rank(
@@ -216,12 +216,15 @@ pub struct PackagistRegistry {
 impl PackagistRegistry {
     /// Creates a new Packagist registry client with the given HTTP cache.
     pub fn new(cache: Arc<HttpCache>) -> Self {
-        Self::with_registry_base(cache, PACKAGIST_BASE.to_string())
+        Self::with_base(cache, PACKAGIST_BASE.to_string())
     }
 
     /// Registry base URL — `PACKAGIST_BASE` in production, overridden to a mockito
-    /// server URL in tests (mirrors `deps-npm`'s `with_registry_base`).
-    fn with_registry_base(cache: Arc<HttpCache>, base: String) -> Self {
+    /// server URL in tests. Unlike `deps-npm` (which splits this into a production
+    /// `with_base` and a separate test-only `with_public_base_for_test`), Composer's own
+    /// constructor serves both roles — there is no alternate-registry concept here that
+    /// needs a distinct tier.
+    fn with_base(cache: Arc<HttpCache>, base: String) -> Self {
         Self { cache, base }
     }
 
@@ -253,7 +256,7 @@ impl PackagistRegistry {
     /// for a package whose only releases so far are all prerelease.
     ///
     /// Equivalent to
-    /// [`get_latest_matching_for_manifest`](Self::get_latest_matching_for_manifest) with no
+    /// [`get_latest_matching_with_context`](Self::get_latest_matching_with_context) with no
     /// manifest `minimum-stability` (`None`) — use that method instead when the caller has a
     /// parsed `composer.json` available (#424).
     ///
@@ -282,7 +285,7 @@ impl PackagistRegistry {
     ///
     /// Returns an error if the HTTP request fails.
     #[tracing::instrument(skip_all, fields(package = ?name, version = ?req_str), level = "debug")]
-    pub async fn get_latest_matching_for_manifest(
+    pub async fn get_latest_matching_with_context(
         &self,
         name: &str,
         req_str: &str,
@@ -329,7 +332,7 @@ impl PackagistRegistry {
     /// which still take priority over the manifest default, exactly as they do for the plain
     /// trait method (#424).
     #[must_use]
-    pub fn select_latest_matching_for_manifest(
+    pub fn select_latest_matching_with_context(
         &self,
         versions: &[Box<dyn deps_core::Version>],
         req: &deps_core::VersionReq,
@@ -383,6 +386,8 @@ impl PackagistRegistry {
         parse_search_response(&data)
     }
 }
+
+deps_core::impl_get_versions_with_passthrough!(PackagistRegistry, ComposerVersion);
 
 /// Packagist v2 API response (outer wrapper).
 #[derive(Deserialize)]
@@ -577,18 +582,8 @@ fn parse_search_response(data: &[u8]) -> Result<Vec<ComposerPackage>> {
 }
 
 impl deps_core::Registry for PackagistRegistry {
-    fn get_versions<'a>(
-        &'a self,
-        name: &'a deps_core::PackageName,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Version>>>> {
-        Box::pin(async move {
-            let versions = self.get_versions(name.as_str()).await?;
-            Ok(versions
-                .into_iter()
-                .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
-                .collect())
-        })
-    }
+    deps_core::impl_registry_versions_method!(get_versions);
+    deps_core::impl_registry_versions_method!(get_versions_with);
 
     fn get_latest_matching<'a>(
         &'a self,
@@ -603,7 +598,7 @@ impl deps_core::Registry for PackagistRegistry {
         })
     }
 
-    /// Routes to [`PackagistRegistry::get_latest_matching_for_manifest`] — see that method
+    /// Routes to [`PackagistRegistry::get_latest_matching_with_context`] — see that method
     /// for the full priority order. This is the trait-level hook a generic LSP fetch loop
     /// downcasting `Arc<dyn Registry>` cannot bypass by calling
     /// [`get_latest_matching`](Self::get_latest_matching) instead (#424 S1).
@@ -615,7 +610,7 @@ impl deps_core::Registry for PackagistRegistry {
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Option<Box<dyn deps_core::Version>>>> {
         Box::pin(async move {
             let version = self
-                .get_latest_matching_for_manifest(name.as_str(), req.as_str(), minimum_stability)
+                .get_latest_matching_with_context(name.as_str(), req.as_str(), minimum_stability)
                 .await?;
             Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
         })
@@ -653,7 +648,7 @@ impl deps_core::Registry for PackagistRegistry {
     ///
     /// Does not read `composer.json`'s own `minimum-stability` field — this trait method has
     /// no manifest context to read it from. A caller with a parsed manifest available should
-    /// use [`PackagistRegistry::select_latest_matching_for_manifest`] instead, which this
+    /// use [`PackagistRegistry::select_latest_matching_with_context`] instead, which this
     /// method is equivalent to with no manifest `minimum-stability` (`None`) (#424).
     fn select_latest_matching(
         &self,
@@ -663,7 +658,7 @@ impl deps_core::Registry for PackagistRegistry {
         self.select_latest_matching_impl(versions, req, None)
     }
 
-    /// Routes to [`PackagistRegistry::select_latest_matching_for_manifest`] — the trait-level
+    /// Routes to [`PackagistRegistry::select_latest_matching_with_context`] — the trait-level
     /// hook a generic LSP fetch loop downcasting `Arc<dyn Registry>` cannot bypass by calling
     /// the plain `select_latest_matching` instead (#424 S1).
     fn select_latest_matching_with_context(
@@ -672,7 +667,7 @@ impl deps_core::Registry for PackagistRegistry {
         req: &deps_core::VersionReq,
         minimum_stability: Option<&str>,
     ) -> Option<usize> {
-        self.select_latest_matching_for_manifest(versions, req, minimum_stability)
+        self.select_latest_matching_with_context(versions, req, minimum_stability)
     }
 
     // Packagist's `abandoned` is package-level, not per-version: `removal_status`
@@ -1367,6 +1362,11 @@ mod tests {
         };
     }
 
+    deps_core::registry_conformance! {
+        mod composer_registry_api_conformance;
+        ty: PackagistRegistry;
+    }
+
     #[test]
     fn test_select_latest_matching_all_abandoned_still_resolves() {
         // Regression test for #347: an abandoned package's versions must
@@ -1408,7 +1408,7 @@ mod tests {
     async fn test_get_latest_matching_wildcard_all_abandoned_still_resolves() {
         let mut server = mockito::Server::new_async().await;
         let base = server.url();
-        let registry = PackagistRegistry::with_registry_base(Arc::new(HttpCache::new()), base);
+        let registry = PackagistRegistry::with_base(Arc::new(HttpCache::new()), base);
 
         server
             .mock("GET", "/p2/vendor/abandoned-pkg.json")
@@ -1499,7 +1499,7 @@ mod tests {
     async fn test_get_latest_matching_wildcard_excludes_prerelease() {
         let mut server = mockito::Server::new_async().await;
         let base = server.url();
-        let registry = PackagistRegistry::with_registry_base(Arc::new(HttpCache::new()), base);
+        let registry = PackagistRegistry::with_base(Arc::new(HttpCache::new()), base);
 
         server
             .mock("GET", "/p2/vendor/pkg.json")
@@ -1584,7 +1584,7 @@ mod tests {
     async fn test_get_latest_matching_allows_prerelease_when_requirement_names_it() {
         let mut server = mockito::Server::new_async().await;
         let base = server.url();
-        let registry = PackagistRegistry::with_registry_base(Arc::new(HttpCache::new()), base);
+        let registry = PackagistRegistry::with_base(Arc::new(HttpCache::new()), base);
 
         server
             .mock("GET", "/p2/vendor/pkg.json")
@@ -1646,7 +1646,7 @@ mod tests {
     async fn test_get_latest_matching_wildcard_prerelease_only_still_resolves() {
         let mut server = mockito::Server::new_async().await;
         let base = server.url();
-        let registry = PackagistRegistry::with_registry_base(Arc::new(HttpCache::new()), base);
+        let registry = PackagistRegistry::with_base(Arc::new(HttpCache::new()), base);
 
         server
             .mock("GET", "/p2/vendor/prerelease-only.json")
@@ -1704,14 +1704,14 @@ mod tests {
     /// or above beta (excluding alpha) as "latest", not fall back to the hardcoded
     /// `minimum-stability: stable` default that would exclude both prereleases.
     #[test]
-    fn test_select_latest_matching_for_manifest_honors_looser_minimum_stability() {
+    fn test_select_latest_matching_with_context_honors_looser_minimum_stability() {
         let cache = Arc::new(HttpCache::new());
         let registry = PackagistRegistry::new(cache);
         let versions = stability_fixture();
         let req = deps_core::VersionReq::new("*");
 
         assert_eq!(
-            registry.select_latest_matching_for_manifest(&versions, &req, Some("beta")),
+            registry.select_latest_matching_with_context(&versions, &req, Some("beta")),
             Some(1),
             "beta release should be latest under minimum-stability: beta"
         );
@@ -1720,14 +1720,14 @@ mod tests {
     /// #424 S1: `minimum-stability: alpha` loosens the floor further still, all the way to
     /// the newest alpha.
     #[test]
-    fn test_select_latest_matching_for_manifest_honors_alpha_minimum_stability() {
+    fn test_select_latest_matching_with_context_honors_alpha_minimum_stability() {
         let cache = Arc::new(HttpCache::new());
         let registry = PackagistRegistry::new(cache);
         let versions = stability_fixture();
         let req = deps_core::VersionReq::new("*");
 
         assert_eq!(
-            registry.select_latest_matching_for_manifest(&versions, &req, Some("alpha")),
+            registry.select_latest_matching_with_context(&versions, &req, Some("alpha")),
             Some(0),
             "alpha release should be latest under minimum-stability: alpha"
         );
@@ -1736,7 +1736,7 @@ mod tests {
     /// #424 S1: with no manifest `minimum-stability` (`None`), behavior must be byte-identical
     /// to the plain trait method — the hardcoded `stable` default from #421/#422.
     #[test]
-    fn test_select_latest_matching_for_manifest_none_matches_default() {
+    fn test_select_latest_matching_with_context_none_matches_default() {
         use deps_core::Registry;
 
         let cache = Arc::new(HttpCache::new());
@@ -1745,7 +1745,7 @@ mod tests {
         let req = deps_core::VersionReq::new("*");
 
         assert_eq!(
-            registry.select_latest_matching_for_manifest(&versions, &req, None),
+            registry.select_latest_matching_with_context(&versions, &req, None),
             registry.select_latest_matching(&versions, &req),
         );
     }
@@ -1753,26 +1753,26 @@ mod tests {
     /// #424 S1: `minimum-stability: stable` (explicit, not just absent) must behave exactly
     /// like the hardcoded default — Composer's own default value, spelled out.
     #[test]
-    fn test_select_latest_matching_for_manifest_explicit_stable_excludes_prerelease() {
+    fn test_select_latest_matching_with_context_explicit_stable_excludes_prerelease() {
         let cache = Arc::new(HttpCache::new());
         let registry = PackagistRegistry::new(cache);
         let versions = stability_fixture();
         let req = deps_core::VersionReq::new("*");
 
         assert_eq!(
-            registry.select_latest_matching_for_manifest(&versions, &req, Some("stable")),
+            registry.select_latest_matching_with_context(&versions, &req, Some("stable")),
             Some(2),
         );
     }
 
-    /// #424 S1: the async `get_latest_matching_for_manifest` fetch-loop entry point must
+    /// #424 S1: the async `get_latest_matching_with_context` fetch-loop entry point must
     /// apply the same manifest stability floor as the pure list-based
-    /// `select_latest_matching_for_manifest`.
+    /// `select_latest_matching_with_context`.
     #[tokio::test]
-    async fn test_get_latest_matching_for_manifest_honors_looser_minimum_stability() {
+    async fn test_get_latest_matching_with_context_honors_looser_minimum_stability() {
         let mut server = mockito::Server::new_async().await;
         let base = server.url();
-        let registry = PackagistRegistry::with_registry_base(Arc::new(HttpCache::new()), base);
+        let registry = PackagistRegistry::with_base(Arc::new(HttpCache::new()), base);
 
         server
             .mock("GET", "/p2/vendor/pkg.json")
@@ -1787,7 +1787,7 @@ mod tests {
             .await;
 
         let latest = registry
-            .get_latest_matching_for_manifest("vendor/pkg", "*", Some("beta"))
+            .get_latest_matching_with_context("vendor/pkg", "*", Some("beta"))
             .await
             .unwrap();
 

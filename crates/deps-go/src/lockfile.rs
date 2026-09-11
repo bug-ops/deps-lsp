@@ -117,7 +117,7 @@ impl LockFileProvider for GoSumParser {
 /// "#;
 ///
 /// let packages = parse_go_sum(content);
-/// assert_eq!(packages.get_version("github.com/gin-gonic/gin"), Some("v1.9.1"));
+/// assert_eq!(packages.version("github.com/gin-gonic/gin"), Some("v1.9.1"));
 /// ```
 pub fn parse_go_sum(content: &str) -> ResolvedPackages {
     let mut packages = ResolvedPackages::new();
@@ -170,10 +170,7 @@ github.com/gin-gonic/gin v1.9.1 h1:4idEAncQnU5cB7BeOkPtxjfCSye0AAm1R0RVIqJ+Jmg=
 github.com/gin-gonic/gin v1.9.1/go.mod h1:hPrL9t9/HBtKc7e/Q7Nb2nqKqTW8mHZy6E7k8m4dLvs=
 ";
         let packages = parse_go_sum(content);
-        assert_eq!(
-            packages.get_version("github.com/gin-gonic/gin"),
-            Some("v1.9.1")
-        );
+        assert_eq!(packages.version("github.com/gin-gonic/gin"), Some("v1.9.1"));
     }
 
     #[test]
@@ -185,13 +182,10 @@ github.com/stretchr/testify v1.8.4 h1:hash3=
 ";
         let packages = parse_go_sum(content);
         assert_eq!(packages.len(), 3);
+        assert_eq!(packages.version("github.com/gin-gonic/gin"), Some("v1.9.1"));
+        assert_eq!(packages.version("golang.org/x/sync"), Some("v0.5.0"));
         assert_eq!(
-            packages.get_version("github.com/gin-gonic/gin"),
-            Some("v1.9.1")
-        );
-        assert_eq!(packages.get_version("golang.org/x/sync"), Some("v0.5.0"));
-        assert_eq!(
-            packages.get_version("github.com/stretchr/testify"),
+            packages.version("github.com/stretchr/testify"),
             Some("v1.8.4")
         );
     }
@@ -204,10 +198,7 @@ github.com/gin-gonic/gin v1.9.1 h1:actual_hash=
 ";
         let packages = parse_go_sum(content);
         assert_eq!(packages.len(), 1);
-        assert_eq!(
-            packages.get_version("github.com/gin-gonic/gin"),
-            Some("v1.9.1")
-        );
+        assert_eq!(packages.version("github.com/gin-gonic/gin"), Some("v1.9.1"));
     }
 
     #[test]
@@ -219,10 +210,7 @@ github.com/pkg/errors v0.9.1 h1:hash2=
         let packages = parse_go_sum(content);
         assert_eq!(packages.len(), 1);
         // Last occurrence should win (newer version added after upgrade)
-        assert_eq!(
-            packages.get_version("github.com/pkg/errors"),
-            Some("v0.9.1")
-        );
+        assert_eq!(packages.version("github.com/pkg/errors"), Some("v0.9.1"));
     }
 
     #[test]
@@ -235,10 +223,7 @@ github.com/pkg/errors v0.9.1 h1:hash2=
     fn test_whitespace_handling() {
         let content = "  github.com/gin-gonic/gin   v1.9.1   h1:hash=  \n";
         let packages = parse_go_sum(content);
-        assert_eq!(
-            packages.get_version("github.com/gin-gonic/gin"),
-            Some("v1.9.1")
-        );
+        assert_eq!(packages.version("github.com/gin-gonic/gin"), Some("v1.9.1"));
     }
 
     #[test]
@@ -255,7 +240,7 @@ github.com/pkg/errors v0.9.1 h1:hash2=
         let content = "golang.org/x/tools v0.0.0-20191109021931-daa7c04131f5 h1:hash=\n";
         let packages = parse_go_sum(content);
         assert_eq!(
-            packages.get_version("golang.org/x/tools"),
+            packages.version("golang.org/x/tools"),
             Some("v0.0.0-20191109021931-daa7c04131f5")
         );
     }
@@ -265,7 +250,7 @@ github.com/pkg/errors v0.9.1 h1:hash2=
         let content = "github.com/some/module v2.0.0+incompatible h1:hash=\n";
         let packages = parse_go_sum(content);
         assert_eq!(
-            packages.get_version("github.com/some/module"),
+            packages.version("github.com/some/module"),
             Some("v2.0.0+incompatible")
         );
     }
@@ -280,11 +265,8 @@ github.com/valid/pkg v1.0.0 h1:valid_hash=
         let packages = parse_go_sum(content);
         // Should only parse the valid lines
         assert_eq!(packages.len(), 2);
-        assert_eq!(
-            packages.get_version("github.com/gin-gonic/gin"),
-            Some("v1.9.1")
-        );
-        assert_eq!(packages.get_version("github.com/valid/pkg"), Some("v1.0.0"));
+        assert_eq!(packages.version("github.com/gin-gonic/gin"), Some("v1.9.1"));
+        assert_eq!(packages.version("github.com/valid/pkg"), Some("v1.0.0"));
     }
 
     #[tokio::test]
@@ -304,11 +286,8 @@ golang.org/x/sync v0.5.0/go.mod h1:RxMgew5V=
         let resolved = parser.parse_lockfile(&lockfile_path).await.unwrap();
 
         assert_eq!(resolved.len(), 2);
-        assert_eq!(
-            resolved.get_version("github.com/gin-gonic/gin"),
-            Some("v1.9.1")
-        );
-        assert_eq!(resolved.get_version("golang.org/x/sync"), Some("v0.5.0"));
+        assert_eq!(resolved.version("github.com/gin-gonic/gin"), Some("v1.9.1"));
+        assert_eq!(resolved.version("golang.org/x/sync"), Some("v0.5.0"));
     }
 
     #[tokio::test]

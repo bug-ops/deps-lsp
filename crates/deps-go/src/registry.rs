@@ -48,7 +48,7 @@ pub const PKG_GO_DEV_URL: &str = "https://pkg.go.dev";
 /// project's `$GOENV` configuration, exists only to keep this map — keyed by
 /// process-config-controlled chain identities — from growing unbounded for the process
 /// lifetime. Mirrors `deps-pypi`/`deps-npm`'s identical cap. Once at capacity, a *new* chain
-/// is simply never registered (see [`GoRegistry::register_chain`]) — a dependency resolved to
+/// is simply never registered (see [`GoRegistry::register_alternate`]) — a dependency resolved to
 /// an unregistered chain degrades to [`DepsError::PackageNotFound`], never to a
 /// `proxy.golang.org` lookup by name (spec FR-009/FR-013).
 const MAX_ALTERNATE_REGISTRIES: usize = 256;
@@ -240,7 +240,7 @@ pub struct GoRegistry {
     /// 0) misses (spec FR-005), each paired with the [`ChainSeparator`] governing the
     /// transition *into* it (spec 034 S2 — `,` = fall through only on not-found, `|` = fall
     /// through on any error). Empty for the `Public`-tier root and every leaf hop — populated
-    /// only on the *head* client [`Self::register_chain`] builds for a multi-hop chain.
+    /// only on the *head* client [`Self::register_alternate`] builds for a multi-hop chain.
     fallback_chain: Vec<(ChainSeparator, Arc<Self>)>,
 }
 
@@ -261,7 +261,7 @@ impl GoRegistry {
     /// (FR-011's redirect-hop gating) instead of the ungated public transport.
     ///
     /// `fallback_chain` is empty for every call except the *head* client
-    /// [`Self::register_chain`] builds for a multi-hop chain — every other hop is a leaf with
+    /// [`Self::register_alternate`] builds for a multi-hop chain — every other hop is a leaf with
     /// nothing further to fall through to, matching `deps-pypi`'s identical design.
     #[must_use]
     fn with_base(
@@ -294,7 +294,7 @@ impl GoRegistry {
     }
 
     /// Builds the client for one [`GoProxyHop`] — a leaf with an empty `fallback_chain`,
-    /// shared by [`Self::register_chain`] for every hop after the first.
+    /// shared by [`Self::register_alternate`] for every hop after the first.
     fn hop_client(cache: &Arc<HttpCache>, hop: &GoProxyHop) -> Arc<Self> {
         Arc::new(match hop {
             GoProxyHop::Url(url) => Self::with_base(Arc::clone(cache), url, Vec::new()),
@@ -305,8 +305,8 @@ impl GoRegistry {
     /// Builds the full hop chain for one [`GoProxyChain`] and inserts the head into
     /// `root.alternates` under `chain.key`. Idempotent per key (a repeat registration for the
     /// same key is a no-op), capacity-capped at `MAX_ALTERNATE_REGISTRIES`. Mirrors
-    /// `deps_pypi::PypiRegistry::register_chain` exactly in shape.
-    pub fn register_chain(root: &Arc<Self>, chain: &GoProxyChain) {
+    /// `deps_pypi::PypiRegistry::register_alternate` exactly in shape.
+    pub fn register_alternate(root: &Arc<Self>, chain: &GoProxyChain) {
         let Some((first_hop, rest_hops)) = chain.hops.split_first() else {
             // Defensive: `GoEnvConfig::resolved_chains` never produces an empty-hop chain.
             return;
@@ -375,7 +375,7 @@ impl GoRegistry {
     /// miss. `/@v/list` alone is incomplete for an untagged/pseudo-version-only module (#364);
     /// a chain hop that only ever tried `/@v/list` silently lost version data for that case.
     async fn get_versions_with_latest_fallback(&self, module_path: &str) -> Result<Vec<GoVersion>> {
-        if let Ok(latest) = self.get_latest(module_path).await {
+        if let Ok(latest) = self.get_latest_stable(module_path).await {
             return Ok(vec![latest]);
         }
         self.get_versions(module_path).await
@@ -550,9 +550,17 @@ impl GoRegistry {
         parse_version_info(module_path, &data)
     }
 
-    /// Fetches latest version using the `/@latest` endpoint.
+    /// Fetches latest version using the Go proxy's `/@latest` endpoint.
     ///
-    /// Returns the latest stable version (non-pseudo).
+    /// The Go proxy protocol defines `/@latest` as "the latest known version" — in the
+    /// common case a stable tag, but it can resolve to a prerelease or pseudo-version when
+    /// the module has no stable tag at all (#834 critic M4: named `_stable` because that is
+    /// the overwhelmingly common case this method exists to serve, not because the proxy
+    /// contractually guarantees it). [`GoVersion::is_pseudo`] on the returned value reflects
+    /// the actual result either way — the `Registry::get_latest_matching` trait impl's own
+    /// `/@v/list` fallback (used only when this call errors, e.g. a 404) does filter
+    /// explicitly on `!is_pseudo`, but this method's own successful result is returned
+    /// as-is, unfiltered.
     ///
     /// # Errors
     ///
@@ -572,12 +580,12 @@ impl GoRegistry {
     /// let cache = Arc::new(HttpCache::new());
     /// let registry = GoRegistry::new(cache);
     ///
-    /// let latest = registry.get_latest("github.com/gin-gonic/gin").await.unwrap();
+    /// let latest = registry.get_latest_stable("github.com/gin-gonic/gin").await.unwrap();
     /// assert!(!latest.is_pseudo);
     /// # }
     /// ```
     #[tracing::instrument(skip_all, fields(package = ?module_path), level = "debug")]
-    pub async fn get_latest(&self, module_path: &str) -> Result<GoVersion> {
+    pub async fn get_latest_stable(&self, module_path: &str) -> Result<GoVersion> {
         if self.tier == GoRegistryTier::Terminal {
             return Err(DepsError::PackageNotFound {
                 package: module_path.to_string(),
@@ -597,6 +605,32 @@ impl GoRegistry {
         .map_err(|e| not_found_or(e, module_path))?;
 
         parse_version_info(module_path, &data)
+    }
+
+    /// Finds "the latest version" for `module_path`.
+    ///
+    /// `req` is currently unused — this extracts the `Registry` trait impl's pre-existing
+    /// behavior unchanged (#834 is a naming-only refactor; not a behavior change) into a
+    /// true inherent method, matching every other ecosystem's `get_latest_matching`
+    /// signature (critic S2). Tries [`Self::get_latest_stable`] (the proxy's `/@latest`
+    /// endpoint) first, falling back to the first non-pseudo, non-retracted entry in
+    /// [`Self::get_versions`]'s `/@v/list` result when `/@latest` errors (it is optional
+    /// per the Go proxy spec).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if both the `/@latest` fast path and the `/@v/list` fallback
+    /// fail.
+    pub async fn get_latest_matching(
+        &self,
+        module_path: &str,
+        _req: &str,
+    ) -> Result<Option<GoVersion>> {
+        if let Ok(version) = self.get_latest_stable(module_path).await {
+            return Ok(Some(version));
+        }
+        let versions = self.get_versions(module_path).await?;
+        Ok(versions.into_iter().find(|v| !v.is_pseudo && !v.retracted))
     }
 
     /// Fetches the go.mod file for a specific version.
@@ -650,6 +684,8 @@ impl GoRegistry {
             .map_err(|e| DepsError::CacheError(format!("Invalid UTF-8 in go.mod: {e}")))
     }
 }
+
+deps_core::impl_get_versions_with_passthrough!(GoRegistry, GoVersion);
 
 /// Version info response from proxy.golang.org.
 #[derive(Deserialize)]
@@ -736,35 +772,20 @@ fn parse_version_info(module_path: &str, data: &[u8]) -> Result<GoVersion> {
 }
 
 impl deps_core::Registry for GoRegistry {
-    fn get_versions<'a>(
-        &'a self,
-        name: &'a deps_core::PackageName,
-    ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn deps_core::Version>>>>
-    {
-        Box::pin(async move {
-            let versions = self.get_versions(name.as_str()).await?;
-            Ok(versions
-                .into_iter()
-                .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
-                .collect())
-        })
-    }
+    deps_core::impl_registry_versions_method!(get_versions);
+    deps_core::impl_registry_versions_method!(get_versions_with);
 
     fn get_latest_matching<'a>(
         &'a self,
         name: &'a deps_core::PackageName,
-        _req: &'a deps_core::VersionReq,
+        req: &'a deps_core::VersionReq,
     ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn deps_core::Version>>>>
     {
         Box::pin(async move {
-            // Try /@latest first (fast path)
-            if let Ok(version) = self.get_latest(name.as_str()).await {
-                return Ok(Some(Box::new(version) as Box<dyn deps_core::Version>));
-            }
-            // Fallback to /@v/list (/@latest is optional per Go proxy spec)
-            let versions = self.get_versions(name.as_str()).await?;
-            let latest = versions.into_iter().find(|v| !v.is_pseudo && !v.retracted);
-            Ok(latest.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
+            let version = self
+                .get_latest_matching(name.as_str(), req.as_str())
+                .await?;
+            Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
         })
     }
 
@@ -1251,7 +1272,7 @@ mod tests {
         let cache = Arc::new(HttpCache::new());
         let registry = GoRegistry::new(cache);
         let latest = registry
-            .get_latest("github.com/gin-gonic/gin")
+            .get_latest_stable("github.com/gin-gonic/gin")
             .await
             .unwrap();
 
@@ -1545,7 +1566,7 @@ mod tests {
     }
 
     #[test]
-    fn test_register_chain_and_alternate_client_roundtrip() {
+    fn test_register_alternate_and_alternate_client_roundtrip() {
         let cache = Arc::new(HttpCache::new());
         let root = Arc::new(GoRegistry::new(Arc::clone(&cache)));
         let chain = GoProxyChain {
@@ -1553,13 +1574,13 @@ mod tests {
             hops: vec![url_hop("https://goproxy.mycorp.example", &all_policy())],
             ..Default::default()
         };
-        GoRegistry::register_chain(&root, &chain);
+        GoRegistry::register_alternate(&root, &chain);
         assert!(root.alternate_client("go-proxy:test").is_some());
         assert!(root.alternate_client("nonexistent").is_none());
     }
 
     #[test]
-    fn test_register_chain_idempotent() {
+    fn test_register_alternate_idempotent() {
         let cache = Arc::new(HttpCache::new());
         let root = Arc::new(GoRegistry::new(Arc::clone(&cache)));
         let chain = GoProxyChain {
@@ -1567,9 +1588,9 @@ mod tests {
             hops: vec![url_hop("https://goproxy.mycorp.example", &all_policy())],
             ..Default::default()
         };
-        GoRegistry::register_chain(&root, &chain);
+        GoRegistry::register_alternate(&root, &chain);
         let first = root.alternate_client("go-proxy:test").unwrap();
-        GoRegistry::register_chain(&root, &chain);
+        GoRegistry::register_alternate(&root, &chain);
         let second = root.alternate_client("go-proxy:test").unwrap();
         assert!(Arc::ptr_eq(&first, &second));
     }
@@ -1597,7 +1618,7 @@ mod tests {
             hops: vec![url_hop(&alt_server.url(), &policy)],
             ..Default::default()
         };
-        GoRegistry::register_chain(&root, &chain);
+        GoRegistry::register_alternate(&root, &chain);
 
         let source = DependencySource::AlternateRegistry {
             index: "go-proxy:test".to_string(),
@@ -1640,7 +1661,7 @@ mod tests {
             hops: vec![url_hop(&hop0.url(), &policy), url_hop(&hop1.url(), &policy)],
             ..Default::default()
         };
-        GoRegistry::register_chain(&root, &chain);
+        GoRegistry::register_alternate(&root, &chain);
 
         let source = DependencySource::AlternateRegistry {
             index: "go-proxy:test".to_string(),
@@ -1685,7 +1706,7 @@ mod tests {
             hops: vec![url_hop(&hop0.url(), &policy), url_hop(&hop1.url(), &policy)],
             ..Default::default()
         };
-        GoRegistry::register_chain(&root, &chain);
+        GoRegistry::register_alternate(&root, &chain);
 
         let source = DependencySource::AlternateRegistry {
             index: "go-proxy:test".to_string(),
@@ -1731,7 +1752,7 @@ mod tests {
             hops: vec![url_hop(&hop0.url(), &policy), url_hop(&hop1.url(), &policy)],
             ..Default::default()
         };
-        GoRegistry::register_chain(&root, &chain);
+        GoRegistry::register_alternate(&root, &chain);
 
         let source = DependencySource::AlternateRegistry {
             index: "go-proxy:test".to_string(),
@@ -1775,7 +1796,7 @@ mod tests {
             hops: vec![url_hop(&hop0.url(), &policy), url_hop(&hop1.url(), &policy)],
             separators: vec![ChainSeparator::AnyError],
         };
-        GoRegistry::register_chain(&root, &chain);
+        GoRegistry::register_alternate(&root, &chain);
 
         let source = DependencySource::AlternateRegistry {
             index: "go-proxy:test".to_string(),
@@ -1822,7 +1843,7 @@ mod tests {
             hops: vec![url_hop(&hop.url(), &policy)],
             ..Default::default()
         };
-        GoRegistry::register_chain(&root, &chain);
+        GoRegistry::register_alternate(&root, &chain);
 
         let source = DependencySource::AlternateRegistry {
             index: "go-proxy:test".to_string(),
@@ -1864,7 +1885,7 @@ mod tests {
             hops: vec![url_hop(&hop0.url(), &policy), GoProxyHop::Direct],
             ..Default::default()
         };
-        GoRegistry::register_chain(&root, &chain);
+        GoRegistry::register_alternate(&root, &chain);
 
         let source = DependencySource::AlternateRegistry {
             index: "go-proxy:test".to_string(),
@@ -1916,7 +1937,7 @@ mod tests {
         cache.set_registry_policy(WorkspaceRegistryAccess::All);
         let root = Arc::new(GoRegistry::new(Arc::clone(&cache)));
         for chain in go_config.resolved_chains() {
-            GoRegistry::register_chain(&root, &chain);
+            GoRegistry::register_alternate(&root, &chain);
         }
 
         let result = root
@@ -1942,7 +1963,7 @@ mod tests {
             hops: vec![GoProxyHop::Off],
             ..Default::default()
         };
-        GoRegistry::register_chain(&root, &chain);
+        GoRegistry::register_alternate(&root, &chain);
 
         let source = DependencySource::AlternateRegistry {
             index: "go-proxy:off".to_string(),
@@ -2010,7 +2031,7 @@ mod tests {
             hops: vec![url_hop(&alt_server.url(), &policy)],
             ..Default::default()
         };
-        GoRegistry::register_chain(&root, &chain);
+        GoRegistry::register_alternate(&root, &chain);
 
         let source = DependencySource::AlternateRegistry {
             index: "go-proxy:test".to_string(),
@@ -2059,7 +2080,7 @@ mod tests {
                 hops: vec![url_hop("https://goproxy.mycorp.example", &policy)],
                 ..Default::default()
             };
-            GoRegistry::register_chain(&root, &chain);
+            GoRegistry::register_alternate(&root, &chain);
         }
         assert_eq!(root.alternates.len(), MAX_ALTERNATE_REGISTRIES);
 
@@ -2068,7 +2089,7 @@ mod tests {
             hops: vec![url_hop("https://goproxy.mycorp.example", &policy)],
             ..Default::default()
         };
-        GoRegistry::register_chain(&root, &overflow);
+        GoRegistry::register_alternate(&root, &overflow);
         assert_eq!(root.alternates.len(), MAX_ALTERNATE_REGISTRIES);
         assert!(root.alternate_client("go-proxy:overflow").is_none());
     }

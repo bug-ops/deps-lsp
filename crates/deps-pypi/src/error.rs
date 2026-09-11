@@ -1,5 +1,34 @@
 use thiserror::Error;
 
+/// Wraps `pep508_rs::Pep508Error` so it is not directly exposed in a `deps-pypi` public signature.
+///
+/// Keeps the pre-1.0 `pep508_rs` dependency type (#835) out of [`PypiError`]'s public
+/// signature — `pep508_rs` can introduce a breaking change to `Pep508Error` without that
+/// counting as a breaking change for `deps-pypi` itself.
+#[derive(Debug)]
+pub struct Pep508ParseError(pep508_rs::Pep508Error);
+
+impl std::fmt::Display for Pep508ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for Pep508ParseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.source()
+    }
+}
+
+impl Pep508ParseError {
+    /// Constructs from the raw `pep508_rs` error. `pub(crate)`, not a public `From` impl —
+    /// a public conversion would put the pre-1.0 `pep508_rs::Pep508Error` type back in this
+    /// crate's public API surface (as the argument type), undoing the point of wrapping it.
+    pub(crate) fn new(error: pep508_rs::Pep508Error) -> Self {
+        Self(error)
+    }
+}
+
 /// Errors specific to PyPI/Python dependency handling.
 ///
 /// These errors cover parsing pyproject.toml files and validating PEP 508
@@ -26,7 +55,7 @@ pub enum PypiError {
     InvalidDependencySpec {
         /// The underlying PEP 508 parser error.
         #[source]
-        source: pep508_rs::Pep508Error,
+        source: Pep508ParseError,
     },
 
     /// Unsupported dependency format

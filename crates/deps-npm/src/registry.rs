@@ -200,7 +200,7 @@ struct PackageTimes {
 pub struct NpmRegistry {
     cache: Arc<HttpCache>,
     /// Registry base URL — `REGISTRY_BASE` in production, overridden to a mockito server URL
-    /// in tests via [`Self::with_registry_base`] (mirrors `deps-nuget`'s
+    /// in tests via [`Self::with_public_base_for_test`] (mirrors `deps-nuget`'s
     /// `NuGetRegistry::with_service_index_url`), or to a `.npmrc`-resolved alternate index
     /// via [`Self::with_base`]. Never carries a trailing slash (see
     /// [`crate::config::NpmRegistryIndex`]'s normalization).
@@ -247,12 +247,12 @@ impl NpmRegistry {
     /// and exercises the same production routing.
     #[cfg(any(test, feature = "test-util"))]
     #[must_use]
-    pub fn with_registry_base(cache: Arc<HttpCache>, registry_base: String) -> Self {
+    pub fn with_public_base_for_test(cache: Arc<HttpCache>, registry_base: String) -> Self {
         Self::build(cache, registry_base, NpmRegistryTier::Public)
     }
 
     /// Creates an [`NpmRegistry`] client for a resolved `.npmrc` alternate registry — an
-    /// ordinary production constructor (unlike `Self::with_registry_base`, not gated).
+    /// ordinary production constructor (unlike `Self::with_public_base_for_test`, not gated).
     ///
     /// No `AlternateNpmClient` type exists: an alternate client *is* an [`NpmRegistry`] with
     /// a different base and `tier: WorkspaceDeclared`, so it fetches through
@@ -381,6 +381,38 @@ impl NpmRegistry {
         .map_err(|e| not_found_or(e, name))?;
 
         parse_package_metadata(&data)
+    }
+
+    /// Same as [`Self::get_versions`], but attaches publish times from the npm registry's
+    /// `time` field when `freshness.enabled` (extracted from the `Registry` trait impl's
+    /// inline logic to give this crate a true inherent `get_versions_with`, matching the
+    /// canonical shape every other ecosystem uses — #834 critic S1/S2).
+    ///
+    /// A2: an alternate (`WorkspaceDeclared`-tier) registry always skips the full-packument
+    /// publish-times fetch, regardless of `freshness.enabled` — `HttpCache` has no
+    /// workspace-gated `get_transport_only_*` variant, and routing an alternate's multi-MB
+    /// full packument through the ungated transport would reopen the redirect-hop hole
+    /// FR-008's routing closes, for a cosmetic relative-age suffix. `Self::publish_times`
+    /// already degrades to an empty map on any failure, so private-registry dependencies
+    /// simply keep that same shape — version data itself is unaffected.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::get_versions`].
+    pub async fn get_versions_with(
+        &self,
+        name: &str,
+        freshness: deps_core::FreshnessSettings,
+    ) -> Result<Vec<NpmVersion>> {
+        let mut versions = self.get_versions(name).await?;
+        if freshness.enabled && self.tier == NpmRegistryTier::Public {
+            let all_versions: Vec<String> =
+                versions.iter().map(|v| v.version.to_string()).collect();
+            let top8 = top_n(&versions, HOVER_RECENT_VERSIONS);
+            let times = self.publish_times(name, &all_versions, &top8).await;
+            attach_publish_times(&mut versions, &times);
+        }
+        Ok(versions)
     }
 
     /// Returns a TTL'd, derived `{version -> PublishTime}` map for `name`, refetching the
@@ -783,49 +815,8 @@ fn parse_search_response(data: &[u8]) -> Result<Vec<NpmPackage>> {
 
 // Implement Registry trait for NpmRegistry
 impl deps_core::Registry for NpmRegistry {
-    fn get_versions<'a>(
-        &'a self,
-        name: &'a deps_core::PackageName,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Version>>>> {
-        Box::pin(async move {
-            let versions = self.get_versions(name.as_str()).await?;
-            Ok(versions
-                .into_iter()
-                .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
-                .collect())
-        })
-    }
-
-    fn get_versions_with<'a>(
-        &'a self,
-        name: &'a deps_core::PackageName,
-        freshness: deps_core::FreshnessSettings,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Version>>>> {
-        Box::pin(async move {
-            let mut versions = self.get_versions(name.as_str()).await?;
-            // A2: an alternate (`WorkspaceDeclared`-tier) registry always skips the
-            // full-packument publish-times fetch, regardless of `freshness.enabled` —
-            // `HttpCache` has no workspace-gated `get_transport_only_*` variant, and routing
-            // an alternate's multi-MB full packument through the ungated transport would
-            // reopen the redirect-hop hole FR-008's routing closes, for a cosmetic
-            // relative-age suffix. `fetch_publish_times` already degrades to an empty map on
-            // any failure, so private-registry dependencies simply keep that same shape —
-            // version data itself is unaffected.
-            if freshness.enabled && self.tier == NpmRegistryTier::Public {
-                let all_versions: Vec<String> =
-                    versions.iter().map(|v| v.version.to_string()).collect();
-                let top8 = top_n(&versions, HOVER_RECENT_VERSIONS);
-                let times = self
-                    .publish_times(name.as_str(), &all_versions, &top8)
-                    .await;
-                attach_publish_times(&mut versions, &times);
-            }
-            Ok(versions
-                .into_iter()
-                .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
-                .collect())
-        })
-    }
+    deps_core::impl_registry_versions_method!(get_versions);
+    deps_core::impl_registry_versions_method!(get_versions_with);
 
     /// Dispatches by `source` (spec FR-010): an `AlternateRegistry` whose index has a
     /// registered client routes there; one with **no** registered client is
@@ -1462,6 +1453,11 @@ mod tests {
         };
     }
 
+    deps_core::registry_conformance! {
+        mod npm_registry_api_conformance;
+        ty: NpmRegistry;
+    }
+
     /// #338: every version is deprecated, but the wildcard existence/latest-for-display
     /// resolution must still return the newest one rather than `None` — a deprecated
     /// package still exists.
@@ -1570,7 +1566,7 @@ mod tests {
     async fn test_get_latest_matching_wildcard_skips_prerelease_at_front() {
         let mut server = mockito::Server::new_async().await;
         let base = server.url();
-        let registry = NpmRegistry::with_registry_base(Arc::new(HttpCache::new()), base);
+        let registry = NpmRegistry::with_public_base_for_test(Arc::new(HttpCache::new()), base);
 
         server
             .mock("GET", "/react")
@@ -1605,7 +1601,7 @@ mod tests {
 
         let mut server = mockito::Server::new_async().await;
         let base = server.url();
-        let registry = NpmRegistry::with_registry_base(Arc::new(HttpCache::new()), base);
+        let registry = NpmRegistry::with_public_base_for_test(Arc::new(HttpCache::new()), base);
 
         let versions_json: Vec<String> = entries
             .iter()
@@ -1707,7 +1703,7 @@ mod tests {
     async fn test_get_latest_matching_wildcard_all_prerelease_none_deprecated_returns_newest() {
         let mut server = mockito::Server::new_async().await;
         let base = server.url();
-        let registry = NpmRegistry::with_registry_base(Arc::new(HttpCache::new()), base);
+        let registry = NpmRegistry::with_public_base_for_test(Arc::new(HttpCache::new()), base);
 
         server
             .mock("GET", "/canary-only-solo")
@@ -1739,7 +1735,7 @@ mod tests {
     async fn test_get_latest_matching_wildcard_all_deprecated_returns_newest() {
         let mut server = mockito::Server::new_async().await;
         let base = server.url();
-        let registry = NpmRegistry::with_registry_base(Arc::new(HttpCache::new()), base);
+        let registry = NpmRegistry::with_public_base_for_test(Arc::new(HttpCache::new()), base);
 
         server
             .mock("GET", "/left-pad")
@@ -1772,7 +1768,7 @@ mod tests {
     async fn test_get_latest_matching_wildcard_prefers_non_deprecated_when_available() {
         let mut server = mockito::Server::new_async().await;
         let base = server.url();
-        let registry = NpmRegistry::with_registry_base(Arc::new(HttpCache::new()), base);
+        let registry = NpmRegistry::with_public_base_for_test(Arc::new(HttpCache::new()), base);
 
         server
             .mock("GET", "/widget")
@@ -2033,7 +2029,7 @@ mod tests {
     //
     // Pre-seeding `publish_times` with a fresh, matching entry exercises the cache-hit
     // branch without a real network fetch. The miss/refetch path is exercised end-to-end via
-    // `mockito` below, using `with_registry_base`.
+    // `mockito` below, using `with_public_base_for_test`.
 
     #[tokio::test]
     async fn test_publish_times_cache_hit_returns_same_arc_without_refetch() {
@@ -2094,7 +2090,7 @@ mod tests {
         // cause a refetch on every call. Mock hit count must stay at 1 across 10 calls.
         let mut server = mockito::Server::new_async().await;
         let base = server.url();
-        let registry = NpmRegistry::with_registry_base(Arc::new(HttpCache::new()), base);
+        let registry = NpmRegistry::with_public_base_for_test(Arc::new(HttpCache::new()), base);
 
         let body = full_packument_body(&[
             ("1.0.0", "2020-01-01T00:00:00Z"),
@@ -2128,7 +2124,7 @@ mod tests {
     async fn test_publish_times_end_to_end_top8_change_triggers_exactly_one_refetch_then_stable() {
         let mut server = mockito::Server::new_async().await;
         let base = server.url();
-        let registry = NpmRegistry::with_registry_base(Arc::new(HttpCache::new()), base);
+        let registry = NpmRegistry::with_public_base_for_test(Arc::new(HttpCache::new()), base);
 
         // Pre-seed a fresh, cached entry for an *old* top8 — the fetch below must happen
         // exactly once, triggered by the top8 mismatch, never by TTL expiry (fetched_at is
@@ -2174,7 +2170,7 @@ mod tests {
 
         let mut server = mockito::Server::new_async().await;
         let base = server.url();
-        let registry = NpmRegistry::with_registry_base(Arc::new(HttpCache::new()), base);
+        let registry = NpmRegistry::with_public_base_for_test(Arc::new(HttpCache::new()), base);
 
         let abbrev_mock = server
             .mock("GET", "/widget")
@@ -2185,16 +2181,16 @@ mod tests {
             .await;
         // No mock registered for `Accept: application/json` — a request there fails the test.
 
-        let versions = registry
-            .get_versions_with(
-                &PackageName::new("widget"),
-                FreshnessSettings {
-                    enabled: false,
-                    cooldown_secs: deps_core::DEFAULT_COOLDOWN_SECS,
-                },
-            )
-            .await
-            .unwrap();
+        let versions = Registry::get_versions_with(
+            &registry,
+            &PackageName::new("widget"),
+            FreshnessSettings {
+                enabled: false,
+                cooldown_secs: deps_core::DEFAULT_COOLDOWN_SECS,
+            },
+        )
+        .await
+        .unwrap();
 
         assert_eq!(versions.len(), 1);
         assert!(versions[0].published_at().is_none());
@@ -2210,7 +2206,7 @@ mod tests {
         let base = server.url();
         let cache = Arc::new(HttpCache::new());
         cache.set_offline(true);
-        let registry = NpmRegistry::with_registry_base(cache, base);
+        let registry = NpmRegistry::with_public_base_for_test(cache, base);
 
         let mock = server
             .mock("GET", "/widget")
@@ -2231,7 +2227,7 @@ mod tests {
 
         let mut server = mockito::Server::new_async().await;
         let base = server.url();
-        let registry = NpmRegistry::with_registry_base(Arc::new(HttpCache::new()), base);
+        let registry = NpmRegistry::with_public_base_for_test(Arc::new(HttpCache::new()), base);
 
         let abbrev_mock = server
             .mock("GET", "/widget")
@@ -2248,10 +2244,13 @@ mod tests {
             .create_async()
             .await;
 
-        let versions = registry
-            .get_versions_with(&PackageName::new("widget"), FreshnessSettings::default())
-            .await
-            .unwrap();
+        let versions = Registry::get_versions_with(
+            &registry,
+            &PackageName::new("widget"),
+            FreshnessSettings::default(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(versions.len(), 1);
         assert!(versions[0].published_at().is_some());
@@ -2269,7 +2268,7 @@ mod tests {
 
         let mut server = mockito::Server::new_async().await;
         let base = server.url();
-        let registry = NpmRegistry::with_registry_base(Arc::new(HttpCache::new()), base);
+        let registry = NpmRegistry::with_public_base_for_test(Arc::new(HttpCache::new()), base);
 
         let abbrev_versions: String = (1..=10)
             .map(|n| format!(r#""{n}.0.0": {{}}"#))
@@ -2295,10 +2294,13 @@ mod tests {
             .create_async()
             .await;
 
-        let versions = registry
-            .get_versions_with(&PackageName::new("widget"), FreshnessSettings::default())
-            .await
-            .unwrap();
+        let versions = Registry::get_versions_with(
+            &registry,
+            &PackageName::new("widget"),
+            FreshnessSettings::default(),
+        )
+        .await
+        .unwrap();
 
         // 10 versions sorted newest-first (10.0.0 .. 1.0.0); the top-8 window is
         // 10.0.0..=3.0.0, so 2.0.0 and 1.0.0 fall outside it.
@@ -2321,7 +2323,7 @@ mod tests {
     async fn test_clone_shares_publish_times_cache_avoiding_duplicate_full_packument_fetch() {
         let mut server = mockito::Server::new_async().await;
         let base = server.url();
-        let registry = NpmRegistry::with_registry_base(Arc::new(HttpCache::new()), base);
+        let registry = NpmRegistry::with_public_base_for_test(Arc::new(HttpCache::new()), base);
         let shared = registry.clone();
 
         let abbrev_mock = server
@@ -2343,19 +2345,25 @@ mod tests {
 
         use deps_core::{FreshnessSettings, PackageName, Registry};
 
-        let first = registry
-            .get_versions_with(&PackageName::new("widget"), FreshnessSettings::default())
-            .await
-            .unwrap();
+        let first = Registry::get_versions_with(
+            &registry,
+            &PackageName::new("widget"),
+            FreshnessSettings::default(),
+        )
+        .await
+        .unwrap();
         assert!(first[0].published_at().is_some());
 
         // A clone — standing in for a second ecosystem instance (e.g. DenoRegistry::npm)
         // sharing this NpmRegistry — must reuse the cached publish-time map rather than
         // refetching the full packument.
-        let second = shared
-            .get_versions_with(&PackageName::new("widget"), FreshnessSettings::default())
-            .await
-            .unwrap();
+        let second = Registry::get_versions_with(
+            &shared,
+            &PackageName::new("widget"),
+            FreshnessSettings::default(),
+        )
+        .await
+        .unwrap();
         assert!(second[0].published_at().is_some());
 
         abbrev_mock.assert_async().await;
@@ -2370,10 +2378,13 @@ mod tests {
         use deps_core::{FreshnessSettings, PackageName, Registry};
 
         let registry = NpmRegistry::new(Arc::new(HttpCache::new()));
-        let versions = registry
-            .get_versions_with(&PackageName::new("express"), FreshnessSettings::default())
-            .await
-            .unwrap();
+        let versions = Registry::get_versions_with(
+            &registry,
+            &PackageName::new("express"),
+            FreshnessSettings::default(),
+        )
+        .await
+        .unwrap();
 
         assert!(!versions.is_empty());
         assert!(versions.iter().take(5).any(|v| v.published_at().is_some()));
@@ -2432,7 +2443,8 @@ mod tests {
 
         let cache = Arc::new(HttpCache::new());
         cache.set_registry_policy(deps_core::net_policy::WorkspaceRegistryAccess::All);
-        let registry = NpmRegistry::with_registry_base(Arc::clone(&cache), public_server.url());
+        let registry =
+            NpmRegistry::with_public_base_for_test(Arc::clone(&cache), public_server.url());
         let index = alternate_index(&alt_server.url());
         registry.register_alternate(index.clone());
 
@@ -2536,7 +2548,7 @@ mod tests {
             .await;
 
         let cache = Arc::new(HttpCache::new());
-        let registry = NpmRegistry::with_registry_base(cache, public_server.url());
+        let registry = NpmRegistry::with_public_base_for_test(cache, public_server.url());
         let source = DependencySource::AlternateRegistry {
             index: "https://never-registered.example".to_string(),
             mirrors_crates_io: false,
@@ -2576,7 +2588,7 @@ mod tests {
             .await;
 
         let cache = Arc::new(HttpCache::new());
-        let registry = NpmRegistry::with_registry_base(cache, public_server.url());
+        let registry = NpmRegistry::with_public_base_for_test(cache, public_server.url());
         let source = DependencySource::AlternateRegistry {
             index: "https://never-registered.example".to_string(),
             mirrors_crates_io: false,
@@ -2616,7 +2628,7 @@ mod tests {
             .await;
 
         let cache = Arc::new(HttpCache::new());
-        let registry = NpmRegistry::with_registry_base(cache, public_server.url());
+        let registry = NpmRegistry::with_public_base_for_test(cache, public_server.url());
         let versions = deps_core::Registry::get_versions_from(
             &registry,
             &PackageName::new("express"),

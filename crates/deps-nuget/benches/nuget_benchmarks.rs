@@ -17,7 +17,7 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use deps_nuget::parser::{
     parse_directory_packages_props, parse_packages_config, parse_project_file,
 };
-use deps_nuget::registry::parse_flat_container;
+use deps_nuget::registry::parse_flat_container_for_bench;
 use deps_nuget::version::{compare_versions, is_prerelease, resolve_float, satisfies};
 use std::hint::black_box;
 use tower_lsp_server::ls_types::Uri;
@@ -270,17 +270,17 @@ fn bench_flat_container_parsing(c: &mut Criterion) {
 
     let small = generate_flat_container_response(10);
     group.bench_function("small_10_versions", |b| {
-        b.iter(|| parse_flat_container(black_box(small.as_bytes())));
+        b.iter(|| parse_flat_container_for_bench(black_box(small.as_bytes())));
     });
 
     let realistic = generate_flat_container_response(84);
     group.bench_function("realistic_84_versions", |b| {
-        b.iter(|| parse_flat_container(black_box(realistic.as_bytes())));
+        b.iter(|| parse_flat_container_for_bench(black_box(realistic.as_bytes())));
     });
 
     let large = generate_flat_container_response(500);
     group.bench_function("large_500_versions", |b| {
-        b.iter(|| parse_flat_container(black_box(large.as_bytes())));
+        b.iter(|| parse_flat_container_for_bench(black_box(large.as_bytes())));
     });
 
     group.finish();

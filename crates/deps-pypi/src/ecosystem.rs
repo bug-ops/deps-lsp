@@ -132,16 +132,16 @@ impl PypiEcosystem {
     /// [`Ecosystem::manifest_filenames`] entry nor a
     /// [`Ecosystem::manifest_patterns`] glob — i.e. this file was routed to PyPI
     /// purely via the [`Ecosystem::manifest_directory_patterns`] fallback
-    /// (`requirements/*.txt`, matched by `EcosystemRegistry::get_for_uri` on
+    /// (`requirements/*.txt`, matched by `EcosystemRegistry::for_uri` on
     /// directory name alone), not a primary basename match.
     ///
-    /// Recomputes the same basename check `EcosystemRegistry::get_for_uri`
+    /// Recomputes the same basename check `EcosystemRegistry::for_uri`
     /// already performed, from the single source of truth (`self`'s own
     /// `manifest_filenames`/`manifest_patterns`) rather than threading a
     /// match-kind flag through `parse_manifest`'s signature — cheap, and
     /// correct as long as this ecosystem's directory-pattern fallback is only
     /// ever reached after both basename stages miss (true by construction in
-    /// [`deps_core::EcosystemRegistry::get_for_uri`]).
+    /// [`deps_core::EcosystemRegistry::for_uri`]).
     fn matched_only_via_directory_pattern(&self, uri: &Uri) -> bool {
         let basename = uri.path().as_str().rsplit('/').next().unwrap_or_default();
         if self.manifest_filenames().contains(&basename) {
@@ -252,13 +252,13 @@ impl Ecosystem for PypiEcosystem {
             // long-lived `PypiRegistry` this ecosystem shares across every document ever
             // meet. A file with no such declaration contributes an empty `resolved_chains`
             // (US-004), so this loop is a no-op for the overwhelming majority of projects.
-            // `register_chain` handles both shapes uniformly: a primary/extras chain and a
-            // single-hop named-source registration (Poetry `source =`/uv `index =`) are both
-            // just `ResolvedChain`s whose hop-tree construction only differs in length — a
-            // named source's `key` is already its own literal URL (`ResolvedChain::named_source`),
-            // so there is no separate `register_named_source` call needed here.
+            // `register_alternate` handles both shapes uniformly: a primary/extras chain and
+            // a single-hop named-source registration (Poetry `source =`/uv `index =`) are
+            // both just `ResolvedChain`s whose hop-tree construction only differs in length —
+            // a named source's `key` is already its own literal URL
+            // (`ResolvedChain::named_source`), so no separate call is needed here.
             for chain in &result.resolved_chains {
-                PypiRegistry::register_chain(&self.registry, chain);
+                PypiRegistry::register_alternate(&self.registry, chain);
             }
             Ok(Box::new(result) as Box<dyn ParseResultTrait>)
         })
@@ -1213,7 +1213,7 @@ mod tests {
             hops: vec![base],
             implicit_public_fallback: false,
         };
-        PypiRegistry::register_chain(&root, &chain);
+        PypiRegistry::register_alternate(&root, &chain);
 
         let source = DependencySource::AlternateRegistry {
             index: chain.key.clone(),
@@ -1828,7 +1828,7 @@ dependencies = []
     }
 
     /// A file with no index declaration anywhere never constructs more than an empty
-    /// `PypiIndexConfig` and never calls `register_chain` (US-004).
+    /// `PypiIndexConfig` and never calls `register_alternate` (US-004).
     #[tokio::test]
     async fn test_parse_manifest_no_declaration_registers_nothing() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1875,7 +1875,7 @@ dependencies = []
             panic!("expected AlternateRegistry, got {source:?}");
         };
         // The registered chain must actually be reachable through the root registry this
-        // ecosystem shares — proving `parse_manifest` really called `register_chain`, not
+        // ecosystem shares — proving `parse_manifest` really called `register_alternate`, not
         // just that `resolve_source_for` computed the right `DependencySource` in isolation.
         assert!(registry.alternate_client(index).is_some());
     }

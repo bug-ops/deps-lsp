@@ -28,7 +28,7 @@ const GOOGLE_MAVEN_BASE: &str = "https://dl.google.com/dl/android/maven2";
 const GRADLE_PLUGIN_PORTAL_BASE: &str = "https://plugins.gradle.org/m2";
 const MAVEN_SEARCH_BASE: &str = "https://search.maven.org/solrsearch/select";
 
-/// Per-attempt timeouts for `search_typed`'s retry loop: first attempt, then second.
+/// Per-attempt timeouts for `search`'s retry loop: first attempt, then second.
 ///
 /// `search.maven.org/solrsearch` fails intermittently as a silent, zero-byte hang
 /// rather than a clean HTTP error — live-verified 2026-08-24 (#274): identical
@@ -48,7 +48,7 @@ const MAVEN_SEARCH_BASE: &str = "https://search.maven.org/solrsearch/select";
 /// `deps_core::completion::COMPLETION_SEARCH_TIMEOUT` — enforced by
 /// `test_search_attempt_budget_exceeds_completion_search_timeout` below. On a total
 /// failure with no stale cache to serve (see `search_with_retry`'s `stale` fallback),
-/// `search_typed` must not finish before the caller's own timeout does: `deps-lsp`'s
+/// `search` must not finish before the caller's own timeout does: `deps-lsp`'s
 /// completion handler otherwise cannot tell a fast empty/error result apart from
 /// "genuinely no results," and re-runs a wasted fallback search against the same
 /// struggling registry instead of taking its existing skip-fallback path.
@@ -62,16 +62,16 @@ const MAVEN_SEARCH_BASE: &str = "https://search.maven.org/solrsearch/select";
 const SEARCH_ATTEMPT_TIMEOUTS: [Duration; 2] =
     [Duration::from_millis(1000), Duration::from_millis(1200)];
 
-/// Delay between `search_typed` retry attempts.
+/// Delay between `search` retry attempts.
 const SEARCH_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 /// `rows` value used for every `solrsearch` request, regardless of the caller's
 /// requested `limit` (#282 gap 2).
 ///
-/// `search_typed`'s caller-facing result count is still capped at `limit` by
+/// `search`'s caller-facing result count is still capped at `limit` by
 /// `parse_search_response`'s `.take(limit)` — this only fixes the *request URL*,
 /// which doubles as `HttpCache`'s cache key. `deps-lsp`'s completion handler calls
-/// `search_typed` with `limit=20` for its primary (typed-field) search and `limit=50`
+/// `search` with `limit=20` for its primary (typed-field) search and `limit=50`
 /// for its fallback search; before this constant, those two calls built different
 /// URLs (`rows=20` vs `rows=50`) and so never shared a cache entry, making
 /// `HttpCache::peek_cached`'s stale-fallback (see `search_with_retry`) always miss on
@@ -84,7 +84,7 @@ const SEARCH_CACHE_ROWS: usize = 50;
 ///
 /// A completion request's own fallback search (`deps-lsp`'s `completion.rs`, once its
 /// extracted query matches the primary path's — see `extract_prefix`'s XML-tag
-/// stripping) issues a second `search_typed` call for the same query within the same
+/// stripping) issues a second `search` call for the same query within the same
 /// request, well inside `COMPLETION_SEARCH_TIMEOUT`, whenever the first call fails
 /// *fast* (DNS failure, connection refused) rather than hanging —
 /// `SEARCH_ATTEMPT_TIMEOUTS`'s hang-mode guarantee (see its doc) only protects against
@@ -95,7 +95,7 @@ const SEARCH_CACHE_ROWS: usize = 50;
 /// By design, this memo is never populated for the hang failure mode itself: a hang
 /// exhausts `SEARCH_ATTEMPT_TIMEOUTS`' full budget, which `deps-lsp`'s own outer
 /// `COMPLETION_SEARCH_TIMEOUT` deadline always wins against first (see that constant's
-/// doc) — the whole `search_typed` future, including the code that would record a
+/// doc) — the whole `search` future, including the code that would record a
 /// failure here, is cancelled before it can run. That's fine: the hang case is already
 /// handled by the caller's existing skip-fallback path, so no second call happens for
 /// this memo to prevent.
@@ -164,7 +164,7 @@ pub fn package_url(name: &str) -> String {
 ///   an existing slice" contract `select_latest_matching` needs.
 /// - If `release` is absent (`<release>` missing from the metadata entirely, common for
 ///   Gradle Plugin Portal and older artifacts), the first non-prerelease entry moves to the
-///   front instead — reproducing `get_latest_matching_typed`'s pre-existing else-branch, so
+///   front instead — reproducing `get_latest_matching`'s pre-existing else-branch, so
 ///   an artifact without `<release>` doesn't report a prerelease as "latest" just because it
 ///   happens to sort first (S7: this was the actual bug behind an earlier version of this
 ///   fix, which only handled the `release`-present case).
@@ -173,7 +173,7 @@ pub fn package_url(name: &str) -> String {
 /// pure `Some(0)` pick (`Registry::get_versions` is the only round trip available to it,
 /// with no side channel for `<release>`), hover's "Recent versions" `*(latest)*` marker,
 /// and completion's version list — agree with the wildcard pick without a second registry
-/// call: `get_versions_typed` and `get_latest_matching_typed` already fetch
+/// call: `get_versions` and `get_latest_matching` already fetch
 /// `(versions, release)` from the same single `get_metadata` call, so reordering here is free.
 fn move_release_to_front(versions: &mut Vec<MavenVersion>, release: Option<&str>) {
     let target = match release {
@@ -201,7 +201,7 @@ fn move_release_to_front(versions: &mut Vec<MavenVersion>, release: Option<&str>
 /// entry absent from `versions`. `move_release_to_front` must return an index into the
 /// existing slice (or no-op), so it can't invent an entry; this function returns an owned
 /// `MavenVersion` and has no such constraint, so it trusts `release` unconditionally instead
-/// — the same asymmetry `get_latest_matching_typed` had before this extraction. The one
+/// — the same asymmetry `get_latest_matching` had before this extraction. The one
 /// exception: when `release` is absent from `versions` AND is itself a prerelease, this
 /// returns `None` rather than synthesizing it. This is the sole path through which this
 /// function is reachable in production (`Registry::get_latest_matching`'s only caller,
@@ -266,7 +266,7 @@ pub struct MavenCentralRegistry {
     cache: Arc<HttpCache>,
     /// Query -> instant of its last unrecoverable live search failure (#282 gap 1).
     ///
-    /// Checked at the top of `search_typed`: a repeat call for the same query within
+    /// Checked at the top of `search`: a repeat call for the same query within
     /// `RECENT_FAILURE_TTL` returns immediately without a network attempt. A `DashMap`
     /// (like `HttpCache::entries`) rather than a `Mutex<HashMap<_>>`, so concurrent
     /// completion requests for different queries don't contend on one lock and a panic
@@ -349,8 +349,8 @@ impl MavenCentralRegistry {
         }
     }
 
-    /// Same as [`Self::get_versions_typed`], but attaches [`MavenVersion::published_at`]
-    /// from the `repo1.maven.org` directory listing when `freshness_enabled` and the
+    /// Same as [`Self::get_versions`], but attaches [`MavenVersion::published_at`]
+    /// from the `repo1.maven.org` directory listing when `freshness.enabled` and the
     /// artifact resolved through Maven Central.
     ///
     /// The listing fetch is gated on the winning base being Maven Central specifically —
@@ -359,17 +359,23 @@ impl MavenCentralRegistry {
     /// Gradle Plugin Portal's listing has no date column (a wasted fetch+parse on every
     /// call). Both degrade to zero extra requests here rather than one doomed one.
     ///
+    /// Takes [`deps_core::FreshnessSettings`] (not a bare `bool`) so this inherent method's
+    /// signature matches `deps-cargo`'s and the `Registry` trait's `get_versions_with`
+    /// exactly — the same name never means three different call shapes across crates (#834
+    /// critic S1).
+    ///
     /// # Errors
     ///
     /// Returns an error if fetching or parsing the artifact's metadata fails.
     #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
-    pub async fn get_versions_typed_with(
+    pub async fn get_versions_with(
         &self,
         name: &str,
-        freshness_enabled: bool,
+        freshness: deps_core::FreshnessSettings,
     ) -> Result<Vec<MavenVersion>> {
         let (mut versions, release, base) = self.get_metadata(name).await?;
-        if freshness_enabled && let Some(base) = base.as_deref().filter(|b| should_fetch_listing(b))
+        if freshness.enabled
+            && let Some(base) = base.as_deref().filter(|b| should_fetch_listing(b))
         {
             let times = self.fetch_publish_times(base).await;
             attach_publish_times(&mut versions, &times);
@@ -380,15 +386,22 @@ impl MavenCentralRegistry {
 
     /// Fetches all available versions, without publish-time enrichment.
     ///
-    /// Delegates to [`Self::get_versions_typed_with`] with freshness disabled so the two
+    /// Delegates to [`Self::get_versions_with`] with freshness disabled so the two
     /// paths cannot drift apart.
     ///
     /// # Errors
     ///
-    /// Same as [`Self::get_versions_typed_with`].
+    /// Same as [`Self::get_versions_with`].
     #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
-    pub async fn get_versions_typed(&self, name: &str) -> Result<Vec<MavenVersion>> {
-        self.get_versions_typed_with(name, false).await
+    pub async fn get_versions(&self, name: &str) -> Result<Vec<MavenVersion>> {
+        self.get_versions_with(
+            name,
+            deps_core::FreshnessSettings {
+                enabled: false,
+                ..Default::default()
+            },
+        )
+        .await
     }
 
     /// Returns the version matching `req` exactly, or the latest stable/release version
@@ -398,11 +411,7 @@ impl MavenCentralRegistry {
     ///
     /// Returns an error if fetching or parsing the artifact's metadata fails.
     #[tracing::instrument(skip_all, fields(package = ?name, version = ?req), level = "debug")]
-    pub async fn get_latest_matching_typed(
-        &self,
-        name: &str,
-        req: &str,
-    ) -> Result<Option<MavenVersion>> {
+    pub async fn get_latest_matching(&self, name: &str, req: &str) -> Result<Option<MavenVersion>> {
         let (versions, release, _base) = self.get_metadata(name).await?;
         // For Maven MVP: exact string match, or latest stable if req is empty/wildcard
         if req.is_empty() || req == "*" {
@@ -435,10 +444,10 @@ impl MavenCentralRegistry {
     /// Returns the last error (an HTTP/network error, or a synthesized timeout error)
     /// if every attempt fails and no cached result is available to fall back to.
     #[tracing::instrument(skip_all, fields(query = ?query), level = "debug")]
-    pub async fn search_typed(&self, query: &str, limit: usize) -> Result<Vec<ArtifactInfo>> {
+    pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<ArtifactInfo>> {
         debug_assert!(
             limit <= SEARCH_CACHE_ROWS,
-            "search_typed's limit ({limit}) exceeds SEARCH_CACHE_ROWS ({SEARCH_CACHE_ROWS}); \
+            "search's limit ({limit}) exceeds SEARCH_CACHE_ROWS ({SEARCH_CACHE_ROWS}); \
              raise SEARCH_CACHE_ROWS to cover every caller's requested limit"
         );
 
@@ -519,7 +528,7 @@ fn record_search_failure(failures: &DashMap<String, tokio::time::Instant>, query
 }
 
 /// Clears `query`'s failure record, if any, after a fully successful (fetched and
-/// parsed) `search_typed` call.
+/// parsed) `search` call.
 fn record_search_success(failures: &DashMap<String, tokio::time::Instant>, query: &str) {
     failures.remove(query);
 }
@@ -536,7 +545,7 @@ fn record_search_success(failures: &DashMap<String, tokio::time::Instant>, query
 /// permanent for the duration of the config, so retrying it just pays
 /// [`SEARCH_RETRY_DELAY`] and an extra iteration for nothing, on a path with a
 /// user-facing completion deadline. Before the M2 fix this cost was absorbed by
-/// `recent_search_failures` after the first query; now that `search_typed` skips
+/// `recent_search_failures` after the first query; now that `search` skips
 /// recording an offline block there, every offline completion would otherwise pay it.
 fn is_retryable_error(e: &DepsError) -> bool {
     !matches!(e, DepsError::HttpStatus { status, .. } if (400..500).contains(status))
@@ -558,7 +567,7 @@ fn is_retryable_error(e: &DepsError) -> bool {
 /// retry budget when cached data is already available (though still only after the
 /// first attempt's timeout has elapsed, not instantly).
 ///
-/// Extracted from `search_typed` so the retry/timeout/backoff/stale-fallback mechanics
+/// Extracted from `search` so the retry/timeout/backoff/stale-fallback mechanics
 /// can be unit-tested with a fake `fetch`/`stale` pair under `tokio::time::pause`,
 /// without a real HTTPS endpoint: `HttpCache` has no test-mode escape hatch for a
 /// mocked server across a crate boundary (its `ensure_https`, in
@@ -888,34 +897,8 @@ fn parse_search_response(data: &[u8], limit: usize) -> Result<Vec<ArtifactInfo>>
 }
 
 impl deps_core::Registry for MavenCentralRegistry {
-    fn get_versions<'a>(
-        &'a self,
-        name: &'a deps_core::PackageName,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Version>>>> {
-        Box::pin(async move {
-            let versions = self.get_versions_typed(name.as_str()).await?;
-            Ok(versions
-                .into_iter()
-                .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
-                .collect())
-        })
-    }
-
-    fn get_versions_with<'a>(
-        &'a self,
-        name: &'a deps_core::PackageName,
-        freshness: deps_core::FreshnessSettings,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Version>>>> {
-        Box::pin(async move {
-            let versions = self
-                .get_versions_typed_with(name.as_str(), freshness.enabled)
-                .await?;
-            Ok(versions
-                .into_iter()
-                .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
-                .collect())
-        })
-    }
+    deps_core::impl_registry_versions_method!(get_versions);
+    deps_core::impl_registry_versions_method!(get_versions_with);
 
     fn get_latest_matching<'a>(
         &'a self,
@@ -924,7 +907,7 @@ impl deps_core::Registry for MavenCentralRegistry {
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Option<Box<dyn deps_core::Version>>>> {
         Box::pin(async move {
             let version = self
-                .get_latest_matching_typed(name.as_str(), req.as_str())
+                .get_latest_matching(name.as_str(), req.as_str())
                 .await?;
             Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
         })
@@ -936,7 +919,7 @@ impl deps_core::Registry for MavenCentralRegistry {
         limit: usize,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Metadata>>>> {
         Box::pin(async move {
-            let results = self.search_typed(query, limit).await?;
+            let results = self.search(query, limit).await?;
             Ok(results
                 .into_iter()
                 .map(|m| Box::new(m) as Box<dyn deps_core::Metadata>)
@@ -1003,6 +986,13 @@ mod tests {
     use super::*;
 
     use std::assert_matches;
+
+    fn freshness(enabled: bool) -> deps_core::FreshnessSettings {
+        deps_core::FreshnessSettings {
+            enabled,
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn test_repo_base_for_group_central() {
@@ -1424,10 +1414,10 @@ mod tests {
     /// endpoint.
     #[tokio::test]
     #[ignore]
-    async fn test_search_typed_real_guava() {
+    async fn test_search_real_guava() {
         let cache = Arc::new(HttpCache::new());
         let registry = MavenCentralRegistry::new(cache);
-        let results = registry.search_typed("guava", 20).await.unwrap();
+        let results = registry.search("guava", 20).await.unwrap();
 
         assert!(!results.is_empty());
         assert!(
@@ -1437,10 +1427,10 @@ mod tests {
         );
     }
 
-    /// S1 guard rail: a total-failure `search_typed` call (no stale cache to fall back
+    /// S1 guard rail: a total-failure `search` call (no stale cache to fall back
     /// on) must take longer than `deps-lsp`'s completion deadline, so that deadline's
     /// own timeout fires first and takes its existing skip-fallback path, rather than
-    /// `search_typed` finishing fast with an empty/error result the caller cannot
+    /// `search` finishing fast with an empty/error result the caller cannot
     /// distinguish from "genuinely no results" (see [`SEARCH_ATTEMPT_TIMEOUTS`]'s doc).
     #[test]
     fn test_search_attempt_budget_exceeds_completion_search_timeout() {
@@ -1448,7 +1438,7 @@ mod tests {
         let delays_total = SEARCH_RETRY_DELAY * (SEARCH_ATTEMPT_TIMEOUTS.len() as u32 - 1);
         assert!(
             attempts_total + delays_total > deps_core::completion::COMPLETION_SEARCH_TIMEOUT,
-            "search_typed's worst-case retry budget must outlast the completion \
+            "search's worst-case retry budget must outlast the completion \
              handler's own timeout (#274/S1)"
         );
     }
@@ -1549,18 +1539,18 @@ mod tests {
         assert!(failures.is_empty());
     }
 
-    /// #282 gap 1: a query that just failed live short-circuits the next `search_typed`
+    /// #282 gap 1: a query that just failed live short-circuits the next `search`
     /// call for the same query with no network attempt — the returned error names the
     /// suppression explicitly, distinguishing it from a real HTTP/timeout failure.
     #[tokio::test]
-    async fn test_search_typed_short_circuits_on_recent_failure() {
+    async fn test_search_short_circuits_on_recent_failure() {
         let cache = Arc::new(HttpCache::new());
         let registry = MavenCentralRegistry::new(cache);
         registry
             .recent_search_failures
             .insert("guava".to_string(), tokio::time::Instant::now());
 
-        let err = registry.search_typed("guava", 20).await.unwrap_err();
+        let err = registry.search("guava", 20).await.unwrap_err();
 
         assert!(err.to_string().contains("skipping duplicate live attempt"));
     }
@@ -1570,12 +1560,12 @@ mod tests {
     /// `RECENT_FAILURE_TTL` would otherwise leave search silently short-circuited for a
     /// while after `network.offline` flips back to `false`.
     #[tokio::test]
-    async fn test_search_typed_offline_does_not_poison_recent_failures() {
+    async fn test_search_offline_does_not_poison_recent_failures() {
         let cache = Arc::new(HttpCache::new());
         cache.set_offline(true);
         let registry = MavenCentralRegistry::new(cache);
 
-        let err = registry.search_typed("guava", 20).await.unwrap_err();
+        let err = registry.search("guava", 20).await.unwrap_err();
 
         assert!(err.is_offline(), "expected Offline, got {err:?}");
         assert!(
@@ -1747,7 +1737,7 @@ mod tests {
     }
 
     // `select_latest_matching`'s contract is "index 0 of a `get_versions`-shaped list
-    // is latest" — `get_versions_typed` is what puts the right entry at index 0 (via
+    // is latest" — `get_versions` is what puts the right entry at index 0 (via
     // `move_release_to_front`), not `select_latest_matching` itself. #794 impl-critic
     // minor: index 0 here is the front-loaded `<release>` *prerelease* (the #340 shape —
     // `<release>` names the most recently deployed artifact, not necessarily the newest
@@ -1772,6 +1762,11 @@ mod tests {
             req: "*";
             expected_index: 1;
         };
+    }
+
+    deps_core::registry_conformance! {
+        mod maven_registry_api_conformance;
+        ty: MavenCentralRegistry;
     }
 
     #[test]
@@ -1942,7 +1937,7 @@ mod tests {
     }
 
     /// S8: `select_latest_matching` (via `move_release_to_front`) and
-    /// `get_latest_matching_typed`'s own wildcard branch (via `pick_wildcard_latest`) must
+    /// `get_latest_matching`'s own wildcard branch (via `pick_wildcard_latest`) must
     /// agree on the same `(versions, release)` fixture when `<release>` names a stable
     /// version or is absent (S3/S7). They deliberately no longer agree when `<release>`
     /// itself names a prerelease *present in `versions`* (#340): `select_latest_matching`
@@ -2398,24 +2393,18 @@ mod tests {
         );
     }
 
-    // --- get_versions_typed_with: end-to-end gating and degradation on the metadata path ---
+    // --- get_versions_with: end-to-end gating and degradation on the metadata path ---
 
     #[tokio::test]
-    async fn test_get_versions_typed_with_invalid_name_short_circuits_before_any_request() {
+    async fn test_get_versions_with_invalid_name_short_circuits_before_any_request() {
         // No colon in the name => `metadata_urls` returns empty and `get_metadata` never
-        // issues a request at all, so this also exercises `get_versions_typed`'s delegation
-        // to `get_versions_typed_with(name, false)` (M1) without needing a network mock.
+        // issues a request at all, so this also exercises `get_versions`'s delegation
+        // to `get_versions_with(name, freshness(false))` (M1) without needing a network mock.
         let registry = MavenCentralRegistry::new(Arc::new(HttpCache::new()));
+        assert!(registry.get_versions("bad-name").await.unwrap().is_empty());
         assert!(
             registry
-                .get_versions_typed("bad-name")
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            registry
-                .get_versions_typed_with("bad-name", true)
+                .get_versions_with("bad-name", freshness(true))
                 .await
                 .unwrap()
                 .is_empty()
@@ -2427,10 +2416,10 @@ mod tests {
     /// what lets hover (`registry.get_versions_with(...).ok()?`) return `None` for a
     /// rejected coordinate instead of a broken "package not found" hover section.
     #[tokio::test]
-    async fn test_get_versions_typed_dot_segment_artifact_id_returns_err() {
+    async fn test_get_versions_dot_segment_artifact_id_returns_err() {
         let registry = MavenCentralRegistry::new(Arc::new(HttpCache::new()));
         let err = registry
-            .get_versions_typed("com.example:..")
+            .get_versions("com.example:..")
             .await
             .expect_err("dot-segment artifactId must be rejected");
         assert_matches!(err, DepsError::PackageNotFound { .. });
@@ -2444,7 +2433,7 @@ mod tests {
     async fn test_live_maven_central_attaches_publish_times() {
         let registry = MavenCentralRegistry::new(Arc::new(HttpCache::new()));
         let versions = registry
-            .get_versions_typed_with("org.apache.commons:commons-lang3", true)
+            .get_versions_with("org.apache.commons:commons-lang3", freshness(true))
             .await
             .unwrap();
 
@@ -2459,7 +2448,7 @@ mod tests {
     async fn test_live_google_maven_never_attaches_publish_times() {
         let registry = MavenCentralRegistry::new(Arc::new(HttpCache::new()));
         let versions = registry
-            .get_versions_typed_with("androidx.core:core", true)
+            .get_versions_with("androidx.core:core", freshness(true))
             .await
             .unwrap();
 
@@ -2477,9 +2466,9 @@ mod tests {
         // Central; verified `repo1` 404 / plugin portal 200 on 2026-08-24) — resolves only
         // via the Gradle Plugin Portal fallback.
         let versions = registry
-            .get_versions_typed_with(
+            .get_versions_with(
                 "com.gradle.develocity:com.gradle.develocity.gradle.plugin",
-                true,
+                freshness(true),
             )
             .await
             .unwrap();

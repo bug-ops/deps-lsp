@@ -106,24 +106,6 @@ impl CratesIoRegistry {
         self.sparse.get_versions(name).await
     }
 
-    /// Like [`Self::get_versions`], but threads `freshness` through so a caller routing via
-    /// `CargoRegistry`'s `get_versions_for_source` crates.io fallback arms cannot silently
-    /// drop it if crates.io ever gains its own publish-time enrichment (issue #588 critic
-    /// M10) — today this is a pure pass-through, identical to [`Self::get_versions`], since
-    /// crates.io's sparse index carries no such enrichment yet.
-    ///
-    /// # Errors
-    ///
-    /// Same as [`Self::get_versions`].
-    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
-    pub async fn get_versions_with(
-        &self,
-        name: &str,
-        _freshness: deps_core::freshness::FreshnessSettings,
-    ) -> Result<Vec<CargoVersion>> {
-        self.get_versions(name).await
-    }
-
     /// Finds the latest version matching the given semver requirement.
     ///
     /// Only returns non-yanked versions.
@@ -197,6 +179,8 @@ impl CratesIoRegistry {
     }
 }
 
+deps_core::impl_get_versions_with_passthrough!(CratesIoRegistry, CargoVersion);
+
 /// Response from crates.io search API.
 #[derive(Deserialize)]
 struct SearchResponse {
@@ -254,18 +238,7 @@ fn select_latest_matching_impl(
 }
 
 impl deps_core::Registry for CratesIoRegistry {
-    fn get_versions<'a>(
-        &'a self,
-        name: &'a deps_core::PackageName,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Version>>>> {
-        Box::pin(async move {
-            let versions = self.get_versions(name.as_str()).await?;
-            Ok(versions
-                .into_iter()
-                .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
-                .collect())
-        })
-    }
+    deps_core::impl_registry_versions_method!(get_versions);
 
     fn get_latest_matching<'a>(
         &'a self,
@@ -316,18 +289,7 @@ impl deps_core::Registry for CratesIoRegistry {
 /// Out-of-Scope), so an alternate registry can never support package-name completion —
 /// only crates.io's REST API does.
 impl deps_core::Registry for SparseIndexClient {
-    fn get_versions<'a>(
-        &'a self,
-        name: &'a deps_core::PackageName,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Version>>>> {
-        Box::pin(async move {
-            let versions = self.get_versions(name.as_str()).await?;
-            Ok(versions
-                .into_iter()
-                .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
-                .collect())
-        })
-    }
+    deps_core::impl_registry_versions_method!(get_versions);
 
     fn get_latest_matching<'a>(
         &'a self,
@@ -833,6 +795,11 @@ mod tests {
             req: "*";
             expected_index: 1;
         };
+    }
+
+    deps_core::registry_conformance! {
+        mod cargo_registry_api_conformance;
+        ty: CratesIoRegistry;
     }
 
     #[test]

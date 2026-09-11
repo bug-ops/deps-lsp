@@ -27,9 +27,9 @@ pub mod types;
 pub use ecosystem::SwiftEcosystem;
 pub use formatter::SwiftFormatter;
 pub use lockfile::SwiftLockParser;
-pub use parser::parse_package_swift;
+pub use parser::{SwiftParseResult, parse_package_swift};
 pub use registry::SwiftRegistry;
-pub use types::{SwiftDependency, SwiftPackage, SwiftParseResult, SwiftVersion};
+pub use types::{SwiftDependency, SwiftPackage, SwiftVersion};
 
 /// Whether `name` matches the `owner/repo` GitHub identifier shape this crate accepts.
 ///

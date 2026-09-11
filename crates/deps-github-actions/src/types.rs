@@ -105,7 +105,7 @@ pub struct GithubActionsVersion {
     pub prerelease: bool,
     /// When the matching GitHub Release was published, if the tags API's own response
     /// (which carries no timestamp) was enriched with one via
-    /// [`crate::registry::GithubActionsRegistry::get_versions_with_release_dates`]
+    /// [`crate::registry::GithubActionsRegistry::get_versions_with`]
     /// (#486). `None` for a plain [`GithubActionsRegistry::get_versions`](crate::registry::GithubActionsRegistry::get_versions)
     /// call, or when the tag has no matching (non-draft, dated) GitHub Release.
     pub published_at: Option<deps_core::PublishTime>,

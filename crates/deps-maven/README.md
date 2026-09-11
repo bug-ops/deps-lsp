@@ -37,7 +37,7 @@ use deps_maven::{parse_pom_xml, MavenCentralRegistry};
 
 let result = parse_pom_xml(content, &uri)?;
 let registry = MavenCentralRegistry::new(cache);
-let versions = registry.get_versions_typed("org.springframework:spring-core").await?;
+let versions = registry.get_versions("org.springframework:spring-core").await?;
 ```
 
 ## Supported pom.xml syntax

@@ -634,8 +634,8 @@ mod tests {
         let resolved = parser.parse_lockfile(&lockfile_path).await.unwrap();
 
         assert_eq!(resolved.len(), 2);
-        assert_eq!(resolved.get_version("express"), Some("4.18.2"));
-        assert_eq!(resolved.get_version("body-parser"), Some("1.20.1"));
+        assert_eq!(resolved.version("express"), Some("4.18.2"));
+        assert_eq!(resolved.version("body-parser"), Some("1.20.1"));
 
         let express_pkg = resolved.get("express").unwrap();
         assert_eq!(express_pkg.dependencies.len(), 1);
@@ -678,9 +678,9 @@ mod tests {
         let resolved = parser.parse_lockfile(&lockfile_path).await.unwrap();
 
         assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved.get_version("react"), Some("18.2.0"));
+        assert_eq!(resolved.version("react"), Some("18.2.0"));
         assert_eq!(
-            resolved.get_version("my-react"),
+            resolved.version("my-react"),
             None,
             "the alias key must not shadow the real package name"
         );
@@ -898,8 +898,8 @@ importers:
         let resolved = parser.parse_lockfile(&lockfile_path).await.unwrap();
 
         assert_eq!(resolved.len(), 2);
-        assert_eq!(resolved.get_version("react"), Some("18.2.0"));
-        assert_eq!(resolved.get_version("typescript"), Some("5.3.3"));
+        assert_eq!(resolved.version("react"), Some("18.2.0"));
+        assert_eq!(resolved.version("typescript"), Some("5.3.3"));
     }
 
     #[tokio::test]
@@ -933,9 +933,9 @@ importers:
         let resolved = parser.parse_lockfile(&lockfile_path).await.unwrap();
 
         assert_eq!(resolved.len(), 2);
-        assert_eq!(resolved.get_all("lodash").unwrap().len(), 2);
-        assert_eq!(resolved.get_version("lodash"), Some("4.17.21"));
-        assert_eq!(resolved.get_version("react"), Some("18.2.0"));
+        assert_eq!(resolved.all("lodash").unwrap().len(), 2);
+        assert_eq!(resolved.version("lodash"), Some("4.17.21"));
+        assert_eq!(resolved.version("react"), Some("18.2.0"));
     }
 
     #[tokio::test]
@@ -960,10 +960,7 @@ importers:
         let parser = NpmLockParser;
         let resolved = parser.parse_lockfile(&lockfile_path).await.unwrap();
 
-        assert_eq!(
-            resolved.get_version("use-sync-external-store"),
-            Some("1.2.0")
-        );
+        assert_eq!(resolved.version("use-sync-external-store"), Some("1.2.0"));
     }
 
     #[tokio::test]
@@ -992,8 +989,8 @@ importers:
         let resolved = parser.parse_lockfile(&lockfile_path).await.unwrap();
 
         assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved.get_version("shared-lib"), None);
-        assert_eq!(resolved.get_version("react"), Some("18.2.0"));
+        assert_eq!(resolved.version("shared-lib"), None);
+        assert_eq!(resolved.version("react"), Some("18.2.0"));
     }
 
     #[tokio::test]
@@ -1131,7 +1128,7 @@ importers:
         let parser = NpmLockParser;
         let resolved = parser.parse_lockfile(&lockfile_path).await.unwrap();
 
-        assert_eq!(resolved.get_version("fsevents"), Some("2.3.3"));
+        assert_eq!(resolved.version("fsevents"), Some("2.3.3"));
     }
 
     /// One importer with `dependencies`, `devDependencies`, and `optionalDependencies` all
@@ -1167,9 +1164,9 @@ importers:
         let resolved = parser.parse_lockfile(&lockfile_path).await.unwrap();
 
         assert_eq!(resolved.len(), 3);
-        assert_eq!(resolved.get_version("react"), Some("18.2.0"));
-        assert_eq!(resolved.get_version("typescript"), Some("5.3.3"));
-        assert_eq!(resolved.get_version("fsevents"), Some("2.3.3"));
+        assert_eq!(resolved.version("react"), Some("18.2.0"));
+        assert_eq!(resolved.version("typescript"), Some("5.3.3"));
+        assert_eq!(resolved.version("fsevents"), Some("2.3.3"));
     }
 
     /// S3 regression: pnpm resolves an `npm:`-aliased importer dependency's `version` field to
@@ -1199,9 +1196,9 @@ importers:
         let resolved = parser.parse_lockfile(&lockfile_path).await.unwrap();
 
         assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved.get_version("lodash"), Some("4.17.21"));
+        assert_eq!(resolved.version("lodash"), Some("4.17.21"));
         assert_eq!(
-            resolved.get_version("my-lodash"),
+            resolved.version("my-lodash"),
             None,
             "the alias key must not shadow the real package name"
         );
@@ -1231,8 +1228,8 @@ importers:
         let parser = NpmLockParser;
         let resolved = parser.parse_lockfile(&lockfile_path).await.unwrap();
 
-        assert_eq!(resolved.get_version("@myorg/pkg"), Some("1.2.3"));
-        assert_eq!(resolved.get_version("my-pkg"), None);
+        assert_eq!(resolved.version("@myorg/pkg"), Some("1.2.3"));
+        assert_eq!(resolved.version("my-pkg"), None);
     }
 
     /// S2 regression: a non-semver-shaped resolution (`file:`, a bare tarball URL,
@@ -1270,10 +1267,10 @@ importers:
         let resolved = parser.parse_lockfile(&lockfile_path).await.unwrap();
 
         assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved.get_version("react"), Some("18.2.0"));
-        assert_eq!(resolved.get_version("local-tarball"), None);
-        assert_eq!(resolved.get_version("from-git"), None);
-        assert_eq!(resolved.get_version("workspace-star"), None);
+        assert_eq!(resolved.version("react"), Some("18.2.0"));
+        assert_eq!(resolved.version("local-tarball"), None);
+        assert_eq!(resolved.version("from-git"), None);
+        assert_eq!(resolved.version("workspace-star"), None);
     }
 
     /// Code-review regression: an unquoted, numeric-looking `version` (e.g. `version: 1.0`)
@@ -1308,8 +1305,8 @@ importers:
         let parser = NpmLockParser;
         let resolved = parser.parse_lockfile(&lockfile_path).await.unwrap();
 
-        assert_eq!(resolved.get_version("widget"), None);
-        assert_eq!(resolved.get_version("react"), Some("18.2.0"));
+        assert_eq!(resolved.version("widget"), None);
+        assert_eq!(resolved.version("react"), Some("18.2.0"));
     }
 
     /// A `version` field that isn't even a scalar (e.g. a nested mapping) must be logged and
@@ -1340,8 +1337,8 @@ importers:
         let parser = NpmLockParser;
         let resolved = parser.parse_lockfile(&lockfile_path).await.unwrap();
 
-        assert_eq!(resolved.get_version("broken"), None);
-        assert_eq!(resolved.get_version("react"), Some("18.2.0"));
+        assert_eq!(resolved.version("broken"), None);
+        assert_eq!(resolved.version("react"), Some("18.2.0"));
     }
 
     #[test]

@@ -209,7 +209,7 @@ mod tests {
         let parser = NuGetLockParser;
         let resolved = parser.parse_lockfile(&path).await.unwrap();
         assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved.get_version("Newtonsoft.Json"), Some("13.0.3"));
+        assert_eq!(resolved.version("Newtonsoft.Json"), Some("13.0.3"));
     }
 
     #[tokio::test]
@@ -233,7 +233,7 @@ mod tests {
         let resolved = parser.parse_lockfile(&path).await.unwrap();
         assert_eq!(resolved.len(), 1);
         assert!(resolved.get("MyCompany.Shared").is_none());
-        assert_eq!(resolved.get_version("Newtonsoft.Json"), Some("13.0.3"));
+        assert_eq!(resolved.version("Newtonsoft.Json"), Some("13.0.3"));
     }
 
     #[tokio::test]
@@ -259,7 +259,7 @@ mod tests {
 
         let parser = NuGetLockParser;
         let resolved = parser.parse_lockfile(&path).await.unwrap();
-        assert_eq!(resolved.get_version("Foo"), Some("1.10.0.0"));
+        assert_eq!(resolved.version("Foo"), Some("1.10.0.0"));
     }
 
     #[tokio::test]
@@ -279,7 +279,7 @@ mod tests {
 
         let parser = NuGetLockParser;
         let resolved = parser.parse_lockfile(&path).await.unwrap();
-        assert_eq!(resolved.get_version("Bare"), Some("1.0.0"));
+        assert_eq!(resolved.version("Bare"), Some("1.0.0"));
     }
 
     #[tokio::test]

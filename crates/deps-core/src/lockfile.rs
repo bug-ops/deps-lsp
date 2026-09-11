@@ -368,7 +368,7 @@ pub enum ResolvedSource {
 ///     .with_dependencies(vec!["serde_derive".into()]),
 /// );
 ///
-/// assert_eq!(packages.get_version("serde"), Some("1.0.195"));
+/// assert_eq!(packages.version("serde"), Some("1.0.195"));
 /// assert_eq!(packages.len(), 1);
 /// ```
 #[derive(Debug, Default, Clone)]
@@ -421,12 +421,12 @@ impl ResolvedPackages {
     }
 
     /// Gets the highest resolved version string for a package.
-    pub fn get_version(&self, name: &str) -> Option<&str> {
+    pub fn version(&self, name: &str) -> Option<&str> {
         self.get(name).map(|p| p.version.as_str())
     }
 
     /// Returns all stored versions for a package.
-    pub fn get_all(&self, name: &str) -> Option<&[ResolvedPackage]> {
+    pub fn all(&self, name: &str) -> Option<&[ResolvedPackage]> {
         self.packages.get(name).map(|v| v.as_slice())
     }
 
@@ -873,7 +873,7 @@ mod tests {
 
         assert_eq!(packages.len(), 1);
         assert!(!packages.is_empty());
-        assert_eq!(packages.get_version("serde"), Some("1.0.195"));
+        assert_eq!(packages.version("serde"), Some("1.0.195"));
 
         let retrieved = packages.get("serde");
         assert!(retrieved.is_some());
@@ -885,7 +885,7 @@ mod tests {
     fn test_resolved_packages_get_nonexistent() {
         let packages = ResolvedPackages::new();
         assert_eq!(packages.get("nonexistent"), None);
-        assert_eq!(packages.get_version("nonexistent"), None);
+        assert_eq!(packages.version("nonexistent"), None);
     }
 
     #[test]
@@ -914,9 +914,9 @@ mod tests {
 
         // Both versions stored, but len counts unique names
         assert_eq!(packages.len(), 1);
-        assert_eq!(packages.get_version("serde"), Some("1.0.195"));
+        assert_eq!(packages.version("serde"), Some("1.0.195"));
         // Both versions accessible via get_all
-        assert_eq!(packages.get_all("serde").unwrap().len(), 2);
+        assert_eq!(packages.all("serde").unwrap().len(), 2);
     }
 
     #[test]
@@ -954,8 +954,8 @@ mod tests {
         });
 
         assert_eq!(packages.len(), 1);
-        assert_eq!(packages.get_version("serde"), Some("2.0.0-beta.1"));
-        assert_eq!(packages.get_all("serde").unwrap().len(), 3);
+        assert_eq!(packages.version("serde"), Some("2.0.0-beta.1"));
+        assert_eq!(packages.all("serde").unwrap().len(), 3);
     }
 
     #[test]
@@ -977,7 +977,7 @@ mod tests {
         });
 
         // Falls back to string comparison: "xyz" > "abc"
-        assert_eq!(packages.get_version("weird"), Some("xyz"));
+        assert_eq!(packages.version("weird"), Some("xyz"));
     }
 
     #[test]
@@ -999,7 +999,7 @@ mod tests {
         });
 
         // Parseable semver is preferred over non-parseable
-        assert_eq!(packages.get_version("mixed"), Some("1.0.0"));
+        assert_eq!(packages.version("mixed"), Some("1.0.0"));
     }
 
     #[test]
@@ -1264,8 +1264,8 @@ mod tests {
         let second = cache.get_or_parse(&provider, &lock_path).await.unwrap();
 
         assert_eq!(provider.parse_count(), 1, "second call should hit cache");
-        assert_eq!(first.get_version("test-package"), Some("1.0.0"));
-        assert_eq!(second.get_version("test-package"), Some("1.0.0"));
+        assert_eq!(first.version("test-package"), Some("1.0.0"));
+        assert_eq!(second.version("test-package"), Some("1.0.0"));
     }
 
     #[tokio::test]
@@ -1281,7 +1281,7 @@ mod tests {
         let cache = LockFileCache::new();
 
         let first = cache.get_or_parse(&provider, &lock_path).await.unwrap();
-        assert_eq!(first.get_version("test-package"), Some("1.0.0"));
+        assert_eq!(first.version("test-package"), Some("1.0.0"));
 
         std::fs::write(&lock_path, "2.0.0").unwrap();
         // Explicitly bump mtime into the future rather than relying on filesystem
@@ -1301,7 +1301,7 @@ mod tests {
             2,
             "stale mtime should trigger reparse"
         );
-        assert_eq!(second.get_version("test-package"), Some("2.0.0"));
+        assert_eq!(second.version("test-package"), Some("2.0.0"));
     }
 
     /// Stub [`LockFileProvider`] that simulates a concurrent writer racing the parse:
@@ -1390,7 +1390,7 @@ mod tests {
         let cache = LockFileCache::new();
 
         let first = cache.get_or_parse(&provider, &lock_path).await.unwrap();
-        assert_eq!(first.get_version("test-package"), Some("1.0.0"));
+        assert_eq!(first.version("test-package"), Some("1.0.0"));
 
         let second = cache.get_or_parse(&provider, &lock_path).await.unwrap();
 
@@ -1399,7 +1399,7 @@ mod tests {
             2,
             "rewrite during first parse must be detected and trigger a reparse"
         );
-        assert_eq!(second.get_version("test-package"), Some("2.0.0"));
+        assert_eq!(second.version("test-package"), Some("2.0.0"));
     }
 
     #[test]

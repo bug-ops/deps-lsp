@@ -60,7 +60,7 @@ pub struct PubDevRegistry {
     cache: Arc<HttpCache>,
     /// API base URL — [`PUB_DEV_API_BASE`] in production, overridden to a mockito server
     /// URL in tests via [`Self::with_base`] (mirrors `deps-npm`'s
-    /// `NpmRegistry::with_registry_base`).
+    /// `NpmRegistry::with_public_base_for_test`).
     base: String,
 }
 
@@ -126,7 +126,7 @@ impl PubDevRegistry {
         for entry in search_result.packages.into_iter().take(limit) {
             // Fetch metadata for each package. `entry.package` is registry-derived (the
             // search response), exactly as untrusted as a manifest-declared name — routed
-            // through the same guard + encoding as `get_versions`/`get_package_info` rather
+            // through the same guard + encoding as `get_versions`/`get_package_metadata` rather
             // than interpolated directly (#349).
             if reject_dot_segment(&entry.package).is_err() {
                 continue;
@@ -149,7 +149,7 @@ impl PubDevRegistry {
     /// Returns an error if `name` is a dot-segment, the request fails, or the
     /// response body fails to parse.
     #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
-    pub async fn get_package_info(&self, name: &str) -> Result<PackageInfo> {
+    pub async fn get_package_metadata(&self, name: &str) -> Result<PackageInfo> {
         reject_dot_segment(name)?;
         let url = package_metadata_url(&self.base, name);
         let data = self.cache.get_cached(&url).await?;
@@ -160,7 +160,7 @@ impl PubDevRegistry {
     /// license tag (issue #660, spec 010 plan §1 "Dart source" row).
     ///
     /// pub.dev's package/version API (the endpoint [`Self::get_versions`]/
-    /// [`Self::get_package_info`] already fetch) has no SPDX license field at all
+    /// [`Self::get_package_metadata`] already fetch) has no SPDX license field at all
     /// (live-verified during #204 planning) — the only license signal anywhere in
     /// pub.dev's API is a `license:<slug>` entry in this separate `/score` endpoint's
     /// `tags` array, itself the output of pub.dev's own automated license detector
@@ -186,6 +186,8 @@ impl PubDevRegistry {
         }
     }
 }
+
+deps_core::impl_get_versions_with_passthrough!(PubDevRegistry, DartVersion);
 
 /// Builds the pub.dev request URL for a package's `/score` response (license detector
 /// tags, likes, download counts). Mirrors [`package_metadata_url`]'s encoding — `name`
@@ -398,18 +400,8 @@ impl deps_core::Metadata for PackageInfo {
 
 // Registry trait (trait object support)
 impl deps_core::Registry for PubDevRegistry {
-    fn get_versions<'a>(
-        &'a self,
-        name: &'a deps_core::PackageName,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Version>>>> {
-        Box::pin(async move {
-            let versions = self.get_versions(name.as_str()).await?;
-            Ok(versions
-                .into_iter()
-                .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
-                .collect())
-        })
-    }
+    deps_core::impl_registry_versions_method!(get_versions);
+    deps_core::impl_registry_versions_method!(get_versions_with);
 
     fn get_latest_matching<'a>(
         &'a self,
@@ -659,7 +651,7 @@ mod tests {
     // --- S1 (impl-critic): a name of exactly `.`/`..` survives percent-encoding (`.` is
     // an unreserved RFC 3986 character) and is collapsed by the URL parser's dot-segment
     // normalization — identical to #341's npm bug, reachable here via `get_versions`,
-    // `get_package_info`, and search's inner per-result fetch. `reject_dot_segment` must
+    // `get_package_metadata`, and search's inner per-result fetch. `reject_dot_segment` must
     // catch it before `package_metadata_url` is ever called. ---
 
     /// Demonstrates the vulnerability `reject_dot_segment` exists to prevent:
@@ -714,16 +706,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_package_info_rejects_bare_dot_as_not_found() {
+    async fn test_get_package_metadata_rejects_bare_dot_as_not_found() {
         let registry = PubDevRegistry::new(Arc::new(HttpCache::new()));
-        let err = registry.get_package_info(".").await.unwrap_err();
+        let err = registry.get_package_metadata(".").await.unwrap_err();
         assert_matches!(err, DepsError::PackageNotFound { .. });
     }
 
     // --- S2 (impl-critic): `search`'s inner per-result fetch (`entry.package`) was
     // fully unencoded and unguarded, 12 lines below the encoded `get_versions` sink — a
     // missed #349 call site. Covered end-to-end via mockito, matching the guard/encoding
-    // now shared with `get_versions`/`get_package_info` through `package_metadata_url` and
+    // now shared with `get_versions`/`get_package_metadata` through `package_metadata_url` and
     // `reject_dot_segment`. ---
 
     #[tokio::test]
@@ -841,6 +833,11 @@ mod tests {
             req: "*";
             expected_index: 1;
         };
+    }
+
+    deps_core::registry_conformance! {
+        mod dart_registry_api_conformance;
+        ty: PubDevRegistry;
     }
 
     #[test]

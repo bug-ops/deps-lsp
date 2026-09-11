@@ -61,7 +61,7 @@ pub async fn register_lock_file_watchers(
 /// Determines the ecosystem type from a lock file path.
 ///
 /// This is a convenience function that extracts the filename and can be used
-/// in conjunction with `EcosystemRegistry::get_for_lockfile()`.
+/// in conjunction with `EcosystemRegistry::for_lockfile()`.
 ///
 /// # Arguments
 ///

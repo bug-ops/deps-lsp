@@ -1126,7 +1126,7 @@ mod tests {
             .await;
 
         let cache = Arc::new(deps_core::HttpCache::new());
-        let registry = NpmRegistry::with_registry_base(cache, public_server.url());
+        let registry = NpmRegistry::with_public_base_for_test(cache, public_server.url());
         let ecosystem = NpmEcosystem::with_registry(Arc::new(registry));
 
         let registry_dep = dep_with_source("@myorg/pkg", DependencySource::Registry, 0);
@@ -1201,7 +1201,7 @@ mod tests {
             .await;
 
         let cache = Arc::new(deps_core::HttpCache::new());
-        let registry = NpmRegistry::with_registry_base(cache, public_server.url());
+        let registry = NpmRegistry::with_public_base_for_test(cache, public_server.url());
         let ecosystem = NpmEcosystem::with_registry(Arc::new(registry));
         let dep = dep_with_source(
             "@myorg/pkg",
@@ -1245,7 +1245,7 @@ mod tests {
             .await;
 
         let cache = Arc::new(deps_core::HttpCache::new());
-        let registry = NpmRegistry::with_registry_base(cache, public_server.url());
+        let registry = NpmRegistry::with_public_base_for_test(cache, public_server.url());
         let ecosystem = NpmEcosystem::with_registry(Arc::new(registry));
         let dep = dep_with_source(
             "@myorg/pkg",

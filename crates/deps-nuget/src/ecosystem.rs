@@ -30,10 +30,10 @@ use deps_core::{
 use crate::config::NuGetParseContext;
 use crate::formatter::NuGetFormatter;
 use crate::lockfile::NuGetLockParser;
+use crate::parser::NuGetParseResult;
 use crate::registry::NuGetRegistry;
-use crate::types::NuGetParseResult;
 
-/// Bounds `NuGetEcosystem::generate_hover`'s `unlisted_versions_for_hover` fetch (S4, #451
+/// Bounds `NuGetEcosystem::generate_hover`'s `unlisted_versions` fetch (S4, #451
 /// follow-up) — mirrors `deps_core::lsp_helpers::hover`'s own private `HOVER_FALLBACK_TIMEOUT`
 /// for its analogous fallback fetch: hover responses must return quickly, and without this
 /// bound a pathological feed's registration-hive walk could run unbounded.
@@ -171,7 +171,7 @@ impl Ecosystem for NuGetEcosystem {
     }
 
     fn lockfile_filenames(&self) -> &[&'static str] {
-        // `packages.*.lock.json` isn't a real filename `EcosystemRegistry::get_for_lockfile`
+        // `packages.*.lock.json` isn't a real filename `EcosystemRegistry::for_lockfile`
         // can exact-match — it exists here only so `all_lockfile_patterns()` registers a
         // glob watcher for per-project lock files with the LSP client (D3, #451).
         // `NuGetLockParser::locate_lockfile` is what actually finds them, independent of
@@ -211,7 +211,7 @@ impl Ecosystem for NuGetEcosystem {
             }
             result.resolved_chains = config.resolved_chains();
             for chain in &result.resolved_chains {
-                NuGetRegistry::register_chain(&self.registry, chain, &self.context.policy);
+                NuGetRegistry::register_alternate(&self.registry, chain, &self.context.policy);
             }
 
             Ok(Box::new(result) as Box<dyn ParseResultTrait>)
@@ -259,7 +259,7 @@ impl Ecosystem for NuGetEcosystem {
 
     /// Overrides the default (`lsp_helpers::generate_hover`) to add a hover-only unlisted
     /// marker (D1, #451): alongside the ordinary hover render, a separate
-    /// [`NuGetRegistry::unlisted_versions_for_hover`] fetch decorates each unlisted entry
+    /// [`NuGetRegistry::unlisted_versions`] fetch decorates each unlisted entry
     /// in the "Recent versions" list with `*(unlisted)*`, matching how other ecosystems in
     /// this codebase mark a `*(yanked)*` version — see that method's doc comment for why
     /// this enrichment is deliberately kept out of `Version::removal_status` (and so out of
@@ -278,9 +278,9 @@ impl Ecosystem for NuGetEcosystem {
     ///
     /// **Issue #523 fix**: the unlisted fetch is only issued when `dep.source()` is plain
     /// `DependencySource::Registry` — `self.registry` here is always the `Public`-tier root,
-    /// so calling `unlisted_versions_for_hover` unconditionally would send a private-feed
+    /// so calling `unlisted_versions` unconditionally would send a private-feed
     /// dependency's real package name to `api.nuget.org`, defeating the entire feature
-    /// (`NuGetRegistry::unlisted_versions_for_hover`'s own tier gate only fires when the
+    /// (`NuGetRegistry::unlisted_versions`'s own tier gate only fires when the
     /// *callee* instance is `WorkspaceDeclared`, which the root never is). A private-feed
     /// dependency simply renders without the `*(unlisted)*` decoration — registration-hive
     /// enrichment is already skipped entirely for alternate feeds in phase 1 (see that
@@ -336,7 +336,7 @@ impl Ecosystem for NuGetEcosystem {
 
             let unlisted_fetch = tokio::time::timeout(
                 HOVER_UNLISTED_TIMEOUT,
-                unlisted_client.unlisted_versions_for_hover(dep.name().as_str()),
+                unlisted_client.unlisted_versions(dep.name().as_str()),
             );
 
             let (hover, unlisted_result) = tokio::join!(base_hover, unlisted_fetch);
@@ -862,7 +862,7 @@ mod tests {
             }],
             implicit_public_fallback: false,
         };
-        NuGetRegistry::register_chain(&root, &chain, &policy);
+        NuGetRegistry::register_alternate(&root, &chain, &policy);
 
         let context = crate::config::NuGetParseContext {
             policy: Arc::clone(&policy),
@@ -1217,7 +1217,7 @@ mod tests {
         let resolved = std::collections::HashMap::new();
         // Freshness disabled: proves the unlisted marker doesn't depend on the freshness
         // toggle at all (unlike `published_at`, which is gated by it) — see
-        // `unlisted_versions_for_hover`'s doc comment.
+        // `unlisted_versions`'s doc comment.
         let freshness = deps_core::FreshnessSettings {
             enabled: false,
             cooldown_secs: deps_core::DEFAULT_COOLDOWN_SECS,
@@ -1450,7 +1450,7 @@ mod tests {
 
     /// C1 regression (impl-critic): `generate_hover`'s unlisted-versions decoration must
     /// never fire against the public root registry for a dependency that resolved to a
-    /// private feed — before the fix, `unlisted_versions_for_hover` was called unconditionally
+    /// private feed — before the fix, `unlisted_versions` was called unconditionally
     /// on `self.registry` (always `Public`-tier), sending the private package's real name to
     /// the mocked-as-public-registry endpoint regardless of which feed it actually resolved
     /// to. The `.expect(0)` mock fails the test if that endpoint is ever hit.

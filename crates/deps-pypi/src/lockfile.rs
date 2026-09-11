@@ -383,8 +383,8 @@ python-versions = "^3.9"
         let resolved = parser.parse_lockfile(&lockfile_path).await.unwrap();
 
         assert_eq!(resolved.len(), 2);
-        assert_eq!(resolved.get_version("requests"), Some("2.31.0"));
-        assert_eq!(resolved.get_version("certifi"), Some("2023.7.22"));
+        assert_eq!(resolved.version("requests"), Some("2.31.0"));
+        assert_eq!(resolved.version("certifi"), Some("2023.7.22"));
 
         let requests_pkg = resolved.get("requests").unwrap();
         assert_eq!(requests_pkg.dependencies.len(), 2);
@@ -432,8 +432,8 @@ source = { registry = "https://pypi.org/simple" }
         let resolved = parser.parse_lockfile(&lockfile_path).await.unwrap();
 
         assert_eq!(resolved.len(), 2);
-        assert_eq!(resolved.get_version("requests"), Some("2.31.0"));
-        assert_eq!(resolved.get_version("certifi"), Some("2023.7.22"));
+        assert_eq!(resolved.version("requests"), Some("2.31.0"));
+        assert_eq!(resolved.version("certifi"), Some("2023.7.22"));
 
         let requests_pkg = resolved.get("requests").unwrap();
         assert_eq!(requests_pkg.dependencies.len(), 2);
@@ -672,7 +672,7 @@ name = "missing-version"
 
         // Should only parse valid package (names are normalized: - → _)
         assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved.get_version("valid-package"), Some("1.0.0"));
+        assert_eq!(resolved.version("valid-package"), Some("1.0.0"));
         assert!(resolved.get("missing-version").is_none());
     }
 }

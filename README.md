@@ -578,7 +578,7 @@ pub trait Ecosystem: Send + Sync {
 }
 
 // EcosystemRegistry discovers the right handler for any manifest file
-let ecosystem = registry.get_for_uri(&uri);
+let ecosystem = registry.for_uri(&uri);
 ```
 
 ### Benchmarks

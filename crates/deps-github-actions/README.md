@@ -35,8 +35,8 @@ or `.github/actions/<name>/`, issue #706), and implements `deps_core::Ecosystem`
   applies the per-step quick fix above to every resolvable mutable-tag step in one edit,
   reusing the same `TagIndex` lookup at zero additional network cost
 - **Release-freshness signal (partial)** (issue #486) — `GithubActionsRegistry::
-  get_versions_with_release_dates`, invoked via `Registry::get_versions_with` when
-  freshness rendering is enabled, attaches GitHub Release publish timestamps to
+  get_versions_with` (invoked by the `Registry` trait impl of the same name when
+  freshness rendering is enabled) attaches GitHub Release publish timestamps to
   tag-derived versions via the shared `deps_core::github::ReleaseDatesCache` (also used
   by `deps-swift`), memoized behind a TTL; requires `GITHUB_TOKEN` and covers only
   versions with a matching GitHub Release (see `ECOSYSTEM_GUIDE.md`)

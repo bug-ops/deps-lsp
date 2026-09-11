@@ -24,5 +24,5 @@ pub use ecosystem::ComposerEcosystem;
 pub use formatter::ComposerFormatter;
 pub use lockfile::ComposerLockParser;
 pub use parser::{ComposerParseResult, parse_composer_json};
-pub use registry::PackagistRegistry;
+pub use registry::{PackagistRegistry, package_url};
 pub use types::{ComposerDependency, ComposerPackage, ComposerSection, ComposerVersion};

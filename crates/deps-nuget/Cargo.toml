@@ -12,6 +12,13 @@ publish = true
 [lints]
 workspace = true
 
+[features]
+# Exposes `parse_flat_container_for_bench` to this crate's own `benches/` target — a
+# `[[bench]]` target compiles the lib as an ordinary, non-test dependency, so plain
+# `#[cfg(test)]` alone does not apply there. Mirrors `deps-core`'s own `test-util` feature
+# and `HttpCache::get_for_bench` (#835 M1). Never enabled outside a benchmark build.
+test-util = []
+
 [dependencies]
 base64 = { workspace = true }
 bytes = { workspace = true }
@@ -42,3 +49,4 @@ tokio-test = { workspace = true }
 [[bench]]
 name = "nuget_benchmarks"
 harness = false
+required-features = ["test-util"]

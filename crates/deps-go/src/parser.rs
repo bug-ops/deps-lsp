@@ -31,7 +31,7 @@ pub struct GoParseResult {
     /// Document URI
     pub uri: Uri,
     /// Every `$GOENV`-resolved `GOPROXY`/`GOPRIVATE`-bypass chain this parse implies (spec
-    /// 034), ready for `GoRegistry::register_chain`. Empty when `$GOENV` declares no
+    /// 034), ready for `GoRegistry::register_alternate`. Empty when `$GOENV` declares no
     /// override (US-005).
     pub resolved_chains: Vec<GoProxyChain>,
     /// `Some((kept, total))` once the manifest declared more dependencies than
@@ -584,11 +584,11 @@ exclude github.com/bad/module v0.1.0
         );
     }
 
-    /// Integration test (issue #559 follow-up): the full parse -> resolve -> `register_chain`
+    /// Integration test (issue #559 follow-up): the full parse -> resolve -> `register_alternate`
     /// -> `get_versions_from` path, exercised end-to-end against a real fixture `$GOENV` file
     /// via [`GoParseContext::goenv_path`] rather than the real host environment.
     #[tokio::test]
-    async fn test_integration_parse_resolve_register_chain_get_versions() {
+    async fn test_integration_parse_resolve_register_alternate_get_versions() {
         use crate::registry::GoRegistry;
         use deps_core::net_policy::{RegistryAccessPolicy, WorkspaceRegistryAccess};
         use deps_core::{FreshnessSettings, HttpCache, Registry};
@@ -624,7 +624,7 @@ exclude github.com/bad/module v0.1.0
 
         let registry = Arc::new(GoRegistry::new(Arc::clone(&cache)));
         for chain in &result.resolved_chains {
-            GoRegistry::register_chain(&registry, chain);
+            GoRegistry::register_alternate(&registry, chain);
         }
 
         let source = result.dependencies[0].source.clone();

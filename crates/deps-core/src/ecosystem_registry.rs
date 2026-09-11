@@ -23,7 +23,7 @@ use crate::Ecosystem;
 /// // registry.register(Arc::new(NpmEcosystem::new(cache.clone())));
 ///
 /// // Look up by filename
-/// if let Some(ecosystem) = registry.get_for_filename("Cargo.toml") {
+/// if let Some(ecosystem) = registry.for_filename("Cargo.toml") {
 ///     println!("Found ecosystem: {}", ecosystem.display_name());
 /// }
 ///
@@ -52,7 +52,7 @@ pub struct EcosystemRegistry {
     /// `(prefix, suffix, ecosystem_id)`, split on the pattern's single `*` at
     /// [`register`](EcosystemRegistry::register) time. Consulted between the
     /// exact-filename and extension stages in
-    /// [`get_for_filename`](EcosystemRegistry::get_for_filename), using
+    /// [`for_filename`](EcosystemRegistry::for_filename), using
     /// most-specific-wins selection over all matches for determinism
     /// regardless of `DashMap` iteration order.
     patterns: DashMap<&'static str, (&'static str, &'static str, &'static str)>,
@@ -139,7 +139,7 @@ impl EcosystemRegistry {
                     .all(|e| e.value().2 == id || *e.key() == pattern),
                 "pattern {pattern:?} would introduce a second ecosystem ({id:?}) into the \
                  single-owner pattern set; the most-specific-wins selection in \
-                 get_for_filename assumes all patterns belong to one ecosystem"
+                 for_filename assumes all patterns belong to one ecosystem"
             );
             self.patterns.insert(pattern, (prefix, suffix, id));
         }
@@ -201,11 +201,11 @@ impl EcosystemRegistry {
     /// use deps_core::EcosystemRegistry;
     ///
     /// let registry = EcosystemRegistry::new();
-    /// if let Some(ecosystem) = registry.get_for_filename("Cargo.toml") {
+    /// if let Some(ecosystem) = registry.for_filename("Cargo.toml") {
     ///     println!("Cargo.toml handled by: {}", ecosystem.display_name());
     /// }
     /// ```
-    pub fn get_for_filename(&self, filename: &str) -> Option<Arc<dyn Ecosystem>> {
+    pub fn for_filename(&self, filename: &str) -> Option<Arc<dyn Ecosystem>> {
         if let Some(id) = self.filename_map.get(filename) {
             return self.get(*id);
         }
@@ -216,7 +216,7 @@ impl EcosystemRegistry {
 
         // Avoid the rsplit_once/format! allocation below when no ecosystem has registered
         // an extension (extension routing is only used by nuget today) — this runs on
-        // every exact-match miss, including every did_open/did_change via get_for_uri.
+        // every exact-match miss, including every did_open/did_change via for_uri.
         if self.extension_map.is_empty() {
             return None;
         }
@@ -288,14 +288,14 @@ impl EcosystemRegistry {
     /// let registry = EcosystemRegistry::new();
     /// let uri = Uri::from_file_path("/home/user/project/Cargo.toml").unwrap();
     ///
-    /// if let Some(ecosystem) = registry.get_for_uri(&uri) {
+    /// if let Some(ecosystem) = registry.for_uri(&uri) {
     ///     println!("File handled by: {}", ecosystem.display_name());
     /// }
     /// ```
-    pub fn get_for_uri(&self, uri: &Uri) -> Option<Arc<dyn Ecosystem>> {
+    pub fn for_uri(&self, uri: &Uri) -> Option<Arc<dyn Ecosystem>> {
         let path = uri.path().as_str();
         let filename = path.rsplit('/').next()?;
-        let by_filename = self.get_for_filename(filename);
+        let by_filename = self.for_filename(filename);
         let by_directory = self.get_for_directory_pattern(path, filename);
         match (by_filename, by_directory) {
             (Some(by_filename), Some(by_directory)) if by_filename.id() != by_directory.id() => {
@@ -313,9 +313,9 @@ impl EcosystemRegistry {
     /// multi-segment `.github/workflows/ci.yml` layout, where the basename alone
     /// carries no ecosystem signal. This needs the full path, not just the basename,
     /// so unlike [`manifest_patterns`](Ecosystem::manifest_patterns) it is consulted
-    /// only from [`get_for_uri`](Self::get_for_uri), never from
-    /// [`get_for_filename`](Self::get_for_filename). Mirrors
-    /// [`get_for_lockfile`](Self::get_for_lockfile)'s linear scan rather than
+    /// only from [`for_uri`](Self::for_uri), never from
+    /// [`for_filename`](Self::for_filename). Mirrors
+    /// [`for_lockfile`](Self::for_lockfile)'s linear scan rather than
     /// building a dedicated map — the pattern count per ecosystem is tiny.
     ///
     /// The scan is `DashMap`-iteration-order-dependent when two ecosystems' *directory*
@@ -330,7 +330,7 @@ impl EcosystemRegistry {
     /// ecosystem (e.g. GitLab CI's `.gitlab/ci/*.yml` directory
     /// pattern vs. GitHub Actions' `action.yml` basename, both matching
     /// `.gitlab/ci/action.yml`) is a separate, resolved case — this function alone cannot
-    /// see the basename side of that conflict; [`get_for_uri`](Self::get_for_uri) resolves
+    /// see the basename side of that conflict; [`for_uri`](Self::for_uri) resolves
     /// it deterministically by preferring the more path-specific directory-pattern match.
     fn get_for_directory_pattern(&self, path: &str, filename: &str) -> Option<Arc<dyn Ecosystem>> {
         for entry in self.ecosystems.iter() {
@@ -401,11 +401,11 @@ impl EcosystemRegistry {
     /// let registry = EcosystemRegistry::new();
     /// // registry.register(cargo_ecosystem);
     ///
-    /// if let Some(ecosystem) = registry.get_for_lockfile("Cargo.lock") {
+    /// if let Some(ecosystem) = registry.for_lockfile("Cargo.lock") {
     ///     println!("Cargo.lock handled by: {}", ecosystem.display_name());
     /// }
     /// ```
-    pub fn get_for_lockfile(&self, filename: &str) -> Option<Arc<dyn Ecosystem>> {
+    pub fn for_lockfile(&self, filename: &str) -> Option<Arc<dyn Ecosystem>> {
         for entry in self.ecosystems.iter() {
             let ecosystem = entry.value();
             let matches = ecosystem
@@ -449,7 +449,7 @@ impl EcosystemRegistry {
     }
 
     /// Get ecosystem for a [`Ecosystem::watched_config_filenames`] entry — mirrors
-    /// [`Self::get_for_lockfile`] exactly, reusing the same exact/single-`*`-wildcard
+    /// [`Self::for_lockfile`] exactly, reusing the same exact/single-`*`-wildcard
     /// matching, but scanning the *config* list instead of the lockfile one.
     ///
     /// # Examples
@@ -460,11 +460,11 @@ impl EcosystemRegistry {
     /// let registry = EcosystemRegistry::new();
     /// // registry.register(npm_ecosystem);
     ///
-    /// if let Some(ecosystem) = registry.get_for_watched_config("pnpm-workspace.yaml") {
+    /// if let Some(ecosystem) = registry.for_watched_config("pnpm-workspace.yaml") {
     ///     println!("pnpm-workspace.yaml handled by: {}", ecosystem.display_name());
     /// }
     /// ```
-    pub fn get_for_watched_config(&self, filename: &str) -> Option<Arc<dyn Ecosystem>> {
+    pub fn for_watched_config(&self, filename: &str) -> Option<Arc<dyn Ecosystem>> {
         for entry in self.ecosystems.iter() {
             let ecosystem = entry.value();
             let matches = ecosystem
@@ -568,7 +568,7 @@ fn directory_pattern_matches(path: &str, filename: &str, dir_pattern: &str, suff
 /// `"requirements*.txt"`).
 ///
 /// Applies the same single-`*`-wildcard semantics
-/// [`EcosystemRegistry::register`]/[`EcosystemRegistry::get_for_filename`] use
+/// [`EcosystemRegistry::register`]/[`EcosystemRegistry::for_filename`] use
 /// internally — but as a stateless, registry-free check.
 ///
 /// Exposed so an ecosystem can ask "would my own `manifest_patterns` have matched this
@@ -910,7 +910,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_for_uri_multi_segment_directory_pattern_matches_yml_and_yaml() {
+    fn test_for_uri_multi_segment_directory_pattern_matches_yml_and_yaml() {
         let registry = gha_pattern_registry();
         for path in [
             "/repo/.github/workflows/ci.yml",
@@ -918,7 +918,7 @@ mod tests {
         ] {
             let uri = crate::test_util::test_uri(path);
             assert_eq!(
-                registry.get_for_uri(&uri).map(|e| e.id()),
+                registry.for_uri(&uri).map(|e| e.id()),
                 Some("github-actions"),
                 "{path} should match the .github/workflows/*.y[a]ml directory pattern"
             );
@@ -926,18 +926,18 @@ mod tests {
     }
 
     #[test]
-    fn test_get_for_uri_multi_segment_directory_pattern_matches_nested_repo() {
+    fn test_for_uri_multi_segment_directory_pattern_matches_nested_repo() {
         let registry = gha_pattern_registry();
         let uri = crate::test_util::test_uri("/home/user/a/b/.github/workflows/x.yml");
         assert_eq!(
-            registry.get_for_uri(&uri).map(|e| e.id()),
+            registry.for_uri(&uri).map(|e| e.id()),
             Some("github-actions"),
             "a repo nested under arbitrary ancestor directories should still match"
         );
     }
 
     #[test]
-    fn test_get_for_uri_multi_segment_directory_pattern_rejects_partial_paths() {
+    fn test_for_uri_multi_segment_directory_pattern_rejects_partial_paths() {
         let registry = gha_pattern_registry();
         for path in [
             // Missing the `.github` segment entirely.
@@ -950,7 +950,7 @@ mod tests {
         ] {
             let uri = crate::test_util::test_uri(path);
             assert!(
-                registry.get_for_uri(&uri).is_none(),
+                registry.for_uri(&uri).is_none(),
                 "{path} should not match the .github/workflows/*.y[a]ml directory pattern"
             );
         }
@@ -983,16 +983,16 @@ mod tests {
     }
 
     #[test]
-    fn test_get_for_uri_directory_pattern_wins_over_different_ecosystems_basename_match() {
+    fn test_for_uri_directory_pattern_wins_over_different_ecosystems_basename_match() {
         let registry = basename_vs_directory_conflict_registry();
 
         // The conflict: `action.yml` matches github-actions' basename rule AND sits in a
         // directory matching gitlab-ci's directory pattern. Before the fix,
-        // `get_for_filename` was consulted first and always won, silently routing this
+        // `for_filename` was consulted first and always won, silently routing this
         // real GitLab CI file to the wrong ecosystem.
         let uri = crate::test_util::test_uri("/repo/.gitlab/ci/action.yml");
         assert_eq!(
-            registry.get_for_uri(&uri).map(|e| e.id()),
+            registry.for_uri(&uri).map(|e| e.id()),
             Some("gitlab-ci"),
             "a directory-pattern match from a different ecosystem must win over a bare \
              basename match"
@@ -1001,7 +1001,7 @@ mod tests {
         // Non-conflicting cases must be unaffected by the precedence change.
         let root_action = crate::test_util::test_uri("/repo/action.yml");
         assert_eq!(
-            registry.get_for_uri(&root_action).map(|e| e.id()),
+            registry.for_uri(&root_action).map(|e| e.id()),
             Some("github-actions"),
             "a root-level action.yml with no competing directory-pattern match must still \
              route by basename"
@@ -1010,7 +1010,7 @@ mod tests {
         let nested_action =
             crate::test_util::test_uri("/repo/.github/actions/my-action/action.yml");
         assert_eq!(
-            registry.get_for_uri(&nested_action).map(|e| e.id()),
+            registry.for_uri(&nested_action).map(|e| e.id()),
             Some("github-actions"),
             "action.yml nested under .github/actions/<name>/ (no directory pattern \
              registered for that path) must still route by basename"
@@ -1018,7 +1018,7 @@ mod tests {
 
         let workflow = crate::test_util::test_uri("/repo/.github/workflows/ci.yml");
         assert_eq!(
-            registry.get_for_uri(&workflow).map(|e| e.id()),
+            registry.for_uri(&workflow).map(|e| e.id()),
             Some("github-actions"),
             "an ordinary workflow file (directory-pattern-only match, no basename match) \
              must be unaffected"
@@ -1026,7 +1026,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_for_filename_pattern_matches_requirements_variants() {
+    fn test_for_filename_pattern_matches_requirements_variants() {
         let registry = pypi_pattern_registry();
         for name in [
             "requirements.txt",
@@ -1039,7 +1039,7 @@ mod tests {
             "constraints-prod.txt",
         ] {
             assert_eq!(
-                registry.get_for_filename(name).map(|e| e.id()),
+                registry.for_filename(name).map(|e| e.id()),
                 Some("pypi"),
                 "{name} should match a PyPI pattern"
             );
@@ -1047,7 +1047,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_for_filename_pattern_does_not_match_unrelated_files() {
+    fn test_for_filename_pattern_does_not_match_unrelated_files() {
         let registry = pypi_pattern_registry();
         for name in [
             "notes.txt",
@@ -1058,14 +1058,14 @@ mod tests {
             "requirements",
         ] {
             assert!(
-                registry.get_for_filename(name).is_none(),
+                registry.for_filename(name).is_none(),
                 "{name} should not match any PyPI pattern"
             );
         }
     }
 
     #[test]
-    fn test_get_for_filename_exact_name_wins_over_pattern() {
+    fn test_for_filename_exact_name_wins_over_pattern() {
         let registry = EcosystemRegistry::new();
         registry.register(Arc::new(MockEcosystem {
             id: "exact",
@@ -1082,13 +1082,13 @@ mod tests {
         }));
 
         assert_eq!(
-            registry.get_for_filename("requirements.txt").unwrap().id(),
+            registry.for_filename("requirements.txt").unwrap().id(),
             "exact"
         );
     }
 
     #[test]
-    fn test_get_for_filename_pattern_wins_over_extension() {
+    fn test_for_filename_pattern_wins_over_extension() {
         let registry = EcosystemRegistry::new();
         registry.register(Arc::new(MockExtEcosystem {
             id: "ext",
@@ -1103,19 +1103,19 @@ mod tests {
         }));
 
         assert_eq!(
-            registry.get_for_filename("requirements.txt").unwrap().id(),
+            registry.for_filename("requirements.txt").unwrap().id(),
             "pattern"
         );
     }
 
     #[test]
-    fn test_get_for_filename_pattern_most_specific_wins_deterministically() {
+    fn test_for_filename_pattern_most_specific_wins_deterministically() {
         let registry = pypi_pattern_registry();
         // Matches both `requirements*.txt` (score 16) and `*.requirements.txt`
         // (score 17) — the longer, more specific pattern must win.
         assert_eq!(
             registry
-                .get_for_filename("requirements.requirements.txt")
+                .for_filename("requirements.requirements.txt")
                 .unwrap()
                 .id(),
             "pypi"
@@ -1176,13 +1176,13 @@ mod tests {
 
         registry.register(ecosystem);
 
-        let retrieved1 = registry.get_for_filename("test.toml").unwrap();
+        let retrieved1 = registry.for_filename("test.toml").unwrap();
         assert_eq!(retrieved1.id(), "test");
 
-        let retrieved2 = registry.get_for_filename("test.json").unwrap();
+        let retrieved2 = registry.for_filename("test.json").unwrap();
         assert_eq!(retrieved2.id(), "test");
 
-        assert!(registry.get_for_filename("unknown.toml").is_none());
+        assert!(registry.for_filename("unknown.toml").is_none());
     }
 
     #[test]
@@ -1199,15 +1199,15 @@ mod tests {
         registry.register(ecosystem);
 
         let uri = crate::test_util::test_uri("/home/user/project/test.toml");
-        let retrieved = registry.get_for_uri(&uri).unwrap();
+        let retrieved = registry.for_uri(&uri).unwrap();
         assert_eq!(retrieved.id(), "test");
 
         let unknown_uri = crate::test_util::test_uri("/home/user/project/unknown.toml");
-        assert!(registry.get_for_uri(&unknown_uri).is_none());
+        assert!(registry.for_uri(&unknown_uri).is_none());
     }
 
     #[test]
-    fn test_get_for_uri_directory_pattern_matches_split_requirements_layout() {
+    fn test_for_uri_directory_pattern_matches_split_requirements_layout() {
         let registry = pypi_pattern_registry();
         for path in [
             "/home/user/project/requirements/base.txt",
@@ -1216,7 +1216,7 @@ mod tests {
         ] {
             let uri = crate::test_util::test_uri(path);
             assert_eq!(
-                registry.get_for_uri(&uri).map(|e| e.id()),
+                registry.for_uri(&uri).map(|e| e.id()),
                 Some("pypi"),
                 "{path} should match the requirements/*.txt directory pattern"
             );
@@ -1224,7 +1224,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_for_uri_directory_pattern_requires_matching_directory_and_suffix() {
+    fn test_for_uri_directory_pattern_requires_matching_directory_and_suffix() {
         let registry = pypi_pattern_registry();
         for path in [
             // Wrong directory name.
@@ -1237,10 +1237,10 @@ mod tests {
         ] {
             let uri = crate::test_util::test_uri(path);
             if path.ends_with("requirements.txt") {
-                assert_eq!(registry.get_for_uri(&uri).map(|e| e.id()), Some("pypi"));
+                assert_eq!(registry.for_uri(&uri).map(|e| e.id()), Some("pypi"));
             } else {
                 assert!(
-                    registry.get_for_uri(&uri).is_none(),
+                    registry.for_uri(&uri).is_none(),
                     "{path} should not match the requirements/*.txt directory pattern"
                 );
             }
@@ -1248,7 +1248,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_for_uri_directory_pattern_requires_exact_directory_segment() {
+    fn test_for_uri_directory_pattern_requires_exact_directory_segment() {
         // Only a path segment that is *exactly* "requirements" counts — a
         // directory that merely contains that string as a substring must not
         // match (#452 S6 follow-up, confirmed by impl-critic).
@@ -1262,21 +1262,21 @@ mod tests {
         ] {
             let uri = crate::test_util::test_uri(path);
             assert!(
-                pypi_pattern_registry().get_for_uri(&uri).is_none(),
+                pypi_pattern_registry().for_uri(&uri).is_none(),
                 "{path} should not match the requirements/*.txt directory pattern"
             );
         }
     }
 
     #[test]
-    fn test_get_for_uri_basename_pattern_wins_over_directory_pattern() {
+    fn test_for_uri_basename_pattern_wins_over_directory_pattern() {
         // `requirements/dev-requirements.txt` matches the basename pattern stage
         // (`*-requirements.txt`) — the directory-pattern fallback must never be
         // reached, let alone override it.
         let registry = pypi_pattern_registry();
         let uri =
             crate::test_util::test_uri("/home/user/project/requirements/dev-requirements.txt");
-        assert_eq!(registry.get_for_uri(&uri).map(|e| e.id()), Some("pypi"));
+        assert_eq!(registry.for_uri(&uri).map(|e| e.id()), Some("pypi"));
     }
 
     #[test]
@@ -1304,18 +1304,12 @@ mod tests {
 
         assert_eq!(registry.ecosystem_ids().len(), 2);
 
-        assert_eq!(
-            registry.get_for_filename("Cargo.toml").unwrap().id(),
-            "cargo"
-        );
-        assert_eq!(
-            registry.get_for_filename("package.json").unwrap().id(),
-            "npm"
-        );
+        assert_eq!(registry.for_filename("Cargo.toml").unwrap().id(), "cargo");
+        assert_eq!(registry.for_filename("package.json").unwrap().id(), "npm");
     }
 
     #[test]
-    fn test_get_for_lockfile() {
+    fn test_for_lockfile() {
         let registry = EcosystemRegistry::new();
         let ecosystem = Arc::new(MockEcosystem {
             id: "cargo",
@@ -1327,16 +1321,16 @@ mod tests {
 
         registry.register(ecosystem);
 
-        let retrieved = registry.get_for_lockfile("Cargo.lock").unwrap();
+        let retrieved = registry.for_lockfile("Cargo.lock").unwrap();
         assert_eq!(retrieved.id(), "cargo");
         assert_eq!(retrieved.display_name(), "Cargo");
 
         // Unknown lockfile should return None
-        assert!(registry.get_for_lockfile("unknown.lock").is_none());
+        assert!(registry.for_lockfile("unknown.lock").is_none());
     }
 
     #[test]
-    fn test_get_for_lockfile_multiple_lockfiles() {
+    fn test_for_lockfile_multiple_lockfiles() {
         let registry = EcosystemRegistry::new();
         let ecosystem = Arc::new(MockEcosystem {
             id: "pypi",
@@ -1348,20 +1342,20 @@ mod tests {
 
         registry.register(ecosystem);
 
-        let retrieved1 = registry.get_for_lockfile("poetry.lock").unwrap();
+        let retrieved1 = registry.for_lockfile("poetry.lock").unwrap();
         assert_eq!(retrieved1.id(), "pypi");
 
-        let retrieved2 = registry.get_for_lockfile("uv.lock").unwrap();
+        let retrieved2 = registry.for_lockfile("uv.lock").unwrap();
         assert_eq!(retrieved2.id(), "pypi");
     }
 
     /// S2 regression (#451 follow-up): a single-`*`-wildcard `lockfile_filenames()` entry
     /// (NuGet's `"packages.*.lock.json"`, registered only so `all_lockfile_patterns()` sets
     /// up a file watcher) must actually route a real multi-project lock filename through
-    /// `get_for_lockfile` — this is what `did_change_watched_files` calls to find the owning
+    /// `for_lockfile` — this is what `did_change_watched_files` calls to find the owning
     /// ecosystem for a changed lock file.
     #[test]
-    fn test_get_for_lockfile_matches_wildcard_pattern() {
+    fn test_for_lockfile_matches_wildcard_pattern() {
         let registry = EcosystemRegistry::new();
         let ecosystem = Arc::new(MockEcosystem {
             id: "nuget",
@@ -1375,19 +1369,17 @@ mod tests {
 
         assert_eq!(
             registry
-                .get_for_lockfile("packages.App1.lock.json")
+                .for_lockfile("packages.App1.lock.json")
                 .map(|e| e.id()),
             Some("nuget")
         );
         assert_eq!(
-            registry
-                .get_for_lockfile("packages.lock.json")
-                .map(|e| e.id()),
+            registry.for_lockfile("packages.lock.json").map(|e| e.id()),
             Some("nuget")
         );
-        assert!(registry.get_for_lockfile("other.lock.json").is_none());
+        assert!(registry.for_lockfile("other.lock.json").is_none());
         // Too short to contain both the prefix and the suffix.
-        assert!(registry.get_for_lockfile("packages.lock").is_none());
+        assert!(registry.for_lockfile("packages.lock").is_none());
     }
 
     #[test]
@@ -1472,7 +1464,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_for_watched_config() {
+    fn test_for_watched_config() {
         let registry = EcosystemRegistry::new();
         let ecosystem = Arc::new(MockEcosystem {
             id: "npm",
@@ -1484,20 +1476,14 @@ mod tests {
 
         registry.register(ecosystem);
 
-        let retrieved = registry
-            .get_for_watched_config("pnpm-workspace.yaml")
-            .unwrap();
+        let retrieved = registry.for_watched_config("pnpm-workspace.yaml").unwrap();
         assert_eq!(retrieved.id(), "npm");
-        let retrieved = registry.get_for_watched_config(".npmrc").unwrap();
+        let retrieved = registry.for_watched_config(".npmrc").unwrap();
         assert_eq!(retrieved.id(), "npm");
 
         // A lockfile is not a watched config, and vice versa.
-        assert!(
-            registry
-                .get_for_watched_config("package-lock.json")
-                .is_none()
-        );
-        assert!(registry.get_for_watched_config("unknown.yaml").is_none());
+        assert!(registry.for_watched_config("package-lock.json").is_none());
+        assert!(registry.for_watched_config("unknown.yaml").is_none());
     }
 
     #[test]
@@ -1532,7 +1518,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_for_filename_extension_fallback() {
+    fn test_for_filename_extension_fallback() {
         let registry = EcosystemRegistry::new();
         registry.register(Arc::new(MockExtEcosystem {
             id: "nuget",
@@ -1540,22 +1526,19 @@ mod tests {
             extensions: &[".csproj", ".fsproj"],
         }));
 
-        assert_eq!(
-            registry.get_for_filename("MyApp.csproj").unwrap().id(),
-            "nuget"
-        );
+        assert_eq!(registry.for_filename("MyApp.csproj").unwrap().id(), "nuget");
         assert_eq!(
             registry
-                .get_for_filename("Directory.Packages.props")
+                .for_filename("Directory.Packages.props")
                 .unwrap()
                 .id(),
             "nuget"
         );
-        assert!(registry.get_for_filename("unrelated.txt").is_none());
+        assert!(registry.for_filename("unrelated.txt").is_none());
     }
 
     #[test]
-    fn test_get_for_filename_extension_fallback_case_insensitive() {
+    fn test_for_filename_extension_fallback_case_insensitive() {
         let registry = EcosystemRegistry::new();
         registry.register(Arc::new(MockExtEcosystem {
             id: "nuget",
@@ -1563,14 +1546,11 @@ mod tests {
             extensions: &[".csproj"],
         }));
 
-        assert_eq!(
-            registry.get_for_filename("MyApp.CSPROJ").unwrap().id(),
-            "nuget"
-        );
+        assert_eq!(registry.for_filename("MyApp.CSPROJ").unwrap().id(), "nuget");
     }
 
     #[test]
-    fn test_get_for_filename_exact_match_case_sensitive_not_shadowed_by_extension() {
+    fn test_for_filename_exact_match_case_sensitive_not_shadowed_by_extension() {
         let registry = EcosystemRegistry::new();
         registry.register(Arc::new(MockExtEcosystem {
             id: "nuget",
@@ -1579,11 +1559,11 @@ mod tests {
         }));
 
         // Exact filenames stay case-sensitive: differently-cased basename does not match.
-        assert!(registry.get_for_filename("packages.Config").is_none());
+        assert!(registry.for_filename("packages.Config").is_none());
     }
 
     #[test]
-    fn test_get_for_filename_no_extension_returns_none() {
+    fn test_for_filename_no_extension_returns_none() {
         let registry = EcosystemRegistry::new();
         registry.register(Arc::new(MockExtEcosystem {
             id: "nuget",
@@ -1591,6 +1571,6 @@ mod tests {
             extensions: &[".csproj"],
         }));
 
-        assert!(registry.get_for_filename("README").is_none());
+        assert!(registry.for_filename("README").is_none());
     }
 }

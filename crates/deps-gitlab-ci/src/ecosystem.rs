@@ -209,7 +209,7 @@ impl Ecosystem for GitlabCiEcosystem {
                 &self.policy,
                 &self.instance_host,
             )?;
-            let refused = self.registry.register_routes(&result.routes);
+            let refused = self.registry.register_alternate(&result.routes);
             if !refused.is_empty() {
                 for dep in &mut result.dependencies {
                     if let deps_core::parser::DependencySource::AlternateRegistry { index, .. } =
@@ -1779,7 +1779,7 @@ mod tests {
         let host_bare = server.url();
         let name = PackageName::new(format!("{host_bare}/org/proj/comp"));
         let index = "gitlab:component-pin-test".to_string();
-        registry.register_routes(&[(
+        registry.register_alternate(&[(
             index.clone(),
             crate::types::GitlabRoute {
                 origin: host_bare.clone(),
