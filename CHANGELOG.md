@@ -38,7 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: `deps_core::conformance` gained a `package_url` hostile-input-safety check (now generated unconditionally by `formatter_conformance!` for all 14 ecosystem crates) and a `no_lockfile_support`/`format_version` optional macro arm, closing design gaps found while reviewing #781 (resolves #782) (#786)
 - **deps-bundler, deps-cargo, deps-composer, deps-dart, deps-go, deps-maven, deps-npm, deps-nuget, deps-pypi, deps-swift**: migrated onto `registry_conformance!` (now 14/14 crates, was 4/14) and extended `completion_guard_conformance!` to maven/swift (11/14; go/github-actions/gitlab-ci confirmed N/A) (resolves #794) (#805)
 - **deps-gradle**: `fetch_license_from` gained a `tracing::instrument` span (matching sibling ecosystem crates' HTTP boundaries), closing Gradle's remaining observability gap (resolves #823)
-- **workspace**: CI's `security` job now runs `gitleaks` against `.gitleaks.toml` (#803), wiring up previously-dead secret-scanning config (resolves #825)
+- **workspace**: CI's `security` job now runs `gitleaks` against `.gitleaks.toml` (#803), wiring up previously-dead secret-scanning config (resolves #825) (#840)
 
 ### Fixed
 - **deps-lsp, deps-core, deps-deno, deps-dart, deps-swift, deps-maven, deps-cargo**: added tracing spans and error detail to previously silent parse, registry-fetch, and filesystem paths (resolves #836) (#842)
