@@ -171,6 +171,7 @@ impl PubDevRegistry {
     /// Returns an empty `Vec` (never an error) when the fetch fails or no `license:`
     /// tag is present — graceful degradation (NFR-003), since this is a best-effort
     /// secondary signal, not core version data.
+    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
     pub async fn get_license(&self, name: &str) -> Vec<String> {
         if reject_dot_segment(name).is_err() {
             return Vec::new();

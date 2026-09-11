@@ -289,6 +289,7 @@ impl MavenCentralRegistry {
     /// whichever repository base (Maven Central, Google Maven, or the Gradle Plugin
     /// Portal fallback) actually served it — `metadata_urls`' bases differ per group, so
     /// the winning base can only be known after the fetch succeeds, not guessed upfront.
+    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
     async fn get_metadata(
         &self,
         name: &str,
@@ -333,6 +334,7 @@ impl MavenCentralRegistry {
     /// Never fails the caller: any fetch error, timeout, or unparseable body degrades to
     /// an empty map, logged at `debug`, so a listing outage never affects the version list
     /// itself — only whether ages are shown alongside it.
+    #[tracing::instrument(skip_all, fields(url = %RedactedUrl::new(base)), level = "debug")]
     async fn fetch_publish_times(&self, base: &str) -> HashMap<String, PublishTime> {
         match self.cache.get_cached(base).await {
             Ok(data) => parse_publish_times(&data),
@@ -384,6 +386,7 @@ impl MavenCentralRegistry {
     /// # Errors
     ///
     /// Same as [`Self::get_versions_typed_with`].
+    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
     pub async fn get_versions_typed(&self, name: &str) -> Result<Vec<MavenVersion>> {
         self.get_versions_typed_with(name, false).await
     }

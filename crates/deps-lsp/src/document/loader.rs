@@ -80,6 +80,7 @@ const LARGE_FILE_THRESHOLD: u64 = 1_000_000; // 1MB
 /// # Ok(())
 /// # }
 /// ```
+#[tracing::instrument(skip_all, fields(uri = ?uri), level = "debug")]
 pub async fn load_document_from_disk(uri: &Uri) -> Result<String> {
     // Convert URI to filesystem path. Owned (not `Cow::Borrowed`), since the read below runs
     // in `spawn_blocking` and needs a `'static` path.

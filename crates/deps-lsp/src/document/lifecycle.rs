@@ -108,13 +108,18 @@ pub async fn handle_document_open(
     // Try to parse manifest (may fail for incomplete syntax)
     let parse_result = deps_core::ecosystem::parse_manifest_blocking(&ecosystem, &content, &uri)
         .await
+        .inspect_err(|e| {
+            tracing::debug!(
+                error = %e,
+                "Failed to parse manifest, storing document without parse result"
+            );
+        })
         .ok();
 
     // Create document state (parse_result may be None)
     let mut doc_state = if let Some(pr) = parse_result {
         DocumentState::new_from_parse_result(ecosystem.ecosystem_id(), content, pr)
     } else {
-        tracing::debug!("Failed to parse manifest, storing document without parse result");
         DocumentState::new_without_parse_result(ecosystem.ecosystem_id(), content)
     };
     doc_state.set_version(version);
@@ -508,6 +513,12 @@ async fn parse_and_diff_manifest(
     // Try to parse manifest (may fail for incomplete syntax)
     let parse_result = deps_core::ecosystem::parse_manifest_blocking(ecosystem, content, uri)
         .await
+        .inspect_err(|e| {
+            tracing::debug!(
+                error = %e,
+                "Failed to parse manifest, storing document without parse result"
+            );
+        })
         .ok();
 
     // Extract new dependency name -> version_requirement map for diff
@@ -587,7 +598,6 @@ fn commit_parsed_document(
     let mut doc_state = if let Some(pr) = parse_result {
         DocumentState::new_from_parse_result(ecosystem.ecosystem_id(), content, pr)
     } else {
-        tracing::debug!("Failed to parse manifest, storing document without parse result");
         DocumentState::new_without_parse_result(ecosystem.ecosystem_id(), content)
     };
     doc_state.set_version(version);

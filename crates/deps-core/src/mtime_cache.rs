@@ -157,6 +157,7 @@ impl<T> MtimeFileCache<T> {
     /// let second = cache.get_or_parse(&path, str::to_owned).unwrap();
     /// assert!(Arc::ptr_eq(&first, &second), "an unchanged file is served from cache");
     /// ```
+    #[tracing::instrument(skip_all, fields(path = %path.display(), label = self.label), level = "debug")]
     pub fn get_or_parse(&self, path: &Path, parse: impl FnOnce(&str) -> T) -> Option<Arc<T>> {
         let metadata = fs_probe::metadata(path).ok()?;
         if !metadata.is_file() {

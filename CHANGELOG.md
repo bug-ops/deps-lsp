@@ -40,6 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-gradle**: `fetch_license_from` gained a `tracing::instrument` span (matching sibling ecosystem crates' HTTP boundaries), closing Gradle's remaining observability gap (resolves #823)
 
 ### Fixed
+- **deps-lsp, deps-core, deps-deno, deps-dart, deps-swift, deps-maven, deps-cargo**: added tracing spans and error detail to previously silent parse, registry-fetch, and filesystem paths (resolves #836) (PR TBD)
 - **deps-pypi**: `register_named_source`'s doc comment now notes it has no production caller and points to `register_chain` as the live path for named sources, closing the staleness that previously misdirected a security fix (resolves #828)
 - **deps-lsp**: fixed a `max_concurrent_fetches = 0` deadlock that could wedge fetches server-wide by starving the shared `fetch_permits` pool (resolves #833) (#841)
 - **deps-cargo, deps-npm, deps-pypi**: alternate-registry-router tracing sites now log a `RedactedUrl`-wrapped index/key instead of the raw string, closing a query-string-credential leak on a validated `RegistryIndex`/`NpmRegistryIndex`/`PypiIndexUrl` (resolves #824)

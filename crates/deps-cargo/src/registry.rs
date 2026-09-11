@@ -101,6 +101,7 @@ impl CratesIoRegistry {
     /// assert!(!versions.is_empty());
     /// # }
     /// ```
+    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
     pub async fn get_versions(&self, name: &str) -> Result<Vec<CargoVersion>> {
         self.sparse.get_versions(name).await
     }
@@ -507,6 +508,7 @@ impl CargoRegistry {
         self.alternates.get(index).map(|entry| Arc::clone(&entry))
     }
 
+    #[tracing::instrument(skip_all, fields(package = ?name, index = tracing::field::Empty), level = "debug")]
     async fn get_versions_for_source(
         &self,
         name: &PackageName,
@@ -517,23 +519,27 @@ impl CargoRegistry {
             DependencySource::AlternateRegistry {
                 index,
                 mirrors_crates_io,
-            } => match self.alternate_client(index) {
-                Some(client) => client.get_versions(name.as_str()).await,
-                // M2 (plan-1b §6): an unregistered *verified crates.io mirror* degrades to
-                // crates.io rather than blanking the whole manifest — correct for a mirror
-                // (Cargo verifies per-version checksum equality against crates.io for it),
-                // wrong for a genuinely private/unregistered registry, which must keep
-                // failing `PackageNotFound` below.
-                None if *mirrors_crates_io => {
-                    self.crates_io
-                        .get_versions_with(name.as_str(), freshness)
-                        .await
+            } => {
+                tracing::Span::current()
+                    .record("index", tracing::field::display(RedactedUrl::new(index)));
+                match self.alternate_client(index) {
+                    Some(client) => client.get_versions(name.as_str()).await,
+                    // M2 (plan-1b §6): an unregistered *verified crates.io mirror* degrades to
+                    // crates.io rather than blanking the whole manifest — correct for a mirror
+                    // (Cargo verifies per-version checksum equality against crates.io for it),
+                    // wrong for a genuinely private/unregistered registry, which must keep
+                    // failing `PackageNotFound` below.
+                    None if *mirrors_crates_io => {
+                        self.crates_io
+                            .get_versions_with(name.as_str(), freshness)
+                            .await
+                    }
+                    None => Err(DepsError::PackageNotFound {
+                        package: name.to_string(),
+                        registry: "alternate registry (not registered)",
+                    }),
                 }
-                None => Err(DepsError::PackageNotFound {
-                    package: name.to_string(),
-                    registry: "alternate registry (not registered)",
-                }),
-            },
+            }
             _ => {
                 self.crates_io
                     .get_versions_with(name.as_str(), freshness)
@@ -542,6 +548,7 @@ impl CargoRegistry {
         }
     }
 
+    #[tracing::instrument(skip_all, fields(package = ?name, version = ?req, index = tracing::field::Empty), level = "debug")]
     async fn get_latest_matching_for_source(
         &self,
         name: &PackageName,
@@ -552,25 +559,29 @@ impl CargoRegistry {
             DependencySource::AlternateRegistry {
                 index,
                 mirrors_crates_io,
-            } => match self.alternate_client(index) {
-                Some(client) => {
-                    client
-                        .get_latest_matching(name.as_str(), req.as_str())
-                        .await
+            } => {
+                tracing::Span::current()
+                    .record("index", tracing::field::display(RedactedUrl::new(index)));
+                match self.alternate_client(index) {
+                    Some(client) => {
+                        client
+                            .get_latest_matching(name.as_str(), req.as_str())
+                            .await
+                    }
+                    // M2 (plan-1b §6, N4): the hover-fallback/background-fetch-mirror dispatch
+                    // site needs the identical arm — this exact enumeration has been wrong twice
+                    // during design review, so both sites are asserted independently in tests.
+                    None if *mirrors_crates_io => {
+                        self.crates_io
+                            .get_latest_matching(name.as_str(), req.as_str())
+                            .await
+                    }
+                    None => Err(DepsError::PackageNotFound {
+                        package: name.to_string(),
+                        registry: "alternate registry (not registered)",
+                    }),
                 }
-                // M2 (plan-1b §6, N4): the hover-fallback/background-fetch-mirror dispatch
-                // site needs the identical arm — this exact enumeration has been wrong twice
-                // during design review, so both sites are asserted independently in tests.
-                None if *mirrors_crates_io => {
-                    self.crates_io
-                        .get_latest_matching(name.as_str(), req.as_str())
-                        .await
-                }
-                None => Err(DepsError::PackageNotFound {
-                    package: name.to_string(),
-                    registry: "alternate registry (not registered)",
-                }),
-            },
+            }
             _ => {
                 self.crates_io
                     .get_latest_matching(name.as_str(), req.as_str())
