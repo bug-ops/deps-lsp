@@ -141,18 +141,55 @@ pub(crate) async fn fetch_license(
 /// parent chain). Each hop re-validates its coordinate/version through [`pom_url`] —
 /// the same allowlist the leaf fetch uses — so a malicious `<parent>` value can no more
 /// escape Maven Central's URL space than a malicious leaf coordinate could.
+///
+/// Deliberately the sole instrumented function on this path (issue #823): the actual
+/// bounded fetch loop lives in [`fetch_license_hops`], a plain, uninstrumented helper
+/// that only returns data, so `hops` is recorded exactly once here rather than at each
+/// of that loop's several exit paths — see that function's doc for why.
+#[tracing::instrument(
+    skip_all,
+    fields(package = ?coordinate, version = ?version, hops = tracing::field::Empty),
+    level = "debug"
+)]
 async fn fetch_license_from(
     cache: &Arc<HttpCache>,
     base: &str,
     coordinate: &str,
     version: &str,
 ) -> Vec<String> {
+    let (licenses, hops) = fetch_license_hops(cache, base, coordinate, version).await;
+    tracing::Span::current().record("hops", hops);
+    licenses
+}
+
+/// Runs [`fetch_license_from`]'s bounded POM fetch loop and returns the discovered
+/// licenses together with the number of POM fetches actually performed (issue #823),
+/// i.e. how many times [`HttpCache::get_cached`] was actually called — *not* how many
+/// loop iterations ran, since the [`pom_url`] guard can reject a coordinate/version
+/// before any network call is made (the documented malformed-coordinate short-circuit,
+/// both for the leaf and for a malformed `<parent>` hop) and that iteration must not be
+/// counted as a fetch.
+///
+/// Kept as a separate, non-instrumented function (impl-critic M2 on issue #823) so
+/// [`fetch_license_from`] can record the `hops` span field at its single return point
+/// instead of at every one of this loop's exit paths, where a future added `return`
+/// could silently omit it — the same silent-omission failure mode issue #819 removes
+/// from the completion-context dispatch, reintroduced one level down if each exit had
+/// to remember its own `Span::current().record` call.
+async fn fetch_license_hops(
+    cache: &Arc<HttpCache>,
+    base: &str,
+    coordinate: &str,
+    version: &str,
+) -> (Vec<String>, u64) {
     let mut current_coordinate = coordinate.to_string();
     let mut current_version = version.to_string();
 
-    for _ in 0..MAX_POM_FETCHES {
+    for hop in 0..MAX_POM_FETCHES {
         let Some(url) = pom_url(base, &current_coordinate, &current_version) else {
-            return Vec::new();
+            // No network call happens on this path, so `hop` (not `hop + 1`) is the
+            // count of fetches actually performed so far.
+            return (Vec::new(), u64::from(hop));
         };
         let pom = match cache.get_cached(&url).await {
             Ok(data) => parse_pom(&data),
@@ -170,22 +207,22 @@ async fn fetch_license_from(
                     error = %e,
                     "gradle license pom fetch failed"
                 );
-                return Vec::new();
+                return (Vec::new(), u64::from(hop) + 1);
             }
         };
         if !pom.licenses.is_empty() {
-            return pom.licenses;
+            return (pom.licenses, u64::from(hop) + 1);
         }
         match pom.parent {
             Some((parent_coordinate, parent_version)) => {
                 current_coordinate = parent_coordinate;
                 current_version = parent_version;
             }
-            None => return Vec::new(),
+            None => return (Vec::new(), u64::from(hop) + 1),
         }
     }
 
-    Vec::new()
+    (Vec::new(), u64::from(MAX_POM_FETCHES))
 }
 
 /// One parsed Maven POM XML document's license-relevant content: its own declared
@@ -836,6 +873,90 @@ mod tests {
         assert!(
             licenses.is_empty(),
             "a path-traversal parent coordinate must degrade to empty, not be followed"
+        );
+    }
+
+    // --- Issue #823 impl-critic M1: `hops` must count POM fetches actually performed
+    // (HTTP calls that happened), not loop iterations — the `pom_url` guard can reject a
+    // coordinate/version, both for the leaf and for a malformed `<parent>` hop, before any
+    // network call is made, and that iteration must not inflate the count. ---
+
+    #[tokio::test]
+    async fn fetch_license_hops_malformed_leaf_coordinate_records_zero_hops() {
+        let cache = Arc::new(HttpCache::new());
+        let (licenses, hops) = fetch_license_hops(&cache, MAVEN_REPO_BASE, "no-colon", "1.0").await;
+
+        assert!(licenses.is_empty());
+        assert_eq!(
+            hops, 0,
+            "no network call happens, so zero fetches were performed"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_license_hops_single_successful_fetch_records_one_hop() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                "/com/squareup/okhttp3/okhttp/4.12.0/okhttp-4.12.0.pom",
+            )
+            .with_status(200)
+            .with_body(
+                r#"<?xml version="1.0"?>
+<project>
+  <licenses>
+    <license><name>Apache-2.0</name></license>
+  </licenses>
+</project>"#,
+            )
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        let (licenses, hops) = fetch_license_hops(
+            &cache,
+            &server.url(),
+            "com.squareup.okhttp3:okhttp",
+            "4.12.0",
+        )
+        .await;
+
+        assert_eq!(licenses, vec!["Apache-2.0".to_string()]);
+        assert_eq!(hops, 1);
+    }
+
+    /// The exact regression this section guards against: before the M1 fix, this
+    /// scenario recorded `hops == 2` (one real leaf fetch, plus the rejected parent hop
+    /// counted as a second) instead of the correct `1`.
+    #[tokio::test]
+    async fn fetch_license_hops_malformed_parent_coordinate_after_leaf_fetch_records_one_hop() {
+        let mut server = mockito::Server::new_async().await;
+        let _leaf = server
+            .mock("GET", "/com/example/leaf/1.0.0/leaf-1.0.0.pom")
+            .with_status(200)
+            .with_body(
+                r#"<?xml version="1.0"?>
+<project>
+  <parent>
+    <groupId>com.example/../evil</groupId>
+    <artifactId>parent-module</artifactId>
+    <version>1.0.0</version>
+  </parent>
+</project>"#,
+            )
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        let (licenses, hops) =
+            fetch_license_hops(&cache, &server.url(), "com.example:leaf", "1.0.0").await;
+
+        assert!(licenses.is_empty());
+        assert_eq!(
+            hops, 1,
+            "only the leaf fetch actually hit the network; the malicious parent hop was \
+             rejected by pom_url before any request"
         );
     }
 

@@ -12,6 +12,33 @@ use deps_maven::MavenCentralRegistry;
 
 use crate::formatter::GradleFormatter;
 
+/// Which manifest position a Gradle completion request resolved to, or none.
+///
+/// A crate-local, non-`&'static str` replacement for the hand-rolled context-type return of
+/// [`GradleEcosystem::detect_completion_context`] and its `detect_catalog_context`/
+/// `detect_dsl_context` helpers (issue #819, same bug class as #793/#118): the dispatch
+/// match in [`Ecosystem::generate_completions`]'s override for this crate must be
+/// exhaustive over this enum, so adding a new completable position forces a compile error
+/// at the match instead of silently falling through a `_ => vec![]` wildcard. `Package` and
+/// `Version` do map conceptually to
+/// [`deps_core::completion::CompletionContext::PackageName`]/`Version` — the reason this
+/// crate keeps its own full override rather than the shared dispatch isn't a missing
+/// concept, it's the detection *source*: `detect_completion_context` scans the manifest's
+/// raw text (DSL coordinate strings or version-catalog TOML) directly, independent of
+/// `parse_result.dependencies()` (deliberately dependency-blind, see
+/// `test_generate_completions_version_context_no_dependency_at_position_returns_empty`
+/// below), whereas [`deps_core::completion::detect_completion_context`] derives its context
+/// from parsed-AST dependency ranges (see that method's default-impl doc).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GradleCompletionContext {
+    /// Cursor is inside a dependency coordinate's version segment.
+    Version,
+    /// Cursor is inside a dependency coordinate's package/module segment.
+    Package,
+    /// Cursor is not inside any completable position.
+    None,
+}
+
 /// [`Ecosystem`] implementation for Gradle (`build.gradle`/`build.gradle.kts`), reusing
 /// Maven Central resolution via [`MavenCentralRegistry`].
 pub struct GradleEcosystem {
@@ -65,11 +92,12 @@ impl GradleEcosystem {
 
     /// Detects completion context for Gradle files at the given position.
     ///
-    /// Returns `(context_type, value, range)` where `context_type` is
-    /// "version" | "package" | ""; `value` is the already-typed prefix up to the
+    /// Returns `(context_type, value, range)` where `context_type` is a
+    /// [`GradleCompletionContext`]; `value` is the already-typed prefix up to the
     /// cursor; `range` spans the *entire* existing package coordinate (module/`group:artifact`)
     /// being completed, not just up to the cursor, and is meaningless when
-    /// `context_type` is not "package" (mirrors `MavenEcosystem::detect_xml_context`).
+    /// `context_type` is not [`GradleCompletionContext::Package`] (mirrors
+    /// `MavenEcosystem::detect_xml_context`).
     ///
     /// `position.character` is a UTF-16 code unit offset (LSP spec) and is converted to a
     /// byte offset once via [`deps_core::completion::utf16_to_byte_offset`] before any
@@ -83,13 +111,13 @@ impl GradleEcosystem {
         content: &'a str,
         position: Position,
         uri: &Uri,
-    ) -> (&'static str, &'a str, Range) {
+    ) -> (GradleCompletionContext, &'a str, Range) {
         let path = uri.path().to_string();
         let lines: Vec<&str> = content.lines().collect();
         let line_idx = position.line as usize;
 
         let Some(&line) = lines.get(line_idx) else {
-            return ("", "", Range::default());
+            return (GradleCompletionContext::None, "", Range::default());
         };
         let col_idx = deps_core::completion::utf16_to_byte_offset(line, position.character)
             .unwrap_or(line.len());
@@ -100,7 +128,7 @@ impl GradleEcosystem {
         } else if path.ends_with(".gradle.kts") || path.ends_with(".gradle") {
             detect_dsl_context(before_cursor, line, col_idx, position.line)
         } else {
-            ("", "", Range::default())
+            (GradleCompletionContext::None, "", Range::default())
         }
     }
 }
@@ -177,7 +205,7 @@ fn detect_catalog_context<'a>(
     line: &'a str,
     col_idx: usize,
     line_idx: u32,
-) -> (&'static str, &'a str, Range) {
+) -> (GradleCompletionContext, &'a str, Range) {
     let cursor = col_idx.min(line.len());
     // Scope keyword/quote-parity detection to the current inline-table field (see
     // `current_field_start`'s doc comment) so an earlier field on the same line can't be
@@ -200,7 +228,11 @@ fn detect_catalog_context<'a>(
     {
         let value_start = field_start + rel_eq_pos + quote_start + 1;
         if value_start <= cursor {
-            return ("version", &line[value_start..cursor], Range::default());
+            return (
+                GradleCompletionContext::Version,
+                &line[value_start..cursor],
+                Range::default(),
+            );
         }
     }
 
@@ -223,11 +255,15 @@ fn detect_catalog_context<'a>(
                     .map_or(cursor, |rel| value_start + rel)
                     .max(cursor);
             let range = byte_range(line, line_idx, value_start, value_end);
-            return ("package", &line[value_start..cursor], range);
+            return (
+                GradleCompletionContext::Package,
+                &line[value_start..cursor],
+                range,
+            );
         }
     }
 
-    ("", "", Range::default())
+    (GradleCompletionContext::None, "", Range::default())
 }
 
 /// Detects completion context in Kotlin/Groovy DSL files.
@@ -244,7 +280,7 @@ fn detect_dsl_context<'a>(
     line: &'a str,
     col_idx: usize,
     line_idx: u32,
-) -> (&'static str, &'a str, Range) {
+) -> (GradleCompletionContext, &'a str, Range) {
     let cursor = col_idx.min(line.len());
     let quote_char = if before_cursor.contains('"') {
         '"'
@@ -257,10 +293,10 @@ fn detect_dsl_context<'a>(
     let (quote_count, last_real_quote) =
         deps_core::fallback_completion::count_real_quotes_with(before_cursor, quote_char);
     if quote_count.is_multiple_of(2) {
-        return ("", "", Range::default());
+        return (GradleCompletionContext::None, "", Range::default());
     }
     let Some(open_pos) = last_real_quote else {
-        return ("", "", Range::default());
+        return (GradleCompletionContext::None, "", Range::default());
     };
 
     let colon_count = before_cursor.chars().filter(|&c| c == ':').count();
@@ -284,7 +320,11 @@ fn detect_dsl_context<'a>(
                 .map_or(scan_limit_rel, |(i, _)| i);
             let value_end = (open_pos + 1 + end_rel).max(cursor);
             let range = byte_range(line, line_idx, open_pos + 1, value_end);
-            ("package", &line[open_pos + 1..cursor], range)
+            (
+                GradleCompletionContext::Package,
+                &line[open_pos + 1..cursor],
+                range,
+            )
         }
         _ => {
             let version_start = before_cursor
@@ -293,7 +333,11 @@ fn detect_dsl_context<'a>(
                 .nth(1)
                 .map(|(i, _)| i + 1)
                 .unwrap_or(before_cursor.len());
-            ("version", &line[version_start..cursor], Range::default())
+            (
+                GradleCompletionContext::Version,
+                &line[version_start..cursor],
+                Range::default(),
+            )
         }
     }
 }
@@ -343,10 +387,12 @@ impl Ecosystem for GradleEcosystem {
     }
 
     /// This is a full override, not the shared [`Ecosystem::generate_completions`] default
-    /// dispatch: Gradle routes on its own `(&'static str, value, range)` DSL/catalog context
-    /// (`Self::detect_completion_context`), which has no
-    /// [`deps_core::completion::CompletionContext`] representation. Opting out of the shared
-    /// dispatch means this ecosystem takes on #793's wildcard-match obligation itself; see
+    /// dispatch: Gradle routes on its own `GradleCompletionContext` DSL/catalog context
+    /// (`Self::detect_completion_context`), detected from raw manifest text rather than
+    /// [`deps_core::completion::detect_completion_context`]'s parsed-AST dependency ranges
+    /// (see `GradleCompletionContext`'s doc for why that source difference — not a missing
+    /// concept — is the actual reason this crate can't reuse the shared dispatch). Opting
+    /// out of it means this ecosystem takes on #793's wildcard-match obligation itself; see
     /// `deps_core::Ecosystem::generate_completions`'s doc.
     fn generate_completions<'a>(
         &'a self,
@@ -359,8 +405,10 @@ impl Ecosystem for GradleEcosystem {
             let uri = parse_result.uri();
             let (ctx_type, value, range) = Self::detect_completion_context(content, position, uri);
 
+            // Exhaustive on purpose (#819, same bug class as #793): no wildcard arm, so a
+            // new `GradleCompletionContext` variant is a compile error right here.
             match ctx_type {
-                "version" => {
+                GradleCompletionContext::Version => {
                     let dep = parse_result.dependencies().into_iter().find(|d| {
                         d.version_range()
                             .is_some_and(|r| position_in_range(position, r))
@@ -379,8 +427,8 @@ impl Ecosystem for GradleEcosystem {
                         vec![]
                     }
                 }
-                "package" => self.complete_package_names(value, range).await,
-                _ => vec![],
+                GradleCompletionContext::Package => self.complete_package_names(value, range).await,
+                GradleCompletionContext::None => vec![],
             }
             .into()
         })
@@ -388,7 +436,8 @@ impl Ecosystem for GradleEcosystem {
 
     /// Required by [`Ecosystem`]; called only from this crate's own
     /// [`Self::generate_completions`] override (Gradle does not use the shared default
-    /// dispatch — see that method's doc), for the `"version"` DSL/catalog context.
+    /// dispatch — see that method's doc), for the `GradleCompletionContext::Version`
+    /// DSL/catalog context.
     fn complete_version<'a>(
         &'a self,
         request: deps_core::completion::CompletionRequest<'a>,
@@ -530,7 +579,7 @@ mod tests {
         let col = 11;
         let before = &line[..col];
         let (t, v, _) = detect_catalog_context(before, line, col, 0);
-        assert_eq!(t, "version");
+        assert_eq!(t, GradleCompletionContext::Version);
         assert_eq!(v, "");
     }
 
@@ -542,7 +591,7 @@ mod tests {
         let col = 14;
         let before = &line[..col];
         let (t, v, _) = detect_catalog_context(before, line, col, 0);
-        assert_eq!(t, "version");
+        assert_eq!(t, GradleCompletionContext::Version);
         assert_eq!(v, "1.0");
     }
 
@@ -554,7 +603,7 @@ mod tests {
         let col = 16;
         let before = &line[..col];
         let (t, v, _) = detect_catalog_context(before, line, col, 0);
-        assert_eq!(t, "version");
+        assert_eq!(t, GradleCompletionContext::Version);
         assert_eq!(v, "1.0.0");
     }
 
@@ -566,7 +615,7 @@ mod tests {
         let col = 16;
         let before = &line[..col];
         let (t, v, range) = detect_catalog_context(before, line, col, 0);
-        assert_eq!(t, "package");
+        assert_eq!(t, GradleCompletionContext::Package);
         assert_eq!(v, "com.ex");
         // range replaces the whole quoted value ("com.example:lib"), not just "com.ex"
         assert_eq!(
@@ -587,7 +636,7 @@ mod tests {
         let col = line.len();
         let before = &line[..col];
         let (t, v, range) = detect_catalog_context(before, line, col, 0);
-        assert_eq!(t, "");
+        assert_eq!(t, GradleCompletionContext::None);
         assert_eq!(v, "");
         assert_eq!(range, Range::default());
     }
@@ -602,7 +651,7 @@ mod tests {
         let col = line.len();
         let before = &line[..col];
         let (t, v, range) = detect_catalog_context(before, line, col, 0);
-        assert_eq!(t, "package");
+        assert_eq!(t, GradleCompletionContext::Package);
         let value_start = line.find('"').unwrap() + 1;
         assert_eq!(v, &line[value_start..col]);
         assert_eq!(
@@ -623,7 +672,7 @@ mod tests {
         let col = 21;
         let before = &line[..col];
         let (t, v, range) = detect_dsl_context(before, line, col, 0);
-        assert_eq!(t, "package");
+        assert_eq!(t, GradleCompletionContext::Package);
         assert_eq!(v, "junit");
         // range replaces the whole "group:artifact" coordinate ("junit:junit"),
         // stopping before the version separator, not just the already-typed "junit"
@@ -641,7 +690,7 @@ mod tests {
         let col = 21; // right after "junit"
         let before = &line[..col];
         let (t, v, range) = detect_dsl_context(before, line, col, 0);
-        assert_eq!(t, "package");
+        assert_eq!(t, GradleCompletionContext::Package);
         assert_eq!(v, "junit");
         assert_eq!(
             range,
@@ -661,7 +710,7 @@ mod tests {
         let col = line.len();
         let before = &line[..col];
         let (t, v, _range) = detect_dsl_context(before, line, col, 0);
-        assert_eq!(t, "package");
+        assert_eq!(t, GradleCompletionContext::Package);
         assert_eq!(v, "com.foo:ba");
     }
 
@@ -673,7 +722,7 @@ mod tests {
         let col = line.len();
         let before = &line[..col];
         let (t, v, _range) = detect_dsl_context(before, line, col, 0);
-        assert_eq!(t, "package");
+        assert_eq!(t, GradleCompletionContext::Package);
         assert_eq!(v, "com.o'reilly:li");
     }
 
@@ -690,7 +739,7 @@ mod tests {
         let col = line.len();
         let before = &line[..col];
         let (t, v, range) = detect_dsl_context(before, line, col, 0);
-        assert_eq!(t, "");
+        assert_eq!(t, GradleCompletionContext::None);
         assert_eq!(v, "");
         assert_eq!(range, Range::default());
     }
@@ -707,7 +756,7 @@ mod tests {
         let position = Position::new(0, 14); // cursor right after "café" (UTF-16 units)
 
         let (t, v, range) = GradleEcosystem::detect_completion_context(content, position, &uri);
-        assert_eq!(t, "package");
+        assert_eq!(t, GradleCompletionContext::Package);
         assert_eq!(v, "café");
         assert_eq!(
             range,
@@ -732,7 +781,7 @@ mod tests {
         let position = Position::new(0, 33); // cursor right after "lib" (UTF-16 units)
 
         let (t, v, range) = GradleEcosystem::detect_completion_context(content, position, &uri);
-        assert_eq!(t, "package");
+        assert_eq!(t, GradleCompletionContext::Package);
         assert_eq!(v, "com.exämple:lib");
         // Range must end at UTF-16 33 (right before the closing quote), not 34 (which
         // would swallow it).
@@ -751,7 +800,7 @@ mod tests {
         let position = Position::new(0, 20); // cursor right after "café" (UTF-16 units)
 
         let (t, v, range) = GradleEcosystem::detect_completion_context(content, position, &uri);
-        assert_eq!(t, "package");
+        assert_eq!(t, GradleCompletionContext::Package);
         assert_eq!(v, "café");
         assert_eq!(
             range,
@@ -768,7 +817,7 @@ mod tests {
         let col = line.len();
         let before = &line[..col];
         let (t, v, range) = detect_catalog_context(before, line, col, 0);
-        assert_eq!(t, "");
+        assert_eq!(t, GradleCompletionContext::None);
         assert_eq!(v, "");
         assert_eq!(range, Range::default());
     }
@@ -781,7 +830,7 @@ mod tests {
         let col = line.len(); // cursor at end of line, right after "li"
         let before = &line[..col];
         let (t, v, range) = detect_catalog_context(before, line, col, 0);
-        assert_eq!(t, "package");
+        assert_eq!(t, GradleCompletionContext::Package);
         assert_eq!(v, "com.example:li");
         assert_eq!(
             range,
@@ -801,7 +850,7 @@ mod tests {
         let col = line.len();
         let before = &line[..col];
         let (t, v, range) = detect_catalog_context(before, line, col, 0);
-        assert_eq!(t, "package");
+        assert_eq!(t, GradleCompletionContext::Package);
         assert_eq!(v, "com.exa");
         assert_eq!(
             range,
@@ -819,7 +868,7 @@ mod tests {
         let col = line.len();
         let before = &line[..col];
         let (t, v, _range) = detect_catalog_context(before, line, col, 0);
-        assert_eq!(t, "version");
+        assert_eq!(t, GradleCompletionContext::Version);
         assert_eq!(v, "1.0");
     }
 
@@ -831,7 +880,7 @@ mod tests {
         let col = line.len();
         let before = &line[..col];
         let (t, v, range) = detect_dsl_context(before, line, col, 0);
-        assert_eq!(t, "package");
+        assert_eq!(t, GradleCompletionContext::Package);
         assert_eq!(v, "junit:junit");
         assert_eq!(
             range,
@@ -847,7 +896,7 @@ mod tests {
         let col = 31;
         let before = &line[..col];
         let (t, v, _) = detect_dsl_context(before, line, col, 0);
-        assert_eq!(t, "version");
+        assert_eq!(t, GradleCompletionContext::Version);
         assert_eq!(v, "4.1");
     }
 
@@ -859,7 +908,7 @@ mod tests {
         let col = 28;
         let before = &line[..col];
         let (t, v, _) = detect_dsl_context(before, line, col, 0);
-        assert_eq!(t, "version");
+        assert_eq!(t, GradleCompletionContext::Version);
         assert_eq!(v, "");
     }
 
@@ -924,17 +973,18 @@ mod tests {
     }
 
     // --- #793 characterization: `GradleEcosystem::generate_completions` keeps its own
-    // full override (string-typed DSL/catalog context, out of #793's scope — see the plan),
-    // but the "version" arm's body moves into the new required `complete_version` hook.
-    // This pins the arm's observable output before that move.
+    // full override (crate-local `GradleCompletionContext`-typed DSL/catalog context, out of
+    // #793's scope — see the plan), but the "version" arm's body moves into the new required
+    // `complete_version` hook. This pins the arm's observable output before that move.
 
     /// Deterministic, CI-enforced counterpart to the network-gated test below:
-    /// `detect_completion_context` (the raw-text DSL scanner) recognizes a `"version"`
-    /// context from the coordinate string's shape alone, independent of the surrounding
-    /// `dependencies { }` block the parser requires — so a coordinate outside that block
-    /// still resolves `ctx_type == "version"` while `parse_result.dependencies()` stays
-    /// empty, and the arm must fail closed to `Completions::default()` without ever calling
-    /// the registry.
+    /// `detect_completion_context` (the raw-text DSL scanner) recognizes a
+    /// [`GradleCompletionContext::Version`] context from the coordinate string's shape
+    /// alone, independent of the surrounding `dependencies { }` block the parser requires —
+    /// so a coordinate outside that block still resolves `ctx_type ==
+    /// GradleCompletionContext::Version` while `parse_result.dependencies()` stays empty,
+    /// and the arm must fail closed to `Completions::default()` without ever calling the
+    /// registry.
     #[tokio::test]
     async fn test_generate_completions_version_context_no_dependency_at_position_returns_empty() {
         // See the comment in `test_parse_manifest_kts` on why this guard is needed here.
@@ -949,6 +999,39 @@ mod tests {
             .generate_completions(
                 parse_result.as_ref(),
                 Position::new(0, 31),
+                content,
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
+        assert_eq!(result, Completions::default());
+    }
+
+    /// #819 characterization: a cursor with no open quoted string on its line resolves to
+    /// [`GradleCompletionContext::None`], which is now a named, non-wildcard match arm in
+    /// `generate_completions` rather than a catch-all `_ => vec![]` — this exercises that
+    /// arm end-to-end through the public `generate_completions` entry point, not just the
+    /// lower-level `detect_dsl_context`/`detect_catalog_context` unit tests above. Note
+    /// this pins the arm's *observable output* (identical before and after #819 —
+    /// `Completions::default()` either way); the actual #819 guarantee is compile-time (a
+    /// new `GradleCompletionContext` variant is a compile error at the match in
+    /// `generate_completions`), which no runtime test can exercise.
+    #[tokio::test]
+    async fn test_generate_completions_none_context_returns_empty() {
+        // See the comment in `test_parse_manifest_kts` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let eco = GradleEcosystem::new(make_cache());
+        let content = "// no dependency coordinate on this line\n";
+        let uri = deps_core::test_util::test_uri("/project/build.gradle.kts");
+        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+
+        let (ctx, _, _) =
+            GradleEcosystem::detect_completion_context(content, Position::new(0, 5), &uri);
+        assert_eq!(ctx, GradleCompletionContext::None);
+
+        let result = eco
+            .generate_completions(
+                parse_result.as_ref(),
+                Position::new(0, 5),
                 content,
                 deps_core::FreshnessSettings::default(),
             )
