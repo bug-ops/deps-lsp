@@ -271,6 +271,7 @@ impl JsrRegistry {
     /// `license` field, or a dot-prefixed `scope`/`name`/`version` segment — graceful
     /// degradation (NFR-003), since this is a best-effort secondary signal, not core
     /// version data.
+    #[tracing::instrument(skip_all, fields(scope = ?scope, package = ?name, version = ?version), level = "debug")]
     pub async fn get_license(&self, scope: &str, name: &str, version: &str) -> Vec<String> {
         if is_dot_prefixed(scope) || is_dot_prefixed(name) || is_dot_prefixed(version) {
             return Vec::new();
@@ -347,6 +348,7 @@ impl JsrRegistry {
     /// Issues the raw `api.jsr.io/packages?query=` request with no scope-aware
     /// post-processing. Used directly for an unscoped query, and as the underlying fetch
     /// for [`Self::search`]'s scope-qualified path.
+    #[tracing::instrument(skip_all, fields(query = ?query), level = "debug")]
     async fn fetch_search(&self, query: &str, limit: usize) -> Result<Vec<JsrPackage>> {
         let url = format!(
             "{}/packages?query={}&limit={}",
@@ -466,6 +468,7 @@ impl DenoRegistry {
     /// already does — out of scope for this pre-fetch (deferred as a follow-up, see
     /// spec 010's tier-3 rollout notes). An `npm:` specifier degrades gracefully to an
     /// empty `Vec` (NFR-003), same as any other missing-source case.
+    #[tracing::instrument(skip_all, fields(package = ?name, version = ?version), level = "debug")]
     pub async fn get_license(&self, name: &PackageName, version: &str) -> Vec<String> {
         match split_scheme(name.as_str()) {
             Some((Scheme::Jsr, rest)) => match split_scoped(rest) {

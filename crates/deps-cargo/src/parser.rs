@@ -741,13 +741,25 @@ fn discover_workspace(doc_uri: &Uri) -> Result<WorkspaceDiscovery> {
                                     path = %workspace_toml.display(),
                                     "skipping ancestor Cargo.toml during workspace root discovery: nesting depth exceeds maximum"
                                 );
-                            } else if let Ok(doc) = toml_span::parse(&content)
-                                && doc
-                                    .as_table()
-                                    .and_then(|t| get_val(t, "workspace"))
-                                    .is_some()
-                            {
-                                workspace_root = Some(dir.to_path_buf());
+                            } else {
+                                match toml_span::parse(&content) {
+                                    Ok(doc) => {
+                                        if doc
+                                            .as_table()
+                                            .and_then(|t| get_val(t, "workspace"))
+                                            .is_some()
+                                        {
+                                            workspace_root = Some(dir.to_path_buf());
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            path = %workspace_toml.display(),
+                                            error = %e,
+                                            "skipping ancestor Cargo.toml during workspace root discovery: TOML parse failed"
+                                        );
+                                    }
+                                }
                             }
                         }
                         Ok(None) => {
@@ -761,7 +773,13 @@ fn discover_workspace(doc_uri: &Uri) -> Result<WorkspaceDiscovery> {
                                 "skipping ancestor Cargo.toml during workspace root discovery: exceeds size cap on read"
                             );
                         }
-                        Err(_) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                path = %workspace_toml.display(),
+                                error = %e,
+                                "skipping ancestor Cargo.toml during workspace root discovery: read failed"
+                            );
+                        }
                     }
                 }
             }
@@ -1996,6 +2014,52 @@ tokio = "1.0"
             stats_after - stats_before,
             2 * MAX_CONFIG_ANCESTOR_DEPTH,
             "expected exactly two stats per ancestor for all MAX_CONFIG_ANCESTOR_DEPTH levels"
+        );
+    }
+
+    /// #836 item 4: a genuine I/O error reading an ancestor `Cargo.toml` (as opposed to the
+    /// size-cap/nesting-depth rejections, which already warned) must not be silently dropped.
+    #[cfg(unix)]
+    #[test]
+    fn test_discover_workspace_logs_warn_on_unreadable_ancestor_cargo_toml() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = deps_core::fs_probe::snapshot_guard();
+
+        let root = tempfile::tempdir().unwrap();
+        let project_dir = root.path().join("proj");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let opened_content = "[dependencies]\nserde = \"1.0\"\n";
+        let opened_path = project_dir.join("Cargo.toml");
+        std::fs::write(&opened_path, opened_content).unwrap();
+        let doc_uri = Uri::from_file_path(&opened_path).unwrap();
+
+        let unreadable_manifest = root.path().join("Cargo.toml");
+        std::fs::write(&unreadable_manifest, "[workspace]\nmembers = [\"proj\"]\n").unwrap();
+        let mut perms = std::fs::metadata(&unreadable_manifest)
+            .unwrap()
+            .permissions();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(&unreadable_manifest, perms.clone()).unwrap();
+
+        let output = deps_core::test_util::capture_tracing_output(|| {
+            discover_workspace(&doc_uri).unwrap();
+        });
+
+        // Restore permissions so the tempdir can clean itself up.
+        perms.set_mode(0o644);
+        let _ = std::fs::set_permissions(&unreadable_manifest, perms);
+
+        assert!(
+            output.contains(
+                "skipping ancestor Cargo.toml during workspace root discovery: read failed"
+            ),
+            "expected a warn log for the unreadable ancestor Cargo.toml, got: {output:?}"
+        );
+        assert!(
+            output.contains(&unreadable_manifest.display().to_string()),
+            "expected the warn log to include the unreadable ancestor's path, got: {output:?}"
         );
     }
 }

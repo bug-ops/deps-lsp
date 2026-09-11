@@ -64,6 +64,7 @@ pub const MAX_LOCKFILE_BYTES: u64 = 32 * 1024 * 1024;
 /// # Ok(())
 /// # }
 /// ```
+#[tracing::instrument(skip_all, fields(path = %path.display(), file_type = %file_type), level = "debug")]
 pub async fn read_lockfile_content(path: &Path, file_type: &str) -> Result<String> {
     let to_parse_error = |e: std::io::Error| DepsError::ParseError {
         file_type: format!("{file_type} at {}", path.display()),
@@ -155,6 +156,7 @@ pub async fn read_lockfile_content(path: &Path, file_type: &str) -> Result<Strin
 /// # Ok(())
 /// # }
 /// ```
+#[tracing::instrument(skip_all, fields(path = %path.display(), file_type = %file_type), level = "debug")]
 pub async fn read_and_parse_lockfile<T, F>(path: &Path, file_type: &str, parse: F) -> Result<T>
 where
     F: FnOnce(String) -> Result<T> + Send + 'static,

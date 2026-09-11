@@ -99,6 +99,7 @@ impl SwiftRegistry {
     ///
     /// Thin wrapper around the shared [`ReleaseDatesCache::fetch`] — see its docs for
     /// the best-effort/memoization contract.
+    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
     async fn release_dates(&self, name: &str) -> Arc<HashMap<String, PublishTime>> {
         self.release_dates.fetch(&self.github, name, "Swift").await
     }
@@ -112,6 +113,7 @@ impl SwiftRegistry {
     /// `license` field, or GitHub's `"NOASSERTION"` sentinel (a detected-but-
     /// unclassified `LICENSE` file, not a real SPDX identifier) — graceful degradation
     /// (NFR-003), since this is a best-effort secondary signal, not core version data.
+    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
     pub async fn get_license(&self, name: &str) -> Vec<String> {
         if validate_owner_repo(name).is_err() {
             return Vec::new();
