@@ -199,6 +199,25 @@ jobs:
       - name: Run cargo-deny
         run: cargo deny check
 
+      - name: Install gitleaks
+        # gitleaks/gitleaks-action requires a paid GITLEAKS_LICENSE for organization-owned
+        # repos (bug-ops is an org, not a personal account) even though this repo is public
+        # — see the action's README "Do I need a free license key?" section. taiki-e/install-
+        # action has no gitleaks manifest either, so the CLI is fetched directly from the
+        # pinned release and checksum-verified instead.
+        run: |
+          curl -sSLO https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  gitleaks_8.30.1_linux_x64.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks_8.30.1_linux_x64.tar.gz gitleaks
+          sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
+
+      - name: Run gitleaks
+        # `dir` scans the checked-out tree rather than git history, since the checkout step
+        # above is a shallow, single-commit clone (no fetch-depth: 0). Picks up
+        # .gitleaks.toml (#803) from the repo root automatically per gitleaks' config
+        # precedence (target-path/.gitleaks.toml), no --config flag needed.
+        run: gitleaks dir . --no-banner --redact
+
   test:
     name: Test (${{ matrix.os }}${{ matrix.rust != 'stable' && format(' / {0}', matrix.rust) || '' }})
     needs: changes
