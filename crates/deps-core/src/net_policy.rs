@@ -529,8 +529,10 @@ pub enum PolicyGate<'a> {
 /// userinfo component itself (an invalid port, a malformed IPv6 literal, a non-ASCII host, or
 /// simply a missing scheme — #536 C2), so this falls back to a parse-independent redaction
 /// rather than returning `raw` untouched; the fallback scans from the `://` scheme separator
-/// when one is present, or from the very start of `raw` otherwise. Returns `raw` unchanged only
-/// when that scan finds no `@` at all — nothing looks like a userinfo component to redact.
+/// when one is present, or from the very start of `raw` otherwise. When that scan finds no `@`,
+/// a colon-separated credential with no `@` at all (e.g. `oauth2:glpat-...`, a GitLab CI job
+/// token, or a bare `.npmrc` `key:value` line — #810) is redacted next; `raw` is returned
+/// unchanged only once both scans come up empty.
 ///
 /// # Examples
 ///
@@ -593,6 +595,11 @@ pub fn redact_userinfo(raw: &str) -> String {
 /// into `***@types/node` (code-review follow-up on #767, root-causing what M1's `redact_if_url`
 /// had worked around locally in `deps_core::error`). This mirrors the parseable path just
 /// above, which already special-cases an empty `username()`/`password()` as a no-op.
+///
+/// When no `@` is found, falls through to [`redact_colon_credential`] — a colon-separated
+/// credential with no `@` (`oauth2:glpat-SECRET`, a GitLab CI `gitlab-ci-token:JOBTOKEN` job
+/// token, an `.npmrc` `key:value` line) reaches this same fallback and, before #810, passed
+/// through unredacted.
 // All indices (`authority_start`, `host_boundary`, `at`) come from `find`/`rfind` of ASCII
 // tokens (`"://"`, `/`, `?`, `#`, `@`), so every slice bound is always a char boundary.
 #[allow(clippy::string_slice)]
@@ -601,12 +608,112 @@ fn redact_userinfo_unparseable(raw: &str) -> String {
     let authority = &raw[authority_start..];
     let host_boundary = authority.find(['/', '?', '#']).unwrap_or(authority.len());
     let Some(at) = authority[..host_boundary].rfind('@') else {
-        return raw.to_string();
+        return redact_colon_credential(raw, authority_start, authority);
     };
     if at == 0 {
         return raw.to_string();
     }
     format!("{}***@{}", &raw[..authority_start], &authority[at + 1..])
+}
+
+/// [`redact_userinfo_unparseable`]'s fallback for the case it does not cover: a colon-separated
+/// credential with no `@` at all (#810), e.g. `oauth2:glpat-SECRET`, a GitLab CI
+/// `gitlab-ci-token:JOBTOKEN` job token, or a bare `.npmrc` `//registry/:_authToken=...` line.
+/// Unlike the `@` scan above, this is not restricted to the authority span before the first
+/// `/`/`?`/`#` — `gitlab.corp/user:hunter2@evil` (repro from #810) has its credential colon
+/// *after* a `/`, so the whole of `authority` (everything after the scheme, or all of `raw`
+/// when there is none) is searched.
+///
+/// Not every colon is a credential separator, so several shapes are left unredacted, checked
+/// in this order:
+/// - a Windows drive letter (`C:\Users\x\.npmrc`, `c:/packages/feed`) — a single ASCII letter
+///   followed by `:` and then `\` or `/`;
+/// - a colon immediately following a bracketed IPv6 literal (`[::1]:8443`, `[::1]:abc`) — this
+///   is always a host:port separator, regardless of what follows, since an IPv6 host is never
+///   itself a credential;
+/// - no colon found in the searched span at all;
+/// - a `host:port` pair, where the value side (up to the next `/`, `?`, `#`, or end) is 1-5
+///   ASCII digits;
+/// - an empty value side (`token:`), mirroring the empty-userinfo no-op above.
+///
+/// A carve-out hit does not stop the scan: it *skips past* the exempted colon and keeps
+/// looking, so a leading non-credential colon (a port, a drive-letter prefix, a bracketed
+/// IPv6 literal) cannot mask a real credential later in the same value — `raw` is returned
+/// unchanged only once the scan runs out of colons entirely. This matters because #810's own
+/// repro (`gitlab.corp/user:hunter2@evil`) is exactly this shape with a `host:port` prefix
+/// added (`gitlab.corp:8443/user:hunter2@evil`): stopping at the first exempted colon would
+/// silently reopen the vulnerability the scan-width widening above was meant to close.
+///
+/// Only the *first non-exempt* colon is ever treated as the split point (`a:b:c` redacts to
+/// `a:***`, not `a:b:***`), and an empty left side is still redacted (`:secret` becomes
+/// `:***`) — for a `:` pair the credential is the value on the right, unlike `@` where it is
+/// the component on the left.
+///
+/// This intentionally produces some false positives on non-credential colon pairs — a Maven
+/// coordinate (`com.google.guava:guava` → `com.google.guava:***`), an npm alias spec
+/// (`mvn:group:artifact:1.0` → `mvn:***`), an RFC 3339 timestamp (`2026-09-11T08:40:19Z` →
+/// `2026-09-11T08:***`), or a path segment that happens to contain a colon
+/// (`https://[:::1]/v1/items:search` → `.../items:***`) — accepted because this function only
+/// ever feeds a `tracing` line, a user-visible error message, or a redacted-URL type, never a
+/// value used for further parsing or comparison. Two shape collisions are accepted as
+/// documented limitations rather than fixed: a bracket-adjacent colon is *never* redacted
+/// regardless of what follows it (needed to keep `[::1]:abc` unchanged), so
+/// `[::1]:glpat-SECRET` is indistinguishable from it and stays unredacted; and a ≤5-digit
+/// credential collides with the `host:port` carve-out (`oauth2:12345` stays unredacted).
+// All indices come from `find` of ASCII tokens (`:`, `]`, `/`, `?`, `#`) or byte-level ASCII
+// checks, so every slice bound is always a char boundary. `cursor` only ever advances (every
+// branch below adds at least 1 to it before looping), so the scan is guaranteed to terminate.
+#[allow(clippy::string_slice)]
+fn redact_colon_credential(raw: &str, authority_start: usize, authority: &str) -> String {
+    let mut cursor = 0;
+    loop {
+        let remaining = &authority[cursor..];
+
+        let bytes = remaining.as_bytes();
+        let is_drive_letter = bytes.first().is_some_and(u8::is_ascii_alphabetic)
+            && bytes.get(1) == Some(&b':')
+            && matches!(bytes.get(2), Some(b'\\' | b'/'));
+        if is_drive_letter {
+            cursor += 2;
+            continue;
+        }
+
+        let (scan_start, bracket_adjacent) = if remaining.starts_with('[') {
+            remaining
+                .find(']')
+                .map_or((0, false), |end| (end + 1, true))
+        } else {
+            (0, false)
+        };
+
+        let Some(colon) = remaining[scan_start..].find(':').map(|i| i + scan_start) else {
+            return raw.to_string();
+        };
+        if bracket_adjacent && colon == scan_start {
+            cursor += colon + 1;
+            continue;
+        }
+
+        let value_start = colon + 1;
+        let value_end = remaining[value_start..]
+            .find(['/', '?', '#'])
+            .map_or(remaining.len(), |i| value_start + i);
+        let value = &remaining[value_start..value_end];
+
+        let is_port =
+            !value.is_empty() && value.len() <= 5 && value.bytes().all(|b| b.is_ascii_digit());
+        if value.is_empty() || is_port {
+            cursor += value_end.max(colon + 1);
+            continue;
+        }
+
+        return format!(
+            "{}{}:***{}",
+            &raw[..authority_start],
+            &authority[..cursor + colon],
+            &authority[cursor + value_end..]
+        );
+    }
 }
 
 /// Strips the query string, fragment, and any userinfo from `raw`, for attaching to a
@@ -623,13 +730,14 @@ fn redact_userinfo_unparseable(raw: &str) -> String {
 /// keep.
 ///
 /// A `raw` that fails to parse as a URL is not returned unredacted outright: this still
-/// applies [`redact_userinfo`]'s own textual fallback (redacting a `user:pass@`-shaped
-/// span if one is found) and still truncates at the first `?`/`#` character found anywhere
-/// in the string, the same as for a parseable URL. There is no placeholder substitution,
-/// though — an unparseable string containing neither an `@` nor a `?`/`#` is returned
-/// unchanged, since nothing in it looks like a userinfo or query component to strip. The
-/// outbound-request URLs this guards (built from `https://...` values, always with a
-/// scheme) are not expected to hit that residual case in practice.
+/// applies [`redact_userinfo`]'s own textual fallback (redacting a `user:pass@`-shaped span,
+/// or failing that a colon-separated `key:value` credential with no `@` — #810) and still
+/// truncates at the first `?`/`#` character found anywhere in the string, the same as for a
+/// parseable URL. There is no placeholder substitution, though — an unparseable string with
+/// no redactable userinfo/credential shape and no `?`/`#` is returned unchanged, since nothing
+/// in it looks like a component to strip. The outbound-request URLs this guards (built from
+/// `https://...` values, always with a scheme) are not expected to hit that residual case in
+/// practice.
 ///
 /// # Examples
 ///
@@ -1309,6 +1417,178 @@ mod tests {
             redact_userinfo("https://registry.example:99999/simple"),
             "https://registry.example:99999/simple"
         );
+    }
+
+    /// #810: a colon-separated credential with no `@` at all (an OAuth2 npm auth line, a
+    /// GitLab CI job token, and the `gitlab.corp/user:hunter2@evil` repro whose credential
+    /// colon sits after a `/`, past the authority-only `@` scan's reach) must be redacted —
+    /// before this fix, all three passed through `url_for_tracing` byte-for-byte unchanged.
+    #[test]
+    fn test_url_for_tracing_redacts_colon_credential_no_at_sign() {
+        let cases = [
+            ("oauth2:glpat-SECRET", "oauth2:***"),
+            ("gitlab-ci-token:JOBTOKEN", "gitlab-ci-token:***"),
+            ("gitlab.corp/user:hunter2@evil", "gitlab.corp/user:***"),
+            (
+                "//registry.npmjs.org/:_authToken=npm_SECRET",
+                "//registry.npmjs.org/:***",
+            ),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(url_for_tracing(raw), expected, "raw={raw:?}");
+        }
+    }
+
+    /// S1 (impl-critic): a leading non-credential colon (a `host:port` prefix here) must not
+    /// mask a real credential later in the same value — the scan must resume after a
+    /// carve-out hit instead of bailing out on the first one. This is #810's own
+    /// `gitlab.corp/user:hunter2@evil` repro shape with a port prepended, so a regression here
+    /// silently reopens #810 through exactly the sink that motivated the scan-width widening
+    /// (`GitlabHost::parse` → `deps-lsp/src/server.rs:90` `window/showMessage`).
+    #[test]
+    fn test_url_for_tracing_colon_credential_after_port_carve_out_is_still_redacted() {
+        let cases = [
+            (
+                "gitlab.corp:8443/user:hunter2@evil",
+                "gitlab.corp:8443/user:***",
+            ),
+            ("gitlab.corp:8443/user:hunter2", "gitlab.corp:8443/user:***"),
+            (
+                "//registry.npmjs.org:443/:_authToken=npm_SECRET",
+                "//registry.npmjs.org:443/:***",
+            ),
+            ("[::1]:8443/user:hunter2", "[::1]:8443/user:***"),
+        ];
+        for (raw, expected) in cases {
+            let redacted = url_for_tracing(raw);
+            assert_eq!(redacted, expected, "raw={raw:?}");
+            assert!(
+                !redacted.contains("SECRET"),
+                "raw={raw:?} redacted={redacted:?}"
+            );
+        }
+    }
+
+    /// S2 (impl-critic): the Windows drive-letter carve-out must exempt only the drive prefix
+    /// itself (`C:\` / `c:/`), not the rest of the string — otherwise it is a 2-byte,
+    /// attacker-controlled bypass prefix for any config scalar routed through this fallback.
+    #[test]
+    fn test_url_for_tracing_colon_credential_after_drive_letter_carve_out_is_still_redacted() {
+        assert_eq!(url_for_tracing(r"C:\x:hunter2"), r"C:\x:***");
+    }
+
+    /// Documented limitations (impl-critic questions, accepted as-is): a bracket-adjacent
+    /// colon is *never* redacted regardless of what follows it (required to keep `[::1]:abc`
+    /// unchanged), so a credential in that exact position is shape-indistinguishable from a
+    /// real port and stays unredacted; and a credential that happens to be 1-5 ASCII digits
+    /// collides with the `host:port` carve-out.
+    #[test]
+    fn test_url_for_tracing_colon_credential_documented_collisions() {
+        assert_eq!(url_for_tracing("[::1]:glpat-SECRET"), "[::1]:glpat-SECRET");
+        assert_eq!(url_for_tracing("oauth2:12345"), "oauth2:12345");
+    }
+
+    /// Known limitation tracked in #811 (found while empirically verifying impl-critic's
+    /// S1/S2 evidence; not fixable inside `redact_colon_credential`): `url::Url::parse` treats
+    /// a bare `scheme:/path` (a *single* slash, no `//`) with a non-special scheme as a valid
+    /// base URL with an empty authority — `username()` and `password()` are both empty
+    /// because there never was an authority component to parse them from, not because the
+    /// value carries no credential. `redact_userinfo`'s primary branch (`net_policy.rs:567`)
+    /// takes this as proof there is nothing to redact and returns `raw` unchanged, so the
+    /// colon-credential text scanner never runs on the path at all. This affects a
+    /// `c:/...`-shaped drive path exactly as much as a genuine `token:/secret`-shaped
+    /// credential — the two are indistinguishable to the parser. Fixing it means loosening
+    /// `redact_userinfo`'s primary-path short-circuit for an empty-authority URL, which the
+    /// original security audit explicitly scoped out ("the parseable path must stay
+    /// untouched"); tracked as a follow-up in #811 rather than fixed here.
+    ///
+    /// This is narrow — only *non-special* schemes (anything other than `http`/`https`/`ws`/
+    /// `wss`/`ftp`/`file`) hit it. A *special* scheme normalizes a single slash into an
+    /// authority per the WHATWG URL spec, so the identical shape with `https:` is not a
+    /// bypass at all: `https:/user:hunter2@evil` parses with a real, non-empty authority
+    /// (`host="evil"`, `username="user"`, `password="hunter2"`) and is redacted correctly by
+    /// the existing primary branch, same as any other URL with real userinfo.
+    #[test]
+    fn test_url_for_tracing_single_slash_scheme_path_bypasses_all_redaction() {
+        assert_eq!(
+            url_for_tracing("c:/user:hunter2@evil"),
+            "c:/user:hunter2@evil"
+        );
+        assert_eq!(
+            url_for_tracing("token:/hunter2:secret"),
+            "token:/hunter2:secret"
+        );
+    }
+
+    /// Contrast case for the #811 limitation above: a *special* scheme (`https`) does not
+    /// share the gap — the WHATWG URL spec normalizes `scheme:/path` into a real authority for
+    /// these schemes, so userinfo is still identified and redacted by the primary branch.
+    #[test]
+    fn test_url_for_tracing_special_scheme_single_slash_still_redacted() {
+        assert_eq!(
+            url_for_tracing("https:/user:hunter2@evil"),
+            "https://***@evil/"
+        );
+    }
+
+    /// #810 carve-outs: none of these colon-bearing values are credentials, so the
+    /// colon-credential fallback must leave every one of them byte-for-byte unchanged.
+    #[test]
+    fn test_url_for_tracing_colon_credential_false_positive_carve_outs() {
+        let unchanged = [
+            "gitlab.corp:8443",
+            "gitlab.corp:8443/api",
+            "git.corp:8443/*",
+            "https://gitlab.corp:8443/api/v4",
+            "https://host:99999/x",
+            "[::1]:8443",
+            "[::1]:abc",
+            "https://[::1]:8443/x",
+            "https://[:::1]:8443/x",
+            "c:/packages/feed",
+            r"C:\Users\x\.npmrc",
+            r"\\server\share\feed",
+            "file:///Users/x/.npmrc",
+            "@types/node",
+            "1.2.3",
+            "^1.2.3",
+            "registry.example",
+            "*.corp.example.com",
+            "token:",
+        ];
+        for raw in unchanged {
+            assert_eq!(url_for_tracing(raw), raw, "raw={raw:?}");
+        }
+    }
+
+    /// #810 edge cases: an empty left side is still redacted (the credential is the value on
+    /// the right for a `:` pair, unlike `@`), only the first colon in a multi-colon value ever
+    /// splits, and a non-ASCII value is neither mangled nor causes a panic.
+    #[test]
+    fn test_url_for_tracing_colon_credential_edge_cases() {
+        assert_eq!(url_for_tracing(":secret"), ":***");
+        assert_eq!(url_for_tracing("a:b:c"), "a:***");
+
+        let redacted = url_for_tracing("польз:секрет@хост");
+        assert!(!redacted.contains("секрет"), "redacted={redacted:?}");
+    }
+
+    /// #810: a double-redaction regression — a URL with a real userinfo component next to an
+    /// IPv6 host:port must still redact via the parseable-URL path (username/password), not
+    /// get mangled a second time by the new colon-credential fallback.
+    #[test]
+    fn test_url_for_tracing_no_double_redaction_with_ipv6_port() {
+        assert_eq!(
+            url_for_tracing("https://user:pass@[::1]:8443/x"),
+            "https://***@[::1]:8443/x"
+        );
+    }
+
+    /// #810: a non-numeric port-like segment is not a `host:port` pair per the digit-only
+    /// carve-out, so it falls through to the general colon-credential redaction.
+    #[test]
+    fn test_url_for_tracing_non_numeric_port_like_segment_redacted() {
+        assert_eq!(url_for_tracing("https://host:abc/x"), "https://host:***/x");
     }
 
     /// Code-review follow-up on #767 (root-causing what `deps_core::error`'s `redact_if_url`

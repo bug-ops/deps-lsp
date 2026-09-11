@@ -171,8 +171,14 @@ pub enum DepsError {
     #[error("{}", registry_error_message(package, source))]
     RegistryError {
         /// Name of the package the request was for — or, at several `deps-core::cache` call
-        /// sites, the request URL instead (see [`RedactedUrl`]'s own docs: it is a no-op for
-        /// a genuine package name, so this field is safe to redact unconditionally).
+        /// sites, the request URL instead (see [`RedactedUrl`]'s own docs). Redaction is safe
+        /// to apply unconditionally: a genuine URL is redacted for real, and a genuine package
+        /// name is left alone unless it happens to contain a `:` or a non-leading `@` (a
+        /// leading `@`, e.g. an npm-scoped name like `@types/node`, is left untouched), in
+        /// which case it is redacted the same way a credential-bearing value would be (e.g. a
+        /// Maven/Gradle `group:artifact` coordinate becomes `group:***`) — a cosmetic false
+        /// positive, never a correctness issue, since no current call site populates this
+        /// field with a coordinate (only `cache.rs` does, always with a URL).
         package: RedactedUrl,
         /// The underlying `reqwest` error, with its embedded request URL stripped.
         #[source]
