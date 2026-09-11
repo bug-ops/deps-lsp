@@ -1584,32 +1584,21 @@ mod tests {
         assert_eq!(url_for_tracing("oauth2:12345"), "oauth2:12345");
     }
 
-    /// Known limitation tracked in #811 (found while empirically verifying impl-critic's
-    /// S1/S2 evidence; not fixable inside `redact_colon_credential`): `url::Url::parse` treats
-    /// a bare `scheme:/path` (a *single* slash, no `//`) with a non-special scheme as a valid
-    /// base URL with an empty authority — `username()` and `password()` are both empty
-    /// because there never was an authority component to parse them from, not because the
-    /// value carries no credential. `redact_userinfo`'s primary branch (`net_policy.rs:567`)
-    /// takes this as proof there is nothing to redact and returns `raw` unchanged, so the
-    /// colon-credential text scanner never runs on the path at all. This affects a
-    /// `c:/...`-shaped drive path exactly as much as a genuine `token:/secret`-shaped
-    /// credential — the two are indistinguishable to the parser. Fixing it means loosening
-    /// `redact_userinfo`'s primary-path short-circuit for an empty-authority URL, which the
-    /// original security audit explicitly scoped out ("the parseable path must stay
-    /// untouched"); tracked as a follow-up in #811 rather than fixed here.
+    /// #811's empty-authority `scheme:/path` fix (`redact_userinfo_opaque_path`), exercised
+    /// through `url_for_tracing` rather than `redact_userinfo` directly: `c:/user:hunter2@evil`
+    /// is now redacted. `token:/hunter2:secret` (no `@` at all) is a distinct, still-open gap
+    /// tracked in #818 — it needs #810's `redact_colon_credential` scanner routed through this
+    /// same empty-authority branch, not a fix to the `@`-based scan here.
     ///
-    /// This is narrow — only *non-special* schemes (anything other than `http`/`https`/`ws`/
-    /// `wss`/`ftp`/`file`) hit it. A *special* scheme normalizes a single slash into an
-    /// authority per the WHATWG URL spec, so the identical shape with `https:` is not a
-    /// bypass at all: `https:/user:hunter2@evil` parses with a real, non-empty authority
+    /// The empty-authority gap is narrow — only *non-special* schemes (anything other than
+    /// `http`/`https`/`ws`/`wss`/`ftp`/`file`) hit it. A *special* scheme normalizes a single
+    /// slash into an authority per the WHATWG URL spec, so the identical shape with `https:` is
+    /// not a bypass at all: `https:/user:hunter2@evil` parses with a real, non-empty authority
     /// (`host="evil"`, `username="user"`, `password="hunter2"`) and is redacted correctly by
     /// the existing primary branch, same as any other URL with real userinfo.
     #[test]
-    fn test_url_for_tracing_single_slash_scheme_path_bypasses_all_redaction() {
-        assert_eq!(
-            url_for_tracing("c:/user:hunter2@evil"),
-            "c:/user:hunter2@evil"
-        );
+    fn test_url_for_tracing_single_slash_scheme_path_redacted_except_no_at_credential() {
+        assert_eq!(url_for_tracing("c:/user:hunter2@evil"), "c:***@evil");
         assert_eq!(
             url_for_tracing("token:/hunter2:secret"),
             "token:/hunter2:secret"
