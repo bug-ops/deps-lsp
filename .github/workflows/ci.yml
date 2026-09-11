@@ -298,6 +298,36 @@ jobs:
         if: matrix.use_cross_tool
         uses: taiki-e/install-action@a82845735191974ac374fc0472388c6df0a158ca  # cross
 
+      # `cross`'s `pre-build` steps for the musl targets (Cross.toml) run `apt-get
+      # update && apt-get install cmake` inside a fresh Docker image build on every
+      # run — needed because aws-lc-sys (pulled in transitively via reqwest's
+      # rustls/aws-lc-rs backend) requires cmake to cross-compile, which the stock
+      # cross-rs musl images don't ship. That `apt-get update` hits Ubuntu 18.04's
+      # archive mirror, observed taking 6-7+ minutes on its own (a single `Fetched
+      # 48.5 MB in 6min 42s (121 kB/s)` run) and accounts for most of this job's
+      # wall time — see #815 for the mirror-flakiness background.
+      #
+      # `cross` tags the image it builds with a content hash of the Dockerfile/
+      # pre-build commands and skips rebuilding whenever an image with that exact
+      # tag already exists locally, so restoring a previously built image via
+      # `docker load` before invoking `cross build` lets it skip the apt-get step
+      # entirely on a cache hit. `docker save`/`load` preserves the tag, so we
+      # don't need to know cross's hash ourselves.
+      - name: Cache cross custom Docker image
+        if: matrix.use_cross_tool
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        id: cross-image-cache
+        with:
+          path: /tmp/cross-image-cache
+          key: cross-image-${{ matrix.target }}-${{ hashFiles('Cross.toml') }}-v1
+
+      - name: Load cached cross custom Docker image
+        if: matrix.use_cross_tool && steps.cross-image-cache.outputs.cache-hit == 'true'
+        run: |
+          if [ -f "/tmp/cross-image-cache/${{ matrix.target }}.tar" ]; then
+            docker load -i "/tmp/cross-image-cache/${{ matrix.target }}.tar"
+          fi
+
       - name: Build for cross-compile target
         if: ${{ !matrix.use_cross_tool }}
         run: cargo build --workspace --target ${{ matrix.target }}
@@ -305,6 +335,21 @@ jobs:
       - name: Build for cross-compile target (musl via cross)
         if: matrix.use_cross_tool
         run: cross build --workspace --target ${{ matrix.target }}
+
+      # Populates the cache path for the `actions/cache` step above to pick up and
+      # upload at job end (its automatic post-step). Skipped on a cache hit (no new
+      # image was built, nothing changed to save) and on i686, which has no
+      # `pre-build` entry in Cross.toml and so builds no custom image at all — the
+      # glob simply matches nothing there. `always()` so a cargo-level build failure
+      # (unrelated to the image) doesn't discard the already-paid-for apt-get work.
+      - name: Save cross custom Docker image to cache
+        if: always() && matrix.use_cross_tool && steps.cross-image-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p /tmp/cross-image-cache
+          images=$(docker images --format '{{.Repository}}:{{.Tag}}' | grep '^cross-custom-' || true)
+          if [ -n "$images" ]; then
+            docker save $images -o "/tmp/cross-image-cache/${{ matrix.target }}.tar"
+          fi
 
       - name: Run tests for cross-compile target (exercises pointer-width guards)
         # Plain `cargo test` via `cross`, not `cargo nextest`: the default cross-rs
