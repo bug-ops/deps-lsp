@@ -112,10 +112,8 @@ pub enum NuGetFeedUrlError {
 impl From<IndexUrlError> for NuGetFeedUrlError {
     fn from(error: IndexUrlError) -> Self {
         match error {
-            // `RedactedUrl::new` is idempotent for already-redacted text, so re-wrapping
-            // `IndexUrlError::InvalidUrl`'s own (already `url_for_tracing`'d) payload here is
-            // a no-op, not a double redaction.
-            IndexUrlError::InvalidUrl(raw) => Self::InvalidUrl(raw.into()),
+            // `raw` is already a `RedactedUrl` (issue #808) — no further redaction needed.
+            IndexUrlError::InvalidUrl(raw) => Self::InvalidUrl(raw),
             IndexUrlError::NotHttps(scheme) => Self::NotHttps(scheme),
             IndexUrlError::UserInfoPresent => Self::UserInfoPresent,
             IndexUrlError::BlockedHost { class } => Self::BlockedHost { class },

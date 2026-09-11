@@ -9,7 +9,8 @@
 //!   host `GITLAB_TOKEN` may ever be attached to (replacing, not extending, `gitlab.com`).
 
 use deps_core::net_policy::{
-    IndexUrlError, PolicyGate, RegistryAccessPolicy, WorkspaceRegistryAccess, validate_index_url,
+    IndexUrlError, PolicyGate, RedactedUrl, RegistryAccessPolicy, WorkspaceRegistryAccess,
+    validate_index_url,
 };
 use std::sync::{Arc, RwLock};
 
@@ -69,13 +70,13 @@ impl GitlabHost {
     /// ```
     pub fn parse(raw: &str, policy: &RegistryAccessPolicy) -> Result<Self, IndexUrlError> {
         if raw.contains([':', '?', '#', '@', '/']) {
-            return Err(IndexUrlError::InvalidUrl(raw.to_string()));
+            return Err(IndexUrlError::InvalidUrl(RedactedUrl::new(raw)));
         }
         let candidate = format!("https://{raw}");
         let url = validate_index_url(&candidate, raw, "gitlab-ci", PolicyGate::Enforce(policy))?;
         let raw_lowercased = raw.to_ascii_lowercase();
         if url.host_str() != Some(raw_lowercased.as_str()) {
-            return Err(IndexUrlError::InvalidUrl(raw.to_string()));
+            return Err(IndexUrlError::InvalidUrl(RedactedUrl::new(raw)));
         }
         Ok(Self {
             host: raw_lowercased,
@@ -413,6 +414,25 @@ mod tests {
         }
     }
 
+    /// Issue #808: `raw` fails the structural-character guard precisely on credential-shaped
+    /// input, so the `InvalidUrl` error built from it must never carry the credential through
+    /// its `Display` — mirroring the redaction fix applied to the other `RedactedUrl`-backed
+    /// `IndexUrlError` construction sites in #807. Asserts both that the credential is absent
+    /// and that the redacted form is present (critic M2 follow-up) — a positive assertion, not
+    /// just an absence check that would pass vacuously if the error message were dropped
+    /// entirely.
+    #[test]
+    fn test_gitlab_host_parse_structural_character_error_redacts_credential() {
+        let p = policy(WorkspaceRegistryAccess::All);
+        let raw = "user:hunter2@gitlab.corp";
+        let err = GitlabHost::parse(raw, &p).unwrap_err();
+        assert!(!err.to_string().contains("hunter2"), "Display: {err}");
+        assert!(
+            err.to_string().contains(&RedactedUrl::new(raw).to_string()),
+            "expected the redacted form to still be present: {err}"
+        );
+    }
+
     #[test]
     fn test_gitlab_host_parse_rejects_blocked_host_class() {
         let p = policy(WorkspaceRegistryAccess::PublicOnly);
@@ -487,6 +507,28 @@ mod tests {
             let handle = GitlabInstanceHost::new(raw, Arc::clone(&policy));
             assert!(handle.get().is_none(), "expected {bad} to be rejected");
         }
+    }
+
+    /// Issue #808: a credential-shaped `registries.gitlab_instance_host` value must not leak
+    /// through the `tracing::warn!` line `GitlabInstanceHost::resolve` emits for a rejected
+    /// value — same threat model as the `.npmrc` case fixed in #767.
+    #[test]
+    fn test_gitlab_instance_host_invalid_value_log_redacts_credential() {
+        let policy = Arc::new(RegistryAccessPolicy::default());
+        let raw_value = "user:hunter2@gitlab.corp";
+        let raw = Arc::new(RwLock::new(Some(raw_value.to_string())));
+        let handle = GitlabInstanceHost::new(raw, policy);
+
+        let log = deps_core::test_util::capture_tracing_output(|| {
+            assert!(handle.get().is_none());
+        });
+        assert!(!log.contains("hunter2"), "log: {log}");
+        // Critic M2 follow-up: a positive assertion, not just an absence check — this would
+        // pass vacuously if the warning were dropped from the log entirely.
+        assert!(
+            log.contains(&RedactedUrl::new(raw_value).to_string()),
+            "expected the redacted form to still be present: {log}"
+        );
     }
 
     #[test]
