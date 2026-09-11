@@ -10,12 +10,20 @@
 # pulls in tzdata, whose postinst script prompts interactively for a
 # timezone. Without it, the build hangs indefinitely waiting for input that
 # never arrives in a CI container (observed on x86_64-unknown-linux-musl).
+#
+# The images' /etc/apt/sources.list ships a malformed archive.archive.ubuntu.com/
+# security.archive.ubuntu.com host (doubled `archive.` prefix) instead of the
+# standard archive.ubuntu.com/security.ubuntu.com. That host resolves and serves
+# release/package indexes, but individual .deb downloads intermittently time out
+# or 404 (#815), so rewrite it to Canonical's standard mirrors before installing.
 [target.x86_64-unknown-linux-musl]
 pre-build = [
+    "sed -i 's|archive\\.archive\\.ubuntu\\.com|archive.ubuntu.com|g; s|security\\.archive\\.ubuntu\\.com|security.ubuntu.com|g' /etc/apt/sources.list",
     "export DEBIAN_FRONTEND=noninteractive && apt-get update && apt-get install --assume-yes cmake",
 ]
 
 [target.aarch64-unknown-linux-musl]
 pre-build = [
+    "sed -i 's|archive\\.archive\\.ubuntu\\.com|archive.ubuntu.com|g; s|security\\.archive\\.ubuntu\\.com|security.ubuntu.com|g' /etc/apt/sources.list",
     "export DEBIAN_FRONTEND=noninteractive && apt-get update && apt-get install --assume-yes cmake",
 ]
