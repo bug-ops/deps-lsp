@@ -63,6 +63,21 @@ impl Ecosystem for MyEcosystem {
 }
 ```
 
+## Versioning
+
+`deps-core`'s public trait signatures (`Ecosystem`, `Dependency`, `ParseResult`,
+`EcosystemFormatter`) — and its public `lsp_helpers` / `completion` helper functions —
+are typed directly against `tower_lsp_server::ls_types` types. `tower-lsp-server` is pinned
+pre-1.0, so a `tower-lsp-server` minor bump (e.g. 0.23 → 0.24) is not an implementation
+detail `deps-core` can absorb silently — it forces a breaking release of `deps-core`: a
+minor version bump while `deps-core` itself remains pre-1.0, a major version bump once
+`deps-core` reaches 1.0.
+
+If you implement `Ecosystem` outside this workspace, depend on the exact matching
+`tower-lsp-server` version via `deps_core::tower_lsp_server` rather than adding your own
+separate direct dependency on `tower-lsp-server`, to avoid it drifting out of sync with the
+version `deps-core` was built against.
+
 ## License
 
 [MIT](../../LICENSE)
