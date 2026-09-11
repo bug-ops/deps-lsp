@@ -63,6 +63,9 @@ pub mod fallback_completion;
 pub mod freshness;
 pub mod fs_probe;
 pub mod github;
+/// Shared bracket-interval version-range grammar (`[1.0,2.0)`-shaped), used by
+/// `deps-maven`, `deps-gradle`, and `deps-nuget` (#821).
+pub mod interval;
 pub mod json_ast;
 pub mod json_helpers;
 pub mod licenses;

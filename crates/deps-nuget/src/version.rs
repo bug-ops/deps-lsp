@@ -149,27 +149,20 @@ pub fn is_prerelease(version: &str) -> bool {
 /// A parsed interval-notation version range (spec §2), produced once per dependency by
 /// [`parse_range`] and reused by [`crate::formatter::NuGetMatcher`] against every candidate
 /// version, instead of being re-parsed per candidate.
-pub(crate) enum VersionRange {
-    Exact(ParsedVersion),
-    Minimum {
-        version: ParsedVersion,
-        inclusive: bool,
-    },
-    Maximum {
-        version: ParsedVersion,
-        inclusive: bool,
-    },
-    Bounded {
-        min: ParsedVersion,
-        min_inclusive: bool,
-        max: ParsedVersion,
-        max_inclusive: bool,
-    },
-}
+///
+/// The bracket-interval *grammar* (delimiter parsing, malformed-input rejection) is shared
+/// with `deps-maven`/`deps-gradle` via [`deps_core::interval`] (#821) — this is a type alias
+/// over that shared enum with NuGet's own pre-parsed [`ParsedVersion`] bound type.
+pub(crate) type VersionRange = deps_core::interval::VersionRange<ParsedVersion>;
 
-// `first`/`last` are validated ASCII brackets before slicing at `len_utf8`, so this slice
-// bound is always a char boundary.
-#[allow(clippy::string_slice)]
+/// Parses a NuGet interval-notation `range` (spec §2), once per dependency.
+///
+/// A bare version (no leading bracket) is a floor — `Minimum { inclusive: true }` — under
+/// `PackageReference`/`PackageVersion` semantics. A bracketed range delegates to
+/// [`deps_core::interval::parse_interval`] under [`deps_core::interval::BracketStyle::Standard`]
+/// (NuGet has no reversed-bracket notation), which rejects nested/stray brackets, a third
+/// comma-separated component, and a no-comma body that isn't the matching inclusive pair
+/// `[...]` — malformed shapes this function used to accept silently before #821.
 pub(crate) fn parse_range(range: &str) -> Option<VersionRange> {
     let range = range.trim();
     if range.is_empty() {
@@ -185,59 +178,9 @@ pub(crate) fn parse_range(range: &str) -> Option<VersionRange> {
         });
     }
 
-    let last = range.chars().next_back()?;
-    if last != ']' && last != ')' {
-        return None;
-    }
-
-    let min_inclusive = first == '[';
-    let max_inclusive = last == ']';
-    let inner = &range[first.len_utf8()..range.len() - last.len_utf8()];
-
-    if let Some((lo, hi)) = inner.split_once(',') {
-        let lo = lo.trim();
-        let hi = hi.trim();
-        let min = (!lo.is_empty()).then(|| ParsedVersion::parse(lo));
-        let max = (!hi.is_empty()).then(|| ParsedVersion::parse(hi));
-        match (min, max) {
-            (Some(min), Some(max)) => Some(VersionRange::Bounded {
-                min,
-                min_inclusive,
-                max,
-                max_inclusive,
-            }),
-            (Some(version), None) => Some(VersionRange::Minimum {
-                version,
-                inclusive: min_inclusive,
-            }),
-            (None, Some(version)) => Some(VersionRange::Maximum {
-                version,
-                inclusive: max_inclusive,
-            }),
-            (None, None) => None,
-        }
-    } else {
-        // No comma inside brackets: exact pin, e.g. "[1.0]" == 1.0.
-        Some(VersionRange::Exact(ParsedVersion::parse(inner.trim())))
-    }
-}
-
-fn satisfies_min(v: &ParsedVersion, min: &ParsedVersion, inclusive: bool) -> bool {
-    let ord = compare_parsed(v, min);
-    if inclusive {
-        ord != Ordering::Less
-    } else {
-        ord == Ordering::Greater
-    }
-}
-
-fn satisfies_max(v: &ParsedVersion, max: &ParsedVersion, inclusive: bool) -> bool {
-    let ord = compare_parsed(v, max);
-    if inclusive {
-        ord != Ordering::Greater
-    } else {
-        ord == Ordering::Less
-    }
+    deps_core::interval::parse_interval(range, deps_core::interval::BracketStyle::Standard, |b| {
+        Some(ParsedVersion::parse(b))
+    })
 }
 
 /// Compares an "up to date" reference version against `range`'s floor, for range shapes
@@ -256,27 +199,16 @@ pub(crate) fn compare_minimum_floor(range: &str, other: &str) -> Option<Ordering
         VersionRange::Minimum { version, .. } => {
             Some(compare_parsed(&version, &ParsedVersion::parse(other)))
         }
-        VersionRange::Exact(_) | VersionRange::Maximum { .. } | VersionRange::Bounded { .. } => {
-            None
-        }
+        // `VersionRange` is `#[non_exhaustive]` (defined in `deps_core::interval`) — a
+        // wildcard arm is required here regardless of how many variants exist today.
+        _ => None,
     }
 }
 
 /// Whether `version` falls inside an already-parsed NuGet interval `range`.
 pub(crate) fn range_contains(version: &str, range: &VersionRange) -> bool {
     let v = ParsedVersion::parse(version);
-
-    match range {
-        VersionRange::Exact(target) => compare_parsed(&v, target) == Ordering::Equal,
-        VersionRange::Minimum { version, inclusive } => satisfies_min(&v, version, *inclusive),
-        VersionRange::Maximum { version, inclusive } => satisfies_max(&v, version, *inclusive),
-        VersionRange::Bounded {
-            min,
-            min_inclusive,
-            max,
-            max_inclusive,
-        } => satisfies_min(&v, min, *min_inclusive) && satisfies_max(&v, max, *max_inclusive),
-    }
+    deps_core::interval::contains(&v, range, compare_parsed)
 }
 
 /// Checks whether `version` satisfies a NuGet interval-notation `range` (spec §2).
@@ -667,5 +599,33 @@ mod tests {
     fn test_resolve_float_invalid_pattern_returns_none() {
         let versions: Vec<String> = vec!["1.0.0".to_string()];
         assert_eq!(resolve_float(&versions, "not-a-pattern"), None);
+    }
+
+    /// #821: `$(...)`'s parentheses trip the shared grammar's nested-bracket guard, so this
+    /// bracketed MSBuild property reference is now rejected outright rather than parsing to a
+    /// `Bounded` 0.0.0-0.0.0 interval as it used to — see `NuGetFormatter::requirement_is_unresolved`'s
+    /// doc for why the `Unresolved` classification still matters independently of this.
+    #[test]
+    fn test_parse_range_rejects_bracketed_msbuild_property_reference() {
+        assert!(parse_range("[$(MinVersion),$(MaxVersion))").is_none());
+    }
+
+    /// #821: these shapes must be rejected (`parse_range` returns `None`), not silently
+    /// accepted — before this fix, `parse_range`'s independent, less-hardened grammar
+    /// accepted all five, so `satisfies` wrongly returned `true` for a candidate that should
+    /// have been undecidable instead. The shared grammar in `deps_core::interval` (also used
+    /// by `deps-maven`/`deps-gradle`) already rejected every one of these.
+    #[test]
+    fn test_satisfies_rejects_all_malformed_interval_shapes() {
+        for malformed in ["[[1.0,2.0)", "[1.0,2.0,3.0]", "(1.0)", "[]", "[1.0,2.0)]"] {
+            assert!(
+                parse_range(malformed).is_none(),
+                "expected {malformed:?} to be rejected by parse_range"
+            );
+            assert!(
+                !satisfies("1.5.0", malformed),
+                "expected {malformed:?} to never satisfy any candidate"
+            );
+        }
     }
 }
