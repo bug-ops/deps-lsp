@@ -438,17 +438,17 @@ impl Default for RegistryAccessPolicy {
 /// # Examples
 ///
 /// ```
-/// use deps_core::net_policy::{IndexUrlError, PolicyGate, validate_index_url};
+/// use deps_core::net_policy::{IndexUrlError, PolicyGate, RedactedUrl, validate_index_url};
 ///
 /// let err = validate_index_url("not a url", "not a url", "cargo", PolicyGate::Skip).unwrap_err();
-/// assert_eq!(err, IndexUrlError::InvalidUrl("not a url".to_string()));
+/// assert_eq!(err, IndexUrlError::InvalidUrl(RedactedUrl::new("not a url")));
 /// ```
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum IndexUrlError {
     /// The value did not parse as a URL at all.
     #[error("not a valid URL: {0}")]
-    InvalidUrl(String),
+    InvalidUrl(RedactedUrl),
     /// The URL's scheme is not `https`.
     #[error("registry index must use https, got scheme {0:?}")]
     NotHttps(String),
@@ -810,7 +810,7 @@ pub fn validate_index_url(
     gate: PolicyGate<'_>,
 ) -> Result<url::Url, IndexUrlError> {
     let url = url::Url::parse(candidate)
-        .map_err(|_| IndexUrlError::InvalidUrl(url_for_tracing(raw_for_log)))?;
+        .map_err(|_| IndexUrlError::InvalidUrl(RedactedUrl::new(raw_for_log)))?;
     let is_https = url.scheme() == "https";
     #[cfg(any(test, feature = "test-util"))]
     let is_https = is_https || is_loopback_url(&url);
@@ -1401,7 +1401,10 @@ mod tests {
         let IndexUrlError::InvalidUrl(redacted) = &err else {
             panic!("expected InvalidUrl, got {err:?}");
         };
-        assert!(!redacted.contains("hunter2"), "redacted: {redacted}");
+        assert!(
+            !redacted.as_ref().contains("hunter2"),
+            "redacted: {redacted}"
+        );
         assert!(!err.to_string().contains("hunter2"), "Display: {err}");
     }
 
@@ -1420,9 +1423,12 @@ mod tests {
             let IndexUrlError::InvalidUrl(redacted) = &err else {
                 panic!("expected InvalidUrl, got {err:?}");
             };
-            assert!(!redacted.contains("hunter2"), "redacted: {redacted}");
             assert!(
-                !redacted.contains("super-secret-value"),
+                !redacted.as_ref().contains("hunter2"),
+                "redacted: {redacted}"
+            );
+            assert!(
+                !redacted.as_ref().contains("super-secret-value"),
                 "redacted: {redacted}"
             );
             assert!(

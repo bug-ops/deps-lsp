@@ -33,8 +33,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use deps_core::net_policy::{
-    PolicyGate, RedactedUrl, RegistryAccessPolicy, redact_userinfo, url_for_tracing,
-    validate_index_url,
+    PolicyGate, RedactedUrl, RegistryAccessPolicy, redact_userinfo, validate_index_url,
 };
 use deps_core::parser::DependencySource;
 
@@ -89,11 +88,11 @@ impl GoProxyUrl {
         // rather than joined incorrectly. `InvalidUrl` is the closest existing
         // `GoProxyUrlError` variant (no `deps-core` change for a Go-only validation rule).
         //
-        // `url_for_tracing`, not `redact_userinfo` alone (#767 S2a): this is exactly the
+        // `RedactedUrl::new`, not `redact_userinfo` alone (#767 S2a): this is exactly the
         // rejection a query-string-bearing `raw` hits, so the payload built here is the one
         // place the offending query string itself would otherwise still be visible.
         if url.query().is_some() || url.fragment().is_some() {
-            return Err(GoProxyUrlError::InvalidUrl(url_for_tracing(raw)));
+            return Err(GoProxyUrlError::InvalidUrl(RedactedUrl::new(raw)));
         }
         let normalized = url.as_str().trim_end_matches('/').to_string();
         Ok(Self { normalized })
@@ -334,7 +333,7 @@ fn parse_goproxy(raw: &str, policy: &RegistryAccessPolicy) -> Result<GoProxyChai
         Err(first_invalid.unwrap_or_else(|| {
             let redacted = RedactedUrl::new(raw);
             InvalidEntry {
-                reason: GoProxyUrlError::InvalidUrl(redacted.to_string()),
+                reason: GoProxyUrlError::InvalidUrl(redacted.clone()),
                 raw: redacted,
             }
         }))
@@ -1083,7 +1082,7 @@ mod tests {
             panic!("expected InvalidUrl, got {err:?}");
         };
         assert!(
-            !redacted.contains("super-secret-value"),
+            !redacted.as_ref().contains("super-secret-value"),
             "redacted: {redacted}"
         );
         assert!(

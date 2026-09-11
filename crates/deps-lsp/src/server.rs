@@ -71,6 +71,31 @@ fn parse_config(value: serde_json::Value) -> Option<DepsConfig> {
     }
 }
 
+/// Builds the `window/showMessage` warning text for a rejected
+/// `registries.gitlab_instance_host` value.
+///
+/// `raw` is redacted via [`deps_core::net_policy::RedactedUrl`] before being interpolated
+/// (issue #808): `raw` is exactly the attacker/user-controlled config value
+/// `deps_gitlab_ci::GitlabHost::parse` rejected, which can be credential-shaped (e.g.
+/// `user:hunter2@gitlab.corp`) — interpolating it verbatim into a message shown in the
+/// editor UI is a second, user-visible sink for the same credential leak #808 closed in the
+/// `tracing::warn!`/error-`Display` path, and arguably worse since it isn't just a log line.
+/// Extracted as its own pure function so the redaction can be unit-tested without driving a
+/// full LSP client transport.
+#[cfg(feature = "gitlab-ci")]
+fn gitlab_instance_host_invalid_message(
+    raw: &str,
+    error: &deps_core::net_policy::IndexUrlError,
+) -> String {
+    let redacted = deps_core::net_policy::RedactedUrl::new(raw);
+    format!(
+        "deps-lsp: registries.gitlab_instance_host value '{redacted}' is invalid \
+         ({error}) and will be ignored — instance-host resolution stays \
+         unresolved and GITLAB_TOKEN will not be sent to gitlab.com or any other \
+         host until this is corrected"
+    )
+}
+
 /// Validates a newly configured `registries.gitlab_instance_host` value and, when it is
 /// rejected, surfaces the rejection to the user via `window/showMessage` rather than only
 /// `tracing::warn` (security review, issue #466) — an invalid value silently redirecting
@@ -92,12 +117,7 @@ async fn warn_if_gitlab_instance_host_invalid(
         client
             .show_message(
                 MessageType::WARNING,
-                format!(
-                    "deps-lsp: registries.gitlab_instance_host value '{raw}' is invalid \
-                     ({error}) and will be ignored — instance-host resolution stays \
-                     unresolved and GITLAB_TOKEN will not be sent to gitlab.com or any other \
-                     host until this is corrected"
-                ),
+                gitlab_instance_host_invalid_message(raw, &error),
             )
             .await;
     }
@@ -3111,5 +3131,30 @@ mod tests {
             })
             .await;
         assert!(result.is_ok());
+    }
+
+    /// Issue #808 (critic S1 follow-up): the `window/showMessage` warning for a rejected
+    /// `registries.gitlab_instance_host` value interpolates `raw` directly — a second,
+    /// user-visible sink for the same credential leak #808 closed in the
+    /// `tracing::warn!`/error-`Display` path. Asserts both that the raw credential never
+    /// appears in the built message and that the redacted form *does* — a positive
+    /// assertion, not just an absence check that would pass vacuously if the value were
+    /// dropped from the message entirely.
+    #[cfg(feature = "gitlab-ci")]
+    #[test]
+    fn test_gitlab_instance_host_invalid_message_redacts_credential() {
+        let policy = deps_core::net_policy::RegistryAccessPolicy::new(
+            deps_core::net_policy::WorkspaceRegistryAccess::All,
+        );
+        let raw = "user:hunter2@gitlab.corp";
+        let error = deps_gitlab_ci::GitlabHost::parse(raw, &policy).unwrap_err();
+
+        let message = gitlab_instance_host_invalid_message(raw, &error);
+
+        assert!(!message.contains("hunter2"), "message: {message}");
+        assert!(
+            message.contains(&deps_core::net_policy::RedactedUrl::new(raw).to_string()),
+            "expected the redacted form to still be present: {message}"
+        );
     }
 }
