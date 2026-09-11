@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - **deps-core**: unified `net_policy`'s duplicated userinfo-redaction carve-out rules into one shared `redact_credential` scanner — zero behavior change (resolves #846) (#863)
 
+### Fixed
+- `fuzz/redact_userinfo`: fixed a false-positive crash where the fuzzer-controlled host/port tail could coincidentally reproduce the sentinel literal, tripping the leak assertion outside any credential; no `net_policy` behavior change (#864)
+
 ## [0.14.0] - 2026-09-11
 
 ### Added

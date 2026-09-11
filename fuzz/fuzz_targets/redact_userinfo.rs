@@ -35,12 +35,23 @@ const SENTINEL: &str = "FUZZSECRET";
 
 /// An alphanumeric-only tail derived from the fuzzer's raw bytes — see this file's own module
 /// doc comment for why non-alphanumeric bytes are filtered out rather than passed through.
+///
+/// libFuzzer's CMP-tracing instrumentation observes `SENTINEL` inside this file's own `assert!`
+/// and auto-adds it as a dictionary token, so the raw byte stream can — and, once discovered, will
+/// repeatedly — spell out `SENTINEL` verbatim. Every template below places `tail` in a
+/// non-credential position (the host/port), so a `tail` that happens to equal `SENTINEL` produces
+/// an output that legitimately contains it outside any credential, which is not a leak but would
+/// still trip invariant (b)'s blanket `!redacted.contains(SENTINEL)` check. Strip any occurrence
+/// of `SENTINEL` from the tail so the assertion only ever observes the one deliberately injected
+/// credential.
 fn tail_from(data: &[u8]) -> String {
-    data.iter()
+    let tail: String = data
+        .iter()
         .filter(|b| b.is_ascii_alphanumeric())
         .take(16)
         .map(|&b| b as char)
-        .collect()
+        .collect();
+    tail.replace(SENTINEL, "")
 }
 
 fuzz_target!(|data: &[u8]| {
