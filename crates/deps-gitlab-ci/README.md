@@ -41,7 +41,7 @@ deps-gitlab-ci = "0.13"
 ```
 
 > [!IMPORTANT]
-> Requires Rust 1.91 or later.
+> Requires Rust 1.98 or later.
 
 ## Usage
 
