@@ -595,14 +595,16 @@ impl LicenseSource {
 ///
 /// ```no_run
 /// use deps_core::{Ecosystem, ParseResult, Registry, EcosystemConfig, PackageName, ConcreteVersion, Metadata};
-/// use deps_core::completion::Completions;
+/// use deps_core::completion::{Completions, build_feature_completion};
 /// use deps_core::lsp_helpers::{
 ///     DiagnosticMessages, DiagnosticPolicy, EcosystemFormatter, OsvNaming, PackageNaming,
 ///     PackageRendering, RequirementResolution, SourcePolicy,
 /// };
 /// use std::sync::Arc;
 /// use std::any::Any;
-/// use tower_lsp_server::ls_types::{Uri, CompletionItem, Position};
+/// use tower_lsp_server::ls_types::{
+///     Uri, CompletionItem, CompletionTextEdit, Position, Range, TextEdit,
+/// };
 ///
 /// struct MyFormatter;
 /// impl PackageNaming for MyFormatter {}
@@ -645,13 +647,50 @@ impl LicenseSource {
 ///
 ///     fn formatter(&self) -> &dyn EcosystemFormatter { &self.formatter }
 ///
+///     // Hook for `CompletionContext::PackageName` — called by `generate_completions`'s
+///     // default dispatch (below) whenever the cursor sits in a package-name token. A
+///     // real ecosystem would search `self.registry` for `prefix` and build one item per
+///     // match, e.g. via `deps_core::completion::complete_package_names_generic`.
+///     fn complete_package_name<'a>(
+///         &'a self,
+///         _request: deps_core::completion::CompletionRequest<'a>,
+///         prefix: String,
+///         range: Range,
+///     ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
+///         Box::pin(async move {
+///             let item = CompletionItem {
+///                 label: prefix.clone(),
+///                 text_edit: Some(CompletionTextEdit::Edit(TextEdit { range, new_text: prefix })),
+///                 ..Default::default()
+///             };
+///             Completions::new(vec![item])
+///         })
+///     }
+///
+///     // Hook for `CompletionContext::Version` — called by `generate_completions`'s
+///     // default dispatch whenever the cursor sits in a version-requirement token.
 ///     fn complete_version<'a>(
 ///         &'a self,
 ///         _request: deps_core::completion::CompletionRequest<'a>,
-///         _package_name: deps_core::PackageName,
+///         _package_name: PackageName,
 ///         _prefix: String,
 ///     ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
 ///         Box::pin(async move { Completions::default() })
+///     }
+///
+///     // Hook for `CompletionContext::Feature` — called by `generate_completions`'s
+///     // default dispatch whenever the cursor sits in a feature-flag array entry. Reuses
+///     // the shared `build_feature_completion` helper rather than hand-building the item.
+///     fn complete_feature<'a>(
+///         &'a self,
+///         _request: deps_core::completion::CompletionRequest<'a>,
+///         package_name: PackageName,
+///         prefix: String,
+///     ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
+///         Box::pin(async move {
+///             let item = build_feature_completion(&prefix, &package_name, None);
+///             Completions::new(vec![item])
+///         })
 ///     }
 ///
 ///     fn completion_insert_text(&self, metadata: &dyn Metadata) -> Option<String> {
@@ -660,6 +699,18 @@ impl LicenseSource {
 ///
 ///     fn as_any(&self) -> &dyn Any { self }
 /// }
+///
+/// // `generate_completions` is not overridden above, so `MyEcosystem` inherits this
+/// // trait's default implementation: it detects the `CompletionContext` at `position` and
+/// // dispatches to whichever of the three hooks above matches — the "three-hook pattern".
+/// # async fn dispatch_demo(ecosystem: &MyEcosystem, parse_result: &dyn ParseResult) {
+/// let freshness = deps_core::FreshnessSettings::default();
+/// let position = Position { line: 0, character: 0 };
+/// let content = r#"serde = "1.0""#;
+/// let _completions = ecosystem
+///     .generate_completions(parse_result, position, content, freshness)
+///     .await;
+/// # }
 /// ```
 pub trait Ecosystem: Send + Sync + private::Sealed {
     /// Exhaustively typed ecosystem identity.
