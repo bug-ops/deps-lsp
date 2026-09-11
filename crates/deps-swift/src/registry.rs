@@ -82,12 +82,23 @@ impl SwiftRegistry {
     /// round trip out of the tag-pagination loop's `P+1`, not half the latency (#223
     /// R7), and on a memo hit the join costs nothing at all.
     ///
+    /// Takes a [`deps_core::FreshnessSettings`] parameter (ignored, like `deps-cargo`'s
+    /// identical `_freshness`) purely so this inherent method's signature matches every
+    /// other ecosystem's `get_versions_with` exactly — the same name never means three
+    /// different call shapes across crates (#834 critic S1). The `Registry` trait impl
+    /// still does the enabled/disabled dispatch itself, choosing this method or the plain
+    /// [`Self::get_versions`].
+    ///
     /// # Errors
     ///
     /// Same as [`Self::get_versions`] — the release-dates fetch is infallible and never
     /// contributes an error.
     #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
-    pub async fn get_versions_with_release_dates(&self, name: &str) -> Result<Vec<SwiftVersion>> {
+    pub async fn get_versions_with(
+        &self,
+        name: &str,
+        _freshness: deps_core::FreshnessSettings,
+    ) -> Result<Vec<SwiftVersion>> {
         let (versions, dates) = tokio::join!(self.get_versions(name), self.release_dates(name));
         let mut versions = versions?;
         attach_publish_times(&mut versions, &dates);
@@ -283,18 +294,7 @@ fn parse_license_response(data: &[u8]) -> Vec<String> {
 }
 
 impl deps_core::Registry for SwiftRegistry {
-    fn get_versions<'a>(
-        &'a self,
-        name: &'a deps_core::PackageName,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Version>>>> {
-        Box::pin(async move {
-            let versions = self.get_versions(name.as_str()).await?;
-            Ok(versions
-                .into_iter()
-                .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
-                .collect())
-        })
-    }
+    deps_core::impl_registry_versions_method!(get_versions);
 
     fn get_versions_with<'a>(
         &'a self,
@@ -303,7 +303,7 @@ impl deps_core::Registry for SwiftRegistry {
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Version>>>> {
         Box::pin(async move {
             let versions = if freshness.enabled {
-                self.get_versions_with_release_dates(name.as_str()).await?
+                self.get_versions_with(name.as_str(), freshness).await?
             } else {
                 self.get_versions(name.as_str()).await?
             };
@@ -584,6 +584,11 @@ mod tests {
         };
     }
 
+    deps_core::registry_conformance! {
+        mod swift_registry_api_conformance;
+        ty: SwiftRegistry;
+    }
+
     // `normalize_tag`, `parse_releases_page`, `classify_release_fetch`, and the
     // TTL/eviction/memo-hit behavior of the release-dates cache now live in
     // `deps_core::github::ReleaseDatesCache` (#486); their unit tests moved there. This
@@ -677,7 +682,9 @@ mod tests {
             ..Default::default()
         };
 
-        let versions = registry.get_versions_with(&name, freshness).await.unwrap();
+        let versions = Registry::get_versions_with(&registry, &name, freshness)
+            .await
+            .unwrap();
 
         assert_eq!(versions.len(), 1);
         assert!(versions.iter().all(|v| v.published_at().is_none()));
@@ -713,7 +720,9 @@ mod tests {
             ..Default::default()
         };
 
-        let versions = registry.get_versions_with(&name, freshness).await.unwrap();
+        let versions = Registry::get_versions_with(&registry, &name, freshness)
+            .await
+            .unwrap();
 
         assert_eq!(versions.len(), 1);
         assert!(versions.iter().all(|v| v.published_at().is_some()));

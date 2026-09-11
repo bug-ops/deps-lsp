@@ -195,7 +195,7 @@ impl ChainSeparator {
 }
 
 /// One fully-resolved, ready-to-register `GOPROXY` chain — produced by
-/// [`GoEnvConfig::goproxy_chain`], consumed by `GoRegistry::register_chain`.
+/// [`GoEnvConfig::goproxy_chain`], consumed by `GoRegistry::register_alternate`.
 ///
 /// Output-only: constructed internally by [`GoEnvConfig::goproxy_chain`], never by external
 /// code — no constructor is provided.
@@ -778,7 +778,7 @@ impl GoEnvConfig {
             .any(|pattern| pattern.tokens.is_some())
     }
 
-    /// Every chain this config implies, ready for `GoRegistry::register_chain` — the resolved
+    /// Every chain this config implies, ready for `GoRegistry::register_alternate` — the resolved
     /// `GOPROXY` chain (if any), plus the fixed [`GOPRIVATE_CHAIN_KEY`] bypass chain when
     /// [`Self::has_goprivate`] holds (registered regardless of whether `GOPROXY` itself is also
     /// declared — FR-008 applies independently of `GOPROXY`). Empty when `$GOENV` declares no
@@ -985,7 +985,7 @@ pub fn resolve(cache: &GoEnvCache, policy: &RegistryAccessPolicy) -> GoEnvConfig
 /// [`GoParseContext::goenv_path`] instead of calling [`goenv_path`] itself.
 ///
 /// This is the seam `crate::parser::parse_go_mod_with_context` calls in production, and the
-/// way tests exercise the full parse -> resolve -> `register_chain` -> `get_versions_from`
+/// way tests exercise the full parse -> resolve -> `register_alternate` -> `get_versions_from`
 /// path without depending on the real host `$GOENV`.
 #[must_use]
 pub fn resolve_with_context(ctx: &GoParseContext) -> GoEnvConfig {

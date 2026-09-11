@@ -596,7 +596,7 @@ mod tests {
             source: deps_core::parser::DependencySource::Registry,
         };
         let uri = deps_core::test_util::test_uri("/test/Package.swift");
-        let parse_result = crate::types::SwiftParseResult {
+        let parse_result = crate::parser::SwiftParseResult {
             dependencies: vec![dep],
             uri,
             dependency_truncation: None,
@@ -622,7 +622,7 @@ mod tests {
     #[tokio::test]
     async fn test_generate_completions_none_context_returns_empty() {
         let uri = deps_core::test_util::test_uri("/test/Package.swift");
-        let parse_result = crate::types::SwiftParseResult {
+        let parse_result = crate::parser::SwiftParseResult {
             dependencies: vec![],
             uri,
             dependency_truncation: None,
@@ -663,7 +663,7 @@ mod tests {
             source: deps_core::parser::DependencySource::Registry,
         };
         let uri = deps_core::test_util::test_uri("/test/Package.swift");
-        let parse_result = crate::types::SwiftParseResult {
+        let parse_result = crate::parser::SwiftParseResult {
             dependencies: vec![dep],
             uri,
             dependency_truncation: None,

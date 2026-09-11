@@ -2357,6 +2357,46 @@ impl LockFileProvider for MyLockParser {
 }
 ```
 
+### Registry Client Method Naming (issue #834)
+
+A registry crate's own struct (`{Ecosystem}Registry`) exposes concrete, non-boxed **inherent**
+methods alongside its `deps_core::Registry` trait impl — the trait's own method of the same
+name should delegate to the inherent one (see Step 5 above). A new ecosystem crate must use
+this exact vocabulary for a new operation; a different name for one of these same operations
+is the #760/#834 bug class:
+
+| Operation | Canonical name |
+| --- | --- |
+| Fetch all versions | `get_versions` |
+| Fetch all versions plus extra data (e.g. publish dates) | `get_versions_with` |
+| Fetch the version matching a requirement | `get_latest_matching` |
+| Search by query | `search` |
+| Register an alternate/private registry source | `register_alternate` |
+| Build the registry's web-display URL for a package | `package_url` (re-export from `lib.rs`) |
+| Construct a client pointed at a non-default base URL | `with_base` |
+| Pure in-memory getter (no I/O) | no `get_` prefix (Rust API Guidelines C-GETTER) |
+
+**Sanctioned, named exceptions** (a deliberate #834 scope decision, not drift to fix):
+- `gem_url` (`deps-bundler`), `crate_url` (`deps-cargo`), `jsr_package_url` (`deps-deno`) —
+  ecosystem-specific display-URL builder names are fine to keep; only the *re-export*
+  consistency (every `package_url`-named builder living in `lib.rs`) was in scope.
+- The metadata-fetch **return type** stays per-ecosystem (`GemInfo`/`PackageInfo`/
+  `ArtifactInfo`/`CrateInfo`/`DenoMetadata`/`GoMetadata`, ...) — only the *method* name
+  converges on `get_package_metadata`; the six type names are unrelated data shapes with no
+  shared field set, and unifying them is a separate, much larger design exercise this issue
+  did not take on.
+
+See `deps_core::Registry`'s own "Registry client API contract" doc section for the full
+rationale, and `deps_core::registry_conformance!`'s `ty:` form to add a compile-time check
+that your crate's registry struct exposes the first four names as true inherent methods
+(not merely reachable through a trait — see `deps_core::conformance::NotInherent`'s doc).
+Wired into 9 of the 14 ecosystem crates directly (`deps-maven`'s check transitively covers
+`deps-gradle`, which reuses `deps-maven`'s `MavenCentralRegistry` unchanged); `deps-go`/
+`deps-github-actions` (no search endpoint to call at all — an inherent `search` would be a
+fabricated stub existing only to pass this check) and `deps-deno`/`deps-gitlab-ci` (no
+single struct the check's assumptions fit) are exempt, with the exact reasoning in
+`deps_core::Registry`'s own doc.
+
 ## Templates
 
 Use the templates in `templates/deps-ecosystem/` as a starting point for new ecosystems.

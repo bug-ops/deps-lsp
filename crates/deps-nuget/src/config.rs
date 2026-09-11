@@ -345,7 +345,7 @@ pub struct ResolvedHop {
     pub url: NuGetFeedUrl,
     /// The lowercased declared `<add key>` that supplied [`Self::auth`], or `None` when this
     /// hop carries no credential. Used (not the credential value) by
-    /// `NuGetSourceChain::chain`'s hash and by `NuGetRegistry::register_chain`'s
+    /// `NuGetSourceChain::chain`'s hash and by `NuGetRegistry::register_alternate`'s
     /// rotation-detection, so a chain's identity is stable across a credential *value*
     /// rotation under the same declared key.
     pub slot: Option<String>,
@@ -373,7 +373,7 @@ impl ResolvedHop {
 }
 
 /// One fully-resolved routing chain, produced by [`NuGetConfig::resolved_chains`], consumed by
-/// `NuGetRegistry::register_chain`. Mirrors `deps_pypi::config::ResolvedChain` exactly.
+/// `NuGetRegistry::register_alternate`. Mirrors `deps_pypi::config::ResolvedChain` exactly.
 ///
 /// Output-only: constructed internally by [`NuGetConfig::resolved_chains`], never by external
 /// code — no constructor is provided.
@@ -754,7 +754,7 @@ impl NuGetConfig {
             .collect()
     }
 
-    /// Every chain this config implies, ready for `NuGetRegistry::register_chain` — one chain
+    /// Every chain this config implies, ready for `NuGetRegistry::register_alternate` — one chain
     /// per distinct `<packageSourceMapping>` hop-set (when a mapping is declared), or the
     /// single plain accumulated chain otherwise. Empty when nothing is registrable (US-004,
     /// R4's fail-closed states, or a mapping group that resolves to only the public source).

@@ -19,6 +19,68 @@ type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>
 /// This trait uses `Box<dyn Trait>` return types instead of associated types
 /// to allow runtime polymorphism and dynamic ecosystem registration.
 ///
+/// # Registry client API contract (#834)
+///
+/// Each ecosystem crate's own registry struct (`CratesIoRegistry`, `NpmRegistry`,
+/// `MavenCentralRegistry`, ...) additionally exposes a set of **inherent** async methods
+/// with concrete (non-boxed) parameter/return types — this trait's own methods box and
+/// type-erase, which every hover/completion/diagnostic call site needs, but a caller that
+/// already knows the concrete ecosystem (most ecosystem-crate-internal code, and every
+/// conformance test) wants the unboxed value directly. The trait method of the same name is
+/// expected to delegate to its inherent counterpart (see `deps-cargo::registry::CratesIoRegistry`
+/// for the canonical shape). Naming previously drifted per crate (issue #760, #834); the
+/// canonical vocabulary going forward is:
+///
+/// - `get_versions` — fetch all versions.
+/// - `get_versions_with` — fetch all versions plus extra data (e.g. publish dates).
+/// - `get_latest_matching` — fetch the single version matching a requirement.
+/// - `search` — fetch search results for a query.
+/// - `register_alternate` — register an alternate/private registry source.
+/// - `package_url` — build the registry's web-display URL for a package (re-exported from
+///   the crate root wherever it exists).
+/// - `with_base` — construct a registry client pointed at a non-default base URL (tests,
+///   alternate-registry hops); a plain, ungated `with_base` for production use, distinct
+///   from any additional `#[cfg(test)]`/`test-util`-gated constructor a crate also needs
+///   (see `deps-npm::registry::NpmRegistry::with_public_base_for_test` for that shape).
+/// - Pure in-memory getters (no I/O) drop the `get_` prefix entirely, per the Rust API
+///   Guidelines' C-GETTER (e.g. `ResolvedPackages::version`/`all`,
+///   `EcosystemRegistry::for_filename`/`for_uri`/`for_lockfile`/`for_watched_config`).
+///
+/// Two sanctioned, named exceptions to this vocabulary (a deliberate #834 scope decision,
+/// not drift left to fix): ecosystem-specific display-URL builder names (`gem_url` in
+/// `deps-bundler`, `crate_url` in `deps-cargo`, `jsr_package_url` in `deps-deno`) stay as-is
+/// — only re-export consistency was in scope, not the name itself; and the metadata-fetch
+/// **return type** stays per-ecosystem (`GemInfo`/`PackageInfo`/`ArtifactInfo`/`CrateInfo`/
+/// `DenoMetadata`/`GoMetadata`, ...) — only the *method* name converges on
+/// `get_package_metadata`.
+///
+/// [`crate::registry_conformance!`]'s `ty:` form asserts the first four names exist on a
+/// given registry type at compile time (and, since #834 critic S5, actually asserts they
+/// are *inherent* — see [`crate::conformance::NotInherent`]'s own doc), so a future
+/// ecosystem crate cannot silently reintroduce this drift. Wired directly into 9 of the 14
+/// ecosystem crates as of #834; `deps-gradle` reuses `deps-maven`'s `MavenCentralRegistry`
+/// unchanged and so is covered transitively through `deps-maven`'s own check. Four crates
+/// are exempt, each for a distinct, documented reason rather than a silent gap:
+/// - `deps-gitlab-ci` — route-based, no name+version registry concept at all; every one of
+///   the four trait methods is an inline stub in the `Registry` impl itself, with no real
+///   per-package logic anywhere to extract.
+/// - `deps-deno` — `DenoRegistry`, the type that implements `Registry`, is a
+///   scheme-dispatching facade with no single struct holding all four methods (it dispatches
+///   by `jsr:`/`npm:` prefix to either its `JsrRegistry` field or an `NpmRegistry`, with
+///   different call shapes on each side). Note this is a statement about `DenoRegistry`
+///   specifically, not about the crate as a whole: `JsrRegistry` itself already has genuine
+///   inherent `get_versions`/`search`, just not `get_versions_with`/`get_latest_matching`,
+///   and its `get_versions(&self, scope: &str, name: &str)` is a fifth, two-part-key
+///   argument shape for the canonical `get_versions` name (JSR packages are scoped,
+///   `@scope/name`) that this contract's table does not otherwise cover.
+/// - `deps-go`, `deps-github-actions` — both have genuine inherent `get_versions`/
+///   `get_versions_with`/`get_latest_matching`; only `search` is missing, because neither
+///   registry (the Go module proxy, the GitHub tags API) exposes a search endpoint this
+///   crate can call at all. An inherent `search` here would be a fabricated always-empty
+///   stub whose only purpose is satisfying this check, not a real, callable operation — the
+///   `Registry` trait impl's own `search` (also always empty, for the same reason) is the
+///   honest place for that.
+///
 /// # Examples
 ///
 /// ```no_run

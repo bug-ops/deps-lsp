@@ -198,7 +198,7 @@ mod tests {
         let parser = SwiftLockParser;
         let resolved = parser.parse_lockfile(&path).await.unwrap();
         assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved.get_version("apple/swift-nio"), Some("2.62.0"));
+        assert_eq!(resolved.version("apple/swift-nio"), Some("2.62.0"));
     }
 
     #[tokio::test]
@@ -224,7 +224,7 @@ mod tests {
         let parser = SwiftLockParser;
         let resolved = parser.parse_lockfile(&path).await.unwrap();
         assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved.get_version("apple/swift-nio"), Some("2.62.0"));
+        assert_eq!(resolved.version("apple/swift-nio"), Some("2.62.0"));
     }
 
     #[tokio::test]
@@ -251,7 +251,7 @@ mod tests {
         let parser = SwiftLockParser;
         let resolved = parser.parse_lockfile(&path).await.unwrap();
         assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved.get_version("vapor/vapor"), Some("4.89.3"));
+        assert_eq!(resolved.version("vapor/vapor"), Some("4.89.3"));
     }
 
     #[tokio::test]
@@ -371,7 +371,7 @@ mod tests {
 
         let parser = SwiftLockParser;
         let resolved = parser.parse_lockfile(&path).await.unwrap();
-        assert_eq!(resolved.get_version("org/mypkg"), Some("3.1.4"));
+        assert_eq!(resolved.version("org/mypkg"), Some("3.1.4"));
     }
 
     #[tokio::test]
@@ -393,7 +393,7 @@ mod tests {
 
         let parser = SwiftLockParser;
         let resolved = parser.parse_lockfile(&path).await.unwrap();
-        assert_eq!(resolved.get_version("org/mypkg"), Some("2.0.0"));
+        assert_eq!(resolved.version("org/mypkg"), Some("2.0.0"));
     }
 
     #[tokio::test]
@@ -420,7 +420,7 @@ mod tests {
 
         let parser = SwiftLockParser;
         let resolved = parser.parse_lockfile(&path).await.unwrap();
-        assert_eq!(resolved.get_version("FallbackName"), Some("1.0.0"));
+        assert_eq!(resolved.version("FallbackName"), Some("1.0.0"));
     }
 
     #[tokio::test]

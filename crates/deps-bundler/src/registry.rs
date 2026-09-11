@@ -36,6 +36,12 @@ fn versions_url(name: &str) -> String {
 }
 
 /// Builds the rubygems.org API request URL for a gem's detailed info.
+///
+/// No production caller since `get_gem_info` (dead code, no callers of its own) was removed
+/// (#834/#835) — kept `#[cfg(test)]`-only so the `#758` JSON-nesting-depth conformance
+/// coverage and the `#349` query-injection guard for this URL shape are not lost along with
+/// the dead production wrapper.
+#[cfg(test)]
 fn gem_info_url(name: &str) -> String {
     format!(
         "{RUBYGEMS_API_BASE}/gems/{}.json",
@@ -102,20 +108,9 @@ impl RubyGemsRegistry {
         let gems = parse_search_response(&data)?;
         Ok(gems.into_iter().take(limit).collect())
     }
-
-    /// Gets detailed gem information.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the HTTP request fails or the response body is not valid JSON
-    /// matching rubygems.org's `gems/{name}.json` shape.
-    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
-    pub async fn get_gem_info(&self, name: &str) -> Result<GemInfo> {
-        let url = gem_info_url(name);
-        let data = self.cache.get_cached(&url).await?;
-        parse_gem_info(&data)
-    }
 }
+
+deps_core::impl_get_versions_with_passthrough!(RubyGemsRegistry, BundlerVersion);
 
 #[derive(Deserialize)]
 struct VersionEntry {
@@ -211,6 +206,9 @@ fn parse_search_response(data: &[u8]) -> Result<Vec<GemInfo>> {
         .collect())
 }
 
+/// No production caller (see [`gem_info_url`]'s doc) — `#[cfg(test)]`-only, kept for the
+/// `#758` JSON-nesting-depth conformance test and its own direct parse coverage.
+#[cfg(test)]
 #[derive(Deserialize)]
 struct GemInfoResponse {
     name: String,
@@ -226,6 +224,7 @@ struct GemInfoResponse {
     downloads: u64,
 }
 
+#[cfg(test)]
 fn parse_gem_info(data: &[u8]) -> Result<GemInfo> {
     let response: GemInfoResponse = deps_core::parse_json_checked(data)?;
 
@@ -296,18 +295,8 @@ impl deps_core::Metadata for GemInfo {
 
 // Implement Registry trait for trait object support
 impl deps_core::Registry for RubyGemsRegistry {
-    fn get_versions<'a>(
-        &'a self,
-        name: &'a deps_core::PackageName,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Version>>>> {
-        Box::pin(async move {
-            let versions = self.get_versions(name.as_str()).await?;
-            Ok(versions
-                .into_iter()
-                .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
-                .collect())
-        })
-    }
+    deps_core::impl_registry_versions_method!(get_versions);
+    deps_core::impl_registry_versions_method!(get_versions_with);
 
     fn get_latest_matching<'a>(
         &'a self,
@@ -744,9 +733,9 @@ mod tests {
         );
     }
 
-    /// #349: same query-injection guard for `get_gem_info`'s `gems/{name}.json` URL.
+    /// #349: same query-injection guard for `gem_info_url`'s `gems/{name}.json` URL.
     #[test]
-    fn test_get_gem_info_url_encodes_query_injection() {
+    fn test_gem_info_url_encodes_query_injection() {
         let name = "foo?callback=evil";
         let url = gem_info_url(name);
         let parsed = url::Url::parse(&url).unwrap();
@@ -947,6 +936,11 @@ mod tests {
             req: "*";
             expected_index: 1;
         };
+    }
+
+    deps_core::registry_conformance! {
+        mod bundler_registry_api_conformance;
+        ty: RubyGemsRegistry;
     }
 
     #[tokio::test]

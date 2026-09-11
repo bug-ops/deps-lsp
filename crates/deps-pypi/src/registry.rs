@@ -44,7 +44,7 @@ pub const REGISTRY: &str = "PyPI";
 /// project's private-index configuration count; exists only to keep this map, keyed by
 /// workspace-controlled chain identities, from growing unbounded for the process lifetime.
 /// Mirrors `deps-npm`'s identical `MAX_ALTERNATE_REGISTRIES`. Once at capacity, a *new* chain
-/// is simply never registered (see [`PypiRegistry::register_chain`]) — a dependency resolved
+/// is simply never registered (see [`PypiRegistry::register_alternate`]) — a dependency resolved
 /// to an unregistered chain degrades to [`DepsError::PackageNotFound`], never to a
 /// `pypi.org` lookup by name (spec FR-010).
 ///
@@ -209,7 +209,7 @@ pub struct PypiRegistry {
     /// Resolved, already-constructed hop clients this instance falls through to when it
     /// (hop 0) misses (spec FR-005, fixes C1). Empty for the `Public`-tier root and every
     /// named-source/leaf client — populated only on the *head* client
-    /// [`Self::register_chain`] builds for a multi-hop chain. Never looked up by string key at
+    /// [`Self::register_alternate`] builds for a multi-hop chain. Never looked up by string key at
     /// fetch time; `Self::get_versions_chained` walks this `Vec` positionally.
     fallback_chain: Vec<Arc<Self>>,
 }
@@ -248,7 +248,7 @@ impl PypiRegistry {
     /// `pypi.org`. Mirrors [`PypiIndexUrl`]'s identical `cfg(test)`/`test-util`-gated loopback
     /// carve-out (validator finding #9).
     ///
-    /// [`Self::register_chain`]'s implicit-public-fallback hop is built from `root`'s own
+    /// [`Self::register_alternate`]'s implicit-public-fallback hop is built from `root`'s own
     /// `simple_base` (not the hardcoded `PYPI_SIMPLE_BASE` constant), so registering a chain
     /// against a root constructed this way makes that hop resolve to the mock server too —
     /// the same code path production uses, just pointed elsewhere.
@@ -272,7 +272,7 @@ impl PypiRegistry {
     /// of the ungated transport.
     ///
     /// `fallback_chain` is empty for every call except the *head* client
-    /// [`Self::register_chain`] builds for a multi-hop chain — every other hop (a chain's own
+    /// [`Self::register_alternate`] builds for a multi-hop chain — every other hop (a chain's own
     /// leaf hops, or a single-hop named-source client) is a dead end with nothing further to
     /// fall through to, matching plan.md §1's "leaf clients are never themselves looked up by
     /// key, only walked positionally" design. Its own `alternates` map starts empty and is
@@ -310,7 +310,7 @@ impl PypiRegistry {
     /// **freshly-constructed `Public`-tier client** ([`Self::new`], same URL/transport as the
     /// root), never `Arc::clone(root)` — cloning the root would create a
     /// root→alternates→head→fallback_chain→root reference cycle (N1's second half).
-    pub fn register_chain(root: &Arc<Self>, chain: &ResolvedChain) {
+    pub fn register_alternate(root: &Arc<Self>, chain: &ResolvedChain) {
         let Some((first_hop, rest_hops)) = chain.hops.split_first() else {
             // Defensive: `PypiIndexConfig::resolved_chains` never produces an empty-hop
             // chain (the zero-hop case resolves to plain `DependencySource::Registry`
@@ -362,35 +362,6 @@ impl PypiRegistry {
         }
     }
 
-    /// Registers a single-hop named-source client (Poetry `source =`/uv `index =`, spec
-    /// FR-007/FR-013) under `index`'s own URL into `root.alternates`. Same
-    /// idempotency/capacity rules and `root: &Arc<Self>` parameter shape as
-    /// [`Self::register_chain`].
-    ///
-    /// Has no production caller today — named sources are actually registered through
-    /// [`Self::register_chain`], whose `ResolvedChain::key` for a named source is already its
-    /// own literal URL.
-    pub fn register_named_source(root: &Arc<Self>, index: &PypiIndexUrl) {
-        let key = index.as_str().to_string();
-        let at_capacity = root.alternates.len() >= MAX_ALTERNATE_REGISTRIES;
-
-        if let dashmap::mapref::entry::Entry::Vacant(slot) = root.alternates.entry(key.clone()) {
-            if at_capacity {
-                tracing::warn!(
-                    key = %RedactedUrl::new(&key),
-                    cap = MAX_ALTERNATE_REGISTRIES,
-                    "PyPI alternate registry cap reached; not registering a new named source"
-                );
-                return;
-            }
-            slot.insert(Arc::new(Self::with_base(
-                Arc::clone(&root.cache),
-                index,
-                Vec::new(),
-            )));
-        }
-    }
-
     /// The registered client for `index` (a [`ResolvedChain::key`] or a named source's own
     /// URL), if any — read-only, performs no registration, no validation.
     ///
@@ -406,7 +377,7 @@ impl PypiRegistry {
 
     /// FR-005/NFR-006: tries `self` (hop 0) first, then each already-resolved
     /// `Self::fallback_chain` entry in order — no further map lookup at any point (verifies
-    /// [`Self::register_chain`]'s C1 fix actually resolves a hop end to end).
+    /// [`Self::register_alternate`]'s C1 fix actually resolves a hop end to end).
     ///
     /// Implements the plan's three-way failure taxonomy: `Ok(versions)` with `versions`
     /// non-empty is terminal success; `Err(PackageNotFound)` or `Ok(versions)` with `versions`
@@ -710,6 +681,8 @@ impl PypiRegistry {
     }
 }
 
+deps_core::impl_get_versions_with_passthrough!(PypiRegistry, PypiVersion);
+
 // Implement Registry trait for PypiRegistry
 impl deps_core::Registry for PypiRegistry {
     fn get_versions<'a>(
@@ -721,6 +694,23 @@ impl deps_core::Registry for PypiRegistry {
     > {
         Box::pin(async move {
             let versions = Self::get_versions(self, name.as_str()).await?;
+            Ok(versions
+                .into_iter()
+                .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
+                .collect())
+        })
+    }
+
+    fn get_versions_with<'a>(
+        &'a self,
+        name: &'a deps_core::PackageName,
+        freshness: FreshnessSettings,
+    ) -> deps_core::ecosystem::BoxFuture<
+        'a,
+        deps_core::error::Result<Vec<Box<dyn deps_core::Version>>>,
+    > {
+        Box::pin(async move {
+            let versions = Self::get_versions_with(self, name.as_str(), freshness).await?;
             Ok(versions
                 .into_iter()
                 .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
@@ -1867,6 +1857,11 @@ mod tests {
         };
     }
 
+    deps_core::registry_conformance! {
+        mod pypi_registry_api_conformance;
+        ty: PypiRegistry;
+    }
+
     #[test]
     fn test_select_latest_matching_excludes_unhyphenated_prerelease() {
         // Regression guard: the trait default `is_prerelease` heuristic (substring match
@@ -2144,7 +2139,7 @@ mod tests {
             hops: vec![primary, extra],
             implicit_public_fallback: false,
         };
-        PypiRegistry::register_chain(&root, &chain);
+        PypiRegistry::register_alternate(&root, &chain);
 
         let source = DependencySource::AlternateRegistry {
             index: chain.key.clone(),
@@ -2340,7 +2335,7 @@ mod tests {
     /// Zero-hop `ResolvedChain::hops` (defensive — `PypiIndexConfig` never actually produces
     /// one) is a no-op registration, not a panic.
     #[test]
-    fn test_register_chain_empty_hops_is_noop() {
+    fn test_register_alternate_empty_hops_is_noop() {
         let cache = Arc::new(HttpCache::new());
         let root = Arc::new(PypiRegistry::new(cache));
         let chain = crate::config::ResolvedChain {
@@ -2348,14 +2343,14 @@ mod tests {
             hops: Vec::new(),
             implicit_public_fallback: false,
         };
-        PypiRegistry::register_chain(&root, &chain);
+        PypiRegistry::register_alternate(&root, &chain);
         assert!(root.alternate_client("empty").is_none());
     }
 
-    /// `register_chain` is idempotent per key — a second registration for the same key is a
+    /// `register_alternate` is idempotent per key — a second registration for the same key is a
     /// no-op (mirrors `deps-npm::NpmRegistry::register_alternate`'s identical guarantee).
     #[test]
-    fn test_register_chain_idempotent() {
+    fn test_register_alternate_idempotent() {
         let cache = Arc::new(HttpCache::new());
         let root = Arc::new(PypiRegistry::new(cache));
         let chain = crate::config::ResolvedChain {
@@ -2363,9 +2358,9 @@ mod tests {
             hops: vec![index_url("https://a.example/simple")],
             implicit_public_fallback: false,
         };
-        PypiRegistry::register_chain(&root, &chain);
+        PypiRegistry::register_alternate(&root, &chain);
         let first = root.alternate_client("dup").unwrap();
-        PypiRegistry::register_chain(&root, &chain);
+        PypiRegistry::register_alternate(&root, &chain);
         let second = root.alternate_client("dup").unwrap();
         assert!(Arc::ptr_eq(&first, &second));
     }
@@ -2373,7 +2368,7 @@ mod tests {
     /// `MAX_ALTERNATE_REGISTRIES` cap: once reached, a new chain is not registered (degrades
     /// to `PackageNotFound` at fetch time, never a silent public fallback).
     #[test]
-    fn test_register_chain_capacity_cap() {
+    fn test_register_alternate_capacity_cap() {
         let cache = Arc::new(HttpCache::new());
         let root = Arc::new(PypiRegistry::new(cache));
         for i in 0..MAX_ALTERNATE_REGISTRIES {
@@ -2382,25 +2377,25 @@ mod tests {
                 hops: vec![index_url("https://a.example/simple")],
                 implicit_public_fallback: false,
             };
-            PypiRegistry::register_chain(&root, &chain);
+            PypiRegistry::register_alternate(&root, &chain);
         }
         let overflow = crate::config::ResolvedChain {
             key: "overflow".to_string(),
             hops: vec![index_url("https://b.example/simple")],
             implicit_public_fallback: false,
         };
-        PypiRegistry::register_chain(&root, &overflow);
+        PypiRegistry::register_alternate(&root, &overflow);
         assert!(root.alternate_client("overflow").is_none());
     }
 
     // Issue #824 (S1 correction): a named source's `ResolvedChain::key` is its own literal
-    // index URL (`PypiIndexConfig::resolved_chains`), routed through `register_chain` — not
-    // `register_named_source`, which has no production caller. `validate_index_url` rejects
-    // userinfo but preserves the query string, so a real Poetry `source =`/uv `index =`
-    // named source can still carry `?_authToken=...` all the way into `register_chain`'s
-    // cap-reached warn; it must log through `RedactedUrl`, not the raw chain key.
+    // index URL (`PypiIndexConfig::resolved_chains`), routed through `register_alternate`
+    // uniformly with any other chain. `validate_index_url` rejects userinfo but preserves
+    // the query string, so a real Poetry `source =`/uv `index =` named source can still
+    // carry `?_authToken=...` all the way into `register_alternate`'s cap-reached warn; it
+    // must log through `RedactedUrl`, not the raw chain key.
     #[test]
-    fn test_register_chain_redacts_query_credential_for_named_source_on_cap_reached() {
+    fn test_register_alternate_redacts_query_credential_for_named_source_on_cap_reached() {
         let cache = Arc::new(HttpCache::new());
         let root = Arc::new(PypiRegistry::new(cache));
         for i in 0..MAX_ALTERNATE_REGISTRIES {
@@ -2409,7 +2404,7 @@ mod tests {
                 hops: vec![index_url("https://a.example/simple")],
                 implicit_public_fallback: false,
             };
-            PypiRegistry::register_chain(&root, &chain);
+            PypiRegistry::register_alternate(&root, &chain);
         }
 
         let mut config = crate::config::PypiIndexConfig::new();
@@ -2426,7 +2421,7 @@ mod tests {
             .expect("named source produces a chain keyed by its own literal URL");
 
         let log = capture_tracing_output(|| {
-            PypiRegistry::register_chain(&root, &named_chain);
+            PypiRegistry::register_alternate(&root, &named_chain);
         });
 
         assert!(
@@ -2452,7 +2447,7 @@ mod tests {
             hops: vec![index_url("https://a.example/simple")],
             implicit_public_fallback: false,
         };
-        PypiRegistry::register_chain(&root, &chain);
+        PypiRegistry::register_alternate(&root, &chain);
         let head = root.alternate_client("chain").unwrap();
         assert!(head.alternate_client("chain").is_none());
     }
@@ -2472,7 +2467,7 @@ mod tests {
             hops: vec![index_url("https://a.example/simple")],
             implicit_public_fallback: true,
         };
-        PypiRegistry::register_chain(&root, &chain);
+        PypiRegistry::register_alternate(&root, &chain);
 
         drop(root);
         assert!(
@@ -2482,13 +2477,13 @@ mod tests {
         );
     }
 
-    /// FR-005(b)/N1: `register_chain` with `implicit_public_fallback: true` appends a
+    /// FR-005(b)/N1: `register_alternate` with `implicit_public_fallback: true` appends a
     /// freshly-constructed `Public`-tier leaf (same URL/transport as `pypi.org`) as the
     /// chain's final hop — verified structurally rather than by dispatching a live
     /// `get_versions_from` call, since walking off the end of this chain would otherwise
     /// contact the real `pypi.org` from a unit test.
     #[test]
-    fn test_register_chain_implicit_public_fallback_hop_shape() {
+    fn test_register_alternate_implicit_public_fallback_hop_shape() {
         let cache = Arc::new(HttpCache::new());
         cache.set_registry_policy(deps_core::net_policy::WorkspaceRegistryAccess::All);
         let root = Arc::new(PypiRegistry::new(Arc::clone(&cache)));
@@ -2499,7 +2494,7 @@ mod tests {
             hops: vec![extra],
             implicit_public_fallback: true,
         };
-        PypiRegistry::register_chain(&root, &chain);
+        PypiRegistry::register_alternate(&root, &chain);
 
         let head = root.alternate_client("case-b").unwrap();
         assert_eq!(head.simple_base, "https://extra.example/simple");
@@ -2546,7 +2541,7 @@ mod tests {
             hops: vec![extra],
             implicit_public_fallback: true,
         };
-        PypiRegistry::register_chain(&root, &chain);
+        PypiRegistry::register_alternate(&root, &chain);
 
         let source = DependencySource::AlternateRegistry {
             index: chain.key.clone(),
@@ -2601,7 +2596,7 @@ mod tests {
             hops: vec![extra],
             implicit_public_fallback: true,
         };
-        PypiRegistry::register_chain(&root, &chain);
+        PypiRegistry::register_alternate(&root, &chain);
 
         let source = DependencySource::AlternateRegistry {
             index: chain.key.clone(),
@@ -2647,7 +2642,7 @@ mod tests {
             hops: vec![index_url(&format!("{}/simple", server.url()))],
             implicit_public_fallback: false,
         };
-        PypiRegistry::register_chain(&root, &chain);
+        PypiRegistry::register_alternate(&root, &chain);
 
         let source = DependencySource::AlternateRegistry {
             index: chain.key.clone(),
@@ -2700,7 +2695,7 @@ mod tests {
         let cache = Arc::new(HttpCache::new());
         cache.set_registry_policy(deps_core::net_policy::WorkspaceRegistryAccess::All);
         // `fallback_chain` is a flat list of every hop after hop 0, all direct children of
-        // the head — never nested per-hop (that's how `register_chain` actually builds it;
+        // the head — never nested per-hop (that's how `register_alternate` actually builds it;
         // `get_versions_chained` only ever walks `self.fallback_chain` one level deep, not
         // recursively).
         let hop1 = Arc::new(PypiRegistry::with_base(

@@ -38,7 +38,7 @@ use deps_nuget::{parse_project_file, NuGetRegistry};
 
 let result = parse_project_file(content, &uri)?;
 let registry = NuGetRegistry::new(cache);
-let versions = registry.get_versions_typed("Newtonsoft.Json").await?;
+let versions = registry.get_versions("Newtonsoft.Json").await?;
 ```
 
 ## Supported manifest syntax

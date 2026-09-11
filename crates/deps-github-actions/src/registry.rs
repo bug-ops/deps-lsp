@@ -351,7 +351,7 @@ impl GithubActionsRegistry {
 
     /// Like [`GithubActionsRegistry::get_versions`], but also attaches GitHub Release
     /// publish times, joined by normalized tag name (#486, mirroring
-    /// `deps_swift::registry::SwiftRegistry::get_versions_with_release_dates`).
+    /// `deps_swift::registry::SwiftRegistry::get_versions_with`).
     ///
     /// Runs the tags fetch and the release-dates fetch concurrently (`tokio::join!`) —
     /// the release-dates fetch is infallible (empty map on any failure), so it can
@@ -369,14 +369,22 @@ impl GithubActionsRegistry {
     /// tripped while a token is present. Left unfixed rather than adding a check that
     /// would never fire in the tokened case it targets.
     ///
+    /// Takes a [`deps_core::FreshnessSettings`] parameter (ignored, like `deps-cargo`'s
+    /// identical `_freshness`) purely so this inherent method's signature matches every
+    /// other ecosystem's `get_versions_with` exactly — the same name never means three
+    /// different call shapes across crates (#834 critic S1). The `Registry` trait impl
+    /// still does the enabled/disabled dispatch itself, choosing this method or the plain
+    /// [`Self::get_versions`].
+    ///
     /// # Errors
     ///
     /// Same as [`Self::get_versions`] — the release-dates fetch is infallible and never
     /// contributes an error.
     #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
-    pub async fn get_versions_with_release_dates(
+    pub async fn get_versions_with(
         &self,
         name: &str,
+        _freshness: deps_core::FreshnessSettings,
     ) -> Result<Vec<GithubActionsVersion>> {
         let (versions, dates) = tokio::join!(
             self.get_versions(name),
@@ -474,18 +482,7 @@ fn attach_publish_times(
 }
 
 impl deps_core::Registry for GithubActionsRegistry {
-    fn get_versions<'a>(
-        &'a self,
-        name: &'a deps_core::PackageName,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Version>>>> {
-        Box::pin(async move {
-            let versions = self.get_versions(name.as_str()).await?;
-            Ok(versions
-                .into_iter()
-                .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
-                .collect())
-        })
-    }
+    deps_core::impl_registry_versions_method!(get_versions);
 
     fn get_versions_with<'a>(
         &'a self,
@@ -494,7 +491,7 @@ impl deps_core::Registry for GithubActionsRegistry {
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Version>>>> {
         Box::pin(async move {
             let versions = if freshness.enabled {
-                self.get_versions_with_release_dates(name.as_str()).await?
+                self.get_versions_with(name.as_str(), freshness).await?
             } else {
                 self.get_versions(name.as_str()).await?
             };
@@ -1278,7 +1275,9 @@ mod tests {
             ..Default::default()
         };
 
-        let versions = registry.get_versions_with(&name, freshness).await.unwrap();
+        let versions = Registry::get_versions_with(&registry, &name, freshness)
+            .await
+            .unwrap();
 
         assert_eq!(versions.len(), 1);
         assert!(versions.iter().all(|v| v.published_at().is_none()));
@@ -1317,7 +1316,9 @@ mod tests {
             ..Default::default()
         };
 
-        let versions = registry.get_versions_with(&name, freshness).await.unwrap();
+        let versions = Registry::get_versions_with(&registry, &name, freshness)
+            .await
+            .unwrap();
 
         assert_eq!(versions.len(), 1);
         assert!(versions.iter().all(|v| v.published_at().is_some()));
@@ -1356,7 +1357,9 @@ mod tests {
             ..Default::default()
         };
 
-        let versions = registry.get_versions_with(&name, freshness).await.unwrap();
+        let versions = Registry::get_versions_with(&registry, &name, freshness)
+            .await
+            .unwrap();
 
         assert_eq!(versions.len(), 1);
         assert!(versions.iter().all(|v| v.published_at().is_none()));
@@ -1393,7 +1396,9 @@ mod tests {
             ..Default::default()
         };
 
-        let versions = registry.get_versions_with(&name, freshness).await.unwrap();
+        let versions = Registry::get_versions_with(&registry, &name, freshness)
+            .await
+            .unwrap();
 
         assert_eq!(versions.len(), 1);
         assert!(versions.iter().all(|v| v.published_at().is_none()));

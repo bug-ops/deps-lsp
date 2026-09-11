@@ -159,7 +159,7 @@ impl MavenEcosystem {
             return vec![];
         }
 
-        let results = match self.registry.search_typed(prefix, 20).await {
+        let results = match self.registry.search(prefix, 20).await {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!("Maven registry search failed for '{}': {}", prefix, e);
@@ -517,7 +517,7 @@ mod tests {
     // #794: `complete_package_names_for_field` (defined above in `impl MavenEcosystem`)
     // guards on the exact same `is_valid_completion_prefix_len` predicate
     // `complete_package_names_generic` uses internally, before calling
-    // `registry.search_typed` — this proves that shared guard predicate behaves correctly,
+    // `registry.search` — this proves that shared guard predicate behaves correctly,
     // mirroring every other ecosystem's `completion_guard_conformance!` invocation (see
     // that macro's doc for why the substitute closure calls `complete_package_names_generic`
     // directly rather than through Maven's own field-completion wiring).
@@ -525,7 +525,7 @@ mod tests {
     // Wiring the substitute closure through the real `complete_package_names_for_field`
     // instead (#794 impl-critic minor) is not feasible without a production change: that
     // method is `&self`-based over `self.registry: Arc<MavenCentralRegistry>` (a concrete
-    // type, calling its inherent `search_typed`, not the `Registry` trait's `search`), while
+    // type, calling its inherent `search`, not the `Registry` trait's `search`), while
     // this macro's `complete:` closure only ever receives a substituted `&dyn Registry` — the
     // fixture registry can't be threaded into `self.registry`'s concrete type without
     // widening that field to `Arc<dyn Registry>`, out of scope for this test-only change.
@@ -632,7 +632,7 @@ mod tests {
     /// (`extract_prefix`/`strip_leading_xml_tag`) must extract the identical query
     /// string for the identical cursor position, since it's a raw-text approximation of
     /// this function's own tag-aware extraction, and both feed the same registry
-    /// dedup/cache-key mechanism (`MavenCentralRegistry::search_typed`). This line and
+    /// dedup/cache-key mechanism (`MavenCentralRegistry::search`). This line and
     /// cursor position are kept intentionally identical to `deps-lsp`'s
     /// `test_fallback_completion_maven_query_matches_tag_value` — if either extractor's
     /// logic changes, update both tests and confirm they still agree.

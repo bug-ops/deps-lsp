@@ -165,8 +165,8 @@ packages:
 "#;
         let packages = parse_pubspec_lock(lock).unwrap();
         assert_eq!(packages.len(), 2);
-        assert_eq!(packages.get_version("http"), Some("1.2.0"));
-        assert_eq!(packages.get_version("provider"), Some("6.1.2"));
+        assert_eq!(packages.version("http"), Some("1.2.0"));
+        assert_eq!(packages.version("provider"), Some("6.1.2"));
     }
 
     /// #721: an unquoted, numeric-looking version (`version: 1.0`, parsed by
@@ -187,7 +187,7 @@ packages:
 "#;
         let packages = parse_pubspec_lock(lock).unwrap();
         assert_eq!(packages.len(), 1);
-        assert_eq!(packages.get_version("http"), Some("1.0"));
+        assert_eq!(packages.version("http"), Some("1.0"));
     }
 
     #[test]
@@ -317,7 +317,7 @@ packages:
     version: "1.2.0"
 "#;
         let packages = parse_pubspec_lock(lock).unwrap();
-        assert_eq!(packages.get_version("http"), Some("1.2.0"));
+        assert_eq!(packages.version("http"), Some("1.2.0"));
     }
 
     // #758: shared `LockFileProvider` conformance, replacing test_locate_lockfile and
@@ -353,6 +353,6 @@ packages:
         let parser = PubspecLockParser;
         let packages = parser.parse_lockfile(&lock_path).await.unwrap();
         assert_eq!(packages.len(), 1);
-        assert_eq!(packages.get_version("http"), Some("1.2.0"));
+        assert_eq!(packages.version("http"), Some("1.2.0"));
     }
 }

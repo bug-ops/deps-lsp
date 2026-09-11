@@ -152,8 +152,8 @@ async fn test_fixture_packages_lock_json() {
 
     // MyCompany.Shared ("type": "Project", no "resolved") must be skipped, not abort parsing.
     assert_eq!(resolved.len(), 2);
-    assert_eq!(resolved.get_version("Newtonsoft.Json"), Some("13.0.3"));
-    assert_eq!(resolved.get_version("Serilog"), Some("3.1.1"));
+    assert_eq!(resolved.version("Newtonsoft.Json"), Some("13.0.3"));
+    assert_eq!(resolved.version("Serilog"), Some("3.1.1"));
     assert!(resolved.get("MyCompany.Shared").is_none());
 }
 

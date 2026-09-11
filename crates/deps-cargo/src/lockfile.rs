@@ -421,8 +421,8 @@ checksum = "def456"
         let resolved = parser.parse_lockfile(&lockfile_path).await.unwrap();
 
         assert_eq!(resolved.len(), 2);
-        assert_eq!(resolved.get_version("serde"), Some("1.0.195"));
-        assert_eq!(resolved.get_version("serde_derive"), Some("1.0.195"));
+        assert_eq!(resolved.version("serde"), Some("1.0.195"));
+        assert_eq!(resolved.version("serde_derive"), Some("1.0.195"));
 
         let serde_pkg = resolved.get("serde").unwrap();
         assert_eq!(serde_pkg.dependencies.len(), 1);

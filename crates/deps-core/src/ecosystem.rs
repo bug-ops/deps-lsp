@@ -697,7 +697,7 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     /// File extensions this ecosystem handles when the manifest basename is
     /// not fixed (e.g. `[".csproj", ".fsproj"]` for NuGet project files).
     ///
-    /// Consulted by [`crate::EcosystemRegistry::get_for_filename`] only after
+    /// Consulted by [`crate::EcosystemRegistry::for_filename`] only after
     /// an exact [`manifest_filenames`](Ecosystem::manifest_filenames) match
     /// fails. Empty by default, indicating this ecosystem is routed solely by
     /// exact filename.
@@ -708,7 +708,7 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     /// Basename glob patterns this ecosystem handles, each containing exactly
     /// one `*` wildcard (e.g. `["requirements*.txt"]`).
     ///
-    /// Consulted by [`crate::EcosystemRegistry::get_for_filename`] as a third
+    /// Consulted by [`crate::EcosystemRegistry::for_filename`] as a third
     /// routing stage, tried after an exact
     /// [`manifest_filenames`](Ecosystem::manifest_filenames) match fails and
     /// before [`manifest_extensions`](Ecosystem::manifest_extensions) — for
@@ -734,11 +734,11 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     /// ancestor directories precede it. Used when the basename alone carries
     /// no ecosystem signal.
     ///
-    /// Consulted by [`crate::EcosystemRegistry::get_for_uri`] only, after both
+    /// Consulted by [`crate::EcosystemRegistry::for_uri`] only, after both
     /// [`manifest_patterns`](Ecosystem::manifest_patterns) and
     /// [`manifest_extensions`](Ecosystem::manifest_extensions) miss on the
     /// basename — it needs the full path, so it is never reachable from
-    /// [`crate::EcosystemRegistry::get_for_filename`]. Empty by default.
+    /// [`crate::EcosystemRegistry::for_filename`]. Empty by default.
     fn manifest_directory_patterns(&self) -> &[(&'static str, &'static str)] {
         &[]
     }

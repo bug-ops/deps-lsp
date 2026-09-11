@@ -4,7 +4,7 @@
 //! (`https://api.nuget.org/v3/index.json`) must be resolved first, then consulted for the
 //! flat-container ("PackageBaseAddress"), search ("SearchQueryService"), and registration
 //! ("RegistrationsBaseUrl") resource URLs — the last one backs both publish-time freshness
-//! and [`NuGetRegistry::unlisted_versions_for_hover`]'s hover-only unlisted enrichment (D1).
+//! and [`NuGetRegistry::unlisted_versions`]'s hover-only unlisted enrichment (D1).
 
 use crate::config::{NuGetAuth, NuGetSourceChain, ResolvedHop};
 use crate::types::{NuGetVersion, PackageInfo};
@@ -42,7 +42,7 @@ fn digest_salt() -> u64 {
 /// argument (FR-014) — `0` when `auth` is `None`, otherwise a salted hash of `declared_origin`
 /// and the credential's header value. Deliberately scoped to *one hop's own* credential, not
 /// the whole chain's (see [`chain_auth_digest`] for the distinct, chain-wide value
-/// `register_chain` uses for rotation detection): each hop's own cache-key correctness depends
+/// `register_alternate` uses for rotation detection): each hop's own cache-key correctness depends
 /// only on its own credential, independent of whether some other hop in the same chain also
 /// rotated.
 fn own_auth_digest(declared_origin: &str, auth: Option<&NuGetAuth>) -> u64 {
@@ -55,7 +55,7 @@ fn own_auth_digest(declared_origin: &str, auth: Option<&NuGetAuth>) -> u64 {
 }
 
 /// A chain-wide digest over every hop's `(url, auth)` pair, in order (issue #561, S3) — used
-/// only by `NuGetRegistry::register_chain` to detect whether *any* hop's credential in a
+/// only by `NuGetRegistry::register_alternate` to detect whether *any* hop's credential in a
 /// re-resolved chain differs from what is currently registered, never as a per-request
 /// `auth_id` (see [`own_auth_digest`] for that, distinct, purpose).
 fn chain_auth_digest(hops: &[ResolvedHop]) -> u64 {
@@ -102,7 +102,7 @@ const MAX_EXTERNAL_PAGE_FETCHES: usize = 2;
 
 /// Upper bound on [`NuGetRegistry::alternates`]' entry count. Mirrors `deps-npm`'s/
 /// `deps-pypi`'s identical `MAX_ALTERNATE_REGISTRIES`. Once at capacity, a *new* chain is
-/// simply never registered (see [`NuGetRegistry::register_chain`]) — a dependency resolved to
+/// simply never registered (see [`NuGetRegistry::register_alternate`]) — a dependency resolved to
 /// an unregistered chain degrades to [`DepsError::PackageNotFound`], never to an api.nuget.org
 /// lookup by name.
 const MAX_ALTERNATE_REGISTRIES: usize = 256;
@@ -223,7 +223,7 @@ struct ServiceIndex {
     package_base_address: String,
     /// `SearchQueryService/3.5.0` (preferred) or bare `SearchQueryService`. `Option`
     /// (FR-016): a private V3 feed (e.g. GitHub Packages) may omit this resource entirely —
-    /// `search_typed` degrades to an empty result rather than failing.
+    /// `search` degrades to an empty result rather than failing.
     search_query_service: Option<String>,
     /// `RegistrationsBaseUrl/3.6.0` (SemVer 2.0.0, preferred), falling back to `3.4.0`
     /// (SemVer 1) or the bare, undated resource. `Option`, not error-gated: a private V3
@@ -391,8 +391,8 @@ struct SearchResultDoc {
 
 /// Returns the nuget.org package page URL for `name`.
 ///
-/// Display link only, never fetched by this process — unlike [`flat_container_url`]/
-/// [`registration_index_url`] (fetch sinks), so it is deliberately not gated against a
+/// Display link only, never fetched by this process — unlike `flat_container_url`/
+/// `registration_index_url` (fetch sinks), so it is deliberately not gated against a
 /// `.`/`..` name (see [`deps_core::is_dot_segment`]'s doc for the fetch-sink-vs-display-link
 /// scope split, #379).
 pub fn package_url(name: &str) -> String {
@@ -446,7 +446,7 @@ pub struct NuGetRegistry {
     alternates: Arc<DashMap<String, Arc<Self>>>,
     /// Resolved, already-constructed hop clients this instance falls through to when it (hop
     /// 0) misses. Empty for the `Public`-tier root and every leaf hop; populated only on the
-    /// *head* client [`Self::register_chain`] builds for a multi-hop chain. Never looked up by
+    /// *head* client [`Self::register_alternate`] builds for a multi-hop chain. Never looked up by
     /// string key at fetch time; `Self::get_versions_chained` walks this `Vec` positionally.
     fallback_chain: Vec<Arc<Self>>,
     /// This hop's own credential (issue #561), or `None` for an unauthenticated hop and always
@@ -461,7 +461,7 @@ pub struct NuGetRegistry {
     /// to `HttpCache::get_cached_pinned_with_headers`. `0` when [`Self::auth`] is `None`.
     own_auth_id: u64,
     /// Meaningful only on a chain's *head* client (the one `root.alternates` maps a
-    /// [`NuGetSourceChain::key`] to) — the chain-wide [`chain_auth_digest`] `register_chain`
+    /// [`NuGetSourceChain::key`] to) — the chain-wide [`chain_auth_digest`] `register_alternate`
     /// last registered it under, used purely for O(1) rotation detection. `0` on every other
     /// instance (a fallback hop, or a not-yet-registered client); never consulted by
     /// [`Self::fetch`].
@@ -497,7 +497,7 @@ impl NuGetRegistry {
     /// `@id` against `policy`.
     ///
     /// `fallback_chain` is empty for every call except the *head* client
-    /// [`Self::register_chain`] builds for a multi-hop chain — every other hop is a dead end
+    /// [`Self::register_alternate`] builds for a multi-hop chain — every other hop is a dead end
     /// with nothing further to fall through to. Its own `alternates` map starts empty and is
     /// never populated — only the root ever registers a chain.
     ///
@@ -605,7 +605,7 @@ impl NuGetRegistry {
     /// and `Self::alternate_client` is a pure lookup with no re-registration path — evicting a
     /// key a live document still references would degrade that document's every hover to
     /// `PackageNotFound` until re-parse.
-    pub fn register_chain(
+    pub fn register_alternate(
         root: &Arc<Self>,
         chain: &NuGetSourceChain,
         policy: &Arc<RegistryAccessPolicy>,
@@ -643,7 +643,7 @@ impl NuGetRegistry {
     }
 
     /// Constructs the head client (and its full `fallback_chain`) for `chain`, stamping
-    /// `chain_auth_digest` on the head only — factored out of [`Self::register_chain`]'s two
+    /// `chain_auth_digest` on the head only — factored out of [`Self::register_alternate`]'s two
     /// insertion arms (Vacant and the occupied-with-differing-digest replace arm), which must
     /// build an identical hop tree.
     fn build_head(
@@ -710,7 +710,7 @@ impl NuGetRegistry {
         });
 
         for hop in std::iter::once(self).chain(self.fallback_chain.iter().map(Arc::as_ref)) {
-            match hop.get_versions_typed(name).await {
+            match hop.get_versions(name).await {
                 Ok(versions) if !versions.is_empty() => return Ok(versions),
                 Ok(empty) => last_miss = Ok(empty),
                 Err(error) if error.is_not_found() => {
@@ -756,20 +756,32 @@ impl NuGetRegistry {
     /// Fetches all available versions for `name` from the flat-container endpoint,
     /// sorted newest-first.
     ///
-    /// Delegates to [`Self::get_versions_typed_with`] with freshness disabled so the two
+    /// Delegates to [`Self::get_versions_with`] with freshness disabled so the two
     /// paths cannot drift apart.
     ///
     /// # Errors
     ///
     /// Returns an error if the service index cannot be resolved or the flat-container
     /// request fails.
-    pub async fn get_versions_typed(&self, name: &str) -> Result<Vec<NuGetVersion>> {
-        self.get_versions_typed_with(name, false).await
+    pub async fn get_versions(&self, name: &str) -> Result<Vec<NuGetVersion>> {
+        self.get_versions_with(
+            name,
+            deps_core::FreshnessSettings {
+                enabled: false,
+                ..Default::default()
+            },
+        )
+        .await
     }
 
-    /// Same as [`Self::get_versions_typed`], but attaches [`NuGetVersion::published_at`]
-    /// from the registration hive when `freshness_enabled` and the feed exposes a
+    /// Same as [`Self::get_versions`], but attaches [`NuGetVersion::published_at`]
+    /// from the registration hive when `freshness.enabled` and the feed exposes a
     /// `RegistrationsBaseUrl` resource.
+    ///
+    /// Takes [`deps_core::FreshnessSettings`] (not a bare `bool`) so this inherent method's
+    /// signature matches `deps-cargo`'s and the `Registry` trait's `get_versions_with`
+    /// exactly — the same name never means three different call shapes across crates (#834
+    /// critic S1).
     ///
     /// The flat-container fetch (version list) and the registration-index fetch (for
     /// publish times) are independent once the service index is resolved, so they run
@@ -796,16 +808,16 @@ impl NuGetRegistry {
     /// Returns an error if the service index cannot be resolved or the flat-container
     /// request fails.
     #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
-    pub async fn get_versions_typed_with(
+    pub async fn get_versions_with(
         &self,
         name: &str,
-        freshness_enabled: bool,
+        freshness: deps_core::FreshnessSettings,
     ) -> Result<Vec<NuGetVersion>> {
         reject_dot_segment(name)?;
         let index = self.service_index().await?;
         let flat_url = flat_container_url(&index.package_base_address, name);
         let flat_trusted_prefix = format!("{}/", index.package_base_address);
-        let registration_base = if freshness_enabled {
+        let registration_base = if freshness.enabled {
             index.registrations_base_url.clone()
         } else {
             None
@@ -943,7 +955,7 @@ impl NuGetRegistry {
     /// (the same [`HOVER_RECENT_VERSIONS`]-bounded window `registration_enrichment_from_index`
     /// walks) that the registry currently reports as unlisted.
     ///
-    /// Deliberately **not** wired into [`Self::get_versions_typed_with`]/[`NuGetVersion`]:
+    /// Deliberately **not** wired into [`Self::get_versions_with`]/[`NuGetVersion`]:
     /// that shared path backs `get_versions_with`, which both hover *and*
     /// `complete_versions_generic` (completion) call, and its results also feed the
     /// per-document version cache that inlay hints and diagnostics render from. Threading
@@ -964,7 +976,7 @@ impl NuGetRegistry {
     /// itself cannot be resolved — both of which also fail the hover response's main
     /// version fetch, so this never surfaces a *distinct* failure mode to the caller.
     #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
-    pub async fn unlisted_versions_for_hover(&self, name: &str) -> Result<HashSet<String>> {
+    pub async fn unlisted_versions(&self, name: &str) -> Result<HashSet<String>> {
         // Issue #562, FR-012: registration-hive enrichment is no longer skipped for
         // `WorkspaceDeclared`-tier feeds — routed through `Self::fetch` (§3.9) like every
         // other site, closing spec 035's NFR-003(3) residual risk.
@@ -993,12 +1005,8 @@ impl NuGetRegistry {
     /// Returns an error if the service index cannot be resolved or the flat-container
     /// request fails.
     #[tracing::instrument(skip_all, fields(package = ?name, version = ?req), level = "debug")]
-    pub async fn get_latest_matching_typed(
-        &self,
-        name: &str,
-        req: &str,
-    ) -> Result<Option<NuGetVersion>> {
-        let versions = self.get_versions_typed(name).await?;
+    pub async fn get_latest_matching(&self, name: &str, req: &str) -> Result<Option<NuGetVersion>> {
+        let versions = self.get_versions(name).await?;
         Ok(pick_latest_matching(versions, req))
     }
 
@@ -1008,7 +1016,7 @@ impl NuGetRegistry {
     ///
     /// Returns an error if the service index cannot be resolved or the search request fails.
     #[tracing::instrument(skip_all, fields(query = ?query), level = "debug")]
-    pub async fn search_typed(&self, query: &str, limit: usize) -> Result<Vec<PackageInfo>> {
+    pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<PackageInfo>> {
         let index = self.service_index().await?;
         // FR-016 (spec 035): a feed may omit `SearchQueryService` entirely (e.g. GitHub
         // Packages).
@@ -1036,14 +1044,14 @@ impl NuGetRegistry {
 /// collapses dot-segments) or truncate the path at `#`/`?`/control characters, making
 /// deps-lsp silently resolve and display a *different* real package's version data under
 /// an attacker-chosen name.
-pub fn flat_container_url(base: &str, name: &str) -> String {
+pub(crate) fn flat_container_url(base: &str, name: &str) -> String {
     let lower = name.to_lowercase();
     format!("{base}/{}/index.json", urlencoding::encode(&lower))
 }
 
 /// Builds the registration-hive index URL for `name`. Same lowercasing/encoding rationale
 /// as [`flat_container_url`].
-pub fn registration_index_url(base: &str, name: &str) -> String {
+pub(crate) fn registration_index_url(base: &str, name: &str) -> String {
     let lower = name.to_lowercase();
     format!("{base}/{}/index.json", urlencoding::encode(&lower))
 }
@@ -1102,7 +1110,7 @@ fn accumulate_catalog_entries(
 ///
 /// `semVerLevel=2.0.0` is mandatory (spec §1) — omitting it silently hides every package
 /// whose latest version uses a dotted prerelease label.
-pub fn search_url(base: &str, query: &str, limit: usize) -> String {
+pub(crate) fn search_url(base: &str, query: &str, limit: usize) -> String {
     format!(
         "{base}?q={}&take={limit}&prerelease=false&semVerLevel=2.0.0",
         urlencoding::encode(query),
@@ -1114,7 +1122,7 @@ pub fn search_url(base: &str, query: &str, limit: usize) -> String {
 /// # Errors
 ///
 /// Returns an error if `data` is not valid JSON matching the flat-container index shape.
-pub fn parse_flat_container(data: &[u8]) -> Result<Vec<NuGetVersion>> {
+pub(crate) fn parse_flat_container(data: &[u8]) -> Result<Vec<NuGetVersion>> {
     let parsed: FlatContainerIndex = deps_core::parse_json_checked(data)?;
 
     let mut versions = parsed.versions;
@@ -1130,6 +1138,20 @@ pub fn parse_flat_container(data: &[u8]) -> Result<Vec<NuGetVersion>> {
             published_at: None,
         })
         .collect())
+}
+
+/// Benchmark-only re-export of [`parse_flat_container`]: `benches/nuget_benchmarks.rs` is
+/// compiled as a separate crate (unlike a `#[cfg(test)]` unit test), so it cannot see the
+/// `pub(crate)` original — mirrors `deps-core`'s `HttpCache::get_for_bench` naming and
+/// `test-util` gate (#835 M1).
+///
+/// # Errors
+///
+/// Same as [`parse_flat_container`].
+#[cfg(feature = "test-util")]
+#[doc(hidden)]
+pub fn parse_flat_container_for_bench(data: &[u8]) -> Result<Vec<NuGetVersion>> {
+    parse_flat_container(data)
 }
 
 /// Picks the highest version matching `req` from an already-fetched, descending-sorted
@@ -1197,34 +1219,8 @@ fn parse_search_response(data: &[u8], limit: usize) -> Result<Vec<PackageInfo>> 
 }
 
 impl deps_core::Registry for NuGetRegistry {
-    fn get_versions<'a>(
-        &'a self,
-        name: &'a deps_core::PackageName,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Version>>>> {
-        Box::pin(async move {
-            let versions = self.get_versions_typed(name.as_str()).await?;
-            Ok(versions
-                .into_iter()
-                .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
-                .collect())
-        })
-    }
-
-    fn get_versions_with<'a>(
-        &'a self,
-        name: &'a deps_core::PackageName,
-        freshness: deps_core::FreshnessSettings,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Version>>>> {
-        Box::pin(async move {
-            let versions = self
-                .get_versions_typed_with(name.as_str(), freshness.enabled)
-                .await?;
-            Ok(versions
-                .into_iter()
-                .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
-                .collect())
-        })
-    }
+    deps_core::impl_registry_versions_method!(get_versions);
+    deps_core::impl_registry_versions_method!(get_versions_with);
 
     fn get_latest_matching<'a>(
         &'a self,
@@ -1233,7 +1229,7 @@ impl deps_core::Registry for NuGetRegistry {
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Option<Box<dyn deps_core::Version>>>> {
         Box::pin(async move {
             let version = self
-                .get_latest_matching_typed(name.as_str(), req.as_str())
+                .get_latest_matching(name.as_str(), req.as_str())
                 .await?;
             Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
         })
@@ -1307,7 +1303,7 @@ impl deps_core::Registry for NuGetRegistry {
                 }
                 _ => {
                     let version = self
-                        .get_latest_matching_typed(name.as_str(), req.as_str())
+                        .get_latest_matching(name.as_str(), req.as_str())
                         .await?;
                     Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
                 }
@@ -1321,7 +1317,7 @@ impl deps_core::Registry for NuGetRegistry {
         limit: usize,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Metadata>>>> {
         Box::pin(async move {
-            let results = self.search_typed(query, limit).await?;
+            let results = self.search(query, limit).await?;
             Ok(results
                 .into_iter()
                 .map(|m| Box::new(m) as Box<dyn deps_core::Metadata>)
@@ -1367,7 +1363,7 @@ impl deps_core::Registry for NuGetRegistry {
     // `types.rs`) — `get_versions`/`get_latest_matching` (this trait's freshness-blind
     // entry points, per `reports_yanked`'s own contract) always resolve through the flat
     // container, which carries no `listed` flag, so `removal_status()` can never reflect
-    // real registry data there (#233). `Self::unlisted_versions_for_hover` (D1, #451) is a
+    // real registry data there (#233). `Self::unlisted_versions` (D1, #451) is a
     // separate, hover-only enrichment that deliberately bypasses `Version` entirely —
     // see its doc comment — so it does not change this answer.
     fn reports_yanked(&self) -> bool {
@@ -1384,6 +1380,13 @@ mod tests {
     use super::*;
     use crate::config::NuGetFeedUrl;
     use std::assert_matches;
+
+    fn freshness(enabled: bool) -> deps_core::FreshnessSettings {
+        deps_core::FreshnessSettings {
+            enabled,
+            ..Default::default()
+        }
+    }
 
     fn service_index_body(package_base_address: &str, search_query_service: &str) -> String {
         format!(
@@ -1894,7 +1897,7 @@ mod tests {
     }
 
     /// #365 end-to-end coverage (critic S2): exercises the real production
-    /// `get_versions_typed_with` — not a reimplemented gate+sink pair — proving the gate is
+    /// `get_versions_with` — not a reimplemented gate+sink pair — proving the gate is
     /// actually wired into the call path a real completion/hover/diagnostic request would
     /// take. No mock is needed: `reject_dot_segment` runs before `service_index()`, so the
     /// gate must reject before any network request is issued.
@@ -1904,10 +1907,10 @@ mod tests {
     /// `api.nuget.org` 404ing for this path today would make a deleted gate go undetected
     /// by this test.
     #[tokio::test]
-    async fn test_get_versions_typed_with_rejects_bare_dot_dot_as_not_found() {
+    async fn test_get_versions_with_rejects_bare_dot_dot_as_not_found() {
         let registry = NuGetRegistry::new(Arc::new(HttpCache::new()));
         let err = registry
-            .get_versions_typed_with("..", false)
+            .get_versions_with("..", freshness(false))
             .await
             .unwrap_err();
         assert_matches!(err, deps_core::DepsError::PackageNotFound { .. });
@@ -1928,6 +1931,11 @@ mod tests {
             req: "*";
             expected_index: 1;
         };
+    }
+
+    deps_core::registry_conformance! {
+        mod nuget_registry_api_conformance;
+        ty: NuGetRegistry;
     }
 
     /// Regression for #423: the trait impl's `select_latest_matching` must rescue a
@@ -2281,10 +2289,10 @@ mod tests {
         assert!(enrichment.unlisted.is_empty());
     }
 
-    // --- unlisted_versions_for_hover: end-to-end (mockito) ---
+    // --- unlisted_versions: end-to-end (mockito) ---
 
     #[tokio::test]
-    async fn test_unlisted_versions_for_hover_reports_explicit_and_legacy_unlisted() {
+    async fn test_unlisted_versions_reports_explicit_and_legacy_unlisted() {
         let mut server = mockito::Server::new_async().await;
         let base = server.url();
 
@@ -2317,10 +2325,7 @@ mod tests {
             Arc::new(HttpCache::new()),
             format!("{base}/index.json"),
         );
-        let unlisted = registry
-            .unlisted_versions_for_hover("widget")
-            .await
-            .unwrap();
+        let unlisted = registry.unlisted_versions("widget").await.unwrap();
 
         assert!(unlisted.contains("1.0.0"));
         assert!(unlisted.contains("2.0.0"));
@@ -2328,7 +2333,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_unlisted_versions_for_hover_no_registrations_base_url_degrades_to_empty() {
+    async fn test_unlisted_versions_no_registrations_base_url_degrades_to_empty() {
         let mut server = mockito::Server::new_async().await;
         let base = server.url();
 
@@ -2346,15 +2351,12 @@ mod tests {
             Arc::new(HttpCache::new()),
             format!("{base}/index.json"),
         );
-        let unlisted = registry
-            .unlisted_versions_for_hover("widget")
-            .await
-            .unwrap();
+        let unlisted = registry.unlisted_versions("widget").await.unwrap();
         assert!(unlisted.is_empty());
     }
 
     #[tokio::test]
-    async fn test_unlisted_versions_for_hover_fetch_failure_degrades_to_empty() {
+    async fn test_unlisted_versions_fetch_failure_degrades_to_empty() {
         let mut server = mockito::Server::new_async().await;
         let base = server.url();
 
@@ -2378,27 +2380,21 @@ mod tests {
             Arc::new(HttpCache::new()),
             format!("{base}/index.json"),
         );
-        let unlisted = registry
-            .unlisted_versions_for_hover("widget")
-            .await
-            .unwrap();
+        let unlisted = registry.unlisted_versions("widget").await.unwrap();
         assert!(unlisted.is_empty());
     }
 
     #[tokio::test]
-    async fn test_unlisted_versions_for_hover_rejects_bare_dot_dot_as_not_found() {
+    async fn test_unlisted_versions_rejects_bare_dot_dot_as_not_found() {
         let registry = NuGetRegistry::new(Arc::new(HttpCache::new()));
-        let err = registry
-            .unlisted_versions_for_hover("..")
-            .await
-            .unwrap_err();
+        let err = registry.unlisted_versions("..").await.unwrap_err();
         assert_matches!(err, deps_core::DepsError::PackageNotFound { .. });
     }
 
-    // --- get_versions_typed_with: end-to-end gating and registration-hive walk (mockito) ---
+    // --- get_versions_with: end-to-end gating and registration-hive walk (mockito) ---
 
     #[tokio::test]
-    async fn test_get_versions_typed_with_disabled_issues_zero_registration_requests() {
+    async fn test_get_versions_with_disabled_issues_zero_registration_requests() {
         let mut server = mockito::Server::new_async().await;
         let base = server.url();
 
@@ -2426,7 +2422,7 @@ mod tests {
         );
 
         let versions = registry
-            .get_versions_typed_with("widget", false)
+            .get_versions_with("widget", freshness(false))
             .await
             .unwrap();
         assert_eq!(versions.len(), 2);
@@ -2434,7 +2430,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_versions_typed_with_enabled_matches_disabled_set_and_order() {
+    async fn test_get_versions_with_enabled_matches_disabled_set_and_order() {
         // FR-006 regression guard: enabling freshness must not change the returned list's
         // set or order, only populate `published_at`.
         let mut server = mockito::Server::new_async().await;
@@ -2476,11 +2472,11 @@ mod tests {
         );
 
         let disabled = registry
-            .get_versions_typed_with("widget", false)
+            .get_versions_with("widget", freshness(false))
             .await
             .unwrap();
         let enabled = registry
-            .get_versions_typed_with("widget", true)
+            .get_versions_with("widget", freshness(true))
             .await
             .unwrap();
 
@@ -2491,7 +2487,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_versions_typed_with_externalized_index_fetches_only_needed_pages() {
+    async fn test_get_versions_with_externalized_index_fetches_only_needed_pages() {
         let mut server = mockito::Server::new_async().await;
         let base = server.url();
         let reg_base = format!("{base}/registrations");
@@ -2560,7 +2556,7 @@ mod tests {
             format!("{base}/index.json"),
         );
         let versions = registry
-            .get_versions_typed_with("widget", true)
+            .get_versions_with("widget", freshness(true))
             .await
             .unwrap();
 
@@ -2571,7 +2567,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_versions_typed_with_external_fetch_cap_stops_walk_at_two_pages() {
+    async fn test_get_versions_with_external_fetch_cap_stops_walk_at_two_pages() {
         // Tester gap: MAX_EXTERNAL_PAGE_FETCHES = 2 was never actually hit by any prior
         // test. Three external pages, each carrying too few entries to reach
         // HOVER_RECENT_VERSIONS alone or even combined two-at-a-time, so the walk must stop
@@ -2656,7 +2652,7 @@ mod tests {
             format!("{base}/index.json"),
         );
         let versions = registry
-            .get_versions_typed_with("widget", true)
+            .get_versions_with("widget", freshness(true))
             .await
             .unwrap();
 
@@ -2690,7 +2686,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_versions_typed_with_single_version_package_terminates() {
+    async fn test_get_versions_with_single_version_package_terminates() {
         // S3 regression: a package with fewer total versions than HOVER_RECENT_VERSIONS
         // must terminate via index exhaustion rather than hanging or looping.
         let mut server = mockito::Server::new_async().await;
@@ -2728,7 +2724,7 @@ mod tests {
             format!("{base}/index.json"),
         );
         let versions = registry
-            .get_versions_typed_with("orchard.core", true)
+            .get_versions_with("orchard.core", freshness(true))
             .await
             .unwrap();
 
@@ -2737,7 +2733,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_versions_typed_with_no_registrations_base_url_degrades_gracefully() {
+    async fn test_get_versions_with_no_registrations_base_url_degrades_gracefully() {
         let mut server = mockito::Server::new_async().await;
         let base = server.url();
 
@@ -2762,7 +2758,7 @@ mod tests {
             format!("{base}/index.json"),
         );
         let versions = registry
-            .get_versions_typed_with("widget", true)
+            .get_versions_with("widget", freshness(true))
             .await
             .unwrap();
 
@@ -2777,7 +2773,7 @@ mod tests {
     async fn test_live_nuget_attaches_publish_times() {
         let registry = NuGetRegistry::new(Arc::new(HttpCache::new()));
         let versions = registry
-            .get_versions_typed_with("Newtonsoft.Json", true)
+            .get_versions_with("Newtonsoft.Json", freshness(true))
             .await
             .unwrap();
 
@@ -2961,14 +2957,14 @@ mod tests {
         hop1_flat.assert_async().await;
     }
 
-    // --- register_chain: multi-hop fallback_chain construction (tester gap #2) ---
+    // --- register_alternate: multi-hop fallback_chain construction (tester gap #2) ---
 
-    /// End-to-end proof that `register_chain` wires a 2-declared-hop chain plus the
+    /// End-to-end proof that `register_alternate` wires a 2-declared-hop chain plus the
     /// implicit-public-fallback hop into a working, positionally-ordered `fallback_chain`:
     /// hop 0 misses, hop 1 misses, the implicit public hop (root's own service index)
     /// succeeds — every prior test registers only single-hop chains.
     #[tokio::test]
-    async fn test_register_chain_multi_hop_fallback_chain_walks_every_hop_in_order() {
+    async fn test_register_alternate_multi_hop_fallback_chain_walks_every_hop_in_order() {
         let mut hop0 = mockito::Server::new_async().await;
         hop0.mock("GET", "/index.json")
             .with_status(200)
@@ -3028,7 +3024,7 @@ mod tests {
             hops: vec![hop(&hop0_feed), hop(&hop1_feed)],
             implicit_public_fallback: true,
         };
-        NuGetRegistry::register_chain(&root, &chain, &policy);
+        NuGetRegistry::register_alternate(&root, &chain, &policy);
 
         let client = root
             .alternate_client(&chain.key)
@@ -3092,13 +3088,13 @@ mod tests {
             Vec::new(),
         );
 
-        let versions = client.get_versions_typed("pkg").await.unwrap();
+        let versions = client.get_versions("pkg").await.unwrap();
         assert_eq!(versions.len(), 1);
         _index.assert_async().await;
         _flat.assert_async().await;
     }
 
-    /// SC-011: `search_typed` is covered by the same authenticated routing as the other three
+    /// SC-011: `search` is covered by the same authenticated routing as the other three
     /// sites — a 401 on `SearchQueryService` (mocked here as a 200-with-header-assertion) must
     /// not be a site the credential skips.
     #[tokio::test]
@@ -3136,13 +3132,13 @@ mod tests {
             Vec::new(),
         );
 
-        let results = client.search_typed("query", 10).await.unwrap();
+        let results = client.search("query", 10).await.unwrap();
         assert!(results.is_empty());
         _search.assert_async().await;
     }
 
     /// SC-011: the registration-hive fetch site (§3.9's third `Self::fetch` call site, inside
-    /// `get_versions_typed_with`) **and** its external-page-walk fetch (inside
+    /// `get_versions_with`) **and** its external-page-walk fetch (inside
     /// `registration_enrichment_from_index`) both attach the credential — distinct from the
     /// service-index/flat-container coverage above, since a call-site-local regression at
     /// either (wrong hop or trusted-prefix passed into that specific `self.fetch` call) would
@@ -3203,7 +3199,10 @@ mod tests {
             Vec::new(),
         );
 
-        let versions = client.get_versions_typed_with("pkg", true).await.unwrap();
+        let versions = client
+            .get_versions_with("pkg", freshness(true))
+            .await
+            .unwrap();
         assert_eq!(versions.len(), 1);
         assert!(versions[0].published_at.is_some());
         _index.assert_async().await;
@@ -3212,11 +3211,11 @@ mod tests {
         _reg_page.assert_async().await;
     }
 
-    /// SC-011: `unlisted_versions_for_hover`'s registration-hive fetch (§3.9's fourth site)
+    /// SC-011: `unlisted_versions`'s registration-hive fetch (§3.9's fourth site)
     /// also attaches the credential — a distinct call site from
-    /// `get_versions_typed_with`'s, per hover's own dedicated enrichment path.
+    /// `get_versions_with`'s, per hover's own dedicated enrichment path.
     #[tokio::test]
-    async fn test_fetch_attaches_credential_on_unlisted_versions_for_hover() {
+    async fn test_fetch_attaches_credential_on_unlisted_versions() {
         let mut server = mockito::Server::new_async().await;
         let base = server.url();
         // codeql[rust/hard-coded-cryptographic-value] -- test fixture literal, not a real credential
@@ -3252,7 +3251,7 @@ mod tests {
             Vec::new(),
         );
 
-        let unlisted = client.unlisted_versions_for_hover("pkg").await.unwrap();
+        let unlisted = client.unlisted_versions("pkg").await.unwrap();
         assert!(unlisted.is_empty());
         _index.assert_async().await;
         _reg.assert_async().await;
@@ -3295,7 +3294,7 @@ mod tests {
             Vec::new(),
         );
 
-        let versions = client.get_versions_typed("pkg").await.unwrap();
+        let versions = client.get_versions("pkg").await.unwrap();
         assert_eq!(versions.len(), 1);
         _index.assert_async().await;
         _attacker_flat.assert_async().await;
@@ -3305,7 +3304,7 @@ mod tests {
     /// client in place even when `alternates` is at `MAX_ALTERNATE_REGISTRIES` — the replace
     /// arm must not be gated by the capacity check that governs only the Vacant-insertion arm.
     #[tokio::test]
-    async fn test_register_chain_credential_rotation_at_capacity_replaces_in_place() {
+    async fn test_register_alternate_credential_rotation_at_capacity_replaces_in_place() {
         let mut server = mockito::Server::new_async().await;
         let base = server.url();
         // codeql[rust/hard-coded-cryptographic-value] -- test fixture literal, not a real credential
@@ -3359,7 +3358,7 @@ mod tests {
             hops: vec![auth_hop(&feed, "corpfeed", "user", "pat-v1")],
             implicit_public_fallback: false,
         };
-        NuGetRegistry::register_chain(&root, &chain_v1, &policy);
+        NuGetRegistry::register_alternate(&root, &chain_v1, &policy);
         assert_eq!(
             root.alternates.len(),
             MAX_ALTERNATE_REGISTRIES,
@@ -3372,7 +3371,7 @@ mod tests {
             hops: vec![auth_hop(&feed, "corpfeed", "user", "pat-v2")],
             implicit_public_fallback: false,
         };
-        NuGetRegistry::register_chain(&root, &chain_v2, &policy);
+        NuGetRegistry::register_alternate(&root, &chain_v2, &policy);
         assert_eq!(
             root.alternates.len(),
             MAX_ALTERNATE_REGISTRIES,

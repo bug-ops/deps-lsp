@@ -1993,12 +1993,14 @@ impl HttpCache {
     }
 
     /// Benchmark-only helper: Direct cache lookup without network requests.
+    #[cfg(feature = "test-util")]
     #[doc(hidden)]
     pub fn get_for_bench(&self, url: &str) -> Option<Bytes> {
         self.entries.get(url).map(|entry| entry.body.clone())
     }
 
     /// Benchmark-only helper: Direct cache insertion.
+    #[cfg(feature = "test-util")]
     #[doc(hidden)]
     pub fn insert_for_bench(&self, url: String, response: CachedResponse) {
         self.store_entry(url, response);

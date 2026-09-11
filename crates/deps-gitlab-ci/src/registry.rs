@@ -269,7 +269,7 @@ impl GitlabCiRegistry {
     /// refused because the cap was already reached (spec §3.2/§4.6's downgrade pass —
     /// `GitlabCiEcosystem::parse_manifest` rewrites every dependency carrying a refused key
     /// to `CustomRegistry` + `HostRef::Unresolved` before returning the parse result).
-    pub fn register_routes(&self, routes: &[(String, GitlabRoute)]) -> HashSet<String> {
+    pub fn register_alternate(&self, routes: &[(String, GitlabRoute)]) -> HashSet<String> {
         let mut refused = HashSet::new();
         let mut warned_once = false;
         for (key, route) in routes {
@@ -637,7 +637,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_versions_from_unrouted_index_is_package_not_found_even_with_other_routes() {
         let registry = GitlabCiRegistry::new(test_client());
-        let refused = registry.register_routes(&[(
+        let refused = registry.register_alternate(&[(
             "gitlab:known".to_string(),
             route("https://gitlab.com", EndpointKind::Tags),
         )]);
@@ -666,10 +666,10 @@ mod tests {
         }
     }
 
-    // --- register_routes: MAX_GITLAB_ROUTES cap refusal ---
+    // --- register_alternate: MAX_GITLAB_ROUTES cap refusal ---
 
     #[test]
-    fn test_register_routes_refuses_route_257() {
+    fn test_register_alternate_refuses_route_257() {
         let registry = GitlabCiRegistry::new(test_client());
         let routes: Vec<(String, GitlabRoute)> = (0..=MAX_GITLAB_ROUTES)
             .map(|i| {
@@ -681,7 +681,7 @@ mod tests {
             .collect();
         assert_eq!(routes.len(), MAX_GITLAB_ROUTES + 1);
 
-        let refused = registry.register_routes(&routes);
+        let refused = registry.register_alternate(&routes);
 
         assert_eq!(refused.len(), 1);
         assert!(refused.contains(&format!("gitlab:route{MAX_GITLAB_ROUTES}")));
@@ -689,7 +689,7 @@ mod tests {
     }
 
     #[test]
-    fn test_register_routes_under_cap_refuses_nothing() {
+    fn test_register_alternate_under_cap_refuses_nothing() {
         let registry = GitlabCiRegistry::new(test_client());
         let routes: Vec<(String, GitlabRoute)> = (0..MAX_GITLAB_ROUTES)
             .map(|i| {
@@ -699,7 +699,7 @@ mod tests {
                 )
             })
             .collect();
-        let refused = registry.register_routes(&routes);
+        let refused = registry.register_alternate(&routes);
         assert!(refused.is_empty());
         assert_eq!(registry.routes.len(), MAX_GITLAB_ROUTES);
     }

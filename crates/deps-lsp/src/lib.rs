@@ -98,6 +98,18 @@ impl EcosystemRuntime {
 }
 
 /// Declares an ecosystem: re-exports types and registers at runtime.
+///
+/// `$types` re-export rule (#834 §6 last bullet — the list used to be asymmetric with no
+/// stated rule: `*Formatter` re-exported for 8/14 ecosystems, `*LockParser` for 4/14,
+/// `*Registry` for 13/14): **always list every `*Registry`/`*Formatter`/`*LockParser`
+/// (or ecosystem-specific-named lock parser, e.g. `GoSumParser`) type the ecosystem crate
+/// actually defines and re-exports from its own crate root.** Omit only when the crate
+/// genuinely has none — e.g. `deps-gradle` has no `GradleRegistry` (reuses
+/// `deps_maven::MavenCentralRegistry` directly), and several ecosystems omit a
+/// `*LockParser` entry because the crate has no `lockfile` module at all (Maven, Gradle,
+/// GitHub Actions, GitLab CI — no lock file format exists for these; Deno — `deno.lock`
+/// exists as a format, but this crate has no parser for it yet, a real coverage gap rather
+/// than "no format" like the other four).
 macro_rules! ecosystem {
     ($feature:literal, $crate_name:ident, $ecosystem:ident, [$($types:ident),* $(,)?]) => {
         #[cfg(feature = $feature)]
@@ -124,8 +136,11 @@ ecosystem!(
     [
         CargoDependency,
         CargoDependencySection,
+        CargoFormatter,
+        CargoLockParser,
         CargoParseResult,
         CargoParser,
+        CargoRegistry,
         CargoVersion,
         CrateInfo,
         CratesIoRegistry,
@@ -140,6 +155,8 @@ ecosystem!(
     [
         NpmDependency,
         NpmDependencySection,
+        NpmFormatter,
+        NpmLockParser,
         NpmPackage,
         NpmParseResult,
         NpmRegistry,
@@ -155,6 +172,8 @@ ecosystem!(
     [
         PypiDependency,
         PypiDependencySection,
+        PypiFormatter,
+        PypiLockParser,
         PypiParser,
         PypiRegistry,
         PypiVersion,
@@ -168,8 +187,10 @@ ecosystem!(
     [
         GoDependency,
         GoDirective,
+        GoFormatter,
         GoParseResult,
         GoRegistry,
+        GoSumParser,
         GoVersion,
         parse_go_mod,
     ]
@@ -181,6 +202,7 @@ ecosystem!(
     BundlerEcosystem,
     [
         BundlerDependency,
+        BundlerFormatter,
         BundlerParseResult,
         BundlerVersion,
         DependencyGroup,
@@ -257,6 +279,8 @@ ecosystem!(
     ComposerEcosystem,
     [
         ComposerDependency,
+        ComposerFormatter,
+        ComposerLockParser,
         ComposerSection,
         ComposerPackage,
         ComposerParseResult,
@@ -679,7 +703,7 @@ mod tests {
 
     /// CRITICAL regression (issue #706 review): GitHub Actions' `action.yml`/`action.yaml`
     /// bare-basename routing and GitLab CI's `.gitlab/ci/*.yml` directory-pattern routing
-    /// can both match `.gitlab/ci/action.yml` — before `EcosystemRegistry::get_for_uri`'s
+    /// can both match `.gitlab/ci/action.yml` — before `EcosystemRegistry::for_uri`'s
     /// fix (deps-core), the basename match was checked first and always won, silently
     /// routing a real GitLab CI file to `github-actions` (which would then, on top of
     /// that, degrade it to zero dependencies since it lacks a top-level `runs:` key —
@@ -694,7 +718,7 @@ mod tests {
 
         let uri = deps_core::test_util::test_uri("/repo/.gitlab/ci/action.yml");
         assert_eq!(
-            registry.get_for_uri(&uri).map(|e| e.id()),
+            registry.for_uri(&uri).map(|e| e.id()),
             Some(deps_core::EcosystemId::GitlabCi.id()),
             "a real .gitlab/ci/action.yml file must route to gitlab-ci, not github-actions"
         );
@@ -702,13 +726,13 @@ mod tests {
         // Non-conflicting action.yml locations must be unaffected.
         let root_action = deps_core::test_util::test_uri("/repo/action.yml");
         assert_eq!(
-            registry.get_for_uri(&root_action).map(|e| e.id()),
+            registry.for_uri(&root_action).map(|e| e.id()),
             Some(deps_core::EcosystemId::GithubActions.id())
         );
         let nested_action =
             deps_core::test_util::test_uri("/repo/.github/actions/my-action/action.yml");
         assert_eq!(
-            registry.get_for_uri(&nested_action).map(|e| e.id()),
+            registry.for_uri(&nested_action).map(|e| e.id()),
             Some(deps_core::EcosystemId::GithubActions.id())
         );
     }

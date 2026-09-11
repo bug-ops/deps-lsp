@@ -4,13 +4,36 @@
 //! comments to avoid false positives. Byte offsets are preserved during
 //! comment stripping for accurate LSP position tracking.
 
-use crate::types::{SwiftDependency, SwiftParseResult};
+use crate::types::SwiftDependency;
 use deps_core::Result;
 use deps_core::lsp_helpers::LineOffsetTable;
 use deps_core::parser::DependencySource;
 use regex::Regex;
 use std::sync::LazyLock;
 use tower_lsp_server::ls_types::{Range, Uri};
+
+/// Result of parsing a Package.swift file.
+#[non_exhaustive]
+#[derive(Debug)]
+pub struct SwiftParseResult {
+    /// Dependencies found in the `Package.swift` manifest.
+    pub dependencies: Vec<SwiftDependency>,
+    /// URI of the manifest this result was parsed from.
+    pub uri: Uri,
+    /// `Some((kept, total))` once the manifest declared more dependencies than
+    /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
+    /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
+    pub dependency_truncation: Option<(usize, usize)>,
+}
+
+deps_core::impl_parse_result!(
+    SwiftParseResult,
+    SwiftDependency {
+        dependencies: dependencies,
+        uri: uri,
+        dependency_truncation: dependency_truncation,
+    }
+);
 
 // Regex patterns for various .package() call forms.
 // All use (?s) DOTALL flag to handle multiline calls.

@@ -466,7 +466,14 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build benchmarks
-        run: cargo build --workspace --benches
+        # `deps-core/test-util` is currently unified in for free via every ecosystem crate's
+        # own dev-dependency edge, but passed explicitly here too so this build does not
+        # silently start skipping `core_benchmarks` if that unification path ever changes.
+        # `deps-nuget/test-util` has no such sibling unification (nothing else depends on
+        # `deps-nuget` with this feature), so it must be passed explicitly or a bare
+        # `--workspace --benches` silently skips `nuget_benchmarks` — its
+        # `parse_flat_container_for_bench` is gated behind it — rather than failing (#835 M1).
+        run: cargo build --workspace --benches --features deps-core/test-util,deps-nuget/test-util
 
   fuzz-tool:
     name: Build cargo-fuzz

@@ -854,7 +854,7 @@ mod tests {
     /// actually issues fails with a connection error rather than silently succeeding —
     /// proof that the empty-name guard short-circuits before any network call.
     fn unreachable_npm(cache: Arc<HttpCache>) -> NpmRegistry {
-        NpmRegistry::with_registry_base(cache, "http://127.0.0.1:1".to_string())
+        NpmRegistry::with_public_base_for_test(cache, "http://127.0.0.1:1".to_string())
     }
 
     #[tokio::test]
@@ -1238,7 +1238,7 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let base = server.url();
         let http_cache = Arc::new(HttpCache::new());
-        let shared_npm = NpmRegistry::with_registry_base(Arc::clone(&http_cache), base);
+        let shared_npm = NpmRegistry::with_public_base_for_test(Arc::clone(&http_cache), base);
 
         let abbrev_mock = server
             .mock("GET", "/widget")

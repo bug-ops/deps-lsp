@@ -805,7 +805,7 @@ mod tests {
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
             let ecosystem = state
                 .ecosystem_registry
-                .get_for_uri(&uri)
+                .for_uri(&uri)
                 .expect("Cargo ecosystem not found");
 
             // No document inserted for `uri` at all — if the ecosystem gate didn't
@@ -831,7 +831,7 @@ mod tests {
 
             let ecosystem = state
                 .ecosystem_registry
-                .get_for_uri(&uri)
+                .for_uri(&uri)
                 .expect("Dart ecosystem not found");
             let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
             let mut doc_state = DocumentState::new_from_parse_result(
@@ -873,7 +873,7 @@ mod tests {
 
             let ecosystem = state
                 .ecosystem_registry
-                .get_for_uri(&uri)
+                .for_uri(&uri)
                 .expect("Swift ecosystem not found");
             let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
             let mut doc_state = DocumentState::new_from_parse_result(
@@ -916,7 +916,7 @@ mod tests {
 
             let ecosystem = state
                 .ecosystem_registry
-                .get_for_uri(&uri)
+                .for_uri(&uri)
                 .expect("Gradle ecosystem not found");
             let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
             let mut doc_state = DocumentState::new_from_parse_result(
@@ -963,7 +963,7 @@ mod tests {
 
             let ecosystem = state
                 .ecosystem_registry
-                .get_for_uri(&uri)
+                .for_uri(&uri)
                 .expect("Gradle ecosystem not found");
             let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
             let mut doc_state = DocumentState::new_from_parse_result(
@@ -1007,7 +1007,7 @@ mod tests {
 
             let ecosystem = state
                 .ecosystem_registry
-                .get_for_uri(&uri)
+                .for_uri(&uri)
                 .expect("Deno ecosystem not found");
             let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
             let mut doc_state = DocumentState::new_from_parse_result(

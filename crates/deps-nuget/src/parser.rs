@@ -34,7 +34,34 @@ use quick_xml::Reader;
 use quick_xml::events::{BytesStart, BytesText, Event};
 use tower_lsp_server::ls_types::{Range, Uri};
 
-use crate::types::NuGetParseResult;
+/// Parsed result of a single manifest file (`.csproj`, `Directory.Packages.props`,
+/// `packages.config`).
+#[non_exhaustive]
+#[derive(Debug)]
+pub struct NuGetParseResult {
+    /// Dependencies found in the manifest.
+    pub dependencies: Vec<NuGetDependency>,
+    /// URI of the manifest this result was parsed from.
+    pub uri: Uri,
+    /// Every routing chain this manifest's resolved `NuGet.Config` implies (issue #523) — one
+    /// per distinct `<packageSourceMapping>` hop-set, or the single plain accumulated chain
+    /// when no mapping is declared. Registered against the shared `NuGetRegistry` by
+    /// `NuGetEcosystem::parse_manifest`; empty when nothing is registrable (no config, or
+    /// every dependency resolves to plain `Registry`/a fail-closed `CustomRegistry`).
+    pub resolved_chains: Vec<crate::config::NuGetSourceChain>,
+    /// `Some((kept, total))` once the manifest declared more dependencies than
+    /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796).
+    pub dependency_truncation: Option<(usize, usize)>,
+}
+
+deps_core::impl_parse_result!(
+    NuGetParseResult,
+    NuGetDependency {
+        dependencies: dependencies,
+        uri: uri,
+        dependency_truncation: dependency_truncation,
+    }
+);
 
 /// Parses a `.csproj`/`.fsproj`/`.vbproj` MSBuild project file, extracting `PackageReference` entries.
 ///

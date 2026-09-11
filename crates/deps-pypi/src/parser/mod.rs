@@ -403,8 +403,8 @@ pub struct ParseResult {
     pub document_links: Vec<RequirementRef>,
     /// Every private-index chain this file's `--index-url`/`--extra-index-url`/Poetry-source/
     /// uv-index declarations imply (spec FR-002/003/005/007/013), ready for
-    /// `PypiRegistry::register_chain`/`register_named_source` — the only point where this
-    /// per-document resolution and the long-lived, shared `PypiRegistry` router meet (see
+    /// `PypiRegistry::register_alternate` — the only point where this per-document
+    /// resolution and the long-lived, shared `PypiRegistry` router meet (see
     /// `PypiEcosystem::parse_manifest`). Empty for a file with no such declaration (US-004).
     pub resolved_chains: Vec<crate::config::ResolvedChain>,
     /// `Some((kept, total))` once the manifest declared more dependencies than
@@ -548,7 +548,11 @@ impl PypiParser {
 
         let requirement = match std::panic::catch_unwind(|| Requirement::from_str(parse_str)) {
             Ok(Ok(requirement)) => requirement,
-            Ok(Err(e)) => return Err(PypiError::InvalidDependencySpec { source: e }),
+            Ok(Err(e)) => {
+                return Err(PypiError::InvalidDependencySpec {
+                    source: crate::error::Pep508ParseError::new(e),
+                });
+            }
             Err(_) => {
                 tracing::warn!(
                     "pep508_rs panicked parsing a PEP 508 requirement, rejecting: {}",
@@ -826,5 +830,36 @@ mod pep508_name_tests {
     #[test]
     fn empty_name_rejected() {
         assert!(!looks_like_valid_pep508_name(""));
+    }
+}
+
+#[cfg(test)]
+mod pep508_parse_error_tests {
+    use super::*;
+
+    /// A validly-named requirement with a malformed marker clause — `Requirement::from_str`
+    /// returns a real `Err` here (not the `#673` panic path, which only triggers on a
+    /// malformed *name*), so this exercises `PypiError::InvalidDependencySpec`'s
+    /// `Pep508ParseError` end to end: construction, `Display`, and `source()` forwarding.
+    #[test]
+    fn malformed_marker_produces_invalid_dependency_spec_with_working_error_impls() {
+        let content = "requests; python_version";
+        let line_table = LineOffsetTable::new(content);
+        let err = PypiParser
+            .parse_pep508_requirement(content, None, content, &line_table)
+            .expect_err("a marker with no operator/value must fail to parse");
+
+        let PypiError::InvalidDependencySpec { source } = err else {
+            panic!("expected InvalidDependencySpec, got {err:?}");
+        };
+
+        assert!(
+            !source.to_string().is_empty(),
+            "Display must forward the underlying pep508_rs error message"
+        );
+        // The underlying `pep508_rs::Pep508Error` is a leaf parse error with no further
+        // `source()` chain of its own — asserting `None` here would break if `pep508_rs`
+        // ever changes that, which is exactly the regression this test exists to catch.
+        assert!(std::error::Error::source(&source).is_none());
     }
 }

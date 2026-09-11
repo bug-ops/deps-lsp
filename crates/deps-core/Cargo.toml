@@ -66,3 +66,4 @@ tokio-test = { workspace = true }
 [[bench]]
 name = "core_benchmarks"
 harness = false
+required-features = ["test-util"]

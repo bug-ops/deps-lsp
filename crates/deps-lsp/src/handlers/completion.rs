@@ -21,7 +21,7 @@ use tower_lsp_server::ls_types::{
 //
 // Shared with `deps_core::completion` (rather than kept local) because
 // registry-backed completion paths that retry internally on failure (e.g.
-// `deps-maven`'s `search_typed`, #274) must size their own retry budget against
+// `deps-maven`'s `search`, #274) must size their own retry budget against
 // this same value — see `deps_core::completion::COMPLETION_SEARCH_TIMEOUT`'s doc.
 
 /// Handles completion requests.
@@ -52,7 +52,7 @@ pub async fn handle_completion(
     // this acquires the config RwLock before the DashMap shard guard, never the reverse.
     let freshness = { config.read().await.freshness.to_settings() };
 
-    // Resolved once, from the URI alone via `get_for_uri` (the same routing
+    // Resolved once, from the URI alone via `for_uri` (the same routing
     // `handle_document_open` uses), rather than from the loaded document's
     // `ecosystem_id` — that would only be available *after* the document-load and
     // document-lookup early returns below. `is_some_and` (not `?`) so an
@@ -60,7 +60,7 @@ pub async fn handle_completion(
     // default) rather than short-circuiting this function.
     let package_search_is_incomplete = state
         .ecosystem_registry
-        .get_for_uri(uri)
+        .for_uri(uri)
         .is_some_and(|e| e.package_search_is_incomplete());
 
     // Shared by the document-load and document-lookup early returns below, so

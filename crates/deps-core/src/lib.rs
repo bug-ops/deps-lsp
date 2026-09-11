@@ -23,10 +23,25 @@
 //! # API stability (issue #769)
 //!
 //! Most public structs and enums here are `#[non_exhaustive]` so a new field or variant
-//! never breaks a downstream ecosystem crate's exhaustive match or struct literal; a type
-//! with no `pub` fields is deliberately left exhaustive instead, since `#[non_exhaustive]`
-//! would be a semantic no-op for it — an external crate can't literal-construct or
-//! destructure it either way.
+//! never breaks a downstream ecosystem crate's exhaustive match or struct literal. This is a
+//! per-kind decision, not one policy for both: on a **struct** with no `pub` fields,
+//! `#[non_exhaustive]` is a semantic no-op (an external crate can't literal-construct or
+//! destructure it either way), so such structs are deliberately left exhaustive instead. On
+//! an **enum**, `#[non_exhaustive]` always forces a downstream `match` to carry a wildcard
+//! arm, regardless of any variant's field visibility — each enum opts in when that forced
+//! wildcard is wanted and stays exhaustive when a future variant should instead be a
+//! compile error downstream; see the individual enum's own doc comment for which applies.
+//!
+//! A few pre-1.0 dependency types remain visible in public signatures as a deliberate
+//! semver commitment rather than an oversight:
+//! - [`error::SanitizedRegistryError`] implements `From<reqwest::Error>` — a `reqwest`
+//!   major bump that reshapes `Error` is a breaking change for this crate too.
+//! - [`parser::yaml_scalar_string`] takes `&yaml_rust2::Yaml`; `yaml_rust2` is re-exported
+//!   from the crate root so callers can name the type without their own direct dependency,
+//!   and a `yaml-rust2` major bump is likewise a breaking change here.
+//! - `deps-gitlab-ci`'s `gitlab_version_req` (`crates/deps-gitlab-ci/src/component.rs`)
+//!   returns `semver::VersionReq` directly — low risk since `semver` is unusually stable
+//!   pre-1.0, but the same commitment applies.
 //!
 //! ## LSP type stability (issue #832)
 //!
@@ -163,3 +178,13 @@ pub use version_matcher::{
     Pep440Matcher, SemverMatcher, VersionRequirementMatcher, extract_pypi_min_version,
     normalize_and_parse_version, normalize_operator_spacing,
 };
+
+/// Re-exported so a caller of [`yaml_scalar_string`] can name `yaml_rust2::Yaml` without
+/// depending on `yaml-rust2` directly — see the "API stability" section above for the
+/// semver implication of this pre-1.0 dependency coupling.
+pub use yaml_rust2;
+
+/// Re-exported so a caller of [`error::SanitizedRegistryError`]'s `From<reqwest::Error>`
+/// impl can name `reqwest::Error` without depending on `reqwest` directly — see the "API
+/// stability" section above for the semver implication of this pre-1.0 dependency coupling.
+pub use reqwest;

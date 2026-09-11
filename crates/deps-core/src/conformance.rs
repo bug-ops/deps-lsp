@@ -631,6 +631,37 @@ pub fn assert_select_latest_matching_overridden(
     );
 }
 
+/// Poison trait for [`registry_conformance!`]'s `ty:` form (#834 critic S5).
+///
+/// A blanket impl providing the same 4 method names as a no-op on every type. Without
+/// this, `<$ty>::get_versions` (etc.) resolves through *any* in-scope trait providing that
+/// name just as happily as through a true inherent method — so if a future contributor
+/// added a module-level `use deps_core::Registry;` to an ecosystem crate's `registry.rs`
+/// (today every such `use` in this workspace is function-local, so it doesn't leak into
+/// the macro's generated module via its `use super::*;`), the `ty:` check would keep
+/// compiling even after the crate's actual inherent method was renamed or deleted —
+/// exactly the drift #834 exists to catch, becoming silent instead of loud.
+///
+/// With this trait `use`d into the generated module, a name reachable *only* via a trait
+/// (this one, or `Registry`, or both) is ambiguous — multiple applicable trait
+/// items, `error[E0034]` — while a genuine inherent method still resolves unambiguously,
+/// since inherent methods always take priority over trait methods in Rust's method
+/// resolution regardless of how many trait candidates are also in scope. Never call these
+/// methods; `#[doc(hidden)]` since this exists purely for the macro's own use.
+#[doc(hidden)]
+pub trait NotInherent {
+    /// Poison stand-in for `get_versions`. See the trait's own doc.
+    fn get_versions(&self) {}
+    /// Poison stand-in for `get_versions_with`. See the trait's own doc.
+    fn get_versions_with(&self) {}
+    /// Poison stand-in for `get_latest_matching`. See the trait's own doc.
+    fn get_latest_matching(&self) {}
+    /// Poison stand-in for `search`. See the trait's own doc.
+    fn search(&self) {}
+}
+
+impl<T: ?Sized> NotInherent for T {}
+
 // ---------------------------------------------------------------------------------------
 // Macros
 // ---------------------------------------------------------------------------------------
@@ -1294,6 +1325,18 @@ macro_rules! json_depth_conformance {
 ///   different crate than the ecosystem invoking this macro and a `build:` fixture would
 ///   only duplicate that other crate's own conformance test.
 ///
+/// A third, unrelated form — `ty:` — takes only a type and asserts the canonical
+/// **inherent** registry-client method names (#834: `get_versions`, `get_versions_with`,
+/// `get_latest_matching`, `search`) exist on it, so a future rename or removal breaks this
+/// crate's own `cargo check --tests` instead of silently reintroducing the pre-#834 naming
+/// drift. The four names are hardcoded in the macro expansion, not caller-supplied — a
+/// misnamed or missing method on `$ty` cannot be worked around by pointing the macro at a
+/// different name, unlike a form that took the names as arguments would allow. Each is
+/// referenced as a plain path (`<$ty>::get_versions`), never called — this needs no live
+/// registry instance, no network request, and no knowledge of the method's argument shape
+/// (which legitimately varies per ecosystem); it only proves the name resolves as a
+/// callable item on `$ty`.
+///
 /// `versions` must be an explicit `Vec<Box<dyn Version>>` — the annotation is load-bearing:
 /// it lets a bare `vec![Box::new(..), ..]` coerce each element without the call site
 /// importing [`crate::Version`] itself.
@@ -1349,6 +1392,26 @@ macro_rules! json_depth_conformance {
 /// }
 /// }
 /// ```
+///
+/// `ty:` — the canonical inherent-method-set check. `FakeInherentRegistry` here has nothing
+/// to do with [`crate::Registry`] at all; the macro only cares that these four method names
+/// resolve on `$ty`, with any argument shape:
+///
+/// ```
+/// mod example_ty {
+/// # struct FakeInherentRegistry;
+/// # impl FakeInherentRegistry {
+/// #     async fn get_versions(&self, _name: &str) -> Vec<String> { vec![] }
+/// #     async fn get_versions_with(&self, _name: &str, _fresh: bool) -> Vec<String> { vec![] }
+/// #     async fn get_latest_matching(&self, _name: &str, _req: &str) -> Option<String> { None }
+/// #     async fn search(&self, _query: &str, _limit: usize) -> Vec<String> { vec![] }
+/// # }
+/// deps_core::registry_conformance! {
+///     mod fake_registry_api_conformance;
+///     ty: FakeInherentRegistry;
+/// }
+/// }
+/// ```
 #[macro_export]
 macro_rules! registry_conformance {
     (
@@ -1398,6 +1461,41 @@ macro_rules! registry_conformance {
             #[test]
             fn select_latest_matching_not_default_none() {
                 select_latest_matching_not_default_none_impl();
+            }
+        }
+    };
+    (
+        mod $mod_name:ident;
+        ty: $ty:ty;
+    ) => {
+        mod $mod_name {
+            #[allow(unused_imports)]
+            use super::*;
+            #[allow(unused_imports)]
+            use $crate::Registry as _;
+            #[allow(unused_imports)]
+            use $crate::conformance::NotInherent as _;
+
+            /// Never called (see the `ty:` form's doc on [`registry_conformance!`]): each
+            /// name is hardcoded here, not caller-supplied, so this actually pins the
+            /// vocabulary — a caller cannot make it pass by pointing it at some other name.
+            /// [`$crate::Registry`] **and** [`$crate::conformance::NotInherent`] must both
+            /// be brought into scope here — ambiguity (`E0034`) only fires when at least
+            /// two same-named trait candidates compete for a name that has no inherent
+            /// winner. `NotInherent` alone is not enough: a name reachable through exactly
+            /// one trait resolves to that trait's method with **no error at all**, so a
+            /// `$ty` missing the inherent method would pass silently once `Registry`
+            /// itself supplies `get_versions`/`get_versions_with`/`get_latest_matching`/
+            /// `search` as its own default-or-overridden trait methods (#834 critic,
+            /// rustc-verified: dropping this `use` was an earlier, broken version of this
+            /// guard that always passed regardless of whether `$ty` had the inherent
+            /// method).
+            #[allow(dead_code)]
+            fn canonical_registry_methods_exist() {
+                let _ = <$ty>::get_versions;
+                let _ = <$ty>::get_versions_with;
+                let _ = <$ty>::get_latest_matching;
+                let _ = <$ty>::search;
             }
         }
     };

@@ -1,4 +1,4 @@
-// `NuGetRegistry::unlisted_versions_for_hover`'s boxed-future coercion in
+// `NuGetRegistry::unlisted_versions`'s boxed-future coercion in
 // `NuGetEcosystem::generate_hover` nests through several layers of `tokio::join!`/
 // `MaybeDone` combinators; rustc's default recursion limit is occasionally insufficient to
 // prove the resulting `Send` bound and downgrades a previously-silent trait-solver retry
@@ -24,6 +24,8 @@ pub mod version;
 pub use ecosystem::NuGetEcosystem;
 pub use formatter::NuGetFormatter;
 pub use lockfile::NuGetLockParser;
-pub use parser::{parse_directory_packages_props, parse_packages_config, parse_project_file};
-pub use registry::NuGetRegistry;
-pub use types::{NuGetDependency, NuGetParseResult, NuGetVersion, PackageInfo};
+pub use parser::{
+    NuGetParseResult, parse_directory_packages_props, parse_packages_config, parse_project_file,
+};
+pub use registry::{NuGetRegistry, package_url};
+pub use types::{NuGetDependency, NuGetVersion, PackageInfo};

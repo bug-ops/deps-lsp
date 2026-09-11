@@ -827,7 +827,7 @@ impl LanguageServer for Backend {
         tracing::info!("document opened: {:?}", uri);
 
         // Use ecosystem registry to check if we support this file type
-        if self.state.ecosystem_registry.get_for_uri(&uri).is_none() {
+        if self.state.ecosystem_registry.for_uri(&uri).is_none() {
             tracing::debug!("unsupported file type: {:?}", uri);
             return;
         }
@@ -844,7 +844,7 @@ impl LanguageServer for Backend {
             let content = change.text.clone();
 
             // Use ecosystem registry to check if we support this file type
-            if self.state.ecosystem_registry.get_for_uri(&uri).is_none() {
+            if self.state.ecosystem_registry.for_uri(&uri).is_none() {
                 tracing::debug!("unsupported file type: {:?}", uri);
                 return;
             }
@@ -876,7 +876,7 @@ impl LanguageServer for Backend {
                 continue;
             };
 
-            if let Some(ecosystem) = self.state.ecosystem_registry.get_for_lockfile(filename) {
+            if let Some(ecosystem) = self.state.ecosystem_registry.for_lockfile(filename) {
                 tracing::info!(
                     "Lock file changed: {} (ecosystem: {})",
                     filename,
@@ -888,11 +888,7 @@ impl LanguageServer for Backend {
                 continue;
             }
 
-            if let Some(ecosystem) = self
-                .state
-                .ecosystem_registry
-                .get_for_watched_config(filename)
-            {
+            if let Some(ecosystem) = self.state.ecosystem_registry.for_watched_config(filename) {
                 tracing::info!(
                     "Watched config file changed: {} (ecosystem: {})",
                     filename,

@@ -95,7 +95,7 @@ impl Ecosystem for GithubActionsEcosystem {
     /// [`crate::parser::parse_workflow_yaml`]'s `uses:` detection is key-driven, not
     /// path-driven, so `runs.steps[].uses:` in such a file already parses identically to
     /// a workflow step — this is a routing-only extension. Matched by exact basename (via
-    /// `deps_core::EcosystemRegistry::get_for_filename`), so it applies regardless of
+    /// `deps_core::EcosystemRegistry::for_filename`), so it applies regardless of
     /// which directory the file lives in, not just a repository root.
     fn manifest_filenames(&self) -> &[&'static str] {
         &["action.yml", "action.yaml"]
@@ -1238,7 +1238,7 @@ mod tests {
         ] {
             let uri = deps_core::test_util::test_uri(path);
             let eco = registry
-                .get_for_uri(&uri)
+                .for_uri(&uri)
                 .unwrap_or_else(|| panic!("expected {path} to route to an ecosystem"));
             assert_eq!(eco.id(), "github-actions", "{path}");
         }

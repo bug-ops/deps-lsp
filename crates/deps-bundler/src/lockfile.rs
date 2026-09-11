@@ -193,9 +193,9 @@ BUNDLED WITH
 
         let packages = parse_gemfile_lock(lockfile).unwrap();
         assert_eq!(packages.len(), 3);
-        assert_eq!(packages.get_version("rails"), Some("7.0.8"));
-        assert_eq!(packages.get_version("pg"), Some("1.5.4"));
-        assert_eq!(packages.get_version("puma"), Some("6.4.0"));
+        assert_eq!(packages.version("rails"), Some("7.0.8"));
+        assert_eq!(packages.version("pg"), Some("1.5.4"));
+        assert_eq!(packages.version("puma"), Some("6.4.0"));
     }
 
     #[test]
@@ -221,7 +221,7 @@ BUNDLED WITH
 
         let packages = parse_gemfile_lock(lockfile).unwrap();
         assert_eq!(packages.len(), 2);
-        assert_eq!(packages.get_version("rails"), Some("7.1.0.alpha"));
+        assert_eq!(packages.version("rails"), Some("7.1.0.alpha"));
 
         let rails = packages.get("rails").unwrap();
         match &rails.source {
@@ -306,6 +306,6 @@ BUNDLED WITH
         let packages = parser.parse_lockfile(&lockfile_path).await.unwrap();
 
         assert_eq!(packages.len(), 1);
-        assert_eq!(packages.get_version("rails"), Some("7.0.8"));
+        assert_eq!(packages.version("rails"), Some("7.0.8"));
     }
 }

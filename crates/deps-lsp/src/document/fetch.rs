@@ -3387,7 +3387,7 @@ mod tests {
         fn test_ecosystem_registry_lookup() {
             let state = ServerState::new();
             let pypi_uri = deps_core::test_util::test_uri("/test/pyproject.toml");
-            assert!(state.ecosystem_registry.get_for_uri(&pypi_uri).is_some());
+            assert!(state.ecosystem_registry.for_uri(&pypi_uri).is_some());
         }
 
         #[tokio::test]
@@ -3400,7 +3400,7 @@ dependencies = ["requests>=2.0.0"]
 
             let ecosystem = state
                 .ecosystem_registry
-                .get_for_uri(&uri)
+                .for_uri(&uri)
                 .expect("pypi ecosystem not found");
 
             let parse_result = ecosystem.parse_manifest(content, &uri).await;
@@ -3535,7 +3535,7 @@ dependencies = ["requests>=2.0.0"]
 
             let ecosystem = state
                 .ecosystem_registry
-                .get_for_uri(&uri)
+                .for_uri(&uri)
                 .expect("pypi ecosystem not found");
             let formatter = ecosystem.formatter();
 

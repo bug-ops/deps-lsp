@@ -144,7 +144,7 @@ pub(crate) fn resolve_entry(
 
 /// One fully-resolved, ready-to-register routing chain — produced by
 /// [`PypiIndexConfig::resolved_chains`], consumed by
-/// `PypiRegistry::register_chain`/`register_named_source`.
+/// `PypiRegistry::register_alternate`.
 ///
 /// Output-only: constructed internally by [`PypiIndexConfig::resolved_chains`], never by
 /// external code — no constructor is provided.
@@ -175,7 +175,7 @@ pub struct ResolvedChain {
     pub hops: Vec<PypiIndexUrl>,
     /// `true` only for a case-(b) chain (spec FR-005(b)) whose final hop is the implicit
     /// public `pypi.org` root, appended at registration time rather than present in
-    /// [`Self::hops`] — `PypiRegistry::register_chain` builds that hop itself.
+    /// [`Self::hops`] — `PypiRegistry::register_alternate` builds that hop itself.
     pub implicit_public_fallback: bool,
 }
 

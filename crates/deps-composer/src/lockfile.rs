@@ -159,8 +159,8 @@ mod tests {
         let resolved = parser.parse_lockfile(&lock_path).await.unwrap();
 
         assert_eq!(resolved.len(), 2);
-        assert_eq!(resolved.get_version("symfony/console"), Some("6.0.0"));
-        assert_eq!(resolved.get_version("phpunit/phpunit"), Some("10.0.0"));
+        assert_eq!(resolved.version("symfony/console"), Some("6.0.0"));
+        assert_eq!(resolved.version("phpunit/phpunit"), Some("10.0.0"));
     }
 
     #[tokio::test]

@@ -155,7 +155,7 @@ impl Ecosystem for GoEcosystem {
             // `$GOENV` resolution and the long-lived `GoRegistry` this ecosystem shares across
             // every document ever meet. See `GoParseResult::resolved_chains`.
             for chain in &result.resolved_chains {
-                GoRegistry::register_chain(&self.registry, chain);
+                GoRegistry::register_alternate(&self.registry, chain);
             }
             Ok(Box::new(result) as Box<dyn ParseResultTrait>)
         })
@@ -977,7 +977,7 @@ require github.com/gin-gonic/gin v1.9.1
             )],
             ..Default::default()
         };
-        GoRegistry::register_chain(&registry, &chain);
+        GoRegistry::register_alternate(&registry, &chain);
 
         let dep = dep_with_source(
             "git.mycorp.example/internal/auth",
