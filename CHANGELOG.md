@@ -38,6 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-bundler, deps-cargo, deps-composer, deps-dart, deps-go, deps-maven, deps-npm, deps-nuget, deps-pypi, deps-swift**: migrated onto `registry_conformance!` (now 14/14 crates, was 4/14) and extended `completion_guard_conformance!` to maven/swift (11/14; go/github-actions/gitlab-ci confirmed N/A) (resolves #794) (#805)
 
 ### Fixed
+- **deps-pypi**: `register_named_source`'s doc comment now notes it has no production caller and points to `register_chain` as the live path for named sources, closing the staleness that previously misdirected a security fix (resolves #828)
 - **deps-cargo, deps-npm, deps-pypi**: alternate-registry-router tracing sites now log a `RedactedUrl`-wrapped index/key instead of the raw string, closing a query-string-credential leak on a validated `RegistryIndex`/`NpmRegistryIndex`/`PypiIndexUrl` (resolves #824)
 - **deps-go**: the three `compile_glob` malformed-`GOPRIVATE`-pattern warnings now log through `RedactedUrl` instead of `redact_userinfo` alone, closing a query-string-credential leak; `redact_userinfo` now has no production caller outside `deps-core` (resolves #822)
 - **deps-core, deps-maven, deps-nuget**: shared the bracket-interval version-range grammar via `deps_core::interval`, fixing `deps-nuget` silently accepting malformed ranges `deps-maven`/`deps-gradle` already rejected (resolves #821) (#830)

@@ -366,6 +366,10 @@ impl PypiRegistry {
     /// FR-007/FR-013) under `index`'s own URL into `root.alternates`. Same
     /// idempotency/capacity rules and `root: &Arc<Self>` parameter shape as
     /// [`Self::register_chain`].
+    ///
+    /// Has no production caller today — named sources are actually registered through
+    /// [`Self::register_chain`], whose `ResolvedChain::key` for a named source is already its
+    /// own literal URL.
     pub fn register_named_source(root: &Arc<Self>, index: &PypiIndexUrl) {
         let key = index.as_str().to_string();
         let at_capacity = root.alternates.len() >= MAX_ALTERNATE_REGISTRIES;
