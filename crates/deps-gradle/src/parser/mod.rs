@@ -313,6 +313,11 @@ mod tests {
 
     #[test]
     fn test_dispatch_kotlin() {
+        // Held per `deps_core::fs_probe::snapshot_guard`'s doc: `parse_gradle` calls
+        // `properties::load_gradle_properties` for a `build.gradle`/`.kts` URI, which
+        // transitively touches fs_probe, and this test runs in the same binary as
+        // `parser/properties.rs`'s diffing test.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let content = "dependencies {\n    implementation(\"org.springframework.boot:spring-boot-starter:3.2.0\")\n}\n";
         let uri = make_uri("/project/build.gradle.kts");
         let result = parse_gradle(content, &uri).unwrap();
@@ -321,6 +326,8 @@ mod tests {
 
     #[test]
     fn test_dispatch_groovy() {
+        // See the comment in `test_dispatch_kotlin` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let content = "dependencies {\n    implementation 'org.springframework.boot:spring-boot-starter:3.2.0'\n}\n";
         let uri = make_uri("/project/build.gradle");
         let result = parse_gradle(content, &uri).unwrap();
@@ -420,6 +427,8 @@ mod tests {
     fn test_parse_result_trait() {
         use deps_core::ParseResult;
 
+        // See the comment in `test_dispatch_kotlin` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let uri = make_uri("/project/build.gradle");
         let result = parse_gradle("", &uri).unwrap();
         assert!(result.dependencies().is_empty());

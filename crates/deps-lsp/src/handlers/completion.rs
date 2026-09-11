@@ -759,6 +759,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_completion_delegates_to_ecosystem() {
+        // Held per `deps_core::fs_probe::snapshot_guard`'s doc: `ecosystem.parse_manifest` (cargo)
+        // transitively touches fs_probe, and this test runs in the same binary as
+        // `document/loader.rs`'s diffing test.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let state = Arc::new(ServerState::new());
         let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
 

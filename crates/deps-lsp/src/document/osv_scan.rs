@@ -905,6 +905,10 @@ mod tests {
         #[tokio::test]
         #[ignore = "hits the real Maven Central API"]
         async fn run_license_prefetch_live_gradle_populates_document_licenses() {
+            // Held per `deps_core::fs_probe::snapshot_guard`'s doc: gradle's `parse_manifest`
+            // transitively touches fs_probe, and this test runs in the same binary as
+            // `document/loader.rs`'s diffing test.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
             let uri = deps_core::test_util::test_uri("/test/build.gradle.kts");
             let content =
@@ -949,6 +953,9 @@ mod tests {
         #[tokio::test]
         #[ignore = "hits the real Maven Central API"]
         async fn run_license_prefetch_live_gradle_follows_parent_pom_for_guava() {
+            // See the comment in `run_license_prefetch_live_gradle_populates_document_licenses`
+            // on why this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
             let uri = deps_core::test_util::test_uri("/test/build.gradle.kts");
             let content =

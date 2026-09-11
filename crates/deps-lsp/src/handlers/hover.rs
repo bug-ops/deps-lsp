@@ -133,6 +133,10 @@ mod tests {
 
         #[tokio::test]
         async fn test_handle_hover() {
+            // Held per `deps_core::fs_probe::snapshot_guard`'s doc: `ecosystem.parse_manifest`
+            // (cargo/npm) transitively touches fs_probe, and this test runs in the same binary as
+            // `document/loader.rs`'s diffing test.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
 
@@ -195,6 +199,8 @@ serde = "1.0.0"
 
         #[tokio::test]
         async fn test_handle_hover() {
+            // See the comment in `test_handle_hover` on why this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
             let uri = deps_core::test_util::test_uri("/test/package.json");
 

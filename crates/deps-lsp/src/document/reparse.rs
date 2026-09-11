@@ -177,6 +177,10 @@ mod tests {
     #[cfg(feature = "cargo")]
     #[tokio::test]
     async fn test_reparse_open_documents_scope_excluding_every_document_is_noop() {
+        // Held per `deps_core::fs_probe::snapshot_guard`'s doc: `ecosystem.parse_manifest`
+        // transitively touches fs_probe, and this test runs in the same binary as
+        // `document/loader.rs`'s diffing test.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let state = Arc::new(ServerState::new());
         let (client, config) = create_test_client_and_config();
         let uri = deps_core::test_util::test_uri("/test/Cargo.toml");

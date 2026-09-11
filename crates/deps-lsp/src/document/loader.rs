@@ -220,6 +220,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_existing_file() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let mut temp_file = NamedTempFile::new().unwrap();
         let content = "test content";
         temp_file.write_all(content.as_bytes()).unwrap();
@@ -233,6 +236,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_nonexistent_file() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let uri = deps_core::test_util::test_uri("/nonexistent/file/path.toml");
         let result = load_document_from_disk(&uri).await;
 
@@ -245,6 +251,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_empty_file() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let temp_file = NamedTempFile::new().unwrap();
         // File is empty, don't write anything
 
@@ -260,6 +269,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_utf8_file() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let mut temp_file = NamedTempFile::new().unwrap();
         let content = "Hello 世界 🌍 Привет";
         temp_file.write_all(content.as_bytes()).unwrap();
@@ -273,6 +285,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_non_utf8_file() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let mut temp_file = NamedTempFile::new().unwrap();
         // Write invalid UTF-8 bytes
         temp_file.write_all(&[0xFF, 0xFE, 0xFD]).unwrap();
@@ -291,6 +306,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn test_load_permission_denied() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
 
@@ -319,6 +337,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_large_file_warning() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         // This test verifies that large files can be loaded (with warning logged)
         // We don't create a 10MB+ file to avoid slow tests, but we verify
         // that normal-sized files load successfully
@@ -335,6 +356,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_cargo_toml() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let mut temp_file = NamedTempFile::new().unwrap();
         let content = r#"[package]
 name = "test"
@@ -363,6 +387,9 @@ serde = "1.0"
     #[cfg(unix)]
     #[tokio::test]
     async fn test_load_symlink_to_valid_file() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         use std::os::unix::fs::symlink;
         use tempfile::TempDir;
 
@@ -381,6 +408,9 @@ serde = "1.0"
     #[cfg(unix)]
     #[tokio::test]
     async fn test_load_circular_symlink() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         use std::os::unix::fs::symlink;
         use tempfile::TempDir;
 
@@ -403,6 +433,9 @@ serde = "1.0"
     #[cfg(unix)]
     #[tokio::test]
     async fn test_load_fifo_does_not_hang() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         use tempfile::TempDir;
 
         let temp_dir = TempDir::new().unwrap();
@@ -432,6 +465,9 @@ serde = "1.0"
 
     #[tokio::test]
     async fn test_load_file_exceeding_max_size() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         use std::io::Write;
 
         // Create a file just over MAX_FILE_SIZE (10MB)
@@ -490,6 +526,9 @@ serde = "1.0"
     /// `deps_core::mtime_cache::tests::file_exactly_at_cap_is_still_cached`).
     #[tokio::test]
     async fn test_load_file_exactly_at_max_size() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let temp_dir = tempfile::TempDir::new().unwrap();
         let path = temp_dir.path().join("exact.toml");
         let content = "a".repeat(MAX_FILE_SIZE as usize);
@@ -512,6 +551,7 @@ serde = "1.0"
         temp_file.flush().unwrap();
 
         let uri = Uri::from_file_path(temp_file.path()).unwrap();
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let (_, reads_before) = deps_core::fs_probe::snapshot();
         load_document_from_disk(&uri).await.unwrap();
         let (_, reads_after) = deps_core::fs_probe::snapshot();

@@ -241,6 +241,10 @@ mod tests {
             content: &str,
             cached: std::collections::HashMap<deps_core::PackageName, deps_core::PackageVersions>,
         ) {
+            // Held per `deps_core::fs_probe::snapshot_guard`'s doc: `ecosystem.parse_manifest`
+            // transitively touches fs_probe, and this test runs in the same binary as
+            // `document/loader.rs`'s diffing test.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
             let parse_result = ecosystem
                 .parse_manifest(content, uri)
@@ -378,6 +382,11 @@ mod tests {
             cached: HashMap<deps_core::PackageName, deps_core::PackageVersions>,
             expected_fragment: &str,
         ) {
+            // Held per `deps_core::fs_probe::snapshot_guard`'s doc: called with every
+            // ecosystem under test here (including cargo/npm/nuget/gradle, which
+            // transitively touch fs_probe), and this shared helper runs in the same binary
+            // as `document/loader.rs`'s diffing test.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let parse_result = ecosystem
                 .parse_manifest(content, uri)
                 .await
@@ -409,6 +418,9 @@ mod tests {
             content: &str,
             cached: HashMap<deps_core::PackageName, deps_core::PackageVersions>,
         ) {
+            // See the comment in `assert_single_edit_produces_valid_declaration` on why
+            // this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let parse_result = ecosystem
                 .parse_manifest(content, uri)
                 .await

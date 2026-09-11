@@ -185,6 +185,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_single_tfm() {
+        // Held per `deps_core::fs_probe::snapshot_guard`'s doc: `parse_lockfile` transitively
+        // touches fs_probe, and this test runs in the same binary as `deps-nuget/src/config.rs`'s
+        // diffing test.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let content = r#"{
   "version": 1,
   "dependencies": {
@@ -210,6 +214,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_project_reference_entry_skipped() {
+        // See the comment in `test_parse_single_tfm` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let content = r#"{
   "version": 2,
   "dependencies": {
@@ -232,6 +238,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_multi_tfm_tie_break_uses_nuget_comparator() {
+        // See the comment in `test_parse_single_tfm` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         // 4-component versions where "1.10.0.0" > "1.9.0.0" numerically but would sort the
         // other way under a broken semver-then-string fallback.
         let content = r#"{
@@ -256,6 +264,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_missing_optional_fields() {
+        // See the comment in `test_parse_single_tfm` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let content = r#"{
   "dependencies": {
     "net8.0": {
@@ -274,6 +284,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_invalid_json_returns_error() {
+        // See the comment in `test_parse_single_tfm` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("packages.lock.json");
         tokio::fs::write(&path, b"not valid json").await.unwrap();
@@ -285,6 +297,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_nesting_at_max_depth_accepted() {
+        // See the comment in `test_parse_single_tfm` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let depth = deps_core::MAX_JSON_NESTING_DEPTH;
         let content = format!(
             r#"{{"dependencies": {{}}, "extra": {}1{}}}"#,
@@ -301,6 +315,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_nesting_over_max_depth_rejected() {
+        // See the comment in `test_parse_single_tfm` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let depth = deps_core::MAX_JSON_NESTING_DEPTH + 1;
         let content = format!(
             r#"{{"dependencies": {{}}, "extra": {}1{}}}"#,
@@ -317,6 +333,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_empty_dependencies_returns_empty() {
+        // See the comment in `test_parse_single_tfm` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let content = r#"{"version": 1, "dependencies": {}}"#;
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("packages.lock.json");
@@ -348,6 +366,10 @@ mod tests {
     /// `packages.*.lock.json` a directory scan happens to find.
     #[test]
     fn test_locate_lockfile_multi_project_matches_own_project_not_first_found() {
+        // Held per `deps_core::fs_probe::snapshot_guard`'s doc: `locate_lockfile` transitively
+        // touches fs_probe (via `fs_probe::is_file`), and this test runs in the same binary as
+        // `deps-nuget/src/config.rs`'s diffing test.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let temp_dir = tempfile::tempdir().unwrap();
         let app1_manifest = temp_dir.path().join("App1.csproj");
         let app2_manifest = temp_dir.path().join("App2.csproj");
@@ -373,6 +395,9 @@ mod tests {
     /// return `None` rather than wrongly attaching an unrelated project's resolved versions.
     #[test]
     fn test_locate_lockfile_multi_project_does_not_match_other_projects_lock_file() {
+        // See the comment in `test_locate_lockfile_multi_project_matches_own_project_not_first_found`
+        // on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let temp_dir = tempfile::tempdir().unwrap();
         let app1_manifest = temp_dir.path().join("App1.csproj");
         let app2_lock = temp_dir.path().join("packages.App2.lock.json");
@@ -386,6 +411,9 @@ mod tests {
 
     #[test]
     fn test_locate_lockfile_finds_multi_project_name_in_manifest_dir() {
+        // See the comment in `test_locate_lockfile_multi_project_matches_own_project_not_first_found`
+        // on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let temp_dir = tempfile::tempdir().unwrap();
         let manifest_path = temp_dir.path().join("MyApp.csproj");
         let lock_path = temp_dir.path().join("packages.MyApp.lock.json");
@@ -399,6 +427,9 @@ mod tests {
 
     #[test]
     fn test_locate_lockfile_prefers_exact_name_over_multi_project() {
+        // See the comment in `test_locate_lockfile_multi_project_matches_own_project_not_first_found`
+        // on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let temp_dir = tempfile::tempdir().unwrap();
         let manifest_path = temp_dir.path().join("MyApp.csproj");
         let exact_lock_path = temp_dir.path().join("packages.lock.json");
@@ -414,6 +445,9 @@ mod tests {
 
     #[test]
     fn test_locate_lockfile_finds_multi_project_name_in_workspace_parent() {
+        // See the comment in `test_locate_lockfile_multi_project_matches_own_project_not_first_found`
+        // on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let temp_dir = tempfile::tempdir().unwrap();
         let project_dir = temp_dir.path().join("src").join("MyApp");
         std::fs::create_dir_all(&project_dir).unwrap();
@@ -429,6 +463,9 @@ mod tests {
 
     #[test]
     fn test_locate_lockfile_ignores_unrelated_files_in_dir() {
+        // See the comment in `test_locate_lockfile_multi_project_matches_own_project_not_first_found`
+        // on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let temp_dir = tempfile::tempdir().unwrap();
         let manifest_path = temp_dir.path().join("MyApp.csproj");
         std::fs::write(&manifest_path, "<Project></Project>").unwrap();

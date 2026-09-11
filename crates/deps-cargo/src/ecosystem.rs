@@ -643,6 +643,10 @@ mod tests {
     async fn test_package_name_completion_context_has_real_range() {
         // Regression test for #232: the textEdit range for a package-name completion
         // must be the real name token span, not the (0,0)-(0,0) placeholder.
+        //
+        // Held per `fs_probe::snapshot_guard`'s doc: `parse_manifest` transitively touches
+        // fs_probe (via `discover_workspace`), and every such test in this file must hold it.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = CargoEcosystem::new(cache);
         let content = "[dependencies]\nserd = \"1.0\"\n";

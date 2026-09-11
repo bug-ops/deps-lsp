@@ -594,6 +594,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_simple_package_lock() {
+        // Held per `deps_core::fs_probe::snapshot_guard`'s doc: `parse_lockfile` transitively
+        // touches fs_probe, and this test runs in the same binary as `deps-npm/src/config.rs`'s
+        // diffing test.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let lockfile_content = r#"{
   "name": "my-project",
   "lockfileVersion": 3,
@@ -643,6 +647,8 @@ mod tests {
     /// key-derived alias basename, so `Dependency::name()` (the real name) finds this entry.
     #[tokio::test]
     async fn test_parse_package_lock_with_npm_alias_resolves_real_name() {
+        // See the comment in `test_parse_simple_package_lock` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let lockfile_content = r#"{
   "name": "my-project",
   "lockfileVersion": 3,
@@ -682,6 +688,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_package_lock_with_git() {
+        // See the comment in `test_parse_simple_package_lock` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let lockfile_content = r#"{
   "lockfileVersion": 3,
   "packages": {
@@ -721,6 +729,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_package_lock_with_local() {
+        // See the comment in `test_parse_simple_package_lock` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let lockfile_content = r#"{
   "lockfileVersion": 3,
   "packages": {
@@ -756,6 +766,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_empty_package_lock() {
+        // See the comment in `test_parse_simple_package_lock` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let lockfile_content = r#"{
   "lockfileVersion": 3,
   "packages": {
@@ -780,6 +792,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_nesting_at_max_depth_accepted() {
+        // See the comment in `test_parse_simple_package_lock` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let depth = deps_core::MAX_JSON_NESTING_DEPTH;
         let content = format!(
             r#"{{"packages": {{}}, "extra": {}1{}}}"#,
@@ -796,6 +810,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_nesting_over_max_depth_rejected() {
+        // See the comment in `test_parse_simple_package_lock` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let depth = deps_core::MAX_JSON_NESTING_DEPTH + 1;
         let content = format!(
             r#"{{"packages": {{}}, "extra": {}1{}}}"#,
@@ -832,6 +848,10 @@ mod tests {
 
     #[test]
     fn test_locate_lockfile_workspace_root() {
+        // Held per `deps_core::fs_probe::snapshot_guard`'s doc: `locate_lockfile` transitively
+        // touches fs_probe (via `fs_probe::is_file`), and this test runs in the same binary as
+        // `deps-npm/src/config.rs`'s diffing test.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let temp_dir = tempfile::tempdir().unwrap();
         let workspace_lock = temp_dir.path().join("package-lock.json");
         let member_dir = temp_dir.path().join("packages").join("member");
@@ -853,6 +873,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_pnpm_lock_single_importer() {
+        // See the comment in `test_parse_simple_package_lock` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let lockfile_content = r"
 lockfileVersion: '9.0'
 importers:
@@ -882,6 +904,8 @@ importers:
 
     #[tokio::test]
     async fn test_parse_pnpm_lock_monorepo_multi_importer_aggregation() {
+        // See the comment in `test_parse_simple_package_lock` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let lockfile_content = r"
 lockfileVersion: '9.0'
 importers:
@@ -916,6 +940,8 @@ importers:
 
     #[tokio::test]
     async fn test_parse_pnpm_lock_strips_peer_suffix() {
+        // See the comment in `test_parse_simple_package_lock` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let lockfile_content = r"
 lockfileVersion: '9.0'
 importers:
@@ -942,6 +968,8 @@ importers:
 
     #[tokio::test]
     async fn test_parse_pnpm_lock_skips_link_entries() {
+        // See the comment in `test_parse_simple_package_lock` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let lockfile_content = r"
 lockfileVersion: '9.0'
 importers:
@@ -970,6 +998,8 @@ importers:
 
     #[tokio::test]
     async fn test_parse_pnpm_lock_malformed_yaml_is_parse_error() {
+        // See the comment in `test_parse_simple_package_lock` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let lockfile_content = "importers: [unterminated";
 
         let temp_dir = tempfile::tempdir().unwrap();
@@ -989,6 +1019,8 @@ importers:
 
     #[tokio::test]
     async fn test_parse_pnpm_lock_empty_importers_is_empty_not_error() {
+        // See the comment in `test_parse_simple_package_lock` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let lockfile_content = "lockfileVersion: '9.0'\n";
 
         let temp_dir = tempfile::tempdir().unwrap();
@@ -1005,6 +1037,8 @@ importers:
 
     #[tokio::test]
     async fn test_parse_pnpm_lock_explicit_empty_importers_map_is_empty_not_error() {
+        // See the comment in `test_parse_simple_package_lock` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let lockfile_content = "lockfileVersion: '9.0'\nimporters: {}\n";
 
         let temp_dir = tempfile::tempdir().unwrap();
@@ -1021,6 +1055,8 @@ importers:
 
     #[tokio::test]
     async fn test_parse_pnpm_lock_unsupported_lockfile_version_is_parse_error() {
+        // See the comment in `test_parse_simple_package_lock` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let lockfile_content = r"
 lockfileVersion: '5.4'
 importers:
@@ -1048,6 +1084,8 @@ importers:
 
     #[tokio::test]
     async fn test_parse_pnpm_lock_non_scalar_lockfile_version_is_parse_error() {
+        // See the comment in `test_parse_simple_package_lock` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let lockfile_content = r"
 lockfileVersion:
   - 9
@@ -1073,6 +1111,8 @@ importers:
 
     #[tokio::test]
     async fn test_parse_pnpm_lock_optional_dependencies() {
+        // See the comment in `test_parse_simple_package_lock` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let lockfile_content = r"
 lockfileVersion: '9.0'
 importers:
@@ -1098,6 +1138,8 @@ importers:
     /// present — every section must contribute its entries to the same aggregated result.
     #[tokio::test]
     async fn test_parse_pnpm_lock_all_three_sections_in_one_importer() {
+        // See the comment in `test_parse_simple_package_lock` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let lockfile_content = r"
 lockfileVersion: '9.0'
 importers:
@@ -1136,6 +1178,8 @@ importers:
     /// #654's `package-lock.json` handling).
     #[tokio::test]
     async fn test_parse_pnpm_lock_npm_alias_resolves_real_name() {
+        // See the comment in `test_parse_simple_package_lock` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let lockfile_content = r"
 lockfileVersion: '9.0'
 importers:
@@ -1167,6 +1211,8 @@ importers:
     /// the *last* `@`, not the first (which would land inside the scope segment).
     #[tokio::test]
     async fn test_parse_pnpm_lock_npm_alias_resolves_scoped_real_name() {
+        // See the comment in `test_parse_simple_package_lock` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let lockfile_content = r"
 lockfileVersion: '9.0'
 importers:
@@ -1194,6 +1240,8 @@ importers:
     /// verbatim into hover text and OSV vulnerability-lookup queries.
     #[tokio::test]
     async fn test_parse_pnpm_lock_skips_non_semver_versions() {
+        // See the comment in `test_parse_simple_package_lock` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let lockfile_content = r"
 lockfileVersion: '9.0'
 importers:
@@ -1237,6 +1285,8 @@ importers:
     /// for looking like the wrong YAML type.
     #[tokio::test]
     async fn test_parse_pnpm_lock_coerces_unquoted_numeric_version_then_semver_gate_skips_it() {
+        // See the comment in `test_parse_simple_package_lock` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let lockfile_content = r"
 lockfileVersion: '9.0'
 importers:
@@ -1266,6 +1316,8 @@ importers:
     /// skipped without panicking, and must not affect resolution of sibling entries.
     #[tokio::test]
     async fn test_parse_pnpm_lock_non_scalar_version_field_is_skipped_without_panic() {
+        // See the comment in `test_parse_simple_package_lock` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let lockfile_content = r"
 lockfileVersion: '9.0'
 importers:
@@ -1294,6 +1346,8 @@ importers:
 
     #[test]
     fn test_locate_lockfile_prefers_package_lock_json_over_pnpm() {
+        // See the comment in `test_locate_lockfile_workspace_root` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let temp_dir = tempfile::tempdir().unwrap();
         let manifest_path = temp_dir.path().join("package.json");
         let npm_lock = temp_dir.path().join("package-lock.json");
@@ -1311,6 +1365,8 @@ importers:
 
     #[test]
     fn test_locate_lockfile_falls_back_to_pnpm_when_no_package_lock() {
+        // See the comment in `test_locate_lockfile_workspace_root` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let temp_dir = tempfile::tempdir().unwrap();
         let manifest_path = temp_dir.path().join("package.json");
         let pnpm_lock = temp_dir.path().join("pnpm-lock.yaml");

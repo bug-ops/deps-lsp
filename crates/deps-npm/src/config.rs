@@ -1083,6 +1083,9 @@ mod tests {
 
     #[test]
     fn test_resolve_with_home_no_npmrc_anywhere_is_default() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let dir = tempfile::tempdir().unwrap();
         let cache = NpmConfigCache::new();
         let policy = all_policy();
@@ -1096,6 +1099,9 @@ mod tests {
 
     #[test]
     fn test_resolve_with_home_project_tier_applies() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(".npmrc"),
@@ -1117,6 +1123,9 @@ mod tests {
     /// FR-002: project tier overrides user tier.
     #[test]
     fn test_resolve_with_home_project_overrides_user() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let project_dir = tempfile::tempdir().unwrap();
         let home_dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -1148,6 +1157,9 @@ mod tests {
 
     #[test]
     fn test_resolve_with_home_user_tier_applies_when_no_project_tier() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let project_dir = tempfile::tempdir().unwrap();
         let home_dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -1177,6 +1189,9 @@ mod tests {
     /// path, so the single file is read once and applied once.
     #[test]
     fn test_resolve_with_home_dedupes_ancestor_matching_user_tier() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let home_dir = tempfile::tempdir().unwrap();
         let project_dir = home_dir.path().join("project");
         std::fs::create_dir(&project_dir).unwrap();
@@ -1204,6 +1219,9 @@ mod tests {
 
     #[test]
     fn test_resolve_with_home_empty_npmrc_is_default() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".npmrc"), "# just a comment\n").unwrap();
         let cache = NpmConfigCache::new();
@@ -1239,6 +1257,7 @@ mod tests {
 
         let cache = NpmConfigCache::new();
         let policy = all_policy();
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let (stats_before, _) = deps_core::fs_probe::snapshot();
         let config = resolve_with_home(
             &current,
@@ -1261,6 +1280,10 @@ mod tests {
 
     #[test]
     fn test_config_cache_reparses_after_mtime_change() {
+        // Held per `deps_core::fs_probe::snapshot_guard`'s doc: `NpmConfigCache::get_or_parse`
+        // transitively touches fs_probe, and this test runs in the same binary as this
+        // file's own diffing test.
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".npmrc");
         std::fs::write(&path, "registry=https://npm.one.example\n").unwrap();

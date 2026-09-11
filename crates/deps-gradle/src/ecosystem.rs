@@ -512,6 +512,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_manifest_kts() {
+        // Held per `fs_probe::snapshot_guard`'s doc: `parse_manifest` transitively touches
+        // fs_probe (via `load_gradle_properties`), and every such test in this file must hold it.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let eco = GradleEcosystem::new(make_cache());
         let content = "dependencies {\n    implementation(\"junit:junit:4.13.2\")\n}\n";
         let uri = deps_core::test_util::test_uri("/project/build.gradle.kts");
@@ -862,6 +865,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_manifest_groovy() {
+        // See the comment in `test_parse_manifest_kts` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let eco = GradleEcosystem::new(make_cache());
         let content = "dependencies {\n    implementation 'junit:junit:4.13.2'\n}\n";
         let uri = deps_core::test_util::test_uri("/project/build.gradle");
@@ -932,6 +937,8 @@ mod tests {
     /// the registry.
     #[tokio::test]
     async fn test_generate_completions_version_context_no_dependency_at_position_returns_empty() {
+        // See the comment in `test_parse_manifest_kts` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let eco = GradleEcosystem::new(make_cache());
         let content = "implementation(\"junit:junit:4.13.2\")\n";
         let uri = deps_core::test_util::test_uri("/project/build.gradle.kts");
@@ -955,6 +962,8 @@ mod tests {
     #[tokio::test]
     #[ignore] // Requires network access
     async fn test_generate_completions_version_arm_dispatches_by_position() {
+        // See the comment in `test_parse_manifest_kts` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let eco = GradleEcosystem::new(make_cache());
         let content = "dependencies {\n    implementation(\"junit:junit:4.13.2\")\n}\n";
         let uri = deps_core::test_util::test_uri("/project/build.gradle.kts");

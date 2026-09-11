@@ -1544,6 +1544,10 @@ mod tests {
     /// into the parse result itself (see `Self::handle_watched_config_change`'s doc).
     #[tokio::test]
     async fn test_watched_config_change_reparses_open_document_with_catalog_dependency() {
+        // Held per `deps_core::fs_probe::snapshot_guard`'s doc: `did_open` routes through npm's
+        // `parse_manifest` (transitively `catalog::load`/`config::resolve`), and this test runs in
+        // the same binary as `document/loader.rs`'s diffing test.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         use tower_lsp_server::ls_types::{
             FileChangeType, FileEvent, HoverContents, Position, TextDocumentIdentifier,
             TextDocumentItem, TextDocumentPositionParams,
@@ -1633,6 +1637,10 @@ mod tests {
     #[cfg(feature = "cargo")]
     #[tokio::test]
     async fn test_handle_lockfile_change_computes_ceiling_per_uri() {
+        // Held per `deps_core::fs_probe::snapshot_guard`'s doc: `ecosystem.parse_manifest`
+        // (cargo) transitively touches fs_probe, and this test runs in the same binary as
+        // `document/loader.rs`'s diffing test.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         use crate::document::DocumentState;
         use deps_core::EcosystemId;
         use std::time::{Duration, Instant};
@@ -2453,6 +2461,9 @@ mod tests {
         #[cfg(feature = "cargo")]
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn test_no_deadlock_between_config_write_and_concurrent_hover_and_diagnostics() {
+            // See the comment in `test_handle_lockfile_change_computes_ceiling_per_uri` on why this
+            // guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             use crate::document::DocumentState;
             use crate::handlers::{diagnostics, hover};
             use deps_core::EcosystemId;
@@ -2565,6 +2576,10 @@ mod tests {
         #[cfg(all(feature = "cargo", feature = "nuget"))]
         #[tokio::test]
         async fn test_rapid_config_changes_coalesce_into_a_union_scope_reparse() {
+            // See the comment in `test_handle_lockfile_change_computes_ceiling_per_uri` on why this
+            // guard is needed here (both the cargo and nuget ecosystem's `parse_manifest` calls in this
+            // test transitively touch fs_probe).
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             use crate::document::DocumentState;
             use deps_core::{EcosystemId, PackageName, PackageVersions};
 
@@ -2691,6 +2706,9 @@ mod tests {
 
         #[tokio::test]
         async fn test_execute_command_update_all_outdated_loading_document_no_op() {
+            // See the comment in `test_handle_lockfile_change_computes_ceiling_per_uri` on why this
+            // guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
             let backend = service.inner();
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
@@ -2721,6 +2739,9 @@ mod tests {
 
         #[tokio::test]
         async fn test_execute_command_update_all_outdated_no_version_no_op() {
+            // See the comment in `test_handle_lockfile_change_computes_ceiling_per_uri` on why this
+            // guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             // `version: None` mirrors a document populated from disk after a missed
             // didOpen (server restart/crash) — must be refused even though loaded and
             // not `Loading`.
@@ -2744,6 +2765,9 @@ mod tests {
 
         #[tokio::test]
         async fn test_execute_command_update_all_outdated_apply_edit_failure_does_not_panic() {
+            // See the comment in `test_handle_lockfile_change_computes_ceiling_per_uri` on why this
+            // guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             // This test `Backend` is never `initialize`d, so `apply_edit` returns `Err`
             // (per its documented behavior) — exercises the failure/warning path.
             let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
@@ -3017,6 +3041,9 @@ mod tests {
     #[cfg(feature = "cargo")]
     #[tokio::test]
     async fn test_execute_command_pin_all_to_sha_non_pin_ecosystem_document_no_op() {
+        // See the comment in `test_handle_lockfile_change_computes_ceiling_per_uri` on why this
+        // guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         use crate::document::DocumentState;
         use deps_core::EcosystemId;
 

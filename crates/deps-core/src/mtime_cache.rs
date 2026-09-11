@@ -226,6 +226,12 @@ mod tests {
         let path = dir.path().join("file.txt");
         std::fs::write(&path, "hello").unwrap();
 
+        // Held even though this test does not itself diff a snapshot: it still calls
+        // `get_or_parse`, which bumps the same process-global fs_probe counters
+        // `hit_does_zero_reads_and_exactly_one_stat` diffs elsewhere in this module —
+        // without the guard here, a concurrently running `cargo test` thread could corrupt
+        // that test's count mid-diff.
+        let _guard = fs_probe::snapshot_guard();
         let cache: MtimeFileCache<Parsed> = MtimeFileCache::new(DEFAULT_MAX_CACHED_FILES, "test");
         let first = cache.get_or_parse(&path, parse_upper).unwrap();
         let second = cache.get_or_parse(&path, parse_upper).unwrap();
@@ -242,6 +248,9 @@ mod tests {
         let path = dir.path().join("file.txt");
         std::fs::write(&path, "hello").unwrap();
 
+        // Acquired before the priming call too: that warm-up still does one real stat/read
+        // through fs_probe, which must not race a sibling test's own measured window either.
+        let _guard = fs_probe::snapshot_guard();
         let cache: MtimeFileCache<Parsed> = MtimeFileCache::new(DEFAULT_MAX_CACHED_FILES, "test");
         cache.get_or_parse(&path, parse_upper).unwrap();
 
@@ -268,6 +277,9 @@ mod tests {
         let path = dir.path().join("file.txt");
         std::fs::write(&path, "one").unwrap();
 
+        // See the comment in `hit_reuses_same_arc_without_reparsing` on why a non-diffing
+        // test still needs this guard.
+        let _guard = fs_probe::snapshot_guard();
         let cache: MtimeFileCache<Parsed> = MtimeFileCache::new(DEFAULT_MAX_CACHED_FILES, "test");
         let first = cache.get_or_parse(&path, parse_upper).unwrap();
 
@@ -306,6 +318,9 @@ mod tests {
             .set_modified(future)
             .unwrap();
 
+        // See the comment in `hit_reuses_same_arc_without_reparsing` on why a non-diffing
+        // test still needs this guard.
+        let _guard = fs_probe::snapshot_guard();
         let cache: MtimeFileCache<Parsed> = MtimeFileCache::new(DEFAULT_MAX_CACHED_FILES, "test");
         let first = cache.get_or_parse(&path, parse_upper).unwrap();
 
@@ -327,6 +342,9 @@ mod tests {
 
     #[test]
     fn missing_path_returns_none() {
+        // See the comment in `hit_reuses_same_arc_without_reparsing` on why a non-diffing
+        // test still needs this guard.
+        let _guard = fs_probe::snapshot_guard();
         let cache: MtimeFileCache<Parsed> = MtimeFileCache::new(DEFAULT_MAX_CACHED_FILES, "test");
         assert!(
             cache
@@ -341,6 +359,9 @@ mod tests {
     #[test]
     fn directory_path_returns_none() {
         let dir = tempfile::tempdir().unwrap();
+        // See the comment in `hit_reuses_same_arc_without_reparsing` on why a non-diffing
+        // test still needs this guard.
+        let _guard = fs_probe::snapshot_guard();
         let cache: MtimeFileCache<Parsed> = MtimeFileCache::new(DEFAULT_MAX_CACHED_FILES, "test");
         assert!(cache.get_or_parse(dir.path(), parse_upper).is_none());
     }
@@ -357,6 +378,9 @@ mod tests {
         file.set_len(MAX_CACHED_FILE_BYTES + 1).unwrap();
         drop(file);
 
+        // See the comment in `hit_reuses_same_arc_without_reparsing` on why a non-diffing
+        // test still needs this guard.
+        let _guard = fs_probe::snapshot_guard();
         let cache: MtimeFileCache<Parsed> = MtimeFileCache::new(DEFAULT_MAX_CACHED_FILES, "test");
         let parse_calls = std::cell::Cell::new(0);
         let result = cache.get_or_parse(&path, |content| {
@@ -382,6 +406,9 @@ mod tests {
         let content = "a".repeat(MAX_CACHED_FILE_BYTES as usize);
         std::fs::write(&path, &content).unwrap();
 
+        // See the comment in `hit_reuses_same_arc_without_reparsing` on why a non-diffing
+        // test still needs this guard.
+        let _guard = fs_probe::snapshot_guard();
         let cache: MtimeFileCache<Parsed> = MtimeFileCache::new(DEFAULT_MAX_CACHED_FILES, "test");
         let result = cache.get_or_parse(&path, parse_upper);
 
@@ -399,6 +426,9 @@ mod tests {
         file.set_len(MAX_CACHED_FILE_BYTES + 1).unwrap();
         drop(file);
 
+        // See the comment in `hit_reuses_same_arc_without_reparsing` on why a non-diffing
+        // test still needs this guard.
+        let _guard = fs_probe::snapshot_guard();
         let cache: MtimeFileCache<Parsed> = MtimeFileCache::new(DEFAULT_MAX_CACHED_FILES, "test");
 
         let log = crate::test_util::capture_tracing_output(|| {
@@ -425,6 +455,9 @@ mod tests {
         file.set_len(MAX_CACHED_FILE_BYTES + 1).unwrap();
         drop(file);
 
+        // See the comment in `hit_reuses_same_arc_without_reparsing` on why a non-diffing
+        // test still needs this guard.
+        let _guard = fs_probe::snapshot_guard();
         let cache: MtimeFileCache<Parsed> = MtimeFileCache::new(DEFAULT_MAX_CACHED_FILES, "test");
 
         let log = crate::test_util::capture_tracing_output(|| {
@@ -458,6 +491,9 @@ mod tests {
         std::fs::write(&path_a, "a").unwrap();
         std::fs::write(&path_b, "b").unwrap();
 
+        // See the comment in `hit_reuses_same_arc_without_reparsing` on why a non-diffing
+        // test still needs this guard.
+        let _guard = fs_probe::snapshot_guard();
         let cache: MtimeFileCache<Parsed> = MtimeFileCache::new(1, "test");
         let first = cache.get_or_parse(&path_a, parse_upper).unwrap();
         assert_eq!(first.0, "A");

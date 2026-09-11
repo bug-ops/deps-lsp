@@ -510,6 +510,10 @@ mod tests {
     async fn test_package_name_completion_context_has_real_range() {
         // Regression test for #232: the textEdit range for a package-name completion
         // must be the real name token span, not the (0,0)-(0,0) placeholder.
+        //
+        // Held per `fs_probe::snapshot_guard`'s doc: `parse_manifest` transitively touches
+        // fs_probe (via `catalog::load`), and every such test in this file must hold it.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = NpmEcosystem::new(cache);
         let content = "{\n  \"dependencies\": {\n    \"express\": \"^4.18.2\"\n  }\n}";
@@ -542,6 +546,10 @@ mod tests {
         // closing quote of `"express"`) must never produce a PackageName textEdit range that
         // extends into the closing quote — applying such an edit would delete the quote and
         // corrupt the JSON.
+        //
+        // See the comment in `test_package_name_completion_context_has_real_range` on why
+        // this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = NpmEcosystem::new(cache);
         let content = "{\n  \"dependencies\": {\n    \"express\": \"^4.18.2\"\n  }\n}";
@@ -700,6 +708,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_manifest_valid_json() {
+        // See the comment in `test_package_name_completion_context_has_real_range` on why
+        // this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = NpmEcosystem::new(cache);
         let uri = deps_core::test_util::test_uri("/test/package.json");
@@ -715,6 +726,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_manifest_invalid_json() {
+        // See the comment in `test_package_name_completion_context_has_real_range` on why
+        // this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = NpmEcosystem::new(cache);
         let uri = deps_core::test_util::test_uri("/test/package.json");
@@ -727,6 +741,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_manifest_empty_dependencies() {
+        // See the comment in `test_package_name_completion_context_has_real_range` on why
+        // this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = NpmEcosystem::new(cache);
         let uri = deps_core::test_util::test_uri("/test/package.json");
@@ -751,6 +768,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_generate_inlay_hints_empty_dependencies() {
+        // See the comment in `test_package_name_completion_context_has_real_range` on why
+        // this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = NpmEcosystem::new(cache);
         let uri = deps_core::test_util::test_uri("/test/package.json");
@@ -776,6 +796,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_generate_completions_no_context() {
+        // See the comment in `test_package_name_completion_context_has_real_range` on why
+        // this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = NpmEcosystem::new(cache);
         let uri = deps_core::test_util::test_uri("/test/package.json");
@@ -802,6 +825,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_generate_completions_feature_context_returns_empty() {
+        // See the comment in `test_package_name_completion_context_has_real_range` on why
+        // this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = NpmEcosystem::new(cache);
 
@@ -830,6 +856,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_generate_hover_no_dependency_at_position() {
+        // See the comment in `test_package_name_completion_context_has_real_range` on why
+        // this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = NpmEcosystem::new(cache);
         let uri = deps_core::test_util::test_uri("/test/package.json");
@@ -858,6 +887,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_generate_code_actions_no_actions() {
+        // See the comment in `test_package_name_completion_context_has_real_range` on why
+        // this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = NpmEcosystem::new(cache);
         let uri = deps_core::test_util::test_uri("/test/package.json");
@@ -895,6 +927,9 @@ mod tests {
     /// `deps_core::lsp_helpers::code_actions::generate_code_actions`'s guard).
     #[tokio::test]
     async fn test_generate_code_actions_suppressed_for_npm_alias() {
+        // See the comment in `test_package_name_completion_context_has_real_range` on why
+        // this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = NpmEcosystem::new(cache);
         let uri = deps_core::test_util::test_uri("/test/package.json");
@@ -933,6 +968,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_generate_diagnostics_no_dependencies() {
+        // See the comment in `test_package_name_completion_context_has_real_range` on why
+        // this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = NpmEcosystem::new(cache);
         let uri = deps_core::test_util::test_uri("/test/package.json");
@@ -1282,6 +1320,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_generate_hover_appends_catalog_line_for_resolved_dependency() {
+        // See the comment in `test_package_name_completion_context_has_real_range` on why
+        // this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let root = tempfile::tempdir().unwrap();
         std::fs::write(
             root.path().join("pnpm-workspace.yaml"),
@@ -1324,6 +1365,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_generate_diagnostics_reports_missing_catalog_entry() {
+        // See the comment in `test_package_name_completion_context_has_real_range` on why
+        // this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let root = tempfile::tempdir().unwrap();
         std::fs::write(
             root.path().join("pnpm-workspace.yaml"),

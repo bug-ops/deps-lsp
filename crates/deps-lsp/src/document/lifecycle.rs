@@ -1232,6 +1232,10 @@ mod tests {
     #[cfg(feature = "cargo")]
     #[tokio::test]
     async fn test_document_over_dependency_ceiling_is_capped_and_reports_a_diagnostic() {
+        // Held per `deps_core::fs_probe::snapshot_guard`'s doc: `parse_manifest_blocking`
+        // (cargo) transitively touches fs_probe (via `discover_workspace`), and this test
+        // runs in the same binary as `document/loader.rs`'s diffing test.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let state = Arc::new(ServerState::new());
         let uri = deps_core::test_util::test_uri("/test/over-ceiling/Cargo.toml");
 
@@ -1285,6 +1289,9 @@ mod tests {
     #[cfg(feature = "cargo")]
     #[tokio::test]
     async fn test_document_at_exactly_the_dependency_ceiling_is_not_truncated() {
+        // See the comment in `test_document_over_dependency_ceiling_is_capped_and_reports_a_diagnostic`
+        // on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let state = Arc::new(ServerState::new());
         let uri = deps_core::test_util::test_uri("/test/at-ceiling/Cargo.toml");
 
@@ -1440,6 +1447,10 @@ mod tests {
         #[cfg(feature = "cargo")]
         #[tokio::test]
         async fn test_forced_refetch_total_failure_renders_lookup_failed_not_unknown_package() {
+            // Held per `deps_core::fs_probe::snapshot_guard`'s doc: `ecosystem.parse_manifest`
+            // transitively touches fs_probe, and this test runs in the same binary as
+            // `document/loader.rs`'s diffing test.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
             let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
@@ -1536,6 +1547,8 @@ mod tests {
         #[tokio::test]
         async fn test_concurrent_diff_edit_after_forced_refetch_drop_does_not_render_unknown_package()
          {
+            // See the comment in `test_forced_refetch_total_failure_renders_lookup_failed_not_unknown_package` on why this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
             // No lock file for this manifest path — the `in_lockfile` guard in
             // `handlers::diagnostics` must not be what's saving this test; it's specifically
@@ -1995,6 +2008,8 @@ mod tests {
     /// fixed function, not a re-implementation of it.
     #[tokio::test]
     async fn test_licenses_pruned_on_dependency_removal() {
+        // See the comment in `test_forced_refetch_total_failure_renders_lookup_failed_not_unknown_package` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let state = Arc::new(ServerState::new());
         let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
 
@@ -2080,6 +2095,9 @@ anyhow = "1.0"
         // Test that load_document_from_disk fails gracefully for missing files
         use super::load_document_from_disk;
 
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this
+        // binary must hold it, not just document/loader.rs's own diffing test.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let uri = deps_core::test_util::test_uri("/nonexistent/Cargo.toml");
         let result = load_document_from_disk(&uri).await;
 
@@ -2102,6 +2120,10 @@ anyhow = "1.0"
 
         #[tokio::test]
         async fn test_document_parsing() {
+            // Held per `deps_core::fs_probe::snapshot_guard`'s doc: `ecosystem.parse_manifest`
+            // (cargo) transitively touches fs_probe, and this test runs in the same binary as
+            // `document/loader.rs`'s diffing test.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
             let content = r#"[dependencies]
@@ -2130,6 +2152,8 @@ serde = "1.0"
 
         #[tokio::test]
         async fn test_document_stored_even_when_parsing_fails() {
+            // See the comment in `test_document_parsing` on why this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
             // Invalid TOML that will fail parsing
@@ -2176,6 +2200,8 @@ serde = "1.0"
 
         #[tokio::test]
         async fn test_ensure_document_loaded_fast_path() {
+            // See the comment in `test_document_parsing` on why this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             // Fast path: document already loaded, should return true without loading
             let state = Arc::new(ServerState::new());
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
@@ -2214,6 +2240,10 @@ serde = "1.0""#;
             use std::fs;
             use tempfile::TempDir;
 
+            // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this
+            // binary must hold it, not just document/loader.rs's own diffing test.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+
             // Create a temporary directory with a Cargo.toml file
             let temp_dir = TempDir::new().unwrap();
             let cargo_toml_path = temp_dir.path().join("Cargo.toml");
@@ -2246,6 +2276,8 @@ serde = "1.0"
 
         #[tokio::test]
         async fn test_ensure_document_loaded_idempotent_check() {
+            // See the comment in `test_document_parsing` on why this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             // Test that repeated loads are idempotent at the state level
             let state = Arc::new(ServerState::new());
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
@@ -2556,6 +2588,9 @@ tokio = "1.0"
 
         #[tokio::test]
         async fn test_document_parsing() {
+            // See the comment in `test_document_parsing` (cargo module) on why this guard
+            // is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
             let uri = deps_core::test_util::test_uri("/test/package.json");
             let content = r#"{"dependencies": {"express": "^4.18.0"}}"#;
