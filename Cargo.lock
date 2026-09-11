@@ -445,7 +445,7 @@ dependencies = [
 
 [[package]]
 name = "deps-bundler"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "criterion",
  "deps-core",
@@ -463,7 +463,7 @@ dependencies = [
 
 [[package]]
 name = "deps-cargo"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "bytes",
  "criterion",
@@ -488,7 +488,7 @@ dependencies = [
 
 [[package]]
 name = "deps-composer"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "deps-core",
  "mockito",
@@ -504,7 +504,7 @@ dependencies = [
 
 [[package]]
 name = "deps-core"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "bytes",
  "criterion",
@@ -534,7 +534,7 @@ dependencies = [
 
 [[package]]
 name = "deps-dart"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "criterion",
  "deps-core",
@@ -554,7 +554,7 @@ dependencies = [
 
 [[package]]
 name = "deps-deno"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "deps-core",
  "deps-npm",
@@ -571,7 +571,7 @@ dependencies = [
 
 [[package]]
 name = "deps-github-actions"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "dashmap",
  "deps-core",
@@ -587,7 +587,7 @@ dependencies = [
 
 [[package]]
 name = "deps-gitlab-ci"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "bytes",
  "dashmap",
@@ -609,7 +609,7 @@ dependencies = [
 
 [[package]]
 name = "deps-go"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "criterion",
  "dashmap",
@@ -630,7 +630,7 @@ dependencies = [
 
 [[package]]
 name = "deps-gradle"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "deps-core",
  "deps-maven",
@@ -648,7 +648,7 @@ dependencies = [
 
 [[package]]
 name = "deps-lsp"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "criterion",
  "dashmap",
@@ -682,7 +682,7 @@ dependencies = [
 
 [[package]]
 name = "deps-maven"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "bytes",
  "dashmap",
@@ -702,7 +702,7 @@ dependencies = [
 
 [[package]]
 name = "deps-npm"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "criterion",
  "dashmap",
@@ -726,7 +726,7 @@ dependencies = [
 
 [[package]]
 name = "deps-nuget"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -753,7 +753,7 @@ dependencies = [
 
 [[package]]
 name = "deps-pypi"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "criterion",
  "dashmap",
@@ -776,7 +776,7 @@ dependencies = [
 
 [[package]]
 name = "deps-swift"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "deps-core",
  "insta",

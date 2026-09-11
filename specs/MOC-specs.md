@@ -30,7 +30,7 @@ status: moc
 | 007 | [[007-lightweight-registry-metadata/plan\|Adopt lightweight registry metadata formats for npm and PyPI version lookups]] | plan | draft — plan complete, 2 open `[NEEDS CLARIFICATION]` items block `/sdd tasks` |
 | 008 | [[008-codelens-update-all-outdated/spec\|CodeLens support for "update all outdated dependencies" action]] | specify | draft — research/parity, P2, 7 open `[NEEDS CLARIFICATION]` items |
 | 009 | [[009-pypi-requirements-txt/spec\|Support requirements.txt (pip family) in deps-pypi]] | specify | draft — enhancement/parity, P2, 7 open `[NEEDS CLARIFICATION]` items |
-| 010 | [[010-license-hover-policy/spec\|License in hover + license-policy diagnostics]] | plan | partially shipped — research/parity, P4, issue #204 closed, PR1 shipped (PR #663: SPDX license hover, 8 ecosystems). Remaining rollout: #660 (tier-3 ecosystems), #661 (Phase 2 policy diagnostics), #662 (DRY follow-up) |
+| 010 | [[010-license-hover-policy/spec\|License in hover + license-policy diagnostics]] | plan | shipped — research/parity, P4 (PR #663 issue #204, PR #682 issues #660/#661, PR #665 issue #662) |
 | 011 | [[011-deprecation-replacement-diagnostics/spec\|Deprecation/abandoned diagnostics with suggested replacement]] | specify | draft — research/parity, P3, 9 open `[NEEDS CLARIFICATION]` items |
 | 012 | [[012-unsatisfiable-requirement-diagnostic/spec\|Diagnostic for requirements matching zero published versions]] | specify | draft — enhancement/parity, P3, 9 open `[NEEDS CLARIFICATION]` items |
 | 013 | [[013-deno-jsr-ecosystem/spec\|New ecosystem: Deno/JSR (deno.json / deno.jsonc)]] | specify | draft — research/new ecosystem, P3, 10 open `[NEEDS CLARIFICATION]` items |
@@ -70,12 +70,12 @@ status: moc
 | 046 | [[046-pnpm-catalogs/spec\|pnpm catalogs + workspace: protocol resolution support]] | specify | shipped — research/enhancement, P3 (PR #589, issue #587) |
 | 047 | [[047-elixir-hex-ecosystem/spec\|New ecosystem: Elixir Hex (mix.exs dependency version hints)]] | specify | draft — research/new-ecosystem, P4, 6 open `[NEEDS CLARIFICATION]` items, issue #642 |
 | 048 | [[048-gitlab-ci-mutable-pin-message-contradicts-quickfix/spec\|GitLab CI mutable-ref-pin diagnostic wrongly claims no automated fix for component Latest/Partial pins]] | specify | shipped — bug, P2 (PR #645, issues #640, #643) |
-| 049 | [[049-osv-malicious-package-severity/spec\|OSV malicious-package (MAL-*) advisory severity distinguishing]] | specify | research/correctness, P2, implemented (issue #646, branch feat/646-osv-malicious-severity) |
+| 049 | [[049-osv-malicious-package-severity/spec\|OSV malicious-package (MAL-*) advisory severity distinguishing]] | specify | shipped — research/correctness, P2 (PR #652, issue #646) |
 | 050 | [[050-cargo-renamed-dependency-lockfile-resolution/spec\|Per-occurrence lockfile version resolution for renamed/aliased dependencies]] | specify | shipped — bug, P1 (PR #653, issue #649) |
 | 051 | [[051-disk-persistent-registry-cache/spec\|Disk-persistent registry cache]] | specify | research/parity, P3, 9 open `[NEEDS CLARIFICATION]` items |
-| 052 | [[052-pnpm-lockfile-provider/spec\|pnpm-lock.yaml lock file provider (npm ecosystem)]] | specify | ready — enhancement/cross-ecosystem, P3, 0 open `[NEEDS CLARIFICATION]` items, issue #709 (scoped to pnpm-lock.yaml only) |
+| 052 | [[052-pnpm-lockfile-provider/spec\|pnpm-lock.yaml lock file provider (npm ecosystem)]] | specify | shipped — enhancement/cross-ecosystem, P3 (PR #719, issue #709; scoped to pnpm-lock.yaml only) |
 | 053 | [[053-ecosystem-sealing-inversion-decision-record/spec\|Ecosystem sealing inversion decision record]] | specify | research/decision-record, P4, shipped — won't-do, spec is the artifact (issue #774 to be closed referencing this spec) |
-| 054 | [[054-redacted-url-structural-chokepoint/spec\|Structural chokepoint for outbound-URL redaction in error/log output]] | specify | in review — enhancement/security, P2, 0 open `[NEEDS CLARIFICATION]` items, issue #789, PR #800 (deps-core stage), ecosystem-crate migration tracked in #801 — follow-up to #767/#775 |
+| 054 | [[054-redacted-url-structural-chokepoint/spec\|Structural chokepoint for outbound-URL redaction in error/log output]] | specify | shipped — enhancement/security, P2 (PR #800 issue #789, PR #807 issue #801) — follow-up to #767/#775 |
 
 ## Completed Specs
 

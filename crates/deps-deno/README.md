@@ -17,12 +17,13 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 - **Node semver resolution** — Full `^`, `~`, `>=`, `<`, range support for both `jsr:` and `npm:` requirements (JSR mandates strict semver)
 - **Scoped packages** — `@scope/pkg` names for both registries
 - **Freshness at zero extra cost** — JSR's `meta.json` carries per-version publish dates in the same response `get_versions` already fetches
+- **License hover** — SPDX license for the resolved and latest version via background pre-fetch, flagging a "License changed" when they differ
 
 ## Installation
 
 ```toml
 [dependencies]
-deps-deno = "0.13"
+deps-deno = "0.14"
 ```
 
 > [!IMPORTANT]

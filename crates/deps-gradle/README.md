@@ -18,6 +18,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 - **Multi-registry** — Resolves from Maven Central, Google Maven, and Gradle Plugin Portal
 - **Maven version comparison** — Full qualifier-aware comparison (`alpha`, `beta`, `RC`, `SNAPSHOT`)
 - **Configuration awareness** — Recognises `implementation`, `api`, `testImplementation`, and other Gradle configurations
+- **License hover** — SPDX license for the resolved and latest version via background pre-fetch; Maven Central POM free-text license names (e.g. "The Apache Software License, Version 2.0") are normalized to SPDX identifiers before comparison and `license_policy` evaluation
 - **Release-freshness signal (partial)** — Per-version ages in hover/completion for Maven Central-resolved dependencies; unavailable for Google Maven and Gradle Plugin Portal artifacts, which have no date column (see `ECOSYSTEM_GUIDE.md`)
 
 > [!NOTE]
@@ -27,7 +28,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 
 ```toml
 [dependencies]
-deps-gradle = "0.13"
+deps-gradle = "0.14"
 ```
 
 > [!IMPORTANT]

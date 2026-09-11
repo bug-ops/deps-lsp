@@ -16,8 +16,9 @@ A universal Language Server Protocol (LSP) server for dependency management acro
 - **Intelligent autocomplete** — Package names, versions, and feature flags
 - **Version hints** — Inlay hints showing latest available versions
 - **Loading indicators** — Visual feedback during registry fetches with LSP progress support
-- **Lock file support** — Reads resolved versions from Cargo.lock, package-lock.json, poetry.lock, uv.lock, go.sum, Gemfile.lock, pubspec.lock, Package.resolved, composer.lock
+- **Lock file support** — Reads resolved versions from Cargo.lock, package-lock.json, pnpm-lock.yaml, poetry.lock, uv.lock, go.sum, Gemfile.lock, pubspec.lock, Package.resolved, composer.lock, packages.lock.json
 - **Diagnostics** — Warnings for outdated, unknown, yanked, unsatisfiable-requirement, or deprecated/abandoned dependencies
+- **License hover & policy** — SPDX license for the resolved and latest version in hover, flagging a "License changed" when they differ, plus an optional `license_policy` allow/deny-list diagnostic, across all 14 ecosystems
 - **Vulnerability scanning** — OSV.dev-backed advisories in diagnostics and hover, across all supported ecosystems
 - **Supply-chain trust signal** — OpenSSF Scorecard score and SLSA/attestation provenance status in hover, via deps.dev, for npm, Cargo, Go, Maven, PyPI, Bundler, and NuGet
 - **Release-freshness signal** — Flags a "latest" version still within a cooldown window in hover and completion, mirroring GitHub Dependabot's default 3-day package cooldown

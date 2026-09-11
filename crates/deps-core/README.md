@@ -27,13 +27,14 @@ This crate provides the shared infrastructure used by all ecosystem-specific cra
 - **`check_yaml_expansion`** — streaming pre-pass over `yaml-rust2`'s own parser event stream rejecting YAML whose anchor/alias references would expand to an excessive number of allocated bytes (billion-laughs-style), independent of nesting depth
 - **`lockfile::read_lockfile_content`** — shared read-and-error-wrap helper for lock file parsers
 - **`deps_dev::DepsDevClient`** — supply-chain trust signal client for the [deps.dev](https://deps.dev) API, resolving a dependency's linked source repository, OpenSSF Scorecard score, and SLSA/attestation provenance status (`SupplyChainTrustSignal`, `ScorecardSummary`, `ProvenanceStatus`)
+- **`licenses::LicensePolicy`** — SPDX allow/deny-list evaluation shared by every ecosystem's `license_policy` diagnostic, plus `Ecosystem::fetch_license`/`license_source()` sealed-trait hooks for tier-3 ecosystems whose license isn't already present in the hot-path registry response
 - **Error types** — Unified error handling with `thiserror`
 
 ## Installation
 
 ```toml
 [dependencies]
-deps-core = "0.13"
+deps-core = "0.14"
 ```
 
 > [!IMPORTANT]

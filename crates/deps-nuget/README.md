@@ -19,6 +19,8 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 - **Lock file support** — `packages.lock.json`, merged across target framework monikers, plus multi-project `packages.<project>.lock.json` resolved by the manifest's own project name
 - **Release-freshness signal** — Per-version ages in hover/completion from the V3 registration hive, covering the newest ~8 versions of a package (see `ECOSYSTEM_GUIDE.md`)
 - **Unlisted-version marker** — Hover flags a delisted/pulled version with `*(unlisted)*` in "Recent versions", enriched from the V3 registration hive on the hover path only
+- **License hover** — SPDX license for the resolved and latest version, flagging a "License changed" when they differ
+- **Fallback completion** — Raw-text attribute-value extraction offers package-name completion even when the surrounding XML fails to parse
 - **Private/custom feed resolution** — `NuGet.Config` `<packageSources>`/`<clear/>`/`<disabledPackageSources>`/`<packageSourceCredentials>`/`<packageSourceMapping>`, merged across every in-repo ancestor config file, fail closed on a bad/disabled/credentialed entry rather than falling back to `api.nuget.org` (see `ECOSYSTEM_GUIDE.md`)
 
 > [!IMPORTANT]
@@ -28,7 +30,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 
 ```toml
 [dependencies]
-deps-nuget = "0.13"
+deps-nuget = "0.14"
 ```
 
 ## Usage

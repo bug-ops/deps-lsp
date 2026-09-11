@@ -13,11 +13,12 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 ## Features
 
 - **JSON parsing** — Parse `package.json` with position tracking for `dependencies`, `devDependencies`, and `peerDependencies`
-- **Lock file parsing** — Extract resolved versions from `package-lock.json` (v2/v3)
+- **Lock file parsing** — Extract resolved versions from `package-lock.json` (v2/v3) or, aggregated across every pnpm workspace importer, `pnpm-lock.yaml`; `package-lock.json` takes precedence when both are present
 - **npm registry** — Client for npm registry API with metadata caching
 - **Custom/private registries** — Resolves project/user-tier `.npmrc` `registry=`/`@scope:registry=` overrides to live registry data, failing closed on a bad entry instead of falling back to `registry.npmjs.org`
 - **Node semver resolution** — Full `^`, `~`, `>=`, `<`, range, and tag specifier support
 - **Scoped packages** — Support for `@scope/package` format
+- **License hover** — SPDX license for the resolved and latest version, flagging a "License changed" when they differ
 - **Release-freshness signal** — Per-version ages in hover/completion, derived from a separately fetched, TTL'd full packument (the abbreviated packument used for the version list carries no publish dates)
 - **Package-level deprecation diagnostic** — flags a package whose latest version carries npm's `deprecated` field
 
@@ -25,7 +26,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 
 ```toml
 [dependencies]
-deps-npm = "0.13"
+deps-npm = "0.14"
 ```
 
 > [!IMPORTANT]
