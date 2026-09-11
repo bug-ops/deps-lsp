@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **deps-core**: unified `net_policy`'s duplicated userinfo-redaction carve-out rules into one shared `redact_credential` scanner — zero behavior change (resolves #846) (#863)
+- **deps-core, deps-cargo, deps-go, deps-lsp**: documented the exhaustive/non_exhaustive justification for 8 public enums per `deps-core`'s API-stability policy; `HostClass` and `deps_lsp::document::DocumentState` are now `#[non_exhaustive]` (resolves #854)
+- `specs/`: reconciled `MOC-specs.md` against actual issue/PR state — 7 stale "draft, P1" spec rows marked shipped with their PR/issue references, all shipped specs moved into a "Completed Specs" section, and `specs/constitution.md` added (resolves #855)
 
 ### Fixed
 - `fuzz/redact_userinfo`: fixed a false-positive crash where the fuzzer-controlled host/port tail could coincidentally reproduce the sentinel literal, tripping the leak assertion outside any credential; no `net_policy` behavior change (#864)

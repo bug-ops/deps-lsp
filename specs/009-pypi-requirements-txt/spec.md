@@ -10,7 +10,7 @@ tags:
   - ecosystem/pypi
   - priority/p2
 created: 2026-08-23
-status: draft
+status: shipped
 related:
   - "[[MOC-specs]]"
 ---

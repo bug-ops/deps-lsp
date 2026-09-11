@@ -66,6 +66,18 @@ pub use deps_core::LoadingState;
 ///
 /// assert!(state.cached_versions.is_empty());
 /// ```
+///
+/// `#[non_exhaustive]` (issue #854): most fields here are `pub` (needed so handlers across
+/// `deps-lsp` can read cache state directly), but the `parse_result` field is private — and a
+/// private field alone already blocks external struct-literal construction (`E0451`) and
+/// forces `..` on external exhaustive destructuring, with or without this attribute. So this
+/// `#[non_exhaustive]` is a no-op today, not an added restriction; it is kept anyway as
+/// forward-compatible intent in case every field is ever made `pub` (at which point silently
+/// removing it would matter) and as an explicit signal that new cache fields keep getting
+/// added here (`vulnerabilities`, `outcomes`, `licenses`, `resolved_version_candidates` all
+/// postdate the struct's original shape) so a hypothetical future fully-public version should
+/// not be exhaustively constructed either.
+#[non_exhaustive]
 pub struct DocumentState {
     /// Package ecosystem identifier, exhaustively typed.
     pub ecosystem: EcosystemId,

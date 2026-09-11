@@ -9,7 +9,7 @@ tags:
   - dependencies
   - deps-dart
 created: 2026-08-19
-status: draft
+status: shipped
 related:
   - "[[constitution]]"
 ---

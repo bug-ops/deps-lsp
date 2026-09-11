@@ -27,10 +27,15 @@ use std::sync::atomic::{AtomicU8, Ordering};
 /// `BlockedAddrResolver` (a `reqwest::dns::Resolve` implementation, fail-closed on lookup
 /// errors, wired into every client via `build_guarded_client`) — see [`classify_addr`], its
 /// counterpart for already-resolved addresses.
-// Exhaustive: security-sensitive SSRF classification — a new host class landing in a
-// wildcard arm at any consuming match site would silently fall through as unclassified
-// instead of failing to compile (issue #769).
+///
+/// `#[non_exhaustive]`: unlike most security-sensitive enums in this module, a new host
+/// class is a realistic, desirable future addition — a newly-documented cloud-metadata
+/// endpoint or reserved range should ship as a non-breaking patch, not force a major version
+/// bump on every consumer. No exhaustive `match` on this enum exists outside `deps-core`
+/// today (`crate::cache::hop_targets_blocked_host` and other callers compare by equality or
+/// [`Self::never_a_registry`], not an exhaustive match), so this costs nothing in-tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum HostClass {
     /// `127.0.0.0/8`, `::1`, `localhost`, `*.localhost`.
     Loopback,
@@ -67,6 +72,11 @@ impl HostClass {
     /// [`HostClass::UniqueLocalV6`]/[`HostClass::InternalName`] are legitimate redirect
     /// targets for a corporate registry's own network — only the classes below are never a
     /// registry under any policy.
+    ///
+    /// Fail-open by construction for a variant not listed below: since [`HostClass`] is
+    /// `#[non_exhaustive]`, a future variant (e.g. a newly-documented cloud-metadata range)
+    /// defaults to "not never-a-registry" here until this function is explicitly updated to
+    /// include it — a new variant must be triaged into this list, not assumed covered.
     #[must_use]
     pub const fn never_a_registry(self) -> bool {
         matches!(
@@ -314,9 +324,10 @@ fn path_under_prefix(path: &str, prefix: &str) -> bool {
 /// Applied **only** to workspace-provenance URLs (a `Cargo.toml`/`.cargo/config.toml` value
 /// found inside the opened workspace) — a `$CARGO_HOME`-provenance index is the user's own
 /// trusted configuration and is never policy-checked, under any variant here.
-// Exhaustive: security-sensitive gate for registry fetches — a new variant landing in a
-// wildcard arm would silently pick an unintended access level instead of failing to
-// compile (issue #769).
+///
+/// **Exhaustive** (issue #769): security-sensitive gate for registry fetches — a new variant
+/// landing in a wildcard arm at any consuming match site would silently pick an unintended
+/// access level instead of failing to compile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum WorkspaceRegistryAccess {
     /// Block every workspace-declared index — the only complete boundary. Also blocks the
@@ -498,9 +509,10 @@ pub enum IndexUrlError {
 ///     .is_err()
 /// );
 /// ```
-// Exhaustive: closed 2-variant Skip/Enforce gate — a third state would change the calling
-// convention at every `validate_index_url` call site, not slot into an existing wildcard
-// arm (issue #769).
+///
+/// **Exhaustive** (issue #769): a closed 2-variant Skip/Enforce gate — a third state would
+/// change the calling convention at every `validate_index_url` call site, not slot into an
+/// existing wildcard arm.
 #[derive(Debug, Clone, Copy)]
 pub enum PolicyGate<'a> {
     /// Skip the policy check entirely — the candidate's provenance is already trusted (e.g.

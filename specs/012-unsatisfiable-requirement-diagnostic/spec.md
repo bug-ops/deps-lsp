@@ -10,7 +10,7 @@ tags:
   - diagnostics
   - priority/p3
 created: 2026-08-23
-status: draft
+status: shipped
 related:
   - "[[MOC-specs]]"
 ---
