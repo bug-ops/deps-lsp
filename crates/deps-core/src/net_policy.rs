@@ -650,6 +650,48 @@ fn find_credential_at(region: &str) -> Option<usize> {
     found
 }
 
+/// Widens a credential-shaped `@` found by [`find_credential_at`] forward across any further `@`
+/// in `region` that is not separated from it by a `/`, `?`, or `#` (#859) — the `OpaquePath`
+/// counterpart to [`RegionKind::Authority`]'s own last-`@`-*overall*-wins bounded pass, needed
+/// because [`find_credential_at`] returns the *last* credential-shaped `@` only, and treats
+/// everything past it (including a literal `@` inside the password itself) as outside the match:
+/// `at` is `find_credential_at`'s result for `user:pa@ss@evil`, but the real credential/host
+/// boundary is the *second* `@` — the segment between them (`ss`) is still part of the password,
+/// not a new path component.
+///
+/// Stops as soon as a `/`, `?`, or `#` appears before the next `@` — the same boundary set
+/// [`redact_credential`]'s own `Authority` bounded pass and [`redact_colon_credential`] already
+/// use, so this doesn't re-introduce the boundary-rule duplication PR #863 unified. `/` is what
+/// keeps `user:hunter2@evil/@scope/pkg` from extending into `@scope` (#845's own boundary); `?`
+/// and `#` matter because [`url_for_tracing`] redacts *before* truncating the query
+/// string/fragment — a `/`-only stop set would let a query-shaped `@` (e.g.
+/// `user:pw@host?email=a@b`) get pulled into the masked span, consuming the very `?` that
+/// `url_for_tracing` needs to find in order to truncate the query string, and leaking it
+/// (impl-critic C1).
+///
+/// Deliberately does **not** stop at `\`: unlike `/`/`?`/`#`, a backslash is not treated as a
+/// general segment boundary anywhere else in this file (only [`colon_is_drive_letter`] gives it
+/// positional meaning, for detecting a standalone drive letter specifically) — an unrelated
+/// `\`-separated Windows-path-shaped tail extending into the masked span is accepted as an
+/// over-redaction trade-off, not a leak, consistent with this file's existing
+/// over-redaction/false-positive trade-offs (see [`redact_colon_credential`]'s own doc comment).
+// `at`/`next` come from `find('@')` on ASCII '@' bytes, so every slice bound is always a char
+// boundary.
+#[allow(clippy::string_slice)]
+fn extend_credential_at(region: &str, at: usize) -> usize {
+    let mut at = at;
+    loop {
+        let tail = &region[at + 1..];
+        let Some(next) = tail.find('@') else {
+            return at;
+        };
+        if tail[..next].contains(['/', '?', '#']) {
+            return at;
+        }
+        at += 1 + next;
+    }
+}
+
 /// Whether `segment` contains a `:` that is not a Windows drive-letter colon, not a bracketed
 /// IPv6 literal's own colon ([`bracket_host_shape_end`]), and not a `host:port`-shaped port
 /// separator ([`is_port_like`]) — [`find_credential_at`]'s shape check. A bare
@@ -901,19 +943,14 @@ enum RegionKind {
 ///
 /// # Coverage per `RegionKind`
 ///
-/// Every carve-out below is shared by both kinds *except* the two marked `Authority`-only —
-/// each is a class PR #845 fixed on the `Authority` side only, tracked under the parent issue
-/// #856, with `OpaquePath`-side follow-ups filed rather than fixed here:
+/// Every carve-out below is shared by both kinds *except* the one marked `Authority`-only
+/// (S4, #858) — a class PR #845 fixed on the `Authority` side only, tracked under the parent
+/// issue #856, with an `OpaquePath`-side follow-up filed rather than fixed here:
 ///
 /// - Username-only userinfo with no password (`ghp_TOKEN@github.com`) — **`Authority` only**
 ///   (C1). The bounded `@` pass never shape-checks, so a bare username redacts correctly; the
 ///   `OpaquePath` twin (`c:/ghp_TOKEN@evil`) has no authority span to license that and stays
 ///   unredacted. See #858 (S4) — no known fix short of ecosystem-specific token-prefix sniffing.
-/// - `@` inside a password (`user:pa@ss@evil` → `***@evil`) — **`Authority`-only** advantage:
-///   its bounded pass takes last-`@`-*overall*-wins, which happens to also close this case;
-///   `OpaquePath` only has [`find_credential_at`]'s last-*credential-shaped*-`@`-wins, so
-///   `c:/user:pa@ss@evil` → `c:***@ss@evil` (the password tail `ss` survives). See #859 (S5) for
-///   a fix sketch.
 ///
 /// `OpaquePath` used to additionally disable the [`redact_colon_credential`] fallback outright
 /// (first for *any* `@` in the region, later — #857's own first pass — narrowed to only a
@@ -930,6 +967,16 @@ enum RegionKind {
 /// Shared by both kinds:
 /// - A leading empty-userinfo `@` (`@types/node`) never short-circuits — both fall through past
 ///   it rather than returning early (code-review Finding 1).
+/// - An `@` inside a password (`user:pa@ss@evil` → `***@evil`) is fully redacted for `Authority`
+///   via its bounded pass, which takes last-`@`-*overall*-wins directly, and for `OpaquePath` via
+///   [`extend_credential_at`], which widens [`find_credential_at`]'s credential-shaped `@` across
+///   any further `@` not separated from it by a `/`/`?`/`#` (#859). `extend_credential_at` is
+///   invoked only when `kind == OpaquePath` — `Authority`'s own rare fall-through into this shared
+///   tail (the `#826` straddle case, where the bounded pass finds no `@` of its own) deliberately
+///   does **not** get widened further, so it can still partially leak through that narrow,
+///   pre-existing path (e.g. `user:pa/ss@wo@rd@evil`), unchanged from `main` (impl-critic S2):
+///   widening it too would be an untested, out-of-scope behavior change, not a fix for a specific
+///   leak.
 /// - A drive-letter colon (`C:\`, `c:/`) is never credential-shaped ([`colon_is_drive_letter`]).
 /// - A bracketed IPv6 literal's own colon is never credential-shaped
 ///   ([`bracket_host_shape_end`]); its immediately-following port separator, once reached, is
@@ -957,6 +1004,7 @@ fn redact_credential(raw: &str, start: usize, kind: RegionKind) -> String {
     }
 
     match find_credential_at(region) {
+        Some(at) if kind == RegionKind::OpaquePath => mask_at(extend_credential_at(region, at)),
         Some(at) => mask_at(at),
         None => redact_colon_credential(raw, start, region),
     }
@@ -2314,17 +2362,68 @@ mod tests {
         assert_eq!(redact_userinfo("c:/ghp_TOKEN@evil"), "c:***@evil");
     }
 
-    /// #846 S5 (tracked at #859): `OpaquePath` only has [`find_credential_at`]'s
+    /// #846 S5 (fixed by #859): `OpaquePath` only had [`find_credential_at`]'s
     /// last-credential-shaped-`@`-wins, unlike `Authority`'s additional bounded
-    /// last-`@`-*overall*-wins pass, so an `@` inside the password survives redaction — unlike
-    /// its `Authority` twin (`***@evil`, pinned at
+    /// last-`@`-*overall*-wins pass, so an `@` inside the password used to survive redaction —
+    /// [`extend_credential_at`] closes the gap by widening the credential-shaped `@` forward
+    /// across any further `@` not separated from it by a `/`, `?`, or `#`, matching its
+    /// `Authority` twin (`***@evil`, pinned at
     /// `test_redact_userinfo_unparseable_at_sign_inside_password_is_fully_redacted` above).
-    /// Fix sketch (#859): after `find_credential_at` returns `at`, extend to the last `@` not
-    /// separated from `at` by a `/`. Remove `#[ignore]` once that lands.
     #[test]
-    #[ignore = "S5: known OpaquePath @-in-password partial leak, see #859"]
     fn test_redact_userinfo_opaque_path_at_sign_inside_password_is_fully_redacted() {
         assert_eq!(redact_userinfo("c:/user:pa@ss@evil"), "c:***@evil");
+    }
+
+    /// #859 companion: a password containing more than one embedded `@` must still fully
+    /// redact — each further `@` extends the match as long as no `/`, `?`, or `#` separates it
+    /// from the previous one.
+    #[test]
+    fn test_redact_userinfo_opaque_path_multiple_at_signs_inside_password_is_fully_redacted() {
+        assert_eq!(redact_userinfo("c:/user:pa@ss@wo@rd@evil"), "c:***@evil");
+    }
+
+    /// #859 companion: the extension must still stop at a `/`-separated trailing segment — an
+    /// `@`-in-password credential immediately followed by #845's own `@scope/pkg` shape must
+    /// redact the password in full without swallowing the unrelated scoped path.
+    #[test]
+    fn test_redact_userinfo_opaque_path_at_sign_inside_password_stops_at_slash_boundary() {
+        assert_eq!(
+            redact_userinfo("c:/user:pa@ss@evil/@scope/pkg"),
+            "c:***@evil/@scope/pkg"
+        );
+    }
+
+    /// impl-critic C1 (counterexample_hunt, regression on the #859 fix): `extend_credential_at`
+    /// must also stop at `?`/`#`, not just `/` — `url_for_tracing` redacts *before* truncating
+    /// the query string/fragment, so a `/`-only stop set lets a query-shaped `@` past the
+    /// credential get pulled into the masked span, consuming the very `?`/`#` `url_for_tracing`
+    /// needs to find in order to truncate the query — leaking every token after it.
+    #[test]
+    fn test_redact_userinfo_opaque_path_at_sign_inside_password_stops_at_query_and_fragment_boundary()
+     {
+        let leaked =
+            url_for_tracing("c:/user:pw@feed.corp?email=john@corp.com&token=glpat-SUPERSECRET");
+        assert!(!leaked.contains("SUPERSECRET"), "leaked={leaked:?}");
+        assert_eq!(leaked, "c:***@feed.corp");
+
+        let leaked =
+            url_for_tracing("c:/user:pw@feed.corp#email=john@corp.com&token=glpat-SUPERSECRET");
+        assert!(!leaked.contains("SUPERSECRET"), "leaked={leaked:?}");
+        assert_eq!(leaked, "c:***@feed.corp");
+    }
+
+    /// impl-critic S2 (assumption_audit): `Authority`'s own rare fall-through into
+    /// [`redact_credential`]'s shared tail (the #826 straddle case — the bounded authority up to
+    /// the first `/`/`?`/`#` has no `@` of its own, but does contain a credential-shaped `:`) must
+    /// not additionally widen via [`extend_credential_at`], which is wired only for `OpaquePath`.
+    /// Widening `Authority` too would silently change already-shipped, untested behavior on an
+    /// unrelated edge case rather than fix a specific leak.
+    #[test]
+    fn test_redact_userinfo_unparseable_straddle_fallthrough_is_not_widened() {
+        assert_eq!(
+            redact_userinfo("https://user:hunter2?x@host@corp"),
+            "https://***@host@corp"
+        );
     }
 
     /// impl-critic S2 (second_order_effects, regression on the #826 fix): a `file:///C:/...`

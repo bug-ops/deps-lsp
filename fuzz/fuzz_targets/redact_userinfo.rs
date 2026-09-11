@@ -22,9 +22,12 @@
 //! part outside either concern.
 //!
 //! Deliberately excluded from invariant (b): `OpaquePath`-shaped inputs (`scheme:/path`).
-//! `RegionKind::OpaquePath` has two known, tracked leak classes (S4 `#858`, S5 `#859`) that
-//! would make this invariant red on day one for a gap this target isn't meant to prove; those
-//! are pinned instead as `#[ignore]`d regression tests in `net_policy.rs`.
+//! `RegionKind::OpaquePath` has one remaining known, tracked leak class (S4 `#858`, a
+//! username-only credential with no password) that would make this invariant red on day one for
+//! a gap this target isn't meant to prove; it is pinned instead as an `#[ignore]`d regression
+//! test in `net_policy.rs`. S5 (`#859`, an `@` inside the password) is fixed — no longer
+//! excluded for that reason, but `OpaquePath` inputs remain out of scope for this target
+//! regardless, since #858 alone still breaks the invariant.
 //!
 //! (c) a credential is never left unredacted across the bracket/colon delimiter space #860/#857
 //!     rewrote — for *both* `RegionKind`s, since #857 removed `OpaquePath`'s special-cased
