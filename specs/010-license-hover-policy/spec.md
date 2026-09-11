@@ -9,7 +9,7 @@ tags:
   - parity-gap
   - priority/p4
 created: 2026-08-23
-status: planned
+status: shipped
 related:
   - "[[MOC-specs]]"
   - "[[plan]]"
@@ -246,7 +246,12 @@ ecosystem).
   should not be assumed to work as documentation suggests — live-verify each against its real
   registry response before implementing its tier-3 fetch, per the project's Registry Integration
   Gate rule. Tracked as a task-level, not spec-blocking, item — see [[plan#1-architecture]] row
-  "Swift / Gradle / Deno source".]
+  "Swift / Gradle / Deno source".] — RESOLVED during PR #682's implementation (tier-3 license
+  hover for Dart, Swift, Gradle, Deno shipped and live-verified).
+
+**Shipped**: PR #663 (Phase 1, tier 1+2 ecosystems), PR #682 (tier-3 ecosystems + Phase 2 policy
+diagnostics, closing issues #660 and #661), PR #665 (DRY follow-up, closing issue #662). Full
+rollout complete.
 
 ## 10. See Also
 

@@ -18,12 +18,13 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 - **Version resolution** — Ruby-aware version matching with pessimistic operator (`~>`)
 - **Dependency sources** — Support for registry, git, path, and github dependencies
 - **Group handling** — Handle `:development`, `:test`, `:production` groups
+- **License hover** — SPDX license for the resolved and latest version, flagging a "License changed" when they differ
 
 ## Installation
 
 ```toml
 [dependencies]
-deps-bundler = "0.13"
+deps-bundler = "0.14"
 ```
 
 > [!IMPORTANT]

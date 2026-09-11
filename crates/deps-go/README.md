@@ -20,12 +20,13 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 - **proxy.golang.org** — Fetch module versions from the Go module proxy
 - **`$GOENV` `GOPROXY`/`GOPRIVATE` support** — Resolves a `GOPROXY` proxy chain (with `direct`/`off` sentinels) or a `GOPRIVATE`-matched module path to live registry data (or a fail-closed, no-data terminal hop for `direct`/`off`), failing closed on a bad hop instead of falling back to `proxy.golang.org`
 - **Module path escaping** — Proper URL encoding for uppercase characters per Go spec
+- **License hover** — SPDX license for the resolved and latest version, flagging a "License changed" when they differ
 
 ## Installation
 
 ```toml
 [dependencies]
-deps-go = "0.13"
+deps-go = "0.14"
 ```
 
 > [!IMPORTANT]

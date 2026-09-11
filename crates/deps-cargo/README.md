@@ -20,12 +20,13 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 - **Workspace support** — Handle `workspace.dependencies` inheritance and `version.workspace = true`
 - **Target-specific dependencies** — Parse `[target.<cfg-expr-or-triple>.dependencies]`/`.dev-dependencies`/`.build-dependencies` tables, same as top-level ones
 - **Git dependency refs** — `tag`/`branch`/`rev` keys on a git dependency populate `DependencySource::Git.rev`
+- **License hover** — SPDX license for the resolved and latest version, flagging a "License changed" when they differ
 
 ## Installation
 
 ```toml
 [dependencies]
-deps-cargo = "0.13"
+deps-cargo = "0.14"
 ```
 
 > [!IMPORTANT]

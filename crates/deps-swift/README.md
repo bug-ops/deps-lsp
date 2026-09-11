@@ -17,6 +17,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 - **Lock file parsing** — Extract resolved versions from `Package.resolved`
 - **All version forms** — `from`, `upToNextMajor`, `upToNextMinor`, `exact`, half-open range, closed range, `branch`, `revision`, `path`
 - **GITHUB_TOKEN support** — Authenticated requests raise the rate limit from 60 to 5,000 requests/hour
+- **License hover** — SPDX license for the resolved and latest version via background pre-fetch, flagging a "License changed" when they differ
 - **Release-freshness signal (partial)** — `SwiftRegistry::get_versions_with` (invoked by the `Registry` trait impl of the same name when freshness rendering is enabled) attaches GitHub Release publish timestamps to tag-derived versions, memoized behind a TTL; requires `GITHUB_TOKEN` and covers only versions with a matching GitHub Release (see `ECOSYSTEM_GUIDE.md`)
 
 > [!TIP]
@@ -26,7 +27,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 
 ```toml
 [dependencies]
-deps-swift = "0.13"
+deps-swift = "0.14"
 ```
 
 > [!IMPORTANT]

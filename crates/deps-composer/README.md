@@ -19,6 +19,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 - **Platform filtering** — Excludes `php`, `ext-*`, and `lib-*` pseudo-packages from registry lookups
 - **Case-insensitive names** — Package names normalized to lowercase (`vendor/package`)
 - **Stability-aware version selection** — "Latest version" excludes alpha/beta/RC releases by default (matching Composer's `minimum-stability: stable`), unless overridden by `composer.json`'s `minimum-stability` field or a per-dependency `@stability` flag (`^1.0@beta`); a wildcard requirement still resolves a prerelease-only package
+- **License hover** — SPDX license for the resolved and latest version, flagging a "License changed" when they differ
 - **Package-level abandonment diagnostic** — flags a Packagist-`abandoned` package, with a "Replace with X" code action when a successor package is named
 
 > [!NOTE]
@@ -28,7 +29,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 
 ```toml
 [dependencies]
-deps-composer = "0.13"
+deps-composer = "0.14"
 ```
 
 > [!IMPORTANT]

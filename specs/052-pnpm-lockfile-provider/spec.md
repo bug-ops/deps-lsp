@@ -9,7 +9,7 @@ tags:
   - pnpm
   - cross-ecosystem
 created: 2026-09-09
-status: ready
+status: shipped
 related:
   - "[[constitution]]"
   - "[[046-pnpm-catalogs/spec|pnpm Catalogs + workspace: Protocol Resolution Support]]"

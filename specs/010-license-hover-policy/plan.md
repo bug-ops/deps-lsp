@@ -217,6 +217,9 @@ scoped:
 3. PR 3 — issue #661, Phase 2 (policy diagnostics): depends on PR 1's `license: Vec<String>`
    data model being in place. Blocked by PR 1.
 
+**Status**: shipped. PR 2 and PR 3 landed together as PR #682, closing #660 and #661. The DRY
+follow-up (shared string-or-array deserializer) landed as PR #665, closing #662. Rollout complete.
+
 ## 10. Constitution Compliance
 
 No `constitution.md` exists in this project (see §0); checked instead against `.claude/CLAUDE.md`

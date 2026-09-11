@@ -18,12 +18,13 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 - **Dependency sources** — Support for hosted, git, path, and SDK sources
 - **Caret semantics** — Dart-specific `^X.Y.Z` version constraint matching
 - **Git sub-path** — Handle `path:` inside git repositories
+- **License hover** — SPDX license for the resolved and latest version via background pre-fetch, with a "(detected)" qualifier for pana-scored results, flagging a "License changed" when they differ
 
 ## Installation
 
 ```toml
 [dependencies]
-deps-dart = "0.13"
+deps-dart = "0.14"
 ```
 
 > [!IMPORTANT]

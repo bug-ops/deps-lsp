@@ -8,7 +8,7 @@ tags:
   - security
   - architecture
 created: 2026-09-10
-status: ready
+status: shipped
 related:
   - "[[constitution]]"
 ---

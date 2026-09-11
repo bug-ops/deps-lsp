@@ -6,15 +6,16 @@
 [![codecov](https://codecov.io/gh/bug-ops/deps-lsp/graph/badge.svg?token=S71PTINTGQ&flag=deps-lsp)](https://codecov.io/gh/bug-ops/deps-lsp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](../../LICENSE)
 
-Language Server Protocol implementation for dependency management across thirteen package ecosystems.
+Language Server Protocol implementation for dependency management across fourteen package ecosystems.
 
-This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) workspace. It provides the LSP server binary and the ecosystem orchestration layer that wires together ecosystem-specific crates (`deps-cargo`, `deps-npm`, `deps-pypi`, `deps-go`, `deps-bundler`, `deps-dart`, `deps-maven`, `deps-gradle`, `deps-swift`, `deps-composer`, `deps-nuget`, `deps-deno`, `deps-github-actions`) via the `Ecosystem` trait from `deps-core`.
+This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) workspace. It provides the LSP server binary and the ecosystem orchestration layer that wires together ecosystem-specific crates (`deps-cargo`, `deps-npm`, `deps-pypi`, `deps-go`, `deps-bundler`, `deps-dart`, `deps-maven`, `deps-gradle`, `deps-swift`, `deps-composer`, `deps-nuget`, `deps-deno`, `deps-github-actions`, `deps-gitlab-ci`) via the `Ecosystem` trait from `deps-core`.
 
 ## Features
 
-- **Multi-ecosystem** — Cargo.toml, package.json, pyproject.toml, go.mod, Gemfile, pubspec.yaml, pom.xml, libs.versions.toml, Package.swift, composer.json, .csproj/.fsproj/.vbproj, deno.json/deno.jsonc, .github/workflows/*.yml
+- **Multi-ecosystem** — Cargo.toml, package.json, pyproject.toml, go.mod, Gemfile, pubspec.yaml, pom.xml, libs.versions.toml, Package.swift, composer.json, .csproj/.fsproj/.vbproj, deno.json/deno.jsonc, .github/workflows/*.yml, action.yml, .gitlab-ci.yml
 - **Inlay hints** — Show latest versions inline with loading indicators
 - **Hover info** — Package descriptions with resolved version from lock file
+- **License hover & policy** — SPDX license for the resolved and latest version in hover, plus an optional `license_policy` allow/deny-list diagnostic
 - **Diagnostics** — Warnings for outdated, unknown, yanked, or unsatisfiable-requirement dependencies
 - **Vulnerability scanning** — OSV.dev-backed advisories in diagnostics and hover, across all supported ecosystems
 - **Supply-chain trust signal** — OpenSSF Scorecard score and SLSA/attestation provenance status in hover, via deps.dev, for npm, Cargo, Go, Maven, PyPI, Bundler, and NuGet
@@ -45,7 +46,7 @@ All ecosystems are enabled by default. Disable unused ones to reduce binary size
 
 ```toml
 [dependencies]
-deps-lsp = { version = "0.13", default-features = false, features = ["cargo", "npm"] }
+deps-lsp = { version = "0.14", default-features = false, features = ["cargo", "npm"] }
 ```
 
 | Feature | Ecosystem | Default |
