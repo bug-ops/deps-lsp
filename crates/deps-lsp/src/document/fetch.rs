@@ -211,7 +211,8 @@ pub(crate) struct FetchResult {
 ///   yank status
 /// * `progress` - Optional progress tracker (will be updated after each fetch)
 /// * `timeout_secs` - Timeout for each individual package fetch (default: 10s)
-/// * `max_concurrent` - Maximum concurrent fetches (default: 20)
+/// * `max_concurrent` - Maximum concurrent fetches (default: 20); clamped to `>= 1`
+///   internally, since `buffer_unordered(0)` would hang forever (issue #833)
 ///
 /// # Timeout Behavior
 ///
@@ -295,7 +296,13 @@ pub(crate) async fn fetch_latest_versions_parallel(
                 .await
             }
         })
-        .buffer_unordered(max_concurrent)
+        // `.max(1)`: `CacheConfig.max_concurrent_fetches` is a `pub` field, so an in-crate
+        // direct field assignment (see the test setup at `server.rs:1680`) bypasses
+        // `with_max_concurrent_fetches`'s own clamp; this is defence-in-depth against a
+        // future in-crate caller doing the same with `0`. `buffer_unordered(0)` never
+        // polls its source stream — it returns `Pending` forever instead of erroring,
+        // hanging every fetch through this document indefinitely (issue #833).
+        .buffer_unordered(max_concurrent.max(1))
         .collect()
         .await;
 
@@ -1446,6 +1453,77 @@ mod tests {
             max <= 22,
             "Concurrency limit violated: {} concurrent requests (limit: 20)",
             max
+        );
+    }
+
+    /// Regression test for issue #833: `buffer_unordered(0)` never polls its source
+    /// stream and returns `Pending` forever, so a `max_concurrent` of `0` reaching this
+    /// call previously hung the fetch indefinitely instead of completing or erroring.
+    /// Wrapped in a short outer timeout so a regression fails fast instead of hanging
+    /// the test suite.
+    #[tokio::test]
+    async fn test_fetch_latest_versions_parallel_zero_max_concurrent_still_completes() {
+        use deps_core::{Metadata, Registry, Version};
+        use std::any::Any;
+
+        struct InstantRegistry;
+
+        impl Registry for InstantRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(None) })
+            }
+
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let registry: Arc<dyn Registry> = Arc::new(InstantRegistry);
+        let packages = vec![PackageName::new("some-package")];
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            fetch_latest_versions_parallel(
+                registry,
+                with_registry_source(packages),
+                &HashMap::new(),
+                None,
+                deps_core::freshness::FreshnessSettings::default(),
+                5,
+                0,
+                None,
+            ),
+        )
+        .await
+        .expect("fetch with max_concurrent=0 must not hang forever");
+
+        assert!(
+            result
+                .no_comparable_versions
+                .contains(&PackageName::new("some-package")),
+            "fetch must still run to completion when max_concurrent is 0"
         );
     }
 

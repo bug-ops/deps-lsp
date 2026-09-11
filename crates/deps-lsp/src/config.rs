@@ -472,16 +472,33 @@ impl CacheConfig {
         self
     }
 
-    /// Overrides [`Self::max_concurrent_fetches`]. See [`Self::new`]. Not clamped to the
-    /// `>= 1` floor `deserialize_max_concurrent` enforces on untrusted LSP-client input —
-    /// unlike [`Self::with_fetch_timeout_secs`], this value is also relied on internally as
-    /// a divisor (`handlers::diagnostics::loading_ceiling`) and as `futures::StreamExt::
-    /// buffer_unordered`'s concurrency limit (`document::fetch`), so a `0` constructed
-    /// through this setter depends on `loading_ceiling`'s own defensive `.max(1)`
-    /// re-guard rather than on this setter enforcing the floor itself.
+    /// Overrides [`Self::max_concurrent_fetches`]. See [`Self::new`]. Enforces the same
+    /// `>= 1` floor (`MIN_CONCURRENT_FETCHES`) that `deserialize_max_concurrent` enforces
+    /// on untrusted LSP-client input — but, unlike that deserializer, does not also cap the
+    /// `MAX_CONCURRENT_FETCHES` ceiling, so a very large value passes through uncapped: this
+    /// value is used directly as `futures::StreamExt::buffer_unordered`'s concurrency limit
+    /// (`document::fetch`), and `buffer_unordered(0)` never polls its source stream, hanging
+    /// the fetch forever instead of erroring (issue #833) — unlike
+    /// [`Self::with_fetch_timeout_secs`], `0` here is not a merely degenerate value, so this
+    /// setter enforces the floor itself rather than relying on a downstream re-guard
+    /// (`handlers::diagnostics::loading_ceiling` also re-guards its own divisor, but that is
+    /// a second, independent consumer, not a safety net for this one).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_lsp::config::CacheConfig;
+    ///
+    /// let config = CacheConfig::new().with_max_concurrent_fetches(0);
+    /// assert_eq!(config.max_concurrent_fetches, 1);
+    /// ```
     #[must_use]
     pub const fn with_max_concurrent_fetches(mut self, max_concurrent_fetches: usize) -> Self {
-        self.max_concurrent_fetches = max_concurrent_fetches;
+        self.max_concurrent_fetches = if max_concurrent_fetches == 0 {
+            MIN_CONCURRENT_FETCHES
+        } else {
+            max_concurrent_fetches
+        };
         self
     }
 }
@@ -1606,6 +1623,14 @@ mod tests {
         assert!(config.enabled);
         assert_eq!(config.fetch_timeout_secs, 5);
         assert_eq!(config.max_concurrent_fetches, 20);
+    }
+
+    #[test]
+    fn test_cache_config_with_max_concurrent_fetches_clamps_zero_to_one() {
+        // Regression test for issue #833: `buffer_unordered(0)` never completes, so
+        // this setter must not let a `0` reach `document::fetch`.
+        let config = CacheConfig::new().with_max_concurrent_fetches(0);
+        assert_eq!(config.max_concurrent_fetches, MIN_CONCURRENT_FETCHES);
     }
 
     #[test]
