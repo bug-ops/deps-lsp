@@ -27,6 +27,21 @@
 //! with no `pub` fields is deliberately left exhaustive instead, since `#[non_exhaustive]`
 //! would be a semantic no-op for it — an external crate can't literal-construct or
 //! destructure it either way.
+//!
+//! ## LSP type stability (issue #832)
+//!
+//! The `Ecosystem`, `Dependency`, `ParseResult`, and `EcosystemFormatter` trait signatures
+//! — and the public `lsp_helpers` / `completion` helper functions — are typed directly
+//! against `tower_lsp_server::ls_types` types (`Hover`, `Diagnostic`, `CodeAction`, and so
+//! on). `tower-lsp-server` is pinned pre-1.0, so a `tower-lsp-server` minor bump (e.g. 0.23
+//! → 0.24) is not an implementation detail this crate can absorb silently — it forces a
+//! breaking release of `deps-core`: a minor version bump while `deps-core` itself remains
+//! pre-1.0, a major version bump once `deps-core` reaches 1.0.
+//!
+//! Downstream consumers implementing [`ecosystem::Ecosystem`] should depend on the exact
+//! matching `tower-lsp-server` version through the [`tower_lsp_server`] re-export rather than
+//! adding their own separate direct dependency, which could otherwise drift out of sync with
+//! the version `deps-core` was built against.
 
 // #673: re-enable the three cast-safety pedantic lints the workspace allows by default
 // (`Cargo.toml`'s `[workspace.lints.clippy]`), specifically for this crate — deps-core
@@ -88,6 +103,12 @@ pub mod secret;
 pub mod test_util;
 pub mod version_matcher;
 pub mod xml_bounds;
+
+/// Re-export of the LSP protocol types that appear in this crate's public trait
+/// signatures. `deps-core`'s version tracks `tower-lsp-server`'s: a
+/// `tower-lsp-server` bump is a breaking change here, by construction. See the
+/// "LSP type stability" section of this module's docs for detail.
+pub use tower_lsp_server;
 
 // Re-export commonly used types
 pub use cache::{BodyLimit, CachedResponse, HttpCache};
