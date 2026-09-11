@@ -534,6 +534,20 @@ pub enum PolicyGate<'a> {
 /// token, or a bare `.npmrc` `key:value` line — #810) is redacted next; `raw` is returned
 /// unchanged only once both scans come up empty.
 ///
+/// Successfully parsing is not proof of an authority-bearing URL either (#811): for a
+/// non-special scheme, the WHATWG parser accepts a bare `scheme:/path` (any number of
+/// leading slashes, including zero, one, or an empty double-slash authority like
+/// `scheme:///path`) as valid, with `host()` staying `None` throughout — `username()`/
+/// `password()` never see a credential-shaped `user:pass@host` sitting right there in what
+/// the parser treats as an opaque-ish path (e.g. `c:/user:hunter2@evil`,
+/// `c:///user:hunter2@evil`). Counting slashes right after the scheme cannot distinguish this
+/// from a legitimate empty-authority path value (e.g. `file:///etc/passwd`, or
+/// `C:/Users/john.doe@corp/project` where `john.doe` is just a directory name) — both shapes
+/// parse to the exact same `host() == None`. So whenever `host()` is `None`, every `@` in the
+/// path is checked, and the last one whose own preceding segment looks userinfo-shaped
+/// (contains a `:`, e.g. `user:hunter2`) rather than an ordinary path component (e.g.
+/// `john.doe`, `@types`) is the one redacted.
+///
 /// # Examples
 ///
 /// ```
@@ -551,6 +565,7 @@ pub enum PolicyGate<'a> {
 ///     redact_userinfo("user:hunter2@registry.example/simple"),
 ///     "***@registry.example/simple"
 /// );
+/// assert_eq!(redact_userinfo("c:/user:hunter2@evil"), "c:***@evil");
 /// ```
 #[must_use]
 pub fn redact_userinfo(raw: &str) -> String {
@@ -565,6 +580,14 @@ pub fn redact_userinfo(raw: &str) -> String {
     // back to the same parse-independent scan used for an outright parse failure.
     if url.cannot_be_a_base() {
         return redact_userinfo_unparseable(raw);
+    }
+    // An empty authority (#811) cannot be told apart from a legitimate empty-authority path
+    // value by slash-counting alone — `c:///user:hunter2@evil` and `file:///etc/passwd` parse
+    // to the exact same `host() == None` regardless of how many slashes follow the scheme —
+    // so every empty-authority `raw` is scanned, and the scan itself (not slash position)
+    // decides whether anything looks like a credential.
+    if url.host().is_none() {
+        return redact_userinfo_opaque_path(raw);
     }
     if url.username().is_empty() && url.password().is_none() {
         return raw.to_string();
@@ -714,6 +737,77 @@ fn redact_colon_credential(raw: &str, authority_start: usize, authority: &str) -
             &authority[cursor + value_end..]
         );
     }
+}
+
+/// [`redact_userinfo`]'s fallback for a *parseable* `raw` whose scheme has an empty authority
+/// (`host() == None`) because it uses some `scheme:/path` form rather than `scheme://host`
+/// (#811) — `raw` is scanned for a userinfo-shaped path segment instead of trusting the
+/// already-empty `username()`/`password()`.
+///
+/// `path_start` (right after the scheme's first `:`) is found textually via `raw.find(':')`
+/// rather than derived from `url.scheme().len()`, since `Url::parse` strips leading
+/// whitespace/C0-control bytes before computing the scheme — a length-based offset would
+/// misalign against `raw` for such an input, even though `raw`'s own first `:` still always
+/// marks the scheme separator (M2 finding).
+///
+/// From `path_start` up to the next `?`/`#` (or the end of `raw`), this does **not** stop at
+/// the first `/`: this shape has no real host segment to bound the scan against (the `/`
+/// right after the scheme starts an opaque-ish path, not a host/path boundary), so an
+/// authority-shaped scan would stop too early (S1 finding, e.g. `c:///user:hunter2@evil`'s
+/// credential sits past three slashes).
+///
+/// Finding an `@` is not by itself proof of a credential (S2 finding): an ordinary path can
+/// contain one too (`file:///home/user@example/file`, an npm-scoped `npm:/@scope/pkg@1.0.0`,
+/// a `deps-nuget` local/UNC feed path like `C:/Users/john.doe@corp/project`). Only an `@`
+/// whose immediately preceding path segment (from the previous `/`, or the start of the path)
+/// itself contains a `:` — i.e. looks like `user:pass`, not an ordinary path component — is
+/// treated as a credential. This also subsumes the empty-userinfo guard
+/// ([`redact_userinfo_unparseable`]'s `at == 0` case): an `@` with nothing before it in its
+/// segment has no `:` either, so it is never mistaken for a credential.
+///
+/// Unlike [`redact_userinfo_unparseable`], the redacted `@` is **not** simply the last one in
+/// the region: a credential can be followed by further path segments that themselves contain
+/// an unrelated `@` (S3 finding, e.g. `c:/user:hunter2@evil/pkg@1.0.0` — the *trailing*
+/// `pkg@1.0.0` `@` has no `:` before it and must not be mistaken for the redaction point,
+/// silently leaving `user:hunter2@evil` unredacted). So every `@` in the region is checked,
+/// and the *last one whose own preceding segment is userinfo-shaped* is the one redacted
+/// (there is normally at most one credential-shaped `@`, so "last" only matters for choosing
+/// among ties).
+///
+/// This heuristic can still over-redact a legitimate colon-containing path segment that isn't
+/// a credential at all (e.g. `c:/logs/12:30@host/x`, a timestamp-like directory name) — an
+/// accepted false-positive trade-off, though a narrower one than
+/// [`redact_userinfo_unparseable`]'s: that function redacts on *any* `@` in the authority
+/// region, with no `:`-shaped check at all.
+///
+/// A password containing `/` itself is a pre-existing, shared limitation, not something this
+/// fix introduces: `seg_start` only looks back to the *nearest* preceding `/`, so
+/// `c:/user:pa/ss@evil` finds `:` in an earlier segment than the one right before `@` and is
+/// left unredacted — [`redact_userinfo_unparseable`] has the same gap (`user:pa/ss@evil`'s
+/// `host_boundary` cuts the scan off at the `/` before `@` is ever reached). Tracked as part
+/// of #826, alongside the pre-existing `?`/`#`-inside-password partial leak, since a real fix
+/// needs a single revised scanning strategy applied consistently across all three
+/// `redact_userinfo*` code paths, not a one-off patch here.
+// `path_start` is an ASCII ':' byte index; `end`/`at`/`seg_start` come from `find`/`rfind`/
+// `match_indices` of ASCII '?'/'#'/'@'/'/' bytes on `raw` from that point on, so every slice
+// bound is always a char boundary.
+#[allow(
+    clippy::string_slice,
+    reason = "all slice bounds are ASCII byte offsets from `find`/`rfind`/`match_indices`, \
+              never landing inside a multi-byte character"
+)]
+fn redact_userinfo_opaque_path(raw: &str) -> String {
+    let path_start = raw.find(':').map_or(0, |scheme_end| scheme_end + 1);
+    let region = &raw[path_start..];
+    let end = region.find(['?', '#']).unwrap_or(region.len());
+    let mut credential_at = region[..end].match_indices('@').filter_map(|(at, _)| {
+        let seg_start = region[..at].rfind('/').map_or(0, |slash| slash + 1);
+        region[seg_start..at].contains(':').then_some(at)
+    });
+    let Some(at) = credential_at.next_back() else {
+        return raw.to_string();
+    };
+    format!("{}***@{}", &raw[..path_start], &region[at + 1..])
 }
 
 /// Strips the query string, fragment, and any userinfo from `raw`, for attaching to a
@@ -1336,6 +1430,8 @@ mod tests {
             "https://registry.example/simple",
             "not-a-url-at-all",
             "@types/node",
+            "c:/user:hunter2@evil",
+            "c:///user:hunter2@evil",
         ];
         for raw in inputs {
             assert_eq!(RedactedUrl::new(raw).to_string(), url_for_tracing(raw));
@@ -1608,6 +1704,181 @@ mod tests {
         let redacted = redact_userinfo("user:hunter2@types/node");
         assert!(!redacted.contains("hunter2"));
         assert_eq!(redacted, "***@types/node");
+    }
+
+    /// #811: a non-special scheme's bare `scheme:/path` form (a single slash, no `://`
+    /// authority marker) parses successfully with an empty authority — `username()`/
+    /// `password()` never see a credential embedded in what the parser treats as an
+    /// opaque-ish path, so the primary parseable-URL branch used to return this unchanged.
+    #[test]
+    fn test_redact_userinfo_redacts_single_slash_scheme_path_credential() {
+        let redacted = redact_userinfo("c:/user:hunter2@evil");
+        assert!(!redacted.contains("hunter2"));
+        assert_eq!(redacted, "c:***@evil");
+    }
+
+    /// Companion case with a different non-special scheme, confirming the fix is not
+    /// specific to a single scheme name.
+    #[test]
+    fn test_redact_userinfo_redacts_single_slash_scheme_path_credential_other_scheme() {
+        let redacted = redact_userinfo("oauth2:/a:b@c/d");
+        assert!(!redacted.contains("a:b"));
+        assert_eq!(redacted, "oauth2:***@c/d");
+    }
+
+    /// Contrast case: a *special* scheme's `scheme:/path` form is normalized by the parser
+    /// into a proper `scheme://host` authority (the WHATWG parser reserves this behavior for
+    /// `http`/`https`/`file`/`ftp`/`ws`/`wss`), so it already redacts correctly through the
+    /// pre-existing authority-bearing branch — this must keep working unchanged.
+    #[test]
+    fn test_redact_userinfo_normalizes_special_scheme_single_slash_to_authority() {
+        let redacted = redact_userinfo("https:/user:hunter2@evil");
+        assert!(!redacted.contains("hunter2"));
+        assert_eq!(redacted, "https://***@evil/");
+    }
+
+    /// A `scheme://` value with an empty authority (e.g. a `file:` URL) parses to the exact
+    /// same `host() == None` as the buggy shape, so it *is* scanned by the opaque-path
+    /// fallback — but the `@`-preceding segment (`user`) is an ordinary path component, not
+    /// userinfo-shaped (no `:`), so it stays a no-op.
+    #[test]
+    fn test_redact_userinfo_empty_authority_double_slash_form_is_noop() {
+        assert_eq!(
+            redact_userinfo("file:///home/user@example/file"),
+            "file:///home/user@example/file"
+        );
+    }
+
+    /// No `@` anywhere in the opaque path: nothing looks like a credential, so this stays a
+    /// no-op just like the unparseable-fallback's own no-`@` case.
+    #[test]
+    fn test_redact_userinfo_single_slash_scheme_path_without_at_is_noop() {
+        assert_eq!(redact_userinfo("c:/simple/path"), "c:/simple/path");
+    }
+
+    /// S1 (impl-critic finding on #811): the same empty-authority bypass reachable through an
+    /// extra slash — `c:///user:hunter2@evil` parses to `host() == None` exactly like
+    /// `c:/user:hunter2@evil`, so slash-counting after the scheme cannot be the redaction
+    /// gate; only the scan-and-check-the-segment logic can tell this apart from a legitimate
+    /// empty-authority path.
+    #[test]
+    fn test_redact_userinfo_redacts_triple_slash_scheme_path_credential() {
+        let redacted = redact_userinfo("c:///user:hunter2@evil");
+        assert!(!redacted.contains("hunter2"));
+        assert_eq!(redacted, "c:***@evil");
+    }
+
+    /// Companion S1 case with a multi-character, `+`-containing scheme (a realistic
+    /// `git+ssh`-style dependency-source scheme), confirming the fix isn't tied to
+    /// single-letter schemes like `c`.
+    #[test]
+    fn test_redact_userinfo_redacts_triple_slash_scheme_path_credential_compound_scheme() {
+        let redacted = redact_userinfo("git+ssh:///user:hunter2@evil");
+        assert!(!redacted.contains("hunter2"));
+        assert_eq!(redacted, "git+ssh:***@evil");
+    }
+
+    /// S2 (impl-critic finding on #811): a real `deps-nuget` local/UNC-feed-shaped path
+    /// (`crates/deps-nuget/src/config.rs`'s `<add value="C:/...">` handling) containing an
+    /// `@` in an ordinary directory name must not be mistaken for a credential — `john.doe`
+    /// has no `:` before the `@`.
+    #[test]
+    fn test_redact_userinfo_single_slash_scheme_path_at_in_directory_name_is_noop() {
+        assert_eq!(
+            redact_userinfo("C:/Users/john.doe@corp/project"),
+            "C:/Users/john.doe@corp/project"
+        );
+    }
+
+    /// S2 companion: an npm-scoped package-with-version path (`@scope/pkg@1.0.0`) has two
+    /// `@`s, neither preceded by a userinfo-shaped (`:`-containing) segment — must stay a
+    /// no-op, preserving the #767 scoped-package protection through this new route too.
+    #[test]
+    fn test_redact_userinfo_single_slash_scheme_path_scoped_package_version_is_noop() {
+        assert_eq!(
+            redact_userinfo("npm:/@scope/pkg@1.0.0"),
+            "npm:/@scope/pkg@1.0.0"
+        );
+    }
+
+    /// S2 companion: a scoped package name with no version suffix, reached through this same
+    /// opaque-path route (distinct from [`test_redact_userinfo_leading_at_with_no_scheme_is_noop`],
+    /// which covers the schemeless case) — must also stay a no-op.
+    #[test]
+    fn test_redact_userinfo_single_slash_scheme_path_scoped_package_name_is_noop() {
+        assert_eq!(
+            redact_userinfo("c:/repo/@types/node"),
+            "c:/repo/@types/node"
+        );
+    }
+
+    /// S2 companion: an ordinary versioned filename (`file@v1.2.3`) must not be mistaken for
+    /// a credential either.
+    #[test]
+    fn test_redact_userinfo_single_slash_scheme_path_versioned_filename_is_noop() {
+        assert_eq!(
+            redact_userinfo("c:/path/to/file@v1.2.3"),
+            "c:/path/to/file@v1.2.3"
+        );
+    }
+
+    /// M1 (impl-critic finding): an `@` with an empty segment before it (nothing since the
+    /// previous `/`) has no `:` either, so it is never mistaken for a credential — this
+    /// subsumes what an explicit `at == 0`-style guard would have covered.
+    #[test]
+    fn test_redact_userinfo_single_slash_scheme_path_bare_at_is_noop() {
+        assert_eq!(redact_userinfo("c:/@only"), "c:/@only");
+    }
+
+    /// S3 (impl-critic finding, round 2): a trailing path segment with its own unrelated `@`
+    /// (a scoped-package-with-version path following the credential) must not shadow the
+    /// actual credential earlier in the string — only the last `@` whose *own* preceding
+    /// segment is userinfo-shaped is the redaction point, not simply the last `@` overall.
+    #[test]
+    fn test_redact_userinfo_redacts_credential_followed_by_unrelated_at_segment() {
+        let redacted = redact_userinfo("c:///user:hunter2@evil/@scope/pkg");
+        assert!(!redacted.contains("hunter2"));
+        assert_eq!(redacted, "c:***@evil/@scope/pkg");
+    }
+
+    /// S3 companion with a realistic private-registry-shaped host and a versioned trailing
+    /// path segment.
+    #[test]
+    fn test_redact_userinfo_redacts_credential_followed_by_versioned_path_segment() {
+        let redacted = redact_userinfo("nexus:/user:hunter2@host/repo/lib@2.0.0");
+        assert!(!redacted.contains("hunter2"));
+        assert_eq!(redacted, "nexus:***@host/repo/lib@2.0.0");
+    }
+
+    /// #818 (follow-up on #811, blocked by #814): a bare colon-separated credential with no
+    /// `@` at all — e.g. `token:/hunter2:secret` — is *not* caught by #811's fix. #811's root
+    /// cause is specifically the empty-authority `scheme:/path` routing bypassing redaction
+    /// entirely; catching a credential pair with no `@` is a separate detection problem
+    /// (issue #810, `redact_colon_credential` in open PR #814) that this fix does not
+    /// duplicate. Pinned here as a known, tracked limitation, by analogy with how #811 itself
+    /// was pinned as a documented gap alongside #810's fix: this assertion documents *current*
+    /// (unsafe) behavior, not desired behavior — once #814 merges and the empty-authority
+    /// route here is updated to reuse its colon-credential scanner, this must flip to a
+    /// redacted expectation, and the test renamed to no longer claim a bypass.
+    #[test]
+    fn test_redact_userinfo_single_slash_scheme_path_no_at_credential_still_bypasses_redaction() {
+        assert_eq!(
+            redact_userinfo("token:/hunter2:secret"),
+            "token:/hunter2:secret"
+        );
+    }
+
+    /// #826 (pre-existing, shared limitation, not introduced by #811's fix): a password
+    /// containing `/` puts the credential's `:` in an earlier path segment than the one
+    /// immediately before `@`, so `redact_userinfo_opaque_path`'s nearest-preceding-`/` segment
+    /// check misses it — `redact_userinfo_unparseable` has the same gap for the equivalent
+    /// authority-shaped input. Pinned here as a known, tracked limitation, by the same
+    /// analogy as the #818 pin above: this documents *current* (unsafe) behavior, and must be
+    /// updated once #826's cross-code-path fix lands.
+    #[test]
+    fn test_redact_userinfo_single_slash_scheme_path_password_with_slash_still_bypasses_redaction()
+    {
+        assert_eq!(redact_userinfo("c:/user:pa/ss@evil"), "c:/user:pa/ss@evil");
     }
 
     /// #756 C1 regression: a `HttpCache`/`GithubTagsClient` outbound-request chokepoint must
