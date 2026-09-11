@@ -15,6 +15,7 @@ use dashmap::DashMap;
 use deps_core::parser::DependencySource;
 use deps_core::{
     DepsError, FreshnessSettings, HttpCache, Result, lsp_helpers::warn_rejected_value,
+    net_policy::RedactedUrl,
 };
 use pep440_rs::{Version, VersionSpecifiers};
 use serde::Deserialize;
@@ -327,7 +328,7 @@ impl PypiRegistry {
         {
             if at_capacity {
                 tracing::warn!(
-                    key = %chain.key,
+                    key = %RedactedUrl::new(&chain.key),
                     cap = MAX_ALTERNATE_REGISTRIES,
                     "PyPI alternate registry cap reached; not registering a new chain"
                 );
@@ -372,7 +373,7 @@ impl PypiRegistry {
         if let dashmap::mapref::entry::Entry::Vacant(slot) = root.alternates.entry(key.clone()) {
             if at_capacity {
                 tracing::warn!(
-                    key = %key,
+                    key = %RedactedUrl::new(&key),
                     cap = MAX_ALTERNATE_REGISTRIES,
                     "PyPI alternate registry cap reached; not registering a new named source"
                 );
@@ -2386,6 +2387,53 @@ mod tests {
         };
         PypiRegistry::register_chain(&root, &overflow);
         assert!(root.alternate_client("overflow").is_none());
+    }
+
+    // Issue #824 (S1 correction): a named source's `ResolvedChain::key` is its own literal
+    // index URL (`PypiIndexConfig::resolved_chains`), routed through `register_chain` — not
+    // `register_named_source`, which has no production caller. `validate_index_url` rejects
+    // userinfo but preserves the query string, so a real Poetry `source =`/uv `index =`
+    // named source can still carry `?_authToken=...` all the way into `register_chain`'s
+    // cap-reached warn; it must log through `RedactedUrl`, not the raw chain key.
+    #[test]
+    fn test_register_chain_redacts_query_credential_for_named_source_on_cap_reached() {
+        let cache = Arc::new(HttpCache::new());
+        let root = Arc::new(PypiRegistry::new(cache));
+        for i in 0..MAX_ALTERNATE_REGISTRIES {
+            let chain = crate::config::ResolvedChain {
+                key: format!("chain-{i}"),
+                hops: vec![index_url("https://a.example/simple")],
+                implicit_public_fallback: false,
+            };
+            PypiRegistry::register_chain(&root, &chain);
+        }
+
+        let mut config = crate::config::PypiIndexConfig::new();
+        config.add_named_source_resolved(
+            "internal".to_string(),
+            Ok(index_url(
+                "https://overflow.example/simple?_authToken=SUPERSECRET_TOKEN",
+            )),
+        );
+        let named_chain = config
+            .resolved_chains()
+            .into_iter()
+            .find(|chain| chain.key.contains("overflow.example"))
+            .expect("named source produces a chain keyed by its own literal URL");
+
+        let log = capture_tracing_output(|| {
+            PypiRegistry::register_chain(&root, &named_chain);
+        });
+
+        assert!(
+            log.contains("PyPI alternate registry cap reached"),
+            "log: {log}"
+        );
+        assert!(!log.contains("SUPERSECRET_TOKEN"), "log: {log}");
+        assert!(
+            log.contains("overflow.example"),
+            "redaction must not remove the non-secret host: {log}"
+        );
     }
 
     /// The C1 invariant: a chain-hop leaf's own `alternates` map is always empty — calling

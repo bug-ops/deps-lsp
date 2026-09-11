@@ -38,6 +38,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-bundler, deps-cargo, deps-composer, deps-dart, deps-go, deps-maven, deps-npm, deps-nuget, deps-pypi, deps-swift**: migrated onto `registry_conformance!` (now 14/14 crates, was 4/14) and extended `completion_guard_conformance!` to maven/swift (11/14; go/github-actions/gitlab-ci confirmed N/A) (resolves #794) (#805)
 
 ### Fixed
+- **deps-cargo, deps-npm, deps-pypi**: alternate-registry-router tracing sites now log a `RedactedUrl`-wrapped index/key instead of the raw string, closing a query-string-credential leak on a validated `RegistryIndex`/`NpmRegistryIndex`/`PypiIndexUrl` (resolves #824)
+- **deps-go**: the three `compile_glob` malformed-`GOPRIVATE`-pattern warnings now log through `RedactedUrl` instead of `redact_userinfo` alone, closing a query-string-credential leak; `redact_userinfo` now has no production caller outside `deps-core` (resolves #822)
 - **deps-core**: `redact_userinfo`'s unparseable-URL fallback now also redacts a colon-separated credential with no `@` (e.g. an npm `oauth2:`/GitLab CI job-token line), closing a gap that let such values reach tracing/log output and `window/showMessage` unredacted (resolves #810) (#814)
 - **deps-core**: `url_for_tracing`/`redact_userinfo` now redact a non-special-scheme `scheme:/path` credential (e.g. `c:/user:hunter2@evil`) that previously bypassed all redaction (resolves #811)
 - **deps-core, deps-gitlab-ci, deps-lsp**: `IndexUrlError::InvalidUrl`'s payload is now a `RedactedUrl`, closing credential-log paths (tracing and `window/showMessage`) via a hostile `registries.gitlab_instance_host` value (resolves #808) (#809)

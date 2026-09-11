@@ -32,9 +32,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-use deps_core::net_policy::{
-    PolicyGate, RedactedUrl, RegistryAccessPolicy, redact_userinfo, validate_index_url,
-};
+use deps_core::net_policy::{PolicyGate, RedactedUrl, RegistryAccessPolicy, validate_index_url};
 use deps_core::parser::DependencySource;
 
 /// Why a candidate `GOPROXY` hop URL failed [`GoProxyUrl::new`]'s validation.
@@ -519,6 +517,13 @@ impl GlobPattern {
 /// unterminated class.
 // `chars[i]` is guarded by `i < chars.len()` and `chars[j]` by `j < chars.len()`, both from
 // their enclosing loop conditions.
+//
+// The three `tracing::warn!`s below log `pattern` through `RedactedUrl::new`, which truncates
+// at the first `?`/`#` (issue #822) — but `?` is also this glob dialect's own `GlobToken::Any`
+// wildcard, so a malformed pattern containing one (e.g. `corp.example/repo?/pkg[abc`) logs a
+// truncated prefix that no longer shows the actual defect location. Deliberate: security
+// (never risk a credential-bearing query-string-shaped suffix reaching the log) over
+// observability here.
 #[allow(clippy::indexing_slicing)]
 fn compile_glob(pattern: &str) -> Option<Vec<GlobToken>> {
     let chars: Vec<char> = pattern.chars().collect();
@@ -537,7 +542,7 @@ fn compile_glob(pattern: &str) -> Option<Vec<GlobToken>> {
             '\\' => {
                 let Some(&escaped) = chars.get(i + 1) else {
                     tracing::warn!(
-                        pattern = redact_userinfo(pattern),
+                        pattern = %RedactedUrl::new(pattern),
                         "GOPRIVATE pattern ends with a trailing unescaped '\\'; it will never \
                          match, so affected modules route to the public proxy instead of being \
                          treated as private"
@@ -567,7 +572,7 @@ fn compile_glob(pattern: &str) -> Option<Vec<GlobToken>> {
                             // behaves normally — so this only logs for observability rather
                             // than invalidating the whole pattern.
                             tracing::warn!(
-                                pattern = redact_userinfo(pattern),
+                                pattern = %RedactedUrl::new(pattern),
                                 "GOPRIVATE pattern has a reversed '[' character-class range \
                                  (lo > hi); that range can never match any character, but the \
                                  rest of the pattern is still evaluated normally, matching Go's \
@@ -583,7 +588,7 @@ fn compile_glob(pattern: &str) -> Option<Vec<GlobToken>> {
                 }
                 if chars.get(j) != Some(&']') {
                     tracing::warn!(
-                        pattern = redact_userinfo(pattern),
+                        pattern = %RedactedUrl::new(pattern),
                         "GOPRIVATE pattern has an unterminated '[' character class; it will \
                          never match, so affected modules route to the public proxy instead of \
                          being treated as private"
@@ -1729,6 +1734,70 @@ mod tests {
         assert!(
             !log.contains("hunter2"),
             "tracing output leaked credential: {log:?}"
+        );
+    }
+
+    /// Issue #822: the three `compile_glob` warn sites (dangling escape, reversed
+    /// character-class range, unterminated character class) used `redact_userinfo` alone,
+    /// which strips userinfo but preserves the query string — a query-string-shaped
+    /// credential embedded in a malformed GOPRIVATE pattern must not leak through the log.
+    #[test]
+    fn test_compile_glob_dangling_escape_warn_redacts_query_credential() {
+        let log = deps_core::test_util::capture_tracing_output(|| {
+            let config = GoEnvConfig::parse(
+                r"GOPRIVATE=git.corp.example/pkg?token=SUPERSECRET_TOKEN\",
+                &all_policy(),
+            );
+            assert!(!config.has_goprivate());
+        });
+        assert!(
+            log.contains("trailing unescaped"),
+            "expected dangling-escape warning: {log}"
+        );
+        assert!(!log.contains("SUPERSECRET_TOKEN"), "log: {log}");
+        assert!(
+            log.contains("git.corp.example"),
+            "redaction must not remove the non-secret host: {log}"
+        );
+    }
+
+    #[test]
+    fn test_compile_glob_reversed_range_warn_redacts_query_credential() {
+        let log = deps_core::test_util::capture_tracing_output(|| {
+            let config = GoEnvConfig::parse(
+                "GOPRIVATE=git.corp.example/repo?token=SUPERSECRET_TOKEN[c-a]",
+                &all_policy(),
+            );
+            assert!(config.has_goprivate());
+        });
+        assert!(
+            log.contains("reversed"),
+            "expected reversed-range warning: {log}"
+        );
+        assert!(!log.contains("SUPERSECRET_TOKEN"), "log: {log}");
+        assert!(
+            log.contains("git.corp.example"),
+            "redaction must not remove the non-secret host: {log}"
+        );
+    }
+
+    #[test]
+    fn test_compile_glob_unterminated_class_warn_redacts_query_credential() {
+        let log = deps_core::test_util::capture_tracing_output(|| {
+            let config = GoEnvConfig::parse(
+                "GOPRIVATE=git.corp.example/repo?token=SUPERSECRET_TOKEN[abc",
+                &all_policy(),
+            );
+            assert!(!config.has_goprivate());
+        });
+        assert!(
+            log.contains("unterminated"),
+            "expected unterminated-class warning: {log}"
+        );
+        assert!(!log.contains("SUPERSECRET_TOKEN"), "log: {log}");
+        assert!(
+            log.contains("git.corp.example"),
+            "redaction must not remove the non-secret host: {log}"
         );
     }
 
