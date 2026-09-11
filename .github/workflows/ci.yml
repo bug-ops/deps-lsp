@@ -504,7 +504,7 @@ jobs:
         # https://github.com/taiki-e/install-action/tree/main/manifests) — the previous
         # attempt here (`uses: taiki-e/install-action@...  # cargo-fuzz`, no `with.tool`)
         # silently installed the SHA's *default* tool, cargo-deny. `cargo install` from
-        # source instead, built once here and shared across the 17-leg `fuzz` matrix
+        # source instead, built once here and shared across the 18-leg `fuzz` matrix
         # below via cache + artifact rather than reinstalled independently in each leg.
         if: steps.cache.outputs.cache-hit != 'true'
         run: cargo install cargo-fuzz --locked
@@ -568,6 +568,7 @@ jobs:
           - pnpm_lockfile
           - pnpm_catalog
           - fallback_completion
+          - redact_userinfo
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
 
@@ -602,7 +603,7 @@ jobs:
 
       - name: Make cargo-fuzz executable
         # Built once in `fuzz-tool` and shared here via artifact instead of each of the
-        # 17 matrix legs independently running `cargo install cargo-fuzz --locked`.
+        # 18 matrix legs independently running `cargo install cargo-fuzz --locked`.
         run: chmod +x ~/.cargo/bin/cargo-fuzz
 
       - name: Run ${{ matrix.target }} for 60s

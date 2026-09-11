@@ -195,3 +195,10 @@ path = "fuzz_targets/fallback_completion.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "redact_userinfo"
+path = "fuzz_targets/redact_userinfo.rs"
+test = false
+doc = false
+bench = false
