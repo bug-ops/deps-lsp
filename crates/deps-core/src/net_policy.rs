@@ -602,45 +602,255 @@ pub fn redact_userinfo(raw: &str) -> String {
     url.as_str().to_string()
 }
 
+/// Finds a credential-shaped userinfo `@` in `region`, for use *only* on a region that has no
+/// reliable authority boundary of its own (the widened tail of an unparseable authority, or an
+/// opaque `scheme:/path` value) — never on a real bounded authority, where every `@` is a
+/// userinfo delimiter regardless of whether it looks credential-shaped (see
+/// [`redact_userinfo_unparseable`]'s own `bounded.rfind('@')` pass for that case).
+///
+/// Returns the *last* `@` whose own preceding segment — back to the previous `@` in `region`, or
+/// the start of `region` if this is the first one — contains a `:` that is not a Windows
+/// drive-letter colon (`C:\`, `c:/`; see [`segment_has_credential_colon`]), i.e. looks
+/// credential-shaped (`user:pass@...`) rather than an ordinary path/query component
+/// (`@scope/pkg`, `john.doe@corp`, `file:///C:/Users/x@corp/project`). An `@` whose segment has
+/// no such `:` is skipped, not treated as a scan boundary — this is what lets an S3-style case
+/// (a trailing unrelated `@scope/pkg` after a real credential, e.g.
+/// `c:///user:hunter2@evil/@scope/pkg`) resolve to the earlier, truly credential-shaped `@`
+/// instead of the last `@` overall.
+///
+/// Delimiting segments by the previous `@` instead of the previous `/` (an earlier revision's
+/// approach) is what closes #826's password-containing-`/` gap: a password containing `/`
+/// (`user:pa/ss@evil`) still has its `:` in the *same* since-last-`@` segment as the `@` that
+/// follows it, however many `/`s sit between them.
+// `at` comes from `match_indices('@')` on ASCII '@' bytes, so every slice bound is always a
+// char boundary.
+#[allow(clippy::string_slice)]
+fn find_credential_at(region: &str) -> Option<usize> {
+    let mut prev_at = 0;
+    let mut found = None;
+    for (at, _) in region.match_indices('@') {
+        if segment_has_credential_colon(&region[prev_at..at]) {
+            found = Some(at);
+        }
+        prev_at = at + 1;
+    }
+    found
+}
+
+/// Whether `segment` contains a `:` that is not a Windows drive-letter colon and not a bracketed
+/// IPv6 literal's own colon (or its immediately-following port separator) — [`find_credential_at`]'s
+/// shape check. A bare `segment.contains(':')` would mistake `file:///C:/Users/x@corp/project`'s
+/// drive letter for evidence of a credential (S2 finding): once `@`-delimited segments can span
+/// past a `/`, the `C:` in a `file:///C:/...` path sits in the same segment as a later, unrelated
+/// `@`. It would likewise mistake `[::1]:8443/pkg@1.0.0`'s own address/port colons for a
+/// credential (code review Finding 2) for the same reason — an ordinary bracketed-IPv6 registry
+/// host ends up in the same segment as a completely unrelated trailing `@version`.
+///
+/// A bracket found anywhere in `segment` (not just at its start) is skipped over — together with
+/// its immediately-following port-separator `:`, unconditionally, matching
+/// [`redact_colon_credential`]'s own bracket-adjacent carve-out exactly (regardless of whether
+/// what follows the bracket looks like a valid port) — before the scan for a real credential
+/// colon continues past it.
+// `bracket`/`colon` come from `find`/`starts_with` of ASCII `[`/`]`/`:` bytes, so every slice
+// bound is always a char boundary.
+#[allow(clippy::string_slice)]
+fn segment_has_credential_colon(segment: &str) -> bool {
+    let mut cursor = 0;
+    while cursor < segment.len() {
+        let remaining = &segment[cursor..];
+
+        if let Some(bracket) = remaining.find('[') {
+            if let Some(colon) = remaining[..bracket].find(':') {
+                if !colon_is_drive_letter(segment, cursor + colon) {
+                    return true;
+                }
+                cursor += colon + 1;
+                continue;
+            }
+            let bracket_end = remaining[bracket..]
+                .find(']')
+                .map_or(remaining.len(), |end| bracket + end + 1);
+            let skips_port_sep = usize::from(remaining[bracket_end..].starts_with(':'));
+            cursor += bracket_end + skips_port_sep;
+            continue;
+        }
+
+        let Some(colon) = remaining.find(':') else {
+            return false;
+        };
+        if !colon_is_drive_letter(segment, cursor + colon) {
+            return true;
+        }
+        cursor += colon + 1;
+    }
+    false
+}
+
+/// Whether the `:` at byte offset `colon` in `text` is a Windows drive-letter colon: a single
+/// ASCII letter — itself preceded by the start of `text`, `/`, or `\` (so it's a standalone
+/// token, not the tail of a longer word) — immediately followed by `/` or `\`. Mirrors
+/// [`redact_colon_credential`]'s own `is_drive_letter` carve-out, which only ever checks this at
+/// the very start of its scan window; this variant checks an arbitrary byte offset, since
+/// [`segment_has_credential_colon`] scans a whole segment rather than a cursor-anchored prefix.
+///
+/// A genuine single-letter *username* immediately followed by a `/`-leading password is
+/// shape-identical to a drive letter and is therefore also left unredacted (M4 finding,
+/// pre-existing HEAD behavior, e.g. `c:/a:/b@evil` stays a no-op) — contrived enough (a
+/// one-character username, itself followed by a password starting with `/`) to accept rather
+/// than fix.
+fn colon_is_drive_letter(text: &str, colon: usize) -> bool {
+    let bytes = text.as_bytes();
+    let is_letter = colon
+        .checked_sub(1)
+        .and_then(|i| bytes.get(i))
+        .is_some_and(u8::is_ascii_alphabetic);
+    let letter_is_standalone = colon == 1
+        || colon
+            .checked_sub(2)
+            .and_then(|i| bytes.get(i))
+            .is_some_and(|b| matches!(b, b'/' | b'\\'));
+    is_letter && letter_is_standalone && matches!(bytes.get(colon + 1), Some(b'/' | b'\\'))
+}
+
+/// Whether `value` (the text right after a `:`, up to the next delimiter or end of input) looks
+/// like a port number (`host:8443`) rather than a credential — 1-5 ASCII digits. Shared by
+/// [`redact_colon_credential`]'s own carve-out and [`redact_userinfo_unparseable`]'s widening
+/// gate, so both agree on what counts as "just a port" (#826).
+fn is_port_like(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 5 && value.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Whether `bounded` (the authority text up to — but not including — the `/`/`?`/`#` that
+/// truncated it) contains a `:` that is *not* just a trailing `host:port` suffix, i.e. evidence
+/// a credential may already have started before that boundary character rather than the
+/// boundary genuinely ending a plain `host[:port]` authority.
+///
+/// Only the boundary's own trailing colon is checked against [`is_port_like`] — `gitlab.corp:8443`
+/// strips down to `gitlab.corp` (no further `:`, not widened) while `user:hunter2:8443` strips
+/// only its trailing port to `user:hunter2` (still contains `:`, still widened) — so a
+/// credential followed by an incidental port-shaped suffix is not missed just because the very
+/// last colon in `bounded` happens to look like a port.
+///
+/// A `bounded` starting with a bracketed IPv6 literal (`[::1]:8443`) has that bracket and its
+/// immediately-following port-separator `:` stripped *unconditionally* before the port check
+/// above — matching [`redact_colon_credential`]'s own bracket-adjacent carve-out, regardless of
+/// whether what follows looks like a valid port — rather than just [`is_port_like`]'s digits-only
+/// check: `is_port_like` alone would leave `[::1]:notaport` still "containing a `:`" (the address
+/// literal's own colons) and wrongly trigger the widened scan even for the well-formed port case
+/// (`[::1]:8443/pkg@1.0.0` — code review Finding 2). This also incidentally fixes a malformed
+/// port's over-redaction (previously accepted as M3) rather than merely documenting it.
+// `colon`/`bracket` come from `rfind`/`find` of ASCII `:`/`[`/`]` bytes, so every slice bound is
+// always a char boundary.
+#[allow(clippy::string_slice)]
+fn bounded_has_credential_colon(bounded: &str) -> bool {
+    let bounded = if bounded.starts_with('[') {
+        bounded.find(']').map_or(bounded, |end| {
+            let after_bracket = &bounded[end + 1..];
+            after_bracket.strip_prefix(':').unwrap_or(after_bracket)
+        })
+    } else {
+        bounded
+    };
+    let trimmed = bounded.rfind(':').map_or(bounded, |colon| {
+        if is_port_like(&bounded[colon + 1..]) {
+            &bounded[..colon]
+        } else {
+            bounded
+        }
+    });
+    trimmed.contains(':')
+}
+
 /// [`redact_userinfo`]'s fallback for a `raw` that fails `Url::parse` outright (S1 finding):
 /// locates the `://` scheme separator when present, then the *last* `@` before the next `/`,
 /// `?`, or `#` (matching how a URL parser resolves multiple unescaped `@`s in the authority —
-/// everything up to it is userinfo, never part of the host), and replaces that whole userinfo
-/// span with `***@`. A `raw` with no `://` at all (e.g. a schemeless `user:pass@host` literal,
-/// which fails `Url::parse` for lacking a scheme rather than for any userinfo-related reason —
-/// #536 C2) is treated the same way, scanning from the very start of `raw` instead of skipping
-/// a scheme. Returns `raw` unchanged when no `@` is found in the searched span (nothing looks
-/// like a userinfo component to redact) or when the `@` is the very first character of the
-/// authority — an *empty* userinfo component carries no credential to hide, and treating it as
-/// one is a false positive: a scheme-less, non-URL value that merely starts with `@` (e.g. an
-/// npm-scoped package name like `@types/node`, passed through this same redaction path by
-/// callers that don't know in advance whether a value is a URL) would otherwise be mangled
-/// into `***@types/node` (code-review follow-up on #767, root-causing what M1's `redact_if_url`
-/// had worked around locally in `deps_core::error`). This mirrors the parseable path just
-/// above, which already special-cases an empty `username()`/`password()` as a no-op.
+/// everything up to it is userinfo, never part of the host, **regardless of whether it looks
+/// credential-shaped**: `ghp_TOKEN@github.com` and `x-access-token@github.com/repo.git` are
+/// real, username-only userinfo with no password at all, and must be redacted exactly like a
+/// `user:pass@host` pair — C1 finding), and replaces that whole userinfo span with `***@`. A
+/// `raw` with no `://` at all (e.g. a schemeless `user:pass@host` literal, which fails
+/// `Url::parse` for lacking a scheme rather than for any userinfo-related reason — #536 C2) is
+/// treated the same way, scanning from the very start of `raw` instead of skipping a scheme.
+/// An `@` that is the very first character of the bounded authority is *not* treated as this
+/// function's answer on its own — an empty userinfo component (`@types/node`, code-review
+/// follow-up on #767) carries no credential to hide, so masking through it would be a false
+/// positive — but it must not short-circuit the function either (code-review Finding 1): a
+/// leading empty-userinfo `@` is treated exactly like "no `@` in the bounded authority at all",
+/// falling through to the same widen/`redact_colon_credential` logic below, since a bounded
+/// prefix that merely *starts* with `@` (`@scope/user:hunter2@evil`) can still have a real
+/// credential past the boundary.
 ///
-/// When no `@` is found, falls through to [`redact_colon_credential`] — a colon-separated
+/// If *no* `@` is found at all within that bounded authority, the bounded text is checked for a
+/// `:` (#826): a `:` preceding the `/`/`?`/`#` boundary with no `@` yet found is evidence a
+/// credential already started before that character, so the character is very likely sitting
+/// *inside* the password (`https://user:pa?ss@evil`, `user:pa/ss@evil`) rather than genuinely
+/// ending the authority — stopping the scan there let the password's own `?`/`#` (partial leak)
+/// or `/` (full bypass) hide the `@` that would have triggered masking. When that's the case,
+/// [`find_credential_at`] — *shape-checked*, unlike the bounded pass above, since widening past
+/// the boundary re-admits ordinary non-credential path/query content that a plain last-`@` scan
+/// would over-match — is tried against the full `authority`. A bounded text with no `:` at all
+/// (`gitlab.corp` in `gitlab.corp/user:hunter2@evil`, #810's own repro) skips widening
+/// entirely: there is no evidence a credential started before the boundary, so the `/` there is
+/// a genuine host/path split.
+///
+/// A bounded text whose *only* `:` is port-shaped (`gitlab.corp:8443`) is ambiguous — it could
+/// be a genuine `host:port` with an unrelated `@` past the boundary (#810's own repro, with a
+/// port prepended, and the ordinary shape of a self-hosted-registry alias like
+/// `nexus.corp:8081/repo/lib@2.0.0` or `localhost:8080/@types/node`), or a password that merely
+/// happens to start with digits (`user:12345/rest@evil`). There is no textual discriminator
+/// between these two — both are `word:digits/…@…`, and a "the word before the colon contains a
+/// dot" heuristic is defeated by `localhost` — so this is a deliberate, documented trade-off
+/// (S4 finding), not an oversight: [`redact_colon_credential`] alone resolves this case, with
+/// **no** widened `@`-scan fallback. A digit-prefixed password whose prefix up to the first
+/// `/`/`?`/`#` is exactly 1-5 ASCII digits therefore still passes through unredacted here — the
+/// same accepted collision this file already documents for `oauth2:12345` — rather than risk
+/// mangling an ordinary `host:port` registry URL (visible in every log line and error message
+/// for any user on a non-default port) into an unreadable `***@...` on every request.
+///
+/// Falls through to [`redact_colon_credential`] whenever no credential-shaped `@` is found at
+/// all (bounded, widened, or via the port-shaped-colon branch above) — a colon-separated
 /// credential with no `@` (`oauth2:glpat-SECRET`, a GitLab CI `gitlab-ci-token:JOBTOKEN` job
 /// token, an `.npmrc` `key:value` line) reaches this same fallback and, before #810, passed
 /// through unredacted.
-// All indices (`authority_start`, `host_boundary`, `at`) come from `find`/`rfind` of ASCII
-// tokens (`"://"`, `/`, `?`, `#`, `@`), so every slice bound is always a char boundary.
+// All indices (`authority_start`, `host_boundary`, `at`) come from `find`/`rfind`/
+// `match_indices` of ASCII tokens (`"://"`, `/`, `?`, `#`, `@`, `:`), so every slice bound is
+// always a char boundary.
 #[allow(clippy::string_slice)]
 fn redact_userinfo_unparseable(raw: &str) -> String {
     let authority_start = raw.find("://").map_or(0, |scheme_end| scheme_end + 3);
     let authority = &raw[authority_start..];
     let host_boundary = authority.find(['/', '?', '#']).unwrap_or(authority.len());
-    let Some(at) = authority[..host_boundary].rfind('@') else {
-        return redact_colon_credential(raw, authority_start, authority);
-    };
-    if at == 0 {
-        return raw.to_string();
+    let bounded = &authority[..host_boundary];
+
+    let mask_at = |at: usize| format!("{}***@{}", &raw[..authority_start], &authority[at + 1..]);
+
+    // A bounded `@` at any position other than 0 is always the true userinfo/host boundary
+    // (URL semantics — see this function's own doc comment). One at position 0 (an *empty*
+    // userinfo, e.g. `@types/node`) carries no credential of its own, but must NOT short-circuit
+    // here (code-review Finding 1): a leading `@scope`-shaped bounded prefix (e.g.
+    // `@scope/user:hunter2@evil`) still needs the same "check past the boundary" treatment as a
+    // bounded prefix with no `@` at all, or a real credential past the boundary leaks in full.
+    if let Some(at) = bounded.rfind('@').filter(|&at| at != 0) {
+        return mask_at(at);
     }
-    format!("{}***@{}", &raw[..authority_start], &authority[at + 1..])
+    if !bounded.contains(':') {
+        return redact_colon_credential(raw, authority_start, authority);
+    }
+    if bounded_has_credential_colon(bounded) {
+        return find_credential_at(authority).map_or_else(
+            || redact_colon_credential(raw, authority_start, authority),
+            mask_at,
+        );
+    }
+
+    // `bounded`'s only `:` is port-shaped: leave it to `redact_colon_credential` alone, with no
+    // widened-scan fallback (S4 finding) — see this function's own doc comment for why.
+    redact_colon_credential(raw, authority_start, authority)
 }
 
-/// [`redact_userinfo_unparseable`]'s fallback for the case it does not cover: a colon-separated
-/// credential with no `@` at all (#810), e.g. `oauth2:glpat-SECRET`, a GitLab CI
+/// [`redact_userinfo_unparseable`]'s (and, since #818, [`redact_userinfo_opaque_path`]'s)
+/// fallback for the case neither covers on its own: a colon-separated credential with no `@` at
+/// all (#810), e.g. `oauth2:glpat-SECRET`, a GitLab CI
 /// `gitlab-ci-token:JOBTOKEN` job token, or a bare `.npmrc` `//registry/:_authToken=...` line.
 /// Unlike the `@` scan above, this is not restricted to the authority span before the first
 /// `/`/`?`/`#` — `gitlab.corp/user:hunter2@evil` (repro from #810) has its credential colon
@@ -723,8 +933,7 @@ fn redact_colon_credential(raw: &str, authority_start: usize, authority: &str) -
             .map_or(remaining.len(), |i| value_start + i);
         let value = &remaining[value_start..value_end];
 
-        let is_port =
-            !value.is_empty() && value.len() <= 5 && value.bytes().all(|b| b.is_ascii_digit());
+        let is_port = is_port_like(value);
         if value.is_empty() || is_port {
             cursor += value_end.max(colon + 1);
             continue;
@@ -750,64 +959,67 @@ fn redact_colon_credential(raw: &str, authority_start: usize, authority: &str) -
 /// misalign against `raw` for such an input, even though `raw`'s own first `:` still always
 /// marks the scheme separator (M2 finding).
 ///
-/// From `path_start` up to the next `?`/`#` (or the end of `raw`), this does **not** stop at
-/// the first `/`: this shape has no real host segment to bound the scan against (the `/`
-/// right after the scheme starts an opaque-ish path, not a host/path boundary), so an
-/// authority-shaped scan would stop too early (S1 finding, e.g. `c:///user:hunter2@evil`'s
-/// credential sits past three slashes).
+/// From `path_start` to the end of `raw`, this does **not** stop at the first `/`, `?`, or `#`:
+/// this shape has no real host segment to bound the scan against (the `/` right after the
+/// scheme starts an opaque-ish path, not a host/path boundary), so an authority-shaped scan
+/// would stop too early (S1 finding, e.g. `c:///user:hunter2@evil`'s credential sits past three
+/// slashes) — and, for the same reason, bounding the scan by the first `?`/`#` is exactly as
+/// unsafe as bounding it by `/`: a password containing either character (#826, e.g.
+/// `c:/user:pa?ss@evil`) would otherwise hide the `@` that follows it from the scan entirely.
 ///
 /// Finding an `@` is not by itself proof of a credential (S2 finding): an ordinary path can
 /// contain one too (`file:///home/user@example/file`, an npm-scoped `npm:/@scope/pkg@1.0.0`,
-/// a `deps-nuget` local/UNC feed path like `C:/Users/john.doe@corp/project`). Only an `@`
-/// whose immediately preceding path segment (from the previous `/`, or the start of the path)
-/// itself contains a `:` — i.e. looks like `user:pass`, not an ordinary path component — is
-/// treated as a credential. This also subsumes the empty-userinfo guard
-/// ([`redact_userinfo_unparseable`]'s `at == 0` case): an `@` with nothing before it in its
-/// segment has no `:` either, so it is never mistaken for a credential.
+/// a `deps-nuget` local/UNC feed path like `C:/Users/john.doe@corp/project`, or —
+/// `file:///C:/Users/john.doe@corp/project`, a second S2 finding — the same path with a
+/// `file://` scheme, whose drive-letter colon must not itself be mistaken for credential
+/// evidence). Delegated to [`find_credential_at`]: only an `@` whose own since-the-previous-`@`
+/// segment contains a non-drive-letter `:` — i.e. looks like `user:pass`, not an ordinary path
+/// component or a `C:\`/`c:/` drive prefix — is treated as a credential, and among several such
+/// candidates the last one wins (S3 finding, e.g. `c:/user:hunter2@evil/pkg@1.0.0` — the
+/// *trailing* `pkg@1.0.0` `@` has no `:` in its own segment and must not be mistaken for the
+/// redaction point, silently leaving `user:hunter2@evil` unredacted). This also subsumes the
+/// empty-userinfo guard (see [`redact_userinfo_unparseable`]'s own bounded-`@` pass): an `@`
+/// with an empty segment before it has no `:` either, so it is never mistaken for a credential.
 ///
-/// Unlike [`redact_userinfo_unparseable`], the redacted `@` is **not** simply the last one in
-/// the region: a credential can be followed by further path segments that themselves contain
-/// an unrelated `@` (S3 finding, e.g. `c:/user:hunter2@evil/pkg@1.0.0` — the *trailing*
-/// `pkg@1.0.0` `@` has no `:` before it and must not be mistaken for the redaction point,
-/// silently leaving `user:hunter2@evil` unredacted). So every `@` in the region is checked,
-/// and the *last one whose own preceding segment is userinfo-shaped* is the one redacted
-/// (there is normally at most one credential-shaped `@`, so "last" only matters for choosing
-/// among ties).
+/// Delimiting each `@`'s segment by the *previous* `@` (not the nearest preceding `/`, as an
+/// earlier revision did) is what closes #826's password-containing-`/` gap: `c:/user:pa/ss@evil`
+/// has no earlier `@`, so the whole `/user:pa/ss` since the start of the path is one segment,
+/// and its `:` is found regardless of the `/` sitting between it and the `@`.
 ///
 /// This heuristic can still over-redact a legitimate colon-containing path segment that isn't
 /// a credential at all (e.g. `c:/logs/12:30@host/x`, a timestamp-like directory name) — an
-/// accepted false-positive trade-off, though a narrower one than
-/// [`redact_userinfo_unparseable`]'s: that function redacts on *any* `@` in the authority
-/// region, with no `:`-shaped check at all.
+/// accepted false-positive trade-off in exchange for never missing a real credential.
 ///
-/// A password containing `/` itself is a pre-existing, shared limitation, not something this
-/// fix introduces: `seg_start` only looks back to the *nearest* preceding `/`, so
-/// `c:/user:pa/ss@evil` finds `:` in an earlier segment than the one right before `@` and is
-/// left unredacted — [`redact_userinfo_unparseable`] has the same gap (`user:pa/ss@evil`'s
-/// `host_boundary` cuts the scan off at the `/` before `@` is ever reached). Tracked as part
-/// of #826, alongside the pre-existing `?`/`#`-inside-password partial leak, since a real fix
-/// needs a single revised scanning strategy applied consistently across all three
-/// `redact_userinfo*` code paths, not a one-off patch here.
-// `path_start` is an ASCII ':' byte index; `end`/`at`/`seg_start` come from `find`/`rfind`/
-// `match_indices` of ASCII '?'/'#'/'@'/'/' bytes on `raw` from that point on, so every slice
-// bound is always a char boundary.
+/// When no credential-shaped `@` is found but at least one `@` is present, `raw` is returned
+/// unchanged — the same call as `find_credential_at` returning `None` above cannot distinguish
+/// "no `@` at all" from "an `@` that isn't credential-shaped", so this checks for either
+/// explicitly. When there is no `@` anywhere in `region`, this instead falls through to
+/// [`redact_colon_credential`] (#818): a colon-separated credential with no `@` at all (e.g.
+/// `token:/hunter2:secret`) is a distinct detection problem #811's original `@`-based scan never
+/// covered, and reuses the same chokepoint [`redact_userinfo_unparseable`] already routes
+/// through for its own no-`@` case, rather than reimplementing its host:port/IPv6/drive-letter
+/// carve-outs here. This does extend [`redact_colon_credential`]'s existing documented
+/// false-positive class to opaque-path values too (M2 finding, e.g. a Maven coordinate
+/// `mvn:/com.google.guava:guava/1.0` → `mvn:/com.google.guava:***`, or an npm-scoped
+/// `@scope/pkg:1.0.0` → `@scope/pkg:***`) — accepted for the same reason the original class was:
+/// this fallback only ever feeds tracing/log/error output, never a value used for further
+/// parsing or comparison.
+// `path_start` is an ASCII ':' byte index; `at` comes from `find_credential_at`'s own
+// `match_indices` scan of ASCII '@' bytes on `raw` from that point on, so every slice bound is
+// always a char boundary.
 #[allow(
     clippy::string_slice,
-    reason = "all slice bounds are ASCII byte offsets from `find`/`rfind`/`match_indices`, \
-              never landing inside a multi-byte character"
+    reason = "all slice bounds are ASCII byte offsets from `find`/`match_indices`, never \
+              landing inside a multi-byte character"
 )]
 fn redact_userinfo_opaque_path(raw: &str) -> String {
     let path_start = raw.find(':').map_or(0, |scheme_end| scheme_end + 1);
     let region = &raw[path_start..];
-    let end = region.find(['?', '#']).unwrap_or(region.len());
-    let mut credential_at = region[..end].match_indices('@').filter_map(|(at, _)| {
-        let seg_start = region[..at].rfind('/').map_or(0, |slash| slash + 1);
-        region[seg_start..at].contains(':').then_some(at)
-    });
-    let Some(at) = credential_at.next_back() else {
-        return raw.to_string();
-    };
-    format!("{}***@{}", &raw[..path_start], &region[at + 1..])
+    match find_credential_at(region) {
+        Some(at) => format!("{}***@{}", &raw[..path_start], &region[at + 1..]),
+        None if region.contains('@') => raw.to_string(),
+        None => redact_colon_credential(raw, path_start, region),
+    }
 }
 
 /// Strips the query string, fragment, and any userinfo from `raw`, for attaching to a
@@ -1586,9 +1798,9 @@ mod tests {
 
     /// #811's empty-authority `scheme:/path` fix (`redact_userinfo_opaque_path`), exercised
     /// through `url_for_tracing` rather than `redact_userinfo` directly: `c:/user:hunter2@evil`
-    /// is now redacted. `token:/hunter2:secret` (no `@` at all) is a distinct, still-open gap
-    /// tracked in #818 — it needs #810's `redact_colon_credential` scanner routed through this
-    /// same empty-authority branch, not a fix to the `@`-based scan here.
+    /// is redacted. `token:/hunter2:secret` (no `@` at all) used to be a distinct gap tracked in
+    /// #818 — now fixed by routing the no-`@` case through [`redact_colon_credential`], the same
+    /// scanner #810 already introduced for [`redact_userinfo_unparseable`]'s equivalent case.
     ///
     /// The empty-authority gap is narrow — only *non-special* schemes (anything other than
     /// `http`/`https`/`ws`/`wss`/`ftp`/`file`) hit it. A *special* scheme normalizes a single
@@ -1597,12 +1809,11 @@ mod tests {
     /// (`host="evil"`, `username="user"`, `password="hunter2"`) and is redacted correctly by
     /// the existing primary branch, same as any other URL with real userinfo.
     #[test]
-    fn test_url_for_tracing_single_slash_scheme_path_redacted_except_no_at_credential() {
+    fn test_url_for_tracing_single_slash_scheme_path_redacted() {
         assert_eq!(url_for_tracing("c:/user:hunter2@evil"), "c:***@evil");
-        assert_eq!(
-            url_for_tracing("token:/hunter2:secret"),
-            "token:/hunter2:secret"
-        );
+        let redacted = url_for_tracing("token:/hunter2:secret");
+        assert!(!redacted.contains("secret"), "redacted={redacted:?}");
+        assert_eq!(redacted, "token:/hunter2:***");
     }
 
     /// Contrast case for the #811 limitation above: a *special* scheme (`https`) does not
@@ -1839,35 +2050,282 @@ mod tests {
         assert_eq!(redacted, "nexus:***@host/repo/lib@2.0.0");
     }
 
-    /// #818 (follow-up on #811, blocked by #814): a bare colon-separated credential with no
-    /// `@` at all — e.g. `token:/hunter2:secret` — is *not* caught by #811's fix. #811's root
-    /// cause is specifically the empty-authority `scheme:/path` routing bypassing redaction
-    /// entirely; catching a credential pair with no `@` is a separate detection problem
-    /// (issue #810, `redact_colon_credential` in open PR #814) that this fix does not
-    /// duplicate. Pinned here as a known, tracked limitation, by analogy with how #811 itself
-    /// was pinned as a documented gap alongside #810's fix: this assertion documents *current*
-    /// (unsafe) behavior, not desired behavior — once #814 merges and the empty-authority
-    /// route here is updated to reuse its colon-credential scanner, this must flip to a
-    /// redacted expectation, and the test renamed to no longer claim a bypass.
+    /// #818 (follow-up on #811, fixed by routing through [`redact_colon_credential`]): a bare
+    /// colon-separated credential with no `@` at all — e.g. `token:/hunter2:secret` — is now
+    /// caught by [`redact_userinfo_opaque_path`]'s no-`@` fallback, the same chokepoint
+    /// [`redact_userinfo_unparseable`] already used for #810.
     #[test]
-    fn test_redact_userinfo_single_slash_scheme_path_no_at_credential_still_bypasses_redaction() {
+    fn test_redact_userinfo_single_slash_scheme_path_no_at_credential_is_redacted() {
+        let redacted = redact_userinfo("token:/hunter2:secret");
+        assert!(!redacted.contains("secret"), "redacted={redacted:?}");
+        assert_eq!(redacted, "token:/hunter2:***");
+    }
+
+    /// #826 (fixed): a password containing `/` used to put the credential's `:` in an earlier
+    /// path segment than the one immediately before `@`, so the old nearest-preceding-`/`
+    /// segment check missed it. [`find_credential_at`] delimits segments by the previous `@`
+    /// instead, so the whole span since the start of the path (or the previous `@`) is checked
+    /// for a `:`, regardless of how many `/`s it contains.
+    #[test]
+    fn test_redact_userinfo_single_slash_scheme_path_password_with_slash_is_redacted() {
+        let redacted = redact_userinfo("c:/user:pa/ss@evil");
+        assert!(!redacted.contains("pa/ss"), "redacted={redacted:?}");
+        assert_eq!(redacted, "c:***@evil");
+    }
+
+    /// #826 companion: the same password-contains-`/` fix through
+    /// [`redact_userinfo_unparseable`] (a schemeless `user:pass@host` literal, no `scheme:/path`
+    /// authority at all) — the sibling code path the issue named as sharing the same gap.
+    #[test]
+    fn test_redact_userinfo_unparseable_password_with_slash_is_redacted() {
+        let redacted = redact_userinfo("user:pa/ss@evil");
+        assert!(!redacted.contains("pa/ss"), "redacted={redacted:?}");
+        assert_eq!(redacted, "***@evil");
+    }
+
+    /// #826: a `?` inside a password used to truncate the authority-boundary scan before it
+    /// ever reached the `@` that would trigger masking, leaking the fragment of the password
+    /// before the `?` (partial leak). Covers both the scheme-bearing and schemeless shapes that
+    /// route through [`redact_userinfo_unparseable`].
+    #[test]
+    fn test_redact_userinfo_unparseable_question_mark_in_password_is_redacted() {
+        let redacted = redact_userinfo("https://user:pa?ss@evil");
+        assert!(!redacted.contains("pa?ss"), "redacted={redacted:?}");
+        assert_eq!(redacted, "https://***@evil");
+
+        let redacted = redact_userinfo("user:pa?ss@evil");
+        assert!(!redacted.contains("pa?ss"), "redacted={redacted:?}");
+        assert_eq!(redacted, "***@evil");
+    }
+
+    /// #826 companion: a `#` inside a password hits the exact same boundary-scan bug as `?` —
+    /// both are treated identically by [`redact_userinfo_unparseable`]'s `host_boundary` scan.
+    #[test]
+    fn test_redact_userinfo_unparseable_hash_in_password_is_redacted() {
         assert_eq!(
-            redact_userinfo("token:/hunter2:secret"),
-            "token:/hunter2:secret"
+            redact_userinfo("https://user:pa#ss@evil"),
+            "https://***@evil"
+        );
+        assert_eq!(redact_userinfo("user:pa#ss@evil"), "***@evil");
+    }
+
+    /// #826: the equivalent `?`/`#`-in-password bug for [`redact_userinfo_opaque_path`] — the
+    /// old `region.find(['?', '#'])` boundary had the same "cuts before reaching `@`" shape as
+    /// [`redact_userinfo_unparseable`]'s `host_boundary`, just for a `scheme:/path` value
+    /// instead of a `scheme://host` one.
+    #[test]
+    fn test_redact_userinfo_opaque_path_question_mark_and_hash_in_password_is_redacted() {
+        assert_eq!(redact_userinfo("c:/user:pa?ss@evil"), "c:***@evil");
+        assert_eq!(redact_userinfo("c:/user:pa#ss@evil"), "c:***@evil");
+    }
+
+    /// #810 regression guard: [`redact_userinfo_unparseable`]'s widened scan (triggered when the
+    /// bounded authority already contains a `:`) must not fire when it does not — `gitlab.corp`
+    /// before the first `/` has no `:`, so the unrelated `@evil` past it is left for
+    /// [`redact_colon_credential`], unchanged from #810's own fix. A regression here would mean
+    /// #826's widening silently broadened to redact a genuine host, not just a password.
+    #[test]
+    fn test_redact_userinfo_unparseable_widen_does_not_fire_without_leading_colon() {
+        assert_eq!(
+            url_for_tracing("gitlab.corp/user:hunter2@evil"),
+            "gitlab.corp/user:***"
         );
     }
 
-    /// #826 (pre-existing, shared limitation, not introduced by #811's fix): a password
-    /// containing `/` puts the credential's `:` in an earlier path segment than the one
-    /// immediately before `@`, so `redact_userinfo_opaque_path`'s nearest-preceding-`/` segment
-    /// check misses it — `redact_userinfo_unparseable` has the same gap for the equivalent
-    /// authority-shaped input. Pinned here as a known, tracked limitation, by the same
-    /// analogy as the #818 pin above: this documents *current* (unsafe) behavior, and must be
-    /// updated once #826's cross-code-path fix lands.
+    /// impl-critic C1 (counterexample_hunt, regression on the #826 fix): a username-only
+    /// userinfo with no password at all — the standard GitHub/GitLab CI token-auth URL shape —
+    /// is still a real credential and must be redacted exactly like `user:pass@host`, even
+    /// though it has no `:` at all. `find_credential_at`'s shape check must never run on the
+    /// bounded authority pass; only `bounded.rfind('@')` (any `@` is a userinfo delimiter there)
+    /// is correct.
     #[test]
-    fn test_redact_userinfo_single_slash_scheme_path_password_with_slash_still_bypasses_redaction()
-    {
-        assert_eq!(redact_userinfo("c:/user:pa/ss@evil"), "c:/user:pa/ss@evil");
+    fn test_redact_userinfo_unparseable_username_only_userinfo_is_redacted() {
+        assert_eq!(redact_userinfo("ghp_TOKEN@github.com"), "***@github.com");
+        assert_eq!(
+            redact_userinfo("x-access-token@github.com/repo.git"),
+            "***@github.com/repo.git"
+        );
+        assert_eq!(
+            redact_userinfo("https://ghp_TOKEN@github.com:99999/x"),
+            "https://***@github.com:99999/x"
+        );
+        let redacted = redact_userinfo("https://glpat-SECRET@gitlab.corp:notaport/x");
+        assert!(!redacted.contains("glpat-SECRET"), "redacted={redacted:?}");
+        assert_eq!(redacted, "https://***@gitlab.corp:notaport/x");
+    }
+
+    /// code-review Finding 1 (HIGH, confirmed leak): a bounded authority whose *only* `@` sits at
+    /// position 0 (an npm-scope-shaped `@scope/...` prefix, empty userinfo) must not short-circuit
+    /// to "no credential here" — a real credential can still exist past the `/`/`?`/`#` boundary.
+    /// Before this fix, `bounded.rfind('@')` finding that leading `@` returned `raw` completely
+    /// unredacted, leaking `user:hunter2` in full; the structurally near-identical
+    /// `gitlab.corp/user:hunter2@evil` (no leading `@`) was already correctly redacted by the same
+    /// function, which is what exposed the inconsistency.
+    #[test]
+    fn test_redact_userinfo_unparseable_leading_at_scope_does_not_hide_later_credential() {
+        let redacted = redact_userinfo("@scope/user:hunter2@evil");
+        assert!(!redacted.contains("hunter2"), "redacted={redacted:?}");
+    }
+
+    /// code-review Finding 1 companion: the empty-userinfo no-op itself (no credential anywhere
+    /// past the boundary) must still hold — this fix must not turn every leading `@` into a forced
+    /// redaction.
+    #[test]
+    fn test_redact_userinfo_unparseable_leading_at_scope_with_no_later_credential_is_noop() {
+        assert_eq!(redact_userinfo("@scope/pkg"), "@scope/pkg");
+    }
+
+    /// impl-critic S1 (counterexample_hunt, regression on the #826 fix): a literal `@` inside
+    /// the password must not leak the tail of the value after it — the *last* `@` in the
+    /// bounded authority is always the userinfo/host boundary (URL semantics), not the *last
+    /// credential-shaped* `@`. Same root cause and fix as C1.
+    #[test]
+    fn test_redact_userinfo_unparseable_at_sign_inside_password_is_fully_redacted() {
+        let redacted = redact_userinfo("user:pa@ss@evil");
+        assert!(!redacted.contains("pa@ss"), "redacted={redacted:?}");
+        assert_eq!(redacted, "***@evil");
+
+        let redacted = redact_userinfo("user:hunter2@evil@host:notaport/x");
+        assert!(!redacted.contains("hunter2"), "redacted={redacted:?}");
+        assert_eq!(redacted, "***@host:notaport/x");
+    }
+
+    /// impl-critic S2 (second_order_effects, regression on the #826 fix): a `file:///C:/...`
+    /// path (`deps-nuget`'s documented local/UNC feed shape) must not be mangled just because
+    /// its Windows drive-letter colon sits in the same `@`-delimited segment as a later,
+    /// unrelated `@` — `find_credential_at`'s shape check must ignore a drive-letter `:`.
+    #[test]
+    fn test_redact_userinfo_opaque_path_file_scheme_drive_letter_is_noop() {
+        assert_eq!(
+            redact_userinfo("file:///C:/Users/john.doe@corp/project"),
+            "file:///C:/Users/john.doe@corp/project"
+        );
+        assert_eq!(
+            redact_userinfo("file:///C:/feeds/pkg@1.0.0.nupkg"),
+            "file:///C:/feeds/pkg@1.0.0.nupkg"
+        );
+        assert_eq!(
+            redact_userinfo("nuget:///C:/Users/john.doe@corp/feed"),
+            "nuget:///C:/Users/john.doe@corp/feed"
+        );
+    }
+
+    /// code-review Finding 2 (HIGH, confirmed over-redaction): a bracketed IPv6 host with a
+    /// perfectly well-formed numeric port must not be mistaken for a credential just because the
+    /// address literal itself contains colons — reachable both through
+    /// `redact_userinfo_unparseable`'s widened scan (`bounded_has_credential_colon` used to see
+    /// `[::1]`'s own `::` as "a non-port colon") and directly through
+    /// `redact_userinfo_opaque_path`'s `find_credential_at` (`segment_has_credential_colon` used
+    /// to have no bracket awareness at all).
+    #[test]
+    fn test_redact_userinfo_bracketed_ipv6_well_formed_port_is_noop() {
+        assert_eq!(
+            redact_userinfo("[::1]:8443/pkg@1.0.0"),
+            "[::1]:8443/pkg@1.0.0"
+        );
+        assert_eq!(
+            redact_userinfo("c:/[::1]:8443/pkg@1.0.0"),
+            "c:/[::1]:8443/pkg@1.0.0"
+        );
+    }
+
+    /// code-review Finding 2 companion: a bracketed IPv6 host with a well-formed port still gets
+    /// its real, unrelated credential caught when one is genuinely present elsewhere in the
+    /// value — the bracket carve-out must not become a blanket no-op for the whole string.
+    #[test]
+    fn test_redact_userinfo_bracketed_ipv6_well_formed_port_with_real_credential_elsewhere() {
+        let redacted = redact_userinfo("user:hunter2@[::1]:8443/pkg");
+        assert!(!redacted.contains("hunter2"), "redacted={redacted:?}");
+        assert_eq!(redacted, "***@[::1]:8443/pkg");
+    }
+
+    /// impl-critic S3/S4 (completeness_check, then second_order_effects): a password whose
+    /// prefix before the `/`/`?`/`#` delimiter is 1-5 ASCII digits collides with the `host:port`
+    /// carve-out and passes through unredacted — a deliberate, documented trade-off (S4), not a
+    /// residual bug: an earlier revision closed this via a widened `@`-scan fallback, but that
+    /// scan cannot tell `user:12345/rest@evil` (credential) apart from an ordinary self-hosted
+    /// registry string like `nexus.corp:8081/repo/lib@2.0.0` (not a credential at all) — both are
+    /// `word:digits/…@…` — so it mangled real hostnames in every non-default-port log line. This
+    /// is the same accepted collision this file already documents for `oauth2:12345`.
+    #[test]
+    fn test_redact_userinfo_unparseable_digit_prefixed_password_is_accepted_gap() {
+        for raw in [
+            "user:12345/rest@evil",
+            "user:12345?rest@evil",
+            "user:12345#rest@evil",
+        ] {
+            assert_eq!(redact_userinfo(raw), raw, "raw={raw:?}");
+        }
+    }
+
+    /// Contrast case: `https://user:1234/secret@evil` is *not* the same shape as the schemeless
+    /// repros above — `https` is a special scheme, so `Url::parse` resolves `user:1234` as a
+    /// genuine `host:port` authority (verified: `host="user"`, `port=1234`, `username`/`password`
+    /// both empty) with `/secret@evil` as an ordinary path, not a credential at all. It never
+    /// reaches `redact_userinfo_unparseable`, so leaving it unchanged is correct regardless of
+    /// the S4 trade-off above.
+    #[test]
+    fn test_redact_userinfo_https_digit_after_colon_before_slash_is_not_a_credential() {
+        assert_eq!(
+            redact_userinfo("https://user:1234/secret@evil"),
+            "https://user:1234/secret@evil"
+        );
+    }
+
+    /// impl-critic S3 companion: the genuine `host:port` shape (#810's own repro, with a port
+    /// prepended) must still resolve through `redact_colon_credential` and keep the host
+    /// visible.
+    #[test]
+    fn test_redact_userinfo_unparseable_host_port_with_trailing_credential_unaffected_by_s3_fix() {
+        assert_eq!(
+            url_for_tracing("gitlab.corp:8443/user:hunter2@evil"),
+            "gitlab.corp:8443/user:***"
+        );
+    }
+
+    /// impl-critic S4 — the over-redaction this round's fix removed: an ordinary self-hosted
+    /// registry `host:port/...` string with no credential anywhere must stay fully visible in
+    /// logs/error output, including the `@scope`-package-name shape #767 already fought once
+    /// (`registry.corp:4873/@scope/pkg`) and `localhost`, which defeats any "the host contains a
+    /// dot" heuristic. `RedactedUrl::new` is applied to arbitrary values including cargo registry
+    /// alias names (`deps-cargo`'s `parser.rs`), so mangling these would be user-visible on every
+    /// request for anyone on a non-default port.
+    #[test]
+    fn test_redact_userinfo_unparseable_host_port_registry_strings_are_not_over_redacted() {
+        for raw in [
+            "nexus.corp:8081/repo/lib@2.0.0",
+            "registry.corp:4873/@scope/pkg",
+            "localhost:8080/@types/node",
+            "gitlab.corp:8443/repo/pkg@1.0.0",
+        ] {
+            assert_eq!(redact_userinfo(raw), raw, "raw={raw:?}");
+        }
+    }
+
+    /// impl-critic M3 (completeness_check), resolved as a side effect of code-review Finding 2:
+    /// an IPv6 host with a malformed (non-numeric) port used to be over-redacted, because
+    /// `bounded_has_credential_colon` saw `[::1]` itself as containing further `:`s (no
+    /// bracket-adjacent carve-out) and triggered the widened scan. Now that
+    /// `bounded_has_credential_colon` strips a leading bracket and its port-separator colon
+    /// unconditionally — matching `redact_colon_credential`'s own bracket-adjacent carve-out,
+    /// which never redacts that colon regardless of what follows it either — this stays a no-op
+    /// like the well-formed-port case, not just the previously-accepted over-redaction.
+    #[test]
+    fn test_redact_userinfo_unparseable_ipv6_malformed_port_is_noop() {
+        assert_eq!(
+            redact_userinfo("https://[::1]:notaport/x@y"),
+            "https://[::1]:notaport/x@y"
+        );
+    }
+
+    /// impl-critic M4 (completeness_check, pre-existing HEAD behavior, not a regression): a
+    /// single-letter username immediately followed by `:/` is indistinguishable from a Windows
+    /// drive-letter prefix (`colon_is_drive_letter`'s shape), so `a:/b@evil` is treated as a
+    /// drive-letter path and left unredacted. Contrived (a one-character username with a
+    /// `/`-leading password), pinned here so the trade-off doesn't silently change.
+    #[test]
+    fn test_redact_userinfo_opaque_path_single_letter_username_matches_drive_letter_shape() {
+        assert_eq!(redact_userinfo("c:/a:/b@evil"), "c:/a:/b@evil");
     }
 
     /// #756 C1 regression: a `HttpCache`/`GithubTagsClient` outbound-request chokepoint must
