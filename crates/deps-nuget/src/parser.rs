@@ -132,10 +132,10 @@ fn parse_package_element(
     let name = name?;
     let name_range = span_to_range(content, line_table, name_span);
     // An empty `version=""` attribute must degrade to "no requirement" like a `$(...)`
-    // MSBuild property reference does — left unguarded, it gets wrapped into the
-    // syntactically valid but bogus exact pin `"[]"` (parses as version `0.0.0.0`), which
-    // silently disguises "no version" as a real, always-unsatisfiable requirement instead
-    // of being skipped by the empty-`VersionReq` guards downstream.
+    // MSBuild property reference does — left unguarded, it gets wrapped into `"[]"`, which
+    // `crate::version::parse_range` now rejects as malformed (#821) rather than treating it
+    // as an exact pin — but wrapping it at all would still turn "no version" into a
+    // requirement string instead of being skipped by the empty-`VersionReq` guards downstream.
     let (version_requirement, version_range) = match version {
         Some(v) if !v.trim().is_empty() && !v.contains("$(") => (
             Some(format!("[{}]", v.trim())),

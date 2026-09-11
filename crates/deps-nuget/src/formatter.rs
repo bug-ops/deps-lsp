@@ -152,12 +152,14 @@ impl RequirementResolution for NuGetFormatter {
     }
 
     /// M3: an unexpanded MSBuild property reference (`$(PropertyName)`) inside a version
-    /// string — most commonly `[$(MinVersion),$(MaxVersion))`, which parses to a `Bounded`
-    /// interval whose min/max both fall back to `0.0.0` (a fail-safe floor, not an error),
-    /// but then rejects every real candidate as out of range. A bare `$(X)` (unbracketed) is
-    /// already fail-safe via that same floor fallback and needs no guard; the bracketed form
-    /// does not. Mirrors Maven's `${property}` / Gradle's `$var`/`${var}` unresolved-variable
-    /// guards.
+    /// string — most commonly `[$(MinVersion),$(MaxVersion))`. `crate::version::parse_range`
+    /// now rejects this bracketed form outright (#821: `$(...)`'s parentheses trip the shared
+    /// grammar's nested-bracket guard), which `compile_requirement` alone would already treat
+    /// as undecidable — but without this guard, `requirement_status` would classify it as a
+    /// generic malformed requirement instead of the more specific `Unresolved` status, losing
+    /// the "not yet expanded, skip the check" diagnostic distinction. A bare `$(X)`
+    /// (unbracketed) has no such bracket to trip a guard and needs this classification too.
+    /// Mirrors Maven's `${property}` / Gradle's `$var`/`${var}` unresolved-variable guards.
     fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
         requirement.as_str().contains("$(")
     }
@@ -466,6 +468,21 @@ mod tests {
         );
     }
 
+    /// #821: `compile_requirement` must classify these as undecidable (no diagnostic), the
+    /// same treatment Maven/Gradle already give them, instead of the previous behavior where
+    /// `crate::version::parse_range`'s independent, less-hardened grammar silently accepted
+    /// them and made every candidate compare as satisfied.
+    #[test]
+    fn test_compile_requirement_rejects_all_malformed_interval_shapes() {
+        let f = NuGetFormatter;
+        for malformed in ["[[1.0,2.0)", "[1.0,2.0,3.0]", "(1.0)", "[]", "[1.0,2.0)]"] {
+            assert!(
+                f.compile_requirement(&VersionReq::new(malformed)).is_none(),
+                "expected {malformed:?} to be undecidable"
+            );
+        }
+    }
+
     #[test]
     fn test_compile_requirement_malformed_floating_pattern_returns_none() {
         let f = NuGetFormatter;
@@ -474,9 +491,11 @@ mod tests {
         assert!(f.compile_requirement(&VersionReq::new("1.*.0")).is_none());
     }
 
-    /// M3: a bracketed MSBuild property reference parses as a `Bounded` 0.0.0-0.0.0
-    /// interval that rejects every real candidate — must be treated as unresolved, not
-    /// checked against `available`.
+    /// M3: a bracketed MSBuild property reference must be classified as unresolved, not
+    /// left to fall through as a generic malformed/undecidable requirement (#821:
+    /// `crate::version::parse_range` now rejects this shape outright via the shared
+    /// nested-bracket guard, since it never resolves and should never be checked against
+    /// `available`).
     #[test]
     fn test_requirement_is_unresolved_bracketed_msbuild_property() {
         let f = NuGetFormatter;

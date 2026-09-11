@@ -1,5 +1,4 @@
-//! Shared bracket-interval version range parsing, used by both `deps-maven` and
-//! `deps-gradle`.
+//! Bracket-interval version range parsing, used by both `deps-maven` and `deps-gradle`.
 //!
 //! Maven and Gradle both express a single version range as a bracket interval
 //! (`[1.0,2.0)`, `[1.0]`, `[1.5,)`, `(,2.0]`). Gradle additionally accepts a
@@ -15,176 +14,29 @@
 //! parsing would misorder bounds like `[1.0-beta,2.0-rc)` — and normalizes a missing trailing
 //! segment as zero, so a bound and the version it is checked against need not share the same
 //! segment count (`[1.0]` matches `1.0.0`).
+//!
+//! The bracket-interval *grammar* itself (delimiter parsing, the three malformed-input
+//! rejection guards) is shared with `deps-nuget` via [`deps_core::interval`] (#821) — this
+//! module now only supplies Maven's raw-string bound type and its qualifier-aware comparator.
 
-use crate::version::compare_versions_for_range;
-use std::cmp::Ordering;
+pub use deps_core::interval::BracketStyle;
 
-/// A single parsed bracket interval, e.g. `[1.0,2.0)` or `[1.0]`.
-#[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum VersionRange {
-    /// `[1.0]` — matches only that exact version.
-    Exact(String),
-    /// `[1.5,)` / `(1.5,)` — an open-ended lower bound.
-    Minimum {
-        /// The lower bound version.
-        version: String,
-        /// Whether `version` itself is included in the range.
-        inclusive: bool,
-    },
-    /// `(,2.0]` / `(,2.0)` — an open-ended upper bound.
-    Maximum {
-        /// The upper bound version.
-        version: String,
-        /// Whether `version` itself is included in the range.
-        inclusive: bool,
-    },
-    /// `[1.0,2.0)` — both bounds present.
-    Bounded {
-        /// The lower bound version.
-        min: String,
-        /// Whether `min` itself is included in the range.
-        min_inclusive: bool,
-        /// The upper bound version.
-        max: String,
-        /// Whether `max` itself is included in the range.
-        max_inclusive: bool,
-    },
-}
-
-/// Selects the delimiter grammar [`parse_interval`] accepts.
-///
-/// `Standard` is Maven's grammar: `[`/`]` are inclusive, `(`/`)` are
-/// exclusive, and no character serves as both an opener and a closer.
-/// `AllowReversed` adds Gradle's reversed-bracket exclusive notation on top:
-/// a leading `]` or trailing `[` is also accepted as an exclusive bound
-/// (`]1.2,1.5]`, `[1.1,2.0[`).
-// Exhaustive: 2-variant grammar selector (Standard/AllowReversed) fixed by `parse_interval`'s
-// call sites (issue #769).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BracketStyle {
-    /// Maven's grammar: `[`/`]` inclusive, `(`/`)` exclusive only.
-    Standard,
-    /// `Standard` plus Gradle's reversed-bracket exclusive notation (`]`/`[`).
-    AllowReversed,
-}
+/// A single parsed bracket interval, e.g. `[1.0,2.0)` or `[1.0]`, with Maven's raw-string
+/// bound representation (comparison happens later, via `compare_versions_for_range`).
+pub type VersionRange = deps_core::interval::VersionRange<String>;
 
 /// Parses one bracketed interval under the given [`BracketStyle`].
 ///
-/// Returns `None` for anything that isn't a well-formed `[`/`(`/`]` ... `]`/`)`/`[`
-/// interval: unbalanced delimiters, a single character that cannot serve as both
-/// delimiters, empty bounds on both sides, a stray bracket character nested inside
-/// the bounds (e.g. `[[1.0,2.0)`, `[1.0,2.0)]`), a third comma-separated component
-/// (`[1.0,2.0,3.0]`), or a no-comma body whose delimiters aren't the matching
-/// inclusive pair `[...]` (`[1.0)`, `(1.0]` — neither grammar has a reversed-bracket
-/// exact-pin form). Callers treat an unparseable interval as satisfying nothing
-/// rather than panicking.
-// `first`/`last` are `chars()` ends sliced at `len_utf8`, and the explicit length guard
-// above prevents `start > end`, so the slice bound is always a char boundary.
-#[allow(clippy::string_slice)]
+/// See [`deps_core::interval::parse_interval`] for the exact grammar and rejection rules.
 pub fn parse_interval(s: &str, style: BracketStyle) -> Option<VersionRange> {
-    let s = s.trim();
-    let first = s.chars().next()?;
-    let min_inclusive = match (first, style) {
-        ('[', _) => true,
-        ('(', _) => false,
-        (']', BracketStyle::AllowReversed) => false,
-        _ => return None,
-    };
-    let last = s.chars().next_back()?;
-    let max_inclusive = match (last, style) {
-        (']', _) => true,
-        (')', _) => false,
-        ('[', BracketStyle::AllowReversed) => false,
-        _ => return None,
-    };
-
-    // A single character cannot be both delimiters; without this the slice below
-    // would have start > end (AllowReversed makes `[` and `]` valid on both sides).
-    if s.len() < first.len_utf8() + last.len_utf8() {
-        return None;
-    }
-
-    let inner = &s[first.len_utf8()..s.len() - last.len_utf8()];
-
-    if inner.contains(['[', ']', '(', ')']) {
-        return None;
-    }
-
-    if let Some((lo, hi)) = inner.split_once(',') {
-        if hi.contains(',') {
-            return None;
-        }
-        let lo = lo.trim();
-        let hi = hi.trim();
-        let min = (!lo.is_empty()).then(|| lo.to_string());
-        let max = (!hi.is_empty()).then(|| hi.to_string());
-        match (min, max) {
-            (Some(min), Some(max)) => Some(VersionRange::Bounded {
-                min,
-                min_inclusive,
-                max,
-                max_inclusive,
-            }),
-            (Some(version), None) => Some(VersionRange::Minimum {
-                version,
-                inclusive: min_inclusive,
-            }),
-            (None, Some(version)) => Some(VersionRange::Maximum {
-                version,
-                inclusive: max_inclusive,
-            }),
-            (None, None) => None,
-        }
-    } else {
-        let inner = inner.trim();
-        (!inner.is_empty() && min_inclusive && max_inclusive)
-            .then(|| VersionRange::Exact(inner.to_string()))
-    }
-}
-
-fn satisfies_min(v: &str, min: &str, inclusive: bool) -> bool {
-    let ord = compare_versions_for_range(v, min);
-    if inclusive {
-        ord != Ordering::Less
-    } else {
-        ord == Ordering::Greater
-    }
-}
-
-fn satisfies_max(v: &str, max: &str, inclusive: bool) -> bool {
-    let ord = compare_versions_for_range(v, max);
-    if inclusive {
-        ord != Ordering::Greater
-    } else {
-        ord == Ordering::Less
-    }
+    deps_core::interval::parse_interval(s, style, |bound| Some(bound.to_string()))
 }
 
 /// Whether `version` falls inside the parsed interval `range`.
 pub fn contains(version: &str, range: &VersionRange) -> bool {
-    match range {
-        VersionRange::Exact(target) => {
-            compare_versions_for_range(version, target) == Ordering::Equal
-        }
-        VersionRange::Minimum {
-            version: min,
-            inclusive,
-        } => satisfies_min(version, min, *inclusive),
-        VersionRange::Maximum {
-            version: max,
-            inclusive,
-        } => satisfies_max(version, max, *inclusive),
-        VersionRange::Bounded {
-            min,
-            min_inclusive,
-            max,
-            max_inclusive,
-        } => {
-            satisfies_min(version, min, *min_inclusive)
-                && satisfies_max(version, max, *max_inclusive)
-        }
-    }
+    deps_core::interval::contains(version, range, |a, b| {
+        crate::version::compare_versions_for_range(a, b)
+    })
 }
 
 #[cfg(test)]
