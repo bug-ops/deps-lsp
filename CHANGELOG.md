@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `specs/`: reconciled `MOC-specs.md` against actual issue/PR state — stale "draft" spec rows marked shipped with their PR/issue references, all shipped specs moved into a "Completed Specs" section, and `specs/constitution.md` added (resolves #855) (#867)
 
 ### Fixed
+- **deps-core**: `net_policy::redact_authority_suffix` now redacts a colon-only credential sitting in the window between two already-masked `@`-shaped decoys instead of emitting it verbatim (resolves #886) (#890)
 - **deps-core**: fixed O(N^2) hover/diagnostics/completion latency on manifests with a dependency value on a non-ASCII line (resolves #882) (#888)
 - **deps-core**: `net_policy::redact_userinfo` now redacts token-prefixed username-only credentials in opaque-path values (resolves #858) (#889)
 - **deps-core**: `net_policy`'s credential-redaction fallback (`redact_authority_suffix`/`redact_colon_credential`) now keeps scanning past an already-masked `@`-shaped or colon-only credential instead of stopping at the first match, closing three leak gaps with no `O(n²)` regression (resolves #870, #873, #874) (#881); #875 remains open as a separate, narrower residual gap.
