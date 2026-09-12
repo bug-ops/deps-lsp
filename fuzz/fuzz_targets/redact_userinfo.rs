@@ -34,11 +34,13 @@
 //!     guard entirely. This is the differential-fuzz coverage #860's own issue body named as a
 //!     precondition for merging (an impl-critic review found the initial implementation skipped
 //!     it and, empirically, net-increased leakage over `main`): the fuzzed "decoration" here is
-//!     drawn from `[`/`]`/`/` only (never `:`, so it can only add bracket/slash noise around a
-//!     scanner-controlled, always-present colon — never inject an uncontrolled one that could
-//!     itself swallow the sentinel through the general, pre-existing "mask stops at the next
-//!     path separator" limitation every colon-based match in this file has, in or out of a
-//!     bracket, and which is out of scope for #860/#857 to fix).
+//!     drawn from `[`/`]`/`/`/`@` only (never `:`, so it can only add bracket/slash/`@` noise
+//!     around a scanner-controlled, always-present colon — never inject an uncontrolled one that
+//!     could itself swallow the sentinel through the general, pre-existing "mask stops at the
+//!     next path separator" limitation every colon-based match in this file has, in or out of a
+//!     bracket, and which is out of scope for #860/#857 to fix). `@` was added to this alphabet by
+//!     #869's fix, so the `mask_at`-tail family it closed (a second, independent colon-credential
+//!     sitting in the tail after the chosen `@`) is fuzz-covered going forward.
 
 #![no_main]
 
@@ -68,13 +70,13 @@ fn tail_from(data: &[u8]) -> String {
     tail.replace(SENTINEL, "")
 }
 
-/// Bracket/slash-only "decoration" for invariant (c) — see this file's own module doc comment
-/// for why `:` is deliberately excluded from this alphabet (it must never be the fuzzer, rather
-/// than a fixed template literal, that introduces the one colon each template's assertion
-/// depends on).
+/// Bracket/slash/`@` "decoration" for invariant (c) — see this file's own module doc comment for
+/// why `:` is deliberately excluded from this alphabet (it must never be the fuzzer, rather than
+/// a fixed template literal, that introduces the one colon each template's assertion depends on).
+/// `@` was added by #869 so this decoration can reach `mask_at`'s tail-redaction path too.
 fn bracket_decoration(data: &[u8]) -> String {
     data.iter()
-        .filter(|b| matches!(b, b'[' | b']' | b'/'))
+        .filter(|b| matches!(b, b'[' | b']' | b'/' | b'@'))
         .take(8)
         .map(|&b| b as char)
         .collect()
