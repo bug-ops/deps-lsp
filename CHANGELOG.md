@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `specs/`: reconciled `MOC-specs.md` against actual issue/PR state — stale "draft" spec rows marked shipped with their PR/issue references, all shipped specs moved into a "Completed Specs" section, and `specs/constitution.md` added (resolves #855) (#867)
 
 ### Fixed
+- **deps-core**: `net_policy::redact_userinfo` now fully redacts an `@` embedded inside a password for opaque-path (`scheme:/path`) values, closing a partial credential leak (resolves #859) (#865)
 - `fuzz/redact_userinfo`: fixed a false-positive crash where the fuzzer-controlled host/port tail could coincidentally reproduce the sentinel literal, tripping the leak assertion outside any credential; no `net_policy` behavior change (#864)
 - **deps-core**: `net_policy`'s bracketed-IPv6-host carve-out no longer silently exempts a credential sitting next to a `[...]` host literal (resolves #860)
 - **deps-core**: `redact_userinfo`'s opaque-path fallback no longer disables credential redaction for an unrelated `@` elsewhere in the value (resolves #857)
