@@ -2,7 +2,7 @@
 //! parse-independent textual scanners `redact_userinfo`/`url_for_tracing` fall back to
 //! whenever `Url::parse` fails outright or produces a cannot-be-a-base/no-host result.
 //!
-//! Two invariants:
+//! Four invariants:
 //! (a) valid-UTF-8 input never panics `redact_userinfo`/`url_for_tracing` (guards every
 //!     `#[allow(clippy::string_slice)]` slice-bound reasoning in `net_policy.rs`) — non-UTF-8
 //!     bytes are skipped (`str::from_utf8` guard), not exercised, so this invariant does not
@@ -21,13 +21,20 @@
 //! avoids both a corrupted structure and re-fuzzing an already-accepted gap; it fuzzes only the
 //! part outside either concern.
 //!
-//! Deliberately excluded from invariant (b): `OpaquePath`-shaped inputs (`scheme:/path`).
-//! `RegionKind::OpaquePath` has one remaining known, tracked leak class (S4 `#858`, a
-//! username-only credential with no password) that would make this invariant red on day one for
-//! a gap this target isn't meant to prove; it is pinned instead as an `#[ignore]`d regression
-//! test in `net_policy.rs`. S5 (`#859`, an `@` inside the password) is fixed — no longer
-//! excluded for that reason, but `OpaquePath` inputs remain out of scope for this target
-//! regardless, since #858 alone still breaks the invariant.
+//! Still excluded from invariant (b): `OpaquePath`-shaped inputs (`scheme:/path`) whose
+//! credential is a username-only value (no password) that `find_token_prefix_at` in
+//! `net_policy.rs` does not recognize — either genuinely unprefixed (`c:/hunter2@evil`) or
+//! token-prefixed but not at that function's own `/`/`?`/`#`/`\` segment-start boundary
+//! (`c:/a;ghp_TOKEN@evil`, where `;` is a legitimate RFC 3986 path-parameter separator, not one
+//! of those boundary characters) — both stay unredacted by design (#858, S4's residual gap; see
+//! `redact_credential`'s own doc comment, C1, and `find_token_prefix_at`'s own doc for the
+//! precise, canonical statement of which shapes qualify) and would make this invariant red on
+//! day one for a gap this target isn't meant to prove — the residual is broader than "unprefixed
+//! only", so do not re-enable this invariant for `OpaquePath` just because unprefixed values are
+//! handled. S5 (`#859`, an `@` inside the password) is fixed, and S4's segment-start-prefixed
+//! case is now fixed too (#858) — see invariant (d) below, which fuzzes exactly that narrower
+//! case with the sentinel given a real token prefix at a real segment start, so it stays in
+//! scope.
 //!
 //! (c) a credential is never left unredacted across the bracket/colon delimiter space #860/#857
 //!     rewrote — for *both* `RegionKind`s, since #857 removed `OpaquePath`'s special-cased
@@ -41,6 +48,16 @@
 //!     bracket, and which is out of scope for #860/#857 to fix). `@` was added to this alphabet by
 //!     #869's fix, so the `mask_at`-tail family it closed (a second, independent colon-credential
 //!     sitting in the tail after the chosen `@`) is fuzz-covered going forward.
+//!
+//! (d) a token-prefixed `OpaquePath` username-only credential (no password) is never left
+//!     unredacted (#858, S4's fix): the sentinel itself is given a fixed, real token prefix
+//!     (`ghp_`) so it can only be recognized via the prefix, never coincidentally via a colon —
+//!     the fuzzed part is the `scheme:` and separator noise preceding it, drawn from the same
+//!     bracket/slash alphabet as invariant (c) plus a handful of `OpaquePath`-eligible schemes. A
+//!     literal `/` always separates that noise from the credential itself, since the fix's own
+//!     contract requires the credential's segment to *start* with a known prefix — decoration
+//!     glued directly onto it with no boundary in between is a documented non-match, not a leak
+//!     this invariant is meant to catch.
 
 #![no_main]
 
@@ -150,6 +167,33 @@ fuzz_target!(|data: &[u8]| {
         format!("file:///home/u{deco}[x]/gitlab-ci-token:{SENTINEL}"),
     ];
     for input in bracket_variants {
+        let redacted = redact_userinfo(&input);
+        assert!(
+            !redacted.contains(SENTINEL),
+            "credential leaked: input={input:?} output={redacted:?}"
+        );
+    }
+
+    // Invariant (d): the sentinel always carries a real token prefix (`ghp_`) so it can only be
+    // recognized via `find_token_prefix_at`'s prefix check, never a coincidental colon (there is
+    // deliberately no `:` anywhere in these templates); only the `OpaquePath`-eligible scheme and
+    // the bracket/slash noise preceding the credential vary. A literal `/` always separates
+    // `deco` from the credential itself: `find_token_prefix_at` requires the credential's own
+    // segment to *start* with a known prefix, so decoration glued directly onto the credential
+    // with no boundary between them is a documented non-match, not a leak this invariant covers
+    // (see that function's own doc comment and its `TOKEN_PREFIXES` const). A fixed `x` also
+    // always separates the scheme's own `/` from `deco`: `c:/` has only one literal slash, so a
+    // `deco` that itself starts with `/` could otherwise combine with it into `c://`, which
+    // `Url::parse` treats as authority-having (empty host) rather than `OpaquePath` — a
+    // pre-existing, unrelated gap (see the #858 security audit's "NEW FINDING"), not what this
+    // invariant is scoped to cover.
+    let token_credential = format!("ghp_{SENTINEL}");
+    let opaque_variants = [
+        format!("c:/x{deco}/{token_credential}@evil"),
+        format!("file:///x{deco}/{token_credential}@evil"),
+        format!("nuget:///x{deco}/{token_credential}@feed.corp/v3"),
+    ];
+    for input in opaque_variants {
         let redacted = redact_userinfo(&input);
         assert!(
             !redacted.contains(SENTINEL),

@@ -683,6 +683,117 @@ fn find_credential_at(region: &str) -> Option<usize> {
     found
 }
 
+/// Case-sensitive prefixes of well-known API-token/secret formats (GitHub, GitLab, npm, PyPI,
+/// Slack, AWS, Stripe-style, Google, DigitalOcean, HashiCorp Vault, Shopify, Figma, Docker, and
+/// other common cloud-key shapes), used as [`find_token_prefix_at`]'s only discriminator for an
+/// `OpaquePath` credential that has no password and so is not colon-shaped enough for
+/// [`find_credential_at`] to recognize (#858). Not exhaustive in either direction: it neither
+/// covers every real token format (see [`find_token_prefix_at`]'s own doc for exactly which
+/// segment shapes it does and doesn't catch — a prefix not at that function's own segment-start
+/// boundary still goes unrecognized, not just an unprefixed username), nor is it free of false
+/// positives on ordinary text (`sk-` in particular is loose enough to match an unrelated
+/// `pkg@1.0.0` name like `sk-lang@2.0.0`) — accepted, consistent with this module's broader
+/// over-redaction-over-leaking trade (see [`redact_colon_credential`]'s own doc comment for the
+/// same trade made elsewhere in this file).
+const TOKEN_PREFIXES: &[&str] = &[
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "ghr_",
+    "github_pat_",
+    "glpat-",
+    "gldt-",
+    "glrt-",
+    "glsoat-",
+    "glptt-",
+    "gloas-",
+    "npm_",
+    "pypi-",
+    "xoxb-",
+    "xoxp-",
+    "xoxa-",
+    "xoxo-",
+    "xoxs-",
+    "xoxr-",
+    "AKIA",
+    "ASIA",
+    "ABIA",
+    "ACCA",
+    "sk-",
+    "sk_live_",
+    "rk_live_",
+    "pk_live_",
+    "AIza",
+    "ya29.",
+    "dop_v1_",
+    "dor_v1_",
+    "doo_v1_",
+    "hvs.",
+    "hvb.",
+    "shpat_",
+    "shpss_",
+    "shpca_",
+    "shppa_",
+    "figd_",
+    "dckr_pat_",
+    "AKCp",
+];
+
+/// [`find_credential_at`]'s fallback for [`RegionKind::OpaquePath`] (#858, S4): finds a `@` whose
+/// own `/`/`?`/`#`/`\`-delimited segment *starts with* one of [`TOKEN_PREFIXES`] — a
+/// username-only credential with no password, which has no `:` and so is invisible to
+/// [`find_credential_at`]'s colon-shape check. This is the precise, canonical statement of the
+/// carve-out's rule — anything else in this module referring to it should defer to this doc
+/// rather than restate it, since "starts with" (not merely "contains") is what actually bounds
+/// the false-positive population: a token prefix sitting anywhere *other than* a segment's own
+/// start (e.g. `c:/a;ghp_TOKEN@evil`, where `;` is a legitimate RFC 3986 path-parameter
+/// separator, not one of this function's boundary characters) still goes unrecognized and is not
+/// covered by this carve-out — see [`redact_credential`]'s own doc comment, C1, for the fuller
+/// picture of what remains unredacted. Only ever called when [`find_credential_at`] already
+/// returned `None` (see [`redact_credential`]'s `OpaquePath` branch), so this can only widen what
+/// gets redacted, never override a colon-shaped match.
+///
+/// A single forward pass over `region`, tracking only the current segment's start — unlike
+/// [`find_credential_at`]'s per-`@` backward rescan of its own segment, this doesn't need one,
+/// since a token prefix is a property of the segment's own start, not something that requires
+/// looking back past earlier `@`s once a boundary has reset `seg_start`. Verified equivalent to,
+/// and measurably faster than, a per-`@` `rfind` alternative over a 400k-input randomized corpus
+/// (#858 security audit).
+///
+/// Returns the *last* qualifying `@`, matching [`find_credential_at`]'s own last-match
+/// convention, so a decoy `@` segment following the real credential still resolves to the
+/// earlier, genuinely token-prefixed one rather than stopping at the first candidate.
+///
+/// Treats `\` as a segment boundary, unlike [`extend_credential_at`], which deliberately does
+/// not (see that function's own doc comment for why). The asymmetry is safe today — both
+/// directions only ever widen what gets redacted — but is undocumented anywhere else, so a future
+/// "unify the boundary sets" cleanup should know it would change behavior for `c:\ghp_X@evil`
+/// before doing so.
+// `i`/`seg_start` come from `enumerate()` over `region.bytes()` and ASCII byte-literal matches
+// against '@'/'/'/'?'/'#'/'\\', so every slice bound stays a char boundary.
+#[allow(clippy::string_slice)]
+fn find_token_prefix_at(region: &str) -> Option<usize> {
+    let mut seg_start = 0;
+    let mut found = None;
+    for (i, b) in region.bytes().enumerate() {
+        match b {
+            b'@' => {
+                if TOKEN_PREFIXES
+                    .iter()
+                    .any(|p| region[seg_start..i].starts_with(p))
+                {
+                    found = Some(i);
+                }
+                seg_start = i + 1;
+            }
+            b'/' | b'?' | b'#' | b'\\' => seg_start = i + 1,
+            _ => {}
+        }
+    }
+    found
+}
+
 /// Widens a credential-shaped `@` found by [`find_credential_at`] forward across any further `@`
 /// in `region` that is not separated from it by a `/`, `?`, or `#` (#859) — the `OpaquePath`
 /// counterpart to [`RegionKind::Authority`]'s own last-`@`-*overall*-wins bounded pass, needed
@@ -1019,9 +1130,11 @@ fn host_boundary_scheme_aware(region: &str) -> usize {
 /// ([`host_boundary_scheme_aware`]) for a further nested credential rather than trusting the
 /// first bounded match (#862) — see that function's own doc comment for its full algorithm.
 /// [`RegionKind::OpaquePath`] skips straight to the shared tail: [`find_credential_at`] on the
-/// whole `region`, masking with `***@` on `Some`, falling through unconditionally to
-/// [`redact_colon_credential`] on `None` (#810/#818) — see "Coverage per `RegionKind`" below,
-/// class S3/#857, for why `OpaquePath` no longer special-cases this fallthrough.
+/// whole `region`, falling back to [`find_token_prefix_at`] when that finds nothing (#858),
+/// masking with `***@` on `Some` from either, falling through unconditionally to
+/// [`redact_colon_credential`] only when both return `None` (#810/#818) — see "Coverage per
+/// `RegionKind`" below, class S3/#857, for why `OpaquePath` no longer special-cases this
+/// fallthrough.
 ///
 /// # Coverage per `RegionKind`
 ///
@@ -1029,10 +1142,24 @@ fn host_boundary_scheme_aware(region: &str) -> usize {
 /// (S4, #858) — a class PR #845 fixed on the `Authority` side only, tracked under the parent
 /// issue #856, with an `OpaquePath`-side follow-up filed rather than fixed here:
 ///
-/// - Username-only userinfo with no password (`ghp_TOKEN@github.com`) — **`Authority` only**
-///   (C1). The bounded `@` pass never shape-checks, so a bare username redacts correctly; the
-///   `OpaquePath` twin (`c:/ghp_TOKEN@evil`) has no authority span to license that and stays
-///   unredacted. See #858 (S4) — no known fix short of ecosystem-specific token-prefix sniffing.
+/// - Username-only userinfo with no password (`ghp_TOKEN@github.com`) — **`Authority` only**,
+///   with one narrower exception on `OpaquePath` (C1). The bounded `@` pass never shape-checks,
+///   so a bare username redacts correctly on `Authority` regardless of its shape; the
+///   `OpaquePath` twin only redacts when [`find_token_prefix_at`] recognizes the username's own
+///   segment as *starting with* one of [`TOKEN_PREFIXES`] (`c:/ghp_TOKEN@evil` → `c:***@evil`,
+///   #858, S4) — see that function's own doc comment for the precise, canonical statement of
+///   which shapes qualify. An unprefixed username-only credential (`c:/hunter2@evil`) still has
+///   no authority span to license unconditional redaction and stays unredacted, by design: there
+///   is no discriminator that distinguishes it from an ordinary path segment without
+///   ecosystem-specific token-prefix sniffing. A *prefixed* one can still leak too, though, when
+///   the prefix isn't at a `/`/`?`/`#`/`\` segment start (`c:/a;ghp_TOKEN@evil` — `;` is a
+///   legitimate RFC 3986 path-parameter separator, not one of those boundary characters) — the
+///   residual gap this carve-out leaves is broader than "unprefixed only". A token-prefixed
+///   credential sitting in `mask_at`'s tail, past an already-masked colon-shaped credential, also
+///   still leaks (`c:/user:pw@evil/ghp_BBB@evil2` → `c:***@evil/ghp_BBB@evil2`) — pre-existing,
+///   byte-identical to `main`, not a regression: [`redact_secondary_colon_credential`]/
+///   [`redact_further_credential`] have no prefix awareness of their own, and wiring one in was
+///   the audit's rejected #875-adjacent approach (19 new leaks elsewhere).
 ///
 /// `OpaquePath` used to additionally disable the [`redact_colon_credential`] fallback outright
 /// (first for *any* `@` in the region, later — #857's own first pass — narrowed to only a
@@ -1091,7 +1218,7 @@ fn redact_credential(raw: &str, start: usize, kind: RegionKind) -> String {
             redact_secondary_colon_credential(&region[at + 1..])
         )
     };
-    match find_credential_at(region) {
+    match find_credential_at(region).or_else(|| find_token_prefix_at(region)) {
         Some(at) => mask_at(extend_credential_at(region, at)),
         None => redact_colon_credential(raw, start, region),
     }
@@ -3014,17 +3141,95 @@ mod tests {
         assert_eq!(redacted, "***@host:***/x");
     }
 
-    /// #846 S4 (tracked at #858): `OpaquePath` has no authority span to license the
+    /// #846 S4 (fixed by #858): `OpaquePath` has no authority span to license the
     /// `Authority`-only unconditional bounded `@` pass, so a username-only credential (no
-    /// password) is not credential-shaped by [`find_credential_at`]'s own rules and passes
-    /// through unredacted — unlike its `Authority` twin, pinned by
-    /// `test_redact_userinfo_unparseable_username_only_userinfo_is_redacted` above. No known fix
-    /// short of ecosystem-specific token-prefix sniffing (`ghp_`, `glpat-`); remove `#[ignore]`
-    /// once #858 lands a fix.
+    /// password) is not credential-shaped by [`find_credential_at`]'s own rules — but a
+    /// token-prefixed one is now caught by [`find_token_prefix_at`], matching its `Authority`
+    /// twin, pinned by `test_redact_userinfo_unparseable_username_only_userinfo_is_redacted`
+    /// above.
     #[test]
-    #[ignore = "S4: known OpaquePath username-only credential leak, see #858"]
     fn test_redact_userinfo_opaque_path_username_only_credential_is_redacted() {
         assert_eq!(redact_userinfo("c:/ghp_TOKEN@evil"), "c:***@evil");
+    }
+
+    /// #858 companion: a token-prefixed username-only credential is redacted regardless of which
+    /// `OpaquePath`-eligible scheme precedes it.
+    #[test]
+    fn test_redact_userinfo_opaque_path_token_prefix_credential_is_redacted_nuget() {
+        assert_eq!(
+            redact_userinfo("nuget:///glpat-SECRET@feed.corp/v3"),
+            "nuget:***@feed.corp/v3"
+        );
+    }
+
+    /// #858 companion: same as above for a `file:///` scheme and a GitHub PAT prefix.
+    #[test]
+    fn test_redact_userinfo_opaque_path_token_prefix_credential_is_redacted_file() {
+        assert_eq!(redact_userinfo("file:///ghp_TOKEN@evil"), "file:***@evil");
+    }
+
+    /// #858 required no-op pins: [`find_token_prefix_at`] must not fire on an unprefixed
+    /// username, even one that superficially resembles a credential (an email-shaped path
+    /// segment, a bare `@scope`) — these stay unredacted by design (see [`redact_credential`]'s
+    /// own doc comment, C1).
+    #[test]
+    fn test_redact_userinfo_opaque_path_token_prefix_no_op_windows_path() {
+        assert_eq!(
+            redact_userinfo("file:///C:/Users/john.doe@corp/project"),
+            "file:///C:/Users/john.doe@corp/project"
+        );
+    }
+
+    #[test]
+    fn test_redact_userinfo_opaque_path_token_prefix_no_op_bare_scope() {
+        assert_eq!(redact_userinfo("c:///@scope/pkg"), "c:///@scope/pkg");
+    }
+
+    #[test]
+    fn test_redact_userinfo_opaque_path_token_prefix_no_op_unprefixed_username() {
+        assert_eq!(
+            redact_userinfo("file:///home/user@example/file"),
+            "file:///home/user@example/file"
+        );
+    }
+
+    /// impl-critic F4.1: pins [`find_token_prefix_at`]'s `starts_with` (not `contains`) rule —
+    /// the one property that keeps its false-positive population bounded. A leading `x` right
+    /// before the token prefix, with no `/`/`?`/`#`/`\` boundary between them, must not match.
+    #[test]
+    fn test_redact_userinfo_opaque_path_token_prefix_requires_segment_start() {
+        assert_eq!(redact_userinfo("c:/xghp_TOKEN@evil"), "c:/xghp_TOKEN@evil");
+    }
+
+    /// impl-critic F4.2: pins the `None` path — a token-prefixed value with no `@` at all is not
+    /// a credential (nothing follows the username), previously untested.
+    #[test]
+    fn test_redact_userinfo_opaque_path_token_prefix_no_at_sign_is_noop() {
+        assert_eq!(redact_userinfo("c:/ghp_TOKEN"), "c:/ghp_TOKEN");
+    }
+
+    /// impl-critic F4.3: pins [`find_token_prefix_at`]'s stated last-match-wins convention — two
+    /// token-prefixed segments must resolve to the later, real credential/host boundary, not the
+    /// first.
+    #[test]
+    fn test_redact_userinfo_opaque_path_token_prefix_last_match_wins() {
+        assert_eq!(
+            redact_userinfo("c:/ghp_AAA@evil/ghp_BBB@evil2"),
+            "c:***@evil2"
+        );
+    }
+
+    /// impl-critic F4.4/F6: pins the residual gap precisely — a token prefix not at a
+    /// `/`/`?`/`#`/`\` segment start still leaks (`;` is a legitimate RFC 3986 path-parameter
+    /// separator, not one of those boundary characters). This is *not* "unprefixed only"; see
+    /// [`redact_credential`]'s own doc comment, C1, and [`find_token_prefix_at`]'s. Exists so a
+    /// future boundary-set change is forced to notice and update this pin.
+    #[test]
+    fn test_redact_userinfo_opaque_path_token_prefix_not_at_segment_start_is_noop() {
+        assert_eq!(
+            redact_userinfo("c:/a;ghp_TOKEN@evil"),
+            "c:/a;ghp_TOKEN@evil"
+        );
     }
 
     /// #846 S5 (fixed by #859): `OpaquePath` only had [`find_credential_at`]'s
