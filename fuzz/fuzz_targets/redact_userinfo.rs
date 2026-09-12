@@ -58,6 +58,14 @@
 //!     contract requires the credential's segment to *start* with a known prefix — decoration
 //!     glued directly onto it with no boundary in between is a documented non-match, not a leak
 //!     this invariant is meant to catch.
+//!
+//! (e) `Authority`-side twin of (d) (#887): a token-prefixed, colon-less credential sitting past a
+//!     `/` boundary in a `RegionKind::Authority` value that has no nested `://` scheme of its own
+//!     (the region `redact_userinfo_unparseable` anchors on, or a value with no scheme at all)
+//!     must never be left unredacted. `redact_authority_suffix`'s widen branch used to call
+//!     `redact_colon_credential` directly there, which returns its input verbatim once it finds no
+//!     colon at all — so this class leaked in full before #887's fix. As with (d), a literal `/`
+//!     always separates the bracket/slash decoration from the credential's own segment start.
 
 #![no_main]
 
@@ -194,6 +202,24 @@ fuzz_target!(|data: &[u8]| {
         format!("nuget:///x{deco}/{token_credential}@feed.corp/v3"),
     ];
     for input in opaque_variants {
+        let redacted = redact_userinfo(&input);
+        assert!(
+            !redacted.contains(SENTINEL),
+            "credential leaked: input={input:?} output={redacted:?}"
+        );
+    }
+
+    // Invariant (e): `Authority`-side twin of (d) — a token-prefixed credential past a `/`
+    // boundary, reached via `redact_authority_suffix`'s widen branch instead of `OpaquePath`'s
+    // `mask_at`. No `:` anywhere in these templates, matching (d)'s own reasoning; `https://`
+    // gives the outer value a scheme so it anchors through `redact_userinfo_unparseable`, but the
+    // region past it has no further `://` of its own (the #887 repro shape).
+    let authority_variants = [
+        format!("https://[/x{deco}/{token_credential}@evil{tail}"),
+        format!("[/x{deco}/{token_credential}@evil{tail}"),
+        format!("x{deco}/{token_credential}@evil{tail}"),
+    ];
+    for input in authority_variants {
         let redacted = redact_userinfo(&input);
         assert!(
             !redacted.contains(SENTINEL),
