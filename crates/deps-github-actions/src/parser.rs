@@ -21,7 +21,8 @@
 
 use crate::types::{GithubActionsDependency, GithubActionsParseResult, PinStyle};
 use deps_core::lsp_helpers::{
-    CharOffsets, LineOffsetTable, is_full_semver_shape, locate_value_span, warn_rejected_value,
+    LineOffsetTable, is_full_semver_shape, locate_value_span, marker_byte_offset,
+    warn_rejected_value,
 };
 use deps_core::parser::DependencySource;
 use deps_core::{DepsError, Result};
@@ -202,7 +203,11 @@ struct Frame {
 struct UsesCandidate {
     value: String,
     style: TScalarStyle,
-    char_index: usize,
+    /// `yaml-rust2` marker line (1-indexed) and column (0-indexed char count) of the
+    /// scalar — see [`marker_byte_offset`] for why these, not `Marker::index()`, are used
+    /// to resolve the value's byte offset (#879).
+    line: usize,
+    col: usize,
 }
 
 /// Collects every `uses:` value-scalar event, skipping any `uses` key that has a `with:`
@@ -303,7 +308,8 @@ impl MarkedEventReceiver for WorkflowReceiver {
                         self.candidates.push(UsesCandidate {
                             value,
                             style,
-                            char_index: marker.index(),
+                            line: marker.line(),
+                            col: marker.col(),
                         });
                     }
                     self.consume_pending_value();
@@ -327,7 +333,7 @@ impl MarkedEventReceiver for WorkflowReceiver {
 /// Builds a [`GithubActionsDependency`] for one `uses:` candidate, or `None` if its
 /// `owner/repo` prefix does not look like a GitHub identifier (logged and skipped, FR-015).
 // `ref_start`/`ref_end` build on `span_start`, which is char-boundary-aligned in `content` via
-// `CharOffsets::byte_offset` + `locate_value_span` and then re-anchored to the trimmed value
+// `marker_byte_offset` + `locate_value_span` and then re-anchored to the trimmed value
 // (see the trim re-anchoring comment below) — plus `before_at_len`/`ref_text.len()`, both
 // whole-substring byte counts, so the arithmetic never lands mid-character. `token_end` is
 // relative to `content[ref_end..]` and derived from `find('\n')` (ASCII) or `.len()`.
@@ -335,7 +341,6 @@ impl MarkedEventReceiver for WorkflowReceiver {
 fn build_dependency(
     content: &str,
     line_table: &LineOffsetTable,
-    char_offsets: &CharOffsets,
     candidate: UsesCandidate,
 ) -> Option<GithubActionsDependency> {
     // Whether the *whole* `uses:` value scalar was written unquoted. For a quoted scalar,
@@ -346,7 +351,7 @@ fn build_dependency(
     // `TScalarStyle::Plain` gate below for the SHA-with-comment case.
     let is_plain_scalar = candidate.style == TScalarStyle::Plain;
 
-    let value_start = char_offsets.byte_offset(candidate.char_index);
+    let value_start = marker_byte_offset(content, line_table, candidate.line, candidate.col);
     let (raw_start, raw_end) = locate_value_span(content, value_start, &candidate.value)?;
 
     // `classify_uses_value` (and every offset computed below) works over the
@@ -603,7 +608,6 @@ pub fn parse_workflow_yaml(content: &str, uri: &Uri) -> Result<GithubActionsPars
     }
 
     let line_table = LineOffsetTable::new(content);
-    let char_offsets = CharOffsets::new(content);
     // #796: checked before `build_dependency` (the expensive step — SHA/tag resolution
     // setup, range computation) rather than after, so a `uses:` step beyond the ceiling
     // never reaches it.
@@ -612,7 +616,7 @@ pub fn parse_workflow_yaml(content: &str, uri: &Uri) -> Result<GithubActionsPars
         .candidates
         .into_iter()
         .filter(|_| budget.allow())
-        .filter_map(|candidate| build_dependency(content, &line_table, &char_offsets, candidate))
+        .filter_map(|candidate| build_dependency(content, &line_table, candidate))
         .collect();
 
     Ok(GithubActionsParseResult {
@@ -1315,5 +1319,78 @@ mod tests {
             let uri = deps_core::test_util::test_uri(path);
             assert_eq!(is_action_manifest_filename(&uri), expected, "{path}");
         }
+    }
+
+    // --- issue #879: yaml-rust2 block-scalar byte-offset drift ---
+    //
+    // Root cause: yaml-rust2 0.12.0's `Scanner::scan_block_scalar_content_line` advances
+    // `Marker::index()` by a content line's *byte* length, not its *char* count, once its
+    // internal 16-char lookahead buffer refills mid-line — every multi-byte char inside a
+    // block scalar (`|`/`>`) permanently desyncs `index()` for the rest of the document.
+    // These fixtures use content lines long enough (well over 16 chars around the
+    // multi-byte char) to force that refill — the actual trigger condition, not merely
+    // "any non-ASCII char present".
+
+    #[test]
+    fn test_issue_879_literal_block_scalar_multibyte_then_uses_resolves() {
+        let content = "on: push\njobs:\n  build:\n    steps:\n      - run: |\n          echo hello \u{2014} world this line is long enough to force yaml-rust2's scanner buffer to refill mid-line\n      - uses: actions/checkout@v4\n";
+        let result = parse_workflow_yaml(content, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1, "{:?}", result.dependencies);
+        let dep = &result.dependencies[0];
+        assert_eq!(dep.name(), "actions/checkout");
+        assert_eq!(slice(content, dep.name_range), "actions/checkout");
+        assert_eq!(slice(content, dep.version_range().unwrap()), "v4");
+    }
+
+    #[test]
+    fn test_issue_879_folded_block_scalar_multibyte_then_uses_resolves() {
+        let content = "on: push\njobs:\n  build:\n    steps:\n      - run: >\n          echo hello \u{2014} world this line is long enough to force yaml-rust2's scanner buffer to refill mid-line\n      - uses: actions/checkout@v4\n";
+        let result = parse_workflow_yaml(content, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1, "{:?}", result.dependencies);
+        let dep = &result.dependencies[0];
+        assert_eq!(dep.name(), "actions/checkout");
+        assert_eq!(slice(content, dep.version_range().unwrap()), "v4");
+    }
+
+    #[test]
+    fn test_issue_879_multiple_block_scalars_drift_does_not_compound() {
+        // Two prior block scalars each containing a multi-byte char must not accumulate
+        // drift onto the second `uses:` step's resolved offset.
+        let content = "on: push\njobs:\n  build:\n    steps:\n      - run: |\n          echo one \u{2014} first multibyte char here padded to be long enough for the scanner buffer refill\n      - uses: actions/checkout@v4\n      - run: |\n          echo two \u{2014} second multibyte char here also padded long enough for another scanner buffer refill\n      - uses: actions/setup-node@v4\n";
+        let result = parse_workflow_yaml(content, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 2, "{:?}", result.dependencies);
+        assert_eq!(result.dependencies[0].name(), "actions/checkout");
+        assert_eq!(
+            slice(content, result.dependencies[0].version_range().unwrap()),
+            "v4"
+        );
+        assert_eq!(result.dependencies[1].name(), "actions/setup-node");
+        assert_eq!(
+            slice(content, result.dependencies[1].version_range().unwrap()),
+            "v4"
+        );
+    }
+
+    #[test]
+    fn test_issue_879_uses_before_multibyte_block_scalar_unaffected() {
+        // Regression guard: a `uses:` step preceding the block scalar was never affected
+        // by the drift (corruption only accumulates *after* the offending content line) —
+        // must keep working exactly as before the fix.
+        let content = "on: push\njobs:\n  build:\n    steps:\n      - uses: actions/checkout@v4\n      - run: |\n          echo hello \u{2014} world this line is long enough to force yaml-rust2's scanner buffer to refill mid-line\n";
+        let result = parse_workflow_yaml(content, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1, "{:?}", result.dependencies);
+        let dep = &result.dependencies[0];
+        assert_eq!(dep.name(), "actions/checkout");
+        assert_eq!(slice(content, dep.version_range().unwrap()), "v4");
+    }
+
+    #[test]
+    fn test_issue_879_multibyte_on_last_line_of_block_scalar_then_uses() {
+        let content = "on: push\njobs:\n  build:\n    steps:\n      - run: |\n          first regular line long enough for buffer padding without any multibyte characters at all\n          echo hello \u{2014} world this final line of the block scalar is long enough too\n      - uses: actions/checkout@v4\n";
+        let result = parse_workflow_yaml(content, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1, "{:?}", result.dependencies);
+        let dep = &result.dependencies[0];
+        assert_eq!(dep.name(), "actions/checkout");
+        assert_eq!(slice(content, dep.version_range().unwrap()), "v4");
     }
 }

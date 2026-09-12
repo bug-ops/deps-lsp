@@ -604,7 +604,7 @@ Event-driven `yaml_rust2::parser::MarkedEventReceiver`, following
 
 | Item | Current location | Carries |
 |---|---|---|
-| `CharOffsets` | `deps-github-actions/src/parser.rs:60` | yaml-rust2's marker is a **char** index despite its docs |
+| `CharOffsets` (superseded by `marker_byte_offset`, #879 — `yaml-rust2`'s `Marker::index()` was found to desync inside block scalars; `marker_byte_offset` resolves via `Marker::line()`/`col()` instead) | `deps-github-actions/src/parser.rs:60` | yaml-rust2's marker is a **char** index despite its docs |
 | `locate_value_span` | `parser.rs:104` | the trimmed-span re-anchoring (security S-1) |
 | `MAX_FALLBACK_SCAN_BYTES` | `parser.rs:93` | the bounded fallback scan (security S-2) |
 | `is_full_sha` | `parser.rs:34` | — |
@@ -964,8 +964,8 @@ for HTTP, `#[tokio::test]` for async.
   **multi-document `spec:` + `---` fixtures in both directions** (an `include:` in document 2
   is found; a nested key in document 2 is not mistaken for a top-level `include:`);
   adversarial fixtures (deep nesting, expansion bomb, YAML aliases, non-ASCII text before a
-  `component:` value to exercise `CharOffsets`, multi-byte leading whitespace in a quoted
-  scalar).
+  `component:` value to exercise the marker-to-byte-offset resolver (`marker_byte_offset`,
+  superseding `CharOffsets` — #879), multi-byte leading whitespace in a quoted scalar).
 - **Host fan-out cap (§4.6)** — a document naming 12 distinct `component:` hosts registers at
   most 8 routes, and the 9th-plus dependencies are `HostRef::Unresolved` with no transport
   touched (assert on mockito hit counts, not on an internal counter). Separately, a
