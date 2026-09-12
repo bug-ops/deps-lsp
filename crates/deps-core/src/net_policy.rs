@@ -611,7 +611,40 @@ pub fn redact_userinfo(raw: &str) -> String {
     if url.set_username("***").is_err() || url.set_password(None).is_err() {
         return "<redacted: index URL contained userinfo>".to_string();
     }
-    url.as_str().to_string()
+    redact_authority_url_tail(url.as_str())
+}
+
+/// #869: an authority-having URL's own userinfo is masked above via `Url::set_username`/
+/// `set_password` directly, never through [`redact_credential`]'s `mask_at` — but the same
+/// tail-leak family still applies here (e.g. `https://user:hunter2@evil/tok:SECRET`, where
+/// `tok:SECRET` sits untouched in the path). `serialized` (the already-userinfo-masked
+/// `url.as_str()`) is expected to contain the literal `***@` marker at this call site, since it is
+/// only reached once both `set_username("***")` and `set_password(None)` succeeded — but rather
+/// than trust that as an unchecked guarantee, the marker-not-found branch still scans the whole
+/// string via [`redact_secondary_colon_credential`] instead of skipping tail redaction outright,
+/// so an unexpected `url` serialization change can only ever *widen* what gets redacted, never
+/// silently fail open (review M1).
+///
+/// This necessarily extends [`redact_colon_credential`]'s existing false-positive population
+/// (e.g. a REST-style path segment like `.../v1/items:search`, or an RFC 3339 timestamp) to every
+/// authority-having URL that also carries userinfo — previously such a path/query passed through
+/// this function verbatim; now it is colon-scanned like any other `mask_at` tail (review M3).
+/// Accepted for the same reason the rest of this file accepts it: the output only ever feeds a
+/// `tracing` line or error string, and over-redacting a non-credential is always safer than
+/// leaking a real one.
+// `serialized.find("***@")` locates an ASCII marker, so `tail_start` always lands on a char
+// boundary.
+#[allow(clippy::string_slice)]
+fn redact_authority_url_tail(serialized: &str) -> String {
+    let Some(marker_at) = serialized.find("***@") else {
+        return redact_secondary_colon_credential(serialized);
+    };
+    let tail_start = marker_at + "***@".len();
+    format!(
+        "{}{}",
+        &serialized[..tail_start],
+        redact_secondary_colon_credential(&serialized[tail_start..])
+    )
 }
 
 /// Finds a credential-shaped userinfo `@` in `region`, for use *only* on a region that has no
@@ -663,11 +696,13 @@ fn find_credential_at(region: &str) -> Option<usize> {
 /// [`redact_credential`]'s own `Authority` bounded pass and [`redact_colon_credential`] already
 /// use, so this doesn't re-introduce the boundary-rule duplication PR #863 unified. `/` is what
 /// keeps `user:hunter2@evil/@scope/pkg` from extending into `@scope` (#845's own boundary); `?`
-/// and `#` matter because [`url_for_tracing`] redacts *before* truncating the query
-/// string/fragment — a `/`-only stop set would let a query-shaped `@` (e.g.
-/// `user:pw@host?email=a@b`) get pulled into the masked span, consuming the very `?` that
-/// `url_for_tracing` needs to find in order to truncate the query string, and leaking it
-/// (impl-critic C1).
+/// and `#` matter because [`redact_userinfo`] itself preserves the query string/fragment for its
+/// own direct callers — a `/`-only stop set would let a query-shaped `@` (e.g.
+/// `user:pw@host?email=a@b`) get pulled into the masked span, consuming the `?`/`#` and any
+/// content after it that a direct [`redact_userinfo`] caller expects kept intact (impl-critic
+/// C1). Since #866, [`url_for_tracing`] no longer depends on this boundary for its own
+/// correctness — it truncates the raw string at the first `?`/`#` before redacting at all — but
+/// [`redact_userinfo`]'s own contract still requires it.
 ///
 /// Deliberately does **not** stop at `\`: unlike `/`/`?`/`#`, a backslash is not treated as a
 /// general segment boundary anywhere else in this file (only [`colon_is_drive_letter`] gives it
@@ -990,7 +1025,13 @@ enum RegionKind {
 #[allow(clippy::string_slice)]
 fn redact_credential(raw: &str, start: usize, kind: RegionKind) -> String {
     let region = &raw[start..];
-    let mask_at = |at: usize| format!("{}***@{}", &raw[..start], &region[at + 1..]);
+    let mask_at = |at: usize| {
+        format!(
+            "{}***@{}",
+            &raw[..start],
+            redact_secondary_colon_credential(&region[at + 1..])
+        )
+    };
 
     if kind == RegionKind::Authority {
         let host_boundary = region.find(['/', '?', '#']).unwrap_or(region.len());
@@ -1008,6 +1049,16 @@ fn redact_credential(raw: &str, start: usize, kind: RegionKind) -> String {
         Some(at) => mask_at(at),
         None => redact_colon_credential(raw, start, region),
     }
+}
+
+/// #869: `mask_at`'s tail — everything after the `@` it selects — is not proof there is no
+/// *second*, independent credential later in the same string (e.g. `evil/tok:SECRET` after
+/// `user:hunter2@`); scans `tail` for a colon-separated credential in isolation, reusing
+/// [`redact_colon_credential`] with `authority_start == 0` so `tail` is both the `raw` and the
+/// `authority` argument — the same self-contained call shape [`redact_credential`]'s own no-`@`
+/// fallback already uses on `region` as a whole.
+fn redact_secondary_colon_credential(tail: &str) -> String {
+    redact_colon_credential(tail, 0, tail)
 }
 
 /// [`redact_userinfo_unparseable`]'s (and, since #818, [`redact_userinfo_opaque_path`]'s)
@@ -1200,6 +1251,17 @@ fn redact_userinfo_opaque_path(raw: &str) -> String {
 /// `https://...` values, always with a scheme) are not expected to hit that residual case in
 /// practice.
 ///
+/// #866's truncate-before-redact ordering (below) is monotonically safer specifically for the
+/// query/fragment-credential-leak class it targets — it can never leak *more* of a query string
+/// than the old redact-then-truncate order did — but is not strictly monotonic output-for-output
+/// against arbitrary hand-constructed input: e.g. `c:/glpat-SECRET?u=user:pw@a&token=OTHER` used
+/// to redact to `c:***@a&token=OTHER` (leaking the whole query, while incidentally hiding the
+/// bare, non-credential-shaped `glpat-SECRET` path segment — the pre-existing #858/S4 gap, not
+/// something this function ever redacted on its own) and now redacts to `c:/glpat-SECRET`
+/// (correctly drops the query, but shows the path). The new output leaks strictly less — the
+/// query is this function's one hard guarantee — just not byte-for-byte "a superset of what was
+/// masked before" in every case (review M2).
+///
 /// # Examples
 ///
 /// ```
@@ -1217,15 +1279,17 @@ fn redact_userinfo_opaque_path(raw: &str) -> String {
 #[must_use]
 #[allow(
     clippy::string_slice,
-    reason = "`end` comes from `find` of ASCII '?'/'#' bytes on the already-redacted \
-              string, so it always lands on a valid char boundary"
+    reason = "`end` comes from `find` of ASCII '?'/'#' bytes on the raw input string, so it \
+              always lands on a valid char boundary"
 )]
 pub fn url_for_tracing(raw: &str) -> String {
-    let without_userinfo = redact_userinfo(raw);
-    let end = without_userinfo
-        .find(['?', '#'])
-        .unwrap_or(without_userinfo.len());
-    without_userinfo[..end].to_string()
+    // #866: truncate the *raw* string at the first `?`/`#` before redacting, not after — a
+    // credential-shaped `@` inside the query/fragment (e.g. `?u=user:pw@a&token=SECRET`) would
+    // otherwise get widened over by `extend_credential_at` during redaction and consume the
+    // real `?`/`#` boundary before this function ever gets to truncate on it, leaking the rest
+    // of the query string.
+    let end = raw.find(['?', '#']).unwrap_or(raw.len());
+    redact_userinfo(&raw[..end])
 }
 
 /// A URL-bearing value that has already been redacted for safe inclusion in error or log
@@ -2308,9 +2372,12 @@ mod tests {
             redact_userinfo("https://ghp_TOKEN@github.com:99999/x"),
             "https://***@github.com:99999/x"
         );
+        // #869: the tail after the masked `@` is itself scanned for a second credential-shaped
+        // colon value now, so `notaport` (non-numeric, hence not `is_port_like`) is redacted too
+        // — this test's own purpose (the userinfo `@` boundary is found correctly) is unaffected.
         let redacted = redact_userinfo("https://glpat-SECRET@gitlab.corp:notaport/x");
         assert!(!redacted.contains("glpat-SECRET"), "redacted={redacted:?}");
-        assert_eq!(redacted, "https://***@gitlab.corp:notaport/x");
+        assert_eq!(redacted, "https://***@gitlab.corp:***/x");
     }
 
     /// code-review Finding 1 (HIGH, confirmed leak): a bounded authority whose *only* `@` sits at
@@ -2344,9 +2411,11 @@ mod tests {
         assert!(!redacted.contains("pa@ss"), "redacted={redacted:?}");
         assert_eq!(redacted, "***@evil");
 
+        // #869: same tail-scan addition as the sibling test above — `notaport` is now redacted
+        // too, without weakening the `hunter2` assertion this test actually exists to check.
         let redacted = redact_userinfo("user:hunter2@evil@host:notaport/x");
         assert!(!redacted.contains("hunter2"), "redacted={redacted:?}");
-        assert_eq!(redacted, "***@host:notaport/x");
+        assert_eq!(redacted, "***@host:***/x");
     }
 
     /// #846 S4 (tracked at #858): `OpaquePath` has no authority span to license the
@@ -2394,10 +2463,11 @@ mod tests {
     }
 
     /// impl-critic C1 (counterexample_hunt, regression on the #859 fix): `extend_credential_at`
-    /// must also stop at `?`/`#`, not just `/` — `url_for_tracing` redacts *before* truncating
-    /// the query string/fragment, so a `/`-only stop set lets a query-shaped `@` past the
-    /// credential get pulled into the masked span, consuming the very `?`/`#` `url_for_tracing`
-    /// needs to find in order to truncate the query — leaking every token after it.
+    /// must also stop at `?`/`#`, not just `/` — a `/`-only stop set lets a query-shaped `@`
+    /// past the credential get pulled into the masked span, swallowing the query string a
+    /// direct [`redact_userinfo`] caller expects preserved. Since #866, `url_for_tracing` itself
+    /// truncates at `?`/`#` before redacting at all, so it no longer depends on this boundary to
+    /// avoid a leak here — this still asserts its end-to-end output stays correct regardless.
     #[test]
     fn test_redact_userinfo_opaque_path_at_sign_inside_password_stops_at_query_and_fragment_boundary()
      {
@@ -2799,6 +2869,56 @@ mod tests {
         assert_eq!(
             url_for_tracing("user:hunter2@registry.example/simple?token=x"),
             "***@registry.example/simple"
+        );
+    }
+
+    /// #869: `mask_at`'s tail — everything after the `@` it selects — used to be left completely
+    /// unredacted, so a second, independent colon-shaped credential sitting there (`tok:SECRET`)
+    /// leaked in full alongside the correctly-masked `user:hunter2@`. This exact repro parses as
+    /// an ordinary authority-having URL, which redacts userinfo via `Url::set_username`/
+    /// `set_password` directly rather than through `mask_at` — so the same tail-leak family is
+    /// closed there too (`redact_authority_url_tail`), not only in `mask_at` itself.
+    #[test]
+    fn test_redact_userinfo_secondary_colon_credential_in_tail_after_at_sign() {
+        assert_eq!(
+            redact_userinfo("https://user:hunter2@evil/tok:SECRET"),
+            "https://***@evil/tok:***"
+        );
+    }
+
+    /// #869 companion: the same tail-leak family reached directly through `mask_at`, via the
+    /// `OpaquePath` (`scheme:/path`, #811) and unparseable-`Authority` (#536 C2) fallbacks that
+    /// `redact_credential` actually implements `mask_at` for.
+    #[test]
+    fn test_redact_userinfo_secondary_colon_credential_in_tail_mask_at_fallbacks() {
+        assert_eq!(
+            redact_userinfo("c:/user:hunter2@evil/tok:SECRET"),
+            "c:***@evil/tok:***"
+        );
+        assert_eq!(
+            redact_userinfo("c:///user:hunter2@evil/tok:SECRET"),
+            "c:***@evil/tok:***"
+        );
+        let redacted = redact_userinfo("not-a-url:user:hunter2@evil/tok:SECRET");
+        assert!(!redacted.contains("SECRET"), "redacted={redacted:?}");
+    }
+
+    /// #866: `url_for_tracing` used to redact the credential-shaped span first and truncate the
+    /// *result* at the first `?`/`#` afterward — so a credential-shaped `@` inside the query
+    /// string itself (`u=user:pw@a`) got widened over by `extend_credential_at`, consuming the
+    /// real `?`/`#` boundary before truncation ever ran, and the whole query string (including
+    /// `token=SUPERSECRET`) survived unredacted. Truncating the *raw* input at `?`/`#` before
+    /// redacting at all guarantees the query/fragment is dropped regardless of where any
+    /// credential-shaped `@` lands within it.
+    #[test]
+    fn test_url_for_tracing_truncates_before_redacting_query_credential_at_sign() {
+        assert_eq!(
+            url_for_tracing("c:/path?u=user:pw@a&token=SUPERSECRET"),
+            "c:/path"
+        );
+        assert_eq!(
+            url_for_tracing("c:/path#u=user:pw@a&token=SUPERSECRET"),
+            "c:/path"
         );
     }
 
