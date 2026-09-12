@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["PKG_GO_DEV_URL","REGISTRY"],"fn":["package_url"],"struct":["GoRegistry"]};

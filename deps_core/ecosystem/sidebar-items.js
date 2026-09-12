@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["EcosystemId","LicenseSource"],"fn":["parse_manifest_blocking"],"struct":["EcosystemConfig"],"trait":["Dependency","Ecosystem","ParseResult"],"type":["BoxFuture"]};

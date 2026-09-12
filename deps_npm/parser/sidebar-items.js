@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["parse_package_json","parse_package_json_with_context"],"struct":["NpmParseResult"]};

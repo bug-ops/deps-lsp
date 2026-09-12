@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["npm_style_name_boundary"],"struct":["ConcreteVersion","InvalidPackageName","PackageName","VersionReq"]};

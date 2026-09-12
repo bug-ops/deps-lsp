@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["MAX_GITLAB_ROUTES","REGISTRY"],"struct":["GitlabCiRegistry","TagIndex"]};

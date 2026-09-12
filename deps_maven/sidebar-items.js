@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"mod":["ecosystem","formatter","interval","parser","range","registry","types","version"]};

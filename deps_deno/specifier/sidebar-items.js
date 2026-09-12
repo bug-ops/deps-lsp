@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["Scheme"],"fn":["is_dot_prefixed","parse_specifier","partial_name_range","split_scheme","split_scoped"],"struct":["ParsedSpecifier"]};

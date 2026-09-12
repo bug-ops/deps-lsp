@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["REGISTRY"],"fn":["jsr_package_url"],"struct":["DenoRegistry","JsrRegistry"]};

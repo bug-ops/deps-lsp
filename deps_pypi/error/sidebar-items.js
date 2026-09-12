@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["PypiError"],"struct":["Pep508ParseError"],"type":["Result"]};

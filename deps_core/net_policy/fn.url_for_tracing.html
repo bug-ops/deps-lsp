@@ -1,0 +1,41 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Strips the query string, fragment, and any userinfo from `raw`, for attaching to a `tracing` span field or log line at an outbound-request chokepoint."><title>url_for_tracing in deps_core::net_policy - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="deps_core" data-themes="" data-resource-suffix="" data-rustdoc-version="1.98.1 (48a229cea 2026-09-01)" data-channel="1.98.1" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc fn"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">url_for_tracing</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../deps_core/index.html">deps_<wbr>core</a><span class="version">0.14.0</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">url_<wbr>for_<wbr>tracing</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#examples" title="Examples">Examples</a></li></ul></section><div id="rustdoc-modnav"><h2><a href="index.html">In deps_<wbr>core::<wbr>net_<wbr>policy</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">deps_core</a>::<wbr><a href="index.html">net_policy</a></div><h1>Function <span class="fn">url_<wbr>for_<wbr>tracing</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/deps_core/net_policy.rs.html#2200-2208">Source</a> </span></div><pre class="rust item-decl"><code>pub fn url_for_tracing(raw: &amp;<a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/string/struct.String.html" title="struct alloc::string::String">String</a></code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Strips the query string, fragment, and any userinfo from <code>raw</code>, for attaching to a
+<code>tracing</code> span field or log line at an outbound-request chokepoint.</p>
+<p>Unlike <a href="fn.redact_userinfo.html" title="fn deps_core::net_policy::redact_userinfo"><code>redact_userinfo</code></a> (which preserves the query string), this additionally drops
+the query string and fragment outright: a chokepoint like
+<code>HttpCache::get_cached_with_headers_via</code> or
+<a href="../github/struct.GithubTagsClient.html#method.fetch_authenticated" title="method deps_core::github::GithubTagsClient::fetch_authenticated"><code>crate::github::GithubTagsClient::fetch_authenticated</code></a> serves every ecosystem’s outbound
+requests, including a custom-registry URL built from an <code>.npmrc</code>-style <code>${VAR}</code>
+expansion (see <code>deps-npm</code>’s <code>NpmRegistryIndex</code> security model) — a token embedded in a
+query parameter (<code>?token=...</code>) is exactly as sensitive as one embedded in userinfo, and
+this chokepoint cannot assume any particular query-param naming convention is safe to
+keep.</p>
+<p>A <code>raw</code> that fails to parse as a URL is not returned unredacted outright: this still
+applies <a href="fn.redact_userinfo.html" title="fn deps_core::net_policy::redact_userinfo"><code>redact_userinfo</code></a>’s own textual fallback (redacting a <code>user:pass@</code>-shaped span,
+or failing that a colon-separated <code>key:value</code> credential with no <code>@</code> — #810) and still
+truncates at the first <code>?</code>/<code>#</code> character found anywhere in the string, the same as for a
+parseable URL. There is no placeholder substitution, though — an unparseable string with
+no redactable userinfo/credential shape and no <code>?</code>/<code>#</code> is returned unchanged, since nothing
+in it looks like a component to strip. The outbound-request URLs this guards (built from
+<code>https://...</code> values, always with a scheme) are not expected to hit that residual case in
+practice.</p>
+<p>#866’s truncate-before-redact ordering (below) is monotonically safer specifically for the
+query/fragment-credential-leak class it targets — it can never leak <em>more</em> of a query string
+than the old redact-then-truncate order did — but is not strictly monotonic output-for-output
+against arbitrary hand-constructed input: e.g. <code>c:/glpat-SECRET?u=user:pw@a&amp;token=OTHER</code> used
+to redact to <code>c:***@a&amp;token=OTHER</code> (leaking the whole query, while incidentally hiding the
+bare, non-credential-shaped <code>glpat-SECRET</code> path segment — the pre-existing #858/S4 gap, not
+something this function ever redacted on its own) and now redacts to <code>c:/glpat-SECRET</code>
+(correctly drops the query, but shows the path). The new output leaks strictly less — the
+query is this function’s one hard guarantee — just not byte-for-byte “a superset of what was
+masked before” in every case (review M2).</p>
+<h2 id="examples"><a class="doc-anchor" href="#examples">§</a>Examples</h2>
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>deps_core::net_policy::url_for_tracing;
+
+<span class="macro">assert_eq!</span>(
+    url_for_tracing(<span class="string">"https://npm.internal/pkg?token=super-secret-value"</span>),
+    <span class="string">"https://npm.internal/pkg"
+</span>);
+<span class="macro">assert_eq!</span>(
+    url_for_tracing(<span class="string">"https://user:hunter2@registry.example/simple?token=x"</span>),
+    <span class="string">"https://***@registry.example/simple"
+</span>);</code></pre></div></div></details></section></div></main></body></html>

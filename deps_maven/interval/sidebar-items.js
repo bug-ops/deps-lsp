@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["BracketStyle"],"fn":["contains","parse_interval"],"type":["VersionRange"]};

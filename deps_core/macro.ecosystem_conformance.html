@@ -1,0 +1,59 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Generates exact-value conformance tests for an `Ecosystem` implementation (#758 macro 1)."><title>ecosystem_conformance in deps_core - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../" data-static-root-path="../static.files/" data-current-crate="deps_core" data-themes="" data-resource-suffix="" data-rustdoc-version="1.98.1 (48a229cea 2026-09-01)" data-channel="1.98.1" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../static.files/favicon-044be391.svg"></head><body class="rustdoc macro"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">ecosystem_conformance</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../deps_core/index.html">deps_<wbr>core</a><span class="version">0.14.0</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">ecosystem_<wbr>conformance</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#examples" title="Examples">Examples</a></li></ul></section><div id="rustdoc-modnav"><h2 class="in-crate"><a href="index.html">In crate deps_<wbr>core</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="index.html">deps_core</a></div><h1>Macro <span class="macro">ecosystem_<wbr>conformance</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../src/deps_core/conformance.rs.html#754-869">Source</a> </span></div><pre class="rust item-decl"><code>macro_rules! ecosystem_conformance {
+    (
+        mod $mod_name:ident;
+        build: $build:expr;
+        ty: $ty:ty;
+        id: $id:expr;
+        display_name: $display_name:expr;
+        manifest_filenames: $manifest_filenames:expr;
+        lockfile_filenames: $lockfile_filenames:expr;
+        no_lockfile_support: $no_lockfile_support:literal;
+    ) =&gt; { ... };
+    (
+        mod $mod_name:ident;
+        build: $build:expr;
+        ty: $ty:ty;
+        id: $id:expr;
+        display_name: $display_name:expr;
+        manifest_filenames: $manifest_filenames:expr;
+        $(lockfile_filenames: $lockfile_filenames:expr;)?
+        $(no_lockfile_support: $no_lockfile_support:literal;)?
+    ) =&gt; { ... };
+}</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Generates exact-value conformance tests for an <a href="ecosystem/trait.Ecosystem.html" title="trait deps_core::ecosystem::Ecosystem"><code>Ecosystem</code></a> implementation (#758 macro 1).</p>
+<p>Replaces per-crate <code>test_ecosystem_id</code>/<code>test_ecosystem_display_name</code>/
+<code>test_ecosystem_manifest_filenames</code>/<code>test_ecosystem_lockfile_filenames</code>/<code>test_as_any</code>/
+<code>test_registry_creation</code>-shaped tests. <code>lockfile_filenames</code> is omitted for an ecosystem
+with no lock file format; pair that omission with <code>no_lockfile_support: true;</code> (#782 gap
+2) to also assert <a href="ecosystem/trait.Ecosystem.html#method.lockfile_provider" title="method deps_core::ecosystem::Ecosystem::lockfile_provider"><code>Ecosystem::lockfile_provider</code></a> agrees — replacing the
+<code>test_lockfile_filenames_empty</code>/<code>test_lockfile_provider_none</code> pair <code>deps-maven</code>/
+<code>deps-gradle</code> used to hand-copy. Supplying both <code>lockfile_filenames</code> and
+<code>no_lockfile_support: true;</code> on the same invocation is a compile error — the two are
+mutually exclusive by construction.</p>
+<p>Must be invoked inside your own <code>#[cfg(test)] mod tests { ... }</code> — this macro does not
+emit its own <code>#[cfg(test)]</code> (a doctest is not compiled with <code>--cfg test</code>, so a
+macro-emitted <code>#[cfg(test)]</code> would cfg-strip the generated body out of every doctest
+before it is even type-checked, silently making the <code># Examples</code> below prove nothing).</p>
+<p>Each generated assertion also lives in a plain, non-<code>#[test]</code> <code>_impl</code> fn called by a
+thin <code>#[test]</code> wrapper, for the same reason and one more: the compiler elides a
+<code>#[test]</code>-attributed item’s <em>body</em> entirely outside a real <code>--test</code> build — the same
+mechanism <code>#[cfg(test)]</code> uses, just built into the <code>#[test]</code> attribute itself — so an
+<code>expr</code>/<code>ty</code> fragment substituted straight into a <code>#[test]</code> fn is never type-checked in a
+doctest even once the redundant <code>#[cfg(test)]</code> above is removed (verified empirically:
+a bare, cfg-free <code>#[test] fn</code> calling an undefined function still compiles clean in
+<code>cargo test --doc</code>). A plain sibling fn holding the substitution is not elided, so it
+gets checked in every build, doctests included.</p>
+<h2 id="examples"><a class="doc-anchor" href="#examples">§</a>Examples</h2>
+<p>Wrapped in an explicit <code>mod example</code> because the generated <code>mod</code>’s <code>use super::*;</code>
+needs a real parent module to see <code>Fake</code>/<code>build_fake</code> through — a merged doctest’s own
+implicit wrapping does not give it one.</p>
+
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">mod </span>example {
+<span class="macro">deps_core::ecosystem_conformance!</span> {
+    <span class="kw">mod </span>fake_ecosystem_conformance;
+    build: build_fake();
+    ty: Fake;
+    id: <span class="string">"fake"</span>;
+    display_name: <span class="string">"Fake"</span>;
+    manifest_filenames: <span class="kw-2">&amp;</span>[<span class="string">"fake.toml"</span>];
+}
+}</code></pre></div></div></details></section></div></main></body></html>

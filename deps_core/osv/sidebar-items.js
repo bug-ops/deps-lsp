@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["ADVISORY_DISPLAY_CAP"],"enum":["ScanOutcome","SkipReason","UpgradeStatus","VulnSeverity"],"fn":["diagnostic_severity_for","vulnerability_keys"],"struct":["Advisory","Capped","DependencyVulnerabilities","FixRecommendation","OsvClient","ScanTarget"],"type":["VulnerabilityMap"]};

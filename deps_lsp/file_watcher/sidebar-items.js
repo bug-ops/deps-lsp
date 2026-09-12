@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["extract_lockfile_name","register_lock_file_watchers"]};

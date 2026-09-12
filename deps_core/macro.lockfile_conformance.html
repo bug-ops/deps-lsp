@@ -1,0 +1,41 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Generates `LockFileProvider` conformance tests, looping over `lockfiles` at runtime."><title>lockfile_conformance in deps_core - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../" data-static-root-path="../static.files/" data-current-crate="deps_core" data-themes="" data-resource-suffix="" data-rustdoc-version="1.98.1 (48a229cea 2026-09-01)" data-channel="1.98.1" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../static.files/favicon-044be391.svg"></head><body class="rustdoc macro"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">lockfile_conformance</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../deps_core/index.html">deps_<wbr>core</a><span class="version">0.14.0</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">lockfile_<wbr>conformance</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#examples" title="Examples">Examples</a></li></ul></section><div id="rustdoc-modnav"><h2 class="in-crate"><a href="index.html">In crate deps_<wbr>core</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="index.html">deps_core</a></div><h1>Macro <span class="macro">lockfile_<wbr>conformance</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../src/deps_core/conformance.rs.html#1066-1155">Source</a> </span></div><pre class="rust item-decl"><code>macro_rules! lockfile_conformance {
+    (
+        mod $mod_name:ident;
+        build: $build:expr;
+        manifest: $manifest_name:literal =&gt; $manifest_content:literal;
+        lockfiles: [ $( $lock_name:literal =&gt; $lock_content:literal ),+ $(,)? ];
+        malformed: $malformed:literal $(;)?
+    ) =&gt; { ... };
+}</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Generates <a href="lockfile/trait.LockFileProvider.html" title="trait deps_core::lockfile::LockFileProvider"><code>LockFileProvider</code></a> conformance tests, looping over <code>lockfiles</code> at runtime.</p>
+<p><code>macro_rules!</code> cannot concatenate identifiers to generate one test function per lock file
+name, so each generated test iterates the list instead (#758 macro 3, M2/M3).</p>
+<p>Must be invoked inside your own <code>#[cfg(test)] mod tests { ... }</code> — see
+<a href="macro.ecosystem_conformance.html" title="macro deps_core::ecosystem_conformance"><code>ecosystem_conformance!</code></a>’s doc for why this macro does not emit its own <code>#[cfg(test)]</code>.</p>
+<h2 id="examples"><a class="doc-anchor" href="#examples">§</a>Examples</h2>
+<p>A multi-entry <code>lockfiles:</code> list (an ecosystem recognizing more than one lock file format,
+e.g. npm’s <code>package-lock.json</code>/<code>pnpm-lock.yaml</code>). Wrapped in an explicit <code>mod example</code> —
+see <a href="macro.ecosystem_conformance.html" title="macro deps_core::ecosystem_conformance"><code>ecosystem_conformance!</code></a>’s doc for why:</p>
+
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">mod </span>example {
+<span class="kw">struct </span>FakeLockParser;
+<span class="kw">impl </span>LockFileProvider <span class="kw">for </span>FakeLockParser {
+    <span class="kw">fn </span>locate_lockfile(<span class="kw-2">&amp;</span><span class="self">self</span>, manifest_uri: <span class="kw-2">&amp;</span>Uri) -&gt; <span class="prelude-ty">Option</span>&lt;PathBuf&gt; {
+        locate_lockfile_for_manifest(manifest_uri, <span class="kw-2">&amp;</span>[<span class="string">"fake.lock"</span>, <span class="string">"fake-alt.lock"</span>])
+    }
+    <span class="kw">fn </span>parse_lockfile&lt;<span class="lifetime">'a</span>&gt;(<span class="kw-2">&amp;</span><span class="lifetime">'a </span><span class="self">self</span>, path: <span class="kw-2">&amp;</span><span class="lifetime">'a </span>Path)
+        -&gt; std::pin::Pin&lt;Box&lt;<span class="kw">dyn </span>std::future::Future&lt;Output = deps_core::Result&lt;ResolvedPackages&gt;&gt; + Send + <span class="lifetime">'a</span>&gt;&gt; {
+        Box::pin(<span class="kw">async move </span>{ read_and_parse_lockfile(path, <span class="string">"fake.lock"</span>, |<span class="kw">_</span>| <span class="prelude-val">Ok</span>(ResolvedPackages::new())).<span class="kw">await </span>})
+    }
+}
+
+<span class="macro">deps_core::lockfile_conformance!</span> {
+    <span class="kw">mod </span>fake_lockfile_conformance;
+    build: FakeLockParser;
+    manifest: <span class="string">"fake.toml" </span>=&gt; <span class="string">"name = \"test\""</span>;
+    lockfiles: [
+        <span class="string">"fake.lock" </span>=&gt; <span class="string">"locked = true"</span>,
+        <span class="string">"fake-alt.lock" </span>=&gt; <span class="string">"locked: true\n"</span>,
+    ];
+    malformed: <span class="string">"\u{0}not a lockfile"</span>;
+}
+}</code></pre></div></div></details></section></div></main></body></html>

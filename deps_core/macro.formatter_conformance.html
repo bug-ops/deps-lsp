@@ -1,0 +1,35 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Generates exact-value conformance tests for an `EcosystemFormatter` implementation (#758 macro 2)."><title>formatter_conformance in deps_core - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../" data-static-root-path="../static.files/" data-current-crate="deps_core" data-themes="" data-resource-suffix="" data-rustdoc-version="1.98.1 (48a229cea 2026-09-01)" data-channel="1.98.1" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../static.files/favicon-044be391.svg"></head><body class="rustdoc macro"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">formatter_conformance</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../deps_core/index.html">deps_<wbr>core</a><span class="version">0.14.0</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">formatter_<wbr>conformance</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#examples" title="Examples">Examples</a></li></ul></section><div id="rustdoc-modnav"><h2 class="in-crate"><a href="index.html">In crate deps_<wbr>core</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="index.html">deps_core</a></div><h1>Macro <span class="macro">formatter_<wbr>conformance</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../src/deps_core/conformance.rs.html#921-1021">Source</a> </span></div><pre class="rust item-decl"><code>macro_rules! formatter_conformance {
+    (
+        mod $mod_name:ident;
+        build: $build:expr;
+        package_url: { $($name:literal =&gt; $expected:literal),+ $(,)? };
+        $(accepts: [ $($accept_name:literal),+ $(,)? ];)?
+        $(rejects: [ $($reject_name:literal),+ $(,)? ];)?
+        $(version_roundtrip: [ $($version:literal, $requirement:literal =&gt; $roundtrip_expected:literal),+ $(,)? ];)?
+        $(format_version: [ $($fv_version:literal =&gt; $fv_expected:literal),+ $(,)? ];)?
+        $(hostile_package_url_expected: $hostile_expected:literal;)?
+    ) =&gt; { ... };
+}</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Generates exact-value conformance tests for an <a href="lsp_helpers/trait.EcosystemFormatter.html" title="trait deps_core::lsp_helpers::EcosystemFormatter"><code>EcosystemFormatter</code></a> implementation
+(#758 macro 2).</p>
+<p><code>accepts</code>/<code>rejects</code>/<code>version_roundtrip</code>/<code>format_version</code>/<code>hostile_package_url_expected</code> are
+optional. Unconditionally also generates a <code>package_url</code> hostile-input-safety test (#782 gap 1),
+via <a href="conformance/fn.assert_package_url_hostile_input_safe.html" title="fn deps_core::conformance::assert_package_url_hostile_input_safe"><code>assert_package_url_hostile_input_safe</code></a> — the same check Layer 1 (<code>deps-lsp</code>’s
+<code>EcosystemId::ALL</code> loop) runs universally across every <em>registered</em> ecosystem at once, but
+reachable here with <code>cargo nextest run -p &lt;crate&gt;</code> alone, without needing a full workspace
+run. This holds for every ecosystem crate invoking this macro today (proven by Layer 1
+already passing for all of them), so adding it is not a per-crate opt-in. That unconditional
+check is vacuous for a formatter that fails closed to a fixed (typically empty) result for
+the hostile payload (#782 critic M2) — set <code>hostile_package_url_expected: "&lt;value&gt;";</code> to
+additionally pin the exact value for such a formatter, via
+<a href="conformance/fn.assert_package_url_hostile_input_expected.html" title="fn deps_core::conformance::assert_package_url_hostile_input_expected"><code>assert_package_url_hostile_input_expected</code></a>.</p>
+<p>Must be invoked inside your own <code>#[cfg(test)] mod tests { ... }</code> — see
+<a href="macro.ecosystem_conformance.html" title="macro deps_core::ecosystem_conformance"><code>ecosystem_conformance!</code></a>’s doc for why this macro does not emit its own <code>#[cfg(test)]</code>.</p>
+<p>Wrapped in an explicit <code>mod example</code> — see <a href="macro.ecosystem_conformance.html" title="macro deps_core::ecosystem_conformance"><code>ecosystem_conformance!</code></a>’s doc for why.</p>
+<h2 id="examples"><a class="doc-anchor" href="#examples">§</a>Examples</h2>
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">mod </span>example {
+<span class="macro">deps_core::formatter_conformance!</span> {
+    <span class="kw">mod </span>fake_formatter_conformance;
+    build: Fake;
+    package_url: { <span class="string">"serde" </span>=&gt; <span class="string">"https://example.com/serde" </span>};
+}
+}</code></pre></div></div></details></section></div></main></body></html>

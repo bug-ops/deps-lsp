@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["MAX_POM_LICENSE_NAME_RAW_CHARS"],"enum":["ViolationReason"],"fn":["evaluate","filter_valid_spdx_ids","normalize_pom_license_name","normalize_pom_license_names","normalize_pom_license_names_checked","resolve_license_entries","resolve_license_entries_for_display"],"struct":["LicensePolicy","LicenseViolation"]};

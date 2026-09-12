@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["CRATES_IO_URL","REGISTRY"],"fn":["crate_url"],"struct":["CargoRegistry","CratesIoRegistry"]};

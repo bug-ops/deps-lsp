@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["NpmRegistryIndexError"],"fn":["resolve"],"struct":["InvalidEntry","NpmConfig","NpmConfigCache","NpmParseContext","NpmRegistryIndex"]};

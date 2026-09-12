@@ -1,0 +1,47 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Resolves a `yaml-rust2` scanner marker’s `(line, col)` position into a byte offset in `content`, via a shared, once-per-document `LineOffsetTable`."><title>marker_byte_offset in deps_core::lsp_helpers - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="deps_core" data-themes="" data-resource-suffix="" data-rustdoc-version="1.98.1 (48a229cea 2026-09-01)" data-channel="1.98.1" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc fn"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">marker_byte_offset</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../deps_core/index.html">deps_<wbr>core</a><span class="version">0.14.0</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">marker_<wbr>byte_<wbr>offset</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#line-ending-assumption" title="Line-ending assumption">Line-ending assumption</a></li><li><a href="#examples" title="Examples">Examples</a></li></ul></section><div id="rustdoc-modnav"><h2><a href="index.html">In deps_<wbr>core::<wbr>lsp_<wbr>helpers</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">deps_core</a>::<wbr><a href="index.html">lsp_helpers</a></div><h1>Function <span class="fn">marker_<wbr>byte_<wbr>offset</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/deps_core/lsp_helpers/git_ref.rs.html#134-166">Source</a> </span></div><pre class="rust item-decl"><code>pub fn marker_byte_offset(
+    content: &amp;<a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>,
+    table: &amp;<a class="struct" href="struct.LineOffsetTable.html" title="struct deps_core::lsp_helpers::LineOffsetTable">LineOffsetTable</a>,
+    line: <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.usize.html">usize</a>,
+    col: <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.usize.html">usize</a>,
+) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.usize.html">usize</a></code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Resolves a <code>yaml-rust2</code> scanner marker’s <code>(line, col)</code> position into a byte offset in
+<code>content</code>, via a shared, once-per-document <a href="struct.LineOffsetTable.html" title="struct deps_core::lsp_helpers::LineOffsetTable"><code>LineOffsetTable</code></a>.</p>
+<p>Deliberately does <strong>not</strong> use <code>yaml_rust2::scanner::Marker::index()</code> — despite its own
+doc comment claiming a byte count, <code>Scanner::scan_block_scalar_content_line</code>
+(<code>yaml-rust2</code> 0.12.0’s <code>scanner.rs:1778-1779</code>) advances <code>mark.index</code> by the <strong>byte</strong>
+length of each block-scalar (<code>|</code>/<code>&gt;</code>) content line, not its char count, once the
+scanner’s internal 16-char lookahead buffer empties mid-line — which happens on
+essentially every real content line. Every multi-byte UTF-8 character consumed this way
+desyncs <code>index</code> permanently for the rest of the document (#879). <code>Marker::line()</code>/
+<code>Marker::col()</code> are unaffected: <code>col</code> resets to <code>0</code> on every line break
+(<code>Scanner::skip_nl</code>), so the corruption from one block-scalar content line never carries
+into a later scalar’s own <code>col</code> — safe for every value this crate resolves spans for
+(<code>uses:</code>, <code>ref:</code>, <code>project:</code>, <code>include:</code>), none of which are themselves inside a block
+scalar’s own content.</p>
+<p>This <code>line</code>/<code>col</code>-based resolver is a workaround for an upstream <code>yaml-rust2</code> 0.12.0 bug
+(tracked in #880, not yet reported upstream). Do not simplify this back to
+<code>Marker::index()</code>-based resolution without first checking whether the upstream bug has
+been fixed.</p>
+<p><code>line</code> is 1-indexed and <code>col</code> a 0-indexed <strong>char</strong> count within that line, matching
+<code>yaml-rust2</code>’s own <code>Marker::line()</code>/<code>Marker::col()</code> <em>behavior</em> — note that
+<code>yaml_rust2::scanner::Marker::col()</code>’s own doc comment claims 1-indexed while its <code>Display</code>
+impl prints <code>col + 1</code>, i.e. the doc is wrong the same way <code>index()</code>’s was; do not “fix” the
+<code>col.min(...)</code>/<code>.nth(col)</code> arithmetic below to match that prose. Returns <code>content.len()</code> if
+<code>line</code> is past the end of <code>content</code>. <code>line</code> must be <code>&gt;= 1</code> (see <code>debug_assert!</code> below) —
+every marker <code>yaml-rust2</code> actually emits satisfies this.</p>
+<h2 id="line-ending-assumption"><a class="doc-anchor" href="#line-ending-assumption">§</a>Line-ending assumption</h2>
+<p>Like every other <a href="struct.LineOffsetTable.html" title="struct deps_core::lsp_helpers::LineOffsetTable"><code>LineOffsetTable</code></a> lookup, this counts only <code>\n</code> as a line break. A
+document using bare <code>\r</code> (no <code>\n</code>) line endings is out of scope: <code>yaml-rust2</code> still
+advances <code>mark.line</code> across such a break (<code>Scanner::skip_nl</code>), but <code>LineOffsetTable::new</code>
+never splits on a lone <code>\r</code>, so <code>line</code> can run past the table’s line count for any content
+after the first line — this function then falls back to <code>content.len()</code>, and the caller’s
+<a href="fn.locate_value_span.html" title="fn deps_core::lsp_helpers::locate_value_span"><code>locate_value_span</code></a> fails to find the value, dropping the candidate (logged at <code>debug</code>
+— see its own doc comment) the same way as any other fallback-scan miss.
+Bare-<code>\r</code> YAML is not a realistic manifest shape; LF and CRLF, which <code>yaml-rust2</code> and this
+crate both handle throughout, are unaffected.</p>
+<h2 id="examples"><a class="doc-anchor" href="#examples">§</a>Examples</h2>
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>deps_core::lsp_helpers::{LineOffsetTable, marker_byte_offset};
+
+<span class="kw">let </span>content = <span class="string">"a: b\nc: \u{2014}d\n"</span>;
+<span class="kw">let </span>table = LineOffsetTable::new(content);
+<span class="comment">// Line 2 ("c: \u{2014}d"), char column 4 -&gt; the 'd' right after the multi-byte em dash.
+</span><span class="macro">assert_eq!</span>(marker_byte_offset(content, <span class="kw-2">&amp;</span>table, <span class="number">2</span>, <span class="number">4</span>), content.find(<span class="string">'d'</span>).unwrap());</code></pre></div></div></details></section></div></main></body></html>

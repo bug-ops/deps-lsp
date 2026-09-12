@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["classify_component_pin_style","gitlab_version_req","resolve_component_pin"]};

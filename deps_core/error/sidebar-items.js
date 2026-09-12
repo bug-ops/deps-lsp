@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["DepsError","FetchFailure"],"struct":["SanitizedRegistryError"],"type":["Result"]};

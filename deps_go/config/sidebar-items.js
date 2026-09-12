@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["GOPRIVATE_CHAIN_KEY"],"enum":["ChainSeparator","GoProxyHop","GoProxyUrlError"],"fn":["goenv_path","resolve","resolve_with_context"],"struct":["GlobPattern","GoEnvCache","GoEnvConfig","GoParseContext","GoProxyChain","GoProxyUrl","InvalidEntry"]};

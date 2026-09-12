@@ -1,0 +1,255 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Source of the Rust file `crates/deps-lsp/src/document/resolved.rs`."><title>resolved.rs - source</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../../../" data-static-root-path="../../../static.files/" data-current-crate="deps_lsp" data-themes="" data-resource-suffix="" data-rustdoc-version="1.98.1 (48a229cea 2026-09-01)" data-channel="1.98.1" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../../static.files/storage-41dd4d93.js"></script><script defer src="../../../static.files/src-script-813739b1.js"></script><script defer src="../../../src-files.js"></script><script defer src="../../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../../static.files/favicon-044be391.svg"></head><body class="rustdoc src"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><nav class="sidebar"><div class="src-sidebar-title"><h2>Files</h2></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><h1><div class="sub-heading">deps_lsp/document/</div>resolved.rs</h1><rustdoc-toolbar></rustdoc-toolbar></div><div class="example-wrap digits-3"><pre class="rust"><code><a href=#1 id=1 data-nosnippet>1</a><span class="doccomment">//! Lock-file and in-use dependency version resolution.
+<a href=#2 id=2 data-nosnippet>2</a>
+<a href=#3 id=3 data-nosnippet>3</a></span><span class="kw">use </span><span class="kw">super</span>::state::ServerState;
+<a href=#4 id=4 data-nosnippet>4</a><span class="kw">use </span>deps_core::ConcreteVersion;
+<a href=#5 id=5 data-nosnippet>5</a><span class="kw">use </span>deps_core::Ecosystem;
+<a href=#6 id=6 data-nosnippet>6</a><span class="kw">use </span>deps_core::EcosystemId;
+<a href=#7 id=7 data-nosnippet>7</a><span class="kw">use </span>deps_core::PackageName;
+<a href=#8 id=8 data-nosnippet>8</a><span class="kw">use </span>deps_core::PackageVersions;
+<a href=#9 id=9 data-nosnippet>9</a><span class="kw">use </span>deps_core::VersionReq;
+<a href=#10 id=10 data-nosnippet>10</a><span class="kw">use </span>deps_core::lsp_helpers::resolve_in_use_version;
+<a href=#11 id=11 data-nosnippet>11</a><span class="kw">use </span>std::collections::HashMap;
+<a href=#12 id=12 data-nosnippet>12</a><span class="kw">use </span>tower_lsp_server::ls_types::Uri;
+<a href=#13 id=13 data-nosnippet>13</a>
+<a href=#14 id=14 data-nosnippet>14</a><span class="doccomment">/// Whether a reparse should only re-fetch what `DependencyDiff` calls for, or force a
+<a href=#15 id=15 data-nosnippet>15</a>/// full re-fetch of every dependency regardless of diff (issue #592).
+<a href=#16 id=16 data-nosnippet>16</a>///
+<a href=#17 id=17 data-nosnippet>17</a>/// A config change that alters registry *routing* (`registries.workspace_registries`,
+<a href=#18 id=18 data-nosnippet>18</a>/// `registries.nuget_user_profile_sources`) feeds `DependencyDiff::compute` an unchanged
+<a href=#19 id=19 data-nosnippet>19</a>/// dependency set — the manifest didn't change, only where its dependencies resolve from —
+<a href=#20 id=20 data-nosnippet>20</a>/// so the default `Self::Diff` policy's `deps_to_fetch` would stay empty and
+<a href=#21 id=21 data-nosnippet>21</a>/// `run_document_change_task`'s `deps_to_fetch.is_empty()` early return would leave the
+<a href=#22 id=22 data-nosnippet>22</a>/// document displaying versions resolved under the *old* routing indefinitely (the same bug
+<a href=#23 id=23 data-nosnippet>23</a>/// class #424 already documents for `minimum-stability`).
+<a href=#24 id=24 data-nosnippet>24</a></span><span class="attr">#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+<a href=#25 id=25 data-nosnippet>25</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">enum </span>RefetchPolicy {
+<a href=#26 id=26 data-nosnippet>26</a>    <span class="doccomment">/// Re-fetch only what `DependencyDiff` calls for (added / version-changed dependencies)
+<a href=#27 id=27 data-nosnippet>27</a>    /// — correct for every real document edit, where the diff already answers "what needs
+<a href=#28 id=28 data-nosnippet>28</a>    /// re-checking".
+<a href=#29 id=29 data-nosnippet>29</a>    </span>Diff,
+<a href=#30 id=30 data-nosnippet>30</a>    <span class="doccomment">/// Force a re-fetch of every dependency in the new parse result, and drop any
+<a href=#31 id=31 data-nosnippet>31</a>    /// previously cached version/fetch-failure data before doing so (in
+<a href=#32 id=32 data-nosnippet>32</a>    /// `fetch_registry_versions_for_change`) — the routing itself changed, so data
+<a href=#33 id=33 data-nosnippet>33</a>    /// obtained under the old routing can no longer be vouched for.
+<a href=#34 id=34 data-nosnippet>34</a>    </span>AllDependencies,
+<a href=#35 id=35 data-nosnippet>35</a>}
+<a href=#36 id=36 data-nosnippet>36</a>
+<a href=#37 id=37 data-nosnippet>37</a><span class="doccomment">/// Builds `dep_name -&gt; [in_use_version, ...]` (§4.5/§4.6) for every
+<a href=#38 id=38 data-nosnippet>38</a>/// dependency with a known in-use version, for the yanked-check probe in
+<a href=#39 id=39 data-nosnippet>39</a>/// `fetch_latest_versions_parallel`. Skips non-registry dependencies
+<a href=#40 id=40 data-nosnippet>40</a>/// (git/path forks, step 0 of `build_scan_targets`'s ladder) so a patched
+<a href=#41 id=41 data-nosnippet>41</a>/// fork is never flagged for a registry version it does not contain.
+<a href=#42 id=42 data-nosnippet>42</a>///
+<a href=#43 id=43 data-nosnippet>43</a>/// One entry per *occurrence* of a name, not a single collapsed value: the
+<a href=#44 id=44 data-nosnippet>44</a>/// same dependency name can appear more than once in a manifest (the same
+<a href=#45 id=45 data-nosnippet>45</a>/// crate under `[dependencies]`/`[dev-dependencies]` or multiple
+<a href=#46 id=46 data-nosnippet>46</a>/// `[target.'cfg(...)'.dependencies]` blocks — #394). A HashMap keyed by
+<a href=#47 id=47 data-nosnippet>47</a>/// name alone would silently drop all but the last occurrence's in-use
+<a href=#48 id=48 data-nosnippet>48</a>/// version from the yanked probe below.
+<a href=#49 id=49 data-nosnippet>49</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>collect_in_use_versions(
+<a href=#50 id=50 data-nosnippet>50</a>    parse_result: <span class="kw-2">&amp;</span><span class="kw">dyn </span>deps_core::ParseResult,
+<a href=#51 id=51 data-nosnippet>51</a>    resolved_versions: <span class="kw-2">&amp;</span>HashMap&lt;PackageName, ConcreteVersion&gt;,
+<a href=#52 id=52 data-nosnippet>52</a>    resolved_version_candidates: <span class="kw-2">&amp;</span>HashMap&lt;PackageName, Vec&lt;ConcreteVersion&gt;&gt;,
+<a href=#53 id=53 data-nosnippet>53</a>    formatter: <span class="kw-2">&amp;</span><span class="kw">dyn </span>deps_core::lsp_helpers::EcosystemFormatter,
+<a href=#54 id=54 data-nosnippet>54</a>    ecosystem: EcosystemId,
+<a href=#55 id=55 data-nosnippet>55</a>) -&gt; HashMap&lt;PackageName, Vec&lt;String&gt;&gt; {
+<a href=#56 id=56 data-nosnippet>56</a>    <span class="kw">let </span><span class="kw-2">mut </span>map: HashMap&lt;PackageName, Vec&lt;String&gt;&gt; = HashMap::new();
+<a href=#57 id=57 data-nosnippet>57</a>    <span class="kw">for </span>dep <span class="kw">in </span>parse_result
+<a href=#58 id=58 data-nosnippet>58</a>        .dependencies()
+<a href=#59 id=59 data-nosnippet>59</a>        .into_iter()
+<a href=#60 id=60 data-nosnippet>60</a>        .filter(|dep| formatter.source_is_public_registry_content(<span class="kw-2">&amp;</span>dep.source()))
+<a href=#61 id=61 data-nosnippet>61</a>    {
+<a href=#62 id=62 data-nosnippet>62</a>        <span class="kw">let </span>normalized_name = formatter.normalize_package_name(dep.name());
+<a href=#63 id=63 data-nosnippet>63</a>        <span class="kw">if let </span><span class="prelude-val">Some</span>(v) = resolve_in_use_version(
+<a href=#64 id=64 data-nosnippet>64</a>            dep,
+<a href=#65 id=65 data-nosnippet>65</a>            <span class="kw-2">&amp;</span>normalized_name,
+<a href=#66 id=66 data-nosnippet>66</a>            resolved_versions,
+<a href=#67 id=67 data-nosnippet>67</a>            <span class="prelude-val">Some</span>(resolved_version_candidates),
+<a href=#68 id=68 data-nosnippet>68</a>            formatter,
+<a href=#69 id=69 data-nosnippet>69</a>            ecosystem,
+<a href=#70 id=70 data-nosnippet>70</a>        ) {
+<a href=#71 id=71 data-nosnippet>71</a>            map.entry(dep.name().clone()).or_default().push(v);
+<a href=#72 id=72 data-nosnippet>72</a>        }
+<a href=#73 id=73 data-nosnippet>73</a>    }
+<a href=#74 id=74 data-nosnippet>74</a>    map
+<a href=#75 id=75 data-nosnippet>75</a>}
+<a href=#76 id=76 data-nosnippet>76</a>
+<a href=#77 id=77 data-nosnippet>77</a><span class="doccomment">/// Builds `name -&gt; [version_requirement, ...]` for every dependency in `pr`,
+<a href=#78 id=78 data-nosnippet>78</a>/// one entry per occurrence, the shape `DependencyDiff::compute` needs. A
+<a href=#79 id=79 data-nosnippet>79</a>/// `HashMap&lt;PackageName, Option&lt;VersionReq&gt;&gt;` (single value per name) would
+<a href=#80 id=80 data-nosnippet>80</a>/// silently collapse a duplicate name to its last occurrence, losing any
+<a href=#81 id=81 data-nosnippet>81</a>/// edit made to an earlier one (#394).
+<a href=#82 id=82 data-nosnippet>82</a>///
+<a href=#83 id=83 data-nosnippet>83</a>/// Occurrence order is whatever `pr.dependencies()` returns, which for
+<a href=#84 id=84 data-nosnippet>84</a>/// `deps-cargo` is *not* document order for multiple `[target.*]` blocks
+<a href=#85 id=85 data-nosnippet>85</a>/// (see `DependencyDiff::compute`'s doc). A consequence worth knowing: if
+<a href=#86 id=86 data-nosnippet>86</a>/// an edit only renames a `[target.'cfg(...)'.dependencies]` expression
+<a href=#87 id=87 data-nosnippet>87</a>/// (no version change), that occurrence can sort into a different position
+<a href=#88 id=88 data-nosnippet>88</a>/// in the new `Vec` than the old one, so `old.get(name) != new.get(name)`
+<a href=#89 id=89 data-nosnippet>89</a>/// trips even though every individual version requirement is unchanged —
+<a href=#90 id=90 data-nosnippet>90</a>/// a spurious but harmless `version_changed` (one extra registry
+<a href=#91 id=91 data-nosnippet>91</a>/// refetch/OSV rescan for that name, never a missed or misattributed one).
+<a href=#92 id=92 data-nosnippet>92</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>dependency_version_map(
+<a href=#93 id=93 data-nosnippet>93</a>    pr: <span class="kw-2">&amp;</span><span class="kw">dyn </span>deps_core::ParseResult,
+<a href=#94 id=94 data-nosnippet>94</a>) -&gt; HashMap&lt;PackageName, Vec&lt;<span class="prelude-ty">Option</span>&lt;VersionReq&gt;&gt;&gt; {
+<a href=#95 id=95 data-nosnippet>95</a>    <span class="kw">let </span><span class="kw-2">mut </span>map: HashMap&lt;PackageName, Vec&lt;<span class="prelude-ty">Option</span>&lt;VersionReq&gt;&gt;&gt; = HashMap::new();
+<a href=#96 id=96 data-nosnippet>96</a>    <span class="kw">for </span>d <span class="kw">in </span>pr.dependencies() {
+<a href=#97 id=97 data-nosnippet>97</a>        map.entry(d.name().clone())
+<a href=#98 id=98 data-nosnippet>98</a>            .or_default()
+<a href=#99 id=99 data-nosnippet>99</a>            .push(d.version_requirement().cloned());
+<a href=#100 id=100 data-nosnippet>100</a>    }
+<a href=#101 id=101 data-nosnippet>101</a>    map
+<a href=#102 id=102 data-nosnippet>102</a>}
+<a href=#103 id=103 data-nosnippet>103</a>
+<a href=#104 id=104 data-nosnippet>104</a><span class="doccomment">/// Builds a `cached_versions` map from lock-file-resolved versions, ahead of any registry
+<a href=#105 id=105 data-nosnippet>105</a>/// fetch.
+<a href=#106 id=106 data-nosnippet>106</a>///
+<a href=#107 id=107 data-nosnippet>107</a>/// `available` is deliberately left empty (`PackageVersions::latest_without_list`, not a
+<a href=#108 id=108 data-nosnippet>108</a>/// plausible-looking one-element list) — this runs before any registry fetch, and
+<a href=#109 id=109 data-nosnippet>109</a>/// `requirement_is_unsatisfiable` treats an empty `available` as "still loading, skip"
+<a href=#110 id=110 data-nosnippet>110</a>/// (FR-004). Using `latest_only` here instead would populate a bogus single-entry list and
+<a href=#111 id=111 data-nosnippet>111</a>/// let the unsatisfiable-requirement check compute a false verdict on every document open,
+<a href=#112 id=112 data-nosnippet>112</a>/// before the fetch that's supposed to suppress it has a chance to run.
+<a href=#113 id=113 data-nosnippet>113</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>cached_versions_from_lockfile(
+<a href=#114 id=114 data-nosnippet>114</a>    resolved: <span class="kw-2">&amp;</span>HashMap&lt;PackageName, ConcreteVersion&gt;,
+<a href=#115 id=115 data-nosnippet>115</a>) -&gt; HashMap&lt;PackageName, PackageVersions&gt; {
+<a href=#116 id=116 data-nosnippet>116</a>    resolved
+<a href=#117 id=117 data-nosnippet>117</a>        .iter()
+<a href=#118 id=118 data-nosnippet>118</a>        .map(|(name, version)| {
+<a href=#119 id=119 data-nosnippet>119</a>            (
+<a href=#120 id=120 data-nosnippet>120</a>                name.clone(),
+<a href=#121 id=121 data-nosnippet>121</a>                PackageVersions::latest_without_list(version.clone()),
+<a href=#122 id=122 data-nosnippet>122</a>            )
+<a href=#123 id=123 data-nosnippet>123</a>        })
+<a href=#124 id=124 data-nosnippet>124</a>        .collect()
+<a href=#125 id=125 data-nosnippet>125</a>}
+<a href=#126 id=126 data-nosnippet>126</a>
+<a href=#127 id=127 data-nosnippet>127</a><span class="doccomment">/// Splits a parsed [`deps_core::lockfile::ResolvedPackages`] into the collapsed
+<a href=#128 id=128 data-nosnippet>128</a>/// `dep_name -&gt; version` map (`ResolvedPackages::iter`, unchanged FR-005 fast path) and a
+<a href=#129 id=129 data-nosnippet>129</a>/// sibling `dep_name -&gt; [version, ...]` map (issue #649) holding every retained lock-file
+<a href=#130 id=130 data-nosnippet>130</a>/// entry for names with more than one — built from `ResolvedPackages::iter_all`, and
+<a href=#131 id=131 data-nosnippet>131</a>/// deliberately omitting a single-occurrence name entirely (NFR-003: the common case never
+<a href=#132 id=132 data-nosnippet>132</a>/// pays for a candidates-map lookup).
+<a href=#133 id=133 data-nosnippet>133</a>///
+<a href=#134 id=134 data-nosnippet>134</a>/// Shared by [`load_resolved_versions`] and `DepsLanguageServer`'s watched-lock-file-change
+<a href=#135 id=135 data-nosnippet>135</a>/// handler (`server.rs`) — both re-parse a lock file and need the identical split.
+<a href=#136 id=136 data-nosnippet>136</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>split_resolved_packages(
+<a href=#137 id=137 data-nosnippet>137</a>    resolved: <span class="kw-2">&amp;</span>deps_core::lockfile::ResolvedPackages,
+<a href=#138 id=138 data-nosnippet>138</a>) -&gt; (
+<a href=#139 id=139 data-nosnippet>139</a>    HashMap&lt;PackageName, ConcreteVersion&gt;,
+<a href=#140 id=140 data-nosnippet>140</a>    HashMap&lt;PackageName, Vec&lt;ConcreteVersion&gt;&gt;,
+<a href=#141 id=141 data-nosnippet>141</a>) {
+<a href=#142 id=142 data-nosnippet>142</a>    <span class="kw">let </span>versions = resolved
+<a href=#143 id=143 data-nosnippet>143</a>        .iter()
+<a href=#144 id=144 data-nosnippet>144</a>        .map(|(name, pkg)| (PackageName::new(name.as_str()), pkg.version.clone().into()))
+<a href=#145 id=145 data-nosnippet>145</a>        .collect();
+<a href=#146 id=146 data-nosnippet>146</a>    <span class="kw">let </span>candidates = resolved
+<a href=#147 id=147 data-nosnippet>147</a>        .iter_all()
+<a href=#148 id=148 data-nosnippet>148</a>        .filter(|(<span class="kw">_</span>, versions)| versions.len() &gt; <span class="number">1</span>)
+<a href=#149 id=149 data-nosnippet>149</a>        .map(|(name, versions)| {
+<a href=#150 id=150 data-nosnippet>150</a>            (
+<a href=#151 id=151 data-nosnippet>151</a>                PackageName::new(name.as_str()),
+<a href=#152 id=152 data-nosnippet>152</a>                versions
+<a href=#153 id=153 data-nosnippet>153</a>                    .iter()
+<a href=#154 id=154 data-nosnippet>154</a>                    .map(|pkg| ConcreteVersion::from(pkg.version.clone()))
+<a href=#155 id=155 data-nosnippet>155</a>                    .collect(),
+<a href=#156 id=156 data-nosnippet>156</a>            )
+<a href=#157 id=157 data-nosnippet>157</a>        })
+<a href=#158 id=158 data-nosnippet>158</a>        .collect();
+<a href=#159 id=159 data-nosnippet>159</a>    (versions, candidates)
+<a href=#160 id=160 data-nosnippet>160</a>}
+<a href=#161 id=161 data-nosnippet>161</a>
+<a href=#162 id=162 data-nosnippet>162</a><span class="doccomment">/// Loads resolved versions from lock file for a given manifest URI.
+<a href=#163 id=163 data-nosnippet>163</a>///
+<a href=#164 id=164 data-nosnippet>164</a>/// Uses the ecosystem's lockfile provider to parse the lock file, then
+<a href=#165 id=165 data-nosnippet>165</a>/// [`split_resolved_packages`]. Both returned maps are empty if no lock file is found or
+<a href=#166 id=166 data-nosnippet>166</a>/// parsing fails.
+<a href=#167 id=167 data-nosnippet>167</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">async fn </span>load_resolved_versions(
+<a href=#168 id=168 data-nosnippet>168</a>    uri: <span class="kw-2">&amp;</span>Uri,
+<a href=#169 id=169 data-nosnippet>169</a>    state: <span class="kw-2">&amp;</span>ServerState,
+<a href=#170 id=170 data-nosnippet>170</a>    ecosystem: <span class="kw-2">&amp;</span><span class="kw">dyn </span>Ecosystem,
+<a href=#171 id=171 data-nosnippet>171</a>) -&gt; (
+<a href=#172 id=172 data-nosnippet>172</a>    HashMap&lt;PackageName, ConcreteVersion&gt;,
+<a href=#173 id=173 data-nosnippet>173</a>    HashMap&lt;PackageName, Vec&lt;ConcreteVersion&gt;&gt;,
+<a href=#174 id=174 data-nosnippet>174</a>) {
+<a href=#175 id=175 data-nosnippet>175</a>    <span class="kw">let </span>lock_provider = <span class="kw">match </span>ecosystem.lockfile_provider() {
+<a href=#176 id=176 data-nosnippet>176</a>        <span class="prelude-val">Some</span>(p) =&gt; p,
+<a href=#177 id=177 data-nosnippet>177</a>        <span class="prelude-val">None </span>=&gt; {
+<a href=#178 id=178 data-nosnippet>178</a>            <span class="macro">tracing::debug!</span>(<span class="string">"No lock file provider for ecosystem {}"</span>, ecosystem.id());
+<a href=#179 id=179 data-nosnippet>179</a>            <span class="kw">return </span>(HashMap::new(), HashMap::new());
+<a href=#180 id=180 data-nosnippet>180</a>        }
+<a href=#181 id=181 data-nosnippet>181</a>    };
+<a href=#182 id=182 data-nosnippet>182</a>
+<a href=#183 id=183 data-nosnippet>183</a>    <span class="kw">let </span>lockfile_path = <span class="kw">match </span>lock_provider.locate_lockfile(uri) {
+<a href=#184 id=184 data-nosnippet>184</a>        <span class="prelude-val">Some</span>(path) =&gt; path,
+<a href=#185 id=185 data-nosnippet>185</a>        <span class="prelude-val">None </span>=&gt; {
+<a href=#186 id=186 data-nosnippet>186</a>            <span class="macro">tracing::debug!</span>(<span class="string">"No lock file found for {:?}"</span>, uri);
+<a href=#187 id=187 data-nosnippet>187</a>            <span class="kw">return </span>(HashMap::new(), HashMap::new());
+<a href=#188 id=188 data-nosnippet>188</a>        }
+<a href=#189 id=189 data-nosnippet>189</a>    };
+<a href=#190 id=190 data-nosnippet>190</a>
+<a href=#191 id=191 data-nosnippet>191</a>    <span class="kw">match </span>state
+<a href=#192 id=192 data-nosnippet>192</a>        .lockfile_cache
+<a href=#193 id=193 data-nosnippet>193</a>        .get_or_parse(lock_provider.as_ref(), <span class="kw-2">&amp;</span>lockfile_path)
+<a href=#194 id=194 data-nosnippet>194</a>        .<span class="kw">await
+<a href=#195 id=195 data-nosnippet>195</a>    </span>{
+<a href=#196 id=196 data-nosnippet>196</a>        <span class="prelude-val">Ok</span>(resolved) =&gt; {
+<a href=#197 id=197 data-nosnippet>197</a>            <span class="macro">tracing::info!</span>(
+<a href=#198 id=198 data-nosnippet>198</a>                <span class="string">"Loaded {} resolved versions from {}"</span>,
+<a href=#199 id=199 data-nosnippet>199</a>                resolved.len(),
+<a href=#200 id=200 data-nosnippet>200</a>                lockfile_path.display()
+<a href=#201 id=201 data-nosnippet>201</a>            );
+<a href=#202 id=202 data-nosnippet>202</a>            split_resolved_packages(<span class="kw-2">&amp;</span>resolved)
+<a href=#203 id=203 data-nosnippet>203</a>        }
+<a href=#204 id=204 data-nosnippet>204</a>        <span class="prelude-val">Err</span>(e) =&gt; {
+<a href=#205 id=205 data-nosnippet>205</a>            <span class="macro">tracing::warn!</span>(<span class="string">"Failed to parse lock file: {}"</span>, e);
+<a href=#206 id=206 data-nosnippet>206</a>            (HashMap::new(), HashMap::new())
+<a href=#207 id=207 data-nosnippet>207</a>        }
+<a href=#208 id=208 data-nosnippet>208</a>    }
+<a href=#209 id=209 data-nosnippet>209</a>}
+<a href=#210 id=210 data-nosnippet>210</a>
+<a href=#211 id=211 data-nosnippet>211</a><span class="attr">#[cfg(test)]
+<a href=#212 id=212 data-nosnippet>212</a></span><span class="kw">mod </span>tests {
+<a href=#213 id=213 data-nosnippet>213</a>    <span class="kw">use super</span>::<span class="kw-2">*</span>;
+<a href=#214 id=214 data-nosnippet>214</a>
+<a href=#215 id=215 data-nosnippet>215</a>    <span class="doccomment">/// N5 regression guard: the lock-file-population path must build every
+<a href=#216 id=216 data-nosnippet>216</a>    /// `PackageVersions` with an **empty** `available` list, never a populated one — an
+<a href=#217 id=217 data-nosnippet>217</a>    /// empty `available` is what makes `requirement_is_unsatisfiable`'s FR-004 guard
+<a href=#218 id=218 data-nosnippet>218</a>    /// suppress the check before any registry fetch has run. This is the exact function
+<a href=#219 id=219 data-nosnippet>219</a>    /// `handle_document_open`'s background task calls, so a regression here (e.g.
+<a href=#220 id=220 data-nosnippet>220</a>    /// swapping `latest_without_list` for `latest_only`) is caught directly, without
+<a href=#221 id=221 data-nosnippet>221</a>    /// racing the background task.
+<a href=#222 id=222 data-nosnippet>222</a>    </span><span class="attr">#[test]
+<a href=#223 id=223 data-nosnippet>223</a>    </span><span class="kw">fn </span>test_cached_versions_from_lockfile_has_empty_available() {
+<a href=#224 id=224 data-nosnippet>224</a>        <span class="kw">let </span><span class="kw-2">mut </span>resolved = HashMap::new();
+<a href=#225 id=225 data-nosnippet>225</a>        resolved.insert(PackageName::new(<span class="string">"serde"</span>), <span class="string">"1.0.195"</span>.into());
+<a href=#226 id=226 data-nosnippet>226</a>        resolved.insert(PackageName::new(<span class="string">"tokio"</span>), <span class="string">"1.35.0"</span>.into());
+<a href=#227 id=227 data-nosnippet>227</a>
+<a href=#228 id=228 data-nosnippet>228</a>        <span class="kw">let </span>cached = cached_versions_from_lockfile(<span class="kw-2">&amp;</span>resolved);
+<a href=#229 id=229 data-nosnippet>229</a>
+<a href=#230 id=230 data-nosnippet>230</a>        <span class="macro">assert_eq!</span>(cached.len(), <span class="number">2</span>);
+<a href=#231 id=231 data-nosnippet>231</a>        <span class="kw">let </span>serde = cached.get(<span class="kw-2">&amp;</span>PackageName::new(<span class="string">"serde"</span>)).unwrap();
+<a href=#232 id=232 data-nosnippet>232</a>        <span class="macro">assert_eq!</span>(serde.latest, <span class="string">"1.0.195"</span>);
+<a href=#233 id=233 data-nosnippet>233</a>        <span class="macro">assert!</span>(
+<a href=#234 id=234 data-nosnippet>234</a>            serde.available.is_empty(),
+<a href=#235 id=235 data-nosnippet>235</a>            <span class="string">"lock-file-populated entries must have an empty available list, got: {:?}"</span>,
+<a href=#236 id=236 data-nosnippet>236</a>            serde.available
+<a href=#237 id=237 data-nosnippet>237</a>        );
+<a href=#238 id=238 data-nosnippet>238</a>        <span class="comment">// Issue #227 C3: a locked/pinned version's age is not actionable, so this
+<a href=#239 id=239 data-nosnippet>239</a>        // instant-display path must never attach a stale `published_at` — there is no
+<a href=#240 id=240 data-nosnippet>240</a>        // second parallel map here that could drift out of sync with `latest`, since
+<a href=#241 id=241 data-nosnippet>241</a>        // both live on the same `PackageVersions` entry.
+<a href=#242 id=242 data-nosnippet>242</a>        </span><span class="macro">assert_eq!</span>(serde.published_at, <span class="prelude-val">None</span>);
+<a href=#243 id=243 data-nosnippet>243</a>        <span class="kw">let </span>tokio = cached.get(<span class="kw-2">&amp;</span>PackageName::new(<span class="string">"tokio"</span>)).unwrap();
+<a href=#244 id=244 data-nosnippet>244</a>        <span class="macro">assert_eq!</span>(tokio.latest, <span class="string">"1.35.0"</span>);
+<a href=#245 id=245 data-nosnippet>245</a>        <span class="macro">assert!</span>(tokio.available.is_empty());
+<a href=#246 id=246 data-nosnippet>246</a>        <span class="macro">assert_eq!</span>(tokio.published_at, <span class="prelude-val">None</span>);
+<a href=#247 id=247 data-nosnippet>247</a>    }
+<a href=#248 id=248 data-nosnippet>248</a>
+<a href=#249 id=249 data-nosnippet>249</a>    <span class="attr">#[test]
+<a href=#250 id=250 data-nosnippet>250</a>    </span><span class="kw">fn </span>test_cached_versions_from_lockfile_empty_input_is_empty_output() {
+<a href=#251 id=251 data-nosnippet>251</a>        <span class="kw">let </span>resolved = HashMap::new();
+<a href=#252 id=252 data-nosnippet>252</a>        <span class="macro">assert!</span>(cached_versions_from_lockfile(<span class="kw-2">&amp;</span>resolved).is_empty());
+<a href=#253 id=253 data-nosnippet>253</a>    }
+<a href=#254 id=254 data-nosnippet>254</a>}
+</code></pre></div></section></main></body></html>

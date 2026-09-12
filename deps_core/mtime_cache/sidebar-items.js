@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["DEFAULT_MAX_CACHED_FILES","MAX_CACHED_FILE_BYTES"],"struct":["MtimeFileCache"]};

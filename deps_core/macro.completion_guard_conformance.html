@@ -1,0 +1,44 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Generates conformance tests for the shared completion-prefix-length guard (#758 macro 4)."><title>completion_guard_conformance in deps_core - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../" data-static-root-path="../static.files/" data-current-crate="deps_core" data-themes="" data-resource-suffix="" data-rustdoc-version="1.98.1 (48a229cea 2026-09-01)" data-channel="1.98.1" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../static.files/favicon-044be391.svg"></head><body class="rustdoc macro"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">completion_guard_conformance</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../deps_core/index.html">deps_<wbr>core</a><span class="version">0.14.0</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">completion_<wbr>guard_<wbr>conformance</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#examples" title="Examples">Examples</a></li></ul></section><div id="rustdoc-modnav"><h2 class="in-crate"><a href="index.html">In crate deps_<wbr>core</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="index.html">deps_core</a></div><h1>Macro <span class="macro">completion_<wbr>guard_<wbr>conformance</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../src/deps_core/conformance.rs.html#1208-1227">Source</a> </span></div><pre class="rust item-decl"><code>macro_rules! completion_guard_conformance {
+    (
+        mod $mod_name:ident;
+        complete: $complete:expr $(;)?
+    ) =&gt; { ... };
+}</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Generates conformance tests for the shared completion-prefix-length guard (#758 macro 4).</p>
+<p><code>complete</code> takes a <code>&amp;dyn Registry</code> and the owned prefix <code>String</code>, returning a boxed,
+lifetime-parameterized future of the completion items (<code>Pin&lt;Box&lt;dyn Future&lt;Output = Vec&lt;CompletionItem&gt;&gt; + Send + '_&gt;&gt;</code>, matching <a href="conformance/fn.assert_completion_guard.html" title="fn deps_core::conformance::assert_completion_guard"><code>assert_completion_guard</code></a>’s bound — see
+its doc for why a plain <code>Fut: Future</code> associated type does not work here) — call your
+ecosystem’s own guard-checking logic (e.g.
+<a href="completion/fn.complete_package_names_generic.html" title="fn deps_core::completion::complete_package_names_generic"><code>crate::completion::complete_package_names_generic</code></a>) with the supplied registry
+substituted for your ecosystem’s real one, rather than routing through a live network
+call: <a href="conformance/fn.assert_completion_guard.html" title="fn deps_core::conformance::assert_completion_guard"><code>assert_completion_guard</code></a> needs a registry it controls to tell “the guard
+rejected this prefix” apart from “the network call failed/returned nothing” — an
+always-offline or always-failing registry can’t distinguish the two.</p>
+<p><strong>Known limitation (#782 gap 3):</strong> every real call site’s <code>complete</code> closure re-invokes
+<a href="completion/fn.complete_package_names_generic.html" title="fn deps_core::completion::complete_package_names_generic"><code>crate::completion::complete_package_names_generic</code></a> (or an equivalent) directly, inline
+in the test — it does not call through the ecosystem’s own production <code>generate_completions</code>
+wiring. This macro therefore proves the shared generic guard itself behaves correctly, but
+cannot detect a production bug where an ecosystem’s real completion path fails to route
+through that guard at all (wiring drift between the tested closure and the actual runtime
+call graph is invisible here). No fix is applied for this: threading a real
+<code>generate_completions</code>-shaped entry point through this macro generically, across ecosystems
+with different <code>ParseResult</code>/position/content parameters, is not additive — it would need a
+broader macro redesign, tracked separately rather than attempted here.</p>
+<p>Must be invoked inside your own <code>#[cfg(test)] mod tests { ... }</code> — see
+<a href="macro.ecosystem_conformance.html" title="macro deps_core::ecosystem_conformance"><code>ecosystem_conformance!</code></a>’s doc for why this macro does not emit its own <code>#[cfg(test)]</code>.</p>
+<p>Wrapped in an explicit <code>mod example</code> — see <a href="macro.ecosystem_conformance.html" title="macro deps_core::ecosystem_conformance"><code>ecosystem_conformance!</code></a>’s doc for why.</p>
+<h2 id="examples"><a class="doc-anchor" href="#examples">§</a>Examples</h2>
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">mod </span>example {
+<span class="kw">fn </span>complete_fake&lt;<span class="lifetime">'a</span>&gt;(
+    registry: <span class="kw-2">&amp;</span><span class="lifetime">'a </span><span class="kw">dyn </span>Registry,
+    prefix: String,
+) -&gt; std::pin::Pin&lt;Box&lt;<span class="kw">dyn </span>std::future::Future&lt;Output = Vec&lt;CompletionItem&gt;&gt; + Send + <span class="lifetime">'a</span>&gt;&gt; {
+    Box::pin(<span class="kw">async move </span>{
+        deps_core::completion::complete_package_names_generic(registry, <span class="kw-2">&amp;</span>prefix, <span class="number">20</span>, Range::default()).<span class="kw">await
+    </span>})
+}
+
+<span class="macro">deps_core::completion_guard_conformance!</span> {
+    <span class="kw">mod </span>fake_completion_guard_conformance;
+    complete: |registry: <span class="kw-2">&amp;</span><span class="kw">dyn </span>Registry, prefix: String| complete_fake(registry, prefix);
+}
+}</code></pre></div></div></details></section></div></main></body></html>

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["ADVERSARIAL_URL_SEGMENTS"],"fn":["assert_dot_segment_gated_or_contained","assert_dot_segment_gated_or_contained_transformed","capture_tracing_output","capture_tracing_output_async","capture_tracing_output_async_at","capture_tracing_output_at","stub_parse_result_with_dependencies","test_uri"],"struct":["MockMetadata"]};

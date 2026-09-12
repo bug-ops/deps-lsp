@@ -1,0 +1,37 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Generates conformance tests for the shared JSON-nesting-depth cap (#758 macro 5)."><title>json_depth_conformance in deps_core - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../" data-static-root-path="../static.files/" data-current-crate="deps_core" data-themes="" data-resource-suffix="" data-rustdoc-version="1.98.1 (48a229cea 2026-09-01)" data-channel="1.98.1" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../static.files/favicon-044be391.svg"></head><body class="rustdoc macro"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">json_depth_conformance</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../deps_core/index.html">deps_<wbr>core</a><span class="version">0.14.0</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">json_<wbr>depth_<wbr>conformance</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#examples" title="Examples">Examples</a></li></ul></section><div id="rustdoc-modnav"><h2 class="in-crate"><a href="index.html">In crate deps_<wbr>core</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="index.html">deps_core</a></div><h1>Macro <span class="macro">json_<wbr>depth_<wbr>conformance</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../src/deps_core/conformance.rs.html#1269-1298">Source</a> </span></div><pre class="rust item-decl"><code>macro_rules! json_depth_conformance {
+    (
+        mod $mod_name:ident;
+        parse: $parse:expr;
+        wrap: $wrap:expr $(;)?
+    ) =&gt; { ... };
+}</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Generates conformance tests for the shared JSON-nesting-depth cap (#758 macro 5).</p>
+<p><code>parse</code> is the ecosystem’s own response parser; <code>wrap</code> embeds a nested-array fragment of
+a given depth into a payload shape <code>parse</code> recognizes (e.g. as an <code>"extra"</code> field next to
+the real, minimal response body).</p>
+<p><strong>Known imprecision (#782 gap 5):</strong> <a href="conformance/fn.assert_json_nesting_at_max_depth_accepted.html" title="fn deps_core::conformance::assert_json_nesting_at_max_depth_accepted"><code>assert_json_nesting_at_max_depth_accepted</code></a>/
+<a href="conformance/fn.assert_json_nesting_over_max_depth_rejected.html" title="fn deps_core::conformance::assert_json_nesting_over_max_depth_rejected"><code>assert_json_nesting_over_max_depth_rejected</code></a> size the embedded <em>fragment</em> to exactly
+<a href="parser/constant.MAX_JSON_NESTING_DEPTH.html" title="constant deps_core::parser::MAX_JSON_NESTING_DEPTH"><code>crate::MAX_JSON_NESTING_DEPTH</code></a> / <code>MAX_JSON_NESTING_DEPTH + 1</code> array levels — but <code>wrap</code>
+typically nests that fragment inside at least one more JSON container (an object field,
+as in the example below), so the <em>final</em> payload’s absolute nesting depth as seen by
+<code>parse</code> is one or more levels deeper than the fragment alone. This macro is therefore not
+independently boundary-tight at the wrapped payload’s true edge; it exercises “near the
+cap”, not “at exactly <code>MAX_JSON_NESTING_DEPTH</code>/<code>+ 1</code> in the payload <code>parse</code> receives”. No
+fix is applied: the cap itself is exact-boundary-tested directly (unwrapped) in
+<code>deps-core/src/parser.rs</code>, so duplicating that precision here per-ecosystem would be
+redundant rather than additive.</p>
+<p>Must be invoked inside your own <code>#[cfg(test)] mod tests { ... }</code> — see
+<a href="macro.ecosystem_conformance.html" title="macro deps_core::ecosystem_conformance"><code>ecosystem_conformance!</code></a>’s doc for why this macro does not emit its own <code>#[cfg(test)]</code>.</p>
+<p>Wrapped in an explicit <code>mod example</code> — see <a href="macro.ecosystem_conformance.html" title="macro deps_core::ecosystem_conformance"><code>ecosystem_conformance!</code></a>’s doc for why.</p>
+<h2 id="examples"><a class="doc-anchor" href="#examples">§</a>Examples</h2>
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">mod </span>example {
+<span class="kw">fn </span>parse_fake(data: <span class="kw-2">&amp;</span>[u8]) -&gt; <span class="prelude-ty">Result</span>&lt;(), std::io::Error&gt; {
+    deps_core::check_json_nesting_depth(data, deps_core::MAX_JSON_NESTING_DEPTH)
+        .map_err(|depth| std::io::Error::other(<span class="macro">format!</span>(<span class="string">"nesting depth {depth} exceeded"</span>)))
+}
+
+<span class="macro">deps_core::json_depth_conformance!</span> {
+    <span class="kw">mod </span>fake_json_depth_conformance;
+    parse: |bytes: <span class="kw-2">&amp;</span>[u8]| parse_fake(bytes);
+    wrap: |nested: <span class="kw-2">&amp;</span>str| <span class="macro">format!</span>(<span class="string">r#"{{"items": [], "extra": {nested}}}"#</span>);
+}
+}</code></pre></div></div></details></section></div></main></body></html>

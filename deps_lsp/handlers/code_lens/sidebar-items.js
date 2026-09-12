@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["COMMAND_ID"],"fn":["handle_code_lens"]};

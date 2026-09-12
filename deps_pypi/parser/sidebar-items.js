@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"mod":["pyproject","requirements"],"struct":["ParseResult","PypiParser","RequirementRef"]};

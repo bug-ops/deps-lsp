@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["LoadingState"],"fn":["ensure_document_loaded","handle_document_change","handle_document_open","load_document_from_disk"],"struct":["ColdStartLimiter","DocumentState","ServerState"]};

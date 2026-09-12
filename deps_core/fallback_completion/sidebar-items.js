@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["count_real_quotes","count_real_quotes_with","find_closing_quote","is_in_json_dependencies","is_in_toml_dependencies","is_in_xml_tag_section","line_at","open_quoted_tail","raw_prefix","strip_leading_xml_tag","strip_open_json_key","strip_open_xml_attribute_value"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["PypiIndexUrlError"],"struct":["InvalidEntry","PypiIndexConfig","PypiIndexUrl","ResolvedChain"]};

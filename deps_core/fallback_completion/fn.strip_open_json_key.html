@@ -1,0 +1,33 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Classifies whether `prefix` (the trimmed line text up to the cursor) sits inside an open JSON string that is a dependency object’s key."><title>strip_open_json_key in deps_core::fallback_completion - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="deps_core" data-themes="" data-resource-suffix="" data-rustdoc-version="1.98.1 (48a229cea 2026-09-01)" data-channel="1.98.1" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc fn"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">strip_open_json_key</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../deps_core/index.html">deps_<wbr>core</a><span class="version">0.14.0</span></h2></div><div class="sidebar-elems"><div id="rustdoc-modnav"><h2><a href="index.html">In deps_<wbr>core::<wbr>fallback_<wbr>completion</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">deps_core</a>::<wbr><a href="index.html">fallback_completion</a></div><h1>Function <span class="fn">strip_<wbr>open_<wbr>json_<wbr>key</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/deps_core/fallback_completion.rs.html#475-495">Source</a> </span></div><pre class="rust item-decl"><code>pub fn strip_open_json_key(prefix: &amp;<a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>) -&gt; (&amp;<a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>, <a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.bool.html">bool</a>)</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Classifies whether <code>prefix</code> (the trimmed line text up to the cursor) sits inside an
+open JSON string that is a dependency object’s <em>key</em>.</p>
+<p>Covers <code>package.json</code>’s <code>"expr</code> while the key is still being typed, and
+<code>composer.json</code>’s <code>require</code>/<code>require-dev</code> entries — distinguishing that from a
+closed key, an open value string, or plain unquoted text.</p>
+<p>Uses quote parity — an odd count of real (see <a href="fn.count_real_quotes.html" title="fn deps_core::fallback_completion::count_real_quotes"><code>count_real_quotes</code></a>) <code>"</code>
+characters means the cursor sits inside an open string literal — adapted for a JSON
+object key instead of an XML tag/attribute: the text immediately before the open
+string’s opening quote decides key-vs-value: a <code>:</code> right before it
+(<code>"express": "^4</code>) means the open string is the <em>value</em>, not the key.</p>
+<p>Returns <code>(text_after_the_open_quote, true)</code> only when the cursor is genuinely
+inside an open key string — the one case where a fallback-completion insert should
+be the bare candidate name rather than a full <code>"{name}": "^{latest}"</code> snippet, the
+same “already open” bare-insert shape as
+<a href="fn.strip_leading_xml_tag.html" title="fn deps_core::fallback_completion::strip_leading_xml_tag"><code>strip_leading_xml_tag</code></a>’s <code>Some("artifactId")</code> case and
+<a href="fn.strip_open_xml_attribute_value.html" title="fn deps_core::fallback_completion::strip_open_xml_attribute_value"><code>strip_open_xml_attribute_value</code></a>’s non-empty result. Every other shape returns
+<code>("", false)</code>:</p>
+<ul>
+<li>Even quote count with at least one real <code>"</code> present means the cursor sits right
+after a fully-closed string (<code>"express"</code> with the cursor past both quotes) —
+quote parity alone cannot tell whether that position wants a new key, is
+mid-value, or something else, so this suppresses rather than guesses (#729 critic
+S1, matching Maven’s “no safe bare text to offer here” discipline for a
+non-<code>artifactId</code> open tag).</li>
+<li>Odd quote count whose open string’s text is preceded by <code>:</code> means the cursor is
+inside an open <em>value</em> string, not the key — a bare package-name insert there
+would corrupt the version instead of completing the key (#729 critic S2).</li>
+</ul>
+<p>Even quote count with <em>zero</em> real <code>"</code> present (plain unquoted text, or nothing
+typed yet) is the one exception: it returns <code>(prefix, false)</code> unchanged, since no
+quote has been opened at all and the normal full-pair insert is still correct
+there.</p>
+</div></details></section></div></main></body></html>

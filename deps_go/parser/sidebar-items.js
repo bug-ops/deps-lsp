@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["parse_go_mod","parse_go_mod_with_context"],"struct":["GoParseResult"]};

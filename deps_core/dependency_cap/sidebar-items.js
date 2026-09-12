@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["MAX_DEPENDENCIES_PER_DOCUMENT"],"fn":["cap_dependencies"],"struct":["DependencyBudget"]};

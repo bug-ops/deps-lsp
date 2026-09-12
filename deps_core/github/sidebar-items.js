@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["GITHUB_API","MAX_TAG_PAGES"],"fn":["github_rate_limit_error","is_valid_github_identity","normalize_tag","paginate_tags","parse_tags_page","validate_owner_repo","warn_if_pagination_truncated"],"struct":["GithubTag","GithubTagCommit","GithubTagsClient","ReleaseDatesCache"]};

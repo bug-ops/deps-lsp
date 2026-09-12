@@ -1,0 +1,64 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Resolves `raw` tier-3 pre-fetched license text for display (hover), for `source` (issue #687 critic S1/S2)."><title>resolve_license_entries_for_display in deps_core::licenses - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="deps_core" data-themes="" data-resource-suffix="" data-rustdoc-version="1.98.1 (48a229cea 2026-09-01)" data-channel="1.98.1" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc fn"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">resolve_license_entries_for_display</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../deps_core/index.html">deps_<wbr>core</a><span class="version">0.14.0</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">resolve_<wbr>license_<wbr>entries_<wbr>for_<wbr>display</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#examples" title="Examples">Examples</a></li></ul></section><div id="rustdoc-modnav"><h2><a href="index.html">In deps_<wbr>core::<wbr>licenses</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">deps_core</a>::<wbr><a href="index.html">licenses</a></div><h1>Function <span class="fn">resolve_<wbr>license_<wbr>entries_<wbr>for_<wbr>display</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/deps_core/licenses.rs.html#772-805">Source</a> </span></div><pre class="rust item-decl"><code>pub fn resolve_license_entries_for_display(
+    source: <a class="enum" href="../ecosystem/enum.LicenseSource.html" title="enum deps_core::ecosystem::LicenseSource">LicenseSource</a>,
+    raw: &amp;[<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>],
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>&gt;</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Resolves <code>raw</code> tier-3 pre-fetched license text for <em>display</em> (hover), for <code>source</code>
+(issue #687 critic S1/S2).</p>
+<p>See <a href="fn.resolve_license_entries.html" title="fn deps_core::licenses::resolve_license_entries"><code>resolve_license_entries</code></a> for the sibling used to <em>evaluate</em> the same data
+against a <a href="struct.LicensePolicy.html" title="struct deps_core::licenses::LicensePolicy"><code>LicensePolicy</code></a>. Differs from it in exactly the two ways display needs:</p>
+<ul>
+<li><strong>Never drops an entry.</strong> <a href="fn.resolve_license_entries.html" title="fn deps_core::licenses::resolve_license_entries"><code>resolve_license_entries</code></a> fails closed and drops an
+entry <a href="fn.normalize_pom_license_name.html" title="fn deps_core::licenses::normalize_pom_license_name"><code>normalize_pom_license_name</code></a> doesn’t recognize (correct for policy
+evaluation: never fabricate a violation from guessed data) — but the
+<code>KNOWN_POM_LICENSE_NAMES</code> table is deliberately non-exhaustive (see the module
+docs above), so dropping is the <em>designed-for</em> path, not a rare edge case, and
+applying it to hover made the license line silently vanish for any unrecognized
+POM name. Falls back to the raw text instead, since showing the author’s declared
+string is strictly more useful to a reader than showing nothing.</li>
+<li><strong>One id per entry when the ids are synonyms, not a policy-matching slice.</strong> A POM
+name ambiguous between SPDX conventions (e.g. the GPL family) normalizes to three
+synonymous ids for <a href="fn.resolve_license_entries.html" title="fn deps_core::licenses::resolve_license_entries"><code>resolve_license_entries</code></a> so a <code>deny</code>/<code>allow</code> list written in
+any of them still matches — correct for policy, but printing <code>`GPL-3.0`, `GPL-3.0-only`, `GPL-3.0-or-later`</code> in hover for what is genuinely one declared
+license reads as three licenses. Keeps only the first (canonical) id in that case —
+but a genuinely disjunctive entry (<code>"CDDL + GPLv2 with classpath exception"</code> names
+two unrelated licenses, not synonyms of one) still shows every id, or a
+dual-licensed dependency would misleadingly read as single-licensed. See this
+module’s private <code>ids_are_synonyms</code> helper for how the two shapes are told apart.</li>
+</ul>
+<p>Entries are deduplicated (preserving first-seen order), same as
+<a href="fn.normalize_pom_license_names_checked.html" title="fn deps_core::licenses::normalize_pom_license_names_checked"><code>normalize_pom_license_names_checked</code></a>.</p>
+<h2 id="examples"><a class="doc-anchor" href="#examples">§</a>Examples</h2>
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>deps_core::LicenseSource;
+<span class="kw">use </span>deps_core::licenses::resolve_license_entries_for_display;
+
+<span class="comment">// Recognized: normalizes to its canonical id, like `resolve_license_entries`.
+</span><span class="kw">let </span>ids = resolve_license_entries_for_display(
+    LicenseSource::PomFreeText,
+    <span class="kw-2">&amp;</span>[<span class="string">"The Apache Software License, Version 2.0"</span>.to_string()],
+);
+<span class="macro">assert_eq!</span>(ids, <span class="macro">vec!</span>[<span class="string">"Apache-2.0"</span>.to_string()]);
+
+<span class="comment">// Unrecognized: falls back to the raw text instead of vanishing (issue #687 S1).
+</span><span class="kw">let </span>ids = resolve_license_entries_for_display(
+    LicenseSource::PomFreeText,
+    <span class="kw-2">&amp;</span>[<span class="string">"Some Bespoke Corporate License"</span>.to_string()],
+);
+<span class="macro">assert_eq!</span>(ids, <span class="macro">vec!</span>[<span class="string">"Some Bespoke Corporate License"</span>.to_string()]);
+
+<span class="comment">// Ambiguous SPDX convention: one canonical id, not the full policy-matching slice
+// (issue #687 S2).
+</span><span class="kw">let </span>ids = resolve_license_entries_for_display(
+    LicenseSource::PomFreeText,
+    <span class="kw-2">&amp;</span>[<span class="string">"GNU General Public License v3"</span>.to_string()],
+);
+<span class="macro">assert_eq!</span>(ids, <span class="macro">vec!</span>[<span class="string">"GPL-3.0"</span>.to_string()]);
+
+<span class="comment">// Genuinely disjunctive (two unrelated licenses, not synonyms of one): both ids
+// are kept, unlike the GPL-family case above (code-review must-fix).
+</span><span class="kw">let </span>ids = resolve_license_entries_for_display(
+    LicenseSource::PomFreeText,
+    <span class="kw-2">&amp;</span>[<span class="string">"CDDL + GPLv2 with classpath exception"</span>.to_string()],
+);
+<span class="macro">assert_eq!</span>(
+    ids,
+    <span class="macro">vec!</span>[<span class="string">"CDDL-1.1"</span>.to_string(), <span class="string">"GPL-2.0-with-classpath-exception"</span>.to_string()]
+);</code></pre></div></div></details></section></div></main></body></html>

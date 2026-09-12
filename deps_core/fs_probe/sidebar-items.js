@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["MAX_CONFIG_ANCESTOR_DEPTH"],"fn":["config_ancestors","exists","is_file","metadata","read_to_string_capped","snapshot","snapshot_guard","snapshot_guard_async"]};
