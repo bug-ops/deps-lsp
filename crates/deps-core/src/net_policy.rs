@@ -1185,30 +1185,28 @@ fn redact_credential(raw: &str, start: usize, kind: RegionKind) -> String {
 /// classes, and the colon-decoy-`@` classes found in rounds 4-6. Steps 1-4 above are what those
 /// rounds converged on.
 ///
-/// Two narrow, low-severity gaps were found during round 7's adversarial sweep and deliberately
-/// deferred rather than chased further:
-/// - **#870**: `colon_evidence` (step 2) is hard-gated on no `@` having been masked yet earlier
-///   in `region`, so once any `@` has been masked the colon fallback can never run again — a
-///   later colon-only credential with no `@` of its own (`oauth2:glpat-SECRET`,
-///   `gitlab-ci-token:JOBTOKEN`) is emitted verbatim once an ordinary decoy `@` (e.g.
-///   `pkg@1.0.0`) has appeared earlier in the same value.
+/// Also fixed, as one unified change (#870/#873/#874 — see [`redact_further_credential`]'s own
+/// doc comment): every fallback path in this function and in [`redact_colon_credential`] that used
+/// to stop looking after finding one credential of a single shape now keeps scanning the tail for
+/// a further credential of *either* shape (`@`-shaped or colon-only) via that shared helper —
+/// `colon_evidence`'s per-window gate (step 2) is unchanged (still `base == 0`-scoped, by design),
+/// but the two points that used to emit an unexamined tail verbatim once it stopped applying (the
+/// widen branch's own `find_credential_at` hit, and the loop-exhaustion branch) now route that
+/// tail through it instead.
+///
+/// One narrow, low-severity gap remains, found during round 7's adversarial sweep and
+/// deliberately deferred rather than chased further:
 /// - **#871**: `has_nested_scheme` is computed once over the whole `region`, not scoped to "a
 ///   genuine `://` still ahead of the current window" as step 3 above implies — when the caller's
 ///   backward anchor has already consumed the string's only `://` while computing `region`'s
 ///   start, the gate reads `false` and step 3's continuation is skipped even though a credential
 ///   sits past the next boundary.
-/// - **#873**: [`find_credential_at`] commits to the first colon-evidenced match it finds, so a
-///   colon-less `TOKEN@host` credential sitting behind an earlier, genuine colon-evidenced decoy
-///   credential is never reached.
-/// - **#874**: [`redact_colon_credential`]'s tail re-scan (its own doc comment, "past it would
-///   never be examined at all") only looks for a further `@`-shaped credential, so a colon-only
-///   credential (no `@` at all) sitting past an already-masked decoy colon value is missed.
 /// - **#875**: multi-`@` input with no nested scheme anywhere can be over-redacted on every `@`
 ///   once the first is masked, not just the first — over-redaction, not a leak, and only reaches
 ///   a `tracing`/error-message sink.
 ///
 /// This doc comment has overclaimed completeness in earlier rounds; treat the step-by-step
-/// description above as bounded by these five documented, tracked exceptions, not as a
+/// description above as bounded by these two documented, tracked exceptions, not as a
 /// completeness guarantee.
 #[allow(clippy::string_slice)]
 fn redact_authority_suffix(region: &str) -> String {
@@ -1268,8 +1266,15 @@ fn redact_authority_suffix(region: &str) -> String {
             // credential just because nothing else was found.
             if colon_evidence && let Some(at) = find_credential_at(remaining) {
                 output.push_str("***@");
-                output.push_str(&remaining[at + 1..]);
-                return output;
+                // #873: continue the very same bounded-`@` pass (`base`/`window_start`, `continue`)
+                // instead of returning immediately — an earlier revision returned right here,
+                // which is exactly what stopped this loop from ever reaching a later, colon-less
+                // `TOKEN@host` credential via its own unconditional per-window `@` check above:
+                // `colon_evidence` requires `base == 0` (see its own definition), so `remaining`
+                // is `region` itself here and `at` is already an absolute offset into it.
+                base = at + 1;
+                window_start = base;
+                continue;
             }
             output.push_str(&redact_colon_credential(remaining, 0, remaining));
             return output;
@@ -1278,7 +1283,13 @@ fn redact_authority_suffix(region: &str) -> String {
             window_start = boundary_abs + 1;
             continue;
         }
-        output.push_str(&region[base..]);
+        // #870: this used to append `&region[base..]` unchanged once any `@` had been masked
+        // earlier (`colon_evidence` above is hard-gated to `base == 0` by design), so a
+        // colon-only credential past that point was never checked at all — see
+        // `redact_further_credential`'s own doc comment. No pre-known bracket offset is available
+        // here (unlike `redact_colon_credential`'s call site), so it's derived once, fresh.
+        let remaining = &region[base..];
+        output.push_str(&redact_further_credential(remaining, remaining.find('[')));
         return output;
     }
 }
@@ -1293,11 +1304,10 @@ fn redact_secondary_colon_credential(tail: &str) -> String {
     redact_colon_credential(tail, 0, tail)
 }
 
-/// [`redact_userinfo_unparseable`]'s (and, since #818, [`redact_userinfo_opaque_path`]'s)
-/// fallback for the case neither covers on its own: a colon-separated credential with no `@` at
-/// all (#810), e.g. `oauth2:glpat-SECRET`, a GitLab CI
-/// `gitlab-ci-token:JOBTOKEN` job token, or a bare `.npmrc` `//registry/:_authToken=...` line.
-/// Unlike the `@` scan above, this is not restricted to the authority span before the first
+/// [`colon_credential_match`]'s scan for the case neither of the `@`-based fallbacks covers on
+/// its own: a colon-separated credential with no `@` at all (#810), e.g. `oauth2:glpat-SECRET`, a
+/// GitLab CI `gitlab-ci-token:JOBTOKEN` job token, or a bare `.npmrc` `//registry/:_authToken=...`
+/// line. Unlike the `@` scan above, this is not restricted to the authority span before the first
 /// `/`/`?`/`#` — `gitlab.corp/user:hunter2@evil` (repro from #810) has its credential colon
 /// *after* a `/`, so the whole of `authority` (everything after the scheme, or all of `raw`
 /// when there is none) is searched.
@@ -1331,12 +1341,14 @@ fn redact_secondary_colon_credential(tail: &str) -> String {
 /// `a:***`, not `a:b:***`), and an empty left side is still redacted (`:secret` becomes
 /// `:***`) — for a `:` pair the credential is the value on the right, unlike `@` where it is
 /// the component on the left. That first match is not assumed to be the *only* credential,
-/// though (#862): the text past the masked value is checked once more via
-/// [`find_credential_at`] for a further `@`-shaped credential and masked too if found — a
-/// non-credential value can shape-collide with this scan's own carve-outs (`notaport` in
-/// `host/x@y:notaport/c://user:hunter2@evil` is not port-like, so it is masked as if it were the
-/// credential) and, without this check, a real credential sitting past it would never be
-/// examined at all.
+/// though (#862): a non-credential value can shape-collide with this scan's own carve-outs
+/// (`notaport` in `host/x@y:notaport/c://user:hunter2@evil` is not port-like, so it is masked as
+/// if it were the credential), so a real credential sitting past it must still be reachable.
+/// This function only finds and masks the *first* match, though — it does not itself look past
+/// its own match; [`redact_further_credential`] is what keeps scanning the returned tail for a
+/// further credential of either shape (#874: an earlier revision had this function's caller,
+/// [`redact_colon_credential`], check only for a further `@`-shaped credential via
+/// [`find_credential_at`] directly, missing a further colon-only one).
 ///
 /// This intentionally produces some false positives on non-credential colon pairs — a Maven
 /// coordinate (`com.google.guava:guava` → `com.google.guava:***`), an npm alias spec
@@ -1351,12 +1363,67 @@ fn redact_secondary_colon_credential(tail: &str) -> String {
 /// than under-redacting a real one. One shape collision remains a documented limitation: a
 /// ≤5-digit credential collides with the `host:port` carve-out (`oauth2:12345` stays
 /// unredacted).
+///
+/// Translates a previously-known `[` offset into "relative to `remaining`", a string that begins
+/// `consumed` bytes past whatever base `known` was itself relative to — or, when `known` has
+/// fallen *behind* `consumed` (the position it named has already been passed, either properly
+/// handled as a bracket span or silently swallowed inside an ordinary masked value), re-derives it
+/// fresh by scanning only `remaining` itself, never the longer string it came from. `None` stays
+/// `None` unconditionally: it means "provably no `[` anywhere in the string this offset is
+/// tracked against", and every `remaining` any caller here ever passes is a suffix of that string,
+/// so it can't have gained one.
+///
+/// The one caching rule every place in this module that carries a bracket offset across a
+/// shrinking string uses, instead of three independently-maintained copies (impl-critic S1/S2's
+/// fix, then a DRY finding on its own near-duplicated call sites): [`colon_credential_match`]'s
+/// own loop (twice — once per iteration relative to `remaining`, once for the tail it returns) and
+/// [`redact_further_credential`]'s `@`-branch. See those functions' own doc comments for why this
+/// pattern is sound and what performance regression it fixes.
+fn translate_bracket(known: Option<usize>, consumed: usize, remaining: &str) -> Option<usize> {
+    match known {
+        Some(b) if b >= consumed => Some(b - consumed),
+        Some(_) => remaining.find('['),
+        None => None,
+    }
+}
+
+/// Returns `None` when the scan runs out of colons in `authority` (mirrors
+/// [`redact_colon_credential`]'s own "no colon" no-op); on a match, returns the masked
+/// `"{prefix}:***"` piece, the still-unexamined tail *after* the masked value, and that tail's own
+/// next-bracket offset (see `next_bracket` below) so a caller looping over successive calls (only
+/// [`redact_further_credential`] does) never has to re-derive it from scratch.
+///
+/// `next_bracket` is the offset of the nearest `[` in `authority`, relative to `authority`'s own
+/// start — `Some` when the caller already knows it (typically from a previous call's own returned
+/// next-bracket offset), `None` when there is provably no `[` anywhere in `authority` at all.
+/// Passing it in instead of this function re-deriving it via its own `remaining.find('[')` on
+/// every iteration (impl-critic S1, then S2 once a *single* `[` anywhere in a long value was found
+/// to still cost `remaining.find('[')` on every repeated call to this function — see
+/// [`redact_further_credential`]'s own doc comment) is what turns a long, colon-dense value with
+/// one or more brackets back from `O(n²)` to amortized `O(n)`: `next_bracket`, being an offset
+/// rather than a boolean, only needs a fresh scan on the rare iteration where the previously-known
+/// bracket position falls *behind* the current `cursor` (i.e. it was actually consumed — either
+/// properly skipped as an IPv6-host span, or silently swallowed inside an ordinary masked value),
+/// and that rescan only ever covers `remaining` — not the original, much longer `authority` — so
+/// its cost is charged to the region it discovers, not repeated on every colon match before it.
 // All indices come from `find` of ASCII tokens (`:`, `]`, `/`, `?`, `#`) or byte-level ASCII
 // checks, so every slice bound is always a char boundary. `cursor` only ever advances (every
 // branch below adds at least 1 to it before looping), so the scan is guaranteed to terminate.
 #[allow(clippy::string_slice)]
-fn redact_colon_credential(raw: &str, authority_start: usize, authority: &str) -> String {
+fn colon_credential_match(
+    authority: &str,
+    next_bracket: Option<usize>,
+) -> Option<(String, &str, Option<usize>)> {
+    // `next_bracket` is a bare offset whose only contract is "relative to `authority`", enforced
+    // by doc comments rather than the type system — a future call site passing an offset relative
+    // to some *other* string would silently misjudge bracket carve-outs into an under-redaction
+    // (a leak), not a panic, so this catches the mismatch immediately in debug builds instead.
+    debug_assert!(
+        next_bracket.is_none_or(|b| b < authority.len()),
+        "next_bracket must be an offset into `authority` itself"
+    );
     let mut cursor = 0;
+    let mut next_bracket = next_bracket;
     // impl-critic R3: sticky for the rest of the scan once any bracket span has been skipped —
     // not reset per colon like an earlier revision's `bracket_adjacent`/`colon_is_bracket_adjacent`
     // pairing (C2), and not a proxy check on `value` itself (the `value.contains(']')`
@@ -1381,7 +1448,13 @@ fn redact_colon_credential(raw: &str, authority_start: usize, authority: &str) -
         }
 
         let next_colon = remaining.find(':');
-        if let Some(bracket) = remaining.find('[') {
+        // See `translate_bracket`'s own doc comment for the translate-or-rescan rule. The result
+        // is re-absolutized (relative to `authority` again, via `cursor +`) so `next_bracket`
+        // stays consistent for the next loop iteration — a no-op when the cheap path was taken
+        // (`cursor + (b - cursor) == b`), the freshly-found position when it wasn't.
+        let bracket_here = translate_bracket(next_bracket, cursor, remaining);
+        next_bracket = bracket_here.map(|b| cursor + b);
+        if let Some(bracket) = bracket_here {
             // A bracket ahead of the next colon (#860, D1: not just one anchored at the very
             // start of `remaining`) opens an IPv6-host span that must be skipped as a unit
             // before any colon inside it — including its own `]:port` separator — can be
@@ -1401,9 +1474,7 @@ fn redact_colon_credential(raw: &str, authority_start: usize, authority: &str) -
             }
         }
 
-        let Some(colon) = next_colon else {
-            return raw.to_string();
-        };
+        let colon = next_colon?;
 
         let value_start = colon + 1;
         let value_end = remaining[value_start..]
@@ -1429,26 +1500,164 @@ fn redact_colon_credential(raw: &str, authority_start: usize, authority: &str) -
             value_end
         };
 
-        // #862 (impl-critic C2, counterexample_hunt): the value masked above is only the *first*
-        // non-exempt colon match — by design (`a:b:c` -> `a:***`, not `a:b:***`) — but that design
-        // assumed nothing credential-shaped could survive past it. A decoy non-port-like value
-        // (`notaport` in `host/x@y:notaport/c://user:hunter2@evil`) breaks that assumption: the
-        // scan above stops and returns right at `notaport`, leaving a genuine `@`-shaped
-        // credential further into the tail completely unexamined. [`find_credential_at`] checks
-        // the remainder past this mask for exactly that shape and masks it too when present,
-        // rather than trusting the first hit was the only one.
-        let tail = &authority[cursor + end..];
-        let tail = match find_credential_at(tail) {
-            Some(at) => format!("***@{}", &tail[at + 1..]),
-            None => tail.to_string(),
-        };
+        let consumed = cursor + end;
+        let tail = &authority[consumed..];
+        // Same `translate_bracket` rule, now relative to the *returned* tail instead of
+        // `remaining` — this is what lets the caller's next call skip straight to the cheap
+        // subtraction path too, rather than starting the whole cache over from `None`.
+        let tail_bracket = translate_bracket(next_bracket, consumed, tail);
 
-        return format!(
-            "{}{}:***{}",
+        return Some((
+            format!("{}:***", &authority[..cursor + colon]),
+            tail,
+            tail_bracket,
+        ));
+    }
+}
+
+/// [`redact_userinfo_unparseable`]'s (and, since #818, [`redact_userinfo_opaque_path`]'s)
+/// fallback for the case neither covers on its own: a colon-separated credential with no `@` at
+/// all. See [`colon_credential_match`] for the actual scan (carve-outs, bracket handling); this
+/// wrapper only adds `raw`/`authority_start` formatting and hands the tail past the match to
+/// [`redact_further_credential`] for whatever else might still be in it (#874: this used to check
+/// only for a further `@`-shaped credential via [`find_credential_at`] directly, missing a
+/// further colon-only one — see that function's own doc comment).
+// `authority_start` is always caller-derived from `find`/`rfind` of ASCII tokens, so it always
+// lands on a char boundary.
+#[allow(clippy::string_slice)]
+fn redact_colon_credential(raw: &str, authority_start: usize, authority: &str) -> String {
+    match colon_credential_match(authority, authority.find('[')) {
+        None => raw.to_string(),
+        Some((masked, tail, tail_bracket)) => format!(
+            "{}{}{}",
             &raw[..authority_start],
-            &authority[..cursor + colon],
-            tail
-        );
+            masked,
+            // `tail_bracket` was already computed by `colon_credential_match` above — threaded
+            // through instead of discarded and re-derived via a second `tail.find('[')` (a
+            // code-review finding: bounded, not asymptotic, but avoidable).
+            redact_further_credential(tail, tail_bracket)
+        ),
+    }
+}
+
+/// The one place every fallback in this module now asks "is there anything else, of *either*
+/// shape, left in this tail" (#870/#873/#874): an `@`-shaped credential ([`find_credential_at`])
+/// or a colon-only one ([`colon_credential_match`]), whichever comes first, masked and then looked
+/// past again — instead of stopping after the first credential of whichever single shape a given
+/// call site happened to check for.
+///
+/// Before this fix, three call sites each asked a narrower version of this question and each
+/// missed the *other* shape past their own match:
+/// - [`redact_authority_suffix`]'s colon-evidence widen path (`find_credential_at` hit) returned
+///   immediately after masking one `@`-shaped credential, never checking whether a further
+///   colon-only credential sat past it (#873).
+/// - [`redact_authority_suffix`]'s loop-exhaustion path emitted whatever remained after the last
+///   masked `@` completely unchecked once any `@` had been masked, since its own `colon_evidence`
+///   gate is (by design — see that function's own doc comment) hard-gated to fire at most once
+///   (#870).
+/// - [`redact_colon_credential`]'s own tail re-scan called [`find_credential_at`] directly,
+///   missing a further colon-only credential past its first match (#874).
+///
+/// This is also the first place `RegionKind::Authority`'s own fallback paths widen an `@`-shaped
+/// match via [`extend_credential_at`] (previously wired only for `OpaquePath`'s `mask_at`) — but
+/// only for a credential found *by this loop*, in a tail that already required falling through to
+/// the unrestricted colon/`@` scan in the first place. It does not touch, and must never be
+/// confused with, `redact_authority_suffix`'s *primary* bounded `@` pass (`window.rfind('@')`),
+/// which impl-critic S2 still deliberately leaves unwidened — see
+/// `test_redact_userinfo_unparseable_straddle_fallthrough_is_not_widened`'s own doc comment.
+///
+/// Implemented as a loop rather than mutual recursion between this scan and
+/// [`colon_credential_match`]/[`find_credential_at`] (which is how each of the three call sites
+/// used to check "is there one more, of the other shape") so that a value chaining many decoy or
+/// real credentials stays bounded to `O(1)` stack depth, consistent with
+/// [`redact_authority_suffix`]'s own loop for the same reason. Each iteration strictly shrinks
+/// `remaining` (an `@`-shaped match always advances past its own `@`; a colon match always
+/// consumes at least its own colon), so the loop is guaranteed to terminate.
+///
+/// impl-critic S1/S2: two per-iteration costs are hoisted/latched to keep the *total* work `O(n)`
+/// (amortized) rather than `O(n²)` on a long, colon-dense, `@`-free-past-the-first-match value —
+/// with or without a `[` anywhere in it — e.g. `"u:p@h/" + "a:b/".repeat(k) + "z"` (measured at
+/// 21.3s for 1.6 MB before this fix) or the same shape with a single trailing `"[::1]"` (S2:
+/// still 2.8s at 800 KB with only a whole-tail `bool` fix for S1, since one `[` anywhere still
+/// cost a fresh `remaining.find('[')` on every one of the `k` calls below):
+/// - `next_bracket` is the caller-supplied offset of the nearest `[` in `tail` (`Some`) or a proof
+///   there is none (`None`) — never re-derived here via a fresh `tail.find('[')`, since every
+///   caller already knows it as a side effect of finding `tail` itself (see
+///   [`redact_colon_credential`], the only other caller, which threads through the exact offset
+///   [`colon_credential_match`] already computed rather than discarding it). Every
+///   [`colon_credential_match`] call this loop makes both consumes the tracked offset (translating
+///   it for the tail it returns, via [`translate_bracket`]) and hands back the translated value
+///   for the *next* call, so no call after the first ever re-derives it from scratch; see that
+///   function's own doc comment for why a stale offset only forces a rescan of `remaining` (never
+///   the original, much longer `tail`), and only on the rare iteration where the tracked bracket
+///   was actually just consumed.
+/// - `find_credential_at` is only ever called until it first returns `None`, then `at_exhausted`
+///   latches and every later iteration skips straight to the colon scan. This is sound not because
+///   `segment_has_credential_colon` is monotone under left-truncation in general — it is *not*:
+///   `segment_has_credential_colon("C:/x")` is `false` (drive-letter exemption) while its own
+///   suffix `":/x"` is `true`, and the same applies to a cut landing inside a skipped bracket span
+///   or between a `[` and its adjacent port colon (impl-critic M4) — but because every cut this
+///   loop's `remaining` can ever undergo lands at a position [`colon_credential_match`] itself
+///   guarantees is safe: its returned tail always begins at a `/`, `?`, or `#` byte (or is empty,
+///   since `bracket_seen` forces `end = remaining.len()`), and neither the drive-letter exemption
+///   (whose own third byte *is* one of `/`/`\`, but is never itself consumed by the 2-byte jump,
+///   so it stays intact for whatever comes after) nor a closed bracket span (`bracket_host_shape_end`'s
+///   own alphabet is hex digits, `:`, and `.` — never `/`, `?`, or `#`) can straddle across one of
+///   those three bytes. So a cut point can never land mid-drive-colon, mid-bracket-span, or between
+///   a `[` and its port colon — the one thing that would let a shorter segment gain evidence a
+///   longer one didn't have. `extend_credential_at`'s own cut (`remaining[at + 1..]`, right after an
+///   `@`) has no such guarantee in general, but only ever shrinks the segment for whichever `@` is
+///   now first, which can only lose evidence, never gain it (an `@`-anchored cut can't land inside
+///   a drive-colon/bracket shape, since none of those contain `@`). Either way, a `None` this
+///   function's own `find_credential_at` call returns stays a `None` for every further shrink — a
+///   future change to `value_end`'s boundary set (`/`, `?`, `#`) or to `bracket_host_shape_end`'s
+///   alphabet that lets either span cross one of those three bytes would break this invariant and
+///   must re-examine this latch, since silently getting it wrong here is an under-redaction (a
+///   leak), not just a missed optimization.
+#[allow(
+    clippy::string_slice,
+    reason = "`at` comes from `extend_credential_at`, itself derived from `match_indices('@')` \
+              on an ASCII byte, so it always lands on a char boundary"
+)]
+fn redact_further_credential(tail: &str, next_bracket: Option<usize>) -> String {
+    debug_assert!(
+        next_bracket.is_none_or(|b| b < tail.len()),
+        "next_bracket must be an offset into `tail` itself"
+    );
+    let mut next_bracket = next_bracket;
+    let mut at_exhausted = false;
+    let mut output = String::new();
+    let mut remaining = tail;
+    loop {
+        // An `@`-shaped credential is checked first, matching every other call site in this file
+        // (a colon-less credential can only be `@`-shaped, so this must run before concluding
+        // there's nothing left just because the colon scan found nothing) — but only while it can
+        // still find one; see this function's own doc comment for why `None` here is sticky.
+        if !at_exhausted {
+            match find_credential_at(remaining) {
+                Some(at) => {
+                    let at = extend_credential_at(remaining, at);
+                    output.push_str("***@");
+                    let consumed = at + 1;
+                    let new_remaining = &remaining[consumed..];
+                    next_bracket = translate_bracket(next_bracket, consumed, new_remaining);
+                    remaining = new_remaining;
+                    continue;
+                }
+                None => at_exhausted = true,
+            }
+        }
+        match colon_credential_match(remaining, next_bracket) {
+            Some((masked, next_tail, tail_bracket)) => {
+                output.push_str(&masked);
+                remaining = next_tail;
+                next_bracket = tail_bracket;
+            }
+            None => {
+                output.push_str(remaining);
+                return output;
+            }
+        }
     }
 }
 
@@ -2686,18 +2895,16 @@ mod tests {
             redact_userinfo("https://ghp_TOKEN@github.com:99999/x"),
             "https://***@github.com:99999/x"
         );
-        // #869's tail continuation (`redact_secondary_colon_credential`) applies to
-        // `redact_credential`'s shared `mask_at` closure, which `RegionKind::Authority` no longer
-        // reaches once #862 gave it its own, more selective continuation
-        // (`redact_authority_suffix`): `notaport` here is not credential-shaped
-        // (`bounded_has_credential_colon`/`is_port_like` both correctly leave it alone) and
-        // `colon_evidence` is only checked while `base == 0` (#870, deliberately deferred) — so
-        // it stays visible rather than being over-redacted the way #869's simpler, unconditional
-        // tail-rescan would. This test's own purpose (the userinfo `@` boundary is found
-        // correctly, and the real credential never leaks) is unaffected either way.
+        // Once the real credential is masked (`base != 0`), `redact_authority_suffix`'s loop
+        // exhausts with no further `@` in `region[base..]` ("gitlab.corp:notaport/x") and now
+        // (#870 fix) routes that remainder through `redact_further_credential` instead of
+        // appending it verbatim — `notaport` is not port-like, so `colon_credential_match`'s own
+        // pre-existing false-positive rule (documented on that function) masks it too. This is
+        // over-redaction of ordinary path text, not a leak: this test's own purpose (the userinfo
+        // `@` boundary is found correctly, and the real credential never leaks) is unaffected.
         let redacted = redact_userinfo("https://glpat-SECRET@gitlab.corp:notaport/x");
         assert!(!redacted.contains("glpat-SECRET"), "redacted={redacted:?}");
-        assert_eq!(redacted, "https://***@gitlab.corp:notaport/x");
+        assert_eq!(redacted, "https://***@gitlab.corp:***/x");
     }
 
     /// code-review Finding 1 (HIGH, confirmed leak): a bounded authority whose *only* `@` sits at
@@ -2731,14 +2938,15 @@ mod tests {
         assert!(!redacted.contains("pa@ss"), "redacted={redacted:?}");
         assert_eq!(redacted, "***@evil");
 
-        // Same reasoning as the sibling test above: `RegionKind::Authority` no longer reaches
-        // #869's `mask_at`/`redact_secondary_colon_credential` tail-rescan since #862 gave it its
-        // own continuation, which deliberately leaves a non-credential-shaped `notaport` alone
-        // once a credential has already been masked (#870) — the `hunter2` assertion this test
+        // Same reasoning as the sibling test above: once `hunter2` is masked (`base != 0`), the
+        // loop exhausts on `region[base..]` ("host:notaport/x") and (#870 fix) that remainder is
+        // now routed through `redact_further_credential`, which masks the non-port-like
+        // `notaport` too via `colon_credential_match`'s own pre-existing false-positive rule —
+        // over-redaction of ordinary path text, not a leak. The `hunter2` assertion this test
         // actually exists to check is unaffected.
         let redacted = redact_userinfo("user:hunter2@evil@host:notaport/x");
         assert!(!redacted.contains("hunter2"), "redacted={redacted:?}");
-        assert_eq!(redacted, "***@host:notaport/x");
+        assert_eq!(redacted, "***@host:***/x");
     }
 
     /// #846 S4 (tracked at #858): `OpaquePath` has no authority span to license the
@@ -2808,14 +3016,23 @@ mod tests {
     /// impl-critic S2 (assumption_audit): `Authority`'s own rare fall-through into
     /// [`redact_credential`]'s shared tail (the #826 straddle case — the bounded authority up to
     /// the first `/`/`?`/`#` has no `@` of its own, but does contain a credential-shaped `:`) must
-    /// not additionally widen via [`extend_credential_at`], which is wired only for `OpaquePath`.
-    /// Widening `Authority` too would silently change already-shipped, untested behavior on an
-    /// unrelated edge case rather than fix a specific leak.
+    /// not additionally widen via [`extend_credential_at`], which is wired only for `OpaquePath`
+    /// — that part is unchanged.
+    ///
+    /// #873 (fixed): the colon-evidenced match found via [`find_credential_at`] here used to
+    /// `return` immediately, which is what let the second `@` (`host@corp`) sit past the point
+    /// where the same unconditional bounded-`@` pass this loop uses for every other window would
+    /// otherwise have found it. Now the match updates `base`/`window_start` and `continue`s the
+    /// very same loop instead of returning — the same fix that closes #873's own colon-less-
+    /// credential-behind-a-decoy repro — so `host` is masked too by that ordinary per-window
+    /// check, not by [`extend_credential_at`]. Still no widening of the credential-shaped match
+    /// itself, and `hunter2` still never leaks; `host` is over-redacted as ordinary path text, the
+    /// safe direction this module always prefers.
     #[test]
     fn test_redact_userinfo_unparseable_straddle_fallthrough_is_not_widened() {
         assert_eq!(
             redact_userinfo("https://user:hunter2?x@host@corp"),
-            "https://***@host@corp"
+            "https://***@***@corp"
         );
     }
 
@@ -3026,17 +3243,14 @@ mod tests {
         }
     }
 
-    /// #870 (impl-critic round 7, `assumption_audit`): `colon_evidence` in
-    /// [`redact_authority_suffix`] is hard-gated on no `@` having been masked yet earlier in
-    /// `region`, so once any `@` has been masked the colon fallback can never run again, and a later colon-only
-    /// credential (no `@` of its own) is emitted verbatim — `oauth2:glpat-SECRET` and
-    /// `gitlab-ci-token:JOBTOKEN` are the two literal examples documented on
-    /// [`redact_colon_credential`] itself (the #810 repro tokens). No known fix short of running
-    /// the colon fallback on the unmasked remainder after the loop instead of gating it on
-    /// "nothing was masked yet" — see #870 for the trade-off that needs its own A/B pass; remove
-    /// `#[ignore]` once #870 lands a fix.
+    /// #870 (fixed): `colon_evidence` in [`redact_authority_suffix`] is hard-gated on no `@`
+    /// having been masked yet earlier in `region`, so once any `@` has been masked the colon
+    /// fallback used to never run again, and a later colon-only credential (no `@` of its own) was
+    /// emitted verbatim — `oauth2:glpat-SECRET` and `gitlab-ci-token:JOBTOKEN` are the two literal
+    /// examples documented on [`redact_colon_credential`] itself (the #810 repro tokens). Fixed by
+    /// routing the loop-exhaustion fallthrough through [`redact_further_credential`] instead of
+    /// appending the unmasked remainder verbatim.
     #[test]
-    #[ignore = "known colon-only-credential-behind-decoy-@ leak, see #870"]
     fn test_redact_userinfo_unparseable_colon_only_credential_behind_decoy_at_is_redacted() {
         assert_eq!(
             redact_userinfo("npmjs.org/pkg@1.0.0/https://oauth2:glpat-SECRET"),
@@ -3045,6 +3259,37 @@ mod tests {
         assert_eq!(
             redact_userinfo("registry.corp/proxy@v2/https://gitlab-ci-token:JOBTOKEN"),
             "registry.corp/***@v2/https://gitlab-ci-token:***"
+        );
+    }
+
+    /// #873 (fixed): [`redact_authority_suffix`]'s colon-evidenced widen branch used to `return`
+    /// immediately after masking the `@`-shaped match [`find_credential_at`] found (`user1:pass1@`
+    /// here), never continuing the loop far enough to reach a later, colon-less `TOKEN@host`
+    /// credential (`ghp_TOKEN@evil2`) sitting behind an unrelated `/decoy/` path segment. Fixed by
+    /// continuing the very same bounded-`@` pass (`base`/`window_start`, `continue`) instead of
+    /// returning, so the ordinary per-window `@` check a few lines above catches it exactly as it
+    /// would for any other window.
+    #[test]
+    fn test_redact_userinfo_unparseable_colon_less_credential_behind_colon_evidenced_decoy_is_redacted()
+     {
+        assert_eq!(
+            redact_userinfo("host:x/user1:pass1@evil1/decoy/ghp_TOKEN@evil2"),
+            "***@evil1/decoy/***@evil2"
+        );
+    }
+
+    /// #874 (fixed): [`redact_colon_credential`]'s own tail re-scan used to check only for a
+    /// further `@`-shaped credential via [`find_credential_at`] directly, so a *second* colon-only
+    /// credential (`oauth2:glpat-SECRET`, no `@` at all) sitting past an already-masked decoy
+    /// colon value (`notaport`) was never examined. Fixed by routing the tail through
+    /// [`redact_further_credential`], which keeps scanning for a credential of either shape
+    /// instead of just the one [`find_credential_at`] recognizes.
+    #[test]
+    fn test_redact_userinfo_unparseable_second_colon_only_credential_behind_decoy_colon_is_redacted()
+     {
+        assert_eq!(
+            redact_userinfo("y:notaport/oauth2:glpat-SECRET"),
+            "y:***/oauth2:***"
         );
     }
 
@@ -3103,6 +3348,61 @@ mod tests {
             elapsed < std::time::Duration::from_secs(5),
             "took {elapsed:?} for n={n} small undecided windows — bounded_has_credential_colon \
              may have regressed to scanning a growing accumulated span"
+        );
+    }
+
+    /// impl-critic S1 (round 8 perf regression): [`redact_further_credential`] used to re-scan
+    /// the entire (shrinking) tail for both a further `@` ([`find_credential_at`]) and a `[`
+    /// bracket ([`colon_credential_match`]'s own `remaining.find('[')`) on every outer iteration,
+    /// even once neither could ever be found again — turning a long, colon-dense,
+    /// bracket-free, single-real-credential value into `O(n²)` (measured, release build: 21.3s at
+    /// 1.6 MB before this fix). Fixed by making the `@` probe sticky and hoisting the
+    /// bracket-presence check out of the per-iteration restart — see that function's own doc
+    /// comment for why both are sound.
+    #[test]
+    fn test_redact_further_credential_colon_dense_chain_is_linear_time() {
+        let k = 400_000;
+        let raw = format!("u:SECRET@h/{}z", "a:b/".repeat(k));
+        let start = std::time::Instant::now();
+        let redacted = redact_userinfo(&raw);
+        let elapsed = start.elapsed();
+        assert!(
+            !redacted.contains("SECRET"),
+            "redacted len={}",
+            redacted.len()
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "took {elapsed:?} for a {k}-segment colon-dense chain — redact_further_credential \
+             may have regressed to quadratic behavior"
+        );
+    }
+
+    /// impl-critic S2 (round 8 perf regression, found in re-review of the S1 fix above): a
+    /// whole-tail `bool` ("does this value contain a `[` anywhere") is defeated by a *single* `[`
+    /// — [`colon_credential_match`] still ran `remaining.find('[')` on every call once that bool
+    /// was `true`, so one bracket anywhere in an otherwise colon-dense value (even one never
+    /// actually reached) restored the same `O(n²)` S1 fixed for the bracket-free case (measured,
+    /// release build: 2.8s at 800 KB with only the S1 fix). Fixed by tracking the bracket's own
+    /// offset instead of a boolean, carried forward and translated (not re-scanned) on every call
+    /// — see `redact_further_credential`'s and `colon_credential_match`'s own doc comments.
+    #[test]
+    fn test_redact_further_credential_colon_dense_chain_with_trailing_bracket_is_linear_time() {
+        let k = 400_000;
+        let raw = format!("u:SECRET@h/{}[::1]", "a:b/".repeat(k));
+        let start = std::time::Instant::now();
+        let redacted = redact_userinfo(&raw);
+        let elapsed = start.elapsed();
+        assert!(
+            !redacted.contains("SECRET"),
+            "redacted len={}",
+            redacted.len()
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "took {elapsed:?} for a {k}-segment colon-dense chain with a trailing bracket — \
+             colon_credential_match may have regressed to quadratic behavior on a bracket-present \
+             value"
         );
     }
 
@@ -3537,16 +3837,15 @@ mod tests {
         );
     }
 
-    /// #870 (same root cause, reached via a different dispatch path than the two examples
+    /// #870 (fixed, same root cause, reached via a different dispatch path than the two examples
     /// already pinned above it): `redact_userinfo_unparseable` finds no `://` before the first
     /// `@` in `raw` (there is no scheme separator anywhere), so `authority_start` is `0` and the
     /// entire string is scanned as one `RegionKind::Authority` region. Once the first `@` is
-    /// masked, `redact_authority_suffix`'s `colon_evidence` check is hard-gated on `base == 0`
-    /// (#870), so a further colon-only credential (`tok:SECRET`, no `@` of its own) later in the
-    /// same value is emitted verbatim. No known fix short of the same #870 A/B pass; remove
-    /// `#[ignore]` once #870 lands a fix.
+    /// masked, `redact_authority_suffix`'s `colon_evidence` check is still hard-gated on
+    /// `base == 0` by design, but the loop-exhaustion fallthrough now routes through
+    /// [`redact_further_credential`] instead of appending the remainder verbatim, so a further
+    /// colon-only credential (`tok:SECRET`, no `@` of its own) later in the same value is caught.
     #[test]
-    #[ignore = "known colon-only-credential-behind-decoy-@ leak (#870), reached with no scheme prefix at all"]
     fn test_redact_userinfo_unparseable_colon_only_credential_reachable_with_no_scheme_prefix_is_redacted()
      {
         assert_eq!(
