@@ -36,16 +36,49 @@ use yaml_rust2::scanner::{Marker, TScalarStyle};
 pub(crate) use deps_core::lsp_helpers::is_full_sha;
 pub(crate) use deps_core::lsp_helpers::is_tag_shaped;
 
-/// The first whitespace-delimited token after a whitespace-preceded `#` in
-/// `rest_of_line` (the raw source text following a ref's end, up to end of line),
-/// accepted as a comment tag only when it has the shape of a full `major.minor.patch`
-/// version ([`is_full_semver_shape`], shared with the crate's `BareRequirementPolicy`
-/// gate so the two mechanisms can't diverge — B2/B3/N1).
+/// Upper bound, in bytes past a ref's end, on how far [`ref_is_last_token_on_line`] and
+/// [`extract_comment_tag`] look ahead on the ref's physical line (issue #885 rework).
 ///
-/// Returns `(tag_text, byte_offset_in_rest_of_line_where_the_token_ends)`. A `#` not
-/// preceded by whitespace is not a YAML comment and is skipped (only the *first*
-/// whitespace-preceded `#` is considered); a shape-rejected token (`# v4`, `# v4.2`) or
-/// no `#` at all yields `None` — the ref degrades to a bare, commentless pin.
+/// Deliberately a separate constant from `deps_core::lsp_helpers::MAX_FALLBACK_SCAN_BYTES`
+/// (code-review finding #4 on the original #885 fix): that constant bounds a byte-offset
+/// *correction* fallback with a completely different cost/correctness profile (a handful of
+/// bytes in real manifests) — reusing it here coupled two unrelated tuning knobs, so that
+/// crate's own consumers (including `deps-gitlab-ci`) would have silently inherited any
+/// widening made for this file's rest-of-line comment/continuation lookahead.
+///
+/// Sized so realistic GitHub Actions inline comments/tags are essentially never truncated:
+/// even a verbose annotation (`# pinned to v4.2.100, see PR #1234 for CVE-XXXX-XXXX`) is
+/// well under a few hundred bytes, leaving an order of magnitude of headroom. Worst-case
+/// cost is still bounded rather than reintroduced as O(document length): with
+/// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (5000) ref-pinned dependencies packed onto
+/// one adversarial physical line, each separated by a whitespace-only gap this large, the
+/// two lookahead scans together visit at most `5000 * 2 * 4096` ≈ 40 MB total (each of the
+/// ~20 MB of distinct gap content visited by both scans) — the distinct content alone is
+/// already most of `deps_core::parser::MAX_YAML_EXPANDED_BYTES`'s 32 MiB document-size
+/// ceiling, so this is close to the worst case such a document can express, not an
+/// understatement of it. `test_build_dependency_rest_of_line_lookup_is_not_quadratic` below
+/// demonstrates this stays a small, constant-per-call cost independent of how much content
+/// follows on the line, unlike the unbounded `find('\n')` scan this issue was filed
+/// against.
+const REST_OF_LINE_WINDOW_BYTES: usize = 4096;
+
+/// Whether [`build_dependency`]'s bounded rest-of-line window ([`REST_OF_LINE_WINDOW_BYTES`])
+/// covers the ref's entire physical line, or was cut short before reaching the real
+/// end-of-line content.
+///
+/// A plain `bool` here previously required the single call site to pass `!window_truncated`
+/// — a negation that a future edit could silently drop or invert, flipping a
+/// security-relevant conservative default to a permissive one with no type-level signal
+/// (code-review finding #7). The two variants make the call site's intent explicit instead.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WindowCoverage {
+    /// The window reached the line's real end — nothing on the line is unexamined.
+    FullLine,
+    /// The window was cut short by [`REST_OF_LINE_WINDOW_BYTES`]; real content may exist
+    /// just past it that this scan never saw.
+    Truncated,
+}
+
 /// Whether nothing unsafe to overwrite follows the ref on its source line: only
 /// whitespace, or a whitespace-preceded YAML comment (the same comment-start rule
 /// [`extract_comment_tag`] uses), all the way to end of line.
@@ -60,9 +93,19 @@ pub(crate) use deps_core::lsp_helpers::is_tag_shaped;
 /// rather than merely leaving it unpinned. This function has no notion of flow vs. block
 /// context itself; it just checks "would writing a comment here swallow real content",
 /// which is true in exactly the flow-style case and false for ordinary block-style lines.
+///
+/// `rest_of_line` may be a window bounded well short of the line's real end (issue #885
+/// rework); `window` being [`WindowCoverage::FullLine`] is the answer to use only when the
+/// *entire* window is whitespace with no `#`/real content found in it — a case this
+/// function cannot resolve on its own, since real content might still exist just past a
+/// truncated window. Finding a `#` comment or non-whitespace content within the window is
+/// always a definitive answer regardless of `window` (impl-critic finding: gating a found
+/// `#`/non-whitespace answer on "was the window truncated" discarded information the
+/// window already proved, producing a false negative that withheld the SHA-pin quickfix on
+/// a perfectly safe line whose comment tag resolved fine within the window).
 // `bytes[i - 1]` is guarded by the `i > 0` conjunct immediately before it.
 #[allow(clippy::indexing_slicing)]
-fn ref_is_last_token_on_line(rest_of_line: &str) -> bool {
+fn ref_is_last_token_on_line(rest_of_line: &str, window: WindowCoverage) -> bool {
     let bytes = rest_of_line.as_bytes();
     for (i, &b) in bytes.iter().enumerate() {
         if b == b'#' && i > 0 && bytes[i - 1].is_ascii_whitespace() {
@@ -72,14 +115,35 @@ fn ref_is_last_token_on_line(rest_of_line: &str) -> bool {
             return false;
         }
     }
-    true
+    window == WindowCoverage::FullLine
 }
 
+/// The first whitespace-delimited token after a whitespace-preceded `#` in
+/// `rest_of_line` (the raw source text following a ref's end, up to end of line),
+/// accepted as a comment tag only when it has the shape of a full `major.minor.patch`
+/// version ([`is_full_semver_shape`], shared with the crate's `BareRequirementPolicy`
+/// gate so the two mechanisms can't diverge — B2/B3/N1).
+///
+/// Returns `(tag_text, byte_offset_in_rest_of_line_where_the_token_ends)`. A `#` not
+/// preceded by whitespace is not a YAML comment and is skipped (only the *first*
+/// whitespace-preceded `#` is considered); a shape-rejected token (`# v4`, `# v4.2`) or
+/// no `#` at all yields `None` — the ref degrades to a bare, commentless pin.
+///
+/// `window` reflects whether `rest_of_line` was cut short of the line's real end (issue
+/// #885 rework). When the token runs all the way to the end of `rest_of_line` with no
+/// terminating whitespace found *and* the window was [`WindowCoverage::Truncated`], the
+/// token's true extent is unknown — real digits may continue just past the window edge
+/// (e.g. a window boundary landing mid-digit turns `v4.2.100` into `v4.2.10`, which still
+/// passes [`is_full_semver_shape`] and would otherwise be silently recorded as the real
+/// version — code-review finding #1). Such an ambiguous token is rejected as `None` rather
+/// than risking a truncated-but-plausible-looking version; a token that ends before the
+/// window's edge (a terminating whitespace was actually observed) is unaffected regardless
+/// of `window`, since its boundary was genuinely seen.
 // `i` is a byte index holding ASCII `b'#'`; `token_len` from `find(char::is_whitespace)` or
 // `.len()`. Both slice bounds are always char boundaries. `bytes[i - 1]` is short-circuited
 // by the `i == 0 ||` conjunct, and `i` ranges `0..bytes.len()` from the loop.
 #[allow(clippy::string_slice, clippy::indexing_slicing)]
-fn extract_comment_tag(rest_of_line: &str) -> Option<(&str, usize)> {
+fn extract_comment_tag(rest_of_line: &str, window: WindowCoverage) -> Option<(&str, usize)> {
     let bytes = rest_of_line.as_bytes();
     for i in 0..bytes.len() {
         if bytes[i] != b'#' {
@@ -91,7 +155,17 @@ fn extract_comment_tag(rest_of_line: &str) -> Option<(&str, usize)> {
         let after_hash = &rest_of_line[i + 1..];
         let after_ws = after_hash.trim_start();
         let ws_len = after_hash.len() - after_ws.len();
-        let token_len = after_ws.find(char::is_whitespace).unwrap_or(after_ws.len());
+        // A single `find` gives both "did a terminator turn up" and "where" — no need
+        // for a separate `contains` pass over the same text first (impl-critic-2 nit).
+        let terminator = after_ws.find(char::is_whitespace);
+        if terminator.is_none() && window == WindowCoverage::Truncated {
+            // The token has no observed end within the window, so its true text may
+            // continue past the edge — accepting it here risks silently recording a
+            // truncated-but-still-semver-shaped value (finding #1). Bail out rather than
+            // guess; the ref degrades to a bare, commentless pin instead of a wrong one.
+            return None;
+        }
+        let token_len = terminator.unwrap_or(after_ws.len());
         let token = &after_ws[..token_len];
         return if is_full_semver_shape(token) {
             Some((token, i + 1 + ws_len + token_len))
@@ -336,7 +410,9 @@ impl MarkedEventReceiver for WorkflowReceiver {
 // `marker_byte_offset` + `locate_value_span` and then re-anchored to the trimmed value
 // (see the trim re-anchoring comment below) — plus `before_at_len`/`ref_text.len()`, both
 // whole-substring byte counts, so the arithmetic never lands mid-character. `token_end` is
-// relative to `content[ref_end..]` and derived from `find('\n')` (ASCII) or `.len()`.
+// relative to `content[ref_end..]`, windowed to at most `REST_OF_LINE_WINDOW_BYTES` past
+// `ref_end` and to the line's own end (resolved via `line_table.line_start` in O(1)), rather
+// than an unbounded `find('\n')` scan (issue #885).
 #[allow(clippy::string_slice)]
 fn build_dependency(
     content: &str,
@@ -453,19 +529,77 @@ fn build_dependency(
                 });
             }
 
-            let rest_of_line = &content[ref_end..];
-            let rest_of_line_end = rest_of_line.find('\n').unwrap_or(rest_of_line.len());
-            let rest_of_line = &rest_of_line[..rest_of_line_end];
+            // O(1) real line-end lookup via `line_table` instead of an unbounded
+            // `find('\n')` scan (issue #885): the latter scanned to end-of-document
+            // once per ref-pinned dependency, an O(N x remaining-document-length)
+            // cost on a single-line manifest with N such deps. Mirrors
+            // `marker_byte_offset`'s own use of `LineOffsetTable::line_start` — that
+            // returns the byte offset right after this line's own '\n' (0-indexed
+            // line `candidate.line`, so passing the 1-indexed `candidate.line` here
+            // lands on the *next* line's start), or `content.len()` if this is the
+            // last line with no trailing newline. `line_end` is always a `content`
+            // char boundary (built from a `char_indices()` walk), and stepping back
+            // one byte off it is too when that byte is the single-byte '\n' itself,
+            // so no boundary clamp is needed for it specifically.
+            let line_end = line_table
+                .line_start(candidate.line)
+                .unwrap_or(content.len());
+            let line_end = match line_end.checked_sub(1) {
+                Some(i) if content.as_bytes().get(i) == Some(&b'\n') => i,
+                _ => line_end,
+            };
+            // Even a correctly-located line can itself be enormous — a
+            // single-physical-line manifest with many ref-pinned dependencies and
+            // no real newline anywhere is exactly #885's threat model, and neither
+            // `ref_is_last_token_on_line` nor `extract_comment_tag` needs more than
+            // a short window after the ref. Cap the window at
+            // `REST_OF_LINE_WINDOW_BYTES` past `ref_end`; `floor_char_boundary`
+            // clamps it back to a valid boundary since (unlike `line_end`) this
+            // bound isn't guaranteed to land on one. `line_end < ref_end` is
+            // defense-in-depth for a `line_table`/`ref_end` mismatch that shouldn't
+            // occur in practice — logged distinctly below (code-review finding #8)
+            // since it's a desync bug, not routine truncation, and without this
+            // disjunct such a mismatch would silently look untruncated instead of
+            // failing safe.
+            let line_end_desynced = line_end < ref_end;
+            if line_end_desynced {
+                tracing::debug!(
+                    ref_end,
+                    line_end,
+                    candidate_line = candidate.line,
+                    "line_table line_end is before ref_end; this should not happen \
+                     in practice — treating the rest-of-line window as truncated"
+                );
+            }
+            let capped_end = ref_end
+                .saturating_add(REST_OF_LINE_WINDOW_BYTES)
+                .min(line_end);
+            let window_truncated = line_end_desynced || capped_end < line_end;
+            let window = if window_truncated {
+                WindowCoverage::Truncated
+            } else {
+                WindowCoverage::FullLine
+            };
+            let capped_end = content.floor_char_boundary(capped_end);
+            let rest_of_line = &content[ref_end..capped_end.max(ref_end)];
             // Security audit finding (issue #633): computed for every ref-pinned form,
             // not just the SHA-with-comment case below, since the mutable-tag SHA-pin
             // edit (`sha_pin_text_edit_for`) needs it for `PinStyle::Tag` too — a flow-
             // style step (`{uses: actions/checkout@v4, with: {...}}`) has real YAML
             // content after the ref that a trailing `# <tag>` comment would swallow.
-            let is_last_on_line = ref_is_last_token_on_line(rest_of_line);
+            // `ref_is_last_token_on_line` gives a definitive answer whenever it finds
+            // a `#` comment or real content within the (possibly truncated) window —
+            // `window` only matters as the fallback when the window is all
+            // whitespace with nothing conclusive in it, where we cannot safely assume
+            // "nothing unsafe follows" (issue #885 rework, impl-critic S1: a naive
+            // bounded window without this fallback flipped `is_last_on_line` from
+            // false to true once enough padding separated the ref from a real
+            // flow-style continuation, reopening the #633 corruption).
+            let is_last_on_line = ref_is_last_token_on_line(rest_of_line, window);
 
             if is_full_sha(&ref_text) {
                 let comment = is_plain_scalar
-                    .then(|| extract_comment_tag(rest_of_line))
+                    .then(|| extract_comment_tag(rest_of_line, window))
                     .flatten();
 
                 return Some(match comment {
@@ -1004,22 +1138,49 @@ mod tests {
 
     #[test]
     fn test_ref_is_last_token_on_line_true_for_empty_and_whitespace_only() {
-        assert!(ref_is_last_token_on_line(""));
-        assert!(ref_is_last_token_on_line("   "));
+        assert!(ref_is_last_token_on_line("", WindowCoverage::FullLine));
+        assert!(ref_is_last_token_on_line("   ", WindowCoverage::FullLine));
+    }
+
+    #[test]
+    fn test_ref_is_last_token_on_line_false_for_empty_and_whitespace_only_when_window_truncated() {
+        // #885 rework: an all-whitespace window gives no definitive answer on its own
+        // when it was truncated before the line's real end — `WindowCoverage::Truncated`
+        // must be honored as the fallback in that case.
+        assert!(!ref_is_last_token_on_line("", WindowCoverage::Truncated));
+        assert!(!ref_is_last_token_on_line("   ", WindowCoverage::Truncated));
     }
 
     #[test]
     fn test_ref_is_last_token_on_line_true_for_trailing_comment() {
-        assert!(ref_is_last_token_on_line(" # my note"));
+        assert!(ref_is_last_token_on_line(
+            " # my note",
+            WindowCoverage::FullLine
+        ));
+    }
+
+    #[test]
+    fn test_ref_is_last_token_on_line_true_for_trailing_comment_even_when_window_truncated() {
+        // #885 rework (impl-critic point 4): finding a `#` comment within the window
+        // is a definitive answer regardless of `WindowCoverage` — the window
+        // being truncated elsewhere in the line doesn't matter once the comment is
+        // found here.
+        assert!(ref_is_last_token_on_line(
+            " # my note",
+            WindowCoverage::Truncated
+        ));
     }
 
     #[test]
     fn test_ref_is_last_token_on_line_false_for_flow_collection_continuation() {
         // The exact shape from the security audit's reproduction: `, with: {node: 20}}`
         // immediately follows a tag ref inside a YAML flow mapping.
-        assert!(!ref_is_last_token_on_line(", with: {node: 20}}"));
-        assert!(!ref_is_last_token_on_line("}"));
-        assert!(!ref_is_last_token_on_line("]"));
+        assert!(!ref_is_last_token_on_line(
+            ", with: {node: 20}}",
+            WindowCoverage::FullLine
+        ));
+        assert!(!ref_is_last_token_on_line("}", WindowCoverage::FullLine));
+        assert!(!ref_is_last_token_on_line("]", WindowCoverage::FullLine));
     }
 
     /// Regression for the security audit's live reproduction: a `uses:` step written in
@@ -1167,14 +1328,199 @@ mod tests {
     #[test]
     fn test_extract_comment_tag_multiple_hashes_uses_first() {
         assert_eq!(
-            extract_comment_tag(" # v1.0.0 # v2.0.0"),
+            extract_comment_tag(" # v1.0.0 # v2.0.0", WindowCoverage::FullLine),
             Some(("v1.0.0", " # v1.0.0".len()))
         );
     }
 
     #[test]
     fn test_extract_comment_tag_no_hash_returns_none() {
-        assert_eq!(extract_comment_tag(" no comment here"), None);
+        assert_eq!(
+            extract_comment_tag(" no comment here", WindowCoverage::FullLine),
+            None
+        );
+    }
+
+    #[test]
+    fn test_extract_comment_tag_rejects_token_reaching_truncated_window_edge() {
+        // Code-review finding #1: a token with no observed terminating whitespace
+        // within a *truncated* window is ambiguous — it might continue past the
+        // edge — and must be rejected rather than accepted as-is, even though it
+        // otherwise has a valid semver shape.
+        assert_eq!(
+            extract_comment_tag(" # v4.2.10", WindowCoverage::Truncated),
+            None
+        );
+    }
+
+    #[test]
+    fn test_extract_comment_tag_accepts_token_reaching_full_line_end() {
+        // The same shape as above is fine when the window covers the real line end:
+        // there is genuinely nothing more to see, so the token is complete.
+        assert_eq!(
+            extract_comment_tag(" # v4.2.10", WindowCoverage::FullLine),
+            Some(("v4.2.10", " # v4.2.10".len()))
+        );
+    }
+
+    // --- issue #885: O(1) line-end lookup past a ref-pinned dependency ---
+
+    #[test]
+    fn test_ref_near_end_of_document_without_trailing_newline_still_finds_comment_tag() {
+        // Edge case for the line-end lookup: the file has no trailing newline at
+        // all, so `line_table.line_start` for this line is `None` (falls back to
+        // `content.len()`). Must still resolve the comment tag correctly.
+        let sha = "a".repeat(40);
+        let content = format!("steps:\n  - uses: actions/checkout@{sha} # v4.2.0");
+        let result = parse_workflow_yaml(&content, &test_uri()).unwrap();
+        let dep = &result.dependencies[0];
+        assert_eq!(
+            dep.version_requirement().map(deps_core::VersionReq::as_str),
+            Some("v4.2.0")
+        );
+    }
+
+    #[test]
+    fn test_flow_style_continuation_beyond_window_still_detected() {
+        // Regression for a bounded-scan-window approach previously considered for
+        // #885 (impl-critic S1): a fixed lookahead window would flip
+        // `is_last_on_line` from false to true once enough whitespace padding sat
+        // between the ref and the flow-mapping's real continuation
+        // (`, with: {...}}`), reopening the exact #633 corruption (a SHA-pin edit
+        // commenting out real YAML). The O(1) `line_table`-bounded lookup covers
+        // the whole physical line regardless of padding length, so this must stay
+        // `false` no matter how far the continuation sits.
+        let sha = "a".repeat(40);
+        let padding = " ".repeat(REST_OF_LINE_WINDOW_BYTES + 100);
+        let content =
+            format!("steps:\n  - {{uses: actions/checkout@{sha}{padding}, with: {{node: 20}}}}\n");
+        let result = parse_workflow_yaml(&content, &test_uri()).unwrap();
+        let dep = &result.dependencies[0];
+        assert!(
+            !dep.is_last_on_line,
+            "a flow-mapping continuation beyond the window must still be detected"
+        );
+    }
+
+    #[test]
+    fn test_sha_comment_tag_resolves_even_with_trailing_annotation_beyond_window() {
+        // #885 rework (impl-critic point 4): a valid `# <tag>` comment found within
+        // the bounded window is a definitive answer regardless of how much more text
+        // follows on the line beyond the window — `is_last_on_line` must stay `true`
+        // (block-style, nothing unsafe to overwrite) and the tag must still resolve.
+        // A naive `!window_truncated && ...` gate would have incorrectly returned
+        // `false` here purely because of the long trailing annotation, withholding
+        // the SHA-pin quickfix on an otherwise perfectly safe line.
+        let sha = "a".repeat(40);
+        let trailing_annotation = "-".repeat(REST_OF_LINE_WINDOW_BYTES + 100);
+        let content =
+            format!("steps:\n  - uses: actions/checkout@{sha} # v4.2.0 {trailing_annotation}\n");
+        let result = parse_workflow_yaml(&content, &test_uri()).unwrap();
+        let dep = &result.dependencies[0];
+        assert_eq!(
+            dep.version_requirement().map(deps_core::VersionReq::as_str),
+            Some("v4.2.0")
+        );
+        assert!(
+            dep.is_last_on_line,
+            "a resolved comment tag within the window must stay safe for block-style \
+             lines regardless of trailing content beyond the window"
+        );
+    }
+
+    #[test]
+    fn test_comment_tag_truncated_at_window_boundary_is_rejected_not_shortened() {
+        // Code-review finding #1 on the #885 rework: a comment tag whose digits
+        // straddle the window boundary must not be silently recorded as the
+        // truncated-but-still-semver-shaped prefix (`v4.2.100` cut to `v4.2.10`,
+        // which still passes `is_full_semver_shape`). Construct `rest_of_line` so
+        // the window (`REST_OF_LINE_WINDOW_BYTES` bytes past `ref_end`) ends exactly
+        // one byte into the last digit of `v4.2.100`, then confirm plenty of real
+        // content continues past the window (so this isn't just routine end-of-line
+        // truncation) and the tag is rejected as ambiguous rather than shortened.
+        let sha = "a".repeat(40);
+        let tag = "v4.2.100";
+        // rest_of_line = padding + "# " + tag; window cuts after the 7th tag byte
+        // ("v4.2.10"), one byte short of the real 8-byte tag.
+        let padding_len = REST_OF_LINE_WINDOW_BYTES - "# ".len() - (tag.len() - 1);
+        let padding = " ".repeat(padding_len);
+        let filler = "z".repeat(REST_OF_LINE_WINDOW_BYTES);
+        let content = format!("steps:\n  - uses: actions/checkout@{sha}{padding}# {tag}{filler}\n");
+        let result = parse_workflow_yaml(&content, &test_uri()).unwrap();
+        let dep = &result.dependencies[0];
+        assert!(
+            !matches!(
+                dep.pin,
+                Some(PinStyle::Sha {
+                    comment_tag: Some(_)
+                })
+            ),
+            "a comment tag straddling the window boundary must not be accepted at all, \
+             truncated or otherwise; got {:?}",
+            dep.pin
+        );
+    }
+
+    #[test]
+    fn test_comment_beyond_window_degrades_to_bare_sha_not_lost_within_window() {
+        // Code-review finding #2 on the #885 rework: sanity check that a `# <tag>`
+        // comment sitting entirely past the window is treated the same as "no
+        // comment" (degrades to a bare, commentless SHA pin) rather than panicking
+        // or misreading nearby bytes — the window is a documented, intentional
+        // limit (see `REST_OF_LINE_WINDOW_BYTES`'s doc comment), not a bug to patch
+        // around per call site.
+        let sha = "a".repeat(40);
+        let padding = " ".repeat(REST_OF_LINE_WINDOW_BYTES + 10);
+        let content = format!("steps:\n  - uses: actions/checkout@{sha}{padding}# v4.2.0\n");
+        let result = parse_workflow_yaml(&content, &test_uri()).unwrap();
+        let dep = &result.dependencies[0];
+        assert!(matches!(dep.pin, Some(PinStyle::Sha { comment_tag: None })));
+    }
+
+    #[test]
+    fn test_build_dependency_rest_of_line_lookup_is_not_quadratic() {
+        // Direct regression test for the O(N^2) defect itself (issue #885),
+        // isolated from `yaml-rust2`'s own O(document length) tokenizing cost —
+        // a full end-to-end `parse_workflow_yaml` benchmark can't isolate this
+        // fix's effect from that unrelated, unavoidable baseline cost (an
+        // earlier version of this test measured ~1s just tokenizing an 8MB
+        // trailing YAML comment with *zero* ref-pinned dependencies present).
+        // `build_dependency` is private to this module, so this calls it
+        // directly with a synthetic candidate against one huge, newline-free
+        // "line" — exactly the shape the old `content[ref_end..].find('\n')`
+        // scanned to end-of-document on, once per call. The O(1)
+        // `line_table.line_start` lookup makes each call's cost independent of
+        // how much content follows on the line.
+        let sha = "a".repeat(40);
+        let filler = "x".repeat(8 * 1024 * 1024);
+        let content = format!("uses: actions/checkout@{sha}{filler}");
+        let line_table = LineOffsetTable::new(&content);
+        let value = format!("actions/checkout@{sha}");
+
+        // Iteration count halved from the original 2000 (finding #4/direction note):
+        // `REST_OF_LINE_WINDOW_BYTES` quadrupled from the original 1024, so each call
+        // now scans up to 4x as many bytes; keeping the wall-clock budget comparable
+        // while still swamping the old code's cost (which scanned the full 8MB tail
+        // per call, independent of iteration count) preserves a wide discrimination
+        // margin without flirting with the assertion's headroom under CI load.
+        let start = std::time::Instant::now();
+        for _ in 0..1000 {
+            let candidate = UsesCandidate {
+                value: value.clone(),
+                style: TScalarStyle::Plain,
+                line: 1,
+                col: "uses: ".len(),
+            };
+            let dep = build_dependency(&content, &line_table, candidate);
+            assert!(dep.is_some());
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "1000 build_dependency calls against an 8MB-tail line took {elapsed:?}; \
+             expected the O(1) line-end lookup to make this independent of the trailing \
+             content size instead of re-scanning ~8MB per call"
+        );
     }
 
     // --- issue #706: composite action.yml routing (parsing side) ---

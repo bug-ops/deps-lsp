@@ -234,13 +234,25 @@ pub fn locate_value_span(content: &str, search_from: usize, value: &str) -> Opti
             return Some((search_from, search_from + value.len()));
         }
     }
-    // Guarded by the `search_from <= bytes.len()` check above.
+    // Bound the window *before* searching for '\n', not after (issue #885 rework):
+    // searching the whole remainder of `content` for the next real newline before
+    // clamping to `MAX_FALLBACK_SCAN_BYTES` made that clamp limit only `scan_end`'s
+    // *value*, not the cost of computing it — the `position()` scan itself still ran
+    // the full remaining-line length. On a single huge physical line (#885's own
+    // shape), this reintroduced the same O(remaining-document-length)-per-call cost
+    // the cap exists to prevent. Bounding first makes `position()` itself
+    // O(`MAX_FALLBACK_SCAN_BYTES`); the resulting `scan_end` is identical either way
+    // (`min` is order-independent), so this is a pure performance fix, no behavior
+    // change. Guarded by the `search_from <= bytes.len()` check above.
     #[allow(clippy::indexing_slicing)]
-    let line_end = bytes[search_from..]
+    let window_end = bytes
+        .len()
+        .min(search_from.saturating_add(MAX_FALLBACK_SCAN_BYTES));
+    #[allow(clippy::indexing_slicing)]
+    let scan_end = bytes[search_from..window_end]
         .iter()
         .position(|&b| b == b'\n')
-        .map_or(bytes.len(), |p| search_from + p);
-    let scan_end = line_end.min(search_from.saturating_add(MAX_FALLBACK_SCAN_BYTES));
+        .map_or(window_end, |p| search_from + p);
     #[allow(clippy::indexing_slicing)]
     let haystack = &bytes[search_from..scan_end];
     let needle = value.as_bytes();
@@ -330,6 +342,41 @@ mod tests {
             start.elapsed()
         );
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_locate_value_span_many_fallback_scans_on_one_huge_line_stay_bounded() {
+        // Regression for #885's rework (S2 finding): the pre-fix code searched the
+        // whole remainder of `content` for the next real newline *before* clamping
+        // to `MAX_FALLBACK_SCAN_BYTES`, so on a single huge physical line with no
+        // real newline nearby, each fallback-triggering call (the quoted-scalar
+        // case, where the direct-offset check misses and this scan runs) still cost
+        // O(remaining-document-length) despite the cap. Simulates many quoted
+        // `uses:`-shaped dependencies spread across one multi-megabyte single-line
+        // manifest, each forcing the fallback path since `value` never matches at
+        // its own `search_from`.
+        let filler_segment = "z".repeat(64);
+        let mut content = String::new();
+        let mut offsets = Vec::new();
+        for _ in 0..2000 {
+            offsets.push(content.len());
+            content.push_str(&filler_segment);
+        }
+        content.push_str(&"w".repeat(8 * 1024 * 1024));
+        let value = "actions/checkout@v4";
+
+        let start = std::time::Instant::now();
+        for &offset in &offsets {
+            let _ = locate_value_span(&content, offset, value);
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "{} locate_value_span fallback calls against an 8MB-tail single line took \
+             {elapsed:?}; expected the pre-bound window to make each call's cost \
+             independent of the trailing content size",
+            offsets.len()
+        );
     }
 
     #[test]
