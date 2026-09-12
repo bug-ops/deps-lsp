@@ -865,17 +865,34 @@ fn extend_credential_at(region: &str, at: usize) -> usize {
 /// immediately followed by a colon (`[:12345`) was wrongly treated as if it opened a genuine
 /// IPv6 host and had its own next colon exempted as a "port" — this scanner's contract is that
 /// only a real bracket licenses that carve-out, an ordinary (non-bracket) colon gets none.
+///
+/// `next_bracket`/`next_colon` are threaded and translated via [`translate_bracket`]/
+/// [`translate_offset`] exactly like [`colon_credential_match_seeded`]'s own loop (#896, the same
+/// pattern #893/#894 fixed there): an unconditional `remaining.find('[')` on every iteration must
+/// scan all of `remaining` just to *prove absence* of a bracket, and the drive-letter branch below
+/// only advances `cursor` by 2-3 bytes per iteration, so a long bracket-free run (e.g. a Windows
+/// path segment, `("c:/" * n) + "@x"`) turned this quadratic before caching — verified
+/// byte-for-byte equivalent to the pre-fix scan via `redact_userinfo`, over all 271,452 strings of
+/// length 1-5 drawn from the 12-character alphabet `[ ] : / ? # \ c a 0 x @` (not committed as a
+/// permanent test; see #896's own tracked follow-up for a durable equivalence harness).
 // `bracket`/`colon` come from `find`/`starts_with` of ASCII `[`/`]`/`:` bytes, so every slice
 // bound is always a char boundary.
 #[allow(clippy::string_slice)]
 fn segment_has_credential_colon(segment: &str) -> bool {
     let mut cursor = 0;
     let mut bracket_adjacent = false;
+    let mut next_bracket = segment.find('[');
+    let mut next_colon = segment.find(':');
     while cursor < segment.len() {
         let remaining = &segment[cursor..];
 
-        if let Some(bracket) = remaining.find('[') {
-            if let Some(colon) = remaining[..bracket].find(':') {
+        let colon_here = translate_offset(next_colon, cursor, remaining, ':');
+        next_colon = colon_here.map(|c| cursor + c);
+        let bracket_here = translate_bracket(next_bracket, cursor, remaining);
+        next_bracket = bracket_here.map(|b| cursor + b);
+
+        if let Some(bracket) = bracket_here {
+            if let Some(colon) = colon_here.filter(|&c| c < bracket) {
                 if !colon_is_drive_letter(segment, cursor + colon) {
                     return true;
                 }
@@ -902,7 +919,7 @@ fn segment_has_credential_colon(segment: &str) -> bool {
             continue;
         }
 
-        let Some(colon) = remaining.find(':') else {
+        let Some(colon) = colon_here else {
             return false;
         };
         let colon_is_bracket_adjacent = bracket_adjacent && colon == 0;
@@ -962,13 +979,13 @@ fn segment_has_credential_colon(segment: &str) -> bool {
 /// bytes) is not itself in the IPv6-literal alphabet, so every `[` in such a run except the *last*
 /// one is provably not a valid opener — its own fate never depends on what comes after it, only
 /// the last one's does (#891). Rather than returning `open + 1` and making the caller rediscover
-/// this one byte at a time (this function's only quadratic-prone caller,
-/// `colon_credential_match_seeded`, re-scans its own remaining tail with `find(':')` on every
-/// iteration — advancing 1 byte per call turned a long run of `[` into O(n²)), this scans the
-/// whole run in one pass and returns the offset of its *last* `[` (`open + L` for a run of length
-/// `L >= 2`) directly, so the caller's next iteration lands there and evaluates that one bracket as
-/// an ordinary (possibly-closed) opener — behavior-equivalent to the one-byte-at-a-time version
-/// since only `[` bytes (never a candidate opener) are skipped.
+/// this one byte at a time (this function's quadratic-prone callers — `colon_credential_match_seeded`,
+/// and, since #896, `segment_has_credential_colon` too — each re-scan their own remaining tail with
+/// `find(':')` on every iteration — advancing 1 byte per call turned a long run of `[` into O(n²)),
+/// this scans the whole run in one pass and returns the offset of its *last* `[` (`open + L` for a
+/// run of length `L >= 2`) directly, so the caller's next iteration lands there and evaluates that
+/// one bracket as an ordinary (possibly-closed) opener — behavior-equivalent to the
+/// one-byte-at-a-time version since only `[` bytes (never a candidate opener) are skipped.
 ///
 /// Deliberately restricted to `i == open + 1` (impl-critic C1): the alphabet-run loop below can
 /// also reach a *later* `[` after first consuming in-alphabet bytes (`:`, `.`, hex digits) — e.g.
@@ -1636,11 +1653,11 @@ fn redact_secondary_colon_credential(tail: &str) -> String {
 /// then #894, which needed the identical rule a second time for `:` and consolidated both into
 /// this one generic helper rather than adding a second copy): [`translate_bracket`] (itself called
 /// from [`colon_credential_match`]'s own loop twice — once per iteration relative to `remaining`,
-/// once for the tail it returns — and from [`redact_further_credential`]'s `@`-branch) and
-/// [`colon_credential_match_seeded`]'s own `next_colon` tracking, which calls this directly with
-/// `':'` since nothing outside that function's loop ever needs the colon offset. See those
-/// functions' own doc comments for why this pattern is sound and what performance regression it
-/// fixes.
+/// once for the tail it returns — and from [`redact_further_credential`]'s `@`-branch) and both
+/// [`colon_credential_match_seeded`]'s and [`segment_has_credential_colon`]'s own `next_colon`
+/// tracking (#896), each of which calls this directly with `':'` since nothing outside their own
+/// loop ever needs the colon offset. See those functions' own doc comments for why this pattern is
+/// sound and what performance regression it fixes.
 fn translate_offset(
     known: Option<usize>,
     consumed: usize,
@@ -1655,9 +1672,9 @@ fn translate_offset(
 }
 
 /// [`translate_offset`] specialized for the nearest `[` — the offset threaded as `next_bracket`
-/// across [`colon_credential_match_seeded`]'s own loop and [`redact_further_credential`]'s
-/// `@`-branch. See `translate_offset`'s own doc comment for the underlying translate-or-rescan
-/// rule and why it is sound.
+/// across [`colon_credential_match_seeded`]'s own loop, [`segment_has_credential_colon`]'s own
+/// loop (#896), and [`redact_further_credential`]'s `@`-branch. See `translate_offset`'s own doc
+/// comment for the underlying translate-or-rescan rule and why it is sound.
 fn translate_bracket(known: Option<usize>, consumed: usize, remaining: &str) -> Option<usize> {
     translate_offset(known, consumed, remaining, '[')
 }
@@ -4706,5 +4723,70 @@ mod tests {
                 "Display: {err}"
             );
         }
+    }
+
+    /// #896: a long, bracket-free run of drive-letter-shaped colons ahead of the loop's cursor
+    /// (the issue's own repro shape, `("c:/" * n) + "@x"`) must stay linear —
+    /// `segment_has_credential_colon`'s per-iteration `remaining.find('[')`/`remaining.find(':')`
+    /// used to have to rescan the whole shrinking `remaining` on every 2-3-byte drive-letter
+    /// step just to prove no bracket/colon was ahead, mirroring
+    /// `test_redact_authority_suffix_mask_site_colon_dense_streak_is_linear_time`'s methodology
+    /// but through `find_credential_at`'s segment scan instead of the mask-site tail.
+    #[test]
+    fn test_redact_userinfo_drive_letter_dense_streak_is_linear_time() {
+        let k = 400_000;
+        let raw = format!("{}@x", "c:/".repeat(k));
+        let start = std::time::Instant::now();
+        let redacted = redact_userinfo(&raw);
+        let elapsed = start.elapsed();
+        assert_eq!(redacted, raw, "redacted len={}", redacted.len());
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "took {elapsed:?} for a {k}-segment drive-letter-dense run before a single `@` — \
+             segment_has_credential_colon may have regressed to quadratic behavior"
+        );
+    }
+
+    /// #896 correctness companion: the drive-letter-dense repro shape itself (many `c:/`
+    /// segments, no bracket, no real credential colon) must remain a no-op regardless of how
+    /// many drive-letter steps the cached `next_bracket`/`next_colon` offsets have to be
+    /// re-derived across.
+    #[test]
+    fn test_redact_userinfo_dense_drive_letter_run_before_unrelated_at_is_noop() {
+        let raw = format!("{}@x", "c:/".repeat(50));
+        assert_eq!(redact_userinfo(&raw), raw);
+    }
+
+    /// #896 correctness companion: a bracket appearing after one or more drive-letter colons
+    /// must still be recognized once `next_bracket` is re-derived past the drive-letter cursor
+    /// advances — the well-formed-port carve-out this mirrors
+    /// (`test_redact_userinfo_bracketed_ipv6_well_formed_port_is_noop`) must not regress when
+    /// more than one drive-letter segment precedes the bracket.
+    #[test]
+    fn test_redact_userinfo_drive_letter_run_then_bracket_is_noop() {
+        assert_eq!(
+            redact_userinfo("c:/c:/c:/[::1]:8443/pkg@1.0.0"),
+            "c:/c:/c:/[::1]:8443/pkg@1.0.0"
+        );
+    }
+
+    /// #896 correctness companion: a real, non-drive-letter credential colon following one or
+    /// more drive-letter colons must still be found once the cached `next_colon` offset has
+    /// fallen behind the cursor and is re-derived from the shrinking `remaining` — same shape
+    /// as `test_redact_userinfo_unclosed_bracket_before_port_like_value_is_not_exempted`'s
+    /// single-drive-letter case, extended to several.
+    #[test]
+    fn test_redact_userinfo_drive_letter_run_then_real_credential_is_redacted() {
+        let redacted = redact_userinfo("c:/c:/user:hunter2@evil");
+        assert!(!redacted.contains("hunter2"), "redacted={redacted:?}");
+        assert_eq!(redacted, "c:***@evil");
+    }
+
+    /// #896 correctness companion: a segment with neither a bracket nor any colon at all must
+    /// return `false` immediately from `segment_has_credential_colon`'s no-colon fallback arm,
+    /// unaffected by the `next_bracket`/`next_colon` seeding this fix introduced.
+    #[test]
+    fn test_redact_userinfo_no_colon_no_bracket_segment_is_noop() {
+        assert_eq!(redact_userinfo("path/to/pkg@1.0.0"), "path/to/pkg@1.0.0");
     }
 }
