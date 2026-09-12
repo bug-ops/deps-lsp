@@ -884,13 +884,20 @@ fn segment_has_credential_colon(segment: &str) -> bool {
                 continue;
             }
             let shape_end = bracket_host_shape_end(remaining, bracket);
-            // code review: only a genuinely *closed* bracket (`shape_end` past more than just
-            // the `[` itself) licenses the `is_port_like` exemption below on the colon that
+            // code review: only a genuinely *closed* bracket (the byte just before `shape_end` is
+            // an actual `]`) licenses the `is_port_like` exemption below on the colon that
             // follows — an earlier revision set this unconditionally, so a stray unclosed `[`
             // (e.g. `[:12345`) got treated as if it opened a real IPv6 host and its own
             // immediately-following colon was wrongly exempted as a "port", when it should have
-            // been evaluated as an entirely ordinary (unexempted) colon instead.
-            bracket_adjacent = shape_end > bracket + 1;
+            // been evaluated as an entirely ordinary (unexempted) colon instead. Checking the
+            // actual closing byte, rather than inferring closure from `shape_end > bracket + 1`,
+            // is defensive since #891: closure is no longer reliably inferable from `shape_end`
+            // alone now that `bracket_host_shape_end` can also advance more than one byte past an
+            // *unclosed* run of consecutive `[` (to stay amortized-linear) — the guard that keeps
+            // that run-skip from ever landing past a genuinely unclosed run (`i == open + 1`, see
+            // that function's own doc comment) happens to keep the old inference sound here too,
+            // but this explicit check does not depend on that happening to hold.
+            bracket_adjacent = remaining.as_bytes().get(shape_end - 1) == Some(&b']');
             cursor += shape_end;
             continue;
         }
@@ -950,7 +957,30 @@ fn segment_has_credential_colon(segment: &str) -> bool {
 /// (`[::1]:8443`) stays exempt while anything else (`[::1]:glpat-SECRET`, or the previously
 /// accepted `[::1]:abc`/`[::1]:notaport` collisions) is treated exactly like any other
 /// non-bracket credential-shaped colon and gets redacted.
-// `open`/`i` are ASCII byte offsets (`[`, `]`, hex digits, `:`, `.` are all single-byte ASCII),
+///
+/// A `[` immediately following `open` (i.e. `text[open + 1] == b'['`, two or more consecutive `[`
+/// bytes) is not itself in the IPv6-literal alphabet, so every `[` in such a run except the *last*
+/// one is provably not a valid opener — its own fate never depends on what comes after it, only
+/// the last one's does (#891). Rather than returning `open + 1` and making the caller rediscover
+/// this one byte at a time (this function's only quadratic-prone caller,
+/// `colon_credential_match_seeded`, re-scans its own remaining tail with `find(':')` on every
+/// iteration — advancing 1 byte per call turned a long run of `[` into O(n²)), this scans the
+/// whole run in one pass and returns the offset of its *last* `[` (`open + L` for a run of length
+/// `L >= 2`) directly, so the caller's next iteration lands there and evaluates that one bracket as
+/// an ordinary (possibly-closed) opener — behavior-equivalent to the one-byte-at-a-time version
+/// since only `[` bytes (never a candidate opener) are skipped.
+///
+/// Deliberately restricted to `i == open + 1` (impl-critic C1): the alphabet-run loop below can
+/// also reach a *later* `[` after first consuming in-alphabet bytes (`:`, `.`, hex digits) — e.g.
+/// `[0:0[ghp_SECRET`'s second `[` at `i` well past `open + 1`. Treating that later `[` the same
+/// way would return an offset past the real credential-separating `:` at `i`'s position, making
+/// the caller's cursor jump straight over it and leave the whole value completely unredacted (a
+/// leak, not just a missed optimization) — confirmed by exhaustive differential testing against
+/// unguarded code (960,799 inputs of length 1-7 over `[ ] : 0 x @ /`: 10,669 divergences, all in
+/// the leak direction, 0 safe). Restricting the run-skip to a `[` that opens *immediately*, with no
+/// intervening alphabet byte, keeps it provably limited to brackets that could never have been a
+/// valid opener regardless of what preceded them.
+// `open`/`i`/`j` are ASCII byte offsets (`[`, `]`, hex digits, `:`, `.` are all single-byte ASCII),
 // so every slice bound derived from this function's return value is always a char boundary.
 fn bracket_host_shape_end(text: &str, open: usize) -> usize {
     let bytes = text.as_bytes();
@@ -959,6 +989,13 @@ fn bracket_host_shape_end(text: &str, open: usize) -> usize {
         match byte {
             b']' => return i + 1,
             b':' | b'.' | b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F' => i += 1,
+            b'[' if i == open + 1 => {
+                let mut j = i;
+                while bytes.get(j) == Some(&b'[') {
+                    j += 1;
+                }
+                return j - 1;
+            }
             _ => break,
         }
     }
@@ -3946,6 +3983,83 @@ mod tests {
              colon_credential_match may have regressed to quadratic behavior on a bracket-present \
              value"
         );
+    }
+
+    /// #891: a run of consecutive `[` with no `:` anywhere made [`bracket_host_shape_end`] advance
+    /// the caller's cursor one byte at a time, forcing `colon_credential_match_seeded`'s own
+    /// `remaining.find(':')` to rescan the shrinking-by-one remainder on every iteration —
+    /// quadratic in the run length (measured: ~799ms release / ~800ms debug at n=200,000 before
+    /// this fix; ~321-339us after, ~16ms including test-harness overhead in a debug build here).
+    /// 300ms keeps generous headroom above the fixed cost for slower CI runners while staying well
+    /// under the unfixed one, so this actually fails if the run-skip regresses (the previous 5s
+    /// bound did not: unfixed HEAD passes it too).
+    #[test]
+    fn test_redact_userinfo_consecutive_bracket_run_is_linear_time() {
+        let n = 200_000;
+        let input = format!("a@{}", "[".repeat(n));
+        let start = std::time::Instant::now();
+        let redacted = redact_userinfo(&input);
+        let elapsed = start.elapsed();
+        // code-review: a future edit that stays fast but corrupts output would slip past a
+        // timing-only assertion, so also pin down the expected shape — the lone `a` username has
+        // no password to leak, but the mask must still fully cover it and leave every `[` alone.
+        assert_eq!(
+            redacted,
+            format!("***@{}", "[".repeat(n)),
+            "redacted len={}",
+            redacted.len()
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(300),
+            "took {elapsed:?} for n={n} consecutive '[' — bracket_host_shape_end may have \
+             regressed to quadratic behavior"
+        );
+    }
+
+    /// #891 companion: an odd-length run of stray `[` (three, none of them valid IPv6 openers on
+    /// their own) immediately followed by a genuinely closed bracketed host and a real credential
+    /// must still land the run-skip on the *last* `[` in the run and evaluate it normally — the
+    /// host must be recognized (not itself mistaken for part of the stray run) and the trailing
+    /// credential must still be redacted.
+    #[test]
+    fn test_redact_userinfo_bracket_run_then_real_host_is_still_redacted() {
+        let redacted = redact_userinfo("[[[::1]:glpat-SECRET");
+        assert!(!redacted.contains("glpat-SECRET"), "redacted={redacted:?}");
+        assert_eq!(redacted, "[[[::1]:***");
+    }
+
+    /// #891 review follow-up (impl-critic C1, critical): a `[` encountered only *after* the
+    /// alphabet-run loop already consumed some in-alphabet bytes (`:`, `.`, hex digits) — i.e. not
+    /// immediately following `open` — must never be treated as the start of a skippable run: doing
+    /// so lets the returned offset land past a real credential-separating `:`, so the caller's
+    /// cursor jumps clean over the credential and nothing gets redacted at all (an under-redaction
+    /// regression, not just a missed optimization). A first, unguarded version of the #891 fix
+    /// regressed exactly this — confirmed by exhaustive differential testing against HEAD
+    /// (960,799 inputs of length 1-7 over `[ ] : 0 x @ /`): 10,669 inputs went from
+    /// correctly-redacted to fully unredacted, 0 in the safe direction. The `i == open + 1` guard
+    /// on `bracket_host_shape_end`'s `[`-run arm is what closes this: it restricts the run-skip to
+    /// brackets that could never have been a valid opener regardless of what preceded them.
+    #[test]
+    fn test_redact_userinfo_bracket_run_not_anchored_at_open_does_not_leak_credential() {
+        assert_eq!(redact_userinfo("[:[ghp_SECRET"), "[:***");
+        assert_eq!(redact_userinfo("[0:0[ghp_SECRET"), "[0:***");
+        assert_eq!(redact_userinfo("[::1:0[glpat-SECRET"), "[:***");
+        assert_eq!(redact_userinfo("[1.2:0[ghp_SECRET"), "[1.2:***");
+    }
+
+    /// #891 review follow-up: [`bounded_has_credential_colon`] is a third caller of
+    /// [`bracket_host_shape_end`] outside the differential-fuzzing scope of the #891 fix itself
+    /// (unlike [`segment_has_credential_colon`] and `colon_credential_match_seeded`, it only ever
+    /// strips one leading bracket span, never loops back to re-examine what follows). Pins its
+    /// behavior for a multi-`[`-run prefix: both cases below return `true` on this branch exactly
+    /// as they did before #891 (verified by hand: the run's own length changes which single `[`
+    /// the one-time strip lands on, but never the *tail* structure `rfind(':')`/[`is_port_like`]
+    /// evaluate afterwards — a pre-existing over-approximation for a bracket-run prefix, not a
+    /// regression introduced here).
+    #[test]
+    fn test_bounded_has_credential_colon_multi_bracket_run_prefix_is_unchanged() {
+        assert!(bounded_has_credential_colon("[[[::1]:glpat-SECRET"));
+        assert!(bounded_has_credential_colon("[[[::1]:8443"));
     }
 
     /// Stack-overflow guard: [`redact_authority_suffix`] must stay a single forward loop, not
