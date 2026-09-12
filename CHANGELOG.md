@@ -8,11 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **deps-core**: `LineOffsetTable` is no longer `Sync` (still `Send`) — build one per document parse, do not share across threads (#888)
 - **deps-core**: unified `net_policy`'s duplicated userinfo-redaction carve-out rules into one shared `redact_credential` scanner — zero behavior change (resolves #846) (#863)
 - **deps-core, deps-cargo, deps-go, deps-lsp**: documented the exhaustive/non_exhaustive justification for 8 public enums per `deps-core`'s API-stability policy; `HostClass` and `deps_lsp::document::DocumentState` are now `#[non_exhaustive]` (resolves #854) (#867)
 - `specs/`: reconciled `MOC-specs.md` against actual issue/PR state — stale "draft" spec rows marked shipped with their PR/issue references, all shipped specs moved into a "Completed Specs" section, and `specs/constitution.md` added (resolves #855) (#867)
 
 ### Fixed
+- **deps-core**: fixed O(N^2) hover/diagnostics/completion latency on manifests with a dependency value on a non-ASCII line (resolves #882) (#888)
 - **deps-core**: `net_policy`'s credential-redaction fallback (`redact_authority_suffix`/`redact_colon_credential`) now keeps scanning past an already-masked `@`-shaped or colon-only credential instead of stopping at the first match, closing three leak gaps with no `O(n²)` regression (resolves #870, #873, #874) (#881); #875 remains open as a separate, narrower residual gap.
 - **deps-core, deps-github-actions, deps-gitlab-ci**: workflow/GitLab CI YAML `uses:`/`ref:`/`project:`/`include:` references after a block scalar (`|`/`>`) containing a non-ASCII character no longer vanish from hover/diagnostics/completion/code lens — upstream `yaml-rust2`'s `Marker::index()` desyncs from a true byte offset inside such block scalars; resolution now uses `Marker::line()`/`col()` instead (resolves #879) (#883)
 - **deps-core**: `net_policy::redact_userinfo` now anchors on the first (not nearest) `://` preceding a credential, so a credential behind multiple stacked scheme separators is no longer left unredacted (resolves #871) (#877)
