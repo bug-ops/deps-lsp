@@ -31,7 +31,7 @@ use crate::types::{
     PinStyle,
 };
 use deps_core::lsp_helpers::{
-    CharOffsets, LineOffsetTable, is_full_sha, is_tag_shaped, locate_value_span,
+    LineOffsetTable, is_full_sha, is_tag_shaped, locate_value_span, marker_byte_offset,
     warn_rejected_value,
 };
 use deps_core::net_policy::RegistryAccessPolicy;
@@ -112,8 +112,10 @@ fn key_for(role: FrameRole, text: &str) -> PendingKey {
 }
 
 /// One raw scalar value captured from an include entry: its text, YAML scalar style, and
-/// `yaml-rust2` char index (for span re-derivation after parsing completes).
-type RawField = (String, TScalarStyle, usize);
+/// `yaml-rust2` marker line (1-indexed) and column (0-indexed char count) — for span
+/// re-derivation after parsing completes via [`marker_byte_offset`], not `Marker::index()`
+/// (#879).
+type RawField = (String, TScalarStyle, usize, usize);
 
 /// One `include:` entry's raw, not-yet-classified field values, collected during the event
 /// stream and finalized into a [`GitlabCiDependency`] after parsing completes.
@@ -231,13 +233,16 @@ impl MarkedEventReceiver for GitlabCiReceiver {
                     if frame.role == FrameRole::IncludeEntry {
                         match frame.pending_key {
                             PendingKey::Project => {
-                                frame.entry.project = Some((value, style, marker.index()));
+                                frame.entry.project =
+                                    Some((value, style, marker.line(), marker.col()));
                             }
                             PendingKey::Ref => {
-                                frame.entry.ref_field = Some((value, style, marker.index()));
+                                frame.entry.ref_field =
+                                    Some((value, style, marker.line(), marker.col()));
                             }
                             PendingKey::Component => {
-                                frame.entry.component = Some((value, style, marker.index()));
+                                frame.entry.component =
+                                    Some((value, style, marker.line(), marker.col()));
                             }
                             PendingKey::Template => frame.entry.has_template = true,
                             PendingKey::Remote => frame.entry.has_remote = true,
@@ -377,12 +382,11 @@ fn make_range(line_table: &LineOffsetTable, content: &str, start: usize, end: us
 fn build_project_dependency(
     content: &str,
     line_table: &LineOffsetTable,
-    char_offsets: &CharOffsets,
     instance_host: &GitlabInstanceHost,
     project_field: RawField,
     ref_field: Option<RawField>,
 ) -> Option<(GitlabCiDependency, Option<(String, GitlabRoute)>)> {
-    let (raw_project, project_style, project_char_index) = project_field;
+    let (raw_project, project_style, project_line, project_col) = project_field;
     if !is_valid_gitlab_coordinate(&raw_project) {
         warn_rejected_value(
             "is_valid_gitlab_coordinate",
@@ -392,7 +396,7 @@ fn build_project_dependency(
         return None;
     }
 
-    let value_start = char_offsets.byte_offset(project_char_index);
+    let value_start = marker_byte_offset(content, line_table, project_line, project_col);
     let (raw_start, raw_end) = locate_value_span(content, value_start, &raw_project)?;
     let name_range = make_range(line_table, content, raw_start, raw_end);
 
@@ -400,8 +404,8 @@ fn build_project_dependency(
     let name = host_qualified_name(&host, &raw_project, None);
 
     let (version_req, version_range, pin, is_plain_scalar) = match ref_field {
-        Some((ref_text, ref_style, ref_char_index)) => {
-            let ref_value_start = char_offsets.byte_offset(ref_char_index);
+        Some((ref_text, ref_style, ref_line, ref_col)) => {
+            let ref_value_start = marker_byte_offset(content, line_table, ref_line, ref_col);
             let (rs, re) = locate_value_span(content, ref_value_start, &ref_text)?;
             let range = make_range(line_table, content, rs, re);
             let pin = classify_project_pin(&ref_text);
@@ -434,13 +438,12 @@ fn build_project_dependency(
 fn build_component_dependency(
     content: &str,
     line_table: &LineOffsetTable,
-    char_offsets: &CharOffsets,
     policy: &RegistryAccessPolicy,
     instance_host: &GitlabInstanceHost,
     admitted_origins: &mut HashSet<String>,
     component_field: RawField,
 ) -> Option<(GitlabCiDependency, Option<(String, GitlabRoute)>)> {
-    let (raw_component, style, char_index) = component_field;
+    let (raw_component, style, comp_line, comp_col) = component_field;
     let Some((prefix, ref_text)) = raw_component.split_once('@') else {
         warn_rejected_value(
             "classify_component_value",
@@ -486,7 +489,7 @@ fn build_component_dependency(
         return None;
     }
 
-    let value_start = char_offsets.byte_offset(char_index);
+    let value_start = marker_byte_offset(content, line_table, comp_line, comp_col);
     let (raw_start, raw_end) = locate_value_span(content, value_start, &raw_component)?;
     let name_end = raw_start + prefix.len();
     let ref_start = name_end + 1; // skip '@'
@@ -519,7 +522,6 @@ fn build_component_dependency(
 fn build_dependency(
     content: &str,
     line_table: &LineOffsetTable,
-    char_offsets: &CharOffsets,
     policy: &RegistryAccessPolicy,
     instance_host: &GitlabInstanceHost,
     admitted_origins: &mut HashSet<String>,
@@ -534,7 +536,6 @@ fn build_dependency(
         return build_component_dependency(
             content,
             line_table,
-            char_offsets,
             policy,
             instance_host,
             admitted_origins,
@@ -545,7 +546,6 @@ fn build_dependency(
         return build_project_dependency(
             content,
             line_table,
-            char_offsets,
             instance_host,
             project_field,
             entry.ref_field,
@@ -629,7 +629,6 @@ pub fn parse_gitlab_ci_yaml(
     }
 
     let line_table = LineOffsetTable::new(content);
-    let char_offsets = CharOffsets::new(content);
     let mut admitted_origins = HashSet::new();
     let mut seen_route_keys = HashSet::new();
     let mut routes = Vec::new();
@@ -646,7 +645,6 @@ pub fn parse_gitlab_ci_yaml(
         let Some((dep, route)) = build_dependency(
             content,
             &line_table,
-            &char_offsets,
             policy,
             instance_host,
             &mut admitted_origins,
@@ -996,5 +994,77 @@ mod tests {
         // Both `project:` includes resolve to the same instance host and the same
         // (origin, Tags) route, so exactly one route entry is registered.
         assert_eq!(result.routes.len(), 1);
+    }
+
+    // --- issue #879: yaml-rust2 block-scalar byte-offset drift ---
+    //
+    // See `deps_github_actions::parser`'s identical section for the root-cause summary;
+    // GitLab CI is affected the same way since `build_project_dependency` resolves spans
+    // via the same shared `deps_core::lsp_helpers::marker_byte_offset`. A job's `script:`
+    // block scalar is never itself visited for dependency extraction (`GitlabCiReceiver`
+    // only tracks the top-level `include:` subtree), but the marker corruption it caused
+    // upstream previously desynced every later scalar's resolved offset regardless.
+    // Content lines here are long enough (well over 16 chars around the multi-byte char)
+    // to force yaml-rust2's lookahead-buffer refill — the actual trigger condition, not
+    // merely "any non-ASCII char present".
+
+    #[test]
+    fn test_issue_879_literal_block_scalar_multibyte_then_include_resolves() {
+        let (policy, instance_host) = ctx();
+        let content = "some_job:\n  script: |\n    echo hello \u{2014} world this line is long enough to force yaml-rust2's scanner buffer to refill mid-line\ninclude:\n  - project: org/proj\n    ref: v1.0.0\n";
+        let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host).unwrap();
+        assert_eq!(result.dependencies.len(), 1, "{:?}", result.dependencies);
+        let dep = &result.dependencies[0];
+        assert_eq!(dep.project_path, "org/proj");
+        assert_eq!(slice(content, dep.name_range), "org/proj");
+        assert_eq!(slice(content, dep.version_range().unwrap()), "v1.0.0");
+    }
+
+    #[test]
+    fn test_issue_879_folded_block_scalar_multibyte_then_include_resolves() {
+        let (policy, instance_host) = ctx();
+        let content = "some_job:\n  script: >\n    echo hello \u{2014} world this line is long enough to force yaml-rust2's scanner buffer to refill mid-line\ninclude:\n  - project: org/proj\n    ref: v1.0.0\n";
+        let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host).unwrap();
+        assert_eq!(result.dependencies.len(), 1, "{:?}", result.dependencies);
+        let dep = &result.dependencies[0];
+        assert_eq!(dep.project_path, "org/proj");
+        assert_eq!(slice(content, dep.version_range().unwrap()), "v1.0.0");
+    }
+
+    #[test]
+    fn test_issue_879_multiple_block_scalars_drift_does_not_compound() {
+        // Two prior block scalars each containing a multi-byte char must not accumulate
+        // drift onto the `include:` entry's resolved offset.
+        let (policy, instance_host) = ctx();
+        let content = "job_one:\n  script: |\n    echo one \u{2014} first multibyte char here padded to be long enough for the scanner buffer refill\njob_two:\n  script: |\n    echo two \u{2014} second multibyte char here also padded long enough for another scanner buffer refill\ninclude:\n  - project: org/proj\n    ref: v1.0.0\n";
+        let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host).unwrap();
+        assert_eq!(result.dependencies.len(), 1, "{:?}", result.dependencies);
+        let dep = &result.dependencies[0];
+        assert_eq!(dep.project_path, "org/proj");
+        assert_eq!(slice(content, dep.version_range().unwrap()), "v1.0.0");
+    }
+
+    #[test]
+    fn test_issue_879_include_before_multibyte_block_scalar_unaffected() {
+        // Regression guard: an `include:` entry preceding the block scalar was never
+        // affected by the drift — must keep working exactly as before the fix.
+        let (policy, instance_host) = ctx();
+        let content = "include:\n  - project: org/proj\n    ref: v1.0.0\nsome_job:\n  script: |\n    echo hello \u{2014} world this line is long enough to force yaml-rust2's scanner buffer to refill mid-line\n";
+        let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host).unwrap();
+        assert_eq!(result.dependencies.len(), 1, "{:?}", result.dependencies);
+        let dep = &result.dependencies[0];
+        assert_eq!(dep.project_path, "org/proj");
+        assert_eq!(slice(content, dep.version_range().unwrap()), "v1.0.0");
+    }
+
+    #[test]
+    fn test_issue_879_multibyte_on_last_line_of_block_scalar_then_include() {
+        let (policy, instance_host) = ctx();
+        let content = "some_job:\n  script: |\n    first regular line long enough for buffer padding without any multibyte characters at all\n    echo hello \u{2014} world this final line of the block scalar is long enough too\ninclude:\n  - project: org/proj\n    ref: v1.0.0\n";
+        let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host).unwrap();
+        assert_eq!(result.dependencies.len(), 1, "{:?}", result.dependencies);
+        let dep = &result.dependencies[0];
+        assert_eq!(dep.project_path, "org/proj");
+        assert_eq!(slice(content, dep.version_range().unwrap()), "v1.0.0");
     }
 }
