@@ -37,7 +37,7 @@ pub use formatter::{
     PackageRendering, RequirementResolution, SourcePolicy,
 };
 pub use git_ref::{
-    CharOffsets, MAX_FALLBACK_SCAN_BYTES, is_full_sha, is_tag_shaped, locate_value_span,
+    MAX_FALLBACK_SCAN_BYTES, is_full_sha, is_tag_shaped, locate_value_span, marker_byte_offset,
     match_v_prefix_style,
 };
 pub use hover::{CMD_DOT_FOOTER, generate_hover};
