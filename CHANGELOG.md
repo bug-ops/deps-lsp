@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `specs/`: reconciled `MOC-specs.md` against actual issue/PR state — stale "draft" spec rows marked shipped with their PR/issue references, all shipped specs moved into a "Completed Specs" section, and `specs/constitution.md` added (resolves #855) (#867)
 
 ### Fixed
-- **deps-core**: `net_policy`'s credential redaction no longer takes `O(n^2)` time on input alternating `[` with a non-colon byte, the sibling case #893's consecutive-`[` fix left open (resolves #894) (#TBD)
+- **deps-core**: `net_policy`'s credential redaction no longer takes `O(n^2)` time on input alternating `[` with a non-colon byte, the sibling case #893's consecutive-`[` fix left open (resolves #894) (#895)
 - **deps-core**: `net_policy`'s credential redaction no longer takes `O(n^2)` time on a run of consecutive `[` characters (resolves #891) (#893)
 - **deps-core**: `net_policy::redact_authority_suffix` now redacts a colon-only credential sitting in the window between two already-masked `@`-shaped decoys instead of emitting it verbatim (resolves #886) (#890)
 - **deps-core**: `net_policy::redact_userinfo` now redacts a colon-less `TOKEN@host` credential reachable only through `redact_authority_suffix`'s widen branch (e.g. behind an unclosed `[` that fails `Url::parse`), previously returned verbatim (resolves #887) (#892)
