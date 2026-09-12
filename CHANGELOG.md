@@ -13,7 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `specs/`: reconciled `MOC-specs.md` against actual issue/PR state — stale "draft" spec rows marked shipped with their PR/issue references, all shipped specs moved into a "Completed Specs" section, and `specs/constitution.md` added (resolves #855) (#867)
 
 ### Fixed
-- **deps-core**: fixed a `net_policy::redact_userinfo` scan-anchor bug that let a later `://`/`@`/`?`/`#` boundary hide a leaked credential in tracing/error output (resolves #862) (#TBD); residual known gaps tracked separately as #870, #871, #873, #874, #875.
+- **deps-core**: `net_policy::redact_userinfo` now anchors on the first (not nearest) `://` preceding a credential, so a credential behind multiple stacked scheme separators is no longer left unredacted (resolves #871)
+- **deps-core**: fixed a `net_policy::redact_userinfo` scan-anchor bug that let a later `://`/`@`/`?`/`#` boundary hide a leaked credential in tracing/error output (resolves #862) (#TBD); residual known gaps tracked separately as #870, #873, #874, #875 (a gate for #875 was tried and reverted — it traded a P4 cosmetic over-redaction for a real credential-leak regression).
 - **deps-core**: `net_policy::redact_userinfo`/`url_for_tracing` now redact a second, independent colon-shaped credential sitting after an already-masked userinfo `@` instead of leaving it untouched (resolves #869) (#872)
 - **deps-core**: `net_policy::url_for_tracing` now truncates the query string/fragment before redacting, so a credential-shaped `@` inside the query can no longer swallow the `?`/`#` boundary and leak the rest of the query unredacted (resolves #866) (#872)
 - **deps-core**: `net_policy::redact_userinfo` now fully redacts an `@` embedded inside a password for opaque-path (`scheme:/path`) values, closing a partial credential leak (resolves #859) (#865)
