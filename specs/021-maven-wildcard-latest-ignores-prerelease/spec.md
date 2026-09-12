@@ -9,7 +9,7 @@ tags:
   - deps-gradle
   - prerelease
 created: 2026-08-24
-status: draft
+status: shipped
 related:
   - "[[MOC-specs]]"
 ---

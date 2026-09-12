@@ -10,7 +10,7 @@ tags:
   - completion
   - performance
 created: 2026-08-20
-status: draft
+status: shipped
 related:
   - "[[constitution]]"
   - "[[MOC-specs]]"

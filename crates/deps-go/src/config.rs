@@ -171,7 +171,11 @@ fn parse_hop(raw: &str, policy: &RegistryAccessPolicy) -> Result<GoProxyHop, Inv
 /// semantics — this crate's `,`-and-`|`-both-fall-through-on-not-found first cut collapsed
 /// that distinction; see [`GoRegistry::get_versions_chained`](crate::registry::GoRegistry)
 /// (registry.rs) for where this is consulted.
-// Exhaustive: fallback rule fixed by Go's `,`/`|` GOPROXY separator grammar (issue #769).
+///
+/// **Exhaustive** (issue #769): a fallback rule fixed by Go's own `,`/`|` GOPROXY separator
+/// grammar — Go itself defines exactly these two separators, so a third variant here would
+/// mean Go changed its own grammar, which should be a deliberate, compile-time-visible update
+/// to every consuming match site, not a silent wildcard fallthrough.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChainSeparator {
     /// `,`: fall through to the next hop only on an explicit not-found response (`404`/`410`)

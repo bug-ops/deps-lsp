@@ -90,7 +90,8 @@ impl std::fmt::Display for AuthToken {
 /// entry (see the module-level docs), not a runtime branch on this enum. A future change
 /// that starts branching on this to decide whether to attach a credential reintroduces the
 /// exact vulnerability class this design closed.
-// Exhaustive: closed 2-variant CargoHome/Workspace split (issue #769).
+///
+/// **Exhaustive** (issue #769): a closed 2-variant `CargoHome`/`Workspace` split.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provenance {
     /// Resolved from `$CARGO_HOME/config.toml` or a `CARGO_REGISTRIES_*` environment
@@ -110,8 +111,10 @@ pub enum Provenance {
 /// protecting the auth boundary; adding a policy branch on it would make that sentence false
 /// and invite a future reader to add an auth branch too. Two small enums, one invariant
 /// each.
-// Exhaustive: security-sensitive Trusted/WorkspaceDeclared split — a wildcard arm would
-// silently trust workspace-declared input (issue #769).
+///
+/// **Exhaustive** (issue #769): a security-sensitive `Trusted`/`WorkspaceDeclared` split — a
+/// wildcard arm at a future consuming match site would silently trust workspace-declared
+/// input instead of failing to compile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IndexTrust {
     /// `$CARGO_HOME/config.toml` or a `CARGO_REGISTRIES_*` environment variable — the

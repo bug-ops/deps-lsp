@@ -1092,8 +1092,9 @@ impl DependencySource {
 /// # Thread Safety
 ///
 /// This enum is `Copy` for efficient passing across thread boundaries in async contexts.
-// Exhaustive: UI state machine — a wildcard arm at any consuming match site would render
-// nothing for a new state instead of failing to compile (issue #769).
+///
+/// **Exhaustive** (issue #769): a closed UI state machine — a wildcard arm at any consuming
+/// match site would silently render nothing for a new state instead of failing to compile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LoadingState {
     /// No data loaded, not currently loading

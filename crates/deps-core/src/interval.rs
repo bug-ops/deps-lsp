@@ -63,8 +63,10 @@ pub enum VersionRange<V> {
 /// character serves as both an opener and a closer. `AllowReversed` adds Gradle's
 /// reversed-bracket exclusive notation on top: a leading `]` or trailing `[` is also accepted
 /// as an exclusive bound (`]1.2,1.5]`, `[1.1,2.0[`).
-// Exhaustive: 2-variant grammar selector (Standard/AllowReversed) fixed by `parse_interval`'s
-// call sites (issue #769).
+///
+/// **Exhaustive** (issue #769): a 2-variant grammar selector fixed by `parse_interval`'s call
+/// sites — a third grammar would change the calling convention there too, not slot into an
+/// existing wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BracketStyle {
     /// Maven's/NuGet's grammar: `[`/`]` inclusive, `(`/`)` exclusive only.
