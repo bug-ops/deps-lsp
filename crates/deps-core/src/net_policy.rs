@@ -580,6 +580,9 @@ pub enum PolicyGate<'a> {
 /// );
 /// assert_eq!(redact_userinfo("c:/user:hunter2@evil"), "c:***@evil");
 /// ```
+// #901: `authority_start` comes from `find(':')` followed by `scheme_separator_end`, both
+// ASCII-byte scans, so it always lands on a char boundary.
+#[allow(clippy::string_slice)]
 #[must_use]
 pub fn redact_userinfo(raw: &str) -> String {
     let Ok(mut url) = url::Url::parse(raw) else {
@@ -602,8 +605,54 @@ pub fn redact_userinfo(raw: &str) -> String {
     if url.host().is_none() {
         return redact_userinfo_opaque_path(raw);
     }
+    // #901: a host-having URL with no userinfo at all is not proof the rest of `raw` is
+    // credential-free — a path segment can still be userinfo-shaped (e.g.
+    // `https://example.com/api/user:glpat-SECRET@internal`, or a `c:/`-corrupted authority
+    // like `https://c:/user:glpat-SECRET@h/p` that still parses to an empty-userinfo host).
+    // Scanned the same way `redact_authority_url_tail` scans the *post-userinfo* tail of a
+    // URL that does have userinfo, anchored past the scheme separator so a leading `c:/`-style
+    // segment before the real authority is not itself mistaken for the credential.
+    //
+    // The anchor is `raw`'s own first `:` (the scheme separator, same derivation
+    // `redact_userinfo_opaque_path` uses), never `find("://")`: a slash-less `scheme:host`
+    // form (e.g. `https:example.com/user:SECRET@h?r=http://y`) can have its own `://`
+    // appear later, inside the path/query, which would let `find("://")` skip straight past
+    // the credential (#901 S1); anchoring on the first `:` instead is a no-op for every
+    // `scheme://` input, since `scheme_separator_end` consumes the following slash run to the
+    // identical offset either way.
+    //
+    // This puts `redact_secondary_colon_credential`'s existing false-positive population
+    // (REST paths like `.../v1/items:search`, Maven coordinates `group:artifact`, RFC 3339
+    // timestamps `T08:40:19Z`) on every host-having, userinfo-free URL — previously only
+    // reachable via the fallback paths for unparseable/opaque URLs — since this is now the
+    // primary redaction path for the common case. Accepted for the same reason as elsewhere in
+    // this module: over-redacting a non-credential is always safer than leaking a real one.
+    // Two shapes still survive unredacted here, as elsewhere in this module. A token-shaped
+    // credential with no separating colon (`.../ghp_TOKENVALUE@internal`) is not fixed since
+    // doing so would require routing through `RegionKind::Authority` and reopening the #887
+    // over-redaction regression pinned by
+    // `test_redact_userinfo_authority_widen_branch_token_prefix_over_redaction_is_accepted`
+    // and `..._no_token_prefix_is_unaffected`. A percent-encoded separator
+    // (`user%3Aglpat-SECRET%40internal`) is a different, structural gap, not a deliberate
+    // trade: with no literal `:` or `@` anywhere in `raw`, no colon/at-sign-based scan in this
+    // module — this one included — can see it.
     if url.username().is_empty() && url.password().is_none() {
-        return raw.to_string();
+        let authority_start = raw
+            .find(':')
+            .map_or(0, |scheme_end| scheme_separator_end(raw, scheme_end));
+        let tail = &raw[authority_start..];
+        // Mirrors `redact_span_colon_credential`'s own `Cow::Borrowed` short-circuit: most
+        // URLs reaching this branch (an ordinary `scheme://host/path` with no colon past the
+        // authority) have nothing for the scan to find, so skip both the scan's own internal
+        // `to_string()` and the `format!` allocation below on that common, credential-free path.
+        if !tail.contains(':') {
+            return raw.to_string();
+        }
+        return format!(
+            "{}{}",
+            &raw[..authority_start],
+            redact_secondary_colon_credential(tail)
+        );
     }
     // `set_username`/`set_password` only fail for a cannot-be-a-base URL — never true here,
     // since a URL with `username()`/`password()` set is always base-having by construction —
@@ -4788,5 +4837,147 @@ mod tests {
     #[test]
     fn test_redact_userinfo_no_colon_no_bracket_segment_is_noop() {
         assert_eq!(redact_userinfo("path/to/pkg@1.0.0"), "path/to/pkg@1.0.0");
+    }
+
+    /// #901: the "host present, empty userinfo" branch (net_policy.rs:605-607 pre-fix) used to
+    /// `return raw.to_string()` unconditionally, so a `c:/`-corrupted authority that still
+    /// parses to `host=Some(_)` with empty username/password left the entire rest of the string
+    /// — including a credential-shaped path segment — completely unscanned. Covers all four
+    /// issue repro shapes.
+    #[test]
+    fn test_redact_userinfo_host_present_empty_userinfo_c_drive_path_credential_is_redacted() {
+        assert_eq!(
+            redact_userinfo("https://c:/c:/user:glpat-SECRET@h/p"),
+            "https://c:/c:/user:***/p"
+        );
+        assert_eq!(
+            redact_userinfo("https://c:/[::1:glpat-SECRET@h/p"),
+            "https://c:/[:***"
+        );
+        assert_eq!(
+            redact_userinfo("https://c:/[[[[:glpat-SECRET@h/p"),
+            "https://c:/[[[[:***"
+        );
+        assert_eq!(
+            redact_userinfo("https://c:/[/::1]:abc/user:SECRET@h/p"),
+            "https://c:/[/:***"
+        );
+    }
+
+    /// #901 companion: the gap is not specific to a `c:/`-corrupted authority — any ordinary,
+    /// uncorrupted `https://host/...` URL with empty userinfo hit the exact same unscanned
+    /// early-return whenever its path happened to contain a credential-shaped colon.
+    #[test]
+    fn test_redact_userinfo_host_present_empty_userinfo_ordinary_host_path_credential_is_redacted()
+    {
+        assert_eq!(
+            redact_userinfo("https://example.com/api/user:glpat-SECRET@internal"),
+            "https://example.com/api/user:***"
+        );
+    }
+
+    /// #901 regression guard: the #887 pinned decision that a well-formed `https://` URL never
+    /// reaches `redact_authority_suffix`'s token-prefix widen branch must still hold after this
+    /// fix — routing the new tail scan through [`redact_secondary_colon_credential`] instead of
+    /// `redact_userinfo_unparseable` is exactly what keeps this byte-identical. Already pinned at
+    /// [`test_redact_userinfo_authority_widen_branch_token_prefix_over_redaction_is_accepted`];
+    /// asserted again here so this file's #901 test group is self-contained.
+    #[test]
+    fn test_redact_userinfo_host_present_empty_userinfo_no_credential_shape_is_noop() {
+        assert_eq!(
+            redact_userinfo("https://docs.rs/sk-lang@1.2.3"),
+            "https://docs.rs/sk-lang@1.2.3"
+        );
+    }
+
+    /// #901 boundary guard: a host-having URL whose path contains no colon at all (no credential
+    /// shape anywhere in the tail) must stay byte-identical — the new scan must not introduce a
+    /// false positive on ordinary paths.
+    #[test]
+    fn test_redact_userinfo_host_present_empty_userinfo_no_colon_in_path_is_noop() {
+        for raw in [
+            "https://example.com/no/colon/at/all",
+            "https://example.com",
+            "https://example.com/",
+        ] {
+            assert_eq!(redact_userinfo(raw), raw, "raw={raw:?}");
+        }
+    }
+
+    /// #901 boundary guard: a `=`-shaped query parameter that merely contains the word "token"
+    /// is not a colon-credential and must not be redacted — only an actual `key:value@` or
+    /// bare `token:value` colon pair triggers the tail scan.
+    #[test]
+    fn test_redact_userinfo_host_present_empty_userinfo_query_param_without_colon_is_noop() {
+        assert_eq!(
+            redact_userinfo("https://example.com/search?token=glpat-SECRET"),
+            "https://example.com/search?token=glpat-SECRET"
+        );
+    }
+
+    /// #901 boundary guard: the new tail scan covers the query string too, not just the path —
+    /// a colon-credential shape after `?` is redacted exactly like one in the path.
+    #[test]
+    fn test_redact_userinfo_host_present_empty_userinfo_colon_credential_in_query_is_redacted() {
+        assert_eq!(
+            redact_userinfo("https://example.com/path?token:SECRET@foo"),
+            "https://example.com/path?token:***"
+        );
+    }
+
+    /// #901 S1 (impl-critic finding): a slash-less `scheme:host` URL can carry its own `://`
+    /// later in the path/query (e.g. a `?r=http://y` redirect param) — anchoring
+    /// `authority_start` on `raw.find("://")` would skip straight past the real credential and
+    /// leave it unredacted. Anchoring on `raw.find(':')` (the scheme separator itself) instead
+    /// fixes both the `@`-bearing and colon-only-no-`@` shapes.
+    #[test]
+    fn test_redact_userinfo_host_present_empty_userinfo_slashless_scheme_credential_before_later_scheme_is_redacted()
+     {
+        assert_eq!(
+            redact_userinfo("https:example.com/user:glpat-SECRET@h/x?r=http://y"),
+            "https:example.com/user:***/x?r=http://y"
+        );
+        assert_eq!(
+            redact_userinfo("https:h/oauth2:glpat-SECRET/x?r=http://y"),
+            "https:h/oauth2:***/x?r=http://y"
+        );
+    }
+
+    /// #901 S2 (impl-critic finding): the same slash-less `scheme:host` shape, with no
+    /// credential anywhere, used to regress to `authority_start == 0` under the `find("://")`
+    /// anchor — scanning the `scheme:` prefix itself and mangling it into `scheme:***`. Anchoring
+    /// on `raw.find(':')` (still the scheme separator) instead keeps this byte-identical.
+    #[test]
+    fn test_redact_userinfo_host_present_empty_userinfo_slashless_scheme_no_credential_is_noop() {
+        assert_eq!(redact_userinfo("https:example.com"), "https:example.com");
+        assert_eq!(
+            redact_userinfo("https:example.com/pkg"),
+            "https:example.com/pkg"
+        );
+    }
+
+    /// #901 boundary guard (impl-critic M3): a port or bracketed IPv6 host must stay exempt from
+    /// the new tail scan, matching the module's existing well-formed-port carve-out — there is no
+    /// credential-shaped colon anywhere past the scheme separator in either case.
+    #[test]
+    fn test_redact_userinfo_host_present_empty_userinfo_port_and_ipv6_host_is_noop() {
+        assert_eq!(
+            redact_userinfo("https://host:8443/x"),
+            "https://host:8443/x"
+        );
+        assert_eq!(
+            redact_userinfo("https://[::1]:8443/x"),
+            "https://[::1]:8443/x"
+        );
+    }
+
+    /// #901 boundary guard (impl-critic M3): the tail scan covers the fragment too, not just the
+    /// path and query — a colon-credential shape after `#` is redacted the same way.
+    #[test]
+    fn test_redact_userinfo_host_present_empty_userinfo_colon_credential_in_fragment_is_redacted() {
+        assert_eq!(
+            redact_userinfo("https://example.com/x#u=user:SECRET@evil"),
+            "https://example.com/x#u=user:***"
+        );
     }
 }
