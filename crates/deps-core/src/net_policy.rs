@@ -1450,6 +1450,41 @@ fn redact_authority_suffix(region: &str) -> String {
                 window_start = base;
                 continue;
             }
+            // #887: neither this window's own `@` check (line ~1389) nor `find_credential_at`
+            // above ever reaches a colon-less `TOKEN@host` credential sitting in a *later*
+            // window once this arm widens to the unrestricted colon scan below — that scan only
+            // recognizes a `:`-separated credential, so `redact_colon_credential` alone returns
+            // `remaining` verbatim when there is no colon anywhere in it at all (its own no-colon
+            // branch), silently skipping past a username-only credential like `ghp_TOKEN@evil`.
+            // Checked here, terminally (mask-and-`return`, never fed back into the bounded-`@`
+            // loop via `continue`): looping back in would set `base != 0`, which permanently
+            // disables `colon_evidence` (hard-gated to `base == 0`) and makes a later window's own
+            // `@` branch emit an unexamined `region[base..window_start]` span verbatim — that span
+            // can itself contain a colon-separated credential this function would otherwise have
+            // masked (reproduced live: `h/ghp_X@a/oauth2:SECRET/b@c` regresses to leaking `SECRET`
+            // under a mask-and-`continue` variant). Accepted trade-off, consistent with this
+            // module's over-redaction-over-leaking design rule: `TOKEN_PREFIXES` entries like
+            // `sk-`/`npm_`/`pypi-` can shape-collide with an ordinary package name segment
+            // (`docs.rs/sk-lang@1.2.3` read as schemeless/malformed text), over-redacting a
+            // version-shaped `@` that was never a credential — but only for schemeless/malformed
+            // input reaching this fallback at all, since a well-formed `https://` URL parses and
+            // never enters `redact_authority_suffix` in the first place. The trade also runs the
+            // other way on a small population: returning here instead of falling into
+            // `redact_colon_credential` can narrow what its own `bracket_seen` stickiness would
+            // have masked through to end-of-string, occasionally *revealing* a glued, credential-
+            // shaped-but-non-matching span past the terminal `@` (e.g. an `AKIA`-prefixed segment
+            // stuck directly onto a host with no `/`/`?`/`#`/`\` boundary before it, so
+            // `find_token_prefix_at`'s own segment-start rule does not recognize it) — never a
+            // regression on a credential this module actually detects (see the differential
+            // audit backing this fix), just a smaller sliver of incidental text than the old,
+            // stickier over-redaction happened to hide.
+            if let Some(at) = find_token_prefix_at(remaining) {
+                let at = extend_credential_at(remaining, at);
+                output.push_str("***@");
+                let tail = &remaining[at + 1..];
+                output.push_str(&redact_further_credential(tail, tail.find('[')));
+                return output;
+            }
             output.push_str(&redact_colon_credential(remaining, 0, remaining));
             return output;
         }
@@ -3313,6 +3348,126 @@ mod tests {
         assert_eq!(
             redact_userinfo("c:/a;ghp_TOKEN@evil"),
             "c:/a;ghp_TOKEN@evil"
+        );
+    }
+
+    /// #887: `redact_authority_suffix`'s widen branch (`base == 0 && !has_nested_scheme`) used to
+    /// call `redact_colon_credential` directly, which returns its input verbatim when it finds no
+    /// colon at all — so a colon-less `TOKEN@host` credential reachable only via this arm (an
+    /// unparseable authority, e.g. an unclosed `[` that fails `Url::parse`) leaked in full. Fixed
+    /// by trying [`find_token_prefix_at`] first, terminally (mask-and-`return`, matching this
+    /// function's own doc comment for why it must never `continue` the bounded-`@` loop instead).
+    #[test]
+    fn test_redact_userinfo_authority_widen_branch_token_prefix_credential_is_redacted() {
+        assert_eq!(
+            redact_userinfo("https://[/ghp_TOKEN@evil"),
+            "https://***@evil"
+        );
+        assert_eq!(redact_userinfo("c://[/ghp_TOKEN@evil"), "c://***@evil");
+        assert_eq!(redact_userinfo("[/ghp_TOKEN@evil"), "***@evil");
+    }
+
+    /// #887 anti-naive-fix guard: the naive fix this issue explicitly warns against (masking the
+    /// token-prefix credential and `continue`-ing the same bounded-`@` loop instead of returning)
+    /// would leak `SECRET` here — reproduced separately during audit as `***@a/oauth2:SECRET/***@c`
+    /// — because `continue`ing sets `base != 0`, which permanently disables `colon_evidence`
+    /// (hard-gated to `base == 0`) and makes a later window's own `@` branch emit an unexamined
+    /// span verbatim. The terminal mask-and-`return` this fix uses never reaches that state, so
+    /// `SECRET` stays masked; the only behavior change from before this fix is that the
+    /// `ghp_X`-prefixed credential earlier in the same string is now *also* masked (previously left
+    /// fully visible, since the pre-fix widen branch only ever looked for a colon-based credential)
+    /// — over-redaction of a second, genuine credential-shaped span, not a leak, and consistent
+    /// with this module's over-redaction-over-leaking design rule.
+    #[test]
+    fn test_redact_userinfo_authority_widen_branch_anti_naive_continue_guard() {
+        for raw in [
+            "h/ghp_X@a/oauth2:SECRET/b@c",
+            "h/ghp_X@[::1]:abc/oauth2:SECRET/b@c",
+        ] {
+            let redacted = redact_userinfo(raw);
+            assert!(
+                !redacted.contains("SECRET"),
+                "raw={raw:?} redacted={redacted:?}"
+            );
+            assert!(
+                !redacted.contains("ghp_X"),
+                "raw={raw:?} redacted={redacted:?}"
+            );
+        }
+        assert_eq!(redact_userinfo("h/ghp_X@a/oauth2:SECRET/b@c"), "***@***@c");
+        assert_eq!(
+            redact_userinfo("h/ghp_X@[::1]:abc/oauth2:SECRET/b@c"),
+            "***@***@c"
+        );
+    }
+
+    /// #887 bracket-sticky regression: a token-prefixed credential following an unclosed
+    /// IPv6-bracket-shaped prefix must still be found and masked, and a further colon-only
+    /// credential past it (`user:SECRET`) must stay masked too.
+    #[test]
+    fn test_redact_userinfo_authority_widen_branch_bracket_sticky_credential() {
+        let redacted = redact_userinfo("[/::1/x]:abc/ghp_X@h/user:SECRET");
+        assert!(!redacted.contains("SECRET"), "redacted={redacted:?}");
+        assert!(!redacted.contains("ghp_X"), "redacted={redacted:?}");
+        assert_eq!(redacted, "***@h/user:***");
+    }
+
+    /// #887 narrowing direction (critic finding M3): the fix's terminal `return` can, on a small
+    /// population, narrow what `redact_colon_credential`'s own `bracket_seen` stickiness would have
+    /// masked through to end-of-string on `main` — occasionally revealing a glued, credential-
+    /// shaped-but-non-matching span (here, an `AKIA`-prefixed segment with no boundary before it, so
+    /// [`find_token_prefix_at`]'s segment-start rule does not recognize it as its own credential).
+    /// Both real credentials in this input (`ghp_X`, `hunter2`) stay masked either way — this pins
+    /// the exact, safe output rather than asserting the old, stickier over-redaction.
+    #[test]
+    fn test_redact_userinfo_authority_widen_branch_narrows_bracket_sticky_over_redaction() {
+        let redacted = redact_userinfo("[/ghp_X@a/user:hunter2@evil/[::1]AKIAX@s3");
+        assert!(!redacted.contains("ghp_X"), "redacted={redacted:?}");
+        assert!(!redacted.contains("hunter2"), "redacted={redacted:?}");
+        assert_eq!(redacted, "***@***@evil/[::1]AKIAX@s3");
+    }
+
+    /// #887 accepted over-redaction, asserted explicitly so it is a documented decision rather than
+    /// an accident: [`TOKEN_PREFIXES`] entries like `sk-`/`npm_`/`pypi-` collide with ordinary
+    /// package/mirror name segments, so a schemeless or otherwise-unparseable value whose path
+    /// segment happens to start with one of them is over-redacted by the new widen-branch fallback
+    /// even though nothing there is a real credential.
+    #[test]
+    fn test_redact_userinfo_authority_widen_branch_token_prefix_over_redaction_is_accepted() {
+        assert_eq!(redact_userinfo("docs.rs/sk-lang@1.2.3"), "***@1.2.3");
+        assert_eq!(redact_userinfo("unpkg.com/npm_thing@3"), "***@3");
+        assert_eq!(redact_userinfo("host/pypi-mirror@2.0.0"), "***@2.0.0");
+        assert_eq!(
+            redact_userinfo("nexus.corp:8081/repo/sk-lib@2.0.0"),
+            "***@2.0.0"
+        );
+        // A well-formed `https://` URL parses successfully and never reaches
+        // `redact_authority_suffix`'s widen branch at all, so the over-redaction above is bounded
+        // to schemeless/malformed input, not a risk for ordinary registry URLs.
+        assert_eq!(
+            redact_userinfo("https://docs.rs/sk-lang@1.2.3"),
+            "https://docs.rs/sk-lang@1.2.3"
+        );
+    }
+
+    /// #887 regression guards: none of these contain a [`TOKEN_PREFIXES`] match, so the new
+    /// widen-branch fallback must never fire on them — byte-identical to pre-fix output. Most stay
+    /// fully unredacted (no credential shape at all); `gitlab.corp/user:hunter2@evil` (#810) is the
+    /// one genuine colon-credential in the set and must keep redacting exactly as before.
+    #[test]
+    fn test_redact_userinfo_authority_widen_branch_no_token_prefix_is_unaffected() {
+        for raw in [
+            "nexus.corp:8081/repo/lib@2.0.0",
+            "[::1]:8443/pkg@1.0.0",
+            "registry.example/@scope/pkg",
+            "@types/node",
+            "file:///C:/Users/x@corp/project",
+        ] {
+            assert_eq!(redact_userinfo(raw), raw, "raw={raw:?}");
+        }
+        assert_eq!(
+            redact_userinfo("gitlab.corp/user:hunter2@evil"),
+            "gitlab.corp/user:***"
         );
     }
 
