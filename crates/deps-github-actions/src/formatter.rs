@@ -179,14 +179,20 @@ impl PackageRendering for GithubActionsFormatter {
             // scalar, `version_range` sits inside the quotes, so appending `# {tag}`
             // would place a `#` inside the string instead of starting a YAML comment —
             // the same corruption the mutable-ref-pin SHA-pin action guards against.
-            // Falls straight to the no-op fallback without even consulting `TagIndex`,
-            // identical to a cache miss.
-            Some(PinStyle::Sha { .. }) if gha_dep.is_plain_scalar => self
-                .tag_index
-                .get(dep.name())
-                .and_then(|index| index.tag_to_sha.get(version.as_str()).cloned())
-                .map(|sha| format!("{sha} # {}", version.as_str()))
-                .unwrap_or_else(|| dep.version_literal().unwrap_or(current).to_string()),
+            // `is_last_on_line` guard (issue #898 critic follow-up): for a flow-style
+            // step with real YAML content after the ref (`, with: {...}}`), appending
+            // `# {tag}` here would comment out that content, producing an unterminated
+            // flow mapping — the same corruption class #633 fixed for the bulk SHA-pin
+            // action, reached here through the version-update code action instead.
+            // Both guards fall straight to the no-op fallback without even consulting
+            // `TagIndex`, identical to a cache miss.
+            Some(PinStyle::Sha { .. }) if gha_dep.is_plain_scalar && gha_dep.is_last_on_line => {
+                self.tag_index
+                    .get(dep.name())
+                    .and_then(|index| index.tag_to_sha.get(version.as_str()).cloned())
+                    .map(|sha| format!("{sha} # {}", version.as_str()))
+                    .unwrap_or_else(|| dep.version_literal().unwrap_or(current).to_string())
+            }
             Some(PinStyle::Sha { .. } | PinStyle::Branch) | None => {
                 dep.version_literal().unwrap_or(current).to_string()
             }
@@ -789,6 +795,68 @@ mod tests {
         let new_text =
             fmt.format_version_replacing_for(&d, &ConcreteVersion::new("v5.0.0"), "v4.2.0");
         assert_eq!(new_text, "oldsha # v4.2.0");
+    }
+
+    /// Issue #898 critic follow-up (S1): a flow-style SHA ref with sibling YAML content
+    /// (`, with: {node-version: 20}}`) must withhold the `# {tag}`-appending edit even on
+    /// a `TagIndex` hit, exactly like the quoted-scalar guard above — otherwise accepting
+    /// the version-update code action comments out the sibling content, producing an
+    /// unterminated flow mapping. Manifest shape from the issue's exact repro:
+    /// `- {uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683, with: {node-version: 20}}`.
+    #[test]
+    fn test_format_version_replacing_for_sha_flow_style_not_last_on_line_falls_back_to_literal() {
+        let fmt = formatter();
+        let name = PackageName::new("actions/checkout");
+        let mut index = TagIndex::default();
+        index
+            .tag_to_sha
+            .insert("v5.0.0".to_string(), "deadbeef".repeat(5));
+        fmt.tag_index.insert(name, Arc::new(index));
+
+        let sha = "11bd71901bbe5b1630ceea73d27597364c9af683";
+        let mut d = dep(
+            Some(PinStyle::Sha { comment_tag: None }),
+            "actions/checkout",
+            None,
+        );
+        d.is_last_on_line = false;
+
+        // Mirrors the real caller: for a commentless flow-style SHA ref, `current` is
+        // the raw declared SHA itself (`version_req`), since `version_literal` is `None`.
+        let new_text = fmt.format_version_replacing_for(&d, &ConcreteVersion::new("v5.0.0"), sha);
+        assert_eq!(
+            new_text, sha,
+            "a flow-style SHA ref with sibling content must never gain a `# {{tag}}` suffix"
+        );
+        assert!(!new_text.contains('#'));
+    }
+
+    /// Positive-control companion to the withhold test above: an ordinary,
+    /// genuinely-last-on-line SHA ref (the overwhelming common case) must keep resolving
+    /// through `TagIndex` and appending `# {tag}` — the #898 fix must not become overly
+    /// conservative and silently withhold a safe, correct edit.
+    #[test]
+    fn test_format_version_replacing_for_sha_last_on_line_still_appends_tag_comment() {
+        let fmt = formatter();
+        let name = PackageName::new("actions/checkout");
+        let mut index = TagIndex::default();
+        index
+            .tag_to_sha
+            .insert("v5.0.0".to_string(), "deadbeef".repeat(5));
+        fmt.tag_index.insert(name, Arc::new(index));
+
+        let d = dep(
+            Some(PinStyle::Sha {
+                comment_tag: Some("v4.2.0".to_string()),
+            }),
+            "actions/checkout",
+            Some("11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.0"),
+        );
+        assert!(d.is_last_on_line);
+
+        let new_text =
+            fmt.format_version_replacing_for(&d, &ConcreteVersion::new("v5.0.0"), "v4.2.0");
+        assert_eq!(new_text, format!("{} # v5.0.0", "deadbeef".repeat(5)));
     }
 
     #[test]

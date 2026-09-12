@@ -598,7 +598,15 @@ fn build_dependency(
             let is_last_on_line = ref_is_last_token_on_line(rest_of_line, window);
 
             if is_full_sha(&ref_text) {
-                let comment = is_plain_scalar
+                // `extract_comment_tag` takes the first whitespace-preceded `#` anywhere
+                // in `rest_of_line`, with no notion of whether that `#` is genuinely this
+                // ref's own trailing comment or belongs to an unrelated later token on the
+                // same flow-style line (issue #898). `is_last_on_line` already answers
+                // exactly that question (see the #633 comment above): reuse it as a gate
+                // so a flow-style continuation (`, with: {...}}`) is never misread as this
+                // ref's comment, which previously computed an over-wide `version_range`
+                // spanning real YAML content past the ref.
+                let comment = (is_plain_scalar && is_last_on_line)
                     .then(|| extract_comment_tag(rest_of_line, window))
                     .flatten();
 
@@ -1521,6 +1529,115 @@ mod tests {
              expected the O(1) line-end lookup to make this independent of the trailing \
              content size instead of re-scanning ~8MB per call"
         );
+    }
+
+    // --- issue #898: comment-tag mis-attribution across sibling flow-mapping keys ---
+    //
+    // `extract_comment_tag` takes the first whitespace-preceded `#` anywhere in
+    // `rest_of_line`, with no notion of whether that `#` is genuinely the ref's own
+    // trailing comment or belongs to an unrelated later token on the same flow-style
+    // line. The fix gates the call on `is_last_on_line` (already computed for the #633
+    // guard) so a flow-style continuation is never misread as this ref's comment.
+
+    #[test]
+    fn test_flow_style_sha_pin_trailing_comment_not_attributed_across_sibling_key() {
+        // Exact issue repro: a flow-style step where `, with: {node: 20}}` sits between
+        // the SHA ref and the line's only `#`. Before the fix, `version_range` swallowed
+        // that whole span as a "trailing comment"; the fix must leave it un-attributed.
+        let sha = "a".repeat(40);
+        let content =
+            format!("steps:\n  - {{uses: actions/checkout@{sha}, with: {{node: 20}}}} # v4.2.0\n");
+        let result = parse_workflow_yaml(&content, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        let dep = &result.dependencies[0];
+        assert_eq!(dep.name(), "actions/checkout");
+        assert!(!dep.is_last_on_line);
+        assert_eq!(dep.pin, Some(PinStyle::Sha { comment_tag: None }));
+        assert_eq!(dep.version_literal, None);
+        assert_eq!(
+            slice(&content, dep.version_range().unwrap()),
+            sha,
+            "version_range must span only the ref itself, never the sibling `with:` key"
+        );
+    }
+
+    #[test]
+    fn test_two_sha_pins_on_one_flow_style_line_get_distinct_non_overlapping_ranges() {
+        // Issue #898 explicitly calls out this variant as worse: two SHA-pinned steps
+        // sharing one flow-style line previously both got the line's single trailing
+        // comment attributed, producing overlapping `version_range`s.
+        let sha1 = "a".repeat(40);
+        let sha2 = "b".repeat(40);
+        let content = format!(
+            "steps: [{{uses: actions/checkout@{sha1}}}, {{uses: actions/setup-node@{sha2}}}] # v4.2.0\n"
+        );
+        let result = parse_workflow_yaml(&content, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 2);
+        let dep0 = &result.dependencies[0];
+        let dep1 = &result.dependencies[1];
+
+        assert!(!dep0.is_last_on_line);
+        assert!(!dep1.is_last_on_line);
+        assert_eq!(dep0.pin, Some(PinStyle::Sha { comment_tag: None }));
+        assert_eq!(dep1.pin, Some(PinStyle::Sha { comment_tag: None }));
+
+        let range0 = dep0.version_range().unwrap();
+        let range1 = dep1.version_range().unwrap();
+        assert_eq!(slice(&content, range0), sha1);
+        assert_eq!(slice(&content, range1), sha2);
+        assert!(
+            range0.end.character <= range1.start.character,
+            "ranges must not overlap: {range0:?} vs {range1:?}"
+        );
+    }
+
+    #[test]
+    fn test_block_style_sha_pin_last_on_line_still_attributes_trailing_comment() {
+        // Non-regression: an ordinary block-style SHA pin (the overwhelming common
+        // case, and the whole reason `extract_comment_tag` exists) must keep resolving
+        // its trailing `# vX.Y.Z` comment — the fix must not become overly conservative.
+        let sha = "a".repeat(40);
+        let content = format!("steps:\n  - uses: actions/checkout@{sha} # v4.2.0\n");
+        let result = parse_workflow_yaml(&content, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        let dep = &result.dependencies[0];
+        assert!(dep.is_last_on_line);
+        assert_eq!(
+            dep.pin,
+            Some(PinStyle::Sha {
+                comment_tag: Some("v4.2.0".to_string())
+            })
+        );
+        assert_eq!(
+            dep.version_requirement().map(deps_core::VersionReq::as_str),
+            Some("v4.2.0")
+        );
+        assert_eq!(dep.version_literal, Some(format!("{sha} # v4.2.0")));
+        assert_eq!(
+            slice(&content, dep.version_range().unwrap()),
+            format!("{sha} # v4.2.0")
+        );
+    }
+
+    #[test]
+    fn test_flow_style_sha_pin_version_range_excludes_sibling_key_text() {
+        // End-to-end corruption-vector check for issue #898: every code action in this
+        // workspace writes its `TextEdit` scoped exactly to `version_range` (see
+        // `ecosystem::sha_pin_text_edit_for`/`deps_core::lsp_helpers::code_actions`'s
+        // `single_file_edit` calls). Proving `version_range` never extends past the
+        // ref's own text is therefore sufficient to prove no such edit could delete the
+        // sibling `with:` key's content — a wider integration test would need to
+        // replicate that same scoping rule to assert anything beyond this.
+        let sha = "a".repeat(40);
+        let content =
+            format!("steps:\n  - {{uses: actions/checkout@{sha}, with: {{node: 20}}}} # v4.2.0\n");
+        let result = parse_workflow_yaml(&content, &test_uri()).unwrap();
+        let dep = &result.dependencies[0];
+        let range = dep.version_range().unwrap();
+        let spanned = slice(&content, range);
+        assert_eq!(spanned, sha);
+        assert!(!spanned.contains("with"));
+        assert!(!spanned.contains('}'));
     }
 
     // --- issue #706: composite action.yml routing (parsing side) ---
