@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **deps-core**: fixed a `net_policy::redact_userinfo` scan-anchor bug that let a later `://`/`@`/`?`/`#` boundary hide a leaked credential in tracing/error output (resolves #862) (#TBD); residual known gaps tracked separately as #870, #871, #873, #874, #875.
+- **deps-core**: `net_policy::redact_userinfo`/`url_for_tracing` now redact a second, independent colon-shaped credential sitting after an already-masked userinfo `@` instead of leaving it untouched (resolves #869) (#872)
+- **deps-core**: `net_policy::url_for_tracing` now truncates the query string/fragment before redacting, so a credential-shaped `@` inside the query can no longer swallow the `?`/`#` boundary and leak the rest of the query unredacted (resolves #866) (#872)
 - **deps-core**: `net_policy::redact_userinfo` now fully redacts an `@` embedded inside a password for opaque-path (`scheme:/path`) values, closing a partial credential leak (resolves #859) (#865)
 - `fuzz/redact_userinfo`: fixed a false-positive crash where the fuzzer-controlled host/port tail could coincidentally reproduce the sentinel literal, tripping the leak assertion outside any credential; no `net_policy` behavior change (#864)
 - **deps-core**: `net_policy`'s bracketed-IPv6-host carve-out no longer silently exempts a credential sitting next to a `[...]` host literal (resolves #860)
