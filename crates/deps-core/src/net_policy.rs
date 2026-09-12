@@ -1621,27 +1621,45 @@ fn redact_secondary_colon_credential(tail: &str) -> String {
 /// ≤5-digit credential collides with the `host:port` carve-out (`oauth2:12345` stays
 /// unredacted).
 ///
-/// Translates a previously-known `[` offset into "relative to `remaining`", a string that begins
-/// `consumed` bytes past whatever base `known` was itself relative to — or, when `known` has
-/// fallen *behind* `consumed` (the position it named has already been passed, either properly
+/// Translates a previously-known `needle` offset into "relative to `remaining`", a string that
+/// begins `consumed` bytes past whatever base `known` was itself relative to — or, when `known`
+/// has fallen *behind* `consumed` (the position it named has already been passed, either properly
 /// handled as a bracket span or silently swallowed inside an ordinary masked value), re-derives it
 /// fresh by scanning only `remaining` itself, never the longer string it came from. `None` stays
-/// `None` unconditionally: it means "provably no `[` anywhere in the string this offset is
+/// `None` unconditionally: it means "provably no `needle` anywhere in the string this offset is
 /// tracked against", and every `remaining` any caller here ever passes is a suffix of that string,
 /// so it can't have gained one.
 ///
-/// The one caching rule every place in this module that carries a bracket offset across a
-/// shrinking string uses, instead of three independently-maintained copies (impl-critic S1/S2's
-/// fix, then a DRY finding on its own near-duplicated call sites): [`colon_credential_match`]'s
-/// own loop (twice — once per iteration relative to `remaining`, once for the tail it returns) and
-/// [`redact_further_credential`]'s `@`-branch. See those functions' own doc comments for why this
-/// pattern is sound and what performance regression it fixes.
-fn translate_bracket(known: Option<usize>, consumed: usize, remaining: &str) -> Option<usize> {
+/// The one caching rule every place in this module that carries a `[` or `:` offset across a
+/// shrinking string uses, instead of independently-maintained copies of the same match arms
+/// (impl-critic S1/S2's fix for `[`, then a DRY finding on its own near-duplicated call sites,
+/// then #894, which needed the identical rule a second time for `:` and consolidated both into
+/// this one generic helper rather than adding a second copy): [`translate_bracket`] (itself called
+/// from [`colon_credential_match`]'s own loop twice — once per iteration relative to `remaining`,
+/// once for the tail it returns — and from [`redact_further_credential`]'s `@`-branch) and
+/// [`colon_credential_match_seeded`]'s own `next_colon` tracking, which calls this directly with
+/// `':'` since nothing outside that function's loop ever needs the colon offset. See those
+/// functions' own doc comments for why this pattern is sound and what performance regression it
+/// fixes.
+fn translate_offset(
+    known: Option<usize>,
+    consumed: usize,
+    remaining: &str,
+    needle: char,
+) -> Option<usize> {
     match known {
-        Some(b) if b >= consumed => Some(b - consumed),
-        Some(_) => remaining.find('['),
+        Some(o) if o >= consumed => Some(o - consumed),
+        Some(_) => remaining.find(needle),
         None => None,
     }
+}
+
+/// [`translate_offset`] specialized for the nearest `[` — the offset threaded as `next_bracket`
+/// across [`colon_credential_match_seeded`]'s own loop and [`redact_further_credential`]'s
+/// `@`-branch. See `translate_offset`'s own doc comment for the underlying translate-or-rescan
+/// rule and why it is sound.
+fn translate_bracket(known: Option<usize>, consumed: usize, remaining: &str) -> Option<usize> {
+    translate_offset(known, consumed, remaining, '[')
 }
 
 /// Returns `None` when the scan runs out of colons in `authority` (mirrors
@@ -1663,6 +1681,14 @@ fn translate_bracket(known: Option<usize>, consumed: usize, remaining: &str) -> 
 /// properly skipped as an IPv6-host span, or silently swallowed inside an ordinary masked value),
 /// and that rescan only ever covers `remaining` — not the original, much longer `authority` — so
 /// its cost is charged to the region it discovers, not repeated on every colon match before it.
+///
+/// The colon scan itself is amortized the same way (#894): #893 fixed the quadratic scan for a
+/// run of *consecutive* `[`, by threading `next_bracket` as above, but a pattern that alternates
+/// a `[` with an intervening non-`[`/non-`:` byte never takes the bracket-run-skip arm at all, so
+/// the loop's own `remaining.find(':')` — previously re-derived from scratch on every iteration
+/// regardless of how far `cursor` advanced — stayed `O(n)` per iteration. `next_colon` is now
+/// tracked and translated via [`translate_offset`] exactly like `next_bracket` is via
+/// [`translate_bracket`], closing this sibling gap.
 fn colon_credential_match(
     authority: &str,
     next_bracket: Option<usize>,
@@ -1696,6 +1722,10 @@ fn colon_credential_match_seeded(
     );
     let mut cursor = 0;
     let mut next_bracket = next_bracket;
+    // #894: seeded once here, up front, from the whole (uncursored) `authority` — mirrors how
+    // `next_bracket` arrives already seeded by the caller — then threaded/translated the same way
+    // on every iteration below instead of re-derived via `remaining.find(':')` each time.
+    let mut next_colon = authority.find(':');
     // impl-critic R3: sticky for the rest of the scan once any bracket span has been skipped —
     // not reset per colon like an earlier revision's `bracket_adjacent`/`colon_is_bracket_adjacent`
     // pairing (C2), and not a proxy check on `value` itself (the `value.contains(']')`
@@ -1719,7 +1749,11 @@ fn colon_credential_match_seeded(
             continue;
         }
 
-        let next_colon = remaining.find(':');
+        // #894: same `translate_offset` rule as `next_bracket` below, applied to the nearest
+        // `:` — see `translate_offset`'s own doc comment for why `next_bracket` and `next_colon`
+        // are tracked independently rather than sharing one cached offset.
+        let next_colon_here = translate_offset(next_colon, cursor, remaining, ':');
+        next_colon = next_colon_here.map(|c| cursor + c);
         // See `translate_bracket`'s own doc comment for the translate-or-rescan rule. The result
         // is re-absolutized (relative to `authority` again, via `cursor +`) so `next_bracket`
         // stays consistent for the next loop iteration — a no-op when the cheap path was taken
@@ -1731,7 +1765,7 @@ fn colon_credential_match_seeded(
             // start of `remaining`) opens an IPv6-host span that must be skipped as a unit
             // before any colon inside it — including its own `]:port` separator — can be
             // evaluated as a possible credential separator by the checks below.
-            if next_colon.is_none_or(|colon| bracket < colon) {
+            if next_colon_here.is_none_or(|colon| bracket < colon) {
                 cursor += bracket_host_shape_end(remaining, bracket);
                 // Deliberately unconditional, unlike `segment_has_credential_colon`'s own
                 // `bracket_adjacent` flag (which requires a genuinely *closed* bracket before
@@ -1746,7 +1780,7 @@ fn colon_credential_match_seeded(
             }
         }
 
-        let colon = next_colon?;
+        let colon = next_colon_here?;
 
         let value_start = colon + 1;
         let value_end = remaining[value_start..]
@@ -4013,6 +4047,34 @@ mod tests {
             elapsed < std::time::Duration::from_millis(300),
             "took {elapsed:?} for n={n} consecutive '[' — bracket_host_shape_end may have \
              regressed to quadratic behavior"
+        );
+    }
+
+    /// #894: #893 fixed the quadratic scan for a run of *consecutive* `[`, but
+    /// [`colon_credential_match_seeded`] still called `remaining.find(':')` unconditionally on
+    /// every loop iteration — a pattern that alternates `[` with an intervening non-`[`/non-`:`
+    /// byte never takes the bracket-run-skip arm (each `[` is followed by a `0`, not another `[`),
+    /// so every iteration only advances `cursor` by 2 while still re-scanning the whole shrinking
+    /// remainder for the next `:`, i.e. still `O(n²)` (measured, release build: ~1.6s at 400 KB
+    /// before this fix). Fixed by threading `next_colon` through the loop the same way
+    /// `next_bracket`/`translate_bracket` already are — see [`translate_offset`].
+    #[test]
+    fn test_redact_userinfo_alternating_bracket_run_is_linear_time() {
+        let n = 200_000;
+        let input = format!("a@{}", "[0".repeat(n));
+        let start = std::time::Instant::now();
+        let redacted = redact_userinfo(&input);
+        let elapsed = start.elapsed();
+        assert_eq!(
+            redacted,
+            format!("***@{}", "[0".repeat(n)),
+            "redacted len={}",
+            redacted.len()
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(300),
+            "took {elapsed:?} for n={n} alternating '[0' pairs — colon_credential_match_seeded \
+             may have regressed to quadratic behavior on the colon rescan"
         );
     }
 
