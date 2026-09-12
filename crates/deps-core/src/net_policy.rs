@@ -863,10 +863,13 @@ fn is_port_like(value: &str) -> bool {
     !value.is_empty() && value.len() <= 5 && value.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// Whether `bounded` (the authority text up to — but not including — the `/`/`?`/`#` that
-/// truncated it) contains a `:` that is *not* just a trailing `host:port` suffix, i.e. evidence
-/// a credential may already have started before that boundary character rather than the
-/// boundary genuinely ending a plain `host[:port]` authority.
+/// Whether `bounded` (the authority text up to — but not including — the genuine `/`/`?`/`#`
+/// boundary that truncated it) contains a `:` that is *not* just a trailing `host:port` suffix,
+/// i.e. evidence a credential may already have started before that boundary character rather
+/// than the boundary genuinely ending a plain `host[:port]` authority. Gates whether
+/// [`redact_authority_suffix`] even attempts [`find_credential_at`]'s `@`-shape check on the
+/// wider `region`, or goes straight to [`redact_colon_credential`]'s unrestricted colon scan
+/// (#826).
 ///
 /// Only the boundary's own trailing colon is checked against [`is_port_like`] — `gitlab.corp:8443`
 /// strips down to `gitlab.corp` (no further `:`, not widened) while `user:hunter2:8443` strips
@@ -924,22 +927,66 @@ enum RegionKind {
     OpaquePath,
 }
 
+/// [`redact_credential`]'s `Authority`-branch host-boundary scan (#862): a plain
+/// `region.find(['/', '?', '#'])` stops on the first `/` of a *nested* `scheme://` just as
+/// readily as on a real path separator, handing the bounded `@` pass that follows a window
+/// truncated before the real credential whenever a credential-shaped `@` sits earlier in
+/// `region` (`a@b://user:hunter2@evil` — a plain scan stops at `b`'s `/` and would mask `a`
+/// instead of `hunter2`). A `/` only counts as a genuine boundary when it is not itself part of
+/// a scheme separator: a run of one or more consecutive `/` immediately preceded by a `:` (a
+/// scheme separator can have any number of slashes, not just the canonical two) is not a
+/// boundary. `?`/`#` never appear inside a scheme, so they always terminate the scan
+/// immediately.
+///
+/// Returns as soon as it can determine the answer, and never re-examines a byte once it has
+/// decided that byte's run is scheme punctuation: whether a run of `/` is a scheme separator
+/// depends only on the single byte *before* the run (`:` or not), which is already known the
+/// instant the run starts — so a non-scheme run returns immediately without scanning to its end,
+/// and a scheme-shaped run is skipped in one inner loop rather than being walked byte-by-byte
+/// from the outer scan. An earlier revision instead deferred that check until it found the byte
+/// *after* the run, forcing a full scan of the run's length just to answer "is this a boundary"
+/// — quadratic when [`redact_authority_suffix`] calls this once per remaining `/` in a long
+/// contiguous run (verified live: 100 KB of contiguous `/` took 1.3s in a release build vs. the
+/// fixed version's low-single-digit-millisecond cost for the same input).
+// Every index here is an ASCII-byte position (`:`, `/`, `?`, `#` are all single-byte ASCII), so
+// the returned boundary always lands on a char boundary.
+fn host_boundary_scheme_aware(region: &str) -> usize {
+    let bytes = region.as_bytes();
+    let mut i = 0;
+    while let Some(&byte) = bytes.get(i) {
+        match byte {
+            b'?' | b'#' => return i,
+            b'/' => {
+                if i > 0 && bytes.get(i - 1) == Some(&b':') {
+                    // A scheme separator: skip the whole run in this one inner loop instead of
+                    // returning to the outer loop per byte, so a long run is visited once.
+                    while bytes.get(i) == Some(&b'/') {
+                        i += 1;
+                    }
+                } else {
+                    return i;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    bytes.len()
+}
+
 /// [`redact_userinfo_unparseable`]'s and [`redact_userinfo_opaque_path`]'s shared credential
 /// scanner (#846, tracked under parent issue #856): one implementation of every carve-out rule
 /// (drive-letter, bracketed-IPv6, port-shaped, credential-colon shape), called once per
 /// [`RegionKind`] with its own `start` offset and its own traversal — see that type's own doc
 /// comment for why the two traversals stay separate rather than merging into one.
 ///
-/// `region` is `&raw[start..]`. [`RegionKind::Authority`] first runs a bounded
-/// `rfind('@').filter(|&at| at != 0)` pass over `region` truncated at the first `/`/`?`/`#` (an
-/// unconditional userinfo delimiter for a real authority — S1/C1 findings), falling through to
-/// the shared tail only when that bounded text has no such `@` and
-/// [`bounded_has_credential_colon`] finds evidence a credential straddles the boundary (#826).
-/// [`RegionKind::OpaquePath`] skips straight to the shared tail. The shared tail:
-/// [`find_credential_at`] on the whole `region`, masking with `***@` on `Some`, falling through
-/// unconditionally to [`redact_colon_credential`] on `None` (#810/#818) for *both* kinds — see
-/// "Coverage per `RegionKind`" below, class S3/#857, for why `OpaquePath` no longer special-cases
-/// this fallthrough.
+/// `region` is `&raw[start..]`. [`RegionKind::Authority`] delegates to
+/// [`redact_authority_suffix`], which keeps looking past every genuine `/`/`?`/`#` boundary
+/// ([`host_boundary_scheme_aware`]) for a further nested credential rather than trusting the
+/// first bounded match (#862) — see that function's own doc comment for its full algorithm.
+/// [`RegionKind::OpaquePath`] skips straight to the shared tail: [`find_credential_at`] on the
+/// whole `region`, masking with `***@` on `Some`, falling through unconditionally to
+/// [`redact_colon_credential`] on `None` (#810/#818) — see "Coverage per `RegionKind`" below,
+/// class S3/#857, for why `OpaquePath` no longer special-cases this fallthrough.
 ///
 /// # Coverage per `RegionKind`
 ///
@@ -971,42 +1018,222 @@ enum RegionKind {
 ///   via its bounded pass, which takes last-`@`-*overall*-wins directly, and for `OpaquePath` via
 ///   [`extend_credential_at`], which widens [`find_credential_at`]'s credential-shaped `@` across
 ///   any further `@` not separated from it by a `/`/`?`/`#` (#859). `extend_credential_at` is
-///   invoked only when `kind == OpaquePath` — `Authority`'s own rare fall-through into this shared
-///   tail (the `#826` straddle case, where the bounded pass finds no `@` of its own) deliberately
-///   does **not** get widened further, so it can still partially leak through that narrow,
-///   pre-existing path (e.g. `user:pa/ss@wo@rd@evil`), unchanged from `main` (impl-critic S2):
-///   widening it too would be an untested, out-of-scope behavior change, not a fix for a specific
-///   leak.
+///   invoked only when `kind == OpaquePath` — `Authority`'s own rare fall-through into
+///   [`redact_authority_suffix`]'s shared tail (the `#826` straddle case, where the bounded pass
+///   finds no `@` of its own) deliberately does **not** get widened further, so it can still
+///   partially leak through that narrow, pre-existing path (e.g. `user:pa/ss@wo@rd@evil`),
+///   unchanged from `main` (impl-critic S2): widening it too would be an untested, out-of-scope
+///   behavior change, not a fix for a specific leak.
 /// - A drive-letter colon (`C:\`, `c:/`) is never credential-shaped ([`colon_is_drive_letter`]).
 /// - A bracketed IPv6 literal's own colon is never credential-shaped
 ///   ([`bracket_host_shape_end`]); its immediately-following port separator, once reached, is
 ///   evaluated by the exact same [`is_port_like`] rule as any other colon (#860, D1).
 /// - A `host:port` suffix (1-5 ASCII digits) is never credential-shaped ([`is_port_like`]).
 /// - A colon-separated credential with no `@` at all falls through to
-///   [`redact_colon_credential`] unconditionally.
+///   [`redact_colon_credential`] unconditionally, which itself keeps scanning past a masked
+///   value for a further `@`-shaped credential rather than stopping at its first match (#862,
+///   see that function's own doc comment).
 // `start` is an ASCII byte offset (`find("://")`/`find(':')` on `raw`), so `region` always
-// starts on a char boundary; every further offset (`host_boundary`, `at`) comes from `find`/
-// `rfind` of ASCII tokens on `region`, so every slice bound stays a char boundary throughout.
+// starts on a char boundary; every further offset comes from `find`/`rfind` of ASCII tokens on
+// `region`, so every slice bound stays a char boundary throughout.
 #[allow(clippy::string_slice)]
 fn redact_credential(raw: &str, start: usize, kind: RegionKind) -> String {
     let region = &raw[start..];
-    let mask_at = |at: usize| format!("{}***@{}", &raw[..start], &region[at + 1..]);
 
     if kind == RegionKind::Authority {
-        let host_boundary = region.find(['/', '?', '#']).unwrap_or(region.len());
-        let bounded = &region[..host_boundary];
-        if let Some(at) = bounded.rfind('@').filter(|&at| at != 0) {
-            return mask_at(at);
-        }
-        if !bounded_has_credential_colon(bounded) {
-            return redact_colon_credential(raw, start, region);
-        }
+        return format!("{}{}", &raw[..start], redact_authority_suffix(region));
     }
 
+    let mask_at = |at: usize| format!("{}***@{}", &raw[..start], &region[at + 1..]);
     match find_credential_at(region) {
-        Some(at) if kind == RegionKind::OpaquePath => mask_at(extend_credential_at(region, at)),
-        Some(at) => mask_at(at),
+        Some(at) => mask_at(extend_credential_at(region, at)),
         None => redact_colon_credential(raw, start, region),
+    }
+}
+
+/// [`redact_credential`]'s `Authority`-branch worker (#862): walks `region` one
+/// [`host_boundary_scheme_aware`]-delimited window at a time. `has_nested_scheme` — whether `://`
+/// appears anywhere in `region` — is computed once up front and gates the one case that isn't
+/// resolved immediately from a single window:
+///
+/// 1. A window with a credential-shaped `@` of its own (`window.rfind('@')`, excluding a leading
+///    `@` at offset 0) masks it and moves on to the text right after that `@`, over-redacting
+///    rather than guessing which of several candidate `@`s is real — unconditionally, regardless
+///    of whether the caller anchored on a real preceding `scheme://` or not, since a
+///    well-anchored match is not a safe reason to stop either
+///    (`https://x@y:notaport/a@b/c://user:hunter2@evil` anchors on a real `https://` just as
+///    confidently as a genuine credential would, yet `x@y` is decorative and the real credential
+///    is `hunter2`, past the genuine `/`).
+/// 2. A window with credential-colon evidence ([`bounded_has_credential_colon`]) but no `@` of
+///    its own widens immediately to the unrestricted, colon-based fallback (#810/#826):
+///    [`find_credential_at`] is tried on everything from `region`'s own start (not just this
+///    window — see below), falling back to [`redact_colon_credential`] when it finds nothing.
+///    [`redact_colon_credential`] no longer stops at its own first masked value either (#862's
+///    own C2: a decoy non-port-like value before a nested scheme, e.g. `notaport` in
+///    `host/x@y:notaport/c://user:hunter2@evil`, used to be masked and returned immediately,
+///    leaving a real credential further into the tail unexamined; see that function's own doc
+///    comment for the fix).
+/// 3. A window with **neither** an `@` **nor** colon evidence, but `has_nested_scheme` is true and
+///    a further genuine boundary is still ahead, is left undecided and scanning continues past it
+///    (#862, impl-critic C1): an ordinary host segment with no `@` and no colon (`host`,
+///    `npmjs.org`) is not by itself evidence there is no credential *anywhere* in `region` when a
+///    `scheme://` is known to follow — a bare `TOKEN@host` (`ghp_`/`glpat`-shaped, no `:` at all)
+///    sitting behind an ordinary decoy path segment (`pkg@1.0.0`, `@scope`, `repo@v1.2.3`) needs
+///    exactly this continuation to ever be reached, since neither [`find_credential_at`] nor
+///    [`redact_colon_credential`] can recognize a colon-less credential on their own — only an
+///    unconditional bounded `@` pass can. An earlier revision gave up at the first such window
+///    unconditionally (no `has_nested_scheme` gate) and fell straight to
+///    [`redact_colon_credential`] on the whole remaining `region`, which is exactly what missed
+///    this family — but *also*, without the gate, mistook an ordinary trailing version segment
+///    for a credential purely because nothing else was found first: impl-critic S4's own
+///    `nexus.corp:8081/repo/lib@2.0.0` (no nested scheme anywhere) must stay fully visible, so a
+///    genuine `://` still ahead is what licenses looking further, not merely "nothing found yet".
+/// 4. Neither an `@`, colon evidence, nor (`has_nested_scheme` false or no boundary left) reason
+///    to keep looking: the streak is over. If nothing has been masked yet, this widens to the
+///    unrestricted colon fallback exactly as step 2 does (round 6's original, narrower behavior
+///    for a plain host with no colon and no scheme nesting, e.g. `gitlab.corp/user:hunter2@evil`
+///    still redacts to `gitlab.corp/user:***`, not `gitlab.corp/***@evil`); if a credential has
+///    already been masked, whatever textually remains is emitted unchanged.
+///
+/// Colon evidence (step 2) is checked *before* falling through to step 3's continuation, on this
+/// window alone — not the accumulated span since `region`'s start — precisely so a real
+/// `host:port`-shaped credential prefix (`host:abc/x`, where `abc` is not port-like) widens
+/// immediately rather than being treated as an undecided pass-through window; the fallback itself
+/// still receives `region` from its own true start (not just this window) so
+/// [`redact_colon_credential`]'s bracket-tracking state sees anything — e.g. a `[` — from several
+/// windows back.
+///
+/// This necessarily also masks a credential-shaped `@` in ordinary path/query content that
+/// happens to sit past a well-anchored URL's own first path separator (e.g. the `b://c@d`
+/// segment in `https://user:hunter2@registry.example:99999/a/b://c@d` is masked too) — accepted
+/// over-redaction of a tracing-only value, per this module's own doc, traded for never
+/// under-redacting.
+///
+/// Implemented as a single forward loop over `region`, not recursion: a `format!`-per-boundary
+/// recursive version has no depth bound, so an untrusted value with enough `/`-separated segments
+/// aborts the whole process with a stack overflow rather than a catchable panic. This loop instead
+/// tracks two absolute offsets into `region` — `base` (the true start of the still-undecided
+/// streak) and `window_start` (the current window alone) — and appends to one growing `output`
+/// buffer, so recursion depth is `O(1)` regardless of how many boundaries `region` contains. Total
+/// work is `O(region.len())`: `window_start` only ever advances, and each call to
+/// `host_boundary_scheme_aware(&region[window_start..])` scans no further than that call's own
+/// boundary — so a byte is scanned by more than one call only in the narrow span between a masked
+/// `@` and the window boundary that was already found past it (`window_start` moves back to just
+/// after the `@`, which can sit before that boundary), meaning every byte is charged to at most
+/// two `host_boundary_scheme_aware` calls, not re-scanned an unbounded number of times.
+/// [`bounded_has_credential_colon`] is likewise checked once per window, on that window alone,
+/// rather than on the growing `region[base..]` span (an earlier revision re-scanned that growing
+/// span on every iteration, which is quadratic on a long run of colon-free, `@`-free windows) —
+/// verified live in a release build at up to 3.2 MB of a single contiguous `/` run, and
+/// separately over many small colon-free/`@`-free windows (the two-cursor path this fix added),
+/// with linear scaling at every size tested in both shapes
+/// (`test_redact_userinfo_unparseable_contiguous_slash_run_is_linear_time`,
+/// `test_redact_userinfo_unparseable_many_small_undecided_windows_is_linear_time`).
+///
+/// # Guarantees and known gaps (after 7 rounds of adversarial verification)
+///
+/// Confirmed fixed by live A/B comparison against `origin/main`, using the adversarial corpus
+/// (~90,000 distinct shapes) accumulated across all 7 rounds: the original #862 report
+/// (colon-less `TOKEN@host` credentials reachable only behind a scheme-aware backward anchor),
+/// impl-critic's C1/C2 decoy-`@`/nested-scheme leak families, the `?`/`#`-terminated window
+/// classes, and the colon-decoy-`@` classes found in rounds 4-6. Steps 1-4 above are what those
+/// rounds converged on.
+///
+/// Two narrow, low-severity gaps were found during round 7's adversarial sweep and deliberately
+/// deferred rather than chased further:
+/// - **#870**: `colon_evidence` (step 2) is hard-gated on no `@` having been masked yet earlier
+///   in `region`, so once any `@` has been masked the colon fallback can never run again — a
+///   later colon-only credential with no `@` of its own (`oauth2:glpat-SECRET`,
+///   `gitlab-ci-token:JOBTOKEN`) is emitted verbatim once an ordinary decoy `@` (e.g.
+///   `pkg@1.0.0`) has appeared earlier in the same value.
+/// - **#871**: `has_nested_scheme` is computed once over the whole `region`, not scoped to "a
+///   genuine `://` still ahead of the current window" as step 3 above implies — when the caller's
+///   backward anchor has already consumed the string's only `://` while computing `region`'s
+///   start, the gate reads `false` and step 3's continuation is skipped even though a credential
+///   sits past the next boundary.
+/// - **#873**: [`find_credential_at`] commits to the first colon-evidenced match it finds, so a
+///   colon-less `TOKEN@host` credential sitting behind an earlier, genuine colon-evidenced decoy
+///   credential is never reached.
+/// - **#874**: [`redact_colon_credential`]'s tail re-scan (its own doc comment, "past it would
+///   never be examined at all") only looks for a further `@`-shaped credential, so a colon-only
+///   credential (no `@` at all) sitting past an already-masked decoy colon value is missed.
+/// - **#875**: multi-`@` input with no nested scheme anywhere can be over-redacted on every `@`
+///   once the first is masked, not just the first — over-redaction, not a leak, and only reaches
+///   a `tracing`/error-message sink.
+///
+/// This doc comment has overclaimed completeness in earlier rounds; treat the step-by-step
+/// description above as bounded by these five documented, tracked exceptions, not as a
+/// completeness guarantee.
+#[allow(clippy::string_slice)]
+fn redact_authority_suffix(region: &str) -> String {
+    // Gates whether a window with neither an `@` nor colon evidence of its own is worth looking
+    // past at all (#862, impl-critic C1's own follow-up finding): continuing unconditionally
+    // reopens exactly the over-redaction impl-critic S4 fixed — an ordinary registry
+    // `host:port/repo/pkg@1.0.0` path, or `[::1]:8443/pkg@1.0.0`, has no nested scheme anywhere
+    // and must stay fully visible, not have its trailing version-shaped `@` mistaken for
+    // userinfo. A colon-less `TOKEN@host` credential is only ever reachable *behind* a nested
+    // `scheme://`, so a genuine `://` still ahead is what licenses looking further; computed once
+    // up front, not re-checked per window, so this costs `O(region.len())` total rather than
+    // `O(region.len())` again on every window.
+    let has_nested_scheme = region.contains("://");
+    let mut output = String::new();
+    // Start of the still-undecided streak: every byte from here on has neither been masked nor
+    // confirmed safe to emit yet. Stays put while a window has no `@` of its own, so that once
+    // colon evidence does turn up (or the streak runs out), `redact_colon_credential`/
+    // `find_credential_at` see the *whole* accumulated span from its true start — not just the
+    // latest window — which matters for `redact_colon_credential`'s own bracket-tracking state
+    // (a `[` several windows back must still be visible to it).
+    let mut base = 0;
+    // Start of the single window currently being checked for its own `@`. Always advances past
+    // a boundary a window turns out to have neither evidence in, independent of `base`, so a
+    // bare `@` several windows past a colon-free host segment is still found as *that window's
+    // own* userinfo delimiter — not merged into one giant mask starting at `base`.
+    let mut window_start = 0;
+    loop {
+        let host_boundary = host_boundary_scheme_aware(&region[window_start..]);
+        let boundary_abs = window_start + host_boundary;
+        let window = &region[window_start..boundary_abs];
+        if let Some(at) = window.rfind('@').filter(|&at| at != 0) {
+            let at_abs = window_start + at;
+            output.push_str(&region[base..window_start]);
+            output.push_str("***@");
+            base = at_abs + 1;
+            window_start = base;
+            continue;
+        }
+        // Checked per-window rather than on the accumulated `region[base..boundary_abs]` span:
+        // `:` never straddles a genuine `/`/`?`/`#` boundary (only IPv6-bracket/port shapes can
+        // span the *start* of a window, and those still resolve correctly window-by-window — see
+        // this function's own doc comment), so nothing is lost by not re-scanning the whole
+        // streak from `base` on every iteration. Re-scanning a growing span here was an earlier
+        // revision's O(n²) regression on a long run of colon-free, `@`-free windows (a bracket-
+        // free host path with many segments) — `bounded_has_credential_colon` costs
+        // `O(window.len())` and was being called on a span that grows by one window each
+        // iteration, for `O(n²)` total.
+        // `base` is only ever reassigned above, to `at_abs + 1` (always >= 1), so `base == 0`
+        // here is equivalent to "no `@` has been masked yet" without a separate flag.
+        let colon_evidence = base == 0 && bounded_has_credential_colon(window);
+        if colon_evidence || (base == 0 && !has_nested_scheme) {
+            let remaining = &region[base..];
+            // No colon evidence and no nested scheme ahead: this is exactly round-6's original,
+            // narrower widening — go straight to the unrestricted colon scan without ever trying
+            // `find_credential_at`, so an ordinary no-colon host (`gitlab.corp`, `nexus.corp:8081`)
+            // does not have a wholly unrelated trailing `@` (`pkg@1.0.0`) mistaken for a
+            // credential just because nothing else was found.
+            if colon_evidence && let Some(at) = find_credential_at(remaining) {
+                output.push_str("***@");
+                output.push_str(&remaining[at + 1..]);
+                return output;
+            }
+            output.push_str(&redact_colon_credential(remaining, 0, remaining));
+            return output;
+        }
+        if boundary_abs < region.len() {
+            window_start = boundary_abs + 1;
+            continue;
+        }
+        output.push_str(&region[base..]);
+        return output;
     }
 }
 
@@ -1047,7 +1274,13 @@ fn redact_credential(raw: &str, start: usize, kind: RegionKind) -> String {
 /// Only the *first non-exempt* colon is ever treated as the split point (`a:b:c` redacts to
 /// `a:***`, not `a:b:***`), and an empty left side is still redacted (`:secret` becomes
 /// `:***`) — for a `:` pair the credential is the value on the right, unlike `@` where it is
-/// the component on the left.
+/// the component on the left. That first match is not assumed to be the *only* credential,
+/// though (#862): the text past the masked value is checked once more via
+/// [`find_credential_at`] for a further `@`-shaped credential and masked too if found — a
+/// non-credential value can shape-collide with this scan's own carve-outs (`notaport` in
+/// `host/x@y:notaport/c://user:hunter2@evil` is not port-like, so it is masked as if it were the
+/// credential) and, without this check, a real credential sitting past it would never be
+/// examined at all.
 ///
 /// This intentionally produces some false positives on non-credential colon pairs — a Maven
 /// coordinate (`com.google.guava:guava` → `com.google.guava:***`), an npm alias spec
@@ -1140,11 +1373,25 @@ fn redact_colon_credential(raw: &str, authority_start: usize, authority: &str) -
             value_end
         };
 
+        // #862 (impl-critic C2, counterexample_hunt): the value masked above is only the *first*
+        // non-exempt colon match — by design (`a:b:c` -> `a:***`, not `a:b:***`) — but that design
+        // assumed nothing credential-shaped could survive past it. A decoy non-port-like value
+        // (`notaport` in `host/x@y:notaport/c://user:hunter2@evil`) breaks that assumption: the
+        // scan above stops and returns right at `notaport`, leaving a genuine `@`-shaped
+        // credential further into the tail completely unexamined. [`find_credential_at`] checks
+        // the remainder past this mask for exactly that shape and masks it too when present,
+        // rather than trusting the first hit was the only one.
+        let tail = &authority[cursor + end..];
+        let tail = match find_credential_at(tail) {
+            Some(at) => format!("***@{}", &tail[at + 1..]),
+            None => tail.to_string(),
+        };
+
         return format!(
             "{}{}:***{}",
             &raw[..authority_start],
             &authority[..cursor + colon],
-            &authority[cursor + end..]
+            tail
         );
     }
 }
@@ -1152,14 +1399,69 @@ fn redact_colon_credential(raw: &str, authority_start: usize, authority: &str) -
 /// [`redact_userinfo`]'s fallback for a `raw` that fails `Url::parse` outright (S1 finding), or
 /// that parses but is a schemeless `user:pass@host` literal with no `://` at all (#536 C2) —
 /// delegates to [`redact_credential`] with [`RegionKind::Authority`]. `authority_start` locates
-/// the `://` scheme separator when present, scanning from the very start of `raw` otherwise. See
+/// the `://` scheme separator that actually bounds the credential-bearing authority: it scans
+/// *backward*, from the **first** `@` in `raw`, for the nearest preceding `://` — not the first
+/// `://` anywhere in the string (#862), and not the last `@` either. The precise guarantee this
+/// provides: `authority_start` never advances past the first `@` in `raw`. That is exactly what
+/// both directions of #862 require —
+/// - a later, unrelated `://` after the credential (e.g. `user:hunter2@evil://x`) can't push the
+///   scan window past the credential (the original report — anchoring on the *first* `://`
+///   anywhere, as this used to, put the whole credential before the scan window and it was never
+///   examined at all);
+/// - a later, unrelated `@` anywhere after it — in the path/query (e.g.
+///   `https://user:hunter2@registry.example/redirect?to=http://evil@x`), or appended directly
+///   (e.g. `user:hunter2@evil://x@y`) — can't pull the window past the *real* credential's own
+///   `@` either (anchoring on the *last* `@` instead of the first would reopen exactly this).
+///
+/// An `@` that precedes the real credential and is itself credential-shaped (e.g.
+/// `a@b://user:hunter2@evil`, or with any number of slashes after the `:`) does not misdirect
+/// this anchor either: [`redact_authority_suffix`]'s own boundary scan
+/// ([`host_boundary_scheme_aware`]) does not treat a nested scheme separator's slashes as a path
+/// terminator, so its bounded `@` pass correctly skips past `a@b://` to find `hunter2`'s `@`
+/// instead of stopping short at `a`'s. [`scheme_separator_end`] (rather than a fixed `+ 3`)
+/// consumes every slash in the separator actually matched, not just the two `rfind`/`find`
+/// themselves found — a third or later slash left dangling at `region`'s own start would
+/// otherwise look, to [`host_boundary_scheme_aware`], like an ordinary leading path separator
+/// instead of more scheme punctuation (impl-critic C1's second sub-shape).
+///
+/// When `raw` has no `@` at all, this falls back to scanning from the very start of `raw` for
+/// the first `://` instead, since [`redact_colon_credential`] (which that branch ultimately
+/// reaches) has no authority-vs-credential distinction to anchor against. See
 /// [`redact_credential`]'s own doc comment for the full carve-out list and its per-`RegionKind`
 /// coverage table.
-// `authority_start` comes from `find("://")` on ASCII bytes, so it always lands on a char
-// boundary.
+// `authority_start` comes from `find('@')` followed by `rfind("://")` (or, with no `@`,
+// `find("://")`) on ASCII bytes, so it always lands on a char boundary.
+#[allow(clippy::string_slice)]
 fn redact_userinfo_unparseable(raw: &str) -> String {
-    let authority_start = raw.find("://").map_or(0, |scheme_end| scheme_end + 3);
+    let authority_start = match raw.find('@') {
+        Some(at) => raw[..at]
+            .rfind("://")
+            .map_or(0, |scheme_end| scheme_separator_end(raw, scheme_end)),
+        None => raw
+            .find("://")
+            .map_or(0, |scheme_end| scheme_separator_end(raw, scheme_end)),
+    };
     redact_credential(raw, authority_start, RegionKind::Authority)
+}
+
+/// Byte offset in `text` just past the `://` scheme separator whose `:` sits at `colon` — but,
+/// unlike a fixed `colon + 3`, consuming *every* consecutive `/` that follows it, not just the
+/// two `"://"` itself matched (#862, impl-critic C1's second sub-shape). A scheme separator can
+/// have any number of slashes (`host_boundary_scheme_aware`'s own boundary rule already treats a
+/// whole such run as one unit), so a third or later slash is still part of the separator, not the
+/// authority that follows: `redact_userinfo_unparseable`'s anchor landing one slash short of the
+/// true authority start (`region` beginning with a leftover `/`) is indistinguishable, to
+/// [`host_boundary_scheme_aware`], from a *genuine* leading path separator — it has no visibility
+/// into what preceded `region`, so a leftover `/` at `region`'s own start (`i == 0`) reads as an
+/// immediate boundary rather than more scheme punctuation, defeating the very continuation
+/// [`redact_authority_suffix`] needs to reach a credential just past it.
+fn scheme_separator_end(text: &str, colon: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut i = colon + 1;
+    while bytes.get(i) == Some(&b'/') {
+        i += 1;
+    }
+    i
 }
 
 /// [`redact_userinfo`]'s fallback for a *parseable* `raw` whose scheme has an empty authority
@@ -1886,6 +2188,13 @@ mod tests {
     /// GitLab CI job token, and the `gitlab.corp/user:hunter2@evil` repro whose credential
     /// colon sits after a `/`, past the authority-only `@` scan's reach) must be redacted —
     /// before this fix, all three passed through `url_for_tracing` byte-for-byte unchanged.
+    /// `gitlab.corp/user:hunter2@evil` keeps this exact shape even after #862 (impl-critic C1):
+    /// its `gitlab.corp` window has no nested `scheme://` anywhere ahead of it, so
+    /// [`redact_authority_suffix`] widens straight to the unrestricted colon fallback here
+    /// (round 6's original behavior) rather than continuing past the boundary — that
+    /// continuation is reserved for windows with a real `://` still ahead (impl-critic S4:
+    /// unconditional continuation reopened over-redaction of ordinary `host:port/pkg@version`
+    /// paths with no scheme nesting at all).
     #[test]
     fn test_url_for_tracing_redacts_colon_credential_no_at_sign() {
         let cases = [
@@ -2423,6 +2732,315 @@ mod tests {
         assert_eq!(
             redact_userinfo("https://user:hunter2?x@host@corp"),
             "https://***@host@corp"
+        );
+    }
+
+    /// #862: `redact_userinfo_unparseable` used to anchor its scan window at the *first* `://`
+    /// anywhere in `raw`, so a credential preceding a later, unrelated `://` (an embedded
+    /// nested-looking scheme) fell entirely before the scan window and leaked unredacted. The
+    /// anchor now scans backward from the *first* `@` in `raw` for the nearest preceding `://`.
+    #[test]
+    fn test_redact_userinfo_unparseable_credential_before_later_unrelated_scheme_is_redacted() {
+        assert_eq!(redact_userinfo("user:hunter2@evil://x"), "***@evil://x");
+        assert_eq!(redact_userinfo("ghp_TOKEN@evil://x"), "***@evil://x");
+        assert_eq!(redact_userinfo("a:user:hunter2@evil://x"), "***@evil://x");
+        assert_eq!(redact_userinfo("://@evil"), "://@evil");
+        assert_eq!(redact_userinfo("://"), "://");
+        assert_eq!(redact_userinfo("@"), "@");
+        assert_eq!(redact_userinfo(""), "");
+        assert_eq!(redact_userinfo("üser:hünter2@évil://x"), "***@évil://x");
+        assert_eq!(redact_userinfo("user:hunter2@evil"), "***@evil");
+    }
+
+    /// impl-critic C1/C2 on an earlier revision of the #862 fix that anchored on the *last* `@`
+    /// in `raw` instead of the *first*: C1 was a brand-new leak where a real scheme + credential,
+    /// followed by a later unrelated `://` past the first `/`/`?`/`#` (in a query value or a
+    /// deeper path segment), pulled the scan window past the *real* credential; C2 was that #862
+    /// itself stayed open whenever a further `@` was appended after the credential's own `://`.
+    /// Anchoring on the *first* `@` instead closes both.
+    #[test]
+    fn test_redact_userinfo_unparseable_credential_before_and_after_unrelated_at_or_scheme() {
+        assert_eq!(redact_userinfo("user:hunter2@evil://x@y"), "***@y");
+        assert_eq!(
+            redact_userinfo(
+                "https://user:hunter2@registry.example:99999/redirect?to=http://evil@x"
+            ),
+            "https://***@registry.example:99999/redirect?***@x"
+        );
+        assert_eq!(
+            redact_userinfo("https://user:hunter2@registry.example:99999/a/b://c@d"),
+            "https://***@registry.example:99999/a/***@d"
+        );
+    }
+
+    /// #862 (nested-scheme gap, closed by [`host_boundary_scheme_aware`]): an `@` that precedes
+    /// the real credential and is itself credential-shaped no longer misdirects the anchor, even
+    /// across multiple nested `scheme://`-look-alike spans and with no real scheme anywhere in
+    /// `raw` at all.
+    #[test]
+    fn test_redact_userinfo_unparseable_leading_credential_shaped_at_before_nested_scheme_is_redacted()
+     {
+        assert_eq!(
+            redact_userinfo("mailto:a@b://user:hunter2@evil"),
+            "***@evil"
+        );
+        assert_eq!(redact_userinfo("a@b://c@d://user:hunter2@evil"), "***@evil");
+        assert_eq!(
+            redact_userinfo("mailto:a@b://user:hunter2@evil://x@y"),
+            "***@y"
+        );
+        assert_eq!(redact_userinfo("a@b:///user:hunter2@evil"), "***@evil");
+        assert_eq!(redact_userinfo("a@b:////user:hunter2@evil"), "***@evil");
+    }
+
+    /// #862: a genuine `/` path separator between a shallow, fake-looking `@` and a later,
+    /// genuinely nested `scheme://` used to stop the bounded scan right at that `/`, leaving the
+    /// real credential past the nested scheme untouched.
+    #[test]
+    fn test_redact_userinfo_unparseable_leading_at_before_genuine_path_separator_then_nested_scheme_is_redacted()
+     {
+        let redacted = redact_userinfo("a@b/c://user:hunter2@evil");
+        assert!(!redacted.contains("hunter2"), "redacted={redacted:?}");
+        assert_eq!(redacted, "***@b/***@evil");
+    }
+
+    /// #862: a well-anchored real `scheme://` is not a safe reason to stop scanning either — it
+    /// anchors a *decorative* credential just as confidently as a genuine one.
+    #[test]
+    fn test_redact_userinfo_unparseable_well_anchored_scheme_is_not_a_safe_reason_to_stop_scanning()
+    {
+        let redacted = redact_userinfo("https://x@y:notaport/a@b/c://user:hunter2@evil");
+        assert!(!redacted.contains("hunter2"), "redacted={redacted:?}");
+        assert_eq!(redacted, "https://***@y:notaport/***@b/***@evil");
+    }
+
+    /// #862 (`?`/`#` continuation gap): a genuine `?` (or `#`) boundary between a fake leading
+    /// `@` and a nested `scheme://` used to hard-stop the continuation scan right there, leaking
+    /// the real credential past it. The continuation now treats `?`/`#` the same as `/`.
+    #[test]
+    fn test_redact_userinfo_unparseable_leading_at_before_query_or_fragment_boundary_then_nested_scheme_is_redacted()
+     {
+        let redacted = redact_userinfo("a@b?c://user:hunter2@evil");
+        assert!(!redacted.contains("hunter2"), "redacted={redacted:?}");
+        assert_eq!(redacted, "***@b?***@evil");
+
+        let redacted = redact_userinfo("a@b#c://user:hunter2@evil");
+        assert!(!redacted.contains("hunter2"), "redacted={redacted:?}");
+        assert_eq!(redacted, "***@b#***@evil");
+    }
+
+    /// #862 regression guard: further adversarial chains combining multiple fake `@`s, genuine
+    /// `/` separators, and nested schemes at varying depths — none of these may ever leak
+    /// `hunter2` again.
+    #[test]
+    fn test_redact_userinfo_unparseable_deeply_chained_fake_credentials_never_leak_the_real_one() {
+        assert_eq!(
+            redact_userinfo("a@b/c@d/e://user:hunter2@evil"),
+            "***@b/***@d/***@evil"
+        );
+        assert_eq!(
+            redact_userinfo("a@b/c/d/e://user:hunter2@evil"),
+            "***@b/c/d/***@evil"
+        );
+        assert_eq!(
+            redact_userinfo("a@b/c://user:hunter2@evil/d@e"),
+            "***@b/***@evil/***@e"
+        );
+        assert_eq!(
+            redact_userinfo("a@b/c://d@e/user:hunter2@evil"),
+            "***@b/***@e/***@evil"
+        );
+    }
+
+    /// #862 (impl-critic C2, the 60-shape leak family): a bounded prefix with **no** colon at all
+    /// (an ordinary host, no port) used to route straight to [`redact_colon_credential`], whose
+    /// first-match-wins scan latched onto a non-port-like decoy value (`notaport`) and returned
+    /// before the real `user:hunter2` credential past a later `://` was ever examined. Fixed by
+    /// having `redact_colon_credential` check its own masked value's tail for a further
+    /// `@`-shaped credential rather than trusting the first hit alone.
+    #[test]
+    fn test_redact_userinfo_unparseable_decoy_colon_before_nested_scheme_does_not_hide_later_credential()
+     {
+        let cases = [
+            "host/x@y:notaport/c://user:hunter2@evil",
+            "host/d:e@f/c://user:hunter2@evil",
+            "/x@y:notaport/c://user:hunter2@evil",
+            "#d:e@f/c://user:hunter2@evil",
+        ];
+        for raw in cases {
+            let redacted = redact_userinfo(raw);
+            assert!(
+                !redacted.contains("hunter2"),
+                "raw={raw:?} redacted={redacted:?}"
+            );
+        }
+    }
+
+    /// #862 (impl-critic C1, round 7: the 923-shape username-only credential leak family): a
+    /// decoy `@` with no colon at all — an ordinary npm/Go token shape (`pkg@1.0.0`, `@scope`,
+    /// `repo@v1.2.3`) — used to pin `authority_start` at 0 and, once its own bounded window had
+    /// neither an `@` nor colon evidence, route straight to `redact_colon_credential` on the
+    /// whole string: a colon-less `TOKEN@host` credential (`ghp_`/`glpat`-shaped) sitting behind
+    /// a nested `scheme://` was then unreachable by any of the three scanners (`redact_colon_credential`
+    /// needs a `:`; `find_credential_at`'s own shape check also needs a `:`; only the unconditional
+    /// bounded `@` pass finds it, and that pass never got a chance to look past the decoy).
+    #[test]
+    fn test_redact_userinfo_unparseable_username_only_credential_behind_decoy_at_sign_is_redacted()
+    {
+        let cases = [
+            "npmjs.org/pkg@1.0.0/https://ghp_TOKEN@evil",
+            "//registry.npmjs.org/@scope/-/x/https://glpat-TOKEN@evil",
+            "github.com/owner/repo@v1.2.3/x://ghp_TOKEN@evil",
+            "registry.corp/proxy@v2/https://ghp_TOKEN@evil",
+            "host/d@e/c://ghp_TOKEN@evil",
+            "/d@e://ghp_TOKEN@evil",
+            "@/c://ghp_TOKEN@evil",
+            "host/x@y:notaport/c://ghp_TOKEN@evil",
+        ];
+        for raw in cases {
+            let redacted = redact_userinfo(raw);
+            assert!(
+                !redacted.contains("ghp_TOKEN") && !redacted.contains("glpat-TOKEN"),
+                "raw={raw:?} redacted={redacted:?}"
+            );
+        }
+        assert_eq!(
+            redact_userinfo("host/d@e/c://ghp_TOKEN@evil"),
+            "host/***@e/***@evil"
+        );
+    }
+
+    /// #862 (impl-critic C1's second sub-shape): the backward anchor can land *inside* a
+    /// multi-slash scheme separator when [`scheme_separator_end`] didn't consume every slash a
+    /// `://` match was followed by, leaving `region` starting with a leftover `/` —
+    /// indistinguishable, to [`host_boundary_scheme_aware`], from a genuine leading path
+    /// separator (it has no visibility into what preceded `region`), which defeated the
+    /// continuation the same way the first sub-shape did.
+    #[test]
+    fn test_redact_userinfo_unparseable_anchor_inside_multi_slash_scheme_separator_is_redacted() {
+        let redacted = redact_userinfo("_://_hostv1:///ghp_TOKEN@h/");
+        assert!(!redacted.contains("ghp_TOKEN"), "redacted={redacted:?}");
+    }
+
+    /// impl-critic S4 (round 7): the C1 fix's continuation must not reopen the over-redaction a
+    /// prior round removed — an ordinary self-hosted registry `host:port/...` string with no
+    /// nested scheme anywhere must stay fully visible, including a version-shaped trailing `@`
+    /// (`pkg@1.0.0`) and a bracketed-IPv6 host with a well-formed port. The continuation past a
+    /// colon-free, `@`-free window is gated on a genuine `://` still being present somewhere in
+    /// `region` — none of these have one.
+    #[test]
+    fn test_redact_userinfo_unparseable_no_over_redaction_without_nested_scheme() {
+        let cases = [
+            "nexus.corp:8081/repo/lib@2.0.0",
+            "registry.corp:4873/@scope/pkg",
+            "localhost:8080/@types/node",
+            "gitlab.corp:8443/repo/pkg@1.0.0",
+            "[::1]:8443/pkg@1.0.0",
+        ];
+        for raw in cases {
+            assert_eq!(redact_userinfo(raw), raw, "raw={raw:?}");
+        }
+    }
+
+    /// #870 (impl-critic round 7, `assumption_audit`): `colon_evidence` in
+    /// [`redact_authority_suffix`] is hard-gated on no `@` having been masked yet earlier in
+    /// `region`, so once any `@` has been masked the colon fallback can never run again, and a later colon-only
+    /// credential (no `@` of its own) is emitted verbatim — `oauth2:glpat-SECRET` and
+    /// `gitlab-ci-token:JOBTOKEN` are the two literal examples documented on
+    /// [`redact_colon_credential`] itself (the #810 repro tokens). No known fix short of running
+    /// the colon fallback on the unmasked remainder after the loop instead of gating it on
+    /// "nothing was masked yet" — see #870 for the trade-off that needs its own A/B pass; remove
+    /// `#[ignore]` once #870 lands a fix.
+    #[test]
+    #[ignore = "known colon-only-credential-behind-decoy-@ leak, see #870"]
+    fn test_redact_userinfo_unparseable_colon_only_credential_behind_decoy_at_is_redacted() {
+        assert_eq!(
+            redact_userinfo("npmjs.org/pkg@1.0.0/https://oauth2:glpat-SECRET"),
+            "npmjs.org/***@1.0.0/https://oauth2:***"
+        );
+        assert_eq!(
+            redact_userinfo("registry.corp/proxy@v2/https://gitlab-ci-token:JOBTOKEN"),
+            "registry.corp/***@v2/https://gitlab-ci-token:***"
+        );
+    }
+
+    /// #871 (impl-critic round 7, `assumption_audit`): `has_nested_scheme` in
+    /// [`redact_authority_suffix`] is computed once over the whole `region`, not scoped to "a
+    /// genuine `://` still ahead of the current window" as its own doc comment claims — when the
+    /// backward anchor in `redact_userinfo_unparseable` consumes the string's only `://` while
+    /// computing `authority_start`, `region` has none left, the gate reads `false`, and the
+    /// continuation past a colon-free/`@`-free window is skipped even though a credential sits
+    /// just past the next boundary. No known fix short of re-deriving an invariant that survives
+    /// the anchor consuming the only scheme separator; remove `#[ignore]` once #871 lands a fix.
+    #[test]
+    #[ignore = "known has_nested_scheme under-redaction when anchor consumes the only ://, see #871"]
+    fn test_redact_userinfo_unparseable_credential_past_anchor_consumed_scheme_is_redacted() {
+        assert_eq!(redact_userinfo("://://?ghp_TOKEN@"), "://***@");
+    }
+
+    /// #862 correctness-gate: a large contiguous run of a single boundary character must not
+    /// regress `host_boundary_scheme_aware`/`redact_authority_suffix` back to quadratic
+    /// behavior — an earlier revision re-scanned the *entire* remaining run from scratch on every
+    /// loop iteration when the run was one long contiguous block (as opposed to alternating
+    /// `/x/x/x` segments, which stayed linear even under that bug). Verified in a release build.
+    #[test]
+    fn test_redact_userinfo_unparseable_contiguous_slash_run_is_linear_time() {
+        let n = 400_000;
+        let raw = format!("a@b{}y", "/".repeat(n));
+        let start = std::time::Instant::now();
+        let redacted = redact_userinfo(&raw);
+        let elapsed = start.elapsed();
+        assert_eq!(redacted, format!("***@b{}y", "/".repeat(n)));
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "took {elapsed:?} for a {n}-byte contiguous slash run — \
+             host_boundary_scheme_aware may have regressed to quadratic behavior"
+        );
+    }
+
+    /// #862 correctness-gate (round 7): a long run of many small, colon-free, `@`-free windows,
+    /// all undecided, with a genuine `://` only at the very end (so `has_nested_scheme` keeps the
+    /// continuation going for the whole run) must stay linear — an earlier revision of this round
+    /// checked `bounded_has_credential_colon` on the *accumulated* `region[base..boundary]` span,
+    /// which grows by one window each iteration, making this `O(n²)`.
+    #[test]
+    fn test_redact_userinfo_unparseable_many_small_undecided_windows_is_linear_time() {
+        let n = 200_000;
+        let raw = format!("{}a@b://ghp_TOKEN@evil", "/x".repeat(n));
+        let start = std::time::Instant::now();
+        let redacted = redact_userinfo(&raw);
+        let elapsed = start.elapsed();
+        assert!(
+            !redacted.contains("ghp_TOKEN"),
+            "redacted len={}",
+            redacted.len()
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "took {elapsed:?} for n={n} small undecided windows — bounded_has_credential_colon \
+             may have regressed to scanning a growing accumulated span"
+        );
+    }
+
+    /// Stack-overflow guard: [`redact_authority_suffix`] must stay a single forward loop, not
+    /// recursion, so a value with a huge number of `/`-separated segments cannot abort the whole
+    /// process with an unbounded stack.
+    #[test]
+    fn test_redact_authority_suffix_large_slash_chain_is_iterative_not_recursive() {
+        let n = 200_000;
+        let raw = format!("a@b{}user:hunter2@evil", "/x".repeat(n));
+        let start = std::time::Instant::now();
+        let redacted = redact_userinfo(&raw);
+        let elapsed = start.elapsed();
+        assert!(
+            !redacted.contains("hunter2"),
+            "redacted len={}",
+            redacted.len()
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "took {elapsed:?} for n={n} segments — may have regressed to recursive/quadratic \
+             behavior"
         );
     }
 
