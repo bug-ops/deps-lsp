@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `specs/`: reconciled `MOC-specs.md` against actual issue/PR state — stale "draft" spec rows marked shipped with their PR/issue references, all shipped specs moved into a "Completed Specs" section, and `specs/constitution.md` added (resolves #855) (#867)
 
 ### Fixed
+- **deps-core**: `net_policy::redact_userinfo` now scans the path/query of a host-having URL with empty userinfo for a credential-shaped segment instead of returning it verbatim, closing a leak reachable via a `c:/`-corrupted or slash-less authority (resolves #901)
 - **deps-github-actions**: `extract_comment_tag` no longer mis-attributes a flow-style line's trailing comment to an unrelated SHA-pinned ref, which could corrupt YAML on version-update code action acceptance (resolves #898) (#900)
 - **deps-core**: `net_policy::segment_has_credential_colon` no longer takes `O(n^2)` time on a drive-letter-dense run, the same unguarded-scan pattern #893/#894 fixed in `colon_credential_match_seeded` (resolves #896) (#900)
 - **deps-core**: `net_policy`'s credential redaction no longer takes `O(n^2)` time on input alternating `[` with a non-colon byte, the sibling case #893's consecutive-`[` fix left open (resolves #894) (#895)
