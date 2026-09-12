@@ -852,10 +852,60 @@ pub fn position_in_range(pos: Position, range: Range) -> bool {
 /// `package.json` with hundreds of dependencies on one line) turns per-offset lookups into
 /// an O(n) scan each, and O(n) lookups across the line's length make the whole document
 /// O(n^2) (#742) — the common case of an ASCII-only line now stays O(1) per lookup; a
-/// non-ASCII line still takes the O(n) scan, unchanged.
+/// non-ASCII line still takes an O(1) lookup too, via a lazily-built per-line index (#882) —
+/// see `with_non_ascii_line_index`.
+///
+/// Interior mutability: this type is `Send` but not `Sync` (the non-ASCII line index cache
+/// uses a `RefCell`). Build one per document parse and never share it across threads.
 pub struct LineOffsetTable {
     line_starts: Vec<usize>,
     line_is_ascii: Vec<bool>,
+    // Lazily populated for non-ASCII lines, keyed by 0-indexed line number. A `HashMap` rather
+    // than a `Vec` sized to the line count so the cost is proportional to lines actually
+    // queried non-ASCII — every other `LineOffsetTable` consumer (JSON/TOML ecosystems, code
+    // lens, code actions) never touches a non-ASCII line's index and pays nothing beyond one
+    // empty `HashMap::new()` (#882).
+    non_ascii_line_index_cache:
+        std::cell::RefCell<std::collections::HashMap<usize, NonAsciiLineIndex>>,
+}
+
+/// A non-ASCII line's char-boundary index, lazily built and cached by
+/// `LineOffsetTable::with_non_ascii_line_index`.
+///
+/// `entries[i]` is `(byte_offset, utf16_units_before)` for the line's `i`-th char boundary
+/// (`byte_offset` relative to the line's own start, `utf16_units_before` the cumulative UTF-16
+/// code-unit count of every char *before* it). A final sentinel entry for the end of the line
+/// (`byte_offset == line.len()`, `utf16_units_before` = the line's total UTF-16 length) makes
+/// end-of-line byte offsets resolvable the same way as any other char boundary.
+///
+/// Serves both directions #882 needs on a non-ASCII line, from one build pass: char index ->
+/// byte offset (`entries.get(col)`, what [`marker_byte_offset`] needs) and byte offset ->
+/// UTF-16 units (`entries.binary_search_by_key`, what
+/// [`byte_offset_to_position`](LineOffsetTable::byte_offset_to_position) needs) — a second,
+/// independent cache would duplicate the exact `char_indices()` walk this one pass already
+/// performs.
+struct NonAsciiLineIndex {
+    entries: Vec<(u32, u32)>,
+}
+
+impl NonAsciiLineIndex {
+    /// Builds the index for one line's text via a single `char_indices()` walk.
+    fn build(line_text: &str) -> Self {
+        let mut entries = Vec::with_capacity(line_text.len() + 1);
+        let mut utf16_units = 0u32;
+        for (byte_offset, c) in line_text.char_indices() {
+            entries.push((u32::try_from(byte_offset).unwrap_or(u32::MAX), utf16_units));
+            utf16_units = utf16_units.saturating_add(u32::try_from(c.len_utf16()).unwrap_or(2));
+        }
+        entries.push((
+            u32::try_from(line_text.len()).unwrap_or(u32::MAX),
+            utf16_units,
+        ));
+        // The initial `line_text.len() + 1` capacity over-reserves 3-4x on a multi-byte-heavy
+        // line (CJK, Devanagari, ...): it reserves per byte but pushes one entry per char.
+        entries.shrink_to_fit();
+        Self { entries }
+    }
 }
 
 impl LineOffsetTable {
@@ -883,7 +933,79 @@ impl LineOffsetTable {
         Self {
             line_starts,
             line_is_ascii,
+            non_ascii_line_index_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Runs `f` against the cached (building it on first call) [`NonAsciiLineIndex`] for the
+    /// non-ASCII line starting at `line0` (0-indexed), given that line's own text.
+    ///
+    /// Callers must pass the exact text of line `line0` as sliced from the same `content` this
+    /// table was built from — the cache trusts its first-seen `line_text` for every later
+    /// lookup of the same `line0` and never re-validates it. Building a line's index the first
+    /// time it is looked up is still O(line length) (one `char_indices()` walk); only repeat
+    /// lookups on an already-cached line become O(1) — a huge non-ASCII line's *first* lookup
+    /// is not free, it is the same one-time cost `LineOffsetTable::new` always paid.
+    ///
+    /// Takes a closure rather than returning a `Ref` so the `RefCell` borrow never outlives one
+    /// call — a caller cannot accidentally hold it open across an unrelated later borrow.
+    // `borrow_mut()` below is dropped before `borrow()` runs (single-threaded, no reentrancy
+    // between the two statements), and the entry it inserts is never removed, so the lookup
+    // always succeeds.
+    #[allow(clippy::expect_used)]
+    fn with_non_ascii_line_index<R>(
+        &self,
+        line0: usize,
+        line_text: &str,
+        f: impl FnOnce(&NonAsciiLineIndex) -> R,
+    ) -> R {
+        self.non_ascii_line_index_cache
+            .borrow_mut()
+            .entry(line0)
+            .or_insert_with(|| NonAsciiLineIndex::build(line_text));
+        let cache = self.non_ascii_line_index_cache.borrow();
+        let index = cache
+            .get(&line0)
+            .expect("just inserted above if it was missing");
+        f(index)
+    }
+
+    /// Byte offset (relative to the line's own start) of the `col`-th char boundary within the
+    /// non-ASCII line starting at `line0`, given that line's text. Clamps to `line_text.len()`
+    /// if `col` is past the line's char count, matching a plain `char_indices().nth(col)` walk.
+    fn non_ascii_char_byte_offset(&self, line0: usize, line_text: &str, col: usize) -> usize {
+        self.with_non_ascii_line_index(line0, line_text, |index| {
+            index
+                .entries
+                .get(col)
+                .map_or(line_text.len(), |&(byte_offset, _)| byte_offset as usize)
+        })
+    }
+
+    /// UTF-16 code-unit count preceding `byte_offset` (relative to the line's own start) within
+    /// the non-ASCII line starting at `line0`, given that line's text.
+    ///
+    /// `byte_offset` must be a char boundary within the line (guaranteed by
+    /// [`byte_offset_to_position`](Self::byte_offset_to_position)'s `floor_char_boundary` clamp
+    /// before calling this) — every char boundary, including end-of-line, has an exact entry in
+    /// the index, so this never needs to interpolate between two boundaries.
+    fn non_ascii_utf16_units_before(
+        &self,
+        line0: usize,
+        line_text: &str,
+        byte_offset: usize,
+    ) -> u32 {
+        self.with_non_ascii_line_index(line0, line_text, |index| {
+            let byte_offset = u32::try_from(byte_offset).unwrap_or(u32::MAX);
+            let found = index
+                .entries
+                .binary_search_by_key(&byte_offset, |&(b, _)| b);
+            // Not a recorded char boundary on `Err` — shouldn't happen given the caller's
+            // `floor_char_boundary` guarantee, but falls back to the nearest preceding entry's
+            // cumulative count rather than panicking.
+            let i = found.unwrap_or_else(|i| i.saturating_sub(1));
+            index.entries.get(i).map_or(0, |&(_, units)| units)
+        })
     }
 
     /// Absolute byte offset where `line` (0-indexed) starts, or `None` if
@@ -942,13 +1064,19 @@ impl LineOffsetTable {
         let character = if self.line_is_ascii.get(line).copied().unwrap_or(false) {
             u32::try_from(offset - line_start).unwrap_or(u32::MAX)
         } else {
-            u32::try_from(
-                content[line_start..offset]
-                    .chars()
-                    .map(char::len_utf16)
-                    .sum::<usize>(),
-            )
-            .unwrap_or(u32::MAX)
+            // #882: a naive `chars().map(len_utf16).sum()` per call is O(line length); N
+            // lookups on the same wide non-ASCII line (e.g. N dependency values sharing a
+            // minified manifest line) made this O(N x line length). The cached per-line
+            // index (shared with `marker_byte_offset`'s identical cost, see
+            // `with_non_ascii_line_index`) makes every lookup after the first on a given line
+            // O(1).
+            let line_end = self
+                .line_starts
+                .get(line + 1)
+                .copied()
+                .unwrap_or(content.len());
+            let line_text = content.get(line_start..line_end).unwrap_or_default();
+            self.non_ascii_utf16_units_before(line, line_text, offset - line_start)
         };
         Position::new(u32::try_from(line).unwrap_or(u32::MAX), character)
     }
@@ -1749,6 +1877,71 @@ mod tests {
             elapsed < std::time::Duration::from_millis(100),
             "8000 byte_offset_to_position calls on a minified line took {elapsed:?}, expected < 100ms"
         );
+    }
+
+    /// Regression guard for #882 (widened scope): `byte_offset_to_position`'s non-ASCII branch
+    /// used to walk `chars().map(len_utf16).sum()` from the line's start on every call, so N
+    /// lookups on the same wide non-ASCII line cost O(N x line length) — the same shape #882
+    /// reported for `marker_byte_offset`, and, per the #882 review, ~300x its cost since
+    /// `make_range` calls this twice per dependency. The shared per-line index makes every
+    /// lookup after the first on a given line O(1).
+    #[test]
+    fn test_byte_offset_to_position_non_ascii_line_cache_stays_fast_on_a_huge_single_line() {
+        let filler = "x".repeat(200 * 1024);
+        let content = format!("{filler}\u{2014}{filler}");
+        let table = LineOffsetTable::new(&content);
+        let step = (content.len() / 5000).max(1);
+        let start = std::time::Instant::now();
+        for offset in (0..content.len()).step_by(step) {
+            std::hint::black_box(table.byte_offset_to_position(&content, offset));
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "byte_offset_to_position took {:?} for ~5000 lookups on a huge non-ASCII line, \
+             expected well under 1s",
+            start.elapsed()
+        );
+    }
+
+    /// Differential test: the cached non-ASCII path must agree with a plain reimplemented
+    /// `chars().map(len_utf16).sum()` walk for every char-boundary offset on a non-ASCII line,
+    /// including offsets on more than one non-ASCII line in the same document (cache isolation
+    /// across lines, sharing the same underlying index `marker_byte_offset` populates).
+    #[test]
+    fn test_byte_offset_to_position_non_ascii_cache_matches_char_sum_result_across_lines() {
+        fn slow_path(content: &str, line_start: usize, offset: usize) -> u32 {
+            u32::try_from(
+                content[line_start..offset]
+                    .chars()
+                    .map(char::len_utf16)
+                    .sum::<usize>(),
+            )
+            .unwrap_or(u32::MAX)
+        }
+
+        let content = "\u{1f680}rocket \u{2014} dash\nascii line\n\u{3000}ideographic \u{e9}nd";
+        let table = LineOffsetTable::new(content);
+        let line_starts = [
+            table.line_start(0).unwrap(),
+            table.line_start(1).unwrap(),
+            table.line_start(2).unwrap(),
+        ];
+        let line_ends = [line_starts[1] - 1, line_starts[2] - 1, content.len()];
+
+        for (line, (&line_start, &line_end)) in line_starts.iter().zip(&line_ends).enumerate() {
+            let line_text = &content[line_start..line_end];
+            for (byte_offset, _) in line_text
+                .char_indices()
+                .chain(std::iter::once((line_text.len(), '\0')))
+            {
+                let offset = line_start + byte_offset;
+                assert_eq!(
+                    table.byte_offset_to_position(content, offset).character,
+                    slow_path(content, line_start, offset),
+                    "line {line} byte offset {byte_offset} desynced from the char-sum walk"
+                );
+            }
+        }
     }
 
     #[test]

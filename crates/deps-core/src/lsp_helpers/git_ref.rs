@@ -95,6 +95,11 @@ pub fn match_v_prefix_style(current: &str, tag: &str) -> String {
 /// (`uses:`, `ref:`, `project:`, `include:`), none of which are themselves inside a block
 /// scalar's own content.
 ///
+/// This `line`/`col`-based resolver is a workaround for an upstream `yaml-rust2` 0.12.0 bug
+/// (tracked in #880, not yet reported upstream). Do not simplify this back to
+/// `Marker::index()`-based resolution without first checking whether the upstream bug has
+/// been fixed.
+///
 /// `line` is 1-indexed and `col` a 0-indexed **char** count within that line, matching
 /// `yaml-rust2`'s own `Marker::line()`/`Marker::col()` *behavior* — note that
 /// `yaml_rust2::scanner::Marker::col()`'s own doc comment claims 1-indexed while its `Display`
@@ -151,10 +156,11 @@ pub fn marker_byte_offset(
     {
         col.min(line_text.len())
     } else {
-        line_text
-            .char_indices()
-            .nth(col)
-            .map_or(line_text.len(), |(b, _)| b)
+        // #882: a non-ASCII line falls back to a char-boundary walk, but a naive
+        // `char_indices().nth(col)` per call is O(line length), turning N lookups on the
+        // same wide non-ASCII line into O(N x line length). `LineOffsetTable`'s cached
+        // per-line index makes every lookup after the first on a given line O(1).
+        table.non_ascii_char_byte_offset(line.saturating_sub(1), line_text, col)
     };
     line_start + byte_in_line
 }
@@ -439,6 +445,94 @@ mod tests {
              under 1s",
             start.elapsed()
         );
+    }
+
+    #[test]
+    fn test_marker_byte_offset_non_ascii_line_cache_stays_fast_on_a_huge_single_line() {
+        // Regression guard for #882: without the per-line char-boundary cache, a non-ASCII
+        // line's `char_indices().nth(col)` walk was O(line length) *per call*, so N lookups
+        // on the same wide non-ASCII line cost O(N x line length) — a several-hundred-KB
+        // line with 5000 lookups took ~500ms in a release build. 5000 lookups here (a
+        // smaller line than the perf agent's throwaway release-build bench, sized to stay
+        // fast in a debug test build too) must complete well under a second.
+        let filler = "x".repeat(200 * 1024);
+        let content = format!("{filler}\u{2014}{filler}");
+        let table = LineOffsetTable::new(&content);
+        let char_count = content.chars().count();
+        let start = std::time::Instant::now();
+        for col in (0..char_count).step_by((char_count / 5000).max(1)) {
+            let _ = marker_byte_offset(&content, &table, 1, col);
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "marker_byte_offset took {:?} for 5000 lookups on a huge non-ASCII line, expected \
+             well under 1s",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn test_marker_byte_offset_non_ascii_cache_matches_char_indices_result() {
+        // Differential test: the cached char-boundary path must agree with a plain
+        // reimplemented `char_indices().nth(col)` walk for every column on a non-ASCII line —
+        // the exact class of desync a caching bug could silently introduce.
+        fn slow_path(content: &str, table: &LineOffsetTable, line: usize, col: usize) -> usize {
+            let Some(line_start) = table.line_start(line.saturating_sub(1)) else {
+                return content.len();
+            };
+            let line_end = table.line_start(line).unwrap_or(content.len());
+            let line_text = content.get(line_start..line_end).unwrap_or_default();
+            let byte_in_line = line_text
+                .char_indices()
+                .nth(col)
+                .map_or(line_text.len(), |(b, _)| b);
+            line_start + byte_in_line
+        }
+
+        let content = "\u{1f680}rocket \u{2014} emoji then em dash \u{3000} and more";
+        let table = LineOffsetTable::new(content);
+        for col in 0..=(content.chars().count() + 5) {
+            assert_eq!(
+                marker_byte_offset(content, &table, 1, col),
+                slow_path(content, &table, 1, col),
+                "cached non-ASCII path desynced from the general char_indices() walk at col \
+                 {col}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_marker_byte_offset_multiple_non_ascii_lines_cache_isolation() {
+        // Coverage gap flagged by the #882 review: the cache is keyed by 0-indexed line
+        // number in a `HashMap`, so two or more distinct non-ASCII lines in the same document
+        // must resolve independently regardless of query order — querying line 2, then line
+        // 3, then re-querying line 2 must not leak or desync line 2's cached boundaries.
+        fn slow_path(content: &str, table: &LineOffsetTable, line: usize, col: usize) -> usize {
+            let Some(line_start) = table.line_start(line.saturating_sub(1)) else {
+                return content.len();
+            };
+            let line_end = table.line_start(line).unwrap_or(content.len());
+            let line_text = content.get(line_start..line_end).unwrap_or_default();
+            let byte_in_line = line_text
+                .char_indices()
+                .nth(col)
+                .map_or(line_text.len(), |(b, _)| b);
+            line_start + byte_in_line
+        }
+
+        let content = "ascii only\n\u{2014}em dash line\n\u{1f680}rocket \u{3000}ideographic line\nascii again";
+        let table = LineOffsetTable::new(content);
+
+        // Query line 3 first, then line 2, then re-query line 3 and line 2 — deliberately out
+        // of line order and with a repeat, to catch any cross-line contamination.
+        let cases: &[(usize, usize)] = &[(3, 5), (2, 2), (3, 0), (2, 5), (3, 8), (2, 0)];
+        for &(line, col) in cases {
+            assert_eq!(
+                marker_byte_offset(content, &table, line, col),
+                slow_path(content, &table, line, col),
+                "line {line} col {col} desynced after interleaved multi-line lookups"
+            );
+        }
     }
 
     #[test]
