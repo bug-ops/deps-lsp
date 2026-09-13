@@ -749,7 +749,8 @@ pub fn build_version_completion(
 pub struct VersionDisplayItem {
     /// Raw version string (e.g., "1.0.0")
     pub version: ConcreteVersion,
-    /// Display label with "(latest)" suffix for first item
+    /// Display label with "(latest)" suffix for the registry-selected latest version —
+    /// not necessarily the first display item (#956).
     pub label: String,
     /// Action description (e.g., "Update serde to 1.0.0")
     pub description: String,
@@ -817,17 +818,88 @@ impl VersionDisplayItem {
 /// Matched by the pre-filter index (not a version string) so two entries sharing a version
 /// string can never both — or wrongly — receive the marker (mirrors `hover.rs`'s own
 /// index-based match for the same reason).
+///
+/// If `latest_idx` survives the yanked filter but falls outside the raw-order
+/// `MAX_COMPLETION_VERSIONS`-entry display cap (e.g. 6+ consecutive pre-release/flagged
+/// versions ahead of the first stable release), it is not silently dropped from the returned
+/// list: the first `MAX_COMPLETION_VERSIONS - 1` surviving entries are kept in raw order and
+/// the picked entry is appended as the final one, still tagged/preselected (#956) — matching
+/// hover's own *uncapped* `**Latest**:` header, which always resolves to this same pick
+/// regardless of any display-window size. This does **not** extend to hover's own *capped*
+/// "Recent versions" list (`HOVER_RECENT_VERSIONS`, `lsp_helpers/hover.rs`'s
+/// `push_recent_versions_hover_section`): that list still omits the marker outright when
+/// its own pick falls outside its own window, by design — a
+/// pre-existing instance of this same defect class in a different surface, deliberately left
+/// unresolved here (tracked as a follow-up) rather than claimed as fixed. Finding the picked
+/// entry only scans as far past the cap as it sits, rather than materializing every surviving
+/// version up front — this stays `O(cap)` in the common case (no pick, or a pick already
+/// within the cap), which matters for a registry with thousands of versions (e.g. an npm
+/// packument) queried on every completion keystroke.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::completion::prepare_version_display_items;
+/// use deps_core::{PackageName, Version};
+/// use std::any::Any;
+/// use std::sync::Arc;
+///
+/// struct SimpleVersion(deps_core::ConcreteVersion);
+///
+/// impl Version for SimpleVersion {
+///     fn version_string(&self) -> &deps_core::ConcreteVersion {
+///         &self.0
+///     }
+///     fn as_any(&self) -> &dyn Any {
+///         self
+///     }
+/// }
+///
+/// // 5 pre-releases sort ahead of the picked stable version in raw fetch order, pushing it
+/// // to post-filter index 5 — one past the `MAX_COMPLETION_VERSIONS` (5) display cap.
+/// let versions: Vec<Arc<dyn Version>> = vec![
+///     Arc::new(SimpleVersion("2.0.0-rc5".into())),
+///     Arc::new(SimpleVersion("2.0.0-rc4".into())),
+///     Arc::new(SimpleVersion("2.0.0-rc3".into())),
+///     Arc::new(SimpleVersion("2.0.0-rc2".into())),
+///     Arc::new(SimpleVersion("2.0.0-rc1".into())),
+///     Arc::new(SimpleVersion("1.0.0".into())),
+/// ];
+///
+/// // The registry resolved index 5 ("1.0.0") as latest.
+/// let items = prepare_version_display_items(&versions, &PackageName::new("demo"), Some(5));
+///
+/// assert_eq!(items.len(), 5, "still capped at MAX_COMPLETION_VERSIONS");
+/// assert_eq!(items[4].version, "1.0.0");
+/// assert!(items[4].is_latest, "the pick is bumped in rather than dropped");
+/// ```
 pub fn prepare_version_display_items<V: AsRef<dyn Version>>(
     versions: &[V],
     package_name: &PackageName,
     latest_idx: Option<usize>,
 ) -> Vec<VersionDisplayItem> {
-    versions
+    let mut survivors = versions
         .iter()
-        .map(|v| v.as_ref())
+        .map(AsRef::as_ref)
         .enumerate()
-        .filter(|(_, v)| !v.removal_status().blocks_resolution())
-        .take(MAX_COMPLETION_VERSIONS)
+        .filter(|(_, v)| !v.removal_status().blocks_resolution());
+
+    let mut head: Vec<(usize, &dyn Version)> =
+        survivors.by_ref().take(MAX_COMPLETION_VERSIONS).collect();
+
+    // The pick falls outside the raw-order display cap: look for it in whatever remains of
+    // `survivors` (bounded by how far past the cap it sits, not by the total survivor count)
+    // and, if it survived the yanked filter, bump it in as the window's final entry instead
+    // of silently dropping it (#956).
+    if let Some(idx) = latest_idx
+        && !head.iter().any(|(i, _)| *i == idx)
+        && let Some(pick) = survivors.find(|(i, _)| *i == idx)
+    {
+        head.truncate(MAX_COMPLETION_VERSIONS - 1);
+        head.push(pick);
+    }
+
+    head.into_iter()
         .enumerate()
         .map(|(display_index, (orig_index, version))| {
             VersionDisplayItem::new(
@@ -2934,6 +3006,225 @@ mod tests {
         assert!(items[1].is_latest);
     }
 
+    /// Regression for #956: the registry-selected pick (`latest_idx`) survives the yanked
+    /// filter but lands at post-filter position 5 — one past the raw-order display cap
+    /// (`MAX_COMPLETION_VERSIONS` = 5) — because 6 pre-release entries sort ahead of it. It
+    /// must still be included and tagged, not silently dropped from the returned window.
+    #[test]
+    fn test_prepare_version_display_items_bumps_pick_outside_raw_order_window() {
+        let versions: Vec<std::sync::Arc<dyn crate::Version>> = vec![
+            std::sync::Arc::new(MockVersion {
+                version: "2.0.0-rc5".into(),
+                yanked: false,
+                prerelease: true,
+            }),
+            std::sync::Arc::new(MockVersion {
+                version: "2.0.0-rc4".into(),
+                yanked: false,
+                prerelease: true,
+            }),
+            std::sync::Arc::new(MockVersion {
+                version: "2.0.0-rc3".into(),
+                yanked: false,
+                prerelease: true,
+            }),
+            std::sync::Arc::new(MockVersion {
+                version: "2.0.0-rc2".into(),
+                yanked: false,
+                prerelease: true,
+            }),
+            std::sync::Arc::new(MockVersion {
+                version: "2.0.0-rc1".into(),
+                yanked: false,
+                prerelease: true,
+            }),
+            std::sync::Arc::new(MockVersion {
+                version: "1.0.0".into(),
+                yanked: false,
+                prerelease: false,
+            }),
+        ];
+
+        let items = prepare_version_display_items(&versions, &pkg("test"), Some(5));
+
+        assert_eq!(items.len(), 5, "still capped at MAX_COMPLETION_VERSIONS");
+        assert_eq!(
+            items[3].version, "2.0.0-rc2",
+            "raw-order window kept otherwise"
+        );
+        assert_eq!(
+            items[4].version, "1.0.0",
+            "the pick is appended rather than dropped"
+        );
+        assert_eq!(items[4].label, "1.0.0 (latest)");
+        assert!(items[4].is_latest);
+        assert!(
+            items.iter().take(4).all(|item| !item.is_latest),
+            "no pre-release entry is mislabeled as latest"
+        );
+    }
+
+    /// Boundary check for #956: `pick_pos == MAX_COMPLETION_VERSIONS - 1` (4) is the last
+    /// slot already inside the raw-order display cap, so no bump/append happens — unlike
+    /// `pos == 5` in the test above.
+    #[test]
+    fn test_prepare_version_display_items_pick_at_last_window_slot_not_bumped() {
+        let versions: Vec<std::sync::Arc<dyn crate::Version>> = vec![
+            std::sync::Arc::new(MockVersion {
+                version: "2.0.0-rc4".into(),
+                yanked: false,
+                prerelease: true,
+            }),
+            std::sync::Arc::new(MockVersion {
+                version: "2.0.0-rc3".into(),
+                yanked: false,
+                prerelease: true,
+            }),
+            std::sync::Arc::new(MockVersion {
+                version: "2.0.0-rc2".into(),
+                yanked: false,
+                prerelease: true,
+            }),
+            std::sync::Arc::new(MockVersion {
+                version: "2.0.0-rc1".into(),
+                yanked: false,
+                prerelease: true,
+            }),
+            std::sync::Arc::new(MockVersion {
+                version: "1.0.0".into(),
+                yanked: false,
+                prerelease: false,
+            }),
+        ];
+
+        let items = prepare_version_display_items(&versions, &pkg("test"), Some(4));
+
+        assert_eq!(
+            items.len(),
+            5,
+            "all 5 raw-order entries returned, nothing bumped"
+        );
+        assert_eq!(items[4].version, "1.0.0");
+        assert_eq!(items[4].label, "1.0.0 (latest)");
+        assert!(items[4].is_latest);
+        assert!(items.iter().take(4).all(|item| !item.is_latest));
+    }
+
+    /// `latest_idx` points at a *yanked* entry while 6 other non-yanked survivors remain —
+    /// unlike `test_prepare_version_display_items_all_yanked`, where survivors end up empty
+    /// and the `None` fallthrough is trivially unobservable. Plain `.take(5)` windowing must
+    /// apply, with nothing appended and no entry incorrectly tagged `is_latest`.
+    #[test]
+    fn test_prepare_version_display_items_pick_filtered_out_with_many_survivors() {
+        let versions: Vec<std::sync::Arc<dyn crate::Version>> = vec![
+            std::sync::Arc::new(MockVersion {
+                version: "9.9.9".into(),
+                yanked: true,
+                prerelease: false,
+            }),
+            std::sync::Arc::new(MockVersion {
+                version: "1.6.0".into(),
+                yanked: false,
+                prerelease: false,
+            }),
+            std::sync::Arc::new(MockVersion {
+                version: "1.5.0".into(),
+                yanked: false,
+                prerelease: false,
+            }),
+            std::sync::Arc::new(MockVersion {
+                version: "1.4.0".into(),
+                yanked: false,
+                prerelease: false,
+            }),
+            std::sync::Arc::new(MockVersion {
+                version: "1.3.0".into(),
+                yanked: false,
+                prerelease: false,
+            }),
+            std::sync::Arc::new(MockVersion {
+                version: "1.2.0".into(),
+                yanked: false,
+                prerelease: false,
+            }),
+            std::sync::Arc::new(MockVersion {
+                version: "1.1.0".into(),
+                yanked: false,
+                prerelease: false,
+            }),
+        ];
+
+        // The registry picked the yanked raw-index-0 entry as "latest" — an edge case
+        // `select_latest_matching` shouldn't produce in practice, but the function must
+        // degrade gracefully rather than panic or misbehave if it does.
+        let items = prepare_version_display_items(&versions, &pkg("test"), Some(0));
+
+        assert_eq!(
+            items.len(),
+            5,
+            "capped at MAX_COMPLETION_VERSIONS, no bump since the pick never survives"
+        );
+        assert_eq!(items[0].version, "1.6.0");
+        assert_eq!(items[4].version, "1.2.0");
+        assert!(
+            items.iter().all(|item| !item.is_latest),
+            "the yanked pick is never tagged"
+        );
+    }
+
+    /// Large-scale mapping check: yanked entries interleaved before and after non-yanked
+    /// ones (12 raw entries, alternating), with the picked stable version near the end.
+    /// Confirms `orig_index` bookkeeping survives significant reindexing by the yanked
+    /// filter, both for the "already in head" check and the bounded remainder lookup.
+    #[test]
+    fn test_prepare_version_display_items_bump_survives_interleaved_yanked_at_scale() {
+        let specs: [(&str, bool, bool); 12] = [
+            ("3.0.0-rc1", false, true),
+            ("2.9.0", true, false),
+            ("2.8.0-rc1", false, true),
+            ("2.7.0", true, false),
+            ("2.6.0-rc1", false, true),
+            ("2.5.0", true, false),
+            ("2.4.0-rc1", false, true),
+            ("2.3.0", true, false),
+            ("2.2.0-rc1", false, true),
+            ("2.1.0", true, false),
+            ("2.0.0-rc1", false, true),
+            ("1.0.0", false, false),
+        ];
+        let versions: Vec<std::sync::Arc<dyn crate::Version>> = specs
+            .into_iter()
+            .map(|(version, yanked, prerelease)| {
+                std::sync::Arc::new(MockVersion {
+                    version: version.into(),
+                    yanked,
+                    prerelease,
+                }) as std::sync::Arc<dyn crate::Version>
+            })
+            .collect();
+
+        // Registry picked raw index 11 ("1.0.0") as latest.
+        let items = prepare_version_display_items(&versions, &pkg("test"), Some(11));
+
+        assert_eq!(
+            items.len(),
+            5,
+            "capped at MAX_COMPLETION_VERSIONS despite 7 survivors"
+        );
+        assert_eq!(items[0].version, "3.0.0-rc1");
+        assert_eq!(
+            items[3].version, "2.4.0-rc1",
+            "4th surviving entry in raw order, yanked ones skipped"
+        );
+        assert_eq!(
+            items[4].version, "1.0.0",
+            "the pick is bumped in from post-filter position 6"
+        );
+        assert_eq!(items[4].label, "1.0.0 (latest)");
+        assert!(items[4].is_latest);
+        assert!(items.iter().take(4).all(|item| !item.is_latest));
+    }
+
     #[test]
     fn test_build_feature_completion() {
         let item = build_feature_completion("derive", &pkg("serde"), None);
@@ -3901,6 +4192,87 @@ mod tests {
         );
         assert_eq!(items[1].label, "1.9.0 (latest)");
         assert_eq!(items[1].preselect, Some(true));
+    }
+
+    /// Regression for #956 through the prefix-filtering branch of
+    /// `complete_versions_generic_from`: `latest_idx` is computed over the already
+    /// prefix-narrowed slice (`completion.rs`'s `has_prefix_match` branch), so the bump must
+    /// still apply when *that* slice's own registry pick falls outside its own display cap —
+    /// not just when it happens over the full unfiltered version list.
+    #[tokio::test]
+    async fn test_complete_versions_generic_from_bump_survives_prefix_filtering() {
+        let registry = MockRegistry {
+            versions: vec![
+                MockVersion {
+                    version: "2.0.0-rc5".into(),
+                    yanked: false,
+                    prerelease: true,
+                },
+                MockVersion {
+                    version: "2.0.0-rc4".into(),
+                    yanked: false,
+                    prerelease: true,
+                },
+                MockVersion {
+                    version: "2.0.0-rc3".into(),
+                    yanked: false,
+                    prerelease: true,
+                },
+                MockVersion {
+                    version: "2.0.0-rc2".into(),
+                    yanked: false,
+                    prerelease: true,
+                },
+                MockVersion {
+                    version: "2.0.0-rc1".into(),
+                    yanked: false,
+                    prerelease: true,
+                },
+                MockVersion {
+                    version: "2.0.0".into(),
+                    yanked: false,
+                    prerelease: false,
+                },
+                // Does not match the "2." prefix below, so it must not affect the
+                // prefix-narrowed slice's own bump computation.
+                MockVersion {
+                    version: "1.0.0".into(),
+                    yanked: false,
+                    prerelease: false,
+                },
+            ],
+        };
+
+        let items = complete_versions_generic(
+            &registry,
+            &pkg("test-pkg"),
+            "2.",
+            &[],
+            FreshnessSettings::default(),
+        )
+        .await;
+
+        // Prefix "2." narrows to 6 entries (5 pre-releases + stable "2.0.0"); the stable
+        // pick lands at post-filter index 5 within that narrowed slice — one past the
+        // MAX_COMPLETION_VERSIONS(5) cap — so it is bumped in as the final display item.
+        assert_eq!(
+            items.len(),
+            5,
+            "capped, bumped via the prefix-filtered slice"
+        );
+        assert_eq!(items[3].label, "2.0.0-rc2");
+        assert_eq!(items[4].label, "2.0.0 (latest)");
+        assert_eq!(items[4].preselect, Some(true));
+        assert!(
+            items
+                .iter()
+                .take(4)
+                .all(|item| item.preselect != Some(true))
+        );
+        assert!(
+            !items.iter().any(|item| item.label == "2.0.0-rc1"),
+            "the 5th raw-order pre-release is displaced by the bumped pick"
+        );
     }
 
     // --- Feature completion detection tests ---

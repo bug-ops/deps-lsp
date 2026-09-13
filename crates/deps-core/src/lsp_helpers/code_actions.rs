@@ -462,10 +462,13 @@ fn build_replacement_action(
 ///    the two fix actions' own formatted text (whitespace-insensitive); an entry
 ///    is skipped, and never added to the set, when its text is already
 ///    present. This is the common case, not a rare edge case:
-///    [`crate::completion::prepare_version_display_items`] lists the top 5
-///    non-yanked registry versions newest-first, so whenever the declared
-///    version is already within 5 releases of latest, it is itself one of
-///    the display items being offered as an "update". The same set also
+///    [`crate::completion::prepare_version_display_items`] normally lists the newest 5
+///    non-yanked registry versions in raw order, so whenever the declared version is
+///    already within 5 releases of latest, it is itself one of the display items being
+///    offered as an "update" — and when the registry-selected latest falls outside that
+///    raw-order window, it is bumped in as the final display item instead (#956), so the
+///    declared version can also collide with *that* entry rather than one of the top 5.
+///    The same set also
 ///    catches two display items whose formatted text coincides — e.g. an
 ///    ecosystem formatter that truncates precision (PyPI's
 ///    `truncate_release_to_match`) can map several distinct registry
@@ -2203,6 +2206,66 @@ mod tests {
             preferred,
             vec!["1.5.0 (latest)"],
             "the stable version must be preferred, not the raw-top pre-release: {actions:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_code_actions_bumps_pick_outside_raw_order_window() {
+        // Regression for #956: 5 consecutive pre-release entries sort ahead of the picked
+        // stable version in raw fetch order, pushing it to post-filter index 5 — one past
+        // the MAX_COMPLETION_VERSIONS(5) raw-order display cap. The bumped entry must still
+        // appear among the generated REFACTOR actions, labeled `(latest)`, and be the one
+        // `isPreferred` action.
+        let (dep, version_range, content) = vulnerable_dep("0.9.0");
+        let parse_result = MockParseResult {
+            deps: vec![dep],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+        let versions = VersionData::new(&cached, &resolved);
+        let registry = FixedVersionRegistry {
+            versions: vec![
+                ("2.0.0-rc5", false),
+                ("2.0.0-rc4", false),
+                ("2.0.0-rc3", false),
+                ("2.0.0-rc2", false),
+                ("2.0.0-rc1", false),
+                ("1.0.0", false),
+            ],
+        };
+
+        let actions = generate_code_actions(
+            &parse_result,
+            version_range.start,
+            parse_result.uri(),
+            versions,
+            &content,
+            &registry,
+            &MockFormatter,
+        )
+        .await;
+
+        let refactor_titles = refactor_titles(&actions);
+        assert!(
+            refactor_titles.contains(&"1.0.0 (latest)"),
+            "the bumped stable pick must still appear, labeled (latest): {refactor_titles:?}"
+        );
+        assert!(
+            !refactor_titles.contains(&"2.0.0-rc1"),
+            "the 5th raw-order pre-release is displaced by the bumped pick: {refactor_titles:?}"
+        );
+
+        let preferred: Vec<&str> = actions
+            .iter()
+            .filter(|a| a.is_preferred == Some(true))
+            .map(|a| a.title.as_str())
+            .collect();
+        assert_eq!(
+            preferred,
+            vec!["1.0.0 (latest)"],
+            "the bumped entry must be isPreferred: {actions:?}"
         );
     }
 
