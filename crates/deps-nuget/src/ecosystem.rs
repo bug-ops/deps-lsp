@@ -208,17 +208,12 @@ impl Ecosystem for NuGetEcosystem {
 
             for dep in &mut result.dependencies {
                 dep.source = config.resolve_source_for(&dep.name);
-                if let Some((class, raw_value, declaration_key)) =
-                    config.blocked_class_for(&dep.name)
-                {
+                // #965: a plain chain can carry more than one independently blocked source, so
+                // every classification `blocked_class_for` finds becomes its own diagnostic.
+                for classification in config.blocked_class_for(&dep.name) {
                     result
                         .blocked_registries
-                        .push(deps_core::BlockedRegistryOccurrence {
-                            range: dep.name_range,
-                            class,
-                            raw_value,
-                            declaration_key,
-                        });
+                        .push(classification.into_occurrence(dep.name_range));
                 }
             }
             result.resolved_chains = config.resolved_chains();

@@ -43,11 +43,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use deps_core::PackageName;
 use deps_core::net_policy::{
     HostClass, IndexUrlError, PolicyGate, RedactedUrl, RegistryAccessPolicy, validate_index_url,
 };
 use deps_core::parser::DependencySource;
+use deps_core::{BlockedSourceClass, PackageName};
 
 /// Why a candidate `registry=`/`@scope:registry=` value failed [`NpmRegistryIndex::new`]'s
 /// validation, or why expansion of a `${VAR}` placeholder inside it failed (FR-007).
@@ -248,18 +248,23 @@ impl NpmConfig {
     /// the two independently-declared blocks — see
     /// `deps_core::ecosystem::ParseResult::blocked_registries`'s own doc.
     #[must_use]
-    pub fn blocked_class_for(
-        &self,
-        package_name: &PackageName,
-    ) -> Option<(HostClass, String, String)> {
+    pub fn blocked_class_for(&self, package_name: &PackageName) -> Option<BlockedSourceClass> {
         if let Some(scope) = scope_of(package_name.as_str())
             && let Some(result) = self.scoped_registries.get(scope)
         {
-            let (class, raw) = blocked_class(result)?;
-            return Some((class, raw, format!("scope:{scope}")));
+            let (class, raw_value) = blocked_class(result)?;
+            return Some(BlockedSourceClass {
+                class,
+                raw_value,
+                declaration_key: format!("scope:{scope}"),
+            });
         }
-        let (class, raw) = blocked_class(self.registry.as_ref()?)?;
-        Some((class, raw, "top-level".to_string()))
+        let (class, raw_value) = blocked_class(self.registry.as_ref()?)?;
+        Some(BlockedSourceClass {
+            class,
+            raw_value,
+            declaration_key: "top-level".to_string(),
+        })
     }
 
     /// Every successfully resolved [`NpmRegistryIndex`] this config carries (the top-level
@@ -1118,12 +1123,12 @@ mod tests {
             },
             "a blocked registry must stay unresolved, not silently become AlternateRegistry"
         );
-        let (class, raw_value, declaration_key) = config
+        let occurrence = config
             .blocked_class_for(&pkg("express"))
             .expect("blocked entry must be reported");
-        assert_eq!(class, HostClass::CloudMetadata);
-        assert_eq!(raw_value, "https://169.254.169.254/registry");
-        assert_eq!(declaration_key, "top-level");
+        assert_eq!(occurrence.class, HostClass::CloudMetadata);
+        assert_eq!(occurrence.raw_value, "https://169.254.169.254/registry");
+        assert_eq!(occurrence.declaration_key, "top-level");
     }
 
     /// The scoped-entry counterpart: a `@scope:registry=` entry blocked by policy must be
@@ -1141,12 +1146,12 @@ mod tests {
             registry: Some(resolve_entry("https://npm.mycorp.example", &policy)),
             scoped_registries: scoped,
         };
-        let (class, raw_value, declaration_key) = config
+        let occurrence = config
             .blocked_class_for(&pkg("@myorg/internal-lib"))
             .expect("blocked scoped entry must be reported");
-        assert_eq!(class, HostClass::CloudMetadata);
-        assert_eq!(raw_value, "https://169.254.169.254/registry");
-        assert_eq!(declaration_key, "scope:@myorg");
+        assert_eq!(occurrence.class, HostClass::CloudMetadata);
+        assert_eq!(occurrence.raw_value, "https://169.254.169.254/registry");
+        assert_eq!(occurrence.declaration_key, "scope:@myorg");
         assert_eq!(config.blocked_class_for(&pkg("express")), None);
     }
 
@@ -1166,14 +1171,14 @@ mod tests {
             registry: Some(resolve_entry("https://169.254.169.254/registry", &policy)),
             scoped_registries: scoped,
         };
-        let (_, _, top_level_key) = config
+        let top_level = config
             .blocked_class_for(&pkg("express"))
             .expect("top-level entry must be reported");
-        let (_, _, scope_key) = config
+        let scoped = config
             .blocked_class_for(&pkg("@myorg/internal-lib"))
             .expect("scoped entry must be reported");
         assert_ne!(
-            top_level_key, scope_key,
+            top_level.declaration_key, scoped.declaration_key,
             "two independently-declared blocked entries must never share a declaration key, \
              even when their raw values coincide"
         );
