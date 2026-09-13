@@ -21,14 +21,15 @@
 
 use crate::types::{GithubActionsDependency, GithubActionsParseResult, PinStyle};
 use deps_core::lsp_helpers::{
-    LineOffsetTable, is_partial_semver_shaped, locate_value_span, marker_byte_offset,
+    LineOffsetTable, MarkedScalar, byte_span_to_range, is_partial_semver_shaped,
     warn_rejected_value,
 };
 use deps_core::parser::DependencySource;
+use deps_core::yaml_walk::{FrameKind, FrameStack, ScalarPosition};
 use deps_core::{DepsError, Result};
 use tower_lsp_server::ls_types::{Range, Uri};
 use yaml_rust2::parser::{Event, MarkedEventReceiver, Parser};
-use yaml_rust2::scanner::{Marker, TScalarStyle};
+use yaml_rust2::scanner::Marker;
 
 /// Re-exported so existing `crate::parser::is_full_sha`/`is_tag_shaped` call sites
 /// (`ecosystem.rs`, `formatter.rs`) keep working after the #472/GitLab-CI-plan §6.1
@@ -259,40 +260,29 @@ fn classify_uses_value(value: &str) -> ParsedUses {
 
 // --- Event-driven `uses:` scalar detection ---
 
-#[derive(Clone, Copy)]
-enum FrameKind {
-    Mapping,
-    Sequence,
-}
-
 /// Which special key (if any) a `Mapping` frame's `awaiting_key: false` state is
 /// currently waiting on the value for.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
 enum PendingKey {
     /// Not awaiting a value (`awaiting_key: true`), or the pending key is neither
     /// `uses` nor `with`.
+    #[default]
     None,
     Uses,
     With,
 }
 
-struct Frame {
-    kind: FrameKind,
-    is_with_ancestor: bool,
-    awaiting_key: bool,
-    pending_key: PendingKey,
-}
+/// The generic frame-stack mechanics ([`deps_core::yaml_walk::FrameStack`]) driven by
+/// [`WorkflowReceiver`]. This crate has no role vocabulary of its own — every
+/// structural distinction it needs collapses to whether a `with:` ancestor is in
+/// scope, so the role type parameter is the unit type and that one fact is carried
+/// directly as each frame's `payload`.
+type Stack = FrameStack<(), PendingKey, bool>;
 
-/// One `uses:` scalar found by [`WorkflowReceiver`], not yet classified or range-mapped.
-struct UsesCandidate {
-    value: String,
-    style: TScalarStyle,
-    /// `yaml-rust2` marker line (1-indexed) and column (0-indexed char count) of the
-    /// scalar — see [`marker_byte_offset`] for why these, not `Marker::index()`, are used
-    /// to resolve the value's byte offset (#879).
-    line: usize,
-    col: usize,
-}
+/// One `uses:` scalar found by [`WorkflowReceiver`], not yet classified or range-mapped —
+/// see [`MarkedScalar`], whose `span()` resolves the value's byte offset only once
+/// parsing completes, via a `line`/`col`-based lookup rather than `Marker::index()` (#879).
+type UsesCandidate = MarkedScalar;
 
 /// Collects every `uses:` value-scalar event, skipping any `uses` key that has a `with:`
 /// ancestor (a step input literally named `uses`) — covers `jobs.*.steps[].uses` and
@@ -303,7 +293,7 @@ struct UsesCandidate {
 /// the `runs:` check separately (e.g. from the URI path instead) would mean a second,
 /// redundant walk of the same event stream for one boolean.
 struct WorkflowReceiver {
-    stack: Vec<Frame>,
+    stack: Stack,
     candidates: Vec<UsesCandidate>,
     /// Whether a `runs:` key was seen in the *document root* mapping (`stack.len() == 1`
     /// at the time its key scalar fired) — issue #706 review finding (security, LOW):
@@ -323,35 +313,28 @@ struct WorkflowReceiver {
 impl WorkflowReceiver {
     fn new() -> Self {
         Self {
-            stack: Vec::new(),
+            stack: Stack::new(),
             candidates: Vec::new(),
             has_top_level_runs_key: false,
         }
     }
 
+    /// Whether a container about to be pushed inherits a `with:` ancestor from its
+    /// parent — either the parent is itself already under one, or the parent is a
+    /// `Mapping` currently holding a value for its own `with:` key.
     fn child_is_with_ancestor(&self) -> bool {
-        self.stack.last().is_some_and(|top| match top.kind {
-            FrameKind::Mapping => top.is_with_ancestor || top.pending_key == PendingKey::With,
-            FrameKind::Sequence => top.is_with_ancestor,
+        self.stack.top().is_some_and(|top| match top.kind() {
+            FrameKind::Mapping => top.payload || *top.pending_key() == PendingKey::With,
+            FrameKind::Sequence => top.payload,
         })
     }
 
-    fn consume_pending_value(&mut self) {
-        if let Some(top) = self.stack.last_mut() {
-            top.awaiting_key = true;
-            top.pending_key = PendingKey::None;
-        }
-    }
-
     fn push_container(&mut self, kind: FrameKind) {
+        // Computed from the parent's state *before* `FrameStack::push` transitions it
+        // (a complex YAML key's subtree included) — the parent's `with:`-ancestor
+        // status must reflect its own position, not the child's freshly pushed one.
         let is_with_ancestor = self.child_is_with_ancestor();
-        self.consume_pending_value();
-        self.stack.push(Frame {
-            kind,
-            is_with_ancestor,
-            awaiting_key: true,
-            pending_key: PendingKey::None,
-        });
+        self.stack.push(kind, (), is_with_ancestor);
     }
 }
 
@@ -362,41 +345,30 @@ impl MarkedEventReceiver for WorkflowReceiver {
             Event::SequenceStart(..) => self.push_container(FrameKind::Sequence),
             Event::MappingEnd | Event::SequenceEnd => {
                 self.stack.pop();
-                self.consume_pending_value();
             }
             Event::Scalar(value, style, _anchor, _tag) => {
-                let is_key = self
-                    .stack
-                    .last()
-                    .is_some_and(|top| matches!(top.kind, FrameKind::Mapping) && top.awaiting_key);
-                if is_key {
-                    if self.stack.len() == 1 && value == "runs" {
+                if self.stack.scalar_position() == ScalarPosition::Key {
+                    if self.stack.depth() == 1 && value == "runs" {
                         self.has_top_level_runs_key = true;
                     }
-                    if let Some(top) = self.stack.last_mut() {
-                        top.pending_key = if value == "uses" && !top.is_with_ancestor {
-                            PendingKey::Uses
-                        } else if value == "with" {
-                            PendingKey::With
-                        } else {
-                            PendingKey::None
-                        };
-                        top.awaiting_key = false;
-                    }
+                    let is_with_ancestor = self.stack.top().is_some_and(|top| top.payload);
+                    let key = if value == "uses" && !is_with_ancestor {
+                        PendingKey::Uses
+                    } else if value == "with" {
+                        PendingKey::With
+                    } else {
+                        PendingKey::None
+                    };
+                    self.stack.observe_key(key);
                 } else {
-                    let is_uses_value = self.stack.last().is_some_and(|top| {
-                        matches!(top.kind, FrameKind::Mapping)
-                            && top.pending_key == PendingKey::Uses
+                    let is_uses_value = self.stack.top().is_some_and(|top| {
+                        top.kind() == FrameKind::Mapping && *top.pending_key() == PendingKey::Uses
                     });
                     if is_uses_value {
-                        self.candidates.push(UsesCandidate {
-                            value,
-                            style,
-                            line: marker.line(),
-                            col: marker.col(),
-                        });
+                        self.candidates
+                            .push(UsesCandidate::new(value, style, &marker));
                     }
-                    self.consume_pending_value();
+                    self.stack.consume_value();
                 }
             }
             // A `uses: *anchor` alias value must still clear the pending `uses`/`with`
@@ -404,7 +376,7 @@ impl MarkedEventReceiver for WorkflowReceiver {
             // gets consumed as if it were this `uses`'s value) — critic M5. GitHub
             // itself does not support YAML anchors/aliases in workflow files, so this
             // is defense-in-depth rather than a reachable real-world case.
-            Event::Alias(_) => self.consume_pending_value(),
+            Event::Alias(_) => self.stack.consume_value(),
             Event::Nothing
             | Event::StreamStart
             | Event::StreamEnd
@@ -435,41 +407,37 @@ fn build_dependency(
     // string rather than starting a YAML comment (spec 031 FR-010). Read once here and
     // carried on every constructed dependency, mirroring the existing single-purpose
     // `TScalarStyle::Plain` gate below for the SHA-with-comment case.
-    let is_plain_scalar = candidate.style == TScalarStyle::Plain;
+    let is_plain_scalar = candidate.is_plain();
 
-    let value_start = marker_byte_offset(content, line_table, candidate.line, candidate.col);
-    let (raw_start, raw_end) = locate_value_span(content, value_start, &candidate.value)?;
+    let (raw_start, raw_end) = candidate.span(content, line_table)?;
 
     // `classify_uses_value` (and every offset computed below) works over the
     // *trimmed* value, but the span located above is the raw, untrimmed scalar
-    // text. For a quoted `uses:` value with leading/trailing whitespace (e.g.
-    // `" actions/checkout@v4"`), anchoring the downstream `name.len()`/
-    // `before_at_len`-relative arithmetic to the untrimmed start desyncs every
-    // computed offset by the trimmed byte count: on ordinary ASCII input this
-    // silently points `version_range` at the wrong text (an accepted "update
-    // version" code action then overwrites the wrong span), and on multi-byte
-    // leading whitespace (e.g. an ideographic space, U+3000) it can split a UTF-8
-    // sequence and panic on a raw `content[..]` slice downstream (security S-1).
-    // Re-anchoring `span_start`/`span_end` to the trimmed text here — both still
-    // guaranteed char-boundary-aligned in `content`, since `str::trim_start`/
-    // `trim_end` only ever cut at `candidate.value`'s own char boundaries, and
-    // that value is byte-identical to `content[raw_start..raw_end]` by
-    // `locate_value_span`'s own contract — means every reference to them
-    // downstream is already correct, with no further per-call adjustment needed.
-    let leading_ws = candidate.value.len() - candidate.value.trim_start().len();
-    let trailing_ws = candidate.value.len() - candidate.value.trim_end().len();
+    // text ([`MarkedScalar::span`]'s own documented contract). For a quoted `uses:`
+    // value with leading/trailing whitespace (e.g. `" actions/checkout@v4"`),
+    // anchoring the downstream `name.len()`/`before_at_len`-relative arithmetic to
+    // the untrimmed start desyncs every computed offset by the trimmed byte count:
+    // on ordinary ASCII input this silently points `version_range` at the wrong
+    // text (an accepted "update version" code action then overwrites the wrong
+    // span), and on multi-byte leading whitespace (e.g. an ideographic space,
+    // U+3000) it can split a UTF-8 sequence and panic on a raw `content[..]` slice
+    // downstream (security S-1). Re-anchoring `span_start`/`span_end` to the
+    // trimmed text here — both still guaranteed char-boundary-aligned in `content`,
+    // since `str::trim_start`/`trim_end` only ever cut at `candidate`'s own text's
+    // char boundaries, and that text is byte-identical to
+    // `content[raw_start..raw_end]` by `span`'s own contract — means every
+    // reference to them downstream is already correct, with no further per-call
+    // adjustment needed.
+    let leading_ws = candidate.text().len() - candidate.text().trim_start().len();
+    let trailing_ws = candidate.text().len() - candidate.text().trim_end().len();
     let span_start = raw_start + leading_ws;
     let span_end = raw_end.saturating_sub(trailing_ws);
-    let trimmed_value = candidate.value.trim().to_string();
+    let trimmed_value = candidate.text().trim().to_string();
 
-    let make_range = |start: usize, end: usize| -> Range {
-        Range::new(
-            line_table.byte_offset_to_position(content, start),
-            line_table.byte_offset_to_position(content, end),
-        )
-    };
+    let make_range =
+        |start: usize, end: usize| -> Range { byte_span_to_range(content, line_table, start, end) };
 
-    match classify_uses_value(&candidate.value) {
+    match classify_uses_value(candidate.text()) {
         ParsedUses::Path => Some(GithubActionsDependency {
             name: trimmed_value.clone().into(),
             name_range: make_range(span_start, span_end),
@@ -545,14 +513,15 @@ fn build_dependency(
             // cost on a single-line manifest with N such deps. Mirrors
             // `marker_byte_offset`'s own use of `LineOffsetTable::line_start` — that
             // returns the byte offset right after this line's own '\n' (0-indexed
-            // line `candidate.line`, so passing the 1-indexed `candidate.line` here
-            // lands on the *next* line's start), or `content.len()` if this is the
-            // last line with no trailing newline. `line_end` is always a `content`
-            // char boundary (built from a `char_indices()` walk), and stepping back
-            // one byte off it is too when that byte is the single-byte '\n' itself,
-            // so no boundary clamp is needed for it specifically.
+            // line `candidate.line()`, so passing the 1-indexed `candidate.line()`
+            // here lands on the *next* line's start), or `content.len()` if this is
+            // the last line with no trailing newline. `line_end` is always a
+            // `content` char boundary (built from a `char_indices()` walk), and
+            // stepping back one byte off it is too when that byte is the
+            // single-byte '\n' itself, so no boundary clamp is needed for it
+            // specifically.
             let line_end = line_table
-                .line_start(candidate.line)
+                .line_start(candidate.line())
                 .unwrap_or(content.len());
             let line_end = match line_end.checked_sub(1) {
                 Some(i) if content.as_bytes().get(i) == Some(&b'\n') => i,
@@ -576,7 +545,7 @@ fn build_dependency(
                 tracing::debug!(
                     ref_end,
                     line_end,
-                    candidate_line = candidate.line,
+                    candidate_line = candidate.line(),
                     "line_table line_end is before ref_end; this should not happen \
                      in practice — treating the rest-of-line window as truncated"
                 );
@@ -672,7 +641,7 @@ fn build_dependency(
             warn_rejected_value(
                 "classify_uses_value",
                 "workflow uses: value",
-                &candidate.value,
+                candidate.text(),
             );
             None
         }
@@ -801,6 +770,7 @@ mod tests {
     use super::*;
     use deps_core::Dependency;
     use std::assert_matches;
+    use yaml_rust2::scanner::TScalarStyle;
 
     fn test_uri() -> Uri {
         deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml")
@@ -1130,6 +1100,74 @@ mod tests {
         let content = "steps:\n  - uses: not-a-valid-identifier\n";
         let result = parse_workflow_yaml(content, &test_uri()).unwrap();
         assert!(result.dependencies.is_empty());
+    }
+
+    // --- deps-lsp#908: complex YAML key (`? <mapping>`/`? <sequence>`) no longer desyncs
+    // the root mapping's key/value alternation — the shared `FrameStack` walker's fix,
+    // which `deps-dart` already had before this refactor.
+    //
+    // This crate's `uses:` detection itself never gates on a top-level key, so a root
+    // mapping desync is invisible to it either way — a `jobs:`-after-a-complex-key style
+    // test would pass on both the old and new code and pin nothing (verified empirically
+    // against `origin/main` during review). The one place a root-level desync IS
+    // observable here is `has_top_level_runs_key` (`Self::depth() == 1` gate, #706): with
+    // the old code, closing a complex key's subtree left the root stuck "awaiting a key",
+    // so the complex key's own *value* scalar was misread as a literal top-level key.
+
+    #[test]
+    fn test_complex_key_value_is_not_misread_as_a_top_level_runs_key() {
+        // `runs` here is the complex key's *value*, not a real top-level key. On the old
+        // (pre-walker) code this was misread as a literal `runs:` key, incorrectly setting
+        // `has_top_level_runs_key = true` and letting `action.yml`'s `is_action_manifest_filename`
+        // gate wave the file through with 1 dependency. With the walker's fix, closing the
+        // complex key's subtree correctly leaves the root "awaiting this entry's value", so
+        // `runs` is read as a value and `has_top_level_runs_key` correctly stays `false` —
+        // `action.yml` has no genuine top-level `runs:` key, so every candidate is withheld.
+        let uri = deps_core::test_util::test_uri("/repo/action.yml");
+        let content =
+            "? { a: 1 }\n: runs\njobs:\n  b:\n    steps:\n      - uses: actions/checkout@v4\n";
+        let result = parse_workflow_yaml(content, &uri).unwrap();
+        assert!(
+            result.dependencies.is_empty(),
+            "a complex key's value scalar must never be misread as a literal top-level \
+             `runs:` key: {:?}",
+            result.dependencies
+        );
+    }
+
+    #[test]
+    fn test_complex_key_before_a_real_top_level_runs_key_does_not_lose_the_action_manifest() {
+        // The false-negative counterpart to the test above: an unrelated complex key
+        // appears *before* the file's genuine top-level `runs:` key. Pre-walker, closing
+        // the complex key's subtree left the root stuck "awaiting a key" instead of
+        // "awaiting this entry's value", so the complex key's own value scalar (`unused`)
+        // was misread as the next key — desyncing the rest of the root mapping and making
+        // the real `runs:` key invisible to `has_top_level_runs_key`, which then withheld
+        // every candidate from this genuinely valid composite action manifest. With the
+        // fix, `runs:` is correctly recognized as a real top-level key, so this file's
+        // `uses:` step is found.
+        let uri = deps_core::test_util::test_uri("/repo/action.yml");
+        let content = "? { a: 1 }\n: unused\nruns:\n  using: composite\n  steps:\n    - uses: actions/checkout@v4\n";
+        let result = parse_workflow_yaml(content, &uri).unwrap();
+        assert_eq!(
+            result.dependencies.len(),
+            1,
+            "a complex key before a genuine top-level runs: key must not hide it from \
+             has_top_level_runs_key: {:?}",
+            result.dependencies
+        );
+        assert_eq!(result.dependencies[0].name(), "actions/checkout");
+    }
+
+    #[test]
+    fn test_complex_mapping_key_does_not_crash_or_lose_sibling_keys() {
+        // Basic complex-key coverage outside the `has_top_level_runs_key` gate: a workflow
+        // file (not `action.yml`, so the gate above never applies) must still parse its
+        // `uses:` steps normally after an unrelated complex key elsewhere in the document.
+        let content = "? { a: 1 }\n: unused\njobs:\n  build:\n    steps:\n      - uses: actions/checkout@v4\n";
+        let result = parse_workflow_yaml(content, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1, "{:?}", result.dependencies);
+        assert_eq!(result.dependencies[0].name(), "actions/checkout");
     }
 
     // --- Structural coverage ---
@@ -1551,6 +1589,27 @@ mod tests {
         let line_table = LineOffsetTable::new(&content);
         let value = format!("actions/checkout@{sha}");
 
+        // `yaml_rust2::scanner::Marker` has no public constructor, so a real one — at
+        // exactly line 1, col `"uses: ".len()`, matching the synthetic candidate this test
+        // used to build by hand — is captured once via a short, cheap parse, entirely
+        // outside the loop below; `Marker` is `Copy`, so the same one is reused for every
+        // iteration.
+        let marker = {
+            struct FirstScalarMarker(Option<Marker>);
+            impl MarkedEventReceiver for FirstScalarMarker {
+                fn on_event(&mut self, event: Event, marker: Marker) {
+                    if matches!(&event, Event::Scalar(v, ..) if v == "actions/checkout@v4") {
+                        self.0.get_or_insert(marker);
+                    }
+                }
+            }
+            let mut receiver = FirstScalarMarker(None);
+            Parser::new_from_str("uses: actions/checkout@v4\n")
+                .load(&mut receiver, false)
+                .unwrap();
+            receiver.0.expect("marker for the uses: value scalar")
+        };
+
         // Iteration count halved from the original 2000 (finding #4/direction note):
         // `REST_OF_LINE_WINDOW_BYTES` quadrupled from the original 1024, so each call
         // now scans up to 4x as many bytes; keeping the wall-clock budget comparable
@@ -1559,12 +1618,7 @@ mod tests {
         // margin without flirting with the assertion's headroom under CI load.
         let start = std::time::Instant::now();
         for _ in 0..1000 {
-            let candidate = UsesCandidate {
-                value: value.clone(),
-                style: TScalarStyle::Plain,
-                line: 1,
-                col: "uses: ".len(),
-            };
+            let candidate = UsesCandidate::new(value.clone(), TScalarStyle::Plain, &marker);
             let dep = build_dependency(&content, &line_table, candidate);
             assert!(dep.is_some());
         }

@@ -8,12 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **deps-core, deps-dart, deps-github-actions, deps-gitlab-ci**: extracted the three YAML `MarkedEventReceiver` parsers' hand-rolled frame-stack state machines into a shared, generic `deps_core::yaml_walk::FrameStack` plus `lsp_helpers::MarkedScalar`/`byte_span_to_range` helpers (resolves #908) (#921)
 - **deps-core**: `LineOffsetTable` is no longer `Sync` (still `Send`) — build one per document parse, do not share across threads (#888)
 - **deps-core**: unified `net_policy`'s duplicated userinfo-redaction carve-out rules into one shared `redact_credential` scanner — zero behavior change (resolves #846) (#863)
 - **deps-core, deps-cargo, deps-go, deps-lsp**: documented the exhaustive/non_exhaustive justification for 8 public enums per `deps-core`'s API-stability policy; `HostClass` and `deps_lsp::document::DocumentState` are now `#[non_exhaustive]` (resolves #854) (#867)
 - `specs/`: reconciled `MOC-specs.md` against actual issue/PR state — stale "draft" spec rows marked shipped with their PR/issue references, all shipped specs moved into a "Completed Specs" section, and `specs/constitution.md` added (resolves #855) (#867)
 
 ### Fixed
+- **deps-github-actions, deps-gitlab-ci**: an explicit complex YAML key (`? <mapping>`/`? <sequence>`) no longer desyncs the enclosing mapping's key/value parsing, matching `deps-dart`'s existing handling (resolves #908) (#921)
 - **deps-github-actions**: SHA-pinned `uses:` refs with a partial `# vX`/`# vX.Y` comment tag now get inlay hints/diagnostics, using the registry-confirmed tag over the comment when available (resolves #907) (#914)
 - **deps-dart**: fixed `is_plain_null` mishandling an explicit YAML tag (including the verbatim null-tag form) and moved `DependencyBudget` enforcement before entry construction; pinned six behavior changes from #903's parser rewrite with regression tests (resolves #906) (#911)
 - **deps-dart**: aliasing a whole dependency section or `environment:` mapping via a YAML anchor now resolves correctly instead of silently losing its data (resolves #905) (#910)

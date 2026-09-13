@@ -118,6 +118,7 @@ pub mod secret;
 pub mod test_util;
 pub mod version_matcher;
 pub mod xml_bounds;
+pub mod yaml_walk;
 
 /// Re-export of the LSP protocol types that appear in this crate's public trait
 /// signatures. `deps-core`'s version tracks `tower-lsp-server`'s: a

@@ -5,6 +5,8 @@
 //! defining them locally.
 
 use super::LineOffsetTable;
+use tower_lsp_server::ls_types::Range;
+use yaml_rust2::scanner::{Marker, TScalarStyle};
 
 /// Length of a full, lowercase-or-not hex commit SHA (git's SHA-1 object id).
 const SHA_LEN: usize = 40;
@@ -319,6 +321,197 @@ pub fn locate_value_span(content: &str, search_from: usize, value: &str) -> Opti
         );
     }
     found
+}
+
+/// Converts a byte span in `content` into an LSP [`Range`] via `table`.
+///
+/// `deps-gitlab-ci`'s `make_range` and `deps-github-actions`'s `make_range` closure each
+/// defined this exact computation byte-for-byte identically before deps-lsp#908 extracted
+/// it here; both crates now call this instead. `deps-dart` keeps its own
+/// `RawField`/`field_range` (a different position-tracking shape, not this function) per
+/// the #908 architect plan — it was never required to migrate onto this helper.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::{LineOffsetTable, byte_span_to_range};
+///
+/// let content = "uses: actions/checkout@v4\n";
+/// let table = LineOffsetTable::new(content);
+/// let range = byte_span_to_range(content, &table, 6, 26);
+/// assert_eq!(range.start.line, 0);
+/// assert_eq!(range.start.character, 6);
+/// ```
+#[must_use]
+pub fn byte_span_to_range(
+    content: &str,
+    table: &LineOffsetTable,
+    start: usize,
+    end: usize,
+) -> Range {
+    Range::new(
+        table.byte_offset_to_position(content, start),
+        table.byte_offset_to_position(content, end),
+    )
+}
+
+/// A YAML scalar captured directly from `yaml-rust2`'s event stream.
+///
+/// Holds the scalar's resolved text, its scalar style, and the scanner's own
+/// marker — the shape all three `MarkedEventReceiver`-based ecosystem parsers
+/// (`deps-dart`, `deps-github-actions`, `deps-gitlab-ci`) build from an
+/// `Event::Scalar` payload before resolving a byte span for it.
+///
+/// Always built via [`MarkedScalar::new`] from a real `&Marker`, never hand-assembled
+/// from raw numbers: `line` is 1-indexed and `col` a 0-indexed **char** count, matching
+/// `yaml-rust2`'s own `Marker::line()`/`Marker::col()` (see [`marker_byte_offset`]'s
+/// docs for why — #879/#882 both trace back to conflating this with a byte count).
+#[derive(Debug, Clone)]
+pub struct MarkedScalar {
+    text: String,
+    style: TScalarStyle,
+    line: usize,
+    col: usize,
+}
+
+impl MarkedScalar {
+    /// Builds a `MarkedScalar` from an `Event::Scalar`'s resolved value/style and the
+    /// scanner marker it fired at.
+    ///
+    /// `yaml-rust2`'s `Marker` has no public constructor — a real one is only ever
+    /// obtained from a live `MarkedEventReceiver::on_event` callback, as shown here.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::MarkedScalar;
+    /// use yaml_rust2::parser::{Event, MarkedEventReceiver, Parser};
+    /// use yaml_rust2::scanner::{Marker, TScalarStyle};
+    ///
+    /// struct Scalars(Vec<(String, TScalarStyle, Marker)>);
+    /// impl MarkedEventReceiver for Scalars {
+    ///     fn on_event(&mut self, event: Event, marker: Marker) {
+    ///         if let Event::Scalar(value, style, ..) = event {
+    ///             self.0.push((value, style, marker));
+    ///         }
+    ///     }
+    /// }
+    ///
+    /// let mut receiver = Scalars(Vec::new());
+    /// Parser::new_from_str("uses: v4\n")
+    ///     .load(&mut receiver, false)
+    ///     .unwrap();
+    /// let (value, style, marker) = receiver.0[1].clone(); // the value scalar
+    /// let scalar = MarkedScalar::new(value, style, &marker);
+    /// assert_eq!(scalar.text(), "v4");
+    /// assert!(scalar.is_plain());
+    /// ```
+    #[must_use]
+    pub fn new(text: String, style: TScalarStyle, marker: &Marker) -> Self {
+        Self {
+            text,
+            style,
+            line: marker.line(),
+            col: marker.col(),
+        }
+    }
+
+    /// The scalar's resolved (dequoted) text.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Consumes the scalar, returning its resolved text.
+    #[must_use]
+    pub fn into_text(self) -> String {
+        self.text
+    }
+
+    /// The YAML scalar style (`Plain`, single/double-quoted, literal/folded block).
+    #[must_use]
+    pub const fn style(&self) -> TScalarStyle {
+        self.style
+    }
+
+    /// Whether the scalar was written unquoted.
+    #[must_use]
+    pub fn is_plain(&self) -> bool {
+        self.style == TScalarStyle::Plain
+    }
+
+    /// The scanner marker's 1-indexed line.
+    #[must_use]
+    pub const fn line(&self) -> usize {
+        self.line
+    }
+
+    /// The scanner marker's 0-indexed char column.
+    #[must_use]
+    pub const fn col(&self) -> usize {
+        self.col
+    }
+
+    /// Resolves this scalar's **raw, untrimmed** byte span within `content`, via
+    /// [`marker_byte_offset`] + [`locate_value_span`].
+    ///
+    /// This is the load-bearing primitive every caller needing a *sub*-span builds
+    /// on: `deps-github-actions` needs `owner/repo@ref`'s ref sub-span
+    /// (`span_start + before_at_len + 1`) and `deps-gitlab-ci` needs
+    /// `component@version`'s name/version sub-spans (`raw_start + prefix.len()`), and
+    /// both derive those from *this* span's start, never from a value this function
+    /// re-trims itself.
+    ///
+    /// Deliberately does **not** trim leading/trailing whitespace off the located
+    /// span — a caller with its own trim-aware offset arithmetic (`deps-github-actions`'s
+    /// UTF-8-boundary guard for a quoted value with non-ASCII padding is the concrete
+    /// case) depends on receiving the untrimmed span and re-anchoring its own
+    /// downstream offsets to it; trimming here would silently desync that arithmetic.
+    /// Returns `None` on the same misses [`locate_value_span`] does (e.g. a folded or
+    /// multiline scalar it cannot locate within its bounded fallback scan).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::{LineOffsetTable, MarkedScalar};
+    /// use yaml_rust2::parser::{Event, MarkedEventReceiver, Parser};
+    /// use yaml_rust2::scanner::{Marker, TScalarStyle};
+    ///
+    /// struct Scalars(Vec<(String, TScalarStyle, Marker)>);
+    /// impl MarkedEventReceiver for Scalars {
+    ///     fn on_event(&mut self, event: Event, marker: Marker) {
+    ///         if let Event::Scalar(value, style, ..) = event {
+    ///             self.0.push((value, style, marker));
+    ///         }
+    ///     }
+    /// }
+    ///
+    /// let content = "uses: actions/checkout@v4\n";
+    /// let mut receiver = Scalars(Vec::new());
+    /// Parser::new_from_str(content)
+    ///     .load(&mut receiver, false)
+    ///     .unwrap();
+    /// let (value, style, marker) = receiver.0[1].clone(); // the value scalar
+    /// let scalar = MarkedScalar::new(value, style, &marker);
+    ///
+    /// let table = LineOffsetTable::new(content);
+    /// let (start, end) = scalar.span(content, &table).unwrap();
+    /// assert_eq!(&content[start..end], "actions/checkout@v4");
+    /// ```
+    #[must_use]
+    pub fn span(&self, content: &str, table: &LineOffsetTable) -> Option<(usize, usize)> {
+        let start = marker_byte_offset(content, table, self.line, self.col);
+        locate_value_span(content, start, &self.text)
+    }
+
+    /// Resolves this scalar's raw span (see [`MarkedScalar::span`]) into an LSP
+    /// [`Range`] via [`byte_span_to_range`], or `None` on the same miss `span` can
+    /// return.
+    #[must_use]
+    pub fn range(&self, content: &str, table: &LineOffsetTable) -> Option<Range> {
+        self.span(content, table)
+            .map(|(start, end)| byte_span_to_range(content, table, start, end))
+    }
 }
 
 #[cfg(test)]
