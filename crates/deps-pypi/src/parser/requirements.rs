@@ -15,7 +15,6 @@ use super::{ParseResult, PypiParser, RequirementRef};
 use crate::config::PypiIndexConfig;
 use crate::error::Result;
 use crate::types::{PypiDependencySection, PypiDependencySource};
-use deps_core::BlockedRegistryOccurrence;
 use deps_core::lsp_helpers::{LineOffsetTable, byte_span_to_range};
 use deps_core::net_policy::RegistryAccessPolicy;
 use tower_lsp_server::ls_types::Uri;
@@ -299,15 +298,8 @@ impl PypiParser {
                     // routing concept.
                     if dep.source == PypiDependencySource::Registry {
                         dep.source = config.resolve_source_for(None);
-                        if let Some((class, raw_value, declaration_key)) =
-                            config.blocked_class_for(None)
-                        {
-                            blocked_registries.push(BlockedRegistryOccurrence {
-                                range: dep.name_range,
-                                class,
-                                raw_value,
-                                declaration_key,
-                            });
+                        if let Some(classification) = config.blocked_class_for(None) {
+                            blocked_registries.push(classification.into_occurrence(dep.name_range));
                         }
                     }
                     dependencies.push(dep);

@@ -44,15 +44,10 @@ impl IndexContext<'_> {
             .get(dep.name.as_str())
             .map(String::as_str);
         dep.source = self.config.resolve_source_for(named);
-        if let Some((class, raw_value, declaration_key)) = self.config.blocked_class_for(named) {
+        if let Some(classification) = self.config.blocked_class_for(named) {
             self.blocked_registries
                 .borrow_mut()
-                .push(BlockedRegistryOccurrence {
-                    range: dep.name_range,
-                    class,
-                    raw_value,
-                    declaration_key,
-                });
+                .push(classification.into_occurrence(dep.name_range));
         }
     }
 }
@@ -636,15 +631,10 @@ impl PypiParser {
             // String-form Poetry dependencies have no `source =` key of their own — resolve
             // through the primary/extras chain only (FR-002/003/005), same as a plain PEP
             // 621/requirements.txt dependency.
-            if let Some((class, raw_value, declaration_key)) = ctx.config.blocked_class_for(None) {
+            if let Some(classification) = ctx.config.blocked_class_for(None) {
                 ctx.blocked_registries
                     .borrow_mut()
-                    .push(BlockedRegistryOccurrence {
-                        range: name_range,
-                        class,
-                        raw_value,
-                        declaration_key,
-                    });
+                    .push(classification.into_occurrence(name_range));
             }
             return Ok(PypiDependency {
                 name: name.into(),
@@ -714,17 +704,10 @@ impl PypiParser {
                 // absent, the dependency routes through the primary/extras chain like any
                 // other plain dependency.
                 let source_name = table.get("source").and_then(|s| s.as_str());
-                if let Some((class, raw_value, declaration_key)) =
-                    ctx.config.blocked_class_for(source_name)
-                {
+                if let Some(classification) = ctx.config.blocked_class_for(source_name) {
                     ctx.blocked_registries
                         .borrow_mut()
-                        .push(BlockedRegistryOccurrence {
-                            range: name_range,
-                            class,
-                            raw_value,
-                            declaration_key,
-                        });
+                        .push(classification.into_occurrence(name_range));
                 }
                 ctx.config.resolve_source_for(source_name)
             };
