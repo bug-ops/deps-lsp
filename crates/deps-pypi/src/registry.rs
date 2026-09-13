@@ -15,7 +15,7 @@ use dashmap::DashMap;
 use deps_core::parser::DependencySource;
 use deps_core::{
     DepsError, FreshnessSettings, HttpCache, Result, lsp_helpers::warn_rejected_value,
-    net_policy::RedactedUrl,
+    net_policy::RedactedUrl, not_found_or as core_not_found_or,
 };
 use pep440_rs::{Version, VersionSpecifiers};
 use serde::Deserialize;
@@ -120,14 +120,7 @@ fn metadata_url(normalized: &str) -> String {
 /// Converts a 404 response into `DepsError::PackageNotFound`, passing through
 /// any other error unchanged.
 fn not_found_or(err: DepsError, name: &str) -> DepsError {
-    if matches!(err, DepsError::HttpStatus { status: 404, .. }) {
-        DepsError::PackageNotFound {
-            package: name.to_string(),
-            registry: REGISTRY,
-        }
-    } else {
-        err
-    }
+    core_not_found_or(err, name, REGISTRY, &[])
 }
 
 /// Builds a search-result stub for `name`, a normalized name matched from the

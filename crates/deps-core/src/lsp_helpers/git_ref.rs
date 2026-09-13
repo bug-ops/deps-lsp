@@ -327,9 +327,18 @@ pub fn locate_value_span(content: &str, search_from: usize, value: &str) -> Opti
 ///
 /// `deps-gitlab-ci`'s `make_range` and `deps-github-actions`'s `make_range` closure each
 /// defined this exact computation byte-for-byte identically before deps-lsp#908 extracted
-/// it here; both crates now call this instead. `deps-dart` keeps its own
-/// `RawField`/`field_range` (a different position-tracking shape, not this function) per
-/// the #908 architect plan — it was never required to migrate onto this helper.
+/// it here. deps-lsp#927 later routed every other ecosystem crate's byte-span-to-`Range`
+/// site through this same function: `deps-cargo`, `deps-pypi`, `deps-gradle`, and
+/// `deps-nuget` each keep a thin local adapter for their own span shape (a
+/// `toml_span::Span`, or a `(usize, usize)` tuple); `deps-swift` keeps its `make_range`
+/// closure, which captures `content`/`line_table` to save two arguments across its ~15
+/// call sites; `deps-bundler`, `deps-go`, `deps-maven`, `deps-deno`, and `deps-pypi`'s
+/// `requirements.rs` call this directly at each bare inline site (`deps-deno` deleted its
+/// own byte-identical `byte_range_to_lsp` rather than keep a pointless delegate); `deps-core`'s
+/// own `json_ast` module calls it directly at two sites (`quoted_lsp_range`, plus
+/// `dependency_position`'s `ObjectPropName::Word` arm). `deps-dart` is a full adopter as
+/// well (see [`MarkedScalar::range`], added by deps-lsp#928) — it does not call this
+/// function directly, but `MarkedScalar::range` does, on its behalf.
 ///
 /// # Examples
 ///
@@ -366,6 +375,13 @@ pub fn byte_span_to_range(
 /// from raw numbers: `line` is 1-indexed and `col` a 0-indexed **char** count, matching
 /// `yaml-rust2`'s own `Marker::line()`/`Marker::col()` (see [`marker_byte_offset`]'s
 /// docs for why — #879/#882 both trace back to conflating this with a byte count).
+///
+/// The marker does not always come from the same event as the text/style: `deps-dart`'s
+/// `on_alias` (key position) builds a `MarkedScalar` whose marker is the *alias*
+/// occurrence's own site but whose text and style are the *anchor* definition's — this is
+/// deliberate (the anchor's style is what `is_plain_null` already checked to accept the
+/// value), and safe because [`MarkedScalar::span`]/[`MarkedScalar::range`] never read
+/// `style`, only `text`/`line`/`col`.
 #[derive(Debug, Clone)]
 pub struct MarkedScalar {
     text: String,

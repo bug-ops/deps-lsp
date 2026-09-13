@@ -14,9 +14,9 @@
 use crate::config::{GoParseContext, GoProxyChain};
 use crate::types::{GoDependency, GoDirective};
 use deps_core::Result;
-use deps_core::lsp_helpers::LineOffsetTable;
+use deps_core::lsp_helpers::{LineOffsetTable, byte_span_to_range};
 use regex::Regex;
-use tower_lsp_server::ls_types::{Range, Uri};
+use tower_lsp_server::ls_types::Uri;
 
 /// Result of parsing a go.mod file.
 #[non_exhaustive]
@@ -231,16 +231,20 @@ fn parse_require_line(
 
     let module_start = line.find(module_path)?;
     let module_offset = line_start_offset + module_start;
-    let module_path_range = Range::new(
-        line_table.byte_offset_to_position(content, module_offset),
-        line_table.byte_offset_to_position(content, module_offset + module_path.len()),
+    let module_path_range = byte_span_to_range(
+        content,
+        line_table,
+        module_offset,
+        module_offset + module_path.len(),
     );
 
     let version_start = line.find(version)?;
     let version_offset = line_start_offset + version_start;
-    let version_range = Range::new(
-        line_table.byte_offset_to_position(content, version_offset),
-        line_table.byte_offset_to_position(content, version_offset + version.len()),
+    let version_range = byte_span_to_range(
+        content,
+        line_table,
+        version_offset,
+        version_offset + version.len(),
     );
 
     Some(GoDependency {
@@ -265,17 +269,21 @@ fn parse_replace_line(
 ) -> Option<GoDependency> {
     let module_start = line.find(module)?;
     let module_offset = line_start_offset + module_start;
-    let module_path_range = Range::new(
-        line_table.byte_offset_to_position(content, module_offset),
-        line_table.byte_offset_to_position(content, module_offset + module.len()),
+    let module_path_range = byte_span_to_range(
+        content,
+        line_table,
+        module_offset,
+        module_offset + module.len(),
     );
 
     let (version_str, version_range) = if let Some(ver) = version {
         let version_start = line.find(ver)?;
         let version_offset = line_start_offset + version_start;
-        let range = Range::new(
-            line_table.byte_offset_to_position(content, version_offset),
-            line_table.byte_offset_to_position(content, version_offset + ver.len()),
+        let range = byte_span_to_range(
+            content,
+            line_table,
+            version_offset,
+            version_offset + ver.len(),
         );
         (Some(ver.to_string()), Some(range))
     } else {
@@ -304,16 +312,20 @@ fn parse_exclude_line(
 ) -> Option<GoDependency> {
     let module_start = line.find(module)?;
     let module_offset = line_start_offset + module_start;
-    let module_path_range = Range::new(
-        line_table.byte_offset_to_position(content, module_offset),
-        line_table.byte_offset_to_position(content, module_offset + module.len()),
+    let module_path_range = byte_span_to_range(
+        content,
+        line_table,
+        module_offset,
+        module_offset + module.len(),
     );
 
     let version_start = line.find(version)?;
     let version_offset = line_start_offset + version_start;
-    let version_range = Range::new(
-        line_table.byte_offset_to_position(content, version_offset),
-        line_table.byte_offset_to_position(content, version_offset + version.len()),
+    let version_range = byte_span_to_range(
+        content,
+        line_table,
+        version_offset,
+        version_offset + version.len(),
     );
 
     Some(GoDependency {

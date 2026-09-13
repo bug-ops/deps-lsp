@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **deps-core, deps-cargo, deps-pypi, deps-gradle, deps-nuget, deps-deno, deps-swift, deps-bundler, deps-go, deps-maven**: routed every remaining byte-span-to-`Range` site through `deps_core::lsp_helpers::byte_span_to_range` instead of a per-crate hand-rolled duplicate (resolves #927) (#950)
+- **deps-dart**: migrated `pubspec.yaml` parsing's `RawField`/`field_range` onto `deps_core::lsp_helpers::MarkedScalar`, the same shared position-tracking type `deps-github-actions`/`deps-gitlab-ci` already use (resolves #928) (#950)
+- **deps-core, deps-pypi, deps-deno, deps-npm, deps-go**: extracted the byte-identical `404`-to-`PackageNotFound` mapper into `deps_core::not_found_or` (resolves #929 item 1) (#950)
+- **deps-core, deps-dart, deps-composer, deps-nuget, deps-npm**: extracted the shared warn-and-error boilerplate behind each ecosystem's own dot-segment guard into `deps_core::lsp_helpers::dot_segment_rejection_error`, leaving every crate's own segmentation predicate untouched (resolves #929 item 2) (#950)
 - **deps-core, deps-dart, deps-github-actions, deps-gitlab-ci**: extracted the three YAML `MarkedEventReceiver` parsers' hand-rolled frame-stack state machines into a shared, generic `deps_core::yaml_walk::FrameStack` plus `lsp_helpers::MarkedScalar`/`byte_span_to_range` helpers (resolves #908) (#921)
 - **deps-core**: `LineOffsetTable` is no longer `Sync` (still `Send`) — build one per document parse, do not share across threads (#888)
 - **deps-core**: unified `net_policy`'s duplicated userinfo-redaction carve-out rules into one shared `redact_credential` scanner — zero behavior change (resolves #846) (#863)

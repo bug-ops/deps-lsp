@@ -6,7 +6,7 @@
 
 use crate::types::SwiftDependency;
 use deps_core::Result;
-use deps_core::lsp_helpers::LineOffsetTable;
+use deps_core::lsp_helpers::{LineOffsetTable, byte_span_to_range};
 use deps_core::parser::DependencySource;
 use regex::Regex;
 use std::sync::LazyLock;
@@ -248,11 +248,9 @@ pub fn parse_package_swift(content: &str, uri: &Uri) -> Result<SwiftParseResult>
     let line_table = LineOffsetTable::new(content);
     let mut dependencies = Vec::new();
 
-    // Helper to make Range from byte start/end offsets in original content
+    // Captures `content`/`line_table` so call sites only pass byte start/end offsets.
     let make_range = |start: usize, end: usize| -> Range {
-        let start_pos = line_table.byte_offset_to_position(content, start);
-        let end_pos = line_table.byte_offset_to_position(content, end);
-        Range::new(start_pos, end_pos)
+        byte_span_to_range(content, &line_table, start, end)
     };
 
     // Find the byte offset of a capture within the stripped content

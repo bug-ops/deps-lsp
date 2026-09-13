@@ -30,7 +30,7 @@
 //! version/source info — see `test_aliased_dependency_to_unresolvable_anchor_still_present`.
 
 use crate::types::{DartDependency, DependencySection, DependencySource};
-use deps_core::lsp_helpers::{LineOffsetTable, locate_value_span, marker_byte_offset};
+use deps_core::lsp_helpers::{LineOffsetTable, MarkedScalar};
 use deps_core::yaml_walk::{FrameKind, FrameStack, ScalarPosition};
 use deps_core::{DependencyBudget, DepsError, Result};
 use std::collections::HashMap;
@@ -54,26 +54,21 @@ pub struct DartParseResult {
     pub dependency_truncation: Option<(usize, usize)>,
 }
 
-/// A scalar value captured from the event stream: its resolved (dequoted) text, plus the
-/// `yaml-rust2` marker line (1-indexed) and column (0-indexed char count) it was read at — for
-/// span re-derivation after parsing completes via [`marker_byte_offset`], not
-/// `Marker::index()` (#879).
-type RawField = (String, usize, usize);
-
-fn raw_field(value: String, marker: &Marker) -> RawField {
-    (value, marker.line(), marker.col())
-}
-
 /// Builds a scalar's [`FieldValue`], forcing [`FieldValue::Unpositioned`] while replaying a
 /// buffered container-anchor subtree (`replay_depth > 0`) — the marker on a replayed event
 /// points at the anchor's own definition site, not this occurrence, so reusing it would
 /// resurrect the duplicate-range bug [`FieldValue::Unpositioned`]'s own docs describe, one
 /// level up (two aliases of the same whole section would otherwise get identical ranges).
-fn scalar_field(replay_depth: usize, value: String, marker: &Marker) -> FieldValue {
+fn scalar_field(
+    replay_depth: usize,
+    value: String,
+    style: TScalarStyle,
+    marker: &Marker,
+) -> FieldValue {
     if replay_depth > 0 {
         FieldValue::Unpositioned(value)
     } else {
-        FieldValue::Positioned(raw_field(value, marker))
+        FieldValue::Positioned(MarkedScalar::new(value, style, marker))
     }
 }
 
@@ -128,7 +123,7 @@ fn is_null_tag(tag: &Tag) -> bool {
 /// A field's resolved text, plus its position in `content` when one genuinely exists.
 enum FieldValue {
     /// A scalar seen directly in the event stream — its own marker gives an exact position.
-    Positioned(RawField),
+    Positioned(MarkedScalar),
     /// Resolved from a YAML alias to a scalar anchor. The text is correct, but the literal
     /// text at the alias's own site is `*anchor`, not this value — [`FieldValue::range`]
     /// deliberately returns `None` rather than reusing the anchor definition's position, which
@@ -142,13 +137,14 @@ enum FieldValue {
 impl FieldValue {
     fn into_text(self) -> String {
         match self {
-            Self::Positioned((text, ..)) | Self::Unpositioned(text) => text,
+            Self::Positioned(scalar) => scalar.into_text(),
+            Self::Unpositioned(text) => text,
         }
     }
 
     fn range(&self, content: &str, line_table: &LineOffsetTable) -> Option<Range> {
         match self {
-            Self::Positioned(field) => field_range(content, line_table, field),
+            Self::Positioned(scalar) => scalar.range(content, line_table),
             Self::Unpositioned(_) => None,
         }
     }
@@ -249,7 +245,7 @@ enum RawDependencyValue {
     /// `pkg:\n  version: ...\n  git: ...` etc. — a nested mapping.
     Entry {
         version: Option<FieldValue>,
-        git: Option<RawGitValue>,
+        git: Option<Box<RawGitValue>>,
         path: Option<FieldValue>,
         sdk: Option<FieldValue>,
     },
@@ -264,7 +260,7 @@ enum RawDependencyValue {
 /// finalized into a [`DartDependency`] after parsing completes.
 struct RawDependency {
     section: DependencySection,
-    name: RawField,
+    name: MarkedScalar,
     /// Whether `name` was captured while replaying a buffered container-anchor subtree (see
     /// [`PubspecReceiver::container_anchors`]) rather than from the live event stream — if so,
     /// `name`'s marker points at the anchor's own definition site, not this occurrence, so
@@ -285,13 +281,13 @@ struct FramePayload {
     section: Option<DependencySection>,
     /// `DependencySectionValue` only: the dependency name just read as a key, awaiting its
     /// value.
-    pending_dep_name: Option<RawField>,
+    pending_dep_name: Option<MarkedScalar>,
     /// `DependencyEntryValue` only: the name carried down from the parent
     /// `DependencySectionValue` frame at push time, used to finalize on `MappingEnd`.
-    dep_name: Option<RawField>,
+    dep_name: Option<MarkedScalar>,
     /// `DependencyEntryValue` only: fields accumulated so far.
     version: Option<FieldValue>,
-    git: Option<RawGitValue>,
+    git: Option<Box<RawGitValue>>,
     path: Option<FieldValue>,
     sdk: Option<FieldValue>,
     /// `GitValue` only: fields accumulated so far.
@@ -311,7 +307,7 @@ impl FramePayload {
     fn assign_field(&mut self, key: PendingKey, value: FieldValue) {
         match key {
             PendingKey::EntryVersion => self.version = Some(value),
-            PendingKey::EntryGit => self.git = Some(RawGitValue::Scalar(value)),
+            PendingKey::EntryGit => self.git = Some(Box::new(RawGitValue::Scalar(value))),
             PendingKey::EntryPath => self.path = Some(value),
             PendingKey::EntrySdk => self.sdk = Some(value),
             PendingKey::GitUrl => self.git_url = Some(value),
@@ -439,7 +435,7 @@ impl PubspecReceiver {
         entries: &mut Vec<RawDependency>,
         budget: &mut DependencyBudget,
         section: Option<DependencySection>,
-        name: RawField,
+        name: MarkedScalar,
         name_is_replay: bool,
         value: impl FnOnce() -> RawDependencyValue,
     ) {
@@ -604,11 +600,11 @@ impl PubspecReceiver {
                 if let Some(parent) = stack.top_mut()
                     && *parent.role() == FrameRole::DependencyEntryValue
                 {
-                    parent.payload.git = Some(RawGitValue::Map {
+                    parent.payload.git = Some(Box::new(RawGitValue::Map {
                         url: frame.payload.git_url,
                         rev: frame.payload.git_ref,
                         path: frame.payload.git_path,
-                    });
+                    }));
                 }
             }
             _ => {}
@@ -643,7 +639,8 @@ impl PubspecReceiver {
                 let role = self.stack.top_role_or(FrameRole::Irrelevant);
                 if role == FrameRole::DependencySectionValue {
                     if let Some(top) = self.stack.top_mut() {
-                        top.payload.pending_dep_name = Some(raw_field(value, marker));
+                        top.payload.pending_dep_name =
+                            Some(MarkedScalar::new(value, style, marker));
                     }
                     self.stack.observe_key(PendingKey::None);
                 } else {
@@ -679,6 +676,7 @@ impl PubspecReceiver {
                                         RawDependencyValue::Simple(scalar_field(
                                             replay_depth,
                                             value,
+                                            style,
                                             marker,
                                         ))
                                     }
@@ -695,7 +693,7 @@ impl PubspecReceiver {
                     FrameRole::DependencyEntryValue | FrameRole::GitValue if !is_null => {
                         let key = *top.pending_key();
                         top.payload
-                            .assign_field(key, scalar_field(replay_depth, value, marker));
+                            .assign_field(key, scalar_field(replay_depth, value, style, marker));
                     }
                     // A null value for one of the keys above — treated the same as the key
                     // being absent entirely.
@@ -718,7 +716,7 @@ impl PubspecReceiver {
             .get(&anchor_id)
             .cloned()
             .filter(|(text, style, tag)| !is_plain_null(*style, tag.as_ref(), text))
-            .map(|(text, ..)| text);
+            .map(|(text, style, _)| (text, style));
 
         match self.stack.scalar_position() {
             ScalarPosition::Outside => {}
@@ -734,13 +732,18 @@ impl PubspecReceiver {
             ScalarPosition::Key => {
                 let role = self.stack.top_role_or(FrameRole::Irrelevant);
                 match (role, resolved) {
-                    (FrameRole::DependencySectionValue, Some(text)) => {
+                    (FrameRole::DependencySectionValue, Some((text, style))) => {
+                        // The marker comes from this alias occurrence, but the text and style
+                        // are the anchor's own — `MarkedScalar` never reads `style` when
+                        // computing a range, and using the anchor's style keeps this consistent
+                        // with the `is_plain_null` check against the anchor's style above.
                         if let Some(top) = self.stack.top_mut() {
-                            top.payload.pending_dep_name = Some(raw_field(text, marker));
+                            top.payload.pending_dep_name =
+                                Some(MarkedScalar::new(text, style, marker));
                         }
                         self.stack.observe_key(PendingKey::None);
                     }
-                    (_, Some(text)) => {
+                    (_, Some((text, _style))) => {
                         let key = key_for(role, &text);
                         self.stack.observe_key(key);
                     }
@@ -823,7 +826,7 @@ impl PubspecReceiver {
                                 name,
                                 replay_depth > 0,
                                 || {
-                                    resolved.map_or(RawDependencyValue::Unresolved, |text| {
+                                    resolved.map_or(RawDependencyValue::Unresolved, |(text, _)| {
                                         RawDependencyValue::Simple(FieldValue::Unpositioned(text))
                                     })
                                 },
@@ -831,7 +834,7 @@ impl PubspecReceiver {
                         }
                     }
                     FrameRole::DependencyEntryValue | FrameRole::GitValue => {
-                        if let Some(text) = resolved {
+                        if let Some((text, _style)) = resolved {
                             let key = *top.pending_key();
                             top.payload
                                 .assign_field(key, FieldValue::Unpositioned(text));
@@ -845,7 +848,7 @@ impl PubspecReceiver {
                     // correctly does.
                     FrameRole::EnvironmentValue => {
                         if *top.pending_key() == PendingKey::EnvSdk
-                            && let Some(text) = resolved
+                            && let Some((text, _style)) = resolved
                         {
                             *sdk = Some(text);
                         }
@@ -905,22 +908,6 @@ impl MarkedEventReceiver for PubspecReceiver {
     }
 }
 
-/// Resolves `field`'s range in `content`, or `None` if `locate_value_span` cannot find it
-/// (e.g. a folded/multiline or escaped-quote scalar) — callers must not fabricate a
-/// zero-position range on a miss, since `deps-core`'s diagnostics fall back from
-/// `version_range` to `name_range` specifically when the former is `None` (a bogus
-/// `Some((0,0),(0,0))` would bypass that fallback and render at document start instead).
-fn field_range(content: &str, line_table: &LineOffsetTable, field: &RawField) -> Option<Range> {
-    let (text, line, col) = field;
-    let value_start = marker_byte_offset(content, line_table, *line, *col);
-    locate_value_span(content, value_start, text).map(|(start, end)| {
-        Range::new(
-            line_table.byte_offset_to_position(content, start),
-            line_table.byte_offset_to_position(content, end),
-        )
-    })
-}
-
 fn build_dependency(
     content: &str,
     line_table: &LineOffsetTable,
@@ -936,10 +923,10 @@ fn build_dependency(
     let name_range = if raw.name_is_replay {
         Range::default()
     } else {
-        field_range(content, line_table, &raw.name).unwrap_or_default()
+        raw.name.range(content, line_table).unwrap_or_default()
     };
     let name_range_is_synthetic = raw.name_is_replay;
-    let name = raw.name.0;
+    let name = raw.name.into_text();
 
     match raw.value {
         RawDependencyValue::Simple(ver_field) => {
@@ -968,7 +955,7 @@ fn build_dependency(
                 }
                 None => (None, None),
             };
-            let (source, git_path) = match git {
+            let (source, git_path) = match git.map(|boxed| *boxed) {
                 Some(RawGitValue::Scalar(url_field)) => (
                     DependencySource::Git {
                         url: url_field.into_text(),

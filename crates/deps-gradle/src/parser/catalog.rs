@@ -163,11 +163,10 @@ fn extract_version(
     (None, None)
 }
 
+/// Adapts a `toml_span::Span` to [`deps_core::lsp_helpers::byte_span_to_range`].
+/// toml-span string spans already exclude surrounding quotes.
 fn span_to_range(content: &str, line_table: &LineOffsetTable, span: toml_span::Span) -> Range {
-    // toml-span string spans already exclude surrounding quotes
-    let start = line_table.byte_offset_to_position(content, span.start);
-    let end = line_table.byte_offset_to_position(content, span.end);
-    Range::new(start, end)
+    deps_core::lsp_helpers::byte_span_to_range(content, line_table, span.start, span.end)
 }
 
 #[cfg(test)]

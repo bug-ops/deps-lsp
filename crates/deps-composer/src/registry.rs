@@ -10,7 +10,8 @@
 
 use crate::types::{ComposerPackage, ComposerVersion};
 use deps_core::{
-    Deprecation, DepsError, HttpCache, Result, is_dot_segment, lsp_helpers::warn_rejected_value,
+    Deprecation, DepsError, HttpCache, Result, is_dot_segment,
+    lsp_helpers::dot_segment_rejection_error,
 };
 use serde::Deserialize;
 use std::any::Any;
@@ -67,8 +68,10 @@ fn p2_url(base: &str, name: &str) -> String {
 }
 
 /// Whether `name` (a bare package name, or `vendor/package` form) has a path segment that
-/// is exactly `.`/`..`, mirroring `deps-npm`'s identical `has_dot_segment` for the same
-/// vulnerability class.
+/// is exactly `.`/`..`, guarding against the same vulnerability class as `deps-npm`'s
+/// `has_dot_segment` — not identical to it, though: npm strips a leading `@` scope marker
+/// before splitting, which this does not need to (a Composer vendor name never starts with
+/// `@`).
 fn has_dot_segment(name: &str) -> bool {
     if let Some((vendor, package)) = name.split_once('/') {
         return is_dot_segment(vendor) || is_dot_segment(package);
@@ -80,11 +83,12 @@ fn has_dot_segment(name: &str) -> bool {
 /// `DepsError::PackageNotFound`.
 fn reject_dot_segment(name: &str) -> Result<()> {
     if has_dot_segment(name) {
-        warn_rejected_value("is_dot_segment", "Packagist p2 metadata request URL", name);
-        return Err(DepsError::PackageNotFound {
-            package: name.to_string(),
-            registry: REGISTRY,
-        });
+        return Err(dot_segment_rejection_error(
+            "is_dot_segment",
+            "Packagist p2 metadata request URL",
+            name,
+            REGISTRY,
+        ));
     }
     Ok(())
 }

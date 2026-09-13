@@ -2,7 +2,7 @@
 
 use crate::types::{DartVersion, PackageInfo};
 use crate::version::compare_versions;
-use deps_core::{DepsError, HttpCache, Result, is_dot_segment, lsp_helpers::warn_rejected_value};
+use deps_core::{HttpCache, Result, is_dot_segment, lsp_helpers::dot_segment_rejection_error};
 use serde::Deserialize;
 use std::any::Any;
 use std::sync::Arc;
@@ -41,15 +41,12 @@ fn package_metadata_url(base: &str, name: &str) -> String {
 /// the `/api/packages/` prefix entirely; `.` collapses it to `/api/packages/`).
 fn reject_dot_segment(name: &str) -> Result<()> {
     if is_dot_segment(name) {
-        warn_rejected_value(
+        return Err(dot_segment_rejection_error(
             "is_dot_segment",
             "pub.dev package metadata request URL",
             name,
-        );
-        return Err(DepsError::PackageNotFound {
-            package: name.to_string(),
-            registry: REGISTRY,
-        });
+            REGISTRY,
+        ));
     }
     Ok(())
 }
@@ -452,6 +449,7 @@ impl deps_core::Registry for PubDevRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::DepsError;
 
     use std::assert_matches;
 

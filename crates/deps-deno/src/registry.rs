@@ -11,7 +11,7 @@ use crate::specifier::{Scheme, is_dot_prefixed, split_scheme, split_scoped};
 use crate::types::{DenoMetadata, JsrPackage, JsrVersion};
 use deps_core::{
     DepsError, FreshnessSettings, HttpCache, Metadata, PackageName, Registry, Result, Version,
-    VersionReq, lsp_helpers::warn_rejected_value,
+    VersionReq, lsp_helpers::warn_rejected_value, not_found_or as core_not_found_or,
 };
 use deps_npm::NpmRegistry;
 use serde::Deserialize;
@@ -108,14 +108,7 @@ fn package_scope(pkg: &JsrPackage) -> &str {
 /// Converts a 404 response into `DepsError::PackageNotFound`, passing through any other
 /// error unchanged. Mirrors `deps-npm`'s `not_found_or` (`deps-npm/src/registry.rs`).
 fn not_found_or(err: DepsError, full_name: &str) -> DepsError {
-    if matches!(err, DepsError::HttpStatus { status: 404, .. }) {
-        DepsError::PackageNotFound {
-            package: full_name.to_string(),
-            registry: REGISTRY,
-        }
-    } else {
-        err
-    }
+    core_not_found_or(err, full_name, REGISTRY, &[])
 }
 
 /// Builds the error for a scheme-qualified name that could not be routed: an unknown or

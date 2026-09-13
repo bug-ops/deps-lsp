@@ -423,15 +423,12 @@ pub fn package_url(name: &str) -> String {
 /// `RegistrationsBaseUrl` prefix.
 fn reject_dot_segment(name: &str) -> Result<()> {
     if deps_core::is_dot_segment(name) {
-        deps_core::lsp_helpers::warn_rejected_value(
+        return Err(deps_core::lsp_helpers::dot_segment_rejection_error(
             "is_dot_segment",
             "NuGet flat-container/registration request URL",
             name,
-        );
-        return Err(deps_core::DepsError::PackageNotFound {
-            package: name.to_string(),
-            registry: REGISTRY,
-        });
+            REGISTRY,
+        ));
     }
     Ok(())
 }
