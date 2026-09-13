@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking (pre-1.0, public API)**: **deps-core**: removed `LockFileProvider::is_lockfile_stale` (the trait method had no callers outside its own conformance tests); added direct unit-test coverage for `LockFileCache::get_or_parse`'s actual staleness comparison instead (resolves #926) (#943)
 
 ### Fixed
+- **deps-dart**: removed flaky wall-clock-ratio assertions from three `pubspec.yaml` parser tests and replaced them with deterministic correctness checks, plus a new `dart_benchmarks` criterion suite to observe scaling behavior locally (resolves #946) (#953)
 - **deps-npm, deps-pypi, deps-nuget**: a dependency whose custom-registry resolution is blocked by `registries.workspace_registries` policy now surfaces an informational diagnostic on its own line, matching `deps-cargo`'s existing behavior, instead of degrading silently to the public registry with no trace (resolves #925) (#949)
 - **deps-gitlab-ci**: an alias key (`*k: value`) whose resolved anchor text matches a recognized `include:`-entry field name is now reinterpreted as that key, the same as a literal key (resolves #942) (#954)
 - **deps-core**: `DependencySource`'s `Debug` impl now redacts URL-bearing variants (`Git`, `Url`, `CustomRegistry`, `AlternateRegistry`) via `RedactedUrl` instead of printing them raw, closing a credential leak reachable through any `tracing::warn!(?source, ...)` call site (resolves #935) (#938)
