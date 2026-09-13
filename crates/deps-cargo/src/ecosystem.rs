@@ -1172,7 +1172,10 @@ mod tests {
         let parse_result = MockParseResult {
             dependencies: vec![dep],
         };
-        let content = "";
+        // #919: `detect_completion_context`'s literal-span guard requires `version_range`'s
+        // slice of `content` to actually match the declared `version_req` ("1.0") — padded
+        // to `mock_dependency`'s fixed 10-char-wide range, whitespace-insensitively equal.
+        let content = "shared-name\n1.0       ";
         let freshness = deps_core::FreshnessSettings::default();
 
         let context =

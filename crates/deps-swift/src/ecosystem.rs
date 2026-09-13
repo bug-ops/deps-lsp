@@ -696,4 +696,40 @@ mod tests {
         // subject to its own rate limiting).
         assert_eq!(via_dispatch.items, direct);
     }
+
+    /// #919 S2 (critic follow-up): a range-form dependency (`"lower"..<"upper"` /
+    /// `"lower"..."upper"`) must withhold version completion entirely, not just quickfix
+    /// edits. `version_range` spans only the lower bound and `version_literal` is
+    /// deliberately `None` (#367 C1) — offering a completion there would let the client
+    /// splice a version string into the middle of the lower-bound literal, which is exactly
+    /// as destructive as the quickfix edit #367 already guards against (it does not merely
+    /// fail to match the synthesized `>=lower, <upper` requirement — nothing about
+    /// completion is safe here, since even inserting *at* the cursor still corrupts the
+    /// range once the trailing `"..<...")` is read back). This is a deliberate decision, not
+    /// an accidental side effect of the #919 guard: no single position within a two-literal
+    /// range is unambiguously safe to complete into.
+    #[tokio::test]
+    async fn test_generate_completions_version_context_withheld_for_range_form() {
+        let content = r#".package(url: "https://github.com/foo/bar", "1.0.0"..<"2.0.0")"#;
+        let uri = deps_core::test_util::test_uri("/test/Package.swift");
+        let parse_result = crate::parser::parse_package_swift(content, &uri).unwrap();
+        let dep = &parse_result.dependencies[0];
+        assert_eq!(
+            dep.version_literal, None,
+            "fixture no longer exercises the #367 range-form shape: {content}"
+        );
+        let position = dep.version_range.unwrap().start;
+
+        let context =
+            deps_core::completion::detect_completion_context(&parse_result, position, content);
+        assert_eq!(context, deps_core::completion::CompletionContext::None);
+
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = SwiftEcosystem::new(cache);
+        let freshness = deps_core::FreshnessSettings::default();
+        let result = eco
+            .generate_completions(&parse_result, position, content, freshness)
+            .await;
+        assert_eq!(result, Completions::default());
+    }
 }

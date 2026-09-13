@@ -414,17 +414,29 @@ impl Ecosystem for GradleEcosystem {
                             .is_some_and(|r| position_in_range(position, r))
                             || d.name_range().start.line == position.line
                     });
-                    if let Some(dep) = dep {
-                        let request = deps_core::completion::CompletionRequest::new(
-                            parse_result,
-                            position,
-                            freshness,
-                        );
-                        self.complete_version(request, dep.name().clone(), value.to_string())
-                            .await
-                            .items
-                    } else {
-                        vec![]
+                    // #919: `detect_completion_context` only checks that the cursor sits
+                    // inside a coordinate's version segment, not that the segment's text is
+                    // a literal value — a `$var`/`${var}` property interpolation
+                    // (`resolve_variables`) must not be offered version completion, since
+                    // accepting one would splice text into the reference instead of editing
+                    // a version. Guarded on `range` (the segment's own detected span),
+                    // matching `dep`'s declared literal/requirement.
+                    match dep {
+                        Some(dep)
+                            if deps_core::lsp_helpers::dependency_version_range_is_literal(
+                                dep, content, range,
+                            ) =>
+                        {
+                            let request = deps_core::completion::CompletionRequest::new(
+                                parse_result,
+                                position,
+                                freshness,
+                            );
+                            self.complete_version(request, dep.name().clone(), value.to_string())
+                                .await
+                                .items
+                        }
+                        _ => vec![],
                     }
                 }
                 GradleCompletionContext::Package => self.complete_package_names(value, range).await,
@@ -1035,6 +1047,50 @@ mod tests {
                 content,
                 deps_core::FreshnessSettings::default(),
             )
+            .await;
+        assert_eq!(result, Completions::default());
+    }
+
+    /// #919 C1 (critic follow-up): an *unresolved* `$var` reference — no matching
+    /// `gradle.properties` entry, since `snapshot_guard_async` isolates this test from any
+    /// real file on disk — must withhold version completion entirely, deterministically and
+    /// without touching the registry. This is the exact scenario #919 was filed over:
+    /// `detect_completion_context`'s raw-text DSL scanner only checks the coordinate's
+    /// shape, so without the literal-span guard this would previously offer the full
+    /// version list and, on accept, splice a version string into `$libVersion`.
+    #[tokio::test]
+    async fn test_generate_completions_version_context_withheld_for_unresolved_variable() {
+        // See the comment in `test_parse_manifest_kts` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let eco = GradleEcosystem::new(make_cache());
+        let content = "dependencies {\n    implementation(\"com.example:lib:$libVersion\")\n}\n";
+        let uri = deps_core::test_util::test_uri("/project/build.gradle.kts");
+        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+        let dep = &parse_result.dependencies()[0];
+        assert_eq!(
+            dep.version_requirement().map(deps_core::VersionReq::as_str),
+            Some("$libVersion"),
+            "fixture no longer exercises the unresolved-variable shape: {content}"
+        );
+        let position = dep.version_range().unwrap().start;
+        let freshness = deps_core::FreshnessSettings::default();
+
+        // M4 (critic follow-up): `Completions::default()` below is also what the
+        // *unguarded* path would produce offline (`complete_versions_generic` returns
+        // `vec![]` on a registry fetch error, network-free or not) — non-discriminating on
+        // its own. Assert the guard's own decision directly against the real parsed `dep`
+        // first, so this test fails loudly if the guard regresses rather than passing
+        // vacuously either way.
+        assert!(
+            !deps_core::lsp_helpers::dependency_version_range_is_literal(
+                *dep,
+                content,
+                dep.version_range().unwrap(),
+            )
+        );
+
+        let result = eco
+            .generate_completions(parse_result.as_ref(), position, content, freshness)
             .await;
         assert_eq!(result, Completions::default());
     }

@@ -267,11 +267,22 @@ pub fn detect_completion_context(
         if let Some(version_range) = dep.version_range()
             && position_in_range(position, version_range)
         {
-            let prefix = extract_prefix(content, position, version_range);
-            return CompletionContext::Version {
-                package_name: dep.name().clone(),
-                prefix,
-            };
+            // #919: `version_range` can span a non-literal token (Maven `${property}`
+            // interpolation, Gradle `$var`/`${var}` interpolation, a YAML alias) whose
+            // text differs from the dependency's own declared value — accepting a
+            // completion there would splice version text into the middle of that
+            // reference instead of editing a literal version. Withhold the `Version`
+            // context in that case rather than return it; the loop still falls through
+            // to this dependency's `features_range` check (harmless — the cursor is not
+            // there either) and then moves on to the next dependency.
+            if crate::lsp_helpers::dependency_version_range_is_literal(dep, content, version_range)
+            {
+                let prefix = extract_prefix(content, position, version_range);
+                return CompletionContext::Version {
+                    package_name: dep.name().clone(),
+                    prefix,
+                };
+            }
         }
 
         // Check if position is within the features array range
@@ -1874,6 +1885,10 @@ mod tests {
                         character: 5,
                     },
                 },
+                // `MockDependency::version_requirement()` always reports "1.0" (see its
+                // impl below) — `version_range` must slice to exactly that literal text
+                // for the #919 literal-span guard in `detect_completion_context` to admit
+                // a `Version` context at all.
                 version_range: Some(Range {
                     start: Position {
                         line: 0,
@@ -1881,14 +1896,14 @@ mod tests {
                     },
                     end: Position {
                         line: 0,
-                        character: 14,
+                        character: 12,
                     },
                 }),
                 features_range: None,
             }],
         };
 
-        let content = r#"serde = "1.0.1""#;
+        let content = r#"serde = "1.0""#;
         let position = Position {
             line: 0,
             character: 11,
@@ -1906,6 +1921,94 @@ mod tests {
             }
             _ => panic!("Expected Version context, got {:?}", context),
         }
+    }
+
+    /// #919: `version_range` slicing to a Maven-style `${property}` interpolation — text
+    /// that differs from the dependency's own declared `version_requirement` ("1.0", per
+    /// `MockDependency`) — must withhold the `Version` completion context entirely, rather
+    /// than let a completion splice version text into the middle of the interpolation.
+    #[test]
+    fn test_detect_version_context_withheld_for_property_interpolation() {
+        let parse_result = MockParseResult {
+            dependencies: vec![MockDependency {
+                name: "slf4j-api".into(),
+                name_range: Range {
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 9,
+                    },
+                },
+                version_range: Some(Range {
+                    start: Position {
+                        line: 0,
+                        character: 13,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 29,
+                    },
+                }),
+                features_range: None,
+            }],
+        };
+
+        let content = r#"slf4j-api = "${slf4j.version}""#;
+        let position = Position {
+            line: 0,
+            character: 20,
+        };
+
+        let context = detect_completion_context(&parse_result, position, content);
+
+        assert_eq!(context, CompletionContext::None);
+    }
+
+    /// #919: `version_range` slicing to a YAML alias-shaped value (`*anchor`, GitLab CI /
+    /// GitHub Actions `ref: *pin` reuse) must likewise withhold the `Version` context — the
+    /// slice text ("*pin") never matches the declared literal ("1.0"), so the guard rejects
+    /// it exactly like the property-interpolation case above.
+    #[test]
+    fn test_detect_version_context_withheld_for_yaml_alias() {
+        let parse_result = MockParseResult {
+            dependencies: vec![MockDependency {
+                name: "my-job".into(),
+                name_range: Range {
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 6,
+                    },
+                },
+                version_range: Some(Range {
+                    start: Position {
+                        line: 0,
+                        character: 7,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 11,
+                    },
+                }),
+                features_range: None,
+            }],
+        };
+
+        let content = "my-job *pin";
+        let position = Position {
+            line: 0,
+            character: 9,
+        };
+
+        let context = detect_completion_context(&parse_result, position, content);
+
+        assert_eq!(context, CompletionContext::None);
     }
 
     #[test]

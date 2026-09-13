@@ -330,17 +330,30 @@ impl Ecosystem for MavenEcosystem {
                             .is_some_and(|r| position_in_range(position, r))
                             || d.name_range().start.line == position.line
                     });
-                    if let Some(dep) = dep {
-                        let request = deps_core::completion::CompletionRequest::new(
-                            parse_result,
-                            position,
-                            freshness,
-                        );
-                        self.complete_version(request, dep.name().clone(), value.to_string())
-                            .await
-                            .items
-                    } else {
-                        vec![]
+                    // #919: `detect_xml_context` only checks that the cursor sits inside a
+                    // `<version>` tag, not that the tag's text is a literal value — a Maven
+                    // `${property}` reference must not be offered version completion, since
+                    // accepting one would splice text into the interpolation instead of
+                    // editing a version. Guarded on `value_range` (the tag's own detected
+                    // span), matching `dep`'s declared literal/requirement.
+                    match dep {
+                        Some(dep)
+                            if deps_core::lsp_helpers::dependency_version_range_is_literal(
+                                dep,
+                                content,
+                                value_range,
+                            ) =>
+                        {
+                            let request = deps_core::completion::CompletionRequest::new(
+                                parse_result,
+                                position,
+                                freshness,
+                            );
+                            self.complete_version(request, dep.name().clone(), value.to_string())
+                                .await
+                                .items
+                        }
+                        _ => vec![],
                     }
                 }
                 MavenXmlContext::ArtifactId => {
@@ -1319,6 +1332,58 @@ mod tests {
                 xml,
                 deps_core::FreshnessSettings::default(),
             )
+            .await;
+        assert_eq!(result, Completions::default());
+    }
+
+    /// #919 C1 (critic follow-up): an *unresolved* `${property}` reference — no
+    /// `<properties>` entry to resolve it against, the dominant real-world shape for a
+    /// version inherited from a parent/BOM POM this crate cannot resolve — must withhold
+    /// version completion entirely, deterministically and without touching the registry.
+    /// This is the exact scenario #919 was filed over: `detect_xml_context` only checks
+    /// that the cursor sits inside a `<version>` tag, so without the literal-span guard
+    /// this would previously offer the full version list and, on accept, splice a version
+    /// string into `${slf4j.version}`.
+    #[tokio::test]
+    async fn test_generate_completions_version_context_withheld_for_unresolved_property() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = MavenEcosystem::new(cache);
+        let xml = r"<project>
+  <dependencies>
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-api</artifactId>
+      <version>${slf4j.version}</version>
+    </dependency>
+  </dependencies>
+</project>";
+        let uri = deps_core::test_util::test_uri("/test/pom.xml");
+        let parse_result = eco.parse_manifest(xml, &uri).await.unwrap();
+        let dep = &parse_result.dependencies()[0];
+        assert_eq!(
+            dep.version_requirement().map(deps_core::VersionReq::as_str),
+            Some("${slf4j.version}"),
+            "fixture no longer exercises the unresolved-property shape: {xml}"
+        );
+        let position = dep.version_range().unwrap().start;
+        let freshness = deps_core::FreshnessSettings::default();
+
+        // M4 (critic follow-up): `Completions::default()` below is also what the
+        // *unguarded* path would produce offline (`complete_versions_generic` returns
+        // `vec![]` on a registry fetch error, network-free or not) — non-discriminating on
+        // its own. Assert the guard's own decision directly against the real parsed `dep`
+        // first, so this test fails loudly if the guard regresses rather than passing
+        // vacuously either way.
+        assert!(
+            !deps_core::lsp_helpers::dependency_version_range_is_literal(
+                *dep,
+                xml,
+                dep.version_range().unwrap(),
+            )
+        );
+
+        let result = eco
+            .generate_completions(parse_result.as_ref(), position, xml, freshness)
             .await;
         assert_eq!(result, Completions::default());
     }

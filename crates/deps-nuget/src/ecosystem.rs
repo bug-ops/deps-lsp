@@ -1973,7 +1973,11 @@ mod tests {
             resolved_chains: Vec::new(),
             dependency_truncation: None,
         };
-        let content = "";
+        // #919: `detect_completion_context`'s literal-span guard requires `version_range`'s
+        // slice of `content` to actually match `dep_with_source`'s declared
+        // `version_requirement` ("1.0.0") — padded to its fixed 10-char-wide range,
+        // whitespace-insensitively equal.
+        let content = "1.0.0     ";
         // Character 1, not 0: `dep_with_source`'s `name_range` is the zero-width
         // `(line,0)-(line,0)`, which `detect_completion_context` would otherwise match
         // exactly at character 0 before ever reaching `version_range`.

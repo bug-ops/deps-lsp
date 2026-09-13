@@ -7,8 +7,8 @@ use tower_lsp_server::ls_types::{Position, Range, TextEdit, Uri};
 use crate::licenses::LicensePolicy;
 use crate::osv::VulnerabilityMap;
 use crate::{
-    ConcreteVersion, Deprecation, DepsDevClient, EcosystemId, FetchFailure, LicenseSource,
-    PackageName, RemovalStatus,
+    ConcreteVersion, Dependency, Deprecation, DepsDevClient, EcosystemId, FetchFailure,
+    LicenseSource, PackageName, RemovalStatus,
 };
 
 mod code_actions;
@@ -1642,6 +1642,130 @@ fn literal_span_matches(slice: &str, requirement: &str) -> bool {
     norm_slice == norm_req || format!("[{norm_slice}]") == norm_req
 }
 
+/// Whether `version_range`'s slice of `content` still holds `dep`'s own declared literal
+/// version text.
+///
+/// The same literal-span discipline [`generate_code_actions`] and
+/// `collect_update_all_edits` already apply before writing a `TextEdit` there, generalized
+/// (issue #919) for any caller about to treat `version_range` as an editable literal: a
+/// completion context, or a raw-text-scanning ecosystem's own completion dispatch (Maven,
+/// Gradle) that never goes through [`crate::completion::detect_completion_context`] at all.
+///
+/// Returns `false` — not editable — when `dep` has no [`Dependency::version_requirement`], the
+/// slice is syntactically reference-shaped (see below), or the slice doesn't textually match
+/// the declared literal.
+///
+/// The reference-shape check runs **independently** of the text comparison (#919 C1): an
+/// *unresolved* Maven `${property}` or Gradle `$var`/`${var}` interpolation is left by its
+/// parser exactly as-is in both `version_range`'s slice and `version_requirement` (there is
+/// nothing else to put there), so the two would otherwise textually agree and wrongly pass —
+/// this is precisely the corruption #919 was filed over, and the dominant real-world Maven
+/// case (a version inherited from a parent/BOM POM this crate cannot resolve) always lands
+/// here. A slice containing `$` anywhere is rejected up front, before ever comparing text —
+/// this single check subsumes both a whole-value `$var`/`${var}` interpolation and a Gradle
+/// GString with the reference embedded mid-string (`1.0.$patch`), which `resolve_variable_ref`
+/// only ever resolves in its whole-value form, leaving the mid-string case byte-identical
+/// between slice and requirement and otherwise invisible to a `starts_with`-only check. A
+/// slice that starts with `*` is rejected the same way *unless* [`crate::is_existence_wildcard_str`]
+/// recognizes it as the project-wide existence-wildcard spelling (synthesized by `deps-npm`,
+/// `deps-composer`, ...) — that case must keep offering a full version list at the exact
+/// moment a user wants to replace the wildcard with a pin, while a `*anchor` YAML alias (any
+/// other leading-`*` shape) still gets rejected.
+///
+/// An empty `version_requirement` is deliberately **not** special-cased here (unlike
+/// `generate_code_actions`'s "nothing to update" early return, which does not apply to
+/// completion): `serde = ""` / `"lodash": ""` — what an editor's auto-closing quotes produce
+/// the instant the opening quote is typed — must still offer the full version list.
+/// `literal_span_matches` alone already handles this correctly: `("", "")` matches (empty
+/// slice, empty requirement — admitted), while a non-empty non-literal slice against an empty
+/// requirement still fails to match (rejected).
+///
+/// Compares against [`Dependency::version_literal`] when the ecosystem provides one, falling
+/// back to `version_requirement` otherwise (see that method's doc for why).
+///
+/// Builds its own [`LineOffsetTable`] for `content` on every call rather than accepting a
+/// caller-built one — unlike `slice_for_range`'s multi-dependency callers (`generate_code_actions`,
+/// `code_lenses`), every current call site invokes this at most once per request (a single
+/// matched dependency), so a table-accepting overload would add API surface with no caller to
+/// exercise it.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::dependency_version_range_is_literal;
+/// use deps_core::{Dependency, PackageName, VersionReq};
+/// use std::any::Any;
+/// use tower_lsp_server::ls_types::{Position, Range};
+///
+/// struct MockDep {
+///     name: PackageName,
+///     version_req: VersionReq,
+///     version_range: Range,
+/// }
+/// impl Dependency for MockDep {
+///     fn name(&self) -> &PackageName {
+///         &self.name
+///     }
+///     fn name_range(&self) -> Range {
+///         Range::default()
+///     }
+///     fn version_requirement(&self) -> Option<&VersionReq> {
+///         Some(&self.version_req)
+///     }
+///     fn version_range(&self) -> Option<Range> {
+///         Some(self.version_range)
+///     }
+///     fn source(&self) -> deps_core::parser::DependencySource {
+///         deps_core::parser::DependencySource::Registry
+///     }
+///     fn as_any(&self) -> &dyn Any {
+///         self
+///     }
+/// }
+///
+/// // A plain literal version is admitted.
+/// let content = r#"serde = "1.0.0""#;
+/// let dep = MockDep {
+///     name: PackageName::new("serde"),
+///     version_req: VersionReq::new("1.0.0"),
+///     version_range: Range::new(Position::new(0, 9), Position::new(0, 14)),
+/// };
+/// assert!(dependency_version_range_is_literal(&dep, content, dep.version_range));
+///
+/// // A Maven `${property}` interpolation is rejected even when unresolved — slice and
+/// // requirement are byte-identical raw reference text, which the shape check catches
+/// // independently of the (otherwise-matching) text comparison.
+/// let content = r"<version>${slf4j.version}</version>";
+/// let dep = MockDep {
+///     name: PackageName::new("slf4j-api"),
+///     version_req: VersionReq::new("${slf4j.version}"),
+///     version_range: Range::new(Position::new(0, 9), Position::new(0, 25)),
+/// };
+/// assert!(!dependency_version_range_is_literal(&dep, content, dep.version_range));
+/// ```
+#[must_use]
+pub fn dependency_version_range_is_literal(
+    dep: &dyn Dependency,
+    content: &str,
+    version_range: Range,
+) -> bool {
+    let Some(version_req) = dep.version_requirement() else {
+        return false;
+    };
+    let table = LineOffsetTable::new(content);
+    let slice = slice_for_range(content, &table, version_range);
+    let trimmed = slice.trim();
+    if trimmed.contains('$')
+        || (trimmed.starts_with('*') && !crate::is_existence_wildcard_str(trimmed))
+    {
+        return false;
+    }
+    let literal_target = dep
+        .version_literal()
+        .unwrap_or_else(|| version_req.as_str());
+    literal_span_matches(slice, literal_target)
+}
+
 #[cfg(test)]
 // Fixtures are single-line ASCII literals with hand-computed byte offsets.
 #[allow(clippy::string_slice)]
@@ -1649,6 +1773,236 @@ mod tests {
     use super::*;
     use crate::lsp_helpers::test_support::*;
     use crate::{PackageName, VersionReq};
+
+    /// #919: a plain literal version — `version_range`'s slice equals the declared
+    /// requirement exactly — must be admitted as editable.
+    #[test]
+    fn test_dependency_version_range_is_literal_plain_literal_admitted() {
+        let content = r#"serde = "1.0.0""#;
+        let dep = MockDep {
+            name: PackageName::new("serde"),
+            version_req: VersionReq::new("1.0.0"),
+            version_range: Range::new(Position::new(0, 9), Position::new(0, 14)),
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+        };
+
+        assert!(dependency_version_range_is_literal(
+            &dep,
+            content,
+            dep.version_range,
+        ));
+    }
+
+    /// #919: a Maven-style `${property}` interpolation — `version_range` slices to the raw
+    /// placeholder text while the parser resolves `version_requirement` to the property's
+    /// value (a different string) — must be rejected, since a completion/edit there would
+    /// splice text into the interpolation instead of updating a version.
+    #[test]
+    fn test_dependency_version_range_is_literal_rejects_property_interpolation() {
+        let content = r"<version>${slf4j.version}</version>";
+        let dep = MockDep {
+            name: PackageName::new("slf4j-api"),
+            version_req: VersionReq::new("2.0.16"), // resolved property value
+            version_range: Range::new(Position::new(0, 9), Position::new(0, 25)), // "${slf4j.version}"
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+        };
+
+        assert!(!dependency_version_range_is_literal(
+            &dep,
+            content,
+            dep.version_range,
+        ));
+    }
+
+    /// #919: a YAML alias-shaped value (`*anchor`, e.g. GitLab CI/GitHub Actions `ref: *pin`
+    /// job reuse) never textually equals a declared literal requirement — rejected the same
+    /// way as the property-interpolation case.
+    #[test]
+    fn test_dependency_version_range_is_literal_rejects_yaml_alias() {
+        let content = "ref: *pin";
+        let dep = MockDep {
+            name: PackageName::new("job"),
+            version_req: VersionReq::new("1.0.0"),
+            version_range: Range::new(Position::new(0, 5), Position::new(0, 9)), // "*pin"
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+        };
+
+        assert!(!dependency_version_range_is_literal(
+            &dep,
+            content,
+            dep.version_range,
+        ));
+    }
+
+    /// S1 (critic follow-up): an empty `version_requirement` over an equally-empty slice —
+    /// exactly what an editor's auto-closing quotes produce the instant `serde = "` is typed
+    /// — must be **admitted**, not rejected. `generate_code_actions`'s "nothing to update"
+    /// semantics for an empty requirement do not apply to completion, where an empty value is
+    /// the single most common moment to offer the full version list.
+    #[test]
+    fn test_dependency_version_range_is_literal_admits_empty_requirement_with_empty_slice() {
+        let content = r#"serde = """#;
+        let dep = MockDep {
+            name: PackageName::new("serde"),
+            version_req: VersionReq::new(""),
+            version_range: Range::new(Position::new(0, 9), Position::new(0, 9)),
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+        };
+
+        assert!(dependency_version_range_is_literal(
+            &dep,
+            content,
+            dep.version_range,
+        ));
+    }
+
+    /// S1 (critic follow-up): an empty `version_requirement` paired with a *non-empty*
+    /// non-literal slice must still be rejected — dropping the old `is_empty()` early return
+    /// must not also drop this case, which the plain text comparison already handles on its
+    /// own (`"1.0" != ""`).
+    #[test]
+    fn test_dependency_version_range_is_literal_rejects_empty_requirement_with_mismatched_slice() {
+        let content = r#"x = "1.0""#;
+        let dep = MockDep {
+            name: PackageName::new("x"),
+            version_req: VersionReq::new(""),
+            version_range: Range::new(Position::new(0, 5), Position::new(0, 8)), // "1.0"
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 1)),
+        };
+
+        assert!(!dependency_version_range_is_literal(
+            &dep,
+            content,
+            dep.version_range,
+        ));
+    }
+
+    /// C1 (critic finding): the headline #919 case — an *unresolved* Maven `${property}`
+    /// reference. The parser leaves an unresolved property as-is in both `version_range`'s
+    /// slice and `version_requirement` (there is nothing else to put there), so the two
+    /// textually agree — `literal_span_matches` alone would wrongly admit this. The
+    /// reference-shape check must reject it independently of that text comparison.
+    #[test]
+    fn test_dependency_version_range_is_literal_rejects_unresolved_maven_property() {
+        let content = r"<version>${slf4j.version}</version>";
+        let dep = MockDep {
+            name: PackageName::new("slf4j-api"),
+            version_req: VersionReq::new("${slf4j.version}"), // left unresolved by the parser
+            version_range: Range::new(Position::new(0, 9), Position::new(0, 25)), // "${slf4j.version}"
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+        };
+
+        assert!(!dependency_version_range_is_literal(
+            &dep,
+            content,
+            dep.version_range,
+        ));
+    }
+
+    /// C1 (critic finding): the Gradle sibling of the unresolved-property case — a `$var`
+    /// reference `resolve_variable_ref` could not resolve, left as raw text in both the slice
+    /// and `version_requirement`.
+    #[test]
+    fn test_dependency_version_range_is_literal_rejects_unresolved_gradle_variable() {
+        let content = "implementation 'com.example:lib:$libVersion'";
+        let dep = MockDep {
+            name: PackageName::new("com.example:lib"),
+            version_req: VersionReq::new("$libVersion"), // left unresolved by the parser
+            version_range: Range::new(Position::new(0, 32), Position::new(0, 43)), // "$libVersion"
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+        };
+
+        assert!(!dependency_version_range_is_literal(
+            &dep,
+            content,
+            dep.version_range,
+        ));
+    }
+
+    /// C1 (critic finding): a partial interpolation embedded mid-string (`1.0-${suffix}`)
+    /// does not start with `$`, but must still be rejected — the `contains("${")` arm of the
+    /// reference-shape check, not just the `starts_with` arms.
+    #[test]
+    fn test_dependency_version_range_is_literal_rejects_embedded_interpolation() {
+        let content = r#"x = "1.0-${suffix}""#;
+        let dep = MockDep {
+            name: PackageName::new("x"),
+            version_req: VersionReq::new("1.0-${suffix}"),
+            version_range: Range::new(Position::new(0, 5), Position::new(0, 18)), // "1.0-${suffix}"
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 1)),
+        };
+
+        assert!(!dependency_version_range_is_literal(
+            &dep,
+            content,
+            dep.version_range,
+        ));
+    }
+
+    /// M2 (critic follow-up): `"*"` — the project-wide existence-wildcard spelling
+    /// (`deps_core::registry::is_existence_wildcard`, synthesized by `deps-npm`,
+    /// `deps-composer`, ...) — must be **admitted**, not caught by the `*`-prefix arm meant
+    /// for a `*anchor` YAML alias. Rejecting it would silently disable version completion at
+    /// the exact moment a user wants to replace `"lodash": "*"` with a pinned version.
+    #[test]
+    fn test_dependency_version_range_is_literal_admits_existence_wildcard() {
+        let content = r#"x = "*""#;
+        let dep = MockDep {
+            name: PackageName::new("x"),
+            version_req: VersionReq::new("*"),
+            version_range: Range::new(Position::new(0, 5), Position::new(0, 6)), // "*"
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 1)),
+        };
+
+        assert!(dependency_version_range_is_literal(
+            &dep,
+            content,
+            dep.version_range,
+        ));
+    }
+
+    /// M3 (critic follow-up): a `*anchor`-shaped slice that is *not exactly* `"*"` — e.g. a
+    /// multi-char alias name — must still be rejected. Distinguishes the wildcard exemption
+    /// above from a genuine leading-`*` reference.
+    #[test]
+    fn test_dependency_version_range_is_literal_rejects_multi_char_alias_despite_wildcard_exemption()
+     {
+        let content = "ref: *pinned-anchor";
+        let dep = MockDep {
+            name: PackageName::new("job"),
+            version_req: VersionReq::new("1.0.0"),
+            version_range: Range::new(Position::new(0, 5), Position::new(0, 19)), // "*pinned-anchor"
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+        };
+
+        assert!(!dependency_version_range_is_literal(
+            &dep,
+            content,
+            dep.version_range,
+        ));
+    }
+
+    /// M3 (critic follow-up): a Gradle GString with a `$var` reference embedded mid-string
+    /// (`1.0.$patch`, no braces, not at the start) is not resolved by
+    /// `resolve_variable_ref` (whole-value only) — the slice stays byte-identical to the raw
+    /// `version_requirement`, so only the shape check (not the text comparison) can reject
+    /// it. This is #919 C1 in a narrower spelling than the whole-value `$var`/`${var}` case.
+    #[test]
+    fn test_dependency_version_range_is_literal_rejects_gradle_mid_string_variable() {
+        let content = r#"implementation "com.example:lib:1.0.$patch""#;
+        let dep = MockDep {
+            name: PackageName::new("com.example:lib"),
+            version_req: VersionReq::new("1.0.$patch"), // left unresolved by the parser
+            version_range: Range::new(Position::new(0, 32), Position::new(0, 42)), // "1.0.$patch"
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+        };
+
+        assert!(!dependency_version_range_is_literal(
+            &dep,
+            content,
+            dep.version_range,
+        ));
+    }
 
     /// The empty-entry pruning invariant: an entry is removed once its last set channel
     /// is cleared, one channel at a time, in every order — never left behind as a
