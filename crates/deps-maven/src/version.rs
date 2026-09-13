@@ -69,10 +69,13 @@ pub fn compare_versions(a: &str, b: &str) -> Ordering {
 ///
 /// Unlike [`compare_versions`], a missing trailing segment (the shorter version ran out of
 /// components) normalizes as equal to a present-but-zero numeric segment at that position, per
-/// Maven's `IntItem.compareTo(null)` rule (the same rule [`compare_qualifiers`] already applies
-/// one level down, to qualifier-token digit runs): `1.0` == `1.0.0` == `1.0.0.0`. This is what
-/// lets a range bound with a different segment count than the version being checked still match
-/// correctly (`[1.0]` contains `1.0.0`; `[4.0,4.1]` contains `4.1.0`).
+/// Maven's `IntItem.compareTo(null)` rule: `1.0` == `1.0.0` == `1.0.0.0`. This is what lets a
+/// range bound with a different segment count than the version being checked still match
+/// correctly (`[1.0]` contains `1.0.0`; `[4.0,4.1]` contains `4.1.0`). Note this normalization is
+/// *not* mirrored one level down, at the qualifier-token digit-run level: [`compare_qualifiers`]
+/// (via `compare_qualifier_tokens`) always ranks a present digit run above a missing one, zero or
+/// not, because applying `IntItem.compareTo(null)` there breaks total order for
+/// [`compare_versions`] — see the note on [`compare_qualifiers`] for why.
 ///
 /// # Not a total order
 ///
@@ -207,11 +210,21 @@ fn compare_numeric_segments(a: &str, b: &str) -> Ordering {
 /// - alpha vs a missing token (one side ran out): ranked against the empty
 ///   qualifier, same as the alpha-vs-alpha case with `""` on the missing
 ///   side.
-/// - digits vs a missing token: a present-but-zero digit run (e.g. `r0` vs
-///   `r`) is treated as equivalent to a missing one, mirroring Maven's
-///   `IntItem.compareTo(null)`, which returns `0` for a zero-valued item
-///   compared against an absent one; any other digit run outranks a missing
-///   token.
+/// - digits vs a missing token: a digit run always outranks a missing token,
+///   including an all-zero one (e.g. `r0` > `r`), mirroring the
+///   numeric-outranks-non-numeric-or-missing rule [`compare_segment`] already
+///   applies at the top level (`1.0.0` > `1.0`, not equal — see the note on
+///   [`compare_versions`]). Unlike Maven's `IntItem.compareTo(null)`, this
+///   does *not* treat a zero digit run as equal to an absent one: doing so
+///   would make an `Alpha` token that normalizes to the release qualifier
+///   (e.g. `ga`) compare equal to a missing token, a zero `Digits` token also
+///   compare equal to a missing token, yet `Alpha` and `Digits` compare
+///   strictly against each other at the same position — breaking
+///   equal-substitution transitivity and, with it, the total order `sort_by`
+///   requires (e.g. `1.0-ga == 1.0`, `1.0 == 1.0-0ga`, but `1.0-ga <
+///   1.0-0ga`). [`compare_versions_for_range`] applies the zero-as-missing
+///   normalization instead, where it is safe because that comparator is
+///   pairwise-only and never sorted.
 fn compare_qualifiers(a: &str, b: &str) -> Ordering {
     let a_tokens = tokenize_qualifier(a);
     let b_tokens = tokenize_qualifier(b);
@@ -260,27 +273,16 @@ fn compare_qualifier_tokens(
             let b_norm = normalize_qualifier(q, matches!(b_next, Some(QualToken::Digits(_))));
             qualifier_rank("").cmp(&qualifier_rank(&b_norm))
         }
-        (Some(QualToken::Digits(p)), None) => {
-            if is_zero_digits(p) {
-                Ordering::Equal
-            } else {
-                Ordering::Greater
-            }
-        }
-        (None, Some(QualToken::Digits(q))) => {
-            if is_zero_digits(q) {
-                Ordering::Equal
-            } else {
-                Ordering::Less
-            }
-        }
+        (Some(QualToken::Digits(_)), None) => Ordering::Greater,
+        (None, Some(QualToken::Digits(_))) => Ordering::Less,
         (None, None) => Ordering::Equal,
     }
 }
 
-/// Whether a digit string's value is zero (all-zero, including `"0"`,
-/// `"00"`, or empty — the latter cannot occur from [`tokenize_qualifier`]
-/// but is handled the same way for safety).
+/// Whether a digit string's value is zero (all-zero, including `"0"` or
+/// `"00"`). Used only by [`compare_segment_for_range`], whose only caller
+/// passes a segment already confirmed numeric (and thus non-empty) via
+/// [`is_numeric_segment`].
 fn is_zero_digits(digits: &str) -> bool {
     digits.bytes().all(|b| b == b'0')
 }
@@ -422,10 +424,14 @@ mod tests {
         assert_eq!(compare_versions("r09", "r03"), Ordering::Greater);
         assert_eq!(compare_versions("r03", "r09"), Ordering::Less);
         assert_eq!(compare_versions("r05", "r05"), Ordering::Equal);
-        // "r0" has a present-but-zero numeric suffix, equivalent to a
-        // missing one, matching Maven's IntItem.compareTo(null).
-        assert_eq!(compare_versions("r0", "r"), Ordering::Equal);
-        assert_eq!(compare_versions("r00", "r"), Ordering::Equal);
+        // #934: a present digit-run token, zero-valued or not, always
+        // outranks a missing one — a zero-as-missing normalization here
+        // (matching Maven's IntItem.compareTo(null)) breaks total order, the
+        // same reason compare_versions itself does not normalize a missing
+        // top-level segment as equal to a zero one (see
+        // test_compare_versions_does_not_normalize_trailing_zero_segments).
+        assert_eq!(compare_versions("r0", "r"), Ordering::Greater);
+        assert_eq!(compare_versions("r00", "r"), Ordering::Greater);
         assert_eq!(compare_versions("r1", "r"), Ordering::Greater);
     }
 
@@ -647,6 +653,27 @@ mod tests {
     }
 
     #[test]
+    fn test_compare_versions_for_range_qualifier_zero_digit_run_outranks_missing() {
+        // #934 intentional side effect: compare_versions_for_range delegates
+        // its per-segment comparison through compare_segment -> compare_qualifiers
+        // -> compare_qualifier_tokens, the same functions the total-order fix
+        // changed. A qualifier-token zero-digit run (e.g. the "0" in "rc0")
+        // no longer normalizes as equal to a missing token, so
+        // "1.0-rc0" vs "1.0-rc" now compares Greater where it previously
+        // compared Equal. This is a real, deliberate behavior change
+        // consumed by crate::interval's range-containment checks (and
+        // crate::formatter) — pinned here so it cannot silently drift back.
+        assert_eq!(
+            compare_versions_for_range("1.0-rc0", "1.0-rc"),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_versions_for_range("1.0-rc", "1.0-rc0"),
+            Ordering::Less
+        );
+    }
+
+    #[test]
     fn test_compare_versions_does_not_normalize_trailing_zero_segments() {
         // compare_versions must stay a total order for sort_by callers
         // (crate::registry::parse_metadata_xml). Unlike
@@ -679,6 +706,15 @@ mod tests {
             "1.1",
             "1.1.0",
             "2.0",
+            // #934: qualifier-token zero-digit-run cases — a present digit
+            // run, zero-valued or not, must outrank a missing token exactly
+            // like `compare_segment`'s numeric-outranks-missing rule, not
+            // normalize to equal it.
+            "1.0-ga",
+            "1.0-0ga",
+            "1.0-final",
+            "1.0-0final",
+            "1.0-00",
         ];
         for &a in &corpus {
             for &b in &corpus {
@@ -707,5 +743,73 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_qualifier_token_total_order_invariants() {
+        // #934: dedicated property test over qualifier-token normalization
+        // edge cases (zero-digit runs, release aliases, above-release
+        // qualifiers, bare versions) — this is the exact corpus shape that
+        // let the qualifier-token total-order violation through undetected:
+        // `compare_versions("1.0-ga", "1.0")` == Equal, `compare_versions("1.0",
+        // "1.0-0ga")` == Equal, but `compare_versions("1.0-ga", "1.0-0ga")` ==
+        // Less, breaking equal-substitution transitivity.
+        let corpus = [
+            "1.0",
+            "1.0-ga",
+            "1.0-0ga",
+            "1.0-final",
+            "1.0-0final",
+            "1.0-release",
+            "1.0-sp",
+            "1.0-0sp",
+            "1.0-00",
+            "1.0-0",
+            "2.0-ga",
+            "2.0",
+        ];
+        for &a in &corpus {
+            for &b in &corpus {
+                assert_eq!(
+                    compare_versions(a, b),
+                    compare_versions(b, a).reverse(),
+                    "antisymmetry: compare({a}, {b}) vs compare({b}, {a})"
+                );
+                if compare_versions(a, b) == Ordering::Equal {
+                    for &c in &corpus {
+                        assert_eq!(
+                            compare_versions(a, c),
+                            compare_versions(b, c),
+                            "equal-substitution: {a} == {b} but compare({a},{c}) != compare({b},{c})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_sort_by_does_not_panic_on_zero_digit_qualifier_corpus() {
+        // #934 regression: `slice::sort_by` (driftsort) panics with "does
+        // not correctly implement a total order" once it observes enough
+        // elements, in a sufficiently disordered arrangement, to exercise
+        // its merge path. This is the exact pattern from the issue: a base
+        // release, its `-ga` alias, and its zero-digit-prefixed `-0ga`
+        // spelling, at two different base versions, cycled to 36 entries.
+        // The comparator arguments are reversed (`b, a`, not `a, b`) to
+        // match `crate::registry::parse_metadata_xml`'s actual descending
+        // `sort_by` call (`registry.rs:737`) — this test is a faithful
+        // reproduction of that reported crash shape, not a general panic
+        // oracle: whether a given permutation/size/direction triggers
+        // driftsort's internal panic detection is non-monotonic and
+        // implementation-specific, so this test passing is not proof the
+        // comparator is a total order. The real correctness guards are the
+        // deterministic invariant tests
+        // (`test_compare_versions_total_order_invariants`,
+        // `test_qualifier_token_total_order_invariants`), which catch this
+        // bug class directly, at any input size or order.
+        let base = ["0.0-ga", "0.0", "0.0-0ga", "1.0-ga", "1.0", "1.0-0ga"];
+        let mut versions: Vec<&str> = base.iter().copied().cycle().take(36).collect();
+        versions.sort_by(|a, b| compare_versions(b, a));
     }
 }
