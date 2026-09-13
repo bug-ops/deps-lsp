@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `specs/`: reconciled `MOC-specs.md` against actual issue/PR state — stale "draft" spec rows marked shipped with their PR/issue references, all shipped specs moved into a "Completed Specs" section, and `specs/constitution.md` added (resolves #855) (#867)
 
 ### Fixed
+- **deps-core**: `DependencySource`'s `Debug` impl now redacts URL-bearing variants (`Git`, `Url`, `CustomRegistry`, `AlternateRegistry`) via `RedactedUrl` instead of printing them raw, closing a credential leak reachable through any `tracing::warn!(?source, ...)` call site (resolves #935)
+- **deps-core, deps-lsp**: redacted two more credential-leak sinks in the same family — `RegistriesConfig`'s debug dump of `gitlab_instance_host` and the blocked-registry diagnostic's raw index value (resolves #936)
 - **deps-core, deps-maven, deps-gradle, deps-swift**: version completion no longer splices text into non-literal version spans (unresolved property/variable interpolation, YAML aliases, Swift version ranges) (resolves #919) (#922)
 - **deps-github-actions, deps-gitlab-ci**: an explicit complex YAML key (`? <mapping>`/`? <sequence>`) no longer desyncs the enclosing mapping's key/value parsing, matching `deps-dart`'s existing handling (resolves #908) (#921)
 - **deps-github-actions**: SHA-pinned `uses:` refs with a partial `# vX`/`# vX.Y` comment tag now get inlay hints/diagnostics, using the registry-confirmed tag over the comment when available (resolves #907) (#914)

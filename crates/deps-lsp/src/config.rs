@@ -972,7 +972,7 @@ where
 /// assert_eq!(config.workspace_registries, WorkspaceRegistriesSetting::PublicOnly);
 /// ```
 #[non_exhaustive]
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Clone, Deserialize, Default)]
 pub struct RegistriesConfig {
     /// Whether workspace-declared registry hosts (e.g. a manifest's own custom index
     /// URLs) may be reached at all, or only the default public registry.
@@ -998,6 +998,29 @@ pub struct RegistriesConfig {
     /// documents the already-open-document limitation of a live change to this setting.
     #[serde(default)]
     pub gitlab_instance_host: String,
+}
+
+/// Hand-written, not derived (#936): `gitlab_instance_host` is a raw, unvalidated host
+/// literal that can be credential-shaped (e.g. `user:hunter2@gitlab.corp`) since **no
+/// validation happens here** (see the field's own doc) — a derived `Debug` would print it
+/// verbatim into `server.rs`'s `tracing::debug!("loaded configuration: {:?}", config)` at
+/// `RUST_LOG=debug`, before `deps_gitlab_ci::host::GitlabInstanceHost::get` ever gets a
+/// chance to reject it. Every field is still shown (this is not a summary); only
+/// `gitlab_instance_host` is routed through [`deps_core::net_policy::RedactedUrl`] first.
+impl std::fmt::Debug for RegistriesConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegistriesConfig")
+            .field("workspace_registries", &self.workspace_registries)
+            .field(
+                "nuget_user_profile_sources",
+                &self.nuget_user_profile_sources,
+            )
+            .field(
+                "gitlab_instance_host",
+                &deps_core::net_policy::RedactedUrl::new(&self.gitlab_instance_host),
+            )
+            .finish()
+    }
 }
 
 /// Controls which workspace-declared registry index hosts this LSP will ever fetch.
@@ -1463,6 +1486,32 @@ mod tests {
         let json = r#"{"registries": {"gitlab_instance_host": "gitlab.mycorp.dev"}}"#;
         let config: DepsConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.registries.gitlab_instance_host, "gitlab.mycorp.dev");
+    }
+
+    /// #936: `RegistriesConfig`'s hand-written `Debug` impl must redact a credential-shaped
+    /// `gitlab_instance_host` (no validation happens on this field before it reaches a log
+    /// line — see the field's own doc) while still identifying the host, and the same
+    /// guarantee must hold when the section is `Debug`-formatted as part of the whole
+    /// `DepsConfig` (the shape `server.rs`'s `tracing::debug!("loaded configuration: {:?}",
+    /// config)` actually formats).
+    #[test]
+    fn test_registries_config_debug_redacts_gitlab_instance_host_credential() {
+        let json = r#"{"registries": {"gitlab_instance_host": "user:hunter2@gitlab.corp"}}"#;
+        let config: DepsConfig = serde_json::from_str(json).unwrap();
+
+        let section_debug = format!("{:?}", config.registries);
+        assert!(!section_debug.contains("hunter2"), "{section_debug}");
+        assert!(section_debug.contains("gitlab.corp"), "{section_debug}");
+
+        let whole_config_debug = format!("{config:?}");
+        assert!(
+            !whole_config_debug.contains("hunter2"),
+            "{whole_config_debug}"
+        );
+        assert!(
+            whole_config_debug.contains("gitlab.corp"),
+            "{whole_config_debug}"
+        );
     }
 
     /// The renamed key: a client still sending the old `cargo` section fails the whole

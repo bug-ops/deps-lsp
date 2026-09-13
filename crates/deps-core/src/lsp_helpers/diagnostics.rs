@@ -8,6 +8,7 @@ use tower_lsp_server::ls_types::{
 use crate::licenses::{
     ViolationReason, evaluate as evaluate_license_policy, resolve_license_entries,
 };
+use crate::net_policy::RedactedUrl;
 use crate::osv::{ScanOutcome, diagnostic_severity_for};
 use crate::{
     ConcreteVersion, Dependency, Deprecation, FetchFailure, ParseResult, PublishTime,
@@ -883,13 +884,19 @@ fn offline_notice(
 /// Suppressed by: nothing. Suppresses: nothing.
 fn blocked_registry_diagnostics(diagnostics: &mut Vec<Diagnostic>, parse_result: &dyn ParseResult) {
     for (range, class, raw_value) in parse_result.blocked_registries() {
+        // #936: `raw_value` is a raw, unvalidated `registry`/`registry-index` literal that can
+        // carry a query-string credential (userinfo is rejected earlier in the pipeline, but
+        // a query string is not) — redact before truncating so host/path survive for the
+        // message to stay identifiable while the credential never reaches this
+        // client-visible diagnostic.
+        let redacted_value = RedactedUrl::new(&raw_value).to_string();
         diagnostics.push(Diagnostic {
             range,
             severity: Some(DiagnosticSeverity::INFORMATION),
             message: format!(
                 "registry index \"{}\" blocked by registries.workspace_registries policy \
                  (host class: {class})",
-                truncate_for_diagnostic(&raw_value, MAX_BLOCKED_REGISTRY_MESSAGE_VALUE_CHARS)
+                truncate_for_diagnostic(&redacted_value, MAX_BLOCKED_REGISTRY_MESSAGE_VALUE_CHARS)
             ),
             source: Some("deps-lsp".into()),
             ..Default::default()
@@ -1927,6 +1934,82 @@ mod tests {
             !blocked_diagnostic.message.contains("CloudMetadata"),
             "message must use the Display form, not the Debug identifier"
         );
+    }
+
+    /// #936: `raw_value` can carry a query-string credential (userinfo is rejected earlier
+    /// in the pipeline, but a query string is not) — the blocked-registry diagnostic message
+    /// must redact it before it reaches the client, while still naming the host so the
+    /// message stays identifiable.
+    #[test]
+    fn test_generate_diagnostics_from_cache_blocked_registry_message_redacts_query_string_credential()
+     {
+        use crate::net_policy::HostClass;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        struct BlockedRegistryParseResult {
+            deps: Vec<MockDep>,
+            uri: Uri,
+            blocked: Vec<(Range, HostClass, String)>,
+        }
+
+        impl ParseResult for BlockedRegistryParseResult {
+            fn dependencies(&self) -> Vec<&dyn Dependency> {
+                self.deps.iter().map(|d| d as &dyn Dependency).collect()
+            }
+            fn workspace_root(&self) -> Option<&std::path::Path> {
+                None
+            }
+            fn uri(&self) -> &Uri {
+                &self.uri
+            }
+            fn blocked_registries(&self) -> Vec<(Range, HostClass, String)> {
+                self.blocked.clone()
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        let name_range = Range::new(Position::new(0, 0), Position::new(0, 14));
+        let formatter = MockFormatter;
+        let parse_result = BlockedRegistryParseResult {
+            deps: vec![MockDep {
+                name: "internal-crate".into(),
+                version_req: "1.0.0".into(),
+                version_range: Range::new(Position::new(0, 20), Position::new(0, 25)),
+                name_range,
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+            blocked: vec![(
+                name_range,
+                HostClass::CloudMetadata,
+                "https://index.mycorp.dev/api?api_key=SECRET".to_string(),
+            )],
+        };
+
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        let blocked_diagnostic = diagnostics
+            .iter()
+            .find(|d| d.message.contains("blocked"))
+            .expect("expected a blocked-registry diagnostic");
+        assert!(
+            !blocked_diagnostic.message.contains("SECRET"),
+            "{blocked_diagnostic:?}"
+        );
+        assert!(blocked_diagnostic.message.contains("index.mycorp.dev"));
+        assert!(blocked_diagnostic.message.contains("/api"));
     }
 
     #[test]
