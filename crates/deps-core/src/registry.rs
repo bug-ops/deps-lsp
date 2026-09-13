@@ -818,6 +818,26 @@ pub fn is_existence_wildcard_str(req: &str) -> bool {
     matches!(req.trim(), "" | "*")
 }
 
+/// Builds the canonical existence-check requirement (`"*"`) [`is_existence_wildcard`] recognizes.
+///
+/// [`Registry::select_latest_matching`] callers pass this when they want "the newest version
+/// for display purposes" rather than an upgrade recommendation against a real constraint.
+/// Centralizes what was three independent `VersionReq::new("*")` call sites (hover, version
+/// completion, code-action quick-fixes) all constructing the identical value for the
+/// identical purpose.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::{existence_wildcard_req, is_existence_wildcard};
+///
+/// assert!(is_existence_wildcard(&existence_wildcard_req()));
+/// ```
+#[must_use]
+pub fn existence_wildcard_req() -> crate::VersionReq {
+    crate::VersionReq::new("*")
+}
+
 /// Index of the version an *existence* check should report as "latest", ignoring `req`
 /// entirely.
 ///

@@ -804,17 +804,39 @@ impl VersionDisplayItem {
 /// deprecated npm package) is not excluded here — only a hard yank is
 /// (#347): excluding advisory-only flags would leave a deprecated-but-
 /// installable package with zero version completions.
+///
+/// `latest_idx` is the index, within `versions` (before this function's own
+/// yanked-filter/cap), that the caller's [`crate::Registry::select_latest_matching`] picked —
+/// the exact same call hover's `live_latest_idx` delegates to (#313, `lsp_helpers/hover.rs`).
+/// It is threaded in rather than re-derived here with a generic [`Version::is_stable`] scan:
+/// an ecosystem whose `select_latest_matching` applies a ranking preference beyond plain
+/// resolvability (e.g. npm's #338 NFR-002 preferring a non-deprecated version over a newer
+/// deprecated one, or a fallback pick for an all-prerelease list) must get that identical
+/// preference reflected here too, rather than completion/code-actions independently picking a
+/// different "latest" than hover and disagreeing about what a click actually writes (#952).
+/// Matched by the pre-filter index (not a version string) so two entries sharing a version
+/// string can never both — or wrongly — receive the marker (mirrors `hover.rs`'s own
+/// index-based match for the same reason).
 pub fn prepare_version_display_items<V: AsRef<dyn Version>>(
     versions: &[V],
     package_name: &PackageName,
+    latest_idx: Option<usize>,
 ) -> Vec<VersionDisplayItem> {
     versions
         .iter()
         .map(|v| v.as_ref())
-        .filter(|v| !v.removal_status().blocks_resolution())
+        .enumerate()
+        .filter(|(_, v)| !v.removal_status().blocks_resolution())
         .take(MAX_COMPLETION_VERSIONS)
         .enumerate()
-        .map(|(index, version)| VersionDisplayItem::new(version, package_name, index, index == 0))
+        .map(|(display_index, (orig_index, version))| {
+            VersionDisplayItem::new(
+                version,
+                package_name,
+                display_index,
+                Some(orig_index) == latest_idx,
+            )
+        })
         .collect()
 }
 
@@ -939,7 +961,10 @@ pub async fn complete_package_names_generic(
 ///
 /// Up to 5 completion items for non-yanked versions, filtered by prefix.
 /// If no versions match the prefix, returns up to 5 non-yanked versions.
-/// The first item (latest version) is marked with "(latest)" suffix and preselected.
+/// Whichever item the registry resolves as latest, via
+/// [`Registry::select_latest_matching`](crate::Registry::select_latest_matching) — not
+/// necessarily the first — is marked with "(latest)" suffix and preselected; a pre-release or
+/// deprecated release sorting above it in fetch order is offered unlabeled instead (#952).
 ///
 /// # Examples
 ///
@@ -1040,18 +1065,27 @@ pub async fn complete_versions_generic_from(
     };
 
     let clean_prefix = prefix.trim_start_matches(operator_chars).trim();
-
-    // Filter versions by prefix first
-    let filtered_versions: Vec<_> = versions
+    let has_prefix_match = versions
         .iter()
-        .filter(|v| v.version_string().as_str().starts_with(clean_prefix))
-        .collect();
+        .any(|v| v.version_string().as_str().starts_with(clean_prefix));
 
-    // Use filtered or all versions, prepare_version_display_items will handle yanked filtering
-    let display_items = if filtered_versions.is_empty() {
-        prepare_version_display_items(&versions, package_name)
+    // The same registry-delegated pick `prepare_version_display_items` needs (see its doc
+    // comment) — computed over whichever slice is actually about to be displayed (the
+    // prefix-narrowed subset, when non-empty, same as the fallback-to-all-versions case
+    // right below), so a prefix match still gets the correct stable/non-deprecated entry
+    // tagged within itself rather than unconditionally the first one shown.
+    let wildcard_req = crate::existence_wildcard_req();
+    let display_items = if has_prefix_match {
+        let filtered_versions: Vec<Box<dyn Version>> = versions
+            .into_iter()
+            .filter(|v| v.version_string().as_str().starts_with(clean_prefix))
+            .collect();
+        let latest_idx = registry.select_latest_matching(&filtered_versions, &wildcard_req);
+        prepare_version_display_items(&filtered_versions, package_name, latest_idx)
     } else {
-        prepare_version_display_items(&filtered_versions, package_name)
+        // Use all versions, prepare_version_display_items will handle yanked filtering
+        let latest_idx = registry.select_latest_matching(&versions, &wildcard_req);
+        prepare_version_display_items(&versions, package_name, latest_idx)
     };
 
     // Don't provide text_edit range - let LSP client insert at cursor position
@@ -1362,6 +1396,19 @@ mod tests {
         ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Metadata>>>>
         {
             Box::pin(async move { Ok(vec![]) })
+        }
+
+        // Mirrors the real 3-rung existence ladder every ecosystem's own `select_latest_matching`
+        // delegates to (`crate::select_latest_for_existence`), rather than the trait default
+        // (always `None`) — needed so this mock exercises the same registry-delegated `(latest)`
+        // pick `prepare_version_display_items` now requires (#952), not an unconditionally
+        // absent one that would leave every version untagged regardless of pre-release status.
+        fn select_latest_matching(
+            &self,
+            versions: &[Box<dyn crate::Version>],
+            _req: &crate::VersionReq,
+        ) -> Option<usize> {
+            crate::select_latest_for_existence(versions, |v| v.as_ref())
         }
 
         fn as_any(&self) -> &dyn Any {
@@ -2740,7 +2787,7 @@ mod tests {
             }),
         ];
 
-        let items = prepare_version_display_items(&versions, &pkg("test"));
+        let items = prepare_version_display_items(&versions, &pkg("test"), Some(0));
 
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].version, "1.0.0");
@@ -2763,7 +2810,7 @@ mod tests {
             })
             .collect();
 
-        let items = prepare_version_display_items(&versions, &pkg("test"));
+        let items = prepare_version_display_items(&versions, &pkg("test"), Some(0));
 
         assert_eq!(items.len(), 5);
         assert_eq!(items[0].version, "1.0.0");
@@ -2776,7 +2823,7 @@ mod tests {
     fn test_prepare_version_display_items_empty() {
         let versions: Vec<std::sync::Arc<dyn crate::Version>> = vec![];
 
-        let items = prepare_version_display_items(&versions, &pkg("test"));
+        let items = prepare_version_display_items(&versions, &pkg("test"), None);
 
         assert_eq!(items.len(), 0);
     }
@@ -2796,9 +2843,95 @@ mod tests {
             }),
         ];
 
-        let items = prepare_version_display_items(&versions, &pkg("test"));
+        let items = prepare_version_display_items(&versions, &pkg("test"), Some(0));
 
         assert_eq!(items.len(), 0);
+    }
+
+    #[test]
+    fn test_prepare_version_display_items_tags_caller_supplied_index_not_raw_zero() {
+        // `is_latest` follows the caller-supplied `latest_idx` — the registry-delegated pick
+        // (#952) — even when that index isn't 0, e.g. because the registry ranked a
+        // pre-release below a stable release in its own `select_latest_matching`.
+        let versions: Vec<std::sync::Arc<dyn crate::Version>> = vec![
+            std::sync::Arc::new(MockVersion {
+                version: "13.0.5-beta1".into(),
+                yanked: false,
+                prerelease: true,
+            }),
+            std::sync::Arc::new(MockVersion {
+                version: "13.0.4".into(),
+                yanked: false,
+                prerelease: false,
+            }),
+            std::sync::Arc::new(MockVersion {
+                version: "13.0.3".into(),
+                yanked: false,
+                prerelease: false,
+            }),
+        ];
+
+        let items = prepare_version_display_items(&versions, &pkg("test"), Some(1));
+
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].version, "13.0.5-beta1");
+        assert!(!items[0].is_latest, "index 0 was not the supplied pick");
+        assert_eq!(items[1].version, "13.0.4");
+        assert_eq!(items[1].label, "13.0.4 (latest)");
+        assert!(items[1].is_latest);
+        assert_eq!(items[2].version, "13.0.3");
+        assert!(!items[2].is_latest);
+    }
+
+    #[test]
+    fn test_prepare_version_display_items_none_latest_idx_tags_nothing() {
+        // A registry-delegated pick of `None` (e.g. every candidate filtered/exhausted)
+        // must not fall back to tagging raw index 0.
+        let versions: Vec<std::sync::Arc<dyn crate::Version>> =
+            vec![std::sync::Arc::new(MockVersion {
+                version: "1.0.0".into(),
+                yanked: false,
+                prerelease: false,
+            })];
+
+        let items = prepare_version_display_items(&versions, &pkg("test"), None);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "1.0.0");
+        assert!(!items[0].is_latest);
+    }
+
+    #[test]
+    fn test_prepare_version_display_items_latest_idx_maps_through_internal_yanked_filter() {
+        // `latest_idx` refers to a position in the *pre-filter* `versions` slice; this
+        // function's own internal yanked filter must not shift which entry it points to.
+        let versions: Vec<std::sync::Arc<dyn crate::Version>> = vec![
+            std::sync::Arc::new(MockVersion {
+                version: "2.0.0".into(),
+                yanked: true,
+                prerelease: false,
+            }),
+            std::sync::Arc::new(MockVersion {
+                version: "1.9.0".into(),
+                yanked: false,
+                prerelease: false,
+            }),
+            std::sync::Arc::new(MockVersion {
+                version: "1.8.0".into(),
+                yanked: false,
+                prerelease: false,
+            }),
+        ];
+
+        // Caller picked pre-filter index 2 ("1.8.0") as latest.
+        let items = prepare_version_display_items(&versions, &pkg("test"), Some(2));
+
+        assert_eq!(items.len(), 2, "the yanked entry is still filtered out");
+        assert_eq!(items[0].version, "1.9.0");
+        assert!(!items[0].is_latest);
+        assert_eq!(items[1].version, "1.8.0");
+        assert_eq!(items[1].label, "1.8.0 (latest)");
+        assert!(items[1].is_latest);
     }
 
     #[test]
@@ -3381,6 +3514,16 @@ mod tests {
             Box::pin(async move { Ok(vec![]) })
         }
 
+        // See `MockRegistry`'s identical override above: without this, `select_latest_matching`
+        // defaults to `None` and no item in this test would ever carry the `(latest)` label.
+        fn select_latest_matching(
+            &self,
+            versions: &[Box<dyn crate::Version>],
+            _req: &crate::VersionReq,
+        ) -> Option<usize> {
+            crate::select_latest_for_existence(versions, |v| v.as_ref())
+        }
+
         fn as_any(&self) -> &dyn Any {
             self
         }
@@ -3617,6 +3760,147 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].label, "v1.9.0 (latest)");
         assert_eq!(items[1].label, "v1.9.1");
+    }
+
+    #[tokio::test]
+    async fn test_complete_versions_generic_from_skips_prerelease_at_raw_top() {
+        // Regression for #952 (sibling of #313, previously hover-only): the raw
+        // registry-fetch-order top entry is a pre-release (Maven spring-boot-starter-web
+        // 4.2.0-M1, NuGet Newtonsoft.Json 13.0.5-beta1 shape). The completion dropdown's
+        // `(latest)` label AND `preselect` must land on the first stable entry, sourced from
+        // `Registry::select_latest_matching` (the same call hover delegates to), not raw
+        // index 0.
+        let registry = MockRegistry {
+            versions: vec![
+                MockVersion {
+                    version: "13.0.5-beta1".into(),
+                    yanked: false,
+                    prerelease: true,
+                },
+                MockVersion {
+                    version: "13.0.4".into(),
+                    yanked: false,
+                    prerelease: false,
+                },
+                MockVersion {
+                    version: "13.0.3".into(),
+                    yanked: false,
+                    prerelease: false,
+                },
+            ],
+        };
+
+        let items = complete_versions_generic(
+            &registry,
+            &pkg("Newtonsoft.Json"),
+            "",
+            &[],
+            FreshnessSettings::default(),
+        )
+        .await;
+
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].label, "13.0.5-beta1");
+        assert_eq!(
+            items[0].preselect,
+            Some(false),
+            "the pre-release must not be preselected"
+        );
+        assert_eq!(items[1].label, "13.0.4 (latest)");
+        assert_eq!(
+            items[1].preselect,
+            Some(true),
+            "the first stable entry must be preselected instead"
+        );
+        assert_eq!(items[2].label, "13.0.3");
+        assert_eq!(items[2].preselect, Some(false));
+    }
+
+    #[tokio::test]
+    async fn test_complete_versions_generic_from_all_prerelease_still_marks_a_latest() {
+        // Critic C1: when every fetched version is a pre-release, the completion dropdown
+        // must still agree with hover's own fallback — hover's `live_latest_idx` (via
+        // `Registry::select_latest_matching`/`select_latest_for_existence`) falls through to
+        // ranking the newest overall rather than tagging nothing, for the ~10 of 14
+        // ecosystems that share this existence ladder. Marking no entry here (the raw
+        // `is_prerelease()`-scan approach this fix replaced) would silently drop the
+        // preselected completion item hover still offers.
+        let registry = MockRegistry {
+            versions: vec![
+                MockVersion {
+                    version: "2.0.0-beta2".into(),
+                    yanked: false,
+                    prerelease: true,
+                },
+                MockVersion {
+                    version: "2.0.0-beta1".into(),
+                    yanked: false,
+                    prerelease: true,
+                },
+            ],
+        };
+
+        let items = complete_versions_generic(
+            &registry,
+            &pkg("test-pkg"),
+            "",
+            &[],
+            FreshnessSettings::default(),
+        )
+        .await;
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].label, "2.0.0-beta2 (latest)");
+        assert_eq!(items[0].preselect, Some(true));
+        assert_eq!(items[1].label, "2.0.0-beta1");
+        assert_eq!(items[1].preselect, Some(false));
+    }
+
+    #[tokio::test]
+    async fn test_complete_versions_generic_from_prefers_non_deprecated_over_newer_deprecated() {
+        // Critic S1: the identical #952 defect class with "deprecated" substituted for
+        // "pre-release" (npm's #338 NFR-002 shape). `is_stable()` alone would still tag the
+        // newer `AdvisoryDeprecated` entry; delegating to the registry's own
+        // `select_latest_matching` (here, the shared 3-rung ladder gating on `is_flagged()`)
+        // must prefer the older, non-flagged release instead, agreeing with hover.
+        use crate::lsp_helpers::test_support::{
+            MockRegistryPreferringUnflagged, MockVersionWithStatus,
+        };
+
+        let registry = MockRegistryPreferringUnflagged {
+            versions: vec![
+                MockVersionWithStatus {
+                    version: "2.0.0".into(),
+                    status: crate::RemovalStatus::AdvisoryDeprecated,
+                },
+                MockVersionWithStatus {
+                    version: "1.9.0".into(),
+                    status: crate::RemovalStatus::Available,
+                },
+            ],
+        };
+
+        let items = complete_versions_generic(
+            &registry,
+            &pkg("test-pkg"),
+            "",
+            &[],
+            FreshnessSettings::default(),
+        )
+        .await;
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(
+            items[0].label, "2.0.0",
+            "the deprecated entry is still offered"
+        );
+        assert_eq!(
+            items[0].preselect,
+            Some(false),
+            "but must not be labeled/preselected as latest"
+        );
+        assert_eq!(items[1].label, "1.9.0 (latest)");
+        assert_eq!(items[1].preselect, Some(true));
     }
 
     // --- Feature completion detection tests ---
@@ -4012,7 +4296,7 @@ mod tests {
             }),
         ];
 
-        let display_items = prepare_version_display_items(&versions, &pkg("test"));
+        let display_items = prepare_version_display_items(&versions, &pkg("test"), Some(0));
         assert_eq!(display_items.len(), 2, "yanked filtering must be unchanged");
 
         let now = PublishTime::now();
