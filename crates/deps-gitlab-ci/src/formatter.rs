@@ -337,6 +337,7 @@ mod tests {
             version_literal: None,
             source,
             is_plain_scalar: true,
+            is_alias_occurrence: false,
             kind: crate::types::IncludeKind::Project,
             host: crate::types::HostRef::Unresolved("$CI_SERVER_FQDN".into()),
             pin,

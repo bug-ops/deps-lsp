@@ -91,6 +91,12 @@ fn sha_pin_quickfix_kind(
     gl_dep: &GitlabCiDependency,
     formatter: &GitlabCiFormatter,
 ) -> Option<ShaPinQuickfixKind> {
+    // FR-010: the single withholding gate for all three SHA-pin call sites (issue #643) —
+    // an alias token (`ref: *pin`) is not an editable literal, so no quickfix may ever
+    // target it. Checked before consulting `pin` at all.
+    if gl_dep.is_alias_occurrence {
+        return None;
+    }
     match &gl_dep.pin {
         Some(PinStyle::Tag) => Some(ShaPinQuickfixKind::StaticTagIndex),
         Some(PinStyle::Latest | PinStyle::Partial) if gl_dep.kind == IncludeKind::Component => {
@@ -264,6 +270,24 @@ impl Ecosystem for GitlabCiEcosystem {
             }) else {
                 return Completions::default();
             };
+            // FR-011: withheld independently of `sha_pin_quickfix_kind` — completion is not
+            // reached through that function. An alias token's `version_range` is not a
+            // literal, so splicing a version string at the cursor would corrupt it.
+            //
+            // #912 critic S3: `deps_core::completion::detect_completion_context` already
+            // rejects a non-literal `version_range` generically (`#922`,
+            // `dependency_version_range_is_literal`), so for a genuine alias site this
+            // `CompletionContext::Version` branch — and this whole `complete_version` call
+            // — is never reached in the first place. This local check is kept as explicit
+            // defense-in-depth (and as FR-011's literal specification), not as the
+            // load-bearing gate.
+            if dep
+                .as_any()
+                .downcast_ref::<GitlabCiDependency>()
+                .is_some_and(|gl_dep| gl_dep.is_alias_occurrence)
+            {
+                return Completions::default();
+            }
 
             deps_core::completion::complete_versions_generic_from(
                 self.registry.as_ref(),
@@ -1101,6 +1125,7 @@ mod tests {
             version_literal: None,
             source: deps_core::parser::DependencySource::CustomRegistry { url: "x".into() },
             is_plain_scalar: true,
+            is_alias_occurrence: false,
             kind: IncludeKind::Component,
             host,
             pin: Some(PinStyle::Tag),
@@ -1210,6 +1235,32 @@ mod tests {
         assert_eq!(found.severity, Some(DiagnosticSeverity::HINT));
         assert!(found.message.contains("v1.0.0"));
         assert!(!found.message.contains("manual edit"));
+    }
+
+    /// #912 critic S1 regression: an aliased `project:` next to a **literal** `ref:` must
+    /// not carry the "(manual edit — no automated fix available for this ref)" suffix —
+    /// `sha_pin_quickfix_kind`'s `Tag` arm always classifies `Some(StaticTagIndex)`
+    /// regardless of `TagIndex` cache state (see the cold-cache test above), and before
+    /// the S1 fix the entry-wide `is_alias_occurrence` OR incorrectly withheld this even
+    /// though the edit path only ever targets the literal `ref:`.
+    #[tokio::test]
+    async fn test_mutable_ref_pin_diagnostic_omits_suffix_when_only_project_is_aliased() {
+        let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+        let content =
+            ".proj: &proj group/project-a\ninclude:\n  - project: *proj\n    ref: v1.0.0\n";
+
+        let diagnostics = diagnostics_for(content, &uri).await;
+
+        let found = diagnostics
+            .iter()
+            .find(|d| d.code == Some(mutable_ref_pin_code()))
+            .expect("expected the mutable-ref-pin diagnostic for a PinStyle::Tag include");
+        assert!(found.message.contains("v1.0.0"));
+        assert!(
+            !found.message.contains("manual edit"),
+            "an aliased project: alone must not withhold the literal ref:'s quickfix: {}",
+            found.message
+        );
     }
 
     /// S3 cold-cache negative test (architect's plan, tester re-review): documents the one
@@ -1802,6 +1853,7 @@ mod tests {
                 mirrors_crates_io: false,
             },
             is_plain_scalar: true,
+            is_alias_occurrence: false,
             kind: IncludeKind::Component,
             host: HostRef::Literal(crate::host::GitlabHost::for_test(&host_bare)),
             pin: Some(pin),
@@ -2019,6 +2071,7 @@ mod tests {
                 version_literal: None,
                 source,
                 is_plain_scalar: true,
+                is_alias_occurrence: false,
                 kind,
                 host: HostRef::Literal(crate::host::GitlabHost::for_test("gitlab.com")),
                 pin: Some(pin),
@@ -2491,6 +2544,7 @@ mod tests {
             version_literal: None,
             source,
             is_plain_scalar: true,
+            is_alias_occurrence: false,
             kind: IncludeKind::Project,
             host: HostRef::Unresolved("$CI_SERVER_FQDN".to_string()),
             pin: Some(PinStyle::Tag),
@@ -2610,5 +2664,197 @@ mod tests {
         .await;
         assert_eq!(via_dispatch.items, direct);
         assert!(!via_dispatch.is_incomplete);
+    }
+
+    // --- #912: alias-occurrence edit/completion withholding (spec FR-010/FR-011) ---
+
+    /// An alias-site dependency for the withholding tests below — mirrors
+    /// `dispatch_test_dep` (`project:`/`ref:` shape, `name_range != version_range`, per
+    /// EC-016/SC-006: the `component:` shape (`name_range == version_range`) must NOT be
+    /// used for an FR-011 test, since `CompletionContext::Version` is unreachable there
+    /// regardless of FR-011 — see spec §9 P2/EC-017) but with `is_alias_occurrence: true`.
+    fn alias_dispatch_test_dep(
+        name_range: tower_lsp_server::ls_types::Range,
+        version_range: tower_lsp_server::ls_types::Range,
+        pin: Option<PinStyle>,
+    ) -> crate::types::GitlabCiDependency {
+        crate::types::GitlabCiDependency {
+            name: "org/proj".into(),
+            name_range,
+            version_req: Some("v1.0.0".into()),
+            version_range: Some(version_range),
+            version_literal: None,
+            source: deps_core::parser::DependencySource::CustomRegistry {
+                url: "https://gitlab.example".into(),
+            },
+            is_plain_scalar: false,
+            is_alias_occurrence: true,
+            kind: IncludeKind::Project,
+            host: HostRef::Unresolved("$CI_SERVER_FQDN".to_string()),
+            pin,
+            project_path: "org/proj".to_string(),
+        }
+    }
+
+    /// FR-010: `sha_pin_quickfix_kind` returns `None` for an alias-occurrence dependency
+    /// before consulting `pin` at all — even a `PinStyle::Tag` pin, which would otherwise
+    /// always classify `Some(StaticTagIndex)`.
+    #[test]
+    fn test_sha_pin_quickfix_kind_withholds_for_alias_occurrence() {
+        let formatter = GitlabCiFormatter::new(Arc::new(DashMap::new()), Arc::new(DashMap::new()));
+        let range = tower_lsp_server::ls_types::Range::default();
+        let gl_dep = alias_dispatch_test_dep(range, range, Some(PinStyle::Tag));
+        assert!(sha_pin_quickfix_kind(&gl_dep, &gl_dep, &formatter).is_none());
+    }
+
+    /// FR-010/US-002: the "Pin to commit SHA" code action must never be offered at an
+    /// alias site, even when a real `TagIndex` entry would otherwise resolve one.
+    #[tokio::test]
+    async fn test_generate_code_actions_withholds_sha_pin_for_alias_occurrence() {
+        let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+        let version_range =
+            tower_lsp_server::ls_types::Range::new(Position::new(2, 9), Position::new(2, 13));
+        let name_range =
+            tower_lsp_server::ls_types::Range::new(Position::new(1, 4), Position::new(1, 12));
+        let gl_dep = alias_dispatch_test_dep(name_range, version_range, Some(PinStyle::Tag));
+        let parse_result = crate::types::GitlabCiParseResult {
+            dependencies: vec![gl_dep],
+            routes: vec![],
+            uri: uri.clone(),
+            dependency_truncation: None,
+        };
+        let content = "include:\n  - project: org/proj\n    ref: *pin\n";
+        let cache = Arc::new(HttpCache::new());
+        let eco = GitlabCiEcosystem::new(cache);
+        let cached = std::collections::HashMap::new();
+        let resolved = std::collections::HashMap::new();
+
+        let actions = eco
+            .generate_code_actions(
+                &parse_result,
+                Position::new(2, 11),
+                &uri,
+                deps_core::VersionData::new(&cached, &resolved),
+                content,
+            )
+            .await;
+        assert!(
+            actions.is_empty(),
+            "expected no quickfix at an alias site: {actions:?}"
+        );
+    }
+
+    /// FR-011/EC-016/SC-006: version completion is withheld at an alias site using the
+    /// `project:`/`ref:` shape (`name_range != version_range`) — the shape where
+    /// `CompletionContext::Version` is actually reachable, so this is a meaningful test of
+    /// the gate rather than a vacuous one (see [`alias_dispatch_test_dep`]'s doc comment).
+    #[tokio::test]
+    async fn test_generate_completions_withholds_version_completion_for_alias_occurrence() {
+        let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+        let name_range =
+            tower_lsp_server::ls_types::Range::new(Position::new(1, 4), Position::new(1, 12));
+        let version_range =
+            tower_lsp_server::ls_types::Range::new(Position::new(2, 9), Position::new(2, 13));
+        let dep = alias_dispatch_test_dep(name_range, version_range, Some(PinStyle::Tag));
+        let parse_result = crate::types::GitlabCiParseResult {
+            dependencies: vec![dep],
+            routes: vec![],
+            uri,
+            dependency_truncation: None,
+        };
+        let content = "include:\n  - project: org/proj\n    ref: *pin\n";
+        let cache = Arc::new(HttpCache::new());
+        let eco = GitlabCiEcosystem::new(cache);
+
+        // Cursor inside the alias token's `version_range`.
+        let result = eco
+            .generate_completions(
+                &parse_result,
+                Position::new(2, 11),
+                content,
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
+        assert_eq!(result, Completions::default());
+    }
+
+    /// #912 critic S3: `#922`'s `dependency_version_range_is_literal` guard already blocks
+    /// `detect_completion_context` from ever returning `Version` for a `*`-leading
+    /// `version_range`, so the `generate_completions`-level test above no longer exercises
+    /// this ecosystem's own FR-011 gate — it now passes even without it. This test calls
+    /// `complete_version` directly, bypassing `detect_completion_context` entirely, to pin
+    /// that the local gate itself still withholds (defense-in-depth, not dead code).
+    #[tokio::test]
+    async fn test_complete_version_directly_withholds_for_alias_occurrence() {
+        let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+        let name_range =
+            tower_lsp_server::ls_types::Range::new(Position::new(1, 4), Position::new(1, 12));
+        let version_range =
+            tower_lsp_server::ls_types::Range::new(Position::new(2, 9), Position::new(2, 13));
+        let dep = alias_dispatch_test_dep(name_range, version_range, Some(PinStyle::Tag));
+        let parse_result = crate::types::GitlabCiParseResult {
+            dependencies: vec![dep],
+            routes: vec![],
+            uri,
+            dependency_truncation: None,
+        };
+        let cache = Arc::new(HttpCache::new());
+        let eco = GitlabCiEcosystem::new(cache);
+        let request = deps_core::completion::CompletionRequest::new(
+            &parse_result,
+            Position::new(2, 11),
+            deps_core::FreshnessSettings::default(),
+        );
+
+        let result = eco
+            .complete_version(request, PackageName::new("org/proj"), "v1.0".to_string())
+            .await;
+        assert_eq!(result, Completions::default());
+    }
+
+    /// FR-010/US-002: the bulk "pin all to SHA" lens must not produce an edit for an
+    /// alias-occurrence dependency, even when its pin would otherwise resolve one.
+    #[test]
+    fn test_collect_pin_all_to_sha_edits_withholds_for_alias_occurrence() {
+        let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+        let range =
+            tower_lsp_server::ls_types::Range::new(Position::new(0, 0), Position::new(0, 4));
+        let gl_dep = alias_dispatch_test_dep(range, range, Some(PinStyle::Tag));
+        let parse_result = crate::types::GitlabCiParseResult {
+            dependencies: vec![gl_dep],
+            routes: vec![],
+            uri,
+            dependency_truncation: None,
+        };
+        let cache = Arc::new(HttpCache::new());
+        let eco = GitlabCiEcosystem::new(cache);
+        let cached = std::collections::HashMap::new();
+        let resolved = std::collections::HashMap::new();
+
+        let edits = eco.collect_pin_all_to_sha_edits(
+            &parse_result,
+            deps_core::VersionData::new(&cached, &resolved),
+        );
+        assert!(edits.is_empty());
+    }
+
+    /// FR-010/#643: an alias-occurrence dependency's mutable-ref-pin diagnostic must carry
+    /// the "manual edit" suffix — `sha_pin_quickfix_kind` (which this message's suffix
+    /// decision reads) withholds regardless of `pin`, so the message stays honest about no
+    /// quickfix being available.
+    #[tokio::test]
+    async fn test_mutable_ref_pin_diagnostic_carries_manual_edit_suffix_for_alias_occurrence() {
+        let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+        let content = ".pin: &pin v1.2.3\ninclude:\n  - project: org/proj\n    ref: *pin\n";
+        let diagnostics = diagnostics_for(content, &uri).await;
+        let found = diagnostics
+            .iter()
+            .find(|d| d.code == Some(mutable_ref_pin_code()))
+            .expect("expected the mutable-ref-pin diagnostic for an alias-occurrence ref");
+        assert!(
+            found.message.contains("no automated fix available"),
+            "alias-occurrence message must carry the manual-edit suffix: {}",
+            found.message
+        );
     }
 }

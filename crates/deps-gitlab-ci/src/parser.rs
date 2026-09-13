@@ -32,13 +32,13 @@ use crate::types::{
 };
 use deps_core::lsp_helpers::{
     LineOffsetTable, MarkedScalar, byte_span_to_range, is_full_sha, is_tag_shaped,
-    warn_rejected_value,
+    marker_byte_offset, warn_rejected_value,
 };
 use deps_core::net_policy::RegistryAccessPolicy;
 use deps_core::parser::DependencySource;
 use deps_core::yaml_walk::{FrameKind, FrameStack, ScalarPosition};
 use deps_core::{DepsError, Result};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use tower_lsp_server::ls_types::Uri;
 use yaml_rust2::parser::{Event, MarkedEventReceiver, Parser};
 use yaml_rust2::scanner::Marker;
@@ -51,6 +51,18 @@ const MAX_HOSTS_PER_DOCUMENT: usize = 8;
 /// Placeholder display text for a `project:` include's implicit host, and for a
 /// `$CI_SERVER_FQDN`-relative `component:` include with no configured instance host.
 const CI_SERVER_FQDN: &str = "$CI_SERVER_FQDN";
+
+/// Maximum character length of one anchored scalar's text recorded into
+/// [`GitlabCiReceiver::anchors`] (spec FR-002/NFR-003). An anchor exceeding this degrades
+/// to the table-miss path (FR-005) — today's existing, safe behavior — rather than being
+/// recorded truncated.
+const MAX_ANCHOR_VALUE_CHARS: usize = 512;
+
+/// Maximum number of distinct anchor ids recorded into [`GitlabCiReceiver::anchors`] (spec
+/// FR-002/NFR-003), mirroring this crate's own `MAX_TAG_INDEX_ENTRIES` precedent
+/// (`registry.rs:92`). An anchor pushing the table past this bound degrades to the
+/// table-miss path (FR-005) the same as [`MAX_ANCHOR_VALUE_CHARS`].
+const MAX_ANCHOR_TABLE_ENTRIES: usize = 256;
 
 /// What a frame means for include-entry extraction purposes.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -109,10 +121,69 @@ fn key_for(role: FrameRole, text: &str) -> PendingKey {
     }
 }
 
-/// One raw scalar value captured from an include entry — see [`MarkedScalar`], whose
-/// `span()` resolves the byte span only after parsing completes, via a `line`/`col`-based
-/// lookup rather than `Marker::index()` (#879).
-type RawField = MarkedScalar;
+/// One raw value captured from an include entry: a literal scalar (see [`MarkedScalar`],
+/// whose `span()` resolves the byte span only after parsing completes, via a
+/// `line`/`col`-based lookup rather than `Marker::index()`, #879), or a same-file alias
+/// resolved through [`GitlabCiReceiver::anchors`] (spec FR-004). An alias variant's span is
+/// the alias **token** itself (`*name`), never the anchor's resolved text — see
+/// [`locate_alias_span`] — since the document text at the alias's marker is the token, not
+/// the text `text` holds.
+enum RawField {
+    /// A literal scalar value, captured directly from an `Event::Scalar`.
+    Literal(MarkedScalar),
+    /// A same-file alias to a tabled scalar anchor (spec FR-004) — `text` is the anchor's
+    /// recorded text (used for classification, exactly like a literal's), `line`/`col` are
+    /// the `Event::Alias`'s own marker (used only to locate the alias token's span).
+    Alias {
+        text: String,
+        line: usize,
+        col: usize,
+    },
+}
+
+impl RawField {
+    /// The field's resolved text — the anchor's text for an alias, matching what a literal
+    /// scalar's `MarkedScalar::text` would hold for the same value.
+    fn text(&self) -> &str {
+        match self {
+            Self::Literal(scalar) => scalar.text(),
+            Self::Alias { text, .. } => text,
+        }
+    }
+
+    /// Consumes the field, returning its resolved text (see [`Self::text`]).
+    fn into_text(self) -> String {
+        match self {
+            Self::Literal(scalar) => scalar.into_text(),
+            Self::Alias { text, .. } => text,
+        }
+    }
+
+    /// Whether the field was written as a plain (unquoted) literal scalar — always `false`
+    /// for an alias: an alias token has no quoting style of its own to be "plain" about.
+    fn is_plain(&self) -> bool {
+        match self {
+            Self::Literal(scalar) => scalar.is_plain(),
+            Self::Alias { .. } => false,
+        }
+    }
+
+    /// Whether this field was captured from a same-file alias (spec FR-009's
+    /// `is_alias_occurrence` carrier).
+    const fn is_alias(&self) -> bool {
+        matches!(self, Self::Alias { .. })
+    }
+
+    /// Resolves the field's raw byte span within `content` — a literal's via
+    /// [`MarkedScalar::span`], an alias's via [`locate_alias_span`] (spec
+    /// FR-006/FR-007): the alias token itself, never the anchor's resolved text.
+    fn span(&self, content: &str, table: &LineOffsetTable) -> Option<(usize, usize)> {
+        match self {
+            Self::Literal(scalar) => scalar.span(content, table),
+            Self::Alias { line, col, .. } => locate_alias_span(content, table, *line, *col),
+        }
+    }
+}
 
 /// One `include:` entry's raw, not-yet-classified field values, collected during the event
 /// stream and finalized into a [`GitlabCiDependency`] after parsing completes.
@@ -137,6 +208,14 @@ type Stack = FrameStack<FrameRole, PendingKey, RawEntry>;
 struct GitlabCiReceiver {
     stack: Stack,
     entries: Vec<RawEntry>,
+    /// Anchor id -> anchored scalar text, built during this same event-stream pass (spec
+    /// FR-001). Not scoped to `include:` — an anchor can be defined anywhere in the
+    /// document (e.g. at the document root) and aliased later inside `include:`. Bounded by
+    /// [`MAX_ANCHOR_VALUE_CHARS`]/[`MAX_ANCHOR_TABLE_ENTRIES`] (FR-002); never reset between
+    /// this crate's multi-document `spec:`-header parses, since a cross-document alias id
+    /// collision is already a whole-document load error in `yaml-rust2` before this code
+    /// runs (spec Data Model).
+    anchors: HashMap<usize, String>,
 }
 
 impl GitlabCiReceiver {
@@ -144,7 +223,27 @@ impl GitlabCiReceiver {
         Self {
             stack: Stack::new(),
             entries: Vec::new(),
+            anchors: HashMap::new(),
         }
+    }
+
+    /// Records `anchor_id`'s scalar text into [`Self::anchors`] (spec FR-001), unless
+    /// `anchor_id` is `0` (no anchor — `yaml-rust2`'s own "no anchor" sentinel, anchor ids
+    /// otherwise start at 1) or the value/table-size bound is exceeded (FR-002), in which
+    /// case any later alias to this id simply misses the table and degrades to the
+    /// existing, safe table-miss path (FR-005).
+    fn record_anchor(&mut self, anchor_id: usize, text: &str) {
+        if anchor_id == 0 {
+            return;
+        }
+        if text.chars().count() > MAX_ANCHOR_VALUE_CHARS {
+            return;
+        }
+        if self.anchors.len() >= MAX_ANCHOR_TABLE_ENTRIES && !self.anchors.contains_key(&anchor_id)
+        {
+            return;
+        }
+        self.anchors.insert(anchor_id, text.to_string());
     }
 
     fn push_container(&mut self, kind: FrameKind) {
@@ -194,45 +293,84 @@ impl MarkedEventReceiver for GitlabCiReceiver {
             Event::MappingStart(..) => self.push_container(FrameKind::Mapping),
             Event::SequenceStart(..) => self.push_container(FrameKind::Sequence),
             Event::MappingEnd | Event::SequenceEnd => self.pop_container(),
-            Event::Scalar(value, style, _anchor, _tag) => match self.stack.scalar_position() {
-                // A bare scalar sequence item (e.g. `include: - templates/x.yml`, the
-                // `local:` shorthand) carries nothing to record; irrelevant items are
-                // ignored the same way.
-                ScalarPosition::Outside => {}
+            Event::Scalar(value, style, anchor_id, _tag) => {
+                // FR-001: recorded regardless of scalar position — an anchor can be
+                // defined anywhere in the document (e.g. `.pin: &pin v1.2.3` at the
+                // document root, entirely outside `include:`), and this is the only
+                // event-stream pass this parser makes.
+                self.record_anchor(anchor_id, &value);
+                match self.stack.scalar_position() {
+                    // A bare scalar sequence item (e.g. `include: - templates/x.yml`, the
+                    // `local:` shorthand) carries nothing to record; irrelevant items are
+                    // ignored the same way.
+                    ScalarPosition::Outside => {}
+                    ScalarPosition::Key => {
+                        let role = self.stack.top_role_or(FrameRole::Irrelevant);
+                        self.stack.observe_key(key_for(role, &value));
+                    }
+                    ScalarPosition::Value => {
+                        if let Some(top) = self.stack.top_mut()
+                            && *top.role() == FrameRole::IncludeEntry
+                        {
+                            let field = RawField::Literal(MarkedScalar::new(value, style, &marker));
+                            match *top.pending_key() {
+                                PendingKey::Project => top.payload.project = Some(field),
+                                PendingKey::Ref => top.payload.ref_field = Some(field),
+                                PendingKey::Component => top.payload.component = Some(field),
+                                PendingKey::Template => top.payload.has_template = true,
+                                PendingKey::Remote => top.payload.has_remote = true,
+                                PendingKey::Local => top.payload.has_local = true,
+                                PendingKey::None | PendingKey::Include => {}
+                            }
+                        }
+                        self.stack.consume_value();
+                    }
+                }
+            }
+            // Spec FR-003/FR-004/FR-005: unlike a literal scalar, an alias's state
+            // transition depends on position alone (key vs. value), while the *capture*
+            // (FR-004) additionally depends on a value-table hit. Handling both together —
+            // rather than always calling `consume_value()`, as before this fix — closes the
+            // pre-existing `? *k` key-position desync (US-003/EC-004/EC-005): a key-position
+            // alias previously left the frame awaiting a key, silently misreading the
+            // entry's next real scalar as a key instead of a value.
+            Event::Alias(id) => match self.stack.scalar_position() {
+                ScalarPosition::Outside => self.stack.consume_value(),
                 ScalarPosition::Key => {
-                    let role = self.stack.top_role_or(FrameRole::Irrelevant);
-                    self.stack.observe_key(key_for(role, &value));
+                    // FR-003: an alias in key position (`? *k`) is never itself resolved to
+                    // a recognized field key — mirrors a scalar key's `observe_key` call,
+                    // exactly like `key_for`'s own catch-all would for an unrecognized text
+                    // key.
+                    self.stack.observe_key(PendingKey::None);
                 }
                 ScalarPosition::Value => {
                     if let Some(top) = self.stack.top_mut()
                         && *top.role() == FrameRole::IncludeEntry
+                        && let Some(text) = self.anchors.get(&id)
                     {
+                        let field = RawField::Alias {
+                            text: text.clone(),
+                            line: marker.line(),
+                            col: marker.col(),
+                        };
                         match *top.pending_key() {
-                            PendingKey::Project => {
-                                top.payload.project =
-                                    Some(MarkedScalar::new(value, style, &marker));
-                            }
-                            PendingKey::Ref => {
-                                top.payload.ref_field =
-                                    Some(MarkedScalar::new(value, style, &marker));
-                            }
-                            PendingKey::Component => {
-                                top.payload.component =
-                                    Some(MarkedScalar::new(value, style, &marker));
-                            }
-                            PendingKey::Template => top.payload.has_template = true,
-                            PendingKey::Remote => top.payload.has_remote = true,
-                            PendingKey::Local => top.payload.has_local = true,
-                            PendingKey::None | PendingKey::Include => {}
+                            PendingKey::Project => top.payload.project = Some(field),
+                            PendingKey::Ref => top.payload.ref_field = Some(field),
+                            PendingKey::Component => top.payload.component = Some(field),
+                            // FR-004 scopes the capture to project/ref/component only — a
+                            // `template:`/`remote:`/`local:` alias (or an unrecognized key,
+                            // or `<<:`, EC-006) is left uncaptured, matching FR-005's
+                            // "capture nothing" default for every other pending key.
+                            PendingKey::Template
+                            | PendingKey::Remote
+                            | PendingKey::Local
+                            | PendingKey::None
+                            | PendingKey::Include => {}
                         }
                     }
                     self.stack.consume_value();
                 }
             },
-            // A `*anchor` alias value must still clear the pending-key slot, mirroring
-            // `deps-github-actions`'s identical fix — GitLab CI files use YAML anchors
-            // heavily for job reuse, so this is a real, not merely defensive, case here.
-            Event::Alias(_) => self.stack.consume_value(),
             Event::DocumentStart | Event::DocumentEnd => {
                 // A GitLab CI **component** file's `spec:` header form is multi-document
                 // (`spec: … \n--- \n job:`); resetting here stops document 1's nesting from
@@ -255,6 +393,51 @@ fn admit_origin(admitted: &mut HashSet<String>, origin: &str) -> bool {
     }
     admitted.insert(origin.to_string());
     true
+}
+
+/// Whether `c` is a character `yaml-rust2`'s scanner accepts inside an anchor/alias name
+/// (spec FR-006) — mirrors `yaml_rust2::char_traits::is_anchor_char` exactly: every
+/// character except space, tab, `\n`, `\r`, NUL, the BOM (`\u{feff}`), and the flow
+/// indicators `,`/`[`/`]`/`{`/`}`. Not an identifier-charset guess (`[A-Za-z0-9_-]`), which
+/// would truncate a verified-parsing name like `*пин` or `*a/b@c`.
+const fn is_gitlab_ci_alias_char(c: char) -> bool {
+    !matches!(
+        c,
+        ' ' | '\t' | '\n' | '\r' | '\0' | '\u{feff}' | ',' | '[' | ']' | '{' | '}'
+    )
+}
+
+/// Locates an `Event::Alias`'s own token span (`*name`) in `content` — spec FR-006/FR-007.
+///
+/// Anchored at the alias marker's own byte offset (via [`marker_byte_offset`], never
+/// `Marker::index()`, per #879) — never a literal-text search, which finds nothing at an
+/// alias site (the document text there is the token, not the anchor's resolved value).
+/// `yaml-rust2`'s alias marker points exactly at the leading `*`, which this span includes
+/// (FR-007): without it, an anchor name that happens to look version-shaped (`&v1 v1.2.3` /
+/// `*v1`, EC-014) would satisfy `literal_span_matches` and reopen an edit path meant to stay
+/// closed at an alias site. The scan is implicitly bounded to the marker's own line and is
+/// char-boundary-safe: [`is_gitlab_ci_alias_char`] excludes `\n`/`\r`, and advancing by
+/// `char::len_utf8()` never splits a multi-byte character.
+///
+/// Returns `None` if `(line, col)` does not resolve to a `*` (should not happen for a real
+/// `Event::Alias` marker, but this is a defensive guard, not an assumed invariant).
+fn locate_alias_span(
+    content: &str,
+    table: &LineOffsetTable,
+    line: usize,
+    col: usize,
+) -> Option<(usize, usize)> {
+    let start = marker_byte_offset(content, table, line, col);
+    let rest = content.get(start..)?;
+    let mut chars = rest.chars();
+    if chars.next() != Some('*') {
+        return None;
+    }
+    let mut end = start + '*'.len_utf8();
+    for c in chars.take_while(|&c| is_gitlab_ci_alias_char(c)) {
+        end += c.len_utf8();
+    }
+    Some((start, end))
 }
 
 /// Classifies a `project:` include's `ref:` text — the same two-way SHA/tag-shape test
@@ -366,24 +549,34 @@ fn build_project_dependency(
     let (raw_start, raw_end) = project_field.span(content, line_table)?;
     let name_range = byte_span_to_range(content, line_table, raw_start, raw_end);
     let project_is_plain = project_field.is_plain();
+    let project_is_alias = project_field.is_alias();
 
     let host = resolve_project_host(instance_host);
     let name = host_qualified_name(&host, project_field.text(), None);
 
-    let (version_req, version_range, pin, is_plain_scalar) = match ref_field {
+    let (version_req, version_range, pin, is_plain_scalar, is_alias_occurrence) = match ref_field {
         Some(ref_field) => {
             let (rs, re) = ref_field.span(content, line_table)?;
             let range = byte_span_to_range(content, line_table, rs, re);
             let pin = classify_project_pin(ref_field.text());
             let plain = ref_field.is_plain();
+            // #912 critic S1: scoped to the field that actually backs `version_range` —
+            // every SHA-pin/completion write path this flag gates only ever touches
+            // `version_range` (never `name_range`, which `literal_span_matches` already
+            // can't satisfy against a host-qualified name regardless). An OR with
+            // `project_is_alias` here withheld a fully auto-fixable literal `ref:` and
+            // appended a factually false "no automated fix available" suffix whenever
+            // `project:` alone was aliased.
+            let is_alias = ref_field.is_alias();
             (
                 Some(ref_field.into_text().into()),
                 Some(range),
                 Some(pin),
                 plain,
+                is_alias,
             )
         }
-        None => (None, None, None, project_is_plain),
+        None => (None, None, None, project_is_plain, project_is_alias),
     };
 
     let (source, route) = build_source_and_route(&host, EndpointKind::Tags);
@@ -397,6 +590,7 @@ fn build_project_dependency(
             version_literal: None,
             source,
             is_plain_scalar,
+            is_alias_occurrence,
             kind: IncludeKind::Project,
             host,
             pin,
@@ -414,6 +608,7 @@ fn build_component_dependency(
     admitted_origins: &mut HashSet<String>,
     component_field: RawField,
 ) -> Option<(GitlabCiDependency, Option<(String, GitlabRoute)>)> {
+    let is_alias_occurrence = component_field.is_alias();
     let raw_component = component_field.text();
     let Some((prefix, ref_text)) = raw_component.split_once('@') else {
         warn_rejected_value(
@@ -461,10 +656,21 @@ fn build_component_dependency(
     }
 
     let (raw_start, raw_end) = component_field.span(content, line_table)?;
-    let name_end = raw_start + prefix.len();
-    let ref_start = name_end + 1; // skip '@'
-    let name_range = byte_span_to_range(content, line_table, raw_start, name_end);
-    let version_range = byte_span_to_range(content, line_table, ref_start, raw_end);
+    // FR-008: at an alias site the document text is the alias token itself (`*x`), not
+    // `component@version` — `name_end = raw_start + prefix.len()` would slice into
+    // unrelated document text, so both ranges collapse onto the whole alias-token span
+    // instead of the usual name/version split.
+    let (name_range, version_range) = if is_alias_occurrence {
+        let alias_range = byte_span_to_range(content, line_table, raw_start, raw_end);
+        (alias_range, alias_range)
+    } else {
+        let name_end = raw_start + prefix.len();
+        let ref_start = name_end + 1; // skip '@'
+        (
+            byte_span_to_range(content, line_table, raw_start, name_end),
+            byte_span_to_range(content, line_table, ref_start, raw_end),
+        )
+    };
 
     let host = resolve_component_host(host_expr, policy, instance_host, admitted_origins);
     let name = host_qualified_name(&host, &project_path, Some(component_name));
@@ -480,6 +686,7 @@ fn build_component_dependency(
             version_literal: None,
             source,
             is_plain_scalar: component_field.is_plain(),
+            is_alias_occurrence,
             kind: IncludeKind::Component,
             host,
             pin: Some(pin),
@@ -1064,5 +1271,276 @@ mod tests {
         let dep = &result.dependencies[0];
         assert_eq!(dep.project_path, "org/proj");
         assert_eq!(slice(content, dep.version_range().unwrap()), "v1.0.0");
+    }
+
+    // --- #912: scalar YAML anchor/alias support inside `include:` (spec 056) ---
+
+    /// EC-001/US-001/SC-001: a scalar anchor used as `ref:`, aliased across two `include:`
+    /// entries, produces two dependency records — one per entry — each with its own
+    /// `version_range` at its own alias token, never collapsed onto one another or onto the
+    /// anchor's definition.
+    #[test]
+    fn test_ref_aliased_to_scalar_anchor_produces_one_dependency_per_entry() {
+        let (policy, instance_host) = ctx();
+        let content = ".pin: &pin v1.2.3\ninclude:\n  - project: group/project-a\n    ref: *pin\n  - project: group/project-b\n    ref: *pin\n";
+        let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host).unwrap();
+        assert_eq!(result.dependencies.len(), 2, "{:?}", result.dependencies);
+        for dep in &result.dependencies {
+            assert!(dep.is_alias_occurrence);
+            assert_eq!(slice(content, dep.version_range().unwrap()), "*pin");
+            assert_eq!(
+                dep.version_req.as_ref().map(deps_core::VersionReq::as_str),
+                Some("v1.2.3")
+            );
+            assert_eq!(dep.pin, Some(PinStyle::Tag));
+        }
+        assert_ne!(
+            result.dependencies[0].version_range(),
+            result.dependencies[1].version_range()
+        );
+    }
+
+    /// EC-002: `project: *proj` — a scalar anchor aliased directly as the `project:` value
+    /// — today a total dependency loss, fixed the same way as EC-001.
+    #[test]
+    fn test_project_aliased_to_scalar_anchor_resolves() {
+        let (policy, instance_host) = ctx();
+        let content =
+            ".proj: &proj group/project-a\ninclude:\n  - project: *proj\n    ref: v1.0.0\n";
+        let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host).unwrap();
+        assert_eq!(result.dependencies.len(), 1, "{:?}", result.dependencies);
+        let dep = &result.dependencies[0];
+        // #912 critic S1: `ref:` here is a literal, so `is_alias_occurrence` (scoped to
+        // the field backing `version_range`) must be `false` — an aliased `project:`
+        // alone must not withhold this fully auto-fixable `ref:`'s SHA-pin quickfix.
+        assert!(!dep.is_alias_occurrence);
+        assert_eq!(dep.project_path, "group/project-a");
+        assert_eq!(slice(content, dep.name_range), "*proj");
+        assert_eq!(slice(content, dep.version_range().unwrap()), "v1.0.0");
+    }
+
+    /// #912 critic S1 regression: an aliased `project:` next to a **literal** `ref:` must
+    /// not widen `is_alias_occurrence` — only a field that actually backs `version_range`
+    /// (here, the literal `ref:`) may set it, so this dependency is NOT an alias
+    /// occurrence and every downstream SHA-pin/completion path stays available for it.
+    #[test]
+    fn test_project_aliased_ref_literal_is_not_an_alias_occurrence() {
+        let (policy, instance_host) = ctx();
+        let content =
+            ".proj: &proj group/project-a\ninclude:\n  - project: *proj\n    ref: v2.0.0\n";
+        let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host).unwrap();
+        assert_eq!(result.dependencies.len(), 1, "{:?}", result.dependencies);
+        assert!(!result.dependencies[0].is_alias_occurrence);
+    }
+
+    /// #912 critic S1: conversely, an aliased `ref:` next to a literal `project:` IS an
+    /// alias occurrence — `version_range` (what every gated write path targets) is the
+    /// alias token here.
+    #[test]
+    fn test_literal_project_aliased_ref_is_an_alias_occurrence() {
+        let (policy, instance_host) = ctx();
+        let content = ".pin: &pin v1.2.3\ninclude:\n  - project: org/proj\n    ref: *pin\n";
+        let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host).unwrap();
+        assert_eq!(result.dependencies.len(), 1, "{:?}", result.dependencies);
+        assert!(result.dependencies[0].is_alias_occurrence);
+    }
+
+    /// EC-003/FR-008: `component: *c` — both `name_range` and `version_range` span the
+    /// alias token itself, and `build_component_dependency`'s normal `prefix.len()` offset
+    /// arithmetic is not run against the 2-character alias site.
+    #[test]
+    fn test_component_aliased_to_scalar_anchor_collapses_name_and_version_range() {
+        let (policy, instance_host) = ctx();
+        let content = ".c: &c gitlab.com/org/proj/comp@1.0.0\ninclude:\n  - component: *c\n";
+        let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host).unwrap();
+        assert_eq!(result.dependencies.len(), 1, "{:?}", result.dependencies);
+        let dep = &result.dependencies[0];
+        assert!(dep.is_alias_occurrence);
+        assert_eq!(dep.project_path, "org/proj");
+        assert_eq!(dep.name_range, dep.version_range().unwrap());
+        assert_eq!(slice(content, dep.name_range), "*c");
+        assert_eq!(
+            dep.version_req.as_ref().map(deps_core::VersionReq::as_str),
+            Some("1.0.0")
+        );
+    }
+
+    /// EC-004/US-003: `? *k` where `*k` aliases a **scalar** anchor (table hit), followed
+    /// by real `project:`/`ref:` scalars in the same entry — the key-position transition
+    /// must not desync the rest of the mapping's key/value alternation.
+    #[test]
+    fn test_alias_in_key_position_table_hit_does_not_desync_following_entry() {
+        let (policy, instance_host) = ctx();
+        let content = ".k: &k dummy\ninclude:\n  - ? *k\n    : ignored\n    project: org/proj\n    ref: v1.0.0\n";
+        let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host).unwrap();
+        assert_eq!(result.dependencies.len(), 1, "{:?}", result.dependencies);
+        let dep = &result.dependencies[0];
+        assert!(!dep.is_alias_occurrence);
+        assert_eq!(dep.project_path, "org/proj");
+        assert_eq!(slice(content, dep.version_range().unwrap()), "v1.0.0");
+    }
+
+    /// EC-005/US-003: `? *k` where `*k` aliases a **container** anchor (table miss),
+    /// followed by real `project:`/`ref:` scalars — fixed as a side effect of making the
+    /// key-position transition unconditional (independent of table hit/miss).
+    #[test]
+    fn test_alias_in_key_position_table_miss_does_not_desync_following_entry() {
+        let (policy, instance_host) = ctx();
+        let content = ".tpl: &tpl {a: 1}\ninclude:\n  - ? *tpl\n    : ignored\n    project: org/proj\n    ref: v1.0.0\n";
+        let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host).unwrap();
+        assert_eq!(result.dependencies.len(), 1, "{:?}", result.dependencies);
+        let dep = &result.dependencies[0];
+        assert!(!dep.is_alias_occurrence);
+        assert_eq!(dep.project_path, "org/proj");
+        assert_eq!(slice(content, dep.version_range().unwrap()), "v1.0.0");
+    }
+
+    /// EC-006: `<<: *anything` (merge key aliasing any anchor) is safe by construction —
+    /// `key_for` never maps `"<<"` to `Project`/`Ref`/`Component`, so no field is ever
+    /// targeted for capture regardless of table hit/miss. Regression test only.
+    #[test]
+    fn test_merge_key_alias_does_not_produce_a_second_dependency() {
+        let (policy, instance_host) = ctx();
+        let content =
+            ".pin: &pin v1.2.3\ninclude:\n  - <<: *pin\n    project: org/proj\n    ref: v1.0.0\n";
+        let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host).unwrap();
+        assert_eq!(result.dependencies.len(), 1, "{:?}", result.dependencies);
+        let dep = &result.dependencies[0];
+        assert!(!dep.is_alias_occurrence);
+        assert_eq!(dep.project_path, "org/proj");
+    }
+
+    /// #912 critic M1 — known limit, pinned rather than fixed here (natural home is the
+    /// `deps-dart`-style `key_for(role, &text)` resolution the S2 follow-up tracks): an
+    /// *implicit* alias key (`*k: value`, not the explicit `? *k` form) whose resolved
+    /// text happens to match a recognized key name (`ref`) is NOT reinterpreted as that
+    /// key. FR-003 mandates the unconditional `PendingKey::None` transition regardless of
+    /// the alias's resolved text, so this entry is captured as ref-less even though its
+    /// intent (`ref: v1.0.0`) is unambiguous to a human reader.
+    #[test]
+    fn test_implicit_alias_key_resolving_to_recognized_name_is_not_reinterpreted_known_limit() {
+        let (policy, instance_host) = ctx();
+        let content = ".k: &k ref\ninclude:\n  - *k : v1.0.0\n    project: org/p\n";
+        let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host).unwrap();
+        assert_eq!(result.dependencies.len(), 1, "{:?}", result.dependencies);
+        let dep = &result.dependencies[0];
+        assert_eq!(dep.project_path, "org/p");
+        assert!(dep.pin.is_none());
+        assert!(dep.version_range().is_none());
+    }
+
+    /// EC-007: `- *tpl` (a whole mapping anchor aliased as an `include:` sequence item) —
+    /// deferred non-goal, must stay a table miss with zero records, matching today.
+    #[test]
+    fn test_mapping_anchor_aliased_as_sequence_item_produces_no_dependency() {
+        let (policy, instance_host) = ctx();
+        let content = ".tpl: &tpl {project: org/proj, ref: v1.0.0}\ninclude:\n  - *tpl\n";
+        let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host).unwrap();
+        assert!(result.dependencies.is_empty(), "{:?}", result.dependencies);
+    }
+
+    /// EC-008: `include: *incs` (a whole sequence anchor aliased at the `include:` key) —
+    /// won't-fix-by-design non-goal, must stay a table miss with zero records.
+    #[test]
+    fn test_sequence_anchor_aliased_as_include_value_produces_no_dependency() {
+        let (policy, instance_host) = ctx();
+        let content = ".incs: &incs\n  - project: org/proj\n    ref: v1.0.0\ninclude: *incs\n";
+        let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host).unwrap();
+        assert!(result.dependencies.is_empty(), "{:?}", result.dependencies);
+    }
+
+    /// EC-012: an anchored empty scalar (`x: &e` / `ref: *e`) is a table hit whose text is
+    /// `""` — must resolve without panicking and without producing a misleading non-empty
+    /// display.
+    #[test]
+    fn test_alias_to_empty_anchor_is_safe() {
+        let (policy, instance_host) = ctx();
+        let content = "x: &e\ninclude:\n  - project: org/proj\n    ref: *e\n";
+        let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host).unwrap();
+        assert_eq!(result.dependencies.len(), 1, "{:?}", result.dependencies);
+        let dep = &result.dependencies[0];
+        assert!(dep.is_alias_occurrence);
+        assert_eq!(
+            dep.version_req.as_ref().map(deps_core::VersionReq::as_str),
+            Some("")
+        );
+    }
+
+    /// EC-013: two aliases to the same scalar anchor on one flow-style line each carry
+    /// their own `Marker`, so the span locator (FR-006) must not collapse them onto one
+    /// range.
+    #[test]
+    fn test_two_aliases_to_same_anchor_on_one_line_get_distinct_ranges() {
+        let (policy, instance_host) = ctx();
+        let content =
+            ".p: &p v1.0.0\ninclude: [{project: org/a, ref: *p}, {project: org/b, ref: *p}]\n";
+        let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host).unwrap();
+        assert_eq!(result.dependencies.len(), 2, "{:?}", result.dependencies);
+        assert_ne!(
+            result.dependencies[0].version_range(),
+            result.dependencies[1].version_range()
+        );
+        for dep in &result.dependencies {
+            assert_eq!(slice(content, dep.version_range().unwrap()), "*p");
+        }
+    }
+
+    /// EC-014/FR-007: the alias span must include the leading `*` — an anchor name that
+    /// happens to look version-shaped (`&v1 v1.2.3` / `*v1`) must not resolve to a span
+    /// that itself looks like the literal version text.
+    #[test]
+    fn test_alias_span_includes_leading_asterisk_even_when_name_looks_version_shaped() {
+        let (policy, instance_host) = ctx();
+        let content = ".pin: &v1 v1.2.3\ninclude:\n  - project: org/proj\n    ref: *v1\n";
+        let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host).unwrap();
+        assert_eq!(result.dependencies.len(), 1, "{:?}", result.dependencies);
+        let dep = &result.dependencies[0];
+        assert_eq!(slice(content, dep.version_range().unwrap()), "*v1");
+    }
+
+    /// EC-015/NFR-004/SC-005: an anchor whose text exceeds [`MAX_ANCHOR_VALUE_CHARS`]
+    /// degrades to the table-miss path — the alias to it captures nothing, same as today.
+    #[test]
+    fn test_anchor_value_over_char_cap_degrades_to_table_miss() {
+        let (policy, instance_host) = ctx();
+        let long_value = "v".repeat(MAX_ANCHOR_VALUE_CHARS + 1);
+        let content =
+            format!(".pin: &pin {long_value}\ninclude:\n  - project: org/proj\n    ref: *pin\n");
+        let result = parse_gitlab_ci_yaml(&content, &test_uri(), &policy, &instance_host).unwrap();
+        assert_eq!(result.dependencies.len(), 1, "{:?}", result.dependencies);
+        let dep = &result.dependencies[0];
+        assert!(!dep.is_alias_occurrence);
+        assert!(dep.pin.is_none());
+        assert!(dep.version_range().is_none());
+    }
+
+    /// EC-015/NFR-004/SC-005: once [`MAX_ANCHOR_TABLE_ENTRIES`] distinct anchors are
+    /// already recorded, one more degrades to the table-miss path the same way.
+    #[test]
+    fn test_anchor_table_over_entry_cap_degrades_to_table_miss() {
+        let (policy, instance_host) = ctx();
+        let mut content = String::new();
+        for i in 0..MAX_ANCHOR_TABLE_ENTRIES {
+            content.push_str(&format!(".a{i}: &a{i} filler\n"));
+        }
+        content
+            .push_str(".extra: &extra v9.9.9\ninclude:\n  - project: org/proj\n    ref: *extra\n");
+        let result = parse_gitlab_ci_yaml(&content, &test_uri(), &policy, &instance_host).unwrap();
+        assert_eq!(result.dependencies.len(), 1, "{:?}", result.dependencies);
+        let dep = &result.dependencies[0];
+        assert!(!dep.is_alias_occurrence);
+        assert!(dep.pin.is_none());
+        assert!(dep.version_range().is_none());
+    }
+
+    /// EC-009/NFR-007: a dangling alias (`*nope` with no matching `&nope` anywhere) is a
+    /// whole-document load error in `yaml-rust2`, degrading to an empty result — not a
+    /// panic, and not reached by this fix's own code.
+    #[test]
+    fn test_dangling_alias_is_a_parse_error_degrading_to_empty_result() {
+        let (policy, instance_host) = ctx();
+        let content = "include:\n  - project: org/proj\n    ref: *nope\n";
+        let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host).unwrap();
+        assert!(result.dependencies.is_empty());
     }
 }

@@ -21,7 +21,7 @@ deps-lsp provides comprehensive LSP support for 14 package ecosystems:
 | **NuGet** | .NET | `.csproj`, `.fsproj`, `.vbproj`, `Directory.Packages.props`, `packages.config` | `packages.lock.json`, `packages.<project>.lock.json` (multi-project) | Hover, inlay hints, completion, code actions, diagnostics, code lens, central package management support, SemVer2 prerelease handling, hover-only unlisted-version marker, private/custom feed resolution via `NuGet.Config` (see below) |
 | **Deno** | JavaScript/TypeScript (Deno runtime) | `deno.json`, `deno.jsonc` | — (no `deno.lock` support yet) | Hover, inlay hints, completion, code actions, diagnostics, code lens — `jsr:` specifiers via the keyless JSR API, `npm:` specifiers delegate to the same registry client `npm` uses; `imports` map only, `scopes`/`importMap` not covered — see below |
 | **GitHub Actions** | YAML | `.github/workflows/*.yml`, `*.yaml`; `action.yml`, `action.yaml` (composite/Docker/JS actions — a repository root or `.github/actions/<name>/`, issue #706) | — (no lock file) | Hover, inlay hints, code actions, diagnostics, code lens (package-name completion not covered — see below); tag/commit-SHA/branch `uses:` pins via the GitHub tags API; reusable-workflow calls recognized but not version-resolved — see below; release-age hint and cooldown diagnostic require `GITHUB_TOKEN` — see below |
-| **GitLab CI/CD** | YAML | `.gitlab-ci.yml`, `.gitlab/ci/*.yml`, `*.yaml` | — (no lock file) | Hover, inlay hints, code actions, diagnostics, code lens (package-name completion not covered); `project:`+`ref:` pins via the GitLab repository-tags API, `component:` CI/CD Catalog pins via the GitLab project-releases API (SHA/exact-release/`~latest`/partial-semver priority ladder); self-hosted instances via `registries.gitlab_instance_host` — see below |
+| **GitLab CI/CD** | YAML | `.gitlab-ci.yml`, `.gitlab/ci/*.yml`, `*.yaml` | — (no lock file) | Hover, inlay hints, code actions, diagnostics, code lens (package-name completion not covered); `project:`+`ref:` pins via the GitLab repository-tags API, `component:` CI/CD Catalog pins via the GitLab project-releases API (SHA/exact-release/`~latest`/partial-semver priority ladder); self-hosted instances via `registries.gitlab_instance_host`; scalar YAML anchor/alias resolution within `include:` — see below |
 
 ### Inlay Hint Icons at a Glance
 
@@ -954,6 +954,29 @@ document's dependency total (including the truncation cap), and are visible to a
 reading the parsed dependency list. A single dependency's own value aliasing a whole mapping
 (`pkg: *shared_entry`, as opposed to the section or `environment:` key itself) is not
 resolved at all — the dependency appears with a real name but no version/source info.
+
+### GitLab CI/CD: YAML Scalar Anchor/Alias Resolution
+
+`.gitlab-ci.yml` supports YAML anchors (`&name`) and aliases (`*name`) for reuse — GitLab's
+own docs recommend anchor-based templates as the standard way to reduce duplication across
+jobs. Within the `include:` subtree, a scalar anchor used as a `ref:`, `project:`, or
+`component:` value and aliased elsewhere in the same file now resolves correctly, with
+hover/diagnostics/inlay hints positioned at the **alias token** (not the anchor's definition
+site).
+
+**SHA-pin quickfix and version completion are withheld at the alias site itself**, scoped to
+whichever field actually backs `version_range` (`ref:` for a `project:` include, `component:`'s
+own field) — resolving an alias produces a value with no editable literal span at that
+position, since rewriting it would need to edit the anchor definition instead. An aliased
+`project:` next to a literal `ref:` is unaffected: only the field that is itself an alias
+loses its quickfix/completion.
+
+**Known limitation — container anchors are out of scope.** A whole `include:` entry reused
+via `- *tpl` / `- <<: *tpl` (mapping-shaped) or `include: *incs` (sequence-shaped) is not
+detected — only a *scalar* anchor aliased as one field's value within an otherwise-literal
+`include:` entry is resolved. Mapping-shaped container anchors are tracked as a follow-up
+(#916); sequence-shaped container anchors are a structural won't-fix (#917) since one alias
+token cannot back N distinct entries' `name_range`/`version_range`.
 
 ### Maven/Gradle Version Range Matching
 

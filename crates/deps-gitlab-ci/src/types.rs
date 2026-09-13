@@ -140,6 +140,19 @@ pub struct GitlabCiDependency {
     /// Whether the whole include-entry value was written as a plain (unquoted) YAML
     /// scalar, mirroring `deps-github-actions`'s identical field.
     pub is_plain_scalar: bool,
+    /// Whether the field this dependency's edit/completion write paths actually target —
+    /// the `ref:` field when one is present, otherwise the `project:`/`component:` field
+    /// itself — was captured from a same-file YAML alias to a scalar anchor recorded
+    /// during parsing (spec FR-004/FR-009), rather than written as a literal in the
+    /// document. Scoped to that one field, not "any field in this entry was ever an
+    /// alias" (#912 critic S1): every SHA-pin/completion write path this flag gates
+    /// (spec FR-010/FR-011) only ever rewrites `version_range`, so an unrelated aliased
+    /// `project:` next to a literal `ref:` must not withhold that `ref:`'s fully
+    /// auto-fixable quickfix or falsely claim "no automated fix available" for it. `true`
+    /// withholds every SHA-pin code action, bulk-edit lens, and version-completion write
+    /// path for this dependency: an alias token (`*pin`) is not an editable literal, so
+    /// no automated fix may ever rewrite it.
+    pub is_alias_occurrence: bool,
     /// Which `include:` form this dependency came from.
     pub kind: IncludeKind,
     /// This dependency's resolved (or not-yet-resolvable) host.
@@ -275,6 +288,7 @@ mod tests {
             version_literal: None,
             source,
             is_plain_scalar: true,
+            is_alias_occurrence: false,
             kind: IncludeKind::Project,
             host,
             pin: Some(PinStyle::Tag),
