@@ -287,6 +287,66 @@ pub struct BlockedRegistryOccurrence {
     pub declaration_key: String,
 }
 
+/// One host-class/raw-value/declaration-key classification an ecosystem config's own
+/// `blocked_class_for` helper produces.
+///
+/// One layer below the [`ParseResult::blocked_registries`] trait boundary — same field shape as
+/// [`BlockedRegistryOccurrence`] minus [`BlockedRegistryOccurrence::range`], which the config
+/// layer never knows: the caller attaches it per affected dependency via
+/// [`Self::into_occurrence`].
+///
+/// A named struct rather than a positional tuple (#966): [`Self::raw_value`] and
+/// [`Self::declaration_key`] are both `String`s, so a positional tuple would let them be
+/// silently swapped at any call site with no compile error — the exact field-swap risk
+/// [`BlockedRegistryOccurrence`] itself was already converted off of (#944 M9). Implemented by
+/// `deps_nuget::config::NuGetConfig::blocked_class_for`, `deps_npm::config::NpmConfig::blocked_class_for`,
+/// and `deps_pypi::config::PypiIndexConfig::blocked_class_for`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockedSourceClass {
+    /// The blocked host's classification.
+    pub class: crate::net_policy::HostClass,
+    /// The exact declared value (URL/alias) that resolved to a blocked host.
+    pub raw_value: String,
+    /// Implementation-opaque string identifying which underlying config declaration produced
+    /// this entry — see [`BlockedRegistryOccurrence::declaration_key`]'s doc for why this must
+    /// stay distinct from [`Self::raw_value`].
+    pub declaration_key: String,
+}
+
+impl BlockedSourceClass {
+    /// Attaches the affected dependency's `range` to produce the [`BlockedRegistryOccurrence`]
+    /// a `ParseResult::blocked_registries()` override reports.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::net_policy::HostClass;
+    /// use deps_core::BlockedSourceClass;
+    /// use deps_core::tower_lsp_server::ls_types::{Position, Range};
+    ///
+    /// let class = BlockedSourceClass {
+    ///     class: HostClass::Loopback,
+    ///     raw_value: "https://internal.example/index".to_string(),
+    ///     declaration_key: "primary".to_string(),
+    /// };
+    /// let range = Range::new(Position::new(0, 0), Position::new(0, 4));
+    /// let occurrence = class.into_occurrence(range);
+    /// assert_eq!(occurrence.declaration_key, "primary");
+    /// ```
+    #[must_use]
+    pub fn into_occurrence(
+        self,
+        range: tower_lsp_server::ls_types::Range,
+    ) -> BlockedRegistryOccurrence {
+        BlockedRegistryOccurrence {
+            range,
+            class: self.class,
+            raw_value: self.raw_value,
+            declaration_key: self.declaration_key,
+        }
+    }
+}
+
 /// Parse result trait containing dependencies and metadata.
 ///
 /// Implementations hold ecosystem-specific dependency types

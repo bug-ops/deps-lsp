@@ -34,6 +34,7 @@
 
 use std::collections::HashMap;
 
+use deps_core::BlockedSourceClass;
 use deps_core::net_policy::{
     HostClass, PolicyGate, RedactedUrl, RegistryAccessPolicy, validate_index_url,
 };
@@ -459,20 +460,29 @@ impl PypiIndexConfig {
     /// last-resort hop, replacing the implicit public fallback in that slot, so it gets the
     /// same treatment as `primary`.
     #[must_use]
-    pub fn blocked_class_for(
-        &self,
-        named_source: Option<&str>,
-    ) -> Option<(HostClass, String, String)> {
+    pub fn blocked_class_for(&self, named_source: Option<&str>) -> Option<BlockedSourceClass> {
         if let Some(name) = named_source {
-            let (class, raw) = blocked_class(self.named_sources.get(name)?)?;
-            return Some((class, raw, format!("named:{name}")));
+            let (class, raw_value) = blocked_class(self.named_sources.get(name)?)?;
+            return Some(BlockedSourceClass {
+                class,
+                raw_value,
+                declaration_key: format!("named:{name}"),
+            });
         }
         if let Some(result) = &self.primary {
-            let (class, raw) = blocked_class(result)?;
-            return Some((class, raw, "primary".to_string()));
+            let (class, raw_value) = blocked_class(result)?;
+            return Some(BlockedSourceClass {
+                class,
+                raw_value,
+                declaration_key: "primary".to_string(),
+            });
         }
-        let (class, raw) = blocked_class(self.tail_hop.as_ref()?)?;
-        Some((class, raw, "uv-tail".to_string()))
+        let (class, raw_value) = blocked_class(self.tail_hop.as_ref()?)?;
+        Some(BlockedSourceClass {
+            class,
+            raw_value,
+            declaration_key: "uv-tail".to_string(),
+        })
     }
 
     /// Every chain this config implies, ready for registration — FR-005(a)/(b) resolved to
@@ -788,12 +798,12 @@ mod tests {
                 url: "https://127.0.0.1:9999/simple".to_string(),
             }
         );
-        let (class, raw_value, declaration_key) = config
+        let occurrence = config
             .blocked_class_for(None)
             .expect("blocked primary must be reported");
-        assert_eq!(class, HostClass::Loopback);
-        assert_eq!(raw_value, "https://127.0.0.1:9999/simple");
-        assert_eq!(declaration_key, "primary");
+        assert_eq!(occurrence.class, HostClass::Loopback);
+        assert_eq!(occurrence.raw_value, "https://127.0.0.1:9999/simple");
+        assert_eq!(occurrence.declaration_key, "primary");
     }
 
     /// A primary rejected for a different reason (not a blocked host) must not be reported.
@@ -866,12 +876,12 @@ mod tests {
             resolve_entry("https://127.0.0.1:9999/simple", &policy),
         );
 
-        let (class, raw_value, declaration_key) = config
+        let occurrence = config
             .blocked_class_for(Some("internal"))
             .expect("blocked named source must be reported");
-        assert_eq!(class, HostClass::Loopback);
-        assert_eq!(raw_value, "https://127.0.0.1:9999/simple");
-        assert_eq!(declaration_key, "named:internal");
+        assert_eq!(occurrence.class, HostClass::Loopback);
+        assert_eq!(occurrence.raw_value, "https://127.0.0.1:9999/simple");
+        assert_eq!(occurrence.declaration_key, "named:internal");
         assert_eq!(config.blocked_class_for(None), None);
     }
 
@@ -890,14 +900,14 @@ mod tests {
             resolve_entry("https://127.0.0.1:9999/simple", &policy),
         );
 
-        let (_, _, primary_key) = config
+        let primary = config
             .blocked_class_for(None)
             .expect("blocked primary must be reported");
-        let (_, _, named_key) = config
+        let named = config
             .blocked_class_for(Some("internal"))
             .expect("blocked named source must be reported");
         assert_ne!(
-            primary_key, named_key,
+            primary.declaration_key, named.declaration_key,
             "two independently-declared blocked entries must never share a declaration key, \
              even when their raw values coincide"
         );
@@ -970,12 +980,12 @@ mod tests {
             "test premise: a blocked tail_hop with no extras degrades to the implicit public \
              fallback, not CustomRegistry"
         );
-        let (class, raw_value, declaration_key) = config
+        let occurrence = config
             .blocked_class_for(None)
             .expect("blocked uv default index must still be reported");
-        assert_eq!(class, HostClass::Loopback);
-        assert_eq!(raw_value, "https://127.0.0.1:9999/simple");
-        assert_eq!(declaration_key, "uv-tail");
+        assert_eq!(occurrence.class, HostClass::Loopback);
+        assert_eq!(occurrence.raw_value, "https://127.0.0.1:9999/simple");
+        assert_eq!(occurrence.declaration_key, "uv-tail");
     }
 
     /// The same blocked `tail_hop`, but with a valid extra present too: resolution still
@@ -992,12 +1002,12 @@ mod tests {
             config.resolve_source_for(None),
             DependencySource::AlternateRegistry { .. }
         );
-        let (class, raw_value, declaration_key) = config
+        let occurrence = config
             .blocked_class_for(None)
             .expect("blocked uv default index must still be reported");
-        assert_eq!(class, HostClass::Loopback);
-        assert_eq!(raw_value, "https://127.0.0.1:9999/simple");
-        assert_eq!(declaration_key, "uv-tail");
+        assert_eq!(occurrence.class, HostClass::Loopback);
+        assert_eq!(occurrence.raw_value, "https://127.0.0.1:9999/simple");
+        assert_eq!(occurrence.declaration_key, "uv-tail");
     }
 
     /// An explicit primary takes priority over `tail_hop` entirely (FR-005(a) beats (b)) — a
