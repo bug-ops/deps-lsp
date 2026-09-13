@@ -31,6 +31,7 @@
 
 use crate::types::{DartDependency, DependencySection, DependencySource};
 use deps_core::lsp_helpers::{LineOffsetTable, locate_value_span, marker_byte_offset};
+use deps_core::yaml_walk::{FrameKind, FrameStack, ScalarPosition};
 use deps_core::{DependencyBudget, DepsError, Result};
 use std::collections::HashMap;
 use tower_lsp_server::ls_types::{Range, Uri};
@@ -153,14 +154,7 @@ impl FieldValue {
     }
 }
 
-/// Which kind of container a [`Frame`] represents.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum FrameKind {
-    Mapping,
-    Sequence,
-}
-
-/// What a [`Frame`] means for dependency-extraction purposes.
+/// What a frame means for dependency-extraction purposes.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FrameRole {
     /// The document's root mapping.
@@ -176,25 +170,21 @@ enum FrameRole {
     /// `git: <url>` shorthand).
     GitValue,
     /// Anything else — `name:`, `flutter:`, `rules:`, or any other structure this parser does
-    /// not need to look inside.
+    /// not need to look inside. Also covers a complex YAML key's subtree (`? <mapping>`/`?
+    /// <sequence>`) used where a plain scalar key is normally expected —
+    /// [`deps_core::yaml_walk::FrameStack`] handles the key/value-alternation bookkeeping for
+    /// that case generically (previously a dedicated `ComplexKey` role existed here solely to
+    /// make that bookkeeping work; the walker now owns it, so this parser never resolves such
+    /// a key to a literal name, the same as an alias that fails to resolve).
     Irrelevant,
-    /// The subtree of an explicit complex YAML key (`? <sequence>` / `? <map>`) used where a
-    /// plain scalar key is normally expected. Its content is never resolved to a literal name
-    /// (treated as unresolvable, the same as an alias that fails to resolve), but the frame
-    /// must still exist: without it, `push_container` would route straight to
-    /// [`FrameRole::Irrelevant`] and never flip the parent's `awaiting_key` to `false`, leaving
-    /// the parent stuck awaiting another key once this subtree closes — desyncing the rest of
-    /// the mapping the same way the alias-as-key bug did (every later scalar reinterpreted
-    /// alternately as a name/value). See [`PubspecReceiver::push_container`]'s early check and
-    /// [`PubspecReceiver::pop_container`]'s matching arm.
-    ComplexKey,
 }
 
 /// Which key (if any) a fixed-vocabulary mapping frame is currently awaiting the value for.
 /// Not used by [`FrameRole::DependencySectionValue`], whose keys are arbitrary dependency
-/// names rather than a fixed set — see [`Frame::pending_dep_name`].
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// names rather than a fixed set — see [`FramePayload::pending_dep_name`].
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
 enum PendingKey {
+    #[default]
     None,
     Environment,
     Section(DependencySection),
@@ -237,9 +227,7 @@ fn key_for(role: FrameRole, text: &str) -> PendingKey {
             "path" => PendingKey::GitPath,
             _ => PendingKey::None,
         },
-        FrameRole::DependencySectionValue | FrameRole::Irrelevant | FrameRole::ComplexKey => {
-            PendingKey::None
-        }
+        FrameRole::DependencySectionValue | FrameRole::Irrelevant => PendingKey::None,
     }
 }
 
@@ -286,17 +274,15 @@ struct RawDependency {
     value: RawDependencyValue,
 }
 
-struct Frame {
-    kind: FrameKind,
-    role: FrameRole,
+/// Per-frame accumulated state — the [`deps_core::yaml_walk::FrameStack`] generic
+/// `payload`, carrying everything a frame's role means beyond the walker's own
+/// structural kind/key-toggling mechanics.
+#[derive(Default)]
+struct FramePayload {
     /// Which section this frame belongs to — set on a [`FrameRole::DependencySectionValue`]
     /// frame when it is created; read back from the parent frame when a child
     /// [`FrameRole::DependencyEntryValue`] finalizes.
     section: Option<DependencySection>,
-    /// Only meaningful for `kind == Mapping`.
-    awaiting_key: bool,
-    /// Only meaningful for `kind == Mapping`, and not [`FrameRole::DependencySectionValue`].
-    pending_key: PendingKey,
     /// `DependencySectionValue` only: the dependency name just read as a key, awaiting its
     /// value.
     pending_dep_name: Option<RawField>,
@@ -314,26 +300,7 @@ struct Frame {
     git_path: Option<FieldValue>,
 }
 
-impl Frame {
-    fn new(kind: FrameKind, role: FrameRole) -> Self {
-        Self {
-            kind,
-            role,
-            section: None,
-            awaiting_key: true,
-            pending_key: PendingKey::None,
-            pending_dep_name: None,
-            dep_name: None,
-            version: None,
-            git: None,
-            path: None,
-            sdk: None,
-            git_url: None,
-            git_ref: None,
-            git_path: None,
-        }
-    }
-
+impl FramePayload {
     /// Assigns `value` to whichever field `key` designates — the single point where
     /// `on_scalar`'s (`FieldValue::Positioned`) and `on_alias`'s
     /// (`FieldValue::Unpositioned`) otherwise-identical `DependencyEntryValue`/`GitValue`
@@ -357,6 +324,11 @@ impl Frame {
         }
     }
 }
+
+/// The generic frame-stack mechanics ([`deps_core::yaml_walk::FrameStack`]) driven by
+/// [`PubspecReceiver`], parameterized on this crate's own role/key vocabulary and
+/// per-frame [`FramePayload`].
+type Stack = FrameStack<FrameRole, PendingKey, FramePayload>;
 
 /// Tracks one anchored mapping/sequence while its subtree streams past, so its extent within
 /// [`PubspecReceiver::event_log`] can be recorded on its closing event — see
@@ -389,7 +361,7 @@ struct RecordingFrame {
 /// Collects every dependency's raw field values from the event stream, gated to exactly the
 /// three top-level dependency sections' subtrees (plus `environment: sdk:`).
 struct PubspecReceiver {
-    stack: Vec<Frame>,
+    stack: Stack,
     entries: Vec<RawDependency>,
     sdk: Option<String>,
     /// Scalar text, style, and tag seen under a YAML anchor (`&name`), keyed by
@@ -439,7 +411,7 @@ struct PubspecReceiver {
 impl PubspecReceiver {
     fn new(cap: usize) -> Self {
         Self {
-            stack: Vec::new(),
+            stack: Stack::new(),
             entries: Vec::new(),
             sdk: None,
             anchors: HashMap::new(),
@@ -526,8 +498,14 @@ impl PubspecReceiver {
 
     /// Determines the role (and, for a dependency section, which one) a new child container
     /// should have, given the current top-of-stack frame.
+    ///
+    /// Deliberately unaware of complex-key positioning: while the top frame is a `Mapping`
+    /// awaiting a key, its `pending_key`/payload's `pending_dep_name` are still at their
+    /// defaults (nothing has resolved a key yet), so every match arm below already falls
+    /// through to `Irrelevant` for that case with no special-casing needed —
+    /// [`deps_core::yaml_walk::FrameStack::push`] handles the complex-key bookkeeping itself.
     fn compute_child_role(&self, kind: FrameKind) -> (FrameRole, Option<DependencySection>) {
-        let Some(top) = self.stack.last() else {
+        let Some(top) = self.stack.top() else {
             return if kind == FrameKind::Mapping {
                 (FrameRole::Root, None)
             } else {
@@ -535,18 +513,18 @@ impl PubspecReceiver {
             };
         };
         if kind == FrameKind::Mapping {
-            match top.role {
-                FrameRole::Root => match &top.pending_key {
+            match *top.role() {
+                FrameRole::Root => match top.pending_key() {
                     PendingKey::Environment => return (FrameRole::EnvironmentValue, None),
                     PendingKey::Section(section) => {
                         return (FrameRole::DependencySectionValue, Some(*section));
                     }
                     _ => {}
                 },
-                FrameRole::DependencySectionValue if top.pending_dep_name.is_some() => {
+                FrameRole::DependencySectionValue if top.payload.pending_dep_name.is_some() => {
                     return (FrameRole::DependencyEntryValue, None);
                 }
-                FrameRole::DependencyEntryValue if top.pending_key == PendingKey::EntryGit => {
+                FrameRole::DependencyEntryValue if *top.pending_key() == PendingKey::EntryGit => {
                     return (FrameRole::GitValue, None);
                 }
                 _ => {}
@@ -556,21 +534,7 @@ impl PubspecReceiver {
     }
 
     fn push_container(&mut self, kind: FrameKind) {
-        // An explicit complex YAML key (`? <sequence>` / `? <map>`) arriving where a plain
-        // scalar key is normally expected — see [`FrameRole::ComplexKey`]'s docs for why this
-        // must short-circuit before the usual value-shape routing below (which assumes any
-        // container arriving here is a *value*, the assumption that produced the alias-as-key
-        // sibling bug when it didn't hold).
-        if let Some(top) = self.stack.last()
-            && top.kind == FrameKind::Mapping
-            && top.awaiting_key
-        {
-            self.stack.push(Frame::new(kind, FrameRole::ComplexKey));
-            return;
-        }
-
         let (new_role, new_section) = self.compute_child_role(kind);
-        let mut carried_name = None;
         let is_replay = self.replay_depth > 0;
         let Self {
             stack,
@@ -579,30 +543,33 @@ impl PubspecReceiver {
             ..
         } = self;
 
-        if let Some(top) = stack.last_mut() {
-            if top.role == FrameRole::DependencySectionValue {
-                if let Some(name) = top.pending_dep_name.take() {
-                    if new_role == FrameRole::DependencyEntryValue {
-                        carried_name = Some(name);
-                    } else {
-                        // A dependency's value is a sequence, or some other shape this parser
-                        // does not resolve a concrete field from.
-                        Self::push_entry(entries, budget, top.section, name, is_replay, || {
-                            RawDependencyValue::Unresolved
-                        });
-                    }
-                }
-                top.awaiting_key = true;
-            } else if top.kind == FrameKind::Mapping {
-                top.awaiting_key = true;
-                top.pending_key = PendingKey::None;
+        let mut payload = FramePayload {
+            section: new_section,
+            ..FramePayload::default()
+        };
+
+        // Carries a dependency name captured as a key on the parent
+        // `DependencySectionValue` frame down into the child's own payload (if the child is
+        // its `DependencyEntryValue`), or finalizes it as an `Unresolved` entry otherwise (a
+        // dependency's value is a sequence, or some other shape this parser does not resolve
+        // a concrete field from). A no-op while the parent is awaiting a key (including a
+        // complex key's own subtree, which `FrameStack::push` handles generically) since
+        // `pending_dep_name` is `None` in that state.
+        if let Some(top) = stack.top_mut()
+            && *top.role() == FrameRole::DependencySectionValue
+            && let Some(name) = top.payload.pending_dep_name.take()
+        {
+            if new_role == FrameRole::DependencyEntryValue {
+                payload.dep_name = Some(name);
+            } else {
+                let section = top.payload.section;
+                Self::push_entry(entries, budget, section, name, is_replay, || {
+                    RawDependencyValue::Unresolved
+                });
             }
         }
 
-        let mut frame = Frame::new(kind, new_role);
-        frame.section = new_section;
-        frame.dep_name = carried_name;
-        stack.push(frame);
+        stack.push(kind, new_role, payload);
     }
 
     fn pop_container(&mut self) {
@@ -616,56 +583,35 @@ impl PubspecReceiver {
             budget,
             ..
         } = self;
-        match frame.role {
-            FrameRole::ComplexKey => {
-                // Closing the complex key's subtree must transition the parent from
-                // "awaiting a key" to "awaiting this entry's value" — exactly what a plain
-                // scalar key does — or the parent stays stuck awaiting another key and
-                // desyncs the rest of the mapping (the sibling bug to alias-as-key). No name
-                // is attached (`pending_dep_name`/`pending_key` are left at their defaults):
-                // the complex key's text is not resolved, matching how an unresolvable alias
-                // key is handled.
-                if let Some(top) = stack.last_mut() {
-                    top.awaiting_key = false;
-                    top.pending_key = PendingKey::None;
-                }
-                return;
-            }
+        match *frame.role() {
             FrameRole::DependencyEntryValue => {
-                if let Some(name) = frame.dep_name
-                    && let Some(parent) = stack.last()
-                    && parent.role == FrameRole::DependencySectionValue
+                if let Some(name) = frame.payload.dep_name
+                    && let Some(parent) = stack.top()
+                    && *parent.role() == FrameRole::DependencySectionValue
                 {
-                    let section = parent.section;
+                    let section = parent.payload.section;
                     Self::push_entry(entries, budget, section, name, is_replay, || {
                         RawDependencyValue::Entry {
-                            version: frame.version,
-                            git: frame.git,
-                            path: frame.path,
-                            sdk: frame.sdk,
+                            version: frame.payload.version,
+                            git: frame.payload.git,
+                            path: frame.payload.path,
+                            sdk: frame.payload.sdk,
                         }
                     });
                 }
             }
             FrameRole::GitValue => {
-                if let Some(parent) = stack.last_mut()
-                    && parent.role == FrameRole::DependencyEntryValue
+                if let Some(parent) = stack.top_mut()
+                    && *parent.role() == FrameRole::DependencyEntryValue
                 {
-                    parent.git = Some(RawGitValue::Map {
-                        url: frame.git_url,
-                        rev: frame.git_ref,
-                        path: frame.git_path,
+                    parent.payload.git = Some(RawGitValue::Map {
+                        url: frame.payload.git_url,
+                        rev: frame.payload.git_ref,
+                        path: frame.payload.git_path,
                     });
                 }
             }
             _ => {}
-        }
-        if let Some(top) = stack.last_mut()
-            && top.role != FrameRole::DependencySectionValue
-            && top.kind == FrameKind::Mapping
-        {
-            top.awaiting_key = true;
-            top.pending_key = PendingKey::None;
         }
     }
 
@@ -691,59 +637,73 @@ impl PubspecReceiver {
         let is_null = is_plain_null(style, tag.as_ref(), &value);
         let replay_depth = self.replay_depth;
 
-        let Self {
-            stack,
-            entries,
-            sdk,
-            budget,
-            ..
-        } = self;
-        let Some(frame) = stack.last_mut() else {
-            return;
-        };
-        if frame.kind != FrameKind::Mapping {
-            return;
-        }
-        if frame.awaiting_key {
-            if frame.role == FrameRole::DependencySectionValue {
-                frame.pending_dep_name = Some(raw_field(value, marker));
-            } else {
-                frame.pending_key = key_for(frame.role, &value);
+        match self.stack.scalar_position() {
+            ScalarPosition::Outside => {}
+            ScalarPosition::Key => {
+                let role = self.stack.top_role_or(FrameRole::Irrelevant);
+                if role == FrameRole::DependencySectionValue {
+                    if let Some(top) = self.stack.top_mut() {
+                        top.payload.pending_dep_name = Some(raw_field(value, marker));
+                    }
+                    self.stack.observe_key(PendingKey::None);
+                } else {
+                    let key = key_for(role, &value);
+                    self.stack.observe_key(key);
+                }
             }
-            frame.awaiting_key = false;
-            return;
-        }
-
-        match frame.role {
-            FrameRole::DependencySectionValue => {
-                if let Some(name) = frame.pending_dep_name.take() {
-                    let section = frame.section;
-                    let is_replay = replay_depth > 0;
-                    Self::push_entry(entries, budget, section, name, is_replay, || {
-                        if is_null {
-                            RawDependencyValue::Unresolved
-                        } else {
-                            RawDependencyValue::Simple(scalar_field(replay_depth, value, marker))
+            ScalarPosition::Value => {
+                let Self {
+                    stack,
+                    entries,
+                    sdk,
+                    budget,
+                    ..
+                } = self;
+                let Some(top) = stack.top_mut() else {
+                    return;
+                };
+                match *top.role() {
+                    FrameRole::DependencySectionValue => {
+                        if let Some(name) = top.payload.pending_dep_name.take() {
+                            let section = top.payload.section;
+                            Self::push_entry(
+                                entries,
+                                budget,
+                                section,
+                                name,
+                                replay_depth > 0,
+                                || {
+                                    if is_null {
+                                        RawDependencyValue::Unresolved
+                                    } else {
+                                        RawDependencyValue::Simple(scalar_field(
+                                            replay_depth,
+                                            value,
+                                            marker,
+                                        ))
+                                    }
+                                },
+                            );
                         }
-                    });
+                    }
+                    FrameRole::Root | FrameRole::Irrelevant => {}
+                    FrameRole::EnvironmentValue => {
+                        if *top.pending_key() == PendingKey::EnvSdk && !is_null {
+                            *sdk = Some(value);
+                        }
+                    }
+                    FrameRole::DependencyEntryValue | FrameRole::GitValue if !is_null => {
+                        let key = *top.pending_key();
+                        top.payload
+                            .assign_field(key, scalar_field(replay_depth, value, marker));
+                    }
+                    // A null value for one of the keys above — treated the same as the key
+                    // being absent entirely.
+                    FrameRole::DependencyEntryValue | FrameRole::GitValue => {}
                 }
+                stack.consume_value();
             }
-            FrameRole::Root | FrameRole::Irrelevant | FrameRole::ComplexKey => {}
-            FrameRole::EnvironmentValue => {
-                if frame.pending_key == PendingKey::EnvSdk && !is_null {
-                    *sdk = Some(value);
-                }
-            }
-            FrameRole::DependencyEntryValue | FrameRole::GitValue if !is_null => {
-                let key = frame.pending_key;
-                frame.assign_field(key, scalar_field(replay_depth, value, marker));
-            }
-            // A null value for one of the keys above — treated the same as the key being
-            // absent entirely.
-            FrameRole::DependencyEntryValue | FrameRole::GitValue => {}
         }
-        frame.awaiting_key = true;
-        frame.pending_key = PendingKey::None;
     }
 
     fn on_alias(&mut self, anchor_id: usize, marker: &Marker) {
@@ -760,14 +720,8 @@ impl PubspecReceiver {
             .filter(|(text, style, tag)| !is_plain_null(*style, tag.as_ref(), text))
             .map(|(text, ..)| text);
 
-        let Some(top) = self.stack.last_mut() else {
-            return;
-        };
-        if top.kind != FrameKind::Mapping {
-            return;
-        }
-
-        if top.awaiting_key {
+        match self.stack.scalar_position() {
+            ScalarPosition::Outside => {}
             // Mirrors `on_scalar`'s key branch. An alias in key position is unusual, but
             // review found the previous code left `awaiting_key` unconditionally `true`
             // afterwards (the same as it already was) instead of flipping it to `false` the
@@ -775,113 +729,135 @@ impl PubspecReceiver {
             // alternately as a name/value, corrupting the rest of the section (review finding
             // #2). Best-effort: an alias resolving to real text is treated exactly as a
             // scalar key would be; an unresolvable one (e.g. a mapping-valued anchor) still
-            // flips the state correctly, just without a name to attach a value to — the same
-            // graceful no-op a `None` `pending_dep_name`/`pending_key` already produces below.
-            // A container can't sensibly serve as a key, so no `container_anchors` lookup here.
-            if let Some(text) = resolved {
-                if top.role == FrameRole::DependencySectionValue {
-                    top.pending_dep_name = Some(raw_field(text, marker));
-                } else {
-                    top.pending_key = key_for(top.role, &text);
-                }
-            } else {
-                top.pending_key = PendingKey::None;
-            }
-            top.awaiting_key = false;
-            return;
-        }
-
-        // A whole-section/mapping alias (`dependencies: *shared_map`, `environment:
-        // *shared_env`) — replay the anchor's buffered subtree through the normal dispatch, so
-        // `push_container`'s `compute_child_role` routes it exactly as a live `MappingStart`/
-        // `SequenceStart` in this same position would. Scoped to `Root` only:
-        // `compute_child_role` has no `EnvironmentValue` -> child-role mapping (everything
-        // under it that isn't `sdk:` routes to `Irrelevant` regardless), so including it here
-        // would never resolve anything — `environment: *shared_env` itself fires with
-        // `top.role == Root` (the alias is the *value of the `environment:` key*, read before
-        // ever pushing an `EnvironmentValue` frame), not this branch. A single dependency's own
-        // value aliasing a whole mapping (`FrameRole::DependencySectionValue`, e.g. `pkg:
-        // *shared_entry`) is deliberately left to the scalar-only resolution below instead —
-        // see `test_aliased_dependency_to_unresolvable_anchor_still_present`.
-        if top.role == FrameRole::Root
-            && let Some((kind, range)) = self.container_anchors.get(&anchor_id).cloned()
-        {
-            // The one clone this design pays for container-anchor replay (see
-            // `RecordingFrame`'s docs) — a slice of the shared `event_log`, copied only now,
-            // once per actual alias occurrence, rather than once per event for every open
-            // anchor regardless of whether it's ever aliased.
-            let Some(slice) = self.event_log.get(range) else {
-                // Every `container_anchors` range is built from indices this same receiver
-                // recorded into `event_log` (see `record_event`) — a miss here means that
-                // invariant broke. Fail loudly in debug/tests rather than silently replaying
-                // nothing, which would reproduce the exact whole-section data loss this
-                // feature exists to fix; in release, skip this alias (leaving it
-                // unresolved, the same graceful outcome as an unknown anchor) rather than
-                // panicking the LSP server.
-                debug_assert!(
-                    false,
-                    "container_anchors[{anchor_id}] range is out of bounds for event_log"
-                );
-                return;
-            };
-            let events: Vec<(Event, Marker)> = slice.to_vec();
-            self.replay_depth += 1;
-            self.push_container(kind);
-            for (event, event_marker) in events {
-                self.on_event(event, event_marker);
-            }
-            self.pop_container();
-            self.replay_depth -= 1;
-            return;
-        }
-
-        let replay_depth = self.replay_depth;
-        let Self {
-            stack,
-            entries,
-            sdk,
-            budget,
-            ..
-        } = self;
-        let Some(top) = stack.last_mut() else {
-            return;
-        };
-        match top.role {
-            FrameRole::DependencySectionValue => {
-                if let Some(name) = top.pending_dep_name.take() {
-                    let section = top.section;
-                    Self::push_entry(entries, budget, section, name, replay_depth > 0, || {
-                        resolved.map_or(RawDependencyValue::Unresolved, |text| {
-                            RawDependencyValue::Simple(FieldValue::Unpositioned(text))
-                        })
-                    });
+            // flips the state correctly, just without a name to attach a value to. A
+            // container can't sensibly serve as a key, so no `container_anchors` lookup here.
+            ScalarPosition::Key => {
+                let role = self.stack.top_role_or(FrameRole::Irrelevant);
+                match (role, resolved) {
+                    (FrameRole::DependencySectionValue, Some(text)) => {
+                        if let Some(top) = self.stack.top_mut() {
+                            top.payload.pending_dep_name = Some(raw_field(text, marker));
+                        }
+                        self.stack.observe_key(PendingKey::None);
+                    }
+                    (_, Some(text)) => {
+                        let key = key_for(role, &text);
+                        self.stack.observe_key(key);
+                    }
+                    (_, None) => self.stack.observe_key(PendingKey::None),
                 }
             }
-            FrameRole::DependencyEntryValue | FrameRole::GitValue => {
-                if let Some(text) = resolved {
-                    let key = top.pending_key;
-                    top.assign_field(key, FieldValue::Unpositioned(text));
-                }
-            }
-            // Mirrors `on_scalar`'s `EnvironmentValue` arm (critic finding C1): an alias to a
-            // *scalar* anchor used as `sdk:`'s value (`sdk: *shared_version`, sharing one
-            // constraint string — the more idiomatic of #905's two named shapes) must resolve
-            // the same way a direct scalar does, not fall through as a no-op the way an
-            // unresolvable one correctly does.
-            FrameRole::EnvironmentValue => {
-                if top.pending_key == PendingKey::EnvSdk
-                    && let Some(text) = resolved
+            ScalarPosition::Value => {
+                // A whole-section/mapping alias (`dependencies: *shared_map`, `environment:
+                // *shared_env`) — replay the anchor's buffered subtree through the normal
+                // dispatch, so `push_container`'s `compute_child_role` routes it exactly as a
+                // live `MappingStart`/`SequenceStart` in this same position would. Scoped to
+                // `Root` only: `compute_child_role` has no `EnvironmentValue` -> child-role
+                // mapping (everything under it that isn't `sdk:` routes to `Irrelevant`
+                // regardless), so including it here would never resolve anything —
+                // `environment: *shared_env` itself fires with the *root* frame on top (the
+                // alias is the *value of the `environment:` key*, read before ever pushing an
+                // `EnvironmentValue` frame), which is exactly this branch. A single
+                // dependency's own value aliasing a whole mapping
+                // (`FrameRole::DependencySectionValue`, e.g. `pkg: *shared_entry`) is
+                // deliberately left to the scalar-only resolution below instead — see
+                // `test_aliased_dependency_to_unresolvable_anchor_still_present`.
+                let role = self.stack.top_role_or(FrameRole::Irrelevant);
+                if role == FrameRole::Root
+                    && let Some((kind, range)) = self.container_anchors.get(&anchor_id).cloned()
                 {
-                    *sdk = Some(text);
+                    // The one clone this design pays for container-anchor replay (see
+                    // `RecordingFrame`'s docs) — a slice of the shared `event_log`, copied
+                    // only now, once per actual alias occurrence, rather than once per event
+                    // for every open anchor regardless of whether it's ever aliased.
+                    let Some(slice) = self.event_log.get(range) else {
+                        // Every `container_anchors` range is built from indices this same
+                        // receiver recorded into `event_log` (see `record_event`) — a miss
+                        // here means that invariant broke. Fail loudly in debug/tests rather
+                        // than silently replaying nothing, which would reproduce the exact
+                        // whole-section data loss this feature exists to fix; in release,
+                        // skip this alias (leaving it unresolved, the same graceful outcome
+                        // as an unknown anchor) rather than panicking the LSP server.
+                        debug_assert!(
+                            false,
+                            "container_anchors[{anchor_id}] range is out of bounds for event_log"
+                        );
+                        return;
+                    };
+                    let events: Vec<(Event, Marker)> = slice.to_vec();
+                    self.replay_depth += 1;
+                    // The container-anchor replay path pushes/pops directly, out of band
+                    // from any live key/value position — never mistaken for a complex key's
+                    // subtree, since `is_complex_key_position` reflects the *live* stack top
+                    // at the moment of this call, which is a `Root` frame awaiting a *value*
+                    // (this whole branch only runs in `ScalarPosition::Value`), not a key.
+                    debug_assert!(!self.stack.is_complex_key_position());
+                    self.push_container(kind);
+                    for (event, event_marker) in events {
+                        self.on_event(event, event_marker);
+                    }
+                    self.pop_container();
+                    self.replay_depth -= 1;
+                    return;
                 }
+
+                let replay_depth = self.replay_depth;
+                let Self {
+                    stack,
+                    entries,
+                    sdk,
+                    budget,
+                    ..
+                } = self;
+                let Some(top) = stack.top_mut() else {
+                    return;
+                };
+                match *top.role() {
+                    FrameRole::DependencySectionValue => {
+                        if let Some(name) = top.payload.pending_dep_name.take() {
+                            let section = top.payload.section;
+                            Self::push_entry(
+                                entries,
+                                budget,
+                                section,
+                                name,
+                                replay_depth > 0,
+                                || {
+                                    resolved.map_or(RawDependencyValue::Unresolved, |text| {
+                                        RawDependencyValue::Simple(FieldValue::Unpositioned(text))
+                                    })
+                                },
+                            );
+                        }
+                    }
+                    FrameRole::DependencyEntryValue | FrameRole::GitValue => {
+                        if let Some(text) = resolved {
+                            let key = *top.pending_key();
+                            top.payload
+                                .assign_field(key, FieldValue::Unpositioned(text));
+                        }
+                    }
+                    // Mirrors `on_scalar`'s `EnvironmentValue` arm (critic finding C1): an
+                    // alias to a *scalar* anchor used as `sdk:`'s value (`sdk:
+                    // *shared_version`, sharing one constraint string — the more idiomatic
+                    // of #905's two named shapes) must resolve the same way a direct scalar
+                    // does, not fall through as a no-op the way an unresolvable one
+                    // correctly does.
+                    FrameRole::EnvironmentValue => {
+                        if *top.pending_key() == PendingKey::EnvSdk
+                            && let Some(text) = resolved
+                        {
+                            *sdk = Some(text);
+                        }
+                    }
+                    // `Root` already tried the container-anchor replay above; this arm now
+                    // only catches a genuinely unresolvable alias in this position (e.g. an
+                    // unknown anchor id) — a graceful no-op, same as `Irrelevant`.
+                    FrameRole::Root | FrameRole::Irrelevant => {}
+                }
+                stack.consume_value();
             }
-            // `Root` already tried the container-anchor replay above; this arm now only
-            // catches a genuinely unresolvable alias in this position (e.g. an unknown anchor
-            // id) — a graceful no-op, same as `Irrelevant`/`ComplexKey`.
-            FrameRole::Root | FrameRole::Irrelevant | FrameRole::ComplexKey => {}
         }
-        top.awaiting_key = true;
-        top.pending_key = PendingKey::None;
     }
 }
 
@@ -1661,6 +1637,35 @@ dependencies:
         assert_eq!(dev_http.version_req, Some("^1.0.0".into()));
         assert!(deps_http.version_range.is_none());
         assert!(dev_http.version_range.is_none());
+    }
+
+    // deps-lsp#908: `on_alias`'s whole-section container-anchor replay pushes/pops the
+    // `FrameStack` directly, out of band from any live key/value position. It must never be
+    // mistaken for a complex YAML key's subtree (`FrameStack::is_complex_key_position`) —
+    // `on_alias` only enters the replay branch from `ScalarPosition::Value`, which already
+    // implies the live top frame is not awaiting a key, so the two can never coincide; a
+    // `debug_assert!` in `on_alias` locks this in. This test exercises the replay path in the
+    // same document as an explicit complex key elsewhere, so a regression that made them
+    // interfere would surface here as either a panic (debug builds) or a dropped/corrupted
+    // dependency (release builds).
+    #[test]
+    fn test_complex_key_inside_a_replayed_whole_section_anchor_does_not_disturb_it() {
+        // The complex key sits *inside* the anchored subtree itself, so replaying it (via
+        // `on_alias`'s `push_container`/`pop_container` out-of-band calls) drives the
+        // complex-key subtree through `FrameStack` a second time, this time under a live
+        // `DependencySectionValue` role (from `dependencies: *shared`) rather than the
+        // `Irrelevant` role it had on its first, live pass under the unrecognized `shared:`
+        // key — exercising the actual replay/complex-key interaction the
+        // `is_complex_key_position` debug_assert in `on_alias` guards, unlike a complex key
+        // that closes *before* the alias ever replays it.
+        let yaml =
+            "shared: &shared\n  ? [a, b]\n  : unused\n  http: ^1.0.0\ndependencies: *shared\n";
+        let result = parse_pubspec_yaml(yaml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1, "{:?}", result.dependencies);
+        let http = &result.dependencies[0];
+        assert_eq!(http.name.as_ref(), "http");
+        assert_eq!(http.version_req, Some("^1.0.0".into()));
+        assert!(matches!(http.section, DependencySection::Dependencies));
     }
 
     #[test]
