@@ -196,6 +196,10 @@ pub fn collect_update_all_edits(
             continue;
         }
 
+        // TODO(critic): intentionally not calling `dependency_version_range_is_literal`
+        // (#919) here — empty-requirement semantics differ (edit: nothing to update;
+        // completion: everything to offer), and this loop hoists its own `line_offsets`
+        // across every dependency rather than rebuilding one per call.
         let slice = slice_for_range(content, &line_offsets, version_range);
         let literal_target = dep
             .version_literal()
