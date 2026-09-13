@@ -122,12 +122,14 @@ by shape and defers both parts on cost/complexity grounds, not on a false "no lo
   higher-value than anchors precisely because it is GitLab's documented mechanism, not an
   undocumented same-file trick; needs its own research issue, including confirming GitLab's config
   processor even accepts `!reference` inside `include:` (open question, not resolved here).
-- The cross-ecosystem class of bug this fix's completion guard (A-7) is one instance of:
+- ~~The cross-ecosystem class of bug this fix's completion guard (A-7) is one instance of:
   `deps_core::completion::detect_completion_context` has no literal-span guard analogous to
-  `literal_span_matches`, so any ecosystem whose `version_range` can span a non-literal token
-  (Maven `${prop}`, Gradle variables, and — once #909 lands — GitHub Actions alias sites) can offer
-  the same cursor-splicing version completion this fix guards locally. Fixing the class belongs in
-  `deps-core`, not per-ecosystem; tracked as a separate follow-up issue (§9), out of #912's scope.
+  `literal_span_matches`~~ — **already shipped as #922** (`crates/deps-core/src/lsp_helpers/mod.rs`'s
+  `dependency_version_range_is_literal`, merged to `main` before this fix's implementation began; see
+  commit `23f440811`). `detect_completion_context` now rejects a `*`-leading (or `$`-containing)
+  `version_range` generically, so this crate's local FR-011 check is defense-in-depth over that
+  shared guard, not the sole barrier this section originally described. Follow-Up #4 (§9) is
+  correspondingly already closed — see its updated status there.
 - Extracting the value-table + alias-token-span mechanism into a shared `deps-core::yaml_anchors`
   helper now. `fix/909-gha-yaml-anchor-alias` is spec-only (no merged source), so there is nothing
   to share yet; extraction is filed as its own follow-up once **both** #909 and #912 have landed,
@@ -434,18 +436,19 @@ conclusion survived into the spec.
    mechanism, not an undocumented same-file trick. First question to resolve: does GitLab's own
    config processor accept `!reference` inside `include:` at all, or only inside job bodies (which
    this crate does not parse regardless)? Needs its own research spike before scoping.
-4. **Cross-ecosystem: `detect_completion_context` has no literal-span guard** — #919, bug, `cross-ecosystem` label, P2.
-   Body: `deps_core::completion::detect_completion_context` returns `CompletionContext::Version`
-   purely from `position_in_range(position, version_range)`, with no check that `version_range`
-   actually slices to a literal value. Any ecosystem whose `version_range` can span a non-literal
-   token can offer a cursor-splicing version completion that corrupts that token on accept: Maven
-   `<version>${prop}</version>`, Gradle variable interpolation, and — once #909 lands — GitHub
-   Actions alias sites. `deps-gitlab-ci` (#912) works around this locally with its own
-   `is_alias_occurrence` gate (FR-011) because the class fix belongs in `deps-core`, not
-   per-ecosystem, and fixing it there changes behavior for several ecosystems simultaneously — well
-   beyond the scope of a single-ecosystem parser bug fix. Fix belongs in
-   `deps-core::completion::detect_completion_context`, applying a `literal_span_matches`-equivalent
-   guard before returning `Version`.
+4. ~~**Cross-ecosystem: `detect_completion_context` has no literal-span guard** — #919, bug,
+   `cross-ecosystem` label, P2.~~ **Already shipped — do not file.** (#912 critic review, S3):
+   `#919` already existed and was already resolved by `#922`
+   (`fix(deps-core): reject non-literal version spans in completion guard`, merged to `main`
+   before this fix's implementation began) — `deps_core::completion::detect_completion_context` now
+   routes through `lsp_helpers::dependency_version_range_is_literal`, which rejects a `*`-leading (or
+   `$`-containing) `version_range` before ever returning `CompletionContext::Version`. `deps-gitlab-ci`
+   (#912) keeps its own `is_alias_occurrence` gate (FR-011) as local defense-in-depth — not because
+   the shared guard is missing, but because it is the gate FR-011 was specified against, and it also
+   covers `sha_pin_quickfix_kind`'s three SHA-pin call sites, which `#922`'s completion-only guard
+   does not. This paragraph originally proposed filing #919 as a new issue without checking whether it
+   already existed — a process lesson, not a design error: always check `gh issue view <N>` /
+   `gh issue list` for an issue number before assuming it is unfiled.
 
 ## 10. See Also
 
@@ -459,7 +462,10 @@ conclusion survived into the spec.
 - GitHub `#909` — the GitHub Actions sibling gap, unmerged, spec-only
 - GitHub `#913` — GitHub Actions' aggregate per-alias-site annotation research idea for the
   container case; this spec's sequence-shaped follow-up (§9, Follow-Up #2) is its GitLab-CI sibling
-- GitHub #916, #917, #918, #919 — this spec's four filed follow-up issues (§9 Follow-Up Issues)
+- GitHub #916, #917, #918 — this spec's three filed follow-up issues (§9 Follow-Up Issues); the
+  fourth (a `detect_completion_context` literal-span guard) was going to be filed as `#919` but that
+  number already existed and was already resolved by `#922` before this fix's implementation began
+  (#912 critic review, S3) — not filed again
 - GitHub `#643` — introduced `sha_pin_quickfix_kind` as the single source of truth for the
   mutable-ref-pin diagnostic's quickfix-availability suffix; this spec's FR-010 preserves that invariant
 - `crates/deps-gitlab-ci/src/parser.rs` — `key_for`, the `Event::Scalar`/`Event::Alias` handling
