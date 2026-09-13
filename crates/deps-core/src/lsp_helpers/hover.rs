@@ -662,14 +662,23 @@ fn push_latest_hover_section(
     }
 }
 
-/// Appends the "Recent versions" list: the top [`HOVER_RECENT_VERSIONS`] entries of
+/// Appends the "Recent versions" list: up to [`HOVER_RECENT_VERSIONS`] entries drawn from
 /// `available_versions`, each optionally aged (freshness-gated) and marked
 /// `*(latest)*` at `live_latest_idx` — matched by position against the header's
 /// stable-latest pick rather than raw index 0 or string equality: `available_versions`
 /// is sorted purely by version number, so index 0 can be a pre-release the header
 /// itself doesn't call "latest" (issue #313), and matching by version string instead
-/// of index could tag more than one entry if two ever shared a version string. No
-/// match in the rendered top-N slice simply omits the marker.
+/// of index could tag more than one entry if two ever shared a version string.
+///
+/// If `live_latest_idx` falls outside the raw-order `HOVER_RECENT_VERSIONS`-entry
+/// window (e.g. 9+ consecutive pre-releases ahead of the first stable release), the
+/// pick is bumped into the window as its final entry instead of being silently
+/// dropped from the list — mirroring
+/// [`crate::completion::prepare_version_display_items`]'s identical bounded-scan
+/// fix for completion/code-actions (#956, #961). Unlike that helper, no separate
+/// filter pass is needed first: this list already renders every entry regardless of
+/// removal status (flagged ones just gain `formatter.yanked_label()`), so the pick
+/// can be looked up by direct index instead of a bounded scan over survivors.
 ///
 /// Renders nothing when `available_versions` is empty (issue #550): an empty
 /// "Recent versions" header with no entries under it is never useful.
@@ -687,12 +696,22 @@ fn push_recent_versions_hover_section(
         return;
     }
 
-    markdown.push_str("**Recent versions**:\n");
-    for (i, version) in available_versions
+    let mut entries: Vec<(usize, &Box<dyn Version>)> = available_versions
         .iter()
-        .take(HOVER_RECENT_VERSIONS)
         .enumerate()
+        .take(HOVER_RECENT_VERSIONS)
+        .collect();
+
+    if let Some(idx) = live_latest_idx
+        && idx >= HOVER_RECENT_VERSIONS
+        && let Some(pick) = available_versions.get(idx)
     {
+        entries.truncate(HOVER_RECENT_VERSIONS - 1);
+        entries.push((idx, pick));
+    }
+
+    markdown.push_str("**Recent versions**:\n");
+    for (i, version) in entries {
         let version_span = markdown_code_span(version.version_string().as_str());
         let age_suffix = if freshness.enabled {
             version_age_suffix(version.as_ref(), now)
@@ -1978,11 +1997,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_generate_hover_latest_marker_omitted_when_stable_outside_top_n() {
+    async fn test_generate_hover_latest_marker_bumped_in_when_stable_outside_top_n() {
         use std::collections::HashMap;
 
         // Nine pre-releases followed by one stable version: the stable pick sits past
-        // `HOVER_RECENT_VERSIONS`, so it never appears in the rendered list.
+        // `HOVER_RECENT_VERSIONS`, so it must be bumped into the rendered list's final
+        // slot rather than silently dropped (#961).
         let mut versions: Vec<MockVersionWithAge> = (0..=HOVER_RECENT_VERSIONS)
             .map(|i| MockVersionWithAge {
                 version: format!("2.0.0-alpha{i}").into(),
@@ -2019,8 +2039,199 @@ mod tests {
             content.value
         );
         assert!(
-            !content.value.contains("*(latest)*"),
-            "the stable latest isn't in the truncated top-N slice, so no entry should be marked; got: {}",
+            content.value.contains("- `1.9.0` *(latest)*"),
+            "the stable pick must be bumped into the capped list instead of omitted; got: {}",
+            content.value
+        );
+        assert_eq!(
+            content.value.matches("*(latest)*").count(),
+            1,
+            "exactly one entry should carry the marker; got: {}",
+            content.value
+        );
+        assert_eq!(
+            content
+                .value
+                .lines()
+                .filter(|l| l.starts_with("- `"))
+                .count(),
+            HOVER_RECENT_VERSIONS,
+            "the list must stay capped at HOVER_RECENT_VERSIONS entries even after the bump-in; got: {}",
+            content.value
+        );
+        assert!(
+            !content.value.contains("2.0.0-alpha7"),
+            "the displaced 8th natural entry must not remain in the capped list; got: {}",
+            content.value
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_hover_latest_marker_at_last_window_slot_not_bumped() {
+        use std::collections::HashMap;
+
+        // The stable pick sits exactly at `HOVER_RECENT_VERSIONS - 1` — already the last
+        // entry the raw-order window naturally displays — so it must render once, in
+        // place, without triggering the bump-in path (boundary just inside the window).
+        let mut versions: Vec<MockVersionWithAge> = (0..HOVER_RECENT_VERSIONS - 1)
+            .map(|i| MockVersionWithAge {
+                version: format!("2.0.0-alpha{i}").into(),
+                yanked: false,
+                published_at: None,
+            })
+            .collect();
+        versions.push(MockVersionWithAge {
+            version: "1.9.0".into(),
+            yanked: false,
+            published_at: None,
+        });
+        assert_eq!(versions.len(), HOVER_RECENT_VERSIONS);
+        let registry = MockRegistryWithVersions { versions };
+        let parse_result = freshness_test_parse_result("example");
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&HashMap::new(), &HashMap::new()),
+            &registry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert_eq!(
+            content.value.matches("- `1.9.0` *(latest)*").count(),
+            1,
+            "the in-window pick must render exactly once, not duplicated by a bump-in; got: {}",
+            content.value
+        );
+        assert_eq!(
+            content
+                .value
+                .lines()
+                .filter(|l| l.starts_with("- `"))
+                .count(),
+            HOVER_RECENT_VERSIONS,
+            "got: {}",
+            content.value
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_hover_latest_marker_one_past_window_triggers_bump() {
+        use std::collections::HashMap;
+
+        // The stable pick sits at exactly `HOVER_RECENT_VERSIONS` — the first index the
+        // bump-in path must catch (minimal boundary, one past
+        // `test_generate_hover_latest_marker_at_last_window_slot_not_bumped` above).
+        let mut versions: Vec<MockVersionWithAge> = (0..HOVER_RECENT_VERSIONS)
+            .map(|i| MockVersionWithAge {
+                version: format!("2.0.0-alpha{i}").into(),
+                yanked: false,
+                published_at: None,
+            })
+            .collect();
+        versions.push(MockVersionWithAge {
+            version: "1.9.0".into(),
+            yanked: false,
+            published_at: None,
+        });
+        assert_eq!(versions.len(), HOVER_RECENT_VERSIONS + 1);
+        let registry = MockRegistryWithVersions { versions };
+        let parse_result = freshness_test_parse_result("example");
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&HashMap::new(), &HashMap::new()),
+            &registry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            content.value.contains("- `1.9.0` *(latest)*"),
+            "the pick at index HOVER_RECENT_VERSIONS must be bumped in; got: {}",
+            content.value
+        );
+        assert!(
+            !content
+                .value
+                .contains(&format!("2.0.0-alpha{}", HOVER_RECENT_VERSIONS - 1)),
+            "the displaced last natural entry must not remain in the capped list; got: {}",
+            content.value
+        );
+        assert_eq!(
+            content
+                .value
+                .lines()
+                .filter(|l| l.starts_with("- `"))
+                .count(),
+            HOVER_RECENT_VERSIONS,
+            "got: {}",
+            content.value
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_hover_latest_marker_flagged_pick_bumped_in_keeps_yanked_label() {
+        use crate::RemovalStatus;
+        use std::collections::HashMap;
+
+        // Hover's "Recent versions" list has no removal-status filter pass (unlike
+        // completion's `prepare_version_display_items`), so the bumped-in pick can itself
+        // be flagged: eight `Yanked` entries fill the raw-order window, so the registry's
+        // 3-rung ranking (`select_latest_for_existence`) falls through to the first
+        // non-blocking entry — an `AdvisoryDeprecated` one sitting past the window. The
+        // bumped-in entry must render both the `*(latest)*` marker and its flag label
+        // together (#961).
+        let mut versions: Vec<MockVersionWithStatus> = (0..HOVER_RECENT_VERSIONS)
+            .map(|i| MockVersionWithStatus {
+                version: format!("5.0.{i}").into(),
+                status: RemovalStatus::Yanked,
+            })
+            .collect();
+        versions.push(MockVersionWithStatus {
+            version: "5.0.99".into(),
+            status: RemovalStatus::AdvisoryDeprecated,
+        });
+        let registry = MockRegistryPreferringUnflagged { versions };
+        let parse_result = freshness_test_parse_result("example");
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&HashMap::new(), &HashMap::new()),
+            &registry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            content.value.contains("- `5.0.99` *(latest)* *(yanked)*"),
+            "the bumped-in flagged pick must carry both the latest marker and its flag label; got: {}",
+            content.value
+        );
+        assert!(
+            !content.value.contains("5.0.7`"),
+            "the displaced last natural entry must not remain in the capped list; got: {}",
             content.value
         );
     }
