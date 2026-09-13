@@ -172,8 +172,8 @@ pub use parser::{
     json_depth_error_message, parse_json_checked, yaml_scalar_string,
 };
 pub use registry::{
-    Deprecation, Metadata, Registry, RemovalStatus, Version, find_latest_stable,
-    has_default_prerelease_marker, hash_routing_key, is_existence_wildcard,
+    Deprecation, Metadata, Registry, RemovalStatus, Version, existence_wildcard_req,
+    find_latest_stable, has_default_prerelease_marker, hash_routing_key, is_existence_wildcard,
     is_existence_wildcard_str, not_found_or, select_latest_for_existence,
 };
 pub use version_matcher::{

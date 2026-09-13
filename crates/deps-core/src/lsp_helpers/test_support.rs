@@ -827,6 +827,18 @@ impl crate::Registry for FixedVersionRegistry {
         Box::pin(async move { Ok(Vec::new()) })
     }
 
+    // Mirrors the real 3-rung existence ladder every ecosystem's own `select_latest_matching`
+    // delegates to (`crate::select_latest_for_existence`), rather than the trait default
+    // (always `None`) — `generate_code_actions`'s `(latest)`/`is_preferred` REFACTOR-action
+    // pick is now sourced from this call (#952), same as hover's `live_latest_idx`.
+    fn select_latest_matching(
+        &self,
+        versions: &[Box<dyn crate::Version>],
+        _req: &VersionReq,
+    ) -> Option<usize> {
+        crate::select_latest_for_existence(versions, |v| v.as_ref())
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

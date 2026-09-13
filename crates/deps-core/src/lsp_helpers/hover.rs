@@ -211,7 +211,7 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     // it's `(latest)` (#347/#348 S1). Recorded as an index rather than a version string so the
     // "Recent versions" marker below can match by position instead of string equality, which
     // could spuriously tag more than one entry if two ever shared a version string.
-    let wildcard_req = VersionReq::new("*");
+    let wildcard_req = crate::existence_wildcard_req();
     let live_latest_idx = available_versions
         .as_ref()
         .and_then(|v| registry.select_latest_matching(v, &wildcard_req));

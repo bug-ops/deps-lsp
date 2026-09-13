@@ -672,7 +672,12 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
 
     let mut latest_refactor_idx = None;
     if let Some(registry_versions) = &registry_versions {
-        let display_items = prepare_version_display_items(registry_versions, dep.name());
+        // Same registry-delegated pick hover's `live_latest_idx` uses (see
+        // `prepare_version_display_items`'s doc comment) — not a re-derived `is_stable()` scan.
+        let latest_idx =
+            registry.select_latest_matching(registry_versions, &crate::existence_wildcard_req());
+        let display_items =
+            prepare_version_display_items(registry_versions, dep.name(), latest_idx);
         for item in display_items {
             if !is_safe_version_string(item.version.as_str()) {
                 warn_rejected_value(
@@ -2146,6 +2151,163 @@ mod tests {
                 .all(|a| a.is_preferred.is_none()),
             "every other action must be None, not Some(false): {actions:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_generate_code_actions_latest_refactor_skips_prerelease_at_raw_top() {
+        // Regression for #952 (sibling of #313, hover-only): the raw registry-fetch-order
+        // top entry is a pre-release (Maven spring-boot-starter-web 4.2.0-M1, NuGet
+        // Newtonsoft.Json 13.0.5-beta1 shape). The `(latest)`-labeled, preferred REFACTOR
+        // action must land on the first stable entry instead, matching hover/diagnostics.
+        let (dep, version_range, content) = vulnerable_dep("1.0.0");
+        let parse_result = MockParseResult {
+            deps: vec![dep],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+        let versions = VersionData::new(&cached, &resolved);
+        let registry = FixedVersionRegistry {
+            versions: vec![("2.0.0-beta1", false), ("1.5.0", false), ("1.0.0", false)],
+        };
+
+        let actions = generate_code_actions(
+            &parse_result,
+            version_range.start,
+            parse_result.uri(),
+            versions,
+            &content,
+            &registry,
+            &MockFormatter,
+        )
+        .await;
+
+        assert!(quickfix_titles(&actions).is_empty());
+        let refactor_titles = refactor_titles(&actions);
+        assert!(
+            refactor_titles.contains(&"2.0.0-beta1"),
+            "the pre-release must still be offered, just unlabeled: {refactor_titles:?}"
+        );
+        assert!(
+            refactor_titles.contains(&"1.5.0 (latest)"),
+            "the first stable entry must carry the latest marker: {refactor_titles:?}"
+        );
+
+        let preferred: Vec<&str> = actions
+            .iter()
+            .filter(|a| a.is_preferred == Some(true))
+            .map(|a| a.title.as_str())
+            .collect();
+        assert_eq!(
+            preferred,
+            vec!["1.5.0 (latest)"],
+            "the stable version must be preferred, not the raw-top pre-release: {actions:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_code_actions_all_prerelease_still_prefers_a_refactor_action() {
+        // Critic C1: when every fetched version is a pre-release, the quick-fix list must
+        // still agree with hover's own fallback (`Registry::select_latest_matching` falls
+        // through the shared existence ladder to the newest overall) rather than leaving no
+        // action preferred — the regression a raw `is_stable()`/`is_prerelease()` re-scan
+        // introduced for the ~10 of 14 ecosystems sharing this ladder.
+        let (dep, version_range, content) = vulnerable_dep("1.0.0");
+        let parse_result = MockParseResult {
+            deps: vec![dep],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+        let versions = VersionData::new(&cached, &resolved);
+        let registry = FixedVersionRegistry {
+            versions: vec![("2.0.0-beta2", false), ("2.0.0-beta1", false)],
+        };
+
+        let actions = generate_code_actions(
+            &parse_result,
+            version_range.start,
+            parse_result.uri(),
+            versions,
+            &content,
+            &registry,
+            &MockFormatter,
+        )
+        .await;
+
+        let refactor_titles = refactor_titles(&actions);
+        assert!(
+            refactor_titles.contains(&"2.0.0-beta2 (latest)"),
+            "the newest overall must still carry the marker: {refactor_titles:?}"
+        );
+
+        let preferred: Vec<&str> = actions
+            .iter()
+            .filter(|a| a.is_preferred == Some(true))
+            .map(|a| a.title.as_str())
+            .collect();
+        assert_eq!(preferred, vec!["2.0.0-beta2 (latest)"]);
+    }
+
+    #[tokio::test]
+    async fn test_generate_code_actions_prefers_non_deprecated_over_newer_deprecated() {
+        // Critic S1: the identical #952 defect class with "deprecated" substituted for
+        // "pre-release" (npm's #338 NFR-002 shape) — `is_stable()` alone would still tag the
+        // newer `AdvisoryDeprecated` entry as latest/preferred; delegating to the registry's
+        // own `select_latest_matching` (the shared 3-rung ladder, gating on `is_flagged()`
+        // rather than only `blocks_resolution()`) must prefer the older, non-flagged release
+        // instead, agreeing with hover.
+        let (dep, version_range, content) = vulnerable_dep("1.0.0");
+        let parse_result = MockParseResult {
+            deps: vec![dep],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+        let versions = VersionData::new(&cached, &resolved);
+        let registry = MockRegistryPreferringUnflagged {
+            versions: vec![
+                MockVersionWithStatus {
+                    version: "2.0.0".into(),
+                    status: crate::RemovalStatus::AdvisoryDeprecated,
+                },
+                MockVersionWithStatus {
+                    version: "1.9.0".into(),
+                    status: crate::RemovalStatus::Available,
+                },
+            ],
+        };
+
+        let actions = generate_code_actions(
+            &parse_result,
+            version_range.start,
+            parse_result.uri(),
+            versions,
+            &content,
+            &registry,
+            &MockFormatter,
+        )
+        .await;
+
+        let refactor_titles = refactor_titles(&actions);
+        assert!(
+            refactor_titles.contains(&"2.0.0"),
+            "the deprecated entry is still offered, unlabeled: {refactor_titles:?}"
+        );
+        assert!(
+            refactor_titles.contains(&"1.9.0 (latest)"),
+            "the non-deprecated entry must carry the marker instead: {refactor_titles:?}"
+        );
+
+        let preferred: Vec<&str> = actions
+            .iter()
+            .filter(|a| a.is_preferred == Some(true))
+            .map(|a| a.title.as_str())
+            .collect();
+        assert_eq!(preferred, vec!["1.9.0 (latest)"]);
     }
 
     #[tokio::test]
