@@ -337,26 +337,7 @@ impl Ecosystem for GithubActionsEcosystem {
                     .push_str(deps_core::lsp_helpers::CMD_DOT_FOOTER);
             }
 
-            let Some(PinStyle::Sha { comment_tag }) = &gha_dep.pin else {
-                return Some(hover);
-            };
-
-            let sha = match comment_tag {
-                // Whitespace-token split, not `split_once(" # ")`: the parser's
-                // comment-tag rule (B3) only requires the `#` to be *preceded* by
-                // whitespace, so `<sha>  # v4.2.0` (two spaces) or `<sha>\t# v4.2.0`
-                // are both valid literals that a single-space exact match would miss
-                // (critic M2).
-                Some(_) => gha_dep
-                    .version_literal
-                    .as_deref()
-                    .and_then(|lit| lit.split_whitespace().next()),
-                None => gha_dep
-                    .version_req
-                    .as_ref()
-                    .map(deps_core::VersionReq::as_str),
-            };
-            let Some(sha) = sha else {
+            let Some(sha) = crate::types::sha_pin_raw_sha(gha_dep) else {
                 return Some(hover);
             };
 
@@ -1557,6 +1538,59 @@ mod tests {
 
         let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
         assert_eq!(edits.len(), 1);
+    }
+
+    /// #907 review follow-up (code review): the "Update N outdated dependencies" code
+    /// lens (`collect_update_all_edits`, shared `deps-core` logic) must agree with
+    /// inlay hints/diagnostics on a SHA pin's status. Here the SHA's registry-confirmed
+    /// tag (`TagIndex.sha_to_tag`) is `v4.0.0`, genuinely behind `latest` `v4.3.1`, even
+    /// though the human-written comment (`# v4`) matches at major-only precision — the
+    /// lens must count and edit it as outdated, not silently exclude it.
+    #[tokio::test]
+    async fn test_collect_update_all_edits_counts_sha_pin_outdated_via_tag_index_ground_truth() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = GithubActionsEcosystem::new(cache);
+        let sha = "a".repeat(40);
+        let mut index = crate::registry::TagIndex::default();
+        index.sha_to_tag.insert(sha.clone(), "v4.0.0".to_string());
+        // Also needed so `format_version_replacing_for` can produce a real (non-no-op)
+        // replacement SHA for `latest` — otherwise it falls back to the unchanged
+        // literal on a `tag_to_sha` miss and the edit is dropped by the no-op guard,
+        // independent of the `requirement_status_for` outcome this test targets.
+        index
+            .tag_to_sha
+            .insert("v4.3.1".to_string(), "b".repeat(40));
+        eco.formatter.tag_index.insert(
+            deps_core::PackageName::new("actions/checkout"),
+            Arc::new(index),
+        );
+
+        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+        let content = format!("steps:\n  - uses: actions/checkout@{sha} # v4\n");
+        let parse_result = eco.parse_manifest(&content, &uri).await.unwrap();
+
+        let mut cached = HashMap::new();
+        cached.insert(
+            deps_core::PackageName::new("actions/checkout"),
+            deps_core::PackageVersions::latest_only("v4.3.1"),
+        );
+        let resolved = HashMap::new();
+        let versions = deps_core::VersionData::new(&cached, &resolved);
+
+        let edits = deps_core::lsp_helpers::collect_update_all_edits(
+            parse_result.as_ref(),
+            &content,
+            versions,
+            &eco.formatter,
+        );
+
+        assert_eq!(
+            edits.len(),
+            1,
+            "the SHA's real tag v4.0.0 is behind latest v4.3.1 and must be counted as \
+             outdated, even though its comment says v4 (which matches v4.3.1 at \
+             major-only precision)"
+        );
     }
 
     #[tokio::test]

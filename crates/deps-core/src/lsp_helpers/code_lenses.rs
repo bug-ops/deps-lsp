@@ -5,8 +5,8 @@ use crate::ParseResult;
 use crate::PublishTime;
 
 use super::{
-    EcosystemFormatter, LineOffsetTable, VersionData, is_safe_version_string, literal_span_matches,
-    slice_for_range, strip_whitespace, warn_rejected_value,
+    EcosystemFormatter, LineOffsetTable, RequirementStatus, VersionData, is_safe_version_string,
+    literal_span_matches, slice_for_range, strip_whitespace, warn_rejected_value,
 };
 
 /// `workspace/executeCommand` id for the bulk "Pin N {noun} to commit SHA" code lens.
@@ -185,7 +185,14 @@ pub fn collect_update_all_edits(
             // emit an edit anchored on a span that was never a version literal.
             continue;
         }
-        if formatter.is_requirement_up_to_date(version_req, latest) {
+        // `requirement_status_for` (not the bare `is_requirement_up_to_date`), matching
+        // `diagnostics.rs`'s `apply_outdated_rule` and `inlay_hints.rs` (#907 review
+        // follow-up): lets e.g. `GithubActionsFormatter` prefer a SHA pin's
+        // registry-confirmed tag over trusting its own comment text, so the "Update N
+        // outdated" count/bulk-edit agrees with what inlay hints/diagnostics show for
+        // the same dependency instead of silently excluding it.
+        if formatter.requirement_status_for(dep, version_req, latest) != RequirementStatus::Outdated
+        {
             continue;
         }
 

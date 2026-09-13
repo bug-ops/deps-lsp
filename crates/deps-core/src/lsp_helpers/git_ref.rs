@@ -51,6 +51,56 @@ pub fn is_tag_shaped(s: &str) -> bool {
     stripped.starts_with(|c: char| c.is_ascii_digit())
 }
 
+/// Whether `s` has the shape of a version safe to trust from free-text context.
+///
+/// Unlike [`is_tag_shaped`] (safe for a constrained git-ref domain GitHub itself
+/// resolves), this is meant for text a human wrote by hand — e.g. a YAML comment.
+///
+/// An optional leading `v`/`V`, 1-3 dot-separated all-digit components, and an optional
+/// `-`/`+` prerelease/build suffix (accepted, not itself validated) — but, unlike
+/// `is_tag_shaped`, a bare all-digit token with **no** `v`/`V` prefix and **no** dot
+/// (`1234`, `20240501`, `0`) is rejected: nothing in the shape alone distinguishes an
+/// unprefixed integer from an arbitrary numeric annotation a human might write in a
+/// comment (a ticket number, a date), whereas `owner/repo@1234` as an actual git *ref* has
+/// no such ambiguity — GitHub either has a ref named `1234` or it doesn't (issue #907
+/// review finding S1: `deps-github-actions`'s SHA-pin trailing-comment parser had used
+/// `is_tag_shaped` and silently treated a genuine non-version annotation as a version).
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::is_partial_semver_shaped;
+///
+/// assert!(is_partial_semver_shaped("v4"));
+/// assert!(is_partial_semver_shaped("v2.9"));
+/// assert!(is_partial_semver_shaped("4.2.0"));
+/// assert!(is_partial_semver_shaped("v4.2.0-beta.1"));
+/// assert!(!is_partial_semver_shaped("1234"));
+/// assert!(!is_partial_semver_shaped("20240501"));
+/// assert!(!is_partial_semver_shaped("0"));
+/// assert!(!is_partial_semver_shaped("2024-01-15"));
+/// assert!(!is_partial_semver_shaped("main"));
+/// ```
+// `idx` comes from `str::find(['-', '+'])`, both ASCII bytes, so it is always a char
+// boundary; `strip_prefix(['v', 'V'])` likewise only ever removes a single ASCII byte.
+#[allow(clippy::string_slice)]
+#[must_use]
+pub fn is_partial_semver_shaped(s: &str) -> bool {
+    let has_v_prefix = s.starts_with(['v', 'V']);
+    let stripped = s.strip_prefix(['v', 'V']).unwrap_or(s);
+    let core = match stripped.find(['-', '+']) {
+        Some(idx) => &stripped[..idx],
+        None => stripped,
+    };
+    let parts: Vec<&str> = core.split('.').collect();
+    if parts.len() > 3 || (!has_v_prefix && parts.len() < 2) {
+        return false;
+    }
+    parts
+        .iter()
+        .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// Rewrites `tag` to match `current`'s leading `v`/`V` prefix style (or lack of one).
 ///
 /// A repository/project can change its tagging convention over time (`4.0.0` -> `v5.0.0`);
@@ -290,6 +340,45 @@ mod tests {
         assert!(is_tag_shaped("4.2.0"));
         assert!(!is_tag_shaped("main"));
         assert!(!is_tag_shaped(&"a".repeat(40)));
+    }
+
+    #[test]
+    fn test_is_partial_semver_shaped_accepts_v_prefixed_at_any_precision() {
+        assert!(is_partial_semver_shaped("v4"));
+        assert!(is_partial_semver_shaped("v2.9"));
+        assert!(is_partial_semver_shaped("v4.2.0"));
+        assert!(is_partial_semver_shaped("v4.2.0-beta.1"));
+        assert!(is_partial_semver_shaped("v4.2.0+build.5"));
+        assert!(is_partial_semver_shaped("V4"));
+    }
+
+    #[test]
+    fn test_is_partial_semver_shaped_accepts_dotted_without_v_prefix() {
+        assert!(is_partial_semver_shaped("2.9"));
+        assert!(is_partial_semver_shaped("4.2.0"));
+    }
+
+    #[test]
+    fn test_is_partial_semver_shaped_rejects_bare_unprefixed_integer() {
+        // #907 review S1: a bare all-digit token with no `v`/`V` prefix and no dot is
+        // indistinguishable from an arbitrary numeric comment annotation (a ticket
+        // number, a date) — must not be accepted as a version, unlike `is_tag_shaped`
+        // (safe only for an actual git ref, not free-text).
+        assert!(!is_partial_semver_shaped("1234"));
+        assert!(!is_partial_semver_shaped("20240501"));
+        assert!(!is_partial_semver_shaped("0"));
+    }
+
+    #[test]
+    fn test_is_partial_semver_shaped_rejects_dash_separated_date_and_branch_names() {
+        assert!(!is_partial_semver_shaped("2024-01-15"));
+        assert!(!is_partial_semver_shaped("main"));
+        assert!(!is_partial_semver_shaped(&"a".repeat(40)));
+    }
+
+    #[test]
+    fn test_is_partial_semver_shaped_rejects_too_many_components() {
+        assert!(!is_partial_semver_shaped("v1.2.3.4"));
     }
 
     #[test]

@@ -21,7 +21,7 @@
 
 use crate::types::{GithubActionsDependency, GithubActionsParseResult, PinStyle};
 use deps_core::lsp_helpers::{
-    LineOffsetTable, is_full_semver_shape, locate_value_span, marker_byte_offset,
+    LineOffsetTable, is_partial_semver_shaped, locate_value_span, marker_byte_offset,
     warn_rejected_value,
 };
 use deps_core::parser::DependencySource;
@@ -120,21 +120,31 @@ fn ref_is_last_token_on_line(rest_of_line: &str, window: WindowCoverage) -> bool
 
 /// The first whitespace-delimited token after a whitespace-preceded `#` in
 /// `rest_of_line` (the raw source text following a ref's end, up to end of line),
-/// accepted as a comment tag only when it has the shape of a full `major.minor.patch`
-/// version ([`is_full_semver_shape`], shared with the crate's `BareRequirementPolicy`
-/// gate so the two mechanisms can't diverge — B2/B3/N1).
+/// accepted as a comment tag whenever it has the shape of a version safe to trust from
+/// free text ([`is_partial_semver_shaped`], issue #907): an optional leading `v`/`V`
+/// followed by 1-3 dot-separated all-digit components, at any precision (`v4`, `v4.2`,
+/// `v4.2.0`) — but, unlike a bare `@ref` pin's `is_tag_shaped` classification, a bare
+/// all-digit token with no `v`/`V` prefix and no dot (`1234`, a ticket number; `20240501`,
+/// a date) is rejected (#907 review finding S1): nothing distinguishes such a token from
+/// an arbitrary numeric annotation a human might write in a *comment*, whereas
+/// `is_tag_shaped` is safe for an actual git *ref*, a domain GitHub itself resolves. The
+/// overwhelmingly common real-world SHA-pin convention pins a major or major.minor
+/// comment (`# v4`, not `# v4.2.0`), which a stricter full-`major.minor.patch`-only gate
+/// rejected outright, silently degrading the ref to a bare, unresolvable SHA for the vast
+/// majority of real workflows.
 ///
 /// Returns `(tag_text, byte_offset_in_rest_of_line_where_the_token_ends)`. A `#` not
 /// preceded by whitespace is not a YAML comment and is skipped (only the *first*
-/// whitespace-preceded `#` is considered); a shape-rejected token (`# v4`, `# v4.2`) or
-/// no `#` at all yields `None` — the ref degrades to a bare, commentless pin.
+/// whitespace-preceded `#` is considered); a shape-rejected token (`# main`, `# cross`,
+/// `# cargo-deny`, `# 20240501`) or no `#` at all yields `None` — the ref degrades to a
+/// bare, commentless pin.
 ///
 /// `window` reflects whether `rest_of_line` was cut short of the line's real end (issue
 /// #885 rework). When the token runs all the way to the end of `rest_of_line` with no
 /// terminating whitespace found *and* the window was [`WindowCoverage::Truncated`], the
 /// token's true extent is unknown — real digits may continue just past the window edge
 /// (e.g. a window boundary landing mid-digit turns `v4.2.100` into `v4.2.10`, which still
-/// passes [`is_full_semver_shape`] and would otherwise be silently recorded as the real
+/// passes [`is_partial_semver_shaped`] and would otherwise be silently recorded as the real
 /// version — code-review finding #1). Such an ambiguous token is rejected as `None` rather
 /// than risking a truncated-but-plausible-looking version; a token that ends before the
 /// window's edge (a terminating whitespace was actually observed) is unaffected regardless
@@ -167,7 +177,7 @@ fn extract_comment_tag(rest_of_line: &str, window: WindowCoverage) -> Option<(&s
         }
         let token_len = terminator.unwrap_or(after_ws.len());
         let token = &after_ws[..token_len];
-        return if is_full_semver_shape(token) {
+        return if is_partial_semver_shaped(token) {
             Some((token, i + 1 + ws_len + token_len))
         } else {
             None
@@ -914,9 +924,13 @@ mod tests {
     }
 
     #[test]
-    fn test_sha_comment_partial_tag_rejected_stays_bare() {
-        // `# v4` / `# v4.2` are deliberately rejected (B2/B3): a partial comment
-        // tag would make the pin permanently "up to date" while the SHA rots.
+    fn test_sha_comment_partial_tag_accepted() {
+        // Issue #907: `# v4` / `# v4.2` are the overwhelmingly common real-world
+        // SHA-pin comment convention (major or major.minor, not a full patch version)
+        // — rejecting them degraded the ref to a bare, unresolvable SHA, silently
+        // dropping the inlay hint/diagnostic/hover for the vast majority of
+        // real-world workflows. Accepted at whatever precision is given
+        // (`is_partial_semver_shaped`).
         let sha = "a1b2c3d4e5a1b2c3d4e5a1b2c3d4e5a1b2c3d4e5";
         for suffix in ["v4", "v4.2"] {
             let content = format!("steps:\n  - uses: actions/checkout@{sha} # {suffix}\n");
@@ -924,10 +938,41 @@ mod tests {
             let dep = &result.dependencies[0];
             assert_eq!(
                 dep.version_requirement().map(deps_core::VersionReq::as_str),
+                Some(suffix),
+                "{suffix}"
+            );
+            assert_eq!(
+                dep.pin,
+                Some(PinStyle::Sha {
+                    comment_tag: Some(suffix.to_string())
+                }),
+                "{suffix}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sha_comment_non_version_text_rejected_stays_bare() {
+        // #907 review finding S1: a genuine non-version SHA-pin comment (a tool name
+        // annotation, a bare ticket number, a date) must still degrade to a bare,
+        // unresolvable SHA — `is_partial_semver_shaped` must not treat free text as a
+        // version just because it starts with a digit, unlike `is_tag_shaped` (safe
+        // only for an actual git ref).
+        let sha = "a1b2c3d4e5a1b2c3d4e5a1b2c3d4e5a1b2c3d4e5";
+        for suffix in ["cargo-deny", "do-not-upgrade", "main", "1234", "20240501"] {
+            let content = format!("steps:\n  - uses: taiki-e/install-action@{sha} # {suffix}\n");
+            let result = parse_workflow_yaml(&content, &test_uri()).unwrap();
+            let dep = &result.dependencies[0];
+            assert_eq!(
+                dep.version_requirement().map(deps_core::VersionReq::as_str),
                 Some(sha),
                 "{suffix}"
             );
-            assert_eq!(dep.pin, Some(PinStyle::Sha { comment_tag: None }));
+            assert_eq!(
+                dep.pin,
+                Some(PinStyle::Sha { comment_tag: None }),
+                "{suffix}"
+            );
         }
     }
 
@@ -1440,8 +1485,9 @@ mod tests {
     fn test_comment_tag_truncated_at_window_boundary_is_rejected_not_shortened() {
         // Code-review finding #1 on the #885 rework: a comment tag whose digits
         // straddle the window boundary must not be silently recorded as the
-        // truncated-but-still-semver-shaped prefix (`v4.2.100` cut to `v4.2.10`,
-        // which still passes `is_full_semver_shape`). Construct `rest_of_line` so
+        // truncated-but-still-partial-semver-shaped prefix (`v4.2.100` cut to
+        // `v4.2.10`, which still passes `is_partial_semver_shaped`). Construct
+        // `rest_of_line` so
         // the window (`REST_OF_LINE_WINDOW_BYTES` bytes past `ref_end`) ends exactly
         // one byte into the last digit of `v4.2.100`, then confirm plenty of real
         // content continues past the window (so this isn't just routine end-of-line

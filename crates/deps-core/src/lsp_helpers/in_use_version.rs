@@ -166,10 +166,16 @@ const fn bare_requirement_policy(ecosystem: EcosystemId) -> BareRequirementPolic
 /// Hand-rolled rather than pulled in via the `regex` crate: this is consulted from
 /// `bare_requirement_policy` in `deps-core`, the workspace's most-depended-on crate,
 /// which has no `regex` dependency today — equivalent to the pattern
-/// `^v?\d+\.\d+\.\d+(?:[-+].*)?$`. Shared verbatim by `deps-github-actions`'s
-/// SHA-comment-tag parsing rule so the two mechanisms can never silently diverge on
-/// what counts as a full version (e.g. `v4.2.0-beta.1` must be treated identically by
-/// both).
+/// `^v?\d+\.\d+\.\d+(?:[-+].*)?$`.
+///
+/// `deps-github-actions`'s SHA-comment-tag parsing rule used to share this predicate
+/// verbatim, but issue #907 (review finding S1) found it rejected the dominant
+/// real-world convention (a major-only `# v4` comment) while accepting free-text
+/// content this predicate was never meant to police in the first place. It now uses
+/// [`crate::lsp_helpers::is_partial_semver_shaped`] instead, which additionally rejects
+/// a bare unprefixed integer (`1234`, `20240501`) that this function's *full*
+/// three-component shape already excludes structurally — the two predicates
+/// intentionally diverge now, each fit to its own domain.
 ///
 /// # Examples
 ///

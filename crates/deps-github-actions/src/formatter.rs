@@ -3,7 +3,7 @@
 use dashmap::DashMap;
 use deps_core::lsp_helpers::{
     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
-    RequirementResolution, SourcePolicy, match_v_prefix_style,
+    RequirementResolution, RequirementStatus, SourcePolicy, match_v_prefix_style,
 };
 use deps_core::parser::DependencySource;
 use deps_core::{
@@ -281,6 +281,64 @@ impl RequirementResolution for GithubActionsFormatter {
     fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
         let req = requirement.as_str();
         is_full_sha(req) || !is_tag_shaped(req)
+    }
+
+    /// Prefers a SHA pin's registry-confirmed tag (`TagIndex.sha_to_tag`, ground truth
+    /// from the tags API) over trusting the comment text, when both are available (#907
+    /// review S2): the trailing `# vX` comment names *a* tag the pin was written against,
+    /// but the SHA itself is immutable — a stale comment can silently read as "up to
+    /// date" against `latest` even though the pinned commit is actually behind newer
+    /// releases still inside the same major/minor line. Falls back to
+    /// [`Self::requirement_status`] (trusting the comment) on any `TagIndex` miss — a
+    /// cold cache before the registry fetch populates it, or a commentless/tag/branch
+    /// pin, for which the comment-trusting path is already correct or already
+    /// `Unresolved`.
+    fn requirement_status_for(
+        &self,
+        dep: &dyn Dependency,
+        requirement: &VersionReq,
+        latest: &ConcreteVersion,
+    ) -> RequirementStatus {
+        self.sha_pin_status_from_tag_index(dep, latest)
+            .unwrap_or_else(|| self.requirement_status(requirement, latest))
+    }
+}
+
+impl GithubActionsFormatter {
+    /// Ground-truth status for a comment-annotated SHA pin whose commit is indexed in
+    /// `tag_index` — see [`RequirementResolution::requirement_status_for`]. `None` when
+    /// `dep` isn't such a pin, or the SHA has no `TagIndex` entry yet.
+    fn sha_pin_status_from_tag_index(
+        &self,
+        dep: &dyn Dependency,
+        latest: &ConcreteVersion,
+    ) -> Option<RequirementStatus> {
+        let gha_dep = dep.as_any().downcast_ref::<GithubActionsDependency>()?;
+        // Deliberately restricted to a *comment-annotated* SHA pin, not every SHA pin
+        // `crate::types::sha_pin_raw_sha` can resolve a raw SHA for: a commentless pin
+        // has no human-written text to distrust in the first place, so it stays on the
+        // ordinary `requirement_is_unresolved` path rather than gaining ground-truth
+        // status here (scope decision, #907 review).
+        if !matches!(
+            gha_dep.pin,
+            Some(PinStyle::Sha {
+                comment_tag: Some(_)
+            })
+        ) {
+            return None;
+        }
+        let sha = crate::types::sha_pin_raw_sha(gha_dep)?;
+        if !is_full_sha(sha) {
+            return None;
+        }
+        let real_tag = self.tag_index.get(dep.name())?.sha_to_tag.get(sha)?.clone();
+        Some(
+            if self.is_requirement_up_to_date(&VersionReq::new(real_tag), latest) {
+                RequirementStatus::UpToDate
+            } else {
+                RequirementStatus::Outdated
+            },
+        )
     }
 }
 
@@ -636,6 +694,233 @@ mod tests {
             is_plain_scalar: true,
             is_last_on_line: true,
         }
+    }
+
+    /// End-to-end regression for issue #907: a SHA-pinned `uses:` ref annotated with the
+    /// common `# vX` (major-only) comment convention must produce a real "outdated" inlay
+    /// hint, not silently emit nothing. Before the fix, `extract_comment_tag` accepted only
+    /// a full `major.minor.patch` comment, so this exact real-world shape degraded to an
+    /// unresolvable bare-SHA requirement and `generate_inlay_hints` emitted no hint at all
+    /// (`RequirementStatus::Unresolved`).
+    #[tokio::test]
+    async fn test_inlay_hint_sha_pin_with_major_only_comment_tag_shows_outdated() {
+        use deps_core::{EcosystemConfig, VersionData};
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::InlayHintLabel;
+
+        let sha = "d23441a48e516b6c34aea4fa41551a30e30af803";
+        let content = format!("steps:\n  - uses: actions/checkout@{sha} # v6\n");
+        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+        let parse_result = crate::parser::parse_workflow_yaml(&content, &uri).unwrap();
+        let fmt = formatter();
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            "actions/checkout".into(),
+            deps_core::PackageVersions::latest_only("v7.0.1"),
+        );
+        let resolved_versions = HashMap::new();
+
+        let config = EcosystemConfig::default();
+        let hints = deps_core::lsp_helpers::generate_inlay_hints(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            deps_core::LoadingState::Loaded,
+            &config,
+            &fmt,
+        );
+
+        assert_eq!(hints.len(), 1, "expected one inlay hint, got: {hints:?}");
+        match &hints[0].label {
+            InlayHintLabel::String(text) => {
+                assert!(
+                    text.contains("v7.0.1"),
+                    "expected an outdated hint naming the latest version, got: {text}"
+                );
+            }
+            other => panic!("expected string label, got: {other:?}"),
+        }
+    }
+
+    /// Companion to the major-only case above at major.minor precision (`# v2.9`) — the
+    /// other real-world precision `is_partial_semver_shaped` accepts, through the full
+    /// `generate_inlay_hints` pipeline rather than only the parser level.
+    #[tokio::test]
+    async fn test_inlay_hint_sha_pin_with_major_minor_comment_tag_shows_outdated() {
+        use deps_core::{EcosystemConfig, VersionData};
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::InlayHintLabel;
+
+        let sha = "6b69fcf40e9b5fb17adeb57e4b6ecd020649a239";
+        let content =
+            format!("steps:\n  - uses: obi1kenobi/cargo-semver-checks-action@{sha} # v2.9\n");
+        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+        let parse_result = crate::parser::parse_workflow_yaml(&content, &uri).unwrap();
+        let fmt = formatter();
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            "obi1kenobi/cargo-semver-checks-action".into(),
+            deps_core::PackageVersions::latest_only("v3.1.0"),
+        );
+        let resolved_versions = HashMap::new();
+
+        let config = EcosystemConfig::default();
+        let hints = deps_core::lsp_helpers::generate_inlay_hints(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            deps_core::LoadingState::Loaded,
+            &config,
+            &fmt,
+        );
+
+        assert_eq!(hints.len(), 1, "expected one inlay hint, got: {hints:?}");
+        match &hints[0].label {
+            InlayHintLabel::String(text) => {
+                assert!(
+                    text.contains("v3.1.0"),
+                    "expected an outdated hint naming the latest version, got: {text}"
+                );
+            }
+            other => panic!("expected string label, got: {other:?}"),
+        }
+    }
+
+    /// #907 review S2: a comment-annotated SHA pin's status must prefer the
+    /// registry-confirmed tag (`TagIndex.sha_to_tag`) over trusting the comment text,
+    /// when the tag index actually has an entry for that SHA. Here the SHA is really
+    /// `v4.0.0` (registry ground truth) even though its comment says `v4` — against a
+    /// `latest` of `v4.3.1`, the naive comment-only comparison would say "up to date"
+    /// (major matches), but the ground-truth-aware path must say "outdated".
+    #[test]
+    fn test_requirement_status_for_sha_pin_prefers_tag_index_ground_truth_over_comment() {
+        let sha = "a".repeat(40);
+        let fmt = formatter();
+        let mut index = TagIndex::default();
+        index.sha_to_tag.insert(sha.clone(), "v4.0.0".to_string());
+        fmt.tag_index
+            .insert(PackageName::new("actions/checkout"), Arc::new(index));
+
+        let d = dep(
+            Some(PinStyle::Sha {
+                comment_tag: Some("v4".to_string()),
+            }),
+            "actions/checkout",
+            Some(format!("{sha} # v4").as_str()),
+        );
+
+        // Sanity check: the naive comment-only path (no tag_index entry) really would
+        // say "up to date" here — confirms the test is exercising a genuine divergence,
+        // not a case where both paths happen to agree.
+        assert_eq!(
+            fmt.requirement_status(&VersionReq::new("v4"), &ConcreteVersion::new("v4.3.1")),
+            RequirementStatus::UpToDate
+        );
+
+        assert_eq!(
+            fmt.requirement_status_for(&d, &VersionReq::new("v4"), &ConcreteVersion::new("v4.3.1")),
+            RequirementStatus::Outdated,
+            "ground-truth tag v4.0.0 is behind latest v4.3.1; must not trust the stale v4 comment"
+        );
+    }
+
+    /// #907 review C1: the parser's comment-tag rule only requires the `#` to be
+    /// *preceded* by whitespace, so a two-space or tab gap before the `#` is a valid
+    /// literal (`ecosystem.rs`'s `generate_hover` SHA-pin branch already documents and
+    /// handles this). `sha_pin_status_from_tag_index` must extract the SHA the same
+    /// whitespace-token way, or it silently misses the `TagIndex` lookup and falls back
+    /// to trusting the (possibly stale) comment — reopening exactly the false-`UpToDate`
+    /// gap S2 fixed.
+    #[test]
+    fn test_requirement_status_for_sha_pin_ground_truth_survives_non_single_space_gap() {
+        let sha = "a".repeat(40);
+        let fmt = formatter();
+        let mut index = TagIndex::default();
+        index.sha_to_tag.insert(sha.clone(), "v4.0.0".to_string());
+        fmt.tag_index
+            .insert(PackageName::new("actions/checkout"), Arc::new(index));
+
+        for literal in [format!("{sha}  # v4"), format!("{sha}\t# v4")] {
+            let d = dep(
+                Some(PinStyle::Sha {
+                    comment_tag: Some("v4".to_string()),
+                }),
+                "actions/checkout",
+                Some(literal.as_str()),
+            );
+            assert_eq!(
+                fmt.requirement_status_for(
+                    &d,
+                    &VersionReq::new("v4"),
+                    &ConcreteVersion::new("v4.3.1")
+                ),
+                RequirementStatus::Outdated,
+                "must still reach the tag_index ground truth (v4.0.0, outdated) through a \
+                 non-single-space gap: {literal:?}"
+            );
+        }
+    }
+
+    /// Companion to the above: on a `TagIndex` miss (SHA not indexed — e.g. cold cache
+    /// before the registry fetch populates it), `requirement_status_for` must fall back
+    /// to trusting the comment text exactly as `requirement_status` already does, not
+    /// silently downgrade to `Unresolved`.
+    #[test]
+    fn test_requirement_status_for_sha_pin_falls_back_to_comment_on_tag_index_miss() {
+        let sha = "a".repeat(40);
+        let fmt = formatter();
+        let d = dep(
+            Some(PinStyle::Sha {
+                comment_tag: Some("v4".to_string()),
+            }),
+            "actions/checkout",
+            Some(format!("{sha} # v4").as_str()),
+        );
+
+        assert_eq!(
+            fmt.requirement_status_for(&d, &VersionReq::new("v4"), &ConcreteVersion::new("v4.3.1")),
+            RequirementStatus::UpToDate,
+            "no TagIndex entry: falls back to the comment-trusting path"
+        );
+    }
+
+    /// #907 review M3: the genuinely strongest argument for accepting a partial comment
+    /// tag is a write/read round trip through this project's own "Pin to commit SHA"
+    /// code action — `format_version_replacing_for`'s `PinStyle::Sha` branch writes the
+    /// user's *current* tag (commonly `v4`) into the `# {tag}` comment, which the
+    /// pre-#907 parser then rejected on the very next parse. Confirms the round trip is
+    /// now stable: write with `format_version_replacing_for`, reparse, same tag back out.
+    #[test]
+    fn test_sha_pin_comment_tag_round_trips_through_format_version_replacing_for() {
+        let sha = "b".repeat(40);
+        let fmt = formatter();
+        let mut index = TagIndex::default();
+        index.tag_to_sha.insert("v4".to_string(), sha.clone());
+        fmt.tag_index
+            .insert(PackageName::new("actions/checkout"), Arc::new(index));
+
+        let old_sha = "c".repeat(40);
+        let d = dep(
+            Some(PinStyle::Sha {
+                comment_tag: Some("v3".to_string()),
+            }),
+            "actions/checkout",
+            Some(format!("{old_sha} # v3").as_str()),
+        );
+        let written = fmt.format_version_replacing_for(&d, &ConcreteVersion::new("v4"), "v3");
+        assert_eq!(written, format!("{sha} # v4"));
+
+        let content = format!("steps:\n  - uses: actions/checkout@{written}\n");
+        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+        let result = crate::parser::parse_workflow_yaml(&content, &uri).unwrap();
+        let reparsed = &deps_core::ParseResult::dependencies(&result)[0];
+        assert_eq!(
+            reparsed
+                .version_requirement()
+                .map(deps_core::VersionReq::as_str),
+            Some("v4"),
+            "the tag this code action just wrote must survive being reparsed"
+        );
     }
 
     #[test]

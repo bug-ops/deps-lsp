@@ -16,8 +16,8 @@ pub enum PinStyle {
     /// A 40-character commit SHA ref, optionally annotated with a trailing
     /// `# vX.Y.Z` comment naming the tag it corresponds to.
     Sha {
-        /// The tag named by the `# vX.Y.Z` comment, if present and shaped like a full
-        /// `major.minor.patch` version (see `parser`'s comment-tag rule).
+        /// The tag named by the `# vX`/`# vX.Y`/`# vX.Y.Z` comment, if present and
+        /// tag-shaped (see `parser`'s comment-tag rule, issue #907).
         comment_tag: Option<String>,
     },
     /// A branch ref, e.g. `@main`.
@@ -91,6 +91,30 @@ deps_core::impl_dependency!(GithubActionsDependency {
     source: source,
     version_literal: version_literal,
 });
+
+/// Extracts the raw 40-hex SHA text a `PinStyle::Sha` pin's literal encodes, or `None` for
+/// any other pin style.
+///
+/// With a comment tag, the SHA is the literal's first whitespace-delimited token — not a
+/// `split_once(" # ")` exact-space match, since the parser's comment-tag rule only
+/// requires the `#` to be *whitespace-preceded* (a tab or double-space gap is a valid
+/// literal too). Without one, `version_req` already *is* the bare SHA.
+///
+/// Shared by `ecosystem.rs`'s `generate_hover` `**Resolved**` splice and
+/// `formatter.rs`'s `requirement_status_for` ground-truth lookup (#907 review DRY note) so
+/// the two can never diverge on what "the pinned SHA" means for a given dependency.
+#[must_use]
+pub(crate) fn sha_pin_raw_sha(dep: &GithubActionsDependency) -> Option<&str> {
+    match &dep.pin {
+        Some(PinStyle::Sha {
+            comment_tag: Some(_),
+        }) => dep.version_literal.as_deref()?.split_whitespace().next(),
+        Some(PinStyle::Sha { comment_tag: None }) => {
+            dep.version_req.as_ref().map(deps_core::VersionReq::as_str)
+        }
+        _ => None,
+    }
+}
 
 /// Version information for a GitHub Actions dependency (a repository tag).
 #[non_exhaustive]
