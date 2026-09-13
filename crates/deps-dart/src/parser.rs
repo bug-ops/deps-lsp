@@ -31,6 +31,7 @@
 
 use crate::types::{DartDependency, DependencySection, DependencySource};
 use deps_core::lsp_helpers::{LineOffsetTable, MarkedScalar};
+use deps_core::yaml_anchor::{AnchorLimits, ScalarAnchorTable};
 use deps_core::yaml_walk::{FrameKind, FrameStack, ScalarPosition};
 use deps_core::{DependencyBudget, DepsError, Result};
 use std::collections::HashMap;
@@ -369,8 +370,11 @@ struct PubspecReceiver {
     /// seen earlier in the document (a YAML parse-order requirement), so this is always
     /// populated by the time an `Alias` event needing it arrives. Populated only for
     /// *scalar* anchors — a mapping/sequence-valued anchor is recorded in
-    /// `container_anchors` instead.
-    anchors: HashMap<usize, (String, TScalarStyle, Option<Tag>)>,
+    /// `container_anchors` instead. Unbounded (spec 056 §8 "Ask First" reserves cap changes
+    /// to a deliberate, separate decision; this crate's own table was already unbounded
+    /// before #942's extraction) — safe because the sum of all anchored scalar texts is
+    /// bounded by the source file itself, on top of `check_yaml_expansion`'s 32 MB gate.
+    anchors: ScalarAnchorTable<(TScalarStyle, Option<Tag>)>,
     /// Every event seen on the live pass while at least one [`RecordingFrame`] is open, in
     /// document order — the single backing store `container_anchors`' ranges index into. See
     /// [`RecordingFrame`]'s docs (critic finding S2) for why this is one flat, append-only log
@@ -410,7 +414,7 @@ impl PubspecReceiver {
             stack: Stack::new(),
             entries: Vec::new(),
             sdk: None,
-            anchors: HashMap::new(),
+            anchors: ScalarAnchorTable::new(AnchorLimits::UNBOUNDED),
             event_log: Vec::new(),
             container_anchors: HashMap::new(),
             recording: Vec::new(),
@@ -620,8 +624,7 @@ impl PubspecReceiver {
         marker: &Marker,
     ) {
         if anchor_id != 0 {
-            self.anchors
-                .insert(anchor_id, (value.clone(), style, tag.clone()));
+            self.anchors.record(anchor_id, &value, (style, tag.clone()));
         }
         // A value-less key (`pkg:` with nothing after it, the normal mid-typing state in a
         // live editor) surfaces here as an empty plain scalar — review found this otherwise
@@ -713,10 +716,9 @@ impl PubspecReceiver {
         // direct null (review finding #1).
         let resolved = self
             .anchors
-            .get(&anchor_id)
-            .cloned()
-            .filter(|(text, style, tag)| !is_plain_null(*style, tag.as_ref(), text))
-            .map(|(text, style, _)| (text, style));
+            .get(anchor_id)
+            .filter(|(text, (style, tag))| !is_plain_null(*style, tag.as_ref(), text))
+            .map(|(text, (style, _tag))| (text.to_string(), *style));
 
         match self.stack.scalar_position() {
             ScalarPosition::Outside => {}

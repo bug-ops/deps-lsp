@@ -36,9 +36,10 @@ use deps_core::lsp_helpers::{
 };
 use deps_core::net_policy::RegistryAccessPolicy;
 use deps_core::parser::DependencySource;
+use deps_core::yaml_anchor::{AnchorLimits, ScalarAnchorTable};
 use deps_core::yaml_walk::{FrameKind, FrameStack, ScalarPosition};
 use deps_core::{DepsError, Result};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use tower_lsp_server::ls_types::Uri;
 use yaml_rust2::parser::{Event, MarkedEventReceiver, Parser};
 use yaml_rust2::scanner::Marker;
@@ -99,6 +100,23 @@ enum PendingKey {
     Local,
 }
 
+/// Resolves `text` (a scalar key's own text, or — since #942 — an alias's resolved anchor
+/// text on a value-table hit) to the key `role`'s mapping frame is now awaiting the value
+/// for.
+///
+/// Because an alias-resolved key is treated identically to a literal one, this reaches every
+/// consequence a literal key has, not just the ones #942 set out to fix: a `*i: [...]` whose
+/// anchor resolves to `"include"` now opens the top-level `include:` gate exactly as the
+/// literal token would (`FrameRole::Root` arm), and a `*t: true`/`*l: /x.yml` entry whose
+/// anchor resolves to `"template"`/`"local"` now marks that entry non-version-pinnable and
+/// suppresses the whole dependency (`FrameRole::IncludeEntry` arm — see
+/// [`RawEntry::has_template`]/[`RawEntry::has_local`]/[`RawEntry::has_remote`] and
+/// `build_dependency`'s early return), the same as the literal key already did. Both are the
+/// correct reading of the YAML (an alias key genuinely is the resolved text), not an
+/// oversight — but both are new *reachability*, not just new capture, so each direction has
+/// its own regression test (`test_alias_key_resolving_to_include_opens_top_level_gate`,
+/// `test_alias_key_resolving_to_template_suppresses_the_whole_entry`,
+/// `test_alias_key_resolving_to_local_suppresses_the_whole_entry`).
 fn key_for(role: FrameRole, text: &str) -> PendingKey {
     match role {
         FrameRole::Root => {
@@ -204,7 +222,8 @@ struct RawEntry {
 type Stack = FrameStack<FrameRole, PendingKey, RawEntry>;
 
 /// Collects every `include:` entry's raw field values, gated to exactly the top-level
-/// `include:` key's subtree.
+/// `include:` key's subtree — reachable via a literal `include:` scalar key or, since #942,
+/// an alias key whose resolved anchor text is `"include"` (see [`key_for`]).
 struct GitlabCiReceiver {
     stack: Stack,
     entries: Vec<RawEntry>,
@@ -215,7 +234,7 @@ struct GitlabCiReceiver {
     /// this crate's multi-document `spec:`-header parses, since a cross-document alias id
     /// collision is already a whole-document load error in `yaml-rust2` before this code
     /// runs (spec Data Model).
-    anchors: HashMap<usize, String>,
+    anchors: ScalarAnchorTable,
 }
 
 impl GitlabCiReceiver {
@@ -223,27 +242,11 @@ impl GitlabCiReceiver {
         Self {
             stack: Stack::new(),
             entries: Vec::new(),
-            anchors: HashMap::new(),
+            anchors: ScalarAnchorTable::new(AnchorLimits::bounded(
+                MAX_ANCHOR_VALUE_CHARS,
+                MAX_ANCHOR_TABLE_ENTRIES,
+            )),
         }
-    }
-
-    /// Records `anchor_id`'s scalar text into [`Self::anchors`] (spec FR-001), unless
-    /// `anchor_id` is `0` (no anchor — `yaml-rust2`'s own "no anchor" sentinel, anchor ids
-    /// otherwise start at 1) or the value/table-size bound is exceeded (FR-002), in which
-    /// case any later alias to this id simply misses the table and degrades to the
-    /// existing, safe table-miss path (FR-005).
-    fn record_anchor(&mut self, anchor_id: usize, text: &str) {
-        if anchor_id == 0 {
-            return;
-        }
-        if text.chars().count() > MAX_ANCHOR_VALUE_CHARS {
-            return;
-        }
-        if self.anchors.len() >= MAX_ANCHOR_TABLE_ENTRIES && !self.anchors.contains_key(&anchor_id)
-        {
-            return;
-        }
-        self.anchors.insert(anchor_id, text.to_string());
     }
 
     fn push_container(&mut self, kind: FrameKind) {
@@ -298,7 +301,7 @@ impl MarkedEventReceiver for GitlabCiReceiver {
                 // defined anywhere in the document (e.g. `.pin: &pin v1.2.3` at the
                 // document root, entirely outside `include:`), and this is the only
                 // event-stream pass this parser makes.
-                self.record_anchor(anchor_id, &value);
+                self.anchors.record(anchor_id, &value, ());
                 match self.stack.scalar_position() {
                     // A bare scalar sequence item (e.g. `include: - templates/x.yml`, the
                     // `local:` shorthand) carries nothing to record; irrelevant items are
@@ -327,29 +330,38 @@ impl MarkedEventReceiver for GitlabCiReceiver {
                     }
                 }
             }
-            // Spec FR-003/FR-004/FR-005: unlike a literal scalar, an alias's state
-            // transition depends on position alone (key vs. value), while the *capture*
-            // (FR-004) additionally depends on a value-table hit. Handling both together —
-            // rather than always calling `consume_value()`, as before this fix — closes the
-            // pre-existing `? *k` key-position desync (US-003/EC-004/EC-005): a key-position
-            // alias previously left the frame awaiting a key, silently misreading the
-            // entry's next real scalar as a key instead of a value.
+            // Spec FR-003/FR-004/FR-005 (FR-003's key-position `pending_key` amended by
+            // #942): unlike a literal scalar, an alias's `awaiting_key` transition depends
+            // on position alone (key vs. value) and is unconditional regardless of a table
+            // hit — closing the pre-existing `? *k` key-position desync (US-003/EC-004/
+            // EC-005): a key-position alias previously left the frame awaiting a key,
+            // silently misreading the entry's next real scalar as a key instead of a value.
+            // The *value* assigned to `pending_key` on a hit (#942) and the value-position
+            // *capture* (FR-004) both additionally depend on a value-table hit.
             Event::Alias(id) => match self.stack.scalar_position() {
                 ScalarPosition::Outside => self.stack.consume_value(),
                 ScalarPosition::Key => {
-                    // FR-003: an alias in key position (`? *k`) is never itself resolved to
-                    // a recognized field key — mirrors a scalar key's `observe_key` call,
-                    // exactly like `key_for`'s own catch-all would for an unrecognized text
-                    // key.
-                    self.stack.observe_key(PendingKey::None);
+                    // Table hit resolves the alias's text the same way a scalar key would
+                    // (`key_for`); a table miss (e.g. a container anchor) falls through to
+                    // `PendingKey::None`, matching `key_for`'s own catch-all for an
+                    // unrecognized text key. Either way `awaiting_key` is flipped
+                    // unconditionally by `observe_key` — the load-bearing half of this
+                    // transition — so this alone doesn't desync the mapping regardless of a
+                    // table hit or miss.
+                    let role = self.stack.top_role_or(FrameRole::Irrelevant);
+                    let key = self
+                        .anchors
+                        .get(id)
+                        .map_or(PendingKey::None, |(text, ())| key_for(role, text));
+                    self.stack.observe_key(key);
                 }
                 ScalarPosition::Value => {
                     if let Some(top) = self.stack.top_mut()
                         && *top.role() == FrameRole::IncludeEntry
-                        && let Some(text) = self.anchors.get(&id)
+                        && let Some((text, ())) = self.anchors.get(id)
                     {
                         let field = RawField::Alias {
-                            text: text.clone(),
+                            text: text.to_string(),
                             line: marker.line(),
                             col: marker.col(),
                         };
@@ -1410,23 +1422,70 @@ mod tests {
         assert_eq!(dep.project_path, "org/proj");
     }
 
-    /// #912 critic M1 — known limit, pinned rather than fixed here (natural home is the
-    /// `deps-dart`-style `key_for(role, &text)` resolution the S2 follow-up tracks): an
-    /// *implicit* alias key (`*k: value`, not the explicit `? *k` form) whose resolved
-    /// text happens to match a recognized key name (`ref`) is NOT reinterpreted as that
-    /// key. FR-003 mandates the unconditional `PendingKey::None` transition regardless of
-    /// the alias's resolved text, so this entry is captured as ref-less even though its
-    /// intent (`ref: v1.0.0`) is unambiguous to a human reader.
+    /// #942: an *implicit* alias key (`*k: value`, not the explicit `? *k` form) whose
+    /// resolved text matches a recognized key name (`ref`) IS now reinterpreted as that
+    /// key, the same `deps-dart`-style `key_for(role, &text)` resolution a table-hit
+    /// explicit complex key already got from #912. Was previously pinned as a known limit
+    /// (`PendingKey::None` unconditionally on FR-003's key-position transition); #942 fixes
+    /// it via the shared `ScalarAnchorTable` migration.
     #[test]
-    fn test_implicit_alias_key_resolving_to_recognized_name_is_not_reinterpreted_known_limit() {
+    fn test_implicit_alias_key_resolving_to_recognized_name_is_reinterpreted() {
         let (policy, instance_host) = ctx();
         let content = ".k: &k ref\ninclude:\n  - *k : v1.0.0\n    project: org/p\n";
         let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host).unwrap();
         assert_eq!(result.dependencies.len(), 1, "{:?}", result.dependencies);
         let dep = &result.dependencies[0];
         assert_eq!(dep.project_path, "org/p");
-        assert!(dep.pin.is_none());
-        assert!(dep.version_range().is_none());
+        assert_eq!(dep.pin, Some(PinStyle::Tag));
+        assert_eq!(slice(content, dep.version_range().unwrap()), "v1.0.0");
+    }
+
+    /// #942: an alias key resolving to a **recognized non-pinnable** field name
+    /// (`"template"`) suppresses the whole entry, exactly as the literal `template:` key
+    /// already does (`build_dependency`'s `entry.has_template` early return) — the
+    /// dependency-*losing* direction of the same `key_for` resolution that
+    /// `test_implicit_alias_key_resolving_to_recognized_name_is_reinterpreted` pins the
+    /// dependency-gaining direction of. Semantically correct (the YAML really does say
+    /// `template:`), but user-visible: `project:`/`ref:` in the same entry are captured and
+    /// then discarded along with it.
+    #[test]
+    fn test_alias_key_resolving_to_template_suppresses_the_whole_entry() {
+        let (policy, instance_host) = ctx();
+        // A clean sibling entry proves the suppression is scoped to the aliased entry, not a
+        // side effect of the whole document failing to parse (which would also produce zero
+        // dependencies, indistinguishable from `test_dangling_alias_is_a_parse_error_...`).
+        let content = ".t: &t template\ninclude:\n  - *t : true\n    project: org/p\n    ref: v1.0.0\n  - project: org/q\n    ref: v2.0.0\n";
+        let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host).unwrap();
+        assert_eq!(result.dependencies.len(), 1, "{:?}", result.dependencies);
+        assert_eq!(result.dependencies[0].project_path, "org/q");
+    }
+
+    /// #942: the `"local"` sibling of
+    /// `test_alias_key_resolving_to_template_suppresses_the_whole_entry` — same suppression,
+    /// different recognized non-pinnable key.
+    #[test]
+    fn test_alias_key_resolving_to_local_suppresses_the_whole_entry() {
+        let (policy, instance_host) = ctx();
+        // See test_alias_key_resolving_to_template_suppresses_the_whole_entry's comment for why
+        // a clean sibling entry is needed here.
+        let content = ".l: &l local\ninclude:\n  - *l : /x.yml\n    project: org/p\n    ref: v1.0.0\n  - project: org/q\n    ref: v2.0.0\n";
+        let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host).unwrap();
+        assert_eq!(result.dependencies.len(), 1, "{:?}", result.dependencies);
+        assert_eq!(result.dependencies[0].project_path, "org/q");
+    }
+
+    /// #942: an alias key resolving to `"include"` opens the top-level `include:` gate itself
+    /// — [`GitlabCiReceiver`]'s "gated to exactly the top-level `include:` key's subtree" is
+    /// still accurate, but that gate is reachable through a resolved alias key, not only the
+    /// literal `include:` token. Correct per the same YAML-resolution logic #942 relies on
+    /// elsewhere, but newly reachable and previously untested.
+    #[test]
+    fn test_alias_key_resolving_to_include_opens_top_level_gate() {
+        let (policy, instance_host) = ctx();
+        let content = ".i: &i include\n*i :\n  - project: org/p\n    ref: v1.0.0\n";
+        let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host).unwrap();
+        assert_eq!(result.dependencies.len(), 1, "{:?}", result.dependencies);
+        assert_eq!(result.dependencies[0].project_path, "org/p");
     }
 
     /// EC-007: `- *tpl` (a whole mapping anchor aliased as an `include:` sequence item) —

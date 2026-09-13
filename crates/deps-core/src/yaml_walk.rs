@@ -11,9 +11,10 @@
 //! key (`? <mapping>` / `? <sequence>`) so its subtree doesn't desync the enclosing
 //! mapping's key/value alternation. [`FrameStack`] owns exactly that, and nothing
 //! else — the role vocabulary, which child role a given parent/key combination
-//! produces, per-role field capture, anchor resolution, dependency budgets, and
-//! multi-document handling all stay in each crate's own receiver, threaded through the
-//! stack's generic `payload: P`.
+//! produces, per-role field capture, alias-resolution *policy* (a scalar-anchor value
+//! table's own mechanics are shared instead, via [`crate::yaml_anchor::ScalarAnchorTable`]),
+//! dependency budgets, and multi-document handling all stay in each crate's own receiver,
+//! threaded through the stack's generic `payload: P`.
 //!
 //! A trait-based visitor was considered and rejected: the three crates' role
 //! vocabularies, capture logic, and finalization steps share nothing beyond the
