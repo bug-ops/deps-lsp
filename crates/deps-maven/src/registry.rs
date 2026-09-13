@@ -1352,6 +1352,39 @@ mod tests {
         assert_eq!(ordered, vec!["1.0.0", "1.0-jre", "1.0"]);
     }
 
+    #[test]
+    fn test_parse_metadata_xml_qualifier_zero_digit_run_sort_does_not_panic() {
+        // #934 regression guard, at the level the panic actually occurred:
+        // parse_metadata_xml's own sort_by call (descending, unlike a plain
+        // ascending sort_by) over enough <version> entries to exercise
+        // driftsort's merge path. compare_qualifier_tokens used to normalize
+        // a zero-digit-run token (the "0" in "0ga") as equal to a missing
+        // one while ranking it strictly against an Alpha token, producing
+        // "1.0-ga" == "1.0", "1.0" == "1.0-0ga", but "1.0-ga" < "1.0-0ga" —
+        // a total-order violation `Vec::sort_by` panics on.
+        let versions_xml: String = (0..6)
+            .map(|_| {
+                "<version>0.0-ga</version><version>0.0</version><version>0.0-0ga</version>\
+                 <version>1.0-ga</version><version>1.0</version><version>1.0-0ga</version>"
+            })
+            .collect();
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<metadata>
+  <groupId>com.example</groupId>
+  <artifactId>widget</artifactId>
+  <versioning>
+    <versions>
+      {versions_xml}
+    </versions>
+  </versioning>
+</metadata>"#
+        );
+
+        let (versions, _release) = parse_metadata_xml(xml.as_bytes()).unwrap();
+        assert_eq!(versions.len(), 36);
+    }
+
     /// Minor item: malformed XML must surface as an error, not silently return a truncated
     /// `versions` list — a truncation could itself drop a real, installable version out of
     /// `available`, the exact false-positive class this PR's diagnostic guards against.

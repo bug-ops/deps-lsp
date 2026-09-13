@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - **deps-core**: `DependencySource`'s `Debug` impl now redacts URL-bearing variants (`Git`, `Url`, `CustomRegistry`, `AlternateRegistry`) via `RedactedUrl` instead of printing them raw, closing a credential leak reachable through any `tracing::warn!(?source, ...)` call site (resolves #935) (#938)
 - **deps-core, deps-lsp**: redacted two more credential-leak sinks in the same family — `RegistriesConfig`'s debug dump of `gitlab_instance_host` and the blocked-registry diagnostic's raw index value (resolves #936) (#938)
+- **deps-maven**: `compare_versions` no longer panics `Vec::sort_by` on a `maven-metadata.xml` version list mixing zero-digit-prefixed qualifiers (e.g. `0ga`) with their bare/aliased spellings (resolves #934) (#940)
 - **deps-gradle**: fixed a total version-completion regression from #922 — compact GAV coordinates and version catalog entries returned zero completions because their detected range was never wired to the literal's real byte span (resolves #931) (#939)
 - **deps-core, deps-maven, deps-gradle, deps-swift**: version completion no longer splices text into non-literal version spans (unresolved property/variable interpolation, YAML aliases, Swift version ranges) (resolves #919) (#922)
 - **deps-github-actions, deps-gitlab-ci**: an explicit complex YAML key (`? <mapping>`/`? <sequence>`) no longer desyncs the enclosing mapping's key/value parsing, matching `deps-dart`'s existing handling (resolves #908) (#921)
