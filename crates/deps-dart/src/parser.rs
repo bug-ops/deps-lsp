@@ -11,17 +11,23 @@
 //!
 //! # Known limitations
 //!
-//! Only *scalar* YAML anchors are tracked (see the receiver's own `anchors` field), so an alias to a
-//! scalar value (`version: *shared_version`) resolves correctly, but an alias to a whole
-//! mapping or sequence does not — `dependencies: *shared_map` (aliasing an entire
-//! `dependencies:` section) or `environment: *shared_env` silently yields no dependencies /
-//! no `sdk_constraint` for that alias, rather than resolving the aliased structure the way
-//! `main`'s `Yaml`-AST-based parser did. Reconstructing this would need buffering and
-//! replaying a whole anchored subtree's events, which is a materially larger change than
-//! scalar-anchor tracking; tracked as a follow-up rather than attempted here. See
-//! `test_aliased_whole_dependencies_section_is_a_known_limitation_losing_all_entries` and
-//! `test_aliased_environment_sdk_is_a_known_limitation_losing_the_constraint`, which pin this
-//! behavior rather than claim it is correct.
+//! Scalar YAML anchors are tracked directly (see the receiver's own `anchors` field); a whole
+//! anchored mapping/sequence is additionally buffered and replayed through the normal event
+//! dispatch on alias resolution (see `container_anchors`, `RecordingFrame`), so `dependencies:
+//! *shared_map` (aliasing an entire `dependencies:` section) and `environment: *shared_env`
+//! (aliasing the whole `environment:` mapping) resolve correctly, alongside a scalar alias
+//! into `environment: sdk:` directly (`sdk: *shared_version`).
+//!
+//! A single dependency's own value aliasing a whole mapping (`pkg: *shared_entry`, as opposed
+//! to the section or environment key itself) is deliberately left out of this change's scope
+//! — the anchor itself is just as resolvable as `dependencies: *shared_map`'s, but resolving
+//! it here would require enabling container-anchor replay for
+//! `FrameRole::DependencySectionValue`, which needs its own fix for a separate mechanical
+//! issue first (`is_replay` is currently derived per-*frame*, at push/pop time, not per-*name*
+//! — enabling replay there would falsely zero a live, literal dependency name's `name_range`
+//! whenever that same section also contains an aliased entry). Tracked as a follow-up. Until
+//! then the dependency still appears (its name is real, literal text) but with no
+//! version/source info — see `test_aliased_dependency_to_unresolvable_anchor_still_present`.
 
 use crate::types::{DartDependency, DependencySection, DependencySource};
 use deps_core::lsp_helpers::{LineOffsetTable, locate_value_span, marker_byte_offset};
@@ -55,6 +61,19 @@ type RawField = (String, usize, usize);
 
 fn raw_field(value: String, marker: &Marker) -> RawField {
     (value, marker.line(), marker.col())
+}
+
+/// Builds a scalar's [`FieldValue`], forcing [`FieldValue::Unpositioned`] while replaying a
+/// buffered container-anchor subtree (`replay_depth > 0`) — the marker on a replayed event
+/// points at the anchor's own definition site, not this occurrence, so reusing it would
+/// resurrect the duplicate-range bug [`FieldValue::Unpositioned`]'s own docs describe, one
+/// level up (two aliases of the same whole section would otherwise get identical ranges).
+fn scalar_field(replay_depth: usize, value: String, marker: &Marker) -> FieldValue {
+    if replay_depth > 0 {
+        FieldValue::Unpositioned(value)
+    } else {
+        FieldValue::Positioned(raw_field(value, marker))
+    }
 }
 
 /// Whether a plain (unquoted) scalar's text denotes an absent value.
@@ -258,6 +277,12 @@ enum RawDependencyValue {
 struct RawDependency {
     section: DependencySection,
     name: RawField,
+    /// Whether `name` was captured while replaying a buffered container-anchor subtree (see
+    /// [`PubspecReceiver::container_anchors`]) rather than from the live event stream — if so,
+    /// `name`'s marker points at the anchor's own definition site, not this occurrence, so
+    /// [`build_dependency`] must not resolve a range from it (same rationale as
+    /// [`FieldValue::Unpositioned`]).
+    name_is_replay: bool,
     value: RawDependencyValue,
 }
 
@@ -333,6 +358,34 @@ impl Frame {
     }
 }
 
+/// Tracks one anchored mapping/sequence while its subtree streams past, so its extent within
+/// [`PubspecReceiver::event_log`] can be recorded on its closing event — see
+/// [`PubspecReceiver::container_anchors`].
+///
+/// Critic finding S2: an earlier version of this design gave each frame its own cloned
+/// `Vec<(Event, Marker)>`, appended to on every event via a loop over all open frames — O(open
+/// anchors) *clones* of every event, not just O(open anchors) integer increments, which
+/// measured ~150x memory and ~4x latency from 60 anchors nested around one large subtree.
+/// Storing only a `start` index into one flat, shared `event_log` makes recording O(1) per
+/// event regardless of how many anchors are concurrently open, and defers the one real clone
+/// (a slice-to-`Vec` copy) to actual replay — paid only for anchors that are ever aliased, and
+/// only once per alias occurrence, rather than once per event for every anchor whether or not
+/// it's ever used.
+struct RecordingFrame {
+    anchor_id: usize,
+    kind: FrameKind,
+    /// Net count of `MappingStart`/`SequenceStart` minus `MappingEnd`/`SequenceEnd` events seen
+    /// since this frame opened — reaches `0` exactly when this frame's own closing event
+    /// arrives (YAML containers are well-nested, so the innermost open frame's `depth` is
+    /// always the one to check).
+    depth: usize,
+    /// Index into `event_log` of the first event *inside* this container (i.e. right after its
+    /// own `MappingStart`/`SequenceStart`, which is not itself replayed — see
+    /// [`PubspecReceiver::on_alias`]'s replay branch, which calls `push_container`/
+    /// `pop_container` directly for the boundary).
+    start: usize,
+}
+
 /// Collects every dependency's raw field values from the event stream, gated to exactly the
 /// three top-level dependency sections' subtrees (plus `environment: sdk:`).
 struct PubspecReceiver {
@@ -346,11 +399,38 @@ struct PubspecReceiver {
     /// [`is_plain_null`] at the alias site) is kept, not the anchor's own position — see
     /// [`FieldValue::Unpositioned`] for why. An alias can only refer to an anchor already
     /// seen earlier in the document (a YAML parse-order requirement), so this is always
-    /// populated by the time an `Alias` event needing it arrives. Only *scalar* anchors are
-    /// recorded — a mapping/sequence-valued anchor (`dependencies: *shared_map` aliasing a
-    /// whole section) cannot currently be resolved; see the module-level docs' "Known
-    /// limitations" note.
+    /// populated by the time an `Alias` event needing it arrives. Populated only for
+    /// *scalar* anchors — a mapping/sequence-valued anchor is recorded in
+    /// `container_anchors` instead.
     anchors: HashMap<usize, (String, TScalarStyle, Option<Tag>)>,
+    /// Every event seen on the live pass while at least one [`RecordingFrame`] is open, in
+    /// document order — the single backing store `container_anchors`' ranges index into. See
+    /// [`RecordingFrame`]'s docs (critic finding S2) for why this is one flat, append-only log
+    /// rather than a per-anchor buffer. Stays empty for a document with no anchors at all
+    /// (critic finding S2-residual): [`Self::record_event`] only appends while `recording` is
+    /// non-empty, so a document that never opens an anchor never touches this field.
+    event_log: Vec<(Event, Marker)>,
+    /// Mapping/sequence-shaped anchors' extents within `event_log`, keyed by anchor id,
+    /// finalized (via [`Self::record_event`]) when each anchored container's closing event
+    /// arrives. Resolved on `Event::Alias` by replaying the indexed slice through the normal
+    /// `on_event`/`push_container`/`pop_container` dispatch — see [`Self::on_alias`]. Only
+    /// populated on the live (non-replay) pass; a nested anchor inside an anchored subtree is
+    /// always fully recorded before any alias referencing the outer anchor can fire, by YAML's
+    /// own forward-reference-only parse order, so replay never needs to record further.
+    container_anchors: HashMap<usize, (FrameKind, std::ops::Range<usize>)>,
+    /// Currently-open [`RecordingFrame`]s, one per anchored container whose closing event has
+    /// not yet arrived — a stack in practice (LIFO by nesting), stored as a `Vec` so every
+    /// still-open ancestor frame's `depth` can be updated in one pass per event.
+    recording: Vec<RecordingFrame>,
+    /// Nesting depth of container-anchor replay (see [`Self::on_alias`]) — `0` on the live
+    /// event stream. A counter, not a `bool`, as cheap insurance against a chained container
+    /// alias nesting one replay inside another — though replay is currently only entered from
+    /// `FrameRole::Root`, and `compute_child_role` degrades every replayed child to
+    /// `DependencySectionValue`/`Irrelevant` (neither of which re-enters at `Root`), so nesting
+    /// is not actually reachable today; a counter costs nothing over a `bool` here and remains
+    /// correct if replay is ever enabled for another role (see the module docs' "Known
+    /// limitations" note on `FrameRole::DependencySectionValue`).
+    replay_depth: usize,
     /// Per-document ceiling on how many dependencies are retained — checked before a
     /// [`RawDependency`] is ever constructed (#906), not after the fact.
     budget: DependencyBudget,
@@ -363,6 +443,10 @@ impl PubspecReceiver {
             entries: Vec::new(),
             sdk: None,
             anchors: HashMap::new(),
+            event_log: Vec::new(),
+            container_anchors: HashMap::new(),
+            recording: Vec::new(),
+            replay_depth: 0,
             budget: DependencyBudget::new(cap),
         }
     }
@@ -384,14 +468,59 @@ impl PubspecReceiver {
         budget: &mut DependencyBudget,
         section: Option<DependencySection>,
         name: RawField,
+        name_is_replay: bool,
         value: impl FnOnce() -> RawDependencyValue,
     ) {
         if budget.allow() {
             entries.push(RawDependency {
                 section: section.unwrap_or_default(),
                 name,
+                name_is_replay,
                 value: value(),
             });
+        }
+    }
+
+    /// Appends every event to [`Self::event_log`], and finalizes the innermost open
+    /// [`RecordingFrame`] into [`Self::container_anchors`] when its closing event arrives.
+    /// Called for every event on the live (non-replay) pass, before that event's normal
+    /// dispatch. O(1) plus O(open anchors) cheap integer `depth` updates per event — see
+    /// [`RecordingFrame`]'s docs for why this no longer clones event data per open frame.
+    fn record_event(&mut self, event: &Event, marker: Marker) {
+        if matches!(event, Event::MappingEnd | Event::SequenceEnd)
+            && let Some(frame) = self.recording.pop_if(|frame| frame.depth == 0)
+        {
+            // `event_log.len()` here is the index the closing event is *about to* occupy
+            // (pushed below), so this range covers exactly the events strictly between the
+            // container's own `MappingStart`/`SequenceStart` and `MappingEnd`/`SequenceEnd` —
+            // matching what `on_alias`'s replay branch expects (it calls `push_container`/
+            // `pop_container` directly for the boundary, replaying only the inner events).
+            self.container_anchors.insert(
+                frame.anchor_id,
+                (frame.kind, frame.start..self.event_log.len()),
+            );
+        }
+
+        // Only worth logging while at least one anchor is actually being recorded — an
+        // anchor-free document (or the stretch of one after its last anchor closes) never
+        // touches `event_log` at all, so this stays O(1) space for the common case rather than
+        // buffering the entire event stream unconditionally. Index-safe: every
+        // `container_anchors` range was built exclusively from indices recorded under this
+        // same guard, so a later `.get(range)` at replay time always hits.
+        if !self.recording.is_empty() {
+            self.event_log.push((event.clone(), marker));
+        }
+
+        let is_start = matches!(event, Event::MappingStart(..) | Event::SequenceStart(..));
+        let is_end = matches!(event, Event::MappingEnd | Event::SequenceEnd);
+        if is_start || is_end {
+            for frame in &mut self.recording {
+                if is_start {
+                    frame.depth += 1;
+                } else {
+                    frame.depth -= 1;
+                }
+            }
         }
     }
 
@@ -442,6 +571,7 @@ impl PubspecReceiver {
 
         let (new_role, new_section) = self.compute_child_role(kind);
         let mut carried_name = None;
+        let is_replay = self.replay_depth > 0;
         let Self {
             stack,
             entries,
@@ -457,7 +587,7 @@ impl PubspecReceiver {
                     } else {
                         // A dependency's value is a sequence, or some other shape this parser
                         // does not resolve a concrete field from.
-                        Self::push_entry(entries, budget, top.section, name, || {
+                        Self::push_entry(entries, budget, top.section, name, is_replay, || {
                             RawDependencyValue::Unresolved
                         });
                     }
@@ -479,6 +609,7 @@ impl PubspecReceiver {
         let Some(frame) = self.stack.pop() else {
             return;
         };
+        let is_replay = self.replay_depth > 0;
         let Self {
             stack,
             entries,
@@ -506,7 +637,7 @@ impl PubspecReceiver {
                     && parent.role == FrameRole::DependencySectionValue
                 {
                     let section = parent.section;
-                    Self::push_entry(entries, budget, section, name, || {
+                    Self::push_entry(entries, budget, section, name, is_replay, || {
                         RawDependencyValue::Entry {
                             version: frame.version,
                             git: frame.git,
@@ -558,6 +689,7 @@ impl PubspecReceiver {
         // matching the pre-rewrite `Yaml`-AST parser's own `Yaml::Null` handling. An explicit
         // non-null tag (`!!str null`) overrides this — see [`is_plain_null`].
         let is_null = is_plain_null(style, tag.as_ref(), &value);
+        let replay_depth = self.replay_depth;
 
         let Self {
             stack,
@@ -586,13 +718,12 @@ impl PubspecReceiver {
             FrameRole::DependencySectionValue => {
                 if let Some(name) = frame.pending_dep_name.take() {
                     let section = frame.section;
-                    Self::push_entry(entries, budget, section, name, || {
+                    let is_replay = replay_depth > 0;
+                    Self::push_entry(entries, budget, section, name, is_replay, || {
                         if is_null {
                             RawDependencyValue::Unresolved
                         } else {
-                            RawDependencyValue::Simple(FieldValue::Positioned(raw_field(
-                                value, marker,
-                            )))
+                            RawDependencyValue::Simple(scalar_field(replay_depth, value, marker))
                         }
                     });
                 }
@@ -605,7 +736,7 @@ impl PubspecReceiver {
             }
             FrameRole::DependencyEntryValue | FrameRole::GitValue if !is_null => {
                 let key = frame.pending_key;
-                frame.assign_field(key, FieldValue::Positioned(raw_field(value, marker)));
+                frame.assign_field(key, scalar_field(replay_depth, value, marker));
             }
             // A null value for one of the keys above — treated the same as the key being
             // absent entirely.
@@ -629,13 +760,7 @@ impl PubspecReceiver {
             .filter(|(text, style, tag)| !is_plain_null(*style, tag.as_ref(), text))
             .map(|(text, ..)| text);
 
-        let Self {
-            stack,
-            entries,
-            budget,
-            ..
-        } = self;
-        let Some(top) = stack.last_mut() else {
+        let Some(top) = self.stack.last_mut() else {
             return;
         };
         if top.kind != FrameKind::Mapping {
@@ -652,6 +777,7 @@ impl PubspecReceiver {
             // scalar key would be; an unresolvable one (e.g. a mapping-valued anchor) still
             // flips the state correctly, just without a name to attach a value to — the same
             // graceful no-op a `None` `pending_dep_name`/`pending_key` already produces below.
+            // A container can't sensibly serve as a key, so no `container_anchors` lookup here.
             if let Some(text) = resolved {
                 if top.role == FrameRole::DependencySectionValue {
                     top.pending_dep_name = Some(raw_field(text, marker));
@@ -665,11 +791,66 @@ impl PubspecReceiver {
             return;
         }
 
+        // A whole-section/mapping alias (`dependencies: *shared_map`, `environment:
+        // *shared_env`) — replay the anchor's buffered subtree through the normal dispatch, so
+        // `push_container`'s `compute_child_role` routes it exactly as a live `MappingStart`/
+        // `SequenceStart` in this same position would. Scoped to `Root` only:
+        // `compute_child_role` has no `EnvironmentValue` -> child-role mapping (everything
+        // under it that isn't `sdk:` routes to `Irrelevant` regardless), so including it here
+        // would never resolve anything — `environment: *shared_env` itself fires with
+        // `top.role == Root` (the alias is the *value of the `environment:` key*, read before
+        // ever pushing an `EnvironmentValue` frame), not this branch. A single dependency's own
+        // value aliasing a whole mapping (`FrameRole::DependencySectionValue`, e.g. `pkg:
+        // *shared_entry`) is deliberately left to the scalar-only resolution below instead —
+        // see `test_aliased_dependency_to_unresolvable_anchor_still_present`.
+        if top.role == FrameRole::Root
+            && let Some((kind, range)) = self.container_anchors.get(&anchor_id).cloned()
+        {
+            // The one clone this design pays for container-anchor replay (see
+            // `RecordingFrame`'s docs) — a slice of the shared `event_log`, copied only now,
+            // once per actual alias occurrence, rather than once per event for every open
+            // anchor regardless of whether it's ever aliased.
+            let Some(slice) = self.event_log.get(range) else {
+                // Every `container_anchors` range is built from indices this same receiver
+                // recorded into `event_log` (see `record_event`) — a miss here means that
+                // invariant broke. Fail loudly in debug/tests rather than silently replaying
+                // nothing, which would reproduce the exact whole-section data loss this
+                // feature exists to fix; in release, skip this alias (leaving it
+                // unresolved, the same graceful outcome as an unknown anchor) rather than
+                // panicking the LSP server.
+                debug_assert!(
+                    false,
+                    "container_anchors[{anchor_id}] range is out of bounds for event_log"
+                );
+                return;
+            };
+            let events: Vec<(Event, Marker)> = slice.to_vec();
+            self.replay_depth += 1;
+            self.push_container(kind);
+            for (event, event_marker) in events {
+                self.on_event(event, event_marker);
+            }
+            self.pop_container();
+            self.replay_depth -= 1;
+            return;
+        }
+
+        let replay_depth = self.replay_depth;
+        let Self {
+            stack,
+            entries,
+            sdk,
+            budget,
+            ..
+        } = self;
+        let Some(top) = stack.last_mut() else {
+            return;
+        };
         match top.role {
             FrameRole::DependencySectionValue => {
                 if let Some(name) = top.pending_dep_name.take() {
                     let section = top.section;
-                    Self::push_entry(entries, budget, section, name, || {
+                    Self::push_entry(entries, budget, section, name, replay_depth > 0, || {
                         resolved.map_or(RawDependencyValue::Unresolved, |text| {
                             RawDependencyValue::Simple(FieldValue::Unpositioned(text))
                         })
@@ -682,13 +863,22 @@ impl PubspecReceiver {
                     top.assign_field(key, FieldValue::Unpositioned(text));
                 }
             }
-            // A whole-section/mapping alias (`dependencies: *shared_map`,
-            // `environment: *shared_env`) is not resolved — see the module-level docs' "Known
-            // limitations" note.
-            FrameRole::Root
-            | FrameRole::EnvironmentValue
-            | FrameRole::Irrelevant
-            | FrameRole::ComplexKey => {}
+            // Mirrors `on_scalar`'s `EnvironmentValue` arm (critic finding C1): an alias to a
+            // *scalar* anchor used as `sdk:`'s value (`sdk: *shared_version`, sharing one
+            // constraint string — the more idiomatic of #905's two named shapes) must resolve
+            // the same way a direct scalar does, not fall through as a no-op the way an
+            // unresolvable one correctly does.
+            FrameRole::EnvironmentValue => {
+                if top.pending_key == PendingKey::EnvSdk
+                    && let Some(text) = resolved
+                {
+                    *sdk = Some(text);
+                }
+            }
+            // `Root` already tried the container-anchor replay above; this arm now only
+            // catches a genuinely unresolvable alias in this position (e.g. an unknown anchor
+            // id) — a graceful no-op, same as `Irrelevant`/`ComplexKey`.
+            FrameRole::Root | FrameRole::Irrelevant | FrameRole::ComplexKey => {}
         }
         top.awaiting_key = true;
         top.pending_key = PendingKey::None;
@@ -697,6 +887,32 @@ impl PubspecReceiver {
 
 impl MarkedEventReceiver for PubspecReceiver {
     fn on_event(&mut self, event: Event, marker: Marker) {
+        // Buffer every event into any still-open container-anchor recording, and start a new
+        // recording when this event itself opens an anchored mapping/sequence — but only on the
+        // live event stream: a nested anchor inside a subtree being replayed (`replay_depth >
+        // 0`) was already fully recorded during its own earlier live definition, by YAML's
+        // forward-reference-only parse order (see `container_anchors`'s docs).
+        if self.replay_depth == 0 {
+            self.record_event(&event, marker);
+            if let Event::MappingStart(id, _) | Event::SequenceStart(id, _) = &event
+                && *id != 0
+            {
+                let kind = if matches!(event, Event::MappingStart(..)) {
+                    FrameKind::Mapping
+                } else {
+                    FrameKind::Sequence
+                };
+                self.recording.push(RecordingFrame {
+                    anchor_id: *id,
+                    kind,
+                    depth: 0,
+                    // `record_event` above already appended this container's own `Start`
+                    // event to `event_log`, so its length here is exactly the index the
+                    // first *inner* event will land at.
+                    start: self.event_log.len(),
+                });
+            }
+        }
         match event {
             Event::MappingStart(..) => self.push_container(FrameKind::Mapping),
             Event::SequenceStart(..) => self.push_container(FrameKind::Sequence),
@@ -737,8 +953,16 @@ fn build_dependency(
     // `name_range` is a required (non-`Option`) field on `DartDependency`, unlike
     // `version_range` — a miss here (vanishingly rare for a real dependency name) falls back
     // to `Range::default()`, same as before this fix; only the *optional* fields computed via
-    // `FieldValue::range` below propagate a genuine `None`.
-    let name_range = field_range(content, line_table, &raw.name).unwrap_or_default();
+    // `FieldValue::range` below propagate a genuine `None`. A replay-derived name (see
+    // `RawDependency::name_is_replay`) always forces `Range::default()`, bypassing the lookup
+    // entirely — its marker points at the container anchor's own definition site, which would
+    // otherwise resolve to a real-but-wrong (and, across multiple aliases, duplicate) range.
+    let name_range = if raw.name_is_replay {
+        Range::default()
+    } else {
+        field_range(content, line_table, &raw.name).unwrap_or_default()
+    };
+    let name_range_is_synthetic = raw.name_is_replay;
     let name = raw.name.0;
 
     match raw.value {
@@ -752,6 +976,7 @@ fn build_dependency(
                 section: raw.section,
                 source: DependencySource::Registry,
                 git_path: None,
+                name_range_is_synthetic,
             }
         }
         RawDependencyValue::Entry {
@@ -806,6 +1031,7 @@ fn build_dependency(
                 section: raw.section,
                 source,
                 git_path,
+                name_range_is_synthetic,
             }
         }
         RawDependencyValue::Unresolved => DartDependency {
@@ -816,6 +1042,7 @@ fn build_dependency(
             section: raw.section,
             source: DependencySource::Registry,
             git_path: None,
+            name_range_is_synthetic,
         },
     }
 }
@@ -1359,33 +1586,143 @@ dependencies:
     }
 
     #[test]
-    fn test_aliased_whole_dependencies_section_is_a_known_limitation_losing_all_entries() {
-        // Review finding #4, assessed and deferred (see module-level "Known limitations"
-        // docs): only *scalar* anchors are tracked, so an alias to a whole mapping
-        // (`dependencies: *shared_deps`) cannot currently be reconstructed. This pins the
-        // resulting data loss as a documented, intentional limitation rather than silently
-        // letting it regress further — `main` resolved this correctly via `doc["dependencies"]`
-        // regardless of whether it came through an alias.
-        let yaml = "shared_deps: &shared_deps\n  http: ^1.0.0\ndependencies: *shared_deps\n";
+    fn test_aliased_whole_dependencies_section_resolves_all_entries() {
+        // Issue #905: an alias to a whole mapping (`dependencies: *shared_deps`) is now
+        // reconstructed by buffering the anchor's subtree and replaying it through the normal
+        // event dispatch on `Event::Alias` — see `PubspecReceiver::container_anchors`.
+        let yaml = "shared_deps: &shared_deps\n  http: ^1.0.0\n  logging: ^1.1.0\ndependencies: *shared_deps\n";
         let result = parse_pubspec_yaml(yaml, &test_uri()).unwrap();
-        assert!(
-            result.dependencies.is_empty(),
-            "known limitation: an aliased whole `dependencies:` section currently loses all \
-             its entries — see the module-level docs and the P2 follow-up issue"
+        assert_eq!(result.dependencies.len(), 2);
+
+        let http = result
+            .dependencies
+            .iter()
+            .find(|d| d.name.as_ref() == "http")
+            .expect("http must resolve from the aliased whole section");
+        let logging = result
+            .dependencies
+            .iter()
+            .find(|d| d.name.as_ref() == "logging")
+            .expect("logging must resolve from the aliased whole section");
+        assert_eq!(http.version_req, Some("^1.0.0".into()));
+        assert_eq!(logging.version_req, Some("^1.1.0".into()));
+
+        // Pitfall 1 (debugger handoff): a replay-derived field's marker points at the anchor's
+        // own definition site, not this occurrence, so it must never resolve to a `Positioned`
+        // range (which would look plausible for a single alias use but produce duplicate
+        // ranges the moment the same anchor is aliased twice — see the test below).
+        assert!(http.version_range.is_none());
+        assert!(logging.version_range.is_none());
+        assert_eq!(http.name_range, Range::default());
+        assert_eq!(logging.name_range, Range::default());
+
+        // Critic finding S1: `name_range_is_synthetic()` is the hook `deps-core`'s shared
+        // diagnostics/hover code checks before trusting `name_range()` as a real, unique
+        // per-dependency position — must be `true` for every replay-derived dependency here.
+        use deps_core::Dependency;
+        assert!(http.name_range_is_synthetic());
+        assert!(logging.name_range_is_synthetic());
+    }
+
+    #[test]
+    fn test_live_dependency_name_range_is_not_synthetic() {
+        // Counterpart to the assertion above: an ordinary, non-aliased dependency's
+        // `name_range_is_synthetic()` must stay `false` — only replay-derived dependencies
+        // opt into the synthetic-range convention.
+        use deps_core::Dependency;
+        let yaml = "dependencies:\n  http: ^1.0.0\n";
+        let result = parse_pubspec_yaml(yaml, &test_uri()).unwrap();
+        assert!(!result.dependencies[0].name_range_is_synthetic());
+    }
+
+    #[test]
+    fn test_two_aliases_of_the_same_whole_section_anchor_do_not_share_a_range() {
+        // Pitfall 1: the exact hazard `FieldValue::Unpositioned` already exists to avoid for
+        // scalar anchors, reproduced one level up for container anchors — aliasing the same
+        // whole section from two different keys must not give both copies of `http` the
+        // identical (and thus invalid, once diagnostics emit "update all" text edits) range.
+        let yaml =
+            "shared: &shared\n  http: ^1.0.0\ndependencies: *shared\ndev_dependencies: *shared\n";
+        let result = parse_pubspec_yaml(yaml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 2);
+
+        let deps_http = result
+            .dependencies
+            .iter()
+            .find(|d| matches!(d.section, DependencySection::Dependencies))
+            .expect("dependencies:'s http must be present");
+        let dev_http = result
+            .dependencies
+            .iter()
+            .find(|d| matches!(d.section, DependencySection::DevDependencies))
+            .expect("dev_dependencies:'s http must be present");
+
+        assert_eq!(deps_http.version_req, Some("^1.0.0".into()));
+        assert_eq!(dev_http.version_req, Some("^1.0.0".into()));
+        assert!(deps_http.version_range.is_none());
+        assert!(dev_http.version_range.is_none());
+    }
+
+    #[test]
+    fn test_nested_anchor_inside_an_aliased_mapping_still_resolves() {
+        // Proves the `RecordingFrame::depth` bookkeeping: a scalar anchor defined *inside* the
+        // whole-section anchor's own subtree, and aliased again inside that same subtree, must
+        // still resolve correctly once the whole section is itself aliased and replayed.
+        let yaml = "shared_deps: &shared_deps\n  http: &http_version ^1.0.0\n  logging: *http_version\ndependencies: *shared_deps\n";
+        let result = parse_pubspec_yaml(yaml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 2);
+
+        let http = result
+            .dependencies
+            .iter()
+            .find(|d| d.name.as_ref() == "http")
+            .unwrap();
+        let logging = result
+            .dependencies
+            .iter()
+            .find(|d| d.name.as_ref() == "logging")
+            .unwrap();
+        assert_eq!(http.version_req, Some("^1.0.0".into()));
+        assert_eq!(
+            logging.version_req,
+            Some("^1.0.0".into()),
+            "the nested alias inside the replayed subtree must resolve via the already-\
+             populated scalar anchor map"
         );
     }
 
     #[test]
-    fn test_aliased_environment_sdk_is_a_known_limitation_losing_the_constraint() {
-        // Same limitation as above, for `environment: *shared_env` aliasing a whole
+    fn test_self_referential_alias_does_not_hang() {
+        // Pitfall 2: `a: &a\n  x: *a` is valid YAML (yaml-rust2 emits `Alias` for it rather
+        // than erroring) — the alias fires while the anchor's own `container_anchors` entry is
+        // still being recorded (not yet finalized on its `MappingEnd`), so the lookup misses
+        // and falls through to the existing graceful "unresolvable" no-op rather than
+        // recursing.
+        let yaml = "dependencies:\n  shared: &shared\n    x: *shared\n";
+        let result = parse_pubspec_yaml(yaml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name.as_ref(), "shared");
+    }
+
+    #[test]
+    fn test_aliased_environment_sdk_resolves_the_constraint() {
+        // Issue #905's other named case: `environment: *shared_env` aliasing the whole
         // `environment:` mapping (rather than just its `sdk:` value).
         let yaml = "shared_env: &shared_env\n  sdk: '>=3.0.0 <4.0.0'\nenvironment: *shared_env\n";
         let result = parse_pubspec_yaml(yaml, &test_uri()).unwrap();
-        assert!(
-            result.sdk_constraint.is_none(),
-            "known limitation: an aliased whole `environment:` mapping currently loses \
-             sdk_constraint — see the module-level docs and the P2 follow-up issue"
-        );
+        assert_eq!(result.sdk_constraint, Some(">=3.0.0 <4.0.0".into()));
+    }
+
+    #[test]
+    fn test_aliased_environment_sdk_scalar_resolves_the_constraint() {
+        // Critic finding C1: issue #905's *other* literal reproduction — a scalar alias into
+        // `environment: sdk:` directly (sharing one constraint string, not a whole mapping),
+        // verbatim from the issue body. `on_alias`'s `FrameRole::EnvironmentValue` arm used to
+        // be part of a no-op catch-all, so this resolved to `None` even though `on_scalar`'s
+        // equivalent arm (a direct, non-aliased `sdk:` value) already worked.
+        let yaml = "sdk_ref: &sdk_ref \">=2.12.0 <3.0.0\"\nenvironment:\n  sdk: *sdk_ref\n";
+        let result = parse_pubspec_yaml(yaml, &test_uri()).unwrap();
+        assert_eq!(result.sdk_constraint, Some(">=2.12.0 <3.0.0".into()));
     }
 
     #[test]
@@ -1545,6 +1882,71 @@ flutter:
             yaml.push_str(&format!("  dep_{i:05}: ^1.{i}.0\n"));
         }
         yaml
+    }
+
+    /// Builds a document with `depth` levels of nested, mutually-unrelated anchored mappings
+    /// (`a0: &a0\n  a1: &a1\n    ...`), each concurrently open while the innermost `inner_lines`
+    /// filler fields stream past, followed by a real `dependencies:` section — for
+    /// `test_many_open_anchors_do_not_multiply_recording_cost` below.
+    fn nested_anchors_then_dependencies_yaml(depth: usize, inner_lines: usize) -> String {
+        let mut yaml = String::from("padding:\n");
+        for i in 0..depth {
+            yaml.push_str(&"  ".repeat(i + 1));
+            yaml.push_str(&format!("a{i}: &a{i}\n"));
+        }
+        let indent = "  ".repeat(depth + 1);
+        for i in 0..inner_lines {
+            yaml.push_str(&indent);
+            yaml.push_str(&format!("field_{i:04}: value_{i:04}\n"));
+        }
+        yaml.push_str("dependencies:\n  http: ^1.0.0\n");
+        yaml
+    }
+
+    #[test]
+    fn test_many_open_anchors_do_not_multiply_recording_cost() {
+        // Critic finding S2: an earlier design cloned every event into every currently-open
+        // anchored container's own buffer (a loop over all open `RecordingFrame`s, each
+        // appending a clone), so N concurrently-open (nested) anchors wrapping the same inner
+        // content multiplied both time and memory by N — measured ~150x memory and ~4x
+        // latency from 60 anchors wrapped around a 480 KB payload, none of them ever aliased.
+        // Recording via one flat, shared `event_log` (see `RecordingFrame`'s docs) makes this
+        // O(1) per event regardless of how many anchors are concurrently open, so parse time
+        // must stay roughly flat as nesting depth grows, not scale with it.
+        //
+        // Shares the same wall-clock-ratio-under-parallel-CPU-contention flakiness profile
+        // #906 item 12 flags for `test_many_dependencies_key_and_value_lookup_scales_linearly_
+        // not_quadratically`/`test_quadratic_scan_stays_bounded_with_quoted_keys` — neither of
+        // those has a nextest test-group/serialization mitigation applied yet either, so this
+        // test intentionally matches their current (not-yet-decided) approach rather than
+        // introducing bespoke serialization for only the newest of the three. Revisit together
+        // if #906 item 12 is ever acted on.
+        const INNER_LINES: usize = 2000;
+        const SHALLOW_DEPTH: usize = 2;
+        const DEEP_DEPTH: usize = 40;
+
+        let shallow_yaml = nested_anchors_then_dependencies_yaml(SHALLOW_DEPTH, INNER_LINES);
+        let start = std::time::Instant::now();
+        let shallow_result = parse_pubspec_yaml(&shallow_yaml, &test_uri()).unwrap();
+        let shallow_elapsed = start.elapsed();
+
+        let deep_yaml = nested_anchors_then_dependencies_yaml(DEEP_DEPTH, INNER_LINES);
+        let start = std::time::Instant::now();
+        let deep_result = parse_pubspec_yaml(&deep_yaml, &test_uri()).unwrap();
+        let deep_elapsed = start.elapsed();
+
+        assert_eq!(shallow_result.dependencies.len(), 1);
+        assert_eq!(deep_result.dependencies.len(), 1);
+
+        let floor = std::time::Duration::from_micros(200);
+        let ratio = deep_elapsed.as_secs_f64() / shallow_elapsed.max(floor).as_secs_f64();
+        assert!(
+            ratio < 6.0,
+            "parsing with {DEEP_DEPTH} concurrently-open (nested, unaliased) anchors took \
+             {deep_elapsed:?} vs {shallow_elapsed:?} with {SHALLOW_DEPTH} (ratio {ratio:.1}x \
+             for a {}x depth increase) — expected roughly flat, not multiplied, recording cost",
+            DEEP_DEPTH / SHALLOW_DEPTH
+        );
     }
 
     #[test]

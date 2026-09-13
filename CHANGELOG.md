@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **deps-dart**: fixed `is_plain_null` mishandling an explicit YAML tag (including the verbatim null-tag form) and moved `DependencyBudget` enforcement before entry construction; pinned six behavior changes from #903's parser rewrite with regression tests (resolves #906) (#911)
+- **deps-dart**: aliasing a whole dependency section or `environment:` mapping via a YAML anchor now resolves correctly instead of silently losing its data (resolves #905) (#910)
 - **deps-dart**: fixed unbounded `O(N x document length)` scans in the pubspec.yaml parser by rewriting position tracking onto `yaml-rust2`'s event API (resolves #899) (#903)
 - **deps-core**: `net_policy::redact_userinfo` now scans the path/query of a host-having URL with empty userinfo for a credential-shaped segment instead of returning it verbatim, closing a leak reachable via a `c:/`-corrupted or slash-less authority (resolves #901) (#902)
 - **deps-github-actions**: `extract_comment_tag` no longer mis-attributes a flow-style line's trailing comment to an unrelated SHA-pinned ref, which could corrupt YAML on version-update code action acceptance (resolves #898) (#900)
