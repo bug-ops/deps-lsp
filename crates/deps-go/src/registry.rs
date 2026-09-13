@@ -30,7 +30,10 @@ use crate::types::GoVersion;
 use crate::version::{escape_module_path, escape_version, is_pseudo_version};
 use dashmap::DashMap;
 use deps_core::parser::DependencySource;
-use deps_core::{DepsError, HttpCache, Result, is_dot_segment, lsp_helpers::warn_rejected_value};
+use deps_core::{
+    DepsError, HttpCache, Result, is_dot_segment, lsp_helpers::warn_rejected_value,
+    not_found_or as core_not_found_or,
+};
 use serde::Deserialize;
 use std::any::Any;
 use std::sync::Arc;
@@ -201,20 +204,7 @@ fn version_url_at(base: &str, module_path: &str, version: &str, suffix: &str) ->
 /// left a real `410` response falling into `get_versions_chained`'s transport-failure arm,
 /// halting chain resolution instead of falling through to the next hop (FR-005).
 fn not_found_or(err: DepsError, module_path: &str) -> DepsError {
-    if matches!(
-        err,
-        DepsError::HttpStatus {
-            status: 404 | 410,
-            ..
-        }
-    ) {
-        DepsError::PackageNotFound {
-            package: module_path.to_string(),
-            registry: REGISTRY,
-        }
-    } else {
-        err
-    }
+    core_not_found_or(err, module_path, REGISTRY, &[410])
 }
 
 /// Client for interacting with proxy.golang.org.

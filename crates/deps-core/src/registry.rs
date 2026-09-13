@@ -1,4 +1,4 @@
-use crate::error::Result;
+use crate::error::{DepsError, Result};
 use crate::parser::DependencySource;
 use crate::{ConcreteVersion, PackageName, VersionReq};
 use std::any::Any;
@@ -395,6 +395,58 @@ pub fn has_default_prerelease_marker(version: &str) -> bool {
         || v.contains("-snapshot")
         || v.contains("-canary")
         || v.contains("-nightly")
+}
+
+/// Maps a `404` (plus any status in `also_not_found`) [`DepsError::HttpStatus`] to
+/// [`DepsError::PackageNotFound`], passing through any other error unchanged.
+///
+/// Extracted from four byte-identical copies of this mapper in `deps-pypi`, `deps-deno`,
+/// `deps-npm`, and `deps-go` (deps-lsp#929 item 1). `also_not_found` keeps ecosystem-specific
+/// extra statuses explicit at the call site instead of hardcoded here — `deps-go` passes
+/// `&[410]` for the Go module proxy's "retracted" status, which the other three ecosystems
+/// must not silently inherit.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::DepsError;
+/// use deps_core::net_policy::RedactedUrl;
+/// use deps_core::not_found_or;
+///
+/// let url = RedactedUrl::new("https://example.test/pkg");
+/// let not_found = DepsError::HttpStatus {
+///     url: url.clone(),
+///     status: 404,
+/// };
+/// assert!(matches!(
+///     not_found_or(not_found, "pkg", "example", &[]),
+///     DepsError::PackageNotFound { .. }
+/// ));
+///
+/// let server_error = DepsError::HttpStatus { url, status: 500 };
+/// assert!(matches!(
+///     not_found_or(server_error, "pkg", "example", &[]),
+///     DepsError::HttpStatus { status: 500, .. }
+/// ));
+/// ```
+#[must_use]
+pub fn not_found_or(
+    err: DepsError,
+    package: &str,
+    registry: &'static str,
+    also_not_found: &[u16],
+) -> DepsError {
+    match err {
+        DepsError::HttpStatus { status, .. }
+            if status == 404 || also_not_found.contains(&status) =>
+        {
+            DepsError::PackageNotFound {
+                package: package.to_string(),
+                registry,
+            }
+        }
+        other => other,
+    }
 }
 
 /// Hashes an ordered sequence of `&str` routing-hop parts into an opaque
