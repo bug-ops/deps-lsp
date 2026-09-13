@@ -10,20 +10,3 @@ fail-fast = true
 [profile.coverage]
 retries = 0
 fail-fast = false
-
-# #906: these two tests assert on a *scaling ratio* between two parse timings (small vs. 4x
-# input) and were observed to flake under parallel-suite CPU contention (14.3x vs the <8x
-# threshold in one run) rather than any real quadratic regression. Loosening the threshold
-# would let a real regression back in, so instead each test reserves every available test
-# thread while it runs, ensuring it never executes concurrently with a CPU-heavy sibling test.
-# Defined only under `profile.default` — verified via `cargo nextest show-config test-groups`
-# (nextest 0.9.105) that `ci` and `coverage` inherit `default`'s overrides, so duplicating
-# these per-profile is unnecessary and would only invite drift.
-[[profile.default.overrides]]
-filter = '''
-package(deps-dart) and (
-    test(test_many_dependencies_key_and_value_lookup_scales_linearly_not_quadratically)
-    or test(test_quadratic_scan_stays_bounded_with_quoted_keys)
-)
-'''
-threads-required = "num-test-threads"

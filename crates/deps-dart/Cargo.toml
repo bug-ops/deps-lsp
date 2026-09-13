@@ -31,3 +31,7 @@ tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-test = { workspace = true }
 url = { workspace = true }
+
+[[bench]]
+name = "dart_benchmarks"
+harness = false

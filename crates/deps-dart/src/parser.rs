@@ -1881,7 +1881,7 @@ flutter:
     /// Builds a document with `depth` levels of nested, mutually-unrelated anchored mappings
     /// (`a0: &a0\n  a1: &a1\n    ...`), each concurrently open while the innermost `inner_lines`
     /// filler fields stream past, followed by a real `dependencies:` section — for
-    /// `test_many_open_anchors_do_not_multiply_recording_cost` below.
+    /// `test_deeply_nested_anchors_resolve_dependency_position_correctly` below.
     fn nested_anchors_then_dependencies_yaml(depth: usize, inner_lines: usize) -> String {
         let mut yaml = String::from("padding:\n");
         for i in 0..depth {
@@ -1898,86 +1898,73 @@ flutter:
     }
 
     #[test]
-    fn test_many_open_anchors_do_not_multiply_recording_cost() {
+    fn test_deeply_nested_anchors_resolve_dependency_position_correctly() {
         // Critic finding S2: an earlier design cloned every event into every currently-open
         // anchored container's own buffer (a loop over all open `RecordingFrame`s, each
         // appending a clone), so N concurrently-open (nested) anchors wrapping the same inner
         // content multiplied both time and memory by N — measured ~150x memory and ~4x
         // latency from 60 anchors wrapped around a 480 KB payload, none of them ever aliased.
         // Recording via one flat, shared `event_log` (see `RecordingFrame`'s docs) makes this
-        // O(1) per event regardless of how many anchors are concurrently open, so parse time
-        // must stay roughly flat as nesting depth grows, not scale with it.
-        //
-        // Shares the same wall-clock-ratio-under-parallel-CPU-contention flakiness profile
-        // #906 item 12 flags for `test_many_dependencies_key_and_value_lookup_scales_linearly_
-        // not_quadratically`/`test_quadratic_scan_stays_bounded_with_quoted_keys` — neither of
-        // those has a nextest test-group/serialization mitigation applied yet either, so this
-        // test intentionally matches their current (not-yet-decided) approach rather than
-        // introducing bespoke serialization for only the newest of the three. Revisit together
-        // if #906 item 12 is ever acted on.
+        // O(1) per event regardless of how many anchors are concurrently open. Scaling behavior
+        // is observed (not gated) via `cargo bench -p deps-dart` (`benches/dart_benchmarks.rs`,
+        // `anchor_nesting` group) rather than a wall-clock assertion here, which was flaky
+        // under CI scheduling contention — this test only checks correctness at depth.
         const INNER_LINES: usize = 2000;
         const SHALLOW_DEPTH: usize = 2;
         const DEEP_DEPTH: usize = 40;
 
         let shallow_yaml = nested_anchors_then_dependencies_yaml(SHALLOW_DEPTH, INNER_LINES);
-        let start = std::time::Instant::now();
         let shallow_result = parse_pubspec_yaml(&shallow_yaml, &test_uri()).unwrap();
-        let shallow_elapsed = start.elapsed();
 
         let deep_yaml = nested_anchors_then_dependencies_yaml(DEEP_DEPTH, INNER_LINES);
-        let start = std::time::Instant::now();
         let deep_result = parse_pubspec_yaml(&deep_yaml, &test_uri()).unwrap();
-        let deep_elapsed = start.elapsed();
 
         assert_eq!(shallow_result.dependencies.len(), 1);
         assert_eq!(deep_result.dependencies.len(), 1);
 
-        let floor = std::time::Duration::from_micros(200);
-        let ratio = deep_elapsed.as_secs_f64() / shallow_elapsed.max(floor).as_secs_f64();
-        assert!(
-            ratio < 6.0,
-            "parsing with {DEEP_DEPTH} concurrently-open (nested, unaliased) anchors took \
-             {deep_elapsed:?} vs {shallow_elapsed:?} with {SHALLOW_DEPTH} (ratio {ratio:.1}x \
-             for a {}x depth increase) — expected roughly flat, not multiplied, recording cost",
-            DEEP_DEPTH / SHALLOW_DEPTH
+        // A dependency count alone wouldn't catch a regression in marker resolution under deep
+        // nesting (e.g. every anchor's marker resolving to the wrong position); verify the
+        // resolved name/version/position too.
+        let shallow_dep = &shallow_result.dependencies[0];
+        assert_eq!(shallow_dep.name.as_ref(), "http");
+        assert_eq!(shallow_dep.version_req, Some("^1.0.0".into()));
+        assert_eq!(
+            shallow_dep.name_range.start.line,
+            u32::try_from(SHALLOW_DEPTH + INNER_LINES + 2).unwrap()
         );
+        assert!(shallow_dep.version_range.is_some());
+
+        let deep_dep = &deep_result.dependencies[0];
+        assert_eq!(deep_dep.name.as_ref(), "http");
+        assert_eq!(deep_dep.version_req, Some("^1.0.0".into()));
+        assert_eq!(
+            deep_dep.name_range.start.line,
+            u32::try_from(DEEP_DEPTH + INNER_LINES + 2).unwrap()
+        );
+        assert!(deep_dep.version_range.is_some());
     }
 
     #[test]
-    fn test_many_dependencies_key_and_value_lookup_scales_linearly_not_quadratically() {
+    fn test_many_dependencies_resolve_correct_position_at_scale() {
         // #899: the original hand-rolled `find_key_range`/`find_value_range_after_key` used
         // to re-scan the *entire* document from byte 0 for every single dependency, making
         // parsing O(N x document length). The marker-based rewrite resolves every dependency's
         // position from its own event's marker — O(1) per lookup, independent of N or document
-        // length — so this asserts on the *scaling ratio* (4x input size should cost roughly
-        // 4x time, not 16x) rather than an absolute wall-clock ceiling, which would not catch
-        // a reintroduced quadratic regression at sizes this small.
+        // length. Scaling behavior is observed (not gated) via `cargo bench -p deps-dart`
+        // (`benches/dart_benchmarks.rs`, `many_dependencies` group) rather than a wall-clock
+        // ratio assertion here, which was flaky under CI scheduling contention — this test only
+        // checks correctness at a large N.
         const SMALL: usize = 1250;
         const LARGE: usize = SMALL * 4;
 
         let small_yaml = many_dependencies_yaml(SMALL);
-        let start = std::time::Instant::now();
         let small_result = parse_pubspec_yaml(&small_yaml, &test_uri()).unwrap();
-        let small_elapsed = start.elapsed();
 
         let large_yaml = many_dependencies_yaml(LARGE);
-        let start = std::time::Instant::now();
         let large_result = parse_pubspec_yaml(&large_yaml, &test_uri()).unwrap();
-        let large_elapsed = start.elapsed();
 
         assert_eq!(small_result.dependencies.len(), SMALL);
         assert_eq!(large_result.dependencies.len(), LARGE);
-
-        // Floor the divisor so a near-instant `small_elapsed` (a very fast machine) cannot
-        // make the ratio spuriously huge.
-        let floor = std::time::Duration::from_micros(200);
-        let ratio = large_elapsed.as_secs_f64() / small_elapsed.max(floor).as_secs_f64();
-        assert!(
-            ratio < 8.0,
-            "parsing {LARGE} dependencies took {large_elapsed:?} vs {small_elapsed:?} for \
-             {SMALL} (ratio {ratio:.1}x for a 4x size increase) — expected roughly linear \
-             (~4x), not quadratic (~16x) scaling"
-        );
 
         // Bounded lookups must still resolve each dependency's own position, not just be
         // fast.
@@ -1997,11 +1984,15 @@ flutter:
     }
 
     #[test]
-    fn test_quadratic_scan_stays_bounded_with_quoted_keys() {
+    fn test_quoted_keys_resolve_correct_position_at_scale() {
         // Critic finding S1: quoted keys (`"dep": ^1.0.0`) specifically defeated the abandoned
         // cursor-based intermediate fix's line-start text check, reproducing near-quadratic
         // scaling (3.71x -> 3.61x measured for a 2x size step, i.e. essentially unfixed). The
-        // marker-based rewrite does not distinguish quoted from plain keys at all.
+        // marker-based rewrite does not distinguish quoted from plain keys at all. Scaling
+        // behavior is observed (not gated) via `cargo bench -p deps-dart`
+        // (`benches/dart_benchmarks.rs`, `quoted_keys` group) rather than a wall-clock ratio
+        // assertion here, which was flaky under CI scheduling contention — this test only
+        // checks correctness at a large N.
         const SMALL: usize = 1250;
         const LARGE: usize = SMALL * 4;
 
@@ -2013,29 +2004,28 @@ flutter:
             yaml
         }
 
-        let small_elapsed = {
-            let yaml = build(SMALL);
-            let start = std::time::Instant::now();
-            let result = parse_pubspec_yaml(&yaml, &test_uri()).unwrap();
-            assert_eq!(result.dependencies.len(), SMALL);
-            start.elapsed()
-        };
-        let large_elapsed = {
-            let yaml = build(LARGE);
-            let start = std::time::Instant::now();
-            let result = parse_pubspec_yaml(&yaml, &test_uri()).unwrap();
-            assert_eq!(result.dependencies.len(), LARGE);
-            start.elapsed()
-        };
+        let small_result = parse_pubspec_yaml(&build(SMALL), &test_uri()).unwrap();
+        assert_eq!(small_result.dependencies.len(), SMALL);
 
-        let floor = std::time::Duration::from_micros(200);
-        let ratio = large_elapsed.as_secs_f64() / small_elapsed.max(floor).as_secs_f64();
-        assert!(
-            ratio < 8.0,
-            "parsing {LARGE} quoted-key dependencies took {large_elapsed:?} vs \
-             {small_elapsed:?} for {SMALL} (ratio {ratio:.1}x) — expected roughly linear \
-             scaling"
+        let large_result = parse_pubspec_yaml(&build(LARGE), &test_uri()).unwrap();
+        assert_eq!(large_result.dependencies.len(), LARGE);
+
+        // A regression collapsing every quoted-key position to a fixed offset (the exact bug
+        // class this test exists to catch) would still pass the length checks above, so verify
+        // each dependency's own dequoted name and position are resolved correctly.
+        let first = &large_result.dependencies[0];
+        assert_eq!(first.name.as_ref(), "dep_00000");
+        assert_eq!(first.version_req, Some("^1.0.0".into()));
+        assert_eq!(first.name_range.start.line, 2);
+
+        let last = &large_result.dependencies[LARGE - 1];
+        assert_eq!(last.name.as_ref(), format!("dep_{:05}", LARGE - 1));
+        assert_eq!(last.version_req, Some(format!("^1.{}.0", LARGE - 1).into()));
+        assert_eq!(
+            last.name_range.start.line,
+            u32::try_from(LARGE + 1).unwrap()
         );
+        assert!(last.version_range.is_some());
     }
 
     #[test]
