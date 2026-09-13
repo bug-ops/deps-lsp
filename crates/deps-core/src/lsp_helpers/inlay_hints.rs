@@ -120,7 +120,12 @@ pub fn generate_inlay_hints(
             }
         } else {
             match dep.version_requirement() {
-                Some(version_req) => formatter.requirement_status(version_req, latest),
+                // `requirement_status_for` (not the bare `requirement_status`), matching
+                // `diagnostics.rs`'s `apply_outdated_rule` (#907 review M-consistency):
+                // hands the ecosystem the dependency itself, letting e.g.
+                // `GithubActionsFormatter` prefer a SHA pin's registry-confirmed tag over
+                // trusting its own comment text when both are available.
+                Some(version_req) => formatter.requirement_status_for(dep, version_req, latest),
                 // No declared requirement at all (e.g. a dangling alias/reference the
                 // parser couldn't resolve to any string) — nothing was verified.
                 None => RequirementStatus::Unresolved,
