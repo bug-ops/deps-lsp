@@ -21,10 +21,14 @@
 //! enforced at the point a host string first turns into a fetch target. A `project:`
 //! include (which never carries a host segment) and a `$CI_SERVER_FQDN`-relative
 //! `component:` include resolve against `registries.gitlab_instance_host` when set, or are
-//! left [`crate::types::HostRef::Unresolved`] otherwise (spec FR-011a/FR-012).
+//! left [`crate::types::HostRef::Unresolved`] otherwise (spec FR-011a/FR-012) — unless the
+//! resolved value is rejected specifically by the `registries.workspace_registries`
+//! reachability policy, in which case it becomes [`crate::types::HostRef::PolicyBlocked`]
+//! instead (issue #967).
 
 use crate::host::{
-    GitlabHost, GitlabInstanceHost, is_valid_gitlab_coordinate, is_valid_path_segment,
+    GitlabHost, GitlabInstanceHost, InstanceHostOutcome, is_valid_gitlab_coordinate,
+    is_valid_path_segment,
 };
 use crate::types::{
     EndpointKind, GitlabCiDependency, GitlabCiParseResult, GitlabRoute, HostRef, IncludeKind,
@@ -468,7 +472,9 @@ fn classify_project_pin(ref_text: &str) -> PinStyle {
 fn host_qualified_name(host: &HostRef, project_path: &str, component_name: Option<&str>) -> String {
     let base = match host {
         HostRef::Literal(h) => format!("{}/{project_path}", h.host()),
-        HostRef::Unresolved(_) | HostRef::CapacityRefused(_) => project_path.to_string(),
+        HostRef::Unresolved(_) | HostRef::CapacityRefused(_) | HostRef::PolicyBlocked { .. } => {
+            project_path.to_string()
+        }
     };
     match component_name {
         Some(name) => format!("{base}/{name}"),
@@ -503,14 +509,47 @@ fn build_source_and_route(
             },
             None,
         ),
+        HostRef::PolicyBlocked { raw, .. } => {
+            (DependencySource::CustomRegistry { url: raw.clone() }, None)
+        }
     }
 }
 
+/// Declaration key shared by every dependency resolving through the
+/// `registries.gitlab_instance_host` setting (#967 S3): a config-global setting applies
+/// identically to every dependency it affects, so `deps_core::lsp_helpers`' diagnostic
+/// grouping collapses them into one occurrence instead of fanning out per dependency.
+const INSTANCE_HOST_DECLARATION_KEY: &str = "gitlab_instance_host";
+
 fn resolve_project_host(instance_host: &GitlabInstanceHost) -> HostRef {
-    instance_host.get().map_or_else(
-        || HostRef::Unresolved(CI_SERVER_FQDN.to_string()),
-        HostRef::Literal,
-    )
+    resolve_instance_host_ref(instance_host, CI_SERVER_FQDN)
+}
+
+/// Resolves a `$CI_SERVER_FQDN`-relative host (either a `project:` include, which always
+/// resolves this way, or a `$`-prefixed `component:` host expression) against the
+/// `registries.gitlab_instance_host` setting, distinguishing a policy-blocked value (issue
+/// #967) from a genuinely unset/malformed one.
+///
+/// `raw` is used only for the `Unresolved` case (the unresolved expression as written in the
+/// manifest, e.g. `$CI_SERVER_FQDN`) — the `PolicyBlocked` case instead carries the actual
+/// configured `registries.gitlab_instance_host` string from [`InstanceHostOutcome::Blocked`]
+/// (#967 S1): that setting, not the manifest expression, is the value a user must change.
+///
+/// Resolves against one [`GitlabInstanceHost::resolve`] call (#967 M1): matching `get()` and
+/// a separate blocked-check call could observe two different outcomes if the setting or
+/// policy changed between them.
+fn resolve_instance_host_ref(instance_host: &GitlabInstanceHost, raw: &str) -> HostRef {
+    match instance_host.resolve() {
+        InstanceHostOutcome::Valid(host) => HostRef::Literal(host),
+        InstanceHostOutcome::Blocked(configured_raw, class) => HostRef::PolicyBlocked {
+            raw: configured_raw,
+            class,
+            declaration_key: INSTANCE_HOST_DECLARATION_KEY.to_string(),
+        },
+        InstanceHostOutcome::Unset | InstanceHostOutcome::Invalid => {
+            HostRef::Unresolved(raw.to_string())
+        }
+    }
 }
 
 fn resolve_component_host(
@@ -520,10 +559,7 @@ fn resolve_component_host(
     admitted_origins: &mut HashSet<String>,
 ) -> HostRef {
     if host_expr.starts_with('$') {
-        return instance_host.get().map_or_else(
-            || HostRef::Unresolved(host_expr.to_string()),
-            HostRef::Literal,
-        );
+        return resolve_instance_host_ref(instance_host, host_expr);
     }
     match GitlabHost::parse(host_expr, policy) {
         Ok(host) if admit_origin(admitted_origins, host.origin()) => HostRef::Literal(host),
@@ -537,6 +573,16 @@ fn resolve_component_host(
                 host_expr,
             );
             HostRef::CapacityRefused(host.origin().to_string())
+        }
+        Err(deps_core::net_policy::IndexUrlError::BlockedHost { class }) => {
+            HostRef::PolicyBlocked {
+                raw: host_expr.to_string(),
+                class,
+                // #967 S3: one per distinct literal host string, unlike the instance-setting
+                // path's single shared key — two different `component:` hosts blocked by policy
+                // are two independently declared literals, not one config declaration.
+                declaration_key: format!("component-host:{host_expr}"),
+            }
         }
         Err(_) => HostRef::Unresolved(host_expr.to_string()),
     }
@@ -814,6 +860,7 @@ pub fn parse_gitlab_ci_yaml(
             routes: Vec::new(),
             uri: uri.clone(),
             dependency_truncation: None,
+            blocked_registries: Vec::new(),
         });
     }
 
@@ -849,11 +896,33 @@ pub fn parse_gitlab_ci_yaml(
         dependencies.push(dep);
     }
 
+    // Issue #967: a `HostRef::PolicyBlocked` dependency is reported through
+    // `ParseResult::blocked_registries` (an informational diagnostic naming the blocked host
+    // class) rather than through `crate::ecosystem`'s unresolved-host diagnostic, which would
+    // misattribute the cause to `registries.gitlab_instance_host` being unset.
+    let blocked_registries = dependencies
+        .iter()
+        .filter_map(|dep| match &dep.host {
+            HostRef::PolicyBlocked {
+                raw,
+                class,
+                declaration_key,
+            } => Some(deps_core::BlockedRegistryOccurrence {
+                range: dep.name_range,
+                class: *class,
+                raw_value: raw.clone(),
+                declaration_key: declaration_key.clone(),
+            }),
+            HostRef::Literal(_) | HostRef::Unresolved(_) | HostRef::CapacityRefused(_) => None,
+        })
+        .collect();
+
     Ok(GitlabCiParseResult {
         dependencies,
         routes,
         uri: uri.clone(),
         dependency_truncation: budget.truncation(),
+        blocked_registries,
     })
 }
 
@@ -999,6 +1068,100 @@ mod tests {
         let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host).unwrap();
         let dep = &result.dependencies[0];
         assert_eq!(dep.name(), "gitlab.mycorp.dev/org/proj/comp");
+    }
+
+    /// Issue #967: a `component:` host blocked by `registries.workspace_registries` must
+    /// resolve to `HostRef::PolicyBlocked` (not `HostRef::Unresolved`) and populate
+    /// `blocked_registries`, so the diagnostic never misattributes the cause to
+    /// `registries.gitlab_instance_host`.
+    #[test]
+    fn test_component_literal_host_blocked_by_policy_populates_blocked_registries() {
+        let (policy, instance_host) = ctx();
+        let content = "include:\n  - component: 10.0.0.1/org/proj/comp@1.0.0\n";
+        let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host).unwrap();
+        let dep = &result.dependencies[0];
+        assert!(matches!(
+            &dep.host,
+            HostRef::PolicyBlocked { raw, .. } if raw == "10.0.0.1"
+        ));
+        assert!(matches!(
+            dep.source(),
+            DependencySource::CustomRegistry { .. }
+        ));
+        assert_eq!(result.blocked_registries.len(), 1);
+        let occurrence = &result.blocked_registries[0];
+        assert_eq!(
+            occurrence.class,
+            deps_core::net_policy::HostClass::PrivateV4
+        );
+        assert_eq!(occurrence.raw_value, "10.0.0.1");
+        // #967 S3: one declaration key per distinct literal `component:` host string.
+        assert_eq!(occurrence.declaration_key, "component-host:10.0.0.1");
+        assert!(result.routes.is_empty());
+    }
+
+    /// Issue #967, `$CI_SERVER_FQDN`-relative path: `registries.gitlab_instance_host` itself
+    /// blocked by policy must resolve to `HostRef::PolicyBlocked`, not `HostRef::Unresolved`,
+    /// and (S1) the diagnostic must name the real configured setting value — not the
+    /// `$CI_SERVER_FQDN` placeholder, which appears nowhere in the user's file or config.
+    #[test]
+    fn test_component_ci_server_fqdn_blocked_instance_host_populates_blocked_registries() {
+        let (policy, instance_host) = ctx_with_instance_host("10.0.0.1");
+        let content = "include:\n  - component: $CI_SERVER_FQDN/org/proj/comp@1.0\n";
+        let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host).unwrap();
+        let dep = &result.dependencies[0];
+        assert_eq!(
+            dep.host,
+            HostRef::PolicyBlocked {
+                raw: "10.0.0.1".to_string(),
+                class: deps_core::net_policy::HostClass::PrivateV4,
+                declaration_key: INSTANCE_HOST_DECLARATION_KEY.to_string(),
+            }
+        );
+        assert_eq!(result.blocked_registries.len(), 1);
+        assert_eq!(result.blocked_registries[0].raw_value, "10.0.0.1");
+    }
+
+    /// Issue #967, `project:` path: same as the component test above, but for the
+    /// unconditional `$CI_SERVER_FQDN` resolution every `project:` include goes through.
+    #[test]
+    fn test_project_ref_blocked_instance_host_populates_blocked_registries() {
+        let (policy, instance_host) = ctx_with_instance_host("10.0.0.1");
+        let content = "include:\n  - project: org/proj\n    ref: v1.0.0\n";
+        let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host).unwrap();
+        let dep = &result.dependencies[0];
+        assert!(matches!(dep.host, HostRef::PolicyBlocked { .. }));
+        assert_eq!(dep.name(), "org/proj");
+        assert_eq!(result.blocked_registries.len(), 1);
+        // S1: the diagnostic must name the real configured host, not `$CI_SERVER_FQDN`.
+        assert_eq!(result.blocked_registries[0].raw_value, "10.0.0.1");
+        assert_eq!(
+            result.blocked_registries[0].declaration_key,
+            INSTANCE_HOST_DECLARATION_KEY
+        );
+        assert!(result.routes.is_empty());
+    }
+
+    /// Issue #967 S3: a `project:` include and a `$`-relative `component:` include, both
+    /// resolving through the same blocked `registries.gitlab_instance_host` setting, must
+    /// share one declaration key — the shared `deps_core::lsp_helpers` diagnostic grouping
+    /// collapses same-key occurrences, so this file must not fan out into two diagnostics for
+    /// what is really one blocked setting.
+    #[test]
+    fn test_project_and_component_instance_host_share_one_declaration_key() {
+        let (policy, instance_host) = ctx_with_instance_host("10.0.0.1");
+        let content = "include:\n  - project: org/proj\n    ref: v1.0.0\n  - component: $CI_SERVER_FQDN/org/proj/comp@1.0\n";
+        let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host).unwrap();
+        assert_eq!(result.blocked_registries.len(), 2);
+        let keys: std::collections::HashSet<_> = result
+            .blocked_registries
+            .iter()
+            .map(|occ| occ.declaration_key.as_str())
+            .collect();
+        assert_eq!(
+            keys,
+            std::collections::HashSet::from([INSTANCE_HOST_DECLARATION_KEY])
+        );
     }
 
     #[test]

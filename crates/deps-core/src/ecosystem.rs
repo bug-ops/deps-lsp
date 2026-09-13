@@ -327,13 +327,6 @@ pub trait ParseResult: Send + Sync {
     /// [`crate::net_policy::validate_index_url`] with [`crate::net_policy::PolicyGate::Enforce`]
     /// — an ecosystem with no such configurable host (nothing a workspace or user config could
     /// point at an unreachable-by-policy host) has nothing to report here and keeps the default.
-    ///
-    /// Known gap tracked as #967, not yet fixed: `deps_gitlab_ci::host::GitlabHost::parse` is
-    /// one such `PolicyGate::Enforce` caller (a configurable GitLab instance host) but still
-    /// keeps this default — a policy-blocked host there instead surfaces through
-    /// `deps_gitlab_ci`'s own `unresolved_host_diagnostics`, whose message is misattributed for
-    /// this specific cause (it tells the user to set `registries.gitlab_instance_host`, which
-    /// does nothing when the real cause is `registries.workspace_registries`).
     fn blocked_registries(&self) -> Vec<BlockedRegistryOccurrence> {
         Vec::new()
     }

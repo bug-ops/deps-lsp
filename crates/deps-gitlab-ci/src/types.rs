@@ -77,6 +77,34 @@ pub enum HostRef {
     /// the diagnostic this produces must never suggest `registries.gitlab_instance_host` as
     /// the fix — a capacity refusal needs fewer distinct hosts/includes, not that setting.
     CapacityRefused(String),
+    /// A host that would otherwise resolve, but whose class is blocked by the current
+    /// `registries.workspace_registries` reachability policy. Deliberately distinct from
+    /// [`Self::Unresolved`] (issue #967): the host itself is fully determinable, so telling
+    /// the user to set `registries.gitlab_instance_host` would be wrong — the fix is to relax
+    /// the policy. Surfaced via [`GitlabCiParseResult::blocked_registries`] instead of the
+    /// `crate::ecosystem`'s unresolved-host diagnostic.
+    ///
+    /// A named struct variant, not a positional tuple (mirrors
+    /// [`deps_core::BlockedRegistryOccurrence`]'s own #944 M9 rationale): `raw` and
+    /// `declaration_key` are both `String`s, so a positional tuple would let them be silently
+    /// swapped at any call site.
+    PolicyBlocked {
+        /// The blocked value itself: the configured `registries.gitlab_instance_host` string
+        /// for the instance-setting-relative path (`project:` includes, and a
+        /// `$`-prefixed `component:` host), or the literal `component:` host expression for
+        /// the inline-literal path — never a placeholder like `$CI_SERVER_FQDN` (#967 S1: a
+        /// placeholder would name a string that appears nowhere in the user's file or
+        /// config).
+        raw: String,
+        /// The blocked host's classification.
+        class: deps_core::net_policy::HostClass,
+        /// Stable declaration id for [`deps_core::BlockedRegistryOccurrence::declaration_key`]
+        /// grouping (#967 S3): `"gitlab_instance_host"` for the instance-setting-relative
+        /// path — shared by every dependency resolving through that one setting, so they
+        /// collapse into a single diagnostic — or `component-host:{host_expr}` for the
+        /// inline-literal path, one per distinct literal host string.
+        declaration_key: String,
+    },
 }
 
 /// The `(host, endpoint)` pair a dependency resolves against, registered at parse time
@@ -257,16 +285,46 @@ pub struct GitlabCiParseResult {
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
     /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
     pub dependency_truncation: Option<(usize, usize)>,
+    /// Dependencies whose host resolved to [`HostRef::PolicyBlocked`] (issue #967), one entry
+    /// per affected dependency. Surfaced by
+    /// [`deps_core::lsp_helpers::generate_diagnostics_from_cache`] via
+    /// [`deps_core::ParseResult::blocked_registries`]'s trait override as an informational
+    /// diagnostic, mirroring `deps_cargo`/`deps_npm`/`deps_pypi`/`deps_nuget`'s identical
+    /// pattern (#925).
+    pub blocked_registries: Vec<deps_core::BlockedRegistryOccurrence>,
 }
 
-deps_core::impl_parse_result!(
-    GitlabCiParseResult,
-    GitlabCiDependency {
-        dependencies: dependencies,
-        uri: uri,
-        dependency_truncation: dependency_truncation,
+// Implemented by hand rather than via `deps_core::impl_parse_result!`: `blocked_registries()`
+// is overridden with real data (`self.blocked_registries.clone()`) — the macro has no field
+// for it, mirroring `deps_cargo`/`deps_nuget`'s own hand-written impls (#925/#967).
+impl deps_core::ParseResult for GitlabCiParseResult {
+    fn dependencies(&self) -> Vec<&dyn deps_core::Dependency> {
+        self.dependencies
+            .iter()
+            .map(|d| d as &dyn deps_core::Dependency)
+            .collect()
     }
-);
+
+    fn workspace_root(&self) -> Option<&std::path::Path> {
+        None
+    }
+
+    fn uri(&self) -> &Uri {
+        &self.uri
+    }
+
+    fn blocked_registries(&self) -> Vec<deps_core::BlockedRegistryOccurrence> {
+        self.blocked_registries.clone()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn dependency_truncation(&self) -> Option<(usize, usize)> {
+        self.dependency_truncation
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -350,6 +408,7 @@ mod tests {
             routes: vec![],
             uri,
             dependency_truncation: None,
+            blocked_registries: Vec::new(),
         };
         assert_eq!(result.dependencies().len(), 1);
         assert!(result.uri().path().as_str().ends_with(".gitlab-ci.yml"));
