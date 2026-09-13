@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `specs/`: reconciled `MOC-specs.md` against actual issue/PR state — stale "draft" spec rows marked shipped with their PR/issue references, all shipped specs moved into a "Completed Specs" section, and `specs/constitution.md` added (resolves #855) (#867)
 
 ### Fixed
-- **deps-core, deps-maven, deps-gradle, deps-swift**: version completion no longer splices text into non-literal version spans (unresolved property/variable interpolation, YAML aliases, Swift version ranges) (resolves #919) (#TBD)
+- **deps-core, deps-maven, deps-gradle, deps-swift**: version completion no longer splices text into non-literal version spans (unresolved property/variable interpolation, YAML aliases, Swift version ranges) (resolves #919) (#922)
 - **deps-github-actions**: SHA-pinned `uses:` refs with a partial `# vX`/`# vX.Y` comment tag now get inlay hints/diagnostics, using the registry-confirmed tag over the comment when available (resolves #907) (#914)
 - **deps-dart**: fixed `is_plain_null` mishandling an explicit YAML tag (including the verbatim null-tag form) and moved `DependencyBudget` enforcement before entry construction; pinned six behavior changes from #903's parser rewrite with regression tests (resolves #906) (#911)
 - **deps-dart**: aliasing a whole dependency section or `environment:` mapping via a YAML anchor now resolves correctly instead of silently losing its data (resolves #905) (#910)
