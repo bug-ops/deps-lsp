@@ -375,6 +375,13 @@ pub fn byte_span_to_range(
 /// from raw numbers: `line` is 1-indexed and `col` a 0-indexed **char** count, matching
 /// `yaml-rust2`'s own `Marker::line()`/`Marker::col()` (see [`marker_byte_offset`]'s
 /// docs for why — #879/#882 both trace back to conflating this with a byte count).
+///
+/// The marker does not always come from the same event as the text/style: `deps-dart`'s
+/// `on_alias` (key position) builds a `MarkedScalar` whose marker is the *alias*
+/// occurrence's own site but whose text and style are the *anchor* definition's — this is
+/// deliberate (the anchor's style is what `is_plain_null` already checked to accept the
+/// value), and safe because [`MarkedScalar::span`]/[`MarkedScalar::range`] never read
+/// `style`, only `text`/`line`/`col`.
 #[derive(Debug, Clone)]
 pub struct MarkedScalar {
     text: String,
