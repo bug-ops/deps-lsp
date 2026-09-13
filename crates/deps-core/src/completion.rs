@@ -231,6 +231,14 @@ pub fn detect_completion_context(
     let dependencies = parse_result.dependencies();
 
     for dep in dependencies {
+        // #905 S1: a synthetic `name_range()` (`Dependency::name_range_is_synthetic`) is not a
+        // real position — worse than the hover/diagnostics cases guarded elsewhere, since
+        // *accepting* a completion here would insert text at that bogus range. Skip the
+        // dependency entirely rather than let `position_in_range` match it.
+        if dep.name_range_is_synthetic() {
+            continue;
+        }
+
         // Check if position is within the dependency name range
         let name_range = dep.name_range();
         // `position_in_range` tolerates a request position one column past
@@ -1590,6 +1598,80 @@ mod tests {
             }
             _ => panic!("Expected PackageName context, got {:?}", context),
         }
+    }
+
+    /// #905 S1: a dependency with a synthetic `name_range()` (e.g. `deps-dart`'s
+    /// container-anchor alias resolution) resolves to `Range::default()` — position (0,0)
+    /// here — which must never yield a `PackageName` completion context. Accepting such a
+    /// completion would insert text at that bogus range, worse than the read-only hover case
+    /// this same guard already protects.
+    #[test]
+    fn test_detect_completion_context_skips_synthetic_range_dependency() {
+        struct SyntheticDep {
+            name: crate::PackageName,
+        }
+
+        impl crate::ecosystem::Dependency for SyntheticDep {
+            fn name(&self) -> &crate::PackageName {
+                &self.name
+            }
+            fn name_range(&self) -> Range {
+                Range::default()
+            }
+            fn version_requirement(&self) -> Option<&crate::VersionReq> {
+                None
+            }
+            fn version_range(&self) -> Option<Range> {
+                None
+            }
+            fn source(&self) -> crate::parser::DependencySource {
+                crate::parser::DependencySource::Registry
+            }
+            fn name_range_is_synthetic(&self) -> bool {
+                true
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        struct SyntheticParseResult {
+            dep: SyntheticDep,
+        }
+
+        impl ParseResult for SyntheticParseResult {
+            fn dependencies(&self) -> Vec<&dyn crate::ecosystem::Dependency> {
+                vec![&self.dep as &dyn crate::ecosystem::Dependency]
+            }
+            fn workspace_root(&self) -> Option<&std::path::Path> {
+                None
+            }
+            fn uri(&self) -> &tower_lsp_server::ls_types::Uri {
+                static URI: std::sync::LazyLock<tower_lsp_server::ls_types::Uri> =
+                    std::sync::LazyLock::new(|| crate::test_util::test_uri("/test/pubspec.yaml"));
+                &URI
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let parse_result = SyntheticParseResult {
+            dep: SyntheticDep {
+                name: "synthetic-pkg".into(),
+            },
+        };
+
+        let context = detect_completion_context(
+            &parse_result,
+            Position {
+                line: 0,
+                character: 0,
+            },
+            "",
+        );
+
+        assert_matches!(context, CompletionContext::None);
     }
 
     #[test]

@@ -21,11 +21,17 @@ pub struct DartDependency {
     /// Dart-specific Git sub-path (e.g., `path: packages/pkg` inside a repo).
     /// Only meaningful when `source` is `DependencySource::Git`.
     pub git_path: Option<String>,
+    /// Whether `name_range` is a synthetic placeholder (typically `Range::default()`) rather
+    /// than a real position — `true` only for a dependency resolved by replaying a whole
+    /// `dependencies:`/`environment:` section's buffered container-anchor alias (issue #905;
+    /// see `crate::parser`'s module docs). Exposed via
+    /// [`deps_core::Dependency::name_range_is_synthetic`].
+    pub name_range_is_synthetic: bool,
 }
 
 /// Which `pubspec.yaml` top-level section a dependency was declared under.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DependencySection {
     /// The `dependencies:` section.
     #[default]
@@ -142,13 +148,38 @@ impl PackageInfo {
 
 // deps-core trait implementations
 
-deps_core::impl_dependency!(DartDependency {
-    name: name,
-    name_range: name_range,
-    version: version_req,
-    version_range: version_range,
-    source: source,
-});
+// Not `impl_dependency!`: this type overrides `name_range_is_synthetic`, which the macro's
+// field-name-substitution pattern has no arm for (only one ecosystem currently needs it — see
+// that method's own docs on `Dependency`).
+impl deps_core::Dependency for DartDependency {
+    fn name(&self) -> &deps_core::PackageName {
+        &self.name
+    }
+
+    fn name_range(&self) -> Range {
+        self.name_range
+    }
+
+    fn version_requirement(&self) -> Option<&deps_core::VersionReq> {
+        self.version_req.as_ref()
+    }
+
+    fn version_range(&self) -> Option<Range> {
+        self.version_range
+    }
+
+    fn source(&self) -> deps_core::parser::DependencySource {
+        self.source.clone()
+    }
+
+    fn name_range_is_synthetic(&self) -> bool {
+        self.name_range_is_synthetic
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -165,6 +196,7 @@ mod tests {
             section: DependencySection::Dependencies,
             source,
             git_path: None,
+            name_range_is_synthetic: false,
         }
     }
 
@@ -350,6 +382,7 @@ mod tests {
             section: DependencySection::Dependencies,
             source: DependencySource::Registry,
             git_path: None,
+            name_range_is_synthetic: false,
         };
         assert!(dep.version_requirement().is_none());
         assert!(dep.version_range().is_none());

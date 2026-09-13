@@ -79,7 +79,13 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     now: PublishTime,
 ) -> Option<Hover> {
     let dep = parse_result.dependencies().into_iter().find(|d| {
-        let on_name = position_in_range(position, d.name_range());
+        // Critic finding S1 (#905): a synthetic `name_range()` (`Dependency::
+        // name_range_is_synthetic`) is not a real position — `position_in_range` is inclusive
+        // on both ends, so without this guard, hovering the document's very first character
+        // (the typical `Range::default()` sentinel) would match whichever such dependency
+        // `dependencies()` happens to list first, showing hover info for an arbitrary
+        // unrelated package.
+        let on_name = !d.name_range_is_synthetic() && position_in_range(position, d.name_range());
         let on_version = d
             .version_range()
             .is_some_and(|r| position_in_range(position, r));
@@ -1283,6 +1289,48 @@ mod tests {
             content.value.contains("License changed"),
             "resolved (1.0.0/MIT) and latest (2.0.0/Apache-2.0) licenses differ; got: {}",
             content.value
+        );
+    }
+
+    /// Critic finding S1 (#905): `position_in_range` is inclusive on both ends, so without a
+    /// guard, hovering the document's very first character — the typical `Range::default()`
+    /// sentinel a synthetic `name_range()` resolves to (e.g. `deps-dart`'s container-anchor
+    /// alias resolution) — would match whichever such dependency `dependencies()` lists first,
+    /// showing hover info for an arbitrary unrelated package instead of nothing.
+    #[tokio::test]
+    async fn test_generate_hover_does_not_match_a_synthetic_range_dependency_at_position_zero() {
+        use std::collections::HashMap;
+
+        let parse_result = MockMixedParseResult {
+            deps: vec![
+                Box::new(MockSyntheticRangeDep {
+                    name: "synthetic-pkg".into(),
+                }),
+                Box::new(MockDep {
+                    name: "real-pkg".into(),
+                    version_req: "1.0.0".into(),
+                    version_range: Range::new(Position::new(3, 10), Position::new(3, 20)),
+                    name_range: Range::new(Position::new(3, 0), Position::new(3, 8)),
+                }),
+            ],
+            uri: crate::test_util::test_uri("/test/pubspec.yaml"),
+        };
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 0),
+            VersionData::new(&HashMap::new(), &HashMap::new()),
+            &MockRegistry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await;
+
+        assert!(
+            hover.is_none(),
+            "position (0,0) must not match the synthetic-range dependency's \
+             Range::default() sentinel"
         );
     }
 

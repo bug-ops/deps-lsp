@@ -850,6 +850,13 @@ pub fn vulnerability_keys(
 
     deps.iter()
         .zip(&signatures)
+        // A synthetic `name_range()` (`Dependency::name_range_is_synthetic`) is not a real,
+        // stable per-dependency position — every such dependency in one document would share
+        // the exact same key, each insertion evicting the last. Excluding them here means
+        // `apply_vulnerability_rule`'s lookup misses and falls through to its own
+        // `normalized_name`/`dep.name()` fallback instead, the same degraded-but-correct path
+        // already taken whenever this map has no entry for a dependency.
+        .filter(|(dep, _)| !dep.name_range_is_synthetic())
         .map(|(dep, (name, signature))| {
             let ambiguous = distinct_signatures_by_name
                 .get(name.as_str())
@@ -1420,6 +1427,52 @@ mod vulnerability_keys_candidates_tests {
             renamed_key.ends_with("v:0.9.15"),
             "renamed occurrence's key must carry its own resolved version, not the collapsed \
              1.0.219: {renamed_key}"
+        );
+    }
+
+    /// Critic finding S1 (#905): a dependency with a synthetic `name_range()` (e.g.
+    /// `deps-dart`'s container-anchor alias resolution) must not get an entry in this map —
+    /// every such dependency in one document would share the exact same key
+    /// (`Range::default()`), each insertion silently evicting the last, so a real dependency
+    /// that happens to collide with that same sentinel (a pre-existing, rarer miss case on
+    /// other ecosystems) could otherwise be handed an unrelated package's OSV lookup key.
+    #[test]
+    fn vulnerability_keys_excludes_synthetic_range_dependencies() {
+        use crate::lsp_helpers::test_support::{MockMixedParseResult, MockSyntheticRangeDep};
+
+        let parse_result = MockMixedParseResult {
+            deps: vec![
+                Box::new(MockSyntheticRangeDep {
+                    name: PackageName::new("synthetic-pkg"),
+                }),
+                Box::new(MockDep {
+                    name: PackageName::new("real-pkg"),
+                    version_req: VersionReq::new("1.0.0"),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 8)),
+                }),
+            ],
+            uri: crate::test_util::test_uri("/test/pubspec.yaml"),
+        };
+
+        let resolved = std::collections::HashMap::new();
+        let keys = vulnerability_keys(
+            &parse_result,
+            &resolved,
+            None,
+            &MockFormatter,
+            EcosystemId::Cargo,
+        );
+
+        assert_eq!(
+            keys.len(),
+            1,
+            "only the real dependency's real name_range should be keyed"
+        );
+        let deps = parse_result.dependencies();
+        assert!(
+            keys.contains_key(&deps[1].name_range()),
+            "the real dependency's own range must still be present"
         );
     }
 }
