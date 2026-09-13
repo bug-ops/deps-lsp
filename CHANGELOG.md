@@ -21,7 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 - **Breaking (pre-1.0, public API)**: **deps-core**: removed `LockFileProvider::is_lockfile_stale` (the trait method had no callers outside its own conformance tests); added direct unit-test coverage for `LockFileCache::get_or_parse`'s actual staleness comparison instead (resolves #926) (#943)
-- **Breaking (pre-1.0, public API)**: **deps-core**: removed the unused `severities: DiagnosticSeverities` parameter from `Ecosystem::generate_code_lenses` — the override it was added for was deleted, and no other override ever read it (resolves #930)
+- **Breaking (pre-1.0, public API)**: **deps-core**: removed the unused `severities: DiagnosticSeverities` parameter from `Ecosystem::generate_code_lenses` — the override it was added for was deleted, and no other override ever read it (resolves #930) (#951)
 
 ### Fixed
 - **deps-dart**: removed flaky wall-clock-ratio assertions from three `pubspec.yaml` parser tests and replaced them with deterministic correctness checks, plus a new `dart_benchmarks` criterion suite to observe scaling behavior locally (resolves #946) (#953)
