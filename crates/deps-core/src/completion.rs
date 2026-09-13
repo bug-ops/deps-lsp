@@ -825,16 +825,14 @@ impl VersionDisplayItem {
 /// list: the first `MAX_COMPLETION_VERSIONS - 1` surviving entries are kept in raw order and
 /// the picked entry is appended as the final one, still tagged/preselected (#956) — matching
 /// hover's own *uncapped* `**Latest**:` header, which always resolves to this same pick
-/// regardless of any display-window size. This does **not** extend to hover's own *capped*
-/// "Recent versions" list (`HOVER_RECENT_VERSIONS`, `lsp_helpers/hover.rs`'s
-/// `push_recent_versions_hover_section`): that list still omits the marker outright when
-/// its own pick falls outside its own window, by design — a
-/// pre-existing instance of this same defect class in a different surface, deliberately left
-/// unresolved here (tracked as a follow-up) rather than claimed as fixed. Finding the picked
-/// entry only scans as far past the cap as it sits, rather than materializing every surviving
-/// version up front — this stays `O(cap)` in the common case (no pick, or a pick already
-/// within the cap), which matters for a registry with thousands of versions (e.g. an npm
-/// packument) queried on every completion keystroke.
+/// regardless of any display-window size. Hover's own *capped* "Recent versions" list
+/// (`HOVER_RECENT_VERSIONS`, `lsp_helpers/hover.rs`'s `push_recent_versions_hover_section`)
+/// carries the identical bump-in fix (#961) — a pre-existing instance of this same defect
+/// class in a different surface, resolved as a follow-up to this function's own fix rather
+/// than left standing. Finding the picked entry only scans as far past the cap as it sits,
+/// rather than materializing every surviving version up front — this stays `O(cap)` in the
+/// common case (no pick, or a pick already within the cap), which matters for a registry
+/// with thousands of versions (e.g. an npm packument) queried on every completion keystroke.
 ///
 /// # Examples
 ///
