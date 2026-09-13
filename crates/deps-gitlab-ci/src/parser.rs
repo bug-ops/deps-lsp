@@ -31,16 +31,17 @@ use crate::types::{
     PinStyle,
 };
 use deps_core::lsp_helpers::{
-    LineOffsetTable, is_full_sha, is_tag_shaped, locate_value_span, marker_byte_offset,
+    LineOffsetTable, MarkedScalar, byte_span_to_range, is_full_sha, is_tag_shaped,
     warn_rejected_value,
 };
 use deps_core::net_policy::RegistryAccessPolicy;
 use deps_core::parser::DependencySource;
+use deps_core::yaml_walk::{FrameKind, FrameStack, ScalarPosition};
 use deps_core::{DepsError, Result};
 use std::collections::HashSet;
-use tower_lsp_server::ls_types::{Range, Uri};
+use tower_lsp_server::ls_types::Uri;
 use yaml_rust2::parser::{Event, MarkedEventReceiver, Parser};
-use yaml_rust2::scanner::{Marker, TScalarStyle};
+use yaml_rust2::scanner::Marker;
 
 /// Bound on distinct literal `component:` hosts admitted per document (spec plan §4.6) —
 /// the bound that matters for a `didOpen` burst, protecting `HttpCache`'s unbounded
@@ -51,14 +52,7 @@ const MAX_HOSTS_PER_DOCUMENT: usize = 8;
 /// `$CI_SERVER_FQDN`-relative `component:` include with no configured instance host.
 const CI_SERVER_FQDN: &str = "$CI_SERVER_FQDN";
 
-/// Which container kind a [`Frame`] represents.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum FrameKind {
-    Mapping,
-    Sequence,
-}
-
-/// What a [`Frame`] means for include-entry extraction purposes.
+/// What a frame means for include-entry extraction purposes.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FrameRole {
     /// The document's root mapping — scanned only for a top-level `include:` key.
@@ -67,18 +61,22 @@ enum FrameRole {
     IncludeValue,
     /// One include entry mapping — either a `include:`'s single-mapping form, or one
     /// mapping item inside an [`FrameRole::IncludeValue`] sequence. Its direct scalar keys
-    /// (`project`/`ref`/`component`/`template`/`remote`/`local`) are captured into
-    /// [`Frame::entry`].
+    /// (`project`/`ref`/`component`/`template`/`remote`/`local`) are captured into the
+    /// frame's own [`RawEntry`] payload.
     IncludeEntry,
     /// Anything else — a job body, `inputs:`, `rules:`, or any other structure this parser
-    /// does not need to look inside.
+    /// does not need to look inside. Also covers a complex YAML key's subtree (`?
+    /// <mapping>`/`? <sequence>`) — [`deps_core::yaml_walk::FrameStack`] handles the
+    /// key/value-alternation bookkeeping for that case generically, so this parser never
+    /// needs its own dedicated role for it.
     Irrelevant,
 }
 
 /// Which key (if any) a [`FrameRole::Root`] or [`FrameRole::IncludeEntry`] mapping frame is
 /// currently awaiting the value for.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
 enum PendingKey {
+    #[default]
     None,
     Include,
     Project,
@@ -111,11 +109,10 @@ fn key_for(role: FrameRole, text: &str) -> PendingKey {
     }
 }
 
-/// One raw scalar value captured from an include entry: its text, YAML scalar style, and
-/// `yaml-rust2` marker line (1-indexed) and column (0-indexed char count) — for span
-/// re-derivation after parsing completes via [`marker_byte_offset`], not `Marker::index()`
-/// (#879).
-type RawField = (String, TScalarStyle, usize, usize);
+/// One raw scalar value captured from an include entry — see [`MarkedScalar`], whose
+/// `span()` resolves the byte span only after parsing completes, via a `line`/`col`-based
+/// lookup rather than `Marker::index()` (#879).
+type RawField = MarkedScalar;
 
 /// One `include:` entry's raw, not-yet-classified field values, collected during the event
 /// stream and finalized into a [`GitlabCiDependency`] after parsing completes.
@@ -129,34 +126,32 @@ struct RawEntry {
     has_local: bool,
 }
 
-struct Frame {
-    kind: FrameKind,
-    role: FrameRole,
-    /// Only meaningful for `kind == Mapping`.
-    awaiting_key: bool,
-    /// Only meaningful for `kind == Mapping`.
-    pending_key: PendingKey,
-    /// Only meaningful for `role == IncludeEntry`.
-    entry: RawEntry,
-}
+/// The generic frame-stack mechanics ([`deps_core::yaml_walk::FrameStack`]) driven by
+/// [`GitlabCiReceiver`], parameterized on this crate's own role/key vocabulary and
+/// per-frame payload (each open `IncludeEntry` mapping's [`RawEntry`] under
+/// construction).
+type Stack = FrameStack<FrameRole, PendingKey, RawEntry>;
 
 /// Collects every `include:` entry's raw field values, gated to exactly the top-level
 /// `include:` key's subtree.
 struct GitlabCiReceiver {
-    stack: Vec<Frame>,
+    stack: Stack,
     entries: Vec<RawEntry>,
 }
 
 impl GitlabCiReceiver {
     fn new() -> Self {
         Self {
-            stack: Vec::new(),
+            stack: Stack::new(),
             entries: Vec::new(),
         }
     }
 
     fn push_container(&mut self, kind: FrameKind) {
-        let role = match self.stack.last() {
+        // Computed from the stack's state *before* `FrameStack::push` transitions the
+        // parent (a complex YAML key's subtree included) — matching `key_for`'s own
+        // reliance on the parent's still-live `pending_key`/`role`.
+        let role = match self.stack.top() {
             None => {
                 if kind == FrameKind::Mapping {
                     FrameRole::Root
@@ -164,14 +159,14 @@ impl GitlabCiReceiver {
                     FrameRole::Irrelevant
                 }
             }
-            Some(parent) if parent.kind == FrameKind::Sequence => {
-                if parent.role == FrameRole::IncludeValue && kind == FrameKind::Mapping {
+            Some(parent) if parent.kind() == FrameKind::Sequence => {
+                if *parent.role() == FrameRole::IncludeValue && kind == FrameKind::Mapping {
                     FrameRole::IncludeEntry
                 } else {
                     FrameRole::Irrelevant
                 }
             }
-            Some(parent) => match (parent.role, parent.pending_key, kind) {
+            Some(parent) => match (*parent.role(), *parent.pending_key(), kind) {
                 (FrameRole::Root, PendingKey::Include, FrameKind::Sequence) => {
                     FrameRole::IncludeValue
                 }
@@ -181,32 +176,15 @@ impl GitlabCiReceiver {
                 _ => FrameRole::Irrelevant,
             },
         };
-        self.consume_pending_value();
-        self.stack.push(Frame {
-            kind,
-            role,
-            awaiting_key: true,
-            pending_key: PendingKey::None,
-            entry: RawEntry::default(),
-        });
-    }
-
-    fn consume_pending_value(&mut self) {
-        if let Some(top) = self.stack.last_mut()
-            && top.kind == FrameKind::Mapping
-        {
-            top.awaiting_key = true;
-            top.pending_key = PendingKey::None;
-        }
+        self.stack.push(kind, role, RawEntry::default());
     }
 
     fn pop_container(&mut self) {
         if let Some(frame) = self.stack.pop()
-            && frame.role == FrameRole::IncludeEntry
+            && *frame.role() == FrameRole::IncludeEntry
         {
-            self.entries.push(frame.entry);
+            self.entries.push(frame.payload);
         }
-        self.consume_pending_value();
     }
 }
 
@@ -216,48 +194,45 @@ impl MarkedEventReceiver for GitlabCiReceiver {
             Event::MappingStart(..) => self.push_container(FrameKind::Mapping),
             Event::SequenceStart(..) => self.push_container(FrameKind::Sequence),
             Event::MappingEnd | Event::SequenceEnd => self.pop_container(),
-            Event::Scalar(value, style, _anchor, _tag) => {
-                let Some(frame) = self.stack.last_mut() else {
-                    return;
-                };
-                if frame.kind != FrameKind::Mapping {
-                    // A bare scalar sequence item (e.g. `include: - templates/x.yml`, the
-                    // `local:` shorthand) carries nothing to record; irrelevant items are
-                    // ignored the same way.
-                    return;
+            Event::Scalar(value, style, _anchor, _tag) => match self.stack.scalar_position() {
+                // A bare scalar sequence item (e.g. `include: - templates/x.yml`, the
+                // `local:` shorthand) carries nothing to record; irrelevant items are
+                // ignored the same way.
+                ScalarPosition::Outside => {}
+                ScalarPosition::Key => {
+                    let role = self.stack.top_role_or(FrameRole::Irrelevant);
+                    self.stack.observe_key(key_for(role, &value));
                 }
-                if frame.awaiting_key {
-                    frame.pending_key = key_for(frame.role, &value);
-                    frame.awaiting_key = false;
-                } else {
-                    if frame.role == FrameRole::IncludeEntry {
-                        match frame.pending_key {
+                ScalarPosition::Value => {
+                    if let Some(top) = self.stack.top_mut()
+                        && *top.role() == FrameRole::IncludeEntry
+                    {
+                        match *top.pending_key() {
                             PendingKey::Project => {
-                                frame.entry.project =
-                                    Some((value, style, marker.line(), marker.col()));
+                                top.payload.project =
+                                    Some(MarkedScalar::new(value, style, &marker));
                             }
                             PendingKey::Ref => {
-                                frame.entry.ref_field =
-                                    Some((value, style, marker.line(), marker.col()));
+                                top.payload.ref_field =
+                                    Some(MarkedScalar::new(value, style, &marker));
                             }
                             PendingKey::Component => {
-                                frame.entry.component =
-                                    Some((value, style, marker.line(), marker.col()));
+                                top.payload.component =
+                                    Some(MarkedScalar::new(value, style, &marker));
                             }
-                            PendingKey::Template => frame.entry.has_template = true,
-                            PendingKey::Remote => frame.entry.has_remote = true,
-                            PendingKey::Local => frame.entry.has_local = true,
+                            PendingKey::Template => top.payload.has_template = true,
+                            PendingKey::Remote => top.payload.has_remote = true,
+                            PendingKey::Local => top.payload.has_local = true,
                             PendingKey::None | PendingKey::Include => {}
                         }
                     }
-                    frame.awaiting_key = true;
-                    frame.pending_key = PendingKey::None;
+                    self.stack.consume_value();
                 }
-            }
+            },
             // A `*anchor` alias value must still clear the pending-key slot, mirroring
             // `deps-github-actions`'s identical fix — GitLab CI files use YAML anchors
             // heavily for job reuse, so this is a real, not merely defensive, case here.
-            Event::Alias(_) => self.consume_pending_value(),
+            Event::Alias(_) => self.stack.consume_value(),
             Event::DocumentStart | Event::DocumentEnd => {
                 // A GitLab CI **component** file's `spec:` header form is multi-document
                 // (`spec: … \n--- \n job:`); resetting here stops document 1's nesting from
@@ -372,13 +347,6 @@ fn resolve_component_host(
     }
 }
 
-fn make_range(line_table: &LineOffsetTable, content: &str, start: usize, end: usize) -> Range {
-    Range::new(
-        line_table.byte_offset_to_position(content, start),
-        line_table.byte_offset_to_position(content, end),
-    )
-}
-
 fn build_project_dependency(
     content: &str,
     line_table: &LineOffsetTable,
@@ -386,33 +354,36 @@ fn build_project_dependency(
     project_field: RawField,
     ref_field: Option<RawField>,
 ) -> Option<(GitlabCiDependency, Option<(String, GitlabRoute)>)> {
-    let (raw_project, project_style, project_line, project_col) = project_field;
-    if !is_valid_gitlab_coordinate(&raw_project) {
+    if !is_valid_gitlab_coordinate(project_field.text()) {
         warn_rejected_value(
             "is_valid_gitlab_coordinate",
             "gitlab-ci project: value",
-            &raw_project,
+            project_field.text(),
         );
         return None;
     }
 
-    let value_start = marker_byte_offset(content, line_table, project_line, project_col);
-    let (raw_start, raw_end) = locate_value_span(content, value_start, &raw_project)?;
-    let name_range = make_range(line_table, content, raw_start, raw_end);
+    let (raw_start, raw_end) = project_field.span(content, line_table)?;
+    let name_range = byte_span_to_range(content, line_table, raw_start, raw_end);
+    let project_is_plain = project_field.is_plain();
 
     let host = resolve_project_host(instance_host);
-    let name = host_qualified_name(&host, &raw_project, None);
+    let name = host_qualified_name(&host, project_field.text(), None);
 
     let (version_req, version_range, pin, is_plain_scalar) = match ref_field {
-        Some((ref_text, ref_style, ref_line, ref_col)) => {
-            let ref_value_start = marker_byte_offset(content, line_table, ref_line, ref_col);
-            let (rs, re) = locate_value_span(content, ref_value_start, &ref_text)?;
-            let range = make_range(line_table, content, rs, re);
-            let pin = classify_project_pin(&ref_text);
-            let plain = ref_style == TScalarStyle::Plain;
-            (Some(ref_text.into()), Some(range), Some(pin), plain)
+        Some(ref_field) => {
+            let (rs, re) = ref_field.span(content, line_table)?;
+            let range = byte_span_to_range(content, line_table, rs, re);
+            let pin = classify_project_pin(ref_field.text());
+            let plain = ref_field.is_plain();
+            (
+                Some(ref_field.into_text().into()),
+                Some(range),
+                Some(pin),
+                plain,
+            )
         }
-        None => (None, None, None, project_style == TScalarStyle::Plain),
+        None => (None, None, None, project_is_plain),
     };
 
     let (source, route) = build_source_and_route(&host, EndpointKind::Tags);
@@ -429,7 +400,7 @@ fn build_project_dependency(
             kind: IncludeKind::Project,
             host,
             pin,
-            project_path: raw_project,
+            project_path: project_field.into_text(),
         },
         route,
     ))
@@ -443,12 +414,12 @@ fn build_component_dependency(
     admitted_origins: &mut HashSet<String>,
     component_field: RawField,
 ) -> Option<(GitlabCiDependency, Option<(String, GitlabRoute)>)> {
-    let (raw_component, style, comp_line, comp_col) = component_field;
+    let raw_component = component_field.text();
     let Some((prefix, ref_text)) = raw_component.split_once('@') else {
         warn_rejected_value(
             "classify_component_value",
             "gitlab-ci component: value (missing @version)",
-            &raw_component,
+            raw_component,
         );
         return None;
     };
@@ -456,7 +427,7 @@ fn build_component_dependency(
         warn_rejected_value(
             "classify_component_value",
             "gitlab-ci component: value (empty version)",
-            &raw_component,
+            raw_component,
         );
         return None;
     }
@@ -471,7 +442,7 @@ fn build_component_dependency(
         warn_rejected_value(
             "classify_component_value",
             "gitlab-ci component: value (too few path segments)",
-            &raw_component,
+            raw_component,
         );
         return None;
     }
@@ -484,17 +455,16 @@ fn build_component_dependency(
         warn_rejected_value(
             "classify_component_value",
             "gitlab-ci component: value (malformed path)",
-            &raw_component,
+            raw_component,
         );
         return None;
     }
 
-    let value_start = marker_byte_offset(content, line_table, comp_line, comp_col);
-    let (raw_start, raw_end) = locate_value_span(content, value_start, &raw_component)?;
+    let (raw_start, raw_end) = component_field.span(content, line_table)?;
     let name_end = raw_start + prefix.len();
     let ref_start = name_end + 1; // skip '@'
-    let name_range = make_range(line_table, content, raw_start, name_end);
-    let version_range = make_range(line_table, content, ref_start, raw_end);
+    let name_range = byte_span_to_range(content, line_table, raw_start, name_end);
+    let version_range = byte_span_to_range(content, line_table, ref_start, raw_end);
 
     let host = resolve_component_host(host_expr, policy, instance_host, admitted_origins);
     let name = host_qualified_name(&host, &project_path, Some(component_name));
@@ -509,7 +479,7 @@ fn build_component_dependency(
             version_range: Some(version_range),
             version_literal: None,
             source,
-            is_plain_scalar: style == TScalarStyle::Plain,
+            is_plain_scalar: component_field.is_plain(),
             kind: IncludeKind::Component,
             host,
             pin: Some(pin),
@@ -674,6 +644,7 @@ mod tests {
     use deps_core::Dependency;
     use deps_core::net_policy::WorkspaceRegistryAccess;
     use std::sync::{Arc, RwLock};
+    use tower_lsp_server::ls_types::Range;
 
     fn test_uri() -> Uri {
         deps_core::test_util::test_uri("/repo/.gitlab-ci.yml")
@@ -881,6 +852,33 @@ mod tests {
         let content = "stages:\n  - build\n  - test\n";
         let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host).unwrap();
         assert!(result.dependencies.is_empty());
+    }
+
+    // --- deps-lsp#908: complex YAML key (`? <mapping>`/`? <sequence>`) no longer desyncs
+    // the root mapping's key/value alternation — the shared `FrameStack` walker's fix,
+    // which `deps-dart` already had before this refactor.
+
+    #[test]
+    fn test_complex_mapping_key_before_include_does_not_desync_root_mapping() {
+        let (policy, instance_host) = ctx();
+        // The root mapping's first entry uses an explicit complex key (a mapping key) —
+        // before the shared walker, popping its subtree unconditionally reset the root to
+        // "awaiting a key" instead of "awaiting this entry's value", so the complex key's
+        // own value scalar was misread as the next key, and every following key/value pair
+        // (including `include:`) desynced.
+        let content = "? { a: 1 }\n: unused\ninclude:\n  - project: org/proj\n    ref: v1.0.0\n";
+        let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host).unwrap();
+        assert_eq!(result.dependencies.len(), 1, "{:?}", result.dependencies);
+        assert_eq!(result.dependencies[0].project_path, "org/proj");
+    }
+
+    #[test]
+    fn test_complex_sequence_key_before_include_does_not_desync_root_mapping() {
+        let (policy, instance_host) = ctx();
+        let content = "? [a, b]\n: unused\ninclude:\n  - project: org/proj\n    ref: v1.0.0\n";
+        let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host).unwrap();
+        assert_eq!(result.dependencies.len(), 1, "{:?}", result.dependencies);
+        assert_eq!(result.dependencies[0].project_path, "org/proj");
     }
 
     #[test]
