@@ -31,10 +31,10 @@
 
 use crate::types::{DartDependency, DependencySection, DependencySource};
 use deps_core::lsp_helpers::{LineOffsetTable, locate_value_span, marker_byte_offset};
-use deps_core::{DepsError, Result};
+use deps_core::{DependencyBudget, DepsError, Result};
 use std::collections::HashMap;
 use tower_lsp_server::ls_types::{Range, Uri};
-use yaml_rust2::parser::{Event, MarkedEventReceiver, Parser};
+use yaml_rust2::parser::{Event, MarkedEventReceiver, Parser, Tag};
 use yaml_rust2::scanner::{Marker, TScalarStyle};
 
 /// Result of parsing a `pubspec.yaml` file.
@@ -76,15 +76,52 @@ fn scalar_field(replay_depth: usize, value: String, marker: &Marker) -> FieldVal
     }
 }
 
-/// Whether a plain (unquoted) scalar's text denotes YAML's implicit null (`pkg:` with nothing
-/// after the colon, or explicit `~`/`null`) — mirrors `yaml_rust2::Yaml::from_str`'s own
-/// `"" | "~" | "null" => Yaml::Null` rule for a plain scalar, which is what the pre-rewrite
-/// `Yaml`-AST-based parser relied on to treat a value-less key as "no value" rather than an
-/// empty string. A *quoted* empty string (`pkg: ""`) is a real, if unusual, explicit value and
-/// must not be treated as absent, matching `Yaml::from_str`'s check applying only when
-/// `style == Plain`.
-fn is_plain_null(style: TScalarStyle, value: &str) -> bool {
-    style == TScalarStyle::Plain && matches!(value, "" | "~" | "null")
+/// Whether a plain (unquoted) scalar's text denotes an absent value.
+///
+/// A completely empty plain scalar (`pkg:` with nothing after the colon — the normal
+/// mid-typing state in a live editor) is *always* absent, regardless of any tag: `!!str` on
+/// no text still means no text was given, not the literal empty string (which needs an
+/// actual quoted `""` to express — see the `style == Plain` guard below). For non-empty text
+/// (`~`/`null`), an explicit tag matters: untagged or explicitly `tag:yaml.org,2002:null`
+/// tagged text still resolves to absent, but any *other* explicit tag (e.g. `!!str`) forces
+/// the scalar to that type instead — `!!str null` is the literal string `"null"`, not an
+/// absent value.
+///
+/// Loosely mirrors `yaml_rust2::YamlLoader`'s own scalar resolution (`Yaml::from_str`'s
+/// `"" | "~" | "null" => Yaml::Null` rule for an untagged plain scalar, and the `null` tag
+/// arm's own `"~" | "null" => Yaml::Null` check) without replicating it exactly: the loader
+/// resolves a `tag:yaml.org,2002:null`-tagged scalar with *other* text (`!!null foo`) to
+/// `Yaml::BadValue` (itself effectively absent), whereas this treats it as present text
+/// `"foo"` — a deliberate, harmless divergence rather than a bug to fix, since a manifest
+/// author writing `!!null foo` should see it as a real (if malformed) value rather than have
+/// it silently vanish.
+///
+/// A *quoted* empty string (`pkg: ""`) is a real, if unusual, explicit value and must not be
+/// treated as absent, matching `Yaml::from_str`'s check applying only when `style == Plain`.
+fn is_plain_null(style: TScalarStyle, tag: Option<&Tag>, value: &str) -> bool {
+    if style != TScalarStyle::Plain {
+        return false;
+    }
+    if value.is_empty() {
+        return true;
+    }
+    match tag {
+        None => matches!(value, "~" | "null"),
+        Some(tag) => is_null_tag(tag) && matches!(value, "~" | "null"),
+    }
+}
+
+/// Whether `tag` is YAML's `null` tag, in either of the two forms `yaml-rust2`'s scanner
+/// produces: the `!!null` shorthand resolves to `Tag { handle: "tag:yaml.org,2002:", suffix:
+/// "null" }`, but the equivalent verbatim form `!<tag:yaml.org,2002:null>` resolves to `Tag {
+/// handle: "", suffix: "tag:yaml.org,2002:null" }` — the whole URI lands in `suffix` with an
+/// empty `handle`, since verbatim tags bypass handle resolution entirely (measured directly
+/// against the scanner; verified empirically, not assumed from reading it). Checking only the
+/// shorthand form left `version: !<tag:yaml.org,2002:null> null` resolving to the literal
+/// string `"null"` instead of absent.
+fn is_null_tag(tag: &Tag) -> bool {
+    (tag.handle == "tag:yaml.org,2002:" && tag.suffix == "null")
+        || (tag.handle.is_empty() && tag.suffix == "tag:yaml.org,2002:null")
 }
 
 /// A field's resolved text, plus its position in `content` when one genuinely exists.
@@ -156,7 +193,7 @@ enum FrameRole {
 /// Which key (if any) a fixed-vocabulary mapping frame is currently awaiting the value for.
 /// Not used by [`FrameRole::DependencySectionValue`], whose keys are arbitrary dependency
 /// names rather than a fixed set — see [`Frame::pending_dep_name`].
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum PendingKey {
     None,
     Environment,
@@ -296,6 +333,29 @@ impl Frame {
             git_path: None,
         }
     }
+
+    /// Assigns `value` to whichever field `key` designates — the single point where
+    /// `on_scalar`'s (`FieldValue::Positioned`) and `on_alias`'s
+    /// (`FieldValue::Unpositioned`) otherwise-identical `DependencyEntryValue`/`GitValue`
+    /// field dispatch converge, differing only in which `FieldValue` constructor the caller
+    /// passes in. Both roles' keys are handled unconditionally since a frame's `pending_key`
+    /// only ever holds a key valid for its own role — an unrecognized key (`PendingKey::None`
+    /// or a root/environment key that reached here by construction error) is a silent no-op.
+    fn assign_field(&mut self, key: PendingKey, value: FieldValue) {
+        match key {
+            PendingKey::EntryVersion => self.version = Some(value),
+            PendingKey::EntryGit => self.git = Some(RawGitValue::Scalar(value)),
+            PendingKey::EntryPath => self.path = Some(value),
+            PendingKey::EntrySdk => self.sdk = Some(value),
+            PendingKey::GitUrl => self.git_url = Some(value),
+            PendingKey::GitRef => self.git_ref = Some(value),
+            PendingKey::GitPath => self.git_path = Some(value),
+            PendingKey::None
+            | PendingKey::Environment
+            | PendingKey::Section(_)
+            | PendingKey::EnvSdk => {}
+        }
+    }
 }
 
 /// Tracks one anchored mapping/sequence while its subtree streams past, so its extent within
@@ -332,16 +392,17 @@ struct PubspecReceiver {
     stack: Vec<Frame>,
     entries: Vec<RawDependency>,
     sdk: Option<String>,
-    /// Scalar text and style seen under a YAML anchor (`&name`), keyed by `yaml-rust2`'s
-    /// internal anchor id — looked up on `Event::Alias` so an aliased dependency value
-    /// (`pkg: *shared`) still resolves to real text instead of being silently dropped. Only
-    /// the text (and the style needed to re-check [`is_plain_null`] at the alias site) is
-    /// kept, not the anchor's own position — see [`FieldValue::Unpositioned`] for why. An
-    /// alias can only refer to an anchor already seen earlier in the document (a YAML
-    /// parse-order requirement), so this is always populated by the time an `Alias` event
-    /// needing it arrives. Populated only for *scalar* anchors — a mapping/sequence-valued
-    /// anchor is recorded in `container_anchors` instead.
-    anchors: HashMap<usize, (String, TScalarStyle)>,
+    /// Scalar text, style, and tag seen under a YAML anchor (`&name`), keyed by
+    /// `yaml-rust2`'s internal anchor id — looked up on `Event::Alias` so an aliased
+    /// dependency value (`pkg: *shared`) still resolves to real text instead of being
+    /// silently dropped. Only the text (and the style/tag needed to re-check
+    /// [`is_plain_null`] at the alias site) is kept, not the anchor's own position — see
+    /// [`FieldValue::Unpositioned`] for why. An alias can only refer to an anchor already
+    /// seen earlier in the document (a YAML parse-order requirement), so this is always
+    /// populated by the time an `Alias` event needing it arrives. Populated only for
+    /// *scalar* anchors — a mapping/sequence-valued anchor is recorded in
+    /// `container_anchors` instead.
+    anchors: HashMap<usize, (String, TScalarStyle, Option<Tag>)>,
     /// Every event seen on the live pass while at least one [`RecordingFrame`] is open, in
     /// document order — the single backing store `container_anchors`' ranges index into. See
     /// [`RecordingFrame`]'s docs (critic finding S2) for why this is one flat, append-only log
@@ -370,10 +431,13 @@ struct PubspecReceiver {
     /// correct if replay is ever enabled for another role (see the module docs' "Known
     /// limitations" note on `FrameRole::DependencySectionValue`).
     replay_depth: usize,
+    /// Per-document ceiling on how many dependencies are retained — checked before a
+    /// [`RawDependency`] is ever constructed (#906), not after the fact.
+    budget: DependencyBudget,
 }
 
 impl PubspecReceiver {
-    fn new() -> Self {
+    fn new(cap: usize) -> Self {
         Self {
             stack: Vec::new(),
             entries: Vec::new(),
@@ -383,6 +447,37 @@ impl PubspecReceiver {
             container_anchors: HashMap::new(),
             recording: Vec::new(),
             replay_depth: 0,
+            budget: DependencyBudget::new(cap),
+        }
+    }
+
+    /// The shared budget-check-then-push chokepoint for all 4 sites that finalize a
+    /// dependency into `entries` (`push_container`'s non-entry-shaped-value branch,
+    /// `pop_container`'s `DependencyEntryValue` arm, and `on_scalar`/`on_alias`'s
+    /// `DependencySectionValue` arms). Takes `entries`/`budget` as plain `&mut` parameters
+    /// rather than `&mut self` because every call site already holds a live mutable borrow of
+    /// `self.stack` (via a `Frame` reference) that a `&mut self` method would conflict with.
+    ///
+    /// `value` is a closure, not an already-built [`RawDependencyValue`], so construction work
+    /// (e.g. resolving a [`FieldValue`]) only happens once `budget.allow()` confirms the cap
+    /// has not been reached — preserving the "check the budget before building the entry"
+    /// contract (#906 item 7) rather than reintroducing the check-after-construction shape
+    /// this chokepoint is meant to prevent call sites from drifting back into.
+    fn push_entry(
+        entries: &mut Vec<RawDependency>,
+        budget: &mut DependencyBudget,
+        section: Option<DependencySection>,
+        name: RawField,
+        name_is_replay: bool,
+        value: impl FnOnce() -> RawDependencyValue,
+    ) {
+        if budget.allow() {
+            entries.push(RawDependency {
+                section: section.unwrap_or_default(),
+                name,
+                name_is_replay,
+                value: value(),
+            });
         }
     }
 
@@ -444,7 +539,7 @@ impl PubspecReceiver {
                 FrameRole::Root => match &top.pending_key {
                     PendingKey::Environment => return (FrameRole::EnvironmentValue, None),
                     PendingKey::Section(section) => {
-                        return (FrameRole::DependencySectionValue, Some(section.clone()));
+                        return (FrameRole::DependencySectionValue, Some(*section));
                     }
                     _ => {}
                 },
@@ -477,7 +572,12 @@ impl PubspecReceiver {
         let (new_role, new_section) = self.compute_child_role(kind);
         let mut carried_name = None;
         let is_replay = self.replay_depth > 0;
-        let Self { stack, entries, .. } = self;
+        let Self {
+            stack,
+            entries,
+            budget,
+            ..
+        } = self;
 
         if let Some(top) = stack.last_mut() {
             if top.role == FrameRole::DependencySectionValue {
@@ -487,12 +587,8 @@ impl PubspecReceiver {
                     } else {
                         // A dependency's value is a sequence, or some other shape this parser
                         // does not resolve a concrete field from.
-                        let section = top.section.clone().unwrap_or_default();
-                        entries.push(RawDependency {
-                            section,
-                            name,
-                            name_is_replay: is_replay,
-                            value: RawDependencyValue::Unresolved,
+                        Self::push_entry(entries, budget, top.section, name, is_replay, || {
+                            RawDependencyValue::Unresolved
                         });
                     }
                 }
@@ -514,7 +610,12 @@ impl PubspecReceiver {
             return;
         };
         let is_replay = self.replay_depth > 0;
-        let Self { stack, entries, .. } = self;
+        let Self {
+            stack,
+            entries,
+            budget,
+            ..
+        } = self;
         match frame.role {
             FrameRole::ComplexKey => {
                 // Closing the complex key's subtree must transition the parent from
@@ -535,17 +636,14 @@ impl PubspecReceiver {
                     && let Some(parent) = stack.last()
                     && parent.role == FrameRole::DependencySectionValue
                 {
-                    let section = parent.section.clone().unwrap_or_default();
-                    entries.push(RawDependency {
-                        section,
-                        name,
-                        name_is_replay: is_replay,
-                        value: RawDependencyValue::Entry {
+                    let section = parent.section;
+                    Self::push_entry(entries, budget, section, name, is_replay, || {
+                        RawDependencyValue::Entry {
                             version: frame.version,
                             git: frame.git,
                             path: frame.path,
                             sdk: frame.sdk,
-                        },
+                        }
                     });
                 }
             }
@@ -571,23 +669,33 @@ impl PubspecReceiver {
         }
     }
 
-    fn on_scalar(&mut self, value: String, style: TScalarStyle, anchor_id: usize, marker: &Marker) {
+    fn on_scalar(
+        &mut self,
+        value: String,
+        style: TScalarStyle,
+        anchor_id: usize,
+        tag: Option<Tag>,
+        marker: &Marker,
+    ) {
         if anchor_id != 0 {
-            self.anchors.insert(anchor_id, (value.clone(), style));
+            self.anchors
+                .insert(anchor_id, (value.clone(), style, tag.clone()));
         }
         // A value-less key (`pkg:` with nothing after it, the normal mid-typing state in a
         // live editor) surfaces here as an empty plain scalar — review found this otherwise
         // yielded `version_req = Some("")` anchored on the *next* key's position (the
         // synthesized empty-scalar event's marker lands there, and `locate_value_span`
         // short-circuits `Some((from, from))` for an empty needle). Treated as absent instead,
-        // matching the pre-rewrite `Yaml`-AST parser's own `Yaml::Null` handling.
-        let is_null = is_plain_null(style, &value);
+        // matching the pre-rewrite `Yaml`-AST parser's own `Yaml::Null` handling. An explicit
+        // non-null tag (`!!str null`) overrides this — see [`is_plain_null`].
+        let is_null = is_plain_null(style, tag.as_ref(), &value);
         let replay_depth = self.replay_depth;
 
         let Self {
             stack,
             entries,
             sdk,
+            budget,
             ..
         } = self;
         let Some(frame) = stack.last_mut() else {
@@ -609,17 +717,14 @@ impl PubspecReceiver {
         match frame.role {
             FrameRole::DependencySectionValue => {
                 if let Some(name) = frame.pending_dep_name.take() {
-                    let section = frame.section.clone().unwrap_or_default();
-                    let dep_value = if is_null {
-                        RawDependencyValue::Unresolved
-                    } else {
-                        RawDependencyValue::Simple(scalar_field(replay_depth, value, marker))
-                    };
-                    entries.push(RawDependency {
-                        section,
-                        name,
-                        name_is_replay: replay_depth > 0,
-                        value: dep_value,
+                    let section = frame.section;
+                    let is_replay = replay_depth > 0;
+                    Self::push_entry(entries, budget, section, name, is_replay, || {
+                        if is_null {
+                            RawDependencyValue::Unresolved
+                        } else {
+                            RawDependencyValue::Simple(scalar_field(replay_depth, value, marker))
+                        }
                     });
                 }
             }
@@ -629,37 +734,10 @@ impl PubspecReceiver {
                     *sdk = Some(value);
                 }
             }
-            FrameRole::DependencyEntryValue if !is_null => match frame.pending_key {
-                PendingKey::EntryVersion => {
-                    frame.version = Some(scalar_field(replay_depth, value, marker));
-                }
-                PendingKey::EntryGit => {
-                    frame.git = Some(RawGitValue::Scalar(scalar_field(
-                        replay_depth,
-                        value,
-                        marker,
-                    )));
-                }
-                PendingKey::EntryPath => {
-                    frame.path = Some(scalar_field(replay_depth, value, marker));
-                }
-                PendingKey::EntrySdk => {
-                    frame.sdk = Some(scalar_field(replay_depth, value, marker));
-                }
-                _ => {}
-            },
-            FrameRole::GitValue if !is_null => match frame.pending_key {
-                PendingKey::GitUrl => {
-                    frame.git_url = Some(scalar_field(replay_depth, value, marker));
-                }
-                PendingKey::GitRef => {
-                    frame.git_ref = Some(scalar_field(replay_depth, value, marker));
-                }
-                PendingKey::GitPath => {
-                    frame.git_path = Some(scalar_field(replay_depth, value, marker));
-                }
-                _ => {}
-            },
+            FrameRole::DependencyEntryValue | FrameRole::GitValue if !is_null => {
+                let key = frame.pending_key;
+                frame.assign_field(key, scalar_field(replay_depth, value, marker));
+            }
             // A null value for one of the keys above — treated the same as the key being
             // absent entirely.
             FrameRole::DependencyEntryValue | FrameRole::GitValue => {}
@@ -679,8 +757,8 @@ impl PubspecReceiver {
             .anchors
             .get(&anchor_id)
             .cloned()
-            .filter(|(text, style)| !is_plain_null(*style, text))
-            .map(|(text, _)| text);
+            .filter(|(text, style, tag)| !is_plain_null(*style, tag.as_ref(), text))
+            .map(|(text, ..)| text);
 
         let Some(top) = self.stack.last_mut() else {
             return;
@@ -762,6 +840,7 @@ impl PubspecReceiver {
             stack,
             entries,
             sdk,
+            budget,
             ..
         } = self;
         let Some(top) = stack.last_mut() else {
@@ -770,51 +849,18 @@ impl PubspecReceiver {
         match top.role {
             FrameRole::DependencySectionValue => {
                 if let Some(name) = top.pending_dep_name.take() {
-                    let section = top.section.clone().unwrap_or_default();
-                    let value = resolved.map_or(RawDependencyValue::Unresolved, |text| {
-                        RawDependencyValue::Simple(FieldValue::Unpositioned(text))
-                    });
-                    entries.push(RawDependency {
-                        section,
-                        name,
-                        name_is_replay: replay_depth > 0,
-                        value,
+                    let section = top.section;
+                    Self::push_entry(entries, budget, section, name, replay_depth > 0, || {
+                        resolved.map_or(RawDependencyValue::Unresolved, |text| {
+                            RawDependencyValue::Simple(FieldValue::Unpositioned(text))
+                        })
                     });
                 }
             }
-            FrameRole::DependencyEntryValue => {
+            FrameRole::DependencyEntryValue | FrameRole::GitValue => {
                 if let Some(text) = resolved {
-                    match top.pending_key {
-                        PendingKey::EntryVersion => {
-                            top.version = Some(FieldValue::Unpositioned(text));
-                        }
-                        PendingKey::EntryGit => {
-                            top.git = Some(RawGitValue::Scalar(FieldValue::Unpositioned(text)));
-                        }
-                        PendingKey::EntryPath => {
-                            top.path = Some(FieldValue::Unpositioned(text));
-                        }
-                        PendingKey::EntrySdk => {
-                            top.sdk = Some(FieldValue::Unpositioned(text));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            FrameRole::GitValue => {
-                if let Some(text) = resolved {
-                    match top.pending_key {
-                        PendingKey::GitUrl => {
-                            top.git_url = Some(FieldValue::Unpositioned(text));
-                        }
-                        PendingKey::GitRef => {
-                            top.git_ref = Some(FieldValue::Unpositioned(text));
-                        }
-                        PendingKey::GitPath => {
-                            top.git_path = Some(FieldValue::Unpositioned(text));
-                        }
-                        _ => {}
-                    }
+                    let key = top.pending_key;
+                    top.assign_field(key, FieldValue::Unpositioned(text));
                 }
             }
             // Mirrors `on_scalar`'s `EnvironmentValue` arm (critic finding C1): an alias to a
@@ -871,8 +917,8 @@ impl MarkedEventReceiver for PubspecReceiver {
             Event::MappingStart(..) => self.push_container(FrameKind::Mapping),
             Event::SequenceStart(..) => self.push_container(FrameKind::Sequence),
             Event::MappingEnd | Event::SequenceEnd => self.pop_container(),
-            Event::Scalar(value, style, anchor, _tag) => {
-                self.on_scalar(value, style, anchor, &marker);
+            Event::Scalar(value, style, anchor, tag) => {
+                self.on_scalar(value, style, anchor, tag, &marker);
             }
             Event::Alias(anchor) => self.on_alias(anchor, &marker),
             // A `pubspec.yaml` is a single document (`Parser::load(_, false)` stops after the
@@ -1045,7 +1091,7 @@ pub fn parse_pubspec_yaml(content: &str, doc_uri: &Uri) -> Result<DartParseResul
         });
     }
 
-    let mut receiver = PubspecReceiver::new();
+    let mut receiver = PubspecReceiver::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
     let mut parser = Parser::new_from_str(content);
     parser
         .load(&mut receiver, false)
@@ -1055,21 +1101,18 @@ pub fn parse_pubspec_yaml(content: &str, doc_uri: &Uri) -> Result<DartParseResul
         })?;
 
     let line_table = LineOffsetTable::new(content);
-    let mut dependencies = Vec::new();
-    let mut budget = deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
-
-    for raw in receiver.entries {
-        if !budget.allow() {
-            continue;
-        }
-        dependencies.push(build_dependency(content, &line_table, raw));
-    }
+    let dependency_truncation = receiver.budget.truncation();
+    let dependencies = receiver
+        .entries
+        .into_iter()
+        .map(|raw| build_dependency(content, &line_table, raw))
+        .collect();
 
     Ok(DartParseResult {
         dependencies,
         sdk_constraint: receiver.sdk,
         uri: doc_uri.clone(),
-        dependency_truncation: budget.truncation(),
+        dependency_truncation,
     })
 }
 
@@ -2086,5 +2129,221 @@ flutter:
 
         assert_eq!(dep.version_req, Some("^1.0.0".into()));
         assert!(dep.version_range.is_some());
+    }
+
+    #[test]
+    fn test_duplicate_dependency_keys_in_one_section_are_both_accepted() {
+        // Intentional: this parser (like the pre-rewrite `Yaml`-AST one) does not deduplicate
+        // repeated keys within a mapping — the event stream simply yields both scalar pairs,
+        // and nothing here rejects or merges them. YAML itself treats duplicate mapping keys
+        // as an error in the strictest reading of the spec, but neither `yaml-rust2` nor this
+        // parser enforce that; pinning the current (permissive) behavior rather than claiming
+        // it is the only valid interpretation.
+        let yaml = "dependencies:\n  http: ^1.0.0\n  http: ^2.0.0\n";
+        let result = parse_pubspec_yaml(yaml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 2);
+        assert!(
+            result
+                .dependencies
+                .iter()
+                .all(|d| d.name.as_ref() == "http")
+        );
+        let reqs: Vec<_> = result
+            .dependencies
+            .iter()
+            .filter_map(|d| d.version_req.as_ref().map(deps_core::VersionReq::as_str))
+            .collect();
+        assert_eq!(reqs, vec!["^1.0.0", "^2.0.0"]);
+    }
+
+    #[test]
+    fn test_git_null_value_falls_through_to_sibling_path() {
+        // Intentional: a `git:` key with no value (null) never populates `frame.git` (the
+        // null guard on `on_scalar`'s `FrameRole::DependencyEntryValue` arm skips the
+        // assignment entirely), so `build_dependency` falls through to the `path:`/`sdk:`
+        // sibling fields exactly as if `git:` had never been declared at all.
+        let yaml = "dependencies:\n  local_pkg:\n    git:\n    path: ../local\n";
+        let result = parse_pubspec_yaml(yaml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        match &result.dependencies[0].source {
+            DependencySource::Path { path } => assert_eq!(path, "../local"),
+            other => panic!("expected Path source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_non_string_yaml_typed_dependency_value_resolves_version_req() {
+        // Intentional: this parser never interprets a plain scalar's YAML-implied type (int,
+        // float, bool) — every non-null plain scalar's literal text is taken as-is for
+        // `version_req`, so a YAML-numeric-looking value like `1.2` (unquoted) resolves to the
+        // literal string `"1.2"` rather than `None`.
+        let yaml = "dependencies:\n  foo: 1.2\n";
+        let result = parse_pubspec_yaml(yaml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].version_req, Some("1.2".into()));
+    }
+
+    #[test]
+    fn test_non_string_dependency_key_is_accepted_as_name() {
+        // Intentional: a dependency section's key text is taken verbatim regardless of what
+        // YAML type it would otherwise imply — an unquoted `123` or `true` key is accepted as
+        // a dependency literally named `"123"`/`"true"`, matching how the value side already
+        // treats every plain scalar as its literal text (see the sibling non-string-value
+        // test above).
+        let yaml = "dependencies:\n  123: ^1.0.0\n  true: ^2.0.0\n";
+        let result = parse_pubspec_yaml(yaml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 2);
+        assert!(result.dependencies.iter().any(|d| d.name.as_ref() == "123"));
+        assert!(
+            result
+                .dependencies
+                .iter()
+                .any(|d| d.name.as_ref() == "true")
+        );
+    }
+
+    #[test]
+    fn test_explicit_str_tag_on_null_like_text_is_not_treated_as_null() {
+        // Real fix (#906): `is_plain_null` used to ignore `Event::Scalar`'s tag entirely, so
+        // an explicitly-tagged `!!str null` (forcing the literal string `"null"`, per YAML's
+        // own tag-resolution rules — see `is_plain_null`'s doc comment) was still treated as
+        // an absent value. It must now resolve to the literal string `"null"`.
+        let yaml = "dependencies:\n  pkg:\n    version: !!str null\n";
+        let result = parse_pubspec_yaml(yaml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].version_req, Some("null".into()));
+    }
+
+    #[test]
+    fn test_explicit_null_tag_on_untagged_null_text_is_still_absent() {
+        // Companion to the `!!str null` fix above: an explicit `tag:yaml.org,2002:null` tag
+        // on null-shaped text must still resolve to absent, the same as an untagged plain
+        // null scalar — the fix only changes behavior for a tag that is *not* `null`.
+        let yaml = "dependencies:\n  pkg:\n    version: !!null null\n";
+        let result = parse_pubspec_yaml(yaml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert!(result.dependencies[0].version_req.is_none());
+    }
+
+    #[test]
+    fn test_explicit_non_null_tag_on_empty_value_is_still_absent() {
+        // impl-critic S1: the `!!str null` fix's `Some(tag)` arm originally returned `false`
+        // for *any* non-null tag, including when the scalar text is empty — reintroducing the
+        // #899 misanchored-empty-version defect: `version: !!str` (a value-less key, just like
+        // `version:` alone) was wrongly resolving to `Some("")` with a bogus zero-width range
+        // at the next sibling key's position, instead of staying absent. An empty plain scalar
+        // is a value-less key regardless of any tag attached to it.
+        let yaml = "dependencies:\n  local_pkg:\n    version: !!str\n    path: ../local\n";
+        let result = parse_pubspec_yaml(yaml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        let dep = &result.dependencies[0];
+        assert!(
+            dep.version_req.is_none(),
+            "an empty `!!str`-tagged scalar must be absent, not Some(\"\")"
+        );
+        assert!(dep.version_range.is_none());
+        match &dep.source {
+            DependencySource::Path { path } => assert_eq!(path, "../local"),
+            other => panic!("expected Path source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_explicit_non_null_tag_on_empty_dependency_value_is_still_absent() {
+        // Same hazard as above, at the dependency-value (section) level rather than a nested
+        // entry field: `pkg: !!str` is the section-shorthand form's value-less key.
+        let yaml = "dependencies:\n  pkg: !!str\n";
+        let result = parse_pubspec_yaml(yaml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name.as_ref(), "pkg");
+        assert!(result.dependencies[0].version_req.is_none());
+    }
+
+    #[test]
+    fn test_aliased_str_tagged_null_like_scalar_resolves_to_literal_text() {
+        // The alias path re-runs `is_plain_null` against the anchor's own stored style/tag
+        // (see `on_alias`'s comment) — this pins that the tag-aware fix applies identically
+        // whether the tagged scalar is seen directly or resolved through an alias.
+        let yaml = "shared: &shared !!str null\ndependencies:\n  pkg:\n    version: *shared\n";
+        let result = parse_pubspec_yaml(yaml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].version_req, Some("null".into()));
+    }
+
+    #[test]
+    fn test_verbatim_null_tag_is_recognized_the_same_as_the_shorthand() {
+        // Code-review finding: `is_null_tag` originally only recognized the `!!null`
+        // shorthand form (`Tag { handle: "tag:yaml.org,2002:", suffix: "null" }`). The
+        // equivalent verbatim tag `!<tag:yaml.org,2002:null>` resolves to a differently
+        // shaped `Tag { handle: "", suffix: "tag:yaml.org,2002:null" }` (the whole URI in
+        // `suffix`, empty `handle`) — measured directly against `yaml-rust2`'s scanner. Both
+        // forms must resolve `~`/`null` text to absent identically.
+        let yaml = "dependencies:\n  pkg:\n    version: !<tag:yaml.org,2002:null> null\n";
+        let result = parse_pubspec_yaml(yaml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert!(result.dependencies[0].version_req.is_none());
+    }
+
+    #[test]
+    fn test_verbatim_str_tag_on_null_like_text_is_not_treated_as_null() {
+        // Companion to the verbatim-null test above, mirroring the `!!str null` vs.
+        // `!!null null` pair: a verbatim tag for a *different* type (`!<tag:yaml.org,2002:str>`)
+        // must still force the literal text, not absence.
+        let yaml = "dependencies:\n  pkg:\n    version: !<tag:yaml.org,2002:str> null\n";
+        let result = parse_pubspec_yaml(yaml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].version_req, Some("null".into()));
+    }
+
+    #[test]
+    fn test_dependency_budget_truncation_follows_physical_document_order_not_section_order() {
+        // Intentional: truncation order tracks the event stream's (i.e. the document's
+        // physical) order, not a canonical `dependencies`/`dev_dependencies`/
+        // `dependency_overrides` section order. Putting `dev_dependencies:` physically first
+        // in an oversized manifest means its entries are kept and `dependencies:`'s entries
+        // (appearing later in the file) are the ones dropped once the cap is hit.
+        let cap = deps_core::MAX_DEPENDENCIES_PER_DOCUMENT;
+        let mut yaml = String::from("name: my_app\ndev_dependencies:\n");
+        for i in 0..cap {
+            yaml.push_str(&format!("  dev_dep_{i:05}: ^1.0.0\n"));
+        }
+        yaml.push_str("dependencies:\n  http: ^1.0.0\n");
+
+        let result = parse_pubspec_yaml(&yaml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), cap);
+        assert_eq!(result.dependency_truncation, Some((cap, cap + 1)));
+        assert!(
+            result
+                .dependencies
+                .iter()
+                .all(|d| matches!(d.section, DependencySection::DevDependencies)),
+            "the physically-later `dependencies:` section's entry must be the one truncated"
+        );
+    }
+
+    #[test]
+    fn test_dependency_budget_enforced_during_parsing_not_after() {
+        // #906 / impl-critic S2: `budget.allow()` used to be checked only in a second pass
+        // over `receiver.entries`, after every entry (including ones beyond the cap) had
+        // already been collected as a full `RawDependency`. The externally-observable
+        // `dependencies.len()`/`dependency_truncation` contract (see the physical-order test
+        // above) is identical either way, so it cannot discriminate old from new — this test
+        // instead inspects `PubspecReceiver` directly (available within this module) to pin
+        // that `receiver.entries` itself, the collection the fix targets, never grows past the
+        // cap in the first place.
+        let cap = 3;
+        let total = cap + 2;
+        let yaml = many_dependencies_yaml(total);
+
+        let mut receiver = PubspecReceiver::new(cap);
+        let mut parser = Parser::new_from_str(&yaml);
+        parser.load(&mut receiver, false).unwrap();
+
+        assert_eq!(
+            receiver.entries.len(),
+            cap,
+            "the receiver's own entry buffer must never exceed the budget's cap"
+        );
+        assert_eq!(receiver.budget.truncation(), Some((cap, total)));
     }
 }

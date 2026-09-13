@@ -31,7 +31,7 @@ pub struct DartDependency {
 
 /// Which `pubspec.yaml` top-level section a dependency was declared under.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DependencySection {
     /// The `dependencies:` section.
     #[default]
