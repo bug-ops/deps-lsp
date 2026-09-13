@@ -232,6 +232,36 @@ impl NpmConfig {
         }
     }
 
+    /// Mirrors [`Self::resolve_source_for`]'s exact branching (scoped entry wins over the
+    /// top-level override), but reports whether the entry that resolution used was rejected
+    /// specifically because its host is blocked by the current
+    /// `registries.workspace_registries` policy — and if so, the blocked
+    /// [`deps_core::net_policy::HostClass`], the raw `registry=`/`@scope:registry=` value as
+    /// written, and a declaration key identifying *which* `.npmrc` field produced it
+    /// (`"top-level"` or `"scope:<@scope>"`) (#925: so the block surfaces as a diagnostic
+    /// instead of only a `tracing::warn!`). `None` for every other outcome (no entry, a valid
+    /// entry, or an entry invalid for a different reason).
+    ///
+    /// The declaration key is never the raw value itself (code-review correctness fix): a
+    /// top-level `registry=` and an unrelated `@scope:registry=` can both be blocked to the
+    /// *same* URL, and a diagnostic deduper keying on value alone would silently drop one of
+    /// the two independently-declared blocks — see
+    /// `deps_core::ecosystem::ParseResult::blocked_registries`'s own doc.
+    #[must_use]
+    pub fn blocked_class_for(
+        &self,
+        package_name: &PackageName,
+    ) -> Option<(HostClass, String, String)> {
+        if let Some(scope) = scope_of(package_name.as_str())
+            && let Some(result) = self.scoped_registries.get(scope)
+        {
+            let (class, raw) = blocked_class(result)?;
+            return Some((class, raw, format!("scope:{scope}")));
+        }
+        let (class, raw) = blocked_class(self.registry.as_ref()?)?;
+        Some((class, raw, "top-level".to_string()))
+    }
+
     /// Every successfully resolved [`NpmRegistryIndex`] this config carries (the top-level
     /// override plus every scoped entry), deduplicated by [`NpmRegistryIndex::as_str`] — fed
     /// to `NpmRegistry::register_alternate` at parse time. An invalid/unresolved entry
@@ -258,6 +288,18 @@ fn source_from_result(result: &Result<NpmRegistryIndex, InvalidEntry>) -> Depend
         Err(invalid) => DependencySource::CustomRegistry {
             url: invalid.raw.to_string(),
         },
+    }
+}
+
+/// `Some((class, raw))` iff `result` is an entry rejected specifically for
+/// [`NpmRegistryIndexError::BlockedHost`] — used by [`NpmConfig::blocked_class_for`].
+fn blocked_class(result: &Result<NpmRegistryIndex, InvalidEntry>) -> Option<(HostClass, String)> {
+    match result {
+        Err(InvalidEntry {
+            raw,
+            reason: NpmRegistryIndexError::BlockedHost { class },
+        }) => Some((*class, raw.to_string())),
+        _ => None,
     }
 }
 
@@ -1055,6 +1097,98 @@ mod tests {
                 url: "not-a-valid-url".to_string(),
             }
         );
+    }
+
+    /// #925: a top-level `registry=` override blocked by the current
+    /// `registries.workspace_registries` policy must populate `blocked_class_for` with the
+    /// blocked host class and the raw declared value, not just leave the dependency
+    /// unresolved with no trace (mirrors `deps-cargo`'s
+    /// `test_parse_registry_index_literal_blocked_by_policy_populates_blocked_registries`).
+    #[test]
+    fn test_blocked_class_for_top_level_override_blocked_by_policy() {
+        let policy = public_only_policy();
+        let config = NpmConfig {
+            registry: Some(resolve_entry("https://169.254.169.254/registry", &policy)),
+            scoped_registries: HashMap::new(),
+        };
+        assert_eq!(
+            config.resolve_source_for(&pkg("express")),
+            DependencySource::CustomRegistry {
+                url: "https://169.254.169.254/registry".to_string(),
+            },
+            "a blocked registry must stay unresolved, not silently become AlternateRegistry"
+        );
+        let (class, raw_value, declaration_key) = config
+            .blocked_class_for(&pkg("express"))
+            .expect("blocked entry must be reported");
+        assert_eq!(class, HostClass::CloudMetadata);
+        assert_eq!(raw_value, "https://169.254.169.254/registry");
+        assert_eq!(declaration_key, "top-level");
+    }
+
+    /// The scoped-entry counterpart: a `@scope:registry=` entry blocked by policy must be
+    /// reported keyed by the scope's own dependency, even though a (non-matching) top-level
+    /// override also exists.
+    #[test]
+    fn test_blocked_class_for_scoped_entry_blocked_by_policy() {
+        let policy = public_only_policy();
+        let mut scoped = HashMap::new();
+        scoped.insert(
+            "@myorg".to_string(),
+            resolve_entry("https://169.254.169.254/registry", &policy),
+        );
+        let config = NpmConfig {
+            registry: Some(resolve_entry("https://npm.mycorp.example", &policy)),
+            scoped_registries: scoped,
+        };
+        let (class, raw_value, declaration_key) = config
+            .blocked_class_for(&pkg("@myorg/internal-lib"))
+            .expect("blocked scoped entry must be reported");
+        assert_eq!(class, HostClass::CloudMetadata);
+        assert_eq!(raw_value, "https://169.254.169.254/registry");
+        assert_eq!(declaration_key, "scope:@myorg");
+        assert_eq!(config.blocked_class_for(&pkg("express")), None);
+    }
+
+    /// Code-review correctness fix (#925): a top-level `registry=` override and an unrelated
+    /// `@scope:registry=` entry that happen to be blocked to the *identical* URL must still
+    /// carry *different* declaration keys — two independent declarations, not one — so a
+    /// diagnostic deduper keyed on the declaration (not the value) never conflates them.
+    #[test]
+    fn test_blocked_class_for_top_level_and_scope_sharing_url_have_distinct_declaration_keys() {
+        let policy = public_only_policy();
+        let mut scoped = HashMap::new();
+        scoped.insert(
+            "@myorg".to_string(),
+            resolve_entry("https://169.254.169.254/registry", &policy),
+        );
+        let config = NpmConfig {
+            registry: Some(resolve_entry("https://169.254.169.254/registry", &policy)),
+            scoped_registries: scoped,
+        };
+        let (_, _, top_level_key) = config
+            .blocked_class_for(&pkg("express"))
+            .expect("top-level entry must be reported");
+        let (_, _, scope_key) = config
+            .blocked_class_for(&pkg("@myorg/internal-lib"))
+            .expect("scoped entry must be reported");
+        assert_ne!(
+            top_level_key, scope_key,
+            "two independently-declared blocked entries must never share a declaration key, \
+             even when their raw values coincide"
+        );
+    }
+
+    /// A valid (non-blocked) entry, or no entry at all, must never be reported as blocked.
+    #[test]
+    fn test_blocked_class_for_none_when_not_blocked() {
+        let policy = all_policy();
+        let config = NpmConfig {
+            registry: Some(resolve_entry("https://npm.mycorp.example", &policy)),
+            scoped_registries: HashMap::new(),
+        };
+        assert_eq!(config.blocked_class_for(&pkg("express")), None);
+        assert_eq!(NpmConfig::default().blocked_class_for(&pkg("lodash")), None);
     }
 
     #[test]

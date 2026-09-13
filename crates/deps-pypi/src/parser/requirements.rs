@@ -151,6 +151,7 @@ impl PypiParser {
         let line_table = LineOffsetTable::new(content);
         let mut dependencies = Vec::new();
         let mut document_links = Vec::new();
+        let mut blocked_registries = Vec::new();
         let mut strong_signal = false;
         let mut failed_lines: usize = 0;
         let mut budget = deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
@@ -295,6 +296,16 @@ impl PypiParser {
                     // routing concept.
                     if dep.source == PypiDependencySource::Registry {
                         dep.source = config.resolve_source_for(None);
+                        if let Some((class, raw_value, declaration_key)) =
+                            config.blocked_class_for(None)
+                        {
+                            blocked_registries.push((
+                                dep.name_range,
+                                class,
+                                raw_value,
+                                declaration_key,
+                            ));
+                        }
                     }
                     dependencies.push(dep);
                 }
@@ -339,6 +350,7 @@ impl PypiParser {
             } else {
                 Vec::new()
             },
+            blocked_registries: if keep { blocked_registries } else { Vec::new() },
             dependency_truncation: if keep { budget.truncation() } else { None },
         })
     }
@@ -1277,6 +1289,29 @@ mod tests {
             result.dependencies[0].source,
             PypiDependencySource::AlternateRegistry { .. }
         );
+    }
+
+    /// #925 (mirrors `deps-cargo`'s
+    /// `test_parse_registry_index_literal_blocked_by_policy_populates_blocked_registries`): an
+    /// `--index-url` blocked by policy must populate `ParseResult::blocked_registries`, not
+    /// just leave the dependency unresolved with no trace.
+    #[test]
+    fn test_index_url_blocked_by_policy_populates_blocked_registries() {
+        let content = "--index-url https://169.254.169.254/simple\nrequests==2.31.0\n";
+        let result = parse(content); // default policy is `public_only`
+        assert_eq!(
+            result.dependencies[0].source,
+            PypiDependencySource::CustomRegistry {
+                url: "https://169.254.169.254/simple".to_string(),
+            },
+            "a blocked index must stay unresolved, not silently become AlternateRegistry"
+        );
+        assert_eq!(result.blocked_registries.len(), 1);
+        let (range, class, raw_value, declaration_key) = &result.blocked_registries[0];
+        assert_eq!(*range, result.dependencies[0].name_range);
+        assert_eq!(*class, deps_core::net_policy::HostClass::CloudMetadata);
+        assert_eq!(raw_value, "https://169.254.169.254/simple");
+        assert_eq!(declaration_key, "primary");
     }
 
     /// `--index-url=<url>` (equals spelling) is captured identically to the space-separated

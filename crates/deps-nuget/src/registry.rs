@@ -258,6 +258,18 @@ impl ServiceIndex {
     /// absent, matching how a feed that never declared the resource at all is already handled.
     /// [`NuGetRegistryTier::Public`] never gates (`PolicyGate::Skip` equivalent) — the default
     /// public registry is trusted unconditionally, matching every other ecosystem's baseline.
+    ///
+    /// **Not surfaced via `ParseResult::blocked_registries()` (#925 M1, deliberate scope
+    /// boundary).** This check runs at *fetch* time, against the `PackageBaseAddress` the
+    /// remote service index response itself names — which can differ from (or simply post-date
+    /// the resolution of) any `NuGet.Config`-declared feed URL `crate::config::NuGetConfig`
+    /// already validated at *parse* time. There is no manifest `Range` to attach a diagnostic
+    /// to here: by the time this rejection fires, parsing has long finished and the async
+    /// registry call is independent of any single dependency line. A rejection here still
+    /// degrades safely (the fetch fails, `Registry::get_versions_from` propagates the error,
+    /// no data crosses the blocked host), just without an editor-visible trace — closing that
+    /// gap would need a different mechanism (e.g. a document-wide notice keyed by URI, not a
+    /// per-dependency `Range`) and is out of #925's scope.
     fn resolve(
         response: &ServiceIndexResponse,
         tier: NuGetRegistryTier,

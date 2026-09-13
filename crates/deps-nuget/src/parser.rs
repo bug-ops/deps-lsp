@@ -49,19 +49,54 @@ pub struct NuGetParseResult {
     /// `NuGetEcosystem::parse_manifest`; empty when nothing is registrable (no config, or
     /// every dependency resolves to plain `Registry`/a fail-closed `CustomRegistry`).
     pub resolved_chains: Vec<crate::config::NuGetSourceChain>,
+    /// Dependency lines whose `NuGet.Config` `<packageSources>`/`<packageSourceMapping>`
+    /// resolution was blocked by the current `registries.workspace_registries` policy (#925,
+    /// mirrors `deps_cargo::parser::CargoParseResult::blocked_registries`) —
+    /// `(name_range, blocked host class, raw declared value, declaration key)` quadruples,
+    /// where the declaration key (from [`crate::config::NuGetConfig::blocked_class_for`]) is
+    /// the source's own declared `<add key>` name, distinguishing two independently declared
+    /// sources even when they share a raw value. Surfaced by
+    /// [`deps_core::lsp_helpers::generate_diagnostics_from_cache`] via
+    /// [`Self::blocked_registries`]'s trait override as an informational diagnostic, so the
+    /// block never degrades silently.
+    pub blocked_registries: Vec<(Range, deps_core::net_policy::HostClass, String, String)>,
     /// `Some((kept, total))` once the manifest declared more dependencies than
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796).
     pub dependency_truncation: Option<(usize, usize)>,
 }
 
-deps_core::impl_parse_result!(
-    NuGetParseResult,
-    NuGetDependency {
-        dependencies: dependencies,
-        uri: uri,
-        dependency_truncation: dependency_truncation,
+// Implemented by hand rather than via `deps_core::impl_parse_result!`: `blocked_registries()`
+// is overridden with real data (`self.blocked_registries.clone()`), mirroring
+// `deps_cargo::parser::CargoParseResult`'s own hand-written impl — the macro has no field for
+// it.
+impl deps_core::ParseResult for NuGetParseResult {
+    fn dependencies(&self) -> Vec<&dyn deps_core::Dependency> {
+        self.dependencies
+            .iter()
+            .map(|d| d as &dyn deps_core::Dependency)
+            .collect()
     }
-);
+
+    fn workspace_root(&self) -> Option<&std::path::Path> {
+        None
+    }
+
+    fn uri(&self) -> &Uri {
+        &self.uri
+    }
+
+    fn blocked_registries(&self) -> Vec<(Range, deps_core::net_policy::HostClass, String, String)> {
+        self.blocked_registries.clone()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn dependency_truncation(&self) -> Option<(usize, usize)> {
+        self.dependency_truncation
+    }
+}
 
 /// Parses a `.csproj`/`.fsproj`/`.vbproj` MSBuild project file, extracting `PackageReference` entries.
 ///
@@ -128,6 +163,7 @@ pub fn parse_packages_config(content: &str, doc_uri: &Uri) -> Result<NuGetParseR
         dependencies,
         uri: doc_uri.clone(),
         resolved_chains: Vec::new(),
+        blocked_registries: Vec::new(),
         dependency_truncation: budget.truncation(),
     })
 }
@@ -255,6 +291,7 @@ fn parse_reference_elements(
         dependencies,
         uri: doc_uri.clone(),
         resolved_chains: Vec::new(),
+        blocked_registries: Vec::new(),
         dependency_truncation: budget.truncation(),
     })
 }

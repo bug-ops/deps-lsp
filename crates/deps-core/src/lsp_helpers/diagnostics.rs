@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use tower_lsp_server::ls_types::{
     CodeDescription, Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, Location,
@@ -878,12 +878,38 @@ fn offline_notice(
 /// version resolution, so it would otherwise leave no trace at all in the editor.
 ///
 /// Reads: `parse_result.blocked_registries()`.
-/// Emits: one [`DiagnosticSeverity::INFORMATION`] per entry, on the dependency's own
-/// range, message truncated at [`MAX_BLOCKED_REGISTRY_MESSAGE_VALUE_CHARS`]. Pushed
-/// after R0, before any per-dependency diagnostic.
+/// Emits: one [`DiagnosticSeverity::INFORMATION`] per **distinct declaration key**, on the
+/// first dependency's range that key was reported against — message truncated at
+/// [`MAX_BLOCKED_REGISTRY_MESSAGE_VALUE_CHARS`]. Pushed after R0, before any per-dependency
+/// diagnostic.
 /// Suppressed by: nothing. Suppresses: nothing.
+///
+/// Deduplicated by declaration key, not by `(host class, raw value)` (#925 S2, then corrected
+/// by a later code-review pass): a config-global declaration (e.g. a single blocked npm
+/// `.npmrc` top-level `registry=` line, or one `NuGet.Config` `<add key>` source) applies
+/// identically to every dependency it affects, so pushing one entry per *dependency* — as each
+/// ecosystem's `ParseResult::blocked_registries()` does — can fan out to as many identical
+/// `INFORMATION` diagnostics as dependencies affected (up to
+/// [`crate::MAX_DEPENDENCIES_PER_DOCUMENT`]) for one underlying declaration. Deduping by
+/// `(host class, raw value)` instead of the declaration key looked equivalent but was not: two
+/// *independently* declared sources that merely happen to share a raw value and host class
+/// (e.g. an npm top-level `registry=` and an unrelated `@scope:registry=`, both blocked to the
+/// same URL) would silently collapse to one diagnostic, leaving every dependency routed
+/// through the second declaration with no diagnostic at all — see
+/// [`ParseResult::blocked_registries`]'s own doc for why the key must identify the
+/// declaration, never the value.
+///
+/// Known gap tracked as #944 M8, deferred (not blocking #925): two Cargo dependencies
+/// declaring the *same* blocked registry alias share one `declaration_key`, so only the
+/// first now gets a diagnostic — this module's own `related_information`-based collapse
+/// (see the fetch-failure handling nearby) would let every affected dependency stay visible
+/// under one representative diagnostic instead of silently dropping the rest.
 fn blocked_registry_diagnostics(diagnostics: &mut Vec<Diagnostic>, parse_result: &dyn ParseResult) {
-    for (range, class, raw_value) in parse_result.blocked_registries() {
+    let mut seen = HashSet::new();
+    for (range, class, raw_value, declaration_key) in parse_result.blocked_registries() {
+        if !seen.insert(declaration_key) {
+            continue;
+        }
         // #936: `raw_value` is a raw, unvalidated `registry`/`registry-index` literal that can
         // carry a query-string credential (userinfo is rejected earlier in the pipeline, but
         // a query string is not) — redact before truncating so host/path survive for the
@@ -1868,7 +1894,7 @@ mod tests {
         struct BlockedRegistryParseResult {
             deps: Vec<MockDep>,
             uri: Uri,
-            blocked: Vec<(Range, HostClass, String)>,
+            blocked: Vec<(Range, HostClass, String, String)>,
         }
 
         impl ParseResult for BlockedRegistryParseResult {
@@ -1881,7 +1907,7 @@ mod tests {
             fn uri(&self) -> &Uri {
                 &self.uri
             }
-            fn blocked_registries(&self) -> Vec<(Range, HostClass, String)> {
+            fn blocked_registries(&self) -> Vec<(Range, HostClass, String, String)> {
                 self.blocked.clone()
             }
             fn as_any(&self) -> &dyn std::any::Any {
@@ -1902,6 +1928,7 @@ mod tests {
             blocked: vec![(
                 name_range,
                 HostClass::CloudMetadata,
+                "https://169.254.169.254/index".to_string(),
                 "https://169.254.169.254/index".to_string(),
             )],
         };
@@ -1949,7 +1976,7 @@ mod tests {
         struct BlockedRegistryParseResult {
             deps: Vec<MockDep>,
             uri: Uri,
-            blocked: Vec<(Range, HostClass, String)>,
+            blocked: Vec<(Range, HostClass, String, String)>,
         }
 
         impl ParseResult for BlockedRegistryParseResult {
@@ -1962,7 +1989,7 @@ mod tests {
             fn uri(&self) -> &Uri {
                 &self.uri
             }
-            fn blocked_registries(&self) -> Vec<(Range, HostClass, String)> {
+            fn blocked_registries(&self) -> Vec<(Range, HostClass, String, String)> {
                 self.blocked.clone()
             }
             fn as_any(&self) -> &dyn std::any::Any {
@@ -1983,6 +2010,7 @@ mod tests {
             blocked: vec![(
                 name_range,
                 HostClass::CloudMetadata,
+                "https://index.mycorp.dev/api?api_key=SECRET".to_string(),
                 "https://index.mycorp.dev/api?api_key=SECRET".to_string(),
             )],
         };
@@ -2010,6 +2038,132 @@ mod tests {
         );
         assert!(blocked_diagnostic.message.contains("index.mycorp.dev"));
         assert!(blocked_diagnostic.message.contains("/api"));
+    }
+
+    /// #925 S2 (then corrected by a later code-review pass, finding #3): a config-global
+    /// block (e.g. a single blocked top-level registry override) applies identically to every
+    /// dependency in the file — `blocked_registries()` reports one entry per affected
+    /// dependency, so without dedup this fans out to as many identical `INFORMATION`
+    /// diagnostics as there are dependencies. Two entries sharing the same **declaration
+    /// key** must collapse to exactly one diagnostic, kept at the first-reported range — but a
+    /// *third* entry sharing the identical `(class, raw_value)` pair through a genuinely
+    /// *different* declaration key (two independent declarations that merely coincide on
+    /// value — e.g. an npm top-level `registry=` and an unrelated `@scope:registry=`, both
+    /// blocked to the same URL) must still get its own diagnostic: deduping by value alone
+    /// would have silently dropped it.
+    #[test]
+    fn test_generate_diagnostics_from_cache_dedups_by_declaration_key_not_by_value() {
+        use crate::net_policy::HostClass;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        struct BlockedRegistryParseResult {
+            deps: Vec<MockDep>,
+            uri: Uri,
+            blocked: Vec<(Range, HostClass, String, String)>,
+        }
+
+        impl ParseResult for BlockedRegistryParseResult {
+            fn dependencies(&self) -> Vec<&dyn Dependency> {
+                self.deps.iter().map(|d| d as &dyn Dependency).collect()
+            }
+            fn workspace_root(&self) -> Option<&std::path::Path> {
+                None
+            }
+            fn uri(&self) -> &Uri {
+                &self.uri
+            }
+            fn blocked_registries(&self) -> Vec<(Range, HostClass, String, String)> {
+                self.blocked.clone()
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        let first_range = Range::new(Position::new(0, 0), Position::new(0, 14));
+        let second_range = Range::new(Position::new(1, 0), Position::new(1, 14));
+        let third_range = Range::new(Position::new(2, 0), Position::new(2, 14));
+        let formatter = MockFormatter;
+        let parse_result = BlockedRegistryParseResult {
+            deps: vec![
+                MockDep {
+                    name: "first-crate".into(),
+                    version_req: "1.0.0".into(),
+                    version_range: Range::new(Position::new(0, 20), Position::new(0, 25)),
+                    name_range: first_range,
+                },
+                MockDep {
+                    name: "second-crate".into(),
+                    version_req: "1.0.0".into(),
+                    version_range: Range::new(Position::new(1, 20), Position::new(1, 25)),
+                    name_range: second_range,
+                },
+                MockDep {
+                    name: "third-crate".into(),
+                    version_req: "1.0.0".into(),
+                    version_range: Range::new(Position::new(2, 20), Position::new(2, 25)),
+                    name_range: third_range,
+                },
+            ],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+            blocked: vec![
+                // Same declaration ("top-level"), same value — genuinely the same config-wide
+                // block, referenced by two dependencies. Must collapse to one diagnostic.
+                (
+                    first_range,
+                    HostClass::CloudMetadata,
+                    "https://169.254.169.254/index".to_string(),
+                    "top-level".to_string(),
+                ),
+                (
+                    second_range,
+                    HostClass::CloudMetadata,
+                    "https://169.254.169.254/index".to_string(),
+                    "top-level".to_string(),
+                ),
+                // A different declaration ("scope:@myorg") that happens to share the exact
+                // same (class, raw_value) — must NOT be swallowed by the dedup above.
+                (
+                    third_range,
+                    HostClass::CloudMetadata,
+                    "https://169.254.169.254/index".to_string(),
+                    "scope:@myorg".to_string(),
+                ),
+            ],
+        };
+
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        let blocked_diagnostics: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.contains("blocked"))
+            .collect();
+        assert_eq!(
+            blocked_diagnostics.len(),
+            2,
+            "two entries sharing a declaration key must collapse to one diagnostic, but a \
+             third entry with a different declaration key must still get its own, got: \
+             {blocked_diagnostics:?}"
+        );
+        let ranges: Vec<Range> = blocked_diagnostics.iter().map(|d| d.range).collect();
+        assert!(ranges.contains(&first_range));
+        assert!(ranges.contains(&third_range));
+        assert!(
+            !ranges.contains(&second_range),
+            "the deduped-away entry must be the second occurrence of the same declaration key, \
+             not the third (different-declaration) entry"
+        );
     }
 
     #[test]
@@ -2046,7 +2200,7 @@ mod tests {
         struct BlockedRegistryParseResult {
             deps: Vec<MockDep>,
             uri: Uri,
-            blocked: Vec<(Range, HostClass, String)>,
+            blocked: Vec<(Range, HostClass, String, String)>,
         }
 
         impl ParseResult for BlockedRegistryParseResult {
@@ -2059,7 +2213,7 @@ mod tests {
             fn uri(&self) -> &Uri {
                 &self.uri
             }
-            fn blocked_registries(&self) -> Vec<(Range, HostClass, String)> {
+            fn blocked_registries(&self) -> Vec<(Range, HostClass, String, String)> {
                 self.blocked.clone()
             }
             fn as_any(&self) -> &dyn std::any::Any {
@@ -2078,7 +2232,12 @@ mod tests {
                 name_range,
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
-            blocked: vec![(name_range, HostClass::InternalName, long_alias.clone())],
+            blocked: vec![(
+                name_range,
+                HostClass::InternalName,
+                long_alias.clone(),
+                long_alias.clone(),
+            )],
         };
 
         let cached_versions = HashMap::new();

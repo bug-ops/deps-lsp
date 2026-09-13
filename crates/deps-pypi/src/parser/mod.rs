@@ -407,21 +407,55 @@ pub struct ParseResult {
     /// resolution and the long-lived, shared `PypiRegistry` router meet (see
     /// `PypiEcosystem::parse_manifest`). Empty for a file with no such declaration (US-004).
     pub resolved_chains: Vec<crate::config::ResolvedChain>,
+    /// Dependency lines whose `--index-url`/Poetry `source =`/uv `index =` resolution was
+    /// blocked by the current `registries.workspace_registries` policy (#925, mirrors
+    /// `deps_cargo::parser::CargoParseResult::blocked_registries`) —
+    /// `(name_range, blocked host class, raw declared value, declaration key)` quadruples,
+    /// where the declaration key (from [`crate::config::PypiIndexConfig::blocked_class_for`])
+    /// distinguishes a blocked primary from a blocked named source or uv tail hop even when
+    /// they share the same raw value. Surfaced by
+    /// [`deps_core::lsp_helpers::generate_diagnostics_from_cache`] via
+    /// [`Self::blocked_registries`]'s trait override as an informational diagnostic, so the
+    /// block never degrades silently.
+    pub blocked_registries: Vec<(Range, deps_core::net_policy::HostClass, String, String)>,
     /// `Some((kept, total))` once the manifest declared more dependencies than
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
     /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
     pub dependency_truncation: Option<(usize, usize)>,
 }
 
-deps_core::impl_parse_result!(
-    ParseResult,
-    PypiDependency {
-        dependencies: dependencies,
-        uri: uri,
-        workspace_root: workspace_root,
-        dependency_truncation: dependency_truncation,
+// Implemented by hand rather than via `deps_core::impl_parse_result!`: `blocked_registries()`
+// is overridden with real data (`self.blocked_registries.clone()`), mirroring
+// `deps_cargo::parser::CargoParseResult`'s own hand-written impl — the macro has no field for
+// it.
+impl deps_core::ParseResult for ParseResult {
+    fn dependencies(&self) -> Vec<&dyn deps_core::Dependency> {
+        self.dependencies
+            .iter()
+            .map(|d| d as &dyn deps_core::Dependency)
+            .collect()
     }
-);
+
+    fn workspace_root(&self) -> Option<&std::path::Path> {
+        self.workspace_root.as_deref()
+    }
+
+    fn uri(&self) -> &Uri {
+        &self.uri
+    }
+
+    fn blocked_registries(&self) -> Vec<(Range, deps_core::net_policy::HostClass, String, String)> {
+        self.blocked_registries.clone()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn dependency_truncation(&self) -> Option<(usize, usize)> {
+        self.dependency_truncation
+    }
+}
 
 /// Parser for Python dependency manifests.
 ///

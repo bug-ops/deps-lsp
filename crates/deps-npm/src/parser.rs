@@ -10,7 +10,8 @@ use deps_core::json_ast::{JsonAst, JsonSection};
 use deps_core::json_helpers::string_valued_entries;
 use deps_core::lsp_helpers::LineOffsetTable;
 use serde_json::Value;
-use tower_lsp_server::ls_types::Uri;
+use std::any::Any;
+use tower_lsp_server::ls_types::{Range, Uri};
 
 /// Result of parsing a package.json file.
 ///
@@ -28,20 +29,55 @@ pub struct NpmParseResult {
     /// the long-lived shared router meet. Empty for a workspace declaring no `.npmrc`
     /// (NFR-005: zero regression).
     pub resolved_registries: Vec<NpmRegistryIndex>,
+    /// Dependency lines whose `.npmrc` `registry`/`@scope:registry` resolution was blocked by
+    /// the current `registries.workspace_registries` policy (#925, mirrors
+    /// `deps_cargo::parser::CargoParseResult::blocked_registries`) —
+    /// `(name_range, blocked host class, raw declared value, declaration key)` quadruples,
+    /// where the declaration key (from [`NpmConfig::blocked_class_for`]) distinguishes a
+    /// top-level `registry=` block from a `@scope:registry=` block even when both happen to
+    /// share the same raw value. Surfaced by
+    /// [`deps_core::lsp_helpers::generate_diagnostics_from_cache`] via
+    /// [`Self::blocked_registries`]'s trait override as an informational diagnostic, so the
+    /// block never degrades silently.
+    pub blocked_registries: Vec<(Range, deps_core::net_policy::HostClass, String, String)>,
     /// `Some((kept, total))` once the manifest declared more dependencies than
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
     /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
     pub dependency_truncation: Option<(usize, usize)>,
 }
 
-deps_core::impl_parse_result!(
-    NpmParseResult,
-    NpmDependency {
-        dependencies: dependencies,
-        uri: uri,
-        dependency_truncation: dependency_truncation,
+// Implemented by hand rather than via `deps_core::impl_parse_result!`: `blocked_registries()`
+// is overridden with real data (`self.blocked_registries.clone()`), mirroring
+// `deps_cargo::parser::CargoParseResult`'s own hand-written impl — the macro has no field for
+// it.
+impl deps_core::ParseResult for NpmParseResult {
+    fn dependencies(&self) -> Vec<&dyn deps_core::Dependency> {
+        self.dependencies
+            .iter()
+            .map(|d| d as &dyn deps_core::Dependency)
+            .collect()
     }
-);
+
+    fn workspace_root(&self) -> Option<&std::path::Path> {
+        None
+    }
+
+    fn uri(&self) -> &Uri {
+        &self.uri
+    }
+
+    fn blocked_registries(&self) -> Vec<(Range, deps_core::net_policy::HostClass, String, String)> {
+        self.blocked_registries.clone()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn dependency_truncation(&self) -> Option<(usize, usize)> {
+        self.dependency_truncation
+    }
+}
 
 /// Parses a package.json file and extracts all dependencies with positions.
 ///
@@ -169,12 +205,17 @@ pub fn parse_package_json_with_context(
         .map(|dir| crate::config::resolve(dir, &ctx.config_cache, &ctx.policy))
         .unwrap_or_default();
 
+    let mut blocked_registries = Vec::new();
     for dep in &mut dependencies {
         // Route by the real registry package name, not the manifest alias (issue #654 S2):
         // a `.npmrc` scope entry (`@myorg:registry=...`) matches the package actually being
         // installed, and routing by the alias instead can send a private scoped package's
         // name to the public registry, or a public package to a private feed.
-        dep.source = npm_config.resolve_source_for(deps_core::Dependency::name(dep));
+        let name = deps_core::Dependency::name(dep).clone();
+        dep.source = npm_config.resolve_source_for(&name);
+        if let Some((class, raw_value, declaration_key)) = npm_config.blocked_class_for(&name) {
+            blocked_registries.push((dep.name_range, class, raw_value, declaration_key));
+        }
     }
 
     // Spec 046 FR-001/NFR-002: cheap fast-path — a non-pnpm manifest pays one string check per
@@ -193,6 +234,7 @@ pub fn parse_package_json_with_context(
         dependencies,
         uri: uri.clone(),
         resolved_registries: npm_config.resolved_registries(),
+        blocked_registries,
         dependency_truncation: budget.truncation(),
     })
 }
@@ -1040,6 +1082,11 @@ mod tests {
 
     /// FR-008: a workspace-declared index blocked by the default `public_only` policy fails
     /// closed to `CustomRegistry`, same shape as an invalid URL.
+    ///
+    /// #925 (impl-critic S3, mirrors `deps-cargo`'s
+    /// `test_parse_registry_index_literal_blocked_by_policy_populates_blocked_registries`):
+    /// `NpmParseResult::blocked_registries` must also be populated — the block must never
+    /// degrade to only a `tracing::warn!` in the server log.
     #[test]
     fn test_parse_with_context_policy_blocked_registry_fails_closed() {
         // See the comment in `test_parse_with_context_top_level_override_and_scope_override_coexist`
@@ -1062,6 +1109,12 @@ mod tests {
             &result.dependencies[0].source,
             deps_core::parser::DependencySource::CustomRegistry { .. }
         );
+        assert_eq!(result.blocked_registries.len(), 1);
+        let (range, class, raw_value, declaration_key) = &result.blocked_registries[0];
+        assert_eq!(*range, result.dependencies[0].name_range);
+        assert_eq!(*class, deps_core::net_policy::HostClass::CloudMetadata);
+        assert_eq!(raw_value, "https://169.254.169.254");
+        assert_eq!(declaration_key, "top-level");
     }
 
     // --- pnpm catalogs (spec 046) ---

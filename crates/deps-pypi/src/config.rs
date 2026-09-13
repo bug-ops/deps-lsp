@@ -34,7 +34,9 @@
 
 use std::collections::HashMap;
 
-use deps_core::net_policy::{PolicyGate, RedactedUrl, RegistryAccessPolicy, validate_index_url};
+use deps_core::net_policy::{
+    HostClass, PolicyGate, RedactedUrl, RegistryAccessPolicy, validate_index_url,
+};
 use deps_core::parser::DependencySource;
 
 /// Why a candidate index URL failed [`PypiIndexUrl::new`]'s validation.
@@ -140,6 +142,18 @@ pub(crate) fn resolve_entry(
             reason,
         }
     })
+}
+
+/// `Some((class, raw))` iff `result` is an entry rejected specifically for
+/// [`PypiIndexUrlError::BlockedHost`] — used by [`PypiIndexConfig::blocked_class_for`].
+fn blocked_class(result: &Result<PypiIndexUrl, InvalidEntry>) -> Option<(HostClass, String)> {
+    match result {
+        Err(InvalidEntry {
+            raw,
+            reason: PypiIndexUrlError::BlockedHost { class },
+        }) => Some((*class, raw.to_string())),
+        _ => None,
+    }
 }
 
 /// One fully-resolved, ready-to-register routing chain — produced by
@@ -412,6 +426,53 @@ impl PypiIndexConfig {
                 _ => DependencySource::Registry,
             },
         }
+    }
+
+    /// Mirrors [`Self::resolve_source_for`]'s `named_source`/explicit-primary/uv-`tail_hop`
+    /// branches, but reports whether the entry that resolution used (or, for a blocked
+    /// `tail_hop`, would have used as the case-(b) chain's last-resort hop) was rejected
+    /// specifically because its host is blocked by the current
+    /// `registries.workspace_registries` policy — and if so, the blocked [`HostClass`], the
+    /// raw declared value, and a declaration key identifying *which* index declaration
+    /// produced it (`"primary"`, `"uv-tail"`, or `"named:<name>"`) (#925: so the block
+    /// surfaces as a diagnostic instead of only a `tracing::warn!`). `None` for every other
+    /// outcome (no override, a valid entry, or an entry invalid for a different reason).
+    ///
+    /// The declaration key is never the raw value itself (code-review correctness fix): an
+    /// explicit primary and a named source can both be blocked to the *same* URL, and a
+    /// diagnostic deduper keying on value alone would silently drop one of the two
+    /// independently-declared blocks — see
+    /// `deps_core::ecosystem::ParseResult::blocked_registries`'s own doc.
+    ///
+    /// `tail_hop` (uv's `default = true` index) is checked precisely when
+    /// [`Self::resolve_source_for`] would have consulted it — only when there is no explicit
+    /// `primary` (code-review finding #925 correctness bug: previously this method never
+    /// inspected `tail_hop` at all, so a blocked uv default index degraded
+    /// `Self::case_b_chain` all the way to the implicit public fallback — the exact
+    /// dependency-silently-resolves-against-the-wrong-registry failure mode #925 exists to
+    /// close — with zero diagnostic, the same silent-degradation shape as NuGet's own S1 fix).
+    ///
+    /// Deliberately does not cover a rejected `--extra-index-url`/supplemental-priority
+    /// entry: FR-006 already drops those from the fallback chain with only a warning (never
+    /// `CustomRegistry`), so there is no dependency-visible resolution outcome to attach a
+    /// diagnostic to. `tail_hop` is not an ordinary extra, though — it is the chain's
+    /// last-resort hop, replacing the implicit public fallback in that slot, so it gets the
+    /// same treatment as `primary`.
+    #[must_use]
+    pub fn blocked_class_for(
+        &self,
+        named_source: Option<&str>,
+    ) -> Option<(HostClass, String, String)> {
+        if let Some(name) = named_source {
+            let (class, raw) = blocked_class(self.named_sources.get(name)?)?;
+            return Some((class, raw, format!("named:{name}")));
+        }
+        if let Some(result) = &self.primary {
+            let (class, raw) = blocked_class(result)?;
+            return Some((class, raw, "primary".to_string()));
+        }
+        let (class, raw) = blocked_class(self.tail_hop.as_ref()?)?;
+        Some((class, raw, "uv-tail".to_string()))
     }
 
     /// Every chain this config implies, ready for registration — FR-005(a)/(b) resolved to
@@ -711,6 +772,49 @@ mod tests {
         assert!(config.resolved_chains().is_empty());
     }
 
+    /// #925 (mirrors `deps-cargo`'s
+    /// `test_parse_registry_index_literal_blocked_by_policy_populates_blocked_registries`): an
+    /// explicit primary rejected specifically because its host is blocked by policy must
+    /// populate `blocked_class_for`, not just fail closed to an unlabeled `CustomRegistry`.
+    #[test]
+    fn test_blocked_class_for_primary_blocked_by_policy() {
+        let policy = off_policy();
+        let mut config = PypiIndexConfig::new();
+        config.set_primary("https://127.0.0.1:9999/simple", &policy);
+
+        assert_eq!(
+            config.resolve_source_for(None),
+            DependencySource::CustomRegistry {
+                url: "https://127.0.0.1:9999/simple".to_string(),
+            }
+        );
+        let (class, raw_value, declaration_key) = config
+            .blocked_class_for(None)
+            .expect("blocked primary must be reported");
+        assert_eq!(class, HostClass::Loopback);
+        assert_eq!(raw_value, "https://127.0.0.1:9999/simple");
+        assert_eq!(declaration_key, "primary");
+    }
+
+    /// A primary rejected for a different reason (not a blocked host) must not be reported.
+    #[test]
+    fn test_blocked_class_for_none_when_primary_invalid_for_other_reason() {
+        let policy = all_policy();
+        let mut config = PypiIndexConfig::new();
+        config.set_primary("not-a-valid-url", &policy);
+        assert_eq!(config.blocked_class_for(None), None);
+    }
+
+    /// A valid primary, or no declaration at all, must never be reported as blocked.
+    #[test]
+    fn test_blocked_class_for_none_when_not_blocked() {
+        let policy = all_policy();
+        let mut config = PypiIndexConfig::new();
+        config.set_primary("https://pypi.mycorp.example/simple", &policy);
+        assert_eq!(config.blocked_class_for(None), None);
+        assert_eq!(PypiIndexConfig::new().blocked_class_for(None), None);
+    }
+
     /// An invalid extra is dropped, not escalated to `CustomRegistry` — the primary still
     /// resolves via its remaining valid hop(s) (S6-shaped: one bad extra must not break a
     /// chain that still has a working hop).
@@ -749,6 +853,54 @@ mod tests {
         let chains = config.resolved_chains();
         assert_eq!(chains.len(), 1);
         assert_eq!(chains[0].key, "https://internal.example/simple");
+    }
+
+    /// #925: a named source (Poetry `source =`/uv `index =`) rejected because its host is
+    /// blocked by policy must populate `blocked_class_for`, keyed by that source's own name.
+    #[test]
+    fn test_blocked_class_for_named_source_blocked_by_policy() {
+        let policy = off_policy();
+        let mut config = PypiIndexConfig::new();
+        config.add_named_source_resolved(
+            "internal".to_string(),
+            resolve_entry("https://127.0.0.1:9999/simple", &policy),
+        );
+
+        let (class, raw_value, declaration_key) = config
+            .blocked_class_for(Some("internal"))
+            .expect("blocked named source must be reported");
+        assert_eq!(class, HostClass::Loopback);
+        assert_eq!(raw_value, "https://127.0.0.1:9999/simple");
+        assert_eq!(declaration_key, "named:internal");
+        assert_eq!(config.blocked_class_for(None), None);
+    }
+
+    /// Code-review correctness fix (#925): an explicit primary and a named source that happen
+    /// to be blocked to the *identical* URL must still carry *different* declaration keys —
+    /// two independent declarations, not one — so a diagnostic deduper keyed on the
+    /// declaration (not the value) never conflates them.
+    #[test]
+    fn test_blocked_class_for_primary_and_named_source_sharing_url_have_distinct_declaration_keys()
+    {
+        let policy = off_policy();
+        let mut config = PypiIndexConfig::new();
+        config.set_primary("https://127.0.0.1:9999/simple", &policy);
+        config.add_named_source_resolved(
+            "internal".to_string(),
+            resolve_entry("https://127.0.0.1:9999/simple", &policy),
+        );
+
+        let (_, _, primary_key) = config
+            .blocked_class_for(None)
+            .expect("blocked primary must be reported");
+        let (_, _, named_key) = config
+            .blocked_class_for(Some("internal"))
+            .expect("blocked named source must be reported");
+        assert_ne!(
+            primary_key, named_key,
+            "two independently-declared blocked entries must never share a declaration key, \
+             even when their raw values coincide"
+        );
     }
 
     /// A `source = "<name>"` reference with no matching entry fails closed, not a silent
@@ -799,6 +951,68 @@ mod tests {
         assert_eq!(chains.len(), 1);
         assert_eq!(chains[0].hops.len(), 1);
         assert!(chains[0].implicit_public_fallback);
+    }
+
+    /// Code-review correctness finding (#925): a uv `default = true` index blocked by policy,
+    /// with no explicit primary and no extras, must populate `blocked_class_for` even though
+    /// `resolve_source_for` degrades all the way to plain `Registry` (zero-hop case-(b) chain)
+    /// — the same silent-degradation failure mode #925 exists to close, previously missed
+    /// entirely because `blocked_class_for` never inspected `tail_hop`.
+    #[test]
+    fn test_blocked_class_for_uv_default_blocked_with_no_extras_degrades_to_registry() {
+        let policy = off_policy();
+        let mut config = PypiIndexConfig::new();
+        config.set_tail_hop_resolved(resolve_entry("https://127.0.0.1:9999/simple", &policy));
+
+        assert_eq!(
+            config.resolve_source_for(None),
+            DependencySource::Registry,
+            "test premise: a blocked tail_hop with no extras degrades to the implicit public \
+             fallback, not CustomRegistry"
+        );
+        let (class, raw_value, declaration_key) = config
+            .blocked_class_for(None)
+            .expect("blocked uv default index must still be reported");
+        assert_eq!(class, HostClass::Loopback);
+        assert_eq!(raw_value, "https://127.0.0.1:9999/simple");
+        assert_eq!(declaration_key, "uv-tail");
+    }
+
+    /// The same blocked `tail_hop`, but with a valid extra present too: resolution still
+    /// succeeds (as an `AlternateRegistry` chain over the extra alone), yet the blocked
+    /// default index must still be reported — it silently vanished from its last-resort slot.
+    #[test]
+    fn test_blocked_class_for_uv_default_blocked_with_valid_extra_present() {
+        let policy = off_policy();
+        let mut config = PypiIndexConfig::new();
+        config.add_extra("https://extra.example/simple", &all_policy());
+        config.set_tail_hop_resolved(resolve_entry("https://127.0.0.1:9999/simple", &policy));
+
+        assert_matches!(
+            config.resolve_source_for(None),
+            DependencySource::AlternateRegistry { .. }
+        );
+        let (class, raw_value, declaration_key) = config
+            .blocked_class_for(None)
+            .expect("blocked uv default index must still be reported");
+        assert_eq!(class, HostClass::Loopback);
+        assert_eq!(raw_value, "https://127.0.0.1:9999/simple");
+        assert_eq!(declaration_key, "uv-tail");
+    }
+
+    /// An explicit primary takes priority over `tail_hop` entirely (FR-005(a) beats (b)) — a
+    /// blocked `tail_hop` must not be reported when it was never going to be consulted.
+    #[test]
+    fn test_blocked_class_for_tail_hop_ignored_when_primary_present() {
+        let policy = all_policy();
+        let mut config = PypiIndexConfig::new();
+        config.set_primary("https://primary.example/simple", &policy);
+        config.set_tail_hop_resolved(resolve_entry(
+            "https://127.0.0.1:9999/simple",
+            &off_policy(),
+        ));
+
+        assert_eq!(config.blocked_class_for(None), None);
     }
 
     /// NFR-001/SC-005 structural guarantee: a URL carrying userinfo is rejected at

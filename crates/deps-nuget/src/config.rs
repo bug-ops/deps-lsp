@@ -48,7 +48,7 @@ use std::sync::atomic::AtomicBool;
 use base64::Engine;
 use deps_core::PackageName;
 use deps_core::net_policy::{
-    IndexUrlError, PolicyGate, RedactedUrl, RegistryAccessPolicy, validate_index_url,
+    HostClass, IndexUrlError, PolicyGate, RedactedUrl, RegistryAccessPolicy, validate_index_url,
 };
 use deps_core::parser::DependencySource;
 use quick_xml::Reader;
@@ -635,6 +635,73 @@ impl NuGetConfig {
         self.resolve_plain()
     }
 
+    /// Mirrors [`Self::resolve_source_for`]'s exact branching (mapping first, plain chain
+    /// otherwise), but reports whether a source `package` would have used is blocked by the
+    /// current `registries.workspace_registries` policy — and if so, the blocked
+    /// [`HostClass`], the raw declared value, and a declaration key identifying *which*
+    /// declared `<add key>` source produced it (#925: so the block surfaces as a diagnostic
+    /// instead of only a `tracing::warn!`). `None` for every other outcome (no mapping match,
+    /// a usable hop, or a source invalid for a different reason).
+    ///
+    /// The declaration key is the source's own declared `<add key>` name — never the raw
+    /// value itself (code-review correctness fix): two independently `<add>`-ed sources can
+    /// coincidentally share a `value=` URL, and a diagnostic deduper keying on value alone
+    /// would silently drop one of the two independent blocks. Using the same key format for
+    /// both branches below also means a package routed to the same source through the
+    /// mapping *and* one routed to it through the plain chain (impossible in the same parse,
+    /// since the two are mutually exclusive, but a useful invariant to hold) would still
+    /// agree — see `deps_core::ecosystem::ParseResult::blocked_registries`'s own doc.
+    ///
+    /// Deliberately **not** gated on `Self::implicit_public_fallback` in the plain
+    /// (no-mapping) branch (#925 S1): the common real-world shape is a single declared feed
+    /// with no `<clear/>`, which — once that feed is blocked — resolves to plain
+    /// [`DependencySource::Registry`], not `CustomRegistry`. Without this, that exact case
+    /// (the sole declared source vanishing with no trace at all, silently substituting the
+    /// public registry) would reproduce the same silent-degradation bug class #925 exists to
+    /// close, only in a stealthier form than an unlabeled `CustomRegistry`.
+    #[must_use]
+    pub fn blocked_class_for(&self, package: &PackageName) -> Option<(HostClass, String, String)> {
+        if !self.mapping.is_empty() {
+            let name_lower = package.as_str().to_lowercase();
+            let keys = self.mapping.resolve_keys_for(&name_lower)?;
+            if !self.hops_for_mapping_keys(&keys).is_empty() {
+                return None;
+            }
+            return keys.iter().find_map(|key| {
+                let entry = resolve_mapping_source_key(key, &self.sources)?;
+                let (class, raw) = blocked_class(entry.value.as_ref())?;
+                Some((class, raw, format!("source:{}", entry.key)))
+            });
+        }
+        // Known gaps tracked as #944 M6/M7, deferred (not blocking #925): M6 — bailing out
+        // whenever *any* hop is valid still misses the common two-source shape (one working
+        // public/corp feed plus a separately blocked one), since `dedup`-by-`declaration_key`
+        // no longer requires collapsing that case the way the original fan-out concern did.
+        // M7 — the `find` below reports only the *first* invalid source, so an earlier
+        // unrelated invalid entry (bad URL, disabled, credentialed) can mask a later
+        // genuinely-blocked one.
+        if !self.valid_hops().is_empty() {
+            return None;
+        }
+        // Mirrors `resolve_plain`'s own `find_map` exactly (same first-invalid-entry, same
+        // order) so a reported class/raw pair always describes the same entry `resolve_plain`
+        // would have named in `CustomRegistry.url` had it not degraded to the implicit public
+        // fallback instead — not merely *some* blocked entry among several differently-invalid
+        // ones.
+        let entry = self.sources.iter().find(|s| s.value.is_err())?;
+        let Err(invalid) = &entry.value else {
+            unreachable!("filtered to Err above")
+        };
+        match &invalid.reason {
+            NuGetFeedUrlError::BlockedHost { class } => Some((
+                *class,
+                invalid.raw.to_string(),
+                format!("source:{}", entry.key),
+            )),
+            _ => None,
+        }
+    }
+
     fn resolve_via_mapping(&self, package: &PackageName) -> DependencySource {
         let name_lower = package.as_str().to_lowercase();
         let Some(keys) = self.mapping.resolve_keys_for(&name_lower) else {
@@ -666,24 +733,32 @@ impl NuGetConfig {
     /// forbids trusting the *key* of a source that **is** declared and points elsewhere;
     /// here nothing is declared under that key at all, so there is no spoofable entry to
     /// misidentify.
+    ///
+    /// Code-review correctness fix (#925): the "no declared entry" fallback above must trigger
+    /// on [`resolve_mapping_source_key`] itself returning `None` (the key names nothing in
+    /// `self.sources`), never on the resolved entry's `value` merely being `Err` (invalid,
+    /// disabled, credentialed, or policy-blocked). Collapsing those two distinct cases into one
+    /// `.and_then().or_else()` chain previously meant an explicitly-declared but
+    /// policy-blocked `nuget.org` source silently substituted the real public feed instead —
+    /// exactly the same wrong-registry-with-zero-diagnostic failure mode #925 exists to close,
+    /// and one [`NuGetConfig::blocked_class_for`] could never detect afterwards, since by the
+    /// time it ran, `hops_for_mapping_keys` had already produced a non-empty (if wrong) hop
+    /// list.
     fn hops_for_mapping_keys(&self, keys: &[&str]) -> Vec<ResolvedHop> {
         let mut hops = Vec::new();
         for key in keys {
-            let resolved = resolve_mapping_source_key(key, &self.sources)
-                .and_then(|entry| {
-                    entry.value.as_ref().ok().map(|url| ResolvedHop {
-                        url: url.clone(),
-                        slot: entry.auth.is_some().then(|| entry.key.to_lowercase()),
-                        auth: entry.auth.clone(),
-                    })
-                })
-                .or_else(|| {
-                    key.eq_ignore_ascii_case("nuget.org").then(|| ResolvedHop {
-                        url: NuGetFeedUrl::trusted_public(),
-                        slot: None,
-                        auth: None,
-                    })
-                });
+            let resolved = match resolve_mapping_source_key(key, &self.sources) {
+                Some(entry) => entry.value.as_ref().ok().map(|url| ResolvedHop {
+                    url: url.clone(),
+                    slot: entry.auth.is_some().then(|| entry.key.to_lowercase()),
+                    auth: entry.auth.clone(),
+                }),
+                None => key.eq_ignore_ascii_case("nuget.org").then(|| ResolvedHop {
+                    url: NuGetFeedUrl::trusted_public(),
+                    slot: None,
+                    auth: None,
+                }),
+            };
             if let Some(hop) = resolved
                 && !hops
                     .iter()
@@ -800,6 +875,18 @@ impl NuGetConfig {
 fn no_source(package: &PackageName) -> DependencySource {
     DependencySource::CustomRegistry {
         url: package.as_str().to_string(),
+    }
+}
+
+/// `Some((class, raw))` iff `value` is an entry rejected specifically for
+/// [`NuGetFeedUrlError::BlockedHost`] — used by [`NuGetConfig::blocked_class_for`].
+fn blocked_class(value: Result<&NuGetFeedUrl, &InvalidEntry>) -> Option<(HostClass, String)> {
+    match value {
+        Err(InvalidEntry {
+            raw,
+            reason: NuGetFeedUrlError::BlockedHost { class },
+        }) => Some((*class, raw.to_string())),
+        _ => None,
     }
 }
 
@@ -2587,6 +2674,166 @@ mod tests {
         );
     }
 
+    /// #925 (mirrors `deps-cargo`'s
+    /// `test_parse_registry_index_literal_blocked_by_policy_populates_blocked_registries`): a
+    /// sole declared source blocked by policy, with the implicit public fallback removed via
+    /// `<clear/>`, must populate `blocked_class_for`, not just fail closed to an unlabeled
+    /// `CustomRegistry`.
+    #[test]
+    fn test_blocked_class_for_plain_chain_blocked_by_policy() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let dir = tempfile::tempdir().unwrap();
+        write_config(
+            dir.path(),
+            r#"<configuration><packageSources>
+                <clear />
+                <add key="Blocked" value="https://169.254.169.254/v3/index.json" />
+            </packageSources></configuration>"#,
+        );
+        let cache = NuGetConfigCache::new();
+        let policy = RegistryAccessPolicy::new(WorkspaceRegistryAccess::PublicOnly);
+        let config = resolve(dir.path(), &cache, &policy);
+
+        assert_eq!(
+            config.resolve_source_for(&pkg("Any.Package")),
+            DependencySource::CustomRegistry {
+                url: "https://169.254.169.254/v3/index.json".to_string(),
+            },
+            "a blocked source must stay unresolved, not silently become Registry"
+        );
+        let (class, raw_value, declaration_key) = config
+            .blocked_class_for(&pkg("Any.Package"))
+            .expect("blocked entry must be reported");
+        assert_eq!(class, HostClass::CloudMetadata);
+        assert_eq!(raw_value, "https://169.254.169.254/v3/index.json");
+        assert_eq!(declaration_key, "source:Blocked");
+    }
+
+    /// #925 S1: the common real-world shape — a single declared feed, no `<clear/>` — must
+    /// still populate `blocked_class_for` even though `resolve_source_for` degrades all the
+    /// way to plain `Registry` (the implicit public fallback stays in effect for zero valid
+    /// hops without `<clear/>`). Before this fix, this exact case vanished with no trace at
+    /// all: not even an unlabeled `CustomRegistry`, just a silent switch to the public
+    /// registry — the same silent-degradation bug class #925 exists to close, in a stealthier
+    /// form.
+    #[test]
+    fn test_blocked_class_for_no_clear_still_reported_despite_registry_fallback() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let dir = tempfile::tempdir().unwrap();
+        write_config(
+            dir.path(),
+            r#"<configuration><packageSources>
+                <add key="Blocked" value="https://169.254.169.254/v3/index.json" />
+            </packageSources></configuration>"#,
+        );
+        let cache = NuGetConfigCache::new();
+        let policy = RegistryAccessPolicy::new(WorkspaceRegistryAccess::PublicOnly);
+        let config = resolve(dir.path(), &cache, &policy);
+
+        assert_eq!(
+            config.resolve_source_for(&pkg("Any.Package")),
+            DependencySource::Registry,
+            "test premise: without <clear/>, zero valid hops degrades to the implicit public \
+             fallback, not CustomRegistry"
+        );
+        let (class, raw_value, declaration_key) =
+            config.blocked_class_for(&pkg("Any.Package")).expect(
+                "blocked entry must still be reported even though resolution fell back to Registry",
+            );
+        assert_eq!(class, HostClass::CloudMetadata);
+        assert_eq!(raw_value, "https://169.254.169.254/v3/index.json");
+        assert_eq!(declaration_key, "source:Blocked");
+    }
+
+    /// The `<packageSourceMapping>` counterpart: a mapped package whose sole matching source
+    /// is blocked by policy must also populate `blocked_class_for`, keyed by that package.
+    #[test]
+    fn test_blocked_class_for_mapping_blocked_by_policy() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let dir = tempfile::tempdir().unwrap();
+        write_config(
+            dir.path(),
+            r#"<configuration>
+                <packageSources>
+                    <add key="Blocked" value="https://169.254.169.254/v3/index.json" />
+                </packageSources>
+                <packageSourceMapping>
+                    <packageSource key="Blocked">
+                        <package pattern="MyCompany.*" />
+                    </packageSource>
+                </packageSourceMapping>
+            </configuration>"#,
+        );
+        let cache = NuGetConfigCache::new();
+        let policy = RegistryAccessPolicy::new(WorkspaceRegistryAccess::PublicOnly);
+        let config = resolve(dir.path(), &cache, &policy);
+
+        assert_eq!(
+            config.resolve_source_for(&pkg("MyCompany.Internal")),
+            DependencySource::CustomRegistry {
+                url: "MyCompany.Internal".to_string(),
+            }
+        );
+        let (class, raw_value, declaration_key) = config
+            .blocked_class_for(&pkg("MyCompany.Internal"))
+            .expect("blocked mapped source must be reported");
+        assert_eq!(class, HostClass::CloudMetadata);
+        assert_eq!(raw_value, "https://169.254.169.254/v3/index.json");
+        assert_eq!(declaration_key, "source:Blocked");
+        assert_eq!(config.blocked_class_for(&pkg("Unrelated.Package")), None);
+    }
+
+    /// Code-review correctness fix (#925): two independently declared `<add key>` sources
+    /// that happen to be blocked to the *identical* URL must still carry *different*
+    /// declaration keys — so a diagnostic deduper keyed on the declaration (not the value)
+    /// never conflates them, silently dropping the diagnostic for packages routed to the
+    /// second source.
+    #[test]
+    fn test_blocked_class_for_two_sources_sharing_url_have_distinct_declaration_keys() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let dir = tempfile::tempdir().unwrap();
+        write_config(
+            dir.path(),
+            r#"<configuration>
+                <packageSources>
+                    <add key="FeedA" value="https://169.254.169.254/v3/index.json" />
+                    <add key="FeedB" value="https://169.254.169.254/v3/index.json" />
+                </packageSources>
+                <packageSourceMapping>
+                    <packageSource key="FeedA">
+                        <package pattern="MyCompany.*" />
+                    </packageSource>
+                    <packageSource key="FeedB">
+                        <package pattern="OtherCorp.*" />
+                    </packageSource>
+                </packageSourceMapping>
+            </configuration>"#,
+        );
+        let cache = NuGetConfigCache::new();
+        let policy = RegistryAccessPolicy::new(WorkspaceRegistryAccess::PublicOnly);
+        let config = resolve(dir.path(), &cache, &policy);
+
+        let (_, _, feed_a_key) = config
+            .blocked_class_for(&pkg("MyCompany.Internal"))
+            .expect("FeedA-blocked package must be reported");
+        let (_, _, feed_b_key) = config
+            .blocked_class_for(&pkg("OtherCorp.Internal"))
+            .expect("FeedB-blocked package must be reported");
+        assert_ne!(
+            feed_a_key, feed_b_key,
+            "two independently-declared blocked sources must never share a declaration key, \
+             even when their raw values coincide"
+        );
+    }
+
     // --- chain key invariant ---
 
     #[test]
@@ -2838,6 +3085,53 @@ mod tests {
                 url: "Newtonsoft.Json".to_string(),
             }
         );
+    }
+
+    /// Code-review correctness fix (#925): unlike the S1 case above (no `<packageSources>`
+    /// entry named `nuget.org` at all), an **explicitly declared** `nuget.org` source that is
+    /// itself policy-blocked must fail closed via the normal no-usable-hop path — not silently
+    /// substitute the real, trusted public feed. Before this fix, `hops_for_mapping_keys`
+    /// could not distinguish "no entry declared under this key" from "an entry is declared but
+    /// invalid", so the S1 fallback fired regardless and the block vanished with zero trace
+    /// (`blocked_class_for` could never detect it either, since `hops_for_mapping_keys` had
+    /// already produced a non-empty, if wrong, hop list).
+    #[test]
+    fn test_mapping_explicitly_declared_nuget_org_blocked_fails_closed_not_public_fallback() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let dir = tempfile::tempdir().unwrap();
+        write_config(
+            dir.path(),
+            r#"<configuration>
+                <packageSources>
+                    <add key="nuget.org" value="https://169.254.169.254/v3/index.json" />
+                </packageSources>
+                <packageSourceMapping>
+                    <packageSource key="nuget.org">
+                        <package pattern="*" />
+                    </packageSource>
+                </packageSourceMapping>
+            </configuration>"#,
+        );
+        let cache = NuGetConfigCache::new();
+        let policy = RegistryAccessPolicy::new(WorkspaceRegistryAccess::PublicOnly);
+        let config = resolve(dir.path(), &cache, &policy);
+
+        assert_eq!(
+            config.resolve_source_for(&pkg("Any.Package")),
+            DependencySource::CustomRegistry {
+                url: "Any.Package".to_string(),
+            },
+            "a blocked, explicitly-declared nuget.org source must fail closed, not silently \
+             substitute the real public feed"
+        );
+        let (class, raw_value, declaration_key) = config
+            .blocked_class_for(&pkg("Any.Package"))
+            .expect("blocked mapped nuget.org source must be reported");
+        assert_eq!(class, HostClass::CloudMetadata);
+        assert_eq!(raw_value, "https://169.254.169.254/v3/index.json");
+        assert_eq!(declaration_key, "source:nuget.org");
     }
 
     // --- S4: <remove key="..."/> ---
