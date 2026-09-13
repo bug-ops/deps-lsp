@@ -389,6 +389,28 @@ pub trait Dependency: Send + Sync {
         None
     }
 
+    /// Whether [`name_range`](Dependency::name_range) is a synthetic placeholder rather than a
+    /// real position in the manifest, for a dependency whose name was resolved from something
+    /// other than the live document text — e.g. `deps-dart`'s container-anchor alias
+    /// resolution (issue #905), where a whole `dependencies:`/`environment:` section aliased
+    /// via `*anchor` is reconstructed from a buffered subtree replayed at the alias site, so no
+    /// position in *this* occurrence's own text corresponds to the resolved name.
+    ///
+    /// `name_range()` itself has no `Option` to express this (unlike `version_range()`), so
+    /// callers that would otherwise treat it as a stable, real, per-dependency position must
+    /// check this hook first. In particular: a `HashMap` keyed by `name_range()` (e.g.
+    /// [`crate::osv::vulnerability_keys`]) must not key on it when this returns `true` — every
+    /// such dependency would share the exact same synthetic range and silently collide, one
+    /// evicting another's entry — and a hover/diagnostic anchor must not render at it either
+    /// (it typically resolves to `Range::default()`, i.e. document start).
+    ///
+    /// The default `false` is correct for every ecosystem whose dependency name is always
+    /// literal text at a real position — which, as of this writing, is every ecosystem except
+    /// the one case named above.
+    fn name_range_is_synthetic(&self) -> bool {
+        false
+    }
+
     /// Downcast to concrete type
     fn as_any(&self) -> &dyn Any;
 }

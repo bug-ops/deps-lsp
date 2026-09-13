@@ -197,6 +197,29 @@ impl ParseResult for MockParseResult {
     }
 }
 
+/// A [`ParseResult`] over heterogeneous [`Dependency`] impls — for tests that mix a
+/// [`MockDep`] with a [`MockSyntheticRangeDep`] in one document, which [`MockParseResult`]'s
+/// homogeneous `Vec<MockDep>` can't express.
+pub(crate) struct MockMixedParseResult {
+    pub(crate) deps: Vec<Box<dyn Dependency>>,
+    pub(crate) uri: Uri,
+}
+
+impl ParseResult for MockMixedParseResult {
+    fn dependencies(&self) -> Vec<&dyn Dependency> {
+        self.deps.iter().map(AsRef::as_ref).collect()
+    }
+    fn workspace_root(&self) -> Option<&std::path::Path> {
+        None
+    }
+    fn uri(&self) -> &Uri {
+        &self.uri
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 pub(crate) struct MockDep {
     pub(crate) name: PackageName,
     pub(crate) version_req: VersionReq,
@@ -219,6 +242,41 @@ impl Dependency for MockDep {
     }
     fn source(&self) -> crate::parser::DependencySource {
         crate::parser::DependencySource::Registry
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// A dependency whose `name_range()` is a synthetic placeholder
+/// (`Dependency::name_range_is_synthetic() == true`) and `version_range()` is always `None` —
+/// mirrors a `deps-dart` container-anchor-alias-resolved dependency (issue #905) for testing
+/// that `name_range()`-keyed lookups and position-based hover/diagnostic anchoring correctly
+/// skip it rather than treat `name_range()` as real. A separate, additive type rather than a
+/// new field on [`MockDep`] (used at many pre-existing call sites across this crate's tests)
+/// specifically so adding it touches none of them.
+pub(crate) struct MockSyntheticRangeDep {
+    pub(crate) name: PackageName,
+}
+
+impl Dependency for MockSyntheticRangeDep {
+    fn name(&self) -> &PackageName {
+        &self.name
+    }
+    fn name_range(&self) -> Range {
+        Range::default()
+    }
+    fn version_requirement(&self) -> Option<&VersionReq> {
+        None
+    }
+    fn version_range(&self) -> Option<Range> {
+        None
+    }
+    fn source(&self) -> crate::parser::DependencySource {
+        crate::parser::DependencySource::Registry
+    }
+    fn name_range_is_synthetic(&self) -> bool {
+        true
     }
     fn as_any(&self) -> &dyn Any {
         self
