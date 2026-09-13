@@ -15,9 +15,9 @@ use super::{ParseResult, PypiParser, RequirementRef};
 use crate::config::PypiIndexConfig;
 use crate::error::Result;
 use crate::types::{PypiDependencySection, PypiDependencySource};
-use deps_core::lsp_helpers::LineOffsetTable;
+use deps_core::lsp_helpers::{LineOffsetTable, byte_span_to_range};
 use deps_core::net_policy::RegistryAccessPolicy;
-use tower_lsp_server::ls_types::{Range, Uri};
+use tower_lsp_server::ls_types::Uri;
 
 /// Pip option tokens recognized on an option line (a line whose first
 /// whitespace-delimited token starts with `-`). Matched by exact equality
@@ -230,9 +230,11 @@ impl PypiParser {
                         let target_abs_start = abs_start + target_offset;
                         let target_abs_end = target_abs_start + target.len();
                         document_links.push(RequirementRef {
-                            range: Range::new(
-                                line_table.byte_offset_to_position(content, target_abs_start),
-                                line_table.byte_offset_to_position(content, target_abs_end),
+                            range: byte_span_to_range(
+                                content,
+                                &line_table,
+                                target_abs_start,
+                                target_abs_end,
                             ),
                             target: target.to_string(),
                         });

@@ -5,7 +5,7 @@
 
 use crate::types::{BundlerDependency, DependencyGroup, DependencySource};
 use deps_core::Result;
-use deps_core::lsp_helpers::LineOffsetTable;
+use deps_core::lsp_helpers::{LineOffsetTable, byte_span_to_range};
 use regex::Regex;
 use std::sync::LazyLock;
 use tower_lsp_server::ls_types::{Range, Uri};
@@ -151,10 +151,7 @@ pub fn parse_gemfile(content: &str, doc_uri: &Uri) -> Result<BundlerParseResult>
             let name_start = line_start + name_match.start();
             let name_end = line_start + name_match.end();
 
-            let name_range = Range::new(
-                line_table.byte_offset_to_position(content, name_start),
-                line_table.byte_offset_to_position(content, name_end),
-            );
+            let name_range = byte_span_to_range(content, &line_table, name_start, name_end);
 
             // Extract version if present
             let rest_of_line = &line[caps.get(0).unwrap().end()..];
@@ -214,10 +211,7 @@ fn extract_version(
         let version_start = base_offset + version_match.start();
         let version_end = base_offset + version_match.end();
 
-        let version_range = Range::new(
-            line_table.byte_offset_to_position(content, version_start),
-            line_table.byte_offset_to_position(content, version_end),
-        );
+        let version_range = byte_span_to_range(content, line_table, version_start, version_end);
 
         (Some(version), Some(version_range))
     } else {

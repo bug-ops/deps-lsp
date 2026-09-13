@@ -8,7 +8,7 @@
 //! `deps-maven::registry::parse_metadata_xml`'s remote, unbounded-by-default input.
 
 use crate::types::{MavenDependency, MavenScope};
-use deps_core::lsp_helpers::LineOffsetTable;
+use deps_core::lsp_helpers::{LineOffsetTable, byte_span_to_range};
 use deps_core::{DepsError, Result};
 use quick_xml::Reader;
 use quick_xml::events::Event;
@@ -326,9 +326,7 @@ fn text_range(
     if let Some(rel) = content[search_from..].find(text) {
         let abs_start = search_from + rel;
         let abs_end = abs_start + text.len();
-        let start = line_table.byte_offset_to_position(content, abs_start);
-        let end = line_table.byte_offset_to_position(content, abs_end);
-        Range::new(start, end)
+        byte_span_to_range(content, line_table, abs_start, abs_end)
     } else {
         Range::default()
     }

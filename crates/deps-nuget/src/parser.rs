@@ -368,11 +368,9 @@ fn attribute_byte_range(content: &str, raw: &str) -> (usize, usize) {
     (offset, offset + raw.len())
 }
 
+/// Adapts a `(start, end)` byte-offset pair to [`deps_core::lsp_helpers::byte_span_to_range`].
 fn span_to_range(content: &str, line_table: &LineOffsetTable, span: (usize, usize)) -> Range {
-    Range::new(
-        line_table.byte_offset_to_position(content, span.0),
-        line_table.byte_offset_to_position(content, span.1),
-    )
+    deps_core::lsp_helpers::byte_span_to_range(content, line_table, span.0, span.1)
 }
 
 fn decode_attr_value(raw: &str) -> String {

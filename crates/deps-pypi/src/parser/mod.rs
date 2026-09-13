@@ -770,11 +770,9 @@ fn span_start(content: &str, line_table: &LineOffsetTable, span: toml_span::Span
     line_table.byte_offset_to_position(content, span.start)
 }
 
-/// Converts a byte span to an LSP `Range` using the pre-computed line table.
+/// Adapts a `toml_span::Span` to [`deps_core::lsp_helpers::byte_span_to_range`].
 fn span_to_range(content: &str, line_table: &LineOffsetTable, span: toml_span::Span) -> Range {
-    let start = line_table.byte_offset_to_position(content, span.start);
-    let end = line_table.byte_offset_to_position(content, span.end);
-    Range::new(start, end)
+    deps_core::lsp_helpers::byte_span_to_range(content, line_table, span.start, span.end)
 }
 
 /// Parses a raw PEP 508 marker expression and serializes it back through

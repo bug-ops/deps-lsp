@@ -24,7 +24,7 @@ use jsonc_parser::{CollectOptions, ParseOptions, parse_to_ast};
 use std::collections::HashMap;
 use tower_lsp_server::ls_types::Range;
 
-use crate::lsp_helpers::LineOffsetTable;
+use crate::lsp_helpers::{LineOffsetTable, byte_span_to_range};
 
 /// Finds the property named `key` among `object`'s own direct children, taking the *last* one
 /// if `key` occurs more than once.
@@ -206,10 +206,9 @@ fn dependency_position(
         // Defensive only: an unquoted property name can't occur in content already accepted by
         // `parse_json_checked`'s strict-JSON parse, but this must not mis-trim quotes that
         // aren't there if it somehow does.
-        ObjectPropName::Word(lit) => Range::new(
-            table.byte_offset_to_position(content, lit.range.start),
-            table.byte_offset_to_position(content, lit.range.end),
-        ),
+        ObjectPropName::Word(lit) => {
+            byte_span_to_range(content, table, lit.range.start, lit.range.end)
+        }
     };
     let version_range = match &prop.value {
         Value::StringLit(lit) => Some(quoted_lsp_range(content, table, lit.range)),
@@ -225,10 +224,7 @@ fn quoted_lsp_range(
     table: &LineOffsetTable,
     range: jsonc_parser::common::Range,
 ) -> Range {
-    Range::new(
-        table.byte_offset_to_position(content, range.start + 1),
-        table.byte_offset_to_position(content, range.end.saturating_sub(1)),
-    )
+    byte_span_to_range(content, table, range.start + 1, range.end.saturating_sub(1))
 }
 
 // #673: fixed test-fixture lengths cast to `u32` for `Position`/`Range` assertions never

@@ -14,7 +14,7 @@
 use crate::specifier::parse_specifier;
 use crate::types::{DenoDependency, DenoDependencySection};
 use deps_core::json_ast::find_last_prop;
-use deps_core::lsp_helpers::LineOffsetTable;
+use deps_core::lsp_helpers::{LineOffsetTable, byte_span_to_range};
 use deps_core::{
     DepsError, MAX_JSON_NESTING_DEPTH, PackageName, Result, VersionReq, json_depth_error_message,
 };
@@ -22,7 +22,7 @@ use jsonc_parser::ast::{Object, StringLit, Value};
 use jsonc_parser::{CollectOptions, ParseOptions, parse_to_ast};
 use std::borrow::Cow;
 use std::collections::HashSet;
-use tower_lsp_server::ls_types::{Range, Uri};
+use tower_lsp_server::ls_types::Uri;
 
 /// Result of parsing a `deno.json`/`deno.jsonc` file.
 #[non_exhaustive]
@@ -232,7 +232,7 @@ fn build_dependency(
         let inner_end = value_lit.range.end.saturating_sub(1);
         return Some(DenoDependency {
             name: PackageName::new(parsed.name),
-            name_range: byte_range_to_lsp(content, line_table, inner_start, inner_end),
+            name_range: byte_span_to_range(content, line_table, inner_start, inner_end),
             version_req: parsed.version_req.map(VersionReq::new),
             version_range: None,
             section: DenoDependencySection::Imports,
@@ -243,14 +243,14 @@ fn build_dependency(
     let value_start = value_lit.range.start + 1;
 
     if let Some(parsed) = parse_specifier(raw_value) {
-        let name_range = byte_range_to_lsp(
+        let name_range = byte_span_to_range(
             content,
             line_table,
             value_start + parsed.name_range.start,
             value_start + parsed.name_range.end,
         );
         let version_range = parsed.version_range.map(|r| {
-            byte_range_to_lsp(
+            byte_span_to_range(
                 content,
                 line_table,
                 value_start + r.start,
@@ -276,7 +276,7 @@ fn build_dependency(
     // — validity is deferred to `DenoFormatter::validate_package_name`'s diagnostic, not
     // gated at parse time.
     let partial_range = crate::specifier::partial_name_range(raw_value)?;
-    let name_range = byte_range_to_lsp(
+    let name_range = byte_span_to_range(
         content,
         line_table,
         value_start + partial_range.start,
@@ -290,14 +290,6 @@ fn build_dependency(
         version_range: None,
         section: DenoDependencySection::Imports,
     })
-}
-
-/// Converts a `[start, end)` byte range in `content` to an LSP `Range`.
-fn byte_range_to_lsp(content: &str, table: &LineOffsetTable, start: usize, end: usize) -> Range {
-    Range::new(
-        table.byte_offset_to_position(content, start),
-        table.byte_offset_to_position(content, end),
-    )
 }
 
 #[cfg(test)]
