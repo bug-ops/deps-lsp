@@ -954,6 +954,11 @@ fn blocked_registry_diagnostics(
 }
 
 /// Builds the [`Diagnostic`] for one [`BlockedRegistryOccurrence`], anchored at its own range.
+///
+/// Includes `declaration_key` alongside `raw_value` (impl-critic M1 on #965/#966): without it,
+/// two independently declared sources sharing the same `raw_value` — a real, intended shape,
+/// see [`BlockedRegistryOccurrence::raw_value`]'s own doc — render as byte-identical messages,
+/// even though each is its own diagnostic anchored at a different declaration.
 fn build_blocked_registry_diagnostic(occurrence: &BlockedRegistryOccurrence) -> Diagnostic {
     // #936: `raw_value` is a raw, unvalidated `registry`/`registry-index` literal that can
     // carry a query-string credential (userinfo is rejected earlier in the pipeline, but
@@ -961,14 +966,37 @@ fn build_blocked_registry_diagnostic(occurrence: &BlockedRegistryOccurrence) -> 
     // message to stay identifiable while the credential never reaches this
     // client-visible diagnostic.
     let redacted_value = RedactedUrl::new(&occurrence.raw_value).to_string();
+    // `declaration_key` is implementation-opaque (see its own doc): most implementors use a
+    // short label (`"top-level"`, `"source:Blocked"`, `"scope:@myorg"`) that `RedactedUrl`'s
+    // userinfo-scan would mangle (it is tuned for actual URLs, and a bare `label:rest` shape
+    // reads exactly like a schemeless `user:pass@host` credential to that scan) — so the
+    // userinfo-redaction step only runs when the key is actually URL-shaped (`deps_cargo`
+    // reuses the raw value verbatim as its own key). The query-string truncation half of
+    // `url_for_tracing`/`RedactedUrl`, however, is scheme-agnostic and must run unconditionally
+    // (impl-critic follow-up): a scheme-colon, slash-less URL (`"https:host/path?api_key=…"`)
+    // still classifies as a blocked host without ever containing `"://"`, and gating query
+    // truncation on that same check would let a query-string credential in `declaration_key`
+    // leak through this field — the exact #936 leak class the `raw_value` redaction above
+    // exists to close.
+    let redacted_key = if occurrence.declaration_key.contains("://") {
+        RedactedUrl::new(&occurrence.declaration_key).to_string()
+    } else {
+        occurrence
+            .declaration_key
+            .split(['?', '#'])
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    };
     Diagnostic {
         range: occurrence.range,
         severity: Some(DiagnosticSeverity::INFORMATION),
         message: format!(
             "registry index \"{}\" blocked by registries.workspace_registries policy \
-             (host class: {})",
+             (host class: {}; declaration: {})",
             truncate_for_diagnostic(&redacted_value, MAX_BLOCKED_REGISTRY_MESSAGE_VALUE_CHARS),
-            occurrence.class
+            occurrence.class,
+            truncate_for_diagnostic(&redacted_key, MAX_BLOCKED_REGISTRY_MESSAGE_VALUE_CHARS),
         ),
         source: Some("deps-lsp".into()),
         ..Default::default()
@@ -2144,6 +2172,87 @@ mod tests {
         assert!(blocked_diagnostic.message.contains("/api"));
     }
 
+    /// Impl-critic follow-up on M1 (#965/#966): a scheme-colon, slash-less URL
+    /// (`"https:host/path?..."`) still classifies as a blocked host (see
+    /// `deps_cargo::parser`'s own raw-value-reused declaration key), but never contains
+    /// `"://"` — so gating query-string truncation on that substring, not just the
+    /// userinfo-redaction step, would let a query-string credential in `declaration_key` leak
+    /// through this field even though `raw_value`'s own redaction still catches it. Both
+    /// fields must have the credential stripped.
+    #[test]
+    fn test_generate_diagnostics_from_cache_blocked_registry_message_redacts_query_string_credential_in_declaration_key_without_scheme_slashes()
+     {
+        use crate::net_policy::HostClass;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        struct BlockedRegistryParseResult {
+            deps: Vec<MockDep>,
+            uri: Uri,
+            blocked: Vec<BlockedRegistryOccurrence>,
+        }
+
+        impl ParseResult for BlockedRegistryParseResult {
+            fn dependencies(&self) -> Vec<&dyn Dependency> {
+                self.deps.iter().map(|d| d as &dyn Dependency).collect()
+            }
+            fn workspace_root(&self) -> Option<&std::path::Path> {
+                None
+            }
+            fn uri(&self) -> &Uri {
+                &self.uri
+            }
+            fn blocked_registries(&self) -> Vec<BlockedRegistryOccurrence> {
+                self.blocked.clone()
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        let name_range = Range::new(Position::new(0, 0), Position::new(0, 14));
+        let formatter = MockFormatter;
+        let slash_less = "https:169.254.169.254/v3/index.json?api_key=SECRET".to_string();
+        let parse_result = BlockedRegistryParseResult {
+            deps: vec![MockDep {
+                name: "internal-crate".into(),
+                version_req: "1.0.0".into(),
+                version_range: Range::new(Position::new(0, 20), Position::new(0, 25)),
+                name_range,
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+            blocked: vec![BlockedRegistryOccurrence {
+                range: name_range,
+                class: HostClass::CloudMetadata,
+                raw_value: slash_less.clone(),
+                declaration_key: slash_less,
+            }],
+        };
+
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        let blocked_diagnostic = diagnostics
+            .iter()
+            .find(|d| d.message.contains("blocked"))
+            .expect("expected a blocked-registry diagnostic");
+        assert!(
+            !blocked_diagnostic.message.contains("SECRET"),
+            "declaration_key's query-string credential must be stripped even without \"://\", \
+             got: {blocked_diagnostic:?}"
+        );
+        assert!(blocked_diagnostic.message.contains("169.254.169.254"));
+    }
+
     /// #925 S2 (then corrected by a later code-review pass, finding #3): a config-global
     /// block (e.g. a single blocked top-level registry override) applies identically to every
     /// dependency in the file — `blocked_registries()` reports one entry per affected
@@ -2287,6 +2396,24 @@ mod tests {
             "related_information message must name the collapsed sibling dependency, got: {:?}",
             related[0].message
         );
+
+        // Impl-critic M1 on #965/#966: the anchor (declaration "top-level") and the
+        // third-entry diagnostic (declaration "scope:@myorg") share the identical `raw_value`
+        // and `class` — without the declaration key in the message, they would render
+        // byte-identical, contradicting `BlockedRegistryOccurrence::raw_value`'s own
+        // "two different blocked aliases render as two distinguishable diagnostic messages"
+        // invariant.
+        let third = blocked_diagnostics
+            .iter()
+            .find(|d| d.range == third_range)
+            .expect("diagnostic for the differently-declared third occurrence must exist");
+        assert_ne!(
+            anchor.message, third.message,
+            "two independently-declared blocked sources sharing the same raw_value must not \
+             render byte-identical diagnostic messages"
+        );
+        assert!(anchor.message.contains("top-level"));
+        assert!(third.message.contains("scope:@myorg"));
     }
 
     /// #944 S2/M3 regression: `push_collapsed_blocked_registries` caps individually-named

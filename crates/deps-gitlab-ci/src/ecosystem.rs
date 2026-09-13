@@ -222,9 +222,15 @@ impl Ecosystem for GitlabCiEcosystem {
                         &dep.source
                         && refused.contains(index)
                     {
+                        // The `PolicyBlocked` alternative is unreachable in practice: it never
+                        // produces a route (`build_source_and_route` returns `None` for it),
+                        // so its source is never `AlternateRegistry` — included only for match
+                        // exhaustiveness.
                         let origin = match &dep.host {
                             HostRef::Literal(host) => host.origin().to_string(),
-                            HostRef::Unresolved(raw) | HostRef::CapacityRefused(raw) => raw.clone(),
+                            HostRef::Unresolved(raw)
+                            | HostRef::CapacityRefused(raw)
+                            | HostRef::PolicyBlocked { raw, .. } => raw.clone(),
                         };
                         dep.source = deps_core::parser::DependencySource::CustomRegistry {
                             url: origin.clone(),
@@ -561,7 +567,12 @@ fn unresolved_host_diagnostics(parse_result: &dyn ParseResultTrait) -> Vec<Diagn
                          (unrelated to the `registries.gitlab_instance_host` setting)."
                     )
                 }
-                HostRef::Literal(_) => return None,
+                // Issue #967: a policy-blocked host is surfaced through
+                // `ParseResult::blocked_registries` (via `generate_diagnostics_from_cache`'s
+                // shared `blocked_registry_diagnostics` path) instead — the host itself is
+                // fully determinable, so the `Unresolved` message above (which tells the user
+                // to set `registries.gitlab_instance_host`) would misattribute the cause.
+                HostRef::Literal(_) | HostRef::PolicyBlocked { .. } => return None,
             };
             Some(Diagnostic {
                 range: gl_dep.name_range,
@@ -1141,6 +1152,7 @@ mod tests {
             routes: vec![],
             uri,
             dependency_truncation: None,
+            blocked_registries: Vec::new(),
         };
 
         let diagnostics = unresolved_host_diagnostics(&parse_result);
@@ -1197,6 +1209,108 @@ mod tests {
             .expect("expected the unresolved-host diagnostic");
         assert_eq!(found.severity, Some(DiagnosticSeverity::INFORMATION));
         assert!(found.message.contains("gitlab_instance_host"));
+    }
+
+    /// Issue #967 end-to-end, inline-literal `component:` host path: a `component:` host
+    /// blocked by `registries.workspace_registries` must produce the shared blocked-registry
+    /// INFORMATION diagnostic (naming the blocked host class), and must **not** produce the
+    /// unresolved-host diagnostic (which would misattribute the cause to
+    /// `registries.gitlab_instance_host`).
+    #[tokio::test]
+    async fn test_generate_diagnostics_component_host_blocked_by_policy() {
+        let cache = Arc::new(HttpCache::new());
+        // `RegistryAccessPolicy::default()` is `PublicOnly` (blocks `10.0.0.1`, a private
+        // address) — `GitlabCiEcosystem::new` wires it in directly.
+        let eco = GitlabCiEcosystem::new(cache);
+        let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+        let content = "include:\n  - component: 10.0.0.1/org/proj/comp@1.0.0\n";
+        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+        let cached = std::collections::HashMap::new();
+        let resolved = std::collections::HashMap::new();
+
+        let diagnostics = eco
+            .generate_diagnostics(
+                parse_result.as_ref(),
+                deps_core::VersionData::new(&cached, &resolved),
+                &uri,
+                deps_core::FreshnessSettings::default(),
+                deps_core::lsp_helpers::DiagnosticSeverities::default(),
+            )
+            .await;
+
+        let blocked: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.to_lowercase().contains("blocked"))
+            .collect();
+        assert_eq!(
+            blocked.len(),
+            1,
+            "expected exactly one blocked-registry diagnostic, got: {diagnostics:?}"
+        );
+        assert_eq!(blocked[0].severity, Some(DiagnosticSeverity::INFORMATION));
+        assert!(
+            diagnostics.iter().all(|d| d.code
+                != Some(NumberOrString::String(
+                    UNRESOLVED_HOST_DIAGNOSTIC_CODE.into()
+                ))),
+            "must not surface the unresolved-host diagnostic for a policy-blocked host: \
+             {diagnostics:?}"
+        );
+        assert!(diagnostics.iter().all(|d| {
+            !d.message
+                .contains("Cannot determine the GitLab instance host")
+        }),);
+    }
+
+    /// Issue #967 end-to-end, `registries.gitlab_instance_host`-relative path: same as above,
+    /// but for a `project:` include resolving through a blocked instance-host setting rather
+    /// than an inline-literal `component:` host.
+    #[tokio::test]
+    async fn test_generate_diagnostics_instance_host_blocked_by_policy() {
+        let cache = Arc::new(HttpCache::new());
+        let policy = Arc::new(RegistryAccessPolicy::default());
+        let gitlab_instance_host_raw = Arc::new(RwLock::new(Some("10.0.0.1".to_string())));
+        let eco = GitlabCiEcosystem::with_context(cache, policy, gitlab_instance_host_raw);
+        let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+        let content = "include:\n  - project: org/proj\n    ref: v1.0.0\n";
+        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+        let cached = std::collections::HashMap::new();
+        let resolved = std::collections::HashMap::new();
+
+        let diagnostics = eco
+            .generate_diagnostics(
+                parse_result.as_ref(),
+                deps_core::VersionData::new(&cached, &resolved),
+                &uri,
+                deps_core::FreshnessSettings::default(),
+                deps_core::lsp_helpers::DiagnosticSeverities::default(),
+            )
+            .await;
+
+        let blocked: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.to_lowercase().contains("blocked"))
+            .collect();
+        assert_eq!(
+            blocked.len(),
+            1,
+            "expected exactly one blocked-registry diagnostic, got: {diagnostics:?}"
+        );
+        // S1: the message must name the real configured value, not the `$CI_SERVER_FQDN`
+        // placeholder, which appears nowhere in this manifest or its config.
+        assert!(blocked[0].message.contains("10.0.0.1"));
+        assert!(
+            diagnostics.iter().all(|d| d.code
+                != Some(NumberOrString::String(
+                    UNRESOLVED_HOST_DIAGNOSTIC_CODE.into()
+                ))),
+            "must not surface the unresolved-host diagnostic for a policy-blocked host: \
+             {diagnostics:?}"
+        );
+        assert!(diagnostics.iter().all(|d| {
+            !d.message
+                .contains("Cannot determine the GitLab instance host")
+        }),);
     }
 
     // --- issue #634: mutable-ref-pin diagnostic + "Pin to commit SHA" code action ---
@@ -1865,6 +1979,7 @@ mod tests {
             routes: vec![],
             uri: uri.clone(),
             dependency_truncation: None,
+            blocked_registries: Vec::new(),
         };
         (registry, formatter, parse_result, uri, range.start)
     }
@@ -2571,6 +2686,7 @@ mod tests {
             routes: vec![],
             uri,
             dependency_truncation: None,
+            blocked_registries: Vec::new(),
         };
         let content = "include:\n  - project: org/proj\n    ref: v1.0.0\n";
         let cache = Arc::new(HttpCache::new());
@@ -2606,6 +2722,7 @@ mod tests {
             routes: vec![],
             uri,
             dependency_truncation: None,
+            blocked_registries: Vec::new(),
         };
         let content = "include:\n  - project: org/proj\n    ref: v1.0.0\n";
         let cache = Arc::new(HttpCache::new());
@@ -2644,6 +2761,7 @@ mod tests {
             routes: vec![],
             uri,
             dependency_truncation: None,
+            blocked_registries: Vec::new(),
         };
         let content = "include:\n  - project: org/proj\n    ref: v1.0.0\n";
         let cache = Arc::new(HttpCache::new());
@@ -2722,6 +2840,7 @@ mod tests {
             routes: vec![],
             uri: uri.clone(),
             dependency_truncation: None,
+            blocked_registries: Vec::new(),
         };
         let content = "include:\n  - project: org/proj\n    ref: *pin\n";
         let cache = Arc::new(HttpCache::new());
@@ -2761,6 +2880,7 @@ mod tests {
             routes: vec![],
             uri,
             dependency_truncation: None,
+            blocked_registries: Vec::new(),
         };
         let content = "include:\n  - project: org/proj\n    ref: *pin\n";
         let cache = Arc::new(HttpCache::new());
@@ -2797,6 +2917,7 @@ mod tests {
             routes: vec![],
             uri,
             dependency_truncation: None,
+            blocked_registries: Vec::new(),
         };
         let cache = Arc::new(HttpCache::new());
         let eco = GitlabCiEcosystem::new(cache);
@@ -2825,6 +2946,7 @@ mod tests {
             routes: vec![],
             uri,
             dependency_truncation: None,
+            blocked_registries: Vec::new(),
         };
         let cache = Arc::new(HttpCache::new());
         let eco = GitlabCiEcosystem::new(cache);

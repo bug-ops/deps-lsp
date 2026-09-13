@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **deps-core**: `LockFileCache::with_capacity` and `DEFAULT_MAX_CACHED_LOCKFILES` — a custom-capacity constructor and the new default entry-count bound (resolves #962) (#971)
+
 ### Changed
 - **deps-core, deps-pypi, deps-npm, deps-go, deps-nuget**: consolidated four near-identical validated-registry-URL newtypes into one generic `deps_core::net_policy::ValidatedRegistryUrl<K>` plus a shared `InvalidEntry<E>` (deps-cargo excluded, see spec D1) (resolves #959) (#974)
 - `specs/constitution.md`: rewrote principle 7 with a post-1.0 breaking-change policy (major-bump-per-crate, a labeled "Breaking" changelog entry, `cargo-semver-checks` as the CI catch-net) alongside the existing pre-1.0 clean-break rule (resolves #948) (#957)
@@ -26,10 +29,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking (pre-1.0, public API)**: **deps-core**: removed the unused `severities: DiagnosticSeverities` parameter from `Ecosystem::generate_code_lenses` — the override it was added for was deleted, and no other override ever read it (resolves #930) (#951)
 
 ### Fixed
+- **deps-gitlab-ci**: a GitLab instance host blocked by `registries.workspace_registries` policy (via `registries.gitlab_instance_host` or an inline `component:` host) now surfaces the shared blocked-registry informational diagnostic naming the blocked host class, instead of the misattributed "set `registries.gitlab_instance_host`" message, matching `deps-cargo`/`deps-npm`/`deps-pypi`/`deps-nuget`'s existing behavior (resolves #967) (#973)
+- **deps-nuget**: a plain (non-mapping) source chain declaring two or more independently blocked feeds now reports every one of them as its own diagnostic, instead of only the first found (resolves #965) (#972)
+- **deps-core, deps-nuget, deps-npm, deps-pypi**: `blocked_class_for`'s internal `(HostClass, String, String)` result is now the named `deps_core::BlockedSourceClass` struct, closing the same raw-value/declaration-key field-swap risk `BlockedRegistryOccurrence` was already converted off of (resolves #966) (#972)
 - **deps-nuget, deps-core, deps-cargo, deps-npm, deps-pypi**: fixed four #925 follow-up gaps in blocked-custom-registry-host detection — NuGet's plain-chain and mapping-shaped source branches no longer mask a blocked host behind a coexisting valid or earlier-invalid source, Cargo/npm/PyPI dependencies sharing a blocked-registry declaration each keep their own visible diagnostic via bounded `related_information`, and `ParseResult::blocked_registries()` now returns a named struct instead of a positional 4-tuple (resolves #944) (#964)
+- **deps-core**: `LockFileCache` is now bounded (256 entries by default) with least-recently-parsed eviction, and its lock file discovery/read now run entirely on the blocking-thread pool instead of the calling tokio worker (resolves #962, #963) (#971)
 - **deps-dart**: removed flaky wall-clock-ratio assertions from three `pubspec.yaml` parser tests and replaced them with deterministic correctness checks, plus a new `dart_benchmarks` criterion suite to observe scaling behavior locally (resolves #946) (#953)
 - **deps-core**: version-completion dropdown and code-action "update version" quick-fix now source their `(latest)` label/preselection from the same registry-delegated pick hover already uses, instead of raw fetch-order index 0 or a re-derived `is_stable()` scan — fixes mislabeling a pre-release or a newer deprecated release as latest (resolves #952, sibling of #313) (#955)
 - **deps-core**: the completion dropdown and code-action quick-fix no longer silently drop the `(latest)` marker when the registry-selected version falls outside the 5-entry raw-order display window — it is now bumped into the displayed window instead (resolves #956) (#960)
+- **deps-core**: hover's "Recent versions" list no longer silently drops the `(latest)` marker when the registry-selected pick falls outside the 8-entry raw-order display window — it is now bumped into the displayed window instead, matching completion/code-actions' #956 fix (resolves #961) (#970)
 - **deps-npm, deps-pypi, deps-nuget**: a dependency whose custom-registry resolution is blocked by `registries.workspace_registries` policy now surfaces an informational diagnostic on its own line, matching `deps-cargo`'s existing behavior, instead of degrading silently to the public registry with no trace (resolves #925) (#949)
 - **deps-go**: a `GOPROXY` hop blocked by `registries.workspace_registries` policy now surfaces a single informational diagnostic per document, instead of only a `tracing::warn!` with no editor-visible trace (resolves #958) (#968)
 - **deps-gitlab-ci**: an alias key (`*k: value`) whose resolved anchor text matches a recognized `include:`-entry field name is now reinterpreted as that key, the same as a literal key (resolves #942) (#954)

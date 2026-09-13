@@ -211,13 +211,8 @@ pub fn parse_package_json_with_context(
         // name to the public registry, or a public package to a private feed.
         let name = deps_core::Dependency::name(dep).clone();
         dep.source = npm_config.resolve_source_for(&name);
-        if let Some((class, raw_value, declaration_key)) = npm_config.blocked_class_for(&name) {
-            blocked_registries.push(deps_core::BlockedRegistryOccurrence {
-                range: dep.name_range,
-                class,
-                raw_value,
-                declaration_key,
-            });
+        if let Some(classification) = npm_config.blocked_class_for(&name) {
+            blocked_registries.push(classification.into_occurrence(dep.name_range));
         }
     }
 

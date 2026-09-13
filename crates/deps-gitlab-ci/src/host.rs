@@ -9,8 +9,8 @@
 //!   host `GITLAB_TOKEN` may ever be attached to (replacing, not extending, `gitlab.com`).
 
 use deps_core::net_policy::{
-    IndexUrlError, PolicyGate, RedactedUrl, RegistryAccessPolicy, WorkspaceRegistryAccess,
-    validate_index_url,
+    HostClass, IndexUrlError, PolicyGate, RedactedUrl, RegistryAccessPolicy,
+    WorkspaceRegistryAccess, validate_index_url,
 };
 use std::sync::{Arc, RwLock};
 
@@ -185,23 +185,41 @@ pub(crate) fn is_valid_path_segment(seg: &str) -> bool {
         && !deps_core::lsp_helpers::is_dot_segment(seg)
 }
 
-/// Tri-state outcome of resolving `registries.gitlab_instance_host` (spec FR-005a/FR-011a).
+/// Outcome of resolving `registries.gitlab_instance_host` (spec FR-005a/FR-011a).
 ///
 /// Distinct from a plain `Option<GitlabHost>` (security review, issue #466 H-security):
 /// [`token_host_origin`] must tell "unset" — the correct, intentional `gitlab.com` default —
 /// apart from "configured but rejected", which must **never** fall back to `gitlab.com`.
 /// Collapsing the two meant an invalid/policy-rejected value silently redirected
 /// `PRIVATE-TOKEN` to `gitlab.com`, leaking a self-hosted credential to the wrong host.
-/// [`GitlabInstanceHost::get`] still collapses `Unset`/`Invalid` to `None` for every other
-/// caller (host *resolution*, not token routing, where "can't resolve" is the same outcome
-/// either way).
+/// [`Self::Blocked`] is kept distinct from [`Self::Invalid`] for the same reason `crate::parser`
+/// needs them apart (issue #967): a policy block has a different fix (relax the policy) than a
+/// malformed value (reconfigure the setting). [`GitlabInstanceHost::get`] still collapses
+/// `Unset`/`Invalid`/`Blocked` to `None` for every other caller (host *resolution*, not token
+/// routing or diagnostic messaging, where "can't resolve" is the same outcome either way).
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum InstanceHostOutcome {
+pub(crate) enum InstanceHostOutcome {
     /// `registries.gitlab_instance_host` is not configured.
     Unset,
-    /// Configured, but rejected by [`GitlabHost::parse`] (malformed, non-`https`-eligible,
-    /// or a blocked [`deps_core::net_policy::HostClass`]).
+    /// Configured, but rejected by [`GitlabHost::parse`] for a reason other than a blocked
+    /// host class (malformed, non-`https`-eligible, carries userinfo, ...).
     Invalid,
+    /// Configured, but rejected specifically because its host class is blocked by the
+    /// current `registries.workspace_registries` policy (issue #967) — kept distinct from
+    /// [`Self::Invalid`] so callers can surface the correct diagnostic (the fix is to relax
+    /// the policy, not to reconfigure `registries.gitlab_instance_host`).
+    ///
+    /// A named struct variant, not a positional tuple (code-review follow-up, consistency
+    /// with [`crate::types::HostRef::PolicyBlocked`]'s own #944 M9-style rationale): `raw`
+    /// and `class` differ in type today so a swap wouldn't compile, but naming them keeps the
+    /// two `Blocked` shapes in this crate consistent as either evolves.
+    Blocked {
+        /// The configured raw value itself (#967 S1: a caller needs the real blocked
+        /// string, not a placeholder, to name it accurately in a diagnostic).
+        raw: String,
+        /// The blocked host's classification.
+        class: HostClass,
+    },
     /// Configured and validated successfully.
     Valid(GitlabHost),
 }
@@ -220,7 +238,8 @@ enum InstanceHostOutcome {
 /// [`RegistryAccessPolicy`] mutates in place: a host accepted under a looser policy must not
 /// keep resolving once the policy tightens). A rejected value is treated as unset for host
 /// *resolution* purposes ([`Self::get`] returns `None`), but is tracked distinctly
-/// (`InstanceHostOutcome::Invalid`) for token-host routing — see [`token_host_origin`].
+/// (`InstanceHostOutcome::Invalid`/`InstanceHostOutcome::Blocked`) for token-host routing —
+/// see [`token_host_origin`] — and for diagnostic messaging — see `crate::parser`.
 pub struct GitlabInstanceHost {
     raw: Arc<RwLock<Option<String>>>,
     policy: Arc<RegistryAccessPolicy>,
@@ -267,22 +286,31 @@ impl GitlabInstanceHost {
     /// configured value fails validation (logged once per distinct `(raw, policy)` pair, not
     /// per read).
     ///
-    /// Collapses `InstanceHostOutcome::Unset` and `InstanceHostOutcome::Invalid` to the
-    /// same `None`: for host *resolution* (what a `project:`/`$...`-relative `component:`
-    /// include resolves against), "not configured" and "configured but rejected" are the
-    /// same outcome. They are **not** the same outcome for token routing — see
-    /// [`token_host_origin`], which calls `Self::resolve` directly instead.
+    /// Collapses `InstanceHostOutcome::Unset`, `InstanceHostOutcome::Invalid` and
+    /// `InstanceHostOutcome::Blocked` to the same `None`: for host *resolution* (what a
+    /// `project:`/`$...`-relative `component:` include resolves against), "not configured"
+    /// and "configured but rejected" are the same outcome. They are **not** the same outcome
+    /// for token routing — see [`token_host_origin`], which calls `Self::resolve` directly
+    /// instead — nor for diagnostic messaging, where a caller needs to tell the two apart:
+    /// see `Self::resolve` (`pub(crate)`, used by `crate::parser`).
     #[must_use]
     pub fn get(&self) -> Option<GitlabHost> {
         match self.resolve() {
             InstanceHostOutcome::Valid(host) => Some(host),
-            InstanceHostOutcome::Unset | InstanceHostOutcome::Invalid => None,
+            InstanceHostOutcome::Unset
+            | InstanceHostOutcome::Invalid
+            | InstanceHostOutcome::Blocked { .. } => None,
         }
     }
 
     /// The full tri-state outcome — see [`InstanceHostOutcome`]'s doc for why `Unset` and
     /// `Invalid` must stay distinguishable here even though [`Self::get`] collapses them.
-    fn resolve(&self) -> InstanceHostOutcome {
+    ///
+    /// `pub(crate)` rather than a `blocked_class`-style public wrapper (#967 M1 follow-up):
+    /// a caller that needs both [`Self::get`]'s `Literal` case and the blocked case must
+    /// match on one [`Self::resolve`] call, not call two separate accessors that could each
+    /// observe a different outcome if the underlying config is written between them.
+    pub(crate) fn resolve(&self) -> InstanceHostOutcome {
         #[cfg(test)]
         if let Some(host) = &self.test_override {
             return InstanceHostOutcome::Valid(host.clone());
@@ -311,6 +339,19 @@ impl GitlabInstanceHost {
 
         let outcome = match GitlabHost::parse(&raw, &self.policy) {
             Ok(host) => InstanceHostOutcome::Valid(host),
+            Err(IndexUrlError::BlockedHost { class }) => {
+                tracing::warn!(
+                    %class,
+                    "registries.gitlab_instance_host is blocked by the current \
+                     registries.workspace_registries policy; treating it as unset for host \
+                     resolution and disabling GITLAB_TOKEN entirely (it is not redirected to \
+                     gitlab.com)"
+                );
+                InstanceHostOutcome::Blocked {
+                    raw: raw.clone(),
+                    class,
+                }
+            }
             Err(e) => {
                 tracing::warn!(
                     error = %e,
@@ -370,7 +411,7 @@ pub fn token_host_origin(instance_host: &GitlabInstanceHost) -> Option<String> {
     match instance_host.resolve() {
         InstanceHostOutcome::Unset => Some(GITLAB_COM_ORIGIN.to_string()),
         InstanceHostOutcome::Valid(host) => Some(host.origin().to_string()),
-        InstanceHostOutcome::Invalid => None,
+        InstanceHostOutcome::Invalid | InstanceHostOutcome::Blocked { .. } => None,
     }
 }
 
@@ -507,6 +548,36 @@ mod tests {
             let handle = GitlabInstanceHost::new(raw, Arc::clone(&policy));
             assert!(handle.get().is_none(), "expected {bad} to be rejected");
         }
+    }
+
+    /// Issue #967: `resolve()` must distinguish a policy-blocked value (`127.0.0.1`,
+    /// `169.254.169.254`) from one rejected for an unrelated reason (`http://` scheme) — both
+    /// collapse to `get() == None`, but only the former is `InstanceHostOutcome::Blocked`, and
+    /// it must carry the real configured raw value (S1: never a placeholder).
+    #[test]
+    fn test_gitlab_instance_host_resolve_distinguishes_policy_block_from_other_invalid() {
+        let policy = Arc::new(RegistryAccessPolicy::default());
+
+        let blocked = GitlabInstanceHost::new(
+            Arc::new(RwLock::new(Some("127.0.0.1".to_string()))),
+            Arc::clone(&policy),
+        );
+        assert_eq!(
+            blocked.resolve(),
+            InstanceHostOutcome::Blocked {
+                raw: "127.0.0.1".to_string(),
+                class: HostClass::Loopback,
+            }
+        );
+
+        let not_blocked = GitlabInstanceHost::new(
+            Arc::new(RwLock::new(Some("http://gitlab.mycorp.dev".to_string()))),
+            Arc::clone(&policy),
+        );
+        assert_eq!(not_blocked.resolve(), InstanceHostOutcome::Invalid);
+
+        let unset = GitlabInstanceHost::new(Arc::new(RwLock::new(None)), policy);
+        assert_eq!(unset.resolve(), InstanceHostOutcome::Unset);
     }
 
     /// Issue #808: a credential-shaped `registries.gitlab_instance_host` value must not leak
