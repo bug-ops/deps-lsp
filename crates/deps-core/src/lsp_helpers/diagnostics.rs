@@ -639,6 +639,18 @@ pub fn generate_diagnostics_from_cache(
     });
 
     for dep in deps {
+        // Critic finding S1 (#905): a dependency whose `name_range()` is a synthetic
+        // placeholder (`Dependency::name_range_is_synthetic`) has no real position in the
+        // document at all — every rule below anchors its diagnostic on `name_range()` or
+        // `version_range().unwrap_or_else(name_range)`, and a synthetic `name_range()` is
+        // always paired with `version_range() == None` (deps-dart never resolves one without
+        // the other for a replayed dependency), so there is no reliable range to anchor on.
+        // Skip diagnostics for it entirely rather than emit diagnostics stacked on a shared
+        // sentinel range — it still contributes parse/completion data via `dependencies()`.
+        if dep.name_range_is_synthetic() {
+            continue;
+        }
+
         let normalized_name = formatter.normalize_package_name(dep.name());
         let ctx = RuleContext {
             dep,
@@ -1669,6 +1681,55 @@ mod tests {
         assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
         assert!(diagnostics[0].message.contains("Unknown package"));
         assert!(diagnostics[0].message.contains("unknown-pkg"));
+    }
+
+    /// Critic finding S1 (#905): a dependency with a synthetic `name_range()` (e.g.
+    /// `deps-dart`'s container-anchor alias resolution) has no reliable position to anchor a
+    /// diagnostic on — `generate_diagnostics_from_cache` must skip it entirely rather than
+    /// emit one at the shared `Range::default()` sentinel, while a normal sibling dependency
+    /// in the same document still gets its diagnostic as usual.
+    #[test]
+    fn test_generate_diagnostics_from_cache_skips_synthetic_range_dependency() {
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let formatter = MockFormatter;
+
+        let parse_result = MockMixedParseResult {
+            deps: vec![
+                Box::new(MockSyntheticRangeDep {
+                    name: "synthetic-pkg".into(),
+                }),
+                Box::new(MockDep {
+                    name: "unknown-pkg".into(),
+                    version_req: "1.0.0".into(),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 11)),
+                }),
+            ],
+            uri: crate::test_util::test_uri("/test/pubspec.yaml"),
+        };
+
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "the synthetic-range dependency must contribute no diagnostic at all, not one \
+             stacked on Range::default()"
+        );
+        assert!(diagnostics[0].message.contains("unknown-pkg"));
+        assert!(!diagnostics[0].message.contains("synthetic-pkg"));
     }
 
     /// #796: a manifest whose dependency count was truncated by

@@ -13,7 +13,7 @@ deps-lsp provides comprehensive LSP support for 14 package ecosystems:
 | **PyPI** | Python | `pyproject.toml`, `requirements.txt`, `constraints.txt` (also recognized under a `requirements/` directory, e.g. `requirements/base.txt`) | `poetry.lock`, `uv.lock` | Hover with PEP 508 environment marker display ("Active when: `<marker>`"), inlay hints, completion, code actions, diagnostics, code lens, document links for `-r`/`-c`/`--requirement`/`--constraint` file references, private/custom index resolution via `--index-url`/`--extra-index-url`, Poetry `[[tool.poetry.source]]`, and uv `[tool.uv.index]`/`[tool.uv.sources]` (see below) |
 | **Go** | Go | `go.mod` | `go.sum` | Hover, inlay hints, completion, code actions, diagnostics, code lens, pseudo-version support, `$GOENV` `GOPROXY`/`GOPRIVATE` proxy-chain resolution (see below) |
 | **Bundler** | Ruby | `Gemfile` | `Gemfile.lock` | Hover, inlay hints, completion, code actions, diagnostics, code lens |
-| **Dart** | Dart | `pubspec.yaml` | `pubspec.lock` | Hover with corrected version ordering (prereleases sort below base release — see below), inlay hints, completion, code actions, diagnostics, code lens |
+| **Dart** | Dart | `pubspec.yaml` | `pubspec.lock` | Hover with corrected version ordering (prereleases sort below base release — see below), inlay hints, completion, code actions, diagnostics, code lens, YAML anchor/alias resolution for whole dependency sections and `environment:` (see below) |
 | **Maven** | Java | `pom.xml` | `maven-metadata.xml` (CDN) | Hover with corrected version ordering (numeric segments outrank qualifiers, prereleases sort below base release), inlay hints, completion, code actions, diagnostics, code lens (property-versioned dependencies not covered — see below) |
 | **Gradle** | Kotlin/Groovy | `build.gradle`, `build.gradle.kts`, `gradle/libs.versions.toml` | — | Hover with corrected version ordering (same as Maven), inlay hints, completion, code actions, diagnostics, code lens (variable/catalog-versioned dependencies not covered — see below), variable resolution (`gradle.properties`) |
 | **Composer** | PHP | `composer.json` | `composer.lock` | Hover, inlay hints, completion, code actions, diagnostics, code lens (requirement matching and "latest version" selection both use corrected stability-qualifier ordering — see below) |
@@ -936,6 +936,24 @@ prerelease-aware ordering:
   `v`/`V` prefix. Known limitation: editing `minimum-stability` alone in an already-open
   document does not refresh already-fetched dependencies' cached "latest" version until the
   document is closed and reopened.
+
+### Dart: YAML Anchor/Alias Resolution
+
+`pubspec.yaml` supports YAML anchors (`&name`) and aliases (`*name`) for sharing structure
+between sections, e.g. a shared `dependencies:` block reused via
+`dev_dependencies: *shared_deps`. Aliasing an entire `dependencies:`/`dev_dependencies:`/
+`dependency_overrides:` section, or an entire `environment:` mapping (not just its `sdk:`
+value), resolves correctly — the aliased dependencies/`sdk:` constraint appear as if written
+out in full, including when the same section is aliased more than once.
+
+**Known limitation**: resolved-via-alias dependencies show no hover, diagnostics, completion,
+inlay hints, or code lens, since no position in the aliasing occurrence's own text
+corresponds to them (only the anchor's original definition does, which would be misleading
+and — for a section aliased more than once — ambiguous). They still count toward the
+document's dependency total (including the truncation cap), and are visible to anything
+reading the parsed dependency list. A single dependency's own value aliasing a whole mapping
+(`pkg: *shared_entry`, as opposed to the section or `environment:` key itself) is not
+resolved at all — the dependency appears with a real name but no version/source info.
 
 ### Maven/Gradle Version Range Matching
 
