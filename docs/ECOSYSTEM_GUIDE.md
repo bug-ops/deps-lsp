@@ -152,7 +152,12 @@ something a cloned repository controls. A blocked index is never silent: it is
 logged, and a `registry`/`registry-index` dependency line additionally gets an
 informational diagnostic naming the blocked host class (a `[source]`-chain block is
 log-only, since it is a property of `.cargo/config.toml`, not of any one
-dependency line).
+dependency line). This diagnostic is not Cargo-specific (issue #925): npm's
+`.npmrc` `registry=`/`@scope:registry=` resolution, PyPI's `--index-url`/Poetry
+`source =`/uv `index =` resolution, and NuGet's `NuGet.Config`
+`<packageSources>`/`<packageSourceMapping>` resolution all surface the same
+informational diagnostic on the affected dependency's own line when a declared
+registry is blocked, instead of degrading silently to the public registry.
 
 Beyond that initial URL-string check, `public_only` (and `off`/`all`) is also
 enforced at **connect time**: the address a workspace-declared index's hostname

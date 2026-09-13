@@ -194,7 +194,7 @@ impl ParseResult for DependencyCappedParseResult {
         self.inner.uri()
     }
 
-    fn blocked_registries(&self) -> Vec<(Range, HostClass, String)> {
+    fn blocked_registries(&self) -> Vec<(Range, HostClass, String, String)> {
         self.inner.blocked_registries()
     }
 

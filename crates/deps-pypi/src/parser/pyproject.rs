@@ -6,10 +6,11 @@ use crate::config::PypiIndexConfig;
 use crate::error::Result;
 use crate::types::{PypiDependency, PypiDependencySection, PypiDependencySource};
 use deps_core::lsp_helpers::LineOffsetTable;
-use deps_core::net_policy::RegistryAccessPolicy;
+use deps_core::net_policy::{HostClass, RegistryAccessPolicy};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use toml_span::value::{Table, Value};
-use tower_lsp_server::ls_types::Uri;
+use tower_lsp_server::ls_types::{Range, Uri};
 
 /// Everything a `pyproject.toml` parse needs to resolve a dependency's PyPI index routing
 /// (spec FR-002/003/005/006/007/013) — built once from the TOML tree's `[[tool.poetry.source]]`
@@ -21,6 +22,13 @@ struct IndexContext<'a> {
     /// `[tool.uv.sources] <dep> = { index = "<name>" }` bindings, keyed by dependency name
     /// (FR-013) — the uv analogue of Poetry's per-dependency `source = "<name>"` key.
     uv_named_by_dep: &'a HashMap<String, String>,
+    /// Accumulates a `(name_range, blocked host class, raw declared value, declaration key)`
+    /// quadruple (#925) for every dependency [`Self::resolve`] routes through an entry blocked
+    /// by the current `registries.workspace_registries` policy — a `RefCell` because `resolve`
+    /// is called from several independent `parse_*` helpers (PEP 621/735, Poetry, build-system
+    /// requires) that each only see their own local `Vec<PypiDependency>`, not one shared
+    /// result accumulator.
+    blocked_registries: RefCell<Vec<(Range, HostClass, String, String)>>,
 }
 
 impl IndexContext<'_> {
@@ -36,6 +44,14 @@ impl IndexContext<'_> {
             .get(dep.name.as_str())
             .map(String::as_str);
         dep.source = self.config.resolve_source_for(named);
+        if let Some((class, raw_value, declaration_key)) = self.config.blocked_class_for(named) {
+            self.blocked_registries.borrow_mut().push((
+                dep.name_range,
+                class,
+                raw_value,
+                declaration_key,
+            ));
+        }
     }
 }
 
@@ -109,6 +125,7 @@ impl PypiParser {
                     uri: uri.clone(),
                     document_links: Vec::new(),
                     resolved_chains: Vec::new(),
+                    blocked_registries: Vec::new(),
                     dependency_truncation: budget.truncation(),
                 });
             }
@@ -133,6 +150,7 @@ impl PypiParser {
         let ctx = IndexContext {
             config: &config,
             uv_named_by_dep: &uv_named_by_dep,
+            blocked_registries: RefCell::new(Vec::new()),
         };
 
         // Parse build-system requires (PEP 517/518)
@@ -201,6 +219,7 @@ impl PypiParser {
             uri: uri.clone(),
             document_links: Vec::new(),
             resolved_chains: config.resolved_chains(),
+            blocked_registries: ctx.blocked_registries.into_inner(),
             dependency_truncation: budget.truncation(),
         })
     }
@@ -615,6 +634,14 @@ impl PypiParser {
             // String-form Poetry dependencies have no `source =` key of their own — resolve
             // through the primary/extras chain only (FR-002/003/005), same as a plain PEP
             // 621/requirements.txt dependency.
+            if let Some((class, raw_value, declaration_key)) = ctx.config.blocked_class_for(None) {
+                ctx.blocked_registries.borrow_mut().push((
+                    name_range,
+                    class,
+                    raw_value,
+                    declaration_key,
+                ));
+            }
             return Ok(PypiDependency {
                 name: name.into(),
                 name_range,
@@ -683,6 +710,16 @@ impl PypiParser {
                 // absent, the dependency routes through the primary/extras chain like any
                 // other plain dependency.
                 let source_name = table.get("source").and_then(|s| s.as_str());
+                if let Some((class, raw_value, declaration_key)) =
+                    ctx.config.blocked_class_for(source_name)
+                {
+                    ctx.blocked_registries.borrow_mut().push((
+                        name_range,
+                        class,
+                        raw_value,
+                        declaration_key,
+                    ));
+                }
                 ctx.config.resolve_source_for(source_name)
             };
 
@@ -2449,6 +2486,44 @@ requests = "^2.28.0"
         assert_matches!(dep.source, PypiDependencySource::AlternateRegistry { .. });
     }
 
+    /// #925 (mirrors `deps-cargo`'s
+    /// `test_parse_registry_index_literal_blocked_by_policy_populates_blocked_registries`): a
+    /// Poetry primary source blocked by the default `public_only` policy must populate
+    /// `ParseResult::blocked_registries`, not just leave the dependency unresolved with no
+    /// trace.
+    #[test]
+    fn test_poetry_primary_source_blocked_by_policy_populates_blocked_registries() {
+        let content = r#"
+[[tool.poetry.source]]
+name = "internal"
+url = "https://169.254.169.254/simple"
+
+[tool.poetry.dependencies]
+requests = "^2.28.0"
+"#;
+        let result = PypiParser::new()
+            .parse_content(content, &test_uri()) // default policy is `public_only`
+            .unwrap();
+        let dep = result
+            .dependencies
+            .iter()
+            .find(|d| d.name == "requests")
+            .unwrap();
+        assert_eq!(
+            dep.source,
+            PypiDependencySource::CustomRegistry {
+                url: "https://169.254.169.254/simple".to_string(),
+            },
+            "a blocked source must stay unresolved, not silently become AlternateRegistry"
+        );
+        assert_eq!(result.blocked_registries.len(), 1);
+        let (range, class, raw_value, declaration_key) = &result.blocked_registries[0];
+        assert_eq!(*range, dep.name_range);
+        assert_eq!(*class, deps_core::net_policy::HostClass::CloudMetadata);
+        assert_eq!(raw_value, "https://169.254.169.254/simple");
+        assert_eq!(declaration_key, "primary");
+    }
+
     /// Validator finding S3: two primary-priority Poetry sources must not silently pick an
     /// arbitrary (last-declared) one — the first registered wins, verified end-to-end via the
     /// registered chain's sole hop.
@@ -2520,6 +2595,47 @@ requests = "^2.28.0"
             .find(|d| d.name == "requests")
             .unwrap();
         assert_eq!(requests.source, PypiDependencySource::Registry);
+    }
+
+    /// #925 (tester coverage gap): the Poetry **table-form** `source = "<name>"` key resolves
+    /// through a different code path than the string-form dependency tested by
+    /// `test_poetry_primary_source_blocked_by_policy_populates_blocked_registries` above (this
+    /// one calls `ctx.config.blocked_class_for(source_name)` directly in the table-format
+    /// branch of `PypiParser::parse_poetry_dependency`, not through `IndexContext::resolve`) —
+    /// a named source blocked by policy must populate `blocked_registries` here too, not just
+    /// for the string-form/primary-chain path.
+    #[test]
+    fn test_poetry_table_form_named_source_blocked_by_policy_populates_blocked_registries() {
+        let content = r#"
+[[tool.poetry.source]]
+name = "internal"
+url = "https://169.254.169.254/simple"
+priority = "explicit"
+
+[tool.poetry.dependencies]
+flask = { version = "^3.0", source = "internal" }
+"#;
+        let result = PypiParser::new()
+            .parse_content(content, &test_uri()) // default policy is `public_only`
+            .unwrap();
+        let flask = result
+            .dependencies
+            .iter()
+            .find(|d| d.name == "flask")
+            .unwrap();
+        assert_eq!(
+            flask.source,
+            PypiDependencySource::CustomRegistry {
+                url: "https://169.254.169.254/simple".to_string(),
+            },
+            "a blocked named source must stay unresolved, not silently become AlternateRegistry"
+        );
+        assert_eq!(result.blocked_registries.len(), 1);
+        let (range, class, raw_value, declaration_key) = &result.blocked_registries[0];
+        assert_eq!(*range, flask.name_range);
+        assert_eq!(*class, deps_core::net_policy::HostClass::CloudMetadata);
+        assert_eq!(raw_value, "https://169.254.169.254/simple");
+        assert_eq!(declaration_key, "named:internal");
     }
 
     #[test]

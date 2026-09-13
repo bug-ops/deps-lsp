@@ -208,6 +208,16 @@ impl Ecosystem for NuGetEcosystem {
 
             for dep in &mut result.dependencies {
                 dep.source = config.resolve_source_for(&dep.name);
+                if let Some((class, raw_value, declaration_key)) =
+                    config.blocked_class_for(&dep.name)
+                {
+                    result.blocked_registries.push((
+                        dep.name_range,
+                        class,
+                        raw_value,
+                        declaration_key,
+                    ));
+                }
             }
             result.resolved_chains = config.resolved_chains();
             for chain in &result.resolved_chains {
@@ -677,6 +687,7 @@ mod tests {
             dependencies: vec![other, target],
             uri: deps_core::test_util::test_uri("/test/App.csproj"),
             resolved_chains: Vec::new(),
+            blocked_registries: Vec::new(),
             dependency_truncation: None,
         };
 
@@ -704,6 +715,7 @@ mod tests {
             dependencies: vec![dep],
             uri: deps_core::test_util::test_uri("/test/App.csproj"),
             resolved_chains: Vec::new(),
+            blocked_registries: Vec::new(),
             dependency_truncation: None,
         };
 
@@ -749,6 +761,7 @@ mod tests {
             dependencies: vec![dep],
             uri: deps_core::test_util::test_uri("/test/App.csproj"),
             resolved_chains: Vec::new(),
+            blocked_registries: Vec::new(),
             dependency_truncation: None,
         };
 
@@ -798,6 +811,7 @@ mod tests {
             dependencies: vec![dep],
             uri: deps_core::test_util::test_uri("/test/App.csproj"),
             resolved_chains: Vec::new(),
+            blocked_registries: Vec::new(),
             dependency_truncation: None,
         };
 
@@ -885,6 +899,7 @@ mod tests {
             dependencies: vec![dep],
             uri: deps_core::test_util::test_uri("/test/App.csproj"),
             resolved_chains: Vec::new(),
+            blocked_registries: Vec::new(),
             dependency_truncation: None,
         };
 
@@ -936,6 +951,7 @@ mod tests {
             dependencies: vec![registry_dep, alternate_dep],
             uri: deps_core::test_util::test_uri("/test/App.csproj"),
             resolved_chains: Vec::new(),
+            blocked_registries: Vec::new(),
             dependency_truncation: None,
         };
 
@@ -1448,6 +1464,67 @@ mod tests {
         _corp_flat_mock.assert_async().await;
     }
 
+    /// #925 (mirrors `deps-cargo`'s
+    /// `test_parse_registry_index_literal_blocked_by_policy_populates_blocked_registries`): a
+    /// `NuGet.Config` source blocked by the current `registries.workspace_registries` policy
+    /// must populate `ParseResult::blocked_registries` at the real `parse_manifest` call path,
+    /// not just leave the dependency unresolved with no trace.
+    #[tokio::test]
+    async fn test_parse_manifest_blocked_source_populates_blocked_registries() {
+        // See the comment in `test_package_name_completion_context_has_real_range` on why
+        // this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("NuGet.Config"),
+            r#"<configuration><packageSources>
+                <clear />
+                <add key="Blocked" value="https://169.254.169.254/v3/index.json" />
+            </packageSources></configuration>"#,
+        )
+        .unwrap();
+        let manifest_path = dir.path().join("App.csproj");
+        let content = r#"<Project><ItemGroup><PackageReference Include="MyCompany.Internal" Version="1.0.0" /></ItemGroup></Project>"#;
+        std::fs::write(&manifest_path, content).unwrap();
+        let uri = tower_lsp_server::ls_types::Uri::from_file_path(&manifest_path).unwrap();
+
+        let policy = Arc::new(deps_core::net_policy::RegistryAccessPolicy::new(
+            deps_core::net_policy::WorkspaceRegistryAccess::PublicOnly,
+        ));
+        let context = crate::config::NuGetParseContext {
+            policy: Arc::clone(&policy),
+            config_cache: Arc::new(crate::config::NuGetConfigCache::new()),
+            user_profile_config: None,
+            user_profile_sources: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let eco = NuGetEcosystem::with_context(
+            Arc::new(NuGetRegistry::new(Arc::new(deps_core::HttpCache::new()))),
+            context,
+        );
+
+        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+        let dep = parse_result
+            .dependencies()
+            .into_iter()
+            .find(|d| d.name().as_str() == "MyCompany.Internal")
+            .expect("dependency must be present");
+        assert_eq!(
+            dep.source(),
+            DependencySource::CustomRegistry {
+                url: "https://169.254.169.254/v3/index.json".to_string(),
+            },
+            "a blocked source must stay unresolved, not silently become Registry"
+        );
+
+        let blocked = parse_result.blocked_registries();
+        assert_eq!(blocked.len(), 1);
+        let (range, class, raw_value, declaration_key) = &blocked[0];
+        assert_eq!(*range, dep.name_range());
+        assert_eq!(*class, deps_core::net_policy::HostClass::CloudMetadata);
+        assert_eq!(raw_value, "https://169.254.169.254/v3/index.json");
+        assert_eq!(declaration_key, "source:Blocked");
+    }
+
     /// C1 regression (impl-critic): `generate_hover`'s unlisted-versions decoration must
     /// never fire against the public root registry for a dependency that resolved to a
     /// private feed — before the fix, `unlisted_versions` was called unconditionally
@@ -1922,6 +1999,7 @@ mod tests {
             dependencies: vec![dep],
             uri: deps_core::test_util::test_uri("/test/App.csproj"),
             resolved_chains: Vec::new(),
+            blocked_registries: Vec::new(),
             dependency_truncation: None,
         };
         let position = Position::new(0, 1);
@@ -1971,6 +2049,7 @@ mod tests {
             dependencies: vec![dep],
             uri: deps_core::test_util::test_uri("/test/App.csproj"),
             resolved_chains: Vec::new(),
+            blocked_registries: Vec::new(),
             dependency_truncation: None,
         };
         // #919: `detect_completion_context`'s literal-span guard requires `version_range`'s

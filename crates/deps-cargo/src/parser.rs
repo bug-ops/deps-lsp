@@ -72,11 +72,16 @@ pub struct CargoParseResult {
     pub resolved_registries: Vec<(RegistryIndex, Option<AuthToken>)>,
     /// Dependency lines whose `registry`/`registry-index` resolution was blocked by the
     /// current `registries.workspace_registries` policy (spec #443, plan-1b §1.7) —
-    /// `(name_range, blocked host class, raw declared value)` triples. Surfaced by
-    /// [`deps_core::lsp_helpers::generate_diagnostics_from_cache`] via
-    /// [`Self::blocked_registries`]'s trait override as an informational diagnostic, so the
-    /// block never degrades silently.
-    pub blocked_registries: Vec<(Range, deps_core::net_policy::HostClass, String)>,
+    /// `(name_range, blocked host class, raw declared value, declaration key)` quadruples.
+    /// The declaration key is the same as the raw declared value here: an alias name or a
+    /// literal URL, both written verbatim by the dependency itself, are already a safe
+    /// dedup key for
+    /// [`deps_core::lsp_helpers::generate_diagnostics_from_cache`]'s declaration-identity
+    /// dedup — two different aliases never share a name, and two dependencies writing the
+    /// identical literal URL are, for diagnostic purposes, indistinguishable anyway. Surfaced
+    /// via [`Self::blocked_registries`]'s trait override as an informational diagnostic, so
+    /// the block never degrades silently.
+    pub blocked_registries: Vec<(Range, deps_core::net_policy::HostClass, String, String)>,
     /// `Some((kept, total))` once the manifest declared more dependencies than
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
     /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
@@ -283,7 +288,7 @@ fn get_val<'a>(table: &'a Table<'a>, key: &str) -> Option<&'a Value<'a>> {
 /// line whose registry-index resolution was blocked by policy (spec #443, plan-1b §1.7).
 type AlternateRegistryResolution = (
     Vec<(RegistryIndex, Option<AuthToken>)>,
-    Vec<(Range, deps_core::net_policy::HostClass, String)>,
+    Vec<(Range, deps_core::net_policy::HostClass, String, String)>,
 );
 
 /// Rewrites every `DependencySource::CustomRegistry` entry in `dependencies` into a
@@ -412,7 +417,7 @@ fn resolve_alternate_registries(
                     mirrors_crates_io: false,
                 };
             } else if let Some(class) = blocked_by_raw_value.get(url) {
-                blocked_registries.push((dep.name_range, *class, url.clone()));
+                blocked_registries.push((dep.name_range, *class, url.clone(), url.clone()));
             }
         }
     }
@@ -796,9 +801,9 @@ fn discover_workspace(doc_uri: &Uri) -> Result<WorkspaceDiscovery> {
 pub struct CargoParser;
 
 // Implemented by hand rather than via `deps_core::impl_parse_result!`: `blocked_registries()`
-// is overridden with real data (`self.blocked_registries.clone()`) — per
-// `deps_core::ParseResult::blocked_registries`'s own doc, `deps-cargo` is the only ecosystem
-// that overrides this today, so the macro has no field for it.
+// is overridden with real data (`self.blocked_registries.clone()`) — the macro has no field
+// for it. `deps-npm`, `deps-pypi`, and `deps-nuget` mirror this same hand-written pattern for
+// their own `blocked_registries()` overrides (#925).
 impl deps_core::ParseResult for CargoParseResult {
     fn dependencies(&self) -> Vec<&dyn deps_core::Dependency> {
         self.dependencies
@@ -815,7 +820,7 @@ impl deps_core::ParseResult for CargoParseResult {
         &self.uri
     }
 
-    fn blocked_registries(&self) -> Vec<(Range, deps_core::net_policy::HostClass, String)> {
+    fn blocked_registries(&self) -> Vec<(Range, deps_core::net_policy::HostClass, String, String)> {
         self.blocked_registries.clone()
     }
 
@@ -1216,10 +1221,11 @@ internal-crate = { version = "1.0", registry-index = "https://169.254.169.254/in
             "a blocked index must stay unresolved, not silently become AlternateRegistry"
         );
         assert_eq!(result.blocked_registries.len(), 1);
-        let (range, class, raw_value) = &result.blocked_registries[0];
+        let (range, class, raw_value, declaration_key) = &result.blocked_registries[0];
         assert_eq!(*range, result.dependencies[0].name_range);
         assert_eq!(*class, deps_core::net_policy::HostClass::CloudMetadata);
         assert_eq!(raw_value, "https://169.254.169.254/index");
+        assert_eq!(declaration_key, raw_value);
     }
 
     /// The alias path's `blocked_registries` counterpart: an alias resolving via
@@ -1248,10 +1254,11 @@ internal-crate = { version = "1.0", registry-index = "https://169.254.169.254/in
         let result = parse_cargo_toml_with_context(manifest_content, &uri, &ctx).unwrap();
 
         assert_eq!(result.blocked_registries.len(), 1);
-        let (range, class, raw_value) = &result.blocked_registries[0];
+        let (range, class, raw_value, declaration_key) = &result.blocked_registries[0];
         assert_eq!(*range, result.dependencies[0].name_range);
         assert_eq!(*class, deps_core::net_policy::HostClass::CloudMetadata);
         assert_eq!(raw_value, "my-corp");
+        assert_eq!(declaration_key, raw_value);
     }
 
     /// #536: a `registry-index` value carrying literal `user:pass@` userinfo fails
