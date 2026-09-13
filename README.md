@@ -343,6 +343,39 @@ Add to `coc-settings.json` (`:CocConfig`). `coc.nvim` attaches every configured 
 
 ## Configuration
 
+### Inlay hint icons
+
+deps-lsp shows the status of a dependency's version as inline text next to it in the manifest (an LSP inlay hint).
+
+| Icon | Meaning | Configurable? |
+|------|---------|---------------|
+| `✅` | The installed version is up to date. | Yes — `inlay_hints.up_to_date_text` |
+| `❌ {latest}` | The installed version is outdated; `{latest}` is replaced with the newest available version. | Yes — `inlay_hints.needs_update_text` |
+| `⏳` | Version/vulnerability data is still being fetched from the registry (shown only as a fallback when the editor doesn't support LSP work-done progress). | Yes — `loading_indicator.loading_text` |
+| `📴` | Offline mode is active — network access is disabled, so version and vulnerability data were not checked. | No — fixed marker |
+
+> [!IMPORTANT]
+> When a lock file (`Cargo.lock`, `package-lock.json`, etc.) is present, `✅`/`❌` compare the **lock-resolved version**, not the manifest's version range. A manifest range that already covers the latest release (e.g. `^2.0` with latest `2.1.1`) still shows `❌` if the lock file wasn't regenerated and still resolves to an older version (e.g. `2.0.5`) — run your ecosystem's lock/update command to clear it. The manifest range is used directly only when no resolved lock version is available. Go is the one exception: it reads the resolved version from `go.mod` rather than `go.sum`, since `go.sum` isn't a reliable source of the in-use version.
+
+> [!NOTE]
+> Other dependency problems — yanked/deprecated packages, unsatisfiable version ranges, vulnerabilities — are **not** shown as icons. They appear as plain text in hover (e.g. `(yanked)`, or a vulnerability severity like `critical`/`high`/`medium`/`low`) and as regular editor diagnostics (squiggly underlines, problem panel), configurable per-severity under `diagnostics` below.
+
+### Hover, diagnostic & code lens text conventions
+
+Hover content is Markdown; diagnostics and code lens titles are plain text — no icons or Markdown there.
+
+| Convention | Example | Meaning |
+|---|---|---|
+| `**Label**: `value`` | `**Current**: `1.2.0``, `**Latest**: `1.3.0`` | Bold label + code span for a version/fact. Package name is an H1 heading, linked to the registry page when available. |
+| `*(status)*` | `` `1.2.0` *(yanked)* `` | Yanked/deprecated status, always italicized in parentheses, shown next to the version in the "Recent versions" list. Composer uses its own terminology, `*(abandoned)*`. |
+| `> callout` | `> ⏳ **Recently published** — ...` | Blockquote shown when a version is still inside the release-cooldown window. |
+| `### Security advisories` | `- **[CVE-XXXX-YYYY](advisory link)** — critical`<br>`  Fixed in: `1.2.4`` | One bullet per advisory: linked CVE/GHSA id, plain-text severity (`critical`/`high`/`medium`/`low`/`unknown severity`/`confirmed malicious package`), summary, fixed-in version. No advisories → `**No known vulnerabilities** (OSV.dev)`. |
+| unheaded line | `🔐 **Supply chain**: OpenSSF Scorecard `7.5`/10 · Provenance: verified` | OpenSSF Scorecard / SLSA-provenance trust signal (deps.dev); omitted entirely when neither signal is available. |
+| `---` + footer | `⌨️ **Press `Cmd+.` to update version**`, `📴 *Offline: version and vulnerability data not checked*` | Divider-prefixed footers: the first when an update is available, the second while `network.offline` is active. |
+
+> [!NOTE]
+> Diagnostic messages (squiggly underlines / problem panel) and code lens titles ("Update N outdated dependencies", "Pin N dependencies to commit SHA") are plain text, not Markdown, and carry no icon convention of their own — their color/severity comes from the `diagnostics` config (HINT/WARNING) below, rendered by the editor itself.
+
 Configure via LSP initialization options:
 
 ```json
