@@ -161,7 +161,7 @@ THEN behavior is byte-for-byte identical to before this feature (same
 | FR-006 | WHEN the lock file's top-level `lockfileVersion` is present and its major version component (parsed as the portion before `.`) is below `6` THE SYSTEM SHALL treat the file as unparseable and return `DepsError::ParseError` with a message naming the unsupported version, rather than silently misparsing an incompatible shape | must |
 | FR-007 | WHEN a dependency name appears with different resolved versions across multiple importers (monorepo, differing workspace-member pins) THE SYSTEM SHALL record every distinct version as a candidate for that name in the returned `ResolvedPackages`, using its existing multi-version-per-name support (`ResolvedPackages::insert`/`get_version`) — no importer-to-manifest correlation is performed; the existing semver-range-based `get_version` selection (already used for `package-lock.json`'s multi-version node_modules entries) picks the right candidate per occurrence | must |
 | FR-008 | WHEN `Ecosystem::lockfile_filenames()` is consulted by the LSP file watcher (`crates/deps-npm/src/ecosystem.rs`) THE SYSTEM SHALL include `"pnpm-lock.yaml"` alongside `"package-lock.json"` so edits to either file trigger a re-resolve | must |
-| FR-009 | WHEN `is_lockfile_stale` is called for a located `pnpm-lock.yaml` THE SYSTEM SHALL use `LockFileProvider`'s existing default mtime-comparison implementation (no override needed) | should |
+| FR-009 | WHEN a located `pnpm-lock.yaml` is looked up through the LSP's lock file cache THE SYSTEM SHALL rely on `LockFileCache::get_or_parse`'s existing mtime-comparison caching (no `LockFileProvider` override needed) exactly as `package-lock.json` already does | should |
 
 ## 4. Non-Functional Requirements
 

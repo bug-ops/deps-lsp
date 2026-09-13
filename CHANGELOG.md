@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-cargo, deps-go, deps-lsp**: documented the exhaustive/non_exhaustive justification for 8 public enums per `deps-core`'s API-stability policy; `HostClass` and `deps_lsp::document::DocumentState` are now `#[non_exhaustive]` (resolves #854) (#867)
 - `specs/`: reconciled `MOC-specs.md` against actual issue/PR state — stale "draft" spec rows marked shipped with their PR/issue references, all shipped specs moved into a "Completed Specs" section, and `specs/constitution.md` added (resolves #855) (#867)
 
+### Removed
+- **Breaking (pre-1.0, public API)**: **deps-core**: removed `LockFileProvider::is_lockfile_stale` (the trait method had no callers outside its own conformance tests); added direct unit-test coverage for `LockFileCache::get_or_parse`'s actual staleness comparison instead (resolves #926)
+
 ### Fixed
 - **deps-core**: `DependencySource`'s `Debug` impl now redacts URL-bearing variants (`Git`, `Url`, `CustomRegistry`, `AlternateRegistry`) via `RedactedUrl` instead of printing them raw, closing a credential leak reachable through any `tracing::warn!(?source, ...)` call site (resolves #935) (#938)
 - **deps-core, deps-lsp**: redacted two more credential-leak sinks in the same family — `RegistriesConfig`'s debug dump of `gitlab_instance_host` and the blocked-registry diagnostic's raw index value (resolves #936) (#938)

@@ -281,8 +281,7 @@ mod tests {
     }
 
     // #758: shared `LockFileProvider` conformance, replacing test_invalid_json_returns_error
-    // — also closes a real gap: this crate had no `locate_lockfile`/`is_lockfile_stale_*`
-    // coverage at all before.
+    // — also closes a real gap: this crate had no `locate_lockfile` coverage at all before.
     deps_core::lockfile_conformance! {
         mod swift_lockfile_conformance;
         build: SwiftLockParser;

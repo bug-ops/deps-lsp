@@ -321,8 +321,7 @@ packages:
     }
 
     // #758: shared `LockFileProvider` conformance, replacing test_locate_lockfile and
-    // test_locate_lockfile_not_found — deps-dart had no prior `is_lockfile_stale` coverage at
-    // all, so this also adds that.
+    // test_locate_lockfile_not_found.
     deps_core::lockfile_conformance! {
         mod dart_lockfile_conformance;
         build: PubspecLockParser;

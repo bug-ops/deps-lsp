@@ -272,8 +272,8 @@ BUNDLED WITH
         assert!(packages.is_empty());
     }
 
-    // #758: shared `LockFileProvider` conformance, replacing test_locate_lockfile_same_directory,
-    // test_locate_lockfile_not_found, and test_is_lockfile_stale_not_modified/_modified.
+    // #758: shared `LockFileProvider` conformance, replacing test_locate_lockfile_same_directory
+    // and test_locate_lockfile_not_found.
     deps_core::lockfile_conformance! {
         mod bundler_lockfile_conformance;
         build: GemfileLockParser;

@@ -239,10 +239,9 @@ mod tests {
     use std::assert_matches;
 
     // #758: shared `LockFileProvider` conformance, replacing test_locate_lockfile_same_directory,
-    // test_locate_lockfile_not_found, test_is_lockfile_stale_not_modified/_modified/_deleted/
-    // _future_time, and test_parse_malformed_cargo_lock. test_locate_lockfile_workspace_root
-    // stays hand-written: it exercises the ancestor-directory search, a scenario this macro
-    // doesn't cover.
+    // test_locate_lockfile_not_found, and test_parse_malformed_cargo_lock.
+    // test_locate_lockfile_workspace_root stays hand-written: it exercises the
+    // ancestor-directory search, a scenario this macro doesn't cover.
     deps_core::lockfile_conformance! {
         mod cargo_lockfile_conformance;
         build: CargoLockParser;

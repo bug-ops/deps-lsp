@@ -316,10 +316,10 @@ golang.org/x/sync v0.5.0/go.mod h1:RxMgew5V=
         assert!(result.is_err());
     }
 
-    // #758: shared `LockFileProvider` conformance, replacing test_locate_lockfile_same_directory,
-    // test_locate_lockfile_not_found, and test_is_lockfile_stale_not_modified/_modified/_deleted/
-    // _future_time. test_locate_lockfile_workspace_root stays hand-written: it exercises the
-    // ancestor-directory search, a scenario this macro doesn't cover.
+    // #758: shared `LockFileProvider` conformance, replacing test_locate_lockfile_same_directory
+    // and test_locate_lockfile_not_found. test_locate_lockfile_workspace_root stays
+    // hand-written: it exercises the ancestor-directory search, a scenario this macro doesn't
+    // cover.
     deps_core::lockfile_conformance! {
         mod go_lockfile_conformance;
         build: GoSumParser;
