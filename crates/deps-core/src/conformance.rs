@@ -42,8 +42,6 @@
 //! (dot-segment/traversal class). See that const's doc for the sink split.
 
 use std::any::Any;
-use std::path::Path;
-use std::time::{Duration, SystemTime};
 
 use tower_lsp_server::ls_types::{CompletionItem, Uri};
 
@@ -347,69 +345,6 @@ pub fn assert_locate_lockfile_same_directory(
         parser.locate_lockfile(&manifest_uri),
         Some(lock_path),
         "expected {lock_name} to be located in the manifest's own directory"
-    );
-}
-
-/// Asserts a freshly written lock file is not considered stale against its own mtime.
-pub fn assert_lockfile_not_stale_when_unmodified(
-    parser: &dyn LockFileProvider,
-    lock_name: &str,
-    lock_content: &str,
-) {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let lockfile_path = temp_dir.path().join(lock_name);
-    std::fs::write(&lockfile_path, lock_content).expect("write lockfile");
-    let mtime = std::fs::metadata(&lockfile_path)
-        .expect("metadata")
-        .modified()
-        .expect("mtime");
-
-    assert!(
-        !parser.is_lockfile_stale(&lockfile_path, mtime),
-        "{lock_name} should not be stale when mtime matches"
-    );
-}
-
-/// Asserts a lock file is considered stale against an old `last_modified` timestamp.
-pub fn assert_lockfile_stale_when_old(
-    parser: &dyn LockFileProvider,
-    lock_name: &str,
-    lock_content: &str,
-) {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let lockfile_path = temp_dir.path().join(lock_name);
-    std::fs::write(&lockfile_path, lock_content).expect("write lockfile");
-
-    assert!(
-        parser.is_lockfile_stale(&lockfile_path, SystemTime::UNIX_EPOCH),
-        "{lock_name} should be stale when last_modified is old"
-    );
-}
-
-/// Asserts a non-existent lock file is considered stale.
-pub fn assert_lockfile_stale_when_missing(parser: &dyn LockFileProvider) {
-    let non_existent = Path::new("/nonexistent/lockfile-conformance-fixture");
-
-    assert!(
-        parser.is_lockfile_stale(non_existent, SystemTime::now()),
-        "a non-existent lock file should be considered stale"
-    );
-}
-
-/// Asserts a lock file is not considered stale against a future `last_modified` timestamp.
-pub fn assert_lockfile_not_stale_in_future(
-    parser: &dyn LockFileProvider,
-    lock_name: &str,
-    lock_content: &str,
-) {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let lockfile_path = temp_dir.path().join(lock_name);
-    std::fs::write(&lockfile_path, lock_content).expect("write lockfile");
-    let future_time = SystemTime::now() + Duration::from_hours(24);
-
-    assert!(
-        !parser.is_lockfile_stale(&lockfile_path, future_time),
-        "{lock_name} should not be stale when last_modified is in the future"
     );
 }
 
@@ -1099,44 +1034,6 @@ macro_rules! lockfile_conformance {
             #[test]
             fn locate_lockfile_same_directory() {
                 locate_lockfile_same_directory_impl();
-            }
-
-            fn is_lockfile_stale_not_modified_impl() {
-                for (name, content) in LOCKFILES {
-                    $crate::conformance::assert_lockfile_not_stale_when_unmodified(&($build), name, content);
-                }
-            }
-            #[test]
-            fn is_lockfile_stale_not_modified() {
-                is_lockfile_stale_not_modified_impl();
-            }
-
-            fn is_lockfile_stale_modified_impl() {
-                for (name, content) in LOCKFILES {
-                    $crate::conformance::assert_lockfile_stale_when_old(&($build), name, content);
-                }
-            }
-            #[test]
-            fn is_lockfile_stale_modified() {
-                is_lockfile_stale_modified_impl();
-            }
-
-            fn is_lockfile_stale_deleted_impl() {
-                $crate::conformance::assert_lockfile_stale_when_missing(&($build));
-            }
-            #[test]
-            fn is_lockfile_stale_deleted() {
-                is_lockfile_stale_deleted_impl();
-            }
-
-            fn is_lockfile_stale_future_time_impl() {
-                for (name, content) in LOCKFILES {
-                    $crate::conformance::assert_lockfile_not_stale_in_future(&($build), name, content);
-                }
-            }
-            #[test]
-            fn is_lockfile_stale_future_time() {
-                is_lockfile_stale_future_time_impl();
             }
 
             async fn parse_malformed_lockfile_does_not_panic_impl() {

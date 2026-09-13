@@ -345,11 +345,9 @@ mod tests {
         assert_eq!(resolved.len(), 0);
     }
 
-    // #758: `LockFileProvider` conformance — exact-name location/staleness/malformed-parse
-    // behavior, replacing test_locate_lockfile and adding the previously-missing
-    // is_lockfile_stale_* family (NuGetLockParser has no stale override, only the shared
-    // default). Does not cover the multi-project (`packages.<project>.lock.json`) fallback
-    // below, which is unique to this crate.
+    // #758: `LockFileProvider` conformance — exact-name location/malformed-parse behavior,
+    // replacing test_locate_lockfile. Does not cover the multi-project
+    // (`packages.<project>.lock.json`) fallback below, which is unique to this crate.
     deps_core::lockfile_conformance! {
         mod nuget_lockfile_conformance;
         build: NuGetLockParser;

@@ -631,8 +631,8 @@ version = 1
         assert_eq!(located.unwrap(), uv_lock);
     }
 
-    // #758: shared `LockFileProvider` conformance, replacing test_locate_lockfile_not_found,
-    // test_is_lockfile_stale_not_modified/_modified/_deleted, and test_parse_malformed_toml.
+    // #758: shared `LockFileProvider` conformance, replacing test_locate_lockfile_not_found
+    // and test_parse_malformed_toml.
     // test_locate_lockfile_poetry_priority/test_locate_lockfile_uv_fallback stay hand-written:
     // they exercise the poetry-over-uv precedence when both lock files coexist, a scenario the
     // macro's per-filename loop doesn't cover.

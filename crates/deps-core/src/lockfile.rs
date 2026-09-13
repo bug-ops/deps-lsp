@@ -539,28 +539,6 @@ pub trait LockFileProvider: Send + Sync {
         &'a self,
         lockfile_path: &'a Path,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ResolvedPackages>> + Send + 'a>>;
-
-    /// Checks if lock file has been modified since last parse.
-    ///
-    /// Used for cache invalidation. Default implementation compares
-    /// file modification time.
-    ///
-    /// # Arguments
-    ///
-    /// * `lockfile_path` - Path to the lock file
-    /// * `last_modified` - Last known modification time
-    ///
-    /// # Returns
-    ///
-    /// `true` if file has been modified or cannot be stat'd, `false` otherwise
-    fn is_lockfile_stale(&self, lockfile_path: &Path, last_modified: SystemTime) -> bool {
-        if let Ok(metadata) = std::fs::metadata(lockfile_path)
-            && let Ok(mtime) = metadata.modified()
-        {
-            return mtime > last_modified;
-        }
-        true
-    }
 }
 
 /// Cached lock file entry with staleness detection.
@@ -1268,6 +1246,63 @@ mod tests {
         assert_eq!(second.version("test-package"), Some("1.0.0"));
     }
 
+    /// A lock file that does not exist (never cached, or deleted since) must surface as an
+    /// `Err`, not panic or silently return empty/stale data — `get_or_parse` has no dedicated
+    /// missing-file branch of its own; its cache-miss path's `tokio::fs::metadata` stat simply
+    /// propagates the failure via `?`.
+    #[tokio::test]
+    async fn test_get_or_parse_missing_file_returns_error() {
+        // See the comment in `test_get_or_parse_cache_hit_does_not_reparse` on why this
+        // guard is needed here.
+        let _guard = fs_probe::snapshot_guard_async().await;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lock_path = temp_dir.path().join("does-not-exist.lock");
+
+        let provider = CountingLockFileProvider::new();
+        let cache = LockFileCache::new();
+
+        let err = cache.get_or_parse(&provider, &lock_path).await.unwrap_err();
+
+        assert!(
+            matches!(err, DepsError::Io(_)),
+            "expected an Io error for a missing lock file, got: {err:?}"
+        );
+        assert_eq!(
+            provider.parse_count(),
+            0,
+            "parse_lockfile must not be called when the file cannot be stat'd"
+        );
+    }
+
+    /// A cached entry whose backing file has since been deleted must not be served as a
+    /// stale-but-valid cache hit: the freshness check's stat fails, falls through to the
+    /// cache-miss path, and that path's own stat also fails, surfacing as `Err` rather than
+    /// resurrecting the old cached packages.
+    #[tokio::test]
+    async fn test_get_or_parse_cached_entry_with_deleted_file_returns_error() {
+        // See the comment in `test_get_or_parse_cache_hit_does_not_reparse` on why this
+        // guard is needed here.
+        let _guard = fs_probe::snapshot_guard_async().await;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lock_path = temp_dir.path().join("test.lock");
+        std::fs::write(&lock_path, "1.0.0").unwrap();
+
+        let provider = CountingLockFileProvider::new();
+        let cache = LockFileCache::new();
+
+        let first = cache.get_or_parse(&provider, &lock_path).await.unwrap();
+        assert_eq!(first.version("test-package"), Some("1.0.0"));
+
+        std::fs::remove_file(&lock_path).unwrap();
+
+        let err = cache.get_or_parse(&provider, &lock_path).await.unwrap_err();
+
+        assert!(
+            matches!(err, DepsError::Io(_)),
+            "expected an Io error once the cached file is deleted, got: {err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_get_or_parse_reparses_when_mtime_advances() {
         // See the comment in `test_get_or_parse_cache_hit_does_not_reparse` on why this
@@ -1302,6 +1337,51 @@ mod tests {
             "stale mtime should trigger reparse"
         );
         assert_eq!(second.version("test-package"), Some("2.0.0"));
+    }
+
+    /// Documents intentional behavior, not a bug: if a lock file's mtime moves *backward*
+    /// relative to what is cached (clock skew, a restored backup, a `git checkout` touching
+    /// an older tree), `get_or_parse`'s freshness check (`mtime <= cached_modified_at`) treats
+    /// it as still fresh and serves the cached (now content-stale) packages rather than
+    /// re-parsing. This mirrors the removed `is_lockfile_stale` default's own behavior for a
+    /// `last_modified` timestamp set to the future, so the semantics are unchanged by its
+    /// removal — this test exists only so the choice stays covered and visible.
+    #[tokio::test]
+    async fn test_get_or_parse_cache_hit_when_mtime_moves_backward() {
+        // See the comment in `test_get_or_parse_cache_hit_does_not_reparse` on why this
+        // guard is needed here.
+        let _guard = fs_probe::snapshot_guard_async().await;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lock_path = temp_dir.path().join("test.lock");
+        std::fs::write(&lock_path, "1.0.0").unwrap();
+
+        let provider = CountingLockFileProvider::new();
+        let cache = LockFileCache::new();
+
+        let first = cache.get_or_parse(&provider, &lock_path).await.unwrap();
+        assert_eq!(first.version("test-package"), Some("1.0.0"));
+
+        std::fs::write(&lock_path, "2.0.0").unwrap();
+        let past_mtime = SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&lock_path)
+            .unwrap()
+            .set_modified(past_mtime)
+            .unwrap();
+
+        let second = cache.get_or_parse(&provider, &lock_path).await.unwrap();
+
+        assert_eq!(
+            provider.parse_count(),
+            1,
+            "a backward-moving mtime must still be treated as a cache hit"
+        );
+        assert_eq!(
+            second.version("test-package"),
+            Some("1.0.0"),
+            "cached (pre-rewrite) content should be served, not the new on-disk content"
+        );
     }
 
     /// Stub [`LockFileProvider`] that simulates a concurrent writer racing the parse:

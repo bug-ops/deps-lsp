@@ -827,9 +827,8 @@ mod tests {
     }
 
     // #758: shared `LockFileProvider` conformance, replacing test_locate_lockfile_same_directory,
-    // test_locate_lockfile_not_found, test_is_lockfile_stale_not_modified/_modified/_deleted/
-    // _future_time, and test_parse_malformed_package_lock. test_locate_lockfile_workspace_root,
-    // test_locate_lockfile_prefers_package_lock_json_over_pnpm,
+    // test_locate_lockfile_not_found, and test_parse_malformed_package_lock.
+    // test_locate_lockfile_workspace_root, test_locate_lockfile_prefers_package_lock_json_over_pnpm,
     // test_locate_lockfile_falls_back_to_pnpm_when_no_package_lock, and
     // test_parse_pnpm_lock_malformed_yaml_is_parse_error stay hand-written: the macro's
     // malformed-content check only exercises LOCKFILES[0] (package-lock.json's JSON parser), so

@@ -198,8 +198,7 @@ mod tests {
     }
 
     // #758: shared `LockFileProvider` conformance, replacing test_locate_lockfile and
-    // test_parse_malformed_lock — also closes a real gap: this crate had no
-    // is_lockfile_stale_* coverage at all before.
+    // test_parse_malformed_lock.
     deps_core::lockfile_conformance! {
         mod composer_lockfile_conformance;
         build: ComposerLockParser;
