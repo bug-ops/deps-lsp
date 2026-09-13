@@ -28,6 +28,7 @@ status: moc
 | 047 | [[047-elixir-hex-ecosystem/spec\|New ecosystem: Elixir Hex (mix.exs dependency version hints)]] | specify | draft — research/new-ecosystem, P4, 6 open `[NEEDS CLARIFICATION]` items, issue #642 |
 | 051 | [[051-disk-persistent-registry-cache/spec\|Disk-persistent registry cache]] | specify | draft — research/enhancement, P4, 9 open `[NEEDS CLARIFICATION]` items, tracked in issue #700 |
 | 056 | [[056-gitlab-ci-yaml-scalar-anchor-alias/spec\|GitLab CI scalar YAML anchor alias detection in include: entries]] | specify | draft — bug, P1, 0 open `[NEEDS CLARIFICATION]` items, ready for implementation (issue #912) |
+| 057 | [[057-gitlab-ci-mapping-container-anchor/spec\|Mapping-shaped container anchor support for include: entries]] | specify | draft — enhancement, P3, 0 open `[NEEDS CLARIFICATION]` items, blocked on #912 implementation landing first (issue #916) |
 
 ## Completed Specs
 
