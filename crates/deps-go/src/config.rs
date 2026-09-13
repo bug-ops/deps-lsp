@@ -32,7 +32,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-use deps_core::net_policy::{PolicyGate, RedactedUrl, RegistryAccessPolicy, validate_index_url};
+use deps_core::net_policy::{
+    HostClass, PolicyGate, RedactedUrl, RegistryAccessPolicy, validate_index_url,
+};
 use deps_core::parser::DependencySource;
 
 /// Why a candidate `GOPROXY` hop URL failed [`GoProxyUrl::new`]'s validation.
@@ -252,10 +254,29 @@ impl GoProxyChain {
 /// re-parses.
 pub const GOPRIVATE_CHAIN_KEY: &str = "go-private:direct";
 
+/// Everything captured when [`parse_goproxy`] finds no usable hop in a `GOPROXY` chain
+/// (FR-009).
+///
+/// `for_resolution` is the *first* invalid hop encountered, in declaration order — unchanged
+/// from the pre-#958 behavior [`GoEnvConfig::resolve_source_for`] relies on to build the
+/// fail-closed `CustomRegistry` source. `first_blocked` is tracked **independently**: the
+/// first hop (again in declaration order, regardless of whether it is also `for_resolution`)
+/// rejected specifically for [`GoProxyUrlError::BlockedHost`]. Two separate fields rather than
+/// reusing `for_resolution` for both purposes, because an earlier hop invalid for an unrelated
+/// reason (malformed URL, non-`https` scheme, userinfo) must never mask a *later* hop's policy
+/// block from [`GoEnvConfig::blocked_class`] — e.g. `GOPROXY=http://a.example,https://b.example`
+/// under a policy blocking `b.example`: `for_resolution` names `a.example` (`NotHttps`, checked
+/// first), but `first_blocked` still names `b.example` (code-review fix, #958).
+#[derive(Debug, Clone)]
+struct GoProxyChainFailure {
+    for_resolution: InvalidEntry,
+    first_blocked: Option<(HostClass, RedactedUrl)>,
+}
+
 /// Parses a raw `GOPROXY` value (FR-002) into either a non-empty [`GoProxyChain`], or — when
-/// every declared hop turned out invalid — the first [`InvalidEntry`] encountered, so the
-/// caller can fail the whole chain closed to `CustomRegistry` (FR-009) rather than silently
-/// falling back to the default public chain.
+/// every declared hop turned out invalid — a [`GoProxyChainFailure`], so the caller can fail
+/// the whole chain closed to `CustomRegistry` (FR-009) rather than silently falling back to
+/// the default public chain.
 ///
 /// Tracks which separator (`,`/`|`) preceded each entry (spec 034 S2) so the resulting
 /// [`GoProxyChain::separators`] preserves Go's own distinction between the two — a manual
@@ -270,10 +291,14 @@ pub const GOPRIVATE_CHAIN_KEY: &str = "go-private:direct";
 // `idx` comes from `find([',', '|'])`, both ASCII bytes, so both slice bounds are always
 // char boundaries.
 #[allow(clippy::string_slice)]
-fn parse_goproxy(raw: &str, policy: &RegistryAccessPolicy) -> Result<GoProxyChain, InvalidEntry> {
+fn parse_goproxy(
+    raw: &str,
+    policy: &RegistryAccessPolicy,
+) -> Result<GoProxyChain, GoProxyChainFailure> {
     let mut hops: Vec<GoProxyHop> = Vec::new();
     let mut separators: Vec<ChainSeparator> = Vec::new();
     let mut first_invalid: Option<InvalidEntry> = None;
+    let mut first_blocked: Option<(HostClass, RedactedUrl)> = None;
     // The separator(s) spanning every entry seen since the last surviving hop (or the start
     // of the chain) — `None` until the first separator is seen. When this spans one or more
     // dropped invalid entries, it accumulates via most-permissive-wins (`AnyError` beats
@@ -314,6 +339,11 @@ fn parse_goproxy(raw: &str, policy: &RegistryAccessPolicy) -> Result<GoProxyChai
                     }
                 }
                 Err(invalid) => {
+                    if first_blocked.is_none()
+                        && let GoProxyUrlError::BlockedHost { class } = invalid.reason
+                    {
+                        first_blocked = Some((class, invalid.raw.clone()));
+                    }
                     if first_invalid.is_none() {
                         first_invalid = Some(invalid);
                     }
@@ -332,13 +362,17 @@ fn parse_goproxy(raw: &str, policy: &RegistryAccessPolicy) -> Result<GoProxyChai
     }
 
     if hops.is_empty() {
-        Err(first_invalid.unwrap_or_else(|| {
+        let for_resolution = first_invalid.unwrap_or_else(|| {
             let redacted = RedactedUrl::new(raw);
             InvalidEntry {
                 reason: GoProxyUrlError::InvalidUrl(redacted.clone()),
                 raw: redacted,
             }
-        }))
+        });
+        Err(GoProxyChainFailure {
+            for_resolution,
+            first_blocked,
+        })
     } else {
         Ok(GoProxyChain::keyed(hops, separators))
     }
@@ -683,7 +717,7 @@ fn tokens_match(tokens: &[GlobToken], text: &[char]) -> bool {
 pub struct GoEnvConfig {
     /// `None` when `$GOENV` declares no `GOPROXY` override (FR-003/US-005: every dependency
     /// keeps resolving to plain [`DependencySource::Registry`], byte-identical to today).
-    goproxy: Option<Result<GoProxyChain, InvalidEntry>>,
+    goproxy: Option<Result<GoProxyChain, GoProxyChainFailure>>,
     /// `GOPRIVATE` glob patterns (FR-007). Empty when absent/declares nothing.
     goprivate: Vec<GlobPattern>,
 }
@@ -752,8 +786,8 @@ impl GoEnvConfig {
                 index: chain.key.clone(),
                 mirrors_crates_io: false,
             },
-            Some(Err(invalid)) => DependencySource::CustomRegistry {
-                url: invalid.raw.to_string(),
+            Some(Err(failure)) => DependencySource::CustomRegistry {
+                url: failure.for_resolution.raw.to_string(),
             },
         }
     }
@@ -763,6 +797,32 @@ impl GoEnvConfig {
     #[must_use]
     pub fn goproxy_chain(&self) -> Option<&GoProxyChain> {
         self.goproxy.as_ref().and_then(|r| r.as_ref().ok())
+    }
+
+    /// `Some((class, raw))` iff `GOPROXY` failed closed (every hop invalid, FR-009) and at
+    /// least one dropped hop — not necessarily the one [`Self::resolve_source_for`] names in
+    /// its `CustomRegistry` source — was rejected for [`GoProxyUrlError::BlockedHost`]. Used by
+    /// `GoParseResult::blocked_registries` (#958, mirrors the `blocked_class` free function
+    /// `deps_npm::config` uses internally from `NpmConfig::blocked_class_for`).
+    ///
+    /// Reads the internal `GoProxyChainFailure::first_blocked`, tracked independently of
+    /// `GoProxyChainFailure::for_resolution` specifically so an earlier hop invalid for an
+    /// unrelated reason can never mask a later hop's policy block (code-review fix, #958) —
+    /// see that type's doc for a worked example.
+    ///
+    /// Unlike npm/Cargo's per-alias declarations, `GOPROXY` is a single config-global
+    /// declaration shared by every module in the document — this returns at most one
+    /// `(class, raw)` pair per parse, regardless of how many `go.mod` dependencies it applies
+    /// to.
+    #[must_use]
+    pub fn blocked_class(&self) -> Option<(HostClass, String)> {
+        match &self.goproxy {
+            Some(Err(failure)) => failure
+                .first_blocked
+                .as_ref()
+                .map(|(class, raw)| (*class, raw.to_string())),
+            _ => None,
+        }
     }
 
     /// Whether at least one declared `GOPRIVATE` pattern actually compiled into a usable
@@ -1496,6 +1556,77 @@ mod tests {
             config.resolve_source_for("github.com/gin-gonic/gin"),
             DependencySource::CustomRegistry { .. }
         );
+    }
+
+    /// #958: a policy-blocked sole hop must also be reported via `blocked_class` — this is
+    /// the data `GoParseResult::blocked_registries` surfaces as a diagnostic.
+    #[test]
+    fn test_blocked_class_some_when_goproxy_policy_blocked() {
+        let config = GoEnvConfig::parse("GOPROXY=https://goproxy.mycorp.example", &off_policy());
+        let (class, raw) = config.blocked_class().expect("expected a blocked class");
+        assert_eq!(class, HostClass::Global);
+        assert_eq!(raw, "https://goproxy.mycorp.example");
+    }
+
+    /// #958: no `GOPROXY` override at all -> nothing to report.
+    #[test]
+    fn test_blocked_class_none_when_no_goproxy() {
+        let config = GoEnvConfig::parse("", &off_policy());
+        assert_eq!(config.blocked_class(), None);
+    }
+
+    /// #958: a hop invalid for a reason other than policy (malformed URL) must not be
+    /// misreported as a policy block.
+    #[test]
+    fn test_blocked_class_none_for_non_policy_invalid_reason() {
+        let config = GoEnvConfig::parse("GOPROXY=not-a-valid-url", &all_policy());
+        assert_eq!(config.blocked_class(), None);
+    }
+
+    /// #958: when a valid hop remains, the chain resolves successfully rather than failing
+    /// closed, so there is nothing blocked to report even though one hop was policy-blocked.
+    #[test]
+    fn test_blocked_class_none_when_valid_hop_remains() {
+        let config = GoEnvConfig::parse(
+            "GOPROXY=https://goproxy.mycorp.example,direct",
+            &off_policy(),
+        );
+        assert_eq!(config.blocked_class(), None);
+    }
+
+    /// #958 code-review fix (S1): an earlier hop invalid for an unrelated reason
+    /// (`InvalidUrl`) must never mask a *later* hop's policy block — `resolve_source_for`'s
+    /// `CustomRegistry` still names the first invalid hop (unchanged resolution behavior), but
+    /// `blocked_class` still reports the second hop's block.
+    #[test]
+    fn test_blocked_class_not_masked_by_earlier_invalid_url_hop() {
+        let config = GoEnvConfig::parse(
+            "GOPROXY=not-a-valid-url,https://goproxy.mycorp.example",
+            &off_policy(),
+        );
+        assert_eq!(
+            config.resolve_source_for("github.com/gin-gonic/gin"),
+            DependencySource::CustomRegistry {
+                url: "not-a-valid-url".to_string(),
+            }
+        );
+        let (class, raw) = config.blocked_class().expect("expected a blocked class");
+        assert_eq!(class, HostClass::Global);
+        assert_eq!(raw, "https://goproxy.mycorp.example");
+    }
+
+    /// #958 code-review fix (S1): the realistic variant — a plain-`http` internal proxy
+    /// (`NotHttps`, checked before any policy lookup) must never mask an `https` fallback
+    /// hop's own policy block.
+    #[test]
+    fn test_blocked_class_not_masked_by_earlier_non_https_hop() {
+        let config = GoEnvConfig::parse(
+            "GOPROXY=http://a.mycorp.example,https://b.mycorp.example",
+            &off_policy(),
+        );
+        let (class, raw) = config.blocked_class().expect("expected a blocked class");
+        assert_eq!(class, HostClass::Global);
+        assert_eq!(raw, "https://b.mycorp.example");
     }
 
     /// FR-002: everything declared after a terminal `direct`/`off` hop is unreachable and

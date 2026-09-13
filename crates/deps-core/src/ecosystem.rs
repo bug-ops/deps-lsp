@@ -322,10 +322,18 @@ pub trait ParseResult: Send + Sync {
     /// raw value is always either a unique alias name or the literal URL the dependency itself
     /// wrote) may reuse the raw value as its own declaration key.
     ///
-    /// Default empty. Overridden today by `deps_cargo::parser::CargoParseResult`,
-    /// `deps_npm::parser::NpmParseResult`, `deps_pypi::parser::ParseResult`, and
-    /// `deps_nuget::parser::NuGetParseResult` (#925); every other ecosystem has no equivalent
-    /// reachability policy to report yet.
+    /// Default empty. An ecosystem overrides this when it enforces `net_policy` reachability
+    /// restrictions on a configurable registry/proxy host via
+    /// [`crate::net_policy::validate_index_url`] with [`crate::net_policy::PolicyGate::Enforce`]
+    /// — an ecosystem with no such configurable host (nothing a workspace or user config could
+    /// point at an unreachable-by-policy host) has nothing to report here and keeps the default.
+    ///
+    /// Known gap tracked as #967, not yet fixed: `deps_gitlab_ci::host::GitlabHost::parse` is
+    /// one such `PolicyGate::Enforce` caller (a configurable GitLab instance host) but still
+    /// keeps this default — a policy-blocked host there instead surfaces through
+    /// `deps_gitlab_ci`'s own `unresolved_host_diagnostics`, whose message is misattributed for
+    /// this specific cause (it tells the user to set `registries.gitlab_instance_host`, which
+    /// does nothing when the real cause is `registries.workspace_registries`).
     fn blocked_registries(&self) -> Vec<BlockedRegistryOccurrence> {
         Vec::new()
     }
