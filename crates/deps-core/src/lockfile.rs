@@ -39,12 +39,12 @@ pub const MAX_LOCKFILE_BYTES: u64 = 32 * 1024 * 1024;
 /// Bounded by [`MAX_LOCKFILE_BYTES`] via [`fs_probe::read_to_string_capped`] — a lock file
 /// is discovered by an unauthenticated ancestor walk ([`locate_lockfile_for_manifest`]) over
 /// a possibly hostile cloned repository, so nothing here may assume it is reasonably sized
-/// or a regular file before reading it in full (CWE-400). The capped read itself runs on
-/// the blocking-thread pool via [`tokio::task::spawn_blocking`], not on the calling tokio
-/// worker thread: it is synchronous I/O with no `.await` of its own, and every
-/// `LockFileProvider::parse_lockfile` call site sits on the LSP request path, where a
-/// worker thread blocked on an 8+ MiB read — or indefinitely, on a FIFO — would violate the
-/// project's non-blocking-handler rule.
+/// or a regular file before reading it in full (CWE-400). The whole stat-then-read sequence
+/// runs as one unit on the blocking-thread pool via [`tokio::task::spawn_blocking`], not on
+/// the calling tokio worker thread: both steps are synchronous I/O with no `.await` of their
+/// own, and every `LockFileProvider::parse_lockfile` call site sits on the LSP request path,
+/// where a worker thread blocked on a `stat` or an 8+ MiB read — or indefinitely, on a FIFO —
+/// would violate the project's non-blocking-handler rule (#963).
 ///
 /// # Errors
 ///
@@ -77,33 +77,42 @@ pub async fn read_lockfile_content(path: &Path, file_type: &str) -> Result<Strin
         ))
     };
 
-    // Cheap `stat` pre-filter (mirrors `MtimeFileCache::get_or_parse`): rejects a
-    // non-regular file (FIFO, socket, directory — reading one of those can block
-    // indefinitely) and an obviously oversized file before it is ever opened. The capped
-    // read below still enforces the size bound on the read itself regardless of what this
-    // reports, closing the same TOCTOU gap (CWE-367) a stat-only check alone would leave
-    // open (e.g. a symlink swapped to a FIFO, or the file growing, between this stat and
-    // the read).
-    if let Ok(metadata) = fs_probe::metadata(path) {
-        if !metadata.is_file() {
-            return Err(to_parse_error(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "not a regular file",
-            )));
-        }
-        if metadata.len() > MAX_LOCKFILE_BYTES {
-            tracing::warn!(
-                path = %path.display(),
-                len = metadata.len(),
-                cap = MAX_LOCKFILE_BYTES,
-                "lock file exceeds size cap; not reading"
-            );
-            return Err(oversized_error());
-        }
-    }
-
+    // Entered inside the closure below so the `path`/`file_type` fields this function's
+    // `#[tracing::instrument]` attaches to its span still show up on events logged from the
+    // blocking pool — a span is not implicitly active on whatever thread `spawn_blocking`
+    // happens to run its closure on.
+    let span = tracing::Span::current();
     let path_buf = path.to_path_buf();
     let read_result = tokio::task::spawn_blocking(move || {
+        let _entered = span.enter();
+        // Cheap `stat` pre-filter (mirrors `MtimeFileCache::get_or_parse`): rejects a
+        // non-regular file (FIFO, socket, directory — reading one of those can block
+        // indefinitely) and an obviously oversized file before it is ever opened. The
+        // capped read below still enforces the size bound on the read itself regardless
+        // of what this reports, closing the same TOCTOU gap (CWE-367) a stat-only check
+        // alone would leave open (e.g. a symlink swapped to a FIFO, or the file growing,
+        // between this stat and the read).
+        if let Ok(metadata) = fs_probe::metadata(&path_buf) {
+            if !metadata.is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "not a regular file",
+                ));
+            }
+            if metadata.len() > MAX_LOCKFILE_BYTES {
+                tracing::warn!(
+                    path = %path_buf.display(),
+                    len = metadata.len(),
+                    cap = MAX_LOCKFILE_BYTES,
+                    "lock file exceeds size cap; not reading"
+                );
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("exceeds {MAX_LOCKFILE_BYTES} byte size cap"),
+                ));
+            }
+        }
+
         fs_probe::read_to_string_capped(&path_buf, MAX_LOCKFILE_BYTES)
     })
     .await
@@ -541,11 +550,31 @@ pub trait LockFileProvider: Send + Sync {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ResolvedPackages>> + Send + 'a>>;
 }
 
+/// Upper bound on a [`LockFileCache`]'s entry count.
+///
+/// Matches [`crate::mtime_cache::DEFAULT_MAX_CACHED_FILES`] — the same generous bound for
+/// any realistic workspace's set of *distinct* lock files. Without a cap, a long-running
+/// server session that opens many workspaces over time (or one pointed at a monorepo with
+/// many independently-locked sub-projects) would grow this cache unboundedly, since entries
+/// previously survived even a `textDocument/didClose` (#962).
+///
+/// Bounds this cache's worst-case retained content at `DEFAULT_MAX_CACHED_LOCKFILES *
+/// MAX_LOCKFILE_BYTES` (256 * 32 MiB = 8 GiB of raw lock file content, before accounting for
+/// parsed [`ResolvedPackages`] overhead) — generous headroom rather than a tight budget,
+/// since a byte-accounted eviction policy (like [`crate::cache::HttpCache`]'s) is more
+/// precision than this entry-count-keyed cache needs.
+pub const DEFAULT_MAX_CACHED_LOCKFILES: usize = 256;
+
 /// Cached lock file entry with staleness detection.
 struct CachedLockFile {
     packages: ResolvedPackages,
     modified_at: SystemTime,
-    #[allow(dead_code)]
+    /// When this entry was last parsed *or* served from a cache hit — the recency key
+    /// [`LockFileCache::evict_oldest`] evicts by once the cache is at capacity. Refreshed on
+    /// every access (not only on (re)parse), so eviction is genuinely LRU rather than
+    /// FIFO-by-parse-time — otherwise a stable, frequently-read lock file would look oldest
+    /// and get evicted first, while one that keeps changing (and reparsing) would never age
+    /// out.
     parsed_at: Instant,
 }
 
@@ -553,6 +582,11 @@ struct CachedLockFile {
 ///
 /// Caches parsed lock file contents and checks file modification time
 /// to avoid re-parsing unchanged files. Thread-safe for concurrent access.
+///
+/// Bounded by a capacity ([`DEFAULT_MAX_CACHED_LOCKFILES`] by default, via [`Self::new`]; a
+/// custom bound via [`Self::with_capacity`]): once full, inserting a new key evicts the
+/// least-recently-used entry first, keyed by `CachedLockFile::parsed_at`, which is
+/// refreshed on every cache hit as well as every (re)parse (#962).
 ///
 /// # Examples
 ///
@@ -569,13 +603,55 @@ struct CachedLockFile {
 /// ```
 pub struct LockFileCache {
     entries: DashMap<PathBuf, CachedLockFile>,
+    capacity: usize,
 }
 
 impl LockFileCache {
-    /// Creates a new empty lock file cache.
+    /// Creates a new empty lock file cache, capped at [`DEFAULT_MAX_CACHED_LOCKFILES`]
+    /// entries.
+    #[must_use]
     pub fn new() -> Self {
+        Self::with_capacity(DEFAULT_MAX_CACHED_LOCKFILES)
+    }
+
+    /// Creates a new empty lock file cache, capped at `capacity` entries.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lockfile::LockFileCache;
+    ///
+    /// let cache = LockFileCache::with_capacity(64);
+    /// assert!(cache.is_empty());
+    /// ```
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
         Self {
             entries: DashMap::new(),
+            capacity,
+        }
+    }
+
+    /// Evicts the least-recently-used entry, making room for one new insert.
+    ///
+    /// A full scan of `entries` by [`CachedLockFile::parsed_at`] — acceptable at this
+    /// cache's scale (bounded by `capacity`, [`DEFAULT_MAX_CACHED_LOCKFILES`] by default),
+    /// unlike [`crate::osv`]'s cache, which is sized an order of magnitude larger and batches
+    /// its eviction accordingly. Logs at `warn` when eviction actually runs, mirroring
+    /// [`crate::mtime_cache::MtimeFileCache`]'s own at-capacity warning.
+    fn evict_oldest(&self) {
+        let oldest = self
+            .entries
+            .iter()
+            .min_by_key(|entry| entry.parsed_at)
+            .map(|entry| entry.key().clone());
+        if let Some(key) = oldest {
+            tracing::warn!(
+                path = %key.display(),
+                capacity = self.capacity,
+                "lock file cache capacity reached; evicting least-recently-used entry"
+            );
+            self.entries.remove(&key);
         }
     }
 
@@ -618,6 +694,12 @@ impl LockFileCache {
             && mtime <= cached_modified_at
         {
             tracing::debug!("Lock file cache hit: {}", lockfile_path.display());
+            // Refresh the recency marker on a hit too, not only on (re)parse: otherwise
+            // eviction is FIFO-by-parse-time rather than LRU, evicting a stable,
+            // frequently-read lock file before one that keeps changing and reparsing.
+            if let Some(mut entry) = self.entries.get_mut(lockfile_path) {
+                entry.parsed_at = Instant::now();
+            }
             return Ok(cached_packages);
         }
 
@@ -634,6 +716,9 @@ impl LockFileCache {
 
         let packages = provider.parse_lockfile(lockfile_path).await?;
 
+        if !self.entries.contains_key(lockfile_path) && self.entries.len() >= self.capacity {
+            self.evict_oldest();
+        }
         self.entries.insert(
             lockfile_path.to_path_buf(),
             CachedLockFile {
@@ -1055,6 +1140,10 @@ mod tests {
         let cache = LockFileCache::new();
         assert!(cache.is_empty());
         assert_eq!(cache.len(), 0);
+        assert_eq!(
+            cache.capacity, DEFAULT_MAX_CACHED_LOCKFILES,
+            "new() must use the documented default capacity"
+        );
     }
 
     #[test]
@@ -1076,6 +1165,96 @@ mod tests {
         cache.invalidate(&test_path);
         assert_eq!(cache.len(), 0);
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn test_lockfile_cache_with_capacity() {
+        let cache = LockFileCache::with_capacity(64);
+        assert_eq!(cache.capacity, 64);
+        assert!(cache.is_empty());
+    }
+
+    /// #962 regression: a [`LockFileCache`] at capacity must evict the least-recently-parsed
+    /// entry before inserting a new key, never grow past its configured bound.
+    #[tokio::test]
+    async fn test_get_or_parse_evicts_oldest_entry_at_capacity() {
+        // See the comment in `test_get_or_parse_cache_hit_does_not_reparse` on why this
+        // guard is needed here.
+        let _guard = fs_probe::snapshot_guard_async().await;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lock_a = temp_dir.path().join("a.lock");
+        let lock_b = temp_dir.path().join("b.lock");
+        let lock_c = temp_dir.path().join("c.lock");
+        std::fs::write(&lock_a, "a").unwrap();
+        std::fs::write(&lock_b, "b").unwrap();
+        std::fs::write(&lock_c, "c").unwrap();
+
+        let provider = CountingLockFileProvider::new();
+        let cache = LockFileCache::with_capacity(2);
+
+        cache.get_or_parse(&provider, &lock_a).await.unwrap();
+        cache.get_or_parse(&provider, &lock_b).await.unwrap();
+        assert_eq!(
+            cache.len(),
+            2,
+            "cache should hold exactly `capacity` entries"
+        );
+
+        // `a` is now the oldest by `parsed_at`; inserting a third distinct key must evict
+        // it rather than growing the cache past its capacity.
+        cache.get_or_parse(&provider, &lock_c).await.unwrap();
+        assert_eq!(
+            cache.len(),
+            2,
+            "cache must not grow past its configured capacity"
+        );
+        assert!(
+            cache.entries.contains_key(&lock_b),
+            "the more recently parsed entry must survive eviction"
+        );
+        assert!(
+            cache.entries.contains_key(&lock_c),
+            "the newly inserted entry must be present"
+        );
+        assert!(
+            !cache.entries.contains_key(&lock_a),
+            "the least-recently-parsed entry must have been evicted"
+        );
+
+        // Re-fetching the evicted `a` must trigger a fresh parse, not a cache hit.
+        let parses_before = provider.parse_count();
+        cache.get_or_parse(&provider, &lock_a).await.unwrap();
+        assert_eq!(
+            provider.parse_count(),
+            parses_before + 1,
+            "an evicted entry must be re-parsed on next access"
+        );
+    }
+
+    /// A repeat `get_or_parse` for an already-cached key at capacity must not trigger
+    /// eviction — the cache-hit path returns before `entries.insert` is ever reached.
+    #[tokio::test]
+    async fn test_get_or_parse_cache_hit_at_capacity_does_not_evict() {
+        // See the comment in `test_get_or_parse_cache_hit_does_not_reparse` on why this
+        // guard is needed here.
+        let _guard = fs_probe::snapshot_guard_async().await;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lock_a = temp_dir.path().join("a.lock");
+        let lock_b = temp_dir.path().join("b.lock");
+        std::fs::write(&lock_a, "a").unwrap();
+        std::fs::write(&lock_b, "b").unwrap();
+
+        let provider = CountingLockFileProvider::new();
+        let cache = LockFileCache::with_capacity(2);
+
+        cache.get_or_parse(&provider, &lock_a).await.unwrap();
+        cache.get_or_parse(&provider, &lock_b).await.unwrap();
+
+        // Re-fetch `a` (unchanged mtime): a cache hit, must not evict `b`.
+        cache.get_or_parse(&provider, &lock_a).await.unwrap();
+        assert_eq!(cache.len(), 2);
+        assert!(cache.entries.contains_key(&lock_a));
+        assert!(cache.entries.contains_key(&lock_b));
     }
 
     #[test]

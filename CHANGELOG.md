@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **deps-core**: `LockFileCache::with_capacity` and `DEFAULT_MAX_CACHED_LOCKFILES` — a custom-capacity constructor and the new default entry-count bound (resolves #962)
+
 ### Changed
 - `specs/constitution.md`: rewrote principle 7 with a post-1.0 breaking-change policy (major-bump-per-crate, a labeled "Breaking" changelog entry, `cargo-semver-checks` as the CI catch-net) alongside the existing pre-1.0 clean-break rule (resolves #948) (#957)
 - **deps-core, deps-cargo, deps-pypi, deps-gradle, deps-nuget, deps-deno, deps-swift, deps-bundler, deps-go, deps-maven**: routed every remaining byte-span-to-`Range` site through `deps_core::lsp_helpers::byte_span_to_range` instead of a per-crate hand-rolled duplicate (resolves #927) (#950)
@@ -26,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **deps-nuget, deps-core, deps-cargo, deps-npm, deps-pypi**: fixed four #925 follow-up gaps in blocked-custom-registry-host detection — NuGet's plain-chain and mapping-shaped source branches no longer mask a blocked host behind a coexisting valid or earlier-invalid source, Cargo/npm/PyPI dependencies sharing a blocked-registry declaration each keep their own visible diagnostic via bounded `related_information`, and `ParseResult::blocked_registries()` now returns a named struct instead of a positional 4-tuple (resolves #944) (#964)
+- **deps-core**: `LockFileCache` is now bounded (256 entries by default) with least-recently-parsed eviction, and its lock file discovery/read now run entirely on the blocking-thread pool instead of the calling tokio worker (resolves #962, #963)
 - **deps-dart**: removed flaky wall-clock-ratio assertions from three `pubspec.yaml` parser tests and replaced them with deterministic correctness checks, plus a new `dart_benchmarks` criterion suite to observe scaling behavior locally (resolves #946) (#953)
 - **deps-core**: version-completion dropdown and code-action "update version" quick-fix now source their `(latest)` label/preselection from the same registry-delegated pick hover already uses, instead of raw fetch-order index 0 or a re-derived `is_stable()` scan — fixes mislabeling a pre-release or a newer deprecated release as latest (resolves #952, sibling of #313) (#955)
 - **deps-core**: the completion dropdown and code-action quick-fix no longer silently drop the `(latest)` marker when the registry-selected version falls outside the 5-entry raw-order display window — it is now bumped into the displayed window instead (resolves #956) (#960)

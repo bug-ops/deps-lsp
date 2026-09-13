@@ -9,6 +9,7 @@ use deps_core::PackageVersions;
 use deps_core::VersionReq;
 use deps_core::lsp_helpers::resolve_in_use_version;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tower_lsp_server::ls_types::Uri;
 
 /// Whether a reparse should only re-fetch what `DependencyDiff` calls for, or force a
@@ -180,10 +181,26 @@ pub(crate) async fn load_resolved_versions(
         }
     };
 
-    let lockfile_path = match lock_provider.locate_lockfile(uri) {
-        Some(path) => path,
-        None => {
+    // `locate_lockfile` does a synchronous ancestor-directory `stat` walk
+    // (`deps_core::lockfile::locate_lockfile_for_manifest`, up to `1 + MAX_WORKSPACE_DEPTH`
+    // levels deep, doubled for NuGet's multi-project fallback); run it in `spawn_blocking`
+    // rather than inline on the calling tokio worker, matching the read/parse path below
+    // (#963).
+    let lock_provider_for_locate = Arc::clone(&lock_provider);
+    let uri_for_locate = uri.clone();
+    let located = tokio::task::spawn_blocking(move || {
+        lock_provider_for_locate.locate_lockfile(&uri_for_locate)
+    })
+    .await;
+
+    let lockfile_path = match located {
+        Ok(Some(path)) => path,
+        Ok(None) => {
             tracing::debug!("No lock file found for {:?}", uri);
+            return (HashMap::new(), HashMap::new());
+        }
+        Err(e) => {
+            tracing::warn!("Lock file discovery task panicked for {:?}: {}", uri, e);
             return (HashMap::new(), HashMap::new());
         }
     };
