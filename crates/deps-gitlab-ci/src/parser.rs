@@ -541,7 +541,10 @@ fn resolve_project_host(instance_host: &GitlabInstanceHost) -> HostRef {
 fn resolve_instance_host_ref(instance_host: &GitlabInstanceHost, raw: &str) -> HostRef {
     match instance_host.resolve() {
         InstanceHostOutcome::Valid(host) => HostRef::Literal(host),
-        InstanceHostOutcome::Blocked(configured_raw, class) => HostRef::PolicyBlocked {
+        InstanceHostOutcome::Blocked {
+            raw: configured_raw,
+            class,
+        } => HostRef::PolicyBlocked {
             raw: configured_raw,
             class,
             declaration_key: INSTANCE_HOST_DECLARATION_KEY.to_string(),
@@ -581,7 +584,10 @@ fn resolve_component_host(
                 // #967 S3: one per distinct literal host string, unlike the instance-setting
                 // path's single shared key — two different `component:` hosts blocked by policy
                 // are two independently declared literals, not one config declaration.
-                declaration_key: format!("component-host:{host_expr}"),
+                // Lowercased (code-review follow-up): hostnames are case-insensitive per
+                // DNS/HTTP, so `FOO.internal` and `foo.internal` must collapse into the same
+                // declaration, not fan out into two.
+                declaration_key: format!("component-host:{}", host_expr.to_ascii_lowercase()),
             }
         }
         Err(_) => HostRef::Unresolved(host_expr.to_string()),
@@ -1161,6 +1167,27 @@ mod tests {
         assert_eq!(
             keys,
             std::collections::HashSet::from([INSTANCE_HOST_DECLARATION_KEY])
+        );
+    }
+
+    /// Code-review follow-up to #967 S3: two `component:` hosts blocked by the same policy,
+    /// differing only in letter case, must collapse into one declaration key — hostnames are
+    /// case-insensitive per DNS/HTTP, so `FOO.internal` and `foo.internal` are the same
+    /// declaration, not two independently-declared literals.
+    #[test]
+    fn test_component_literal_hosts_differing_only_in_case_share_one_declaration_key() {
+        let (policy, instance_host) = ctx();
+        let content = "include:\n  - component: FOO.internal/org/a/c@1.0\n  - component: foo.internal/org/b/c@1.0\n";
+        let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host).unwrap();
+        assert_eq!(result.blocked_registries.len(), 2);
+        let keys: std::collections::HashSet<_> = result
+            .blocked_registries
+            .iter()
+            .map(|occ| occ.declaration_key.as_str())
+            .collect();
+        assert_eq!(
+            keys,
+            std::collections::HashSet::from(["component-host:foo.internal"])
         );
     }
 

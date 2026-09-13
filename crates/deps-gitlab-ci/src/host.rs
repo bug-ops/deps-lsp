@@ -207,10 +207,19 @@ pub(crate) enum InstanceHostOutcome {
     /// Configured, but rejected specifically because its host class is blocked by the
     /// current `registries.workspace_registries` policy (issue #967) — kept distinct from
     /// [`Self::Invalid`] so callers can surface the correct diagnostic (the fix is to relax
-    /// the policy, not to reconfigure `registries.gitlab_instance_host`). Carries the
-    /// configured raw value itself (#967 S1: a caller needs the real blocked string, not a
-    /// placeholder, to name it accurately in a diagnostic).
-    Blocked(String, HostClass),
+    /// the policy, not to reconfigure `registries.gitlab_instance_host`).
+    ///
+    /// A named struct variant, not a positional tuple (code-review follow-up, consistency
+    /// with [`crate::types::HostRef::PolicyBlocked`]'s own #944 M9-style rationale): `raw`
+    /// and `class` differ in type today so a swap wouldn't compile, but naming them keeps the
+    /// two `Blocked` shapes in this crate consistent as either evolves.
+    Blocked {
+        /// The configured raw value itself (#967 S1: a caller needs the real blocked
+        /// string, not a placeholder, to name it accurately in a diagnostic).
+        raw: String,
+        /// The blocked host's classification.
+        class: HostClass,
+    },
     /// Configured and validated successfully.
     Valid(GitlabHost),
 }
@@ -290,7 +299,7 @@ impl GitlabInstanceHost {
             InstanceHostOutcome::Valid(host) => Some(host),
             InstanceHostOutcome::Unset
             | InstanceHostOutcome::Invalid
-            | InstanceHostOutcome::Blocked(..) => None,
+            | InstanceHostOutcome::Blocked { .. } => None,
         }
     }
 
@@ -338,7 +347,10 @@ impl GitlabInstanceHost {
                      resolution and disabling GITLAB_TOKEN entirely (it is not redirected to \
                      gitlab.com)"
                 );
-                InstanceHostOutcome::Blocked(raw.clone(), class)
+                InstanceHostOutcome::Blocked {
+                    raw: raw.clone(),
+                    class,
+                }
             }
             Err(e) => {
                 tracing::warn!(
@@ -399,7 +411,7 @@ pub fn token_host_origin(instance_host: &GitlabInstanceHost) -> Option<String> {
     match instance_host.resolve() {
         InstanceHostOutcome::Unset => Some(GITLAB_COM_ORIGIN.to_string()),
         InstanceHostOutcome::Valid(host) => Some(host.origin().to_string()),
-        InstanceHostOutcome::Invalid | InstanceHostOutcome::Blocked(..) => None,
+        InstanceHostOutcome::Invalid | InstanceHostOutcome::Blocked { .. } => None,
     }
 }
 
@@ -552,7 +564,10 @@ mod tests {
         );
         assert_eq!(
             blocked.resolve(),
-            InstanceHostOutcome::Blocked("127.0.0.1".to_string(), HostClass::Loopback)
+            InstanceHostOutcome::Blocked {
+                raw: "127.0.0.1".to_string(),
+                class: HostClass::Loopback,
+            }
         );
 
         let not_blocked = GitlabInstanceHost::new(
