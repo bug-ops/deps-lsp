@@ -93,11 +93,14 @@ impl GradleEcosystem {
     /// Detects completion context for Gradle files at the given position.
     ///
     /// Returns `(context_type, value, range)` where `context_type` is a
-    /// [`GradleCompletionContext`]; `value` is the already-typed prefix up to the
-    /// cursor; `range` spans the *entire* existing package coordinate (module/`group:artifact`)
-    /// being completed, not just up to the cursor, and is meaningless when
-    /// `context_type` is not [`GradleCompletionContext::Package`] (mirrors
-    /// `MavenEcosystem::detect_xml_context`).
+    /// [`GradleCompletionContext`]; `value` is the already-typed prefix up to the cursor;
+    /// `range` spans the entire existing value being completed, not just up to the
+    /// cursor — the whole package coordinate (module/`group:artifact`) for
+    /// [`GradleCompletionContext::Package`], or the whole version literal for
+    /// [`GradleCompletionContext::Version`] (the latter is also consumed by
+    /// [`deps_core::lsp_helpers::dependency_version_range_is_literal`] at the
+    /// `Version`-arm call site in [`Ecosystem::generate_completions`]) — and is meaningless
+    /// only when `context_type` is [`GradleCompletionContext::None`].
     ///
     /// `position.character` is a UTF-16 code unit offset (LSP spec) and is converted to a
     /// byte offset once via [`deps_core::completion::utf16_to_byte_offset`] before any
@@ -226,12 +229,43 @@ fn detect_catalog_context<'a>(
             deps_core::fallback_completion::count_real_quotes(after)
         && !quote_count.is_multiple_of(2)
     {
+        // `version.ref = "alias"` refers to a `[versions]` table alias name, not a
+        // registry version literal directly — `field.rfind("version")` above also matches
+        // this variant. Computing a real range for it here would let
+        // `dependency_version_range_is_literal` wrongly ACCEPT whenever the alias name
+        // happens to equal its own already-resolved value (critic follow-up to #931).
+        // Alias-name completion semantics are out of scope for this fix (see the spec's
+        // Edge Cases table), so this keeps the pre-#931 placeholder range, which the guard
+        // always rejects — the same safe-but-wrong behavior `version.ref` had before #931,
+        // not a regression.
+        // TOML's dotted-key syntax allows whitespace around the `.` (`version . ref = ...`
+        // is legal), so `trim_start()` before checking for the dot — a bare `starts_with`
+        // would miss that spacing and fall through to the real-range branch below,
+        // reintroducing the wrong-direction-accept bug this check exists to prevent.
+        let is_version_ref = after
+            .get("version".len()..)
+            .is_some_and(|rest| rest.trim_start().starts_with('.'));
         let value_start = field_start + rel_eq_pos + quote_start + 1;
         if value_start <= cursor {
+            let range = if is_version_ref {
+                Range::default()
+            } else {
+                // Same unterminated-string fallback as the `module` arm below: bound by
+                // the cursor rather than end-of-line so an unclosed value doesn't swallow
+                // trailing line content into the range (#931 — this arm previously
+                // returned `Range::default()` unconditionally, which made
+                // `dependency_version_range_is_literal`'s content slice never match the
+                // declared version, rejecting every completion here).
+                let value_end =
+                    deps_core::fallback_completion::find_closing_quote(&line[value_start..], '"')
+                        .map_or(cursor, |rel| value_start + rel)
+                        .max(cursor);
+                byte_range(line, line_idx, value_start, value_end)
+            };
             return (
                 GradleCompletionContext::Version,
                 &line[value_start..cursor],
-                Range::default(),
+                range,
             );
         }
     }
@@ -333,10 +367,21 @@ fn detect_dsl_context<'a>(
                 .nth(1)
                 .map(|(i, _)| i + 1)
                 .unwrap_or(before_cursor.len());
+            // Same unterminated-string fallback as the `colon_count 0 | 1` arm above (#931 —
+            // this arm previously returned `Range::default()`, which made
+            // `dependency_version_range_is_literal`'s content slice never match the declared
+            // version, rejecting every compact-coordinate completion here).
+            let rest = &line[version_start..];
+            let closing_quote_rel =
+                deps_core::fallback_completion::find_closing_quote(rest, quote_char);
+            let value_end = closing_quote_rel
+                .map_or(cursor, |rel| version_start + rel)
+                .max(cursor);
+            let range = byte_range(line, line_idx, version_start, value_end);
             (
                 GradleCompletionContext::Version,
                 &line[version_start..cursor],
-                Range::default(),
+                range,
             )
         }
     }
@@ -590,9 +635,15 @@ mod tests {
         // before_cursor = `version = "`, cursor at 11 (right after '"')
         let col = 11;
         let before = &line[..col];
-        let (t, v, _) = detect_catalog_context(before, line, col, 0);
+        let (t, v, range) = detect_catalog_context(before, line, col, 0);
         assert_eq!(t, GradleCompletionContext::Version);
         assert_eq!(v, "");
+        // #931: range must span the whole literal value ("1.0.0"), not Range::default().
+        assert_eq!(
+            range,
+            Range::new(Position::new(0, 11), Position::new(0, 16))
+        );
+        assert_eq!(&line[11..16], "1.0.0");
     }
 
     #[test]
@@ -602,9 +653,14 @@ mod tests {
         // value_start = 11, "1.0" = 3 chars, cursor at 14
         let col = 14;
         let before = &line[..col];
-        let (t, v, _) = detect_catalog_context(before, line, col, 0);
+        let (t, v, range) = detect_catalog_context(before, line, col, 0);
         assert_eq!(t, GradleCompletionContext::Version);
         assert_eq!(v, "1.0");
+        // #931: the range covers the whole literal value regardless of cursor position.
+        assert_eq!(
+            range,
+            Range::new(Position::new(0, 11), Position::new(0, 16))
+        );
     }
 
     #[test]
@@ -614,9 +670,13 @@ mod tests {
         // value_start = 11, "1.0.0" = 5 chars, cursor at 16
         let col = 16;
         let before = &line[..col];
-        let (t, v, _) = detect_catalog_context(before, line, col, 0);
+        let (t, v, range) = detect_catalog_context(before, line, col, 0);
         assert_eq!(t, GradleCompletionContext::Version);
         assert_eq!(v, "1.0.0");
+        assert_eq!(
+            range,
+            Range::new(Position::new(0, 11), Position::new(0, 16))
+        );
     }
 
     #[test]
@@ -879,9 +939,52 @@ mod tests {
         let line = r#"lib = { module = "com.example:lib", version = "1.0"#;
         let col = line.len();
         let before = &line[..col];
-        let (t, v, _range) = detect_catalog_context(before, line, col, 0);
+        let (t, v, range) = detect_catalog_context(before, line, col, 0);
         assert_eq!(t, GradleCompletionContext::Version);
         assert_eq!(v, "1.0");
+        // #931 (tester follow-up): this exercises the fixed Version arm in a
+        // multi-field-per-line scenario — unterminated value, so the range is bounded by
+        // the cursor rather than end-of-line.
+        assert_eq!(
+            range,
+            Range::new(Position::new(0, 47), Position::new(0, col as u32))
+        );
+        assert_eq!(&line[47..col], "1.0");
+    }
+
+    #[test]
+    fn test_detect_catalog_context_version_ref_keeps_placeholder_range() {
+        // lib = { module = "com.example:lib", version.ref = "guavaVersion|" — `version.ref`
+        // refers to a `[versions]` table alias name, not a registry version literal
+        // directly. Critic follow-up to #931: computing a real range here (as for plain
+        // `version = "..."`) would let `dependency_version_range_is_literal` wrongly
+        // ACCEPT whenever the alias name happens to equal its own resolved value, which is
+        // a newly introduced wrong-direction accept versus the pre-#931 code's blanket
+        // (always-wrong-but-safe) rejection. This must keep returning `Range::default()`.
+        let line = r#"lib = { module = "com.example:lib", version.ref = "guavaVersion" }"#;
+        let col = line.len() - 3; // cursor inside "guavaVersion", right before the closing quote
+        let before = &line[..col];
+        let (t, v, range) = detect_catalog_context(before, line, col, 0);
+        assert_eq!(t, GradleCompletionContext::Version);
+        assert_eq!(v, "guavaVersion");
+        assert_eq!(range, Range::default());
+    }
+
+    #[test]
+    fn test_detect_catalog_context_version_ref_with_toml_whitespace_keeps_placeholder_range() {
+        // lib = { module = "com.example:lib", version . ref = "guavaVersion|" — TOML's
+        // dotted-key syntax allows whitespace around the `.` (`version . ref = ...` is
+        // legal TOML), so a bare `starts_with('.')` check (without `trim_start()`) would
+        // miss this spacing, fall through to the real-range branch, and reintroduce the
+        // wrong-direction-accept bug the `is_version_ref` check exists to prevent
+        // (follow-up to the critic's M2 finding on #931).
+        let line = r#"lib = { module = "com.example:lib", version . ref = "guavaVersion" }"#;
+        let col = line.len() - 3; // cursor inside "guavaVersion", right before the closing quote
+        let before = &line[..col];
+        let (t, v, range) = detect_catalog_context(before, line, col, 0);
+        assert_eq!(t, GradleCompletionContext::Version);
+        assert_eq!(v, "guavaVersion");
+        assert_eq!(range, Range::default());
     }
 
     #[test]
@@ -907,9 +1010,17 @@ mod tests {
         // second ':' at index 27; version_start=28, "4.1"=3 chars, cursor at 31
         let col = 31;
         let before = &line[..col];
-        let (t, v, _) = detect_dsl_context(before, line, col, 0);
+        let (t, v, range) = detect_dsl_context(before, line, col, 0);
         assert_eq!(t, GradleCompletionContext::Version);
         assert_eq!(v, "4.1");
+        // #931: range must span the whole literal version segment ("4.13.2"), not
+        // Range::default() — otherwise `dependency_version_range_is_literal`'s content
+        // slice never matches the declared version and completion is rejected outright.
+        assert_eq!(
+            range,
+            Range::new(Position::new(0, 28), Position::new(0, 34))
+        );
+        assert_eq!(&line[28..34], "4.13.2");
     }
 
     #[test]
@@ -919,9 +1030,29 @@ mod tests {
         // second ':' at index 27, cursor at 28 (right after it)
         let col = 28;
         let before = &line[..col];
-        let (t, v, _) = detect_dsl_context(before, line, col, 0);
+        let (t, v, range) = detect_dsl_context(before, line, col, 0);
         assert_eq!(t, GradleCompletionContext::Version);
         assert_eq!(v, "");
+        assert_eq!(
+            range,
+            Range::new(Position::new(0, 28), Position::new(0, 34))
+        );
+    }
+
+    #[test]
+    fn test_detect_dsl_context_version_unterminated_falls_back_to_cursor() {
+        // implementation("junit:junit:4.13.2 — no closing quote/paren on the line; the
+        // range must stop at the cursor, not swallow the rest of the line (#931).
+        let line = r#"implementation("junit:junit:4.13.2"#;
+        let col = line.len();
+        let before = &line[..col];
+        let (t, v, range) = detect_dsl_context(before, line, col, 0);
+        assert_eq!(t, GradleCompletionContext::Version);
+        assert_eq!(v, "4.13.2");
+        assert_eq!(
+            range,
+            Range::new(Position::new(0, 28), Position::new(0, col as u32))
+        );
     }
 
     #[tokio::test]
@@ -1093,6 +1224,50 @@ mod tests {
             .generate_completions(parse_result.as_ref(), position, content, freshness)
             .await;
         assert_eq!(result, Completions::default());
+    }
+
+    /// #931 regression: a plain literal compact-coordinate version must be admitted by the
+    /// #922 guard now that `detect_dsl_context`'s `colon_count >= 2` arm returns the real
+    /// span of the version segment instead of `Range::default()` — the guard's content
+    /// slice previously never matched the declared version, rejecting every such
+    /// completion.
+    #[tokio::test]
+    async fn test_dsl_context_range_admits_plain_literal_compact_coordinate() {
+        // See the comment in `test_parse_manifest_kts` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let eco = GradleEcosystem::new(make_cache());
+        let content = "dependencies {\n    implementation 'com.google.guava:guava:32.0.1-jre'\n}\n";
+        let uri = deps_core::test_util::test_uri("/project/build.gradle");
+        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+        let dep = &parse_result.dependencies()[0];
+        let position = dep.version_range().unwrap().start;
+
+        let (ctx, _, range) = GradleEcosystem::detect_completion_context(content, position, &uri);
+        assert_eq!(ctx, GradleCompletionContext::Version);
+        assert!(deps_core::lsp_helpers::dependency_version_range_is_literal(
+            *dep, content, range,
+        ));
+    }
+
+    /// #931 regression: a plain literal `version = "..."` catalog value must be admitted
+    /// by the #922 guard now that `detect_catalog_context`'s `version` arm returns the
+    /// real span of the value instead of `Range::default()`.
+    #[tokio::test]
+    async fn test_catalog_context_range_admits_plain_literal_version() {
+        // See the comment in `test_parse_manifest_kts` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let eco = GradleEcosystem::new(make_cache());
+        let content = "[libraries]\ncommons-lang = { module = \"org.apache.commons:commons-lang3\", version = \"3.12.0\" }\n";
+        let uri = deps_core::test_util::test_uri("/project/libs.versions.toml");
+        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+        let dep = &parse_result.dependencies()[0];
+        let position = dep.version_range().unwrap().start;
+
+        let (ctx, _, range) = GradleEcosystem::detect_completion_context(content, position, &uri);
+        assert_eq!(ctx, GradleCompletionContext::Version);
+        assert!(deps_core::lsp_helpers::dependency_version_range_is_literal(
+            *dep, content, range,
+        ));
     }
 
     // `complete_versions` has no offline guard for an already-well-formed package name, so
