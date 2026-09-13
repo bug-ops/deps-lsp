@@ -89,14 +89,7 @@ pub async fn handle_code_lens(
 
     let versions = VersionData::new(&cached_versions, &resolved_versions).with_offline(offline);
     let mut lenses = ecosystem
-        .generate_code_lenses(
-            parse_result.as_ref(),
-            &content,
-            versions,
-            uri,
-            COMMAND_ID,
-            severities,
-        )
+        .generate_code_lenses(parse_result.as_ref(), &content, versions, uri, COMMAND_ID)
         .await;
 
     // M4 (#640): the bulk "Pin N {noun} to commit SHA" lens lives here, not as an
