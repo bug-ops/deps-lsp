@@ -1,7 +1,10 @@
 use std::collections::BTreeMap;
+use std::fmt;
 use yaml_rust2::Event;
 use yaml_rust2::parser::{MarkedEventReceiver, Parser};
 use yaml_rust2::scanner::Marker;
+
+use crate::net_policy::RedactedUrl;
 
 /// Maximum allowed nesting depth for TOML table/array recursion before
 /// [`check_toml_nesting_depth`] rejects the input.
@@ -913,7 +916,7 @@ pub fn parse_json_checked<T: serde::de::DeserializeOwned>(
 ///
 /// Covers the union of all source types across Cargo, npm, PyPI, Go,
 /// Dart, Bundler, Maven, and Gradle ecosystems.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DependencySource {
     /// Default package registry (crates.io, npm, PyPI, pub.dev, rubygems.org, Maven Central).
@@ -957,13 +960,16 @@ pub enum DependencySource {
     /// has validated and can fetch against. See [`AlternateRegistry`](Self::AlternateRegistry)
     /// for the resolved counterpart.
     ///
-    /// `url` is never redacted (unlike every `tracing::warn!` naming the same raw value —
-    /// see `deps_core::net_policy::redact_userinfo`'s doc, #536): a literal `registry-index`
-    /// carrying `user:pass@` userinfo that fails to resolve lands here verbatim. Currently
-    /// latent — nothing renders `CustomRegistry::url` in hover/diagnostics text today — but a
-    /// future caller surfacing it must redact first, matching every logging call site.
+    /// `url` itself is stored raw (unresolved alias or a literal `registry-index`, possibly
+    /// carrying `user:pass@` userinfo or a credential-bearing query string) — never redact
+    /// this field in place, since `dedup_dependencies_by_source`'s collision check and other
+    /// equality-based logic must keep comparing the real value. [`DependencySource`]'s own
+    /// [`Debug`] impl redacts it via [`RedactedUrl`] before it can reach a log line; any
+    /// future caller rendering `url` into hover/diagnostics text (currently latent — nothing
+    /// does today) must redact it the same way rather than relying on `Debug` alone.
     CustomRegistry {
-        /// Unresolved alias or raw index URL, never redacted (see the variant's own doc).
+        /// Unresolved alias or raw index URL — redacted only when [`Debug`]-formatted (see
+        /// the variant's own doc).
         url: String,
     },
 
@@ -973,12 +979,16 @@ pub enum DependencySource {
     /// state instead of string-sniffing an unresolved alias vs. a URL. Produced only by a
     /// parser that validated `index` against its own registry-configuration source (e.g.
     /// `deps-cargo`'s `.cargo/config.toml` resolution) — `deps-core` itself never constructs
-    /// this variant. `index` is the `sparse+` prefix-stripped, https-only index URL; it
-    /// carries no credential and is not itself an authorization decision — see the
-    /// originating crate's config-resolution module for how (and whether) a request against
-    /// it is authenticated.
+    /// this variant. `index` is the `sparse+` prefix-stripped, https-only index URL —
+    /// userinfo is rejected by `validate_index_url` before a URL can resolve to this variant,
+    /// but a credential-bearing query string is not stripped there and CAN still be present
+    /// (#935); [`DependencySource`]'s own [`Debug`] impl redacts `index` via [`RedactedUrl`]
+    /// so a `tracing::warn!(?source, ...)` call site can never leak one. `index` is not
+    /// itself an authorization decision — see the originating crate's config-resolution
+    /// module for how (and whether) a request against it is authenticated.
     AlternateRegistry {
-        /// The resolved index URL, validated and normalized by the originating parser.
+        /// The resolved index URL, validated and normalized by the originating parser —
+        /// redacted only when [`Debug`]-formatted (see the variant's own doc).
         index: String,
         /// `true` exactly when this source was reached via a `[source.crates-io]
         /// replace-with` chain (Cargo `[source]` mirroring, spec
@@ -993,6 +1003,48 @@ pub enum DependencySource {
         /// See [`crate::lsp_helpers::SourcePolicy::source_is_public_registry_content`].
         mirrors_crates_io: bool,
     },
+}
+
+/// Hand-written, not derived (#935): a derived `Debug` would have printed `Git.url`,
+/// `Url.url`, `CustomRegistry.url`, and `AlternateRegistry.index` raw — every one of them
+/// can carry a credential (userinfo or a query-string secret) that never gets a chance to be
+/// stripped, since none of these fields is validated/redacted before construction on every
+/// code path (see [`DependencySource::AlternateRegistry`] and
+/// [`DependencySource::CustomRegistry`]'s own docs). Any `tracing::warn!(?source, ...)` or
+/// `{source:?}` call site — a common, idiomatic alternative to a hand-rolled `Display` — must
+/// not be able to reopen this leak, so it is closed once here at the type level instead of at
+/// each logging call site. Every variant and field is still shown (this is not a summary);
+/// only URL-bearing field values are routed through [`RedactedUrl`] first.
+impl fmt::Debug for DependencySource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Registry => f.write_str("Registry"),
+            Self::Git { url, rev } => f
+                .debug_struct("Git")
+                .field("url", &RedactedUrl::new(url))
+                .field("rev", rev)
+                .finish(),
+            Self::Path { path } => f.debug_struct("Path").field("path", path).finish(),
+            Self::Url { url } => f
+                .debug_struct("Url")
+                .field("url", &RedactedUrl::new(url))
+                .finish(),
+            Self::Sdk { sdk } => f.debug_struct("Sdk").field("sdk", sdk).finish(),
+            Self::Workspace => f.write_str("Workspace"),
+            Self::CustomRegistry { url } => f
+                .debug_struct("CustomRegistry")
+                .field("url", &RedactedUrl::new(url))
+                .finish(),
+            Self::AlternateRegistry {
+                index,
+                mirrors_crates_io,
+            } => f
+                .debug_struct("AlternateRegistry")
+                .field("index", &RedactedUrl::new(index))
+                .field("mirrors_crates_io", mirrors_crates_io)
+                .finish(),
+        }
+    }
 }
 
 impl DependencySource {
@@ -1894,6 +1946,29 @@ dev_dependencies:
         // treated as version-resolvable against the public registry (#248).
         assert!(source.is_registry());
         assert!(!source.is_version_resolvable());
+    }
+
+    #[test]
+    fn test_dependency_source_debug_redacts_custom_registry_userinfo() {
+        let source = DependencySource::CustomRegistry {
+            url: "https://user:hunter2@gems.example.com/simple".into(),
+        };
+        let debug_output = format!("{source:?}");
+        assert!(!debug_output.contains("hunter2"), "{debug_output}");
+        assert!(debug_output.contains("gems.example.com"), "{debug_output}");
+        assert!(debug_output.contains("/simple"), "{debug_output}");
+    }
+
+    #[test]
+    fn test_dependency_source_debug_redacts_alternate_registry_query_string() {
+        let source = DependencySource::AlternateRegistry {
+            index: "https://index.mycorp.dev/api?api_key=SECRET".into(),
+            mirrors_crates_io: false,
+        };
+        let debug_output = format!("{source:?}");
+        assert!(!debug_output.contains("SECRET"), "{debug_output}");
+        assert!(debug_output.contains("index.mycorp.dev"), "{debug_output}");
+        assert!(debug_output.contains("/api"), "{debug_output}");
     }
 
     #[test]

@@ -1177,6 +1177,57 @@ mod tests {
             assert!(sources.is_empty());
             assert!(collided.is_empty());
         }
+
+        /// #935/#936 sink-level regression test, mirroring the repo's precedent for this bug
+        /// class (`deps-cargo/src/parser.rs`'s `test_parse_registry_index_env_collision_...`
+        /// tests, and cache.rs #756): pinning the type-level fix (`DependencySource`'s
+        /// hand-written `Debug`) alone leaves the actual `tracing::warn!(?source, ...)` call
+        /// site in this function untested. Two `AlternateRegistry` sources, each carrying a
+        /// distinct query-string credential, collide — this is the exact `tracing::warn!`
+        /// this module emits with `source_a`/`source_b` via `?` (Debug) formatting.
+        #[test]
+        fn test_collision_warning_redacts_credentials_in_alternate_registry_debug_output() {
+            let parse_result = MockParseResult {
+                deps: vec![
+                    MockDep {
+                        name: PackageName::new("shared-name"),
+                        source: DependencySource::AlternateRegistry {
+                            index: "https://index-a.mycorp.dev/api?api_key=SECRET_A".into(),
+                            mirrors_crates_io: false,
+                        },
+                        addr_tag: 0,
+                    },
+                    MockDep {
+                        name: PackageName::new("shared-name"),
+                        source: DependencySource::AlternateRegistry {
+                            index: "https://index-b.mycorp.dev/api?api_key=SECRET_B".into(),
+                            mirrors_crates_io: false,
+                        },
+                        addr_tag: 1,
+                    },
+                ],
+            };
+
+            let log = deps_core::test_util::capture_tracing_output(|| {
+                let (sources, collided) =
+                    dedup_dependencies_by_source(&parse_result, &AlternateAwareFormatter);
+                assert!(!sources.contains_key(&PackageName::new("shared-name")));
+                assert!(collided.contains(&PackageName::new("shared-name")));
+            });
+
+            assert!(
+                log.contains("two different resolved registries"),
+                "expected the collision WARN to fire: {log:?}"
+            );
+            assert!(
+                !log.contains("SECRET_A") && !log.contains("SECRET_B"),
+                "tracing output leaked a query-string credential: {log:?}"
+            );
+            assert!(
+                log.contains("index-a.mycorp.dev") && log.contains("index-b.mycorp.dev"),
+                "host should survive redaction: {log:?}"
+            );
+        }
     }
 
     #[tokio::test]
