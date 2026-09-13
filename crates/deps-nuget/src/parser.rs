@@ -51,15 +51,14 @@ pub struct NuGetParseResult {
     pub resolved_chains: Vec<crate::config::NuGetSourceChain>,
     /// Dependency lines whose `NuGet.Config` `<packageSources>`/`<packageSourceMapping>`
     /// resolution was blocked by the current `registries.workspace_registries` policy (#925,
-    /// mirrors `deps_cargo::parser::CargoParseResult::blocked_registries`) —
-    /// `(name_range, blocked host class, raw declared value, declaration key)` quadruples,
-    /// where the declaration key (from [`crate::config::NuGetConfig::blocked_class_for`]) is
-    /// the source's own declared `<add key>` name, distinguishing two independently declared
+    /// mirrors `deps_cargo::parser::CargoParseResult::blocked_registries`), where the
+    /// declaration key (from [`crate::config::NuGetConfig::blocked_class_for`]) is the
+    /// source's own declared `<add key>` name, distinguishing two independently declared
     /// sources even when they share a raw value. Surfaced by
     /// [`deps_core::lsp_helpers::generate_diagnostics_from_cache`] via
     /// [`Self::blocked_registries`]'s trait override as an informational diagnostic, so the
     /// block never degrades silently.
-    pub blocked_registries: Vec<(Range, deps_core::net_policy::HostClass, String, String)>,
+    pub blocked_registries: Vec<deps_core::BlockedRegistryOccurrence>,
     /// `Some((kept, total))` once the manifest declared more dependencies than
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796).
     pub dependency_truncation: Option<(usize, usize)>,
@@ -85,7 +84,7 @@ impl deps_core::ParseResult for NuGetParseResult {
         &self.uri
     }
 
-    fn blocked_registries(&self) -> Vec<(Range, deps_core::net_policy::HostClass, String, String)> {
+    fn blocked_registries(&self) -> Vec<deps_core::BlockedRegistryOccurrence> {
         self.blocked_registries.clone()
     }
 

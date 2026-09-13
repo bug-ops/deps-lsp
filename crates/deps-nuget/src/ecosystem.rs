@@ -211,12 +211,14 @@ impl Ecosystem for NuGetEcosystem {
                 if let Some((class, raw_value, declaration_key)) =
                     config.blocked_class_for(&dep.name)
                 {
-                    result.blocked_registries.push((
-                        dep.name_range,
-                        class,
-                        raw_value,
-                        declaration_key,
-                    ));
+                    result
+                        .blocked_registries
+                        .push(deps_core::BlockedRegistryOccurrence {
+                            range: dep.name_range,
+                            class,
+                            raw_value,
+                            declaration_key,
+                        });
                 }
             }
             result.resolved_chains = config.resolved_chains();
@@ -1518,11 +1520,17 @@ mod tests {
 
         let blocked = parse_result.blocked_registries();
         assert_eq!(blocked.len(), 1);
-        let (range, class, raw_value, declaration_key) = &blocked[0];
-        assert_eq!(*range, dep.name_range());
-        assert_eq!(*class, deps_core::net_policy::HostClass::CloudMetadata);
-        assert_eq!(raw_value, "https://169.254.169.254/v3/index.json");
-        assert_eq!(declaration_key, "source:Blocked");
+        let occurrence = &blocked[0];
+        assert_eq!(occurrence.range, dep.name_range());
+        assert_eq!(
+            occurrence.class,
+            deps_core::net_policy::HostClass::CloudMetadata
+        );
+        assert_eq!(
+            occurrence.raw_value,
+            "https://169.254.169.254/v3/index.json"
+        );
+        assert_eq!(occurrence.declaration_key, "source:Blocked");
     }
 
     /// C1 regression (impl-critic): `generate_hover`'s unlisted-versions decoration must

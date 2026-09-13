@@ -409,15 +409,13 @@ pub struct ParseResult {
     pub resolved_chains: Vec<crate::config::ResolvedChain>,
     /// Dependency lines whose `--index-url`/Poetry `source =`/uv `index =` resolution was
     /// blocked by the current `registries.workspace_registries` policy (#925, mirrors
-    /// `deps_cargo::parser::CargoParseResult::blocked_registries`) —
-    /// `(name_range, blocked host class, raw declared value, declaration key)` quadruples,
-    /// where the declaration key (from [`crate::config::PypiIndexConfig::blocked_class_for`])
-    /// distinguishes a blocked primary from a blocked named source or uv tail hop even when
-    /// they share the same raw value. Surfaced by
-    /// [`deps_core::lsp_helpers::generate_diagnostics_from_cache`] via
+    /// `deps_cargo::parser::CargoParseResult::blocked_registries`), where the declaration key
+    /// (from [`crate::config::PypiIndexConfig::blocked_class_for`]) distinguishes a blocked
+    /// primary from a blocked named source or uv tail hop even when they share the same raw
+    /// value. Surfaced by [`deps_core::lsp_helpers::generate_diagnostics_from_cache`] via
     /// [`Self::blocked_registries`]'s trait override as an informational diagnostic, so the
     /// block never degrades silently.
-    pub blocked_registries: Vec<(Range, deps_core::net_policy::HostClass, String, String)>,
+    pub blocked_registries: Vec<deps_core::BlockedRegistryOccurrence>,
     /// `Some((kept, total))` once the manifest declared more dependencies than
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
     /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
@@ -444,7 +442,7 @@ impl deps_core::ParseResult for ParseResult {
         &self.uri
     }
 
-    fn blocked_registries(&self) -> Vec<(Range, deps_core::net_policy::HostClass, String, String)> {
+    fn blocked_registries(&self) -> Vec<deps_core::BlockedRegistryOccurrence> {
         self.blocked_registries.clone()
     }
 
