@@ -27,7 +27,6 @@ status: moc
 | 044 | [[044-precommit-hooks-ecosystem/spec\|New ecosystem: pre-commit hooks (.pre-commit-config.yaml repo/rev pins)]] | specify | draft — research/new ecosystem, P4, 6 open `[NEEDS CLARIFICATION]` items, tracked in issue #575 |
 | 047 | [[047-elixir-hex-ecosystem/spec\|New ecosystem: Elixir Hex (mix.exs dependency version hints)]] | specify | draft — research/new-ecosystem, P4, 6 open `[NEEDS CLARIFICATION]` items, issue #642 |
 | 051 | [[051-disk-persistent-registry-cache/spec\|Disk-persistent registry cache]] | specify | draft — research/enhancement, P4, 9 open `[NEEDS CLARIFICATION]` items, tracked in issue #700 |
-| 056 | [[056-gitlab-ci-yaml-scalar-anchor-alias/spec\|GitLab CI scalar YAML anchor alias detection in include: entries]] | specify | draft — bug, P1, 0 open `[NEEDS CLARIFICATION]` items, ready for implementation (issue #912) |
 | 057 | [[057-gradle-version-completion-range-default-regression/spec\|Gradle version completion returns zero results for every real-world manifest shape, regressed by PR #922]] | specify | bug, P1, 0 open `[NEEDS CLARIFICATION]` items, ready for implementation (issue #931) |
 | 058 | [[058-gitlab-ci-mapping-container-anchor/spec\|Mapping-shaped container anchor support for include: entries]] | specify | draft — enhancement, P3, 0 open `[NEEDS CLARIFICATION]` items, blocked on #912 implementation landing first (issue #916) |
 | 059 | [[059-completion-code-action-latest-marker-prerelease-mismatch/spec\|Version-completion and code-action quick-fix lists mislabel a pre-release as "(latest)"]] | specify | bug, P1, 2 open `[NEEDS CLARIFICATION]` items, issue #952, sibling defect to #313 |
@@ -85,6 +84,7 @@ status: moc
 | 052 | [[052-pnpm-lockfile-provider/spec\|pnpm-lock.yaml lock file provider (npm ecosystem)]] | specify | shipped — enhancement/cross-ecosystem, P3 (PR #719, issue #709; scoped to pnpm-lock.yaml only) |
 | 053 | [[053-ecosystem-sealing-inversion-decision-record/spec\|Ecosystem sealing inversion decision record]] | specify | shipped — research/decision-record, P4, won't-do, spec is the artifact (issue #774 to be closed referencing this spec) |
 | 054 | [[054-redacted-url-structural-chokepoint/spec\|Structural chokepoint for outbound-URL redaction in error/log output]] | specify | shipped — enhancement/security, P2 (PR #800 issue #789, PR #807 issue #801) — follow-up to #767/#775 |
+| 056 | [[056-gitlab-ci-yaml-scalar-anchor-alias/spec\|GitLab CI scalar YAML anchor alias detection in include: entries]] | specify | shipped — bug, P1 (PR #941, issue #912); FR-003's key-position `pending_key` amended by #942 (`deps_core::yaml_anchor::ScalarAnchorTable` extraction) |
 
 ## Project Foundation
 

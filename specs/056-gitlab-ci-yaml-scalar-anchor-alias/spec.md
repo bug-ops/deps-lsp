@@ -130,11 +130,14 @@ by shape and defers both parts on cost/complexity grounds, not on a false "no lo
   `version_range` generically, so this crate's local FR-011 check is defense-in-depth over that
   shared guard, not the sole barrier this section originally described. Follow-Up #4 (§9) is
   correspondingly already closed — see its updated status there.
-- Extracting the value-table + alias-token-span mechanism into a shared `deps-core::yaml_anchors`
+- ~~Extracting the value-table + alias-token-span mechanism into a shared `deps-core::yaml_anchors`
   helper now. `fix/909-gha-yaml-anchor-alias` is spec-only (no merged source), so there is nothing
   to share yet; extraction is filed as its own follow-up once **both** #909 and #912 have landed,
   per this project's DRY/cross-ecosystem-consistency rule (see `.claude/rules/*` — do not attempt
-  the extraction speculatively).
+  the extraction speculatively).~~ — the value-table mechanism (not the alias-token-span scanner,
+  which stays per-crate) was extracted as `deps_core::yaml_anchor::ScalarAnchorTable`/
+  `AnchorLimits` by #942, once #912 (this spec) landed; `deps-github-actions` was left out since
+  its parser has no anchor/alias support at all (`fix/909-gha-yaml-anchor-alias` never merged).
 - A pre-existing, unrelated false-negative noted during review: a `ref:` aliased to a **sequence**
   anchor (`&s [a, b]`) is a table miss under this design, so `mutable_ref_pin_diagnostics` still
   fires its "project has no `ref:`" message — which is then factually wrong, since a `ref:` *is*
@@ -204,9 +207,9 @@ THEN the `ref:` value is captured correctly regardless of whether `*k` was a
 
 | ID | Requirement | Priority |
 |----|------------|----------|
-| FR-001 | WHEN the parser's single event-stream pass encounters a `Scalar` event carrying a non-zero anchor id THE SYSTEM SHALL record that anchor id's text in a value table (`HashMap<usize, String>`), built during the existing pass, with no additional pass over the document | must |
-| FR-002 | WHEN the recorded text for an anchor id exceeds `MAX_ANCHOR_VALUE_CHARS` (512) OR the table already holds `MAX_ANCHOR_TABLE_ENTRIES` (256) distinct entries THE SYSTEM SHALL skip recording that anchor id, so any alias to it degrades to the table-miss path (FR-003) — the existing, safe, current-behavior path — rather than being recorded partially or rejected outright | must |
-| FR-003 | WHEN `Event::Alias(id)` is processed THE SYSTEM SHALL perform exactly one of the following two state transitions, chosen by position, regardless of whether `id` is present in the value table: <br>— **key position**: `pending_key = PendingKey::None; awaiting_key = false;` <br>— **value position**: `awaiting_key = true; pending_key = PendingKey::None;` (≡ today's `consume_pending_value()`) <br>These transitions are the complete, literal specification — they are not "whatever a literal scalar in the same position would do," since a literal's value-position transition additionally writes a field, which the miss case must not do (see FR-004) | must |
+| FR-001 | WHEN the parser's single event-stream pass encounters a `Scalar` event carrying a non-zero anchor id THE SYSTEM SHALL record that anchor id's text in a value table (`deps_core::yaml_anchor::ScalarAnchorTable`, a `HashMap<usize, (String, M)>` wrapper shared with `deps-dart` since #942; `M = ()` for this crate), built during the existing pass, with no additional pass over the document | must |
+| FR-002 | WHEN the recorded text for an anchor id exceeds `MAX_ANCHOR_VALUE_CHARS` (512) OR the table already holds `MAX_ANCHOR_TABLE_ENTRIES` (256) distinct entries AND that anchor id is not already present in the table THE SYSTEM SHALL skip recording that anchor id, so any alias to it degrades to the table-miss path (FR-003) — the existing, safe, current-behavior path — rather than being recorded partially or rejected outright. Re-recording an anchor id already present in the table always overwrites it, even at the entry cap (since #942's shared `ScalarAnchorTable::record`; in practice unreachable for this crate — `yaml-rust2` anchor ids are monotonic and never reused within a document — but preserved and tested for exact behavior parity with the pre-#942 per-crate implementation) | must |
+| FR-003 | WHEN `Event::Alias(id)` is processed THE SYSTEM SHALL perform exactly one of the following two state transitions, chosen by position: <br>— **key position**: `awaiting_key = false;` unconditionally, regardless of whether `id` is present in the value table — this half of the transition is load-bearing (EC-004/EC-005) and never changes. `pending_key` is set to `key_for(role, text)` on a table hit, or `PendingKey::None` on a table miss (amended by #942 — a table hit was previously always `PendingKey::None`, pinned as a known limit; see §9 P5 for the full consequences of this amendment, including EC-018/EC-019/EC-020) <br>— **value position**: `awaiting_key = true; pending_key = PendingKey::None;` (≡ today's `consume_pending_value()`) <br>These transitions are the complete, literal specification — they are not "whatever a literal scalar in the same position would do," since a literal's value-position transition additionally writes a field, which the miss case must not do (see FR-004) | must |
 | FR-004 | WHEN, in addition to FR-003's value-position transition, `id` IS present in the value table AND `frame.role == FrameRole::IncludeEntry` THE SYSTEM SHALL additionally capture the tabled text into the matching entry field (`project`/`ref_field`/`component`, keyed by `frame.pending_key`, exactly as `Event::Scalar`'s literal branch does at `parser.rs:239-242`) — this capture is conditional on the table hit; the transition in FR-003 is not | must |
 | FR-005 | WHEN `id` is **absent** from the value table (a sequence- or mapping-shaped container anchor; a dangling/forward-referencing id is already a whole-document load error before this code runs, per §9's verified-safe claim) THE SYSTEM SHALL perform only FR-003's transition and capture nothing, matching today's behavior except for the corrected key-position transition | must |
 | FR-006 | WHEN a dependency record is produced from an alias-site capture (FR-004) THE SYSTEM SHALL locate its `version_range` (and, for a `component:` alias, its `name_range` too — see FR-008) via a bounded forward scan from the `Alias` event's own marker (located via `marker_byte_offset`, never `Marker::index()`, per #879), over yaml-rust2's actual anchor-name charset (`is_anchor_char`: every character except space, tab, `\n`, `\r`, NUL, `,`, `[`, `]`, `{`, `}` — not an identifier-charset guess such as `[A-Za-z0-9_-]`, which would truncate a verified-parsing name like `*пин` or `*a/b@c`), bounded to the alias token's own line, char-boundary-safe (`char_indices().take_while(...)`, never a byte-indexed slice) — never via a literal-text search (which finds nothing at an alias site) | must |
@@ -235,7 +238,7 @@ THEN the `ref:` value is captured correctly regardless of whether `*k` was a
 
 | Entity | Description | Key Attributes |
 |--------|-------------|-----------------|
-| Scalar-anchor value table | A per-parse, transient `HashMap<usize, String>` mapping a yaml-rust2 anchor id to the anchored scalar's text, built during the single existing event-stream pass, bounded by NFR-003 | key: anchor id (`usize`, monotonic, never reused per document — cross-document aliasing is already a load error, so no per-document reset is needed); value: the scalar's text only, capped at `MAX_ANCHOR_VALUE_CHARS`; capped overall at `MAX_ANCHOR_TABLE_ENTRIES` |
+| Scalar-anchor value table | A per-parse, transient `deps_core::yaml_anchor::ScalarAnchorTable` (since #942; a `HashMap<usize, (String, M)>` wrapper shared with `deps-dart`, `M = ()` for this crate) mapping a yaml-rust2 anchor id to the anchored scalar's text, built during the single existing event-stream pass, bounded by NFR-003 via `deps_core::yaml_anchor::AnchorLimits::bounded(MAX_ANCHOR_VALUE_CHARS, MAX_ANCHOR_TABLE_ENTRIES)` | key: anchor id (`usize`, monotonic, never reused per document — cross-document aliasing is already a load error, so no per-document reset is needed); value: the scalar's text only, capped at `MAX_ANCHOR_VALUE_CHARS`; capped overall at `MAX_ANCHOR_TABLE_ENTRIES`, except that re-recording an id already in the table always overwrites it even at capacity (in practice unreachable, since ids are monotonic and never reused) |
 | Alias-site dependency record | A `GitlabCiDependency` occurrence produced when `Event::Alias(id)` hits the value table inside an `IncludeEntry` frame (FR-004) | `name`/`version_req`/`pin` classified from the anchor's recorded text; `name_range`/`version_range` both span the alias token for a `component:` alias (FR-008), or `version_range` alone spans it for `ref:` (`name_range` stays at the entry's own `project:`/`component:` value); `is_alias_occurrence = true`; `version_literal = None` (FR-012) |
 | Container-anchor alias site | An `Event::Alias(id)` where `id` is absent from the value table | Produces no capture (FR-005); only FR-003's state transition runs; no change to existing definition-site behavior (which, per the Non-Goal above, was already zero for a container defined outside `include:`) |
 
@@ -246,7 +249,7 @@ THEN the `ref:` value is captured correctly regardless of whether `*k` was a
 | EC-001 | `ref: *pin` (scalar anchor aliased as a `ref:` value) | In scope, most plausible pattern (FR-001–FR-010) |
 | EC-002 | `project: *proj` (scalar anchor aliased as a `project:` value) | In scope; today total dep loss (`build_dependency` → `None`), fixed the same way as EC-001 |
 | EC-003 | `component: *c` (scalar anchor aliased as a `component:` value) | In scope; `name_range == version_range`, both the alias token (FR-008); `build_component_dependency`'s normal offset arithmetic is bypassed for this site |
-| EC-004 | `? *k` where `*k` aliases a **scalar** anchor (table hit), followed by a real `ref: v1.0.0` in the same entry | Fixed: FR-003's key-position transition plus FR-004's capture behave like the literal `? ref` control; the following `ref:` is captured correctly |
+| EC-004 | `? *k` where `*k` aliases a **scalar** anchor whose text is `"dummy"` (table hit, but not a recognized field name), followed by a real `ref: v1.0.0` in the same entry | Fixed: FR-003's key-position transition plus FR-004's capture behave like the literal `? ref` control; the following `ref:` is captured correctly. #942's `key_for(role, text)` resolution of `pending_key` on a table hit does not change this explicit-`? *k`-form case's outcome, since `"dummy"` resolves to `PendingKey::None` regardless — see EC-018 for the distinct *implicit* alias-key form (`*k: value`, not `? *k`) that #942 does change |
 | EC-005 | `? *k` where `*k` aliases a **container** anchor (table miss), followed by a real `ref: v1.0.0` in the same entry | Fixed as a side effect of making FR-003's transition unconditional: the following `ref:` is captured correctly even though `*k` itself yields no dependency (US-003) |
 | EC-006 | `<<: *anything` (merge key aliasing any anchor) | Safe by construction, unaffected by this fix: `key_for(IncludeEntry, "<<") == PendingKey::None`, so no field is ever targeted for capture regardless of table hit/miss. Regression test only |
 | EC-007 | `- *tpl` (a whole mapping anchor aliased as a sequence item under `include:`) | Deferred (Non-Goal, mapping-shaped case) — table miss, FR-005 applies, zero records, same as today |
@@ -260,6 +263,9 @@ THEN the `ref:` value is captured correctly regardless of whether `*k` was a
 | EC-015 | An anchor definition exceeding `MAX_ANCHOR_VALUE_CHARS` or the table already at `MAX_ANCHOR_TABLE_ENTRIES` | Degrades to the table-miss path (FR-002, NFR-004) — zero records at any alias to it, same as today; no partial/truncated capture |
 | EC-016 | Version completion requested with the cursor inside a `ref: *pin` alias token (a `project:`/`ref:` shape where `name_range != version_range`) | `complete_version` returns `Completions::default()` (FR-011) — this is the shape where the gate is actually reachable and must be the one exercised by the FR-011 regression test |
 | EC-017 | Version completion requested with the cursor inside a `component: *c` alias token | `CompletionContext::Version` is unreachable at all for this shape (`name_range == version_range`, `detect_completion_context` resolves `PackageName` first per NFR-006) — no completion appears, but via the unimplemented `complete_package_name` path, not via FR-011. A test asserting "FR-011 withholds completion here" would pass vacuously and must not be written for this shape |
+| EC-018 | `#942`: an **implicit** alias key (`*k: value`, not the explicit `? *k` form) whose resolved text matches a recognized field name (`ref`), followed by a `project:` in the same entry | Fixed by #942: `key_for(role, text)` on the table hit resolves `pending_key` the same as a literal `ref:` key would; previously pinned as a known limit (`pending_key` was unconditionally `PendingKey::None` on a table hit) |
+| EC-019 | `#942`: an implicit alias key whose resolved text matches a recognized **non-pinnable** field name (`"template"`/`"local"`), followed by real `project:`/`ref:` scalars in the same entry | Newly reachable by #942, not previously possible: the whole entry is suppressed (`build_dependency`'s `entry.has_template`/`entry.has_local` early return), exactly as the literal `template:`/`local:` key already does — a user-visible dependency *loss*, semantically correct but not the direction #942's own FR-003/EC-004 text originally described |
+| EC-020 | `#942`: an implicit alias key at the document root whose resolved text is `"include"` | Newly reachable by #942: opens the top-level `include:` gate the same way the literal `include:` token does — `GitlabCiReceiver`'s "gated to exactly the top-level `include:` key's subtree" invariant still holds, but the gate is no longer opened only by the literal token |
 
 ## 7. Success Criteria
 
@@ -294,8 +300,9 @@ THEN the `ref:` value is captured correctly regardless of whether `*k` was a
   `.claude/rules/branching.md` before any PR
 
 ### Ask First
-- Extracting the value-table mechanism into a shared `deps-core` helper now, ahead of #909 landing
-  — the Out of Scope section defers this; only ask if circumstances change (e.g. #909 merges mid-implementation)
+- ~~Extracting the value-table mechanism into a shared `deps-core` helper now, ahead of #909 landing
+  — the Out of Scope section defers this; only ask if circumstances change (e.g. #909 merges mid-implementation)~~
+  — done, see #942 (§1 Out of Scope)
 - Changing `MAX_ANCHOR_VALUE_CHARS` (512) or `MAX_ANCHOR_TABLE_ENTRIES` (256) — NFR-003/004
   establish these as safe-to-fix-now precisely because exceeding them only withholds the new
   feature, never regresses existing behavior; a request to tighten or loosen them should be a
@@ -354,9 +361,10 @@ conclusion survived into the spec.
   container alias. That flips `pin` from `None` to `Some(PinStyle::Branch)`, which **suppresses**
   the correct "project has no `ref:`" diagnostic (`ecosystem.rs:592-609`) and emits nothing in its
   place — a regression versus today's behavior. FR-003/FR-004 instead specify three separate,
-  literal rules: an unconditional key-position transition, an unconditional value-position
-  transition, and a capture that is conditional on table hit **and** value position **and**
-  `IncludeEntry` role, all together.
+  literal rules: a key-position transition whose `awaiting_key = false` half is unconditional but
+  whose `pending_key` value is conditional on the table hit (amended by #942 — see P5), an
+  unconditional value-position transition, and a capture that is conditional on table hit **and**
+  value position **and** `IncludeEntry` role, all together.
 - **P4 — the value-table bound needs concrete numbers, following this crate's own precedent.**
   "A plausible value, a few hundred bytes" and "cap the entry count" are not implementable as
   stated. `MAX_ANCHOR_VALUE_CHARS = 512` and `MAX_ANCHOR_TABLE_ENTRIES = 256` (NFR-003) follow the
@@ -365,6 +373,29 @@ conclusion survived into the spec.
   Because exceeding either bound degrades to the existing, safe table-miss path (NFR-004), fixing
   concrete numbers now carries no regression risk and does not need to wait for real-world tuning
   data.
+- **P5 — #942's `key_for(role, text)` amendment to FR-003's key-position `pending_key` cuts both
+  ways, and reaches every consequence a literal key has, not just the one it targeted.** #942 (the
+  `deps_core::yaml_anchor::ScalarAnchorTable` extraction) fixed the known limit an *implicit* alias
+  key (`*k: value`) previously hit: on a table hit, `pending_key` is now `key_for(role, text)`
+  instead of unconditionally `PendingKey::None` (EC-018). Because this makes an alias-resolved key
+  behave identically to a literal one, it is reachable through every branch `key_for` has, not only
+  `project`/`ref`/`component`:
+  - **Dependency-losing direction (EC-019):** an alias resolving to `"template"`/`"remote"`/`"local"`
+    now suppresses the whole entry (`build_dependency`'s early return), exactly as the literal key
+    already does — a user-visible loss of hover/diagnostics for `project:`/`ref:` fields captured in
+    the same entry, semantically correct but not analysed by the original FR-003/EC-004 text or the
+    #942 CHANGELOG entry, which described only the dependency-gaining direction.
+  - **Top-level gate reachability (EC-020):** an alias resolving to `"include"` at the document root
+    now opens the top-level `include:` subtree gate the literal token opens — correct per the same
+    resolution logic, but newly reachable via an alias rather than only the literal token, the
+    guard-context-expansion risk class spec 055/§9 (`fix/909-gha-yaml-anchor-alias`) flags for a
+    sibling ecosystem. No guard bypass results here: the receiver still visits only what
+    `push_container`'s role computation routes to `IncludeEntry`/`IncludeValue`, whether that route
+    was opened by a literal or a resolved-alias key.
+  Both directions are covered by dedicated regression tests
+  (`test_alias_key_resolving_to_template_suppresses_the_whole_entry`,
+  `test_alias_key_resolving_to_local_suppresses_the_whole_entry`,
+  `test_alias_key_resolving_to_include_opens_top_level_gate`) rather than by EC-018 alone.
 - **Mechanism: value table, not event replay.** Chosen for the same reason as #909's design: replay
   cannot satisfy `name_range`/`version_range` uniqueness (an anchor referenced by M alias sites
   would replay at the anchor's own marker M times, colliding), and it re-derives ambient parser
@@ -403,7 +434,8 @@ conclusion survived into the spec.
   only `specs/055-.../spec.md` and one `MOC-specs.md` line). #912 has no dependency on it and no
   collision risk beyond that one shared `MOC-specs.md` line, which is the docs-only fast path per
   `.claude/rules/branching.md`. A shared `deps-core` extraction of the anchor-alias-scalar pattern
-  is deliberately deferred to a follow-up filed once **both** #909 and #912 have landed.
+  was deliberately deferred to a follow-up, filed as #942 once #912 landed (`fix/909-gha-yaml-anchor-alias`
+  never merged, so `deps-github-actions` was excluded from the extraction — see §1 Out of Scope).
 - **Process: specify phase only, no plan/tasks.** Per `.claude/rules/specs.md` ("not every spec
   needs all three phases") and mirroring `specs/055-.../spec.md`'s own precedent for the sibling
   #909 fix: the remaining work is one value table, one split state transition, one bounded scanner,

@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-dart**: migrated `pubspec.yaml` parsing's `RawField`/`field_range` onto `deps_core::lsp_helpers::MarkedScalar`, the same shared position-tracking type `deps-github-actions`/`deps-gitlab-ci` already use (resolves #928) (#950)
 - **deps-core, deps-pypi, deps-deno, deps-npm, deps-go**: extracted the byte-identical `404`-to-`PackageNotFound` mapper into `deps_core::not_found_or` (resolves #929 item 1) (#950)
 - **deps-core, deps-dart, deps-composer, deps-nuget, deps-npm**: extracted the shared warn-and-error boilerplate behind each ecosystem's own dot-segment guard into `deps_core::lsp_helpers::dot_segment_rejection_error`, leaving every crate's own segmentation predicate untouched (resolves #929 item 2) (#950)
+- **deps-core, deps-dart, deps-gitlab-ci**: extracted the duplicated bounded YAML scalar-anchor value tables into a shared `deps_core::yaml_anchor::ScalarAnchorTable`/`AnchorLimits` (resolves #942) (#954)
 - **deps-core, deps-dart, deps-github-actions, deps-gitlab-ci**: extracted the three YAML `MarkedEventReceiver` parsers' hand-rolled frame-stack state machines into a shared, generic `deps_core::yaml_walk::FrameStack` plus `lsp_helpers::MarkedScalar`/`byte_span_to_range` helpers (resolves #908) (#921)
 - **deps-core**: `LineOffsetTable` is no longer `Sync` (still `Send`) — build one per document parse, do not share across threads (#888)
 - **deps-core**: unified `net_policy`'s duplicated userinfo-redaction carve-out rules into one shared `redact_credential` scanner — zero behavior change (resolves #846) (#863)
@@ -23,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **deps-npm, deps-pypi, deps-nuget**: a dependency whose custom-registry resolution is blocked by `registries.workspace_registries` policy now surfaces an informational diagnostic on its own line, matching `deps-cargo`'s existing behavior, instead of degrading silently to the public registry with no trace (resolves #925) (#949)
+- **deps-gitlab-ci**: an alias key (`*k: value`) whose resolved anchor text matches a recognized `include:`-entry field name is now reinterpreted as that key, the same as a literal key (resolves #942) (#954)
 - **deps-core**: `DependencySource`'s `Debug` impl now redacts URL-bearing variants (`Git`, `Url`, `CustomRegistry`, `AlternateRegistry`) via `RedactedUrl` instead of printing them raw, closing a credential leak reachable through any `tracing::warn!(?source, ...)` call site (resolves #935) (#938)
 - **deps-core, deps-lsp**: redacted two more credential-leak sinks in the same family — `RegistriesConfig`'s debug dump of `gitlab_instance_host` and the blocked-registry diagnostic's raw index value (resolves #936) (#938)
 - **deps-maven**: `compare_versions` no longer panics `Vec::sort_by` on a `maven-metadata.xml` version list mixing zero-digit-prefixed qualifiers (e.g. `0ga`) with their bare/aliased spellings (resolves #934) (#940)
