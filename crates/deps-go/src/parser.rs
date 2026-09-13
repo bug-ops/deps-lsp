@@ -17,7 +17,7 @@ use deps_core::Result;
 use deps_core::lsp_helpers::{LineOffsetTable, byte_span_to_range};
 use regex::Regex;
 use std::any::Any;
-use tower_lsp_server::ls_types::{Range, Uri};
+use tower_lsp_server::ls_types::Uri;
 
 /// Fixed declaration key for every [`GoParseResult::blocked_registries`] entry (#958) — see
 /// that field's doc for why a single `GOPROXY` declaration must always dedupe to one
@@ -40,23 +40,19 @@ pub struct GoParseResult {
     /// 034), ready for `GoRegistry::register_alternate`. Empty when `$GOENV` declares no
     /// override (US-005).
     pub resolved_chains: Vec<GoProxyChain>,
-    /// At most one `(module_path_range, blocked host class, raw declared value, declaration
-    /// key)` quadruple (#958, mirrors `deps_cargo::parser::CargoParseResult::blocked_registries`
-    /// in shape, but not cardinality — see below), present iff at least one `require`/
-    /// `replace`/`exclude` module line's resolution fell back to
-    /// [`deps_core::parser::DependencySource::CustomRegistry`] because every `GOPROXY` hop was
-    /// rejected by the current `registries.workspace_registries` policy.
+    /// One [`deps_core::BlockedRegistryOccurrence`] per `require`/`replace`/`exclude` module
+    /// line whose resolution fell back to [`deps_core::parser::DependencySource::CustomRegistry`]
+    /// because every `GOPROXY` hop was rejected by the current `registries.workspace_registries`
+    /// policy (#958, mirrors `deps_cargo::parser::CargoParseResult::blocked_registries`).
     ///
     /// Unlike Cargo/npm's per-alias declarations, `GOPROXY` is a single config-global
-    /// declaration (one `$GOENV` value shared by every module in the document): every affected
-    /// dependency would carry byte-identical `class`/raw-value/declaration-key data, and
-    /// [`deps_core::lsp_helpers::generate_diagnostics_from_cache`] already renders only the
-    /// first entry per declaration key — so this carries at most one entry (using the first
-    /// affected dependency's range) rather than one per affected dependency, avoiding
-    /// redundant identical allocations for entries that would only be deduped away. Surfaced
-    /// via [`Self::blocked_registries`]'s trait override as an informational diagnostic, so
-    /// the block never degrades silently.
-    pub blocked_registries: Vec<(Range, deps_core::net_policy::HostClass, String, String)>,
+    /// declaration (one `$GOENV` value shared by every module in the document), so every entry
+    /// here shares the same fixed `GOPROXY_BLOCKED_DECLARATION_KEY` — `deps_core`'s
+    /// `blocked_registry_diagnostics` groups by that key and collapses the group into one
+    /// diagnostic with the other affected modules named as `related_information`. Surfaced via
+    /// [`Self::blocked_registries`]'s trait override as an informational diagnostic, so the
+    /// block never degrades silently.
+    pub blocked_registries: Vec<deps_core::BlockedRegistryOccurrence>,
     /// `Some((kept, total))` once the manifest declared more dependencies than
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
     /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
@@ -199,45 +195,31 @@ pub fn parse_go_mod_with_context(
     );
 
     let go_config = crate::config::resolve_with_context(ctx);
-    // Loop-invariant (#958 code review M1): `GOPROXY` is one config-global declaration, so
-    // `blocked_class()` cannot vary across dependencies — computed once rather than once per
-    // dependency (up to `MAX_DEPENDENCIES_PER_DOCUMENT`).
+    // Loop-invariant: `GOPROXY` is one config-global declaration, so `blocked_class()` cannot
+    // vary across dependencies — computed once rather than once per dependency (up to
+    // `MAX_DEPENDENCIES_PER_DOCUMENT`).
     let blocked_class = go_config.blocked_class();
-    // Tracks the first dependency actually affected by the blocked chain, so exactly one
-    // `blocked_registries` entry is built after the loop (below) instead of one per affected
-    // dependency (#958 code review follow-up): every entry would carry byte-identical `class`/
-    // `raw`/declaration-key data anyway (one `GOPROXY` declaration governs the whole document),
-    // and `deps_core::lsp_helpers::generate_diagnostics_from_cache` already renders only the
-    // first entry per declaration key — building N-1 more only to have them dropped would
-    // redo the very per-dependency `String` allocations M1 hoisted `blocked_class()` out of
-    // the loop to avoid.
-    let mut first_blocked_range = None;
+    let mut blocked_registries = Vec::new();
     for dep in &mut dependencies {
         dep.source = go_config.resolve_source_for(dep.module_path.as_str());
         // Only a dependency that actually fell back to `CustomRegistry` was affected by the
         // blocked chain — a `GOPRIVATE`-matched module bypasses `GOPROXY` entirely and keeps
         // resolving via `AlternateRegistry`, so it must not also get a blocked-registry notice.
-        if first_blocked_range.is_none()
-            && blocked_class.is_some()
-            && matches!(
+        if let (Some((class, raw)), true) = (
+            &blocked_class,
+            matches!(
                 dep.source,
                 deps_core::parser::DependencySource::CustomRegistry { .. }
-            )
-        {
-            first_blocked_range = Some(dep.module_path_range);
+            ),
+        ) {
+            blocked_registries.push(deps_core::BlockedRegistryOccurrence {
+                range: dep.module_path_range,
+                class: *class,
+                raw_value: raw.clone(),
+                declaration_key: GOPROXY_BLOCKED_DECLARATION_KEY.to_string(),
+            });
         }
     }
-    let blocked_registries = match (blocked_class, first_blocked_range) {
-        (Some((class, raw)), Some(range)) => {
-            vec![(
-                range,
-                class,
-                raw,
-                GOPROXY_BLOCKED_DECLARATION_KEY.to_string(),
-            )]
-        }
-        _ => Vec::new(),
-    };
 
     Ok(GoParseResult {
         dependencies,
@@ -418,7 +400,7 @@ impl deps_core::ParseResult for GoParseResult {
         &self.uri
     }
 
-    fn blocked_registries(&self) -> Vec<(Range, deps_core::net_policy::HostClass, String, String)> {
+    fn blocked_registries(&self) -> Vec<deps_core::BlockedRegistryOccurrence> {
         self.blocked_registries.clone()
     }
 
@@ -766,19 +748,19 @@ exclude github.com/bad/module v0.1.0
 
         let blocked = result.blocked_registries();
         assert_eq!(blocked.len(), 1);
-        let (range, class, raw_value, declaration_key) = &blocked[0];
-        assert_eq!(*range, result.dependencies[0].module_path_range);
-        assert_eq!(*class, HostClass::Global);
-        assert_eq!(raw_value, "https://goproxy.mycorp.example");
-        assert_eq!(declaration_key, GOPROXY_BLOCKED_DECLARATION_KEY);
+        let occurrence = &blocked[0];
+        assert_eq!(occurrence.range, result.dependencies[0].module_path_range);
+        assert_eq!(occurrence.class, HostClass::Global);
+        assert_eq!(occurrence.raw_value, "https://goproxy.mycorp.example");
+        assert_eq!(occurrence.declaration_key, GOPROXY_BLOCKED_DECLARATION_KEY);
     }
 
-    /// #958 code-review follow-up: `GOPROXY` is one config-global declaration — every affected
-    /// `require` line would carry byte-identical `blocked_registries` data, so multiple
-    /// affected dependencies must still collapse to exactly *one* entry (using the first
-    /// affected dependency's range), not one redundant entry per dependency.
+    /// `GOPROXY` is one config-global declaration — every affected `require` line gets its own
+    /// [`deps_core::BlockedRegistryOccurrence`], but all of them share the same declaration key
+    /// so `deps_core::lsp_helpers::diagnostics::blocked_registry_diagnostics` groups and collapses
+    /// them into one diagnostic with the other affected modules as `related_information`.
     #[test]
-    fn test_parse_go_mod_blocked_goproxy_collapses_to_one_entry_across_dependencies() {
+    fn test_parse_go_mod_blocked_goproxy_shares_declaration_key_across_dependencies() {
         use crate::config::GoEnvCache;
         use deps_core::ParseResult as _;
         use deps_core::net_policy::{RegistryAccessPolicy, WorkspaceRegistryAccess};
@@ -803,10 +785,14 @@ require (
 ";
         let result = parse_go_mod_with_context(content, &test_uri(), &ctx).unwrap();
         let blocked = result.blocked_registries();
-        assert_eq!(blocked.len(), 1);
-        let (range, _, _, key) = &blocked[0];
-        assert_eq!(*range, result.dependencies[0].module_path_range);
-        assert_eq!(key, GOPROXY_BLOCKED_DECLARATION_KEY);
+        assert_eq!(blocked.len(), 2);
+        assert_eq!(blocked[0].range, result.dependencies[0].module_path_range);
+        assert_eq!(blocked[1].range, result.dependencies[1].module_path_range);
+        assert!(
+            blocked
+                .iter()
+                .all(|occurrence| occurrence.declaration_key == GOPROXY_BLOCKED_DECLARATION_KEY)
+        );
     }
 
     /// #958: a `GOPRIVATE`-matched module bypasses `GOPROXY` entirely (routes to the `direct`

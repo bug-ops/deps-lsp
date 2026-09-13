@@ -15,6 +15,7 @@ use super::{ParseResult, PypiParser, RequirementRef};
 use crate::config::PypiIndexConfig;
 use crate::error::Result;
 use crate::types::{PypiDependencySection, PypiDependencySource};
+use deps_core::BlockedRegistryOccurrence;
 use deps_core::lsp_helpers::{LineOffsetTable, byte_span_to_range};
 use deps_core::net_policy::RegistryAccessPolicy;
 use tower_lsp_server::ls_types::Uri;
@@ -301,12 +302,12 @@ impl PypiParser {
                         if let Some((class, raw_value, declaration_key)) =
                             config.blocked_class_for(None)
                         {
-                            blocked_registries.push((
-                                dep.name_range,
+                            blocked_registries.push(BlockedRegistryOccurrence {
+                                range: dep.name_range,
                                 class,
                                 raw_value,
                                 declaration_key,
-                            ));
+                            });
                         }
                     }
                     dependencies.push(dep);
@@ -1309,11 +1310,14 @@ mod tests {
             "a blocked index must stay unresolved, not silently become AlternateRegistry"
         );
         assert_eq!(result.blocked_registries.len(), 1);
-        let (range, class, raw_value, declaration_key) = &result.blocked_registries[0];
-        assert_eq!(*range, result.dependencies[0].name_range);
-        assert_eq!(*class, deps_core::net_policy::HostClass::CloudMetadata);
-        assert_eq!(raw_value, "https://169.254.169.254/simple");
-        assert_eq!(declaration_key, "primary");
+        let occurrence = &result.blocked_registries[0];
+        assert_eq!(occurrence.range, result.dependencies[0].name_range);
+        assert_eq!(
+            occurrence.class,
+            deps_core::net_policy::HostClass::CloudMetadata
+        );
+        assert_eq!(occurrence.raw_value, "https://169.254.169.254/simple");
+        assert_eq!(occurrence.declaration_key, "primary");
     }
 
     /// `--index-url=<url>` (equals spelling) is captured identically to the space-separated
