@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- `specs/constitution.md`: rewrote principle 7 with a post-1.0 breaking-change policy (major-bump-per-crate, a labeled "Breaking" changelog entry, `cargo-semver-checks` as the CI catch-net) alongside the existing pre-1.0 clean-break rule (resolves #948)
 - **deps-core, deps-cargo, deps-pypi, deps-gradle, deps-nuget, deps-deno, deps-swift, deps-bundler, deps-go, deps-maven**: routed every remaining byte-span-to-`Range` site through `deps_core::lsp_helpers::byte_span_to_range` instead of a per-crate hand-rolled duplicate (resolves #927) (#950)
 - **deps-dart**: migrated `pubspec.yaml` parsing's `RawField`/`field_range` onto `deps_core::lsp_helpers::MarkedScalar`, the same shared position-tracking type `deps-github-actions`/`deps-gitlab-ci` already use (resolves #928) (#950)
 - **deps-core, deps-pypi, deps-deno, deps-npm, deps-go**: extracted the byte-identical `404`-to-`PackageNotFound` mapper into `deps_core::not_found_or` (resolves #929 item 1) (#950)
