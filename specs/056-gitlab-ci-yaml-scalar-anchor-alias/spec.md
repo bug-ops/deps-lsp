@@ -408,9 +408,9 @@ conclusion survived into the spec.
   and two independent withholding gates, with every FR/EC/AC already enumerated above. Hand
   implementation directly to a developer from §3/§6/§9 of this spec.
 
-### Follow-Up Issues (not resolved here — drafted for team-lead to file verbatim after this spec commits)
+### Follow-Up Issues (filed after this spec's commit)
 
-1. **Mapping-shaped container anchor support** (`- *tpl`, `- <<: *tpl`) — P3, enhancement.
+1. **Mapping-shaped container anchor support** (`- *tpl`, `- <<: *tpl`) — #916, P3, enhancement.
    Body: same-file scalar-anchor-alias support for `include:` entries landed in #912. A mapping
    anchor aliased as a whole `include:` entry (`- *tpl` or `- <<: *tpl`) is still not detected —
    the anchor's fields are never captured because the definition site sits in a
@@ -421,20 +421,20 @@ conclusion survived into the spec.
    dependency; (b) re-interpreting keys captured in an `Irrelevant` frame, which reintroduces
    #909's guard-context-bypass risk class in a form #912's scalar-only design avoided. Design and
    critique this as its own spec before implementing.
-2. **Sequence-shaped container anchor** (`include: *incs`) — won't-fix-by-design, research/decision-record, P4.
+2. **Sequence-shaped container anchor** (`include: *incs`) — #917, won't-fix-by-design, research/decision-record, P4.
    Body: aliasing a whole sequence of `include:` entries from one token (`include: *incs`) cannot
    give each of the N entries a distinct `name_range`/`version_range` from `Dependency`'s
    one-name/one-range model, the same structural limit `#913` documents for GitHub Actions'
    container case. Close as won't-fix-by-design, referencing #913 as the GitHub Actions sibling and
    this spec's Non-Goal section for the analysis.
-3. **`ref: !reference [.t]` support** — research, P3.
+3. **`ref: !reference [.t]` support** — #918, research, P3.
    Body: GitLab's own recommended cross-file template-reuse tag (`!reference`) is silently dropped
    by this crate today — verified via event trace, `SequenceStart(tag=!reference)` has no handling
    path. This may be higher-value than YAML-anchor support since it is GitLab's documented
    mechanism, not an undocumented same-file trick. First question to resolve: does GitLab's own
    config processor accept `!reference` inside `include:` at all, or only inside job bodies (which
    this crate does not parse regardless)? Needs its own research spike before scoping.
-4. **Cross-ecosystem: `detect_completion_context` has no literal-span guard** — bug, `cross-ecosystem` label, P2.
+4. **Cross-ecosystem: `detect_completion_context` has no literal-span guard** — #919, bug, `cross-ecosystem` label, P2.
    Body: `deps_core::completion::detect_completion_context` returns `CompletionContext::Version`
    purely from `position_in_range(position, version_range)`, with no check that `version_range`
    actually slices to a literal value. Any ecosystem whose `version_range` can span a non-literal
@@ -459,6 +459,7 @@ conclusion survived into the spec.
 - GitHub `#909` — the GitHub Actions sibling gap, unmerged, spec-only
 - GitHub `#913` — GitHub Actions' aggregate per-alias-site annotation research idea for the
   container case; this spec's sequence-shaped follow-up (§9, Follow-Up #2) is its GitLab-CI sibling
+- GitHub #916, #917, #918, #919 — this spec's four filed follow-up issues (§9 Follow-Up Issues)
 - GitHub `#643` — introduced `sha_pin_quickfix_kind` as the single source of truth for the
   mutable-ref-pin diagnostic's quickfix-availability suffix; this spec's FR-010 preserves that invariant
 - `crates/deps-gitlab-ci/src/parser.rs` — `key_for`, the `Event::Scalar`/`Event::Alias` handling
