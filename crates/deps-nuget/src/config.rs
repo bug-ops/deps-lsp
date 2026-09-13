@@ -48,7 +48,8 @@ use std::sync::atomic::AtomicBool;
 use base64::Engine;
 use deps_core::PackageName;
 use deps_core::net_policy::{
-    HostClass, IndexUrlError, PolicyGate, RedactedUrl, RegistryAccessPolicy, validate_index_url,
+    BlockedHostReason, HostClass, IndexUrlError, RedactedUrl, RegistryAccessPolicy,
+    RegistryUrlKind, ValidatedRegistryUrl,
 };
 use deps_core::parser::DependencySource;
 use quick_xml::Reader;
@@ -125,54 +126,71 @@ impl From<IndexUrlError> for NuGetFeedUrlError {
     }
 }
 
-/// A validated, normalized, https-only NuGet V3 service index URL with no embedded userinfo.
-///
-/// Mirrors `deps_pypi::config::PypiIndexUrl`/`deps_npm::config::NpmRegistryIndex`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct NuGetFeedUrl {
-    /// The validated URL, normalized by stripping a trailing `/`.
-    normalized: String,
-}
-
-impl NuGetFeedUrl {
-    /// Validates and normalizes `raw` against `policy`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`NuGetFeedUrlError`] if `raw` does not parse as a URL, is not `https` (outside
-    /// the `cfg(test)`/`test-util` loopback carve-out), carries a userinfo component, or
-    /// resolves to a host class the current `policy` blocks.
-    pub fn new(raw: &str, policy: &RegistryAccessPolicy) -> Result<Self, NuGetFeedUrlError> {
-        let url = validate_index_url(raw, raw, "nuget", PolicyGate::Enforce(policy))?;
-        Ok(Self {
-            normalized: url.as_str().trim_end_matches('/').to_string(),
-        })
-    }
-
-    /// The normalized feed URL. Never carries a trailing `/`.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.normalized
-    }
-
-    /// The real public NuGet service index, trusted unconditionally — never policy-gated,
-    /// since it is a hardcoded constant this LSP already queries ungated for every project
-    /// declaring no `NuGet.Config` override at all (FR-010's carve-out), not workspace
-    /// provenance. Used only for S1 (impl-critic): a `<packageSourceMapping>` key literally
-    /// naming `nuget.org` that does not resolve to any declared `<packageSources>` entry —
-    /// the near-universal real shape where `nuget.org` itself is declared in the
-    /// machine/user-profile config this feature deliberately does not read.
-    fn trusted_public() -> Self {
-        Self {
-            normalized: crate::registry::NUGET_ORG_INDEX_URL.to_string(),
+impl BlockedHostReason for NuGetFeedUrlError {
+    fn blocked_host_class(&self) -> Option<HostClass> {
+        match self {
+            Self::BlockedHost { class } => Some(*class),
+            _ => None,
         }
     }
 }
 
-impl std::fmt::Display for NuGetFeedUrl {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
+/// [`deps_core::net_policy::RegistryUrlKind`] marker selecting NuGet's validation rules for
+/// [`NuGetFeedUrl`] (issue #959).
+pub enum NuGetFeedKind {}
+
+impl deps_core::net_policy::private::Sealed for NuGetFeedKind {}
+
+impl RegistryUrlKind for NuGetFeedKind {
+    const ECOSYSTEM: &'static str = "nuget";
+    const REJECT_QUERY_FRAGMENT: bool = false;
+    type Error = NuGetFeedUrlError;
+}
+
+/// Opts `NuGetFeedKind` into [`ValidatedRegistryUrl::new_trusted_constant`] (issue #959 code
+/// review, S1) — the one real user of that escape hatch: `trusted_public` validates the
+/// hardcoded public NuGet service index without checking it against a live
+/// [`RegistryAccessPolicy`], since it is a compile-time constant, never workspace-declared
+/// input. No other ecosystem marker in this workspace implements this trait.
+impl deps_core::net_policy::TrustedConstantRegistryUrl for NuGetFeedKind {}
+
+/// A validated, normalized, https-only NuGet V3 service index URL with no embedded userinfo.
+///
+/// Mirrors `deps_pypi::config::PypiIndexUrl`/`deps_npm::config::NpmRegistryIndex`. An alias of
+/// the shared [`deps_core::net_policy::ValidatedRegistryUrl`] (issue #959) — see that type's
+/// docs for the implementation every ecosystem's validated-URL newtype now shares. The
+/// normalized feed URL never carries a trailing `/`.
+pub type NuGetFeedUrl = ValidatedRegistryUrl<NuGetFeedKind>;
+
+/// The real public NuGet service index, trusted unconditionally — never policy-gated, since it
+/// is a hardcoded constant this LSP already queries ungated for every project declaring no
+/// `NuGet.Config` override at all (FR-010's carve-out), not workspace provenance. Used only for
+/// S1 (impl-critic): a `<packageSourceMapping>` key literally naming `nuget.org` that does not
+/// resolve to any declared `<packageSources>` entry — the near-universal real shape where
+/// `nuget.org` itself is declared in the machine/user-profile config this feature deliberately
+/// does not read.
+///
+/// `NuGetFeedUrl` is now a [`deps_core::net_policy::ValidatedRegistryUrl`] alias (issue #959),
+/// so this can no longer be an inherent method — it now goes through
+/// [`deps_core::net_policy::ValidatedRegistryUrl::new_trusted_constant`] (gated on
+/// [`deps_core::net_policy::TrustedConstantRegistryUrl`], which only [`NuGetFeedKind`]
+/// implements) rather than wrapping the constant unchecked, which is a deliberate, low-risk
+/// behavior change: the constant still runs through every non-policy check (https-only, no
+/// userinfo) `new_trusted_constant` applies — only the live `registries.workspace_registries`
+/// policy check is skipped, since this is a compile-time constant, not workspace-declared
+/// input. The constant (`https://api.nuget.org/v3/index.json`, no trailing slash) passes
+/// validation trivially today (see `test_trusted_public_does_not_panic` below), mirroring
+/// `deps_cargo::config::RegistryIndex::builtin`'s own guard test for the same
+/// always-expected-valid-constant shape.
+///
+/// # Panics
+///
+/// Panics if `NUGET_ORG_INDEX_URL` fails validation. Covered by a unit test so this panic is
+/// unreachable in practice.
+fn trusted_public() -> NuGetFeedUrl {
+    let raw = crate::registry::NUGET_ORG_INDEX_URL;
+    NuGetFeedUrl::new_trusted_constant(raw)
+        .unwrap_or_else(|error| panic!("NUGET_ORG_INDEX_URL {raw:?} failed validation: {error}"))
 }
 
 /// Which tier a parsed `NuGet.Config` file came from (issue #561, FR-001).
@@ -295,18 +313,10 @@ impl std::fmt::Display for RedactedSecret {
 /// A present-but-unusable `<add>` entry — an invalid URL, a policy-blocked host, a
 /// disabled/credentialed source, or an unsupported protocol/local-feed value.
 ///
-/// Output-only: constructed internally by this module's own resolution logic, never by
-/// external code — no constructor is provided.
-#[non_exhaustive]
-#[derive(Debug, Clone)]
-pub struct InvalidEntry {
-    /// The raw value, as written (or the source's resolved URL if it was invalidated only
-    /// after passing URL validation, e.g. disabled/credentialed), with any embedded userinfo
-    /// redacted.
-    pub raw: RedactedUrl,
-    /// Why it was rejected.
-    pub reason: NuGetFeedUrlError,
-}
+/// An alias of the shared [`deps_core::net_policy::InvalidEntry`] (issue #959). Output-only: a
+/// caller builds one only via [`deps_core::net_policy::InvalidEntry::new`]/
+/// [`deps_core::net_policy::InvalidEntry::logged`], never a struct literal.
+pub type InvalidEntry = deps_core::net_policy::InvalidEntry<NuGetFeedUrlError>;
 
 /// One resolved `<packageSources>` entry, keyed by its declared `key` (case preserved, but
 /// every comparison against it goes through `key_candidates`).
@@ -677,7 +687,11 @@ impl NuGetConfig {
             // being overridden, not merely falling back to the implicit public tail.
             return keys.iter().find_map(|key| {
                 let entry = resolve_mapping_source_key(key, &self.sources)?;
-                let (class, raw) = blocked_class(entry.value.as_ref())?;
+                let (class, raw) = entry
+                    .value
+                    .as_ref()
+                    .err()
+                    .and_then(InvalidEntry::blocked_class)?;
                 Some((class, raw, format!("source:{}", entry.key)))
             });
         }
@@ -692,7 +706,11 @@ impl NuGetConfig {
         // `related_information`) instead of this method needing to bail out early to avoid a
         // diagnostic fan-out.
         self.sources.iter().find_map(|entry| {
-            let (class, raw) = blocked_class(entry.value.as_ref())?;
+            let (class, raw) = entry
+                .value
+                .as_ref()
+                .err()
+                .and_then(InvalidEntry::blocked_class)?;
             Some((class, raw, format!("source:{}", entry.key)))
         })
     }
@@ -749,7 +767,7 @@ impl NuGetConfig {
                     auth: entry.auth.clone(),
                 }),
                 None => key.eq_ignore_ascii_case("nuget.org").then(|| ResolvedHop {
-                    url: NuGetFeedUrl::trusted_public(),
+                    url: trusted_public(),
                     slot: None,
                     auth: None,
                 }),
@@ -870,18 +888,6 @@ impl NuGetConfig {
 fn no_source(package: &PackageName) -> DependencySource {
     DependencySource::CustomRegistry {
         url: package.as_str().to_string(),
-    }
-}
-
-/// `Some((class, raw))` iff `value` is an entry rejected specifically for
-/// [`NuGetFeedUrlError::BlockedHost`] — used by [`NuGetConfig::blocked_class_for`].
-fn blocked_class(value: Result<&NuGetFeedUrl, &InvalidEntry>) -> Option<(HostClass, String)> {
-    match value {
-        Err(InvalidEntry {
-            raw,
-            reason: NuGetFeedUrlError::BlockedHost { class },
-        }) => Some((*class, raw.to_string())),
-        _ => None,
     }
 }
 
@@ -1156,10 +1162,10 @@ fn resolve_source_entry(add: &RawSourceAdd, policy: &RegistryAccessPolicy) -> In
             key = %add.key,
             "skipping NuGet V2 (protocolVersion=\"2\") package source; only V3 feeds are supported"
         );
-        return Err(InvalidEntry {
-            raw: RedactedUrl::new(&add.value),
-            reason: NuGetFeedUrlError::UnsupportedProtocolVersion("2".to_string()),
-        });
+        return Err(InvalidEntry::new(
+            RedactedUrl::new(&add.value),
+            NuGetFeedUrlError::UnsupportedProtocolVersion("2".to_string()),
+        ));
     }
     if !add.value.contains("://") {
         let redacted = RedactedUrl::new(&add.value);
@@ -1168,10 +1174,10 @@ fn resolve_source_entry(add: &RawSourceAdd, policy: &RegistryAccessPolicy) -> In
             value = %redacted,
             "skipping local/UNC NuGet package source; only V3 http(s) feeds are supported"
         );
-        return Err(InvalidEntry {
-            raw: redacted,
-            reason: NuGetFeedUrlError::LocalFeedUnsupported,
-        });
+        return Err(InvalidEntry::new(
+            redacted,
+            NuGetFeedUrlError::LocalFeedUnsupported,
+        ));
     }
     NuGetFeedUrl::new(&add.value, policy).map_err(|reason| {
         // #767 S2a: `RedactedUrl`, not `redact_userinfo` alone — `raw` also lands in
@@ -1179,10 +1185,7 @@ fn resolve_source_entry(add: &RawSourceAdd, policy: &RegistryAccessPolicy) -> In
         // hover/diagnostics text, so a query-string credential must be stripped too.
         let redacted = RedactedUrl::new(&add.value);
         tracing::warn!(key = %add.key, raw = %redacted, %reason, "NuGet package source failed validation");
-        InvalidEntry {
-            raw: redacted,
-            reason,
-        }
+        InvalidEntry::new(redacted, reason)
     })
 }
 
@@ -1860,7 +1863,7 @@ fn fail_closed(
         }
     }
 
-    entry.value = Err(InvalidEntry { raw, reason });
+    entry.value = Err(InvalidEntry::new(raw, reason));
 }
 
 /// §3.2/FR-007: attempts to bind a user-profile credential to `entry` (whose resolved URL is
@@ -2071,6 +2074,34 @@ mod tests {
         assert_eq!(a, b);
     }
 
+    /// Issue #959 code review (S2): unlike `deps-go`'s `GoProxyUrl`, NuGet's kind does not set
+    /// `REJECT_QUERY_FRAGMENT` — a query string must still be accepted, and survive verbatim in
+    /// `as_str()`, after the generic-machinery migration.
+    #[test]
+    fn test_feed_url_accepts_query_string() {
+        let policy = all_policy();
+        let url = NuGetFeedUrl::new(
+            "https://feed.mycorp.example/v3/index.json?token=abc",
+            &policy,
+        )
+        .expect("query string must not be rejected for nuget");
+        assert_eq!(
+            url.as_str(),
+            "https://feed.mycorp.example/v3/index.json?token=abc"
+        );
+    }
+
+    /// Issue #959: `trusted_public` now runs `NUGET_ORG_INDEX_URL` through
+    /// `ValidatedRegistryUrl::new_trusted_constant` instead of wrapping it unchecked — this is
+    /// the coverage that makes its `unwrap_or_else(|e| panic!(..))` fallback unreachable in
+    /// practice, mirroring `deps_cargo::config::RegistryIndex::builtin`'s own guard test for the
+    /// same always-expected-valid-constant shape.
+    #[test]
+    fn test_trusted_public_does_not_panic() {
+        let index = trusted_public();
+        assert_eq!(index.as_str(), crate::registry::NUGET_ORG_INDEX_URL);
+    }
+
     // --- decode_xml_name / key_candidates (C3) ---
 
     #[test]
@@ -2103,10 +2134,8 @@ mod tests {
     fn source(key: &str, url: &str, policy: &RegistryAccessPolicy) -> PackageSourceEntry {
         PackageSourceEntry {
             key: key.to_string(),
-            value: NuGetFeedUrl::new(url, policy).map_err(|reason| InvalidEntry {
-                raw: RedactedUrl::new(url),
-                reason,
-            }),
+            value: NuGetFeedUrl::new(url, policy)
+                .map_err(|reason| InvalidEntry::new(RedactedUrl::new(url), reason)),
             tier: ConfigTier::Repo,
             auth: None,
         }

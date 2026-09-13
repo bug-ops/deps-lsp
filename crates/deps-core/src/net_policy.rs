@@ -15,6 +15,7 @@
 //! this exact classifier — see [`HostClass::never_a_registry`].
 
 use std::borrow::Cow;
+use std::marker::PhantomData;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -2430,6 +2431,401 @@ pub fn validate_index_url(
         }
     }
     Ok(url)
+}
+
+/// Soft-sealing mechanism for [`RegistryUrlKind`]/[`TrustedConstantRegistryUrl`], shared by
+/// every ecosystem crate in this workspace that defines a marker (`deps-pypi`, `deps-npm`, ...)
+/// — each implements [`private::Sealed`] for its own marker type. Mirrors
+/// `deps_core::ecosystem::private` exactly; see that module's doc for why `pub` (not
+/// `pub(crate)`) is required for a "sibling workspace crate, not a truly external one" sealing
+/// level, and why that makes this a documented contract enforced by code review rather than a
+/// compiler-enforced wall.
+#[doc(hidden)]
+pub mod private {
+    /// Marker trait every ecosystem crate in this workspace implements for its own
+    /// [`super::RegistryUrlKind`] marker type.
+    pub trait Sealed {}
+}
+
+/// Marker trait selecting one ecosystem's validation rules for [`ValidatedRegistryUrl`].
+///
+/// An uninhabited type (`enum Foo {}`) implementing this trait carries everything that used to
+/// vary between `deps-pypi`/`deps-npm`/`deps-go`/`deps-nuget`'s independently-defined,
+/// near-identical validated-URL newtypes (issue #959): the tracing label
+/// [`validate_index_url`] logs under, whether a query string/fragment is rejected (`deps-go`
+/// only, see [`Self::REJECT_QUERY_FRAGMENT`]), and the crate's own error type each
+/// `new`/`new_with_raw_for_log` call returns. A marker type, not a value parameter, because
+/// every ecosystem crate needs its *own* [`ValidatedRegistryUrl<K>`] to stay a distinct type —
+/// `PypiIndexUrl` and `NpmRegistryIndex` must never be interchangeable even though they
+/// validate identically today.
+///
+/// # Sealing
+///
+/// Requires `Self: private::Sealed`, exactly as [`crate::ecosystem::Ecosystem`] does — see that
+/// trait's `# Sealing` doc section for the full reasoning. This matters more here than it
+/// otherwise might (issue #959 code review, S1/M5): without it, a foreign crate could mint its
+/// own marker and, combined with an ungated construction path, produce a "validated" URL that
+/// never ran [`classify_host`]. [`ValidatedRegistryUrl::new`]/
+/// [`ValidatedRegistryUrl::new_with_raw_for_log`] always enforce the policy gate regardless of
+/// sealing — sealing closes who can define new *kinds*, not a gap in what an already-sealed
+/// kind can do.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::net_policy::{
+///     IndexUrlError, RegistryAccessPolicy, RegistryUrlKind, ValidatedRegistryUrl,
+/// };
+///
+/// pub enum MyIndexKind {}
+///
+/// // Real in-workspace ecosystem crates implement `Sealed` exactly like this — see
+/// // `deps_core::ecosystem::private`'s doc for why this line compiling here, out-of-crate, is
+/// // not a bug.
+/// impl deps_core::net_policy::private::Sealed for MyIndexKind {}
+///
+/// impl RegistryUrlKind for MyIndexKind {
+///     const ECOSYSTEM: &'static str = "my-ecosystem";
+///     const REJECT_QUERY_FRAGMENT: bool = false;
+///     type Error = IndexUrlError;
+/// }
+///
+/// type MyIndexUrl = ValidatedRegistryUrl<MyIndexKind>;
+///
+/// let policy = RegistryAccessPolicy::default();
+/// assert!(MyIndexUrl::new("https://index.mycorp.example", &policy).is_ok());
+/// ```
+pub trait RegistryUrlKind: private::Sealed {
+    /// [`validate_index_url`]'s `ecosystem` tracing label for this kind.
+    const ECOSYSTEM: &'static str;
+    /// Whether a query string or fragment on the candidate is rejected outright, after the
+    /// shared [`validate_index_url`] checks pass. `false` for every kind except `deps-go`'s (F3,
+    /// spec 034 review): a `GOPROXY` hop is later suffixed with `/{module}/@v/...`, which has no
+    /// well-defined append point onto a URL that already carries either.
+    ///
+    /// No default value (issue #959 code review, M1): matches this project's `EcosystemId`
+    /// convention (#118) of forcing every new implementor to state security-relevant behavior
+    /// explicitly at compile time, rather than silently inheriting the permissive default.
+    const REJECT_QUERY_FRAGMENT: bool;
+    /// This kind's own error type — must be constructible from [`IndexUrlError`] so
+    /// [`ValidatedRegistryUrl::new_with_raw_for_log`] can propagate a shared validation failure
+    /// via `?`.
+    type Error: From<IndexUrlError>;
+}
+
+/// Opt-in capability for a [`RegistryUrlKind`] that needs to validate one compile-time-known
+/// trusted constant without checking it against a live policy.
+///
+/// See [`ValidatedRegistryUrl::new_trusted_constant`] — `deps-nuget`'s hardcoded public service
+/// index is the motivating case. Deliberately a separate, narrower trait rather than a flag on
+/// [`RegistryUrlKind`] itself
+/// (issue #959 code review, S1): only the one marker type that actually owns a trusted constant
+/// implements it, so `PypiIndexUrl`/`NpmRegistryIndex`/`GoProxyUrl` — which are always built
+/// from workspace-provenance input, never a compile-time literal — get no policy-skipping
+/// construction path at all, public or otherwise. Sealed transitively through its
+/// [`RegistryUrlKind`] supertrait bound.
+pub trait TrustedConstantRegistryUrl: RegistryUrlKind {}
+
+/// A validated, normalized, https-only registry/index URL with no embedded userinfo,
+/// parameterized by an ecosystem marker `K` (see [`RegistryUrlKind`]).
+///
+/// Promotes the four near-identical newtypes `deps-pypi`'s `PypiIndexUrl`, `deps-npm`'s
+/// `NpmRegistryIndex`, `deps-go`'s `GoProxyUrl`, and `deps-nuget`'s `NuGetFeedUrl` used to
+/// define independently into one generic type (issue #959) — `K` is what keeps
+/// `ValidatedRegistryUrl<PypiIndexKind>` and `ValidatedRegistryUrl<NpmRegistryIndexKind>`
+/// distinct at the type level despite sharing an implementation, and what lets each ecosystem's
+/// `new`/`as_str` keep returning its own error type via [`RegistryUrlKind::Error`] rather than
+/// forcing every call site onto a shared, less specific one.
+///
+/// `deps-cargo`'s `RegistryIndex` deliberately does not migrate to this type (issue #959, D1):
+/// it stores a `url::Url` rather than a normalized `String`, does not trim a trailing `/`, and
+/// carries an `IndexTrust` this type has no field for.
+///
+/// Carries no bound on `K` itself — [`Clone`], [`Debug`](std::fmt::Debug), [`PartialEq`],
+/// [`Eq`], [`Hash`](std::hash::Hash), and [`Display`](std::fmt::Display) are all hand-written
+/// below (not derived) so that none of them require `K: Clone`/`K: Debug`/etc., and
+/// `PhantomData<fn() -> K>` (rather than `PhantomData<K>`) keeps [`Send`]/[`Sync`] unconditional
+/// regardless of `K`.
+pub struct ValidatedRegistryUrl<K> {
+    normalized: String,
+    kind: PhantomData<fn() -> K>,
+}
+
+impl<K> Clone for ValidatedRegistryUrl<K> {
+    fn clone(&self) -> Self {
+        Self {
+            normalized: self.normalized.clone(),
+            kind: PhantomData,
+        }
+    }
+}
+
+/// Bounded on `K: RegistryUrlKind` (unlike every other hand-written impl on this type) so the
+/// rendered name carries `K::ECOSYSTEM` instead of the generic `ValidatedRegistryUrl` — issue
+/// #959 code review (M4): a debug dump of a containing struct must still read
+/// `pypi("https://...")`-shaped, not lose which ecosystem the URL belongs to. This bound is on
+/// `K: RegistryUrlKind`, never `K: Debug`, so it costs nothing extra: every `K` this type is
+/// ever instantiated with already implements `RegistryUrlKind`.
+impl<K: RegistryUrlKind> std::fmt::Debug for ValidatedRegistryUrl<K> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple(K::ECOSYSTEM).field(&self.normalized).finish()
+    }
+}
+
+impl<K> PartialEq for ValidatedRegistryUrl<K> {
+    fn eq(&self, other: &Self) -> bool {
+        self.normalized == other.normalized
+    }
+}
+
+impl<K> Eq for ValidatedRegistryUrl<K> {}
+
+impl<K> std::hash::Hash for ValidatedRegistryUrl<K> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.normalized.hash(state);
+    }
+}
+
+impl<K> std::fmt::Display for ValidatedRegistryUrl<K> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.normalized)
+    }
+}
+
+impl<K: RegistryUrlKind> ValidatedRegistryUrl<K> {
+    /// Validates and normalizes `raw` against `policy`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `K::Error` if `raw` does not parse as a URL, is not `https` (outside the
+    /// `cfg(test)`/`test-util` loopback carve-out), carries a userinfo component, or resolves to
+    /// a host class the current `policy` blocks.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::net_policy::{
+    ///     IndexUrlError, RegistryAccessPolicy, RegistryUrlKind, ValidatedRegistryUrl,
+    /// };
+    ///
+    /// pub enum MyIndexKind {}
+    ///
+    /// impl deps_core::net_policy::private::Sealed for MyIndexKind {}
+    ///
+    /// impl RegistryUrlKind for MyIndexKind {
+    ///     const ECOSYSTEM: &'static str = "my-ecosystem";
+    ///     const REJECT_QUERY_FRAGMENT: bool = false;
+    ///     type Error = IndexUrlError;
+    /// }
+    ///
+    /// let policy = RegistryAccessPolicy::default();
+    /// let url =
+    ///     ValidatedRegistryUrl::<MyIndexKind>::new("https://index.mycorp.example/", &policy)
+    ///         .unwrap();
+    /// assert_eq!(url.as_str(), "https://index.mycorp.example");
+    /// ```
+    pub fn new(raw: &str, policy: &RegistryAccessPolicy) -> Result<Self, K::Error> {
+        Self::new_with_raw_for_log(raw, raw, policy)
+    }
+
+    /// Like [`Self::new`], but validates `candidate` (the value actually parsed) while using
+    /// `raw_for_log` — a pre-expansion or otherwise-earlier form of the same value — for every
+    /// error payload and `tracing::warn!` call. Always enforces `policy` — unlike the internal
+    /// `Self::build` this delegates to, this public entry point never accepts
+    /// [`PolicyGate::Skip`] (issue #959 code review, S1): every value this constructs is
+    /// workspace-provenance input, so there is no legitimate reason for an ecosystem crate to
+    /// skip the live policy check here — only `new_trusted_constant` (gated by
+    /// [`TrustedConstantRegistryUrl`]) may do that, for the one real compile-time-constant case.
+    ///
+    /// `deps-npm`'s `.npmrc` `${VAR}` expansion is the reason this split from [`Self::new`]
+    /// exists: a rejected candidate built from `${SOME_TOKEN}` must never leak that token's
+    /// expanded value into a log line or an error payload — `raw_for_log` is always redacted the
+    /// same way regardless of which caller it came from (#767 S2b). `RedactedUrl::new`, not
+    /// `redact_userinfo` alone, is what performs that redaction throughout this type and
+    /// [`InvalidEntry::logged`]: a query-string credential must be stripped too, not just
+    /// userinfo, since `raw_for_log`/`InvalidEntry::raw` can both surface in
+    /// ecosystem-crate-built hover/diagnostics text.
+    ///
+    /// # Errors
+    ///
+    /// Returns `K::Error` under the same conditions as [`Self::new`], plus — only when
+    /// `K::REJECT_QUERY_FRAGMENT` is `true` (`deps-go`) — a candidate carrying a query string or
+    /// fragment.
+    pub fn new_with_raw_for_log(
+        candidate: &str,
+        raw_for_log: &str,
+        policy: &RegistryAccessPolicy,
+    ) -> Result<Self, K::Error> {
+        Self::build(candidate, raw_for_log, PolicyGate::Enforce(policy))
+    }
+
+    /// The shared construction logic behind [`Self::new_with_raw_for_log`] and
+    /// [`Self::new_trusted_constant`] — deliberately not `pub` (issue #959 code review, S1): a
+    /// public `gate` parameter would let any caller pass [`PolicyGate::Skip`] directly, for
+    /// every ecosystem at once, reopening exactly the ungated-construction gap this split
+    /// exists to close. Only this module's own two public constructors may choose a gate.
+    fn build(candidate: &str, raw_for_log: &str, gate: PolicyGate<'_>) -> Result<Self, K::Error> {
+        let url = validate_index_url(candidate, raw_for_log, K::ECOSYSTEM, gate)?;
+        if K::REJECT_QUERY_FRAGMENT && (url.query().is_some() || url.fragment().is_some()) {
+            return Err(IndexUrlError::InvalidUrl(RedactedUrl::new(raw_for_log)).into());
+        }
+        let normalized = url.as_str().trim_end_matches('/').to_string();
+        Ok(Self {
+            normalized,
+            kind: PhantomData,
+        })
+    }
+
+    /// The normalized URL. Never carries a trailing `/`.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.normalized
+    }
+}
+
+impl<K: TrustedConstantRegistryUrl> ValidatedRegistryUrl<K> {
+    /// Validates `raw` — a compile-time-known literal, never workspace-declared input — without
+    /// checking it against a live [`RegistryAccessPolicy`] (`raw` is trusted by construction, not
+    /// by provenance the policy could meaningfully gate). Only callable for a `K` whose
+    /// ecosystem crate opted into [`TrustedConstantRegistryUrl`] (issue #959 code review, S1) —
+    /// `deps-nuget`'s hardcoded public service index is, at the time of writing, the only real
+    /// user of this.
+    ///
+    /// Still runs every other [`Self::new`] check (https-only, no userinfo, no rejected query
+    /// string/fragment) — only the policy gate is skipped, not URL-shape validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns `K::Error` if `raw` fails any non-policy check [`Self::new`] would also apply.
+    pub fn new_trusted_constant(raw: &'static str) -> Result<Self, K::Error> {
+        Self::build(raw, raw, PolicyGate::Skip)
+    }
+}
+
+/// Whether an ecosystem's own validation-failure reason names a policy-blocked host — the
+/// shared half of [`InvalidEntry::blocked_class`].
+pub trait BlockedHostReason {
+    /// `Some(class)` iff `self` is the blocked-host variant, naming the blocked [`HostClass`].
+    fn blocked_host_class(&self) -> Option<HostClass>;
+}
+
+impl BlockedHostReason for IndexUrlError {
+    fn blocked_host_class(&self) -> Option<HostClass> {
+        match self {
+            Self::BlockedHost { class } => Some(*class),
+            _ => None,
+        }
+    }
+}
+
+/// A present-but-unusable registry/index entry — an invalid URL, a policy-blocked host, or any
+/// other reason `E` names.
+///
+/// Shared by `deps-pypi`, `deps-npm`, `deps-go`, and `deps-nuget` (issue #959), each of which
+/// aliases this with its own error type `E` (`PypiIndexUrlError`, `NpmRegistryIndexError`,
+/// `GoProxyUrlError`, `NuGetFeedUrlError`) rather than redefining an identically-shaped struct.
+///
+/// `#[non_exhaustive]`: a caller builds one only via [`Self::new`]/[`Self::logged`], never a
+/// struct literal — slightly weaker than each ecosystem crate's previous "output-only, no
+/// constructor is provided" doc invariant (accepted, pre-1.0, workspace-internal per #959's
+/// review), but keeps a struct-literal escape hatch closed to any consumer outside the crate
+/// that owns a given `E`.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct InvalidEntry<E = IndexUrlError> {
+    /// The raw value, as written, with any embedded userinfo and query string/fragment
+    /// redacted — see [`RedactedUrl`].
+    pub raw: RedactedUrl,
+    /// Why it was rejected.
+    pub reason: E,
+}
+
+impl<E> InvalidEntry<E> {
+    /// Builds an entry directly from an already-redacted `raw` and a `reason`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::net_policy::{IndexUrlError, InvalidEntry, RedactedUrl};
+    ///
+    /// let entry = InvalidEntry::new(
+    ///     RedactedUrl::new("https://example.com"),
+    ///     IndexUrlError::UserInfoPresent,
+    /// );
+    /// assert_eq!(entry.raw.to_string(), "https://example.com");
+    /// ```
+    #[must_use]
+    pub fn new(raw: RedactedUrl, reason: E) -> Self {
+        Self { raw, reason }
+    }
+
+    /// Redacts `raw`, emits a `tracing::warn!` naming it, `ecosystem`, and `reason` under
+    /// `message`, then builds the resulting entry — the repeated redact-then-log-then-construct
+    /// shape each ecosystem's own `resolve_entry`/`parse_hop` used to write out longhand.
+    /// `RedactedUrl::new`, not `redact_userinfo` alone (#767 S2a), is what performs the
+    /// redaction: a query-string credential must be stripped too, not just userinfo, since the
+    /// resulting entry's `raw` field can surface in an ecosystem crate's own
+    /// hover/diagnostics text (e.g. `DependencySource::CustomRegistry`).
+    ///
+    /// Takes `ecosystem` explicitly (issue #959 code review, M2) so this warning carries the
+    /// same `ecosystem` field [`validate_index_url`] logs with, under the same
+    /// `deps_core::net_policy` target every caller now shares post-migration — without it, a
+    /// `RUST_LOG=deps_npm=warn`-style filter (`deps-lsp/src/main.rs`'s `EnvFilter`) would no
+    /// longer surface this warning at all, since it would carry no field naming which ecosystem
+    /// it came from.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::net_policy::{IndexUrlError, InvalidEntry};
+    ///
+    /// let entry = InvalidEntry::logged(
+    ///     "https://user:pass@example.com",
+    ///     IndexUrlError::UserInfoPresent,
+    ///     "example-ecosystem",
+    ///     "index URL failed validation",
+    /// );
+    /// assert_eq!(entry.raw.to_string(), "https://***@example.com/");
+    /// ```
+    pub fn logged(raw: &str, reason: E, ecosystem: &'static str, message: &'static str) -> Self
+    where
+        E: std::fmt::Display,
+    {
+        let redacted = RedactedUrl::new(raw);
+        tracing::warn!(raw = %redacted, %reason, ecosystem, "{}", message);
+        Self::new(redacted, reason)
+    }
+}
+
+impl<E: BlockedHostReason> InvalidEntry<E> {
+    /// `Some((class, raw))` iff this entry was rejected specifically for a policy-blocked host —
+    /// the shared half of each ecosystem's own `blocked_class`/`blocked_class_for`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::net_policy::{HostClass, IndexUrlError, InvalidEntry, RedactedUrl};
+    ///
+    /// let blocked = InvalidEntry::new(
+    ///     RedactedUrl::new("https://127.0.0.1:9999"),
+    ///     IndexUrlError::BlockedHost {
+    ///         class: HostClass::Loopback,
+    ///     },
+    /// );
+    /// assert_eq!(
+    ///     blocked.blocked_class(),
+    ///     Some((HostClass::Loopback, "https://127.0.0.1:9999".to_string()))
+    /// );
+    ///
+    /// let other = InvalidEntry::new(RedactedUrl::new("not-a-url"), IndexUrlError::UserInfoPresent);
+    /// assert_eq!(other.blocked_class(), None);
+    /// ```
+    #[must_use]
+    pub fn blocked_class(&self) -> Option<(HostClass, String)> {
+        self.reason
+            .blocked_host_class()
+            .map(|class| (class, self.raw.to_string()))
+    }
 }
 
 #[cfg(test)]
@@ -4979,5 +5375,159 @@ mod tests {
             redact_userinfo("https://example.com/x#u=user:SECRET@evil"),
             "https://example.com/x#u=user:***"
         );
+    }
+
+    // --- ValidatedRegistryUrl / InvalidEntry generic machinery (issue #959 code review) ---
+
+    /// Test-only permissive marker (`REJECT_QUERY_FRAGMENT = false`) — mirrors
+    /// `deps-pypi`/`deps-npm`/`deps-nuget`'s real markers, so the generic dispatch is proven
+    /// correct independent of any downstream ecosystem crate's own tests.
+    enum PermissiveTestKind {}
+
+    impl private::Sealed for PermissiveTestKind {}
+
+    impl RegistryUrlKind for PermissiveTestKind {
+        const ECOSYSTEM: &'static str = "test-permissive";
+        const REJECT_QUERY_FRAGMENT: bool = false;
+        type Error = IndexUrlError;
+    }
+
+    /// Test-only rejecting marker (`REJECT_QUERY_FRAGMENT = true`) — mirrors `deps-go`'s real
+    /// marker, so the generic dispatch is proven correct independent of `deps-go`'s own tests.
+    enum RejectingTestKind {}
+
+    impl private::Sealed for RejectingTestKind {}
+
+    impl RegistryUrlKind for RejectingTestKind {
+        const ECOSYSTEM: &'static str = "test-rejecting";
+        const REJECT_QUERY_FRAGMENT: bool = true;
+        type Error = IndexUrlError;
+    }
+
+    // Both test-only markers opt into the trusted-constant escape hatch too, so the same two
+    // markers cover every generic-machinery test below — a real ecosystem marker (e.g.
+    // `deps-nuget`'s `NuGetFeedKind`) implements only one of these traits, never both; nothing
+    // stops a test-only marker from implementing both for coverage convenience.
+    impl TrustedConstantRegistryUrl for PermissiveTestKind {}
+    impl TrustedConstantRegistryUrl for RejectingTestKind {}
+
+    fn permissive_policy() -> RegistryAccessPolicy {
+        RegistryAccessPolicy::new(WorkspaceRegistryAccess::All)
+    }
+
+    #[test]
+    fn test_validated_registry_url_accepts_query_string_when_kind_opts_out() {
+        let url = ValidatedRegistryUrl::<PermissiveTestKind>::new(
+            "https://example.com/path?token=abc",
+            &permissive_policy(),
+        )
+        .unwrap();
+        assert_eq!(url.as_str(), "https://example.com/path?token=abc");
+    }
+
+    #[test]
+    fn test_validated_registry_url_accepts_fragment_when_kind_opts_out() {
+        let url = ValidatedRegistryUrl::<PermissiveTestKind>::new(
+            "https://example.com/path#frag",
+            &permissive_policy(),
+        )
+        .unwrap();
+        assert_eq!(url.as_str(), "https://example.com/path#frag");
+    }
+
+    #[test]
+    fn test_validated_registry_url_rejects_query_string_when_kind_opts_in() {
+        assert_matches!(
+            ValidatedRegistryUrl::<RejectingTestKind>::new(
+                "https://example.com/path?token=abc",
+                &permissive_policy(),
+            ),
+            Err(IndexUrlError::InvalidUrl(_))
+        );
+    }
+
+    #[test]
+    fn test_validated_registry_url_rejects_fragment_when_kind_opts_in() {
+        assert_matches!(
+            ValidatedRegistryUrl::<RejectingTestKind>::new(
+                "https://example.com/path#frag",
+                &permissive_policy(),
+            ),
+            Err(IndexUrlError::InvalidUrl(_))
+        );
+    }
+
+    #[test]
+    fn test_validated_registry_url_debug_names_ecosystem() {
+        let url = ValidatedRegistryUrl::<PermissiveTestKind>::new(
+            "https://example.com",
+            &permissive_policy(),
+        )
+        .unwrap();
+        assert_eq!(
+            format!("{url:?}"),
+            "test-permissive(\"https://example.com\")"
+        );
+    }
+
+    /// Backs [`ValidatedRegistryUrl`]'s doc claim that `Send`/`Sync` stay unconditional
+    /// regardless of `K` — `PermissiveTestKind` is an uninhabited marker with no derives at
+    /// all, so this instantiation would fail to compile if `PhantomData<fn() -> K>` ever
+    /// leaked a `K: Send`/`K: Sync` requirement onto the outer type.
+    #[test]
+    fn test_validated_registry_url_send_sync_unconditional_regardless_of_kind() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<ValidatedRegistryUrl<PermissiveTestKind>>();
+    }
+
+    #[test]
+    fn test_validated_registry_url_new_trusted_constant_skips_policy() {
+        // A host `all_policy`/`permissive_policy` already allows, so this only proves
+        // `new_trusted_constant` performs the non-policy checks (rather than proving the
+        // policy was actually skipped) — see the next test for that.
+        let url =
+            ValidatedRegistryUrl::<PermissiveTestKind>::new_trusted_constant("https://example.com")
+                .unwrap();
+        assert_eq!(url.as_str(), "https://example.com");
+    }
+
+    #[test]
+    fn test_validated_registry_url_new_trusted_constant_bypasses_blocked_host_policy() {
+        // `new` (Enforce) rejects a loopback host under a public-only policy; the same host,
+        // through `new_trusted_constant`, must still succeed — this is the "policy actually
+        // skipped, not merely satisfied" half of the S1 fix's coverage.
+        let policy = RegistryAccessPolicy::new(WorkspaceRegistryAccess::PublicOnly);
+        assert_matches!(
+            ValidatedRegistryUrl::<RejectingTestKind>::new("https://127.0.0.1:9999", &policy),
+            Err(IndexUrlError::BlockedHost { .. })
+        );
+        let url = ValidatedRegistryUrl::<RejectingTestKind>::new_trusted_constant(
+            "https://127.0.0.1:9999",
+        )
+        .unwrap();
+        assert_eq!(url.as_str(), "https://127.0.0.1:9999");
+    }
+
+    #[test]
+    fn test_invalid_entry_blocked_class_some_for_blocked_host() {
+        let entry = InvalidEntry::new(
+            RedactedUrl::new("https://127.0.0.1:9999"),
+            IndexUrlError::BlockedHost {
+                class: HostClass::Loopback,
+            },
+        );
+        assert_eq!(
+            entry.blocked_class(),
+            Some((HostClass::Loopback, "https://127.0.0.1:9999".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_invalid_entry_blocked_class_none_for_other_reason() {
+        let entry = InvalidEntry::new(
+            RedactedUrl::new("not-a-url"),
+            IndexUrlError::InvalidUrl(RedactedUrl::new("not-a-url")),
+        );
+        assert_eq!(entry.blocked_class(), None);
     }
 }

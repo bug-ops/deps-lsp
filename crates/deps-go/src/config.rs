@@ -33,7 +33,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use deps_core::net_policy::{
-    HostClass, PolicyGate, RedactedUrl, RegistryAccessPolicy, validate_index_url,
+    BlockedHostReason, HostClass, RedactedUrl, RegistryAccessPolicy, RegistryUrlKind,
+    ValidatedRegistryUrl,
 };
 use deps_core::parser::DependencySource;
 
@@ -43,73 +44,47 @@ use deps_core::parser::DependencySource;
 /// the variants and their wording.
 pub use deps_core::net_policy::IndexUrlError as GoProxyUrlError;
 
+/// [`deps_core::net_policy::RegistryUrlKind`] marker selecting Go's validation rules for
+/// [`GoProxyUrl`] (issue #959) — the only kind with [`RegistryUrlKind::REJECT_QUERY_FRAGMENT`]
+/// set.
+pub enum GoProxyKind {}
+
+impl deps_core::net_policy::private::Sealed for GoProxyKind {}
+
+impl RegistryUrlKind for GoProxyKind {
+    const ECOSYSTEM: &'static str = "go";
+    /// F3 (spec 034 review): every request URL is built by appending
+    /// `/{module}/@v/...`/`/{module}/@latest` after this normalized base
+    /// (`crate::registry::versions_list_url_at` and friends) — a hop carrying a query string or
+    /// fragment has no well-defined append point (`https://host/?tok=x` would silently become
+    /// `https://host/?tok=x/github.com/.../@v/list`, an entirely different — and likely
+    /// 404ing — request than intended), so it is rejected here rather than joined incorrectly.
+    const REJECT_QUERY_FRAGMENT: bool = true;
+    type Error = GoProxyUrlError;
+}
+
 /// A validated, normalized, https-only Go module proxy URL with no embedded userinfo.
 ///
-/// Mirrors `deps_pypi::config::PypiIndexUrl`/`deps_npm::config::NpmRegistryIndex`; kept
-/// `deps-go`-local rather than promoted to `deps-core` per this spec's Open Questions
-/// (consolidate only once a fourth near-identical implementation makes the duplication
-/// concrete).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct GoProxyUrl {
-    /// The validated URL, normalized by stripping a trailing `/` — matches the
-    /// `{base}/{module}/@v/...` join convention `crate::registry` already uses for
-    /// `PROXY_BASE`.
-    normalized: String,
-}
-
-impl GoProxyUrl {
-    /// Validates and normalizes `raw` against `policy`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`GoProxyUrlError`] if `raw` does not parse as a URL, is not `https` (outside
-    /// the `cfg(test)`/`test-util` loopback carve-out), carries a userinfo component, or
-    /// resolves to a host class the current `policy` blocks.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use deps_core::net_policy::RegistryAccessPolicy;
-    /// use deps_go::config::GoProxyUrl;
-    ///
-    /// let policy = RegistryAccessPolicy::default();
-    /// assert!(GoProxyUrl::new("https://goproxy.mycorp.example", &policy).is_ok());
-    /// assert!(GoProxyUrl::new("http://goproxy.mycorp.example", &policy).is_err());
-    /// assert!(GoProxyUrl::new("https://user:pass@goproxy.mycorp.example", &policy).is_err());
-    /// ```
-    pub fn new(raw: &str, policy: &RegistryAccessPolicy) -> Result<Self, GoProxyUrlError> {
-        let url = validate_index_url(raw, raw, "go", PolicyGate::Enforce(policy))?;
-        // F3 (spec 034 review): every request URL is built by appending
-        // `/{module}/@v/...`/`/{module}/@latest` after this normalized base
-        // (`crate::registry::versions_list_url_at` and friends) — a hop carrying a query
-        // string or fragment has no well-defined append point (`https://host/?tok=x` would
-        // silently become `https://host/?tok=x/github.com/.../@v/list`, an entirely
-        // different — and likely 404ing — request than intended), so it is rejected here
-        // rather than joined incorrectly. `InvalidUrl` is the closest existing
-        // `GoProxyUrlError` variant (no `deps-core` change for a Go-only validation rule).
-        //
-        // `RedactedUrl::new`, not `redact_userinfo` alone (#767 S2a): this is exactly the
-        // rejection a query-string-bearing `raw` hits, so the payload built here is the one
-        // place the offending query string itself would otherwise still be visible.
-        if url.query().is_some() || url.fragment().is_some() {
-            return Err(GoProxyUrlError::InvalidUrl(RedactedUrl::new(raw)));
-        }
-        let normalized = url.as_str().trim_end_matches('/').to_string();
-        Ok(Self { normalized })
-    }
-
-    /// The normalized proxy URL. Never carries a trailing `/`.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.normalized
-    }
-}
-
-impl std::fmt::Display for GoProxyUrl {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
+/// Mirrors `deps_pypi::config::PypiIndexUrl`/`deps_npm::config::NpmRegistryIndex`. An alias of
+/// the shared [`deps_core::net_policy::ValidatedRegistryUrl`] (issue #959) — see that type's
+/// docs for the implementation every ecosystem's validated-URL newtype now shares, and
+/// [`GoProxyKind`] for this kind's Go-specific query/fragment rejection rule.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::net_policy::RegistryAccessPolicy;
+/// use deps_go::config::GoProxyUrl;
+///
+/// let policy = RegistryAccessPolicy::default();
+/// assert!(GoProxyUrl::new("https://goproxy.mycorp.example", &policy).is_ok());
+/// assert!(GoProxyUrl::new("http://goproxy.mycorp.example", &policy).is_err());
+/// assert!(GoProxyUrl::new("https://user:pass@goproxy.mycorp.example", &policy).is_err());
+/// ```
+///
+/// The normalized proxy URL never carries a trailing `/` — matches the `{base}/{module}/@v/...`
+/// join convention `crate::registry` already uses for `PROXY_BASE`.
+pub type GoProxyUrl = ValidatedRegistryUrl<GoProxyKind>;
 
 /// One `GOPROXY` chain entry (FR-002): either a validated proxy URL, or one of the two
 /// sentinel values `go help goproxy` defines.
@@ -135,17 +110,10 @@ pub enum GoProxyHop {
 /// [`DependencySource::CustomRegistry`] when every hop in a chain is invalid, or log a warning
 /// naming a dropped hop, without ever holding or surfacing the credential itself.
 ///
-/// Output-only: constructed internally by this module's own `parse_hop`, never by external
-/// code — no constructor is provided.
-#[non_exhaustive]
-#[derive(Debug, Clone)]
-pub struct InvalidEntry {
-    /// The raw `GOPROXY` hop value, as written in `$GOENV`, with any `user:pass@`/`user@`
-    /// userinfo component and any query string/fragment stripped.
-    pub raw: RedactedUrl,
-    /// Why it was rejected.
-    pub reason: GoProxyUrlError,
-}
+/// An alias of the shared [`deps_core::net_policy::InvalidEntry`] (issue #959). Output-only: a
+/// caller builds one only via [`deps_core::net_policy::InvalidEntry::new`]/
+/// [`deps_core::net_policy::InvalidEntry::logged`], never a struct literal.
+pub type InvalidEntry = deps_core::net_policy::InvalidEntry<GoProxyUrlError>;
 
 /// Parses and validates one `,`-or-`|`-separated `GOPROXY` chain entry (FR-002), logging a
 /// `tracing::warn!` naming the raw value (redacted — see
@@ -157,12 +125,12 @@ fn parse_hop(raw: &str, policy: &RegistryAccessPolicy) -> Result<GoProxyHop, Inv
         _ => GoProxyUrl::new(raw, policy)
             .map(GoProxyHop::Url)
             .map_err(|reason| {
-                let redacted = RedactedUrl::new(raw);
-                tracing::warn!(raw = %redacted, %reason, "GOPROXY hop failed validation");
-                InvalidEntry {
-                    raw: redacted,
+                InvalidEntry::logged(
+                    raw,
                     reason,
-                }
+                    GoProxyKind::ECOSYSTEM,
+                    "GOPROXY hop failed validation",
+                )
             }),
     }
 }
@@ -340,7 +308,7 @@ fn parse_goproxy(
                 }
                 Err(invalid) => {
                     if first_blocked.is_none()
-                        && let GoProxyUrlError::BlockedHost { class } = invalid.reason
+                        && let Some(class) = invalid.reason.blocked_host_class()
                     {
                         first_blocked = Some((class, invalid.raw.clone()));
                     }
@@ -364,10 +332,7 @@ fn parse_goproxy(
     if hops.is_empty() {
         let for_resolution = first_invalid.unwrap_or_else(|| {
             let redacted = RedactedUrl::new(raw);
-            InvalidEntry {
-                reason: GoProxyUrlError::InvalidUrl(redacted.clone()),
-                raw: redacted,
-            }
+            InvalidEntry::new(redacted.clone(), GoProxyUrlError::InvalidUrl(redacted))
         });
         Err(GoProxyChainFailure {
             for_resolution,
