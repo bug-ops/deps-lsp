@@ -71,9 +71,8 @@ pub struct CargoParseResult {
     /// NFR-005's corrected premise).
     pub resolved_registries: Vec<(RegistryIndex, Option<AuthToken>)>,
     /// Dependency lines whose `registry`/`registry-index` resolution was blocked by the
-    /// current `registries.workspace_registries` policy (spec #443, plan-1b §1.7) —
-    /// `(name_range, blocked host class, raw declared value, declaration key)` quadruples.
-    /// The declaration key is the same as the raw declared value here: an alias name or a
+    /// current `registries.workspace_registries` policy (spec #443, plan-1b §1.7). The
+    /// declaration key is the same as the raw declared value here: an alias name or a
     /// literal URL, both written verbatim by the dependency itself, are already a safe
     /// dedup key for
     /// [`deps_core::lsp_helpers::generate_diagnostics_from_cache`]'s declaration-identity
@@ -81,7 +80,7 @@ pub struct CargoParseResult {
     /// identical literal URL are, for diagnostic purposes, indistinguishable anyway. Surfaced
     /// via [`Self::blocked_registries`]'s trait override as an informational diagnostic, so
     /// the block never degrades silently.
-    pub blocked_registries: Vec<(Range, deps_core::net_policy::HostClass, String, String)>,
+    pub blocked_registries: Vec<deps_core::BlockedRegistryOccurrence>,
     /// `Some((kept, total))` once the manifest declared more dependencies than
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
     /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
@@ -288,7 +287,7 @@ fn get_val<'a>(table: &'a Table<'a>, key: &str) -> Option<&'a Value<'a>> {
 /// line whose registry-index resolution was blocked by policy (spec #443, plan-1b §1.7).
 type AlternateRegistryResolution = (
     Vec<(RegistryIndex, Option<AuthToken>)>,
-    Vec<(Range, deps_core::net_policy::HostClass, String, String)>,
+    Vec<deps_core::BlockedRegistryOccurrence>,
 );
 
 /// Rewrites every `DependencySource::CustomRegistry` entry in `dependencies` into a
@@ -417,7 +416,12 @@ fn resolve_alternate_registries(
                     mirrors_crates_io: false,
                 };
             } else if let Some(class) = blocked_by_raw_value.get(url) {
-                blocked_registries.push((dep.name_range, *class, url.clone(), url.clone()));
+                blocked_registries.push(deps_core::BlockedRegistryOccurrence {
+                    range: dep.name_range,
+                    class: *class,
+                    raw_value: url.clone(),
+                    declaration_key: url.clone(),
+                });
             }
         }
     }
@@ -818,7 +822,7 @@ impl deps_core::ParseResult for CargoParseResult {
         &self.uri
     }
 
-    fn blocked_registries(&self) -> Vec<(Range, deps_core::net_policy::HostClass, String, String)> {
+    fn blocked_registries(&self) -> Vec<deps_core::BlockedRegistryOccurrence> {
         self.blocked_registries.clone()
     }
 
@@ -1219,11 +1223,14 @@ internal-crate = { version = "1.0", registry-index = "https://169.254.169.254/in
             "a blocked index must stay unresolved, not silently become AlternateRegistry"
         );
         assert_eq!(result.blocked_registries.len(), 1);
-        let (range, class, raw_value, declaration_key) = &result.blocked_registries[0];
-        assert_eq!(*range, result.dependencies[0].name_range);
-        assert_eq!(*class, deps_core::net_policy::HostClass::CloudMetadata);
-        assert_eq!(raw_value, "https://169.254.169.254/index");
-        assert_eq!(declaration_key, raw_value);
+        let occurrence = &result.blocked_registries[0];
+        assert_eq!(occurrence.range, result.dependencies[0].name_range);
+        assert_eq!(
+            occurrence.class,
+            deps_core::net_policy::HostClass::CloudMetadata
+        );
+        assert_eq!(occurrence.raw_value, "https://169.254.169.254/index");
+        assert_eq!(occurrence.declaration_key, occurrence.raw_value);
     }
 
     /// The alias path's `blocked_registries` counterpart: an alias resolving via
@@ -1252,11 +1259,14 @@ internal-crate = { version = "1.0", registry-index = "https://169.254.169.254/in
         let result = parse_cargo_toml_with_context(manifest_content, &uri, &ctx).unwrap();
 
         assert_eq!(result.blocked_registries.len(), 1);
-        let (range, class, raw_value, declaration_key) = &result.blocked_registries[0];
-        assert_eq!(*range, result.dependencies[0].name_range);
-        assert_eq!(*class, deps_core::net_policy::HostClass::CloudMetadata);
-        assert_eq!(raw_value, "my-corp");
-        assert_eq!(declaration_key, raw_value);
+        let occurrence = &result.blocked_registries[0];
+        assert_eq!(occurrence.range, result.dependencies[0].name_range);
+        assert_eq!(
+            occurrence.class,
+            deps_core::net_policy::HostClass::CloudMetadata
+        );
+        assert_eq!(occurrence.raw_value, "my-corp");
+        assert_eq!(occurrence.declaration_key, occurrence.raw_value);
     }
 
     /// #536: a `registry-index` value carrying literal `user:pass@` userinfo fails

@@ -5,12 +5,13 @@ use super::{ParseResult, PypiParser, normalize_marker_string, span_start, span_t
 use crate::config::PypiIndexConfig;
 use crate::error::Result;
 use crate::types::{PypiDependency, PypiDependencySection, PypiDependencySource};
+use deps_core::BlockedRegistryOccurrence;
 use deps_core::lsp_helpers::LineOffsetTable;
-use deps_core::net_policy::{HostClass, RegistryAccessPolicy};
+use deps_core::net_policy::RegistryAccessPolicy;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use toml_span::value::{Table, Value};
-use tower_lsp_server::ls_types::{Range, Uri};
+use tower_lsp_server::ls_types::Uri;
 
 /// Everything a `pyproject.toml` parse needs to resolve a dependency's PyPI index routing
 /// (spec FR-002/003/005/006/007/013) — built once from the TOML tree's `[[tool.poetry.source]]`
@@ -22,13 +23,12 @@ struct IndexContext<'a> {
     /// `[tool.uv.sources] <dep> = { index = "<name>" }` bindings, keyed by dependency name
     /// (FR-013) — the uv analogue of Poetry's per-dependency `source = "<name>"` key.
     uv_named_by_dep: &'a HashMap<String, String>,
-    /// Accumulates a `(name_range, blocked host class, raw declared value, declaration key)`
-    /// quadruple (#925) for every dependency [`Self::resolve`] routes through an entry blocked
-    /// by the current `registries.workspace_registries` policy — a `RefCell` because `resolve`
-    /// is called from several independent `parse_*` helpers (PEP 621/735, Poetry, build-system
-    /// requires) that each only see their own local `Vec<PypiDependency>`, not one shared
-    /// result accumulator.
-    blocked_registries: RefCell<Vec<(Range, HostClass, String, String)>>,
+    /// Accumulates a [`BlockedRegistryOccurrence`] (#925) for every dependency
+    /// [`Self::resolve`] routes through an entry blocked by the current
+    /// `registries.workspace_registries` policy — a `RefCell` because `resolve` is called from
+    /// several independent `parse_*` helpers (PEP 621/735, Poetry, build-system requires) that
+    /// each only see their own local `Vec<PypiDependency>`, not one shared result accumulator.
+    blocked_registries: RefCell<Vec<BlockedRegistryOccurrence>>,
 }
 
 impl IndexContext<'_> {
@@ -45,12 +45,14 @@ impl IndexContext<'_> {
             .map(String::as_str);
         dep.source = self.config.resolve_source_for(named);
         if let Some((class, raw_value, declaration_key)) = self.config.blocked_class_for(named) {
-            self.blocked_registries.borrow_mut().push((
-                dep.name_range,
-                class,
-                raw_value,
-                declaration_key,
-            ));
+            self.blocked_registries
+                .borrow_mut()
+                .push(BlockedRegistryOccurrence {
+                    range: dep.name_range,
+                    class,
+                    raw_value,
+                    declaration_key,
+                });
         }
     }
 }
@@ -635,12 +637,14 @@ impl PypiParser {
             // through the primary/extras chain only (FR-002/003/005), same as a plain PEP
             // 621/requirements.txt dependency.
             if let Some((class, raw_value, declaration_key)) = ctx.config.blocked_class_for(None) {
-                ctx.blocked_registries.borrow_mut().push((
-                    name_range,
-                    class,
-                    raw_value,
-                    declaration_key,
-                ));
+                ctx.blocked_registries
+                    .borrow_mut()
+                    .push(BlockedRegistryOccurrence {
+                        range: name_range,
+                        class,
+                        raw_value,
+                        declaration_key,
+                    });
             }
             return Ok(PypiDependency {
                 name: name.into(),
@@ -713,12 +717,14 @@ impl PypiParser {
                 if let Some((class, raw_value, declaration_key)) =
                     ctx.config.blocked_class_for(source_name)
                 {
-                    ctx.blocked_registries.borrow_mut().push((
-                        name_range,
-                        class,
-                        raw_value,
-                        declaration_key,
-                    ));
+                    ctx.blocked_registries
+                        .borrow_mut()
+                        .push(BlockedRegistryOccurrence {
+                            range: name_range,
+                            class,
+                            raw_value,
+                            declaration_key,
+                        });
                 }
                 ctx.config.resolve_source_for(source_name)
             };
@@ -2517,11 +2523,14 @@ requests = "^2.28.0"
             "a blocked source must stay unresolved, not silently become AlternateRegistry"
         );
         assert_eq!(result.blocked_registries.len(), 1);
-        let (range, class, raw_value, declaration_key) = &result.blocked_registries[0];
-        assert_eq!(*range, dep.name_range);
-        assert_eq!(*class, deps_core::net_policy::HostClass::CloudMetadata);
-        assert_eq!(raw_value, "https://169.254.169.254/simple");
-        assert_eq!(declaration_key, "primary");
+        let occurrence = &result.blocked_registries[0];
+        assert_eq!(occurrence.range, dep.name_range);
+        assert_eq!(
+            occurrence.class,
+            deps_core::net_policy::HostClass::CloudMetadata
+        );
+        assert_eq!(occurrence.raw_value, "https://169.254.169.254/simple");
+        assert_eq!(occurrence.declaration_key, "primary");
     }
 
     /// Validator finding S3: two primary-priority Poetry sources must not silently pick an
@@ -2631,11 +2640,14 @@ flask = { version = "^3.0", source = "internal" }
             "a blocked named source must stay unresolved, not silently become AlternateRegistry"
         );
         assert_eq!(result.blocked_registries.len(), 1);
-        let (range, class, raw_value, declaration_key) = &result.blocked_registries[0];
-        assert_eq!(*range, flask.name_range);
-        assert_eq!(*class, deps_core::net_policy::HostClass::CloudMetadata);
-        assert_eq!(raw_value, "https://169.254.169.254/simple");
-        assert_eq!(declaration_key, "named:internal");
+        let occurrence = &result.blocked_registries[0];
+        assert_eq!(occurrence.range, flask.name_range);
+        assert_eq!(
+            occurrence.class,
+            deps_core::net_policy::HostClass::CloudMetadata
+        );
+        assert_eq!(occurrence.raw_value, "https://169.254.169.254/simple");
+        assert_eq!(occurrence.declaration_key, "named:internal");
     }
 
     #[test]

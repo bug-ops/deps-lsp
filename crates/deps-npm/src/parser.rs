@@ -11,7 +11,7 @@ use deps_core::json_helpers::string_valued_entries;
 use deps_core::lsp_helpers::LineOffsetTable;
 use serde_json::Value;
 use std::any::Any;
-use tower_lsp_server::ls_types::{Range, Uri};
+use tower_lsp_server::ls_types::Uri;
 
 /// Result of parsing a package.json file.
 ///
@@ -31,15 +31,13 @@ pub struct NpmParseResult {
     pub resolved_registries: Vec<NpmRegistryIndex>,
     /// Dependency lines whose `.npmrc` `registry`/`@scope:registry` resolution was blocked by
     /// the current `registries.workspace_registries` policy (#925, mirrors
-    /// `deps_cargo::parser::CargoParseResult::blocked_registries`) —
-    /// `(name_range, blocked host class, raw declared value, declaration key)` quadruples,
-    /// where the declaration key (from [`NpmConfig::blocked_class_for`]) distinguishes a
-    /// top-level `registry=` block from a `@scope:registry=` block even when both happen to
-    /// share the same raw value. Surfaced by
-    /// [`deps_core::lsp_helpers::generate_diagnostics_from_cache`] via
+    /// `deps_cargo::parser::CargoParseResult::blocked_registries`), where the declaration key
+    /// (from [`NpmConfig::blocked_class_for`]) distinguishes a top-level `registry=` block
+    /// from a `@scope:registry=` block even when both happen to share the same raw value.
+    /// Surfaced by [`deps_core::lsp_helpers::generate_diagnostics_from_cache`] via
     /// [`Self::blocked_registries`]'s trait override as an informational diagnostic, so the
     /// block never degrades silently.
-    pub blocked_registries: Vec<(Range, deps_core::net_policy::HostClass, String, String)>,
+    pub blocked_registries: Vec<deps_core::BlockedRegistryOccurrence>,
     /// `Some((kept, total))` once the manifest declared more dependencies than
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
     /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
@@ -66,7 +64,7 @@ impl deps_core::ParseResult for NpmParseResult {
         &self.uri
     }
 
-    fn blocked_registries(&self) -> Vec<(Range, deps_core::net_policy::HostClass, String, String)> {
+    fn blocked_registries(&self) -> Vec<deps_core::BlockedRegistryOccurrence> {
         self.blocked_registries.clone()
     }
 
@@ -214,7 +212,12 @@ pub fn parse_package_json_with_context(
         let name = deps_core::Dependency::name(dep).clone();
         dep.source = npm_config.resolve_source_for(&name);
         if let Some((class, raw_value, declaration_key)) = npm_config.blocked_class_for(&name) {
-            blocked_registries.push((dep.name_range, class, raw_value, declaration_key));
+            blocked_registries.push(deps_core::BlockedRegistryOccurrence {
+                range: dep.name_range,
+                class,
+                raw_value,
+                declaration_key,
+            });
         }
     }
 
@@ -1110,11 +1113,14 @@ mod tests {
             deps_core::parser::DependencySource::CustomRegistry { .. }
         );
         assert_eq!(result.blocked_registries.len(), 1);
-        let (range, class, raw_value, declaration_key) = &result.blocked_registries[0];
-        assert_eq!(*range, result.dependencies[0].name_range);
-        assert_eq!(*class, deps_core::net_policy::HostClass::CloudMetadata);
-        assert_eq!(raw_value, "https://169.254.169.254");
-        assert_eq!(declaration_key, "top-level");
+        let occurrence = &result.blocked_registries[0];
+        assert_eq!(occurrence.range, result.dependencies[0].name_range);
+        assert_eq!(
+            occurrence.class,
+            deps_core::net_policy::HostClass::CloudMetadata
+        );
+        assert_eq!(occurrence.raw_value, "https://169.254.169.254");
+        assert_eq!(occurrence.declaration_key, "top-level");
     }
 
     // --- pnpm catalogs (spec 046) ---

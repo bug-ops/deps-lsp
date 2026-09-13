@@ -32,10 +32,9 @@
 use std::any::Any;
 use std::path::Path;
 
-use tower_lsp_server::ls_types::{Range, Uri};
+use tower_lsp_server::ls_types::Uri;
 
-use crate::ecosystem::{Dependency, ParseResult};
-use crate::net_policy::HostClass;
+use crate::ecosystem::{BlockedRegistryOccurrence, Dependency, ParseResult};
 
 /// Maximum number of dependencies [`ParseResult::dependencies`] returns for one open
 /// document, enforced by [`cap_dependencies`].
@@ -194,7 +193,7 @@ impl ParseResult for DependencyCappedParseResult {
         self.inner.uri()
     }
 
-    fn blocked_registries(&self) -> Vec<(Range, HostClass, String, String)> {
+    fn blocked_registries(&self) -> Vec<BlockedRegistryOccurrence> {
         self.inner.blocked_registries()
     }
 

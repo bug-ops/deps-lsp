@@ -263,6 +263,30 @@ impl std::fmt::Display for EcosystemId {
     }
 }
 
+/// One dependency declaration whose registry-index resolution was blocked by a
+/// workspace-registry reachability policy — returned by [`ParseResult::blocked_registries`].
+///
+/// A named struct rather than a positional tuple (#944 M9): [`Self::raw_value`] and
+/// [`Self::declaration_key`] are both `String`s, so a positional tuple would let them be
+/// silently swapped at any call site with no compile error — the same shape as the value/key
+/// mixup this type exists to rule out.
+#[derive(Debug, Clone)]
+pub struct BlockedRegistryOccurrence {
+    /// LSP range of the affected dependency's name in the manifest.
+    pub range: tower_lsp_server::ls_types::Range,
+    /// The blocked host's classification.
+    pub class: crate::net_policy::HostClass,
+    /// The exact `registry`/`registry-index` alias or URL the dependency declared, so two
+    /// different blocked aliases render as two distinguishable diagnostic messages, not one
+    /// byte-identical warning.
+    pub raw_value: String,
+    /// Implementation-opaque string identifying *which underlying config declaration*
+    /// produced this entry — never the resolved value itself (code-review correctness fix,
+    /// #925). See [`ParseResult::blocked_registries`]'s doc for why this must be distinct
+    /// from [`Self::raw_value`].
+    pub declaration_key: String,
+}
+
 /// Parse result trait containing dependencies and metadata.
 ///
 /// Implementations hold ecosystem-specific dependency types
@@ -279,46 +303,30 @@ pub trait ParseResult: Send + Sync {
 
     /// Dependency lines whose registry-index resolution was blocked by a workspace-registry
     /// reachability policy (spec `.local/specs/023-cargo-custom-registries/plan-1b.md` §1.7,
-    /// #443) — `(name_range, blocked host class, raw declared value, declaration key)`
-    /// quadruples, where the raw value is the exact `registry`/`registry-index` alias or URL
-    /// the dependency declared (so two different blocked aliases render as two distinguishable
-    /// messages, not one byte-identical warning). Used by
-    /// [`crate::lsp_helpers::generate_diagnostics_from_cache`] to surface an
+    /// #443). Used by [`crate::lsp_helpers::generate_diagnostics_from_cache`] to surface an
     /// [`tower_lsp_server::ls_types::DiagnosticSeverity::INFORMATION`] diagnostic on the
     /// blocked dependency's line so the block never degrades silently.
     ///
-    /// The fourth element, `declaration key`, is an implementation-opaque string identifying
-    /// *which underlying config declaration* produced this entry — never the resolved
-    /// value itself (code-review correctness fix, #925): a config-global declaration (e.g. a
-    /// single blocked npm `.npmrc` `registry=` line, or one `NuGet.Config` `<add key>` source)
-    /// applies identically to every dependency it affects, so
-    /// [`crate::lsp_helpers::generate_diagnostics_from_cache`] dedupes by this key alone to
-    /// collapse that fan-out to one diagnostic — but two *independently* declared sources that
-    /// merely happen to share the same raw value/host class (e.g. an npm top-level `registry=`
-    /// and an unrelated `@scope:registry=` both blocked to the same URL) must carry
-    /// *different* keys, or the second declaration's own dependents would silently lose their
-    /// diagnostic even though nothing links the two declarations. An implementor with no
-    /// realistic risk of two distinct declarations coincidentally sharing a raw value (e.g.
-    /// `deps_cargo`, where the raw value is always either a unique alias name or the literal
-    /// URL the dependency itself wrote) may reuse the raw value as its own declaration key.
+    /// [`BlockedRegistryOccurrence::declaration_key`] is an implementation-opaque string
+    /// identifying *which underlying config declaration* produced this entry — never the
+    /// resolved value itself (code-review correctness fix, #925): a config-global declaration
+    /// (e.g. a single blocked npm `.npmrc` `registry=` line, or one `NuGet.Config` `<add key>`
+    /// source) applies identically to every dependency it affects, so
+    /// [`crate::lsp_helpers::generate_diagnostics_from_cache`] groups by this key alone to
+    /// collapse that fan-out — but two *independently* declared sources that merely happen to
+    /// share the same raw value/host class (e.g. an npm top-level `registry=` and an unrelated
+    /// `@scope:registry=` both blocked to the same URL) must carry *different* keys, or the
+    /// second declaration's own dependents would silently lose their diagnostic even though
+    /// nothing links the two declarations. An implementor with no realistic risk of two
+    /// distinct declarations coincidentally sharing a raw value (e.g. `deps_cargo`, where the
+    /// raw value is always either a unique alias name or the literal URL the dependency itself
+    /// wrote) may reuse the raw value as its own declaration key.
     ///
     /// Default empty. Overridden today by `deps_cargo::parser::CargoParseResult`,
     /// `deps_npm::parser::NpmParseResult`, `deps_pypi::parser::ParseResult`, and
     /// `deps_nuget::parser::NuGetParseResult` (#925); every other ecosystem has no equivalent
     /// reachability policy to report yet.
-    ///
-    /// Known gap tracked as #944 M9, deferred (not blocking #925): the two adjacent `String`
-    /// fields (raw value, declaration key) can be swapped positionally at any call site with
-    /// no compile error — converting this tuple to a named struct would make that a compile-time
-    /// error instead of a silent behavior bug.
-    fn blocked_registries(
-        &self,
-    ) -> Vec<(
-        tower_lsp_server::ls_types::Range,
-        crate::net_policy::HostClass,
-        String,
-        String,
-    )> {
+    fn blocked_registries(&self) -> Vec<BlockedRegistryOccurrence> {
         Vec::new()
     }
 
