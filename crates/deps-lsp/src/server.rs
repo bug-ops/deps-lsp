@@ -223,25 +223,40 @@ impl Backend {
             return;
         };
 
-        // Find all open documents using this lock file
-        let affected_uris: Vec<Uri> = self
-            .state
-            .documents
-            .iter()
-            .filter_map(|entry| {
-                let uri = entry.key();
-                let doc = entry.value();
-                if doc.ecosystem_id() != ecosystem_id {
-                    return None;
-                }
-                let doc_lockfile = lock_provider.locate_lockfile(uri)?;
-                if doc_lockfile == lockfile_path {
-                    Some(uri.clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
+        // Find all open documents using this lock file. `locate_lockfile` does a
+        // synchronous ancestor-directory `stat` walk per candidate document (#963), so
+        // scanning every open document inline here would run one such walk per document
+        // on the calling tokio worker thread — worse than the single-document case
+        // `resolved.rs`/`lockfile.rs` already fixed. Run the whole scan in
+        // `spawn_blocking` instead.
+        let state = Arc::clone(&self.state);
+        let lock_provider_for_scan = Arc::clone(&lock_provider);
+        let ecosystem_id_owned = ecosystem_id.to_string();
+        let lockfile_path_owned = lockfile_path.to_path_buf();
+        let affected_uris: Vec<Uri> = tokio::task::spawn_blocking(move || {
+            state
+                .documents
+                .iter()
+                .filter_map(|entry| {
+                    let uri = entry.key();
+                    let doc = entry.value();
+                    if doc.ecosystem_id() != ecosystem_id_owned {
+                        return None;
+                    }
+                    let doc_lockfile = lock_provider_for_scan.locate_lockfile(uri)?;
+                    if doc_lockfile == lockfile_path_owned {
+                        Some(uri.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("lock file affected-document scan panicked: {}", e);
+            Vec::new()
+        });
 
         if affected_uris.is_empty() {
             tracing::debug!(
