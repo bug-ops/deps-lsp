@@ -11,7 +11,8 @@ use crate::types::{NpmPackage, NpmVersion};
 use dashmap::DashMap;
 use deps_core::{
     DepsError, HOVER_RECENT_VERSIONS, HttpCache, PublishTime, Result, is_dot_segment,
-    lsp_helpers::warn_rejected_value, net_policy::RedactedUrl, parser::DependencySource,
+    lsp_helpers::dot_segment_rejection_error, net_policy::RedactedUrl,
+    not_found_or as core_not_found_or, parser::DependencySource,
 };
 use serde::Deserialize;
 use std::any::Any;
@@ -156,14 +157,7 @@ fn versions_url(base: &str, name: &str) -> String {
 /// Converts a 404 response into `DepsError::PackageNotFound`, passing through
 /// any other error unchanged.
 fn not_found_or(err: DepsError, name: &str) -> DepsError {
-    if matches!(err, DepsError::HttpStatus { status: 404, .. }) {
-        DepsError::PackageNotFound {
-            package: name.to_string(),
-            registry: REGISTRY,
-        }
-    } else {
-        err
-    }
+    core_not_found_or(err, name, REGISTRY, &[])
 }
 
 /// A TTL'd, derived `{version -> PublishTime}` map built from one package's full packument,
@@ -361,11 +355,12 @@ impl NpmRegistry {
     #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
     pub async fn get_versions(&self, name: &str) -> Result<Vec<NpmVersion>> {
         if has_dot_segment(name) {
-            warn_rejected_value("npm_dot_segment_guard", "npm packument request URL", name);
-            return Err(DepsError::PackageNotFound {
-                package: name.to_string(),
-                registry: REGISTRY,
-            });
+            return Err(dot_segment_rejection_error(
+                "is_dot_segment",
+                "npm packument request URL",
+                name,
+                REGISTRY,
+            ));
         }
 
         let url = versions_url(&self.registry_base, name);

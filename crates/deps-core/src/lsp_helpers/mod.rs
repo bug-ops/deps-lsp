@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tower_lsp_server::ls_types::{Position, Range, TextEdit, Uri};
 
+use crate::error::DepsError;
 use crate::licenses::LicensePolicy;
 use crate::osv::VulnerabilityMap;
 use crate::{
@@ -1576,6 +1577,45 @@ pub fn warn_rejected_value(gate: &str, context: &str, value: &str) {
         len = value.len(),
         "rejected unsafe value before manifest/registry sink"
     );
+}
+
+/// Logs a [`warn_rejected_value`] warning and builds the [`DepsError::PackageNotFound`] a
+/// caller returns after its own `is_dot_segment`/`has_dot_segment` predicate rejects `name`.
+///
+/// Extracted from four equivalent `warn_rejected_value` + `PackageNotFound`
+/// constructions in `deps-dart`, `deps-composer`, `deps-nuget`, and `deps-npm`
+/// (deps-lsp#929 item 2) — `deps-npm`'s `gate` label was `"npm_dot_segment_guard"` rather
+/// than the other three's `"is_dot_segment"` before this extraction normalized it. Each
+/// crate keeps its own dot-segment *predicate* and the call to it exactly where it is
+/// today; only this trailing boilerplate is shared. Deliberately does **not** fold in
+/// `deps-go`'s guard, which returns `DepsError::InvalidVersionReq`, not `PackageNotFound`.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::dot_segment_rejection_error;
+/// use deps_core::DepsError;
+///
+/// let err = dot_segment_rejection_error(
+///     "is_dot_segment",
+///     "example package metadata request URL",
+///     "..",
+///     "example",
+/// );
+/// assert!(matches!(err, DepsError::PackageNotFound { .. }));
+/// ```
+#[must_use]
+pub fn dot_segment_rejection_error(
+    gate: &str,
+    context: &str,
+    name: &str,
+    registry: &'static str,
+) -> DepsError {
+    warn_rejected_value(gate, context, name);
+    DepsError::PackageNotFound {
+        package: name.to_string(),
+        registry,
+    }
 }
 
 /// Builds a single-entry [`tower_lsp_server::ls_types::WorkspaceEdit::changes`] map replacing `range` in `uri`
