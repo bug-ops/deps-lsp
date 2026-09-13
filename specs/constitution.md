@@ -53,7 +53,42 @@ status: active
 
 7. **Pre-1.0 means clean breaks.** Before v1.0.0, correctness and clarity win
    over backward compatibility — breaking changes are made directly and
-   documented in `CHANGELOG.md`, not hidden behind deprecation shims.
+   documented in `CHANGELOG.md`, not hidden behind deprecation shims. This
+   principle is historical once v1.0.0 ships and applies only to changes made
+   before that release.
+
+8. **Post-1.0 breaking-change policy.** Once v1.0.0 ships, this project's 16
+   published crates (`deps-core` + 14 `deps-<ecosystem>` crates + `deps-lsp`)
+   are a compatibility contract with downstream consumers, and a breaking
+   change is no longer a same-version edit:
+   - Any breaking change to a published crate's public API requires a major
+     version bump (standard semver) for that crate.
+   - Breaking changes are documented in `CHANGELOG.md` under a clearly
+     labeled "Breaking" entry — never folded silently into an unrelated
+     "Changed"/"Fixed" line — so a downstream consumer scanning the changelog
+     can find every breaking change without reading full diffs.
+   - Automated semver enforcement (`cargo-semver-checks`, intended as a
+     blocking CI gate per issue #945) is the mechanism meant to catch an
+     *accidental* breaking change before release; it does not replace the
+     changelog obligation above for *intentional* ones. (As of this writing
+     the `semver` CI job is still advisory/`continue-on-error` on normal
+     PR/push runs — only the scheduled weekly run hard-fails — so this gate
+     is a stated goal, not yet a live guarantee.)
+   - Where a deprecation window is used instead of an immediate break, mark
+     the item `#[deprecated]` (or the ecosystem-appropriate equivalent) with
+     a note pointing to its replacement, kept for at least one minor release
+     before removal. A deprecation window is not mandatory for every
+     breaking change — some breaks (e.g. removing a genuinely unused item)
+     may still go straight to a major bump — but when used, it follows this
+     minimum.
+   - How often a major bump is actually needed — e.g. whether third-party
+     dependency types (`reqwest::Error`, `yaml_rust2::Yaml`,
+     `semver::VersionReq`, `tower-lsp-server` types, ...) are wrapped or
+     exposed directly in `deps-core`'s public API — is a separate design
+     question (issue #851, no decision recorded yet) that this principle
+     does not prejudge; whichever way #851 resolves, the bump/changelog/
+     enforcement rules above still apply to whatever ends up in the public
+     API.
 
 ## See Also
 
