@@ -11,6 +11,7 @@ created: 2026-09-14
 status: draft
 related:
   - "[[constitution]]"
+  - "[[architecture-decision]]"
 ---
 
 # Feature: CLI Check Mode (`deps-cli check`)
@@ -210,7 +211,7 @@ THEN  X's verdict is reported normally, Y is reported as `unknown (offline,
 ## 8. Agent Boundaries
 
 ### Always (without asking)
-- Reuse `EcosystemRegistry`, `Ecosystem::generate_diagnostics`, and existing `fs_probe`/`net_policy` helpers rather than reimplementing routing, parsing, or SSRF guards
+- Reuse `EcosystemRegistry`, `Ecosystem::generate_diagnostics`, `deps_engine`'s classification functions that assemble `generate_diagnostics`'s inputs (see `[[architecture-decision]]`), and existing `fs_probe`/`net_policy` helpers rather than reimplementing routing, parsing, or SSRF guards
 - Run the full pre-commit check suite (`.claude/rules/branching.md`) before any PR
 - Add `CHANGELOG.md` entries under `[Unreleased]`
 
@@ -252,14 +253,16 @@ the project owner before moving to `/sdd plan`; none are blocking any longer.
   before pinning it in root `Cargo.toml`'s `[workspace.dependencies]`
   (alphabetically sorted, no features specified there, per this project's
   workspace conventions).
-- **Crate publishing — RESOLVED**: `deps-cli` publishes from its first release
-  as the workspace's 17th published crate, under the same
-  `version = "1.0.0"`/compatibility contract as the other 16 (constitution
-  principle 8). Its CLI flag surface, `deps.toml` schema, `json`/`sarif` output
-  schemas, and any public library API it exposes are therefore all subject to
-  the standard major-bump-on-breaking-change and `CHANGELOG.md` "Breaking"
-  labeling rules from day one — there is no pre-1.0 grace period for this new
-  crate to accumulate breaking changes informally.
+- **Crate publishing — RESOLVED**: `deps-engine` (see
+  `[[architecture-decision]]`) publishes as the workspace's 17th published
+  crate, and `deps-cli` publishes from its first release as the 18th, both
+  under the same `version = "1.0.0"`/compatibility contract as the other 16
+  (constitution principle 8). Their CLI flag surface (`deps-cli`), `deps.toml`
+  schema, `json`/`sarif` output schemas, and any public library API either
+  exposes are therefore all subject to the standard major-bump-on-breaking-change
+  and `CHANGELOG.md` "Breaking" labeling rules from day one — there is no
+  pre-1.0 grace period for these new crates to accumulate breaking changes
+  informally.
 
 ## 10. See Also
 
