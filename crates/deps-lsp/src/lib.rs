@@ -570,7 +570,7 @@ mod tests {
             );
         }
 
-        let mut expected = Vec::new();
+        let mut expected: Vec<&str> = Vec::new();
         #[cfg(feature = "cargo")]
         expected.push("cargo");
         #[cfg(feature = "npm")]
@@ -918,6 +918,22 @@ mod tests {
         }
     }
 
+    #[cfg(any(
+        feature = "cargo",
+        feature = "npm",
+        feature = "go",
+        feature = "bundler",
+        feature = "dart",
+        feature = "maven",
+        feature = "composer",
+        feature = "gradle",
+        feature = "nuget",
+        feature = "deno",
+        feature = "github-actions",
+        feature = "gitlab-ci",
+        feature = "swift",
+        feature = "pypi"
+    ))]
     #[test]
     fn test_concrete_pin_version_agrees_with_formatter_for_bare_version() {
         use deps_core::{ConcreteVersion, VersionReq};

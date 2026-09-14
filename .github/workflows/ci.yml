@@ -93,7 +93,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -114,11 +114,32 @@ jobs:
         # under a reduced feature set (issue #975) — `--each-feature` is linear in feature
         # count (41 invocations here), not the 2^n a full --feature-powerset would cost.
         # `cargo hack clippy` (not `check`) so this catches the same clippy-level lints as
-        # the `clippy` job, just per individual feature. `--no-dev-deps` is required: deps-lsp's
-        # `#[cfg(test)]` test module does not compile under reduced feature sets at all
-        # (pre-existing bug, out of scope here — will be tracked in a follow-up issue) and would
-        # otherwise fail this gate for an unrelated reason.
+        # the `clippy` job, just per individual feature. `--no-dev-deps` is required:
+        # `deps-core`'s `test-util`-gated helpers are referenced unconditionally by some of
+        # its own `#[cfg(test)]` modules, so a reduced feature set without `test-util` fails
+        # to compile dev-deps for an unrelated reason (tracked in #1000, out of scope here).
+        # deps-lsp's own test-compilation gap under a reduced feature set (issue #998) is
+        # covered instead by the dedicated step below, scoped to the one crate that is
+        # actually clean to compile (though not yet warning-free, see that step's comment).
         run: cargo hack clippy --workspace --each-feature --no-dev-deps -- -D warnings
+
+      - name: Check deps-lsp test compilation across the feature matrix
+        # deps-lsp (issue #998, following #975's fix for lib/bin targets): its
+        # `#[cfg(test)]` module and test helpers must also compile under every reduced
+        # feature set, not just under --all-features. `check` (not `clippy`) and RUSTFLAGS
+        # cleared below: every config here does compile, but most reduced-feature configs
+        # still emit unused-import/dead-code warnings (25-34 depending on config) from test
+        # helpers/fixtures whose only consumers are ecosystem-gated tests that get stripped
+        # out first — those warnings are tracked in #1001 rather than fixed here, to keep
+        # #998's fix scoped to the compile failure it was filed for. The workflow-level
+        # `RUSTFLAGS: -D warnings` (see top-level `env:`) would otherwise turn those
+        # warnings into errors even without an explicit `-- -D warnings` on this command,
+        # so it's cleared for this step only. Upgrade this step to
+        # `cargo hack clippy -p deps-lsp --each-feature --all-targets -- -D warnings`
+        # (dropping the RUSTFLAGS override too) once #1001 is resolved.
+        env:
+          RUSTFLAGS: ""
+        run: cargo hack check -p deps-lsp --each-feature --all-targets
 
   doc-and-hygiene:
     name: Doc + Hygiene
