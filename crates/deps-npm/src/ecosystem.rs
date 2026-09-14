@@ -683,40 +683,91 @@ mod tests {
         assert!(results.is_empty());
     }
 
+    /// #1066: was a live-registry round-trip asserting `results.is_empty() ||
+    /// !results.is_empty()` — a tautology that could never fail, including on a broken
+    /// zero-request code path. Mirrors deps-cargo's `test_complete_package_names_special_characters`
+    /// fix (#1052/#1054): mocks the search endpoint, verifies it was actually hit, and checks
+    /// a real completion item instead.
     #[tokio::test]
     async fn test_complete_package_names_special_characters() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = NpmEcosystem::new(cache);
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/-/v1/search?text=%40type&size=20")
+            .with_status(200)
+            .with_body(
+                r#"{"objects":[{"package":{"name":"@types/node","version":"20.1.0","description":null}}]}"#,
+            )
+            .create_async()
+            .await;
+
+        let registry = NpmRegistry::with_public_base_for_test(
+            Arc::new(deps_core::HttpCache::new()),
+            server.url(),
+        );
+        let ecosystem = NpmEcosystem::with_registry(Arc::new(registry));
 
         // Package names with special characters (@scope/package) should work
         let results = ecosystem
             .complete_package_names("@type", Range::default())
             .await;
-        // Should not panic or error
-        assert!(results.is_empty() || !results.is_empty());
+
+        mock.assert_async().await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].label, "@types/node");
+        assert_eq!(results[0].detail.as_deref(), Some("v20.1.0"));
     }
 
+    /// #1066: was `assert!(results.len() <= 20)` against a live registry — a tautology given
+    /// the actual display cap (`MAX_COMPLETION_VERSIONS`, `deps-core`) is 5, not 20, so it
+    /// passed vacuously (even for 0 results) and could never catch a cap regression. Mocks 8
+    /// matching versions and asserts the count is exactly the real cap.
+    ///
+    /// Freshness is explicitly disabled: `NpmRegistry::get_versions_with` issues a second,
+    /// differently-`Accept`-headered request to the same packument URL when it's enabled,
+    /// which `mockito`'s default path-only matching would double-count against this single
+    /// mock — orthogonal to what this test verifies.
     #[tokio::test]
-    #[ignore] // Requires network access
-    async fn test_complete_versions_limit_20() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = NpmEcosystem::new(cache);
+    async fn test_complete_versions_capped_at_max_completion_versions() {
+        let mut server = mockito::Server::new_async().await;
+        let versions_body = format!(
+            r#"{{"versions": {{{}}}}}"#,
+            (0..8)
+                .map(|i| format!(r#""4.0.{i}": {{}}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let mock = server
+            .mock("GET", "/express")
+            .with_status(200)
+            .with_body(versions_body)
+            .create_async()
+            .await;
+
+        let registry = NpmRegistry::with_public_base_for_test(
+            Arc::new(deps_core::HttpCache::new()),
+            server.url(),
+        );
+        let ecosystem = NpmEcosystem::with_registry(Arc::new(registry));
         let dep = dep_with_source("express", DependencySource::Registry, 0);
         let position = dep.version_range.unwrap().start;
         let parse_result = MockParseResult {
             dependencies: vec![dep],
         };
 
-        // Test that we respect the 20 result limit
+        // Test that we respect the display cap, not just some loose upper bound.
         let results = ecosystem
             .complete_versions(
                 &parse_result,
                 position,
                 "4",
-                deps_core::FreshnessSettings::default(),
+                deps_core::FreshnessSettings {
+                    enabled: false,
+                    cooldown_secs: 0,
+                },
             )
             .await;
-        assert!(results.len() <= 20);
+        mock.assert_async().await;
+        assert_eq!(results.len(), 5);
     }
 
     #[tokio::test]
@@ -849,15 +900,39 @@ mod tests {
         assert!(completions.items.is_empty());
     }
 
+    /// #1066/M4: was `test_generate_completions_feature_context_returns_empty`, asserting
+    /// `completions.items.is_empty() || !completions.items.is_empty()` — a tautology, and a
+    /// misnomer: npm has no `Feature` completion-context arm at all, and the cursor here
+    /// (character 30, inside `"4.0.0"`) actually lands in a `Version` context. Renamed to
+    /// describe what it actually exercises, and mirrors the existing
+    /// `test_complete_versions_unknown_package` pattern: a mocked 404 makes the "returns
+    /// empty" outcome deterministic and `mock.assert_async()` proves the registry was
+    /// actually queried rather than the emptiness coming from a broken zero-request path.
+    ///
+    /// M5: freshness stays enabled (`FreshnessSettings::default()`) here, unlike
+    /// `test_complete_versions_capped_at_max_completion_versions`'s explicit disable, because
+    /// `NpmRegistry::get_versions_with` propagates `get_versions`'s 404 via `?` before ever
+    /// reaching the freshness-probe fetch — this mock's default `expect(1)` is exactly the
+    /// one request that path makes today, not an assumption a future error-path change would
+    /// silently keep intact.
     #[tokio::test]
-    async fn test_generate_completions_feature_context_returns_empty() {
+    async fn test_generate_completions_version_context_unknown_package_returns_empty() {
         // See the comment in `test_package_name_completion_context_has_real_range` on why
         // this guard is needed here.
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = NpmEcosystem::new(cache);
 
-        // npm doesn't have features, so this should always return empty
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/express")
+            .with_status(404)
+            .create_async()
+            .await;
+        let registry = NpmRegistry::with_public_base_for_test(
+            Arc::new(deps_core::HttpCache::new()),
+            server.url(),
+        );
+        let ecosystem = NpmEcosystem::with_registry(Arc::new(registry));
+
         let content = r#"{"dependencies": {"express": "4.0.0"}}"#;
         let uri = deps_core::test_util::test_uri("/test/package.json");
         let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
@@ -876,8 +951,8 @@ mod tests {
             )
             .await;
 
-        // Should not crash, returns empty or package/version completions
-        assert!(completions.items.is_empty() || !completions.items.is_empty());
+        mock.assert_async().await;
+        assert!(completions.items.is_empty());
     }
 
     #[tokio::test]

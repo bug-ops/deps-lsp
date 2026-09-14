@@ -988,13 +988,30 @@ mod tests {
         assert_eq!(results[0].detail.as_deref(), Some("v0.7.10"));
     }
 
+    /// #1066: was `assert!(results.len() <= 20)` against a live registry — a tautology given
+    /// the actual display cap (`MAX_COMPLETION_VERSIONS`, `deps-core`) is 5, not 20, so it
+    /// passed vacuously (even for 0 results) and could never catch a cap regression. Mocks 8
+    /// matching versions and asserts the count is exactly the real cap.
     #[tokio::test]
-    #[ignore] // Requires network access
-    async fn test_complete_versions_limit_20() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = CargoEcosystem::new(cache);
+    async fn test_complete_versions_capped_at_max_completion_versions() {
+        let mut server = mockito::Server::new_async().await;
+        let versions_body = (0..8)
+            .map(|i| format!(r#"{{"name":"serde","vers":"1.0.{i}","yanked":false,"features":{{}},"deps":[]}}"#))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mock = server
+            .mock("GET", "/se/rd/serde")
+            .with_status(200)
+            .with_body(versions_body)
+            .create_async()
+            .await;
 
-        // Test that we respect the 20 result limit
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let crates_io = CratesIoRegistry::with_base_for_test(Arc::clone(&cache), &server.url());
+        let registry = CargoRegistry::with_crates_io_for_test(Arc::clone(&cache), crates_io);
+        let ecosystem = CargoEcosystem::with_registry_for_test(registry);
+
+        // Test that we respect the display cap, not just some loose upper bound.
         let dep = mock_dependency("serde", Some("1.0"), 0, 0);
         let position = dep.version_range.unwrap().start;
         let parse_result = MockParseResult {
@@ -1008,7 +1025,8 @@ mod tests {
                 deps_core::FreshnessSettings::default(),
             )
             .await;
-        assert!(results.len() <= 20);
+        mock.assert_async().await;
+        assert_eq!(results.len(), 5);
     }
 
     #[tokio::test]

@@ -1236,7 +1236,7 @@ mod tests {
     #[tokio::test]
     async fn test_complete_package_names_uses_index() {
         let mut server = mockito::Server::new_async().await;
-        let _mock = server
+        let mock = server
             .mock("GET", "/simple/")
             .with_status(200)
             .with_body(crate::search::sample_index_body(&["requests"]))
@@ -1260,6 +1260,7 @@ mod tests {
             100,
         )
         .await;
+        mock.assert_async().await;
         assert!(!results.is_empty());
         assert!(results.iter().any(|r| r.label == "requests"));
     }
@@ -1273,7 +1274,7 @@ mod tests {
     #[tokio::test]
     async fn test_complete_package_names_filter_text_matches_raw_typed_prefix() {
         let mut server = mockito::Server::new_async().await;
-        let _mock = server
+        let mock = server
             .mock("GET", "/simple/")
             .with_status(200)
             .with_body(crate::search::sample_index_body(&["zope-interface"]))
@@ -1290,6 +1291,7 @@ mod tests {
         )
         .await;
 
+        mock.assert_async().await;
         let item = results
             .iter()
             .find(|r| r.label == "zope-interface")
@@ -1669,26 +1671,75 @@ mod tests {
         );
     }
 
+    /// #1066: was `assert!(results.is_empty() || !results.is_empty())` — a tautology that
+    /// could never fail identically whether cold-start behaved correctly, the network was
+    /// down, `complete_package_names` were replaced with `vec![]` unconditionally, or the
+    /// prefix-length gate rejected before the index was ever consulted. Mirrors
+    /// `test_complete_package_names_uses_index`: a mocked index proves the cold start is
+    /// genuinely empty (not just "empty for the wrong reason"), then `poll_until_nonempty` +
+    /// `mock.assert_async()` + a concrete label prove the index actually works once built.
     #[tokio::test]
     async fn test_complete_package_names_special_characters() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = PypiEcosystem::new(cache);
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/simple/")
+            .with_status(200)
+            .with_body(crate::search::sample_index_body(&["scikit-learn"]))
+            .create_async()
+            .await;
 
-        // Package names with hyphens and underscores should work
-        let results = ecosystem
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let index_url = format!("{}/simple/", server.url());
+        let ecosystem = ecosystem_with_index_url(cache, index_url);
+
+        // Package names with hyphens and underscores should work.
+        let cold_start = ecosystem
             .complete_package_names("scikit-le", Range::default())
             .await;
-        // Should not panic or error
-        assert!(results.is_empty() || !results.is_empty());
+        assert!(
+            cold_start.is_empty(),
+            "cold start must not block on the index download"
+        );
+
+        let results = poll_until_nonempty(
+            || ecosystem.complete_package_names("scikit-le", Range::default()),
+            100,
+        )
+        .await;
+        mock.assert_async().await;
+        assert!(!results.is_empty());
+        assert!(results.iter().any(|r| r.label == "scikit-learn"));
     }
 
+    /// #1066: was `assert!(results.len() <= 20)` against a live registry — a tautology given
+    /// the actual display cap (`MAX_COMPLETION_VERSIONS`, `deps-core`) is 5, not 20, so it
+    /// passed vacuously (even for 0 results) and could never catch a cap regression. Mocks 8
+    /// matching versions and asserts the count is exactly the real cap.
     #[tokio::test]
-    #[ignore] // Requires network access
-    async fn test_complete_versions_limit_20() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = PypiEcosystem::new(cache);
+    async fn test_complete_versions_capped_at_max_completion_versions() {
+        let mut server = mockito::Server::new_async().await;
+        let versions = (0..8)
+            .map(|i| format!(r#""2.{i}.0""#))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mock = server
+            .mock("GET", "/simple/requests/")
+            .with_status(200)
+            .with_body(format!(r#"{{"versions": [{versions}], "files": []}}"#))
+            .create_async()
+            .await;
 
-        // Test that we respect the 20 result limit
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let registry = PypiRegistry::with_public_base_for_test(
+            Arc::clone(&cache),
+            format!("{}/simple", server.url()),
+        );
+        let ecosystem = PypiEcosystem::with_policy(
+            Arc::new(registry),
+            Arc::new(deps_core::net_policy::RegistryAccessPolicy::default()),
+        );
+
+        // Test that we respect the display cap, not just some loose upper bound.
         let parse_result = parse_result_with_dependency("requests", DependencySource::Registry);
         let results = ecosystem
             .complete_versions(
@@ -1698,7 +1749,8 @@ mod tests {
                 deps_core::FreshnessSettings::default(),
             )
             .await;
-        assert!(results.len() <= 20);
+        mock.assert_async().await;
+        assert_eq!(results.len(), 5);
     }
 
     #[tokio::test]
@@ -1827,27 +1879,43 @@ name = "test"
         assert!(!completions.is_incomplete);
     }
 
+    /// #1066/M4: was `test_generate_completions_feature_context_returns_empty`, asserting
+    /// `completions.items.is_empty() || !completions.items.is_empty()` — a tautology, and a
+    /// misnomer: PyPI has no `Feature` completion-context arm at all, and the cursor here
+    /// (line 1, character 20, inside `"requests"`) actually lands in a `PackageName` context
+    /// (confirmed via `deps_core::completion::detect_completion_context`'s position math).
+    /// Renamed to describe what it actually exercises, and rewritten like
+    /// `test_complete_package_names_special_characters`: a mocked index proves the cold
+    /// start is genuinely empty, then `poll_until_nonempty` + `mock.assert_async()` + a
+    /// concrete label prove the `PackageName` context resolves through `generate_completions`'
+    /// full position-detection dispatch (not just via the direct `complete_package_names`
+    /// call the sibling test above exercises).
     #[tokio::test]
-    async fn test_generate_completions_feature_context_returns_empty() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = PypiEcosystem::new(cache);
+    async fn test_generate_completions_package_name_context_completes_via_index() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/simple/")
+            .with_status(200)
+            .with_body(crate::search::sample_index_body(&["requests"]))
+            .create_async()
+            .await;
 
-        // PyPI doesn't have features, so this should always return empty
-        // Even if we detect a feature context (which shouldn't happen for PyPI)
-        // This tests the Feature branch in generate_completions
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let index_url = format!("{}/simple/", server.url());
+        let ecosystem = ecosystem_with_index_url(cache, index_url);
+
         let content = r#"[project]
 dependencies = ["requests"]
 "#;
         let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
         let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
 
-        // Test with any position - feature context should return empty
         let position = Position {
             line: 1,
             character: 20,
         };
 
-        let completions = ecosystem
+        let cold_start = ecosystem
             .generate_completions(
                 parse_result.as_ref(),
                 position,
@@ -1855,9 +1923,29 @@ dependencies = ["requests"]
                 deps_core::FreshnessSettings::default(),
             )
             .await;
+        assert!(
+            cold_start.items.is_empty(),
+            "cold start must not block on the index download"
+        );
 
-        // Should not crash, returns empty or package/version completions
-        assert!(completions.items.is_empty() || !completions.items.is_empty());
+        let results = poll_until_nonempty(
+            || async {
+                ecosystem
+                    .generate_completions(
+                        parse_result.as_ref(),
+                        position,
+                        content,
+                        deps_core::FreshnessSettings::default(),
+                    )
+                    .await
+                    .items
+            },
+            100,
+        )
+        .await;
+        mock.assert_async().await;
+        assert!(!results.is_empty());
+        assert!(results.iter().any(|r| r.label == "requests"));
     }
 
     #[tokio::test]

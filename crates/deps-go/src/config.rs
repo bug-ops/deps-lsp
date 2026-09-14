@@ -995,15 +995,29 @@ fn goenv_path_with_env(env_value: Option<String>) -> Option<PathBuf> {
 ///
 /// # Examples
 ///
+/// [`resolve`] reads the real host `$GOENV` path, so its result depends on whatever is (or
+/// isn't) actually configured on the machine running this doctest — not asserted on here.
+/// The deterministic seam to demonstrate its "no override" fallback is
+/// [`resolve_with_context`] with an explicit `goenv_path: None` (the same seam production
+/// callers use to avoid reading the live environment implicitly):
+///
 /// ```
 /// use deps_core::net_policy::RegistryAccessPolicy;
-/// use deps_go::config::{GoEnvCache, resolve};
+/// use deps_go::config::{GoEnvCache, GoParseContext, resolve, resolve_with_context};
+/// use std::sync::Arc;
 ///
 /// let cache = GoEnvCache::new();
 /// let policy = RegistryAccessPolicy::default();
-/// let config = resolve(&cache, &policy);
-/// // No override anywhere in a typical test/CI environment with no $GOENV file.
-/// assert!(config.goproxy_chain().is_none() || config.goproxy_chain().is_some());
+/// let _ = resolve(&cache, &policy);
+///
+/// let ctx = GoParseContext::new(
+///     Arc::new(RegistryAccessPolicy::default()),
+///     Arc::new(GoEnvCache::new()),
+///     None,
+/// );
+/// let config = resolve_with_context(&ctx);
+/// // No `$GOENV` path at all resolves to `GoEnvConfig::default`.
+/// assert!(config.goproxy_chain().is_none());
 /// ```
 #[must_use]
 pub fn resolve(cache: &GoEnvCache, policy: &RegistryAccessPolicy) -> GoEnvConfig {
