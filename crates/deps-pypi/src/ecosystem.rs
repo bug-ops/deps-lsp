@@ -897,6 +897,25 @@ mod tests {
         );
     }
 
+    /// Builds a workspace-root `PathBuf` fixture that matches
+    /// [`deps_core::test_util::test_uri`]'s own platform handling: on Windows,
+    /// `test_uri` prepends `C:` to its POSIX-style input so `Uri::from_file_path`
+    /// accepts it (a drive-less path isn't a valid Windows file URI), so a
+    /// `workspace_root` fixture built from the same POSIX-style string must get the
+    /// same prefix — otherwise it and the `base_dir` derived from a `test_uri`
+    /// document (which *does* carry the drive) never share a common root, and the
+    /// containment check spuriously rejects every target on Windows.
+    fn test_workspace_root(unix_path: &str) -> std::path::PathBuf {
+        #[cfg(windows)]
+        {
+            std::path::PathBuf::from(format!("C:{unix_path}"))
+        }
+        #[cfg(not(windows))]
+        {
+            std::path::PathBuf::from(unix_path)
+        }
+    }
+
     /// A single-document-link `ParseResult` with an explicit `workspace_root`, used to
     /// exercise the containment check directly (`parse_manifest` never produces a
     /// non-`None` `workspace_root` for pypi today — see the field's own doc).
@@ -931,7 +950,7 @@ mod tests {
 
         let parse_result = parse_result_with_document_link(
             uri.clone(),
-            Some(std::path::PathBuf::from("/project")),
+            Some(test_workspace_root("/project")),
             "../../../../etc/shadow",
         );
 
@@ -956,7 +975,7 @@ mod tests {
 
         let parse_result = parse_result_with_document_link(
             uri.clone(),
-            Some(std::path::PathBuf::from("/project")),
+            Some(test_workspace_root("/project")),
             "../../../project/x.txt",
         );
 
@@ -978,7 +997,7 @@ mod tests {
 
         let parse_result = parse_result_with_document_link(
             uri.clone(),
-            Some(std::path::PathBuf::from("/project")),
+            Some(test_workspace_root("/project")),
             "../shared/req.txt",
         );
 
