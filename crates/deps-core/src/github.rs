@@ -771,6 +771,7 @@ impl ReleaseDatesCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "test-util")]
     use crate::test_util::{capture_tracing_output, capture_tracing_output_async};
 
     // --- is_valid_github_identity / validate_owner_repo ---
@@ -847,6 +848,7 @@ mod tests {
         assert!(!page_has_more(0));
     }
 
+    #[cfg(feature = "test-util")]
     #[test]
     fn test_pagination_warns_when_truncated_at_cap() {
         let output = capture_tracing_output(|| {
@@ -857,6 +859,7 @@ mod tests {
         assert!(output.contains("cap"), "output was: {output}");
     }
 
+    #[cfg(feature = "test-util")]
     #[test]
     fn test_pagination_silent_when_under_cap() {
         let output = capture_tracing_output(|| {
@@ -865,6 +868,7 @@ mod tests {
         assert!(output.is_empty(), "output was: {output}");
     }
 
+    #[cfg(feature = "test-util")]
     #[test]
     fn test_pagination_silent_when_last_page_at_cap_is_partial() {
         let output = capture_tracing_output(|| {
@@ -906,6 +910,7 @@ mod tests {
         assert_eq!(result.len(), 42);
     }
 
+    #[cfg(feature = "test-util")]
     #[tokio::test]
     async fn test_paginate_tags_stops_after_partial_page() {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -1042,6 +1047,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "test-util")]
     #[tokio::test]
     async fn test_paginate_tags_warns_when_cap_reached_with_full_last_page() {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -1426,6 +1432,7 @@ mod tests {
         assert!(cache.dates.is_empty());
     }
 
+    #[cfg(feature = "test-util")]
     #[tokio::test]
     async fn test_fetch_positive_ttl_hit_returns_memoized_value_without_refetch() {
         let cache = ReleaseDatesCache::new();
@@ -1455,6 +1462,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "test-util")]
     #[tokio::test]
     async fn test_fetch_empty_but_successful_fetch_retained_under_positive_ttl() {
         let cache = ReleaseDatesCache::new();
@@ -1482,6 +1490,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "test-util")]
     #[tokio::test]
     async fn test_fetch_unexpired_error_ttl_entry_is_memo_hit() {
         let cache = ReleaseDatesCache::new();
@@ -1508,6 +1517,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "test-util")]
     #[tokio::test]
     async fn test_fetch_expired_error_ttl_entry_falls_through_to_token_gate() {
         let cache = ReleaseDatesCache::new();
@@ -1537,6 +1547,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "test-util")]
     #[tokio::test]
     async fn test_fetch_token_gate_skip_logs_once_per_cache_and_names_ecosystem() {
         let cache = ReleaseDatesCache::new();
@@ -1564,6 +1575,7 @@ mod tests {
         assert!(RELEASE_DATES_ERROR_TTL < RELEASE_DATES_TTL);
     }
 
+    #[cfg(feature = "test-util")]
     #[tokio::test]
     async fn test_fetch_does_not_serve_a_hit_seeded_under_a_different_api_base() {
         // #486 critic M1: the cache is keyed on `(api_base, name)`, not `name` alone, so two

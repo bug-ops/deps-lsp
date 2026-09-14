@@ -1598,6 +1598,7 @@ mod tests {
 
     /// #969 S1: a `KeyShape::Url` key must be redacted before it reaches the cap-reached log
     /// line — the query-string credential must never appear, but the non-secret host must.
+    #[cfg(feature = "test-util")]
     #[test]
     fn test_register_capped_url_shape_redacts_credential_on_cap_reached() {
         let map: DashMap<String, usize> = DashMap::new();
@@ -1634,6 +1635,7 @@ mod tests {
     /// would otherwise collapse a `"<prefix>:<hex>"` shape to an information-free
     /// `"<prefix>:***"`, destroying the correlation handle to other diagnostics about the
     /// same chain.
+    #[cfg(feature = "test-util")]
     #[test]
     fn test_register_capped_opaque_shape_is_not_redacted_on_cap_reached() {
         let map: DashMap<String, usize> = DashMap::new();

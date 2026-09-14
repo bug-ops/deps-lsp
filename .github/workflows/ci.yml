@@ -114,12 +114,13 @@ jobs:
         # under a reduced feature set (issue #975) — `--each-feature` is linear in feature
         # count (41 invocations here), not the 2^n a full --feature-powerset would cost.
         # `cargo hack clippy` (not `check`) so this catches the same clippy-level lints as
-        # the `clippy` job, just per individual feature. `--no-dev-deps` is required:
-        # `deps-core`'s `test-util`-gated helpers are referenced unconditionally by some of
-        # its own `#[cfg(test)]` modules, so a reduced feature set without `test-util` fails
-        # to compile dev-deps for an unrelated reason (tracked in #1000, out of scope here).
-        # deps-lsp's own test-compilation gap under a reduced feature set (issue #998) is
-        # covered instead by the dedicated step below, scoped to the one crate that is
+        # the `clippy` job, just per individual feature. `--no-dev-deps` is still required:
+        # deps-core's own #[cfg(test)] gap (issue #1000, `deps-core`'s test-util-gated
+        # helpers referenced unconditionally by some of its own #[cfg(test)] modules) is
+        # fixed, but dropping `--no-dev-deps` workspace-wide still fails on deps-lsp's own
+        # reduced-feature-set warnings under --all-targets (tracked in #1001, out of scope
+        # here). deps-lsp's own test-compilation gap under a reduced feature set (issue #998)
+        # is covered instead by the dedicated step below, scoped to the one crate that is
         # actually clean to compile (though not yet warning-free, see that step's comment).
         run: cargo hack clippy --workspace --each-feature --no-dev-deps -- -D warnings
 

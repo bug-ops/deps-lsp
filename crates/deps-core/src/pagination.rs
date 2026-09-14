@@ -147,6 +147,7 @@ where
 #[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
+    #[cfg(feature = "test-util")]
     use crate::test_util::capture_tracing_output_async;
 
     #[test]
@@ -164,6 +165,7 @@ mod tests {
     /// condition and its `pages_fetched` field off the *passed* `max_pages`, not a
     /// hardcoded constant — a caller with a cap other than 30 must still warn on its own
     /// last page and never warn early.
+    #[cfg(feature = "test-util")]
     #[tokio::test]
     async fn test_warn_if_pagination_truncated_uses_passed_max_pages_not_a_constant() {
         let output = capture_tracing_output_async(async {
