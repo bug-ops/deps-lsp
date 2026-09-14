@@ -195,60 +195,12 @@ fn resolve_registry_source(url_str: &str) -> (String, DependencySource) {
 /// Handles:
 /// - `//` line comments (not inside string literals)
 /// - `/* ... */` block comments (not nested)
-// Every index is preceded by an `i < len` / `i + 1 < len` guard, and `result` is a
-// same-length copy of `bytes`.
-#[allow(clippy::indexing_slicing)]
+///
+/// Thin wrapper over the shared [`deps_core::quote_scan::blank_comments`] (#1022) — kept
+/// as its own named function so its callers and the offset-preservation contract below
+/// stay stable regardless of where the scan itself lives.
 fn strip_comments(content: &str) -> String {
-    let bytes = content.as_bytes();
-    let len = bytes.len();
-    let mut result: Vec<u8> = bytes.to_vec();
-
-    let mut i = 0;
-    let mut in_string = false;
-
-    while i < len {
-        if in_string {
-            if bytes[i] == b'\\' && i + 1 < len {
-                i += 2;
-            } else if bytes[i] == b'"' {
-                in_string = false;
-                i += 1;
-            } else {
-                i += 1;
-            }
-        } else if bytes[i] == b'"' {
-            in_string = true;
-            i += 1;
-        } else if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'/' {
-            // Line comment: replace until newline
-            while i < len && bytes[i] != b'\n' {
-                result[i] = b' ';
-                i += 1;
-            }
-        } else if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'*' {
-            // Block comment: replace until */
-            result[i] = b' ';
-            result[i + 1] = b' ';
-            i += 2;
-            while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                if bytes[i] != b'\n' {
-                    result[i] = b' ';
-                }
-                i += 1;
-            }
-            if i + 1 < len {
-                result[i] = b' ';
-                result[i + 1] = b' ';
-                i += 2;
-            }
-        } else {
-            i += 1;
-        }
-    }
-
-    // The only non-ASCII bytes in comments are preserved as-is (replaced with spaces),
-    // so the resulting bytes are valid UTF-8.
-    String::from_utf8(result).unwrap_or_else(|_| content.to_string())
+    deps_core::quote_scan::blank_comments(content, deps_core::quote_scan::ScanSyntax::Swift)
 }
 
 /// Computes the next major version string for `upToNextMajor` requirements.
