@@ -91,16 +91,6 @@ pub struct TagIndex {
 /// Maximum number of [`GitlabCiRegistry::tag_index`] entries.
 const MAX_TAG_INDEX_ENTRIES: usize = 256;
 
-fn evict_if_full<K: std::hash::Hash + Eq + Clone, V>(map: &DashMap<K, V>, max_entries: usize) {
-    if map.len() < max_entries {
-        return;
-    }
-    let victim = map.iter().next().map(|e| e.key().clone());
-    if let Some(key) = victim {
-        map.remove(&key);
-    }
-}
-
 /// Populates one `TagIndex` entry from raw `(name, sha)` pairs — independent of whatever
 /// semver filter the caller's own version-list conversion (`tags_to_versions`) applies.
 ///
@@ -134,7 +124,7 @@ pub(crate) fn populate_tag_index_entries<'a>(
             .or_insert_with(|| sha.to_string());
     }
     if !index.contains_key(&key) {
-        evict_if_full(index, MAX_TAG_INDEX_ENTRIES);
+        deps_core::cache_policy::evict_arbitrary_if_full(index, MAX_TAG_INDEX_ENTRIES);
     }
     index.insert(key, Arc::new(built));
 }

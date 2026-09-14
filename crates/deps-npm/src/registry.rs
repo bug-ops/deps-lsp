@@ -486,13 +486,12 @@ impl NpmRegistry {
     /// not a copy of `HttpCache::evict_entries`'s byte-budget eviction shape — entries here
     /// are small enough that count-based eviction is sufficient.
     fn evict_publish_times(&self) {
-        let now = Instant::now();
-        self.publish_times.retain(|_, cached| {
-            now.saturating_duration_since(cached.fetched_at) < PUBLISH_TIMES_TTL
-        });
-        if self.publish_times.len() >= PUBLISH_TIMES_MAX_ENTRIES {
-            self.publish_times.clear();
-        }
+        deps_core::cache_policy::evict_expired_then_clear_all(
+            &self.publish_times,
+            PUBLISH_TIMES_MAX_ENTRIES,
+            |c| c.fetched_at,
+            PUBLISH_TIMES_TTL,
+        );
     }
 
     /// Finds the latest version matching the given npm semver requirement.
