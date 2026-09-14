@@ -64,38 +64,15 @@ pub struct NuGetParseResult {
     pub dependency_truncation: Option<(usize, usize)>,
 }
 
-// Implemented by hand rather than via `deps_core::impl_parse_result!`: `blocked_registries()`
-// is overridden with real data (`self.blocked_registries.clone()`), mirroring
-// `deps_cargo::parser::CargoParseResult`'s own hand-written impl — the macro has no field for
-// it.
-impl deps_core::ParseResult for NuGetParseResult {
-    fn dependencies(&self) -> Vec<&dyn deps_core::Dependency> {
-        self.dependencies
-            .iter()
-            .map(|d| d as &dyn deps_core::Dependency)
-            .collect()
+deps_core::impl_parse_result!(
+    NuGetParseResult,
+    NuGetDependency {
+        dependencies: dependencies,
+        uri: uri,
+        dependency_truncation: dependency_truncation,
+        blocked_registries: blocked_registries,
     }
-
-    fn workspace_root(&self) -> Option<&std::path::Path> {
-        None
-    }
-
-    fn uri(&self) -> &Uri {
-        &self.uri
-    }
-
-    fn blocked_registries(&self) -> Vec<deps_core::BlockedRegistryOccurrence> {
-        self.blocked_registries.clone()
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn dependency_truncation(&self) -> Option<(usize, usize)> {
-        self.dependency_truncation
-    }
-}
+);
 
 /// Parses a `.csproj`/`.fsproj`/`.vbproj` MSBuild project file, extracting `PackageReference` entries.
 ///

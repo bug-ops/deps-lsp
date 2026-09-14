@@ -486,6 +486,14 @@ macro_rules! impl_metadata {
 ///   [`ecosystem::ParseResult::dependency_truncation`](crate::ecosystem::ParseResult::dependency_truncation)
 ///   override (#796) — omit when the parser has no [`crate::DependencyBudget`] wired in yet
 ///   (the trait default `None` applies).
+/// * `blocked_registries` - Optional, matched last: field name for the `Vec<BlockedRegistryOccurrence>`
+///   [`ecosystem::ParseResult::blocked_registries`](crate::ecosystem::ParseResult::blocked_registries)
+///   override (#925, #969), read via `.clone()` — omit when the ecosystem enforces no
+///   configurable-registry reachability policy (the trait default empty `Vec` applies).
+///
+/// All optional fields are matched in the fixed order shown above — `workspace_root`, then
+/// `dependency_truncation`, then `blocked_registries` — any subset may be omitted, but a
+/// present field cannot appear out of order.
 ///
 /// # Examples
 ///
@@ -509,6 +517,14 @@ macro_rules! impl_metadata {
 ///     uri: uri,
 ///     workspace_root: workspace_root,
 ///     dependency_truncation: dependency_truncation,
+/// });
+///
+/// // With a policy-blocked-registry override too:
+/// impl_parse_result!(MyParseResult, MyDependency {
+///     dependencies: dependencies,
+///     uri: uri,
+///     dependency_truncation: dependency_truncation,
+///     blocked_registries: blocked_registries,
 /// });
 /// ```
 #[macro_export]
@@ -614,6 +630,138 @@ macro_rules! impl_parse_result {
 
             fn uri(&self) -> &::tower_lsp_server::ls_types::Uri {
                 &self.$uri
+            }
+
+            fn as_any(&self) -> &dyn ::std::any::Any {
+                self
+            }
+
+            fn dependency_truncation(&self) -> Option<(usize, usize)> {
+                self.$dependency_truncation
+            }
+        }
+    };
+    ($type:ty, $dep_type:ty {
+        dependencies: $dependencies:ident,
+        uri: $uri:ident,
+        blocked_registries: $blocked_registries:ident $(,)?
+    }) => {
+        impl $crate::ecosystem::ParseResult for $type {
+            fn dependencies(&self) -> Vec<&dyn $crate::ecosystem::Dependency> {
+                self.$dependencies
+                    .iter()
+                    .map(|d| d as &dyn $crate::ecosystem::Dependency)
+                    .collect()
+            }
+
+            fn workspace_root(&self) -> Option<&::std::path::Path> {
+                None
+            }
+
+            fn uri(&self) -> &::tower_lsp_server::ls_types::Uri {
+                &self.$uri
+            }
+
+            fn blocked_registries(&self) -> Vec<$crate::ecosystem::BlockedRegistryOccurrence> {
+                self.$blocked_registries.clone()
+            }
+
+            fn as_any(&self) -> &dyn ::std::any::Any {
+                self
+            }
+        }
+    };
+    ($type:ty, $dep_type:ty {
+        dependencies: $dependencies:ident,
+        uri: $uri:ident,
+        workspace_root: $workspace_root:ident,
+        blocked_registries: $blocked_registries:ident $(,)?
+    }) => {
+        impl $crate::ecosystem::ParseResult for $type {
+            fn dependencies(&self) -> Vec<&dyn $crate::ecosystem::Dependency> {
+                self.$dependencies
+                    .iter()
+                    .map(|d| d as &dyn $crate::ecosystem::Dependency)
+                    .collect()
+            }
+
+            fn workspace_root(&self) -> Option<&::std::path::Path> {
+                self.$workspace_root.as_deref()
+            }
+
+            fn uri(&self) -> &::tower_lsp_server::ls_types::Uri {
+                &self.$uri
+            }
+
+            fn blocked_registries(&self) -> Vec<$crate::ecosystem::BlockedRegistryOccurrence> {
+                self.$blocked_registries.clone()
+            }
+
+            fn as_any(&self) -> &dyn ::std::any::Any {
+                self
+            }
+        }
+    };
+    ($type:ty, $dep_type:ty {
+        dependencies: $dependencies:ident,
+        uri: $uri:ident,
+        dependency_truncation: $dependency_truncation:ident,
+        blocked_registries: $blocked_registries:ident $(,)?
+    }) => {
+        impl $crate::ecosystem::ParseResult for $type {
+            fn dependencies(&self) -> Vec<&dyn $crate::ecosystem::Dependency> {
+                self.$dependencies
+                    .iter()
+                    .map(|d| d as &dyn $crate::ecosystem::Dependency)
+                    .collect()
+            }
+
+            fn workspace_root(&self) -> Option<&::std::path::Path> {
+                None
+            }
+
+            fn uri(&self) -> &::tower_lsp_server::ls_types::Uri {
+                &self.$uri
+            }
+
+            fn blocked_registries(&self) -> Vec<$crate::ecosystem::BlockedRegistryOccurrence> {
+                self.$blocked_registries.clone()
+            }
+
+            fn as_any(&self) -> &dyn ::std::any::Any {
+                self
+            }
+
+            fn dependency_truncation(&self) -> Option<(usize, usize)> {
+                self.$dependency_truncation
+            }
+        }
+    };
+    ($type:ty, $dep_type:ty {
+        dependencies: $dependencies:ident,
+        uri: $uri:ident,
+        workspace_root: $workspace_root:ident,
+        dependency_truncation: $dependency_truncation:ident,
+        blocked_registries: $blocked_registries:ident $(,)?
+    }) => {
+        impl $crate::ecosystem::ParseResult for $type {
+            fn dependencies(&self) -> Vec<&dyn $crate::ecosystem::Dependency> {
+                self.$dependencies
+                    .iter()
+                    .map(|d| d as &dyn $crate::ecosystem::Dependency)
+                    .collect()
+            }
+
+            fn workspace_root(&self) -> Option<&::std::path::Path> {
+                self.$workspace_root.as_deref()
+            }
+
+            fn uri(&self) -> &::tower_lsp_server::ls_types::Uri {
+                &self.$uri
+            }
+
+            fn blocked_registries(&self) -> Vec<$crate::ecosystem::BlockedRegistryOccurrence> {
+                self.$blocked_registries.clone()
             }
 
             fn as_any(&self) -> &dyn ::std::any::Any {

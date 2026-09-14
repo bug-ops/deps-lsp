@@ -2514,6 +2514,15 @@ requests = "^2.28.0"
         );
         assert_eq!(occurrence.raw_value, "https://169.254.169.254/simple");
         assert_eq!(occurrence.declaration_key, "primary");
+
+        // #969 (impl-critic S2): assert through the trait method, not just the struct field —
+        // `deps_core::impl_parse_result!` generates this override; a regression that silently
+        // dropped the `blocked_registries:` arm would fall back to the trait's empty-`Vec`
+        // default while leaving the struct field (asserted above) untouched, so a field-only
+        // assertion would not catch it.
+        let via_trait = deps_core::ParseResult::blocked_registries(&result);
+        assert_eq!(via_trait.len(), 1);
+        assert_eq!(via_trait[0].raw_value, "https://169.254.169.254/simple");
     }
 
     /// Validator finding S3: two primary-priority Poetry sources must not silently pick an

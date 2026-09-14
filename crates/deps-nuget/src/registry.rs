@@ -12,6 +12,9 @@ use crate::version::compare_versions;
 use dashmap::DashMap;
 use deps_core::net_policy::{PolicyGate, RegistryAccessPolicy, is_trusted_prefix};
 use deps_core::parser::DependencySource;
+#[cfg(test)]
+use deps_core::registry::MAX_ALTERNATE_REGISTRIES;
+use deps_core::registry::{KeyShape, register_capped_with_occupied};
 use deps_core::{
     DepsError, FreshnessSettings, HOVER_RECENT_VERSIONS, HttpCache, PublishTime, Result,
 };
@@ -99,13 +102,6 @@ pub(crate) const NUGET_ORG_INDEX_URL: &str = "https://api.nuget.org/v3/index.jso
 /// Safety bound on external (non-inline) registration page fetches per `get_versions_with`
 /// call. Real packages need at most one (§1.1); this only guards a pathological feed.
 const MAX_EXTERNAL_PAGE_FETCHES: usize = 2;
-
-/// Upper bound on [`NuGetRegistry::alternates`]' entry count. Mirrors `deps-npm`'s/
-/// `deps-pypi`'s identical `MAX_ALTERNATE_REGISTRIES`. Once at capacity, a *new* chain is
-/// simply never registered (see [`NuGetRegistry::register_alternate`]) — a dependency resolved to
-/// an unregistered chain degrades to [`DepsError::PackageNotFound`], never to an api.nuget.org
-/// lookup by name.
-const MAX_ALTERNATE_REGISTRIES: usize = 256;
 
 /// Display name for NuGet used in not-found and API-response error messages.
 pub const REGISTRY: &str = "NuGet";
@@ -602,18 +598,20 @@ impl NuGetRegistry {
     /// `service_index_url` (never `Arc::clone(root)`, which would create a
     /// root→alternates→head→fallback_chain→root reference cycle).
     ///
-    /// Issue #561 (S3/FR-016): a vacant slot is capacity-capped at `MAX_ALTERNATE_REGISTRIES`
-    /// as before. An **occupied** slot whose currently-registered
-    /// `Self::chain_auth_digest` differs from `chain`'s freshly-computed
-    /// `chain_auth_digest` is **replaced in place** — rebuilt exactly like the vacant arm,
-    /// then inserted over the old `Arc`. This is deliberately **not** gated by the
-    /// capacity check (M4): replacing an already-occupied slot does not grow the map, and
-    /// gating it would silently strand a credential rotation once the cap is hit — reintroducing
-    /// the revoked-PAT staleness bug this replace arm exists to fix. Not LRU: `chain.key` is
-    /// stored as `DependencySource::AlternateRegistry.index` inside already-parsed documents,
-    /// and `Self::alternate_client` is a pure lookup with no re-registration path — evicting a
-    /// key a live document still references would degrade that document's every hover to
-    /// `PackageNotFound` until re-parse.
+    /// Issue #561 (S3/FR-016): a vacant slot is capacity-capped at
+    /// [`deps_core::registry::MAX_ALTERNATE_REGISTRIES`] as before — a dependency resolved to
+    /// an unregistered chain degrades to [`DepsError::PackageNotFound`], never to an
+    /// api.nuget.org lookup by name. An **occupied** slot
+    /// whose currently-registered `Self::chain_auth_digest` differs from `chain`'s
+    /// freshly-computed `chain_auth_digest` is **replaced in place** — rebuilt exactly like
+    /// the vacant arm, then inserted over the old `Arc`. This is deliberately **not** gated
+    /// by the capacity check (M4): replacing an already-occupied slot does not grow the map,
+    /// and gating it would silently strand a credential rotation once the cap is hit —
+    /// reintroducing the revoked-PAT staleness bug this replace arm exists to fix. Not LRU:
+    /// `chain.key` is stored as `DependencySource::AlternateRegistry.index` inside
+    /// already-parsed documents, and `Self::alternate_client` is a pure lookup with no
+    /// re-registration path — evicting a key a live document still references would degrade
+    /// that document's every hover to `PackageNotFound` until re-parse.
     pub fn register_alternate(
         root: &Arc<Self>,
         chain: &NuGetSourceChain,
@@ -624,31 +622,19 @@ impl NuGetRegistry {
         };
         let new_digest = chain_auth_digest(&chain.hops);
 
-        // Read before `entry()`: `DashMap::len` read-locks every shard, and `entry()` holds a
-        // write guard on one — checking capacity from inside the `Vacant` arm would
-        // self-deadlock on that shard.
-        let at_capacity = root.alternates.len() >= MAX_ALTERNATE_REGISTRIES;
-
-        match root.alternates.entry(chain.key.clone()) {
-            dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
-                if occupied.get().chain_auth_digest != new_digest {
-                    let head = Self::build_head(root, chain, first_hop, policy, new_digest);
-                    occupied.insert(Arc::new(head));
+        register_capped_with_occupied(
+            &root.alternates,
+            chain.key.clone(),
+            "NuGet",
+            KeyShape::Opaque,
+            || Arc::new(Self::build_head(root, chain, first_hop, policy, new_digest)),
+            |current| {
+                if current.chain_auth_digest != new_digest {
+                    *current =
+                        Arc::new(Self::build_head(root, chain, first_hop, policy, new_digest));
                 }
-            }
-            dashmap::mapref::entry::Entry::Vacant(slot) => {
-                if at_capacity {
-                    tracing::warn!(
-                        key = %chain.key,
-                        cap = MAX_ALTERNATE_REGISTRIES,
-                        "NuGet alternate registry cap reached; not registering a new chain"
-                    );
-                    return;
-                }
-                let head = Self::build_head(root, chain, first_hop, policy, new_digest);
-                slot.insert(Arc::new(head));
-            }
-        }
+            },
+        );
     }
 
     /// Constructs the head client (and its full `fallback_chain`) for `chain`, stamping
@@ -3394,5 +3380,55 @@ mod tests {
         assert_eq!(versions[0].version.as_str(), "2.0.0");
         _index.assert_async().await;
         _flat.assert_async().await;
+    }
+
+    // #969 (impl-critic M5/S3): the cap-reached warn line itself was unverified for this
+    // crate — only the resulting map state was, unlike cargo/npm/pypi's equivalent tests.
+    // Uses a real `hash_routing_key`-shaped overflow key (not an arbitrary literal) to prove
+    // `KeyShape::Opaque` actually keeps the digest intact rather than collapsing it to
+    // `RedactedUrl`'s "<prefix>:***" false-positive rendering (S3).
+    #[tokio::test]
+    async fn test_register_alternate_cap_reached_logs_ecosystem_and_key() {
+        let server = mockito::Server::new_async().await;
+        let base = server.url();
+        let policy = all_policy();
+        let cache = Arc::new(HttpCache::new());
+        let root = Arc::new(NuGetRegistry::with_service_index_url(
+            Arc::clone(&cache),
+            NUGET_ORG_INDEX_URL.to_string(),
+        ));
+        let feed = NuGetFeedUrl::new(&format!("{base}/index.json"), &policy).unwrap();
+
+        for i in 0..MAX_ALTERNATE_REGISTRIES {
+            let dummy = NuGetRegistry::with_base(
+                Arc::clone(&cache),
+                &hop(&feed),
+                Arc::clone(&policy),
+                Vec::new(),
+            );
+            root.alternates
+                .insert(format!("dummy-{i}"), Arc::new(dummy));
+        }
+        assert_eq!(root.alternates.len(), MAX_ALTERNATE_REGISTRIES);
+
+        let overflow_key = deps_core::hash_routing_key("nuget-chain", std::iter::once("overflow"));
+        let overflow = NuGetSourceChain {
+            key: overflow_key.clone(),
+            hops: vec![hop(&feed)],
+            implicit_public_fallback: false,
+        };
+        let log = deps_core::test_util::capture_tracing_output(|| {
+            NuGetRegistry::register_alternate(&root, &overflow, &policy);
+        });
+
+        assert!(
+            log.contains("NuGet alternate registry cap reached"),
+            "log: {log}"
+        );
+        assert!(
+            log.contains(&overflow_key),
+            "the opaque hash must survive intact, not collapse to a redacted '***': {log}"
+        );
+        assert_eq!(root.alternates.len(), MAX_ALTERNATE_REGISTRIES);
     }
 }

@@ -30,9 +30,13 @@ use crate::types::GoVersion;
 use crate::version::{escape_module_path, escape_version, is_pseudo_version};
 use dashmap::DashMap;
 use deps_core::parser::DependencySource;
+#[cfg(test)]
+use deps_core::registry::MAX_ALTERNATE_REGISTRIES;
 use deps_core::{
-    DepsError, HttpCache, Result, is_dot_segment, lsp_helpers::warn_rejected_value,
+    DepsError, HttpCache, Result, is_dot_segment,
+    lsp_helpers::warn_rejected_value,
     not_found_or as core_not_found_or,
+    registry::{KeyShape, register_capped},
 };
 use serde::Deserialize;
 use std::any::Any;
@@ -46,15 +50,6 @@ pub const REGISTRY: &str = "Go proxy";
 
 /// Base URL for Go package documentation
 pub const PKG_GO_DEV_URL: &str = "https://pkg.go.dev";
-
-/// Upper bound on [`GoRegistry::alternates`]' entry count. Generous for any realistic
-/// project's `$GOENV` configuration, exists only to keep this map — keyed by
-/// process-config-controlled chain identities — from growing unbounded for the process
-/// lifetime. Mirrors `deps-pypi`/`deps-npm`'s identical cap. Once at capacity, a *new* chain
-/// is simply never registered (see [`GoRegistry::register_alternate`]) — a dependency resolved to
-/// an unregistered chain degrades to [`DepsError::PackageNotFound`], never to a
-/// `proxy.golang.org` lookup by name (spec FR-009/FR-013).
-const MAX_ALTERNATE_REGISTRIES: usize = 256;
 
 /// Which transport/behavior a [`GoRegistry`] instance uses (spec 034 FR-004/FR-006/FR-011).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -294,7 +289,10 @@ impl GoRegistry {
 
     /// Builds the full hop chain for one [`GoProxyChain`] and inserts the head into
     /// `root.alternates` under `chain.key`. Idempotent per key (a repeat registration for the
-    /// same key is a no-op), capacity-capped at `MAX_ALTERNATE_REGISTRIES`. Mirrors
+    /// same key is a no-op), capacity-capped at
+    /// [`deps_core::registry::MAX_ALTERNATE_REGISTRIES`] — a dependency resolved to an
+    /// unregistered chain degrades to [`DepsError::PackageNotFound`], never to a
+    /// `proxy.golang.org` lookup by name (spec FR-009/FR-013). Mirrors
     /// `deps_pypi::PypiRegistry::register_alternate` exactly in shape.
     pub fn register_alternate(root: &Arc<Self>, chain: &GoProxyChain) {
         let Some((first_hop, rest_hops)) = chain.hops.split_first() else {
@@ -302,50 +300,40 @@ impl GoRegistry {
             return;
         };
 
-        // Read before `entry()`: `DashMap::len` read-locks every shard, and `entry()` holds a
-        // write guard on one — checking capacity from inside the `Vacant` arm would
-        // self-deadlock on that shard.
-        let at_capacity = root.alternates.len() >= MAX_ALTERNATE_REGISTRIES;
+        register_capped(
+            &root.alternates,
+            chain.key.clone(),
+            "Go",
+            KeyShape::Opaque,
+            || {
+                // `chain.separators[i]` is the separator between `hops[i]` and `hops[i + 1]`
+                // (spec 034 S2); `rest_hops[i]` is `hops[i + 1]`, so both are indexed by `i`
+                // here. A shorter/empty `separators` (every hand-built test chain, and the
+                // single-hop `GOPRIVATE` chain) defaults every transition to `NotFoundOnly`.
+                let fallback_chain: Vec<(ChainSeparator, Arc<Self>)> = rest_hops
+                    .iter()
+                    .enumerate()
+                    .map(|(i, hop)| {
+                        let sep = chain
+                            .separators
+                            .get(i)
+                            .copied()
+                            .unwrap_or(ChainSeparator::NotFoundOnly);
+                        (sep, Self::hop_client(&root.cache, hop))
+                    })
+                    .collect();
 
-        if let dashmap::mapref::entry::Entry::Vacant(slot) =
-            root.alternates.entry(chain.key.clone())
-        {
-            if at_capacity {
-                tracing::warn!(
-                    key = %chain.key,
-                    cap = MAX_ALTERNATE_REGISTRIES,
-                    "Go alternate proxy cap reached; not registering a new chain"
-                );
-                return;
-            }
-
-            // `chain.separators[i]` is the separator between `hops[i]` and `hops[i + 1]`
-            // (spec 034 S2); `rest_hops[i]` is `hops[i + 1]`, so both are indexed by `i`
-            // here. A shorter/empty `separators` (every hand-built test chain, and the
-            // single-hop `GOPRIVATE` chain) defaults every transition to `NotFoundOnly`.
-            let fallback_chain: Vec<(ChainSeparator, Arc<Self>)> = rest_hops
-                .iter()
-                .enumerate()
-                .map(|(i, hop)| {
-                    let sep = chain
-                        .separators
-                        .get(i)
-                        .copied()
-                        .unwrap_or(ChainSeparator::NotFoundOnly);
-                    (sep, Self::hop_client(&root.cache, hop))
-                })
-                .collect();
-
-            let head = match first_hop {
-                GoProxyHop::Url(url) => {
-                    Self::with_base(Arc::clone(&root.cache), url, fallback_chain)
-                }
-                GoProxyHop::Direct | GoProxyHop::Off => {
-                    Self::terminal(Arc::clone(&root.cache), fallback_chain)
-                }
-            };
-            slot.insert(Arc::new(head));
-        }
+                let head = match first_hop {
+                    GoProxyHop::Url(url) => {
+                        Self::with_base(Arc::clone(&root.cache), url, fallback_chain)
+                    }
+                    GoProxyHop::Direct | GoProxyHop::Off => {
+                        Self::terminal(Arc::clone(&root.cache), fallback_chain)
+                    }
+                };
+                Arc::new(head)
+            },
+        );
     }
 
     /// The registered client for `index` (a [`GoProxyChain::key`] or
@@ -2082,5 +2070,44 @@ mod tests {
         GoRegistry::register_alternate(&root, &overflow);
         assert_eq!(root.alternates.len(), MAX_ALTERNATE_REGISTRIES);
         assert!(root.alternate_client("go-proxy:overflow").is_none());
+    }
+
+    // #969 (impl-critic M5/S3): the cap-reached warn line itself was unverified for this
+    // crate — only the resulting map state was, unlike cargo/npm/pypi's equivalent tests.
+    // Uses a real `hash_routing_key`-shaped overflow key (not an arbitrary literal) to prove
+    // `KeyShape::Opaque` actually keeps the digest intact rather than collapsing it to
+    // `RedactedUrl`'s "<prefix>:***" false-positive rendering (S3).
+    #[test]
+    fn test_alternate_registries_cap_reached_logs_ecosystem_and_key() {
+        let cache = Arc::new(HttpCache::new());
+        let root = Arc::new(GoRegistry::new(cache));
+        let policy = all_policy();
+        for i in 0..MAX_ALTERNATE_REGISTRIES {
+            let chain = GoProxyChain {
+                key: format!("go-proxy:cap-{i}"),
+                hops: vec![url_hop("https://goproxy.mycorp.example", &policy)],
+                ..Default::default()
+            };
+            GoRegistry::register_alternate(&root, &chain);
+        }
+
+        let overflow_key = deps_core::hash_routing_key("go-proxy", std::iter::once("overflow"));
+        let overflow = GoProxyChain {
+            key: overflow_key.clone(),
+            hops: vec![url_hop("https://goproxy.mycorp.example", &policy)],
+            ..Default::default()
+        };
+        let log = deps_core::test_util::capture_tracing_output(|| {
+            GoRegistry::register_alternate(&root, &overflow);
+        });
+
+        assert!(
+            log.contains("Go alternate registry cap reached"),
+            "log: {log}"
+        );
+        assert!(
+            log.contains(&overflow_key),
+            "the opaque hash must survive intact, not collapse to a redacted '***': {log}"
+        );
     }
 }

@@ -10,7 +10,6 @@ use deps_core::json_ast::{JsonAst, JsonSection};
 use deps_core::json_helpers::string_valued_entries;
 use deps_core::lsp_helpers::LineOffsetTable;
 use serde_json::Value;
-use std::any::Any;
 use tower_lsp_server::ls_types::Uri;
 
 /// Result of parsing a package.json file.
@@ -44,38 +43,15 @@ pub struct NpmParseResult {
     pub dependency_truncation: Option<(usize, usize)>,
 }
 
-// Implemented by hand rather than via `deps_core::impl_parse_result!`: `blocked_registries()`
-// is overridden with real data (`self.blocked_registries.clone()`), mirroring
-// `deps_cargo::parser::CargoParseResult`'s own hand-written impl — the macro has no field for
-// it.
-impl deps_core::ParseResult for NpmParseResult {
-    fn dependencies(&self) -> Vec<&dyn deps_core::Dependency> {
-        self.dependencies
-            .iter()
-            .map(|d| d as &dyn deps_core::Dependency)
-            .collect()
+deps_core::impl_parse_result!(
+    NpmParseResult,
+    NpmDependency {
+        dependencies: dependencies,
+        uri: uri,
+        dependency_truncation: dependency_truncation,
+        blocked_registries: blocked_registries,
     }
-
-    fn workspace_root(&self) -> Option<&std::path::Path> {
-        None
-    }
-
-    fn uri(&self) -> &Uri {
-        &self.uri
-    }
-
-    fn blocked_registries(&self) -> Vec<deps_core::BlockedRegistryOccurrence> {
-        self.blocked_registries.clone()
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn dependency_truncation(&self) -> Option<(usize, usize)> {
-        self.dependency_truncation
-    }
-}
+);
 
 /// Parses a package.json file and extracts all dependencies with positions.
 ///
@@ -1116,6 +1092,15 @@ mod tests {
         );
         assert_eq!(occurrence.raw_value, "https://169.254.169.254");
         assert_eq!(occurrence.declaration_key, "top-level");
+
+        // #969 (impl-critic S2): assert through the trait method, not just the struct field —
+        // `deps_core::impl_parse_result!` generates this override; a regression that silently
+        // dropped the `blocked_registries:` arm would fall back to the trait's empty-`Vec`
+        // default while leaving the struct field (asserted above) untouched, so a field-only
+        // assertion would not catch it.
+        let via_trait = deps_core::ParseResult::blocked_registries(&result);
+        assert_eq!(via_trait.len(), 1);
+        assert_eq!(via_trait[0].raw_value, "https://169.254.169.254");
     }
 
     // --- pnpm catalogs (spec 046) ---

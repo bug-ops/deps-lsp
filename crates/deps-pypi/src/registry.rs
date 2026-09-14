@@ -13,9 +13,11 @@ use crate::config::{PypiIndexUrl, ResolvedChain};
 use crate::types::{PypiPackage, PypiVersion};
 use dashmap::DashMap;
 use deps_core::parser::DependencySource;
+#[cfg(test)]
+use deps_core::registry::MAX_ALTERNATE_REGISTRIES;
 use deps_core::{
     DepsError, FreshnessSettings, HttpCache, Result, lsp_helpers::warn_rejected_value,
-    net_policy::RedactedUrl, not_found_or as core_not_found_or,
+    not_found_or as core_not_found_or, registry::register_capped,
 };
 use pep440_rs::{Version, VersionSpecifiers};
 use serde::Deserialize;
@@ -39,20 +41,6 @@ pub(crate) const SIMPLE_API_ACCEPT: &str = "application/vnd.pypi.simple.v1+json"
 
 /// Display name for PyPI used in not-found and API-response error messages.
 pub const REGISTRY: &str = "PyPI";
-
-/// Upper bound on [`PypiRegistry::alternates`]' entry count. Generous for any realistic
-/// project's private-index configuration count; exists only to keep this map, keyed by
-/// workspace-controlled chain identities, from growing unbounded for the process lifetime.
-/// Mirrors `deps-npm`'s identical `MAX_ALTERNATE_REGISTRIES`. Once at capacity, a *new* chain
-/// is simply never registered (see [`PypiRegistry::register_alternate`]) — a dependency resolved
-/// to an unregistered chain degrades to [`DepsError::PackageNotFound`], never to a
-/// `pypi.org` lookup by name (spec FR-010).
-///
-/// Note (plan.md §1's risk note): this cap counts distinct *chain identities*
-/// ([`ResolvedChain::key`]), not distinct index URLs — a monorepo with many files declaring
-/// different `--extra-index-url` combinations against the same primary could exhaust it
-/// faster than a simpler one-registration-per-URL model.
-const MAX_ALTERNATE_REGISTRIES: usize = 256;
 
 /// Which transport a [`PypiRegistry`] instance fetches through (spec FR-008).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -290,7 +278,15 @@ impl PypiRegistry {
 
     /// Builds the full hop tree for one [`ResolvedChain`] and inserts the head into
     /// `root.alternates` under `chain.key`. Idempotent per key (a repeat registration for the
-    /// same key is a no-op), capacity-capped at `MAX_ALTERNATE_REGISTRIES`.
+    /// same key is a no-op), capacity-capped at
+    /// [`deps_core::registry::MAX_ALTERNATE_REGISTRIES`] — a dependency resolved to an
+    /// unregistered chain degrades to [`DepsError::PackageNotFound`], never to a `pypi.org`
+    /// lookup by name (spec FR-010).
+    ///
+    /// Note (plan.md §1's risk note): this cap counts distinct *chain identities*
+    /// ([`ResolvedChain::key`]), not distinct index URLs — a monorepo with many files
+    /// declaring different `--extra-index-url` combinations against the same primary could
+    /// exhaust it faster than a simpler one-registration-per-URL model.
     ///
     /// Called only from `PypiEcosystem::parse_manifest` over
     /// `PypiIndexConfig::resolved_chains()`, at parse time only. Takes `root: &Arc<Self>` as a
@@ -311,48 +307,38 @@ impl PypiRegistry {
             return;
         };
 
-        // Read before `entry()`: `DashMap::len` read-locks every shard, and `entry()` holds
-        // a write guard on one — checking capacity from inside the `Vacant` arm would
-        // self-deadlock on that shard (mirrors `deps-npm::NpmRegistry::register_alternate`).
-        let at_capacity = root.alternates.len() >= MAX_ALTERNATE_REGISTRIES;
+        register_capped(
+            &root.alternates,
+            chain.key.clone(),
+            "PyPI",
+            chain.key_shape,
+            || {
+                let mut fallback_chain: Vec<Arc<Self>> = rest_hops
+                    .iter()
+                    .map(|hop| Arc::new(Self::with_base(Arc::clone(&root.cache), hop, Vec::new())))
+                    .collect();
+                if chain.implicit_public_fallback {
+                    // Built from `root`'s own `simple_base`/`index_url` rather than
+                    // `Self::new(..)`'s hardcoded `PYPI_SIMPLE_BASE` (validator finding #9) —
+                    // in production `root` is always constructed via `Self::new`, so this is
+                    // the exact same URL either way; in a test built via
+                    // `Self::with_public_base_for_test`, this hop follows the root to a mock
+                    // server, making the implicit-fallback ordering behaviorally testable.
+                    fallback_chain.push(Arc::new(Self {
+                        cache: Arc::clone(&root.cache),
+                        index_url: root.index_url.clone(),
+                        simple_base: root.simple_base.clone(),
+                        index: Arc::new(crate::search::IndexCell::new()),
+                        tier: PypiRegistryTier::Public,
+                        alternates: Arc::new(DashMap::new()),
+                        fallback_chain: Vec::new(),
+                    }));
+                }
 
-        if let dashmap::mapref::entry::Entry::Vacant(slot) =
-            root.alternates.entry(chain.key.clone())
-        {
-            if at_capacity {
-                tracing::warn!(
-                    key = %RedactedUrl::new(&chain.key),
-                    cap = MAX_ALTERNATE_REGISTRIES,
-                    "PyPI alternate registry cap reached; not registering a new chain"
-                );
-                return;
-            }
-
-            let mut fallback_chain: Vec<Arc<Self>> = rest_hops
-                .iter()
-                .map(|hop| Arc::new(Self::with_base(Arc::clone(&root.cache), hop, Vec::new())))
-                .collect();
-            if chain.implicit_public_fallback {
-                // Built from `root`'s own `simple_base`/`index_url` rather than
-                // `Self::new(..)`'s hardcoded `PYPI_SIMPLE_BASE` (validator finding #9) — in
-                // production `root` is always constructed via `Self::new`, so this is the
-                // exact same URL either way; in a test built via
-                // `Self::with_public_base_for_test`, this hop follows the root to a mock
-                // server, making the implicit-fallback ordering behaviorally testable.
-                fallback_chain.push(Arc::new(Self {
-                    cache: Arc::clone(&root.cache),
-                    index_url: root.index_url.clone(),
-                    simple_base: root.simple_base.clone(),
-                    index: Arc::new(crate::search::IndexCell::new()),
-                    tier: PypiRegistryTier::Public,
-                    alternates: Arc::new(DashMap::new()),
-                    fallback_chain: Vec::new(),
-                }));
-            }
-
-            let head = Self::with_base(Arc::clone(&root.cache), first_hop, fallback_chain);
-            slot.insert(Arc::new(head));
-        }
+                let head = Self::with_base(Arc::clone(&root.cache), first_hop, fallback_chain);
+                Arc::new(head)
+            },
+        );
     }
 
     /// The registered client for `index` (a [`ResolvedChain::key`] or a named source's own
@@ -2129,6 +2115,7 @@ mod tests {
         let extra = index_url(&format!("{}/simple", extra_server.url()));
         let chain = crate::config::ResolvedChain {
             key: "test-chain-a".to_string(),
+            key_shape: deps_core::registry::KeyShape::Opaque,
             hops: vec![primary, extra],
             implicit_public_fallback: false,
         };
@@ -2333,6 +2320,7 @@ mod tests {
         let root = Arc::new(PypiRegistry::new(cache));
         let chain = crate::config::ResolvedChain {
             key: "empty".to_string(),
+            key_shape: deps_core::registry::KeyShape::Opaque,
             hops: Vec::new(),
             implicit_public_fallback: false,
         };
@@ -2348,6 +2336,7 @@ mod tests {
         let root = Arc::new(PypiRegistry::new(cache));
         let chain = crate::config::ResolvedChain {
             key: "dup".to_string(),
+            key_shape: deps_core::registry::KeyShape::Opaque,
             hops: vec![index_url("https://a.example/simple")],
             implicit_public_fallback: false,
         };
@@ -2367,6 +2356,7 @@ mod tests {
         for i in 0..MAX_ALTERNATE_REGISTRIES {
             let chain = crate::config::ResolvedChain {
                 key: format!("chain-{i}"),
+                key_shape: deps_core::registry::KeyShape::Opaque,
                 hops: vec![index_url("https://a.example/simple")],
                 implicit_public_fallback: false,
             };
@@ -2374,6 +2364,7 @@ mod tests {
         }
         let overflow = crate::config::ResolvedChain {
             key: "overflow".to_string(),
+            key_shape: deps_core::registry::KeyShape::Opaque,
             hops: vec![index_url("https://b.example/simple")],
             implicit_public_fallback: false,
         };
@@ -2394,6 +2385,7 @@ mod tests {
         for i in 0..MAX_ALTERNATE_REGISTRIES {
             let chain = crate::config::ResolvedChain {
                 key: format!("chain-{i}"),
+                key_shape: deps_core::registry::KeyShape::Opaque,
                 hops: vec![index_url("https://a.example/simple")],
                 implicit_public_fallback: false,
             };
@@ -2437,6 +2429,7 @@ mod tests {
         let root = Arc::new(PypiRegistry::new(Arc::clone(&cache)));
         let chain = crate::config::ResolvedChain {
             key: "chain".to_string(),
+            key_shape: deps_core::registry::KeyShape::Opaque,
             hops: vec![index_url("https://a.example/simple")],
             implicit_public_fallback: false,
         };
@@ -2457,6 +2450,7 @@ mod tests {
 
         let chain = crate::config::ResolvedChain {
             key: "implicit".to_string(),
+            key_shape: deps_core::registry::KeyShape::Opaque,
             hops: vec![index_url("https://a.example/simple")],
             implicit_public_fallback: true,
         };
@@ -2484,6 +2478,7 @@ mod tests {
         let extra = index_url("https://extra.example/simple");
         let chain = crate::config::ResolvedChain {
             key: "case-b".to_string(),
+            key_shape: deps_core::registry::KeyShape::Opaque,
             hops: vec![extra],
             implicit_public_fallback: true,
         };
@@ -2531,6 +2526,7 @@ mod tests {
         let extra = index_url(&format!("{}/simple", extra_server.url()));
         let chain = crate::config::ResolvedChain {
             key: "case-b-request-count".to_string(),
+            key_shape: deps_core::registry::KeyShape::Opaque,
             hops: vec![extra],
             implicit_public_fallback: true,
         };
@@ -2586,6 +2582,7 @@ mod tests {
         let extra = index_url(&format!("{}/simple", extra_server.url()));
         let chain = crate::config::ResolvedChain {
             key: "case-b-fallthrough".to_string(),
+            key_shape: deps_core::registry::KeyShape::Opaque,
             hops: vec![extra],
             implicit_public_fallback: true,
         };
@@ -2632,6 +2629,7 @@ mod tests {
 
         let chain = crate::config::ResolvedChain {
             key: "latest-matching-happy-path".to_string(),
+            key_shape: deps_core::registry::KeyShape::Opaque,
             hops: vec![index_url(&format!("{}/simple", server.url()))],
             implicit_public_fallback: false,
         };
