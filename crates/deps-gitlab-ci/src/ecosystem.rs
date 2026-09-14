@@ -142,7 +142,7 @@ impl GitlabCiEcosystem {
     }
 
     /// Creates a GitLab CI ecosystem sharing live `policy`/`gitlab_instance_host` handles —
-    /// the production wiring path (`deps-lsp`'s `register_ecosystems`), mirroring
+    /// the production wiring path (`deps_engine::setup::register_ecosystems`), mirroring
     /// `NuGetEcosystem`/`PypiEcosystem`'s identical `with_context` precedent.
     ///
     /// `gitlab_instance_host_raw` is the feature-agnostic `Arc<RwLock<Option<String>>>` cell

@@ -22,45 +22,31 @@ path = "src/lib.rs"
 
 [features]
 default = ["cargo", "npm", "pypi", "go", "bundler", "dart", "maven", "gradle", "swift", "composer", "nuget", "deno", "github-actions", "gitlab-ci"]
-cargo = ["dep:deps-cargo"]
-npm = ["dep:deps-npm"]
-pypi = ["dep:deps-pypi"]
-go = ["dep:deps-go"]
-bundler = ["dep:deps-bundler"]
-dart = ["dep:deps-dart"]
-maven = ["dep:deps-maven"]
-gradle = ["dep:deps-gradle"]
-swift = ["dep:deps-swift"]
-composer = ["dep:deps-composer"]
-nuget = ["dep:deps-nuget"]
-github-actions = ["dep:deps-github-actions"]
-gitlab-ci = ["dep:deps-gitlab-ci"]
+cargo = ["deps-engine/cargo"]
+npm = ["dep:deps-npm", "deps-engine/npm"]
+pypi = ["deps-engine/pypi"]
+go = ["deps-engine/go"]
+bundler = ["deps-engine/bundler"]
+dart = ["deps-engine/dart"]
+maven = ["deps-engine/maven"]
+gradle = ["deps-engine/gradle"]
+swift = ["deps-engine/swift"]
+composer = ["deps-engine/composer"]
+nuget = ["deps-engine/nuget"]
+github-actions = ["dep:deps-github-actions", "deps-engine/github-actions"]
+gitlab-ci = ["dep:deps-gitlab-ci", "deps-engine/gitlab-ci"]
 # Pulls in deps-npm transitively (DenoRegistry delegates npm: specifiers to it, D3) even
 # when the "npm" feature itself is disabled.
-deno = ["dep:deps-deno"]
-
-# Consumed only through the `ecosystem!`/`register!` macros in `src/lib.rs`, not via direct
-# `use` statements, so cargo-machete cannot see the usage and flags them as unused.
-[package.metadata.cargo-machete]
-ignored = ["deps-bundler", "deps-composer", "deps-dart", "deps-gradle", "deps-maven", "deps-pypi", "deps-swift"]
+deno = ["dep:deps-deno", "deps-engine/deno"]
 
 [dependencies]
 # Internal crates
-deps-bundler = { workspace = true, optional = true }
-deps-cargo = { workspace = true, optional = true }
-deps-composer = { workspace = true, optional = true }
 deps-core = { workspace = true }
-deps-dart = { workspace = true, optional = true }
 deps-deno = { workspace = true, optional = true }
+deps-engine = { workspace = true }
 deps-github-actions = { workspace = true, optional = true }
 deps-gitlab-ci = { workspace = true, optional = true }
-deps-go = { workspace = true, optional = true }
-deps-gradle = { workspace = true, optional = true }
-deps-maven = { workspace = true, optional = true }
 deps-npm = { workspace = true, optional = true }
-deps-nuget = { workspace = true, optional = true }
-deps-pypi = { workspace = true, optional = true }
-deps-swift = { workspace = true, optional = true }
 
 # External dependencies
 dashmap = { workspace = true }

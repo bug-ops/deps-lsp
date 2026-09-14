@@ -61,7 +61,7 @@ impl NuGetEcosystem {
 
     /// Creates a new NuGet ecosystem sharing `context`'s reachability policy and
     /// `NuGet.Config` memoization cache, around an existing [`NuGetRegistry`] instance — the
-    /// production constructor, used by `deps-lsp`'s `register_ecosystems` so
+    /// production constructor, used by `deps_engine::setup::register_ecosystems` so
     /// `initialize`/`workspace/didChangeConfiguration` can update the same
     /// `Arc<RegistryAccessPolicy>` this ecosystem's every parse reads (mirrors `deps-npm`'s/
     /// `deps-pypi`'s identical split — `Self::new`'s default, disconnected policy would never

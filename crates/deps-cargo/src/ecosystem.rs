@@ -32,7 +32,7 @@ pub struct CargoEcosystem {
     /// The reachability policy (spec #443) and `.cargo/config.toml` memoization cache (spec
     /// NFR-005) every `parse_manifest` call threads through to
     /// [`crate::parser::parse_cargo_toml_with_context`]. Defaulted by [`Self::new`]; set
-    /// explicitly by [`Self::with_context`] so `crate::lib::register_ecosystems` can share
+    /// explicitly by [`Self::with_context`] so `deps_engine::setup::register_ecosystems` can share
     /// one process-wide policy handle with `ServerState`.
     context: CargoParseContext,
 }
@@ -90,7 +90,7 @@ impl CargoEcosystem {
 
     /// Creates a new Cargo ecosystem sharing `ctx`'s reachability policy and config-file
     /// cache — the production constructor (plan-1b §1.6), used by
-    /// `crate::lib::register_ecosystems` so `initialize`/`workspace/didChangeConfiguration`
+    /// `deps_engine::setup::register_ecosystems` so `initialize`/`workspace/didChangeConfiguration`
     /// can update the same `Arc<RegistryAccessPolicy>` this ecosystem's every parse reads.
     pub fn with_context(cache: Arc<deps_core::HttpCache>, ctx: CargoParseContext) -> Self {
         Self {
