@@ -220,6 +220,48 @@ static ANY_OPTION_KEY: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&alternation).expect("Invalid regex")
 });
 
+/// Matches a bare Ruby hash-key shape at the very start of text: an identifier (optionally
+/// suffixed with `!`/`?`) immediately followed by `:` — e.g. `branch:`, `force_ruby_platform:`,
+/// `valid?:`. Unlike [`ANY_OPTION_KEY`], not restricted to a fixed set of known Bundler option
+/// names — see [`looks_like_generic_option_key`] for why an unrestricted match is safe here.
+///
+/// No whitespace is allowed between the identifier and `:` (#1039 critic finding m1) — Ruby's
+/// own label syntax permits none either, so allowing it here (an earlier version used `\s*`)
+/// let a bare method call with a symbol argument masquerade as a key-shaped continuation line,
+/// e.g. `helper :x, source: "evil"` (`helper` followed by whitespace then `:x,`) — a residual of
+/// vector 3 this stricter match closes.
+///
+/// Does not itself exclude `::` (Ruby's namespace separator); callers must check the byte after
+/// the match (`regex` has no lookahead) — see [`looks_like_generic_option_key`].
+// Same guarantee as GEM_PATTERN above.
+#[allow(clippy::expect_used)]
+static GENERIC_OPTION_KEY_SHAPE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[[:alpha:]_][[:alnum:]_]*[!?]?:").expect("Invalid regex"));
+
+/// True when `stripped` begins with *any* bare Ruby hash-key shape (`identifier:`), not just one
+/// of [`ANY_OPTION_KEY`]'s 8 known Bundler option names — #1039 critic finding C1: restricting
+/// the bracket-free comma-continuation path (see [`looks_like_option_or_array_content`]) to only
+/// those 8 keys made every other documented Bundler `gem` option (`branch:`, `ref:`, `tag:`,
+/// `submodules:`, `glob:`, `default:`, `force_ruby_platform:`, `platform:`, `groups:`, `gist:`,
+/// `bitbucket:`, ...) terminate the continuation early on an ordinary, well-formed Gemfile,
+/// dropping a *later*, genuinely private `git:`/`path:`/`source:` line entirely — the #991/#1019
+/// leak class, reachable without any malformed Ruby at all.
+///
+/// Matching on shape (any identifier followed by `:`) rather than enumerating every known option
+/// name closes that gap without needing a second key list kept in sync with Bundler's own
+/// documented option set. Explicitly rejects `::` (Ruby's namespace separator, e.g. `Foo::BAR =
+/// source: "evil"`) by checking that the byte right after the matched colon isn't also a colon.
+/// Without this, `Foo::BAR = ...` would match `Foo:` as if `Foo` were an option key, reopening a
+/// shape-based variant of the vector-3 bypass this whole check exists to close (an assignment
+/// statement, not a continuation, absorbed because its *first token* happens to look key-shaped).
+// `m.end()` is a regex match-end offset, always a char boundary.
+#[allow(clippy::string_slice)]
+fn looks_like_generic_option_key(stripped: &str) -> bool {
+    GENERIC_OPTION_KEY_SHAPE
+        .find(stripped)
+        .is_some_and(|m| m.start() == 0 && !stripped[m.end()..].starts_with(':'))
+}
+
 // Same guarantee as GEM_PATTERN above.
 #[allow(clippy::expect_used)]
 static RUBY_VERSION_PATTERN: LazyLock<Regex> =
@@ -399,24 +441,114 @@ struct PendingGem<'a> {
     /// each continuation line in full) together with its absolute byte offset in the source, so
     /// an option value on any line still gets a correct LSP range.
     segments: Vec<(&'a str, usize)>,
-    /// Stack of currently-unclosed `[`/`{`/`(` characters across every accumulated segment, each
-    /// popped by a later `]`/`}` (see [`apply_bracket_delta`]) — a non-empty stack means an
-    /// array/hash literal (e.g. `platforms: [`) opened on an earlier line is still unclosed,
-    /// which keeps the call open even without a trailing comma or backslash (#1017). A stack
-    /// (rather than a signed depth counter) structurally rules out the negative-depth bug a
-    /// counter had (critic finding M1: an unmatched closing bracket earlier in the call could
-    /// drive a counter negative and then mask a later, legitimate literal opening) — popping an
-    /// empty stack is simply a no-op — and lets [`bracket_only_should_stop`] tell an array (`[`)
-    /// context apart from a hash (`{`) context via the top element (critic finding, correctness
-    /// gate re-check: an anchored option-key-shaped line like `source: "..."` is plausible hash
-    /// content but not array element content, so whether to trust it depends on bracket *kind*,
-    /// not just depth).
+    /// Stack of currently-unclosed `[`/`{`/`(` characters *literally present in the accumulated
+    /// text* — never the paren call's own opening `(`, which sits before the captured name and
+    /// is not part of any segment (#1039 critic findings A/B, correctness-gate re-check: an
+    /// earlier version of this fix seeded that opening paren onto this same stack, but doing so
+    /// entangled the outer call's "still needs its own closer" state with two other mechanisms
+    /// that specifically depend on this stack tracking *nested* literals only — see
+    /// [`looks_like_option_or_array_content`]'s doc for the full history). Whether an
+    /// `is_paren_call`'s own closer has been seen yet is tracked independently, via
+    /// `outer_paren_depth` below, not via this field.
+    ///
+    /// Each opener pushed here is popped by a later `]`/`}`/`)` (see [`apply_bracket_delta`]) — a
+    /// non-empty stack means an array/hash/nested-call literal (e.g. `platforms: [`,
+    /// `install_if: check(`) opened on an earlier line is still unclosed, which keeps the call
+    /// open even without a trailing comma or backslash (#1017). A stack (rather than a signed
+    /// depth counter) structurally rules out the negative-depth bug a counter had (critic finding
+    /// M1: an unmatched closing bracket earlier in the call could drive a counter negative and
+    /// then mask a later, legitimate literal opening) — popping an empty stack is simply a no-op
+    /// — and lets [`continuation_should_stop`] tell an array (`[`) context apart from a hash
+    /// (`{`) context via the top element (critic finding, correctness gate re-check: an anchored
+    /// option-key-shaped line like `source: "..."` is plausible hash content but not array
+    /// element content, so whether to trust it depends on bracket *kind*, not just depth).
     bracket_stack: Vec<char>,
     /// Whether the call opened with `gem(...)` rather than the bare `gem ...` form — threaded
     /// through to [`extract_version`] so its `)`-as-terminator tolerance (#1021) only applies
     /// when there's an actual enclosing `gem(...)` paren to terminate against, not any unrelated
     /// trailing `)` on the line (critic finding S3).
     is_paren_call: bool,
+    /// Running `(`/`)`-only depth of the paren call's own outer parens, meaningful only when
+    /// `is_paren_call` — seeded to `1` (the opening `(` that sits before the captured name and is
+    /// never itself part of any segment) and updated by [`apply_paren_call_delta`] as each line is
+    /// absorbed; `<= 0` means the call's own closer has been seen — and, once reached, stays `<=
+    /// 0` permanently (`apply_paren_call_delta` is a no-op past that point), so this can only ever
+    /// transition open → closed, never back (#1039 round-6 correctness-gate blocking finding 2 —
+    /// see that function's doc). The incremental counterpart of [`find_paren_call_closer`] (#1039
+    /// perf finding p1): an earlier version of this fix instead re-joined and re-scanned *every*
+    /// accumulated segment from scratch on every continuation line via a `paren_call_closer_seen`
+    /// helper, making accumulation O(n²) in segments × line length — a ~200x slowdown on the parse
+    /// hot path for a paren call typed without trailing commas (measured: ~7.5ms → 1.54s on a
+    /// 963 KB adversarial input). Both counters use the identical `(`/`)`-only counting rule
+    /// (ignoring `[`/`{`) and the identical "stop at the first zero-crossing" rule, so they agree
+    /// on where the closer falls for text where no string literal crosses a segment/line boundary
+    /// — see [`apply_paren_call_delta`]'s doc for the one case where they can still diverge (and
+    /// why that stays fail-closed regardless); this field just computes the common case
+    /// incrementally, one line at a time, instead of by repeated full re-scans.
+    outer_paren_depth: i32,
+}
+
+/// Applies `line`'s code-positioned `(`/`)` count to `depth` — the incremental counterpart of
+/// [`find_paren_call_closer`]'s one-shot scan, used to update [`PendingGem::outer_paren_depth`]
+/// as each new line is absorbed (#1039 perf finding p1). Ignores `[`/`{` for the same reason
+/// `find_paren_call_closer` does: they never affect where the outer call's own paren balance
+/// point falls.
+///
+/// **Stops permanently at the first point `depth` would reach `0`** (#1039 round-6
+/// correctness-gate blocking finding 2) — mirroring `find_paren_call_closer`'s own "first excess
+/// `)` wins, nothing after matters" semantics exactly, rather than continuing to sum every `(`/`)`
+/// in `line` (and every later line) regardless of where the call's own closer actually falls. An
+/// earlier, unclamped version kept accumulating past that point, so unrelated content *after* the
+/// real closer — on the same line (`) foo(`) or a later absorbed one — could push `depth` back
+/// positive, making `still_open` wrongly stay true and silently pull unrelated, already-outside-
+/// the-call physical lines into this `PendingGem`'s `segments` instead of letting them be
+/// processed as their own top-level statements (a data-loss/functional regression; `source`
+/// extraction itself stayed safe regardless, since [`find_paren_call_closer`]'s own independent
+/// one-shot scan at finalize time already truncated correctly — but the two mechanisms disagreeing
+/// about *when* the call closes is exactly the failure class [`PendingGem::bracket_stack`] being a
+/// `Vec` instead of a signed counter was built to structurally rule out for the nested-literal
+/// case; a bare, unclamped counter reintroduced it here for the outer-paren case). Once `depth`
+/// reaches `0` here, every subsequent call is a no-op (the guard at the top returns immediately),
+/// so the two counters now agree on the same first zero-crossing position — *for text where no
+/// string literal spans a segment/line boundary*.
+///
+/// **Known divergence, not fully "provably equivalent" (correctness-gate re-check, round 7
+/// finding n2):** this function builds a fresh [`deps_core::quote_scan::CodeSpans`] *per physical
+/// line*, while [`find_paren_call_closer`] builds one over the whole *joined* multi-line text at
+/// finalize time. An unterminated string literal on one line therefore classifies differently
+/// between the two — e.g. `gem("a", require: "unterminated` followed by `), source: "..."`: this
+/// function, scanning that first line alone, sees no closing quote and (per
+/// [`deps_core::quote_scan`]'s documented unterminated-literal behavior) treats the rest of *that
+/// line* as non-code, so the `)` on the *next* line is still seen as code and closes the call
+/// there; `find_paren_call_closer`, scanning the properly joined text where the string's real
+/// closing quote is later in the same logical value, would find no closer at that position at
+/// all. Both outcomes stay fail-closed in practice (a premature "closed" here just means
+/// `OptionScan` scans a shorter, still-correctly-classified prefix; a "still open" there under
+/// [`find_paren_call_closer`] means [`OptionScan::new`]'s `None` branch poisons rather than
+/// silently trusting stale content) — this divergence changes *when* accumulation stops, not
+/// whether extraction stays safe, so it is left as a documented edge case rather than fixed by
+/// switching this function to scan the joined text too (which would reintroduce the O(n²)
+/// re-scanning this function exists to avoid, see [`PendingGem::outer_paren_depth`]'s doc).
+fn apply_paren_call_delta(line: &str, depth: &mut i32) {
+    if *depth <= 0 {
+        return;
+    }
+    let code = deps_core::quote_scan::CodeSpans::new(line, deps_core::quote_scan::ScanSyntax::Ruby);
+    for (idx, ch) in line.char_indices() {
+        if !code.is_code_byte(idx) {
+            continue;
+        }
+        match ch {
+            '(' => *depth += 1,
+            ')' => {
+                *depth -= 1;
+                if *depth <= 0 {
+                    return;
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Hard cap on how many physical lines a single [`PendingGem`] may accumulate before being
@@ -472,7 +604,7 @@ fn strip_trailing_comment(line: &str) -> &str {
 /// disagreed on when a call was "still open". A stack instead of a signed counter means an
 /// unmatched closer can never leave a negative balance (critic finding M1) and lets callers
 /// recover the *kind* of the innermost still-open literal via `stack.last()`, not just whether one
-/// is open (needed by [`bracket_only_should_stop`]). Callers pass an already comment-stripped line
+/// is open (needed by [`continuation_should_stop`]). Callers pass an already comment-stripped line
 /// (via [`strip_trailing_comment`]) so a bracket inside a trailing comment is never counted —
 /// though `CodeSpans` would also exclude one on its own.
 ///
@@ -484,7 +616,7 @@ fn strip_trailing_comment(line: &str) -> &str {
 /// function's doc). Popping unconditionally can only make this stack's length shrink faster than,
 /// never slower than, `bracket_depths`' own depth, so this stack's length is always ≤
 /// `bracket_depths`' computed depth at every position in the joined text. Consequently, whenever
-/// [`bracket_only_should_stop`] sees this stack non-empty (an open `(`, which it never content-gates
+/// [`continuation_should_stop`] sees this stack non-empty (an open `(`, which it never content-gates
 /// for that kind) and lets a line be absorbed, `bracket_depths` at that same position is guaranteed
 /// to be either poisoned or strictly greater than 0 — so [`OptionScan`]'s depth-0 match gate still
 /// rejects any `source:`/`git:`/`path:`/`group:` text absorbed while a `(` continuation is open,
@@ -506,72 +638,127 @@ fn apply_bracket_delta(line: &str, stack: &mut Vec<char>) {
 }
 
 /// True when a comment-stripped, trimmed, non-empty line looks like array/hash literal element
-/// content for the innermost currently-open bracket `current_kind` (`Some('[')`/`Some('{')`) — a
-/// bare symbol (`:mri`), a quoted string, a closing `]`/`}`, or a leading `,` (all valid inside
-/// either kind), or, *only* while `current_kind` is `Some('{')`, a recognized per-gem option key
-/// anchored at the start of the line ([`ANY_OPTION_KEY`], e.g. `source: "..."` — plausible
-/// content for a hash literal like `gem "x", { source: "..." }`, but never for an array element:
-/// `[source: "..."]` isn't valid Ruby array content). Used only to decide whether such a line may
-/// be absorbed into a still bracket-open [`PendingGem`] (see [`bracket_only_should_stop`]).
+/// content for the innermost currently-open *nested* bracket `current_kind`
+/// (`Some('[')`/`Some('{')`; never `Some('(')`, which [`continuation_should_stop`] handles itself
+/// — see its doc), or for a *bracket-free* continuation held open by a trailing comma alone
+/// (`current_kind: None`) — a bare symbol (`:mri`), a quoted string, or a leading `,` (valid in
+/// any of these positions); a closing `]` only when `current_kind` is `Some('[')` and a closing
+/// `}` only when it is `Some('{')` (#1039 critic finding M2 — with nothing open at all, a leading
+/// `]`/`}` has nothing to close and is not legitimate content, just a stray closer that should be
+/// treated as a boundary, not silently absorbed and left for [`bracket_depths`] to poison
+/// retroactively); a closing `)` only when `current_kind` is `None` *and* `is_paren_call` — the
+/// outer call's own closer, tracked separately from `current_kind` (see
+/// [`continuation_should_stop`]'s doc for why nested and outer parens must not share one signal);
+/// or, whenever `current_kind` is not `Some('[')`, a bare hash-key-shaped line
+/// ([`looks_like_generic_option_key`], e.g. `source: "..."` — plausible content for a hash
+/// literal like `gem "x", { source: "..." }` or for a bare comma-continued call like `gem "x",\n
+/// source: "..."`, but never for an array element: `[source: "..."]` isn't valid Ruby array
+/// content). Used to decide whether such a line may be absorbed into a still-open [`PendingGem`]
+/// (see [`continuation_should_stop`]).
 ///
-/// Not called at all when `current_kind` is `Some('(')` — see [`bracket_only_should_stop`], which
-/// skips this content-shape check entirely for a paren-open continuation, since a method call's
-/// argument list can contain arbitrary Ruby expressions with no fixed shape to allowlist.
+/// Not called at all when `current_kind` is `Some('(')` (a genuinely *nested*, still-open method
+/// call within the argument list, e.g. `install_if: SomeCheck(`) — see
+/// [`continuation_should_stop`], which skips this content-shape check entirely for that case,
+/// since a method call's argument list can contain arbitrary Ruby expressions with no fixed shape
+/// to allowlist.
 ///
 /// Gating the option-key branch on bracket kind matters (correctness-gate re-check after critic
-/// findings S2/S2b): an anchored option-key match alone is indistinguishable from a genuinely new
-/// top-level declaration when the open bracket is `[` — `gem "x", platforms: [` followed by a
-/// bare `source: "https://evil.example.com"` line must NOT adopt that `source:` merely because it
-/// is anchored-option-key-shaped, since array element content can never look like that. Also
-/// anchoring the check at position 0 (critic finding S2b): `ANY_OPTION_KEY` also matches `git:`
-/// *inside* `Bundler.require(git: "...")` as a substring, so an unanchored check would still let
-/// that unrelated statement through.
-fn looks_like_option_or_array_content(stripped: &str, current_kind: Option<char>) -> bool {
-    let array_element_shaped = stripped.starts_with(':')
+/// findings S2/S2b): a key-shaped match alone is indistinguishable from a genuinely new top-level
+/// declaration when the open bracket is `[` — `gem "x", platforms: [` followed by a bare `source:
+/// "https://evil.example.com"` line must NOT adopt that `source:` merely because it is
+/// key-shaped, since array element content can never look like that. Also anchoring the check at
+/// position 0 (critic finding S2b): a bare key match also matches `git:` *inside*
+/// `Bundler.require(git: "...")` as a substring, so an unanchored check would still let that
+/// unrelated statement through.
+fn looks_like_option_or_array_content(
+    stripped: &str,
+    current_kind: Option<char>,
+    is_paren_call: bool,
+) -> bool {
+    let closer_shaped = (current_kind == Some('[') && stripped.starts_with(']'))
+        || (current_kind == Some('{') && stripped.starts_with('}'))
+        || (current_kind.is_none() && is_paren_call && stripped.starts_with(')'));
+    let value_shaped = stripped.starts_with(':')
         || stripped.starts_with('\'')
         || stripped.starts_with('"')
-        || stripped.starts_with(']')
-        || stripped.starts_with('}')
         || stripped.starts_with(',');
-    array_element_shaped
-        || (current_kind == Some('{')
-            && ANY_OPTION_KEY
-                .find(stripped)
-                .is_some_and(|m| m.start() == 0))
+    closer_shaped
+        || value_shaped
+        || (current_kind != Some('[') && looks_like_generic_option_key(stripped))
 }
 
-/// True when `line` must not be absorbed into a [`PendingGem`] that is currently open *only*
-/// because of an unclosed bracket/brace literal (no trailing comma or backslash signal) —
-/// because it doesn't look like array/hash literal element content for `current_kind`, the
-/// innermost currently-open bracket (critic findings S2/S2b/correctness-gate re-check for
-/// #1017). Allowlisting the shapes Ruby's array/hash grammar actually produces for the bracket
-/// kind actually open, rather than blocklisting unrelated-statement shapes or allowlisting by
-/// shape alone, is the conservative direction: a blocklist is open-ended and was still
-/// bypassable (e.g. `x = { source: "..." }` isn't `identifier(`-shaped but still leaks a fake
-/// `source:`), and a kind-blind allowlist let an anchored `source:`/`git:`-shaped line through
-/// even while the open bracket was an array (`[`), where such a line can never be legitimate
-/// content.
+/// True when `line` must not be absorbed into a still-open [`PendingGem`] — because it doesn't
+/// look like continuation content for `current_kind`, the innermost currently-open *nested*
+/// bracket, or (`current_kind: None`) for a continuation held open by a trailing comma or an
+/// still-open outer paren call, with no nested bracket involved at all. Allowlisting the shapes
+/// Ruby's grammar actually produces for the position actually open, rather than blocklisting
+/// unrelated-statement shapes or allowlisting by shape alone, is the conservative direction: a
+/// blocklist is open-ended and was still bypassable (e.g. `x = { source: "..." }` isn't
+/// `identifier(`-shaped but still leaks a fake `source:`), and a kind-blind allowlist let an
+/// anchored `source:`/`git:`-shaped line through even while the open bracket was an array (`[`),
+/// where such a line can never be legitimate content.
+///
+/// `current_kind` and `is_paren_call` are deliberately independent parameters, never conflated
+/// into one signal (#1039 critic findings A/B, correctness-gate re-check — the root cause both
+/// trace back to): `current_kind` answers "what *nested* `[`/`{`/`(` literal, if any, is
+/// currently open within the argument list" (from [`PendingGem::bracket_stack`], which only ever
+/// tracks brackets literally present in the accumulated text); `is_paren_call` separately answers
+/// "did the call itself open with `gem(...)`, so it still needs its own closing `)` somewhere,
+/// regardless of what nested literals come and go". An earlier version of this fix folded the
+/// second question into the first by seeding `bracket_stack` with the call's own opening `(` —
+/// which broke *both* of this function's other consumers of `current_kind == Some('(')`: the
+/// early-return below (meant only for a genuinely nested, still-open method call) started
+/// exempting *every* line of every paren call from the shape check (finding A, reopening the
+/// vector-3 leak class specifically for `gem(...)` calls), and the segment-cap tier selection in
+/// [`parse_gemfile`] (meant to distinguish "no explicit continuation signal" from "an explicit
+/// one") always picked the smaller cap for every paren call regardless of its real length,
+/// force-finalizing long-but-valid calls before their own closer was ever reached (finding B).
+/// Keeping the two questions separate — `current_kind` untouched, `is_paren_call` threaded through
+/// as its own parameter purely to recognize a bare `)`-leading closer line in
+/// [`looks_like_option_or_array_content`] (the *outer*-call-closer symmetric counterpart of M2's
+/// *nested*-bracket-closer rule) — fixes both without reintroducing either.
+///
+/// Applying the `current_kind: None` branch (comma continuation) closes the #1039 vector-3
+/// comma-continuation class itself: before that fix, a [`PendingGem`] held open *purely* by a
+/// trailing comma (no bracket ever opened) absorbed the next physical line unconditionally,
+/// regardless of shape — e.g. `gem "x", "~> 1.0",` followed by an unrelated `x = source: "evil"`
+/// assignment statement, which doesn't independently match [`starts_new_top_level_construct`]
+/// either, was silently pulled into the call's argument text and its `source:` misread as a
+/// direct option. `None` is treated the same as `Some('{')` in
+/// [`looks_like_option_or_array_content`] (a bare option key is plausible content for either), so
+/// this correctly still allows the common `gem "x",\n  source: "..."` continuation shape while
+/// rejecting an assignment or other non-continuation statement — including inside a paren call
+/// (`current_kind` is `None` there too whenever no nested literal is currently open), since
+/// `is_paren_call` only ever adds the narrow `)`-leading-closer allowance, nothing broader.
 ///
 /// A blank/comment-only line is deliberately *not* a boundary on its own (critic finding S2a):
 /// it carries no statement content, so it can't be the unrelated line this guard exists to
-/// catch, and [`MAX_BRACKET_ONLY_CONTINUATION_SEGMENTS`] already bounds a run of them — this
-/// also keeps parity with the comma-continued path, which already tolerates blank lines between
-/// continuation options.
+/// catch, and [`MAX_BRACKET_ONLY_CONTINUATION_SEGMENTS`]/[`MAX_PENDING_GEM_SEGMENTS`] already
+/// bound a run of them.
 ///
 /// When `current_kind` is `Some('(')` this always returns `false` — never a boundary
 /// (correctness-gate finding F1): the array/hash allowlist in
-/// [`looks_like_option_or_array_content`] doesn't apply to a method call's argument list, which
-/// can contain arbitrary Ruby expressions (`install_if: SomeCheck(\n  ENV["X"]\n), source:
-/// "..."` — `ENV["X"]` is legitimate paren-call content but isn't array/hash-element-shaped).
-/// Trusting the depth signal alone here matches the comma-continuation path, which never
-/// validates content shape either; [`MAX_BRACKET_ONLY_CONTINUATION_SEGMENTS`] still bounds how
-/// long an unclosed `(` can keep absorbing lines.
-fn bracket_only_should_stop(line: &str, current_kind: Option<char>) -> bool {
+/// [`looks_like_option_or_array_content`] doesn't apply to a *nested* method call's argument
+/// list, which can contain arbitrary Ruby expressions (`install_if: SomeCheck(\n  ENV["X"]\n),
+/// source: "..."` — `ENV["X"]` is legitimate paren-call content but isn't array/hash-element-
+/// shaped). Trusting the continuation signal alone here (as the bracket-free comma path did
+/// before the vector-3 fix) matches that a method call's argument list has no fixed shape to
+/// allowlist. [`MAX_BRACKET_ONLY_CONTINUATION_SEGMENTS`] bounds how long an unclosed nested `(`
+/// can keep absorbing lines *only* when `is_paren_call` is `false` — for a paren call, the
+/// segment-cap tier in [`parse_gemfile`] always picks the larger [`MAX_PENDING_GEM_SEGMENTS`]
+/// instead, even while a nested `(` is also open, since the call itself needing its own outer
+/// closer is already an explicit signal (#1039 perf/doc finding p2: this widens `extract_version`'s
+/// already-documented phantom-version exposure window for that specific combination — see its doc
+/// — but not `source`, which stays gated via `OptionScan` regardless of either cap). This is
+/// otherwise unrelated to `is_paren_call`/the *outer* call's own parens — see this function's main
+/// doc above.
+fn continuation_should_stop(line: &str, current_kind: Option<char>, is_paren_call: bool) -> bool {
     if current_kind == Some('(') {
         return false;
     }
     let stripped = strip_trailing_comment(line).trim();
-    !stripped.is_empty() && !looks_like_option_or_array_content(stripped, current_kind)
+    !stripped.is_empty()
+        && !looks_like_option_or_array_content(stripped, current_kind, is_paren_call)
 }
 
 /// True when a comment-stripped, trimmed line ends with one of Ruby's two implicit
@@ -650,7 +837,7 @@ fn finalize_pending_gem(
     );
     let lines: Vec<&str> = stripped_segments.iter().map(|(text, _)| *text).collect();
     let joined = joined_lines(&lines);
-    let scan = OptionScan::new(&joined);
+    let scan = OptionScan::new(&joined, pending.is_paren_call);
     let group =
         extract_group(&scan).unwrap_or_else(|| block_group.unwrap_or(DependencyGroup::Default));
     let source = extract_source(&scan, gemfile_source_url, block_source_url);
@@ -698,14 +885,19 @@ pub fn parse_gemfile(content: &str, doc_uri: &Uri) -> Result<BundlerParseResult>
         // before every other line-level pattern below, since its content usually belongs to
         // the `gem` call's argument list, not to a new top-level construct.
         if let Some(pending) = pending_gem.take() {
-            // #1017 follow-up (critic findings S2/S2b): while an array/hash literal opened by
-            // this call is still unclosed, a line that doesn't look like content for the
-            // innermost open bracket's *kind* must not be silently absorbed either — an unclosed
-            // bracket is a routine transient mid-edit state, not license to swallow everything up
-            // to the next recognized top-level construct or the segment cap.
-            let bracket_only_boundary = !pending.bracket_stack.is_empty()
-                && bracket_only_should_stop(line, pending.bracket_stack.last().copied());
-            if starts_new_top_level_construct(line) || bracket_only_boundary {
+            // #1017 follow-up (critic findings S2/S2b) and #1039 (generalized to the
+            // bracket-free, comma-only continuation too): a line that doesn't look like content
+            // for the innermost open bracket's *kind* — or, with none open, for a bare
+            // comma-continued argument list — must not be silently absorbed. An unclosed bracket
+            // is a routine transient mid-edit state, and a trailing comma alone carries no
+            // structural signal either, so neither is license to swallow everything up to the
+            // next recognized top-level construct or the segment cap.
+            let continuation_boundary = continuation_should_stop(
+                line,
+                pending.bracket_stack.last().copied(),
+                pending.is_paren_call,
+            );
+            if starts_new_top_level_construct(line) || continuation_boundary {
                 // This line is not actually part of the pending call's argument list — it
                 // independently opens/closes/declares something else (a new `gem`, a block
                 // opener/closer, `source`, `ruby`, ...). Finalize the pending gem from what
@@ -726,16 +918,36 @@ pub fn parse_gemfile(content: &str, doc_uri: &Uri) -> Result<BundlerParseResult>
             } else {
                 let mut pending = pending;
                 apply_bracket_delta(strip_trailing_comment(line), &mut pending.bracket_stack);
+                if pending.is_paren_call {
+                    apply_paren_call_delta(
+                        strip_trailing_comment(line),
+                        &mut pending.outer_paren_depth,
+                    );
+                }
                 pending.segments.push((line, line_start));
-                // A call relying solely on bracket depth to stay open (no trailing comma or
-                // backslash signal) is capped far below the general limit (critic finding S2).
-                let segment_cap = if pending.bracket_stack.is_empty() {
+                // A call relying solely on nested-bracket depth to stay open (no trailing comma
+                // or backslash signal) is capped far below the general limit (critic finding S2).
+                // An `is_paren_call` (#1039 critic findings A/B follow-up) always gets the general
+                // limit instead, even while `bracket_stack` happens to be empty — the call itself
+                // needing its own closing `)` is exactly the kind of explicit, unambiguous
+                // continuation signal this smaller cap was meant to exclude, not the "no signal at
+                // all but for a stray unclosed literal" case it actually guards against. This also
+                // widens the exposure `extract_version`'s doc already documents as a known,
+                // bounded, low-severity limitation (#1039 perf/doc finding p2) — see its doc.
+                let segment_cap = if pending.is_paren_call || pending.bracket_stack.is_empty() {
                     MAX_PENDING_GEM_SEGMENTS
                 } else {
                     MAX_BRACKET_ONLY_CONTINUATION_SEGMENTS
                 };
+                // An `is_paren_call` call must also keep accumulating while its own closing `)`
+                // hasn't been seen yet, independent of `bracket_stack` (which never represents the
+                // outer call's own parens — see `looks_like_option_or_array_content`'s doc for why
+                // that must stay a separate signal, #1039 critic findings A/B follow-up).
+                // `outer_paren_depth` is updated incrementally above (`apply_paren_call_delta`)
+                // rather than recomputed from scratch here (#1039 perf finding p1).
                 let still_open = (continues_gem_declaration(line)
-                    || !pending.bracket_stack.is_empty())
+                    || !pending.bracket_stack.is_empty()
+                    || (pending.is_paren_call && pending.outer_paren_depth > 0))
                     && pending.segments.len() < segment_cap;
                 if still_open {
                     pending_gem = Some(pending);
@@ -850,15 +1062,37 @@ pub fn parse_gemfile(content: &str, doc_uri: &Uri) -> Result<BundlerParseResult>
             // option on its own line (#991), or an array/hash literal opened but not yet closed
             // on this line, e.g. `gem "x", platforms: [` (#1017) — accumulate rather than
             // resolve now.
+            //
+            // `bracket_stack` tracks only *nested* `[`/`{`/`(` literals that literally appear in
+            // the accumulated text — never the paren call's own opening `(`, which sits *before*
+            // the captured name and is never part of `rest_of_line`/`stripped_rest` to begin with
+            // (#1039 critic findings A/B, correctness-gate re-check): an earlier version of this
+            // fix seeded the call's own `(` onto this same stack, but `bracket_stack` already has
+            // two other, narrower meanings elsewhere — `continuation_should_stop`'s
+            // `current_kind == Some('(')` early-return (trusting arbitrary content inside a
+            // *nested* unclosed call) and the segment-cap tier selection (distinguishing "no
+            // explicit continuation signal but for a nested literal" from "an explicit signal") —
+            // and entangling the outer call's state with either broke it: the early-return started
+            // exempting *every* line of a paren call from the vector-3 shape check (finding A), and
+            // the cap tier always picked the smaller one for every paren call regardless of length
+            // (finding B). Tracking whether the *outer* call's own closer has been seen is instead
+            // `outer_paren_depth`'s job, consulted directly in `still_open` below, and
+            // `continuation_should_stop` gets `is_paren_call` as its own, separate parameter for
+            // recognizing a bare `)`-leading closer line — see both functions' docs.
             let mut opening_bracket_stack: Vec<char> = Vec::new();
             apply_bracket_delta(stripped_rest, &mut opening_bracket_stack);
             if ends_with_trailing_comma(rest_of_line) || !opening_bracket_stack.is_empty() {
+                let mut outer_paren_depth = i32::from(is_paren_call);
+                if is_paren_call {
+                    apply_paren_call_delta(stripped_rest, &mut outer_paren_depth);
+                }
                 pending_gem = Some(PendingGem {
                     name,
                     name_range,
                     segments: vec![(rest_of_line, rest_offset)],
                     bracket_stack: opening_bracket_stack,
                     is_paren_call,
+                    outer_paren_depth,
                 });
                 continue;
             }
@@ -872,7 +1106,7 @@ pub fn parse_gemfile(content: &str, doc_uri: &Uri) -> Result<BundlerParseResult>
             );
 
             // Extract group from inline option or current block
-            let scan = OptionScan::new(stripped_rest);
+            let scan = OptionScan::new(stripped_rest, is_paren_call);
             let group = extract_group(&scan)
                 .unwrap_or_else(|| current_group(&group_stack).unwrap_or(DependencyGroup::Default));
 
@@ -963,13 +1197,23 @@ pub fn parse_gemfile(content: &str, doc_uri: &Uri) -> Result<BundlerParseResult>
 /// `extract_platforms`/`extract_require`, this function has no [`bracket_depths`] gating, since it
 /// runs per raw physical segment rather than over `finalize_pending_gem`'s joined text. A line
 /// absorbed into a still-open [`PendingGem`] purely because of an unclosed `(` (see
-/// [`bracket_only_should_stop`]'s F1 relaxation) can therefore still supply a phantom version —
+/// [`continuation_should_stop`]'s F1 relaxation) can therefore still supply a phantom version —
 /// e.g. `gem "sidekiq-pro", tags: Check(` followed by `RAILS = "7.0.4"` yields
 /// `version_req: Some("7.0.4")`. The blast radius is a wrong outdated/unsatisfiable diagnostic
 /// while the file sits in that transient unclosed-paren state, not a source misclassification (the
 /// leak class this module exists to close): `extract_source` and friends stay correctly gated via
 /// `OptionScan`'s depth-0 check regardless. A `{`-kind absorption doesn't share this exposure,
-/// since [`bracket_only_should_stop`] still content-gates it.
+/// since [`continuation_should_stop`] still content-gates it.
+///
+/// **Exposure window widened for a paren call (#1039 perf/doc finding p2, side effect of the
+/// finding-B fix, not a new leak):** [`MAX_BRACKET_ONLY_CONTINUATION_SEGMENTS`] (20) no longer
+/// bounds this for `is_paren_call` — the segment cap unconditionally picks the general
+/// [`MAX_PENDING_GEM_SEGMENTS`] (256) whenever `is_paren_call`, even while a *nested* unclosed `(`
+/// (e.g. `gem("x", tags: Check(` never closed) also has `bracket_stack` non-empty, since the call
+/// itself needing its own outer closer is already an explicit, unambiguous continuation signal
+/// (see the segment-cap comment in [`parse_gemfile`]). This widens the above phantom-version
+/// window from 20 to 256 physical lines for the paren-call case specifically (12.8x) — still
+/// bounded, not unbounded, and still confined to `version_req`, never `source`.
 ///
 /// **Known limitation (correctness-gate M3, documented rather than fixed — safe direction, false
 /// negative not false positive, and rare):** [`NESTED_CALL_OPEN`] truncates before *every* nested
@@ -1083,34 +1327,36 @@ fn joined_lines(lines: &[&str]) -> String {
 /// option key) genuinely at depth 0 in syntactically valid text is correctly a direct keyword
 /// argument of the `gem` call, and one genuinely nested is correctly rejected. It is best-effort
 /// and fail-closed, not exhaustive, against text containing *invalid* Ruby: depth is a proxy for
-/// real structure, which is undefined once the text isn't structurally valid to begin with. An
-/// odd quote run can still hide a bracket from `code`, a balanced inner pair (`({})`) can still
-/// restore an empty stack ahead of a later excess closer, and the comma-continuation path (kept
-/// open by a trailing comma alone, no bracket involved) is untouched by any of this. Closing
-/// those requires a real bracket/string-aware scanner, tracked as its own follow-up
-/// (bug-ops/deps-lsp#1039, sibling scope to #1022) rather than further pattern-matching here —
-/// every such vector requires the Gemfile to already contain invalid Ruby, so it grants no
-/// capability beyond what a valid `source: "evil"` already would.
+/// real structure, which is undefined once the text isn't structurally valid to begin with. Every
+/// such vector requires the Gemfile to already contain invalid Ruby, so closing it grants no
+/// capability beyond what a valid `source: "evil"` already would — this is defense-in-depth
+/// (bug-ops/deps-lsp#1039).
 ///
 /// A closer that doesn't match the innermost currently-open bracket — either the *type* is
 /// wrong (e.g. a stray `]` while only a `{` is open) or there's nothing open at all — makes the
-/// text structurally broken from that point on: **fail-closed poisoning** (critic finding, 8th
-/// vector / correctness-gate re-check round 5) marks every later position untrusted (a sentinel
-/// depth that can never compare equal to 0) rather than the earlier `.max(0)` clamp, which let
-/// such a stray closer silently reset nesting to 0 and made everything after it read as a direct
-/// depth-0 keyword argument again — the same malformed/mid-edit class (a file mid-edit is an
-/// LSP's normal operating condition, not a rare adversarial-only shape) the team already ruled
-/// unacceptable for the original S2.
+/// text structurally broken **from the very start**, not just from that point on: **fail-closed,
+/// retroactive poisoning** (#1039 follow-up to the critic finding / correctness-gate re-check
+/// round 5 that introduced prospective-only poisoning) marks *every* position — including ones
+/// before the anomaly — untrusted (a sentinel depth that can never compare equal to 0) once any
+/// such closer is found anywhere in `text`. Prospective-only poisoning left a residual leak: a
+/// balanced inner pair can legitimately empty the stack again before a *later* excess closer
+/// (e.g. `install_if: { a: ({}) } , source: "evil" }`), so a `source:` sitting textually before
+/// that later excess closer still read as a trusted depth-0 match despite the text as a whole
+/// being just as structurally broken. Retroactive poisoning treats the whole text as untrusted
+/// the moment *any* stray/mismatched closer is found, regardless of where.
 ///
 /// A *matched* closer (type and nesting both correct) behaves normally — pops the stack, depth
 /// decreases — so a real `platforms: [ :mri ], source: "..."` still resolves `source:` at depth
 /// 0 after the array legitimately closes; only a genuinely mismatched or excess closer poisons.
 ///
-/// The gem call's own trailing `)` surviving into the joined text for a parenthesized call is
-/// itself such an unmatched closer (its opening `(` sits before the captured name and is
-/// excluded from `text`), but it always comes *after* all the options, so poisoning starting
-/// there has no effect on anything already matched — verified for both single- and multi-line
-/// paren calls.
+/// The gem call's own trailing `)` surviving into the joined text for a parenthesized call would
+/// itself be such an unmatched closer (its opening `(` sits before the captured name and is
+/// excluded from `text`) — retroactive poisoning would otherwise blind *every* option in every
+/// parenthesized `gem(...)` call, since this trailing closer is present on every one of them.
+/// Callers avoid this by stripping it before calling this function (see
+/// [`find_paren_call_closer`], applied in [`OptionScan::new`]) rather than this function special-
+/// casing "the last closer of the text", so a genuine excess closer that happens to also be the
+/// last character (a real anomaly, not the call's own paren) still poisons correctly.
 ///
 /// Scanning the *joined* text in one continuous pass — rather than per original physical line —
 /// also closes the #1017/#3 per-line reset gap for this specific sink: a string literal that
@@ -1171,7 +1417,56 @@ fn bracket_depths(text: &str, code: &deps_core::quote_scan::CodeSpans<'_>) -> Ve
             i32::try_from(stack.len()).unwrap_or(i32::MAX)
         };
     }
+    // Retroactive poisoning (#1039): a stray/mismatched closer anywhere in `text` invalidates
+    // every position, not just the ones from that point on — see this function's doc.
+    if poisoned {
+        depths.fill(i32::MAX);
+    }
     depths
+}
+
+/// Finds the byte offset of a parenthesized `gem(...)` call's own closing `)` within `text` —
+/// the position [`OptionScan::new`] must truncate at before [`bracket_depths`] runs, so that
+/// always-present, always-benign closer isn't mistaken for the kind of excess closer that now
+/// (#1039) poisons the *entire* text. `text` is the post-name option portion of the call (the
+/// opening `(` sits before the captured name and was never part of `text` to begin with), so
+/// this closer is the first code-positioned `)` that would close beyond anything `text` itself
+/// opened — tracked with a `(`/`)`-only virtual depth counter, deliberately ignoring `[`/`{`
+/// (which never affect where *this* call's own paren balance point falls, and a `[`/`{` anomaly
+/// is [`bracket_depths`]'s concern on the truncated text, not this function's).
+///
+/// #1039 critic finding C2: a prior version of this function only checked whether `)` was the
+/// very last non-whitespace byte of `text`, so a trailing statement modifier after the call
+/// (`gem("x", source: "...") if COND`) left the call's own benign closer sitting later than
+/// expected — undetected, so retroactive poisoning then blinded every option in the call.
+/// Scanning for the actual paren-balance point finds it regardless of what (if anything) follows.
+///
+/// Returns `None` if `text` never reaches that point — e.g. a still-accumulating multi-line paren
+/// call that hasn't reached its closing paren yet, or content the parser otherwise force-closed
+/// before the call's own `)` was ever typed. [`OptionScan::new`] treats that as a fail-closed
+/// poisoning trigger (critic finding M1) rather than silently scanning `text` as if it were
+/// already complete.
+fn find_paren_call_closer(
+    text: &str,
+    code: &deps_core::quote_scan::CodeSpans<'_>,
+) -> Option<usize> {
+    let mut depth: i32 = 0;
+    for (idx, ch) in text.char_indices() {
+        if !code.is_code_byte(idx) {
+            continue;
+        }
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                if depth == 0 {
+                    return Some(idx);
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Precomputed, shared classification of a (possibly multi-line, already [`joined_lines`])
@@ -1192,7 +1487,39 @@ struct OptionScan<'a> {
 }
 
 impl<'a> OptionScan<'a> {
-    fn new(text: &'a str) -> Self {
+    /// `is_paren_call` must match the `gem` call's own opening form (see [`PendingGem`]'s field
+    /// of the same name) — it gates [`find_paren_call_closer`], which must only ever locate a
+    /// closing `)` that is genuinely the call's own, never an unrelated trailing paren on a bare
+    /// `gem ...` call (where a trailing `)` is a real anomaly, not this benign case).
+    ///
+    /// For a paren call, `text` is truncated right before that closing `)` — dropping it and
+    /// anything after (a trailing statement modifier, `if COND`/`unless COND`, is never part of
+    /// the call's own argument list). If `text` never reaches its own closing `)` at all (critic
+    /// finding M1 — e.g. a still-accumulating multi-line call the parser force-closed early),
+    /// that is itself untrustworthy: fail-closed by poisoning every position, rather than
+    /// silently scanning `text` as if the call were already known-complete.
+    fn new(text: &'a str, is_paren_call: bool) -> Self {
+        if is_paren_call {
+            let probe = deps_core::quote_scan::CodeSpans::new(
+                text,
+                deps_core::quote_scan::ScanSyntax::Ruby,
+            );
+            if let Some(closer) = find_paren_call_closer(text, &probe) {
+                let text = text.get(..closer).unwrap_or(text);
+                let code = deps_core::quote_scan::CodeSpans::new(
+                    text,
+                    deps_core::quote_scan::ScanSyntax::Ruby,
+                );
+                let depths = bracket_depths(text, &code);
+                return Self { text, code, depths };
+            }
+            let depths = vec![i32::MAX; text.len() + 1];
+            return Self {
+                text,
+                code: probe,
+                depths,
+            };
+        }
         let code =
             deps_core::quote_scan::CodeSpans::new(text, deps_core::quote_scan::ScanSyntax::Ruby);
         let depths = bracket_depths(text, &code);
@@ -3891,5 +4218,376 @@ gem "innocent-gem", install_if: { a: } , source: "https://evil.example.com" }"#;
             }
             other => panic!("expected CustomRegistry, got {other:?}"),
         }
+    }
+
+    /// Regression (#1039, vector 1 — odd quote run): the exact snippet from the issue.
+    /// Live-verified this already didn't leak even before this fix — the odd quote run happens
+    /// to swallow `source:` itself into the same string span that hides the `{`, so the existing
+    /// `CodeSpans` quote-awareness already rejects it as a decoy (non-code) match. This particular
+    /// snippet's safety is incidental, not a general closure of the class — see
+    /// [`test_1039_char_literal_quote_does_not_leak_nested_source`] below for the actual general
+    /// fix (critic finding S1: this snippet alone does not prove the class is closed).
+    #[test]
+    fn test_1039_odd_quote_run_does_not_leak_nested_source() {
+        let gemfile = "source 'https://rubygems.org'\ngem \"g\", require: \"a\" + \"b, install_if: { source: \"evil\" }\"";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].source, DependencySource::Registry);
+    }
+
+    /// Regression (#1039, vector 1 — general closure): critic finding S1's exact PoC. A `?"`
+    /// one-character literal (not a string) hides the matching `}` from the naive quote-toggling
+    /// scan, so `source:` — genuinely nested inside `install_if`'s hash per real Ruby (`ruby -c`
+    /// confirmed, dumped kwargs show `source:` inside `install_if`, not top-level) — used to read
+    /// as a trusted depth-0 match. Fixed in `deps_core::quote_scan` (`is_char_literal_quote`), not
+    /// here, since the root cause is the shared Ruby scanner not knowing about `?x` literals.
+    #[test]
+    fn test_1039_char_literal_quote_does_not_leak_nested_source() {
+        let gemfile = "source 'https://rubygems.org'\ngem \"g\", a: ?\", install_if: { b: ?\", source: \"https://evil.example.com\", c: ?\" }";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].source, DependencySource::Registry);
+    }
+
+    /// Regression (#1039, vector 2 — balanced inner pair before an excess closer): a fully
+    /// balanced `install_if: { a: ({}) }` legitimately empties the bracket stack, so `source:`
+    /// right after it type-checked as a trusted depth-0 match under prospective-only poisoning —
+    /// even though the line's later, genuinely unmatched trailing `}` proves the whole statement
+    /// is structurally broken. Retroactive poisoning (this fix) invalidates the entire text once
+    /// any such anomaly is found anywhere, not just from that point forward.
+    #[test]
+    fn test_1039_balanced_inner_pair_excess_closer_does_not_leak_source() {
+        let gemfile = "source 'https://rubygems.org'\ngem \"g\", install_if: { a: ({}) } , source: \"https://evil.example.com\" }";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].source, DependencySource::Registry);
+    }
+
+    /// Regression (#1039, vector 3 — bracket-independent comma continuation): a [`PendingGem`]
+    /// held open purely by a trailing comma (no bracket ever opened) previously absorbed the next
+    /// physical line unconditionally, even when that line is an unrelated statement
+    /// (`x = source: "..."`, an assignment, not a continuation of the call's argument list) —
+    /// [`continuation_should_stop`] now gates the comma-only continuation path the same way it
+    /// already gated the bracket-open one.
+    #[test]
+    fn test_1039_comma_continuation_unrelated_statement_does_not_leak_source() {
+        let gemfile = "source 'https://rubygems.org'\ngem \"g\", \"~> 1.0\",\nx = source: \"https://evil.example.com\"";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "g");
+        assert_eq!(result.dependencies[0].version_req, Some("~> 1.0".into()));
+        assert_eq!(result.dependencies[0].source, DependencySource::Registry);
+    }
+
+    /// Regression (#1039): a parenthesized `gem(...)` call's own trailing `)` must not itself
+    /// trigger retroactive poisoning — [`find_paren_call_closer`] strips it before
+    /// [`bracket_depths`] runs, so a legitimate `source:` option in a well-formed paren call is
+    /// still correctly resolved.
+    #[test]
+    fn test_1039_paren_call_trailing_close_not_treated_as_excess_closer() {
+        let gemfile = "gem(\"private_gem\", source: \"https://gems.corp\")";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        match &result.dependencies[0].source {
+            DependencySource::CustomRegistry { url } => assert_eq!(url, "https://gems.corp"),
+            other => panic!("expected CustomRegistry, got {other:?}"),
+        }
+    }
+
+    /// Regression (#1039): a genuine excess closer *inside* a parenthesized call — distinct from
+    /// the call's own benign trailing `)`, which [`find_paren_call_closer`] already strips —
+    /// still triggers retroactive poisoning.
+    #[test]
+    fn test_1039_paren_call_genuine_excess_closer_still_poisons() {
+        let gemfile = "source 'https://rubygems.org'\ngem(\"g\", install_if: { a: ({}) } , source: \"https://evil.example.com\" })";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].source, DependencySource::Registry);
+    }
+
+    /// Regression (#1039 critic finding C1): a comma-continuation preceded by a legitimate but
+    /// uncommon Bundler option key not in [`ANY_OPTION_KEY`]'s 8-key list (`branch:`) must not
+    /// terminate the continuation before the actual source-bearing `git:` line is reached — the
+    /// exact repro from the critic, reachable on a fully well-formed Gemfile with no malformed
+    /// Ruby at all.
+    #[test]
+    fn test_1039_branch_continuation_before_git_still_resolves_source() {
+        let gemfile = "source 'https://rubygems.org'\ngem \"foo\",\n  branch: \"main\",\n  git: \"https://git.corp/foo.git\"";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        match &result.dependencies[0].source {
+            DependencySource::Git { url, .. } => assert_eq!(url, "https://git.corp/foo.git"),
+            other => panic!("expected Git, got {other:?}"),
+        }
+    }
+
+    /// Regression (#1039 critic finding C1), a second key not in the 8-key list
+    /// (`force_ruby_platform:`) before `source:`.
+    #[test]
+    fn test_1039_force_ruby_platform_continuation_before_source_still_resolves() {
+        let gemfile = "gem \"sidekiq-pro\", \"~> 5.0\",\n  force_ruby_platform: true,\n  source: \"https://gems.contribsys.com\"";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        match &result.dependencies[0].source {
+            DependencySource::CustomRegistry { url } => {
+                assert_eq!(url, "https://gems.contribsys.com");
+            }
+            other => panic!("expected CustomRegistry, got {other:?}"),
+        }
+    }
+
+    /// Regression (#1039 critic finding C2): a trailing `if` statement modifier after a
+    /// parenthesized call's closing `)` must not prevent [`find_paren_call_closer`] from locating
+    /// that closer — the exact repro from the critic.
+    #[test]
+    fn test_1039_paren_call_with_trailing_if_modifier_still_resolves_source() {
+        let gemfile =
+            "gem(\"sidekiq-pro\", source: \"https://gems.contribsys.com\") if ENV[\"PRO\"]";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        match &result.dependencies[0].source {
+            DependencySource::CustomRegistry { url } => {
+                assert_eq!(url, "https://gems.contribsys.com");
+            }
+            other => panic!("expected CustomRegistry, got {other:?}"),
+        }
+    }
+
+    /// Regression (#1039 critic finding C2), the `unless` variant with a method-call condition.
+    #[test]
+    fn test_1039_paren_call_with_trailing_unless_modifier_still_resolves_source() {
+        let gemfile =
+            "gem(\"x\", source: \"https://gems.corp\") unless RUBY_PLATFORM.match?(/java/)";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        match &result.dependencies[0].source {
+            DependencySource::CustomRegistry { url } => assert_eq!(url, "https://gems.corp"),
+            other => panic!("expected CustomRegistry, got {other:?}"),
+        }
+    }
+
+    /// Regression (#1039 tester gap #1): a well-formed multi-option paren call must resolve
+    /// *every* option correctly once its own trailing `)` is located and stripped — not just
+    /// `source:` in isolation.
+    #[test]
+    fn test_1039_paren_call_multiple_options_all_resolve() {
+        let gemfile = "gem(\"private_gem\", source: \"https://gems.corp\", require: \"custom_lib\", platforms: [:mri])";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        let dep = &result.dependencies[0];
+        match &dep.source {
+            DependencySource::CustomRegistry { url } => assert_eq!(url, "https://gems.corp"),
+            other => panic!("expected CustomRegistry, got {other:?}"),
+        }
+        assert_eq!(dep.require, Some("custom_lib".to_string()));
+        assert_eq!(dep.platforms, vec!["mri".to_string()]);
+    }
+
+    /// Regression (#1039 tester gap #2): a bracket-free comma-continuation absorbing a line that
+    /// itself contains vector 2's balanced-inner-pair-then-excess-closer shape must still hand
+    /// off correctly to [`bracket_depths`]'s retroactive poisoning over the joined text.
+    #[test]
+    fn test_1039_comma_continuation_absorbing_excess_closer_line_still_poisons() {
+        let gemfile = "source 'https://rubygems.org'\ngem \"g\",\n  install_if: { a: ({}) } , source: \"https://evil.example.com\" }";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].source, DependencySource::Registry);
+    }
+
+    /// Regression (#1039 tester gap #3 / critic finding M1): an unterminated multi-line
+    /// parenthesized `gem(...)` call at EOF never reaches its own closing `)`, so
+    /// [`find_paren_call_closer`] returns `None` and `OptionScan` fails closed (poisons
+    /// entirely) rather than silently resolving a source from a call that was never known to be
+    /// complete — a deliberate, more conservative choice than the bare (non-paren) form's
+    /// existing `test_multiline_gem_unterminated_at_eof_still_resolves` behavior, justified by
+    /// this being the same source-classification path #1039 hardens.
+    #[test]
+    fn test_1039_unterminated_paren_call_at_eof_fails_closed() {
+        let gemfile = "source \"https://rubygems.org\"\ngem(\"internal-gem\",\n  source: \"https://gems.corp\"";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "internal-gem");
+        assert_eq!(result.dependencies[0].source, DependencySource::Registry);
+    }
+
+    /// Regression (#1039 critic finding C3, shape 1 — closer on its own line): a multi-line
+    /// `gem(...)` call whose last continuation line before the closing `)` has no trailing comma
+    /// and no bracket of its own must still stay open until that `)` is actually seen — exact
+    /// repro from the critic.
+    #[test]
+    fn test_1039_paren_call_closer_on_own_line_still_resolves_source() {
+        let gemfile = "gem(\"x\",\n  source: \"https://gems.corp\"\n)";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        match &result.dependencies[0].source {
+            DependencySource::CustomRegistry { url } => assert_eq!(url, "https://gems.corp"),
+            other => panic!("expected CustomRegistry, got {other:?}"),
+        }
+    }
+
+    /// Regression (#1039 critic finding C3, shape 2 — trailing comma before the closer on its
+    /// own line).
+    #[test]
+    fn test_1039_paren_call_trailing_comma_then_closer_on_own_line_still_resolves_source() {
+        let gemfile = "gem(\"x\",\n  source: \"https://gems.corp\",\n)";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        match &result.dependencies[0].source {
+            DependencySource::CustomRegistry { url } => assert_eq!(url, "https://gems.corp"),
+            other => panic!("expected CustomRegistry, got {other:?}"),
+        }
+    }
+
+    /// Regression (#1039 critic finding C3, shape 3 — a nested call on an earlier continuation
+    /// line, `install_if: check(a)`, must not desync the seeded outer-call bracket tracking).
+    #[test]
+    fn test_1039_paren_call_with_nested_call_line_then_closer_still_resolves_source() {
+        let gemfile = "gem(\"x\",\n  install_if: check(a),\n  source: \"https://gems.corp\"\n)";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        match &result.dependencies[0].source {
+            DependencySource::CustomRegistry { url } => assert_eq!(url, "https://gems.corp"),
+            other => panic!("expected CustomRegistry, got {other:?}"),
+        }
+    }
+
+    /// Regression (#1039 critic finding C3, shape 4 — a statement modifier on the same line as
+    /// the closer, in a multi-line call).
+    #[test]
+    fn test_1039_paren_call_closer_with_trailing_modifier_on_own_line_still_resolves_source() {
+        let gemfile = "gem(\"x\",\n  source: \"https://gems.corp\"\n) if ENV[\"A\"]";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        match &result.dependencies[0].source {
+            DependencySource::CustomRegistry { url } => assert_eq!(url, "https://gems.corp"),
+            other => panic!("expected CustomRegistry, got {other:?}"),
+        }
+    }
+
+    /// Regression (#1039 critic finding C4, end-to-end): a ternary whose condition is a string
+    /// literal, immediately followed by `?` with no space, must not have its string value misread
+    /// as containing a top-level `source:` option — the exact repro from the critic. Real Ruby
+    /// (`ruby -c` confirmed) treats the whole right-hand side as a single `require:` value; there
+    /// is no `source:` key at all.
+    #[test]
+    fn test_1039_ternary_string_condition_does_not_leak_source() {
+        let gemfile = "source 'https://rubygems.org'\ngem \"g\", require: \"a\"?\" source: 'https://evil.example.com' \":\"b\"";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].source, DependencySource::Registry);
+    }
+
+    /// Regression (#1039 critic finding C4, end-to-end): a ternary with a space before `?` but a
+    /// value (not fresh-expression punctuation) as the real predecessor past that space.
+    #[test]
+    fn test_1039_ternary_space_before_question_mark_does_not_leak_source() {
+        let gemfile = "source 'https://rubygems.org'\ngem \"g\", require: 1 ?\" source: 'https://evil.example.com' \" : \"b\"";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].source, DependencySource::Registry);
+    }
+
+    /// Regression (#1039 critic finding m1): `GENERIC_OPTION_KEY_SHAPE` must not allow whitespace
+    /// between the identifier and `:` — Ruby's label syntax permits none, so a bare method call
+    /// with a symbol argument (`helper :x,`) must not masquerade as a key-shaped continuation line
+    /// that legitimizes an unrelated `source:` on the same line.
+    #[test]
+    fn test_1039_bare_method_call_with_symbol_arg_does_not_leak_source() {
+        let gemfile = "source 'https://rubygems.org'\ngem \"g\", \"~> 1.0\",\nhelper :x, source: \"https://evil.example.com\"";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].source, DependencySource::Registry);
+    }
+
+    /// Regression (#1039, `looks_like_generic_option_key`'s `::` exclusion, pinned per tester
+    /// request): `Foo::BAR` superficially matches `GENERIC_OPTION_KEY_SHAPE` as `Foo:` (an
+    /// identifier immediately followed by `:`), but the second `:` of `::` (Ruby's namespace
+    /// separator) must reject it — otherwise a `Foo::BAR = ...` assignment statement, not a
+    /// continuation of the `gem` call's argument list, would be absorbed merely because its first
+    /// token happens to look key-shaped.
+    #[test]
+    fn test_1039_generic_option_key_rejects_namespace_separator() {
+        let gemfile = "source 'https://rubygems.org'\ngem \"g\", \"~> 1.0\",\nFoo::BAR = source: \"https://evil.example.com\"";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].source, DependencySource::Registry);
+    }
+
+    /// Regression (#1039 round-4 correctness-gate finding A): a paren call must not be exempted
+    /// from the vector-3 comma-continuation shape check merely because it is a paren call — the
+    /// exact repro from the correctness gate. Before this fix, seeding `PendingGem::bracket_stack`
+    /// with the call's own `(` made `current_kind` read `Some('(')` for the *entire*
+    /// accumulation, which `continuation_should_stop`'s nested-paren early-return then wrongly
+    /// trusted unconditionally, reopening the vector-3 leak specifically for `gem(...)` calls.
+    #[test]
+    fn test_1039_paren_call_comma_continuation_unrelated_statement_does_not_leak_source() {
+        let gemfile = "source 'https://rubygems.org'\ngem(\"g\", \"~> 1.0\",\nx = source: \"https://evil.example.com\")";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].source, DependencySource::Registry);
+    }
+
+    /// Regression (#1039 round-4 correctness-gate finding B): a well-formed parenthesized
+    /// `gem(...)` call with more than [`MAX_BRACKET_ONLY_CONTINUATION_SEGMENTS`] (20) continuation
+    /// lines must not be force-finalized before its own closing `)` is reached — a paren call is
+    /// an explicit, unambiguous continuation signal and must use the general
+    /// [`MAX_PENDING_GEM_SEGMENTS`] cap, the same tier as a trailing-comma continuation, not the
+    /// smaller cap meant for "no signal but a stray unclosed literal".
+    #[test]
+    fn test_1039_paren_call_long_option_list_still_resolves_source() {
+        let mut gemfile = String::from("gem(\"g\",\n");
+        for i in 0..25 {
+            gemfile.push_str(&format!("  opt{i}: {i},\n"));
+        }
+        gemfile.push_str("  source: \"https://gems.corp\"\n)");
+        let result = parse_gemfile(&gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        match &result.dependencies[0].source {
+            DependencySource::CustomRegistry { url } => assert_eq!(url, "https://gems.corp"),
+            other => panic!("expected CustomRegistry, got {other:?}"),
+        }
+    }
+
+    /// Regression (#1039 round-6 correctness gate, blocking finding 2): `apply_paren_call_delta`
+    /// must stop permanently at the first point `depth` reaches `0`, never resuming — even when a
+    /// mismatched trailing closer (`}` instead of `)`) would let [`apply_bracket_delta`]'s
+    /// unconditional-pop `bracket_stack` return to empty while an unclamped depth counter would
+    /// still see the unmatched `(` from `foo(` and go positive again. Direct unit test on the
+    /// counter itself (rather than end-to-end via [`parse_gemfile`]) since the bug's *observable*
+    /// effect — an unrelated line silently absorbed as inert text instead of independently
+    /// processed — looks identical to correct behavior whenever that line doesn't itself match
+    /// [`starts_new_top_level_construct`] (which always rescues it regardless of this bug), making
+    /// the counter's own value the only reliable place to pin this property.
+    #[test]
+    fn test_1039_apply_paren_call_delta_stops_at_first_zero_crossing() {
+        let mut depth = 1;
+        apply_paren_call_delta(") foo(bar}", &mut depth);
+        assert_eq!(depth, 0);
+    }
+
+    /// Regression (#1039 round-6 correctness gate, blocking finding 2): trailing content after the
+    /// real closer — even a fully unmatched nested call — must never push the depth back positive
+    /// on the same line the closer appears on.
+    #[test]
+    fn test_1039_apply_paren_call_delta_ignores_unmatched_content_after_closer() {
+        let mut depth = 1;
+        apply_paren_call_delta(") unrelated_call(a, b, c", &mut depth);
+        assert_eq!(depth, 0);
+    }
+
+    /// Regression (#1039 round-6 correctness gate, blocking finding 2): once closed (`<= 0`), the
+    /// counter must stay closed forever — a later, wholly separate line with its own unmatched `(`
+    /// must not reopen it. This is what makes `outer_paren_depth` agree with
+    /// `find_paren_call_closer`'s one-shot "first excess closer wins" semantics (for text where no
+    /// string literal spans a line boundary — see `apply_paren_call_delta`'s doc for the one
+    /// documented case where they can still diverge, and why that stays fail-closed) rather than
+    /// two independently-fooled mechanisms that could disagree arbitrarily.
+    #[test]
+    fn test_1039_apply_paren_call_delta_never_reopens_once_closed() {
+        let mut depth = 0;
+        apply_paren_call_delta("more_stuff(", &mut depth);
+        assert_eq!(depth, 0);
+        apply_paren_call_delta("(((", &mut depth);
+        assert_eq!(depth, 0);
     }
 }
