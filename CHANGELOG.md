@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **ci**: moved `Cross.toml` to `.github/Cross.toml` to declutter the repo root; `cross` steps now set `CROSS_CONFIG` explicitly since `cross` only auto-discovers a root-level file
+- **CI**: split the `feature-matrix` job's test execution into a separate `feature-matrix-test` job so it runs in parallel with the clippy/lint checks instead of sequentially on one runner
 
 ### Fixed
 - **CI**: `cargo-semver-checks` is now a blocking gate on PR/push and part of `ci-success` (was advisory-only, milestone criterion B3) (resolves #945) (#1012)
