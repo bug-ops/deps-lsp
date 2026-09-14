@@ -10,7 +10,7 @@ tags:
   - deps-core
   - deps-lsp
 created: 2026-09-14
-status: ready
+status: shipped
 related:
   - "[[constitution]]"
   - "[[002-osv-vulnerability-diagnostics/spec|OSV vulnerability diagnostics]]"
