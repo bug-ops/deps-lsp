@@ -100,6 +100,19 @@ impl CargoEcosystem {
         }
     }
 
+    /// Test-only: wraps an already-constructed [`CargoRegistry`] (e.g. one built via
+    /// [`CargoRegistry::with_crates_io_for_test`] pointed at a mock server) instead of
+    /// building a live-registry one (#1045).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_registry_for_test(registry: CargoRegistry) -> Self {
+        Self {
+            registry: Arc::new(registry),
+            formatter: CargoFormatter,
+            context: CargoParseContext::default(),
+        }
+    }
+
     async fn complete_package_names(&self, prefix: &str, range: Range) -> Vec<CompletionItem> {
         // Package-name search is crates.io-only unconditionally (spec Out of Scope: the
         // sparse index protocol has no search endpoint), so this never needs source
@@ -344,6 +357,7 @@ fn extract_prefix(line: &str, character: u32) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::CratesIoRegistry;
     use crate::types::{CargoDependency, CargoDependencySection, DependencySource};
     use deps_core::{EcosystemConfig, PackageVersions, VersionData};
     use std::collections::HashMap;
@@ -877,10 +891,22 @@ mod tests {
         );
     }
 
+    /// #1045: uses a mockito 404 instead of the live crates.io sparse index, so a regression
+    /// that makes zero requests (and so also produces an empty result) can no longer pass
+    /// vacuously — `mock.assert_async()` requires the request to actually have been made.
     #[tokio::test]
     async fn test_complete_versions_unknown_package() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/th/is/this-package-does-not-exist-12345")
+            .with_status(404)
+            .create_async()
+            .await;
+
         let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = CargoEcosystem::new(cache);
+        let crates_io = CratesIoRegistry::with_base_for_test(Arc::clone(&cache), &server.url());
+        let registry = CargoRegistry::with_crates_io_for_test(Arc::clone(&cache), crates_io);
+        let ecosystem = CargoEcosystem::with_registry_for_test(registry);
         let dep = mock_dependency("this-package-does-not-exist-12345", Some("1.0"), 0, 0);
         let position = dep.version_range.unwrap().start;
         let parse_result = MockParseResult {
@@ -896,13 +922,26 @@ mod tests {
                 deps_core::FreshnessSettings::default(),
             )
             .await;
+        mock.assert_async().await;
         assert!(results.is_empty());
     }
 
+    /// #1045: uses a mockito 404 instead of the live crates.io sparse index, so a regression
+    /// that makes zero requests (and so also produces an empty result) can no longer pass
+    /// vacuously — `mock.assert_async()` requires the request to actually have been made.
     #[tokio::test]
     async fn test_complete_features_unknown_package() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/th/is/this-package-does-not-exist-12345")
+            .with_status(404)
+            .create_async()
+            .await;
+
         let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = CargoEcosystem::new(cache);
+        let crates_io = CratesIoRegistry::with_base_for_test(Arc::clone(&cache), &server.url());
+        let registry = CargoRegistry::with_crates_io_for_test(Arc::clone(&cache), crates_io);
+        let ecosystem = CargoEcosystem::with_registry_for_test(registry);
 
         // Unknown package should return empty (graceful degradation)
         let results = ecosystem
@@ -912,6 +951,7 @@ mod tests {
                 "",
             )
             .await;
+        mock.assert_async().await;
         assert!(results.is_empty());
     }
 
