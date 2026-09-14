@@ -451,6 +451,23 @@ impl DenoRegistry {
         }
     }
 
+    /// Test-only: constructs a Deno registry facade with the `jsr:` half's `meta.json`/
+    /// version-endpoint bases pointed at a mock server (#1038), mirroring
+    /// `deps_npm::NpmRegistry::with_public_base_for_test`.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_bases_for_test(
+        cache: Arc<HttpCache>,
+        npm: NpmRegistry,
+        jsr_base: String,
+        jsr_api_base: String,
+    ) -> Self {
+        Self {
+            jsr: JsrRegistry::with_bases(cache, jsr_base, jsr_api_base),
+            npm,
+        }
+    }
+
     /// Fetches `name`'s (already scheme-qualified, e.g. `"jsr:@std/fs"`) license at
     /// `version` (issue #660).
     ///
