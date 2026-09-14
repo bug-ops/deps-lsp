@@ -50,7 +50,7 @@ pub async fn handle_completion(
 
     // Snapshot before any document lookup, matching hover.rs/diagnostics.rs's ordering —
     // this acquires the config RwLock before the DashMap shard guard, never the reverse.
-    let freshness = { config.read().await.freshness.to_settings() };
+    let freshness = { config.read().await.policy.freshness.to_settings() };
 
     // Resolved once, from the URI alone via `for_uri` (the same routing
     // `handle_document_open` uses), rather than from the loaded document's
@@ -887,7 +887,7 @@ mod tests {
     /// Issue #227 tester gap: `build_version_completion`'s `label_details`
     /// present/absent-when-`freshness.enabled`-toggles behavior is already unit-tested
     /// directly in `deps_core::completion` — this test covers the piece that isn't: that
-    /// `handle_completion` (`completion.rs:47`) re-reads `config.freshness` on *every*
+    /// `handle_completion` (`completion.rs:47`) re-reads `config.policy.freshness` on *every*
     /// call, so a `workspace/didChangeConfiguration`-driven config update (simulated here
     /// by writing directly to the shared `Arc<RwLock<DepsConfig>>`, exactly what
     /// `Backend::did_change_configuration` does) changes completion's age-suffix presence
@@ -1070,7 +1070,7 @@ mod tests {
 
         let (client, config) = create_test_client_and_config();
         assert!(
-            config.read().await.freshness.enabled,
+            config.read().await.policy.freshness.enabled,
             "default config ships freshness enabled"
         );
 
@@ -1092,7 +1092,7 @@ mod tests {
 
         // Exactly what `Backend::did_change_configuration` does to the stored config —
         // no document reload, no server restart.
-        config.write().await.freshness.enabled = false;
+        config.write().await.policy.freshness.enabled = false;
 
         let after = handle_completion(state, params(), client, config)
             .await

@@ -120,6 +120,12 @@ pub mod pagination;
 /// Shared manifest-parsing helpers: bounded JSON/TOML/YAML nesting checks and
 /// depth-limited parsing used by every ecosystem's manifest parser.
 pub mod parser;
+/// The policy-relevant subset of `deps-lsp`'s configuration.
+///
+/// Diagnostics severities, cache, freshness, supply-chain, registries, network, license
+/// policy — shared with `deps-cli` so both compose the same type instead of each parsing its
+/// own copy.
+pub mod policy_config;
 /// Shared escape-aware string-literal and comment scanning.
 ///
 /// [`quote_scan::read_string_literal`], [`quote_scan::strip_line_comment`],

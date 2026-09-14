@@ -43,7 +43,7 @@ pub async fn handle_inlay_hints(
         let full_config = full_config.read().await;
         (
             full_config.loading_indicator.clone(),
-            full_config.network.offline,
+            full_config.policy.network.offline,
         )
     };
 

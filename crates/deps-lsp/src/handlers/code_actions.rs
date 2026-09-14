@@ -31,7 +31,7 @@ pub async fn handle_code_actions(
         return vec![];
     }
 
-    let offline = { config.read().await.network.offline };
+    let offline = { config.read().await.policy.network.offline };
 
     // Own everything `generate_code_actions` needs and release the DashMap shard
     // `Ref` before awaiting it: the default impl awaits a real registry fetch, so

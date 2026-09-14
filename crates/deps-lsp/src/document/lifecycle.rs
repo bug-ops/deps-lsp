@@ -132,11 +132,11 @@ pub async fn handle_document_open(
     let (cache_config, vulnerabilities_enabled, freshness_settings, diagnostic_severities, offline) = {
         let cfg = config.read().await;
         (
-            cfg.cache.clone(),
-            cfg.diagnostics.vulnerabilities_enabled,
-            cfg.freshness.to_settings(),
-            cfg.diagnostics.to_severities(),
-            cfg.network.offline,
+            cfg.policy.cache.clone(),
+            cfg.policy.diagnostics.vulnerabilities_enabled,
+            cfg.policy.freshness.to_settings(),
+            cfg.policy.diagnostics.to_severities(),
+            cfg.policy.network.offline,
         )
     };
 
@@ -778,11 +778,11 @@ pub(crate) async fn handle_document_change_guarded(
     let (cache_config, vulnerabilities_enabled, freshness_settings, diagnostic_severities, offline) = {
         let cfg = config.read().await;
         (
-            cfg.cache.clone(),
-            cfg.diagnostics.vulnerabilities_enabled,
-            cfg.freshness.to_settings(),
-            cfg.diagnostics.to_severities(),
-            cfg.network.offline,
+            cfg.policy.cache.clone(),
+            cfg.policy.diagnostics.vulnerabilities_enabled,
+            cfg.policy.freshness.to_settings(),
+            cfg.policy.diagnostics.to_severities(),
+            cfg.policy.network.offline,
         )
     };
 
