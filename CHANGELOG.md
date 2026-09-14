@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-dart**: `is_plain_null` now recognizes `Null`/`NULL` in addition to `~`/`null` — the four spellings GitLab's Psych YAML loader treats as null (#1028)
 
 ### Fixed
+- **deps-core**: `HttpCache::cache_key` no longer collapses an unauthenticated `Pinned`-tier fetch and an authenticated one whose credential digest happens to hash to `0` onto the same cache key (resolves #1025)
 - **CI**: the `cross-check` job's i686 leg now builds and tests natively via `gcc-multilib` on `ubuntu-latest` instead of through `cross`'s musl Docker container, dropping the associated apt-get/Docker overhead and the `--test-threads=1` workaround (now uses `cargo nextest`) (#1027)
 - **CI**: `cargo-semver-checks` is now a blocking gate on PR/push and part of `ci-success` (was advisory-only, milestone criterion B3) (resolves #945) (#1012)
 - **deps-bundler**: multi-line `gem` declarations (continuation-line `:source =>`/`source:`, backslash continuation, or a commented-out option) no longer leak private gem names to the public rubygems.org registry, and the parser's block/group state tracking is now O(1) per line instead of O(block depth) (resolves #991, #1009) (#1016)
