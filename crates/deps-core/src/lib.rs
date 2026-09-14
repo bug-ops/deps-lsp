@@ -71,6 +71,9 @@
 )]
 /// HTTP response cache with `ETag`/`Last-Modified` conditional-request validation.
 pub mod cache;
+/// Bounded-`DashMap` capacity policies shared by [`cache`], [`github`], [`deps_dev`], and
+/// [`osv`].
+pub(crate) mod cache_policy;
 pub mod completion;
 /// Shared `#[macro_export]`ed conformance-test scaffolding (#758).
 ///
