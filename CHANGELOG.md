@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-gitlab-ci**: an empty/null-like `ref:` on an ordinary, anchor-free `include:` entry now ships no version at all, instead of `version_req = Some("")` with a zero-width range (#1028)
 - **deps-core, deps-dart**: `is_plain_null` now recognizes `Null`/`NULL` in addition to `~`/`null` — the four spellings GitLab's Psych YAML loader treats as null (#1028)
 - **deps-bundler**: `extract_group`/`extract_source`/`extract_platforms`/`extract_require` now take the same `&[(&str, usize)]` slice as `extract_version`, dropping a redundant per-gem `Vec` allocation in `finalize_pending_gem` (resolves #1023) (#1036)
+- bumped `rustls` 0.23.44 -> 0.23.45 (RUSTSEC-2026-0285: TLS 1.3 handshake messages incorrectly accepted across encryption level boundaries) (#1036)
 
 ### Fixed
 - **deps-core**: `HttpCache::cache_key` no longer collapses an unauthenticated `Pinned`-tier fetch and an authenticated one whose credential digest happens to hash to `0` onto the same cache key (resolves #1025)
