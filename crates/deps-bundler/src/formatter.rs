@@ -170,6 +170,12 @@ impl PackageRendering for BundlerFormatter {
     fn package_url(&self, name: &PackageName) -> String {
         crate::registry::gem_url(name.as_str())
     }
+
+    /// Suppresses the rubygems.org hover link for a gem resolved from a non-default
+    /// source — rendering it would falsely imply the gem is published there.
+    fn suppress_package_url(&self, source: &deps_core::DependencySource) -> bool {
+        !self.source_is_public_registry_content(source)
+    }
 }
 
 impl RequirementResolution for BundlerFormatter {
@@ -272,6 +278,23 @@ mod tests {
             "1.0.1", "!= 1.0.0" => true,
             "1.0.0", "!= 1.0.0" => false
         ];
+    }
+
+    #[test]
+    fn test_suppress_package_url() {
+        let formatter = BundlerFormatter;
+        assert!(!formatter.suppress_package_url(&deps_core::DependencySource::Registry));
+        assert!(
+            formatter.suppress_package_url(&deps_core::DependencySource::CustomRegistry {
+                url: "https://gems.mycorp.com".into(),
+            })
+        );
+        assert!(
+            formatter.suppress_package_url(&deps_core::DependencySource::Git {
+                url: "https://github.com/rails/rails".into(),
+                rev: None,
+            })
+        );
     }
 
     #[test]

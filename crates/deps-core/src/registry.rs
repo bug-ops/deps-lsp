@@ -452,6 +452,51 @@ pub fn not_found_or(
     }
 }
 
+/// Classifies a manifest-declared registry URL against an ecosystem's own default-registry
+/// aliases.
+///
+/// A URL matching one of `default_urls` (ignoring a trailing slash) resolves to
+/// [`DependencySource::Registry`]; anything else has no client this LSP can query, so it
+/// becomes [`DependencySource::CustomRegistry`].
+///
+/// Extracted from byte-identical logic independently added to `deps-bundler` (rubygems.org)
+/// and `deps-dart` (pub.dev, plus its legacy `pub.dartlang.org` alias) in the same change
+/// (deps-lsp#980) — this project's cross-ecosystem-consistency rule treats that pattern as a
+/// bug class rather than an acceptable duplication (see `.claude/CLAUDE.md`, and the #976/#969
+/// precedent of centralizing similarly-shaped per-crate logic into `deps-core`).
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::DependencySource;
+/// use deps_core::classify_default_registry_url;
+///
+/// assert_eq!(
+///     classify_default_registry_url("https://rubygems.org".to_string(), &["https://rubygems.org"]),
+///     DependencySource::Registry
+/// );
+///
+/// // A trailing slash is ignored when comparing against the default list.
+/// assert_eq!(
+///     classify_default_registry_url("https://pub.dev/".to_string(), &["https://pub.dev", "https://pub.dartlang.org"]),
+///     DependencySource::Registry
+/// );
+///
+/// assert_eq!(
+///     classify_default_registry_url("https://gems.mycorp.com".to_string(), &["https://rubygems.org"]),
+///     DependencySource::CustomRegistry { url: "https://gems.mycorp.com".to_string() }
+/// );
+/// ```
+#[must_use]
+pub fn classify_default_registry_url(url: String, default_urls: &[&str]) -> DependencySource {
+    let normalized = url.trim_end_matches('/');
+    if default_urls.contains(&normalized) {
+        DependencySource::Registry
+    } else {
+        DependencySource::CustomRegistry { url }
+    }
+}
+
 /// Hashes an ordered sequence of `&str` routing-hop parts into an opaque
 /// `"{prefix}:{digest:016x}"` chain-identity key, using
 /// [`std::collections::hash_map::DefaultHasher`].

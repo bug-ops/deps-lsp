@@ -45,20 +45,74 @@ static VERSION_PATTERN: LazyLock<Regex> =
 static SOURCE_PATTERN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"^\s*source\s+['"]([^'"]+)['"]\s*$"#).expect("Invalid regex"));
 
+/// Matches a `source "..." do` block opener, e.g. `source "https://gems.corp" do`. Tolerates
+/// a trailing comment (`... do # internal mirror`) — critic finding S2: without this, the
+/// block never opens and every gem inside it silently resolves against the file-level source.
+// Same guarantee as GEM_PATTERN above.
+#[allow(clippy::expect_used)]
+static SOURCE_BLOCK_START: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^\s*source\s+['"]([^'"]+)['"]\s+do\s*(#.*)?$"#).expect("Invalid regex")
+});
+
+/// Matches the per-gem inline `source:` option, e.g. `gem "x", source: "https://gems.corp"`.
+// Same guarantee as GEM_PATTERN above.
+#[allow(clippy::expect_used)]
+static SOURCE_OPTION: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"source:\s*['"]([^'"]+)['"]"#).expect("Invalid regex"));
+
 // Same guarantee as GEM_PATTERN above.
 #[allow(clippy::expect_used)]
 static RUBY_VERSION_PATTERN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"^\s*ruby\s+['"]([^'"]+)['"]\s*$"#).expect("Invalid regex"));
 
-// Same guarantee as GEM_PATTERN above.
+// Same guarantee as GEM_PATTERN above. Comment-tolerant for the same reason as
+// SOURCE_BLOCK_START.
 #[allow(clippy::expect_used)]
 static GROUP_BLOCK_START: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\s*group\s+(.+?)\s+do\s*$").expect("Invalid regex"));
+    LazyLock::new(|| Regex::new(r"^\s*group\s+(.+?)\s+do\s*(#.*)?$").expect("Invalid regex"));
 
+/// Matches any other `... do` block opener Bundler's DSL supports besides `group`/`source`
+/// (`platforms ... do`, `install_if ... do`, `git "..." do`, `path "..." do`, `env ... do`,
+/// etc.) — pushed onto [`OpenBlock::Other`] purely to keep [`BLOCK_END`] pops balanced
+/// against pushes. Critic finding S1: without this, one of these openers nested inside a
+/// `source ... do` block pops the *source* block early and every gem declared after it
+/// silently resolves against the file-level source instead.
+///
+/// Anchored so `do` must appear before any `#` — critic finding N1: an unanchored pattern
+/// also matches a `do` occurring only inside a trailing comment (`gem "rails" # lots to do`),
+/// which would silently drop the whole line as a false block opener instead of parsing it.
 // Same guarantee as GEM_PATTERN above.
 #[allow(clippy::expect_used)]
-static GROUP_BLOCK_END: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\s*end\s*$").expect("Invalid regex"));
+static GENERIC_BLOCK_START: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[^#]*\bdo\s*(\|[^|]*\|)?\s*(#.*)?$").expect("Invalid regex"));
+
+/// Matches Ruby's `end`-terminated block keywords that do **not** take a `do` (`if`,
+/// `unless`, `case`, `begin`, `def`, `class`, `module`, `while`, `until`, `for`) — anchored at
+/// the line start, with an optional leading `identifier = ` assignment prefix (`flag = if
+/// COND ... end`, an expression-valued `if`), so the common single-line statement-modifier
+/// form (`gem "x" if RUBY_VERSION > "2.0"`, which starts with `gem`, not the keyword or an
+/// assignment to it) is correctly left unmatched, since that form has no matching `end` to
+/// balance. Pushed onto [`OpenBlock::Other`] for the same reason as [`GENERIC_BLOCK_START`] —
+/// code-review finding #1 (post-N1): without this, one of these constructs (most commonly `if
+/// RUBY_PLATFORM =~ ... / end`) nested inside a `source ... do` block still pops the *source*
+/// block early via its own bare `end`, reopening the same #980 leak class through a different
+/// Ruby construct. The assignment-prefix extension closes the residual `flag = if ... end`
+/// case impl-critic flagged after the initial fix (validated fix, same leak direction).
+// Same guarantee as GEM_PATTERN above.
+#[allow(clippy::expect_used)]
+static BARE_BLOCK_START: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\s*(?:\S+\s*=\s*)?(if|unless|case|begin|def|class|module|while|until|for)\b")
+        .expect("Invalid regex")
+});
+
+/// Matches the closing `end` of a `group`/`source`/other `... do` block. Comment-tolerant
+/// (critic finding S2): without this, `end # close` never closes a `source` block and the
+/// rest of the file is mis-classified as `CustomRegistry` (safe direction, but a functional
+/// regression for every later gem's hover/diagnostics).
+// Same guarantee as GEM_PATTERN above.
+#[allow(clippy::expect_used)]
+static BLOCK_END: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*end\s*(#.*)?$").expect("Invalid regex"));
 
 // Same guarantee as GEM_PATTERN above.
 #[allow(clippy::expect_used)]
@@ -90,6 +144,42 @@ static REQUIRE_OPTION: LazyLock<Regex> =
 static PLATFORMS_OPTION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"platforms:\s*(\[.+?\]|:\w+)").expect("Invalid regex"));
 
+/// A `group ... do`, `source ... do`, or any other Bundler DSL `... do ... end` block
+/// currently open while scanning the file.
+///
+/// Every kind shares one `end`-terminated syntax and can nest inside any other in any order,
+/// so they are all tracked on a single stack rather than as independent `Option`s (or just the
+/// two kinds this parser cares about) — anything less than tracking every opener leaves
+/// [`BLOCK_END`]'s pops unbalanced against pushes, popping the wrong (e.g. an enclosing
+/// `source`) block early (critic finding S1).
+#[derive(Debug, Clone)]
+enum OpenBlock {
+    /// An open `group :name do ... end` block.
+    Group(DependencyGroup),
+    /// An open `source "url" do ... end` block.
+    Source(String),
+    /// Any other open `... do ... end` block this parser does not otherwise interpret
+    /// (`platforms ... do`, `install_if ... do`, `git "..." do`, `path "..." do`, `env ...
+    /// do`, etc.) — tracked purely to keep the stack balanced.
+    Other,
+}
+
+/// Returns the innermost open `group` block's classification, if any.
+fn current_group(open_blocks: &[OpenBlock]) -> Option<DependencyGroup> {
+    open_blocks.iter().rev().find_map(|block| match block {
+        OpenBlock::Group(group) => Some(group.clone()),
+        OpenBlock::Source(_) | OpenBlock::Other => None,
+    })
+}
+
+/// Returns the innermost open `source` block's URL, if any.
+fn current_source_block(open_blocks: &[OpenBlock]) -> Option<&str> {
+    open_blocks.iter().rev().find_map(|block| match block {
+        OpenBlock::Source(url) => Some(url.as_str()),
+        OpenBlock::Group(_) | OpenBlock::Other => None,
+    })
+}
+
 /// Parses a Gemfile and extracts all dependencies with positions.
 ///
 /// # Errors
@@ -104,13 +194,21 @@ pub fn parse_gemfile(content: &str, doc_uri: &Uri) -> Result<BundlerParseResult>
     let mut dependencies = Vec::new();
     let mut ruby_version = None;
     let mut source_url = None;
-    let mut current_group: Option<DependencyGroup> = None;
+    let mut open_blocks: Vec<OpenBlock> = Vec::new();
     let mut budget = deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
 
     for (line_idx, line) in content.lines().enumerate() {
         let Some(line_start) = line_table.line_start(line_idx) else {
             continue;
         };
+
+        // Check for source block start (must precede the single-line SOURCE_PATTERN check:
+        // SOURCE_PATTERN is `$`-anchored and never matches a `... do` opener, but checking
+        // this first keeps the precedence explicit).
+        if let Some(caps) = SOURCE_BLOCK_START.captures(line) {
+            open_blocks.push(OpenBlock::Source(caps[1].to_string()));
+            continue;
+        }
 
         // Check for source declaration
         if let Some(caps) = SOURCE_PATTERN.captures(line) {
@@ -128,13 +226,31 @@ pub fn parse_gemfile(content: &str, doc_uri: &Uri) -> Result<BundlerParseResult>
 
         // Check for group block start
         if let Some(caps) = GROUP_BLOCK_START.captures(line) {
-            current_group = Some(parse_group_symbols(&caps[1]));
+            open_blocks.push(OpenBlock::Group(parse_group_symbols(&caps[1])));
             continue;
         }
 
-        // Check for group block end
-        if GROUP_BLOCK_END.is_match(line) {
-            current_group = None;
+        // Check for a block end (closes whichever block is innermost) — must precede the
+        // generic opener check below: critic finding N1, `end # nothing left to do` would
+        // otherwise match GENERIC_BLOCK_START's `do` first and be mistaken for an opener
+        // instead of the closer it actually is.
+        if BLOCK_END.is_match(line) {
+            open_blocks.pop();
+            continue;
+        }
+
+        // Check for any other `... do` block opener (platforms, install_if, git, path, env,
+        // etc.) — pushed only to keep BLOCK_END's pops balanced (critic finding S1).
+        if GENERIC_BLOCK_START.is_match(line) {
+            open_blocks.push(OpenBlock::Other);
+            continue;
+        }
+
+        // Check for a bare (no `do`) `end`-terminated block keyword (if/unless/case/begin/
+        // def/class/module/while/until/for) — pushed for the same balancing reason as
+        // GENERIC_BLOCK_START above (code-review finding #1).
+        if BARE_BLOCK_START.is_match(line) {
+            open_blocks.push(OpenBlock::Other);
             continue;
         }
 
@@ -164,10 +280,14 @@ pub fn parse_gemfile(content: &str, doc_uri: &Uri) -> Result<BundlerParseResult>
 
             // Extract group from inline option or current block
             let group = extract_group(rest_of_line)
-                .unwrap_or_else(|| current_group.clone().unwrap_or(DependencyGroup::Default));
+                .unwrap_or_else(|| current_group(&open_blocks).unwrap_or(DependencyGroup::Default));
 
             // Extract source
-            let source = extract_source(rest_of_line, source_url.as_deref());
+            let source = extract_source(
+                rest_of_line,
+                source_url.as_deref(),
+                current_source_block(&open_blocks),
+            );
 
             // Extract platforms
             let platforms = extract_platforms(rest_of_line);
@@ -244,16 +364,30 @@ fn parse_group_symbols(text: &str) -> DependencyGroup {
 /// Bundler's implicit default gem source when a Gemfile declares no `source` line.
 const DEFAULT_RUBYGEMS_SOURCE: &str = "https://rubygems.org";
 
+/// Classifies a plain registry URL: the implicit default (rubygems.org) resolves as
+/// `Registry`; anything else has no client this LSP can query, so it becomes
+/// `CustomRegistry` — mirroring Cargo's `registry = "..."` handling (#248). Thin wrapper
+/// around the shared `deps_core::classify_default_registry_url` (code-review finding #2: this
+/// was byte-identical logic duplicated with `deps-dart`'s `classify_hosted_url`).
+fn classify_registry_url(url: &str) -> DependencySource {
+    deps_core::classify_default_registry_url(url.to_string(), &[DEFAULT_RUBYGEMS_SOURCE])
+}
+
 /// Classifies a gem's dependency source.
 ///
-/// `gemfile_source_url` is the Gemfile-level `source "..."` declaration (if any),
-/// captured once per file in [`parse_gemfile`] and threaded through here so a gem
-/// with no per-line `git:`/`github:`/`path:` option is classified against the
-/// source that actually resolves it, rather than defaulting to the public
-/// registry. A non-default URL (anything but rubygems.org) has no client this LSP
-/// can query, so it becomes `CustomRegistry` — mirroring Cargo's `registry = "..."`
-/// handling (#248).
-fn extract_source(line: &str, gemfile_source_url: Option<&str>) -> DependencySource {
+/// `gemfile_source_url` is the Gemfile-level, single-line `source "..."` declaration (if
+/// any); `block_source_url` is the innermost enclosing `source "..." do ... end` block's URL
+/// (if any) — both captured once per file in [`parse_gemfile`] and threaded through here so a
+/// gem with no per-line `git:`/`github:`/`path:`/`source:` option is classified against the
+/// source that actually resolves it, rather than defaulting to the public registry.
+///
+/// Precedence: `git:`/`github:`/`path:` (explicit non-registry source) → inline `source:`
+/// option → enclosing `source ... do` block → file-level `source` → `Registry`.
+fn extract_source(
+    line: &str,
+    gemfile_source_url: Option<&str>,
+    block_source_url: Option<&str>,
+) -> DependencySource {
     if let Some(caps) = GIT_OPTION.captures(line) {
         return DependencySource::Git {
             url: caps[1].to_string(),
@@ -274,12 +408,15 @@ fn extract_source(line: &str, gemfile_source_url: Option<&str>) -> DependencySou
         };
     }
 
-    match gemfile_source_url {
-        Some(url) if url != DEFAULT_RUBYGEMS_SOURCE => DependencySource::CustomRegistry {
-            url: url.to_string(),
-        },
-        _ => DependencySource::Registry,
+    if let Some(caps) = SOURCE_OPTION.captures(line) {
+        return classify_registry_url(&caps[1]);
     }
+
+    if let Some(url) = block_source_url {
+        return classify_registry_url(url);
+    }
+
+    gemfile_source_url.map_or(DependencySource::Registry, classify_registry_url)
 }
 
 fn extract_platforms(line: &str) -> Vec<String> {
@@ -466,6 +603,437 @@ gem 'internal-gem'";
 gem 'rails', git: 'https://github.com/rails/rails.git'";
         let result = parse_gemfile(gemfile, &test_uri()).unwrap();
         assert_matches!(result.dependencies[0].source, DependencySource::Git { .. });
+    }
+
+    /// Security regression: the block form `source "..." do ... end` was previously invisible
+    /// to `SOURCE_PATTERN` (`$`-anchored), so a gem declared inside it silently fell through
+    /// to `Registry` and leaked its name to rubygems.org.
+    #[test]
+    fn test_source_block_form_classified_as_custom_registry() {
+        let gemfile = r#"source "https://rubygems.org"
+source "https://gems.mycorp.com" do
+  gem "internal-gem"
+end"#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        match &result.dependencies[0].source {
+            DependencySource::CustomRegistry { url } => {
+                assert_eq!(url, "https://gems.mycorp.com");
+            }
+            other => panic!("expected CustomRegistry, got {other:?}"),
+        }
+    }
+
+    /// A gem outside a `source ... do` block still resolves against the file-level source.
+    #[test]
+    fn test_source_block_does_not_leak_into_surrounding_gems() {
+        let gemfile = r#"source "https://rubygems.org"
+source "https://gems.mycorp.com" do
+  gem "internal-gem"
+end
+gem "rails""#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 2);
+        assert_eq!(result.dependencies[1].source, DependencySource::Registry);
+    }
+
+    /// Security regression: the per-gem inline `source:` option was previously not consulted
+    /// by `extract_source` at all, so a gem using it silently fell through to `Registry` and
+    /// leaked its name to rubygems.org.
+    #[test]
+    fn test_inline_source_option_classified_as_custom_registry() {
+        let gemfile = r#"source "https://rubygems.org"
+gem "internal-gem", source: "https://gems.mycorp.com""#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        match &result.dependencies[0].source {
+            DependencySource::CustomRegistry { url } => {
+                assert_eq!(url, "https://gems.mycorp.com");
+            }
+            other => panic!("expected CustomRegistry, got {other:?}"),
+        }
+    }
+
+    /// The inline `source:` option must still lose to an explicit `git:`/`path:` option, per
+    /// `extract_source`'s documented precedence.
+    #[test]
+    fn test_inline_source_option_does_not_override_explicit_git_source() {
+        let gemfile = r#"source "https://rubygems.org"
+gem "rails", git: "https://github.com/rails/rails.git", source: "https://gems.mycorp.com""#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_matches!(result.dependencies[0].source, DependencySource::Git { .. });
+    }
+
+    /// Trap regression: a `group` block nested inside a `source ... do` block (or vice versa)
+    /// must not mis-pair its `end` against the wrong opener — both the group classification
+    /// and the source classification must still resolve correctly for a gem declared inside
+    /// both.
+    #[test]
+    fn test_nested_group_inside_source_block() {
+        let gemfile = r#"source "https://rubygems.org"
+source "https://gems.mycorp.com" do
+  group :test do
+    gem "internal-test-gem"
+  end
+  gem "internal-gem"
+end
+gem "rails""#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 3);
+
+        assert_matches!(result.dependencies[0].group, DependencyGroup::Test);
+        match &result.dependencies[0].source {
+            DependencySource::CustomRegistry { url } => {
+                assert_eq!(url, "https://gems.mycorp.com");
+            }
+            other => panic!("expected CustomRegistry, got {other:?}"),
+        }
+
+        assert_matches!(result.dependencies[1].group, DependencyGroup::Default);
+        match &result.dependencies[1].source {
+            DependencySource::CustomRegistry { url } => {
+                assert_eq!(url, "https://gems.mycorp.com");
+            }
+            other => panic!("expected CustomRegistry, got {other:?}"),
+        }
+
+        assert_matches!(result.dependencies[2].group, DependencyGroup::Default);
+        assert_eq!(result.dependencies[2].source, DependencySource::Registry);
+    }
+
+    /// Trap regression: a `source ... do` block nested inside a `group` block must also
+    /// unwind correctly — the reverse nesting order from the test above.
+    #[test]
+    fn test_nested_source_block_inside_group() {
+        let gemfile = r#"source "https://rubygems.org"
+group :test do
+  source "https://gems.mycorp.com" do
+    gem "internal-test-gem"
+  end
+  gem "rspec"
+end
+gem "rails""#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 3);
+
+        assert_matches!(result.dependencies[0].group, DependencyGroup::Test);
+        match &result.dependencies[0].source {
+            DependencySource::CustomRegistry { url } => {
+                assert_eq!(url, "https://gems.mycorp.com");
+            }
+            other => panic!("expected CustomRegistry, got {other:?}"),
+        }
+
+        assert_matches!(result.dependencies[1].group, DependencyGroup::Test);
+        assert_eq!(result.dependencies[1].source, DependencySource::Registry);
+
+        assert_matches!(result.dependencies[2].group, DependencyGroup::Default);
+        assert_eq!(result.dependencies[2].source, DependencySource::Registry);
+    }
+
+    /// Security regression (impl-critic S1): an unrecognized `... do` opener (`platforms ...
+    /// do` here — Bundler also has `install_if`, `git "..." do`, `path "..." do`, `env ...
+    /// do`) nested inside a `source ... do` block must not pop the *source* block early. Before
+    /// the `OpenBlock::Other` fix, `platforms :ruby do ... end`'s own `end` popped the
+    /// enclosing `source` block, so `after-inner-gem` (declared after it but still textually
+    /// inside the `source` block) silently resolved against rubygems.org instead.
+    #[test]
+    fn test_unrecognized_do_block_does_not_unbalance_source_block() {
+        let gemfile = r#"source "https://rubygems.org"
+source "https://gems.corp" do
+  platforms :ruby do
+    gem "inner-gem"
+  end
+  gem "after-inner-gem"
+end"#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 2);
+        for dep in &result.dependencies {
+            match &dep.source {
+                DependencySource::CustomRegistry { url } => {
+                    assert_eq!(url, "https://gems.corp");
+                }
+                other => panic!("expected CustomRegistry for {}, got {other:?}", dep.name),
+            }
+        }
+    }
+
+    /// Security regression (impl-critic S1): same trap, but the unbalancing opener
+    /// (`install_if ... do`) sits *after* the gem it must not affect, closing on `install_if`'s
+    /// own `end` while the `source` block is still open around it.
+    #[test]
+    fn test_unrecognized_do_block_after_gem_does_not_unbalance_source_block() {
+        let gemfile = r#"source "https://rubygems.org"
+source "https://gems.corp" do
+  gem "before-inner-gem"
+  install_if -> { true } do
+    gem "conditional-gem"
+  end
+  gem "after-inner-gem"
+end"#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 3);
+        for dep in &result.dependencies {
+            match &dep.source {
+                DependencySource::CustomRegistry { url } => {
+                    assert_eq!(url, "https://gems.corp");
+                }
+                other => panic!("expected CustomRegistry for {}, got {other:?}", dep.name),
+            }
+        }
+    }
+
+    /// Security regression (impl-critic S2): a trailing comment on the `source ... do` opener
+    /// must not prevent the block from opening — before the fix, `SOURCE_BLOCK_START`'s `$`
+    /// anchor never matched the comment-bearing line, so the gem inside silently resolved
+    /// against the file-level rubygems.org source instead.
+    #[test]
+    fn test_source_block_start_tolerates_trailing_comment() {
+        let gemfile = r#"source "https://rubygems.org"
+source "https://gems.corp" do # internal mirror
+  gem "internal-gem"
+end"#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        match &result.dependencies[0].source {
+            DependencySource::CustomRegistry { url } => {
+                assert_eq!(url, "https://gems.corp");
+            }
+            other => panic!("expected CustomRegistry, got {other:?}"),
+        }
+    }
+
+    /// Security/functional regression (impl-critic S2): a trailing comment on `end` must
+    /// still close the block — before the fix, `BLOCK_END`'s `$` anchor never matched, so the
+    /// `source` block stayed open for the rest of the file and every later gem was
+    /// mis-classified as `CustomRegistry` instead of `Registry`.
+    #[test]
+    fn test_block_end_tolerates_trailing_comment() {
+        let gemfile = r#"source "https://rubygems.org"
+source "https://gems.corp" do
+  gem "internal-gem"
+end # close
+
+gem "rails""#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 2);
+        match &result.dependencies[0].source {
+            DependencySource::CustomRegistry { url } => {
+                assert_eq!(url, "https://gems.corp");
+            }
+            other => panic!("expected CustomRegistry, got {other:?}"),
+        }
+        assert_eq!(result.dependencies[1].source, DependencySource::Registry);
+    }
+
+    /// impl-critic M1: a trailing slash on the default rubygems.org source must not cause a
+    /// misclassification as `CustomRegistry`.
+    #[test]
+    fn test_classify_registry_url_ignores_trailing_slash() {
+        assert_eq!(
+            classify_registry_url("https://rubygems.org/"),
+            DependencySource::Registry
+        );
+        assert_eq!(
+            classify_registry_url("https://rubygems.org"),
+            DependencySource::Registry
+        );
+    }
+
+    /// Regression (impl-critic N1, case 1): a gem line whose trailing comment happens to end
+    /// in the word "do" must still parse as a normal gem declaration — before the fix,
+    /// `GENERIC_BLOCK_START` was unanchored and matched the `do` inside the comment, silently
+    /// dropping the dependency and unbalancing the block stack for the rest of the file.
+    #[test]
+    fn test_gem_line_with_trailing_do_comment_still_parses() {
+        // Note: `VERSION_PATTERN` does not tolerate a trailing comment after the quoted
+        // version string either (a pre-existing, separate limitation — critic's M2/M3-adjacent
+        // territory, not part of this fix), so `version_req` is not asserted here; this test's
+        // purpose is narrower: the gem must not be dropped from the parse entirely, which is
+        // what the unanchored `GENERIC_BLOCK_START` regression (N1) caused.
+        let gemfile = r#"source "https://rubygems.org"
+gem "rails", "~> 7.0" # lots of things to do
+gem "rspec""#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 2);
+        assert_eq!(result.dependencies[0].name, "rails");
+        assert_eq!(result.dependencies[0].source, DependencySource::Registry);
+        assert_eq!(result.dependencies[1].name, "rspec");
+        assert_eq!(result.dependencies[1].source, DependencySource::Registry);
+    }
+
+    /// Regression (impl-critic N1, case 2): `end # nothing left to do` must still close the
+    /// enclosing block — before the fix (and the `BLOCK_END`-before-`GENERIC_BLOCK_START`
+    /// reorder), the `do` inside the comment made `GENERIC_BLOCK_START` match first, so the
+    /// `source` block never closed and every later gem stayed mis-classified `CustomRegistry`.
+    #[test]
+    fn test_block_end_with_trailing_do_comment_still_closes_block() {
+        let gemfile = r#"source "https://rubygems.org"
+source "https://gems.corp" do
+  gem "internal-gem"
+end # nothing left to do
+
+gem "rails""#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 2);
+        match &result.dependencies[0].source {
+            DependencySource::CustomRegistry { url } => {
+                assert_eq!(url, "https://gems.corp");
+            }
+            other => panic!("expected CustomRegistry, got {other:?}"),
+        }
+        assert_eq!(result.dependencies[1].source, DependencySource::Registry);
+    }
+
+    /// Regression (impl-critic N1, case 3): a bare comment line ending in "do" must not push
+    /// an unbalancing `Other` block.
+    #[test]
+    fn test_bare_comment_line_ending_in_do_does_not_push_block() {
+        let gemfile = r#"source "https://rubygems.org"
+# things left to do
+gem "rails""#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].source, DependencySource::Registry);
+    }
+
+    /// Sanity check (impl-critic N1): a normal Gemfile mixing a `ruby` directive, a `group
+    /// ... do` block, and an unrelated `.each do |x|` iterator block must still parse exactly
+    /// as before these fixes.
+    #[test]
+    fn test_normal_gemfile_with_each_block_unaffected() {
+        let gemfile = r#"source "https://rubygems.org"
+ruby "3.2.2"
+
+%w[foo bar].each do |name|
+  gem name
+end
+
+group :development, :test do
+  gem "rspec"
+end
+
+gem "rails""#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.ruby_version, Some("3.2.2".into()));
+        assert_eq!(result.dependencies.len(), 2);
+        assert_eq!(result.dependencies[0].name, "rspec");
+        // `parse_group_symbols` checks `:development` before `:test` (matching the existing
+        // test_group_array_syntax precedent), so `group :development, :test do` resolves to
+        // `Development`, not `Test`.
+        assert_matches!(result.dependencies[0].group, DependencyGroup::Development);
+        assert_eq!(result.dependencies[1].name, "rails");
+        assert_matches!(result.dependencies[1].group, DependencyGroup::Default);
+    }
+
+    /// Security regression (code-review finding #1, post-N1): a bare (no `do`) `if ... end`
+    /// block nested inside a `source ... do` block must not pop the *source* block early via
+    /// its own `end`. Exact repro from the reviewer: before the `BARE_BLOCK_START` fix,
+    /// `after-if-gem` (declared after the `if` block but still textually inside the `source`
+    /// block) silently resolved against rubygems.org instead of staying `CustomRegistry`.
+    #[test]
+    fn test_bare_if_block_does_not_unbalance_source_block() {
+        let gemfile = r#"source "https://rubygems.org"
+source "https://gems.corp" do
+  if RUBY_PLATFORM =~ /darwin/
+    gem "mac-only-gem"
+  end
+  gem "after-if-gem"
+end"#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 2);
+        for dep in &result.dependencies {
+            match &dep.source {
+                DependencySource::CustomRegistry { url } => {
+                    assert_eq!(url, "https://gems.corp");
+                }
+                other => panic!("expected CustomRegistry for {}, got {other:?}", dep.name),
+            }
+        }
+    }
+
+    /// Same trap as above, covering `unless`, `case`, and `def` — the other bare
+    /// `end`-terminated keywords `BARE_BLOCK_START` must recognize.
+    #[test]
+    fn test_other_bare_block_keywords_do_not_unbalance_source_block() {
+        let gemfile = r#"source "https://rubygems.org"
+source "https://gems.corp" do
+  unless ENV["CI"]
+    gem "dev-only-gem"
+  end
+  case RUBY_PLATFORM
+  when /darwin/
+    gem "mac-gem"
+  end
+  def helper_method
+    true
+  end
+  gem "after-all-blocks-gem"
+end"#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 3);
+        for dep in &result.dependencies {
+            match &dep.source {
+                DependencySource::CustomRegistry { url } => {
+                    assert_eq!(url, "https://gems.corp");
+                }
+                other => panic!("expected CustomRegistry for {}, got {other:?}", dep.name),
+            }
+        }
+    }
+
+    /// Sanity check: a single-line statement-modifier `if`/`unless` (`gem "x" if cond`) must
+    /// NOT be treated as a block opener — the line starts with `gem`, not the keyword, so
+    /// `BARE_BLOCK_START`'s line-start anchor correctly leaves it unmatched (this form has no
+    /// matching `end` to balance).
+    #[test]
+    fn test_statement_modifier_if_is_not_treated_as_block_opener() {
+        let gemfile = r#"source "https://rubygems.org"
+source "https://gems.corp" do
+  gem "mac-only-gem" if RUBY_PLATFORM =~ /darwin/
+  gem "after-modifier-gem" unless ENV["CI"]
+end
+gem "rails""#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 3);
+        assert_eq!(result.dependencies[0].name, "mac-only-gem");
+        assert_eq!(result.dependencies[1].name, "after-modifier-gem");
+        for dep in &result.dependencies[..2] {
+            match &dep.source {
+                DependencySource::CustomRegistry { url } => {
+                    assert_eq!(url, "https://gems.corp");
+                }
+                other => panic!("expected CustomRegistry for {}, got {other:?}", dep.name),
+            }
+        }
+        assert_eq!(result.dependencies[2].name, "rails");
+        assert_eq!(result.dependencies[2].source, DependencySource::Registry);
+    }
+
+    /// Security regression (impl-critic, post-#1): the expression-valued (assignment) form
+    /// `flag = if COND ... end` has its `if` preceded by `flag = `, so it does not start the
+    /// line — before extending `BARE_BLOCK_START` with the optional assignment prefix, this
+    /// bare `end` still popped the enclosing `source` block early, and `after-assignment-gem`
+    /// (declared after it but still textually inside the block) silently fell back to
+    /// `Registry` — the same leak direction the original #980 fix and finding #1 both close.
+    #[test]
+    fn test_assignment_form_if_block_does_not_unbalance_source_block() {
+        let gemfile = r#"source "https://rubygems.org"
+source "https://gems.corp" do
+  flag = if RUBY_VERSION > "3"
+    true
+  else
+    false
+  end
+  gem "after-assignment-gem"
+end"#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        match &result.dependencies[0].source {
+            DependencySource::CustomRegistry { url } => {
+                assert_eq!(url, "https://gems.corp");
+            }
+            other => panic!("expected CustomRegistry, got {other:?}"),
+        }
     }
 
     #[test]
