@@ -856,10 +856,15 @@ dropped with a logged warning at config-load time rather than rejecting the whol
   *any* entry matches a non-empty `allow` (the permissive reading — the consumer
   can pick whichever license they comply with).
 
-**Coverage is exactly the ecosystems [License Hover](#license-hover)'s
-background pre-fetch covers — Dart, Swift, Deno, and Gradle.** Gradle's Maven
-Central POM licenses are free text (e.g. `"The Apache Software License, Version
-2.0"`), never SPDX identifiers, so directly matching them against an SPDX
+**Coverage is Composer, plus exactly the ecosystems [License Hover](#license-hover)'s
+background pre-fetch covers — Dart, Swift, Deno, and Gradle.** Composer's license
+arrives for free in its hot-path registry response (`RegistryDeclaredSpdx`, via
+Packagist's own version list — see [License Hover](#license-hover) above), so it
+needs no dedicated pre-fetch to populate the diagnostic's synchronous license map;
+any other ecosystem whose registry client starts returning a `license:` field on
+its version type joins this set the same way, with no further code changes. Gradle's
+Maven Central POM licenses are free text (e.g. `"The Apache Software License,
+Version 2.0"`), never SPDX identifiers, so directly matching them against an SPDX
 allow/deny list would produce both false positives (a compliant `Apache-2.0`
 dependency reported "not on the allowed license list") and false negatives (a
 `GPL-3.0` deny-list entry never matching `"GNU General Public License v3"`).
