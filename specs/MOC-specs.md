@@ -86,6 +86,7 @@ status: moc
 | 056 | [[056-gitlab-ci-yaml-scalar-anchor-alias/spec\|GitLab CI scalar YAML anchor alias detection in include: entries]] | specify | shipped — bug, P1 (PR #941, issue #912); FR-003's key-position `pending_key` amended by #942 (`deps_core::yaml_anchor::ScalarAnchorTable` extraction) |
 | 057 | [[057-gradle-version-completion-range-default-regression/spec\|Gradle version completion returns zero results for every real-world manifest shape, regressed by PR #922]] | specify | shipped — bug, P1 (PR #939, issue #931) |
 | 059 | [[059-completion-code-action-latest-marker-prerelease-mismatch/spec\|Version-completion and code-action quick-fix lists mislabel a pre-release as "(latest)"]] | specify | shipped — bug, P1 (PR #955, issue #952); capped-display-window follow-up gaps fixed separately (PR #960 issue #956, PR #970 issue #961) |
+| 061 | [[061-feature-matrix-test-sharding/spec\|Shard feature-matrix-test CI job across parallel runners]] | specify | testing-infra/enhancement, P2 (issue #1030) |
 
 ## Project Foundation
 

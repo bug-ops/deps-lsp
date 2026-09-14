@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - **ci**: moved `Cross.toml` to `.github/Cross.toml` to declutter the repo root; `cross` steps now set `CROSS_CONFIG` explicitly since `cross` only auto-discovers a root-level file
 - **CI**: split the `feature-matrix` job's test execution into a separate `feature-matrix-test` job so it runs in parallel with the clippy/lint checks instead of sequentially on one runner
+- **CI**: `feature-matrix-test` now shards across a 4-leg matrix and drops the redundant `--features default` slice (identical coverage to `--all-features`), cutting its wall-clock time from ~10m47s to an expected few minutes (resolves #1030) (#1031)
 - **deps-gitlab-ci**: a literal inline `<<: {...}` merge key (no anchor/alias involved) now folds into the `include:` entry, matching GitLab's actual YAML loader — previously `<<` was treated as an unrecognized key and silently ignored (#1028)
 - **deps-gitlab-ci**: an empty/null-like `ref:` on an ordinary, anchor-free `include:` entry now ships no version at all, instead of `version_req = Some("")` with a zero-width range (#1028)
 - **deps-core, deps-dart**: `is_plain_null` now recognizes `Null`/`NULL` in addition to `~`/`null` — the four spellings GitLab's Psych YAML loader treats as null (#1028)
@@ -21,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - **CI**: the `cross-check` job's i686 leg now builds and tests natively via `gcc-multilib` on `ubuntu-latest` instead of through `cross`'s musl Docker container, dropping the associated apt-get/Docker overhead and the `--test-threads=1` workaround (now uses `cargo nextest`) (#1027)
 - **CI**: `cargo-semver-checks` is now a blocking gate on PR/push and part of `ci-success` (was advisory-only, milestone criterion B3) (resolves #945) (#1012)
+- **deps-bundler**: multi-line `gem` declarations (continuation-line `:source =>`/`source:`, backslash continuation, or a commented-out option) no longer leak private gem names to the public rubygems.org registry, and the parser's block/group state tracking is now O(1) per line instead of O(block depth) (resolves #991, #1009) (#1016)
 - **deps-lsp**: gated 4 tests that panicked (not just failed to compile) under a reduced ecosystem feature set, and fixed the crate's remaining unused-import/dead-code warnings across the feature matrix; CI now lints deps-lsp's test targets with `-D warnings` and runs `cargo hack nextest run -p deps-lsp --each-feature` on every individual feature (resolves #1005, #1001) (#1011)
 - **docs**: corrected README.md's and ECOSYSTEM_GUIDE.md's contradictory `license_policy` diagnostic ecosystem-scope claims — the diagnostic actually fires for five ecosystems (Composer, Dart, Swift, Deno, Gradle), not "all 14" or the previously listed four (resolves #1004) (#1013)
 
