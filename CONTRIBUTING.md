@@ -34,6 +34,13 @@ cargo +nightly fmt
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
+CI also runs a feature-matrix job (`cargo hack clippy --workspace --each-feature
+--no-dev-deps`) that lints each ecosystem feature flag on its own, and reduced
+feature sets in general — a warning that only appears with a single feature
+enabled (e.g. an unused parameter that's only used when other ecosystems are
+also compiled in) is invisible to the `--all-features` command above. Run the
+same command locally before adding or changing a feature flag.
+
 ## Testing
 
 ```bash

@@ -30,7 +30,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 
 ```toml
 [dependencies]
-deps-nuget = "0.14"
+deps-nuget = "1.0"
 ```
 
 ## Usage

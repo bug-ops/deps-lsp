@@ -57,10 +57,11 @@ status: active
    principle is historical once v1.0.0 ships and applies only to changes made
    before that release.
 
-8. **Post-1.0 breaking-change policy.** Once v1.0.0 ships, this project's 16
-   published crates (`deps-core` + 14 `deps-<ecosystem>` crates + `deps-lsp`)
-   are a compatibility contract with downstream consumers, and a breaking
-   change is no longer a same-version edit:
+8. **Post-1.0 breaking-change policy.** Starting with the v1.0.0 release and
+   every release after it, this project's 16 published crates (`deps-core` + 14
+   `deps-<ecosystem>` crates + `deps-lsp`) are a compatibility contract with
+   downstream consumers, and a breaking change is no longer a same-version
+   edit:
    - Any breaking change to a published crate's public API requires a major
      version bump (standard semver) for that crate.
    - Breaking changes are documented in `CHANGELOG.md` under a clearly
