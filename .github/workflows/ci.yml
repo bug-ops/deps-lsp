@@ -126,14 +126,19 @@ jobs:
       - name: Check deps-lsp test compilation across the feature matrix
         # deps-lsp (issue #998, following #975's fix for lib/bin targets): its
         # `#[cfg(test)]` module and test helpers must also compile under every reduced
-        # feature set, not just under --all-features. `check` (not `clippy`) and no
-        # `-D warnings`: every config here does compile, but most reduced-feature configs
+        # feature set, not just under --all-features. `check` (not `clippy`) and RUSTFLAGS
+        # cleared below: every config here does compile, but most reduced-feature configs
         # still emit unused-import/dead-code warnings (25-34 depending on config) from test
         # helpers/fixtures whose only consumers are ecosystem-gated tests that get stripped
         # out first — those warnings are tracked in #1001 rather than fixed here, to keep
-        # #998's fix scoped to the compile failure it was filed for. Upgrade this step to
-        # `cargo hack clippy -p deps-lsp --each-feature --all-targets -- -D warnings` once
-        # #1001 is resolved.
+        # #998's fix scoped to the compile failure it was filed for. The workflow-level
+        # `RUSTFLAGS: -D warnings` (see top-level `env:`) would otherwise turn those
+        # warnings into errors even without an explicit `-- -D warnings` on this command,
+        # so it's cleared for this step only. Upgrade this step to
+        # `cargo hack clippy -p deps-lsp --each-feature --all-targets -- -D warnings`
+        # (dropping the RUSTFLAGS override too) once #1001 is resolved.
+        env:
+          RUSTFLAGS: ""
         run: cargo hack check -p deps-lsp --each-feature --all-targets
 
   doc-and-hygiene:
