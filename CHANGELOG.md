@@ -30,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking (pre-1.0, public API)**: **deps-core**: removed the unused `severities: DiagnosticSeverities` parameter from `Ecosystem::generate_code_lenses` — the override it was added for was deleted, and no other override ever read it (resolves #930) (#951)
 
 ### Fixed
+- **deps-core**: blocked-registry diagnostics no longer skip userinfo redaction on `declaration_key` for a scheme-colon slash-less or opaque-label-prefixed credential shape that a bare `"://"` substring check missed (resolves #981) (#992)
 - **deps-bundler**: hash-rocket per-gem options (`:source =>`, `:git =>`, `:path =>`, `:github =>`) are now recognized, closing the same registry-name-leak class as #980 for Ruby's older Gemfile syntax (resolves #987) (#989)
 - **deps-bundler**: a version constraint followed by a trailing comment (`gem "rails", "~> 7.0" # ...`) is no longer dropped from hover/diagnostics (resolves #988) (#989)
 - **deps-swift**: `Package.swift`/`Package.resolved` dependencies on a non-GitHub host are no longer coerced into an attacker-nameable GitHub `owner/repo` identity queried with the user's `GITHUB_TOKEN`; they now stay visible as a non-resolvable Git source under their raw URL (resolves #979) (#982)
