@@ -22,48 +22,16 @@ use serde::Deserialize;
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use tokio::sync::OnceCell;
-
-/// Per-process salt for [`own_auth_digest`]/[`chain_auth_digest`] (issue #561, FR-014). The
-/// salt matters because a chain's `key` is `tracing::debug!`-logged and surfaces as
-/// `DependencySource::AlternateRegistry.index`: an unsalted 64-bit non-cryptographic hash of a
-/// credential header value in a log file is a brute-force target.
-fn digest_salt() -> u64 {
-    static SALT: OnceLock<u64> = OnceLock::new();
-    *SALT.get_or_init(|| {
-        use std::collections::hash_map::RandomState;
-        use std::hash::BuildHasher;
-        let mut hasher = RandomState::new().build_hasher();
-        std::process::id().hash(&mut hasher);
-        std::time::SystemTime::now().hash(&mut hasher);
-        hasher.finish()
-    })
-}
-
-/// A per-request auth identity for [`HttpCache::get_cached_pinned_with_headers`]'s `auth_id`
-/// argument (FR-014) — `0` when `auth` is `None`, otherwise a salted hash of `declared_origin`
-/// and the credential's header value. Deliberately scoped to *one hop's own* credential, not
-/// the whole chain's (see [`chain_auth_digest`] for the distinct, chain-wide value
-/// `register_alternate` uses for rotation detection): each hop's own cache-key correctness depends
-/// only on its own credential, independent of whether some other hop in the same chain also
-/// rotated.
-fn own_auth_digest(declared_origin: &str, auth: Option<&NuGetAuth>) -> u64 {
-    let Some(auth) = auth else { return 0 };
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    digest_salt().hash(&mut hasher);
-    declared_origin.hash(&mut hasher);
-    auth.header_value().hash(&mut hasher);
-    hasher.finish()
-}
 
 /// A chain-wide digest over every hop's `(url, auth)` pair, in order (issue #561, S3) — used
 /// only by `NuGetRegistry::register_alternate` to detect whether *any* hop's credential in a
 /// re-resolved chain differs from what is currently registered, never as a per-request
-/// `auth_id` (see [`own_auth_digest`] for that, distinct, purpose).
+/// `auth_id` (see [`deps_core::secret::auth_digest`] for that, distinct, purpose).
 fn chain_auth_digest(hops: &[ResolvedHop]) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    digest_salt().hash(&mut hasher);
+    deps_core::secret::digest_salt().hash(&mut hasher);
     for hop in hops {
         hop.url.as_str().hash(&mut hasher);
         match &hop.auth {
@@ -462,9 +430,10 @@ pub struct NuGetRegistry {
     /// empty string can never equal a real request's origin), computed once at construction.
     /// The declared source origin C1 pins both comparison sides to (§3.1).
     declared_origin: String,
-    /// This hop's own [`own_auth_digest`] — the per-request `auth_id` [`Self::fetch`] passes
-    /// to `HttpCache::get_cached_pinned_with_headers`. `0` when [`Self::auth`] is `None`.
-    own_auth_id: u64,
+    /// This hop's own [`deps_core::secret::auth_digest`] — the per-request `auth_id`
+    /// [`Self::fetch`] passes to `HttpCache::get_cached_pinned_with_headers`. `None` when
+    /// [`Self::auth`] is `None`.
+    own_auth_id: Option<u64>,
     /// Meaningful only on a chain's *head* client (the one `root.alternates` maps a
     /// [`NuGetSourceChain::key`] to) — the chain-wide [`chain_auth_digest`] `register_alternate`
     /// last registered it under, used purely for O(1) rotation detection. `0` on every other
@@ -491,7 +460,7 @@ impl NuGetRegistry {
             fallback_chain: Vec::new(),
             auth: None,
             declared_origin,
-            own_auth_id: 0,
+            own_auth_id: None,
             chain_auth_digest: 0,
         }
     }
@@ -519,7 +488,10 @@ impl NuGetRegistry {
         fallback_chain: Vec<Arc<Self>>,
     ) -> Self {
         let declared_origin = origin_of(hop.url.as_str()).unwrap_or_default();
-        let own_auth_id = own_auth_digest(&declared_origin, hop.auth.as_ref());
+        let own_auth_id = deps_core::secret::auth_digest(
+            &declared_origin,
+            hop.auth.as_ref().map(NuGetAuth::header_value),
+        );
         Self {
             cache,
             service_index_url: hop.url.as_str().to_string(),
@@ -571,7 +543,7 @@ impl NuGetRegistry {
                     url,
                     trusted_prefix,
                     true,
-                    Some(self.own_auth_id),
+                    self.own_auth_id,
                     &[(reqwest::header::AUTHORIZATION, auth.header_value())],
                 )
                 .await;

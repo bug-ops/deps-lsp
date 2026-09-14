@@ -42,6 +42,10 @@
 //! - `deps-gitlab-ci`'s `gitlab_version_req` (`crates/deps-gitlab-ci/src/component.rs`)
 //!   returns `semver::VersionReq` directly — low risk since `semver` is unusually stable
 //!   pre-1.0, but the same commitment applies.
+//! - [`cache_policy`] takes/returns `&dashmap::DashMap<K, V>` in its public functions; this
+//!   is not new coupling — [`registry::register_capped_with_occupied`] already exposes
+//!   `&DashMap` publicly without a `pub use dashmap` — so a `dashmap` major bump is already
+//!   a breaking change here regardless of this module's visibility.
 //!
 //! ## LSP type stability (issue #832)
 //!
@@ -73,7 +77,10 @@
 pub mod cache;
 /// Bounded-`DashMap` capacity policies shared by [`cache`], [`github`], [`deps_dev`], and
 /// [`osv`].
-pub(crate) mod cache_policy;
+///
+/// `pub`, so ecosystem crates (`deps-gitlab-ci`, `deps-github-actions`, `deps-npm`) reach it
+/// directly too.
+pub mod cache_policy;
 pub mod completion;
 /// Shared `#[macro_export]`ed conformance-test scaffolding (#758).
 ///

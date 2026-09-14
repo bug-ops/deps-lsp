@@ -23,6 +23,13 @@
 //! and rewrap it in a new [`Redacted<T>`] right away, the way `deps_core::github::AuthToken`,
 //! `deps_cargo::config::AuthToken`, and `deps_nuget::config::NuGetAuth` all do; reach for a
 //! bare [`zeroize::Zeroizing`] only when that per-request re-derivation is unavoidable.
+//!
+//! [`digest_salt`] and [`auth_digest`] cover the adjacent "identify a credential for a cache
+//! key without exposing it in a log line" concern (issue #1003): `deps-gitlab-ci` and
+//! `deps-nuget` each used to carry their own copy of this salted-hash pair.
+
+use std::hash::{Hash, Hasher};
+use std::sync::OnceLock;
 
 use zeroize::{Zeroize, Zeroizing};
 
@@ -105,6 +112,65 @@ impl<T: Zeroize + std::hash::Hash> std::hash::Hash for Redacted<T> {
 /// zeroing is performed by the wrapped [`Zeroizing<T>`] field's own [`Drop`] impl.
 impl<T: Zeroize> zeroize::ZeroizeOnDrop for Redacted<T> {}
 
+/// A per-process random salt, mixed into [`auth_digest`] so the digest cannot be
+/// reconstructed offline from a known origin/secret pair.
+///
+/// An unsalted, non-cryptographic 64-bit hash of a credential value is a brute-force target if
+/// it ever reaches a log line: an attacker who can enumerate candidate secrets offline can hash
+/// each one and compare against the leaked digest, needing no access to the origin service at
+/// all (issue #561). The salt closes that path — the digest cannot be reproduced without also
+/// knowing this process's random salt, which is never logged, persisted, or exposed.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::secret::digest_salt;
+///
+/// // Stable within one process, whatever its actual value is.
+/// assert_eq!(digest_salt(), digest_salt());
+/// ```
+pub fn digest_salt() -> u64 {
+    static SALT: OnceLock<u64> = OnceLock::new();
+    *SALT.get_or_init(|| {
+        use std::collections::hash_map::RandomState;
+        use std::hash::BuildHasher;
+        let mut hasher = RandomState::new().build_hasher();
+        std::process::id().hash(&mut hasher);
+        std::time::SystemTime::now().hash(&mut hasher);
+        hasher.finish()
+    })
+}
+
+/// A per-request auth identity for a cache key.
+///
+/// `None` when `secret` is `None`, otherwise a salted hash of `origin` and `secret`. Lets a
+/// caller distinguish an authenticated response from an unauthenticated one (or one fetched
+/// with a different credential) in a cache key without ever storing or logging the
+/// credential itself.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::secret::auth_digest;
+///
+/// assert_eq!(auth_digest("https://example.com", None), None);
+///
+/// let a = auth_digest("https://example.com", Some("token-a")).unwrap();
+/// let b = auth_digest("https://other.example.com", Some("token-a")).unwrap();
+/// assert_ne!(a, b, "different origins must digest differently");
+///
+/// let c = auth_digest("https://example.com", Some("token-b")).unwrap();
+/// assert_ne!(a, c, "different secrets must digest differently");
+/// ```
+pub fn auth_digest(origin: &str, secret: Option<&str>) -> Option<u64> {
+    let secret = secret?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    digest_salt().hash(&mut hasher);
+    origin.hash(&mut hasher);
+    secret.hash(&mut hasher);
+    Some(hasher.finish())
+}
+
 #[cfg(test)]
 mod tests {
     use super::Redacted;
@@ -161,5 +227,34 @@ mod tests {
     fn implements_zeroize_on_drop() {
         fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
         assert_zeroize_on_drop::<Redacted<String>>();
+    }
+
+    // --- auth_digest / digest_salt ---
+
+    #[test]
+    fn auth_digest_no_secret_is_none() {
+        assert_eq!(super::auth_digest("https://example.com", None), None);
+    }
+
+    #[test]
+    fn auth_digest_same_origin_and_secret_is_stable_within_process() {
+        let a = super::auth_digest("https://example.com", Some("token"));
+        let b = super::auth_digest("https://example.com", Some("token"));
+        assert_eq!(a, b);
+        assert!(a.is_some());
+    }
+
+    #[test]
+    fn auth_digest_different_origins_diverge() {
+        let a = super::auth_digest("https://example.com", Some("token")).unwrap();
+        let b = super::auth_digest("https://other.example.com", Some("token")).unwrap();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn auth_digest_different_secrets_diverge() {
+        let a = super::auth_digest("https://example.com", Some("token-a")).unwrap();
+        let b = super::auth_digest("https://example.com", Some("token-b")).unwrap();
+        assert_ne!(a, b);
     }
 }

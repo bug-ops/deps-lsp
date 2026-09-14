@@ -102,30 +102,10 @@ pub struct TagIndex {
     pub sha_to_tag: HashMap<String, String>,
 }
 
-/// Evicts entries from `map` when it is already at `max_entries`, ahead of an insert that
-/// would otherwise grow it further — the single oldest-inserted entry, approximated by
-/// removing an arbitrary entry (this map has no per-entry timestamp; unlike
-/// `deps-swift`'s TTL-based memo, a repeated fetch simply repopulates whichever entry was
-/// dropped). The O(n) scan runs only on an insert that finds the map full.
-fn evict_if_full<V>(map: &DashMap<PackageName, V>, max_entries: usize) {
-    if map.len() < max_entries {
-        return;
-    }
-    // The victim key is resolved in its own `let` binding, fully dropping the
-    // iterator (and whatever shard guard it holds) before `remove` runs — folding
-    // this into a single `if let Some(key) = map.iter()....` risks the iterator's
-    // temporary being scope-extended across the `remove` call (Rust's `if let`
-    // temporary-lifetime-extension rule), which can deadlock against DashMap's
-    // internal per-shard locking.
-    let victim = map.iter().next().map(|e| e.key().clone());
-    if let Some(key) = victim {
-        map.remove(&key);
-    }
-}
-
-/// Evicts entries from the in-flight coalescing map, but — unlike [`evict_if_full`] —
-/// **only** an entry whose `Arc<Mutex<()>>` is not currently held by another waiter
-/// (`Arc::strong_count() == 1`, meaning the map's own reference is the only one left).
+/// Evicts entries from the in-flight coalescing map, but — unlike
+/// [`deps_core::cache_policy::evict_arbitrary_if_full`] — **only** an entry whose
+/// `Arc<Mutex<()>>` is not currently held by another waiter (`Arc::strong_count() == 1`,
+/// meaning the map's own reference is the only one left).
 ///
 /// Evicting a held lock would silently defeat coalescing under exactly the load it
 /// targets: the next caller for that repository would create a *fresh* mutex and proceed
@@ -136,8 +116,9 @@ fn evict_in_flight_if_full(map: &DashMap<PackageName, Arc<tokio::sync::Mutex<()>
     if map.len() < MAX_IN_FLIGHT_ENTRIES {
         return;
     }
-    // See `evict_if_full`'s comment: the victim is resolved in its own `let`
-    // binding so the iterator's shard guard is fully released before `remove` runs.
+    // See `deps_core::cache_policy::evict_arbitrary_if_full`'s comment: the victim is
+    // resolved in its own `let` binding so the iterator's shard guard is fully released
+    // before `remove` runs.
     let victim = map
         .iter()
         .find(|e| Arc::strong_count(e.value()) == 1)
@@ -298,7 +279,10 @@ impl GithubActionsRegistry {
                 .or_insert_with(|| tag.commit.sha.clone());
         }
         if !self.tag_index.contains_key(name) {
-            evict_if_full(&self.tag_index, MAX_TAG_INDEX_ENTRIES);
+            deps_core::cache_policy::evict_arbitrary_if_full(
+                &self.tag_index,
+                MAX_TAG_INDEX_ENTRIES,
+            );
         }
         self.tag_index.insert(name.clone(), Arc::new(index));
     }
