@@ -130,17 +130,45 @@ jobs:
         run: cargo hack clippy -p deps-lsp --each-feature --all-targets --keep-going -- -D warnings
 
   feature-matrix-test:
-    name: Feature Matrix Test
+    name: Feature Matrix Test (${{ matrix.name }})
     needs: changes
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # issue #1030: `--each-feature` used to run all 17 slices (14 ecosystem features,
+        # `default`, --all-features, --no-default-features) serially on one runner (~10m47s
+        # measured), making this the pipeline's critical path once #1018 split it out on its
+        # own. `default` is dropped entirely: `[features] default = [...all 14 ecosystems...]`
+        # in crates/deps-lsp/Cargo.toml activates the exact same feature set as --all-features
+        # (verified: a --all-features build followed by --no-default-features --features
+        # default recompiles nothing — a pure cache-hit), so it was a fully redundant re-run of
+        # the same 571 tests with zero new coverage. The remaining 16 slices are split across 4
+        # matrix legs (measured per-slice timing: ~51s all-features, ~39s no-default-features,
+        # ~24-36s per ecosystem feature) so the slowest leg finishes in a few minutes instead of
+        # summing all 16 on one runner. `--include-features` restricts cargo-hack's
+        # `--each-feature` iteration to exactly the listed names (verified: still one nextest
+        # invocation per feature, not one invocation with all of them enabled together) — a
+        # future 15th ecosystem feature should be added to the shortest `run:` list below.
+        include:
+          - name: baseline
+            run: |
+              cargo nextest run -p deps-lsp --all-features --profile ci --no-fail-fast
+              cargo nextest run -p deps-lsp --no-default-features --profile ci --no-fail-fast
+          - name: ecosystems-1
+            run: cargo hack nextest run -p deps-lsp --each-feature --include-features "bundler, cargo, composer, dart, deno" --keep-going --profile ci --no-fail-fast
+          - name: ecosystems-2
+            run: cargo hack nextest run -p deps-lsp --each-feature --include-features "github-actions, gitlab-ci, go, gradle, maven" --keep-going --profile ci --no-fail-fast
+          - name: ecosystems-3
+            run: cargo hack nextest run -p deps-lsp --each-feature --include-features "npm, nuget, pypi, swift" --keep-going --profile ci --no-fail-fast
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3  # v1
         with:
-          cache-extra-identifier: feature-matrix-test
+          cache-extra-identifier: feature-matrix-test-${{ matrix.name }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -149,18 +177,16 @@ jobs:
         with:
           tool: cargo-hack, cargo-nextest
 
-      - name: Run deps-lsp tests across the feature matrix
+      - name: Run deps-lsp tests for this shard
         # issue #1005: a hardcoded ecosystem-name lookup (e.g. `ecosystem_registry.get("cargo")`)
         # in a test can compile fine yet panic at runtime once that ecosystem's feature is
         # disabled — the `feature-matrix` job's clippy steps only prove compilation, not that
         # the resulting binary actually runs clean under every reduced feature set. No `--lib`:
         # nextest's default target set (lib + bins + tests) also covers the `tests/`
         # integration suites, which hardcode ecosystem names just as easily as unit tests do.
-        # `--no-fail-fast`/`--keep-going` so one bad slice doesn't hide failures in the rest.
-        # Originally proposed in #998. Split into its own job (#1014) so test execution across
-        # the feature matrix runs in parallel with the `feature-matrix` clippy/lint checks
-        # instead of paying compile+lint time and test time back to back on one runner.
-        run: cargo hack nextest run -p deps-lsp --each-feature --keep-going --profile ci --no-fail-fast
+        # `--no-fail-fast`/`--keep-going` so one bad slice doesn't hide failures in the rest of
+        # its shard, and `fail-fast: false` above does the same across shards.
+        run: ${{ matrix.run }}
 
   doc-and-hygiene:
     name: Doc + Hygiene
