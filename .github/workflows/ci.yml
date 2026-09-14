@@ -191,20 +191,28 @@ jobs:
   semver:
     name: Semver Check
     needs: changes
-    # Advisory only (issue #755), mirroring the `fuzz` job's `continue-on-error` pattern
-    # below (#701) rather than the unconditional-and-silent anti-pattern #701 itself fixed:
-    # `cargo semver-checks check-release -p deps-core --all-features` currently fails
-    # locally with "unsupported rustdoc format v60" — a toolchain/rustdoc-JSON version
-    # mismatch between this workspace's pinned nightly and the `cargo-semver-checks`
-    # release used here, unrelated to any actual API break (tracked in #755; CI's own
-    # pinned toolchain may not hit this at all, so this job can still catch real breaks).
-    # PR/push runs stay non-blocking so a toolchain mismatch here never blocks a merge —
-    # not part of `ci-success`'s `needs` — but the weekly scheduled sweep hard-fails and
-    # files/updates a tracking issue, so a real regression is never silently lost.
+    # Blocking on every PR/push (#945). The `obi1kenobi/cargo-semver-checks-action` install
+    # step always provisions its own fresh `stable` toolchain via rustup (`rust-toolchain`
+    # input defaults to `stable` and is applied "regardless of ... the rust-toolchain.toml
+    # file"), so it never touches this workspace's pinned nightly — the local
+    # "unsupported rustdoc format v60" mismatch from issue #755 was an artifact of running
+    # `cargo semver-checks` directly against a bleeding-edge local nightly and an older
+    # cargo-semver-checks release, not something this job's isolated environment hits.
+    # cargo-semver-checks v0.50.0+ (auto-installed by the action) also added rustdoc v61
+    # support, covering the format version #755 originally failed on. Live CI runs confirm
+    # this: the job passes on ordinary PR/push runs, and the 2026-09-13 scheduled run's
+    # hard failure (#904) was a real, legitimate API break (deps-core's `LineOffsetTable`
+    # lost auto-trait impls, `HostClass` gained `#[non_exhaustive]`, `CharOffsets` was
+    # removed) that shipped correctly as part of the v1.0.0 major bump (#1010) — proof the
+    # check produces accurate signal, not spurious toolchain noise.
+    # Part of `ci-success`'s `needs`. The weekly scheduled sweep still files/updates a
+    # tracking issue on failure as a belt-and-suspenders fallback (e.g. for drift the
+    # `changes` path filter skipped on a given PR); scheduled runs stay non-blocking since
+    # PR/push is now the primary gate and the tracking issue already surfaces a failure.
     if: github.event_name == 'schedule' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    continue-on-error: ${{ github.event_name != 'schedule' }}
+    continue-on-error: ${{ github.event_name == 'schedule' }}
     permissions:
       contents: read
       issues: write
@@ -223,7 +231,7 @@ jobs:
           run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           body="Scheduled semver-check run ${run_url} failed.
 
-          This job is part of the weekly regression sweep (\`.github/workflows/ci.yml\`, job \`semver\`), tracked by issue #755. See the run log for the semver-violation or build-failure detail — a failure here that also reproduces on a PR/push run's non-blocking check is a real breaking-change candidate, not the known rustdoc-format mismatch (issue #755)."
+          This job is part of the weekly regression sweep (\`.github/workflows/ci.yml\`, job \`semver\`). Since #945, this check also blocks every PR/push run directly, so a scheduled-only failure usually means drift the \`changes\` path filter skipped on a prior PR rather than an undetected break — see the run log for the semver-violation or build-failure detail."
           existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --search "in:title \"${title}\"" --state open --json number --jq '.[0].number // empty')
           if [ -n "$existing" ]; then
             gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
@@ -734,6 +742,7 @@ jobs:
         feature-matrix,
         doc-and-hygiene,
         security,
+        semver,
         test,
         cross-check,
         coverage,
@@ -767,6 +776,7 @@ jobs:
           check_job "${{ needs.feature-matrix.result }}" "feature-matrix" || failed=1
           check_job "${{ needs.doc-and-hygiene.result }}" "doc-and-hygiene" || failed=1
           check_job "${{ needs.security.result }}" "security" || failed=1
+          check_job "${{ needs.semver.result }}" "semver" || failed=1
           check_job "${{ needs.test.result }}" "test" || failed=1
           check_job "${{ needs.cross-check.result }}" "cross-check" || failed=1
           check_job "${{ needs.coverage.result }}" "coverage" || failed=1
