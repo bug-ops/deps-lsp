@@ -35,7 +35,6 @@ use crate::config::{
 use crate::types::{CargoDependency, CargoDependencySection, DependencySource};
 use deps_core::net_policy::RegistryAccessPolicy;
 use deps_core::{DepsError, Result};
-use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -802,38 +801,16 @@ fn discover_workspace(doc_uri: &Uri) -> Result<WorkspaceDiscovery> {
 /// Parser for Cargo.toml manifests implementing the deps-core traits.
 pub struct CargoParser;
 
-// Implemented by hand rather than via `deps_core::impl_parse_result!`: `blocked_registries()`
-// is overridden with real data (`self.blocked_registries.clone()`) — the macro has no field
-// for it. `deps-npm`, `deps-pypi`, and `deps-nuget` mirror this same hand-written pattern for
-// their own `blocked_registries()` overrides (#925).
-impl deps_core::ParseResult for CargoParseResult {
-    fn dependencies(&self) -> Vec<&dyn deps_core::Dependency> {
-        self.dependencies
-            .iter()
-            .map(|d| d as &dyn deps_core::Dependency)
-            .collect()
+deps_core::impl_parse_result!(
+    CargoParseResult,
+    CargoDependency {
+        dependencies: dependencies,
+        uri: uri,
+        workspace_root: workspace_root,
+        dependency_truncation: dependency_truncation,
+        blocked_registries: blocked_registries,
     }
-
-    fn workspace_root(&self) -> Option<&std::path::Path> {
-        self.workspace_root.as_deref()
-    }
-
-    fn uri(&self) -> &Uri {
-        &self.uri
-    }
-
-    fn blocked_registries(&self) -> Vec<deps_core::BlockedRegistryOccurrence> {
-        self.blocked_registries.clone()
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn dependency_truncation(&self) -> Option<(usize, usize)> {
-        self.dependency_truncation
-    }
-}
+);
 
 #[cfg(test)]
 mod tests {
@@ -1231,6 +1208,15 @@ internal-crate = { version = "1.0", registry-index = "https://169.254.169.254/in
         );
         assert_eq!(occurrence.raw_value, "https://169.254.169.254/index");
         assert_eq!(occurrence.declaration_key, occurrence.raw_value);
+
+        // #969 (impl-critic S2): assert through the trait method, not just the struct field —
+        // `deps_core::impl_parse_result!` generates this override; a regression that silently
+        // dropped the `blocked_registries:` arm would fall back to the trait's empty-`Vec`
+        // default while leaving the struct field (asserted above) untouched, so a field-only
+        // assertion would not catch it.
+        let via_trait = deps_core::ParseResult::blocked_registries(&result);
+        assert_eq!(via_trait.len(), 1);
+        assert_eq!(via_trait[0].raw_value, "https://169.254.169.254/index");
     }
 
     /// The alias path's `blocked_registries` counterpart: an alias resolving via

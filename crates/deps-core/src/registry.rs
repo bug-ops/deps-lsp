@@ -1,7 +1,10 @@
 use crate::error::{DepsError, Result};
 use crate::parser::DependencySource;
 use crate::{ConcreteVersion, PackageName, VersionReq};
+use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use std::any::Any;
+use std::hash::Hash;
 use std::pin::Pin;
 
 type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
@@ -948,6 +951,152 @@ pub trait Metadata: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 }
 
+/// Shared capacity ceiling for a per-ecosystem alternate-registry client map.
+///
+/// Reached via each ecosystem's own `register_alternate` (`Cargo`, `npm`, `PyPI`, `NuGet`,
+/// `Go`, #976). Once reached, a not-yet-registered key is refused rather than evicting an
+/// existing, possibly still-in-use, client.
+pub const MAX_ALTERNATE_REGISTRIES: usize = 256;
+
+/// How a [`register_capped`]/[`register_capped_with_occupied`] key must be rendered in the
+/// cap-reached log line (#969 S3).
+///
+/// A URL-shaped key is redacted via [`crate::net_policy::RedactedUrl`]; an already-opaque
+/// token (e.g. a [`hash_routing_key`] digest) is logged verbatim, since `RedactedUrl`'s
+/// Maven-coordinate/REST-path false-positive scan would otherwise collapse every such key —
+/// which is exactly one colon plus a hex digest, the shape that scan is designed to catch —
+/// to an identical, information-free `"<prefix>:***"`, destroying the very correlation handle
+/// the log line exists to provide. A closed, two-variant choice rather than an open `Display`
+/// bypass: a call site declares which shape its key is, but cannot smuggle an unredacted URL
+/// through under the `Opaque` label by accident in the type system's own vocabulary — though
+/// nothing stops a caller from mislabeling one at the value level, so get this right: labeling
+/// a URL-shaped key `Opaque` leaks any query-string credential it carries (the dangerous
+/// direction); labeling an opaque token `Url` only over-redacts a value that had no secret to
+/// begin with (the safe direction).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyShape {
+    /// Redact via [`crate::net_policy::RedactedUrl`] before logging.
+    Url,
+    /// Log verbatim — this value is known to never carry a credential (e.g. a
+    /// [`hash_routing_key`] digest, or another fixed, non-URL literal).
+    Opaque,
+}
+
+/// Registers `key` in a capacity-bounded alternate-client map, refusing (never evicting)
+/// once full.
+///
+/// A no-op when `key` is already registered — the first successful registration for a given
+/// key sticks. A no-op, with a `tracing::warn!`, once [`MAX_ALTERNATE_REGISTRIES`] is reached
+/// and `key` is not already present.
+///
+/// Reads `map.len()` **before** calling `entry()`: `DashMap::len` read-locks every shard,
+/// while `entry()` holds a write guard on one — checking capacity from inside the `Vacant`
+/// arm would self-deadlock on that shard.
+///
+/// `ecosystem` names the caller in the cap-reached log line (e.g. `"npm"`, `"PyPI"`).
+/// `key_shape` picks how `key` is rendered in that same line — see [`KeyShape`].
+///
+/// Returns `true` when `make()` was inserted, `false` when `key` was already occupied or the
+/// map was at capacity.
+///
+/// # Examples
+///
+/// ```
+/// use dashmap::DashMap;
+/// use deps_core::registry::{KeyShape, register_capped};
+///
+/// let map: DashMap<String, u32> = DashMap::new();
+/// assert!(register_capped(&map, "a".to_string(), "test", KeyShape::Opaque, || 1));
+/// assert!(!register_capped(&map, "a".to_string(), "test", KeyShape::Opaque, || 2));
+/// assert_eq!(*map.get("a").unwrap(), 1);
+/// ```
+pub fn register_capped<K, V>(
+    map: &DashMap<K, V>,
+    key: K,
+    ecosystem: &'static str,
+    key_shape: KeyShape,
+    make: impl FnOnce() -> V,
+) -> bool
+where
+    K: Eq + Hash + AsRef<str>,
+{
+    register_capped_with_occupied(map, key, ecosystem, key_shape, make, |_| {})
+}
+
+/// [`register_capped`], plus an `on_occupied` callback for an already-registered key.
+///
+/// Lets an ecosystem still act on that key — folding a re-registration's trust tier
+/// (`deps-cargo`) or rebuilding a client whose credential digest changed (`deps-nuget`).
+///
+/// `on_occupied` runs instead of `make`/the capacity check, never gated by
+/// [`MAX_ALTERNATE_REGISTRIES`] — replacing an already-occupied slot does not grow the map,
+/// so gating it would strand a legitimate in-place update (e.g. a rotated credential) once
+/// the cap is hit for unrelated keys.
+///
+/// Returns `true` when `make()` was inserted (the `Vacant` arm), `false` otherwise —
+/// `on_occupied` signals its own outcome (e.g. via `tracing::warn!`) rather than through this
+/// return value.
+///
+/// # Examples
+///
+/// ```
+/// use dashmap::DashMap;
+/// use deps_core::registry::{KeyShape, register_capped_with_occupied};
+///
+/// let map: DashMap<String, u32> = DashMap::new();
+/// register_capped_with_occupied(&map, "a".to_string(), "test", KeyShape::Opaque, || 1, |_| {});
+/// register_capped_with_occupied(
+///     &map,
+///     "a".to_string(),
+///     "test",
+///     KeyShape::Opaque,
+///     || 1,
+///     |v| *v += 10,
+/// );
+/// assert_eq!(*map.get("a").unwrap(), 11);
+/// ```
+pub fn register_capped_with_occupied<K, V>(
+    map: &DashMap<K, V>,
+    key: K,
+    ecosystem: &'static str,
+    key_shape: KeyShape,
+    make: impl FnOnce() -> V,
+    on_occupied: impl FnOnce(&mut V),
+) -> bool
+where
+    K: Eq + Hash + AsRef<str>,
+{
+    let at_capacity = map.len() >= MAX_ALTERNATE_REGISTRIES;
+
+    match map.entry(key) {
+        Entry::Occupied(mut slot) => {
+            on_occupied(slot.get_mut());
+            false
+        }
+        Entry::Vacant(slot) => {
+            if at_capacity {
+                // `slot.key()` reads the key back out of the entry rather than requiring a
+                // borrow held across the `entry()` call above, so the (possibly allocating)
+                // redaction work below stays entirely off the far more common
+                // successful-registration path.
+                let key_ref = slot.key().as_ref();
+                let rendered_key = match key_shape {
+                    KeyShape::Url => crate::net_policy::RedactedUrl::new(key_ref).to_string(),
+                    KeyShape::Opaque => key_ref.to_string(),
+                };
+                tracing::warn!(
+                    key = %rendered_key,
+                    cap = MAX_ALTERNATE_REGISTRIES,
+                    "{ecosystem} alternate registry cap reached; not registering a new entry"
+                );
+                return false;
+            }
+            slot.insert(make());
+            true
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1400,5 +1549,70 @@ mod tests {
             ["https://feed.test/", "corp", "hunter2"].into_iter(),
         );
         assert_ne!(identity_only, with_credential_included);
+    }
+
+    /// #969 S1: a `KeyShape::Url` key must be redacted before it reaches the cap-reached log
+    /// line — the query-string credential must never appear, but the non-secret host must.
+    #[test]
+    fn test_register_capped_url_shape_redacts_credential_on_cap_reached() {
+        let map: DashMap<String, usize> = DashMap::new();
+        for i in 0..MAX_ALTERNATE_REGISTRIES {
+            assert!(register_capped(
+                &map,
+                format!("https://index{i}.example"),
+                "test",
+                KeyShape::Url,
+                || i,
+            ));
+        }
+
+        let log = crate::test_util::capture_tracing_output(|| {
+            register_capped(
+                &map,
+                "https://overflow.example/?api_key=SUPERSECRET_TOKEN".to_string(),
+                "test",
+                KeyShape::Url,
+                || 0,
+            );
+        });
+
+        assert!(
+            log.contains("test alternate registry cap reached"),
+            "log: {log}"
+        );
+        assert!(!log.contains("SUPERSECRET_TOKEN"), "log: {log}");
+        assert!(log.contains("overflow.example"), "log: {log}");
+    }
+
+    /// #969 S3: a `KeyShape::Opaque` key (e.g. a [`hash_routing_key`] digest) must survive
+    /// the cap-reached log line intact — `RedactedUrl`'s Maven-coordinate false-positive scan
+    /// would otherwise collapse a `"<prefix>:<hex>"` shape to an information-free
+    /// `"<prefix>:***"`, destroying the correlation handle to other diagnostics about the
+    /// same chain.
+    #[test]
+    fn test_register_capped_opaque_shape_is_not_redacted_on_cap_reached() {
+        let map: DashMap<String, usize> = DashMap::new();
+        for i in 0..MAX_ALTERNATE_REGISTRIES {
+            let key = hash_routing_key("test-chain", std::iter::once(i.to_string().as_str()));
+            assert!(register_capped(&map, key, "test", KeyShape::Opaque, || i));
+        }
+
+        let overflow_key = hash_routing_key("test-chain", std::iter::once("overflow"));
+        let log = crate::test_util::capture_tracing_output(|| {
+            register_capped(&map, overflow_key.clone(), "test", KeyShape::Opaque, || 0);
+        });
+
+        assert!(
+            log.contains("test alternate registry cap reached"),
+            "log: {log}"
+        );
+        assert!(
+            log.contains(&overflow_key),
+            "opaque key must not be redacted: {log}"
+        );
+        assert!(
+            !log.contains("***"),
+            "opaque key must not collapse to '***': {log}"
+        );
     }
 }

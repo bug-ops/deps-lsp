@@ -1211,6 +1211,7 @@ mod tests {
         .unwrap();
         let chain = crate::config::ResolvedChain {
             key: "test-alt-chain".to_string(),
+            key_shape: deps_core::registry::KeyShape::Opaque,
             hops: vec![base],
             implicit_public_fallback: false,
         };

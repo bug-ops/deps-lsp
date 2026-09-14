@@ -146,6 +146,13 @@ pub struct ResolvedChain {
     /// For a named-source chain (Poetry `source =`/uv `index =`): the source's own literal
     /// URL, matching Cargo/npm's convention for a single resolved index.
     pub key: String,
+    /// Which of [`Self::key`]'s two possible shapes this chain carries (#969 S3) — read by
+    /// `PypiRegistry::register_alternate` to pick [`Self::key`]'s
+    /// [`deps_core::registry::KeyShape`] for the cap-reached log line: the hashed-token shape
+    /// must never be redacted as a URL (it would collapse to an information-free
+    /// `"pypi-chain:***"`), and the named-source shape must always be, since it is a real,
+    /// potentially credential-bearing URL.
+    pub key_shape: deps_core::registry::KeyShape,
     /// Ordered, already-validated hops. Hop 0 becomes the registered client's own
     /// `simple_base`; the rest become its `fallback_chain`. Never empty — see
     /// [`PypiIndexConfig::resolved_chains`]'s zero-hop handling.
@@ -171,6 +178,7 @@ impl ResolvedChain {
         );
         Self {
             key,
+            key_shape: deps_core::registry::KeyShape::Opaque,
             hops,
             implicit_public_fallback,
         }
@@ -179,6 +187,7 @@ impl ResolvedChain {
     fn named_source(url: PypiIndexUrl) -> Self {
         Self {
             key: url.as_str().to_string(),
+            key_shape: deps_core::registry::KeyShape::Url,
             hops: vec![url],
             implicit_public_fallback: false,
         }

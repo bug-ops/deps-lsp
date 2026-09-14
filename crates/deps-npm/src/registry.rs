@@ -9,10 +9,14 @@
 use crate::config::NpmRegistryIndex;
 use crate::types::{NpmPackage, NpmVersion};
 use dashmap::DashMap;
+#[cfg(test)]
+use deps_core::registry::MAX_ALTERNATE_REGISTRIES;
 use deps_core::{
     DepsError, HOVER_RECENT_VERSIONS, HttpCache, PublishTime, Result, is_dot_segment,
-    lsp_helpers::dot_segment_rejection_error, net_policy::RedactedUrl,
-    not_found_or as core_not_found_or, parser::DependencySource,
+    lsp_helpers::dot_segment_rejection_error,
+    not_found_or as core_not_found_or,
+    parser::DependencySource,
+    registry::{KeyShape, register_capped},
 };
 use serde::Deserialize;
 use std::any::Any;
@@ -72,15 +76,6 @@ const PUBLISH_TIMES_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 /// Display name for the npm registry used in not-found and API-response
 /// error messages.
 pub const REGISTRY: &str = "npm";
-
-/// Upper bound on [`NpmRegistry::alternates`]' entry count. Generous for any realistic
-/// `.npmrc` registry count; exists only to keep this map, keyed by workspace-controlled
-/// URLs, from growing unbounded for the process lifetime. Mirrors `deps-cargo`'s
-/// `MAX_ALTERNATE_REGISTRIES`. Once at capacity, a *new* index is simply never registered
-/// (see [`NpmRegistry::register_alternate`]) — a dependency resolved to an unregistered
-/// alternate index degrades to [`DepsError::PackageNotFound`], never to a
-/// `registry.npmjs.org` lookup by name (spec FR-010).
-const MAX_ALTERNATE_REGISTRIES: usize = 256;
 
 /// Which transport an [`NpmRegistry`] instance fetches through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -277,8 +272,8 @@ impl NpmRegistry {
     ///
     /// A no-op when `index` is already registered — the first successful registration for a
     /// given index URL sticks for the process lifetime. Also a no-op, with a
-    /// `tracing::warn!`, once `MAX_ALTERNATE_REGISTRIES` is reached and `index` is not
-    /// already present: the dependency stays unregistered (fails closed to
+    /// `tracing::warn!`, once [`deps_core::registry::MAX_ALTERNATE_REGISTRIES`] is reached and
+    /// `index` is not already present: the dependency stays unregistered (fails closed to
     /// [`DepsError::PackageNotFound`] at fetch time, spec FR-010) rather than evicting an
     /// existing, possibly still-in-use, client.
     ///
@@ -287,23 +282,10 @@ impl NpmRegistry {
     /// meet. Registration is parse-time-only; there is no lazy creation on the fetch path
     /// (spec FR-010 dispatch table).
     pub fn register_alternate(&self, index: NpmRegistryIndex) {
-        // Read before `entry()`: `DashMap::len` read-locks every shard, and `entry()` holds
-        // a write guard on one — checking capacity from inside the `Vacant` arm would
-        // self-deadlock on that shard (mirrors `deps-cargo::CargoRegistry::register_alternate`).
-        let at_capacity = self.alternates.len() >= MAX_ALTERNATE_REGISTRIES;
         let key = index.as_str().to_string();
-
-        if let dashmap::mapref::entry::Entry::Vacant(slot) = self.alternates.entry(key.clone()) {
-            if at_capacity {
-                tracing::warn!(
-                    index = %RedactedUrl::new(&key),
-                    cap = MAX_ALTERNATE_REGISTRIES,
-                    "npm alternate registry cap reached; not registering a new index"
-                );
-                return;
-            }
-            slot.insert(Arc::new(Self::with_base(Arc::clone(&self.cache), &index)));
-        }
+        register_capped(&self.alternates, key, "npm", KeyShape::Url, || {
+            Arc::new(Self::with_base(Arc::clone(&self.cache), &index))
+        });
     }
 
     /// The registered client for `index`, if any — read-only, performs no registration, no

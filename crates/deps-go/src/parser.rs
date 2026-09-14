@@ -16,7 +16,6 @@ use crate::types::{GoDependency, GoDirective};
 use deps_core::Result;
 use deps_core::lsp_helpers::{LineOffsetTable, byte_span_to_range};
 use regex::Regex;
-use std::any::Any;
 use tower_lsp_server::ls_types::Uri;
 
 /// Fixed declaration key for every [`GoParseResult::blocked_registries`] entry (#958) — see
@@ -381,37 +380,15 @@ fn parse_exclude_line(
     })
 }
 
-// Implemented by hand rather than via `deps_core::impl_parse_result!`: `blocked_registries()`
-// is overridden with real data (`self.blocked_registries.clone()`), mirroring
-// `deps_npm::parser::NpmParseResult`'s own hand-written impl — the macro has no field for it.
-impl deps_core::ParseResult for GoParseResult {
-    fn dependencies(&self) -> Vec<&dyn deps_core::Dependency> {
-        self.dependencies
-            .iter()
-            .map(|d| d as &dyn deps_core::Dependency)
-            .collect()
+deps_core::impl_parse_result!(
+    GoParseResult,
+    GoDependency {
+        dependencies: dependencies,
+        uri: uri,
+        dependency_truncation: dependency_truncation,
+        blocked_registries: blocked_registries,
     }
-
-    fn workspace_root(&self) -> Option<&std::path::Path> {
-        None
-    }
-
-    fn uri(&self) -> &Uri {
-        &self.uri
-    }
-
-    fn blocked_registries(&self) -> Vec<deps_core::BlockedRegistryOccurrence> {
-        self.blocked_registries.clone()
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn dependency_truncation(&self) -> Option<(usize, usize)> {
-        self.dependency_truncation
-    }
-}
+);
 
 #[cfg(test)]
 mod tests {

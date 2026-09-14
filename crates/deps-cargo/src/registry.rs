@@ -28,6 +28,9 @@ use crate::config::{AuthToken, RegistryIndex};
 use crate::sparse::SparseIndexClient;
 use crate::types::{CargoVersion, CrateInfo};
 use deps_core::parser::DependencySource;
+#[cfg(test)]
+use deps_core::registry::MAX_ALTERNATE_REGISTRIES;
+use deps_core::registry::{KeyShape, register_capped_with_occupied};
 use deps_core::{DepsError, HttpCache, PackageName, Result, net_policy::RedactedUrl};
 use semver::{Version, VersionReq};
 use serde::Deserialize;
@@ -325,15 +328,6 @@ impl deps_core::Registry for SparseIndexClient {
     }
 }
 
-/// Upper bound on [`CargoRegistry::alternates`]' entry count (spec NFR-007). Generous for
-/// any realistic `.cargo/config.toml` registry count; exists only to keep this DashMap,
-/// keyed by workspace-controlled URLs, from growing unbounded for the process lifetime.
-/// Once at capacity, a *new* index is simply never registered (see
-/// [`CargoRegistry::register_alternate`]) rather than evicted — a dependency on an
-/// unregistered alternate index degrades to [`DepsError::PackageNotFound`], never to a
-/// crates.io lookup by name.
-const MAX_ALTERNATE_REGISTRIES: usize = 256;
-
 /// Router in front of crates.io and every resolved alternate/private registry a workspace's
 /// `.cargo/config.toml` hierarchy names.
 ///
@@ -396,9 +390,11 @@ impl CargoRegistry {
     /// two different resolution paths with different tokens across the process's lifetime,
     /// which no current call site does.
     ///
-    /// Also a no-op, with a `tracing::warn!`, once `MAX_ALTERNATE_REGISTRIES` is reached
-    /// and `index` is not already present (spec NFR-007) — the dependency stays
-    /// unregistered rather than evicting an existing, possibly still-in-use, client.
+    /// Also a no-op, with a `tracing::warn!`, once
+    /// [`deps_core::registry::MAX_ALTERNATE_REGISTRIES`] is reached and `index` is not
+    /// already present (spec NFR-007) — the dependency stays unregistered rather than
+    /// evicting an existing, possibly still-in-use, client: it degrades to
+    /// [`DepsError::PackageNotFound`], never to a crates.io lookup by name.
     ///
     /// Issue #455, C3: a re-registration of an *already-registered* index URL now folds to
     /// the stricter of the stored and incoming [`crate::config::IndexTrust`] tier, dropping
@@ -410,49 +406,46 @@ impl CargoRegistry {
     /// stricter, not weaker, version of the pre-existing idempotency contract this method's
     /// summary line above documents.
     pub fn register_alternate(&self, index: RegistryIndex, auth: Option<AuthToken>) {
-        // Read before `entry()`: `DashMap::len` read-locks every shard, and `entry()` holds a
-        // write guard on one — checking capacity from inside the `Vacant` arm below would
-        // self-deadlock on that shard.
-        let at_capacity = self.alternates.len() >= MAX_ALTERNATE_REGISTRIES;
         let key = index.as_str().to_string();
         let incoming_trust = index.trust();
-        let index_display = RedactedUrl::new(index.as_str());
+        // Cloned unconditionally, once — the Vacant/Occupied outcome isn't known until
+        // `register_capped_with_occupied` inspects the map, and `make` below moves the
+        // original `index`, so the (rare) trust-fold replace path needs its own owned copy.
+        // `RegistryIndex` is a cheap `Clone` (a `Url` plus a `Copy` trust tag), so this is not
+        // worth avoiding via a larger redesign of the two-closure split.
+        let index_for_replace = index.clone();
 
-        match self.alternates.entry(key) {
-            dashmap::mapref::entry::Entry::Occupied(mut slot) => {
-                let stored_trust = slot.get().trust();
-                let folded = stored_trust.min(incoming_trust);
-                if folded != stored_trust {
-                    tracing::warn!(
-                        index = %index_display,
-                        "re-registration folds an alternate registry to the stricter trust \
-                         tier; dropping any stored credential"
-                    );
-                    slot.insert(Arc::new(SparseIndexClient::with_auth(
-                        index,
-                        Arc::clone(&self.cache),
-                        None,
-                        "alternate registry",
-                    )));
-                }
-            }
-            dashmap::mapref::entry::Entry::Vacant(slot) => {
-                if at_capacity {
-                    tracing::warn!(
-                        index = %index_display,
-                        cap = MAX_ALTERNATE_REGISTRIES,
-                        "alternate registry cap reached; not registering a new index"
-                    );
-                    return;
-                }
-                slot.insert(Arc::new(SparseIndexClient::with_auth(
+        register_capped_with_occupied(
+            &self.alternates,
+            key,
+            "Cargo",
+            KeyShape::Url,
+            || {
+                Arc::new(SparseIndexClient::with_auth(
                     index,
                     Arc::clone(&self.cache),
                     auth,
                     "alternate registry",
-                )));
-            }
-        }
+                ))
+            },
+            |current| {
+                let stored_trust = current.trust();
+                let folded = stored_trust.min(incoming_trust);
+                if folded != stored_trust {
+                    tracing::warn!(
+                        index = %RedactedUrl::new(index_for_replace.as_str()),
+                        "re-registration folds an alternate registry to the stricter trust \
+                         tier; dropping any stored credential"
+                    );
+                    *current = Arc::new(SparseIndexClient::with_auth(
+                        index_for_replace,
+                        Arc::clone(&self.cache),
+                        None,
+                        "alternate registry",
+                    ));
+                }
+            },
+        );
     }
 
     /// The registered client for `index`, if any — read-only, performs no registration, no
