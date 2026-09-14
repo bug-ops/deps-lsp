@@ -508,23 +508,12 @@ fn is_in_pypi_project_dependencies_array(content: &str, line_number: usize) -> b
 /// Strips a trailing TOML comment (`# ...`) from `line`, ignoring a `#` that appears
 /// inside a quoted string.
 ///
-/// Naive like this module's other hand-rolled raw-text scanners: does not handle a
-/// `\"` escape inside a double-quoted string, which would end the string one
-/// character too early. Good enough for the fallback-completion heuristic this feeds.
+/// Thin wrapper over the shared [`deps_core::quote_scan::strip_line_comment`] (#1022),
+/// which is escape-aware for `"..."` literals (a `\"` inside one no longer ends the
+/// string a character early — the bug this module's own hand-rolled scanner had).
 fn strip_trailing_toml_comment(line: &str) -> &str {
-    let mut in_string: Option<char> = None;
-    for (idx, ch) in line.char_indices() {
-        match in_string {
-            Some(quote) if ch == quote => in_string = None,
-            Some(_) => {}
-            None if ch == '"' || ch == '\'' => in_string = Some(ch),
-            // `idx` comes from `char_indices`, so it is always a char boundary.
-            #[allow(clippy::string_slice)]
-            None if ch == '#' => return line[..idx].trim_end(),
-            None => {}
-        }
-    }
-    line
+    deps_core::quote_scan::strip_line_comment(line, deps_core::quote_scan::ScanSyntax::Toml)
+        .trim_end()
 }
 
 /// Whether `trimmed` opens the `dependencies = [...]` array (`dependencies = [` or

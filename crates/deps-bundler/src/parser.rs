@@ -75,20 +75,15 @@ fn option_pattern(key: &str, value_pattern: &str) -> String {
     format!(r"{}\s*{value_pattern}", option_key_pattern(key))
 }
 
-/// Builds a regex pattern matching a Bundler per-gem inline option with a quoted-string value,
-/// in either the modern `key: value` syntax or Ruby's legacy hash-rocket `:key => value` syntax
-/// (e.g. `source: "..."` or `:source => "..."`). Shared by [`SOURCE_OPTION`], [`GIT_OPTION`],
-/// [`PATH_OPTION`], and [`GITHUB_OPTION`].
-fn option_value_pattern(key: &str) -> String {
-    option_pattern(key, r#"['"]([^'"]+)['"]"#)
-}
-
-/// Matches the per-gem inline `source:` option, e.g. `gem "x", source: "https://gems.corp"`
-/// or the hash-rocket form `gem "x", :source => "https://gems.corp"`.
+/// Matches the per-gem inline `source:` option's *key* alone, e.g. `source:` or
+/// `:source =>` — its string value is read separately by [`option_string_value`], which
+/// scans past the key for a string literal rather than a fixed-width value regex (#1020:
+/// a value regex built on `['"][^'"]+['"]` truncates at the first embedded quote of the
+/// *other* kind, e.g. an unescaped `'` inside a `"`-delimited value).
 // Same guarantee as GEM_PATTERN above.
 #[allow(clippy::expect_used)]
 static SOURCE_OPTION: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&option_value_pattern("source")).expect("Invalid regex"));
+    LazyLock::new(|| Regex::new(&option_key_pattern("source")).expect("Invalid regex"));
 
 /// Matches any recognized per-gem inline option's *key* alone (`source:`/`:source =>`,
 /// `group:`/`:group =>`, `git:`/`:git =>`, `path:`/`:path =>`, `github:`/`:github =>`,
@@ -177,34 +172,36 @@ static GROUP_OPTION: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&option_pattern("group", r"(\[.+?\]|:\w+)")).expect("Invalid regex")
 });
 
-/// Matches the per-gem inline `git:` option, e.g. `gem "x", git: "https://..."` or the
-/// hash-rocket form `gem "x", :git => "https://..."`.
+/// Matches the per-gem inline `git:` option's *key* alone. See [`SOURCE_OPTION`] for why
+/// the value is not part of this pattern.
 // Same guarantee as GEM_PATTERN above.
 #[allow(clippy::expect_used)]
 static GIT_OPTION: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&option_value_pattern("git")).expect("Invalid regex"));
+    LazyLock::new(|| Regex::new(&option_key_pattern("git")).expect("Invalid regex"));
 
-/// Matches the per-gem inline `path:` option, e.g. `gem "x", path: "../local"` or the
-/// hash-rocket form `gem "x", :path => "../local"`.
+/// Matches the per-gem inline `path:` option's *key* alone. See [`SOURCE_OPTION`] for why
+/// the value is not part of this pattern.
 // Same guarantee as GEM_PATTERN above.
 #[allow(clippy::expect_used)]
 static PATH_OPTION: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&option_value_pattern("path")).expect("Invalid regex"));
+    LazyLock::new(|| Regex::new(&option_key_pattern("path")).expect("Invalid regex"));
 
-/// Matches the per-gem inline `github:` option, e.g. `gem "x", github: "org/repo"` or the
-/// hash-rocket form `gem "x", :github => "org/repo"`.
+/// Matches the per-gem inline `github:` option's *key* alone. See [`SOURCE_OPTION`] for
+/// why the value is not part of this pattern.
 // Same guarantee as GEM_PATTERN above.
 #[allow(clippy::expect_used)]
 static GITHUB_OPTION: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&option_value_pattern("github")).expect("Invalid regex"));
+    LazyLock::new(|| Regex::new(&option_key_pattern("github")).expect("Invalid regex"));
 
-/// Matches the per-gem inline `require:` option, e.g. `gem "x", require: false` or the
-/// hash-rocket form `gem "x", :require => false`.
+/// Matches the per-gem inline `require:` option's *key* alone, e.g. `require:` or
+/// `:require =>`. Unlike [`SOURCE_OPTION`]/[`GIT_OPTION`]/[`PATH_OPTION`]/[`GITHUB_OPTION`],
+/// `require`'s value is not always a string (`require: false` is valid), so
+/// [`extract_require`] parses its value directly rather than through
+/// [`option_string_value`].
 // Same guarantee as GEM_PATTERN above.
 #[allow(clippy::expect_used)]
-static REQUIRE_OPTION: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(&option_pattern("require", r#"(false|['"][^'"]*['"]\s*)"#)).expect("Invalid regex")
-});
+static REQUIRE_OPTION: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(&option_key_pattern("require")).expect("Invalid regex"));
 
 /// Matches the per-gem inline `platforms:` option, e.g. `gem "x", platforms: :ruby` or the
 /// hash-rocket form `gem "x", :platforms => :ruby`.
@@ -213,6 +210,79 @@ static REQUIRE_OPTION: LazyLock<Regex> = LazyLock::new(|| {
 static PLATFORMS_OPTION: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&option_pattern("platforms", r"(\[.+?\]|:\w+)")).expect("Invalid regex")
 });
+
+/// Returns the first match of `re` on `line` that sits in code — outside every string
+/// literal and comment (per [`deps_core::quote_scan::CodeSpans`]) — rather than simply the
+/// first match `re` finds.
+///
+/// A decoy match (an option-key-shaped substring sitting inside an already-open quoted
+/// value, e.g. `git:` inside `path: 'vendor/git: "cache"'`) is skipped in favor of the
+/// next candidate instead of rejecting the line outright — S1: the old idiom
+/// (`re.captures(line)`, taking whichever match `regex` finds first, decoy or not) could
+/// match the decoy and never see the real option further down the same line.
+///
+/// Builds one [`deps_core::quote_scan::CodeSpans`] for `line` and checks every `find_iter`
+/// candidate against it, rather than reclassifying all of `line` per candidate — #1022
+/// impl-critic C1: the latter made a single lookup O(candidates × line length), quadratic
+/// once the `*_OPTION` regexes went key-only (a decoy key can now match anywhere on the
+/// line, not just right before a quote) against an adversarial line packed with decoys.
+fn first_code_match<'a>(line: &'a str, re: &Regex) -> Option<regex::Match<'a>> {
+    let code = deps_core::quote_scan::CodeSpans::new(line, deps_core::quote_scan::ScanSyntax::Ruby);
+    re.find_iter(line).find(|m| code.is_code_byte(m.start()))
+}
+
+/// Same as [`first_code_match`], but for a regex with capture groups the caller needs:
+/// returns the first code-positioned match's full [`regex::Captures`] directly (via
+/// `captures_iter`, one regex pass), instead of the caller having to re-run `captures` on
+/// the matched substring to recover groups after the fact — impl-critic m1, folded in
+/// while already touching this code for C1.
+fn first_code_captures<'a>(line: &'a str, re: &Regex) -> Option<regex::Captures<'a>> {
+    let code = deps_core::quote_scan::CodeSpans::new(line, deps_core::quote_scan::ScanSyntax::Ruby);
+    re.captures_iter(line)
+        .find(|caps| code.is_code_byte(caps.get(0).map_or(0, |m| m.start())))
+}
+
+/// Reads a Bundler inline option's string value: finds `key_re`'s first code-positioned
+/// match ([`first_code_match`]), skips whitespace, and reads the string literal that
+/// follows via [`deps_core::quote_scan::read_string_literal`] — escape-aware, so an
+/// embedded escaped quote of the *other* kind (e.g. `\'` inside a `"`-delimited value)
+/// no longer truncates the value early (#1020).
+///
+/// Returns `None` for a missing key, a value that is not a string literal at all, an
+/// unterminated one, or an **empty** one — S2: mirrors the `+` (one-or-more) that the
+/// value regex this replaces used, so `source: ""` / `github: ""` / `git: ""` /
+/// `path: ""` keep falling through to the next-lower-precedence source instead of
+/// resolving to e.g. `CustomRegistry("")`. [`extract_require`] does not use this helper
+/// precisely because `require: ""` must keep parsing (its value regex used `*`, not `+`).
+///
+/// Only ever tries the *first* code-positioned key: on an (invalid, duplicated-key) line
+/// like `git: SOME_CONST, git: "..."`, this returns `None` rather than backtracking to the
+/// second `git:` the way the old single key+value regex would have via its own internal
+/// backtracking (impl-critic m2). Not reachable from valid Ruby (a duplicate keyword
+/// argument is itself a syntax error), and the fallthrough direction is the same safe one
+/// as every other `None` case above.
+// `key_match.end()` is a regex match-end offset, always a char boundary; `rest.trim_start()`
+// only trims whitespace, itself always single-byte ASCII, so `at` stays a char boundary;
+// `literal.content` comes from `read_string_literal`, likewise always char-boundary bounds.
+#[allow(clippy::string_slice)]
+fn option_string_value<'a>(line: &'a str, key_re: &Regex) -> Option<&'a str> {
+    let key_match = first_code_match(line, key_re)?;
+    let rest = &line[key_match.end()..];
+    let at = key_match.end() + (rest.len() - rest.trim_start().len());
+    let quote = line[at..].chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let literal = deps_core::quote_scan::read_string_literal(
+        line,
+        at,
+        deps_core::quote_scan::ScanSyntax::Ruby,
+    )?;
+    if literal.content.is_empty() {
+        return None;
+    }
+    Some(&line[literal.content])
+}
 
 /// Which kind of `group ... do`, `source ... do`, or other Bundler DSL `... do ... end` block
 /// is currently open while scanning the file — tracks only the *kind*, not the block's value.
@@ -288,30 +358,12 @@ const MAX_PENDING_GEM_SEGMENTS: usize = 256;
 /// [`continues_gem_declaration`]; unrelated to the simpler (non-quote-aware) comment tolerance
 /// the block-tracking regexes elsewhere in this module use, since those match whole
 /// single-line constructs where a `#` inside a quoted URL is not a realistic concern.
-// `idx` comes from `char_indices()`, always a char boundary.
-#[allow(clippy::string_slice)]
+///
+/// Thin wrapper over the shared [`deps_core::quote_scan::strip_line_comment`] (#1022) — kept
+/// as its own named function so this doc comment, which explains why *this call site* needs
+/// quote-aware stripping, stays attached to it.
 fn strip_trailing_comment(line: &str) -> &str {
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut escaped = false;
-    for (idx, ch) in line.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match ch {
-            // A backslash only escapes the next character inside a quoted string — outside
-            // one, Ruby gives it no such meaning, so it must not swallow a real comment's `#`
-            // (code-review finding: `require: foo \# real comment` failed to detect the
-            // comment because the bare backslash was unconditionally treated as an escape).
-            '\\' if in_single || in_double => escaped = true,
-            '\'' if !in_double => in_single = !in_single,
-            '"' if !in_single => in_double = !in_double,
-            '#' if !in_single && !in_double => return &line[..idx],
-            _ => {}
-        }
-    }
-    line
+    deps_core::quote_scan::strip_line_comment(line, deps_core::quote_scan::ScanSyntax::Ruby)
 }
 
 /// True when a comment-stripped, trimmed line ends with one of Ruby's two implicit
@@ -383,12 +435,11 @@ fn finalize_pending_gem(
         .map(|(text, offset)| (strip_trailing_comment(text), *offset))
         .collect();
     let (version_req, version_range) = extract_version(&stripped_segments, content, line_table);
-    let lines: Vec<&str> = stripped_segments.iter().map(|(text, _)| *text).collect();
-    let group =
-        extract_group(&lines).unwrap_or_else(|| block_group.unwrap_or(DependencyGroup::Default));
-    let source = extract_source(&lines, gemfile_source_url, block_source_url);
-    let platforms = extract_platforms(&lines);
-    let require = extract_require(&lines);
+    let group = extract_group(&stripped_segments)
+        .unwrap_or_else(|| block_group.unwrap_or(DependencyGroup::Default));
+    let source = extract_source(&stripped_segments, gemfile_source_url, block_source_url);
+    let platforms = extract_platforms(&stripped_segments);
+    let require = extract_require(&stripped_segments);
 
     BundlerDependency {
         name: pending.name.into(),
@@ -570,21 +621,21 @@ pub fn parse_gemfile(content: &str, doc_uri: &Uri) -> Result<BundlerParseResult>
                 extract_version(&[(stripped_rest, rest_offset)], content, &line_table);
 
             // Extract group from inline option or current block
-            let group = extract_group(std::slice::from_ref(&stripped_rest))
+            let group = extract_group(&[(stripped_rest, rest_offset)])
                 .unwrap_or_else(|| current_group(&group_stack).unwrap_or(DependencyGroup::Default));
 
             // Extract source
             let source = extract_source(
-                std::slice::from_ref(&stripped_rest),
+                &[(stripped_rest, rest_offset)],
                 source_url.as_deref(),
                 current_source_block(&source_stack),
             );
 
             // Extract platforms
-            let platforms = extract_platforms(std::slice::from_ref(&stripped_rest));
+            let platforms = extract_platforms(&[(stripped_rest, rest_offset)]);
 
             // Extract require option
-            let require = extract_require(std::slice::from_ref(&stripped_rest));
+            let require = extract_require(&[(stripped_rest, rest_offset)]);
 
             dependencies.push(BundlerDependency {
                 name: name.into(),
@@ -628,12 +679,14 @@ pub fn parse_gemfile(content: &str, doc_uri: &Uri) -> Result<BundlerParseResult>
 ///
 /// A version constraint can only be a *positional* argument, and Ruby requires positional
 /// arguments before keyword arguments in a method call — so each segment is searched only up
-/// to the start of its first recognized option key ([`ANY_OPTION_KEY`]), if any, and once a
-/// segment contains one, scanning stops there entirely (every later segment is necessarily
-/// inside keyword-argument territory too). Without this, `VERSION_PATTERN` — which matches any
-/// quoted string starting with a version-ish character — could match an unrelated option's
-/// value on a later line (e.g. `require: "5.x_bridge"`) and misreport it as the version
-/// constraint, while the real one further down was never reached (code-review finding).
+/// to the start of its first recognized, code-positioned option key ([`ANY_OPTION_KEY`] via
+/// [`first_code_match`] — M4: a decoy key sitting inside an earlier quoted positional value
+/// must not truncate the search area before the real option territory begins), if any, and
+/// once a segment contains one, scanning stops there entirely (every later segment is
+/// necessarily inside keyword-argument territory too). Without this, `VERSION_PATTERN` — which
+/// matches any quoted string starting with a version-ish character — could match an unrelated
+/// option's value on a later line (e.g. `require: "5.x_bridge"`) and misreport it as the
+/// version constraint, while the real one further down was never reached (code-review finding).
 // Group 1 is mandatory in `VERSION_PATTERN`; `key_match.start()` is a regex match-start offset,
 // always a char boundary.
 #[allow(clippy::unwrap_used, clippy::string_slice)]
@@ -644,7 +697,7 @@ fn extract_version(
 ) -> (Option<String>, Option<Range>) {
     for (line, base_offset) in lines {
         let line: &str = line;
-        let key_match = ANY_OPTION_KEY.find(line);
+        let key_match = first_code_match(line, &ANY_OPTION_KEY);
         let search_area = key_match.map_or(line, |m| &line[..m.start()]);
 
         if let Some(caps) = VERSION_PATTERN.captures(search_area) {
@@ -667,12 +720,15 @@ fn extract_version(
     (None, None)
 }
 
-/// Scans each accumulated line for the inline `group:` option, returning the first match.
-fn extract_group(lines: &[&str]) -> Option<DependencyGroup> {
-    lines
-        .iter()
-        .find_map(|line| GROUP_OPTION.captures(line))
-        .map(|caps| parse_group_symbols(&caps[1]))
+/// Scans each accumulated line for the inline `group:` option, returning the first
+/// code-positioned match (N1: `GROUP_OPTION.captures(line)` alone would also match a
+/// `group:`-shaped decoy inside an already-open quoted value, same hazard [`first_code_match`]
+/// guards against for the other six `*_OPTION` lookups).
+fn extract_group(lines: &[(&str, usize)]) -> Option<DependencyGroup> {
+    lines.iter().find_map(|(line, _)| {
+        let caps = first_code_captures(line, &GROUP_OPTION)?;
+        Some(parse_group_symbols(&caps[1]))
+    })
 }
 
 fn parse_group_symbols(text: &str) -> DependencyGroup {
@@ -720,32 +776,44 @@ fn classify_registry_url(url: &str) -> DependencySource {
 /// Precedence: `git:`/`github:`/`path:` (explicit non-registry source) → inline `source:`
 /// option → enclosing `source ... do` block → file-level `source` → `Registry`.
 fn extract_source(
-    lines: &[&str],
+    lines: &[(&str, usize)],
     gemfile_source_url: Option<&str>,
     block_source_url: Option<&str>,
 ) -> DependencySource {
-    if let Some(caps) = lines.iter().find_map(|line| GIT_OPTION.captures(line)) {
+    if let Some(value) = lines
+        .iter()
+        .find_map(|(line, _)| option_string_value(line, &GIT_OPTION))
+    {
         return DependencySource::Git {
-            url: caps[1].to_string(),
+            url: value.to_string(),
             rev: None,
         };
     }
 
-    if let Some(caps) = lines.iter().find_map(|line| GITHUB_OPTION.captures(line)) {
+    if let Some(value) = lines
+        .iter()
+        .find_map(|(line, _)| option_string_value(line, &GITHUB_OPTION))
+    {
         return DependencySource::Git {
-            url: format!("https://github.com/{}", &caps[1]),
+            url: format!("https://github.com/{value}"),
             rev: None,
         };
     }
 
-    if let Some(caps) = lines.iter().find_map(|line| PATH_OPTION.captures(line)) {
+    if let Some(value) = lines
+        .iter()
+        .find_map(|(line, _)| option_string_value(line, &PATH_OPTION))
+    {
         return DependencySource::Path {
-            path: caps[1].to_string(),
+            path: value.to_string(),
         };
     }
 
-    if let Some(caps) = lines.iter().find_map(|line| SOURCE_OPTION.captures(line)) {
-        return classify_registry_url(&caps[1]);
+    if let Some(value) = lines
+        .iter()
+        .find_map(|(line, _)| option_string_value(line, &SOURCE_OPTION))
+    {
+        return classify_registry_url(value);
     }
 
     if let Some(url) = block_source_url {
@@ -755,15 +823,15 @@ fn extract_source(
     gemfile_source_url.map_or(DependencySource::Registry, classify_registry_url)
 }
 
-/// Scans each accumulated line for the inline `platforms:` option, returning the first match.
-fn extract_platforms(lines: &[&str]) -> Vec<String> {
-    let Some(caps) = lines
-        .iter()
-        .find_map(|line| PLATFORMS_OPTION.captures(line))
-    else {
+/// Scans each accumulated line for the inline `platforms:` option, returning the first
+/// code-positioned match (N1, same reasoning as [`extract_group`]).
+fn extract_platforms(lines: &[(&str, usize)]) -> Vec<String> {
+    let Some(platforms_str) = lines.iter().find_map(|(line, _)| {
+        let caps = first_code_captures(line, &PLATFORMS_OPTION)?;
+        Some(caps[1].to_string())
+    }) else {
         return vec![];
     };
-    let platforms_str = &caps[1];
     if platforms_str.starts_with('[') {
         // Parse array: [:mingw, :mswin]
         platforms_str
@@ -778,17 +846,52 @@ fn extract_platforms(lines: &[&str]) -> Vec<String> {
     }
 }
 
-/// Scans each accumulated line for the inline `require:` option, returning the first match.
-fn extract_require(lines: &[&str]) -> Option<String> {
-    let caps = lines
-        .iter()
-        .find_map(|line| REQUIRE_OPTION.captures(line))?;
-    let value = &caps[1];
-    if value == "false" {
-        Some("false".to_string())
-    } else {
-        Some(value.trim_matches(|c| c == '\'' || c == '"').to_string())
-    }
+/// Scans each accumulated line for the inline `require:` option, returning the first
+/// code-positioned match.
+///
+/// Unlike [`extract_source`]'s options, `require`'s value is not always a string
+/// (`require: false`), so it is parsed directly here rather than through
+/// [`option_string_value`] — and, unlike that helper, an **empty** string value
+/// (`require: ""`) is accepted, not rejected (S2): `REQUIRE_OPTION`'s old value pattern used
+/// `*` (zero-or-more), not `+`, so `require: ""` has always meant "explicitly disable the
+/// default require", distinct from no `require:` option at all.
+///
+/// The `false` branch requires a word boundary right after it (N4: `require: falsey` and
+/// `require: false_thing` are option-value-shaped text that happens to start with `false`,
+/// not the boolean literal — a bug in the regex this replaces, `(false|...)`, which matched
+/// on the `false` prefix alone; fixed here since this line is being rewritten anyway).
+fn extract_require(lines: &[(&str, usize)]) -> Option<String> {
+    lines.iter().find_map(|(line, _)| {
+        let key_match = first_code_match(line, &REQUIRE_OPTION)?;
+        // `key_match.end()` and `rest.trim_start()`'s skip are always char boundaries — see
+        // `option_string_value`'s identical justification.
+        #[allow(clippy::string_slice)]
+        let rest = &line[key_match.end()..];
+        let trimmed = rest.trim_start();
+        if let Some(after_false) = trimmed.strip_prefix("false") {
+            let is_word_boundary = after_false
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+            if is_word_boundary {
+                return Some("false".to_string());
+            }
+        }
+        let at = key_match.end() + (rest.len() - trimmed.len());
+        #[allow(clippy::string_slice)]
+        let quote = line[at..].chars().next()?;
+        if quote != '"' && quote != '\'' {
+            return None;
+        }
+        let literal = deps_core::quote_scan::read_string_literal(
+            line,
+            at,
+            deps_core::quote_scan::ScanSyntax::Ruby,
+        )?;
+        #[allow(clippy::string_slice)]
+        let value = &line[literal.content];
+        Some(value.to_string())
+    })
 }
 
 /// Parser for Gemfile manifests.
@@ -2320,5 +2423,135 @@ gem "sidekiq",
     fn test_strip_trailing_comment_escaped_quote_inside_string_still_tracked() {
         let line = r#"source: "a\"b#c""#;
         assert_eq!(strip_trailing_comment(line), line);
+    }
+
+    // --- #1022/#1020/#1023 regression tests ---
+
+    /// S1 repro (architect/critic handoff, #1022): `path:`'s single-quoted value contains a
+    /// `"`-delimited substring that looks like another option (`git: "cache"`). The old value
+    /// regex `['"]([^'"]+)['"]` closed on the first embedded quote of *either* kind, so
+    /// `path:`'s "value" ended at `vendor/git: `, leaving `"cache"', git: ` unconsumed and
+    /// the real `git:` option undetected. `option_string_value`/`read_string_literal` only
+    /// close a `'`-delimited literal on another `'`, so `path:`'s value is genuinely
+    /// `vendor/git: "cache"` and the real, later `git:` option is found.
+    #[test]
+    fn test_path_option_decoy_does_not_swallow_real_git_option() {
+        let gemfile = r#"source "https://rubygems.org"
+gem "x", path: 'vendor/git: "cache"', git: "https://real.example/r""#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_matches!(
+            result.dependencies[0].source,
+            DependencySource::Git { ref url, .. } if url == "https://real.example/r"
+        );
+    }
+
+    /// S2: an inline `source:` option with an **empty** string value must fall through to
+    /// the enclosing `source ... do` block's URL, not resolve to `CustomRegistry("")` —
+    /// `option_string_value` rejects an empty span, mirroring the `+` (one-or-more) the old
+    /// value regex used.
+    #[test]
+    fn test_empty_source_option_falls_through_to_block_source() {
+        let gemfile = r#"source "https://rubygems.org"
+source "https://gems.corp" do
+  gem "x", source: ""
+end"#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_matches!(
+            result.dependencies[0].source,
+            DependencySource::CustomRegistry { ref url } if url == "https://gems.corp"
+        );
+    }
+
+    /// S2, `github:` variant of the same empty-value fallthrough.
+    #[test]
+    fn test_empty_github_option_falls_through_to_block_source() {
+        let gemfile = r#"source "https://rubygems.org"
+source "https://gems.corp" do
+  gem "x", github: ""
+end"#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_matches!(
+            result.dependencies[0].source,
+            DependencySource::CustomRegistry { ref url } if url == "https://gems.corp"
+        );
+    }
+
+    /// S2 carve-out: unlike `source:`/`git:`/`path:`/`github:`, `require: ""` must still
+    /// parse to an empty string rather than being rejected — `REQUIRE_OPTION`'s old value
+    /// pattern always allowed zero-or-more characters (`*`), not one-or-more, and
+    /// `extract_require` preserves that by not routing through `option_string_value`.
+    #[test]
+    fn test_empty_require_option_still_parses() {
+        let gemfile = "source \"https://rubygems.org\"\ngem \"x\", require: \"\"";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies[0].require, Some(String::new()));
+    }
+
+    /// #1020 repro (backslash form): a backslash-escaped apostrophe inside a `"`-delimited
+    /// `source:` value must not be mistaken for the string's close.
+    #[test]
+    fn test_1020_source_option_backslash_escaped_apostrophe_not_truncated() {
+        let gemfile = "source \"https://rubygems.org\"\ngem \"x\", source: \"https://o\\'brien.example/gems\"";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_matches!(
+            result.dependencies[0].source,
+            DependencySource::CustomRegistry { ref url } if url == "https://o\\'brien.example/gems"
+        );
+    }
+
+    /// #1020 repro (no-backslash form, critic-found): an *unescaped* apostrophe inside a
+    /// `"`-delimited value is not a delimiter at all under Ruby syntax (`"` and `'` each only
+    /// close their own kind), so it must not truncate the value either.
+    #[test]
+    fn test_1020_source_option_unescaped_apostrophe_not_truncated() {
+        let gemfile =
+            "source \"https://rubygems.org\"\ngem \"x\", source: \"https://o'brien.example/gems\"";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_matches!(
+            result.dependencies[0].source,
+            DependencySource::CustomRegistry { ref url } if url == "https://o'brien.example/gems"
+        );
+    }
+
+    /// N1 (critic second-pass finding): `GROUP_OPTION` must also route through
+    /// `first_code_match`, not just the other six `*_OPTION` lookups — otherwise a
+    /// `group:`-shaped decoy inside an already-open quoted value (here, `source:`'s) is
+    /// mistaken for a real `group:` option.
+    #[test]
+    fn test_group_option_decoy_inside_source_value_is_ignored() {
+        let gemfile = r#"source "https://rubygems.org"
+gem "x", source: "https://h/group: [:test]""#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_matches!(result.dependencies[0].group, DependencyGroup::Default);
+    }
+
+    /// #1023.2 regression: `extract_group`/`extract_source`/`extract_platforms`/
+    /// `extract_require` switching from `&[&str]` to `&[(&str, usize)]` (dropping
+    /// `finalize_pending_gem`'s second, offset-stripped `Vec` allocation) must not disturb
+    /// the budget/truncation interaction with a still-pending multi-line `gem` call at the
+    /// budget boundary — the file-end `PendingGem` flush must still respect
+    /// `MAX_DEPENDENCIES_PER_DOCUMENT` rather than smuggling one more dependency past it.
+    #[test]
+    fn test_budget_boundary_with_trailing_multiline_gem() {
+        let mut gemfile = String::from("source \"https://rubygems.org\"\n");
+        for i in 0..deps_core::MAX_DEPENDENCIES_PER_DOCUMENT {
+            gemfile.push_str(&format!("gem \"g{i}\"\n"));
+        }
+        gemfile.push_str("gem \"over\",\n  source: \"https://internal.example\"");
+
+        let result = parse_gemfile(&gemfile, &test_uri()).unwrap();
+
+        assert_eq!(
+            result.dependencies.len(),
+            deps_core::MAX_DEPENDENCIES_PER_DOCUMENT
+        );
+        assert!(!result.dependencies.iter().any(|d| d.name == "over"));
+        assert_eq!(
+            result.dependency_truncation,
+            Some((
+                deps_core::MAX_DEPENDENCIES_PER_DOCUMENT,
+                deps_core::MAX_DEPENDENCIES_PER_DOCUMENT + 1
+            ))
+        );
     }
 }

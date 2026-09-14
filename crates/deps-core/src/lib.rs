@@ -120,6 +120,13 @@ pub mod pagination;
 /// Shared manifest-parsing helpers: bounded JSON/TOML/YAML nesting checks and
 /// depth-limited parsing used by every ecosystem's manifest parser.
 pub mod parser;
+/// Shared escape-aware string-literal and comment scanning.
+///
+/// [`quote_scan::read_string_literal`], [`quote_scan::strip_line_comment`],
+/// [`quote_scan::blank_comments`], and [`quote_scan::is_code_byte`], parameterized over
+/// [`quote_scan::ScanSyntax`] — used by `deps-bundler`, `deps-swift`, and `deps-pypi`
+/// instead of each hand-rolling its own scanner (#1022).
+pub mod quote_scan;
 /// The [`registry::Registry`] trait: version lookup and search that every
 /// ecosystem's registry client implements.
 pub mod registry;
