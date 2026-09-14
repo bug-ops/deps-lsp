@@ -58,13 +58,29 @@ static SOURCE_BLOCK_START: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"^\s*source\s+['"]([^'"]+)['"]\s+do\s*(#.*)?$"#).expect("Invalid regex")
 });
 
-/// Builds a regex pattern matching a Bundler per-gem inline option in either the modern
-/// `key: value` syntax or Ruby's legacy hash-rocket `:key => value` syntax (e.g. `source:
-/// "..."` or `:source => "..."`). Shared by [`SOURCE_OPTION`], [`GIT_OPTION`],
-/// [`PATH_OPTION`], and [`GITHUB_OPTION`] so the hash-rocket gap (#987) is fixed once for all
-/// four options instead of patched separately per option.
+/// Builds the key-delimiter portion shared by every Bundler per-gem inline option, matching
+/// either the modern `key:` syntax or Ruby's legacy hash-rocket `:key =>` syntax. Independent
+/// of value shape, so it composes with any value pattern (`option_value_pattern` below for
+/// quoted-string values, or a bespoke value pattern for array/boolean/symbol values like
+/// [`GROUP_OPTION`], [`REQUIRE_OPTION`], and [`PLATFORMS_OPTION`]) — the single place the
+/// hash-rocket gap (#987, #990) is fixed for all seven `*_OPTION` regexes.
+fn option_key_pattern(key: &str) -> String {
+    format!(r"(?:\b{key}:|:{key}\s*=>)")
+}
+
+/// Joins an option's key pattern with its value pattern (`key_pattern\s*value_pattern`) — the
+/// single place every `*_OPTION` regex composes its key and value halves, so a future grammar
+/// tweak (e.g. loosening `\s*` to `\s+`) is a one-line change instead of one edit per option.
+fn option_pattern(key: &str, value_pattern: &str) -> String {
+    format!(r"{}\s*{value_pattern}", option_key_pattern(key))
+}
+
+/// Builds a regex pattern matching a Bundler per-gem inline option with a quoted-string value,
+/// in either the modern `key: value` syntax or Ruby's legacy hash-rocket `:key => value` syntax
+/// (e.g. `source: "..."` or `:source => "..."`). Shared by [`SOURCE_OPTION`], [`GIT_OPTION`],
+/// [`PATH_OPTION`], and [`GITHUB_OPTION`].
 fn option_value_pattern(key: &str) -> String {
-    format!(r#"(?:{key}:|:{key}\s*=>)\s*['"]([^'"]+)['"]"#)
+    option_pattern(key, r#"['"]([^'"]+)['"]"#)
 }
 
 /// Matches the per-gem inline `source:` option, e.g. `gem "x", source: "https://gems.corp"`
@@ -128,10 +144,13 @@ static BARE_BLOCK_START: LazyLock<Regex> = LazyLock::new(|| {
 static BLOCK_END: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*end\s*(#.*)?$").expect("Invalid regex"));
 
+/// Matches the per-gem inline `group:` option, e.g. `gem "x", group: [:test]` or the
+/// hash-rocket form `gem "x", :group => [:test]`.
 // Same guarantee as GEM_PATTERN above.
 #[allow(clippy::expect_used)]
-static GROUP_OPTION: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"group:\s*(\[.+?\]|:\w+)").expect("Invalid regex"));
+static GROUP_OPTION: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&option_pattern("group", r"(\[.+?\]|:\w+)")).expect("Invalid regex")
+});
 
 /// Matches the per-gem inline `git:` option, e.g. `gem "x", git: "https://..."` or the
 /// hash-rocket form `gem "x", :git => "https://..."`.
@@ -154,15 +173,21 @@ static PATH_OPTION: LazyLock<Regex> =
 static GITHUB_OPTION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(&option_value_pattern("github")).expect("Invalid regex"));
 
+/// Matches the per-gem inline `require:` option, e.g. `gem "x", require: false` or the
+/// hash-rocket form `gem "x", :require => false`.
 // Same guarantee as GEM_PATTERN above.
 #[allow(clippy::expect_used)]
-static REQUIRE_OPTION: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"require:\s*(false|['"][^'"]*['"]\s*)"#).expect("Invalid regex"));
+static REQUIRE_OPTION: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&option_pattern("require", r#"(false|['"][^'"]*['"]\s*)"#)).expect("Invalid regex")
+});
 
+/// Matches the per-gem inline `platforms:` option, e.g. `gem "x", platforms: :ruby` or the
+/// hash-rocket form `gem "x", :platforms => :ruby`.
 // Same guarantee as GEM_PATTERN above.
 #[allow(clippy::expect_used)]
-static PLATFORMS_OPTION: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"platforms:\s*(\[.+?\]|:\w+)").expect("Invalid regex"));
+static PLATFORMS_OPTION: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&option_pattern("platforms", r"(\[.+?\]|:\w+)")).expect("Invalid regex")
+});
 
 /// A `group ... do`, `source ... do`, or any other Bundler DSL `... do ... end` block
 /// currently open while scanning the file.
@@ -1381,5 +1406,130 @@ gem "rails", "~> 7.0" # pinned for Rails 7 compat"#;
 gem 'sidekiq', '~> 7.0', require: false";
         let result = parse_gemfile(gemfile, &test_uri()).unwrap();
         assert_eq!(result.dependencies[0].version_req, Some("~> 7.0".into()));
+    }
+
+    /// Security regression (#990), same gap as #987 but for the `group:` option: the
+    /// hash-rocket `:group => [...]` form was previously unmatched by `GROUP_OPTION`
+    /// (`key:`-only), so the gem's group inline option was silently dropped.
+    #[test]
+    fn test_hash_rocket_group_option_array_classified() {
+        let gemfile = r#"source "https://rubygems.org"
+gem "rspec", :group => [:test]"#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_matches!(result.dependencies[0].group, DependencyGroup::Test);
+    }
+
+    /// Same gap as above for the `group:` option with a bare symbol value.
+    #[test]
+    fn test_hash_rocket_group_option_symbol_classified() {
+        let gemfile = r#"source "https://rubygems.org"
+gem "sidekiq", :group => :production"#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_matches!(result.dependencies[0].group, DependencyGroup::Production);
+    }
+
+    /// Security regression (#990), same gap as #987 but for the `require:` option.
+    #[test]
+    fn test_hash_rocket_require_option_false_classified() {
+        let gemfile = r#"source "https://rubygems.org"
+gem "puma", :require => false"#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies[0].require, Some("false".into()));
+    }
+
+    /// Same gap as above for the `require:` option with a custom path value.
+    #[test]
+    fn test_hash_rocket_require_option_custom_path_classified() {
+        let gemfile = r#"source "https://rubygems.org"
+gem "my_gem", :require => "custom/path""#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies[0].require, Some("custom/path".into()));
+    }
+
+    /// Security regression (#990), same gap as #987 but for the `platforms:` option.
+    #[test]
+    fn test_hash_rocket_platforms_option_symbol_classified() {
+        let gemfile = r#"source "https://rubygems.org"
+gem "wdm", :platforms => :mswin"#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies[0].platforms, vec!["mswin"]);
+    }
+
+    /// Same gap as above for the `platforms:` option with an array value.
+    #[test]
+    fn test_hash_rocket_platforms_option_array_classified() {
+        let gemfile = r#"source "https://rubygems.org"
+gem "tzinfo-data", :platforms => [:mingw, :mswin]"#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies[0].platforms, vec!["mingw", "mswin"]);
+    }
+
+    /// A Gemfile mixing modern and hash-rocket syntax across different gems and options must
+    /// resolve every option correctly regardless of which syntax each line uses.
+    #[test]
+    fn test_mixed_modern_and_hash_rocket_syntax_gemfile() {
+        let gemfile = r#"source "https://rubygems.org"
+gem "rspec", group: [:test], :require => false
+gem "sidekiq", :group => :production, require: "sidekiq/testing"
+gem "wdm", platforms: :mswin
+gem "tzinfo-data", :platforms => [:mingw, :mswin]"#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 4);
+
+        assert_matches!(result.dependencies[0].group, DependencyGroup::Test);
+        assert_eq!(result.dependencies[0].require, Some("false".into()));
+
+        assert_matches!(result.dependencies[1].group, DependencyGroup::Production);
+        assert_eq!(
+            result.dependencies[1].require,
+            Some("sidekiq/testing".into())
+        );
+
+        assert_eq!(result.dependencies[2].platforms, vec!["mswin"]);
+        assert_eq!(result.dependencies[3].platforms, vec!["mingw", "mswin"]);
+    }
+
+    /// Regression (impl-critic M1): the modern `{key}:` branch must not match a key that is
+    /// merely a suffix of a longer identifier — `subgroup:` must not be mistaken for `group:`.
+    /// Without the `\b` left word boundary, `GROUP_OPTION` matched inside `subgroup:` and
+    /// misclassified the gem's group.
+    #[test]
+    fn test_group_option_does_not_match_prefixed_key() {
+        let gemfile = r#"source "https://rubygems.org"
+gem "rails", subgroup: [:test]"#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_matches!(result.dependencies[0].group, DependencyGroup::Default);
+    }
+
+    /// Same M1 regression for `REQUIRE_OPTION`: `autorequire:` must not be mistaken for
+    /// `require:`.
+    #[test]
+    fn test_require_option_does_not_match_prefixed_key() {
+        let gemfile = r#"source "https://rubygems.org"
+gem "rails", autorequire: false"#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies[0].require, None);
+    }
+
+    /// Same M1 regression for `PLATFORMS_OPTION`: `force_ruby_platforms:` must not be mistaken
+    /// for `platforms:`.
+    #[test]
+    fn test_platforms_option_does_not_match_prefixed_key() {
+        let gemfile = r#"source "https://rubygems.org"
+gem "rails", force_ruby_platforms: :ruby"#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert!(result.dependencies[0].platforms.is_empty());
+    }
+
+    /// Sanity check accompanying the M1 fix: the real `group:`/`require:`/`platforms:` keys
+    /// (immediately preceded by a comma+space, a normal word boundary) must still match.
+    #[test]
+    fn test_real_keys_still_match_after_word_boundary_fix() {
+        let gemfile = r#"source "https://rubygems.org"
+gem "rspec", group: [:test], require: false, platforms: :ruby"#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_matches!(result.dependencies[0].group, DependencyGroup::Test);
+        assert_eq!(result.dependencies[0].require, Some("false".into()));
+        assert_eq!(result.dependencies[0].platforms, vec!["ruby"]);
     }
 }
