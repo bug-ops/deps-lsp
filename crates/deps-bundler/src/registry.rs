@@ -7,6 +7,7 @@ use crate::version::{compare_versions, version_matches_requirement};
 use deps_core::{HttpCache, Result};
 use serde::Deserialize;
 use std::any::Any;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -28,11 +29,8 @@ pub fn gem_url(name: &str) -> String {
 }
 
 /// Builds the rubygems.org API request URL for a gem's version list.
-fn versions_url(name: &str) -> String {
-    format!(
-        "{RUBYGEMS_API_BASE}/versions/{}.json",
-        urlencoding::encode(name)
-    )
+fn versions_url(base: &str, name: &str) -> String {
+    format!("{base}/versions/{}.json", urlencoding::encode(name))
 }
 
 /// Builds the rubygems.org API request URL for a gem's detailed info.
@@ -42,23 +40,41 @@ fn versions_url(name: &str) -> String {
 /// coverage and the `#349` query-injection guard for this URL shape are not lost along with
 /// the dead production wrapper.
 #[cfg(test)]
-fn gem_info_url(name: &str) -> String {
-    format!(
-        "{RUBYGEMS_API_BASE}/gems/{}.json",
-        urlencoding::encode(name)
-    )
+fn gem_info_url(base: &str, name: &str) -> String {
+    format!("{base}/gems/{}.json", urlencoding::encode(name))
 }
 
 /// Client for interacting with rubygems.org registry.
 #[derive(Clone)]
 pub struct RubyGemsRegistry {
     cache: Arc<HttpCache>,
+    /// API base URL — `RUBYGEMS_API_BASE` (borrowed, keeping [`Self::new`] a `const fn`) in
+    /// production, overridden to an owned mockito server URL in tests via
+    /// [`Self::with_base_for_test`] (mirrors `deps-npm`'s
+    /// `NpmRegistry::with_public_base_for_test`, #1038).
+    api_base: Cow<'static, str>,
 }
 
 impl RubyGemsRegistry {
     /// Creates a new registry client with the given HTTP cache.
+    #[must_use]
     pub const fn new(cache: Arc<HttpCache>) -> Self {
-        Self { cache }
+        Self {
+            cache,
+            api_base: Cow::Borrowed(RUBYGEMS_API_BASE),
+        }
+    }
+
+    /// Test-only: constructs a registry client with `api_base` pointed at a mock server
+    /// (#1038), so unknown-package/error-path tests can assert a request was actually made
+    /// instead of hitting the live `rubygems.org`.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_base_for_test(cache: Arc<HttpCache>, api_base: String) -> Self {
+        Self {
+            cache,
+            api_base: Cow::Owned(api_base),
+        }
     }
 
     /// Fetches all versions for a gem.
@@ -69,7 +85,7 @@ impl RubyGemsRegistry {
     /// matching rubygems.org's `versions.json` shape.
     #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
     pub async fn get_versions(&self, name: &str) -> Result<Vec<BundlerVersion>> {
-        let url = versions_url(name);
+        let url = versions_url(&self.api_base, name);
         let data = self.cache.get_cached(&url).await?;
         parse_versions_response(&data, name)
     }
@@ -101,7 +117,7 @@ impl RubyGemsRegistry {
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<GemInfo>> {
         let url = format!(
             "{}/search.json?query={}",
-            RUBYGEMS_API_BASE,
+            self.api_base,
             urlencoding::encode(query)
         );
         let data = self.cache.get_cached(&url).await?;
@@ -722,7 +738,7 @@ mod tests {
     #[test]
     fn test_get_versions_url_encodes_query_injection() {
         let name = "foo?callback=evil";
-        let url = versions_url(name);
+        let url = versions_url(RUBYGEMS_API_BASE, name);
         let parsed = url::Url::parse(&url).unwrap();
         assert!(parsed.query().is_none());
         assert_eq!(parsed.path_segments().unwrap().count(), 4);
@@ -737,7 +753,7 @@ mod tests {
     #[test]
     fn test_gem_info_url_encodes_query_injection() {
         let name = "foo?callback=evil";
-        let url = gem_info_url(name);
+        let url = gem_info_url(RUBYGEMS_API_BASE, name);
         let parsed = url::Url::parse(&url).unwrap();
         assert!(parsed.query().is_none());
         assert_eq!(parsed.path_segments().unwrap().count(), 4);
@@ -757,12 +773,12 @@ mod tests {
     #[test]
     fn test_versions_and_gem_info_url_dot_segment_sweep() {
         deps_core::test_util::assert_dot_segment_gated_or_contained(
-            |seg| Some(versions_url(seg)),
+            |seg| Some(versions_url(RUBYGEMS_API_BASE, seg)),
             "rubygems.org",
             "/api/v1/versions/",
         );
         deps_core::test_util::assert_dot_segment_gated_or_contained(
-            |seg| Some(gem_info_url(seg)),
+            |seg| Some(gem_info_url(RUBYGEMS_API_BASE, seg)),
             "rubygems.org",
             "/api/v1/gems/",
         );

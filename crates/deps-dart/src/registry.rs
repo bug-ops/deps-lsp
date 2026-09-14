@@ -73,7 +73,7 @@ impl PubDevRegistry {
     /// Creates a registry client pointed at a custom API base URL, for pointing at a
     /// mockito server in tests.
     #[cfg(test)]
-    fn with_base(cache: Arc<HttpCache>, base: String) -> Self {
+    pub(crate) fn with_base(cache: Arc<HttpCache>, base: String) -> Self {
         Self { cache, base }
     }
 

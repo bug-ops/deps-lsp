@@ -450,6 +450,7 @@ dependencies = [
  "criterion",
  "deps-core",
  "insta",
+ "mockito",
  "regex",
  "serde",
  "tempfile",
