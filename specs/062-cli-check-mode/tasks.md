@@ -245,13 +245,13 @@ as v1's T002 warned about — but now applied to a new crate instead of `deps-co
 
 ### T005: Compile-only public-API-path non-breakage test
 
-**Context**: CI's `semver` job already blocks on every PR/push via the
-`obi1kenobi/cargo-semver-checks-action` (`ci.yml:239-263`), which provisions its own isolated
-toolchain and is unaffected by local environment mismatches. The `cargo-semver-checks` CLI
-itself just cannot be run directly in this local dev sandbox (`error: unsupported rustdoc
-format v60`), so contributors have no way to self-check before pushing. A compile-only test
-that `use`s every previously-public path is a fast, local, pre-push supplement for this
-specific move — it does not replace CI's gate.
+**Context**: CI's `semver` job (`obi1kenobi/cargo-semver-checks-action`) is advisory-only on
+every PR/push as of commit `1777dce8f` (2026-09-14, #1049) — it hard-fails only on the weekly
+scheduled sweep, and is excluded from `ci-success`'s `needs`. The `cargo-semver-checks` CLI
+itself also cannot be run directly in this local dev sandbox (`error: unsupported rustdoc
+format v60`). Neither environment blocks an individual PR on this move's public-API-path
+claim, so this compile-only test — which runs in the ordinary, blocking test job — is the
+actual enforcement for that claim, not a convenience layered on top of a stronger gate.
 **Spec reference**: [[architecture-decision]] §7.1
 **Acceptance criteria**:
 - [ ] `crates/deps-lsp/tests/public_api_paths.rs` created: a test module (does not need to

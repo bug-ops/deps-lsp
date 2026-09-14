@@ -546,40 +546,52 @@ whose `main` dispatches to the three as libraries — still no adapter-to-adapte
 
 ## 7. Impact on `deps-lsp` (the shipped, 1.0.0-tagged adapter)
 
-### 7.1 A compile-only local check complements (not replaces) CI's `cargo-semver-checks` gate *(rewritten — critic M3; corrected — reviewer 2026-09-14)*
+### 7.1 A compile-only local check, since CI's `cargo-semver-checks` gate is advisory again *(rewritten — critic M3; corrected — reviewer 2026-09-14; corrected again — commit review, 2026-09-14, see below)*
 
 v1 proposed `cargo-semver-checks` as the gate and `#[deprecated]` on re-exports as the
 migration path. The `#[deprecated]` part is wrong outright — it's a known rustc no-op on a
-`pub use` re-export for downstream consumers. The `cargo-semver-checks` part needs a more
-careful split between two distinct environments, not a blanket "cannot run" claim:
+`pub use` re-export for downstream consumers. The `cargo-semver-checks` part has moved
+target twice in one day and the account below is the state as of commit `1777dce8f`
+(2026-09-14) — treat any claim about this gate's enforcement mode as time-stamped, not
+architectural fact:
 
 - **Local dev sandbox**: running the `cargo-semver-checks` CLI directly against this
   environment's toolchain fails — installed 0.45.0 errors with
-  `error: unsupported rustdoc format v60`. This is a real, documented limitation for anyone
-  trying to run the tool by hand before pushing, and is the reason a fast, local,
-  pre-push check is worth adding.
-- **CI's actual gate is live and functioning**: `ci.yml`'s `semver` job (`ci.yml:239-263`)
-  does not invoke the local CLI at all — it uses the `obi1kenobi/cargo-semver-checks-action`,
-  which provisions its own isolated `stable` toolchain via rustup regardless of this
-  workspace's pinned nightly, and (per that job's own comments) auto-installs
-  cargo-semver-checks v0.50.0+, which added rustdoc v61 support — so it never hits the local
-  format-v60 mismatch. It blocks on every PR/push (`continue-on-error` applies only to the
-  separate *scheduled* run); it is not advisory. Live runs confirm the signal is real: it
-  passed on ordinary PR/push runs and caught a genuine breaking change in the 2026-09-13
-  scheduled run (issue #904 — `LineOffsetTable` lost auto-trait impls, `HostClass` gained
-  `#[non_exhaustive]`, `CharOffsets` was removed). (Note separately:
-  `specs/constitution.md` principle 8's parenthetical calling this gate "advisory/
-  `continue-on-error` on normal PR/push runs" is **stale and should be corrected** in a
-  follow-up to this spec revision; see [[tasks]]'s handoff note.)
+  `error: unsupported rustdoc format v60`. Still true, unaffected by the CI history below.
+- **CI's gate history**: issue #945/PR #1012 made the `semver` job (`ci.yml`'s `semver`
+  job) blocking on every PR/push for a period. It genuinely caught a real breaking change
+  in a 2026-09-13 scheduled run (issue #904). But `commit 1777dce8f` ("ci: revert
+  cargo-semver-checks to advisory-only", #1049, resolving #1048) reverted it back to
+  advisory-only on PR/push (`continue-on-error: ${{ github.event_name != 'schedule' }}`,
+  excluded from `ci-success`'s `needs`) — the blocking gate also fired on incidental,
+  non-breaking additive changes across this workspace's many small `publish = true`
+  ecosystem crates (e.g. `#[must_use]` added to satisfy `clippy::pedantic`), and the
+  revert's own rationale is explicit: "these crates evolve together at one workspace
+  version and are consumed primarily through `deps-lsp`'s own `Ecosystem` wiring rather
+  than as independently-versioned libraries in practice." It still hard-fails and files a
+  tracking issue on the weekly scheduled sweep, so a genuine break is never silently lost —
+  it just no longer blocks an individual PR. **`specs/constitution.md` principle 8's
+  parenthetical calling this gate "advisory/`continue-on-error` on normal PR/push runs" is
+  therefore accurate again as of this writing** — the "stale" finding from the prior
+  reviewer pass was correct *at the time it was written*, about a state that has since been
+  reverted; no correction to `constitution.md` is needed after all.
 
-**Additional local check**: a compile-only test in `deps-lsp` (`tests/public_api_paths.rs`)
-that `use`s every previously-public path — `deps_lsp::{EcosystemRuntime,
-register_ecosystems}`, `deps_lsp::config::{CacheConfig, DiagnosticsConfig, …}`, and each of
-the ~110 `ecosystem!`-generated type paths. If a path stops resolving, the workspace stops
-compiling. This is a fast, local, pre-push check that catches simple path-removal breakage
-for a contributor who cannot run the real `cargo-semver-checks` CLI locally — it does not
-replace CI's `semver` job, which remains the authoritative, blocking non-breakage gate. It
-costs one file.
+**Practical consequence for this plan**: since CI's own gate does not block a PR on a real
+API break, the compile-only local test below is not a mere convenience alongside a working
+gate — for the specific paths this refactor promises to preserve, it *is* the actual
+PR-blocking assurance. `cargo nextest run` already runs it on every PR via the existing test
+job, giving this narrow guarantee real enforcement despite the broader gate's advisory
+status.
+
+**The check**: a compile-only test in `deps-lsp` (`tests/public_api_paths.rs`) that `use`s
+every previously-public path — `deps_lsp::{EcosystemRuntime, register_ecosystems}`,
+`deps_lsp::config::{CacheConfig, DiagnosticsConfig, …}`, and each of the ~110
+`ecosystem!`-generated type paths. If a path stops resolving, the workspace stops compiling.
+It catches simple path-removal breakage; it does **not** catch a field-layout change on an
+existing type (see PR 1a's own `Breaking (public API)` CHANGELOG entry for exactly that gap,
+caught only during commit review, not by any prior agent pass) — scope it as "type paths
+resolve," not "no public API broke," when writing or reading this test's acceptance
+criteria.
 
 ### 7.2 Phase-by-phase breakage
 
@@ -740,11 +752,14 @@ reshape, no wholesale test rewrites, no new concurrency model.
   fields without a `deps-core` major? The developer's rationale for exhaustive is sound on
   its own terms; it was decided before the principle-8 cost was on the table. **Route to the
   user, not a guess** — carried into [[plan]] as `[NEEDS CLARIFICATION: O-6]`.
-- **O-7**: `specs/constitution.md` principle 8's parenthetical describing
-  `cargo-semver-checks` as advisory is stale — `ci.yml:239-263` blocks on it for PR/push.
-  Correct it in a follow-up to this spec revision, and record that the tool currently cannot
-  run locally (rustdoc format v60). Flagged separately for the team lead to action —
-  `constitution.md` is not edited by this revision.
+- **O-7 — WITHDRAWN (commit review, 2026-09-14)**: an earlier pass of this document flagged
+  `specs/constitution.md` principle 8's "advisory" parenthetical as stale, based on a
+  blocking-gate state that was live at the time. Commit `1777dce8f` ("ci: revert
+  cargo-semver-checks to advisory-only", #1049) reverted that the same day. The
+  parenthetical is accurate again; no `constitution.md` correction is needed. Left here as a
+  record of the false alarm rather than deleted, since the same file was cited as evidence
+  in two different, contradictory states within one working session — a caution for whoever
+  next cites `ci.yml`'s CI-gate enforcement mode as a settled fact.
 
 ### Risks
 
@@ -755,7 +770,7 @@ reshape, no wholesale test rewrites, no new concurrency model.
 | Per-adapter orchestrators drift despite a shared classification layer | FR-005 regression | The PR-2 parity test; cheap now that both share `classify` |
 | Public-dependency coupling forces cascading majors (§7.3) | More majors over time | Name it, route to #851, do not re-litigate here |
 | Config growth now breaks `deps-core` (§7.3) | Recurring tax | Stated trade-off; O-6 offers the alternative |
-| `cargo-semver-checks` CLI unusable in local dev sandbox | A contributor cannot self-check before pushing | CI's `semver` job is the real, blocking gate; §7.1's compile-only path test adds a fast local pre-push supplement |
+| `cargo-semver-checks` CLI unusable in local dev sandbox, and CI's own `semver` job is advisory-only again (commit `1777dce8f`) | Neither environment blocks a real public-API break for this refactor | §7.1's compile-only `public_api_paths.rs` test is the actual enforcement for the type-path guarantee this plan makes (runs in the ordinary, blocking test job); it does not cover field-layout changes — those are caught by review, as PR 1a's own `Breaking` CHANGELOG entry demonstrates |
 | PR 1c-iv (N3) skipped or under-scoped | FR-005 hole reopens exactly where Option F exists to close it | Sequenced as a mandatory 4th step in §8, not optional cleanup |
 
 ## See Also
