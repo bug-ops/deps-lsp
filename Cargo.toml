@@ -61,7 +61,7 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 url = "2.5"
 urlencoding = "2.1"
-yaml-rust2 = "0.12"
+yaml-rust2 = { version = "0.13", default-features = false }
 zed_extension_api = "0.7"
 zeroize = "1.9"
 
