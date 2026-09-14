@@ -22,7 +22,7 @@
 //! cursor sits in). **Use this module** when comments are also in play, or when the string's
 //! start position is not already known and must be found by scanning.
 
-use crate::fallback_completion::find_closing_quote;
+use crate::fallback_completion::{count_real_quotes_with, find_closing_quote};
 use std::ops::Range;
 
 /// Which manifest syntax family a scan should follow: which characters open a string
@@ -308,25 +308,24 @@ fn scan_spans(text: &str, syntax: ScanSyntax) -> Vec<Span> {
 /// — closing on the first same-type quote, as a naive scan would, truncates the value right
 /// there (#1041)).
 ///
-/// Tracks `#{` … `}` interpolation-depth (as a counter, so nested interpolation like
-/// `#{a["b#{c}"]}` closes correctly) and suspends the outer-quote check for its extent. While
-/// inside an interpolation span, a `'`/`"` opens a *nested* string whose own `{`/`}` are then
-/// content, not depth markers (`#{ENV["A}B"]}`) — otherwise the nested string's `}` would drop
-/// `interpolation_depth` early and its own closing quote would be misread as the outer
-/// literal's terminator (the same #1041 leak class via a different construct). Falls back to
-/// a plain, interpolation-depth-only rescan (no nested-quote tracking) when the nested-quote
-/// pass finds no close: nested-quote tracking assumes every quote inside `#{...}` opens a
-/// string, which is false for a regex literal (`/'/`) or a character literal (`?'`) — there
-/// the tracked-open latch would swallow every later `}`, including the interpolation's real
-/// terminator.
+/// Three-tier chain: [`find_ruby_closing_quote_primary`], then
+/// [`find_ruby_closing_quote_fallback`] when the primary pass can't resolve a close, then
+/// [`find_ruby_closing_quote_naive`] as a final, quote-blind resort that never fails on input
+/// the pre-#1047 baseline could resolve — see each function's doc for what it covers and why
+/// the next is needed.
 fn find_ruby_closing_quote(rest: &str, quote: char) -> Option<usize> {
-    find_ruby_closing_quote_impl(rest, quote, true)
-        .or_else(|| find_ruby_closing_quote_impl(rest, quote, false))
+    find_ruby_closing_quote_primary(rest, quote)
+        .or_else(|| find_ruby_closing_quote_fallback(rest, quote))
+        .or_else(|| find_ruby_closing_quote_naive(rest, quote))
 }
 
-/// Core scan behind [`find_ruby_closing_quote`]; `track_nested_quotes` selects between the
-/// nested-string-aware pass and the plain interpolation-depth-only fallback — see that
-/// function's doc for why both passes exist.
+/// Primary pass behind [`find_ruby_closing_quote`]: tracks `#{` … `}` interpolation-depth (as
+/// a counter, so nested interpolation like `#{a["b#{c}"]}` closes correctly) and suspends the
+/// outer-quote check for its extent. While inside an interpolation span, a `'`/`"` opens a
+/// *nested* string whose own `{`/`}` are then content, not depth markers (`#{ENV["A}B"]}`) —
+/// otherwise the nested string's `}` would drop `interpolation_depth` early and its own
+/// closing quote would be misread as the outer literal's terminator (the same #1041 leak class
+/// via a different construct).
 ///
 /// Security regression (critic finding S2, #1041 follow-up): a cross-type nested "string"
 /// (`nested_quote` holding the *other* quote character from `quote`) that is actually a regex
@@ -337,40 +336,215 @@ fn find_ruby_closing_quote(rest: &str, quote: char) -> Option<usize> {
 /// should have ended the interpolation) as swallowed "nested string content". The result was a
 /// `Some` too far past the literal's true end rather than a clean scan failure, so the
 /// `find_ruby_closing_quote` fallback (triggered only by `None`) never engaged. Guarded here by
-/// aborting the nested-quote-aware pass — returning `None` so the fallback pass takes over —
-/// the moment `quote` itself (the *outer* literal's own delimiter) is seen while a
-/// *cross-type* nested quote is still open: a well-formed cross-type nested string (`ENV['X']`
-/// inside a `"..."` literal) has no structural reason to contain the outer literal's own quote
-/// character before its own close, so seeing one there is treated as proof the nested-quote
-/// assumption doesn't hold. This can never misfire for a *same-type* nested string
-/// (`nq == quote`): there, any occurrence of `quote` always satisfies the `ch == nq` arm first
-/// and closes the nested span normally instead of reaching this check.
-fn find_ruby_closing_quote_impl(
-    rest: &str,
-    quote: char,
-    track_nested_quotes: bool,
-) -> Option<usize> {
+/// aborting — returning `None` so [`find_ruby_closing_quote_fallback`] takes over — the moment
+/// `quote` itself (the *outer* literal's own delimiter) is seen while a *cross-type* nested
+/// quote is still open: a well-formed cross-type nested string (`ENV['X']` inside a `"..."`
+/// literal) has no structural reason to contain the outer literal's own quote character before
+/// its own close, so seeing one there is treated as proof the nested-quote assumption doesn't
+/// hold here — even though it may still hold in general (the fallback pass resolves those
+/// cases, see its doc). This can never misfire for a *same-type* nested string (`nq == quote`):
+/// there, any occurrence of `quote` always satisfies the `ch == nq` arm first and closes the
+/// nested span normally instead of reaching this check.
+fn find_ruby_closing_quote_primary(rest: &str, quote: char) -> Option<usize> {
     let mut chars = rest.char_indices().peekable();
     let mut interpolation_depth: u32 = 0;
     let mut nested_quote: Option<char> = None;
     while let Some((idx, ch)) = chars.next() {
         if interpolation_depth > 0 {
-            if track_nested_quotes {
-                if let Some(nq) = nested_quote {
-                    if ch == '\\' {
-                        chars.next();
-                    } else if ch == nq {
-                        nested_quote = None;
-                    } else if ch == quote {
-                        return None;
-                    }
-                    continue;
+            if let Some(nq) = nested_quote {
+                if ch == '\\' {
+                    chars.next();
+                } else if ch == nq {
+                    nested_quote = None;
+                } else if ch == quote {
+                    return None;
                 }
-                if ch == '\'' || ch == '"' {
-                    nested_quote = Some(ch);
-                    continue;
-                }
+                continue;
             }
+            if ch == '\'' || ch == '"' {
+                nested_quote = Some(ch);
+                continue;
+            }
+            match ch {
+                '{' => interpolation_depth += 1,
+                '}' => interpolation_depth -= 1,
+                _ => {}
+            }
+            continue;
+        }
+        if ch == '\\' {
+            chars.next();
+            continue;
+        }
+        if ch == '#' && chars.peek().is_some_and(|&(_, next)| next == '{') {
+            chars.next();
+            interpolation_depth = 1;
+            continue;
+        }
+        if ch == quote {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+/// Looks ahead from `start` (just past a candidate nested-quote opener `nq`, met while
+/// [`find_ruby_closing_quote_fallback`] is inside an open interpolation and already cleared by
+/// its lexical `/`/`?`-predecessor gate) for `nq`'s escape-aware matching close via
+/// [`find_closing_quote`], and decides whether to trust the span in between as genuine
+/// nested-string content (so its `{`/`}` are skipped as content, not counted as depth markers).
+///
+/// This is a *second* gate, not the sole trust signal (#1047 follow-up round 2: neither
+/// direction of this parity check is a proof on its own — see the caller's doc for the lexical
+/// gate that runs first). The signal here is the parity of how many *real* (non-escaped, via
+/// [`count_real_quotes_with`] — matching [`find_closing_quote`]'s own escape rule) times the
+/// *outer* literal's own `quote` character appears inside the candidate span: an odd count
+/// (including exactly one) is what genuine nested content containing the outer delimiter
+/// verbatim looks like (`'}a"b'` inside a `"..."` literal — the outer `"` appears once, as
+/// plain content, #1047); an even count means a complete `"..."`/`'...'` literal fully opened
+/// and closed inside the supposed span — one signature (among others the lexical gate catches
+/// instead) of `nq` being a stray non-string quote whose "close" is really some later,
+/// unrelated value's own delimiter (the #1041-follow-up S2 latch bug the primary pass's abort
+/// exists to dodge). Returns `None` — untrusted — when no close is found at all, or the parity
+/// check fails.
+///
+/// Parity alone is not infallible in *either* direction: a stray quote's candidate span can
+/// land on odd parity by chance and get wrongly trusted (#1047 follow-up round 2), or on even
+/// parity and get wrongly rejected when genuine (#1047 follow-up round 1, caught by
+/// [`find_ruby_closing_quote_naive`]).
+///
+/// The wrongly-trusted (odd-parity) direction is caught by the caller's lexical gate only for a
+/// stray quote shaped like a regex or character literal (`/'/`, `?'`) — [`find_ruby_closing_quote_naive`]
+/// can't help here, since a wrongly-trusted span can still resolve to a `Some`, not just a
+/// `None`. It does *not* cover every construct that can produce a lone, non-string-opening
+/// quote: a `%`-literal (`%r|'|`, `%w[...]`) or a `#` line comment containing an apostrophe can
+/// still trigger the same false-trust failure mode uncaught — a known, narrower residual gap
+/// (#1047 follow-up, tracked separately) left unaddressed here as disproportionate to fix for
+/// how implausible the combination is; the module remains a strict improvement over its
+/// pre-#1047 baseline without it.
+fn nested_span_len(rest: &str, start: usize, nq: char, quote: char) -> Option<usize> {
+    let close_len = find_closing_quote(rest.get(start..)?, nq)?;
+    let content = rest.get(start..start + close_len)?;
+    let (quote_count, _) = count_real_quotes_with(content, quote);
+    (!quote_count.is_multiple_of(2)).then_some(close_len + nq.len_utf8())
+}
+
+/// Middle tier behind [`find_ruby_closing_quote`], engaged once
+/// [`find_ruby_closing_quote_primary`] has already aborted (returned `None`) rather than risk
+/// a wrong answer.
+///
+/// Tracks `#{` … `}` interpolation-depth like the primary pass, but resolves each candidate
+/// nested-quote span via two gates instead of the primary pass's char-by-char latch that never
+/// finds a close and must abort to get here in the first place (#1047: without this, a `}`
+/// inside a genuine nested string — same-type-as-outer or cross-type — was misread as closing
+/// the interpolation early, leaking or truncating whatever followed depending on which quote
+/// the mis-termination landed on):
+///
+/// 1. **Lexical gate** (#1047 follow-up round 2): a `'`/`"` immediately preceded by `?` (a
+///    Ruby character literal, e.g. `?'`) is never a string opener — an absolute grammar fact.
+///    Preceded by `/` it is *usually* a regex literal, not always (`/` is also division), but
+///    treating it as never a string opener is still safe here: it only ever widens which
+///    candidates fall through to plain brace counting instead of being parity-checked, which
+///    the pre-#1047 baseline already did unconditionally for every quote — so this can only
+///    recover cases that baseline got right, never regress below it. Either way the quote is
+///    never passed to [`nested_span_len`] at all and always falls through to plain brace
+///    counting for that character. Without this, a stray regex/char-literal quote whose
+///    candidate span happened
+///    to land on odd parity (see below) was wrongly trusted, silently swallowing everything up
+///    to and past the interpolation's true close as far as some later, unrelated same-type
+///    quote — a `Some` too far, which (unlike the `None` failure mode round 1 covers) the
+///    [`find_ruby_closing_quote_naive`] tier chained after this one is structurally unable to
+///    catch, since `.or_else` only fires on `None`.
+/// 2. **Parity gate** ([`nested_span_len`]) for whatever the lexical gate doesn't already rule
+///    out.
+///
+/// The previous character is tracked in `prev` as the byte-by-byte scan proceeds — no extra
+/// pass or allocation.
+///
+/// A backslash at interpolation top level (not yet inside a trusted nested-quote span) is
+/// consumed together with the character it escapes, *before* that character is ever considered
+/// as a candidate quote opener — both because an escaped quote character is not a real
+/// delimiter, and because without this a long run of escaped quotes (`\'\'\'...`) would each
+/// independently trigger [`nested_span_len`]'s `O(n)` lookahead, an `O(n²)` blowup on
+/// attacker-controlled document text with no size cap (#1047 follow-up C2). The primary pass
+/// does not do this at interpolation top level (only inside an already-open nested quote) —
+/// harmless in practice (verified on `#{ x.gsub(/\}/, '') }"`), but an intentional divergence
+/// between the two passes' otherwise-matching depth tracking.
+///
+/// Even with both gates, this tier is not proven infallible, so it can still fail to find a
+/// close that [`find_ruby_closing_quote_naive`] — chained after it — would have found; unlike
+/// that final tier, this one is allowed to return `None`.
+fn find_ruby_closing_quote_fallback(rest: &str, quote: char) -> Option<usize> {
+    let mut interpolation_depth: u32 = 0;
+    let mut i = 0;
+    let mut prev: Option<char> = None;
+    while i < rest.len() {
+        let ch = rest.get(i..)?.chars().next()?;
+        let ch_len = ch.len_utf8();
+        if interpolation_depth > 0 {
+            if ch == '\\' {
+                let escaped = rest.get(i + ch_len..)?.chars().next();
+                i += ch_len + escaped.map_or(0, char::len_utf8);
+                prev = escaped.or(Some(ch));
+                continue;
+            }
+            let is_regex_or_char_literal_quote = matches!(prev, Some('/' | '?'));
+            if (ch == '\'' || ch == '"')
+                && !is_regex_or_char_literal_quote
+                && let Some(span_len) = nested_span_len(rest, i + ch_len, ch, quote)
+            {
+                i += ch_len + span_len;
+                prev = Some(ch);
+                continue;
+            }
+            match ch {
+                '{' => interpolation_depth += 1,
+                '}' => interpolation_depth -= 1,
+                _ => {}
+            }
+            i += ch_len;
+            prev = Some(ch);
+            continue;
+        }
+        if ch == '\\' {
+            i += ch_len
+                + rest
+                    .get(i + ch_len..)?
+                    .chars()
+                    .next()
+                    .map_or(0, char::len_utf8);
+            continue;
+        }
+        if ch == '#' && rest.get(i + ch_len..).is_some_and(|r| r.starts_with('{')) {
+            i += ch_len + 1;
+            interpolation_depth = 1;
+            prev = None;
+            continue;
+        }
+        if ch == quote {
+            return Some(i);
+        }
+        i += ch_len;
+    }
+    None
+}
+
+/// Last-resort tier behind [`find_ruby_closing_quote`]: plain `#{` … `}` brace-depth counting
+/// with no quote-awareness at all, byte-for-byte the same scan this module used as its only
+/// fallback before #1047's [`nested_span_len`]/[`find_ruby_closing_quote_fallback`] heuristic
+/// was added.
+///
+/// Chained last specifically *because* that heuristic can trust a wrong span (a stray
+/// regex/char-literal quote whose candidate span happens to land on odd parity by chance) and
+/// then run off the end of `rest` without `interpolation_depth` ever returning to 0 — this tier
+/// guarantees [`find_ruby_closing_quote`] never regresses below this module's pre-#1047
+/// baseline: for any input that baseline could resolve, this tier resolves it the same way
+/// (#1047 follow-up C1).
+fn find_ruby_closing_quote_naive(rest: &str, quote: char) -> Option<usize> {
+    let mut chars = rest.char_indices().peekable();
+    let mut interpolation_depth: u32 = 0;
+    while let Some((idx, ch)) = chars.next() {
+        if interpolation_depth > 0 {
             match ch {
                 '{' => interpolation_depth += 1,
                 '}' => interpolation_depth -= 1,
@@ -698,14 +872,183 @@ mod tests {
     /// value's own delimiter), rather than failing to close at all — in which case the
     /// nested-quote-aware pass returns a `Some` that reaches (and swallows) past the literal's
     /// true end, instead of the clean `None` the `.or_else` fallback in
-    /// [`find_ruby_closing_quote`] is triggered by. Guarded in `find_ruby_closing_quote_impl` by
-    /// aborting the moment the *outer* delimiter is seen while a *cross-type* nested quote is
-    /// still open.
+    /// [`find_ruby_closing_quote`] is triggered by. Guarded in
+    /// `find_ruby_closing_quote_primary` by aborting the moment the *outer* delimiter is seen
+    /// while a *cross-type* nested quote is still open.
     #[test]
     fn read_string_literal_ruby_interpolation_regex_apostrophe_does_not_swallow_later_value() {
         let text = r##""#{x =~ /'/}", "https://a'b}c""##;
         let literal = read_string_literal(text, 0, ScanSyntax::Ruby).unwrap();
         assert_eq!(&text[literal.content], r"#{x =~ /'/}");
+    }
+
+    /// #1047 (leak direction, as reported): with the outer `"` escaped (`\"`) inside the
+    /// nested `'}a\"b'`, the primary pass's own backslash handling inside its nested-quote
+    /// latch consumes that escaped quote before ever reaching its cross-type abort check, so
+    /// this exact repro resolves on the primary pass alone — pinned here as a regression, but
+    /// it does not exercise the fallback (see
+    /// `read_string_literal_ruby_fallback_nested_brace_in_cross_type_quote_not_truncated` for
+    /// the un-escaped variant that does).
+    #[test]
+    fn read_string_literal_ruby_leak_repro_with_escaped_outer_quote_resolves_via_primary() {
+        let text = r##"gem "p", require: "#{ ENV['}a\"b']}", source: "https://gems.corp/""##;
+        let quote_pos = text.find("\"#{").unwrap();
+        assert!(find_ruby_closing_quote_primary(&text[quote_pos + 1..], '"').is_some());
+        let literal = read_string_literal(text, quote_pos, ScanSyntax::Ruby).unwrap();
+        assert_eq!(&text[literal.content], r#"#{ ENV['}a\"b']}"#);
+    }
+
+    /// #1047 (leak direction): the fallback pass must be nested-quote-aware, not just
+    /// brace-depth-aware — the `}` inside the cross-type nested `'}a"b'` (no escaping this
+    /// time, so the primary pass genuinely aborts and the fallback must resolve it) must not be
+    /// misread as closing the interpolation, which would truncate the `require:` value and
+    /// leave `source:` misparsed (falling through to the public registry instead of resolving
+    /// to `https://gems.corp/`).
+    #[test]
+    fn read_string_literal_ruby_fallback_nested_brace_in_cross_type_quote_not_truncated() {
+        let text = r##"gem "p", require: "#{ ENV['}a"b']}", source: "https://gems.corp/""##;
+        let quote_pos = text.find("\"#{").unwrap();
+        assert!(find_ruby_closing_quote_primary(&text[quote_pos + 1..], '"').is_none());
+        let literal = read_string_literal(text, quote_pos, ScanSyntax::Ruby).unwrap();
+        assert_eq!(&text[literal.content], r#"#{ ENV['}a"b']}"#);
+    }
+
+    /// #1047 (truncation direction): same root cause as the leak-direction repro above, but
+    /// the mis-termination lands on the outer literal's own quote character instead — the
+    /// nested `'}a"b'` string's `}` closes the interpolation early, and the very next `"a`
+    /// content is then misread as the outer literal's closing quote.
+    #[test]
+    fn read_string_literal_ruby_fallback_nested_brace_in_same_type_quote_not_truncated() {
+        let text = r#"source "https://#{ENV['}a"b']}@gems.corp/" do"#;
+        let quote_pos = text.find('"').unwrap();
+        assert!(find_ruby_closing_quote_primary(&text[quote_pos + 1..], '"').is_none());
+        let literal = read_string_literal(text, quote_pos, ScanSyntax::Ruby).unwrap();
+        assert_eq!(
+            &text[literal.content],
+            r#"https://#{ENV['}a"b']}@gems.corp/"#
+        );
+    }
+
+    /// Direct unit coverage of the fallback pass itself (rather than only through
+    /// `read_string_literal`'s `.or_else`), pinning that it resolves the #1047 nested-brace
+    /// case correctly even when reached in isolation.
+    #[test]
+    fn find_ruby_closing_quote_fallback_skips_brace_inside_nested_quote() {
+        let rest = r#"https://#{ENV['}a"b']}@gems.corp/" do"#;
+        let len = find_ruby_closing_quote_fallback(rest, '"').unwrap();
+        assert_eq!(&rest[..len], r#"https://#{ENV['}a"b']}@gems.corp/"#);
+    }
+
+    /// The fallback pass must still reject a stray regex/char-literal quote instead of
+    /// latching onto a later, unrelated occurrence of the same character (the #1041-follow-up
+    /// S2 bug `nested_span_len`'s parity check exists to avoid re-introducing). Must include
+    /// the `#{` opener so the scan actually enters `interpolation_depth > 0` and reaches the
+    /// parity check (#1047 follow-up S1: a prior version of this test omitted it and passed
+    /// vacuously, exercising nothing).
+    #[test]
+    fn find_ruby_closing_quote_fallback_rejects_unpaired_quote_far_match() {
+        let rest = r#"#{x =~ /'/}", "https://a'b}c""#;
+        let len = find_ruby_closing_quote_fallback(rest, '"').unwrap();
+        assert_eq!(&rest[..len], r"#{x =~ /'/}");
+    }
+
+    /// #1047 follow-up C1 (round 1): before the lexical `/`/`?`-predecessor gate was added
+    /// (round 2), the fallback pass's parity heuristic alone could land on *odd* parity by
+    /// chance for a stray regex-literal apostrophe (one real quote inside `ENV['GEM_HOST']`'s
+    /// own value) and wrongly trust it, jumping past the true interpolation close so
+    /// `interpolation_depth` never returned to 0 — reintroducing #1047's own leak class one
+    /// level up (an apparently-unterminated `require:` swallowing `source:`). The lexical gate
+    /// now rules this quote out before parity is ever consulted (the apostrophe is directly
+    /// preceded by `/`), so this now resolves within the fallback tier itself; kept as a
+    /// regression pin for the original round-1 shape, and the naive tier remains in place as a
+    /// backstop for whatever the two gates together still miss.
+    #[test]
+    fn read_string_literal_ruby_fallback_regex_apostrophe_before_later_odd_parity_value() {
+        let text = r##"gem "p", require: "#{x =~ /'/}", source: ENV['GEM_HOST']"##;
+        let quote_pos = text.find("\"#{").unwrap();
+        assert!(find_ruby_closing_quote_primary(&text[quote_pos + 1..], '"').is_none());
+        let literal = read_string_literal(text, quote_pos, ScanSyntax::Ruby).unwrap();
+        assert_eq!(&text[literal.content], r"#{x =~ /'/}");
+    }
+
+    /// #1047 follow-up C1 (round 1), second reproducer from the critic: same shape, this time
+    /// landing on 3 real quotes (also odd) inside a later `git:` option's single-quoted value —
+    /// also now resolved within the fallback tier by the lexical gate.
+    #[test]
+    fn read_string_literal_ruby_fallback_regex_apostrophe_before_later_odd_parity_value_git_option()
+    {
+        let text = r##"gem "p", require: "#{x =~ /'/}", source: "https://gems.corp/", git: 'https://git.corp/p.git'"##;
+        let quote_pos = text.find("\"#{").unwrap();
+        assert!(find_ruby_closing_quote_primary(&text[quote_pos + 1..], '"').is_none());
+        let literal = read_string_literal(text, quote_pos, ScanSyntax::Ruby).unwrap();
+        assert_eq!(&text[literal.content], r"#{x =~ /'/}");
+    }
+
+    /// #1047 follow-up round 2 (W1-W4): the parity heuristic also fails in the *opposite*
+    /// direction from round 1 — a wrongly-trusted span can resolve to a too-long `Some` instead
+    /// of `None` whenever *any* later `}` in the rest of the literal brings
+    /// `interpolation_depth` back to 0 before the damage is undone. Unlike round 1's `None`
+    /// failure, `.or_else` never triggers the naive tier for a wrong `Some`, so these are
+    /// structurally invisible to the three-tier chain without the lexical gate. All four are
+    /// real Bundler/Ruby syntax with a stray regex/char-literal quote ahead of a later `}`.
+    #[test]
+    fn read_string_literal_ruby_lexical_gate_w1_install_if_lambda() {
+        let text = r##"gem "p", require: "#{x =~ /'/}", install_if: -> { ENV['CI'] }, source: "https://gems.corp/""##;
+        let quote_pos = text.find("\"#{").unwrap();
+        assert!(find_ruby_closing_quote_primary(&text[quote_pos + 1..], '"').is_none());
+        let literal = read_string_literal(text, quote_pos, ScanSyntax::Ruby).unwrap();
+        assert_eq!(&text[literal.content], r"#{x =~ /'/}");
+    }
+
+    #[test]
+    fn read_string_literal_ruby_lexical_gate_w2_hash_literal_option() {
+        let text = r##"gem "p", require: "#{x =~ /'/}", git: { url: ENV['U'] }, source: "https://gems.corp/""##;
+        let quote_pos = text.find("\"#{").unwrap();
+        assert!(find_ruby_closing_quote_primary(&text[quote_pos + 1..], '"').is_none());
+        let literal = read_string_literal(text, quote_pos, ScanSyntax::Ruby).unwrap();
+        assert_eq!(&text[literal.content], r"#{x =~ /'/}");
+    }
+
+    #[test]
+    fn read_string_literal_ruby_lexical_gate_w3_brace_in_later_value() {
+        let text = r##"gem "p", require: "#{x =~ /'/}", source: ENV['A}B'], x: "q""##;
+        let quote_pos = text.find("\"#{").unwrap();
+        assert!(find_ruby_closing_quote_primary(&text[quote_pos + 1..], '"').is_none());
+        let literal = read_string_literal(text, quote_pos, ScanSyntax::Ruby).unwrap();
+        assert_eq!(&text[literal.content], r"#{x =~ /'/}");
+    }
+
+    #[test]
+    fn read_string_literal_ruby_lexical_gate_w4_char_literal() {
+        let text = r##"gem "p", require: "#{x == ?'}",  install_if: -> { ENV['CI'] }, source: "https://gems.corp/""##;
+        let quote_pos = text.find("\"#{").unwrap();
+        assert!(find_ruby_closing_quote_primary(&text[quote_pos + 1..], '"').is_none());
+        let literal = read_string_literal(text, quote_pos, ScanSyntax::Ruby).unwrap();
+        assert_eq!(&text[literal.content], r"#{x == ?'}");
+    }
+
+    /// Direct unit coverage of the naive last-resort tier: pins that it resolves the same,
+    /// quote-blind brace-counted close this module always used before #1047's nested-quote
+    /// lookahead was added — kept as a backstop the fallback tier's two gates can still fall
+    /// through to.
+    #[test]
+    fn find_ruby_closing_quote_naive_ignores_nested_quotes() {
+        let rest = r#"#{ENV["A"]}", source: "https://gems.corp/""#;
+        let len = find_ruby_closing_quote_naive(rest, '"').unwrap();
+        assert_eq!(&rest[..len], r#"#{ENV["A"]}"#);
+    }
+
+    /// #1047 follow-up C2: a long run of escaped quotes inside an interpolation must not
+    /// trigger a separate `O(n)` [`nested_span_len`] lookahead per occurrence — each `\'` is
+    /// consumed as one escaped unit before ever being considered a candidate quote opener. This
+    /// does not assert on timing (flaky in CI); it pins the *correctness* of that escape
+    /// handling, which is what makes the `O(n)` behavior possible.
+    #[test]
+    fn find_ruby_closing_quote_fallback_handles_long_escaped_quote_run_without_misparsing() {
+        let escaped_run = r"\'".repeat(2000);
+        let rest = format!("#{{ x.gsub(/{escaped_run}/, '') }}\"");
+        let len = find_ruby_closing_quote_fallback(&rest, '"').unwrap();
+        assert_eq!(&rest[..len], format!("#{{ x.gsub(/{escaped_run}/, '') }}"));
     }
 
     /// Security regression (critic finding S1, #1041 follow-up): Ruby's `'...'` literals never
