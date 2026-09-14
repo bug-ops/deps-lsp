@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: promoted `is_plain_null`/`is_null_tag` (originally `deps-dart`-private) into `lsp_helpers`, now shared by `deps-dart` and `deps-gitlab-ci` (#1028)
 
 ### Changed
+- **deps-core, deps-dart, deps-github-actions, deps-gitlab-ci, deps-npm**: bumped `yaml-rust2` 0.12 -> 0.13 (upstream MSRV-only `encoding_rs` pin fix, no API/behavior change) and disabled its unused default `encoding` feature, dropping a duplicate `encoding_rs 0.7.2`/`cfg-if 0.1.10` that the new upstream pin would otherwise have pulled in alongside the already-used `encoding_rs 0.8.40` (resolves #923)
 - **ci**: moved `Cross.toml` to `.github/Cross.toml` to declutter the repo root; `cross` steps now set `CROSS_CONFIG` explicitly since `cross` only auto-discovers a root-level file
 - **CI**: split the `feature-matrix` job's test execution into a separate `feature-matrix-test` job so it runs in parallel with the clippy/lint checks instead of sequentially on one runner
 - **CI**: `feature-matrix-test` now shards across a 4-leg matrix and drops the redundant `--features default` slice (identical coverage to `--all-features`), cutting its wall-clock time from ~10m47s to an expected few minutes (resolves #1030) (#1031)
