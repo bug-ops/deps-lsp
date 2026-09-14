@@ -156,7 +156,8 @@ impl OsvNaming for SwiftFormatter {
     fn osv_package_name(&self, dep: &dyn Dependency) -> Option<String> {
         let swift_dep = dep.as_any().downcast_ref::<SwiftDependency>()?;
         let host = reqwest::Url::parse(&swift_dep.url).ok()?;
-        matches!(host.host_str(), Some("github.com" | "www.github.com"))
+        host.host_str()
+            .is_some_and(crate::is_github_host)
             .then(|| format!("github.com/{}", dep.name()))
     }
 }

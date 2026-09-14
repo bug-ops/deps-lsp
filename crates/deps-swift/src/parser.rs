@@ -115,41 +115,63 @@ static RE_PATH: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?s)\.package\s*\(\s*path\s*:\s*"([^"]+)"\s*\)"#).expect("RE_PATH")
 });
 
-/// Converts a GitHub or generic Git URL to `owner/repo` identity string.
+/// Converts a `github.com` Git URL to an `owner/repo` identity string.
 ///
-/// Strips trailing `.git` and extracts the last two path segments.
-// `colon_pos` comes from `find(':')`, an ASCII byte, so both slice bounds are always char
-// boundaries.
-#[allow(clippy::string_slice)]
+/// Accepts HTTPS/SSH URL forms (`https://github.com/owner/repo`, `git@github.com:owner/repo`)
+/// and strips a trailing `.git` suffix (before or after a trailing slash). Returns `None` for
+/// any URL whose host is not GitHub's (a self-hosted git server, GitLab, or any other host —
+/// #979: this crate's registry backend only resolves GitHub `owner/repo` identities via the
+/// GitHub API, so silently mapping a non-GitHub URL onto an `owner/repo` pair would query an
+/// unrelated, attacker-nameable GitHub repository with the user's `GITHUB_TOKEN` attached).
 pub fn url_to_identity(url: &str) -> Option<String> {
-    // Handle SSH-style URLs: git@github.com:user/repo.git
-    let url = if let Some(rest) = url.strip_prefix("git@") {
-        // Replace first ':' with '/' to normalize
-        if let Some(colon_pos) = rest.find(':') {
-            let host = &rest[..colon_pos];
-            let path = &rest[colon_pos + 1..];
-            format!("https://{host}/{path}")
-        } else {
-            url.to_string()
-        }
+    // Normalize SSH-style URLs (git@host:owner/repo[.git]) to an https URL so the rest of
+    // this function only ever deals with one shape.
+    let normalized = if let Some(rest) = url.strip_prefix("git@") {
+        let (host, path) = rest.split_once(':')?;
+        format!("https://{host}/{path}")
     } else {
         url.to_string()
     };
 
-    // Strip trailing .git
-    let url = url.strip_suffix(".git").unwrap_or(&url);
+    // `reqwest::Url` re-exports `url::Url` — reuse it rather than adding a second URL-parsing
+    // dependency (`deps-swift` already depends on `reqwest`, and `formatter::osv_package_name`
+    // parses the same way).
+    let parsed = reqwest::Url::parse(&normalized).ok()?;
+    let host = parsed.host_str()?;
+    if !crate::is_github_host(host) {
+        return None;
+    }
 
-    // Extract last two path segments (owner/repo)
-    let parts: Vec<&str> = url.split('/').filter(|s| !s.is_empty()).collect();
-    if let [.., owner, repo] = parts.as_slice() {
-        let (owner, repo) = (*owner, *repo);
-        // Filter out protocol parts like "https:" or "github.com"
-        if owner.contains(':') || owner.contains('.') {
-            return None;
-        }
+    let trimmed = parsed.path().trim_end_matches('/');
+    let path = trimmed.strip_suffix(".git").unwrap_or(trimmed);
+    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if let [owner, repo] = parts.as_slice() {
         Some(format!("{owner}/{repo}"))
     } else {
         None
+    }
+}
+
+/// Resolves the display name and [`DependencySource`] for a registry-form (`from:`,
+/// `.upToNextMajor`, `.upToNextMinor`, `.exact`, `..<`, `...`) dependency URL.
+///
+/// A GitHub URL resolves to [`DependencySource::Registry`] under its `owner/repo` identity,
+/// enabling GitHub-tags version resolution. Any other host (#979) still keeps the dependency
+/// visible — matching the `.branch`/`.revision` forms below — as [`DependencySource::Git`]
+/// with the raw URL as its name, so it renders in hover/document-link/inlay-hint output
+/// instead of silently vanishing, while never being queried against GitHub
+/// (`EcosystemFormatter::can_resolve_source` defaults to `Registry`-only, which this crate
+/// does not override).
+fn resolve_registry_source(url_str: &str) -> (String, DependencySource) {
+    match url_to_identity(url_str) {
+        Some(identity) => (identity, DependencySource::Registry),
+        None => (
+            url_str.to_string(),
+            DependencySource::Git {
+                url: url_str.to_string(),
+                rev: None,
+            },
+        ),
     }
 }
 
@@ -279,11 +301,6 @@ pub fn parse_package_swift(content: &str, uri: &Uri) -> Result<SwiftParseResult>
         let url_str = &content[url.start()..url.end()];
         let ver_str = &content[ver.start()..ver.end()];
 
-        let Some(identity) = url_to_identity(url_str) else {
-            matched_ranges.push(full.start()..full.end());
-            continue;
-        };
-
         let parts: Vec<&str> = ver_str.splitn(3, '.').collect();
         let major = parts.first().copied().unwrap_or("0");
         let version_req = format!(">={ver_str}, <{}.0.0", next_major(major));
@@ -292,14 +309,15 @@ pub fn parse_package_swift(content: &str, uri: &Uri) -> Result<SwiftParseResult>
             matched_ranges.push(full.start()..full.end());
             continue;
         }
+        let (name, source) = resolve_registry_source(url_str);
         dependencies.push(SwiftDependency {
-            name: identity.into(),
+            name: name.into(),
             name_range: make_range(url.start(), url.end()),
             version_req: Some(version_req.into()),
             version_range: Some(make_range(ver.start(), ver.end())),
             version_literal: Some(ver_str.to_string()),
             url: url_str.to_string(),
-            source: DependencySource::Registry,
+            source,
         });
         matched_ranges.push(full.start()..full.end());
     }
@@ -316,11 +334,6 @@ pub fn parse_package_swift(content: &str, uri: &Uri) -> Result<SwiftParseResult>
         let url_str = &content[url.start()..url.end()];
         let ver_str = &content[ver.start()..ver.end()];
 
-        let Some(identity) = url_to_identity(url_str) else {
-            matched_ranges.push(full.start()..full.end());
-            continue;
-        };
-
         let parts: Vec<&str> = ver_str.splitn(3, '.').collect();
         let major = parts.first().copied().unwrap_or("0");
         let minor = parts.get(1).copied().unwrap_or("0");
@@ -330,14 +343,15 @@ pub fn parse_package_swift(content: &str, uri: &Uri) -> Result<SwiftParseResult>
             matched_ranges.push(full.start()..full.end());
             continue;
         }
+        let (name, source) = resolve_registry_source(url_str);
         dependencies.push(SwiftDependency {
-            name: identity.into(),
+            name: name.into(),
             name_range: make_range(url.start(), url.end()),
             version_req: Some(version_req.into()),
             version_range: Some(make_range(ver.start(), ver.end())),
             version_literal: Some(ver_str.to_string()),
             url: url_str.to_string(),
-            source: DependencySource::Registry,
+            source,
         });
         matched_ranges.push(full.start()..full.end());
     }
@@ -354,25 +368,21 @@ pub fn parse_package_swift(content: &str, uri: &Uri) -> Result<SwiftParseResult>
         let url_str = &content[url.start()..url.end()];
         let ver_str = &content[ver.start()..ver.end()];
 
-        let Some(identity) = url_to_identity(url_str) else {
-            matched_ranges.push(full.start()..full.end());
-            continue;
-        };
-
         let version_req = format!("={ver_str}");
 
         if !budget.allow() {
             matched_ranges.push(full.start()..full.end());
             continue;
         }
+        let (name, source) = resolve_registry_source(url_str);
         dependencies.push(SwiftDependency {
-            name: identity.into(),
+            name: name.into(),
             name_range: make_range(url.start(), url.end()),
             version_req: Some(version_req.into()),
             version_range: Some(make_range(ver.start(), ver.end())),
             version_literal: Some(ver_str.to_string()),
             url: url_str.to_string(),
-            source: DependencySource::Registry,
+            source,
         });
         matched_ranges.push(full.start()..full.end());
     }
@@ -391,19 +401,15 @@ pub fn parse_package_swift(content: &str, uri: &Uri) -> Result<SwiftParseResult>
         let lower_str = &content[lower.start()..lower.end()];
         let upper_str = &content[upper.start()..upper.end()];
 
-        let Some(identity) = url_to_identity(url_str) else {
-            matched_ranges.push(full.start()..full.end());
-            continue;
-        };
-
         let version_req = format!(">={lower_str}, <{upper_str}");
 
         if !budget.allow() {
             matched_ranges.push(full.start()..full.end());
             continue;
         }
+        let (name, source) = resolve_registry_source(url_str);
         dependencies.push(SwiftDependency {
-            name: identity.into(),
+            name: name.into(),
             name_range: make_range(url.start(), url.end()),
             version_req: Some(version_req.into()),
             version_range: Some(make_range(lower.start(), lower.end())),
@@ -415,7 +421,7 @@ pub fn parse_package_swift(content: &str, uri: &Uri) -> Result<SwiftParseResult>
             // `None` keeps this form fail-closed, matching pre-fix behavior.
             version_literal: None,
             url: url_str.to_string(),
-            source: DependencySource::Registry,
+            source,
         });
         matched_ranges.push(full.start()..full.end());
     }
@@ -434,19 +440,15 @@ pub fn parse_package_swift(content: &str, uri: &Uri) -> Result<SwiftParseResult>
         let lower_str = &content[lower.start()..lower.end()];
         let upper_str = &content[upper.start()..upper.end()];
 
-        let Some(identity) = url_to_identity(url_str) else {
-            matched_ranges.push(full.start()..full.end());
-            continue;
-        };
-
         let version_req = format!(">={lower_str}, <={upper_str}");
 
         if !budget.allow() {
             matched_ranges.push(full.start()..full.end());
             continue;
         }
+        let (name, source) = resolve_registry_source(url_str);
         dependencies.push(SwiftDependency {
-            name: identity.into(),
+            name: name.into(),
             name_range: make_range(url.start(), url.end()),
             version_req: Some(version_req.into()),
             version_range: Some(make_range(lower.start(), lower.end())),
@@ -455,7 +457,7 @@ pub fn parse_package_swift(content: &str, uri: &Uri) -> Result<SwiftParseResult>
             // the lower bound alone and invert the range.
             version_literal: None,
             url: url_str.to_string(),
-            source: DependencySource::Registry,
+            source,
         });
         matched_ranges.push(full.start()..full.end());
     }
@@ -472,25 +474,21 @@ pub fn parse_package_swift(content: &str, uri: &Uri) -> Result<SwiftParseResult>
         let url_str = &content[url.start()..url.end()];
         let ver_str = &content[ver.start()..ver.end()];
 
-        let Some(identity) = url_to_identity(url_str) else {
-            matched_ranges.push(full.start()..full.end());
-            continue;
-        };
-
         let version_req = format!(">={ver_str}, <{}.0.0", next_major(ver_str));
 
         if !budget.allow() {
             matched_ranges.push(full.start()..full.end());
             continue;
         }
+        let (name, source) = resolve_registry_source(url_str);
         dependencies.push(SwiftDependency {
-            name: identity.into(),
+            name: name.into(),
             name_range: make_range(url.start(), url.end()),
             version_req: Some(version_req.into()),
             version_range: Some(make_range(ver.start(), ver.end())),
             version_literal: Some(ver_str.to_string()),
             url: url_str.to_string(),
-            source: DependencySource::Registry,
+            source,
         });
         matched_ranges.push(full.start()..full.end());
     }
@@ -615,6 +613,16 @@ mod tests {
     fn test_url_to_identity_https() {
         assert_eq!(
             url_to_identity("https://github.com/apple/swift-nio.git"),
+            Some("apple/swift-nio".into())
+        );
+    }
+
+    /// Regression for #979 critic M1: a trailing slash after `.git` (a valid, if unusual,
+    /// clone URL) must not defeat the `.git`-suffix strip and leave it stuck onto `repo`.
+    #[test]
+    fn test_url_to_identity_git_suffix_with_trailing_slash() {
+        assert_eq!(
+            url_to_identity("https://github.com/apple/swift-nio.git/"),
             Some("apple/swift-nio".into())
         );
     }
@@ -829,11 +837,59 @@ let package = Package(
     }
 
     #[test]
-    fn test_url_to_identity_non_github_host() {
-        // Non-github hosts should work as long as path has two segments
+    fn test_url_to_identity_non_github_host_returns_none() {
+        // #979: a non-GitHub host must never be coerced into a GitHub owner/repo
+        // identity — this crate's registry only resolves GitHub `owner/repo` pairs via
+        // the GitHub API, so doing so would query an unrelated, attacker-nameable
+        // GitHub repository with the user's GITHUB_TOKEN attached.
+        assert_eq!(url_to_identity("https://gitlab.com/myorg/myrepo"), None);
+    }
+
+    #[test]
+    fn test_url_to_identity_self_hosted_git_returns_none() {
         assert_eq!(
-            url_to_identity("https://gitlab.com/myorg/myrepo"),
-            Some("myorg/myrepo".into())
+            url_to_identity("https://git.example.internal/myorg/myrepo.git"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_url_to_identity_ssh_non_github_host_returns_none() {
+        assert_eq!(url_to_identity("git@gitlab.com:myorg/myrepo.git"), None);
+    }
+
+    #[test]
+    fn test_url_to_identity_www_github_host() {
+        assert_eq!(
+            url_to_identity("https://www.github.com/apple/swift-nio.git"),
+            Some("apple/swift-nio".into())
+        );
+    }
+
+    #[test]
+    fn test_url_to_identity_uppercase_github_host() {
+        assert_eq!(
+            url_to_identity("https://GitHub.com/apple/swift-nio.git"),
+            Some("apple/swift-nio".into())
+        );
+    }
+
+    #[test]
+    fn test_url_to_identity_lookalike_host_suffix_returns_none() {
+        // A host that merely ends with "github.com" is not GitHub.
+        assert_eq!(
+            url_to_identity("https://github.com.evil.example/owner/repo"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_url_to_identity_userinfo_spoof_returns_none() {
+        // The real host here is "evil.example" — "github.com" is just userinfo, a
+        // classic URL-confusion trick. Must resolve by the real (parsed) host only.
+        assert_eq!(
+            url_to_identity("https://github.com@evil.example/owner/repo"),
+            None
         );
     }
 
@@ -882,51 +938,90 @@ let package = Package(
         assert_eq!(result.dependencies[0].name(), "real/pkg");
     }
 
-    // --- parser: non-identity URLs should be skipped (not panic) ---
+    // --- parser: registry-form dependencies with no GitHub identity fall back to a
+    // non-resolvable Git source instead of vanishing (#979 critic S1) ---
+
+    /// Asserts the shared #979 fallback shape: the dependency stays visible under the raw
+    /// URL as its name, tagged `DependencySource::Git` (never queried against GitHub, since
+    /// `EcosystemFormatter::can_resolve_source` defaults to `Registry`-only), but the
+    /// version requirement declared in the manifest is still preserved for display.
+    fn assert_git_fallback(dep: &SwiftDependency, url_str: &str) {
+        assert_eq!(dep.name(), url_str);
+        assert_matches!(dep.source(), DependencySource::Git { .. });
+    }
 
     #[test]
-    fn test_parse_from_non_identity_url_skipped() {
-        // URL that cannot produce owner/repo identity → dependency is skipped
+    fn test_parse_from_non_identity_url_falls_back_to_git_source() {
         let content = r#".package(url: "https://example.com/onlyone", from: "1.0.0")"#;
         let result = parse_package_swift(content, &test_uri()).unwrap();
-        assert_eq!(result.dependencies.len(), 0);
+        assert_eq!(result.dependencies.len(), 1);
+        assert_git_fallback(&result.dependencies[0], "https://example.com/onlyone");
+        assert_eq!(
+            result.dependencies[0]
+                .version_requirement()
+                .map(deps_core::VersionReq::as_str),
+            Some(">=1.0.0, <2.0.0")
+        );
     }
 
     #[test]
-    fn test_parse_exact_non_identity_url_skipped() {
+    fn test_parse_exact_non_identity_url_falls_back_to_git_source() {
         let content = r#".package(url: "https://example.com/onlyone", .exact("2.0.0"))"#;
         let result = parse_package_swift(content, &test_uri()).unwrap();
-        assert_eq!(result.dependencies.len(), 0);
+        assert_eq!(result.dependencies.len(), 1);
+        assert_git_fallback(&result.dependencies[0], "https://example.com/onlyone");
     }
 
     #[test]
-    fn test_parse_range_half_open_non_identity_skipped() {
+    fn test_parse_range_half_open_non_identity_falls_back_to_git_source() {
         let content = r#".package(url: "https://example.com/onlyone", "1.0.0"..<"2.0.0")"#;
         let result = parse_package_swift(content, &test_uri()).unwrap();
-        assert_eq!(result.dependencies.len(), 0);
+        assert_eq!(result.dependencies.len(), 1);
+        assert_git_fallback(&result.dependencies[0], "https://example.com/onlyone");
     }
 
     #[test]
-    fn test_parse_range_closed_non_identity_skipped() {
+    fn test_parse_range_closed_non_identity_falls_back_to_git_source() {
         let content = r#".package(url: "https://example.com/onlyone", "1.0.0"..."2.0.0")"#;
         let result = parse_package_swift(content, &test_uri()).unwrap();
-        assert_eq!(result.dependencies.len(), 0);
+        assert_eq!(result.dependencies.len(), 1);
+        assert_git_fallback(&result.dependencies[0], "https://example.com/onlyone");
     }
 
     #[test]
-    fn test_parse_up_to_next_major_non_identity_skipped() {
+    fn test_parse_up_to_next_major_non_identity_falls_back_to_git_source() {
         let content =
             r#".package(url: "https://example.com/onlyone", .upToNextMajor(from: "1.0.0"))"#;
         let result = parse_package_swift(content, &test_uri()).unwrap();
-        assert_eq!(result.dependencies.len(), 0);
+        assert_eq!(result.dependencies.len(), 1);
+        assert_git_fallback(&result.dependencies[0], "https://example.com/onlyone");
     }
 
     #[test]
-    fn test_parse_up_to_next_minor_non_identity_skipped() {
+    fn test_parse_up_to_next_minor_non_identity_falls_back_to_git_source() {
         let content =
             r#".package(url: "https://example.com/onlyone", .upToNextMinor(from: "1.0.0"))"#;
         let result = parse_package_swift(content, &test_uri()).unwrap();
-        assert_eq!(result.dependencies.len(), 0);
+        assert_eq!(result.dependencies.len(), 1);
+        assert_git_fallback(&result.dependencies[0], "https://example.com/onlyone");
+    }
+
+    /// Regression for #979: a registry-form (`from:`) dependency declared against a
+    /// non-GitHub host (here GitLab) must never be resolved into a `Dependency` whose
+    /// identity is queried against an unrelated GitHub repository — it stays visible as a
+    /// non-resolvable `Git`-sourced dependency under its raw URL instead.
+    #[test]
+    fn test_parse_from_non_github_host_falls_back_to_git_source() {
+        let content = r#".package(url: "https://gitlab.com/myorg/myrepo", from: "1.0.0")"#;
+        let result = parse_package_swift(content, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_git_fallback(&result.dependencies[0], "https://gitlab.com/myorg/myrepo");
+        assert_eq!(
+            result.dependencies[0]
+                .version_requirement()
+                .map(deps_core::VersionReq::as_str),
+            Some(">=1.0.0, <2.0.0")
+        );
     }
 
     // --- branch/revision fallback to raw URL when no identity ---
@@ -947,6 +1042,21 @@ let package = Package(
         let result = parse_package_swift(content, &test_uri()).unwrap();
         assert_eq!(result.dependencies.len(), 1);
         assert_eq!(result.dependencies[0].name(), "https://example.com/onlyone");
+    }
+
+    /// Regression for #979: a `.branch(...)` dependency on a non-GitHub host must fall
+    /// back to the raw URL for display, never a fabricated `owner/repo` GitHub identity.
+    /// These forms carry `DependencySource::Git`, so they were never registry-resolvable
+    /// via GitHub regardless — this only guards the display/lockfile-matching identity.
+    #[test]
+    fn test_parse_branch_non_github_host_uses_raw_url() {
+        let content = r#".package(url: "https://gitlab.com/myorg/myrepo", .branch("main"))"#;
+        let result = parse_package_swift(content, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(
+            result.dependencies[0].name(),
+            "https://gitlab.com/myorg/myrepo"
+        );
     }
 
     // --- path: nested directory name extraction ---
