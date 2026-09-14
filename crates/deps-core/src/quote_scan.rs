@@ -128,11 +128,93 @@ fn is_escaped(syntax: ScanSyntax, quote: char) -> bool {
     }
 }
 
+/// True when the `"`/`'` at `text[at]` is actually Ruby's `?"`/`?'` one-character literal — a
+/// self-contained token, not a string-opening delimiter — e.g. the `?"` in `a: ?"` (bug-ops/
+/// deps-lsp#1039: a naive quote-toggling scan misreads `?"` as *opening* a string, desyncing
+/// quote state for everything after and hiding real brackets/option keys from bracket-depth
+/// tracking that assumes it can trust that state).
+///
+/// Heuristic, matching Ruby's real "expression expected" lexer state closely enough for manifest
+/// scanning without a full Ruby lexer: fires only when `?` is immediately followed (no space) by
+/// the quote character, **and** the last non-whitespace character before `?` — skipping over any
+/// run of plain spaces/tabs, so a space right before `?` never hides what actually precedes it —
+/// is one that unambiguously starts a fresh Ruby expression (`,` `(` `[` `{` `=` `>` `<` `|` `&`
+/// `~` `+` `-` `*` `/` `%` `^` `:` `;` `\n`, or nothing at all — start of text). Any other
+/// preceding token means a *value* already sits there, putting `?` in ternary-operator position
+/// instead (`cond ? "a" : "b"`, the unspaced `cond?"a":"b"`, or a ternary whose condition is
+/// itself a string literal like `"a" ? "b" : "c"`), where the following quote is a genuine string
+/// delimiter, not a character literal.
+///
+/// Allowlist-based, not a blocklist (#1039 critic finding C4): an earlier blocklist version
+/// (reject only when preceded by an identifier char or a closing `)`/`]`/`}`) missed that a
+/// *closing quote* or a bare space can also immediately precede `?` in genuine ternary position
+/// — `"a"?"..."` (condition is a string literal, no space at all before `?`) and `1 ?"..."`
+/// (space before `?`, but the real predecessor past that space is the value `1`) both slipped
+/// through the blocklist and had their real string's opening quote misread as a character
+/// literal, silently exposing the string's contents as "code" — reopening the exact quote-desync
+/// leak class this function exists to close, in the opposite direction. An allowlist cannot make
+/// that mistake: it only fires where a value provably cannot already be sitting.
+///
+/// **`!` is deliberately excluded** (#1039, defense-in-depth — see the round-7 correctness-gate
+/// doc correction below; this is *not* fixing a demonstrated false positive against valid Ruby).
+/// An earlier version of this doc justified the exclusion by claiming a bang-suffixed value like
+/// `save!` puts a following `?` in ternary-operator position, not char-literal position — that
+/// claim is factually wrong. Verified with `ruby -c`: both `x.save!?"a"` and `x.save! ?"a"`
+/// produce a syntax error ("unexpected character literal"), meaning Ruby's own lexer treats `!`
+/// exactly like the other allowlisted punctuation here — it puts `?"`/`?'` in char-literal
+/// (expression-begin) position, not ternary — and simply rejects the *result* as invalid in that
+/// argument position. So `!` in the allowlist was never a reachable false positive against
+/// genuinely valid Ruby; the shape that originally motivated removing it was itself not valid
+/// Ruby to begin with.
+///
+/// `!` stays excluded anyway, but as a conservative simplification rather than a correctness fix:
+/// relying on "Ruby will always reject this shape anyway" to justify recognizing a `?"`/`?'` right
+/// after `!` as a char literal is fragile — it ties this heuristic's correctness to an assumption
+/// about what surrounding Ruby *rejects*, not just what a `?"`/`?'` itself means, which is a
+/// larger and more easily invalidated assumption than the other allowlisted characters need. The
+/// cost is narrow: a genuine `!?"..."` (logical-NOT applied to a character literal, e.g. `x =
+/// !?"a"`) is now a false negative — the quote falls back to being read as a real string
+/// delimiter — rather than a demonstrated regression on any currently-valid Ruby input.
+///
+/// **Scope of the fix — a narrow set of unambiguous punctuation predecessors only.** This closes
+/// the `?"`/`?'` desync class when the character before `?` is one of the allowlisted punctuation
+/// characters above. A Ruby *keyword* predecessor (`and`, `or`, `not`, `then`, `return`, `when`,
+/// `else`, etc. — e.g. `return ?"` or `x = flag ? ?a : ?b`, where `?"`/`?a` right after
+/// `return`/`?`/`:` still legitimately opens a character literal) is not in the allowlist and so
+/// is not recognized, meaning a genuine char-literal position right after one of those keywords
+/// still desyncs quote state today. Ruby's real `?X` disambiguation is a lexer-state decision
+/// (`EXPR_BEG`/`EXPR_ARG` vs `EXPR_END`) plus a spacing rule — no character-class test of a single
+/// preceding byte can fully decide it, keyword or punctuation; closing the keyword-predecessor
+/// case (along with `%q`/`%w` percent-literals, regex literals, and heredocs — the other Ruby
+/// literal forms [`ScanSyntax::Ruby`] does not tokenize) needs real token-level lexing, not
+/// another allowlist entry. Tracked as a known, documented gap rather than attempted here — see
+/// bug-ops/deps-lsp#1039's follow-up discussion; every such vector still requires the Gemfile to
+/// already contain unusual/invalid-for-this-scanner Ruby, so it grants no capability beyond what
+/// a plain, valid `source: "evil"` already would.
+///
+/// Only ever called for [`ScanSyntax::Ruby`] — `?"` is not a distinct token in Swift or TOML.
+fn is_char_literal_quote(text: &str, at: usize) -> bool {
+    let Some('?') = text.get(..at).and_then(|s| s.chars().next_back()) else {
+        return false;
+    };
+    let question_at = at - '?'.len_utf8();
+    let before = text.get(..question_at).unwrap_or_default();
+    let trimmed = before.trim_end_matches([' ', '\t']);
+    trimmed.is_empty()
+        || trimmed.ends_with([
+            ',', '(', '[', '{', '=', '>', '<', '|', '&', '~', '+', '-', '*', '/', '%', '^', ':',
+            ';', '\n',
+        ])
+}
+
 /// Finds the first delimiter or comment-start marker in `text` at or after `from`.
 fn find_next_marker(text: &str, from: usize, syntax: ScanSyntax) -> Option<(usize, Marker)> {
     let rest = text.get(from..)?;
     for (offset, ch) in rest.char_indices() {
         if is_delimiter(ch, syntax) {
+            if syntax == ScanSyntax::Ruby && is_char_literal_quote(text, from + offset) {
+                continue;
+            }
             return Some((from + offset, Marker::Delim));
         }
         match syntax {
@@ -751,5 +833,120 @@ mod tests {
         assert!(!code.is_code_byte(text.len()));
         assert!(!code.is_code_byte(text.len() + 5));
         assert!(!code.is_code_byte(2));
+    }
+
+    /// Regression (bug-ops/deps-lsp#1039, vector 1): Ruby's `?"` one-character literal must not
+    /// be misread as opening a string — the exact critic PoC, confirmed with `ruby -c` and a stub
+    /// `gem` method dumping parsed kwargs to show Ruby itself treats `source:` as nested inside
+    /// `install_if`'s hash, not a top-level argument.
+    #[test]
+    fn char_literal_quote_does_not_open_a_string() {
+        let line = r#"a: ?", install_if: { b: ?", source: "https://evil.example.com", c: ?" }"#;
+        let code = CodeSpans::new(line, ScanSyntax::Ruby);
+        let brace = line.find('{').unwrap();
+        let source_key = line.find("source:").unwrap();
+        // The `{` must be seen as code (not swallowed into a bogus string opened by `?"`).
+        assert!(code.is_code_byte(brace));
+        // `source:` sits inside the (correctly recognized) `install_if` hash, not in a string.
+        assert!(code.is_code_byte(source_key));
+        // The genuine string value is still read correctly.
+        let quote = line[source_key..].find('"').unwrap() + source_key;
+        let literal = read_string_literal(line, quote, ScanSyntax::Ruby).unwrap();
+        assert_eq!(&line[literal.content], "https://evil.example.com");
+    }
+
+    #[test]
+    fn char_literal_quote_single_quote_variant_also_recognized() {
+        let line = "a: ?', b: 1";
+        let code = CodeSpans::new(line, ScanSyntax::Ruby);
+        let b_key = line.find('b').unwrap();
+        assert!(code.is_code_byte(b_key));
+    }
+
+    #[test]
+    fn ternary_with_space_still_opens_a_real_string() {
+        // `cond ? "a" : "b"` — a space between `?` and `"` means this is the ternary operator
+        // followed by a genuine string literal, not a character literal.
+        let line = r#"cond ? "a" : "b""#;
+        let code = CodeSpans::new(line, ScanSyntax::Ruby);
+        let quote = line.find('"').unwrap();
+        assert!(code.is_code_byte(quote));
+        let literal = read_string_literal(line, quote, ScanSyntax::Ruby).unwrap();
+        assert_eq!(&line[literal.content], "a");
+    }
+
+    #[test]
+    fn unspaced_ternary_after_value_still_opens_a_real_string() {
+        // `flag?"a":"b"` — `?` directly follows an identifier (a value), so this is still
+        // ternary-operator position, not a character literal, even with no space.
+        let line = r#"flag?"a":"b""#;
+        let code = CodeSpans::new(line, ScanSyntax::Ruby);
+        let quote = line.find('"').unwrap();
+        assert!(code.is_code_byte(quote));
+    }
+
+    /// Regression (#1039 critic finding C4): a ternary whose *condition* is itself a string
+    /// literal (`"a"?"..."`, no space at all between the condition's closing quote and `?`) must
+    /// not be misread as a character literal — the closing quote right before `?` proves a value
+    /// already sits there.
+    #[test]
+    fn ternary_with_string_condition_and_no_space_still_opens_a_real_string() {
+        let line = r#""a"?"b":"c""#;
+        let code = CodeSpans::new(line, ScanSyntax::Ruby);
+        let quote_after_question_mark = line.find('?').unwrap() + 1;
+        assert!(code.is_code_byte(quote_after_question_mark));
+        let literal =
+            read_string_literal(line, quote_after_question_mark, ScanSyntax::Ruby).unwrap();
+        assert_eq!(&line[literal.content], "b");
+    }
+
+    /// Regression (#1039 critic finding C4): a space before `?` does not by itself mean
+    /// character-literal position — `1 ?"..."` is still a ternary (condition `1`), since the
+    /// real predecessor past the space is a value, not a fresh-expression punctuation character.
+    #[test]
+    fn ternary_with_space_but_value_before_it_still_opens_a_real_string() {
+        let line = r#"1 ?"b":"c""#;
+        let code = CodeSpans::new(line, ScanSyntax::Ruby);
+        let quote = line.find('"').unwrap();
+        assert!(code.is_code_byte(quote));
+        let literal = read_string_literal(line, quote, ScanSyntax::Ruby).unwrap();
+        assert_eq!(&line[literal.content], "b");
+    }
+
+    /// Regression (#1039 critic finding C4): a char literal right after an assignment `=` must
+    /// still be recognized (part of the allowlist's operator set), distinct from the ternary
+    /// cases above.
+    #[test]
+    fn char_literal_quote_after_assignment_operator_still_recognized() {
+        let line = r#"x = ?", y = 1"#;
+        let code = CodeSpans::new(line, ScanSyntax::Ruby);
+        let y_pos = line.find('y').unwrap();
+        assert!(code.is_code_byte(y_pos));
+    }
+
+    /// Regression (#1039, `!` excluded from `is_char_literal_quote`'s allowlist — see its doc for
+    /// why this is defense-in-depth, not a fix for a reachable false positive on valid Ruby).
+    /// Asserting `is_code_byte` on the *first* quote alone does not discriminate this: that
+    /// position reads as code either way (an unrecognized-as-delimiter quote is still ordinary
+    /// code, and a delimiter's own opening position also counts as code — see [`CodeSpans`]'s
+    /// doc), so a prior version of this test passed unchanged whether `!` was allowlisted or not
+    /// (tester finding, round-6 re-validation). The real discriminator is whether the SECOND
+    /// string (`source:`'s value) is still correctly recognized as string content: if `!` were
+    /// wrongly allowlisted, the first quote (right after `!?`) would be skipped as a non-delimiter,
+    /// so the *next* quote (`"a"`'s closer) opens a bogus string that swallows `, source: ` and
+    /// closes on the quote just before `https:`, leaving the real URL sitting in plain code —
+    /// exactly the "content misread as code" failure this whole function exists to prevent.
+    #[test]
+    fn bang_before_question_mark_does_not_swallow_source_option_into_bogus_string() {
+        let line = r#"save!?"a", source: "https://evil.example.com""#;
+        let code = CodeSpans::new(line, ScanSyntax::Ruby);
+        let url_start = line.find("https").unwrap();
+        assert!(
+            !code.is_code_byte(url_start),
+            "the source: value must stay recognized as string content, not be exposed as code by a bogus string span opened when '!' was (wrongly, defensively excluded now) treated as license for a char literal"
+        );
+        let url_quote = url_start - 1;
+        let literal = read_string_literal(line, url_quote, ScanSyntax::Ruby).unwrap();
+        assert_eq!(&line[literal.content], "https://evil.example.com");
     }
 }
