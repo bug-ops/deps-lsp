@@ -29,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **CI**: `cargo-semver-checks` is advisory-only on PR/push again (was a blocking gate since #945), reverted after it blocked a routine bug-fix PR over an incidental non-breaking `#[must_use]` addition; the weekly scheduled sweep still hard-fails and tracks genuine breaks (resolves #1048) (#1049)
 
 ### Fixed
+- **deps-npm, deps-pypi**: the package-name search and position-based version completion tests now run against mocked registry endpoints instead of the live registry, and assert real completion items instead of a tautological `is_empty() || !is_empty()` check (resolves #1055) (#1065)
 - **deps-cargo**: the package-name search completion test now runs against a mocked crates.io search API instead of the live registry, and asserts a real completion item instead of a tautological `is_empty() || !is_empty()` check (resolves #1052) (#1054)
 - **deps-cargo**: unknown-package completion tests now run against a mocked crates.io sparse index instead of the live registry, so a network outage or a real zero-request regression no longer passes vacuously (resolves #1045) (#1051)
 - **deps-npm, deps-pypi, deps-deno, deps-bundler, deps-dart**: unknown-package completion tests now run against a mockito server instead of the live registry, so a network outage or a real zero-request regression no longer passes vacuously (resolves #1038) (#1044)

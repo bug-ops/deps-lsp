@@ -685,15 +685,32 @@ mod tests {
 
     #[tokio::test]
     async fn test_complete_package_names_special_characters() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = NpmEcosystem::new(cache);
+        // #1055: was a live, unmocked search that asserted the tautology
+        // `results.is_empty() || !results.is_empty()`. Mock the search endpoint and assert on
+        // the actual returned completion (issue #1038's mocking pattern).
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/-/v1/search")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(
+                r#"{"objects": [{"package": {"name": "@types/node", "version": "20.0.0"}}]}"#,
+            )
+            .create_async()
+            .await;
+        let registry = NpmRegistry::with_public_base_for_test(
+            Arc::new(deps_core::HttpCache::new()),
+            server.url(),
+        );
+        let ecosystem = NpmEcosystem::with_registry(Arc::new(registry));
 
         // Package names with special characters (@scope/package) should work
         let results = ecosystem
             .complete_package_names("@type", Range::default())
             .await;
-        // Should not panic or error
-        assert!(results.is_empty() || !results.is_empty());
+        mock.assert_async().await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].label, "@types/node");
     }
 
     #[tokio::test]
@@ -717,19 +734,6 @@ mod tests {
             )
             .await;
         assert!(results.len() <= 20);
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires network access
-    async fn test_complete_package_names_scoped() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = NpmEcosystem::new(cache);
-
-        // Scoped packages (@types/node, etc.)
-        let results = ecosystem
-            .complete_package_names("@types", Range::default())
-            .await;
-        assert!(!results.is_empty() || results.is_empty()); // May not have results but shouldn't panic
     }
 
     #[tokio::test]
@@ -850,14 +854,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_generate_completions_feature_context_returns_empty() {
+    async fn test_generate_completions_version_context_returns_versions() {
         // See the comment in `test_package_name_completion_context_has_real_range` on why
         // this guard is needed here.
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = NpmEcosystem::new(cache);
 
-        // npm doesn't have features, so this should always return empty
+        // #1055: position 30 lands inside the `"4.0.0"` version literal — a `Version`
+        // completion context, not "feature" (npm has none, and never overrides
+        // `complete_feature`) as this test's old name claimed. It previously drove an
+        // unmocked live version-completion request to the public registry while asserting the
+        // tautology `completions.items.is_empty() || !completions.items.is_empty()`. Mock the
+        // `express` packument and assert on the actual returned completion instead.
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/express")
+            .with_status(200)
+            .with_body(r#"{"versions": {"4.0.0": {}, "4.1.0": {}}}"#)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        let registry = NpmRegistry::with_public_base_for_test(
+            Arc::new(deps_core::HttpCache::new()),
+            server.url(),
+        );
+        let ecosystem = NpmEcosystem::with_registry(Arc::new(registry));
+
         let content = r#"{"dependencies": {"express": "4.0.0"}}"#;
         let uri = deps_core::test_util::test_uri("/test/package.json");
         let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
@@ -876,8 +897,13 @@ mod tests {
             )
             .await;
 
-        // Should not crash, returns empty or package/version completions
-        assert!(completions.items.is_empty() || !completions.items.is_empty());
+        mock.assert_async().await;
+        let labels: Vec<&str> = completions.items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            ["4.1.0 (latest)", "4.0.0"],
+            "newest-first, per the mocked packument"
+        );
     }
 
     #[tokio::test]

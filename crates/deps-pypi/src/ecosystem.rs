@@ -1671,15 +1671,31 @@ mod tests {
 
     #[tokio::test]
     async fn test_complete_package_names_special_characters() {
+        // #1055: was a live, unmocked search index build that asserted the tautology
+        // `results.is_empty() || !results.is_empty()`. Mocked via the same
+        // `ecosystem_with_index_url`/`sample_index_body` seam `test_complete_package_names_uses_index`
+        // (issue #419) already established.
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/simple/")
+            .with_status(200)
+            .with_body(crate::search::sample_index_body(&["scikit-learn"]))
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
         let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = PypiEcosystem::new(cache);
+        let index_url = format!("{}/simple/", server.url());
+        let ecosystem = ecosystem_with_index_url(cache, index_url);
 
         // Package names with hyphens and underscores should work
-        let results = ecosystem
-            .complete_package_names("scikit-le", Range::default())
-            .await;
-        // Should not panic or error
-        assert!(results.is_empty() || !results.is_empty());
+        let results = poll_until_nonempty(
+            || ecosystem.complete_package_names("scikit-le", Range::default()),
+            100,
+        )
+        .await;
+        mock.assert_async().await;
+        assert!(results.iter().any(|r| r.label == "scikit-learn"));
     }
 
     #[tokio::test]
@@ -1699,19 +1715,6 @@ mod tests {
             )
             .await;
         assert!(results.len() <= 20);
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires network access
-    async fn test_complete_package_names_special_chars_real() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = PypiEcosystem::new(cache);
-
-        // Real packages with special characters
-        let results = ecosystem
-            .complete_package_names("scikit-le", Range::default())
-            .await;
-        assert!(!results.is_empty() || results.is_empty()); // May or may not have results
     }
 
     #[tokio::test]
@@ -1828,36 +1831,55 @@ name = "test"
     }
 
     #[tokio::test]
-    async fn test_generate_completions_feature_context_returns_empty() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = PypiEcosystem::new(cache);
+    async fn test_generate_completions_package_name_context_returns_matches() {
+        // #1055: position (1, 20) lands inside the bare `requests` entry (no version
+        // specifier), which `detect_completion_context` resolves as a `PackageName` context,
+        // not a `Feature` one (pypi never overrides `complete_feature`) — so this previously
+        // drove an unmocked, live search-index build while asserting the tautology
+        // `completions.items.is_empty() || !completions.items.is_empty()`. Mocked via the same
+        // seam as `test_complete_package_names_uses_index` (#419).
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/simple/")
+            .with_status(200)
+            .with_body(crate::search::sample_index_body(&["requests"]))
+            .expect_at_least(1)
+            .create_async()
+            .await;
 
-        // PyPI doesn't have features, so this should always return empty
-        // Even if we detect a feature context (which shouldn't happen for PyPI)
-        // This tests the Feature branch in generate_completions
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let index_url = format!("{}/simple/", server.url());
+        let ecosystem = ecosystem_with_index_url(cache, index_url);
+
         let content = r#"[project]
 dependencies = ["requests"]
 "#;
         let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
         let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
 
-        // Test with any position - feature context should return empty
         let position = Position {
             line: 1,
             character: 20,
         };
 
-        let completions = ecosystem
-            .generate_completions(
-                parse_result.as_ref(),
-                position,
-                content,
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
+        let completions = poll_until_nonempty(
+            || async {
+                ecosystem
+                    .generate_completions(
+                        parse_result.as_ref(),
+                        position,
+                        content,
+                        deps_core::FreshnessSettings::default(),
+                    )
+                    .await
+                    .items
+            },
+            100,
+        )
+        .await;
 
-        // Should not crash, returns empty or package/version completions
-        assert!(completions.items.is_empty() || !completions.items.is_empty());
+        mock.assert_async().await;
+        assert!(completions.iter().any(|r| r.label == "requests"));
     }
 
     #[tokio::test]
