@@ -12,8 +12,7 @@ use deps_core::cache::HttpCache;
 use deps_core::error::{DepsError, Result};
 use reqwest::header::HeaderName;
 use serde::Deserialize;
-use std::hash::{BuildHasher, Hash, Hasher};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use crate::host::{GitlabHost, GitlabInstanceHost, token_host_origin};
 
@@ -54,33 +53,6 @@ impl std::fmt::Debug for AuthToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("AuthToken(***)")
     }
-}
-
-/// A per-process random salt, mixed into [`own_auth_digest`] so the digest cannot be
-/// reconstructed offline from a known origin/token pair — mirrors
-/// `deps_nuget::registry::digest_salt`.
-fn digest_salt() -> u64 {
-    static SALT: OnceLock<u64> = OnceLock::new();
-    *SALT.get_or_init(|| {
-        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
-        std::process::id().hash(&mut hasher);
-        std::time::SystemTime::now().hash(&mut hasher);
-        hasher.finish()
-    })
-}
-
-/// A per-request auth identity for `HttpCache::get_cached_pinned_with_headers`'s `auth_id`
-/// argument — `None` when unauthenticated, otherwise a salted hash of `origin` and the
-/// token's header value. Ensures a response fetched without the token can never be served
-/// back to a request that would have carried it, or vice versa (spec §4.5's cache-key
-/// consequence of authenticating some hosts and not others for the same project).
-fn own_auth_digest(origin: &str, token: Option<&str>) -> Option<u64> {
-    let token = token?;
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    digest_salt().hash(&mut hasher);
-    origin.hash(&mut hasher);
-    token.hash(&mut hasher);
-    Some(hasher.finish())
 }
 
 /// The actionable error returned when a request hits GitLab's rate limit, or a 401/403
@@ -330,7 +302,7 @@ impl GitlabApiClient {
         } else {
             None
         };
-        let auth_id = own_auth_digest(host.origin(), token_value);
+        let auth_id = deps_core::secret::auth_digest(host.origin(), token_value);
         let headers: Vec<(HeaderName, &str)> = token_value
             .map(|t| vec![(private_token_header(), t)])
             .unwrap_or_default();

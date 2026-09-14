@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **ci**: moved `Cross.toml` to `.github/Cross.toml` to declutter the repo root; `cross` steps now set `CROSS_CONFIG` explicitly since `cross` only auto-discovers a root-level file
 - **CI**: split the `feature-matrix` job's test execution into a separate `feature-matrix-test` job so it runs in parallel with the clippy/lint checks instead of sequentially on one runner
 - **CI**: `feature-matrix-test` now shards across a 4-leg matrix and drops the redundant `--features default` slice (identical coverage to `--all-features`), cutting its wall-clock time from ~10m47s to an expected few minutes (resolves #1030) (#1031)
+- **deps-core, deps-gitlab-ci, deps-github-actions, deps-npm**: consolidated `deps-gitlab-ci`/`deps-github-actions`/`deps-npm`'s near-duplicate `DashMap` eviction helpers into `deps_core::cache_policy::evict_arbitrary_if_full`/`evict_expired_then_clear_all` (resolves #996)
+- **deps-core, deps-gitlab-ci, deps-nuget**: consolidated `deps-gitlab-ci`/`deps-nuget`'s near-duplicate salted credential-digest helpers into `deps_core::secret::digest_salt`/`auth_digest` (resolves #1003)
 
 ### Fixed
 - **CI**: the `cross-check` job's i686 leg now builds and tests natively via `gcc-multilib` on `ubuntu-latest` instead of through `cross`'s musl Docker container, dropping the associated apt-get/Docker overhead and the `--test-threads=1` workaround (now uses `cargo nextest`) (#1027)
