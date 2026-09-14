@@ -44,7 +44,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use deps_core::net_policy::{
-    HostClass, IndexUrlError, PolicyGate, RedactedUrl, RegistryAccessPolicy, validate_index_url,
+    BlockedHostReason, HostClass, IndexUrlError, RedactedUrl, RegistryAccessPolicy,
+    RegistryUrlKind, ValidatedRegistryUrl,
 };
 use deps_core::parser::DependencySource;
 use deps_core::{BlockedSourceClass, PackageName};
@@ -94,6 +95,27 @@ impl From<IndexUrlError> for NpmRegistryIndexError {
     }
 }
 
+impl BlockedHostReason for NpmRegistryIndexError {
+    fn blocked_host_class(&self) -> Option<HostClass> {
+        match self {
+            Self::BlockedHost { class } => Some(*class),
+            _ => None,
+        }
+    }
+}
+
+/// [`deps_core::net_policy::RegistryUrlKind`] marker selecting npm's validation rules for
+/// [`NpmRegistryIndex`] (issue #959).
+pub enum NpmRegistryIndexKind {}
+
+impl deps_core::net_policy::private::Sealed for NpmRegistryIndexKind {}
+
+impl RegistryUrlKind for NpmRegistryIndexKind {
+    const ECOSYSTEM: &'static str = "npm";
+    const REJECT_QUERY_FRAGMENT: bool = false;
+    type Error = NpmRegistryIndexError;
+}
+
 /// A validated, normalized npm registry index URL.
 ///
 /// `https`-only (the sole carve-out is a `cfg(test)`/`test-util`-only `http` loopback host),
@@ -103,76 +125,22 @@ impl From<IndexUrlError> for NpmRegistryIndexError {
 ///
 /// Normalized so `https://npm.pkg.github.com/` and `https://npm.pkg.github.com` produce the
 /// **same** [`Self::as_str`] output — one router entry, not two, and no doubled slash when a
-/// caller splices a package path onto it (`{base}/{name}`).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct NpmRegistryIndex {
-    /// The validated URL, normalized by stripping trailing `/` characters — see the type
-    /// doc. Always the exact string returned by [`Self::as_str`].
-    normalized: String,
-}
-
-impl NpmRegistryIndex {
-    /// Validates, normalizes, and wraps `raw` — an already `${VAR}`-expanded candidate
-    /// string (expansion happens in [`resolve`], before this is called).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`NpmRegistryIndexError`] if `raw` does not parse as a URL, is not `https`
-    /// (outside the `cfg(test)`/`test-util` loopback carve-out), carries a userinfo
-    /// component, or resolves to a host class the current `policy` blocks.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use deps_core::net_policy::RegistryAccessPolicy;
-    /// use deps_npm::config::NpmRegistryIndex;
-    ///
-    /// let policy = RegistryAccessPolicy::default();
-    /// assert!(NpmRegistryIndex::new("https://npm.pkg.github.com", &policy).is_ok());
-    /// assert!(NpmRegistryIndex::new("http://npm.pkg.github.com", &policy).is_err());
-    /// assert!(NpmRegistryIndex::new("https://user:pass@npm.example", &policy).is_err());
-    /// ```
-    pub fn new(raw: &str, policy: &RegistryAccessPolicy) -> Result<Self, NpmRegistryIndexError> {
-        Self::new_for_log(raw, raw, policy)
-    }
-
-    /// Like [`Self::new`], but validates `expanded` (the candidate to actually parse) while
-    /// using `raw_for_log` — the pre-expansion `.npmrc` value — for every error payload and
-    /// `tracing::warn!` call. [`Self::new`] passes the same string for both, since it has no
-    /// separate pre-expansion form; [`resolve_entry`] passes the true `${VAR}`-expanded value
-    /// alongside the original raw one, so a rejected candidate built from `${SOME_TOKEN}`
-    /// never leaks that token's expanded value into a log line or an
-    /// [`NpmRegistryIndexError::InvalidUrl`] payload — see this module's security-model doc.
-    /// `raw_for_log` is always redacted the same way regardless of which caller it came from
-    /// (`validate_index_url` applies `url_for_tracing` unconditionally) — an earlier revision
-    /// tried to log the pre-expansion form more permissively, on the theory that it could only
-    /// ever spell a placeholder like `${VAR}`, never a real secret, but that assumption does
-    /// not hold: a hostile `.npmrc` can write a credential directly into the raw value with no
-    /// expansion involved at all (#767 S2b, matching this module's own M1 threat-model note
-    /// above about literal userinfo).
-    fn new_for_log(
-        expanded: &str,
-        raw_for_log: &str,
-        policy: &RegistryAccessPolicy,
-    ) -> Result<Self, NpmRegistryIndexError> {
-        let url = validate_index_url(expanded, raw_for_log, "npm", PolicyGate::Enforce(policy))?;
-        let normalized = url.as_str().trim_end_matches('/').to_string();
-        Ok(Self { normalized })
-    }
-
-    /// The normalized index URL — the canonical key for the router's `alternates` map and
-    /// for [`DependencySource::AlternateRegistry`]'s `index`. Never carries a trailing `/`.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.normalized
-    }
-}
-
-impl std::fmt::Display for NpmRegistryIndex {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
+/// caller splices a package path onto it (`{base}/{name}`). An alias of the shared
+/// [`deps_core::net_policy::ValidatedRegistryUrl`] (issue #959) — see that type's docs for the
+/// implementation every ecosystem's validated-URL newtype now shares.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::net_policy::RegistryAccessPolicy;
+/// use deps_npm::config::NpmRegistryIndex;
+///
+/// let policy = RegistryAccessPolicy::default();
+/// assert!(NpmRegistryIndex::new("https://npm.pkg.github.com", &policy).is_ok());
+/// assert!(NpmRegistryIndex::new("http://npm.pkg.github.com", &policy).is_err());
+/// assert!(NpmRegistryIndex::new("https://user:pass@npm.example", &policy).is_err());
+/// ```
+pub type NpmRegistryIndex = ValidatedRegistryUrl<NpmRegistryIndexKind>;
 
 /// A `registry=`/`@scope:registry=` entry that was present in `.npmrc` but unusable.
 ///
@@ -184,16 +152,10 @@ impl std::fmt::Display for NpmRegistryIndex {
 /// could leak an environment variable's contents into the log, and never a literal credential
 /// the user wrote directly in `.npmrc`.
 ///
-/// Output-only: constructed internally by this module's own resolution logic, never by
-/// external code — no constructor is provided.
-#[non_exhaustive]
-#[derive(Debug, Clone)]
-pub struct InvalidEntry {
-    /// The raw `.npmrc` value, unexpanded, with any literal userinfo/query string redacted.
-    pub raw: RedactedUrl,
-    /// Why it was rejected.
-    pub reason: NpmRegistryIndexError,
-}
+/// An alias of the shared [`deps_core::net_policy::InvalidEntry`] (issue #959). Output-only: a
+/// caller builds one only via [`deps_core::net_policy::InvalidEntry::new`]/
+/// [`deps_core::net_policy::InvalidEntry::logged`], never a struct literal.
+pub type InvalidEntry = deps_core::net_policy::InvalidEntry<NpmRegistryIndexError>;
 
 /// The merged, resolved view of a workspace's `.npmrc` hierarchy (project tier overrides
 /// user tier). A plain lookup table with one resolution method — mirrors `deps-cargo`'s
@@ -252,14 +214,22 @@ impl NpmConfig {
         if let Some(scope) = scope_of(package_name.as_str())
             && let Some(result) = self.scoped_registries.get(scope)
         {
-            let (class, raw_value) = blocked_class(result)?;
+            let (class, raw_value) = result
+                .as_ref()
+                .err()
+                .and_then(InvalidEntry::blocked_class)?;
             return Some(BlockedSourceClass {
                 class,
                 raw_value,
                 declaration_key: format!("scope:{scope}"),
             });
         }
-        let (class, raw_value) = blocked_class(self.registry.as_ref()?)?;
+        let (class, raw_value) = self
+            .registry
+            .as_ref()?
+            .as_ref()
+            .err()
+            .and_then(InvalidEntry::blocked_class)?;
         Some(BlockedSourceClass {
             class,
             raw_value,
@@ -293,18 +263,6 @@ fn source_from_result(result: &Result<NpmRegistryIndex, InvalidEntry>) -> Depend
         Err(invalid) => DependencySource::CustomRegistry {
             url: invalid.raw.to_string(),
         },
-    }
-}
-
-/// `Some((class, raw))` iff `result` is an entry rejected specifically for
-/// [`NpmRegistryIndexError::BlockedHost`] — used by [`NpmConfig::blocked_class_for`].
-fn blocked_class(result: &Result<NpmRegistryIndex, InvalidEntry>) -> Option<(HostClass, String)> {
-    match result {
-        Err(InvalidEntry {
-            raw,
-            reason: NpmRegistryIndexError::BlockedHost { class },
-        }) => Some((*class, raw.to_string())),
-        _ => None,
     }
 }
 
@@ -418,19 +376,29 @@ fn expand_env_vars_with(
 /// a hostile `.npmrc` can
 /// write a credential straight into `registry=`/`@scope:registry=` with no `${VAR}` expansion
 /// involved, whether as userinfo or as a query parameter.
+///
+/// Passes the `${VAR}`-expanded value as
+/// [`deps_core::net_policy::ValidatedRegistryUrl::new_with_raw_for_log`]'s `candidate` and the
+/// original, unexpanded `raw` as its `raw_for_log` — an earlier revision logged the
+/// pre-expansion form more permissively, on the theory that it could only ever spell a
+/// placeholder like `${VAR}`, never a real secret, but that assumption does not hold: a hostile
+/// `.npmrc` can write a credential directly into the raw value with no expansion involved at all
+/// (#767 S2b, matching this function's own M1 threat-model note above about literal userinfo).
 fn resolve_entry(
     raw: &str,
     policy: &RegistryAccessPolicy,
 ) -> Result<NpmRegistryIndex, InvalidEntry> {
     match expand_env_vars(raw) {
-        Ok(expanded) => NpmRegistryIndex::new_for_log(&expanded, raw, policy).map_err(|reason| {
-            let redacted = RedactedUrl::new(raw);
-            tracing::warn!(raw = %redacted, %reason, "npm registry index failed validation");
-            InvalidEntry {
-                raw: redacted,
-                reason,
-            }
-        }),
+        Ok(expanded) => {
+            NpmRegistryIndex::new_with_raw_for_log(&expanded, raw, policy).map_err(|reason| {
+                InvalidEntry::logged(
+                    raw,
+                    reason,
+                    NpmRegistryIndexKind::ECOSYSTEM,
+                    "npm registry index failed validation",
+                )
+            })
+        }
         Err(var) => {
             let redacted = RedactedUrl::new(raw);
             tracing::warn!(
@@ -438,10 +406,10 @@ fn resolve_entry(
                 var,
                 "npm registry value references an undefined environment variable"
             );
-            Err(InvalidEntry {
-                raw: redacted,
-                reason: NpmRegistryIndexError::UndefinedEnvVar(var),
-            })
+            Err(InvalidEntry::new(
+                redacted,
+                NpmRegistryIndexError::UndefinedEnvVar(var),
+            ))
         }
     }
 }
@@ -695,6 +663,17 @@ mod tests {
         );
     }
 
+    /// Issue #959 code review (S2): unlike `deps-go`'s `GoProxyUrl`, npm's kind does not set
+    /// `REJECT_QUERY_FRAGMENT` — a query string must still be accepted, and survive verbatim in
+    /// `as_str()`, after the generic-machinery migration.
+    #[test]
+    fn test_npm_registry_index_accepts_query_string() {
+        let policy = all_policy();
+        let url = NpmRegistryIndex::new("https://npm.pkg.github.com/path?token=abc", &policy)
+            .expect("query string must not be rejected for npm");
+        assert_eq!(url.as_str(), "https://npm.pkg.github.com/path?token=abc");
+    }
+
     /// S5: `https://x/` and `https://x` normalize to one index, and neither carries a
     /// trailing slash — building `{base}/@scope/pkg` on top must not double the slash.
     #[test]
@@ -861,8 +840,8 @@ mod tests {
     /// would defeat the whole point of never logging the expanded form (this module's
     /// security-model doc, `InvalidEntry`'s doc). `expand_env_vars` cannot be exercised here
     /// without mutating the real process environment (forbidden — see
-    /// `expand_env_vars_with`'s doc), so this drives `new_for_log` directly with the two
-    /// strings `resolve_entry` would have passed it after a real `${VAR}` expansion.
+    /// `expand_env_vars_with`'s doc), so this drives `new_with_raw_for_log` directly with the
+    /// two strings `resolve_entry` would have passed it after a real `${VAR}` expansion.
     #[test]
     fn test_new_for_log_blocked_host_reports_raw_not_expanded() {
         let expanded_secret = "https://127.0.0.1:9999/?token=super-secret-value";
@@ -871,11 +850,12 @@ mod tests {
 
         // `BlockedHost`'s own `Display` never carries the URL at all (only the host
         // class) — the actual leak this guards against is the `tracing::warn!` emitted
-        // from inside `new_for_log`, so this must inspect the captured log line itself,
-        // not just the returned error's rendering.
+        // from inside `new_with_raw_for_log`, so this must inspect the captured log line
+        // itself, not just the returned error's rendering.
         let log = deps_core::test_util::capture_tracing_output(|| {
-            let err = NpmRegistryIndex::new_for_log(expanded_secret, raw_placeholder, &policy)
-                .unwrap_err();
+            let err =
+                NpmRegistryIndex::new_with_raw_for_log(expanded_secret, raw_placeholder, &policy)
+                    .unwrap_err();
             assert_matches!(err, NpmRegistryIndexError::BlockedHost { .. });
         });
 
@@ -915,8 +895,8 @@ mod tests {
         let raw_placeholder = "${SECRET_VAR}";
         let policy = all_policy();
 
-        let err =
-            NpmRegistryIndex::new_for_log(expanded_secret, raw_placeholder, &policy).unwrap_err();
+        let err = NpmRegistryIndex::new_with_raw_for_log(expanded_secret, raw_placeholder, &policy)
+            .unwrap_err();
 
         assert_eq!(
             err,

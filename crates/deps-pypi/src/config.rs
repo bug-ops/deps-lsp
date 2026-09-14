@@ -35,8 +35,10 @@
 use std::collections::HashMap;
 
 use deps_core::BlockedSourceClass;
+#[cfg(test)]
+use deps_core::net_policy::HostClass;
 use deps_core::net_policy::{
-    HostClass, PolicyGate, RedactedUrl, RegistryAccessPolicy, validate_index_url,
+    RedactedUrl, RegistryAccessPolicy, RegistryUrlKind, ValidatedRegistryUrl,
 };
 use deps_core::parser::DependencySource;
 
@@ -46,56 +48,39 @@ use deps_core::parser::DependencySource;
 /// for the variants and their wording.
 pub use deps_core::net_policy::IndexUrlError as PypiIndexUrlError;
 
+/// [`deps_core::net_policy::RegistryUrlKind`] marker selecting PyPI's validation rules for
+/// [`PypiIndexUrl`] (issue #959).
+pub enum PypiIndexKind {}
+
+impl deps_core::net_policy::private::Sealed for PypiIndexKind {}
+
+impl RegistryUrlKind for PypiIndexKind {
+    const ECOSYSTEM: &'static str = "pypi";
+    const REJECT_QUERY_FRAGMENT: bool = false;
+    type Error = PypiIndexUrlError;
+}
+
 /// A validated, normalized, https-only PyPI-protocol index URL with no embedded userinfo.
 ///
-/// Mirrors `deps_npm::config::NpmRegistryIndex` (see FR-006/FR-011); kept `deps-pypi`-local
-/// rather than promoted to `deps-core` per this spec's Open Questions (consolidate only once a
-/// third near-identical type makes the duplication concrete).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct PypiIndexUrl {
-    /// The validated URL, normalized by stripping a trailing `/` — matches
-    /// `simple_api_url`'s existing `{base}/{name}/` join convention (PEP 503).
-    normalized: String,
-}
-
-impl PypiIndexUrl {
-    /// Validates and normalizes `raw` against `policy`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PypiIndexUrlError`] if `raw` does not parse as a URL, is not `https` (outside
-    /// the `cfg(test)`/`test-util` loopback carve-out), carries a userinfo component, or
-    /// resolves to a host class the current `policy` blocks.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use deps_core::net_policy::RegistryAccessPolicy;
-    /// use deps_pypi::config::PypiIndexUrl;
-    ///
-    /// let policy = RegistryAccessPolicy::default();
-    /// assert!(PypiIndexUrl::new("https://pypi.mycorp.example/simple", &policy).is_ok());
-    /// assert!(PypiIndexUrl::new("http://pypi.mycorp.example/simple", &policy).is_err());
-    /// assert!(PypiIndexUrl::new("https://user:pass@pypi.mycorp.example", &policy).is_err());
-    /// ```
-    pub fn new(raw: &str, policy: &RegistryAccessPolicy) -> Result<Self, PypiIndexUrlError> {
-        let url = validate_index_url(raw, raw, "pypi", PolicyGate::Enforce(policy))?;
-        let normalized = url.as_str().trim_end_matches('/').to_string();
-        Ok(Self { normalized })
-    }
-
-    /// The normalized index URL. Never carries a trailing `/`.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.normalized
-    }
-}
-
-impl std::fmt::Display for PypiIndexUrl {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
+/// Mirrors `deps_npm::config::NpmRegistryIndex` (see FR-006/FR-011). An alias of the shared
+/// [`deps_core::net_policy::ValidatedRegistryUrl`] (issue #959) — see that type's docs for the
+/// implementation every ecosystem's validated-URL newtype now shares.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::net_policy::RegistryAccessPolicy;
+/// use deps_pypi::config::PypiIndexUrl;
+///
+/// let policy = RegistryAccessPolicy::default();
+/// assert!(PypiIndexUrl::new("https://pypi.mycorp.example/simple", &policy).is_ok());
+/// assert!(PypiIndexUrl::new("http://pypi.mycorp.example/simple", &policy).is_err());
+/// assert!(PypiIndexUrl::new("https://user:pass@pypi.mycorp.example", &policy).is_err());
+/// ```
+///
+/// The normalized index URL never carries a trailing `/` — matches `simple_api_url`'s existing
+/// `{base}/{name}/` join convention (PEP 503).
+pub type PypiIndexUrl = ValidatedRegistryUrl<PypiIndexKind>;
 
 /// A present-but-unusable index entry — an invalid URL, a policy-blocked host, or a
 /// well-formed-but-non-https/userinfo-bearing value.
@@ -110,17 +95,10 @@ impl std::fmt::Display for PypiIndexUrl {
 /// exactly the case where `raw` would otherwise still contain `user:pass@` (a query-string
 /// credential can reach the same field via any other rejection reason).
 ///
-/// Output-only: constructed internally by this module's own `resolve_entry`, never by
-/// external code — no constructor is provided.
-#[non_exhaustive]
-#[derive(Debug, Clone)]
-pub struct InvalidEntry {
-    /// The raw index value, as written in the source file, with any `user:pass@`/`user@`
-    /// userinfo component and any query string/fragment stripped.
-    pub raw: RedactedUrl,
-    /// Why it was rejected.
-    pub reason: PypiIndexUrlError,
-}
+/// An alias of the shared [`deps_core::net_policy::InvalidEntry`] (issue #959). Output-only: a
+/// caller builds one only via [`deps_core::net_policy::InvalidEntry::new`]/
+/// [`deps_core::net_policy::InvalidEntry::logged`], never a struct literal.
+pub type InvalidEntry = deps_core::net_policy::InvalidEntry<PypiIndexUrlError>;
 
 /// Validates and normalizes one raw index value, logging a `tracing::warn!` naming the raw
 /// value (redacted — see [`deps_core::net_policy::RedactedUrl`]) on failure. `pub(crate)`:
@@ -132,29 +110,13 @@ pub(crate) fn resolve_entry(
     policy: &RegistryAccessPolicy,
 ) -> Result<PypiIndexUrl, InvalidEntry> {
     PypiIndexUrl::new(raw, policy).map_err(|reason| {
-        // #767 S2a: `RedactedUrl`, not `redact_userinfo` alone — this value is also
-        // stored in `InvalidEntry::raw`, which can surface as `DependencySource::CustomRegistry`'s
-        // hover/diagnostics text, so a query-string credential must be stripped too, not just
-        // userinfo. Host and path still survive, so hover stays identifiable.
-        let redacted = RedactedUrl::new(raw);
-        tracing::warn!(raw = %redacted, %reason, "PyPI index URL failed validation");
-        InvalidEntry {
-            raw: redacted,
-            reason,
-        }
-    })
-}
-
-/// `Some((class, raw))` iff `result` is an entry rejected specifically for
-/// [`PypiIndexUrlError::BlockedHost`] — used by [`PypiIndexConfig::blocked_class_for`].
-fn blocked_class(result: &Result<PypiIndexUrl, InvalidEntry>) -> Option<(HostClass, String)> {
-    match result {
-        Err(InvalidEntry {
+        InvalidEntry::logged(
             raw,
-            reason: PypiIndexUrlError::BlockedHost { class },
-        }) => Some((*class, raw.to_string())),
-        _ => None,
-    }
+            reason,
+            PypiIndexKind::ECOSYSTEM,
+            "PyPI index URL failed validation",
+        )
+    })
 }
 
 /// One fully-resolved, ready-to-register routing chain — produced by
@@ -433,8 +395,9 @@ impl PypiIndexConfig {
     /// branches, but reports whether the entry that resolution used (or, for a blocked
     /// `tail_hop`, would have used as the case-(b) chain's last-resort hop) was rejected
     /// specifically because its host is blocked by the current
-    /// `registries.workspace_registries` policy — and if so, the blocked [`HostClass`], the
-    /// raw declared value, and a declaration key identifying *which* index declaration
+    /// `registries.workspace_registries` policy — and if so, the blocked
+    /// [`deps_core::net_policy::HostClass`], the raw declared value, and a declaration key
+    /// identifying *which* index declaration
     /// produced it (`"primary"`, `"uv-tail"`, or `"named:<name>"`) (#925: so the block
     /// surfaces as a diagnostic instead of only a `tracing::warn!`). `None` for every other
     /// outcome (no override, a valid entry, or an entry invalid for a different reason).
@@ -462,7 +425,12 @@ impl PypiIndexConfig {
     #[must_use]
     pub fn blocked_class_for(&self, named_source: Option<&str>) -> Option<BlockedSourceClass> {
         if let Some(name) = named_source {
-            let (class, raw_value) = blocked_class(self.named_sources.get(name)?)?;
+            let (class, raw_value) = self
+                .named_sources
+                .get(name)?
+                .as_ref()
+                .err()
+                .and_then(InvalidEntry::blocked_class)?;
             return Some(BlockedSourceClass {
                 class,
                 raw_value,
@@ -470,14 +438,22 @@ impl PypiIndexConfig {
             });
         }
         if let Some(result) = &self.primary {
-            let (class, raw_value) = blocked_class(result)?;
+            let (class, raw_value) = result
+                .as_ref()
+                .err()
+                .and_then(InvalidEntry::blocked_class)?;
             return Some(BlockedSourceClass {
                 class,
                 raw_value,
                 declaration_key: "primary".to_string(),
             });
         }
-        let (class, raw_value) = blocked_class(self.tail_hop.as_ref()?)?;
+        let (class, raw_value) = self
+            .tail_hop
+            .as_ref()?
+            .as_ref()
+            .err()
+            .and_then(InvalidEntry::blocked_class)?;
         Some(BlockedSourceClass {
             class,
             raw_value,
@@ -594,6 +570,17 @@ mod tests {
             PypiIndexUrl::new("https://pypi.mycorp.example/simple", &policy).unwrap();
         assert_eq!(with_slash, without_slash);
         assert!(!with_slash.as_str().ends_with('/'));
+    }
+
+    /// Issue #959 code review (S2): unlike `deps-go`'s `GoProxyUrl`, PyPI's kind does not set
+    /// `REJECT_QUERY_FRAGMENT` — a query string must still be accepted, and survive verbatim in
+    /// `as_str()`, after the generic-machinery migration.
+    #[test]
+    fn test_index_url_accepts_query_string() {
+        let policy = all_policy();
+        let url = PypiIndexUrl::new("https://pypi.mycorp.example/simple?token=abc", &policy)
+            .expect("query string must not be rejected for pypi");
+        assert_eq!(url.as_str(), "https://pypi.mycorp.example/simple?token=abc");
     }
 
     #[test]
