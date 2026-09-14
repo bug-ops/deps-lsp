@@ -422,6 +422,61 @@ mod tests {
         assert_eq!(resolved.version("FallbackName"), Some("1.0.0"));
     }
 
+    /// Regression for #979: a v2/v3 pin on a non-GitHub host (`location`) must never be
+    /// resolved into an `owner/repo` identity by naively slicing the URL path — it must
+    /// fall back to the pin's own `identity` field, exactly like the existing
+    /// no-identity fallback for single-segment URLs.
+    #[tokio::test]
+    async fn test_v2_non_github_host_falls_back_to_identity() {
+        let content = r#"{
+  "pins": [
+    {
+      "identity": "myrepo",
+      "kind": "remoteSourceControl",
+      "location": "https://gitlab.com/myorg/myrepo.git",
+      "state": { "revision": "abc", "version": "1.0.0" }
+    }
+  ],
+  "version": 2
+}"#;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("Package.resolved");
+        tokio::fs::write(&path, content).await.unwrap();
+
+        let parser = SwiftLockParser;
+        let resolved = parser.parse_lockfile(&path).await.unwrap();
+        assert_eq!(resolved.version("myrepo"), Some("1.0.0"));
+        assert_eq!(resolved.version("myorg/myrepo"), None);
+    }
+
+    /// Regression for #979: same guarantee as the v2/v3 case above, for the v1 format.
+    #[tokio::test]
+    async fn test_v1_non_github_host_falls_back_to_package_name() {
+        let content = r#"{
+  "object": {
+    "pins": [
+      {
+        "package": "MyRepo",
+        "repositoryURL": "https://gitlab.com/myorg/myrepo.git",
+        "state": {
+          "revision": "abc",
+          "version": "1.0.0"
+        }
+      }
+    ]
+  },
+  "version": 1
+}"#;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("Package.resolved");
+        tokio::fs::write(&path, content).await.unwrap();
+
+        let parser = SwiftLockParser;
+        let resolved = parser.parse_lockfile(&path).await.unwrap();
+        assert_eq!(resolved.version("MyRepo"), Some("1.0.0"));
+        assert_eq!(resolved.version("myorg/myrepo"), None);
+    }
+
     #[tokio::test]
     async fn test_skip_branch_only_pins() {
         let content = r#"{

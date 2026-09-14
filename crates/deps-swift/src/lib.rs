@@ -41,3 +41,16 @@ pub use types::{SwiftDependency, SwiftPackage, SwiftVersion};
 pub(crate) fn is_valid_github_identity(name: &str) -> bool {
     deps_core::github::is_valid_github_identity(name)
 }
+
+/// Whether `host` is GitHub's own hostname (case-insensitive).
+///
+/// Shared by `parser::url_to_identity` (a credential-bearing fetch-URL gate: only a
+/// `github.com` URL may be turned into an `owner/repo` identity queried against the GitHub
+/// API, #979) and `formatter::osv_package_name` (an advisory-attribution gate), so the two
+/// predicates cannot drift out of sync on what counts as GitHub. A plain string match (e.g.
+/// `host.ends_with("github.com")`) would accept attacker-owned hosts like
+/// `github.com.evil.com` — callers must pass the fully-parsed host component (`Url::host_str`),
+/// never a raw URL string.
+pub(crate) fn is_github_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("github.com") || host.eq_ignore_ascii_case("www.github.com")
+}
