@@ -419,6 +419,7 @@ mod tests {
     /// Impl-critic S2 regression: an oversized file must warn at most once per distinct
     /// mtime, not once per call — an oversized file is never memoized in `files`, so without
     /// this every hover/completion/diagnostic pass touching it would re-emit the warning.
+    #[cfg(feature = "test-util")]
     #[test]
     fn oversized_file_warns_once_per_mtime_not_once_per_call() {
         let dir = tempfile::tempdir().unwrap();
@@ -448,6 +449,7 @@ mod tests {
 
     /// A file that changes (still oversized) after already being warned about must warn
     /// again — the dedup is per file *version*, not a one-time-ever suppression.
+    #[cfg(feature = "test-util")]
     #[test]
     fn oversized_file_warns_again_after_mtime_changes() {
         let dir = tempfile::tempdir().unwrap();

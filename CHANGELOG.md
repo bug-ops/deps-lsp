@@ -31,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking (pre-1.0, public API)**: **deps-core**: removed the unused `severities: DiagnosticSeverities` parameter from `Ecosystem::generate_code_lenses` — the override it was added for was deleted, and no other override ever read it (resolves #930) (#951)
 
 ### Fixed
+- **deps-core**: `fs_probe`'s snapshot helpers and 16 tracing-capture tests (`registry`, `pagination`, `github`, `mtime_cache`) now compile under a reduced feature set without `test-util`, matching #998's fix for `deps-lsp` (resolves #1000)
 - **deps-lsp**: `lib.rs`'s `#[cfg(test)]` module now compiles under any reduced ecosystem feature set; CI's feature-matrix job gained a dedicated `cargo hack check -p deps-lsp --each-feature --all-targets` step to catch this class of regression (resolves #998)
 - **deps-swift**: a non-GitHub-host registry-form `Package.swift` dependency no longer surfaces the misleading "Invalid package name... must be a GitHub 'owner/repo' identifier" diagnostic; version resolution is silently skipped for it instead, matching `deps-github-actions`'s existing non-resolvable-source handling (resolves #983) (#994)
 - **deps-swift**: fixed a `version_req`/fixture-content mismatch in the ignored completion-dispatch test that made it exercise the wrong code path when run manually (resolves #924) (#994)

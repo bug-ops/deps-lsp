@@ -146,7 +146,7 @@ pub fn exists(path: &Path) -> bool {
 /// For a test to snapshot before an operation and diff against afterward — never a global
 /// "reset to zero", since `cargo nextest` gives each test its own process but a bare
 /// count-from-zero would still race a hypothetical future multi-threaded runner.
-#[cfg(feature = "test-util")]
+#[cfg(any(test, feature = "test-util"))]
 #[must_use]
 pub fn snapshot() -> (usize, usize) {
     (
@@ -157,7 +157,7 @@ pub fn snapshot() -> (usize, usize) {
 
 /// Backing lock for [`snapshot_guard`]/[`snapshot_guard_async`] — shared so a sync and an
 /// async caller serialize against each other, not just against callers of the same function.
-#[cfg(feature = "test-util")]
+#[cfg(any(test, feature = "test-util"))]
 static SNAPSHOT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Serializes a `snapshot`-before/operation/`snapshot`-after/assert section, run from a plain
@@ -200,7 +200,7 @@ static SNAPSHOT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(())
 /// let (stats_after, _) = snapshot();
 /// assert!(stats_after >= stats_before);
 /// ```
-#[cfg(feature = "test-util")]
+#[cfg(any(test, feature = "test-util"))]
 #[must_use = "dropping the guard immediately releases it, guarding nothing — bind it to a \
               named variable (e.g. `let _guard = snapshot_guard();`) held for the whole \
               measured section"]
@@ -234,7 +234,7 @@ pub fn snapshot_guard() -> tokio::sync::MutexGuard<'static, ()> {
 /// assert!(stats_after >= stats_before);
 /// # }
 /// ```
-#[cfg(feature = "test-util")]
+#[cfg(any(test, feature = "test-util"))]
 #[must_use = "dropping the guard immediately releases it, guarding nothing — bind it to a \
               named variable (e.g. `let _guard = snapshot_guard_async().await;`) held for the \
               whole measured section"]
