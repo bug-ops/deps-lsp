@@ -35,10 +35,14 @@ pub struct BundlerParseResult {
 static GEM_PATTERN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"^\s*gem\s+['"]([^'"]+)['"]"#).expect("Invalid regex"));
 
+/// Matches a gem's version-constraint string, e.g. `gem "rails", "~> 7.0"`. Tolerant of a
+/// trailing comment after the closing quote (`"~> 7.0" # pinned for Rails 7 compat`, #988) —
+/// mirroring the comment-tolerance already added to the block-tracking regexes in #986.
 // Same guarantee as GEM_PATTERN above.
 #[allow(clippy::expect_used)]
-static VERSION_PATTERN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"['"]([~>=<!\d][^'"]*)['"]\s*(?:,|$)"#).expect("Invalid regex"));
+static VERSION_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"['"]([~>=<!\d][^'"]*)['"]\s*(?:,|(?:#.*)?$)"#).expect("Invalid regex")
+});
 
 // Same guarantee as GEM_PATTERN above.
 #[allow(clippy::expect_used)]
@@ -54,11 +58,21 @@ static SOURCE_BLOCK_START: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"^\s*source\s+['"]([^'"]+)['"]\s+do\s*(#.*)?$"#).expect("Invalid regex")
 });
 
-/// Matches the per-gem inline `source:` option, e.g. `gem "x", source: "https://gems.corp"`.
+/// Builds a regex pattern matching a Bundler per-gem inline option in either the modern
+/// `key: value` syntax or Ruby's legacy hash-rocket `:key => value` syntax (e.g. `source:
+/// "..."` or `:source => "..."`). Shared by [`SOURCE_OPTION`], [`GIT_OPTION`],
+/// [`PATH_OPTION`], and [`GITHUB_OPTION`] so the hash-rocket gap (#987) is fixed once for all
+/// four options instead of patched separately per option.
+fn option_value_pattern(key: &str) -> String {
+    format!(r#"(?:{key}:|:{key}\s*=>)\s*['"]([^'"]+)['"]"#)
+}
+
+/// Matches the per-gem inline `source:` option, e.g. `gem "x", source: "https://gems.corp"`
+/// or the hash-rocket form `gem "x", :source => "https://gems.corp"`.
 // Same guarantee as GEM_PATTERN above.
 #[allow(clippy::expect_used)]
 static SOURCE_OPTION: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"source:\s*['"]([^'"]+)['"]"#).expect("Invalid regex"));
+    LazyLock::new(|| Regex::new(&option_value_pattern("source")).expect("Invalid regex"));
 
 // Same guarantee as GEM_PATTERN above.
 #[allow(clippy::expect_used)]
@@ -119,20 +133,26 @@ static BLOCK_END: LazyLock<Regex> =
 static GROUP_OPTION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"group:\s*(\[.+?\]|:\w+)").expect("Invalid regex"));
 
+/// Matches the per-gem inline `git:` option, e.g. `gem "x", git: "https://..."` or the
+/// hash-rocket form `gem "x", :git => "https://..."`.
 // Same guarantee as GEM_PATTERN above.
 #[allow(clippy::expect_used)]
 static GIT_OPTION: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"git:\s*['"]([^'"]+)['"]\s*"#).expect("Invalid regex"));
+    LazyLock::new(|| Regex::new(&option_value_pattern("git")).expect("Invalid regex"));
 
+/// Matches the per-gem inline `path:` option, e.g. `gem "x", path: "../local"` or the
+/// hash-rocket form `gem "x", :path => "../local"`.
 // Same guarantee as GEM_PATTERN above.
 #[allow(clippy::expect_used)]
 static PATH_OPTION: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"path:\s*['"]([^'"]+)['"]\s*"#).expect("Invalid regex"));
+    LazyLock::new(|| Regex::new(&option_value_pattern("path")).expect("Invalid regex"));
 
+/// Matches the per-gem inline `github:` option, e.g. `gem "x", github: "org/repo"` or the
+/// hash-rocket form `gem "x", :github => "org/repo"`.
 // Same guarantee as GEM_PATTERN above.
 #[allow(clippy::expect_used)]
 static GITHUB_OPTION: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"github:\s*['"]([^'"]+)['"]\s*"#).expect("Invalid regex"));
+    LazyLock::new(|| Regex::new(&option_value_pattern("github")).expect("Invalid regex"));
 
 // Same guarantee as GEM_PATTERN above.
 #[allow(clippy::expect_used)]
@@ -845,17 +865,13 @@ gem "rails""#;
     /// dropping the dependency and unbalancing the block stack for the rest of the file.
     #[test]
     fn test_gem_line_with_trailing_do_comment_still_parses() {
-        // Note: `VERSION_PATTERN` does not tolerate a trailing comment after the quoted
-        // version string either (a pre-existing, separate limitation — critic's M2/M3-adjacent
-        // territory, not part of this fix), so `version_req` is not asserted here; this test's
-        // purpose is narrower: the gem must not be dropped from the parse entirely, which is
-        // what the unanchored `GENERIC_BLOCK_START` regression (N1) caused.
         let gemfile = r#"source "https://rubygems.org"
 gem "rails", "~> 7.0" # lots of things to do
 gem "rspec""#;
         let result = parse_gemfile(gemfile, &test_uri()).unwrap();
         assert_eq!(result.dependencies.len(), 2);
         assert_eq!(result.dependencies[0].name, "rails");
+        assert_eq!(result.dependencies[0].version_req, Some("~> 7.0".into()));
         assert_eq!(result.dependencies[0].source, DependencySource::Registry);
         assert_eq!(result.dependencies[1].name, "rspec");
         assert_eq!(result.dependencies[1].source, DependencySource::Registry);
@@ -1276,5 +1292,94 @@ gem 'rspec', group: [:test, :development]";
         let gemfile = "source 'https://rubygems.org'\n# UTF-8: \u{1F600}\ngem 'rails'";
         let result = parse_gemfile(gemfile, &test_uri()).unwrap();
         assert_eq!(result.dependencies.len(), 1);
+    }
+
+    /// Security regression (#987): the hash-rocket `:source => "..."` form was previously
+    /// unmatched by `SOURCE_OPTION` (`key: value` only), so a gem using it silently fell
+    /// through to `Registry` and leaked its name to rubygems.org.
+    #[test]
+    fn test_hash_rocket_source_option_classified_as_custom_registry() {
+        let gemfile = r#"source "https://rubygems.org"
+gem "internal-gem", :source => "https://gems.mycorp.com""#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        match &result.dependencies[0].source {
+            DependencySource::CustomRegistry { url } => {
+                assert_eq!(url, "https://gems.mycorp.com");
+            }
+            other => panic!("expected CustomRegistry, got {other:?}"),
+        }
+    }
+
+    /// Security regression (#987), same gap as above for the `git:` option.
+    #[test]
+    fn test_hash_rocket_git_option_classified_as_git_source() {
+        let gemfile = r#"source "https://rubygems.org"
+gem "rails", :git => "https://github.com/rails/rails.git""#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        match &result.dependencies[0].source {
+            DependencySource::Git { url, .. } => {
+                assert_eq!(url, "https://github.com/rails/rails.git");
+            }
+            other => panic!("expected Git source, got {other:?}"),
+        }
+    }
+
+    /// Security regression (#987), same gap as above for the `path:` option.
+    #[test]
+    fn test_hash_rocket_path_option_classified_as_path_source() {
+        let gemfile = r#"source "https://rubygems.org"
+gem "local_gem", :path => "../local_gem""#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        match &result.dependencies[0].source {
+            DependencySource::Path { path } => {
+                assert_eq!(path, "../local_gem");
+            }
+            other => panic!("expected Path source, got {other:?}"),
+        }
+    }
+
+    /// Security regression (#987), same gap as above for the `github:` option.
+    #[test]
+    fn test_hash_rocket_github_option_classified_as_git_source() {
+        let gemfile = r#"source "https://rubygems.org"
+gem "rails", :github => "rails/rails""#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        match &result.dependencies[0].source {
+            DependencySource::Git { url, .. } => {
+                assert!(url.contains("github.com/rails/rails"));
+            }
+            other => panic!("expected Git source, got {other:?}"),
+        }
+    }
+
+    /// The hash-rocket `:git =>` option must still take precedence over `:source =>`, mirroring
+    /// `test_inline_source_option_does_not_override_explicit_git_source` for the modern syntax.
+    #[test]
+    fn test_hash_rocket_git_option_takes_precedence_over_hash_rocket_source_option() {
+        let gemfile = r#"source "https://rubygems.org"
+gem "rails", :git => "https://github.com/rails/rails.git", :source => "https://gems.mycorp.com""#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_matches!(result.dependencies[0].source, DependencySource::Git { .. });
+    }
+
+    /// Regression (#988): a trailing comment after a version constraint must not drop
+    /// `version_req` entirely — before the fix, `VERSION_PATTERN` was anchored right after the
+    /// closing quote and never matched a line like `gem "rails", "~> 7.0" # pinned`.
+    #[test]
+    fn test_version_with_trailing_comment_still_captured() {
+        let gemfile = r#"source "https://rubygems.org"
+gem "rails", "~> 7.0" # pinned for Rails 7 compat"#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies[0].version_req, Some("~> 7.0".into()));
+    }
+
+    /// Sanity check: a version constraint immediately followed by more inline options (no
+    /// comment) must still parse exactly as before this fix.
+    #[test]
+    fn test_version_followed_by_options_without_comment_still_captured() {
+        let gemfile = r"source 'https://rubygems.org'
+gem 'sidekiq', '~> 7.0', require: false";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies[0].version_req, Some("~> 7.0".into()));
     }
 }

@@ -30,6 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking (pre-1.0, public API)**: **deps-core**: removed the unused `severities: DiagnosticSeverities` parameter from `Ecosystem::generate_code_lenses` — the override it was added for was deleted, and no other override ever read it (resolves #930) (#951)
 
 ### Fixed
+- **deps-bundler**: hash-rocket per-gem options (`:source =>`, `:git =>`, `:path =>`, `:github =>`) are now recognized, closing the same registry-name-leak class as #980 for Ruby's older Gemfile syntax (resolves #987)
+- **deps-bundler**: a version constraint followed by a trailing comment (`gem "rails", "~> 7.0" # ...`) is no longer dropped from hover/diagnostics (resolves #988)
 - **deps-swift**: `Package.swift`/`Package.resolved` dependencies on a non-GitHub host are no longer coerced into an attacker-nameable GitHub `owner/repo` identity queried with the user's `GITHUB_TOKEN`; they now stay visible as a non-resolvable Git source under their raw URL (resolves #979) (#982)
 - **deps-bundler, deps-dart**: gems behind a Gemfile `source ... do` block or inline `source:` option, and `hosted:` pubspec dependencies, are now classified as a custom registry instead of being queried against rubygems.org/pub.dev (resolves #980) (#986)
 - **deps-gitlab-ci**: a GitLab instance host blocked by `registries.workspace_registries` policy (via `registries.gitlab_instance_host` or an inline `component:` host) now surfaces the shared blocked-registry informational diagnostic naming the blocked host class, instead of the misattributed "set `registries.gitlab_instance_host`" message, matching `deps-cargo`/`deps-npm`/`deps-pypi`/`deps-nuget`'s existing behavior (resolves #967) (#973)
