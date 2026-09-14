@@ -10,7 +10,7 @@ tags:
   - deps-core
   - deps-lsp
 created: 2026-09-14
-status: draft
+status: shipped
 related:
   - "[[constitution]]"
   - "[[002-osv-vulnerability-diagnostics/spec|OSV vulnerability diagnostics]]"
@@ -22,7 +22,7 @@ related:
 
 > [!info] Metadata
 > **Author**: continuous-improvement cycle (research stream)
-> **Branch**: no issue number assigned yet — file a GitHub issue before branching
+> **Branch**: issue #1007
 > **Priority**: P3
 > **Type**: enhancement (research-originated, correctness/UX gap)
 
@@ -205,12 +205,16 @@ Use EARS notation. Prefix with FR-NNN.
 | ID | Requirement | Priority |
 |----|------------|----------|
 | FR-001 | WHEN parsing an OSV record's `affected[]` entries THE SYSTEM SHALL deserialize each entry's `database_specific.informational` field (new field on `OsvAffected`, `crates/deps-core/src/osv/types.rs`) so the value is available at `classify()`'s call site, mirroring how `ecosystem_specific` is already carried per-entry | must |
-| FR-002 | WHEN an OSV record's relevant `affected[]` entry (i.e. the entry already filtered to the package actually queried, per `OsvVulnRecord::into_advisory`) carries a non-empty `database_specific.informational` value THE SYSTEM SHALL classify that advisory into a distinct informational category rather than falling through to `VulnSeverity::Unknown` — `[NEEDS CLARIFICATION: exact new-variant name and shape — see §9(a)]` | must |
-| FR-003 | WHEN an advisory is classified as informational THE SYSTEM SHALL render a hover label distinct from `"unknown severity"` and distinct from every existing graded/malicious label | must |
-| FR-004 | WHEN an advisory is classified as informational THE SYSTEM SHALL produce a diagnostic distinguishable from a `VulnSeverity::Unknown` diagnostic for an ordinary CVE via severity and/or message content and diagnostic code — `[NEEDS CLARIFICATION: target DiagnosticSeverity — see §9(a)]` | must |
-| FR-005 | WHEN an OSV record's relevant `affected[]` entry carries BOTH a graded severity field (record-level `database_specific.severity` or per-entry `ecosystem_specific.severity`) AND an `informational` value (possible in principle, not yet live-observed) THE SYSTEM SHALL still surface the graded severity as primary — unlike the `MAL-*` precedent (#646 FR-004), an `informational` value on an otherwise-graded record does not represent a categorically more urgent finding, so it must not override an existing severity signal; open to revision if a live counterexample is found (`[NEEDS CLARIFICATION: precedence when both are present — see §9]`) | should |
+| FR-002 | WHEN an OSV record's relevant `affected[]` entries (i.e. the entries already filtered to the package actually queried, per `OsvVulnRecord::into_advisory`) carry a non-empty `database_specific.informational` value on at least one entry, AND no entry among those same relevant entries carries a graded severity field (record-level `database_specific.severity` or per-entry `ecosystem_specific.severity`) THE SYSTEM SHALL classify that advisory as a new `VulnSeverity::Informational` variant, distinct from `Unknown`/`Malicious`/graded variants, mapped to `DiagnosticSeverity::INFORMATION` (resolved 2026-09-14, revised after critic review: `INFORMATION`, not `HINT` — see §9(a) for why `HINT` was rejected) | must |
+| FR-002a | WHEN `classify()` evaluates a record's relevant `affected[]` entries THE SYSTEM SHALL run the graded-severity check across ALL relevant entries first (as today — first entry found with a graded severity wins) and only fall through to the informational check (FR-002) if NO relevant entry carries a graded severity — the informational check MUST NOT be interleaved entry-by-entry with the graded-severity check, and MUST run as a separate pass after the existing `MAL-` → graded-severity chain, immediately before the final `Unknown` fallback. This is the corrected slotting for FR-005: interleaving (checking each entry for informational-or-severity in one pass) lets an early entry's `informational` value win over a later entry's graded severity, which is exactly the outcome FR-005 forbids | must |
+| FR-002b | WHEN `OsvVulnRecord::into_advisory` falls back to using ALL `affected[]` entries because none matched the queried package (the existing "no entry matches" fallback) THE SYSTEM SHALL NOT apply the informational classification (FR-002) from that fallback set — an `informational` value on an unrelated ("stranger") package entry must not downgrade an otherwise-`Unknown` record's diagnostic severity for a package it does not actually describe. In this fallback case, `classify()` continues past the informational check to `Unknown` exactly as before this spec. ADDITIONALLY (impl-critic finding M2): `into_advisory`'s existing relevant-entry filter treats a `package`-less `affected[]` entry (`entry.package.is_none()`) as matching ANY queried package — this is pre-existing, permissive-by-design leniency for other fields, but for the NEW informational check specifically, a `package`-less entry MUST NOT count as a "genuine match" (it is not actually about the queried package at all) — the informational check's genuine-match guard must require `entry.package` to be `Some` and actually equal to the queried package, a strictly narrower condition than the existing general relevant-entry filter used for severity | must |
+| FR-003 | WHEN an advisory is classified as informational THE SYSTEM SHALL render a hover label distinct from `"unknown severity"` and distinct from every existing graded/malicious label — a plain text label, no dedicated icon/callout (resolved: §9(d)). If the advisory has no `summary` text, the label MUST still stand alone as a comprehensible notice (not just append "(no summary provided)" to a bare category word) | must |
+| FR-004 | WHEN an advisory is classified as informational THE SYSTEM SHALL produce a diagnostic with `DiagnosticSeverity::INFORMATION` (revised, see FR-002) AND a `[INFORMATIONAL]` message prefix (mirroring the `[MALWARE]` precedent from #646). `INFORMATION` keeps the finding visible in every client's Problems panel — unlike `HINT`, which VS Code excludes from the Problems panel entirely and Zed de-emphasizes. `Unknown` (an ordinary unscored CVE) stays at `WARNING`, so severity alone already separates the two; the `[INFORMATIONAL]` prefix is the additional signal for a user filtering/reading by message text or diagnostic code rather than by severity icon | must |
+| FR-005 | WHEN an OSV record's relevant `affected[]` entry carries BOTH a graded severity field (record-level `database_specific.severity` or per-entry `ecosystem_specific.severity`) AND an `informational` value (possible in principle, not yet live-observed) THE SYSTEM SHALL still surface the graded severity as primary — unlike the `MAL-*` precedent (#646 FR-004), an `informational` value on an otherwise-graded record does not represent a categorically more urgent finding, so it must not override an existing severity signal. Enforced via the two-pass precedence in FR-002a | should |
 | FR-006 | WHEN `classify()`'s existing precedence chain (`MAL-` prefix -> `database_specific.severity` -> `ecosystem_specific.severity` -> `Unknown`) runs on a record that has NO `informational` value on its relevant `affected[]` entries THE SYSTEM SHALL continue to behave exactly as today — this spec adds a new classification branch, it does not change existing precedence for records without the field | must |
-| FR-007 | WHERE OSV's schema defines `informational` as an enum with (at minimum) `"unknown"` and `"unmaintained"` as recognized values THE SYSTEM SHALL handle an unrecognized/future `informational` string value by still classifying the advisory as generically informational (not silently reverting to `VulnSeverity::Unknown`) — `[NEEDS CLARIFICATION: whether "unknown" (the enum value, confusingly distinct from this crate's own VulnSeverity::Unknown) needs its own handling — see §9(c)]` | must |
+| FR-007 | WHERE a relevant `affected[]` entry's non-empty (post-`trim()`) `database_specific.informational` value is `"unmaintained"` THE SYSTEM SHALL classify the advisory as `VulnSeverity::Informational` (REVISED 2026-09-14, twice, after security review — see §9(f) — was originally "any non-empty value", then narrowed to an allowlist of `"unmaintained"`/`"notice"`, now narrowed further to `"unmaintained"` alone). Any OTHER value — including RUSTSEC's `"unsound"` (a real memory-safety/UB finding) and `"notice"` (live-verified to also carry real defects, e.g. `RUSTSEC-2026-0174`/`http-types`'s incorrect `unsafe` justification for an ASCII-invariant violation — not a reliably maintenance-only category, see §9(f)), OSV's own `"unknown"` enum value, an unrecognized future value, a missing field, `null`, or an empty/whitespace-only string — MUST NOT trigger `Informational` classification and instead falls through to the existing precedence chain (graded severity, else `Unknown`) exactly as before this spec. Defaulting unrecognized/unreliable values to the safer, more-visible `Unknown`/`WARNING` treatment (rather than the less-visible `Informational`/`INFORMATION`) is the deliberate fail-safe direction here | must |
+| FR-008 | WHEN rendering the "Latest version is also affected" candidate-vulnerable hover line for a dependency THE SYSTEM SHALL suppress mentioning any advisory id whose classification is `VulnSeverity::Informational` — an informational/unmaintained notice has no "fixed version" concept, so flagging the latest version as "also affected" by it is misleading. REVISED 2026-09-14 after implementation-critique (impl-critic findings S1/S2, superseding an earlier draft that special-cased `Informational` inside `check_candidates()` itself): this filtering MUST be implemented purely as a hover-rendering-time step (`crates/deps-core/src/lsp_helpers/hover.rs`) over the advisory ids `check_candidates()` already returns — `check_candidates()` itself, its `CandidateVulnerable`/`CandidateClean`/`UpgradeStatus` classification, the `Capped` truncation semantics it already correctly respects, and every downstream consumer (`osv_scan.rs`, `code_actions.rs`'s `fix_target_is_verified`) MUST remain byte-for-byte unchanged by this spec. If the ids `check_candidates()` returns are ALL `Informational`, hover suppresses the line entirely for that dependency; if the set is mixed (informational + non-informational), hover still renders it (a real vulnerability signal must never be silently dropped) | must |
+| FR-010 | WHEN the hover-render-time filter from FR-008 evaluates whether to suppress the "also affected" line THE SYSTEM SHALL treat an empty candidate-id set, OR a candidate-id set for which `!Capped::is_complete()`, as "cannot confirm all-informational" and render the line (fail OPEN) — never suppress on incomplete information (impl-critic finding N1, security finding L2) | must |
 
 ## 4. Non-Functional Requirements
 
@@ -225,29 +229,41 @@ Use EARS notation. Prefix with FR-NNN.
 | Entity | Description | Key Attributes |
 |--------|-------------|----------------|
 | `OsvAffected` (existing, `crates/deps-core/src/osv/types.rs`, `pub(super) struct OsvAffected`, ~line 960) | Wire type for one `affected[]` entry | Currently `package`, `ecosystem_specific`, `ranges` — needs a new `#[serde(default)] database_specific: Option<serde_json::Value>` field (FR-001) to carry the per-entry `informational` value through to `classify()`; note this is a *different* `database_specific` than `OsvVulnRecord`'s existing record-level `database_specific` (which is already read for `severity` today) |
-| `VulnSeverity` (existing, `crates/deps-core/src/osv/types.rs`, `#[non_exhaustive] pub enum VulnSeverity`) | Severity/category bucket enum | Currently `Critical`, `High`, `Medium`, `Low`, `Unknown`, `Malicious` (the last added by #646) — `[NEEDS CLARIFICATION: add a new variant (e.g. `Informational` or `Unmaintained`) vs. a separate parallel enum/field — see §9(a)]` |
-| `classify()` (existing, `crates/deps-core/src/osv/severity.rs`) | Severity-classification function | Signature takes `id`, `aliases`, `database_specific` (record-level), `relevant_affected: &[&OsvAffected]` — the new informational check would read `relevant_affected[].database_specific.informational` (the new per-entry field from FR-001), most naturally slotted after the `MAL-` check and before (or interleaved with, per FR-005) the graded-severity fallback |
-| *(new)* Informational classification signal | Where the check reads from | `relevant_affected[].database_specific.informational` (new field per FR-001), an OSV enum documented as including at least `"unknown"` and `"unmaintained"` |
+| `VulnSeverity` (existing, `crates/deps-core/src/osv/types.rs`, `#[non_exhaustive] pub enum VulnSeverity`) | Severity/category bucket enum | Currently `Critical`, `High`, `Medium`, `Low`, `Unknown`, `Malicious` (the last added by #646) — gains a new `Informational` variant (resolved: §9(a)), mapped to `DiagnosticSeverity::INFORMATION` |
+| `severity_rank` (existing, `crates/deps-core/src/osv/types.rs:489`) | Ordering/comparison const fn over `VulnSeverity`, exhaustive match | Missing from the original spec draft (critic finding 4) — adding `VulnSeverity::Informational` to the enum breaks this exhaustive match at compile time; the new variant needs an explicit rank. Recommended: rank it below `Unknown` (least urgent) — an informational/maintenance notice is not a graded-or-unscored vulnerability and should sort after all of them |
+| `classify()` (existing, `crates/deps-core/src/osv/severity.rs`) | Severity-classification function | Signature takes `id`, `aliases`, `database_specific` (record-level), `relevant_affected: &[&OsvAffected]` — implements the two-pass precedence from FR-002/FR-002a/FR-002b: `MAL-` check, then a full pass over `relevant_affected` for graded severity (existing behavior, unchanged), then — only if no graded severity was found AND `relevant_affected` reflects a genuine per-package match (not the "no entry matched, use all" fallback) — a pass over `relevant_affected` for a non-empty `database_specific.informational` value, then `Unknown` |
+| `to_diagnostic_severity()` (existing, `crates/deps-core/src/osv/severity.rs:111`) | Maps `VulnSeverity` -> `DiagnosticSeverity` | Gains a `VulnSeverity::Informational -> DiagnosticSeverity::INFORMATION` arm |
+| `severity_label()` (existing, `crates/deps-core/src/lsp_helpers/hover.rs:834`) | Hover severity label text | Gains a label for `Informational` (FR-003) |
+| `push_vulnerability_diagnostics()` (existing, `crates/deps-core/src/lsp_helpers/diagnostics.rs:1776`, `== Malicious` compare at `:1794`) | Diagnostic message construction, incl. the `[MALWARE]` prefix special-case | Gains an `Informational -> [INFORMATIONAL]` prefix special-case alongside the existing `Malicious -> [MALWARE]` one (FR-004) |
+| `check_candidates()` (existing, `crates/deps-core/src/osv/mod.rs:218-226`) | Determines whether "Latest version is also affected" is shown in hover | Gains a check: skip this line for `VulnSeverity::Informational` advisories (FR-008) |
+| *(new)* Informational classification signal | Where the check reads from | `relevant_affected[].database_specific.informational` (new field per FR-001) on an entry whose `package` is `Some` and exactly matches the queried package (FR-002b/M2) — read via `.as_str()`, `.trim()`-guarded against empty/whitespace, then matched against the FR-007 allowlist (`"unmaintained"` only — see §9(f)); any other value (including OSV's own `"unknown"` enum value and RUSTSEC's `"unsound"`/`"notice"`) is treated as NOT triggering `Informational` classification |
 
 ## 6. Edge Cases and Error Handling
 
 | Scenario | Expected Behavior |
 |----------|-------------------|
 | Record's relevant `affected[]` entry has `informational: "unmaintained"` and no severity field anywhere (live-observed: `RUSTSEC-2024-0320` / `yaml-rust`) | Classified as informational per FR-002; hover/diagnostic render distinctly from `"unknown severity"` |
-| Record's relevant `affected[]` entry has `informational: "unknown"` (OSV's own enum value, distinct from this crate's `VulnSeverity::Unknown`) | Still classified as generically informational per FR-007, not left to fall through to `VulnSeverity::Unknown` — naming collision between OSV's `informational: "unknown"` and this crate's `VulnSeverity::Unknown` variant must not cause the two concepts to be conflated in code or docs |
-| Record has both a graded `severity` field AND an `informational` value on the same relevant entry (hypothetical, not yet live-observed) | Per FR-005 (tentative — see §9), graded severity remains primary; open question whether the informational aspect should still be surfaced as a secondary note |
+| Record's relevant `affected[]` entry has `informational: "unknown"` (OSV's own enum value, distinct from this crate's `VulnSeverity::Unknown`) | REVISED (§9(f)): NOT in the FR-007 allowlist (`unmaintained` only) — falls through to `VulnSeverity::Unknown` exactly like a record with no `informational` field. This also sidesteps the naming-collision risk the original draft worried about, since the two concepts now share the same code path rather than needing to stay distinguished |
+| Record's relevant `affected[]` entry has `informational: "unsound"` (RUSTSEC's memory-safety/UB category, e.g. `RUSTSEC-2021-0145`/`atty`, `RUSTSEC-2019-0036`/`failure` — live-verified via `GET api.osv.dev/v1/vulns/{id}`) | NOT in the FR-007 allowlist — classifies as `Unknown`/`WARNING`, same as today. Security review (finding H1) confirmed this must NOT become `Informational`: `"unsound"` describes a real UB/memory-safety defect, not a maintenance-status notice, and the `Informational` hover label's "not a vulnerability" framing would be actively misleading here |
+| Record has a graded `severity` field on one relevant entry AND an `informational` value on a *different* relevant entry of the same record (hypothetical, not yet live-observed) | Per FR-005/FR-002a, graded severity remains primary — the two-pass precedence checks ALL relevant entries for graded severity before checking any for `informational`, so entry order does not matter |
 | A dependency has both an informational advisory and one or more ordinary graded/unscored/malicious advisories | Each advisory keeps its own independent classification; the informational one must not be conflated with or hidden by unrelated advisories on the same dependency |
 | `informational` value present at the record's top-level `database_specific` rather than per-`affected[]`-entry (not observed live for RUSTSEC-unmaintained records, which is documented as an `affected[]`-scoped field, but OSV's schema evolves) | Out of scope for this spec unless a live counterexample is found — FR-001 only adds the per-entry field |
 | `Capped` truncation (`ADVISORY_DISPLAY_CAP`) causes an informational advisory to fall outside the displayed slice | Out of scope for this spec — no reordering; pre-existing truncation/ordering behavior is unchanged, matching the #646 precedent's resolution for the same question |
+| `OsvVulnRecord::into_advisory` falls back to using ALL `affected[]` entries because none matched the queried package (existing fallback, `types.rs:1039-1047`), and one of those unrelated entries carries an `informational` value (critic finding 6a) | Per FR-002b: the informational classification MUST NOT apply from this fallback set — the record classifies as it would have before this spec (graded severity if present anywhere, else `Unknown`). Prevents a stranger package's maintenance-status notice from silently downgrading a possibly-real advisory's severity for the queried package |
+| `MAL-` id/alias prefix present AND an `informational` value present on a relevant entry (both signals on the same record) | `Malicious` wins — the existing `MAL-` check runs first in `classify()`'s chain and returns immediately, before either the graded-severity or the new informational pass; unchanged by this spec |
+| `informational` field present but value is an empty string, whitespace-only string, or `null` | Treated as absent — does not trigger `Informational` classification (FR-007); record classifies per existing rules (graded severity or `Unknown`) |
+| Advisory classified as `Informational` has no `summary` text from OSV | Hover label must still read as a self-contained notice (FR-003) — do not degrade to a bare category word plus a "(no summary provided)" placeholder that conveys nothing about *why* the advisory is informational |
+| `check_candidates()`'s displayed (`Capped`) advisory slice is ALL `Informational`, but more advisories exist beyond the displayed/capped slice (of unknown severity) | RESOLVED architecturally, not via a truncation-count comparison: since FR-008 (revised) never touches `check_candidates()`, its existing `Capped`-aware `CandidateVulnerable`/`CandidateClean` classification is untouched and keeps its pre-existing correctness guarantee (`code_actions.rs`'s `!advisory_ids.is_complete()` rejection, unrelated to this spec, still applies exactly as before). This edge case was only a risk under the superseded check_candidates-level design (security finding M1 / impl-critic S1) and does not exist under the hover-rendering-only design |
 
 ## 7. Success Criteria
 
 | ID | Metric | Target |
 |----|--------|--------|
 | SC-001 | Hover rendering for `RUSTSEC-2024-0320` (`yaml-rust`) or an equivalent live informational record | Never renders `"unknown severity"`; renders a distinct informational/unmaintained-category label |
-| SC-002 | Diagnostic distinguishability | An informational-advisory diagnostic and a `VulnSeverity::Unknown` ordinary-CVE diagnostic on the same dependency are distinguishable without opening hover |
+| SC-002 | Diagnostic distinguishability | An informational-advisory diagnostic and a `VulnSeverity::Unknown` ordinary-CVE diagnostic on the same dependency are distinguishable without opening hover — verified via severity (`INFORMATION` vs `WARNING`) AND, since severity alone may not render distinctly in every client's UI chrome, the `[INFORMATIONAL]` message prefix. Verify visually in at least one real editor's Problems-panel-equivalent, not by unit assertion alone (critic finding 2) |
 | SC-003 | Regression | All existing `severity.rs` and hover/diagnostics tests for non-informational `Unknown` records continue to pass unchanged |
-| SC-004 | Cross-ecosystem consistency | The fix lives entirely in `deps-core::osv` / `deps-core::lsp_helpers` — no ecosystem crate needs a parallel change to see the new classification (per NFR-002 and the project's cross-ecosystem-consistency rule) |
+| SC-004 | Cross-ecosystem consistency | The fix lives entirely in `deps-core::osv` / `deps-core::lsp_helpers` — no ecosystem crate needs a parallel change to see the new classification (per NFR-002 and the project's cross-ecosystem-consistency rule); confirmed true by critic review — `VulnSeverity` and `OsvAffected`/`relevant_affected` never leave `deps-core::osv` |
+| SC-005 | No misleading "also affected" line | Hovering an `Informational`-only advisory never shows the "Latest version is also affected" candidate-vulnerable line (FR-008) |
 
 ## 8. Agent Boundaries
 
@@ -260,44 +276,179 @@ Use EARS notation. Prefix with FR-NNN.
   must not be silently dropped
 - Preserve existing graded-severity precedence and existing `Unknown`
   behavior for records with no `informational` signal (FR-006, NFR-003)
-- Add/update unit tests in `severity.rs` for the `informational` field
-  check, including the `"unknown"`-value-collision edge case (FR-007) and
-  the both-signals-present case (FR-005)
+- Add/update unit tests in `severity.rs` covering, at minimum: the plain
+  `"unmaintained"` case; the `"unknown"`-value-collision edge case
+  (FR-007); the both-graded-and-informational-present case across two
+  different relevant entries (FR-005/FR-002a); the `MAL-` + informational
+  combination (Malicious still wins); informational present only on a
+  *non-relevant* / fallback-all entry (FR-002b — must NOT classify as
+  Informational); and `informational: ""` / whitespace-only / `null`
+  (must NOT classify as Informational, FR-007)
+- Update `severity_rank` (`types.rs:489`) for the new variant — this is a
+  compile-time-enforced exhaustive match, so it cannot be skipped
+- Update `README.md` (`:362`, `:373`) and `docs/ECOSYSTEM_GUIDE.md` (`:74`)
+  wherever they enumerate the hover severity-label list verbatim, per
+  `.claude/rules/branching.md`
+- Update `CHANGELOG.md`'s `[Unreleased]` section with a one-line entry for
+  this change (impl-critic finding M6) — link the PR once its number is
+  known, per `.claude/CLAUDE.md`
+- Add a test asserting `into_advisory` itself computes the genuine-match
+  signal correctly end-to-end (impl-critic finding M3) — not just a unit
+  test that hands the signal in directly to `classify()`
+- Add a hover-rendering test for the mixed informational+non-informational
+  candidate-vulnerable case (FR-008, revised architecture: verify the line
+  still renders and still lists only the non-informational id(s) when the
+  set is mixed) — supersedes the originally-planned `check_candidates()`
+  mixed-case test (impl-critic finding M5), which no longer applies since
+  `check_candidates()` is untouched by this spec
 - Run full CI checks (`cargo +nightly fmt --check`, clippy, nextest,
   rustdoc gate) per project convention before any PR
 - Live-verify against a real current OSV `informational`-carrying record
   (e.g. re-query `RUSTSEC-2024-0320`/`yaml-rust`, since OSV data can
   change) per the project's Live Testing Principle
   (`.claude/rules/continuous-improvement.md`) — do not conclude from code
-  reading or unit tests alone
+  reading or unit tests alone. Also visually confirm the diagnostic and
+  hover render distinctly in a real editor per SC-002 — a passing unit
+  test alone does not confirm Problems-panel visibility
 
 ### Ask First
-- The open design decisions in §9 (target `DiagnosticSeverity`, whether to
-  unify with the `Deprecation` pathway, exact `VulnSeverity` variant shape,
-  precedence when both graded severity and `informational` are present)
-  must be resolved with the user before implementation begins — this spec
-  intentionally leaves them open per the P3/research-cycle scope
+- (resolved, see §9) Any further deviation from the decisions recorded in
+  §9 must still be surfaced to the user before implementation proceeds
 
 ### Never
-- Silently pick a `DiagnosticSeverity` or unify-vs-sibling design without
-  surfacing the trade-off to the user first — unlike #646 (which resolved
-  its open questions interactively before implementation), this spec is
-  produced in a non-interactive research cycle and its FR-002/FR-004/FR-005
-  markers are genuinely unresolved
-- File this as fixed without live-testing against a real
-  `informational`-carrying OSV record, per the project's Live Testing
-  Principle
 - Fold informational classification into the existing graded-severity scale
   in a way that makes it indistinguishable from an ordinary CVE — the whole
   point of this spec is that "no maintainer" is categorically different
   from "known/suspected vulnerability"
+- File this as fixed without live-testing against a real
+  `informational`-carrying OSV record, per the project's Live Testing
+  Principle
 
 ## 9. Open Questions
 
-- `[NEEDS CLARIFICATION: (a) exact target classification and DiagnosticSeverity for informational advisories — options include (i) a new VulnSeverity::Informational/Unmaintained variant mapping to DiagnosticSeverity::HINT or DiagnosticSeverity::INFORMATION (distinct from the WARNING bucket every graded/Unknown/Malicious variant currently shares), or (ii) reusing DiagnosticSeverity::INFORMATION (already used today for Medium/Low and the "+N more advisories" notice) with a distinguishing message/code only. FR-002 and FR-004 are gated on this decision.]`
-- `[NEEDS CLARIFICATION: (b) whether to route OSV-informational findings through the existing Deprecation/push_deprecation_diagnostic pathway (crates/deps-core/src/lsp_helpers/diagnostics.rs, from #205/[[011-deprecation-replacement-diagnostics/spec]]) for a single unified "this package has a maintenance problem" diagnostic UX across registry-native and OSV-native signals, or keep OSV-informational as a VulnSeverity-adjacent sibling category alongside Malicious (architecturally simpler — Deprecation is populated from Registry/VersionData::outcomes, a completely separate data path from DependencyVulnerabilities/OSV, so unifying would require either threading OSV data into Deprecation or threading Deprecation-shaped output out of the OSV pipeline).]`
-- `[NEEDS CLARIFICATION: (c) whether other OSV informational values besides "unmaintained" need distinct handling — per the OSV schema, "unknown" is also a defined enum value (see the Edge Cases table's naming-collision note with this crate's own VulnSeverity::Unknown) and future schema revisions could add more; FR-007 proposes generic handling (any non-empty informational value maps to the same new category) as the default resolution unless the user wants per-value distinction.]`
-- `[NEEDS CLARIFICATION: whether the new category (once named) should also get its own hover icon/callout treatment analogous to Malicious's rendering, or text-label-only is sufficient for a P3 item — not yet scoped.]`
+All open questions were resolved with the user prior to implementation
+(2026-09-14), with **(a)** revised on 2026-09-14 after `rust-critic`
+review of the initial resolution surfaced a concrete regression risk:
+
+- **(a) Target classification and `DiagnosticSeverity`** — REVISED. Initial
+  resolution chose a new `VulnSeverity::Informational` variant mapped to
+  `DiagnosticSeverity::HINT`. Critic review found this fails the spec's own
+  Goal and US-002/SC-002: VS Code's Problems panel excludes `Hint`-severity
+  diagnostics entirely (Zed de-emphasizes them too), and FR-004 as
+  originally written forbade a message-text fallback signal — so an
+  `Informational` finding could become *less* visible than today's
+  `WARNING`-bucket `Unknown` treatment, the opposite of the spec's goal.
+  Final resolution: `VulnSeverity::Informational` maps to
+  `DiagnosticSeverity::INFORMATION` (already used for `Medium`/`Low` and
+  the "+N more advisories" notice — confirmed to render in Problems panels)
+  AND the diagnostic message carries a `[INFORMATIONAL]` prefix, mirroring
+  the `[MALWARE]` precedent from #646's `Malicious` variant. Applied in
+  FR-002/FR-004 and the `VulnSeverity`/`to_diagnostic_severity()`
+  data-model entries above.
+- **(a-precedence) Classification precedence mechanics** — not originally
+  posed as a question, but critic review found the spec's own §5 wording
+  ("most naturally slotted after the `MAL-` check and before or
+  *interleaved with* the graded-severity fallback") would violate FR-005
+  if implemented as an interleaved per-entry check, because `classify()`
+  returns on the first relevant entry with a graded severity — an earlier
+  entry's `informational` value could win over a later entry's graded
+  severity. Resolved: `classify()` implements two full passes over
+  `relevant_affected` — graded severity first (unchanged from today, first
+  match wins), informational second, only if no entry in the first pass
+  matched (FR-002a). See FR-002a/FR-002b for the corrected precedence
+  rule, including the additional "no genuine package match" fallback
+  guard (FR-002b, critic finding 6a).
+- **(b) Deprecation-pathway unification**: kept as a `VulnSeverity`-adjacent
+  sibling category alongside `Malicious`, not unified with the
+  `Deprecation`/`push_deprecation_diagnostic` pathway from #205 — that
+  pathway is populated from a separate `Registry`/`VersionData::outcomes`
+  data path, and unifying would require nontrivial cross-pipeline threading
+  out of proportion with this P3 item's scope.
+- **(c) Per-value distinction** — SUPERSEDED by (f) below. Originally:
+  generic handling, any non-empty `informational` value (including OSV's
+  own `"unknown"` enum value) maps to the same `VulnSeverity::Informational`
+  category, per FR-007, no per-value special-casing. Security review
+  (finding H1, 2026-09-14) found a concrete counterexample —
+  RUSTSEC's `"unsound"` value — that this generic rule mishandled; see (f)
+  for the narrowed, current rule. The FR-004 message prefix remains the
+  generic `[INFORMATIONAL]` (not a value-specific tag) for the two values
+  that DO still classify as `Informational` under (f) — a per-value tag
+  remains unwarranted by the currently live-observed values.
+- **(d) Hover icon/callout**: text-label-only, no dedicated icon/callout
+  treatment — consistent with every existing severity label except
+  `Malicious`'s `[MALWARE]` prefix, and proportionate to a P3 item.
+- **(e) "Latest version is also affected" candidate-vulnerable line**
+  (critic finding 6b, not originally scoped) — SUPERSEDED by (g) below for
+  *how* it's implemented; the *what* (suppress the line for
+  Informational-only findings) still holds. Originally: `check_candidates()`
+  (`crates/deps-core/src/osv/mod.rs:218-226`) marks any informational-only
+  finding as `CandidateVulnerable` today, so hover shows a misleading
+  "Latest version X is also affected" line for an already-unmaintained
+  package. Original resolution (superseded): suppress inside
+  `check_candidates()` itself. See (g) for why that locus was wrong and
+  what replaced it.
+- **(f) `informational` value allowlist** (security review findings H1 and
+  L1, 2026-09-14, supersedes (c)) — REVISED TWICE. RUSTSEC's
+  `informational` field carries three live values — `"unmaintained"`,
+  `"unsound"`, `"notice"`. First revision (H1): `"unsound"`
+  (live-verified: `RUSTSEC-2021-0145`/`atty` "potential unaligned read",
+  `RUSTSEC-2019-0036`/`failure` "type confusion") denotes a real
+  memory-safety/UB defect, not a maintenance-status notice — the original
+  generic rule (c) would have classified it `Informational` with a hover
+  label literally reading "not a vulnerability", a false downgrade of a
+  real security finding. Resolved (first pass): FR-007 became an allowlist
+  of `"unmaintained"`/`"notice"`. Second revision (L1, same review cycle):
+  re-audit found `"notice"` is ALSO not a reliably maintenance-only
+  category — live-verified `RUSTSEC-2026-0174`/`http-types` carries
+  `informational: "notice"` while describing a real defect (an `unsafe`
+  justification for an ASCII-invariant guarantee found to be incorrect),
+  the same failure class as H1 at smaller scale (~12 `notice` records vs.
+  100+ `unsound` in the live RUSTSEC corpus at review time, some purely
+  editorial and some not). Final resolution: FR-007's allowlist is
+  `"unmaintained"` alone. Every other value — `"unsound"`, `"notice"`,
+  OSV's own `"unknown"` enum value, any unrecognized future value, a
+  missing/`null`/empty/whitespace-only value — falls through to the
+  existing precedence chain (graded severity, else `Unknown`/`WARNING`).
+  This is a deliberate fail-safe default, applied consistently: an
+  unrecognized or unreliable `informational` value keeps today's
+  more-visible `WARNING` treatment rather than being silently downgraded
+  to the less-visible `Informational`/`INFORMATION` bucket. `"unmaintained"`
+  alone was judged reliably single-purpose across the live corpus checked
+  during this review.
+- **(g) Implementation locus for the candidate-vulnerable suppression**
+  (impl-critic implementation-critique findings S1/S2, 2026-09-14,
+  supersedes (e)'s original locus): filtering `Informational` advisories
+  out inside `check_candidates()` itself (the original (e) resolution) had
+  two bugs — it compared against the *displayed* (`Capped`,
+  `ADVISORY_DISPLAY_CAP`-truncated) advisory slice rather than the true
+  `total()` (security finding M1, a real advisory beyond the cap could be
+  silently swallowed into a false "clean" verdict), and it changed
+  `UpgradeStatus`/`fix_target_is_verified` (`code_actions.rs:59`)
+  behavior that the original (e) explicitly promised would stay
+  unaffected — bypassing the `!advisory_ids.is_complete()` safety
+  rejection `code_actions.rs` already relies on for exactly this failure
+  mode (#462 critic M1 precedent). Resolved: `check_candidates()` is
+  reverted to byte-for-byte its pre-feature state; the "also affected"
+  line is suppressed purely as a hover-render-time filter
+  (`crates/deps-core/src/lsp_helpers/hover.rs`) over the advisory ids
+  `check_candidates()` already returns — `check_candidates()`,
+  `UpgradeStatus`, and every downstream consumer remain untouched by this
+  spec, restoring (e)'s original scope commitment. The render-time filter
+  must fail OPEN (render the line) whenever it cannot confirm every
+  candidate id is `Informational` — including when the candidate id set
+  itself is empty (a real vulnerability signal whose detail fetch failed
+  or was capped out must never be silently dropped just because no
+  severity could be confirmed for it at render time; impl-critic finding
+  N1). ADDITIONALLY (security re-review finding L2, same review cycle):
+  the render-time filter must accept the candidate id set as its original
+  `Capped<String>` type (not a bare `Vec`/slice) and fail OPEN whenever
+  `!candidate_ids.is_complete()` — the same truncation-blindness risk (e)
+  and M1 already identified for `check_candidates()`'s old locus recurs,
+  narrower in scope, at the new hover-render locus: if more than
+  `ADVISORY_DISPLAY_CAP` advisories exist for the candidate version and
+  every one of the *displayed* ones happens to be `Informational`, the
+  line must still render, because an undisplayed advisory beyond the cap
+  could be a real vulnerability (FR-010).
 
 ## 10. See Also
 

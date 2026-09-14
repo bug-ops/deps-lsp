@@ -125,6 +125,14 @@ pub enum VulnSeverity {
     /// CVSS-CRITICAL score, and collapsing the two would make them
     /// indistinguishable to a reader.
     Malicious,
+    /// A relevant `affected[]` entry carries a non-empty
+    /// `database_specific.informational` value (e.g. RUSTSEC's
+    /// `"unmaintained"`) and no graded severity was found anywhere on the
+    /// record. Distinct from [`Self::Unknown`]: this is not a vulnerability
+    /// this crate failed to grade, it is OSV explicitly saying the record is
+    /// a maintenance-status notice rather than a security finding — see
+    /// `crate::osv::severity::classify`'s two-pass precedence (issue #1007).
+    Informational,
 }
 
 /// A single vulnerability advisory, converted from OSV's wire format at the
@@ -488,12 +496,13 @@ pub struct FixRecommendation {
 /// typically has none.
 const fn severity_rank(severity: VulnSeverity) -> u8 {
     match severity {
-        VulnSeverity::Malicious => 5,
-        VulnSeverity::Critical => 4,
-        VulnSeverity::High => 3,
-        VulnSeverity::Medium => 2,
-        VulnSeverity::Low => 1,
-        VulnSeverity::Unknown => 0,
+        VulnSeverity::Malicious => 6,
+        VulnSeverity::Critical => 5,
+        VulnSeverity::High => 4,
+        VulnSeverity::Medium => 3,
+        VulnSeverity::Low => 2,
+        VulnSeverity::Unknown => 1,
+        VulnSeverity::Informational => 0,
     }
 }
 
@@ -966,6 +975,13 @@ pub(super) struct OsvAffected {
     pub(super) package: Option<OsvPackage>,
     #[serde(default)]
     pub(super) ecosystem_specific: Option<serde_json::Value>,
+    /// Per-entry `database_specific` — distinct from [`OsvVulnRecord`]'s
+    /// record-level `database_specific` field (already read for
+    /// `severity`). Carries OSV's `informational` value (e.g.
+    /// RUSTSEC's `"unmaintained"`), read by `severity::classify` (issue
+    /// #1007, FR-001).
+    #[serde(default)]
+    pub(super) database_specific: Option<serde_json::Value>,
     #[serde(default)]
     pub(super) ranges: Vec<OsvRange>,
 }
@@ -1036,7 +1052,8 @@ impl OsvVulnRecord {
         // this record in response to our exact query, so that should not
         // happen in practice. Fall back to using every entry rather than
         // rendering fixed_versions/severity as empty/Unknown outright.
-        let relevant: Vec<&OsvAffected> = if relevant.is_empty() && !self.affected.is_empty() {
+        let used_fallback_all = relevant.is_empty() && !self.affected.is_empty();
+        let relevant: Vec<&OsvAffected> = if used_fallback_all {
             tracing::warn!(
                 id = %self.id, osv_name, osv_eco,
                 "no affected[] entry matched the queried package; using all entries"
@@ -1046,11 +1063,22 @@ impl OsvVulnRecord {
             relevant
         };
 
+        // FR-002b: `classify()` itself requires each candidate entry's
+        // `package` to equal `osv_name`/`osv_eco` exactly before treating
+        // its `informational` value as genuine — this rejects both a
+        // `package`-less entry (lenient for graded-severity purposes only)
+        // and every entry pulled in via the fallback-to-all-entries path
+        // above (whose entries, by construction, never equal `osv_name`/
+        // `osv_eco`), so a stranger or ambiguous entry can never downgrade
+        // this record's classification for a package it does not actually,
+        // confirmedly describe (impl-critic finding M2).
         let severity = super::severity::classify(
             &self.id,
             &self.aliases,
             self.database_specific.as_ref(),
             &relevant,
+            osv_name,
+            osv_eco,
         );
         let cvss_vector = self
             .severity
@@ -1263,6 +1291,7 @@ mod osv_version_validation_tests {
             affected: vec![OsvAffected {
                 package: None,
                 ecosystem_specific: None,
+                database_specific: None,
                 ranges: vec![OsvRange {
                     events: fixed
                         .iter()
@@ -1333,6 +1362,159 @@ mod osv_version_validation_tests {
         for v in ["1.0.0\", git = \"evil", "1.0.0,2.0.0", "1.0.0\nEvil", ""] {
             assert!(!is_safe_version_string(v), "expected {v:?} to be rejected");
         }
+    }
+}
+
+/// Issue #1007: `into_advisory` end-to-end against the exact live-verified OSV wire
+/// shape for `RUSTSEC-2024-0320` (`yaml-rust`) — re-queried 2026-09-14 via
+/// `POST https://api.osv.dev/v1/query {"package":{"name":"yaml-rust","ecosystem":"crates.io"},
+/// "version":"0.4.5"}`. Captured as a fixture rather than a live HTTP call per the
+/// project's existing `mockito`-based test convention.
+#[cfg(test)]
+mod informational_record_tests {
+    use super::*;
+
+    const YAML_RUST_RUSTSEC_2024_0320: &str = r#"{
+        "id": "RUSTSEC-2024-0320",
+        "summary": "yaml-rust is unmaintained.",
+        "modified": "2024-11-01T12:31:51Z",
+        "database_specific": { "license": "CC0-1.0" },
+        "affected": [
+            {
+                "package": {
+                    "name": "yaml-rust",
+                    "ecosystem": "crates.io",
+                    "purl": "pkg:cargo/yaml-rust"
+                },
+                "ranges": [
+                    { "type": "SEMVER", "events": [{ "introduced": "0.0.0-0" }] }
+                ],
+                "ecosystem_specific": {
+                    "affects": { "arch": [], "functions": [], "os": [] },
+                    "affected_functions": null
+                },
+                "database_specific": {
+                    "categories": [],
+                    "cvss": null,
+                    "informational": "unmaintained",
+                    "source": "https://github.com/rustsec/advisory-db/blob/osv/crates/RUSTSEC-2024-0320.json"
+                }
+            }
+        ],
+        "schema_version": "1.7.3"
+    }"#;
+
+    #[test]
+    fn live_yaml_rust_unmaintained_record_classifies_as_informational() {
+        let record: OsvVulnRecord = serde_json::from_str(YAML_RUST_RUSTSEC_2024_0320).unwrap();
+        let advisory = record
+            .into_advisory("yaml-rust", "crates.io")
+            .expect("valid id, should resolve");
+
+        assert_eq!(advisory.severity, VulnSeverity::Informational);
+        assert!(
+            advisory.fixed_versions.is_empty(),
+            "an unmaintained notice has no fixed version"
+        );
+        assert_eq!(
+            advisory.summary.as_deref(),
+            Some("yaml-rust is unmaintained.")
+        );
+    }
+
+    /// M3 (impl-critic): confirms `into_advisory` itself computes the
+    /// genuine-match signal end-to-end — not just that `classify()` respects
+    /// a pre-computed flag handed to it directly. Queries a *different*
+    /// package than the record's sole `affected[]` entry names, so
+    /// `into_advisory` falls back to its "no entry matched; using all
+    /// entries" path (FR-002b) — the `informational` value on that stranger
+    /// entry must not classify the record as `Informational`.
+    #[test]
+    fn into_advisory_rejects_informational_from_fallback_all_entries() {
+        let record: OsvVulnRecord = serde_json::from_str(YAML_RUST_RUSTSEC_2024_0320).unwrap();
+        let advisory = record
+            .into_advisory("some-other-crate", "crates.io")
+            .expect("valid id, should resolve");
+
+        assert_ne!(advisory.severity, VulnSeverity::Informational);
+    }
+
+    /// M2/M3 (impl-critic): an `affected[]` entry with no `package` field at
+    /// all is lenient-matched into `into_advisory`'s `relevant` set (not the
+    /// fallback-all path — see the existing `is_none_or` filter), but must
+    /// still not count as a genuine per-package match for the informational
+    /// check specifically.
+    #[test]
+    fn into_advisory_rejects_informational_from_package_less_entry() {
+        let json = r#"{
+            "id": "RUSTSEC-2020-0071",
+            "modified": "2023-01-01T00:00:00Z",
+            "affected": [
+                { "database_specific": { "informational": "unmaintained" } }
+            ]
+        }"#;
+        let record: OsvVulnRecord = serde_json::from_str(json).unwrap();
+        let advisory = record
+            .into_advisory("yaml-rust", "crates.io")
+            .expect("valid id, should resolve");
+
+        assert_ne!(advisory.severity, VulnSeverity::Informational);
+    }
+
+    /// H1 (security): RUSTSEC's `"unsound"` category (live-verified shape,
+    /// e.g. `RUSTSEC-2021-0145`/`atty`) is a real memory-safety/UB finding,
+    /// not a maintenance-status notice — `into_advisory` must never classify
+    /// it as `Informational`.
+    #[test]
+    fn into_advisory_rejects_unsound_value() {
+        let json = r#"{
+            "id": "RUSTSEC-2021-0145",
+            "modified": "2021-07-06T00:00:00Z",
+            "affected": [
+                {
+                    "package": { "name": "atty", "ecosystem": "crates.io" },
+                    "database_specific": { "informational": "unsound" }
+                }
+            ]
+        }"#;
+        let record: OsvVulnRecord = serde_json::from_str(json).unwrap();
+        let advisory = record
+            .into_advisory("atty", "crates.io")
+            .expect("valid id, should resolve");
+
+        assert_ne!(
+            advisory.severity,
+            VulnSeverity::Informational,
+            "an unsound (UB/memory-safety) advisory must never be downgraded to Informational"
+        );
+    }
+
+    /// M4 (impl-critic, low): a non-object `database_specific` and a
+    /// non-string `informational` value must never panic — both guard
+    /// chains (`.as_object()`-free `.get()`/`.as_str()`) already handle
+    /// this by returning `None`, this pins that behavior.
+    #[test]
+    fn into_advisory_does_not_panic_on_non_object_database_specific_or_non_string_informational() {
+        let json = r#"{
+            "id": "RUSTSEC-2020-0071",
+            "modified": "2023-01-01T00:00:00Z",
+            "affected": [
+                {
+                    "package": { "name": "yaml-rust", "ecosystem": "crates.io" },
+                    "database_specific": "not-an-object"
+                },
+                {
+                    "package": { "name": "yaml-rust", "ecosystem": "crates.io" },
+                    "database_specific": { "informational": 12345 }
+                }
+            ]
+        }"#;
+        let record: OsvVulnRecord = serde_json::from_str(json).unwrap();
+        let advisory = record
+            .into_advisory("yaml-rust", "crates.io")
+            .expect("valid id, should resolve");
+
+        assert_eq!(advisory.severity, VulnSeverity::Unknown);
     }
 }
 
