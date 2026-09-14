@@ -1048,19 +1048,44 @@ impl HttpCache {
     ///
     /// `auth_id` (FR-014) is folded in only for [`CacheTier::Pinned`] — a separate credential
     /// identity from `digest` (see that variant's docs), so a rotated or distinct credential
-    /// against the same origin never reads back a body fetched under a different one. `None`
-    /// serializes as 16 zero hex digits, matching an unauthenticated `#562` fetch.
+    /// against the same origin never reads back a body fetched under a different one.
+    /// `authenticated` (the tier's own field) is folded in too, so an authenticated and an
+    /// unauthenticated fetch against the same origin/`auth_id` can never share an entry either
+    /// — relevant only in principle today (every current caller correlates `authenticated` and
+    /// `auth_id.is_some()`), but [`HttpCache::get_cached_pinned_with_headers`] is a public API
+    /// with no enforced invariant tying the two together, so the key format does not assume one.
+    ///
+    /// Both `auth_id` and `authenticated` are encoded as one-char tags immediately preceding a
+    /// fixed-width field (`0`/`1` before a 16-hex-digit `auth_id` field, `U`/`A` right before
+    /// `url`), rather than collapsing `auth_id: None` to a `0` sentinel value:
+    /// [`auth_digest`](crate::secret::auth_digest) is a non-cryptographic hash, so `Some(0)` is
+    /// a legitimate (if astronomically unlikely) digest a real credential can produce, and
+    /// `unwrap_or(0)` would make that fetch's cache key identical to an unauthenticated one —
+    /// letting a cached authenticated body be served to an unauthenticated request, or vice
+    /// versa (issue #1025). Every hex field is written at a fixed width (`digest`, `auth_id`),
+    /// so no tag or field can be confused with part of `digest`, the `auth_id` field, or `url`
+    /// — a variable-width field would let two distinct `(digest, auth_id)` pairs produce the
+    /// same concatenated string.
     fn cache_key<'a>(&self, url: &'a str, tier: CacheTier, auth_id: Option<u64>) -> Cow<'a, str> {
         match tier {
             CacheTier::Baseline => Cow::Borrowed(url),
             CacheTier::WorkspaceDeclared(snapshot) => {
                 Cow::Owned(format!("{}{}{url}", Self::WS_KEY_PREFIX, snapshot.to_u8()))
             }
-            CacheTier::Pinned { digest, .. } => Cow::Owned(format!(
-                "{}{digest:016x}{:016x}{url}",
-                Self::PINNED_KEY_PREFIX,
-                auth_id.unwrap_or(0)
-            )),
+            CacheTier::Pinned {
+                digest,
+                authenticated,
+            } => {
+                let (auth_tag, id) = match auth_id {
+                    Some(id) => ('1', id),
+                    None => ('0', 0),
+                };
+                let authenticated_tag = if authenticated { 'A' } else { 'U' };
+                Cow::Owned(format!(
+                    "{}{digest:016x}{auth_tag}{id:016x}{authenticated_tag}{url}",
+                    Self::PINNED_KEY_PREFIX,
+                ))
+            }
         }
     }
 
@@ -4188,6 +4213,108 @@ mod tests {
             b"body-for-credential-b",
             "a distinct auth_id must not read back credential A's cached body"
         );
+    }
+
+    /// #1025: `auth_id: None` (unauthenticated) and `auth_id: Some(0)` (a credential whose
+    /// salted digest happens to hash to exactly `0`) must produce different `Pinned`-tier
+    /// cache keys — collapsing `None` to the same `0` sentinel `Some(0)` digests to would let
+    /// a cached authenticated body be served to a subsequent unauthenticated request, or vice
+    /// versa.
+    #[test]
+    fn test_cache_key_pinned_none_and_some_zero_auth_id_never_collide() {
+        let cache = HttpCache::new();
+        let tier = CacheTier::Pinned {
+            digest: 42,
+            authenticated: true,
+        };
+
+        let unauthenticated = cache.cache_key("https://example.com/pkg", tier, None);
+        let zero_digest_credential = cache.cache_key("https://example.com/pkg", tier, Some(0));
+
+        assert_ne!(unauthenticated, zero_digest_credential);
+    }
+
+    /// #1025 regression guard: non-zero `auth_id` values keep producing the pre-existing,
+    /// distinct-per-id cache key behavior (only the `None` vs `Some(0)` collision was fixed).
+    #[test]
+    fn test_cache_key_pinned_nonzero_auth_id_still_distinct() {
+        let cache = HttpCache::new();
+        let tier = CacheTier::Pinned {
+            digest: 42,
+            authenticated: true,
+        };
+
+        let a = cache.cache_key("https://example.com/pkg", tier, Some(1));
+        let b = cache.cache_key("https://example.com/pkg", tier, Some(2));
+        let unauthenticated = cache.cache_key("https://example.com/pkg", tier, None);
+
+        assert_ne!(a, b);
+        assert_ne!(a, unauthenticated);
+        assert_ne!(b, unauthenticated);
+    }
+
+    /// #1025 M2: proves the fixed-width invariant itself, not just a couple of hand-picked
+    /// values — a regression that dropped zero-padding (e.g. `{digest:x}` instead of
+    /// `{digest:016x}`) would still pass the two tests above (`None != Some(0)`,
+    /// `Some(1) != Some(2)`) but would let differently-shaped `(digest, auth_id)` pairs collide,
+    /// e.g. `digest=0x1, auth_id=Some(0x11)` vs. `digest=0x11, auth_id=Some(0x1)` concatenating
+    /// to the same string once padding is gone. Every `(digest, auth_id)` combination drawn
+    /// from these boundary-value sets must produce a pairwise-distinct key.
+    #[test]
+    fn test_cache_key_pinned_digest_and_auth_id_matrix_never_collide() {
+        let cache = HttpCache::new();
+        let digests = [0u64, 1, 0x11, u64::MAX];
+        let auth_ids = [None, Some(0u64), Some(1), Some(0x11), Some(u64::MAX)];
+
+        let mut keys = Vec::new();
+        for &digest in &digests {
+            for &auth_id in &auth_ids {
+                let tier = CacheTier::Pinned {
+                    digest,
+                    authenticated: true,
+                };
+                keys.push((
+                    (digest, auth_id),
+                    cache
+                        .cache_key("https://example.com/pkg", tier, auth_id)
+                        .into_owned(),
+                ));
+            }
+        }
+
+        for i in 0..keys.len() {
+            for j in (i + 1)..keys.len() {
+                assert_ne!(
+                    keys[i].1, keys[j].1,
+                    "inputs {:?} and {:?} produced the same cache key",
+                    keys[i].0, keys[j].0
+                );
+            }
+        }
+    }
+
+    /// #1025 M1: `authenticated` is folded into the `Pinned`-tier cache key too, not just
+    /// `auth_id` — otherwise `(authenticated: true, auth_id: None)` and
+    /// `(authenticated: false, auth_id: None)` against the same origin would collide. Not
+    /// reachable through any current caller (every ecosystem correlates the two), but
+    /// `get_cached_pinned_with_headers` is public API with no enforced invariant tying them
+    /// together, so the key format must not assume one.
+    #[test]
+    fn test_cache_key_pinned_authenticated_flag_never_collides_with_unauthenticated() {
+        let cache = HttpCache::new();
+        let authenticated_tier = CacheTier::Pinned {
+            digest: 42,
+            authenticated: true,
+        };
+        let unauthenticated_tier = CacheTier::Pinned {
+            digest: 42,
+            authenticated: false,
+        };
+
+        let a = cache.cache_key("https://example.com/pkg", authenticated_tier, None);
+        let b = cache.cache_key("https://example.com/pkg", unauthenticated_tier, None);
+
+        assert_ne!(a, b);
     }
 
     /// FR-015/NFR-004: a 401 revalidation response against an authenticated `Pinned`-tier
