@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **ci**: moved `Cross.toml` to `.github/Cross.toml` to declutter the repo root; `cross` steps now set `CROSS_CONFIG` explicitly since `cross` only auto-discovers a root-level file
+
 ### Fixed
 - **CI**: `cargo-semver-checks` is now a blocking gate on PR/push and part of `ci-success` (was advisory-only, milestone criterion B3) (resolves #945) (#1012)
 - **deps-lsp**: gated 4 tests that panicked (not just failed to compile) under a reduced ecosystem feature set, and fixed the crate's remaining unused-import/dead-code warnings across the feature matrix; CI now lints deps-lsp's test targets with `-D warnings` and runs `cargo hack nextest run -p deps-lsp --each-feature` on every individual feature (resolves #1005, #1001) (#1011)

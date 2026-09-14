@@ -45,7 +45,7 @@ jobs:
               - '**/Cargo.lock'
               - 'rust-toolchain.toml'
               - 'deny.toml'
-              - 'Cross.toml'
+              - '.github/Cross.toml'
             workflows:
               - '.github/workflows/**'
 
@@ -358,7 +358,7 @@ jobs:
         if: matrix.use_cross_tool
         uses: taiki-e/install-action@a82845735191974ac374fc0472388c6df0a158ca  # cross
 
-      # `cross`'s `pre-build` steps for the musl targets (Cross.toml) run `apt-get
+      # `cross`'s `pre-build` steps for the musl targets (.github/Cross.toml) run `apt-get
       # update && apt-get install cmake` inside a fresh Docker image build on every
       # run — needed because aws-lc-sys (pulled in transitively via reqwest's
       # rustls/aws-lc-rs backend) requires cmake to cross-compile, which the stock
@@ -379,7 +379,7 @@ jobs:
         id: cross-image-cache
         with:
           path: /tmp/cross-image-cache
-          key: cross-image-${{ matrix.target }}-${{ hashFiles('Cross.toml') }}-v1
+          key: cross-image-${{ matrix.target }}-${{ hashFiles('.github/Cross.toml') }}-v1
 
       - name: Load cached cross custom Docker image
         if: matrix.use_cross_tool && steps.cross-image-cache.outputs.cache-hit == 'true'
@@ -394,12 +394,14 @@ jobs:
 
       - name: Build for cross-compile target (musl via cross)
         if: matrix.use_cross_tool
+        env:
+          CROSS_CONFIG: .github/Cross.toml
         run: cross build --workspace --target ${{ matrix.target }}
 
       # Populates the cache path for the `actions/cache` step above to pick up and
       # upload at job end (its automatic post-step). Skipped on a cache hit (no new
       # image was built, nothing changed to save) and on i686, which has no
-      # `pre-build` entry in Cross.toml and so builds no custom image at all — the
+      # `pre-build` entry in .github/Cross.toml and so builds no custom image at all — the
       # glob simply matches nothing there. `always()` so a cargo-level build failure
       # (unrelated to the image) doesn't discard the already-paid-for apt-get work.
       - name: Save cross custom Docker image to cache
@@ -424,6 +426,8 @@ jobs:
         # test can bump the same counters mid-assertion. Single-threaded here avoids that
         # without touching the tests themselves.
         if: matrix.run_tests
+        env:
+          CROSS_CONFIG: .github/Cross.toml
         run: cross test --workspace --target ${{ matrix.target }} -- --test-threads=1
 
   coverage:
