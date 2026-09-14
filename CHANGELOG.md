@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **deps-core**: new `VulnSeverity::Informational` category for OSV advisories carrying `database_specific.informational: "unmaintained"` (e.g. RUSTSEC unmaintained-crate notices), rendered distinctly from a graded/unscored vulnerability in hover and diagnostics instead of as `"unknown severity"` (resolves #1007)
 - **deps-gitlab-ci**: mapping-shaped YAML container-anchor support for `include:` entries aliased as a whole mapping (`- *tpl`, `include: *tpl`, `- <<: *tpl`, `- <<: [*a, *b]`), resolved per GitLab's actual Psych merge-key precedence rather than the abstract YAML 1.1 spec (resolves #933, #916) (#1028)
 - **deps-core**: promoted `is_plain_null`/`is_null_tag` (originally `deps-dart`-private) into `lsp_helpers`, now shared by `deps-dart` and `deps-gitlab-ci` (#1028)
 - **deps-core**: new `quote_scan` module — shared escape-aware string-literal and comment scanning (`ScanSyntax`, `read_string_literal`, `strip_line_comment`, `blank_comments`, `is_code_byte`), now used by `deps-bundler`, `deps-swift`, and `deps-pypi` instead of each hand-rolling its own scanner (resolves #1022) (#1036)
