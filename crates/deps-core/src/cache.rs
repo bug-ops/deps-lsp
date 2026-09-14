@@ -3407,6 +3407,8 @@ mod tests {
             },
         );
 
+        // TODO(critic): migrate onto deps_core::test_util capture helpers once they expose
+        // span events (#1006).
         let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
         let subscriber = tracing_subscriber::fmt()
             .with_writer(TestWriter(std::sync::Arc::clone(&buf)))

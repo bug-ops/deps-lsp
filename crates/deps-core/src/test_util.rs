@@ -20,7 +20,10 @@
 //! [`capture_tracing_output`]/[`capture_tracing_output_async`] let a test assert a
 //! `tracing` call actually fired (originally added standalone in `deps-swift` for #357,
 //! then duplicated per-crate for #380/#378's `warn_rejected_value` coverage before being
-//! consolidated here).
+//! consolidated here). Backed by one process-wide subscriber rather than a fresh one per
+//! call, to avoid an untraced sibling test permanently poisoning a shared callsite's
+//! `tracing-core` `Interest` cache before the capturing test's own subscriber was installed
+//! (#1006).
 
 use tower_lsp_server::ls_types::Uri;
 
@@ -296,60 +299,175 @@ pub fn assert_dot_segment_gated_or_contained_transformed(
 // `cfg(test)`, i.e. `cargo test -p deps-core` with no explicit features): `tracing-subscriber`
 // is an *optional* dependency enabled only by the `test-util` feature, so a build that hits
 // this module via bare `cfg(test)` alone would fail to resolve it without this narrower gate.
+//
+// This installs exactly one process-wide subscriber (guarded by `Once`) instead of swapping in
+// a fresh scoped one per call. `tracing-core` caches a callsite's `Interest` once, for the life
+// of the process, the first time that callsite executes. With a single live dispatcher (the
+// common case), that verdict is computed against it directly — but with two or more dispatchers
+// live at once, `tracing-core` unions interest across all of them instead of asking just one.
+// That is exactly the situation concurrent tests created under the old per-call scoped-subscriber
+// design (each installing its own `Dispatch` via `with_default`/`set_default`), which is why the
+// original bug was intermittent rather than reproducible by a simple sequential repro: an
+// untraced sibling test's dispatcher could contribute `Interest::never()` to that union before
+// the capturing test's own scoped subscriber was ever installed, permanently poisoning the
+// callsite and silently emptying the capturing test's buffer regardless of its own subscriber
+// (#1006). A single global subscriber removes the multiple-live-dispatcher scenario entirely,
+// and its filter always reporting `Interest::sometimes()` (see `ThreadLocalLevelFilter` below)
+// keeps the cached verdict from ever finalizing to a terminal `never`/`always` — `sometimes` is
+// still a cached decision, just one meaning "call `enabled()` again on every occurrence" rather
+// than a permanent skip or permanent record.
 #[cfg(feature = "test-util")]
-#[derive(Clone, Default)]
-struct CapturingWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+mod tracing_capture {
+    use std::cell::{Cell, RefCell};
+    use std::sync::Once;
 
-#[cfg(feature = "test-util")]
-impl std::io::Write for CapturingWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::{Context, Filter, SubscriberExt};
+
+    thread_local! {
+        /// This thread's own capture buffer. Never shared across threads, so tests running
+        /// concurrently on different threads never see each other's captured output.
+        static BUFFER: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+        /// `Some(max_level)` while this thread is inside a `capture_tracing_output*` call,
+        /// `None` otherwise — gates capture so untraced code sharing this OS thread (a sibling
+        /// test, or code outside the `f`/`fut` under capture) is never written to `BUFFER`.
+        static MAX_LEVEL: Cell<Option<tracing::Level>> = const { Cell::new(None) };
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
+    #[derive(Clone, Default)]
+    struct ThreadLocalWriter;
+
+    impl std::io::Write for ThreadLocalWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            BUFFER.with(|b| b.borrow_mut().extend_from_slice(buf));
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
-}
 
-#[cfg(feature = "test-util")]
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturingWriter {
-    type Writer = Self;
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ThreadLocalWriter {
+        type Writer = Self;
 
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
     }
-}
 
-#[cfg(feature = "test-util")]
-fn capturing_subscriber_at(
-    max_level: tracing::Level,
-) -> (CapturingWriter, impl tracing::Subscriber) {
-    let writer = CapturingWriter::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(writer.clone())
-        .with_max_level(max_level)
-        .without_time()
-        .with_target(false)
-        .finish();
-    (writer, subscriber)
-}
+    /// Per-thread level gate that never lets `tracing-core` cache a callsite verdict.
+    ///
+    /// The global subscriber must accept `TRACE` (the most permissive level any caller here
+    /// needs) so it can serve every `capture_tracing_output*` caller from one process-wide
+    /// instance, so per-call level filtering (`capture_tracing_output` vs `_at`) happens here
+    /// instead, dynamically, per thread. Returning `false`/`true` from [`Filter::enabled`]
+    /// without overriding `callsite_enabled` keeps the default `Interest::sometimes()` for
+    /// every callsite this subscriber sees — the load-bearing property that stops any callsite
+    /// from ever being cached `never`/`always` based on whichever thread happens to touch it
+    /// first (the root cause of #1006).
+    ///
+    /// This filter provides no `max_level_hint`, so once any capture helper installs the global
+    /// subscriber, tracing's process-wide max-level filter rises to `TRACE` for the rest of the
+    /// test binary — negligible in a test process, but a real side effect the old per-call
+    /// scoped subscribers didn't have.
+    struct ThreadLocalLevelFilter;
 
-#[cfg(feature = "test-util")]
-fn capturing_subscriber() -> (CapturingWriter, impl tracing::Subscriber) {
-    // INFO (not WARN): some call sites emit `tracing::info!` (e.g. deps-swift's
-    // release-dates token-gate skip) that a WARN-only filter would silently drop,
-    // alongside every `warn_rejected_value`/other WARN-level emission this helper
-    // exists to assert on.
-    capturing_subscriber_at(tracing::Level::INFO)
+    impl<S> Filter<S> for ThreadLocalLevelFilter {
+        fn enabled(&self, meta: &tracing::Metadata<'_>, _cx: &Context<'_, S>) -> bool {
+            MAX_LEVEL.with(|cell| cell.get().is_some_and(|max| *meta.level() <= max))
+        }
+    }
+
+    static INIT: Once = Once::new();
+
+    /// Installs the single process-wide capturing subscriber the first time any
+    /// `capture_tracing_output*` call runs; a no-op on every later call.
+    fn ensure_installed() {
+        INIT.call_once(|| {
+            let fmt_layer = tracing_subscriber::fmt::layer()
+                .with_writer(ThreadLocalWriter)
+                .without_time()
+                .with_target(false)
+                .with_filter(ThreadLocalLevelFilter);
+            let subscriber = tracing_subscriber::registry().with(fmt_layer);
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("test-capture tracing subscriber must install exactly once per process");
+            // `set_global_default` already rebuilds the interest cache as a side effect of
+            // constructing the new `Dispatch`, so any callsite a pre-existing subscriber-less
+            // default had already cached `never` for is un-poisoned before this line runs. This
+            // explicit call is defense-in-depth insurance, not the primary un-poisoning step —
+            // kept in case that internal behavior of `set_global_default` ever changes.
+            tracing::callsite::rebuild_interest_cache();
+        });
+    }
+
+    /// Resets this thread's capture level on drop, including on unwind out of `f`/`fut`.
+    ///
+    /// Without this, a panicking capture would leave `MAX_LEVEL` stuck `Some` for whatever
+    /// test next reuses this OS thread — e.g. plain `cargo test`'s shared thread pool (unlike
+    /// `cargo nextest`, which runs each test in its own process).
+    struct CaptureGuard;
+
+    impl Drop for CaptureGuard {
+        fn drop(&mut self) {
+            MAX_LEVEL.with(|cell| cell.set(None));
+        }
+    }
+
+    fn begin_capture(max_level: tracing::Level) -> CaptureGuard {
+        ensure_installed();
+        // Unconditional `assert!`, not `debug_assert!`: this is test-only utility code with no
+        // perf-sensitive hot path (it only runs when a test calls a capture helper), so there is
+        // no cost to catching a nested call in every build profile rather than compiling the
+        // check out of release-profile test runs and silently corrupting output instead.
+        assert!(
+            MAX_LEVEL.with(Cell::get).is_none(),
+            "nested capture_tracing_output* is not supported: the inner call's buffer/level \
+             would silently clobber the outer call's"
+        );
+        BUFFER.with(|b| b.borrow_mut().clear());
+        MAX_LEVEL.with(|cell| cell.set(Some(max_level)));
+        CaptureGuard
+    }
+
+    fn take_captured() -> String {
+        BUFFER.with(|b| {
+            String::from_utf8(std::mem::take(&mut *b.borrow_mut()))
+                .expect("tracing output is valid utf8")
+        })
+    }
+
+    pub(super) fn capture_at(max_level: tracing::Level, f: impl FnOnce()) -> String {
+        let _guard = begin_capture(max_level);
+        f();
+        take_captured()
+    }
+
+    pub(super) async fn capture_async_at(
+        max_level: tracing::Level,
+        fut: impl std::future::Future<Output = ()>,
+    ) -> String {
+        let _guard = begin_capture(max_level);
+        fut.await;
+        take_captured()
+    }
 }
 
 /// Captures `tracing` output emitted synchronously during `f` into a `String`.
 ///
 /// Lets a test assert a `tracing::warn!`/`info!` call actually fired — e.g.
 /// [`crate::lsp_helpers::warn_rejected_value`] — without a real logging sink or a
-/// network-dependent end-to-end path. Filters below `INFO`, so a `tracing::debug!`/`trace!`
-/// emission never appears here — use [`capture_tracing_output_at`] for those.
+/// network-dependent end-to-end path. Defaults to `INFO`, not `WARN`: some call sites emit
+/// `tracing::info!` (e.g. deps-swift's release-dates token-gate skip) that a WARN-only filter
+/// would silently drop, alongside every `warn_rejected_value`/other WARN-level emission this
+/// helper exists to assert on. Filters below `INFO`, so a `tracing::debug!`/`trace!` emission
+/// never appears here — use [`capture_tracing_output_at`] for those.
+///
+/// Backed by one process-wide subscriber (installed lazily, once) writing into a per-thread
+/// buffer, rather than a fresh scoped subscriber per call — a fresh-per-call subscriber let an
+/// untraced sibling test permanently poison a shared callsite's `tracing-core` interest cache
+/// before this call's own subscriber was ever installed (#1006).
 ///
 /// # Examples
 ///
@@ -362,9 +480,7 @@ fn capturing_subscriber() -> (CapturingWriter, impl tracing::Subscriber) {
 #[cfg(feature = "test-util")]
 #[must_use]
 pub fn capture_tracing_output(f: impl FnOnce()) -> String {
-    let (writer, subscriber) = capturing_subscriber();
-    tracing::subscriber::with_default(subscriber, f);
-    String::from_utf8(writer.0.lock().unwrap().clone()).expect("tracing output is valid utf8")
+    tracing_capture::capture_at(tracing::Level::INFO, f)
 }
 
 /// Like [`capture_tracing_output`], but capturing every level up to and including `max_level`
@@ -387,23 +503,23 @@ pub fn capture_tracing_output(f: impl FnOnce()) -> String {
 #[cfg(feature = "test-util")]
 #[must_use]
 pub fn capture_tracing_output_at(max_level: tracing::Level, f: impl FnOnce()) -> String {
-    let (writer, subscriber) = capturing_subscriber_at(max_level);
-    tracing::subscriber::with_default(subscriber, f);
-    String::from_utf8(writer.0.lock().unwrap().clone()).expect("tracing output is valid utf8")
+    tracing_capture::capture_at(max_level, f)
 }
 
 /// Async counterpart of [`capture_tracing_output`], for a `tracing` emission inside an
 /// `async fn`/`.await`ed future.
 ///
-/// Relies on a `#[tokio::test]` current-thread runtime polling `fut` on the same thread
-/// that installed the subscriber as the thread-local default.
+/// Requires `fut` to stay on one OS thread for its whole lifetime — true of a `#[tokio::test]`
+/// using the default current-thread runtime flavor (every existing caller), but not of a
+/// `flavor = "multi_thread"` test, where an awaited future can resume on a different worker
+/// thread and would then read/write a different thread's capture buffer.
 ///
 /// # Examples
 ///
 /// ```
 /// use deps_core::test_util::capture_tracing_output_async;
 ///
-/// # #[tokio::main]
+/// # #[tokio::main(flavor = "current_thread")]
 /// # async fn main() {
 /// let output = capture_tracing_output_async(async {
 ///     tracing::warn!("something rejected");
@@ -414,25 +530,22 @@ pub fn capture_tracing_output_at(max_level: tracing::Level, f: impl FnOnce()) ->
 /// ```
 #[cfg(feature = "test-util")]
 pub async fn capture_tracing_output_async(fut: impl std::future::Future<Output = ()>) -> String {
-    let (writer, subscriber) = capturing_subscriber();
-    let guard = tracing::subscriber::set_default(subscriber);
-    fut.await;
-    drop(guard);
-    String::from_utf8(writer.0.lock().unwrap().clone()).expect("tracing output is valid utf8")
+    tracing_capture::capture_async_at(tracing::Level::INFO, fut).await
 }
 
 /// Like [`capture_tracing_output_async`], but capturing every level up to and including
 /// `max_level`.
 ///
 /// The async counterpart of [`capture_tracing_output_at`], needed to assert a
-/// `tracing::debug!` emission inside an `async fn`/`.await`ed future.
+/// `tracing::debug!` emission inside an `async fn`/`.await`ed future. Same single-OS-thread
+/// requirement as [`capture_tracing_output_async`].
 ///
 /// # Examples
 ///
 /// ```
 /// use deps_core::test_util::capture_tracing_output_async_at;
 ///
-/// # #[tokio::main]
+/// # #[tokio::main(flavor = "current_thread")]
 /// # async fn main() {
 /// let output = capture_tracing_output_async_at(tracing::Level::DEBUG, async {
 ///     tracing::debug!("quiet detail");
@@ -446,11 +559,7 @@ pub async fn capture_tracing_output_async_at(
     max_level: tracing::Level,
     fut: impl std::future::Future<Output = ()>,
 ) -> String {
-    let (writer, subscriber) = capturing_subscriber_at(max_level);
-    let guard = tracing::subscriber::set_default(subscriber);
-    fut.await;
-    drop(guard);
-    String::from_utf8(writer.0.lock().unwrap().clone()).expect("tracing output is valid utf8")
+    tracing_capture::capture_async_at(max_level, fut).await
 }
 
 /// Minimal [`crate::Dependency`] fixture used by [`stub_parse_result_with_dependencies`] —
@@ -537,4 +646,93 @@ pub fn stub_parse_result_with_dependencies(count: usize) -> Box<dyn crate::Parse
             .collect(),
         uri: test_uri("/project/manifest.toml"),
     })
+}
+
+#[cfg(all(test, feature = "test-util"))]
+mod tests {
+    use super::capture_tracing_output;
+
+    /// Regression test for #1006: a sibling thread's untraced touch of a callsite,
+    /// while a capture is in flight on this thread, must not poison that callsite
+    /// against this thread's own capture.
+    ///
+    /// The channel below forces the spawned thread's untraced touch to complete
+    /// before this thread's own (still in-flight) traced touch, rather than leaving
+    /// that interleaving to OS scheduling luck as the original flake did. That
+    /// synchronization is what makes this a *meaningful regression test against the
+    /// old, pre-fix implementation* — it deterministically reproduces the historical
+    /// race shape (a second thread winning a first-touch of the callsite while
+    /// another thread's scoped subscriber was already active but not yet globally
+    /// visible) instead of relying on chance. It is not required for this test to
+    /// pass against the current, fixed implementation: the fix makes the property
+    /// under test hold unconditionally regardless of timing, since
+    /// `ThreadLocalLevelFilter` never lets a callsite's interest finalize to a
+    /// terminal `never`/`always` no matter which thread touches it first.
+    #[test]
+    fn concurrent_untraced_touch_does_not_poison_active_capture() {
+        fn emit_marker() {
+            tracing::warn!("deps-core-1006-concurrent-touch-regression-marker");
+        }
+
+        let output = capture_tracing_output(|| {
+            let (untraced_touched_tx, untraced_touched_rx) = std::sync::mpsc::channel();
+            let handle = std::thread::spawn(move || {
+                // Untraced sibling thread: no capture active here, mirroring the
+                // original bug's untraced sibling test.
+                emit_marker();
+                untraced_touched_tx.send(()).unwrap();
+            });
+            // Wait for the sibling's touch to complete before this thread's own
+            // touch, so the interleaving that mattered for #1006 is forced rather
+            // than left to chance.
+            untraced_touched_rx.recv().unwrap();
+            emit_marker();
+            handle.join().unwrap();
+        });
+
+        assert!(
+            output.contains("deps-core-1006-concurrent-touch-regression-marker"),
+            "capture was empty after a concurrent sibling-thread untraced touch — \
+             tracing-core's per-callsite Interest cache regressed (#1006): {output:?}"
+        );
+    }
+
+    /// Locks in two invariants `ThreadLocalLevelFilter`/`begin_capture` depend on for
+    /// correctness, neither of which would fail loudly if it regressed:
+    /// - `capture_tracing_output`'s default `INFO` filter must still reject a
+    ///   `tracing::debug!` emission. If `ThreadLocalLevelFilter::enabled`'s level check, or
+    ///   its implicit `Interest::sometimes()` from `callsite_enabled`, were ever changed to
+    ///   something more permissive (e.g. `Interest::always()`), level filtering would
+    ///   silently stop working instead of failing loudly.
+    /// - a `tracing::warn!` emitted outside any capture window must not leak into the
+    ///   *next* capture's result — proves the level gate (and the buffer clear on the next
+    ///   `begin_capture`) actually prevent cross-call contamination rather than
+    ///   accumulating output across calls.
+    #[test]
+    fn capture_filters_by_level_and_does_not_leak_across_calls() {
+        // Below the default INFO filter: must never appear in a plain `capture_tracing_output`.
+        let output = capture_tracing_output(|| {
+            tracing::debug!("deps-core-1006-level-filter-marker-should-not-appear");
+        });
+        assert!(
+            !output.contains("deps-core-1006-level-filter-marker-should-not-appear"),
+            "capture_tracing_output's default INFO filter captured a DEBUG emission — \
+             level filtering regressed: {output:?}"
+        );
+
+        // Emitted with no capture active on this thread: must not surface in a later capture.
+        tracing::warn!("deps-core-1006-stale-marker-should-not-leak");
+        let output = capture_tracing_output(|| {
+            tracing::warn!("deps-core-1006-fresh-marker");
+        });
+        assert!(
+            !output.contains("deps-core-1006-stale-marker-should-not-leak"),
+            "a warn! emitted outside any capture window leaked into the next capture's \
+             result — cross-call isolation regressed: {output:?}"
+        );
+        assert!(
+            output.contains("deps-core-1006-fresh-marker"),
+            "the current capture's own emission is missing: {output:?}"
+        );
+    }
 }

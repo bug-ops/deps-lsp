@@ -39,6 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-go**: `test_generate_code_actions_on_module` now runs against a mockito server instead of live `proxy.golang.org`, removing an intermittent CI failure (resolves #1014) (#1032)
 - **deps-bundler**: `source:`/`git:`/`path:`/`github:` inline option values no longer truncate at an embedded quote of the opposite kind (e.g. an escaped or unescaped `'` inside a `"`-delimited value) (resolves #1020) (#1036)
 - **deps-go**: `test_get_versions_from_plain_registry_source_unchanged`, `test_complete_versions_unknown_package`, and `test_generate_hover_on_module_path` now run against a mockito server instead of live `proxy.golang.org` (resolves #1034) (#1037)
+- **deps-core**: `capture_tracing_output`/`_at`/`_async`/`_async_at` no longer silently return empty output when an untraced sibling test touches the same tracing callsite first under a shared-process test run (resolves #1006) (#1042)
 
 ## [1.0.0] - 2026-09-14
 
