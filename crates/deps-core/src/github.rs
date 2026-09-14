@@ -537,19 +537,12 @@ struct ReleaseDatesEntry {
 /// own `ttl`, then — only if that freed nothing — the single oldest entry by `fetched_at`.
 /// The O(n) scan runs only on an insert that finds the map full (#223 M7).
 fn evict_release_dates_if_full(map: &DashMap<String, ReleaseDatesEntry>) {
-    if map.len() < MAX_RELEASE_DATES_MEMO_ENTRIES {
-        return;
-    }
-    let now = Instant::now();
-    map.retain(|_, entry| now.duration_since(entry.fetched_at) < entry.ttl);
-    if map.len() >= MAX_RELEASE_DATES_MEMO_ENTRIES
-        && let Some(oldest) = map
-            .iter()
-            .min_by_key(|e| e.fetched_at)
-            .map(|e| e.key().clone())
-    {
-        map.remove(&oldest);
-    }
+    crate::cache_policy::evict_expired_then_oldest(
+        map,
+        MAX_RELEASE_DATES_MEMO_ENTRIES,
+        |e| e.fetched_at,
+        |e| e.ttl,
+    );
 }
 
 /// GitHub releases API response item.

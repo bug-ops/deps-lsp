@@ -140,35 +140,6 @@ impl Drop for InFlightGuard<'_> {
     }
 }
 
-/// Evicts entries from `map` when it is already at `max_entries`, ahead of
-/// an insert that would otherwise grow it further: first every entry expired
-/// against its own TTL, then — only if that freed nothing — the single
-/// oldest entry by `fetched_at`. Mirrors
-/// `github::evict_release_dates_if_full`'s policy, generalized over both of
-/// this module's memo maps.
-fn evict_if_full<K, V>(
-    map: &DashMap<K, V>,
-    max_entries: usize,
-    fetched_at: impl Fn(&V) -> Instant,
-    ttl: impl Fn(&V) -> Duration,
-) where
-    K: Eq + std::hash::Hash + Clone,
-{
-    if map.len() < max_entries {
-        return;
-    }
-    let now = Instant::now();
-    map.retain(|_, v| now.duration_since(fetched_at(v)) < ttl(v));
-    if map.len() >= max_entries
-        && let Some(oldest) = map
-            .iter()
-            .min_by_key(|e| fetched_at(e.value()))
-            .map(|e| e.key().clone())
-    {
-        map.remove(&oldest);
-    }
-}
-
 /// Maps a deps-lsp [`EcosystemId`] to deps.dev's `system` path segment.
 ///
 /// Exhaustive, with **no wildcard arm**: the six ecosystems deps.dev does
@@ -376,7 +347,12 @@ impl DepsDevClient {
 
     fn store_memo(&self, key: MemoKey, signal: Option<SupplyChainTrustSignal>, ttl: Duration) {
         if !self.memo.contains_key(&key) {
-            evict_if_full(&self.memo, MAX_MEMO_ENTRIES, |e| e.fetched_at, |e| e.ttl);
+            crate::cache_policy::evict_expired_then_oldest(
+                &self.memo,
+                MAX_MEMO_ENTRIES,
+                |e| e.fetched_at,
+                |e| e.ttl,
+            );
         }
         self.memo.insert(
             key,
@@ -390,7 +366,7 @@ impl DepsDevClient {
 
     fn store_project_memo(&self, key: ProjectKeyMemo, overall_score: Option<f32>, ttl: Duration) {
         if !self.projects.contains_key(&key) {
-            evict_if_full(
+            crate::cache_policy::evict_expired_then_oldest(
                 &self.projects,
                 MAX_MEMO_ENTRIES,
                 |e| e.fetched_at,

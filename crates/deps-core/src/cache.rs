@@ -6,6 +6,7 @@
 //! instead of re-fetched. Entry count and total retained bytes are both
 //! capped to keep memory use predictable under long-running LSP sessions.
 
+use crate::cache_policy::CACHE_EVICTION_PERCENTAGE;
 use crate::error::{DepsError, Result};
 use crate::net_policy::{RedactedUrl, RegistryAccessPolicy, WorkspaceRegistryAccess};
 use bytes::{Bytes, BytesMut};
@@ -73,9 +74,6 @@ const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 /// Simple API full index, ~43 MB decompressed today, capped at 96 MiB for organic
 /// growth) while still bounding the pathological case.
 const ABSOLUTE_MAX_RESPONSE_BYTES: usize = 128 * 1024 * 1024;
-
-/// Percentage of cache entries to evict when capacity is reached.
-const CACHE_EVICTION_PERCENTAGE: usize = 10;
 
 /// Upper bound on a single response body, clamped at construction so no caller can
 /// weaken the guard `read_body_capped` enforces past `ABSOLUTE_MAX_RESPONSE_BYTES`.

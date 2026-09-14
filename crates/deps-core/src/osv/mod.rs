@@ -55,10 +55,6 @@ const RECORD_FETCH_CONCURRENCY: usize = 10;
 /// Entry-count bound shared by `query_cache` and `record_cache`.
 const MAX_CACHE_ENTRIES: usize = 10_000;
 
-/// Percentage of cache entries evicted when [`MAX_CACHE_ENTRIES`] is reached,
-/// mirroring [`crate::cache::HttpCache::evict_entries`].
-const CACHE_EVICTION_PERCENTAGE: usize = 10;
-
 const OSV_API_BASE: &str = "https://api.osv.dev";
 
 /// Compares two version-like strings by their leading numeric dot-segments,
@@ -94,29 +90,6 @@ struct RecordCacheEntry {
     advisory: Arc<Advisory>,
     modified: String,
     fetched_at: Instant,
-}
-
-/// Evicts the oldest `1/CACHE_EVICTION_PERCENTAGE` of `map`'s entries,
-/// mirroring [`crate::cache::HttpCache::evict_entries`]'s oldest-first policy.
-fn evict_oldest<K, V>(map: &DashMap<K, V>, fetched_at: impl Fn(&V) -> Instant)
-where
-    K: Eq + std::hash::Hash + Clone + Ord,
-{
-    use std::cmp::Reverse;
-    use std::collections::BinaryHeap;
-
-    let target_removals = (MAX_CACHE_ENTRIES / CACHE_EVICTION_PERCENTAGE).max(1);
-    let mut oldest: BinaryHeap<Reverse<(Instant, K)>> = map
-        .iter()
-        .map(|entry| Reverse((fetched_at(entry.value()), entry.key().clone())))
-        .collect();
-
-    for _ in 0..target_removals {
-        let Some(Reverse((_, key))) = oldest.pop() else {
-            break;
-        };
-        map.remove(&key);
-    }
 }
 
 /// Batches dependency versions against OSV.dev and resolves matching
@@ -676,7 +649,9 @@ impl OsvClient {
         vuln_ids: &[(String, String)],
     ) {
         if self.query_cache.len() >= MAX_CACHE_ENTRIES {
-            evict_oldest(&self.query_cache, |e| e.fetched_at);
+            crate::cache_policy::evict_oldest_batch(&self.query_cache, MAX_CACHE_ENTRIES, |e| {
+                e.fetched_at
+            });
         }
         self.query_cache.insert(
             (osv_eco, target.osv_name.clone(), target.version.clone()),
@@ -689,7 +664,9 @@ impl OsvClient {
 
     fn store_record_cache(&self, advisory: &Arc<Advisory>) {
         if self.record_cache.len() >= MAX_CACHE_ENTRIES {
-            evict_oldest(&self.record_cache, |e| e.fetched_at);
+            crate::cache_policy::evict_oldest_batch(&self.record_cache, MAX_CACHE_ENTRIES, |e| {
+                e.fetched_at
+            });
         }
         self.record_cache.insert(
             advisory.id.clone(),
