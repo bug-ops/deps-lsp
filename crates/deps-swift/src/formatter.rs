@@ -36,6 +36,25 @@ fn is_valid_owner_repo(name: &str) -> bool {
     crate::is_valid_github_identity(name)
 }
 
+/// Returns `true` when `name` parses as a URL (HTTPS or `git@host:path` SSH form) whose
+/// host is present but is not GitHub's.
+///
+/// `parser::resolve_registry_source` (#979/#982) sets a registry-form dependency's
+/// `dep.name()` to its raw URL when that URL's host isn't GitHub, tagging the dependency
+/// `DependencySource::Git` instead of `Registry`. `validate_package_name` sees only that
+/// raw string, so this reuses [`crate::parser::parse_git_url`] — the same URL
+/// normalization+parse step [`crate::parser::url_to_identity`] uses — and
+/// [`crate::is_github_host`], the same host predicate #982 uses to decide the `Git`
+/// tagging, rather than re-deriving either from scratch here and drifting out of sync
+/// (#983 critic S2: a from-scratch `reqwest::Url::parse` on the raw string would miss the
+/// SSH form, since it has no URL scheme).
+fn is_non_github_registry_url(name: &str) -> bool {
+    crate::parser::parse_git_url(name).is_some_and(|url| {
+        url.host_str()
+            .is_some_and(|host| !crate::is_github_host(host))
+    })
+}
+
 /// Formatter for Swift/SPM ecosystem LSP responses.
 pub struct SwiftFormatter;
 
@@ -44,9 +63,9 @@ impl PackageNaming for SwiftFormatter {
         name.as_str().to_lowercase()
     }
 
-    /// Accepts either `is_valid_owner_repo`'s `owner/repo` GitHub identifier shape (the same
-    /// one `package_url` and the registry's fetch-URL gate require), or a bare single-segment
-    /// name with no `/`.
+    /// Accepts `is_valid_owner_repo`'s `owner/repo` GitHub identifier shape (the same one
+    /// `package_url` and the registry's fetch-URL gate require), a bare single-segment name
+    /// with no `/`, or a URL on a non-GitHub host.
     ///
     /// The bare-name case matters because `name` is not always a GitHub coordinate to begin
     /// with: `deps_swift::parser`'s `.package(path:)` handling sets it to the target
@@ -57,17 +76,30 @@ impl PackageNaming for SwiftFormatter {
     /// registry-style name typo'd without its `owner/` prefix — per this trait's "err on the
     /// side of accepting anything ambiguous" contract, the bare form is accepted rather than
     /// flagged, which also fixes a false "Invalid package name" on every local Swift package
-    /// dependency (#402 critique C1). A multi-segment name (extra segment, disallowed
-    /// character, or a `.`/`..` segment) still fails the `owner/repo` check and is rejected,
-    /// same as before.
+    /// dependency (#402 critique C1).
+    ///
+    /// The non-GitHub-host-URL case (#983) follows the exact same precedent, applied to
+    /// `resolve_registry_source`'s raw-URL fallback name for a non-GitHub registry-form
+    /// dependency (`DependencySource::Git`, per PR #982): this crate's `can_resolve_source`
+    /// (default, unoverridden — see `deps-github-actions::formatter::GithubActionsFormatter`'s
+    /// analogous override for the same pattern) already treats that source as non-resolvable,
+    /// so returning `Err` here — even with a reworded reason — would still surface a WARNING
+    /// diagnostic implying the manifest itself is wrong. Accepting it instead means no
+    /// diagnostic fires at all, consistent with how every other non-resolvable source in this
+    /// codebase is handled silently.
+    ///
+    /// A multi-segment name that is neither the `owner/repo` shape nor a parseable URL (extra
+    /// segment, disallowed character, or a `.`/`..` segment) still fails and is rejected, same
+    /// as before.
     ///
     /// # Errors
     ///
     /// Returns [`InvalidPackageName`] when `name` is empty, is exactly `.`/`..`, or contains a
-    /// `/` without matching the `owner/repo` shape.
+    /// `/` without matching the `owner/repo` shape and without parsing as a non-GitHub-host
+    /// URL.
     fn validate_package_name(&self, name: &str) -> Result<(), InvalidPackageName> {
         let bare_name_ok = !name.contains('/') && !name.is_empty() && !is_dot_segment(name);
-        if is_valid_owner_repo(name) || bare_name_ok {
+        if is_valid_owner_repo(name) || bare_name_ok || is_non_github_registry_url(name) {
             Ok(())
         } else {
             Err(InvalidPackageName::new(
@@ -199,7 +231,10 @@ mod tests {
             "apple/." => "",
             "../repo" => "",
         };
-        accepts: ["apple/swift-nio", "MyLib", "my-package", "LocalPackage", "no-slash"];
+        accepts: [
+            "apple/swift-nio", "MyLib", "my-package", "LocalPackage", "no-slash",
+            "https://gitlab.com/myorg/myrepo", "git@gitlab.com:myorg/myrepo.git"
+        ];
         rejects: ["", ".", "..", "owner/repo/extra", "../../etc/passwd", "apple/.."];
         version_roundtrip: [
             "2.62.0", ">=2.0.0, <3.0.0" => true,
@@ -235,6 +270,47 @@ mod tests {
         assert!(
             !output.contains("etc/passwd"),
             "raw rejected value must not be logged: {output}"
+        );
+    }
+
+    #[test]
+    fn test_validate_package_name_non_github_host_url_accepted() {
+        // #983 critic S1: `apply_unknown_package_rule` wraps any `Err` reason as
+        // "Invalid package name '<url>': {reason}" regardless of wording, so a non-GitHub
+        // registry-form dependency's raw URL must return `Ok(())` — no diagnostic at all —
+        // rather than a differently-worded `Err`, which would still misleadingly imply the
+        // URL itself is malformed.
+        let fmt = SwiftFormatter;
+        assert!(
+            fmt.validate_package_name("https://gitlab.com/myorg/myrepo")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_validate_package_name_non_github_ssh_host_url_accepted() {
+        // #983 critic S2: the SCP-style SSH form (`git@host:path`, no URL scheme) must be
+        // recognized too — `parser::parse_git_url` normalizes it before parsing, shared
+        // with `url_to_identity`, so this can't silently regress to the malformed-name
+        // branch the way a from-scratch `reqwest::Url::parse(name)` would.
+        let fmt = SwiftFormatter;
+        assert!(
+            fmt.validate_package_name("git@gitlab.com:myorg/myrepo.git")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_validate_package_name_malformed_name_keeps_owner_repo_message() {
+        // A genuinely malformed name (not a URL at all) must keep the original wording —
+        // the #983 fix only changes behavior for the non-GitHub-host-URL case.
+        let fmt = SwiftFormatter;
+        let err = fmt
+            .validate_package_name("owner/repo/extra")
+            .expect_err("multi-segment name must still be rejected");
+        assert_eq!(
+            err.reason(),
+            "name must be a GitHub 'owner/repo' identifier"
         );
     }
 
