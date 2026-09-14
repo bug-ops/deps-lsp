@@ -1553,6 +1553,7 @@ mod tests {
     /// references its catalog — not just refresh cached resolved versions the way a lock
     /// file change does (`Self::handle_lockfile_change`), since catalog resolution is baked
     /// into the parse result itself (see `Self::handle_watched_config_change`'s doc).
+    #[cfg(feature = "npm")]
     #[tokio::test]
     async fn test_watched_config_change_reparses_open_document_with_catalog_dependency() {
         // Held per `deps_core::fs_probe::snapshot_guard`'s doc: `did_open` routes through npm's

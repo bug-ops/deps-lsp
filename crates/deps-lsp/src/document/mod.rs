@@ -14,7 +14,25 @@ mod fetch;
 mod lifecycle;
 mod loader;
 mod osv_scan;
-#[cfg(test)]
+// Every snapshot test inside is gated on one of these ecosystem features; with none
+// enabled, the module's shared fixtures/helpers would otherwise be dead code.
+#[cfg(all(
+    test,
+    any(
+        feature = "cargo",
+        feature = "npm",
+        feature = "pypi",
+        feature = "go",
+        feature = "bundler",
+        feature = "dart",
+        feature = "maven",
+        feature = "gradle",
+        feature = "swift",
+        feature = "composer",
+        feature = "nuget",
+        feature = "deno"
+    )
+))]
 mod osv_snapshot_tests;
 pub(crate) mod reparse;
 mod resolved;

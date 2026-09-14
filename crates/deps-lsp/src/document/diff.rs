@@ -250,7 +250,7 @@ impl DependencyDiff {
     /// re-probed against its new in-use version, and any stale finding
     /// against the *old* version must not linger (security F1 / impl-critic
     /// S1).
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cargo"))]
     pub(crate) fn needs_fetch(&self) -> bool {
         !self.added.is_empty() || !self.version_changed.is_empty()
     }
@@ -265,7 +265,10 @@ impl DependencyDiff {
     }
 }
 
-#[cfg(test)]
+// The single `incremental_fetch_tests` module below is gated on `feature = "cargo"` (it
+// parses Cargo.toml manifests), and it is `mod tests`'s only content — so these imports (used
+// exclusively by that module) are unused, and this whole module unreachable, without it.
+#[cfg(all(test, feature = "cargo"))]
 mod tests {
     use super::super::resolved::dependency_version_map;
     use super::super::state::ServerState;
@@ -279,7 +282,6 @@ mod tests {
     use std::sync::Arc;
 
     // Phase 1: Cache Preservation Tests
-    #[cfg(feature = "cargo")]
     mod incremental_fetch_tests {
         use super::*;
 
@@ -985,54 +987,6 @@ time = "0.1.43"
                 doc.outcomes.deprecation("vendor/a").is_none(),
                 "a name that was fetched and produced no finding must be cleared"
             );
-        }
-
-        /// I2: two raw names that normalize to the same key (Composer's `normalize_package_name`
-        /// lowercases, so `"Vendor/Package"` and `"vendor/package"` collide) must merge
-        /// deterministically — a finding under either raw name must survive regardless of
-        /// `fetched_names`' (unspecified `HashMap::keys()`) iteration order.
-        #[test]
-        fn test_merge_deprecations_after_fetch_is_order_independent_across_normalization_collision()
-        {
-            let state = ServerState::new();
-            let ecosystem = state.ecosystem_registry.get("composer").unwrap();
-            let formatter = ecosystem.formatter();
-
-            for names in [
-                [
-                    PackageName::new("vendor/package"),
-                    PackageName::new("Vendor/Package"),
-                ],
-                [
-                    PackageName::new("Vendor/Package"),
-                    PackageName::new("vendor/package"),
-                ],
-            ] {
-                let mut doc =
-                    DocumentState::new_without_parse_result(EcosystemId::Composer, String::new());
-
-                let mut fetched = HashMap::new();
-                fetched.insert(
-                    PackageName::new("Vendor/Package"),
-                    Deprecation {
-                        reason: None,
-                        replacement: Some("vendor/other".to_string()),
-                    },
-                );
-                // "vendor/package" (lowercase) is fetched too and reports no finding.
-
-                merge_deprecations_after_fetch(&mut doc, &names, fetched, formatter);
-
-                assert_eq!(
-                    doc.outcomes.deprecation("vendor/package"),
-                    Some(&Deprecation {
-                        reason: None,
-                        replacement: Some("vendor/other".to_string()),
-                    }),
-                    "a finding under either raw name sharing a normalized key must survive, \
-                     regardless of fetch order: {names:?}"
-                );
-            }
         }
 
         /// Regression for critic finding C3 (#550): `merge_no_comparable_versions_after_fetch`'s
@@ -1937,6 +1891,64 @@ tokio = "1.0"
             assert!(doc.cached_versions.contains_key("serde"));
             assert!(doc.cached_versions.contains_key("tokio"));
             assert!(!doc.cached_versions.contains_key("anyhow"));
+        }
+    }
+}
+
+// Sibling to `mod tests` above (not nested inside it) so this test is reachable under
+// `--features composer` alone: `mod tests` is gated on `feature = "cargo"` since every other
+// test inside it hardcodes `ecosystem_registry.get("cargo")`, and nesting a composer-only test
+// in there would need `cargo AND composer` to run it — never true under a composer-only build.
+#[cfg(all(test, feature = "composer"))]
+mod composer_regression_tests {
+    use super::super::state::ServerState;
+    use super::*;
+    use deps_core::EcosystemId;
+
+    /// I2: two raw names that normalize to the same key (Composer's `normalize_package_name`
+    /// lowercases, so `"Vendor/Package"` and `"vendor/package"` collide) must merge
+    /// deterministically — a finding under either raw name must survive regardless of
+    /// `fetched_names`' (unspecified `HashMap::keys()`) iteration order.
+    #[test]
+    fn test_merge_deprecations_after_fetch_is_order_independent_across_normalization_collision() {
+        let state = ServerState::new();
+        let ecosystem = state.ecosystem_registry.get("composer").unwrap();
+        let formatter = ecosystem.formatter();
+
+        for names in [
+            [
+                PackageName::new("vendor/package"),
+                PackageName::new("Vendor/Package"),
+            ],
+            [
+                PackageName::new("Vendor/Package"),
+                PackageName::new("vendor/package"),
+            ],
+        ] {
+            let mut doc =
+                DocumentState::new_without_parse_result(EcosystemId::Composer, String::new());
+
+            let mut fetched = HashMap::new();
+            fetched.insert(
+                PackageName::new("Vendor/Package"),
+                Deprecation {
+                    reason: None,
+                    replacement: Some("vendor/other".to_string()),
+                },
+            );
+            // "vendor/package" (lowercase) is fetched too and reports no finding.
+
+            merge_deprecations_after_fetch(&mut doc, &names, fetched, formatter);
+
+            assert_eq!(
+                doc.outcomes.deprecation("vendor/package"),
+                Some(&Deprecation {
+                    reason: None,
+                    replacement: Some("vendor/other".to_string()),
+                }),
+                "a finding under either raw name sharing a normalized key must survive, \
+                 regardless of fetch order: {names:?}"
+            );
         }
     }
 }

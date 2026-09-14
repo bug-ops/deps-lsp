@@ -757,6 +757,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "cargo")]
     #[tokio::test]
     async fn test_completion_delegates_to_ecosystem() {
         // Held per `deps_core::fs_probe::snapshot_guard`'s doc: `ecosystem.parse_manifest` (cargo)

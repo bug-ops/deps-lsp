@@ -116,7 +116,23 @@ mod tests {
     use super::*;
     use crate::document::ServerState;
     use crate::test_utils::test_helpers::create_test_client_and_config;
-    use deps_core::{EcosystemId, PackageVersions};
+    use deps_core::EcosystemId;
+    // Only `cargo_tests` and `cross_ecosystem_tests`' per-ecosystem cases consume this.
+    #[cfg(any(
+        feature = "cargo",
+        feature = "npm",
+        feature = "pypi",
+        feature = "go",
+        feature = "dart",
+        feature = "nuget",
+        feature = "composer",
+        feature = "bundler",
+        feature = "maven",
+        feature = "gradle",
+        feature = "swift",
+        feature = "github-actions"
+    ))]
+    use deps_core::PackageVersions;
     use tower_lsp_server::ls_types::TextDocumentIdentifier;
 
     fn params(uri: tower_lsp_server::ls_types::Uri) -> CodeLensParams {
@@ -350,14 +366,58 @@ mod tests {
     // `clippy::string_slice` has no `allow-*-in-tests` clippy.toml knob (unlike
     // indexing_slicing/unwrap_used/expect_used), so it needs an explicit allow here.
     #[allow(clippy::string_slice)]
+    // Every test below is gated on one specific ecosystem feature; with none of them
+    // enabled the shared helpers (`apply_single_edit` and friends) have no caller left.
+    #[cfg(any(
+        feature = "cargo",
+        feature = "npm",
+        feature = "pypi",
+        feature = "go",
+        feature = "dart",
+        feature = "nuget",
+        feature = "composer",
+        feature = "bundler",
+        feature = "maven",
+        feature = "gradle",
+        feature = "swift",
+        feature = "github-actions"
+    ))]
     mod cross_ecosystem_tests {
         use super::*;
         use std::collections::HashMap;
+        // Only `apply_single_edit` (below) names `TextEdit` directly; gradle-only skips it.
+        #[cfg(any(
+            feature = "cargo",
+            feature = "npm",
+            feature = "pypi",
+            feature = "go",
+            feature = "dart",
+            feature = "nuget",
+            feature = "composer",
+            feature = "bundler",
+            feature = "maven",
+            feature = "swift",
+            feature = "github-actions"
+        ))]
         use tower_lsp_server::ls_types::TextEdit;
 
         /// Applies a single `TextEdit` to `content`, using the exact inverse of the
         /// `Position`-to-byte-offset conversion `collect_update_all_edits` used to build
         /// the edit's range in the first place.
+        // Every ecosystem here except gradle-only exercises the single-edit path below.
+        #[cfg(any(
+            feature = "cargo",
+            feature = "npm",
+            feature = "pypi",
+            feature = "go",
+            feature = "dart",
+            feature = "nuget",
+            feature = "composer",
+            feature = "bundler",
+            feature = "maven",
+            feature = "swift",
+            feature = "github-actions"
+        ))]
         fn apply_single_edit(content: &str, edit: &TextEdit) -> String {
             let table = deps_core::LineOffsetTable::new(content);
             let start = table.position_to_byte_offset(content, edit.range.start);
@@ -368,6 +428,19 @@ mod tests {
         /// Asserts the ecosystem produces exactly one edit for `content`, and that
         /// applying it yields text which both contains `expected_fragment` and still
         /// parses successfully under the same ecosystem parser.
+        #[cfg(any(
+            feature = "cargo",
+            feature = "npm",
+            feature = "pypi",
+            feature = "go",
+            feature = "dart",
+            feature = "nuget",
+            feature = "composer",
+            feature = "bundler",
+            feature = "maven",
+            feature = "swift",
+            feature = "github-actions"
+        ))]
         async fn assert_single_edit_produces_valid_declaration(
             ecosystem: &dyn deps_core::Ecosystem,
             uri: &tower_lsp_server::ls_types::Uri,
@@ -405,6 +478,12 @@ mod tests {
         }
 
         /// Asserts the ecosystem produces no edit at all — the literal-span guard case.
+        #[cfg(any(
+            feature = "maven",
+            feature = "gradle",
+            feature = "swift",
+            feature = "github-actions"
+        ))]
         async fn assert_guard_skips(
             ecosystem: &dyn deps_core::Ecosystem,
             uri: &tower_lsp_server::ls_types::Uri,

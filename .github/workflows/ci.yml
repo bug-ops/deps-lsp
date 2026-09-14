@@ -93,7 +93,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -104,43 +104,41 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install cargo-hack
+      - name: Install cargo-hack and cargo-nextest
         uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
         with:
-          tool: cargo-hack
+          tool: cargo-hack, cargo-nextest
 
       - name: Check each feature individually
         # `clippy` above only lints --all-features, which hides lints that only surface
         # under a reduced feature set (issue #975) — `--each-feature` is linear in feature
         # count (41 invocations here), not the 2^n a full --feature-powerset would cost.
         # `cargo hack clippy` (not `check`) so this catches the same clippy-level lints as
-        # the `clippy` job, just per individual feature. `--no-dev-deps` is still required:
-        # deps-core's own #[cfg(test)] gap (issue #1000, `deps-core`'s test-util-gated
-        # helpers referenced unconditionally by some of its own #[cfg(test)] modules) is
-        # fixed, but dropping `--no-dev-deps` workspace-wide still fails on deps-lsp's own
-        # reduced-feature-set warnings under --all-targets (tracked in #1001, out of scope
-        # here). deps-lsp's own test-compilation gap under a reduced feature set (issue #998)
-        # is covered instead by the dedicated step below, scoped to the one crate that is
-        # actually clean to compile (though not yet warning-free, see that step's comment).
-        run: cargo hack clippy --workspace --each-feature --no-dev-deps -- -D warnings
+        # the `clippy` job, just per individual feature. `--no-dev-deps` keeps this
+        # workspace-wide sweep (15 crates) fast by skipping test-target compilation; deps-lsp
+        # is the one crate that needs its own dev-deps/test-target coverage per feature, so it
+        # gets a dedicated `--all-targets` step below instead of paying that cost here for
+        # every crate. `--keep-going` reports every failing slice in one run, not just the first.
+        run: cargo hack clippy --workspace --each-feature --no-dev-deps --keep-going -- -D warnings
 
-      - name: Check deps-lsp test compilation across the feature matrix
+      - name: Check deps-lsp test compilation and lints across the feature matrix
         # deps-lsp (issue #998, following #975's fix for lib/bin targets): its
-        # `#[cfg(test)]` module and test helpers must also compile under every reduced
-        # feature set, not just under --all-features. `check` (not `clippy`) and RUSTFLAGS
-        # cleared below: every config here does compile, but most reduced-feature configs
-        # still emit unused-import/dead-code warnings (25-34 depending on config) from test
-        # helpers/fixtures whose only consumers are ecosystem-gated tests that get stripped
-        # out first — those warnings are tracked in #1001 rather than fixed here, to keep
-        # #998's fix scoped to the compile failure it was filed for. The workflow-level
-        # `RUSTFLAGS: -D warnings` (see top-level `env:`) would otherwise turn those
-        # warnings into errors even without an explicit `-- -D warnings` on this command,
-        # so it's cleared for this step only. Upgrade this step to
-        # `cargo hack clippy -p deps-lsp --each-feature --all-targets -- -D warnings`
-        # (dropping the RUSTFLAGS override too) once #1001 is resolved.
-        env:
-          RUSTFLAGS: ""
-        run: cargo hack check -p deps-lsp --each-feature --all-targets
+        # `#[cfg(test)]` module and test helpers must also compile, and lint clean, under
+        # every reduced feature set, not just under --all-features (#1001 fixed the
+        # remaining unused-import/dead-code warnings so this can run at the same
+        # `-D warnings` strictness as the workspace-wide `clippy` job above).
+        run: cargo hack clippy -p deps-lsp --each-feature --all-targets --keep-going -- -D warnings
+
+      - name: Run deps-lsp tests across the feature matrix
+        # issue #1005: a hardcoded ecosystem-name lookup (e.g. `ecosystem_registry.get("cargo")`)
+        # in a test can compile fine yet panic at runtime once that ecosystem's feature is
+        # disabled — the check/clippy steps above only prove compilation, not that the
+        # resulting binary actually runs clean under every reduced feature set. No `--lib`:
+        # nextest's default target set (lib + bins + tests) also covers the `tests/`
+        # integration suites, which hardcode ecosystem names just as easily as unit tests do.
+        # `--no-fail-fast`/`--keep-going` so one bad slice doesn't hide failures in the rest.
+        # Originally proposed in #998.
+        run: cargo hack nextest run -p deps-lsp --each-feature --keep-going --profile ci --no-fail-fast
 
   doc-and-hygiene:
     name: Doc + Hygiene
