@@ -24,6 +24,8 @@
 //! }
 //! ```
 
+#[cfg(test)]
+use crate::config::IndexTrust;
 use crate::config::{AuthToken, RegistryIndex};
 use crate::sparse::SparseIndexClient;
 use crate::types::{CargoVersion, CrateInfo};
@@ -74,6 +76,36 @@ impl CratesIoRegistry {
                 RegistryIndex::builtin(SPARSE_INDEX_BASE),
                 Arc::clone(&cache),
             ),
+            cache,
+        }
+    }
+
+    /// Test-only: constructs a registry client with the sparse-index base pointed at `base`
+    /// (e.g. a `mockito::Server` URL) instead of the live crates.io sparse index (#1045),
+    /// mirroring `deps_dart::registry::PubDevRegistry::with_base`. Lets an unknown-package
+    /// test assert the mock was actually requested, so a zero-request regression can no
+    /// longer pass vacuously by coincidentally also returning an empty result.
+    ///
+    /// Redirects the sparse index only — [`Self::search`] still targets the live
+    /// `SEARCH_API_BASE`, so a test built on this seam is not fully mocked if it exercises
+    /// package-name search.
+    ///
+    /// `#[cfg(test)]`, not `#[cfg(feature = "test-util")]`: the `expect` below only succeeds
+    /// because `deps-core`'s `test-util` feature relaxes `RegistryIndex::new`'s https-only
+    /// gate for a loopback host, and that feature is pulled in unconditionally by this
+    /// crate's own `deps-cargo = { path = ".", features = ["test-util"] }` dev-dependency
+    /// (`Cargo.toml`) — so it is guaranteed active in every build where `#[cfg(test)]` code
+    /// runs, making a separate `test-util` feature gate on this `pub(crate)`-only helper
+    /// redundant. `test-util` itself stays feature-gated because, unlike this function, it
+    /// is a crate-level opt-in any downstream `Cargo.toml` could enable (`publish = true`).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_base_for_test(cache: Arc<HttpCache>, base: &str) -> Self {
+        let policy = deps_core::net_policy::RegistryAccessPolicy::default();
+        let index = RegistryIndex::new(base, IndexTrust::Trusted, &policy)
+            .expect("mock server URL must pass RegistryIndex validation");
+        Self {
+            sparse: SparseIndexClient::new(index, Arc::clone(&cache)),
             cache,
         }
     }
@@ -374,6 +406,22 @@ impl CargoRegistry {
     pub fn new(cache: Arc<HttpCache>) -> Self {
         Self {
             crates_io: CratesIoRegistry::new(Arc::clone(&cache)),
+            alternates: dashmap::DashMap::new(),
+            cache,
+        }
+    }
+
+    /// Test-only: wraps an already-constructed [`CratesIoRegistry`] (e.g. one built via
+    /// [`CratesIoRegistry::with_base_for_test`] pointed at a mock server) instead of building
+    /// a live-registry one (#1045).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_crates_io_for_test(
+        cache: Arc<HttpCache>,
+        crates_io: CratesIoRegistry,
+    ) -> Self {
+        Self {
+            crates_io,
             alternates: dashmap::DashMap::new(),
             cache,
         }
