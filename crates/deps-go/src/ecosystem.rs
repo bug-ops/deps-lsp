@@ -547,10 +547,36 @@ mod tests {
         assert!(results.iter().all(|r| r.label.starts_with("v1.9")));
     }
 
+    /// #1034: backed by a mockito server (rather than a live `proxy.golang.org` request) so
+    /// the `is_empty()` assertion is driven by a deliberately-failing mocked 404 response,
+    /// not by whatever the live network happens to do — an offline run was previously
+    /// vacuously green here, masking a real regression in error handling. Only `/@v/list` is
+    /// mocked: `complete_versions` routes through `Registry::get_versions_with` → the
+    /// inherent `get_versions`, which never requests `/@latest` (that endpoint belongs to
+    /// `get_latest_matching`, a different call path).
+    ///
+    /// `assert_async` (impl-critic S1) proves the mock was actually hit, not just that some
+    /// error occurred — `completions` has no `Result` to match a specific error variant on
+    /// (it always degrades a fetch error to an empty `Vec`), so this is the strongest signal
+    /// available that the empty result came from the intended mocked 404 rather than an
+    /// unrelated failure (e.g. mockito's own `501` for an unmatched request, which would
+    /// satisfy a bare `is_empty()` just as well).
     #[tokio::test]
     async fn test_complete_versions_unknown_package() {
+        let mut server = mockito::Server::new_async().await;
+        let list_mock = server
+            .mock("GET", "/github.com/nonexistent/package12345/@v/list")
+            .with_status(404)
+            .create_async()
+            .await;
+
         let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = GoEcosystem::new(cache);
+        let registry = Arc::new(GoRegistry::with_public_base_for_test(
+            Arc::clone(&cache),
+            server.url(),
+        ));
+        let ecosystem = GoEcosystem::with_context(registry, GoParseContext::default());
+
         let dep = mock_dependency("github.com/nonexistent/package12345", Some("v1.0"), 0);
         let position = dep.version_range.unwrap().start;
         let parse_result = MockParseResult {
@@ -567,6 +593,8 @@ mod tests {
                 deps_core::FreshnessSettings::default(),
             )
             .await;
+
+        list_mock.assert_async().await;
         assert!(results.is_empty());
     }
 
@@ -606,10 +634,25 @@ mod tests {
         assert!(results.len() <= 20);
     }
 
+    /// #1034: backed by a mockito server (rather than a live `proxy.golang.org` request) so
+    /// this is deterministic and fast — the sibling `test_generate_diagnostics_basic`
+    /// documents why the live-network shape is otherwise `#[ignore]`d.
     #[tokio::test]
     async fn test_generate_hover_on_module_path() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/github.com/gin-gonic/gin/@v/list")
+            .with_status(200)
+            .with_body("v1.9.0\nv1.9.1\nv1.10.0\n")
+            .create_async()
+            .await;
+
         let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = GoEcosystem::new(cache);
+        let registry = Arc::new(GoRegistry::with_public_base_for_test(
+            Arc::clone(&cache),
+            server.url(),
+        ));
+        let ecosystem = GoEcosystem::with_context(registry, GoParseContext::default());
 
         let uri = deps_core::test_util::test_uri("/test/go.mod");
         let parse_result = MockParseResult {
@@ -634,11 +677,16 @@ mod tests {
             )
             .await;
 
-        // Returns hover with package URL
+        // Returns hover with package URL and the mock-derived latest version (impl-critic
+        // M1: without this, the assertions never depended on the mocked response at all).
         assert!(hover.is_some());
         let hover_content = hover.unwrap();
         let markdown = format!("{:?}", hover_content.contents);
         assert!(markdown.contains("pkg.go.dev"));
+        assert!(
+            markdown.contains("**Latest**: `v1.10.0`"),
+            "expected the mocked /@v/list's highest version to render as Latest: {markdown}"
+        );
     }
 
     #[tokio::test]
