@@ -2056,13 +2056,28 @@ mod tests {
     }
 
     /// A plain `DependencySource::Registry` source keeps the existing public-registry path
-    /// (`/@latest` fast path) unchanged (NFR-005).
+    /// unchanged (NFR-005): `get_versions_from` routes it through `Registry::get_versions_with`
+    /// → the inherent `get_versions`, which only ever requests `/@v/list` (the `/@latest` fast
+    /// path belongs to `get_latest_matching`, not this call path — no mock for it here).
+    ///
+    /// #1034 (impl-critic S1): asserts the mock was actually hit (`assert_async`) and matches
+    /// the specific `PackageNotFound` variant, not a bare `is_err()` — mockito answers an
+    /// unmatched request with its own `501`, which a bare `is_err()` can't distinguish from
+    /// the intended mocked `404`, so a real regression (e.g. `PackageNotFound` from zero
+    /// requests) would previously have passed too.
     #[tokio::test]
     async fn test_get_versions_from_plain_registry_source_unchanged() {
         use deps_core::{FreshnessSettings, Registry};
 
+        let mut server = mockito::Server::new_async().await;
+        let list_mock = server
+            .mock("GET", "/github.com/nonexistent/module12345/@v/list")
+            .with_status(404)
+            .create_async()
+            .await;
+
         let cache = Arc::new(HttpCache::new());
-        let root = GoRegistry::new(cache);
+        let root = GoRegistry::with_public_base_for_test(cache, server.url());
         let result = root
             .get_versions_from(
                 &deps_core::PackageName::new("github.com/nonexistent/module12345"),
@@ -2070,9 +2085,12 @@ mod tests {
                 FreshnessSettings::default(),
             )
             .await;
-        // No network mock configured — a real request would error, proving this path still
-        // goes through the ordinary public fetch rather than being silently no-op'd.
-        assert!(result.is_err());
+
+        list_mock.assert_async().await;
+        let Err(err) = result else {
+            panic!("expected the mocked 404 to surface as an error");
+        };
+        assert_matches!(err, DepsError::PackageNotFound { .. });
     }
 
     #[test]

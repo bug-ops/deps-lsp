@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **deps-gitlab-ci**: mapping-shaped YAML container-anchor support for `include:` entries aliased as a whole mapping (`- *tpl`, `include: *tpl`, `- <<: *tpl`, `- <<: [*a, *b]`), resolved per GitLab's actual Psych merge-key precedence rather than the abstract YAML 1.1 spec (resolves #933, #916) (#1028)
 - **deps-core**: promoted `is_plain_null`/`is_null_tag` (originally `deps-dart`-private) into `lsp_helpers`, now shared by `deps-dart` and `deps-gitlab-ci` (#1028)
+- **deps-core**: new `quote_scan` module — shared escape-aware string-literal and comment scanning (`ScanSyntax`, `read_string_literal`, `strip_line_comment`, `blank_comments`, `is_code_byte`), now used by `deps-bundler`, `deps-swift`, and `deps-pypi` instead of each hand-rolling its own scanner (resolves #1022) (#1036)
 
 ### Changed
 - **deps-core, deps-dart, deps-github-actions, deps-gitlab-ci, deps-npm**: bumped `yaml-rust2` 0.12 -> 0.13 (upstream MSRV-only `encoding_rs` pin fix, no API/behavior change) and disabled its unused default `encoding` feature, dropping a duplicate `encoding_rs 0.7.2`/`cfg-if 0.1.10` that the new upstream pin would otherwise have pulled in alongside the already-used `encoding_rs 0.8.40` (resolves #923) (#1033)
@@ -21,15 +22,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-gitlab-ci**: a literal inline `<<: {...}` merge key (no anchor/alias involved) now folds into the `include:` entry, matching GitLab's actual YAML loader — previously `<<` was treated as an unrecognized key and silently ignored (#1028)
 - **deps-gitlab-ci**: an empty/null-like `ref:` on an ordinary, anchor-free `include:` entry now ships no version at all, instead of `version_req = Some("")` with a zero-width range (#1028)
 - **deps-core, deps-dart**: `is_plain_null` now recognizes `Null`/`NULL` in addition to `~`/`null` — the four spellings GitLab's Psych YAML loader treats as null (#1028)
+- **deps-bundler**: `extract_group`/`extract_source`/`extract_platforms`/`extract_require` now take the same `&[(&str, usize)]` slice as `extract_version`, dropping a redundant per-gem `Vec` allocation in `finalize_pending_gem` (resolves #1023) (#1036)
+- bumped `rustls` 0.23.44 -> 0.23.45 (RUSTSEC-2026-0285: TLS 1.3 handshake messages incorrectly accepted across encryption level boundaries) (#1036)
 
 ### Fixed
 - **deps-core**: `HttpCache::cache_key` no longer collapses an unauthenticated `Pinned`-tier fetch and an authenticated one whose credential digest happens to hash to `0` onto the same cache key (resolves #1025)
 - **CI**: the `cross-check` job's i686 leg now builds and tests natively via `gcc-multilib` on `ubuntu-latest` instead of through `cross`'s musl Docker container, dropping the associated apt-get/Docker overhead and the `--test-threads=1` workaround (now uses `cargo nextest`) (#1027)
 - **CI**: `cargo-semver-checks` is now a blocking gate on PR/push and part of `ci-success` (was advisory-only, milestone criterion B3) (resolves #945) (#1012)
 - **deps-bundler**: multi-line `gem` declarations (continuation-line `:source =>`/`source:`, backslash continuation, or a commented-out option) no longer leak private gem names to the public rubygems.org registry, and the parser's block/group state tracking is now O(1) per line instead of O(block depth) (resolves #991, #1009) (#1016)
+- **deps-bundler**: a `source ... do` block URL containing Ruby string interpolation with a nested single-quoted literal (e.g. `ENV['CREDS']`) now still opens the block instead of silently leaking its gems to the public registry (resolves #1019) (#1040)
+- **deps-bundler**: a multi-line `gem` call whose continuation opens an array/hash literal (e.g. `platforms: [`) instead of ending in a trailing comma is now tracked as open until the literal closes, so a later option on the same call is no longer dropped (resolves #1017) (#1040)
+- **deps-bundler**: a parenthesized `gem(...)` call, at the top level or nested inside a block, is now recognized as a dependency instead of silently producing no diagnostic, hover, or completion (resolves #1021) (#1040)
 - **deps-lsp**: gated 4 tests that panicked (not just failed to compile) under a reduced ecosystem feature set, and fixed the crate's remaining unused-import/dead-code warnings across the feature matrix; CI now lints deps-lsp's test targets with `-D warnings` and runs `cargo hack nextest run -p deps-lsp --each-feature` on every individual feature (resolves #1005, #1001) (#1011)
 - **docs**: corrected README.md's and ECOSYSTEM_GUIDE.md's contradictory `license_policy` diagnostic ecosystem-scope claims — the diagnostic actually fires for five ecosystems (Composer, Dart, Swift, Deno, Gradle), not "all 14" or the previously listed four (resolves #1004) (#1013)
 - **deps-go**: `test_generate_code_actions_on_module` now runs against a mockito server instead of live `proxy.golang.org`, removing an intermittent CI failure (resolves #1014) (#1032)
+- **deps-bundler**: `source:`/`git:`/`path:`/`github:` inline option values no longer truncate at an embedded quote of the opposite kind (e.g. an escaped or unescaped `'` inside a `"`-delimited value) (resolves #1020) (#1036)
+- **deps-go**: `test_get_versions_from_plain_registry_source_unchanged`, `test_complete_versions_unknown_package`, and `test_generate_hover_on_module_path` now run against a mockito server instead of live `proxy.golang.org` (resolves #1034) (#1037)
 - **deps-core**: `capture_tracing_output`/`_at`/`_async`/`_async_at` no longer silently return empty output when an untraced sibling test touches the same tracing callsite first under a shared-process test run (resolves #1006) (#1042)
 
 ## [1.0.0] - 2026-09-14
