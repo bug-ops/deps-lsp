@@ -359,10 +359,17 @@ impl Ecosystem for PypiEcosystem {
         // its doc), and a relative root (e.g. `".."`) would normalize to `""`, against
         // which every path spuriously `starts_with` — silently defeating the containment
         // check instead of the intended skip-if-unknown fallback (#937 finding R2).
+        //
+        // Absoluteness is checked with `is_absolute_document_link_target` (on the root's
+        // string form), not `Path::is_absolute()`: that method's notion of "absolute" is
+        // platform-dependent, and a POSIX-style root like `/project` is NOT absolute per
+        // `Path` on Windows (no drive prefix) — using it here would silently skip
+        // containment for exactly this shape on Windows, the same C1-class bug the target
+        // check was already written to avoid.
         let workspace_root = result
             .workspace_root
             .as_deref()
-            .filter(|root| root.is_absolute())
+            .filter(|root| root.to_str().is_some_and(is_absolute_document_link_target))
             .map(lexically_normalize);
 
         result
@@ -663,15 +670,19 @@ fn is_absolute_document_link_target(target: &str) -> bool {
 /// `canonicalize`, no symlink resolution, since `generate_document_links` never opens the
 /// target, only publishes it as a clickable `DocumentLink`.
 ///
-/// Assumes `path` is absolute: a `..` with nothing left to pop is simply dropped rather
+/// Assumes `path` is rooted: a `..` with nothing left to pop is simply dropped rather
 /// than kept as a literal component — the same clamp-at-root behavior a real filesystem
 /// gives `/..`. Keeping it (a prior version of this function did) produces a non-canonical
 /// path like `/../etc/shadow`: still rejected by the workspace-root containment check
 /// today, but a misleading tooltip if that check is ever skipped (#937 finding C2). Every
 /// call site upholds the assumption: the join-target call always sees `base_dir.join(...)`
-/// (absolute, since `base_dir` comes from the manifest's own file URI), and the
-/// workspace-root call site filters to `Path::is_absolute()` first (#937 finding R2) — a
-/// relative `path` isn't rejected here, it just won't clamp to a meaningful root.
+/// (rooted, since `base_dir` comes from the manifest's own file URI), and the
+/// workspace-root call site filters through [`is_absolute_document_link_target`] first
+/// (#937 finding R2) rather than `Path::is_absolute()` — the latter is platform-dependent
+/// (a POSIX-style root like `/project` is not "absolute" per `Path` on Windows, only
+/// "has_root"), which would silently skip containment for exactly that shape on Windows. A
+/// relative `path` isn't rejected here either way, it just won't clamp to a meaningful
+/// root.
 fn lexically_normalize(path: &std::path::Path) -> std::path::PathBuf {
     let mut result = std::path::PathBuf::new();
     for component in path.components() {
