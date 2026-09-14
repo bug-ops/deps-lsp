@@ -8,7 +8,7 @@ use tower_lsp_server::ls_types::{
 use crate::licenses::{
     ViolationReason, evaluate as evaluate_license_policy, resolve_license_entries,
 };
-use crate::net_policy::RedactedUrl;
+use crate::net_policy::{RedactedUrl, is_authority_bearing_url};
 use crate::osv::{ScanOutcome, diagnostic_severity_for};
 use crate::{
     BlockedRegistryOccurrence, ConcreteVersion, Dependency, Deprecation, FetchFailure, ParseResult,
@@ -970,15 +970,33 @@ fn build_blocked_registry_diagnostic(occurrence: &BlockedRegistryOccurrence) -> 
     // short label (`"top-level"`, `"source:Blocked"`, `"scope:@myorg"`) that `RedactedUrl`'s
     // userinfo-scan would mangle (it is tuned for actual URLs, and a bare `label:rest` shape
     // reads exactly like a schemeless `user:pass@host` credential to that scan) — so the
-    // userinfo-redaction step only runs when the key is actually URL-shaped (`deps_cargo`
-    // reuses the raw value verbatim as its own key). The query-string truncation half of
-    // `url_for_tracing`/`RedactedUrl`, however, is scheme-agnostic and must run unconditionally
-    // (impl-critic follow-up): a scheme-colon, slash-less URL (`"https:host/path?api_key=…"`)
-    // still classifies as a blocked host without ever containing `"://"`, and gating query
-    // truncation on that same check would let a query-string credential in `declaration_key`
-    // leak through this field — the exact #936 leak class the `raw_value` redaction above
-    // exists to close.
-    let redacted_key = if occurrence.declaration_key.contains("://") {
+    // userinfo-redaction step only runs when the key parses as a URL with a real host (checked
+    // via `is_authority_bearing_url`, giving `redact_userinfo` a genuine authority boundary to
+    // work from — not, as an earlier version of this comment claimed, the same "primary,
+    // authority-aware" dispatch path for every input: a host-having-but-userinfo-free URL
+    // still runs through `redact_userinfo`'s own aggressive `redact_secondary_colon_credential`
+    // text-scan, e.g. `https://10.0.0.1/v1/items:search` renders as
+    // `https://10.0.0.1/v1/items:***` despite being authority-bearing; the gate here is about
+    // whether a userinfo/tail scan is safe to run at all, not about which internal scan runs)
+    // OR the key contains `"://"` (`deps_cargo` reuses the raw value verbatim as its own key,
+    // and `file://`-style URLs, which have no host, both rely on this half). Neither condition
+    // alone is a superset of the vulnerability class: `is_authority_bearing_url` alone missed
+    // `"source:https://user:hunter2@10.0.0.1/v3/index.json"` (an opaque-label-prefixed URL —
+    // `Url::parse` treats "source" as the scheme and the whole rest as an opaque path, so
+    // `host()` is `None` even though the tail is a real credentialed URL); `"://"` alone missed
+    // a scheme-colon, slash-less credential (`"https:user:pass@10.0.0.1/index"` — never
+    // contains `"://"` yet still a genuine URL with userinfo, #981's original S1). The union of
+    // both conditions is required: every opaque label the 6 ecosystems currently emit
+    // (`"top-level"`, `"source:Blocked"`, `"scope:@myorg"`, `"primary"`, `"uv-tail"`,
+    // `"named:internal"`, the Go blocked-goproxy constant, `"component-host:<host>"`) contains
+    // neither `"://"` nor parses to an authority-bearing URL, so all still take the plain
+    // `else` branch below unmangled.
+    //
+    // TODO(critic): move this branch into net_policy::redact_declaration_key so the no-leak
+    // guarantee is unconditional at the render site (#981 structural follow-up).
+    let redacted_key = if is_authority_bearing_url(&occurrence.declaration_key)
+        || occurrence.declaration_key.contains("://")
+    {
         RedactedUrl::new(&occurrence.declaration_key).to_string()
     } else {
         occurrence
@@ -2251,6 +2269,259 @@ mod tests {
              got: {blocked_diagnostic:?}"
         );
         assert!(blocked_diagnostic.message.contains("169.254.169.254"));
+    }
+
+    /// #981: gating `declaration_key`'s userinfo-redaction step on a bare `"://"` substring
+    /// check missed a scheme-colon, slash-less credential (`Url::parse` still resolves it to
+    /// an authority-bearing URL for a special scheme like `https`, even without the `//`) — it
+    /// fell into the query/fragment-only `else` branch and rendered `user:pass@` verbatim.
+    /// `is_authority_bearing_url` fixes this: the key parses as a URL with a real host, giving
+    /// `redact_userinfo` a genuine authority boundary to work from — not proof of which
+    /// internal scan runs — rather than string-matching `"://"` alone.
+    #[test]
+    fn test_generate_diagnostics_from_cache_blocked_registry_message_redacts_userinfo_in_declaration_key_without_scheme_slashes()
+     {
+        use crate::net_policy::HostClass;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        struct BlockedRegistryParseResult {
+            deps: Vec<MockDep>,
+            uri: Uri,
+            blocked: Vec<BlockedRegistryOccurrence>,
+        }
+
+        impl ParseResult for BlockedRegistryParseResult {
+            fn dependencies(&self) -> Vec<&dyn Dependency> {
+                self.deps.iter().map(|d| d as &dyn Dependency).collect()
+            }
+            fn workspace_root(&self) -> Option<&std::path::Path> {
+                None
+            }
+            fn uri(&self) -> &Uri {
+                &self.uri
+            }
+            fn blocked_registries(&self) -> Vec<BlockedRegistryOccurrence> {
+                self.blocked.clone()
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        let name_range = Range::new(Position::new(0, 0), Position::new(0, 14));
+        let formatter = MockFormatter;
+        let slash_less_credential = "https:user:hunter2@10.0.0.1/index".to_string();
+        let parse_result = BlockedRegistryParseResult {
+            deps: vec![MockDep {
+                name: "internal-crate".into(),
+                version_req: "1.0.0".into(),
+                version_range: Range::new(Position::new(0, 20), Position::new(0, 25)),
+                name_range,
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+            blocked: vec![BlockedRegistryOccurrence {
+                range: name_range,
+                class: HostClass::CloudMetadata,
+                raw_value: slash_less_credential.clone(),
+                declaration_key: slash_less_credential,
+            }],
+        };
+
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        let blocked_diagnostic = diagnostics
+            .iter()
+            .find(|d| d.message.contains("blocked"))
+            .expect("expected a blocked-registry diagnostic");
+        assert!(
+            !blocked_diagnostic.message.contains("hunter2"),
+            "declaration_key's userinfo must be redacted even without \"://\", \
+             got: {blocked_diagnostic:?}"
+        );
+        assert!(blocked_diagnostic.message.contains("10.0.0.1"));
+    }
+
+    /// #981: `declaration_key` opaque labels that merely *look* userinfo/credential-shaped
+    /// (`"scope:@myorg"`, an npm scoped-registry label; `"source:Blocked"`, a NuGet source
+    /// label; plus every other fixed label the remaining ecosystem crates emit) must survive
+    /// unredacted — none of them are authority-bearing URLs, and none contains `"://"`, so all
+    /// take the plain query/fragment-strip branch instead of `RedactedUrl`'s aggressive
+    /// text-scan fallbacks, which would otherwise mangle e.g. `"scope:@myorg"` into
+    /// `"***@myorg"` or `"source:Blocked"` into `"source:***"`.
+    #[test]
+    fn test_generate_diagnostics_from_cache_blocked_registry_message_does_not_mangle_opaque_declaration_keys()
+     {
+        use crate::net_policy::HostClass;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        struct BlockedRegistryParseResult {
+            deps: Vec<MockDep>,
+            uri: Uri,
+            blocked: Vec<BlockedRegistryOccurrence>,
+        }
+
+        impl ParseResult for BlockedRegistryParseResult {
+            fn dependencies(&self) -> Vec<&dyn Dependency> {
+                self.deps.iter().map(|d| d as &dyn Dependency).collect()
+            }
+            fn workspace_root(&self) -> Option<&std::path::Path> {
+                None
+            }
+            fn uri(&self) -> &Uri {
+                &self.uri
+            }
+            fn blocked_registries(&self) -> Vec<BlockedRegistryOccurrence> {
+                self.blocked.clone()
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        let formatter = MockFormatter;
+        for opaque_key in [
+            "scope:@myorg",
+            "source:Blocked",
+            "top-level",
+            "primary",
+            "uv-tail",
+            "named:internal",
+            "goproxy",
+            "component-host:10.0.0.1",
+        ] {
+            let name_range = Range::new(Position::new(0, 0), Position::new(0, 14));
+            let parse_result = BlockedRegistryParseResult {
+                deps: vec![MockDep {
+                    name: "internal-crate".into(),
+                    version_req: "1.0.0".into(),
+                    version_range: Range::new(Position::new(0, 20), Position::new(0, 25)),
+                    name_range,
+                }],
+                uri: crate::test_util::test_uri("/test/Cargo.toml"),
+                blocked: vec![BlockedRegistryOccurrence {
+                    range: name_range,
+                    class: HostClass::CloudMetadata,
+                    raw_value: "https://169.254.169.254/index".to_string(),
+                    declaration_key: opaque_key.to_string(),
+                }],
+            };
+
+            let cached_versions = HashMap::new();
+            let resolved_versions = HashMap::new();
+
+            let diagnostics = generate_diagnostics_from_cache(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions),
+                &formatter,
+                parse_result.uri(),
+                crate::freshness::FreshnessSettings::default(),
+                DiagnosticSeverities::default(),
+                PublishTime::now(),
+            );
+
+            let blocked_diagnostic = diagnostics
+                .iter()
+                .find(|d| d.message.contains("blocked"))
+                .expect("expected a blocked-registry diagnostic");
+            assert!(
+                blocked_diagnostic.message.contains(opaque_key),
+                "opaque declaration_key {opaque_key:?} must survive unmangled, \
+                 got: {blocked_diagnostic:?}"
+            );
+        }
+    }
+
+    /// #981 S1 (impl-critic regression on the first #981 fix): `is_authority_bearing_url`
+    /// alone is not a superset of the pre-#981 `.contains("://")` gate. An opaque-label-prefixed
+    /// `declaration_key` (`"source:https://user:hunter2@10.0.0.1/v3/index.json"`, the shape
+    /// NuGet's `format!("source:{}", entry.key)` or PyPI's `format!("named:{name}")` build from
+    /// a user-chosen source name) parses with `Url::parse` treating `"source"` as the scheme
+    /// and the rest as an opaque, host-less path — `is_authority_bearing_url` returns `false`
+    /// for it — so the gate must still fall back to `.contains("://")` to catch this shape, the
+    /// same way the pre-#981 code did.
+    #[test]
+    fn test_generate_diagnostics_from_cache_blocked_registry_message_still_redacts_opaque_label_prefixed_url_in_declaration_key()
+     {
+        use crate::net_policy::HostClass;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        struct BlockedRegistryParseResult {
+            deps: Vec<MockDep>,
+            uri: Uri,
+            blocked: Vec<BlockedRegistryOccurrence>,
+        }
+
+        impl ParseResult for BlockedRegistryParseResult {
+            fn dependencies(&self) -> Vec<&dyn Dependency> {
+                self.deps.iter().map(|d| d as &dyn Dependency).collect()
+            }
+            fn workspace_root(&self) -> Option<&std::path::Path> {
+                None
+            }
+            fn uri(&self) -> &Uri {
+                &self.uri
+            }
+            fn blocked_registries(&self) -> Vec<BlockedRegistryOccurrence> {
+                self.blocked.clone()
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        let name_range = Range::new(Position::new(0, 0), Position::new(0, 14));
+        let formatter = MockFormatter;
+        let opaque_prefixed_url = "source:https://user:hunter2@10.0.0.1/v3/index.json".to_string();
+        let parse_result = BlockedRegistryParseResult {
+            deps: vec![MockDep {
+                name: "internal-crate".into(),
+                version_req: "1.0.0".into(),
+                version_range: Range::new(Position::new(0, 20), Position::new(0, 25)),
+                name_range,
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+            blocked: vec![BlockedRegistryOccurrence {
+                range: name_range,
+                class: HostClass::CloudMetadata,
+                raw_value: "https://10.0.0.1/v3/index.json".to_string(),
+                declaration_key: opaque_prefixed_url,
+            }],
+        };
+
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        let blocked_diagnostic = diagnostics
+            .iter()
+            .find(|d| d.message.contains("blocked"))
+            .expect("expected a blocked-registry diagnostic");
+        assert!(
+            !blocked_diagnostic.message.contains("hunter2"),
+            "an opaque-label-prefixed URL's userinfo must still be redacted, \
+             got: {blocked_diagnostic:?}"
+        );
+        assert!(blocked_diagnostic.message.contains("10.0.0.1"));
     }
 
     /// #925 S2 (then corrected by a later code-review pass, finding #3): a config-global

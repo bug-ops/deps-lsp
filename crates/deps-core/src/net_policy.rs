@@ -2257,6 +2257,42 @@ pub fn url_for_tracing(raw: &str) -> String {
     redact_userinfo(&raw[..end])
 }
 
+/// Whether `raw` parses as a URL with an actual authority (`host()` is `Some`).
+///
+/// This is not proof [`redact_userinfo`] takes any *particular* internal branch for `raw` — a
+/// host-having URL with no userinfo of its own can still be reached by its aggressive
+/// `redact_secondary_colon_credential` tail-scan (e.g. `https://10.0.0.1/v1/items:search`
+/// redacts to `https://10.0.0.1/v1/items:***` despite being authority-bearing). What this
+/// function does confirm is that `raw` has a genuine authority boundary for [`redact_userinfo`]
+/// to work from at all, rather than being handed to its unparseable/opaque-path fallback scans,
+/// which treat plain text with no real URL structure as a possible credential.
+///
+/// Exposed so a caller holding a value that is only *sometimes* a URL — e.g.
+/// [`crate::ecosystem::BlockedRegistryOccurrence::declaration_key`], which most ecosystems set
+/// to a short opaque label (`"top-level"`, `"source:Blocked"`, `"scope:@myorg"`) and only one
+/// (`deps_cargo`) sets to the real registry URL — can redact only when the value is confirmed
+/// to actually be a URL, instead of running [`redact_userinfo`]'s fallback scans on plain text
+/// they were never designed for: those scans treat any `word:word@`/`word:@` shape as a
+/// possible credential (#810's `key:value` carve-out), which would mangle an opaque label like
+/// `"scope:@myorg"` (`"***@myorg"`) or `"source:Blocked"` (`"source:***"`) into a false-positive
+/// redaction (#981).
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::net_policy::is_authority_bearing_url;
+///
+/// assert!(is_authority_bearing_url("https://registry.example/index"));
+/// assert!(is_authority_bearing_url("https:user:pass@10.0.0.1/index"));
+/// assert!(!is_authority_bearing_url("scope:@myorg"));
+/// assert!(!is_authority_bearing_url("source:Blocked"));
+/// assert!(!is_authority_bearing_url("top-level"));
+/// ```
+#[must_use]
+pub fn is_authority_bearing_url(raw: &str) -> bool {
+    url::Url::parse(raw).is_ok_and(|url| url.host().is_some())
+}
+
 /// A URL-bearing value that has already been redacted for safe inclusion in error or log
 /// output — the structural chokepoint for outbound-URL redaction (issue #789).
 ///
@@ -2833,6 +2869,24 @@ mod tests {
     use super::*;
 
     use std::assert_matches;
+
+    #[test]
+    fn is_authority_bearing_url_true_for_real_urls_including_scheme_colon_slash_less_ones() {
+        assert!(is_authority_bearing_url("https://registry.example/index"));
+        assert!(is_authority_bearing_url(
+            "https:user:hunter2@10.0.0.1/index"
+        ));
+        assert!(is_authority_bearing_url("https:169.254.169.254/index"));
+    }
+
+    #[test]
+    fn is_authority_bearing_url_false_for_opaque_declaration_key_labels() {
+        assert!(!is_authority_bearing_url("scope:@myorg"));
+        assert!(!is_authority_bearing_url("source:Blocked"));
+        assert!(!is_authority_bearing_url("top-level"));
+        assert!(!is_authority_bearing_url("component-host:10.0.0.1"));
+        assert!(!is_authority_bearing_url("named:internal"));
+    }
 
     fn host_class(url: &str) -> HostClass {
         classify_host(&url::Url::parse(url).unwrap())
