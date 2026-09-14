@@ -413,20 +413,93 @@ fn find_ruby_closing_quote_primary(rest: &str, quote: char) -> Option<usize> {
 /// parity and get wrongly rejected when genuine (#1047 follow-up round 1, caught by
 /// [`find_ruby_closing_quote_naive`]).
 ///
-/// The wrongly-trusted (odd-parity) direction is caught by the caller's lexical gate only for a
-/// stray quote shaped like a regex or character literal (`/'/`, `?'`) — [`find_ruby_closing_quote_naive`]
-/// can't help here, since a wrongly-trusted span can still resolve to a `Some`, not just a
-/// `None`. It does *not* cover every construct that can produce a lone, non-string-opening
-/// quote: a `%`-literal (`%r|'|`, `%w[...]`) or a `#` line comment containing an apostrophe can
-/// still trigger the same false-trust failure mode uncaught — a known, narrower residual gap
-/// (#1047 follow-up, tracked separately) left unaddressed here as disproportionate to fix for
-/// how implausible the combination is; the module remains a strict improvement over its
-/// pre-#1047 baseline without it.
+/// The wrongly-trusted (odd-parity) direction is caught by the caller for a stray quote
+/// shaped like a regex or character literal (`/'/`, `?'`) via its lexical gate, and — since
+/// #1060 — for one embedded in a `%`-literal (`%r|'|`, `%w[a'b]`) or a `#` line comment via a
+/// span-skip that never lets `nested_span_len` see that quote at all.
+/// [`find_ruby_closing_quote_naive`] can't help with any of these, since a wrongly-trusted
+/// span can still resolve to a `Some`, not just a `None`. Three residual gaps remain, all
+/// documented rather than fixed because closing them costs more (in leaked, over-long spans)
+/// than the truncation they prevent — see [`find_ruby_closing_quote_fallback`]'s doc for the
+/// `%`/`#` gate this reasoning applies to:
+/// - Ruby heredocs, a literal form this scanner does not tokenize at all.
+/// - String content that happens to look like a `#` comment once this function has already
+///   rejected it as a nested string (`ENV["c#d"]` inside `#{...}`) — the `#` there is
+///   unconditionally treated as a real comment (#1060 follow-up round 2, critic finding S3).
+/// - `%`-literal recognition is predecessor-approximated (an `after_value` heuristic, not real
+///   EXPR_BEG/EXPR_ARG lexer state), so a `%` in an ambiguous position can still be mis-skipped
+///   (#1060 follow-up round 2, critic finding M3).
 fn nested_span_len(rest: &str, start: usize, nq: char, quote: char) -> Option<usize> {
     let close_len = find_closing_quote(rest.get(start..)?, nq)?;
     let content = rest.get(start..start + close_len)?;
     let (quote_count, _) = count_real_quotes_with(content, quote);
     (!quote_count.is_multiple_of(2)).then_some(close_len + nq.len_utf8())
+}
+
+/// Maps a Ruby `%`-literal's opening delimiter to its closing delimiter: the four
+/// bracket-pair openers nest (`%w[a[b]c]`'s inner `[`/`]` don't close the literal early);
+/// every other delimiter (including `%r|...|`'s `|`) closes on its own next unescaped
+/// occurrence.
+fn percent_literal_closing_delim(open: char) -> char {
+    match open {
+        '(' => ')',
+        '[' => ']',
+        '{' => '}',
+        '<' => '>',
+        other => other,
+    }
+}
+
+/// Byte offset in `rest` just past a Ruby `%`-literal's closing delimiter, given
+/// `rest[at] == '%'` — `None` when `at` is not actually a `%`-literal opener, so the caller
+/// falls through to treating `%` as ordinary content (e.g. the modulo operator in `a % b`).
+///
+/// Recognizes an optional one-letter literal type — Ruby's full set, `%q`/`%Q` (string),
+/// `%w`/`%W` (word array), `%i`/`%I` (symbol array), `%r` (regex), `%s` (symbol), `%x`
+/// (command) — immediately followed by a delimiter, or a bare `%<delim>` (`%(...)`, `%{...}`,
+/// ...).
+/// Requires the delimiter to sit immediately after `%` (or the type letter) with no space —
+/// `a % b`'s `%` is followed by a space, which is neither a type letter nor a punctuation
+/// delimiter, so it is correctly rejected here. The delimiter itself must be neither
+/// alphanumeric nor whitespace, which also rules out `%` inside an identifier.
+///
+/// An unterminated `%`-literal (its delimiter never closes) absorbs the rest of `rest`,
+/// mirroring how an unterminated string literal is handled elsewhere in this module. Ruby
+/// heredocs are a distinct literal form this scanner does not tokenize and remain out of
+/// scope (see [`find_ruby_closing_quote_fallback`]'s doc).
+fn percent_literal_end(rest: &str, at: usize) -> Option<usize> {
+    let after_percent = at + '%'.len_utf8();
+    let mut chars = rest.get(after_percent..)?.char_indices();
+    let (_, first) = chars.next()?;
+    let (open_offset, open) =
+        if matches!(first, 'r' | 'q' | 'Q' | 'w' | 'W' | 'i' | 'I' | 's' | 'x') {
+            chars.next()?
+        } else {
+            (0, first)
+        };
+    if open.is_alphanumeric() || open.is_whitespace() {
+        return None;
+    }
+    let close = percent_literal_closing_delim(open);
+    let body_start = after_percent + open_offset + open.len_utf8();
+    let mut depth = 1u32;
+    let mut body_chars = rest.get(body_start..)?.char_indices();
+    while let Some((idx, ch)) = body_chars.next() {
+        // Delimiter recognition runs before escape-consumption, so a delimiter that happens
+        // to be `\` itself (Ruby permits any non-alphanumeric, non-whitespace delimiter) still
+        // closes the literal instead of always being swallowed as an escape.
+        if close != open && ch == open {
+            depth += 1;
+        } else if ch == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(body_start + idx + close.len_utf8());
+            }
+        } else if ch == '\\' {
+            body_chars.next();
+        }
+    }
+    Some(rest.len())
 }
 
 /// Middle tier behind [`find_ruby_closing_quote`], engaged once
@@ -474,6 +547,21 @@ fn nested_span_len(rest: &str, start: usize, nq: char, quote: char) -> Option<us
 /// Even with both gates, this tier is not proven infallible, so it can still fail to find a
 /// close that [`find_ruby_closing_quote_naive`] — chained after it — would have found; unlike
 /// that final tier, this one is allowed to return `None`.
+///
+/// A third mechanism, added for #1060, runs *before* either gate: a `%`-literal
+/// (`%r|'|`, `%w[a'b]`, ...) or a `#` line comment met while `interpolation_depth > 0` is
+/// skipped as a whole span via [`percent_literal_end`] / [`line_comment_end`] before any
+/// quote-shaped byte inside it is ever considered a candidate at all — unlike the lexical
+/// gate, which only ever looks at the single character immediately preceding a candidate
+/// quote, these two constructs can put a stray apostrophe arbitrarily far past their own
+/// opener (`%w[a'b]`'s `'` is preceded by `a`, not `%`/`w`/`[`), so a predecessor-only check
+/// cannot catch them; span-skipping sidesteps the candidate check entirely instead of trying
+/// to extend it. The `%` half of this skip is additionally gated on `prev` not being a value
+/// token (`x%=2` is modulo, not a `%`-literal); the `#` half is deliberately left ungated —
+/// see the `after_value` comment at this function's `%`/`#` branches for why the two are not
+/// symmetric, verified against a Ruby/Prism oracle (#1060 follow-up round 2). Ruby heredocs
+/// are a distinct literal form this scanner does not tokenize and remain out of scope, per
+/// this module's top-level doc.
 fn find_ruby_closing_quote_fallback(rest: &str, quote: char) -> Option<usize> {
     let mut interpolation_depth: u32 = 0;
     let mut i = 0;
@@ -488,6 +576,79 @@ fn find_ruby_closing_quote_fallback(rest: &str, quote: char) -> Option<usize> {
                 prev = escaped.or(Some(ch));
                 continue;
             }
+            // Ruby decides `%`'s role by lexer state (EXPR_BEG/EXPR_ARG vs EXPR_END), the same
+            // class of ambiguity `is_char_literal_quote`'s doc documents for `?`. After a value
+            // token — an identifier/number char, `_`, or a closer (`)`, `]`, `}`, `'`, `"`) —
+            // `%` is always the modulo/format operator, never a `%`-literal opener (critic
+            // finding S1, #1060 follow-up): without this gate, `percent_literal_end` reads any
+            // non-alphanumeric byte after a bare `%` as a delimiter, so `x%=2` is misread as a
+            // literal delimited by `=` and swallows text up to a later, unrelated `=` —
+            // reopening #1060's own over-long-span leak via a different trigger. Gating on
+            // `prev` costs nothing extra — the loop already tracks it for the lexical gate
+            // below.
+            //
+            // `#` is deliberately **not** gated the same way (critic finding S3, second
+            // #1060 follow-up round — correcting this function's own first-round doc, which
+            // wrongly claimed `#` "cannot start a comment" after a value token): in real Ruby a
+            // `#` starts a comment even directly abutting one (`x# comment` is a comment), so
+            // gating it would wrongly re-admit an apostrophe inside that comment as a quote
+            // candidate. Measured against a Ruby/Prism oracle over 86k valid-Ruby cases, gating
+            // `#` fixes one narrow class — string content that looks like a comment once the
+            // parity gate has already rejected a nested string, e.g. `ENV["c#d"]` inside
+            // `#{...}` — at the cost of ~2193 new over-long (leak-direction) errors elsewhere,
+            // against only 406 residual if `#` is left ungated. The two failure directions are
+            // not symmetric: leaving `#` ungated fails by truncating the literal early (the
+            // safer direction — see `read_string_literal_ruby_fallback_hash_in_rejected_nested_string_is_a_documented_residual_gap`,
+            // pinned as a known residual gap alongside heredocs, not fixed here), while gating
+            // it fails by leaking text past the literal's true end into a later option (the
+            // credential-retention / `git:`-dropped path traced in the S1/S2 handoff).
+            let after_value = matches!(
+                prev,
+                Some(c) if c.is_alphanumeric() || matches!(c, '_' | ')' | ']' | '}' | '\'' | '"')
+            );
+            if ch == '#' {
+                // `prev = None` is safe here (unlike the `%` branch below): `line_comment_end`
+                // always stops *at* the `\n` when one exists, never past it, so the very next
+                // iteration reprocesses that `\n` as an ordinary character and sets `prev =
+                // Some('\n')` before `after_value` is ever consulted again; when the comment
+                // instead runs to the end of `rest` (no trailing `\n`), the loop terminates and
+                // `prev` is never read again either way.
+                i = line_comment_end(rest, i);
+                prev = None;
+                continue;
+            }
+            if ch == '%'
+                && !after_value
+                && let Some(end) = percent_literal_end(rest, i)
+            {
+                i = end;
+                // A `%`-literal always produces a value (a string, array, regex, or symbol),
+                // regardless of which punctuation character closed it — `)` stands in here as
+                // a synthetic "predecessor was a value" marker for the next iteration's
+                // `after_value` check, the same role it already plays for a real `)`. Code-review
+                // finding: `prev = None` here let the literal's own close be misread as a fresh
+                // EXPR_BEG position, re-admitting a `%` immediately following it (e.g. the `%` in
+                // `%w[a]%=2`) to `percent_literal_end` as if it were a literal opener again —
+                // reopening S1's leak via a new trigger. Reading back the actual closing
+                // delimiter character instead would still miss this for any delimiter outside
+                // `after_value`'s closer set (e.g. `%r|...|`'s `|`), so a fixed value-marker is
+                // used instead of the real character.
+                prev = Some(')');
+                continue;
+            }
+            // Deliberately not `is_char_literal_quote` (#1062): the reason to keep these
+            // separate is semantic, not (as an earlier version of this comment wrongly
+            // claimed) about performance — `is_char_literal_quote` is O(1) amortized per
+            // scan, not O(n) per candidate, since its whitespace-trim only ever runs for a
+            // `?`-preceded candidate and the whitespace runs before distinct `?` positions
+            // are disjoint. The real reason: `is_char_literal_quote` also disambiguates a
+            // genuine ternary (`flag?'a'`) from a char literal, returning `false` for the
+            // ternary case — swapping it in would *narrow* this gate and re-admit that quote
+            // to `nested_span_len`, reopening the wrong-trust direction #1047 round 2 closed.
+            // Treating every unspaced `?`-predecessor as non-opening here (real char literal
+            // or not) is strictly conservative instead: it only ever widens which candidates
+            // fall through to plain brace counting, never regressing below this function's
+            // pre-#1047 baseline (see the round-2 lexical-gate doc above).
             let is_regex_or_char_literal_quote = matches!(prev, Some('/' | '?'));
             if (ch == '\'' || ch == '"')
                 && !is_regex_or_char_literal_quote
@@ -1025,6 +1186,174 @@ mod tests {
         assert!(find_ruby_closing_quote_primary(&text[quote_pos + 1..], '"').is_none());
         let literal = read_string_literal(text, quote_pos, ScanSyntax::Ruby).unwrap();
         assert_eq!(&text[literal.content], r"#{x == ?'}");
+    }
+
+    /// #1060 repro 1: a `%r|'|` percent-literal regex inside `#{...}` contains an apostrophe
+    /// that is not a string-opening quote at all — the fallback's span-skip gate must consume
+    /// the whole `%r|...|` construct so this apostrophe never reaches the nested-quote parity
+    /// check, rather than only inspecting the single character before it.
+    #[test]
+    fn read_string_literal_ruby_percent_literal_regex_apostrophe_not_swallowed() {
+        let text = r##"gem "p", require: "#{x =~ %r|'| }", install_if: -> { ENV['CI'] }, x: "q""##;
+        let quote_pos = text.find("\"#{").unwrap();
+        let literal = read_string_literal(text, quote_pos, ScanSyntax::Ruby).unwrap();
+        assert_eq!(&text[literal.content], r"#{x =~ %r|'| }");
+    }
+
+    /// #1060 repro 2: a `%w[a'b]` word-array percent literal, whose apostrophe sits inside the
+    /// bracket delimiter body rather than right after the `%w` opener — the span-skip gate
+    /// must still find and consume the whole construct.
+    #[test]
+    fn read_string_literal_ruby_percent_literal_word_array_apostrophe_not_swallowed() {
+        let text = r##"gem "p", require: "#{ %w[a'b] }", install_if: -> { ENV['CI'] }, x: "q""##;
+        let quote_pos = text.find("\"#{").unwrap();
+        let literal = read_string_literal(text, quote_pos, ScanSyntax::Ruby).unwrap();
+        assert_eq!(&text[literal.content], r"#{ %w[a'b] }");
+    }
+
+    /// #1060 repro 3: a `#` line comment inside `#{...}` containing an apostrophe must be
+    /// skipped up to the next newline, never scanned for a quote.
+    #[test]
+    fn read_string_literal_ruby_hash_comment_apostrophe_not_swallowed() {
+        let text =
+            "gem \"p\", require: \"#{ # don't\n x }\", install_if: -> { ENV['CI'] }, x: \"q\"";
+        let quote_pos = text.find("\"#{").unwrap();
+        let literal = read_string_literal(text, quote_pos, ScanSyntax::Ruby).unwrap();
+        assert_eq!(&text[literal.content], "#{ # don't\n x }");
+    }
+
+    /// #1060 non-regression: `a % b` (spaced modulo) inside `#{...}` must not be misread as a
+    /// `%`-literal opener — the space right after `%` is neither a literal-type letter nor a
+    /// punctuation delimiter, so `percent_literal_end` must reject it.
+    #[test]
+    fn read_string_literal_ruby_percent_modulo_not_misread_as_literal() {
+        let text = r##""#{a % b}""##;
+        let literal = read_string_literal(text, 0, ScanSyntax::Ruby).unwrap();
+        assert_eq!(&text[literal.content], "#{a % b}");
+    }
+
+    /// impl-critic S1 (#1060 follow-up): `%` immediately after a value token (the identifier
+    /// `x`, here at EXPR_END) is always the modulo/format operator, never a `%`-literal opener
+    /// — `%=` in particular is Ruby's modulo-assign operator, never a literal delimiter.
+    /// Without the `after_value` gate, `percent_literal_end` read any non-alphanumeric byte
+    /// after a bare `%` as a delimiter, so `x%=2` was misread as a `%`-literal delimited by
+    /// `=` and swallowed everything up to the next unrelated `=` — reopening #1060's own
+    /// over-long-span leak via a different trigger. `ENV['a"b']` forces the primary tier to
+    /// abort so this exercises the fallback tier specifically.
+    #[test]
+    fn read_string_literal_ruby_fallback_percent_after_value_is_modulo_not_over_long_leak() {
+        let text = r##"gem "a", source: "#{ ENV['a"b'] + x%=2 }", install_if: -> { ENV['CI'] == "1" }, git: "https://TOKEN@evil""##;
+        let quote_pos = text.find("\"#{").unwrap();
+        assert!(find_ruby_closing_quote_primary(&text[quote_pos + 1..], '"').is_none());
+        let literal = read_string_literal(text, quote_pos, ScanSyntax::Ruby).unwrap();
+        assert_eq!(&text[literal.content], r#"#{ ENV['a"b'] + x%=2 }"#);
+    }
+
+    /// Code-review finding (#1060 follow-up, code-review round): a `%`-literal's own close was
+    /// resetting `prev` to `None` instead of a value marker, so a `%` immediately following it
+    /// (`%w[a]%=2`) was wrongly re-admitted to `percent_literal_end` as a fresh opener,
+    /// reopening S1's leak via a new trigger — `%w[a]` produces a value just as much as an
+    /// identifier does, so the `%` right after it must also resolve as modulo.
+    #[test]
+    fn read_string_literal_ruby_fallback_percent_after_percent_literal_close_is_modulo() {
+        let text = r##"gem "a", source: "#{ ENV['a"b'] + %w[a]%=2 }", install_if: -> { ENV['CI'] == "1" }, git: "https://TOKEN@evil""##;
+        let quote_pos = text.find("\"#{").unwrap();
+        assert!(find_ruby_closing_quote_primary(&text[quote_pos + 1..], '"').is_none());
+        let literal = read_string_literal(text, quote_pos, ScanSyntax::Ruby).unwrap();
+        assert_eq!(&text[literal.content], r#"#{ ENV['a"b'] + %w[a]%=2 }"#);
+    }
+
+    /// Direct unit coverage of the `after_value` gate itself: `%` right after an identifier
+    /// character, with no space at all, must resolve as modulo rather than opening a
+    /// `%`-literal delimited by `y`.
+    #[test]
+    fn find_ruby_closing_quote_fallback_percent_immediately_after_identifier_is_modulo() {
+        let rest = "#{x%y}\" tail";
+        let len = find_ruby_closing_quote_fallback(rest, '"').unwrap();
+        assert_eq!(&rest[..len], "#{x%y}");
+    }
+
+    /// impl-critic S2/S3 (#1060 follow-up, second round): pinned known-gap test, not a
+    /// regression check — a `#` reached only because the parity gate already rejected the
+    /// nested string `ENV["c#d"]` is string CONTENT, not a comment, but this scanner cannot
+    /// tell code from string content at this point (no predecessor test separates `x# comment`
+    /// from `ENV["c#d"]`, since both have a value predecessor). Verified against a Ruby/Prism
+    /// oracle: gating `#` on `after_value` to fix this one case costs ~2193 new over-long
+    /// (leak-direction) errors elsewhere across 86k valid-Ruby cases, against only 406 residual
+    /// if `#` stays ungated — so `#` is deliberately left ungated, and this construct
+    /// truncates the literal early (the safer failure direction) instead. See the `%`/`#`
+    /// branch comment in `find_ruby_closing_quote_fallback` and this module's residual-gap doc
+    /// on `nested_span_len`, which lists this beside heredocs.
+    #[test]
+    fn read_string_literal_ruby_fallback_hash_in_rejected_nested_string_is_a_documented_residual_gap()
+     {
+        let text = r##"gem "a", source: "#{ ENV['a"b'] + ENV["c#d"].map { |v|
+  v } + "z" }", git: "ok""##;
+        let quote_pos = text.find("\"#{").unwrap();
+        assert!(find_ruby_closing_quote_primary(&text[quote_pos + 1..], '"').is_none());
+        let literal = read_string_literal(text, quote_pos, ScanSyntax::Ruby).unwrap();
+        let full_value = r#"#{ ENV['a"b'] + ENV["c#d"].map { |v|
+  v } + "z" }"#;
+        let resolved = &text[literal.content];
+        // Truncates before the true end (the safer, non-leaking direction) rather than
+        // resolving the full interpolation.
+        assert!(resolved.len() < full_value.len());
+        assert!(full_value.starts_with(resolved));
+    }
+
+    /// impl-critic M1 (#1060 follow-up): `%s` (symbol literal) is Ruby's own type-letter set
+    /// but was missing from the allowlist — exact mirror of repro 1's `%r` case.
+    #[test]
+    fn read_string_literal_ruby_percent_literal_symbol_apostrophe_not_swallowed() {
+        let text = r##"gem "p", require: "#{x =~ %s|'| }", install_if: -> { ENV['CI'] }, x: "q""##;
+        let quote_pos = text.find("\"#{").unwrap();
+        let literal = read_string_literal(text, quote_pos, ScanSyntax::Ruby).unwrap();
+        assert_eq!(&text[literal.content], r"#{x =~ %s|'| }");
+    }
+
+    /// impl-critic M1 (#1060 follow-up): `%x` (command literal) was also missing from the
+    /// allowlist — exact mirror of repro 1's `%r` case.
+    #[test]
+    fn read_string_literal_ruby_percent_literal_command_apostrophe_not_swallowed() {
+        let text = r##"gem "p", require: "#{x =~ %x|'| }", install_if: -> { ENV['CI'] }, x: "q""##;
+        let quote_pos = text.find("\"#{").unwrap();
+        let literal = read_string_literal(text, quote_pos, ScanSyntax::Ruby).unwrap();
+        assert_eq!(&text[literal.content], r"#{x =~ %x|'| }");
+    }
+
+    /// Direct unit coverage of [`percent_literal_end`]: a bracket-delimited `%`-literal nests
+    /// its own delimiter type, so an inner `[`/`]` pair does not close the literal early.
+    #[test]
+    fn percent_literal_end_handles_nested_brackets() {
+        let rest = "%w[a[b]c] tail";
+        let end = percent_literal_end(rest, 0).unwrap();
+        assert_eq!(&rest[..end], "%w[a[b]c]");
+    }
+
+    /// Direct unit coverage of [`percent_literal_end`]: a bare `%<delim>` literal with no
+    /// type-letter prefix is still recognized.
+    #[test]
+    fn percent_literal_end_bare_delimiter_without_type_letter() {
+        let rest = "%(hello world) tail";
+        let end = percent_literal_end(rest, 0).unwrap();
+        assert_eq!(&rest[..end], "%(hello world)");
+    }
+
+    /// Code-review finding, low severity (#1060 follow-up, code-review round): a `\`-delimited
+    /// `%`-literal (`%\...\`, rare/unidiomatic but syntactically permitted — Ruby allows any
+    /// non-alphanumeric, non-whitespace delimiter) must still close on its own delimiter rather
+    /// than always having it consumed as an escape.
+    #[test]
+    fn percent_literal_end_backslash_delimiter_closes() {
+        let rest = r"%\a\ tail";
+        let end = percent_literal_end(rest, 0).unwrap();
+        assert_eq!(&rest[..end], r"%\a\");
+    }
+
+    /// Direct unit coverage of [`percent_literal_end`]'s modulo-operator guard.
+    #[test]
+    fn percent_literal_end_rejects_spaced_percent() {
+        assert!(percent_literal_end("% b", 0).is_none());
     }
 
     /// Direct unit coverage of the naive last-resort tier: pins that it resolves the same,
