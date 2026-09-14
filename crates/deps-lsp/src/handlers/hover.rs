@@ -100,6 +100,7 @@ mod tests {
     use super::*;
     use crate::document::ServerState;
     use crate::test_utils::test_helpers::create_test_client_and_config;
+    #[cfg(any(feature = "cargo", feature = "npm"))]
     use deps_core::EcosystemId;
     use tower_lsp_server::ls_types::{
         Position, TextDocumentIdentifier, TextDocumentPositionParams,

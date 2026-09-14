@@ -935,9 +935,13 @@ pub(crate) fn merge_registry_fetch_result(
 
 #[cfg(test)]
 mod tests {
+    // Only `pypi_tests`/`pypi_yanked_key_guard_tests` below consume these.
+    #[cfg(feature = "pypi")]
     use super::super::state::DocumentState;
     use super::*;
+    #[cfg(feature = "pypi")]
     use deps_core::DependencyOutcomes;
+    #[cfg(feature = "pypi")]
     use deps_core::EcosystemId;
     use deps_core::parser::DependencySource;
 

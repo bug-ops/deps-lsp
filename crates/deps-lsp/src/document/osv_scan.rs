@@ -737,6 +737,13 @@ fn apply_live_fix_target_statuses(
 #[cfg(test)]
 mod tests {
     use super::super::resolved::collect_in_use_versions;
+    // Only `license_prefetch_tests`' dart/swift/gradle/deno-gated cases consume this.
+    #[cfg(any(
+        feature = "dart",
+        feature = "swift",
+        feature = "gradle",
+        feature = "deno"
+    ))]
     use super::super::state::DocumentState;
     use super::*;
     use deps_core::VersionReq;

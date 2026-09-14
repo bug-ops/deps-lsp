@@ -149,8 +149,10 @@ pub(crate) async fn reparse_open_documents(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "cargo")]
     use crate::document::DocumentState;
     use crate::test_utils::test_helpers::create_test_client_and_config;
+    #[cfg(feature = "cargo")]
     use deps_core::EcosystemId;
 
     /// A `scope` that matches no open document must be a quiet no-op.

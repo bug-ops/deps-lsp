@@ -6,6 +6,8 @@
 use deps_core::EcosystemId;
 use deps_lsp::config::{DepsConfig, LoadingIndicatorConfig};
 use deps_lsp::document::{DocumentState, LoadingState, ServerState};
+// Only the cargo-gated tests below wrap `ServerState` in an `Arc`.
+#[cfg(feature = "cargo")]
 use std::sync::Arc;
 use std::time::Duration;
 

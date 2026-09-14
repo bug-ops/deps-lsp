@@ -518,6 +518,7 @@ impl LspClient {
     }
 
     /// Open a text document.
+    #[allow(dead_code)] // Used in lsp_integration tests; only cargo-gated in notification_ordering
     pub(crate) fn did_open(&mut self, uri: &str, language_id: &str, text: &str) {
         self.send(&json!({
             "jsonrpc": "2.0",

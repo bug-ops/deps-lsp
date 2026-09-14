@@ -1227,11 +1227,16 @@ pub async fn ensure_document_loaded(
 #[cfg(test)]
 mod tests {
     use super::super::diff::drop_cache_for_forced_refetch;
+    #[cfg(feature = "cargo")]
     use super::super::fetch::FetchResult;
     use super::*;
     use deps_core::EcosystemId;
+    #[cfg(feature = "cargo")]
     use deps_core::Registry;
     use deps_core::RemovalStatus;
+    // Only the cargo-gated tests below sleep or time out on a bare `Duration`
+    // (go_tests imports its own `tokio::time::Duration` locally instead).
+    #[cfg(feature = "cargo")]
     use std::time::Duration;
 
     /// #796: the dependency-count ceiling applies through the full `deps-lsp`
@@ -1640,6 +1645,11 @@ mod tests {
     /// the permit limit never flips a queued document to `Loading` before its permit
     /// arrives (the exact defect M1 fixed by moving the permit acquisition ahead of
     /// `set_loading()`/`RegistryProgress::start`).
+    ///
+    /// The whole module is gated on `feature = "cargo"`: its sole test overrides the real
+    /// "cargo" ecosystem registration with a fake slow one, so it needs that registration to
+    /// exist to override in the first place.
+    #[cfg(feature = "cargo")]
     mod open_path_semaphore_e2e_tests {
         use super::*;
         use deps_core::ecosystem::BoxFuture;
@@ -1857,7 +1867,6 @@ mod tests {
             }
         }
 
-        #[cfg(feature = "cargo")]
         #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
         #[allow(
             clippy::async_yields_async,
@@ -2015,6 +2024,7 @@ mod tests {
     /// document closed. Calls the real `commit_parsed_document` (not a hand-copied
     /// pruning loop, unlike the sibling tests above) so this actually exercises the
     /// fixed function, not a re-implementation of it.
+    #[cfg(feature = "cargo")]
     #[tokio::test]
     async fn test_licenses_pruned_on_dependency_removal() {
         // See the comment in `test_forced_refetch_total_failure_renders_lookup_failed_not_unknown_package` on why this guard is needed here.

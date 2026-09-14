@@ -10,6 +10,8 @@
 mod common;
 
 use common::LspClient;
+// Only the cargo-gated tests below sleep on a `Duration`.
+#[cfg(feature = "cargo")]
 use std::time::Duration;
 
 /// Verifies notification capture infrastructure works correctly.
