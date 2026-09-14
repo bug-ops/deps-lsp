@@ -4590,4 +4590,91 @@ gem "innocent-gem", install_if: { a: } , source: "https://evil.example.com" }"#;
         apply_paren_call_delta("(((", &mut depth);
         assert_eq!(depth, 0);
     }
+
+    /// Security regression (#1047 leak direction): the fallback pass in
+    /// `deps_core::quote_scan` must be nested-quote-aware, not just brace-depth-aware — a `}`
+    /// inside a cross-type nested string (`ENV['}a"b']`) embedded in an unrelated option's
+    /// interpolated value (`require:`) must not be misread as closing the interpolation, which
+    /// would desync the scanner and leave the real `source:` option unparsed, falling through
+    /// to the public registry instead of resolving to `https://gems.corp/`.
+    #[test]
+    fn test_1047_fallback_nested_brace_in_require_does_not_leak_source() {
+        let gemfile = r##"gem "p", require: "#{ ENV['}a"b']}", source: "https://gems.corp/""##;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(
+            result.dependencies[0].require,
+            Some(r#"#{ ENV['}a"b']}"#.to_string())
+        );
+        match &result.dependencies[0].source {
+            DependencySource::CustomRegistry { url } => {
+                assert_eq!(url, "https://gems.corp/");
+            }
+            other => panic!("expected CustomRegistry, got {other:?}"),
+        }
+    }
+
+    /// Security regression (#1047 truncation direction): same root cause as the leak-direction
+    /// repro above, but the mis-termination lands on the `source:` value's own quote character
+    /// instead — the nested `'}a"b'` string's `}` closes the interpolation early inside the
+    /// `source:` URL itself, truncating it to `https://#{ENV['}a` rather than resolving the
+    /// full custom-registry URL.
+    #[test]
+    fn test_1047_fallback_nested_brace_in_source_url_not_truncated() {
+        let gemfile = r#"source "https://#{ENV['}a"b']}@gems.corp/" do
+  gem "p"
+end"#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        match &result.dependencies[0].source {
+            DependencySource::CustomRegistry { url } => {
+                assert_eq!(url, r#"https://#{ENV['}a"b']}@gems.corp/"#);
+            }
+            other => panic!("expected CustomRegistry, got {other:?}"),
+        }
+    }
+
+    /// Security regression (#1047 follow-up round 2, critic finding W1): a stray regex-literal
+    /// apostrophe in an unrelated option's interpolated value (`require:`), followed later on
+    /// the same line by a `-> { ... }` lambda (real, documented `install_if:` syntax), must not
+    /// be mistaken for a genuine nested string whose "close" is really that lambda's brace —
+    /// which would swallow the real `source:` option and fall through to the public registry.
+    /// Exact repro from the critic; guarded by `quote_scan`'s lexical `/`/`?`-predecessor gate.
+    #[test]
+    fn test_1047_round2_w1_regex_apostrophe_before_install_if_lambda_does_not_leak_source() {
+        let gemfile = r##"gem "p", require: "#{x =~ /'/}", install_if: -> { ENV['CI'] }, source: "https://gems.corp/""##;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(
+            result.dependencies[0].require,
+            Some(r"#{x =~ /'/}".to_string())
+        );
+        match &result.dependencies[0].source {
+            DependencySource::CustomRegistry { url } => {
+                assert_eq!(url, "https://gems.corp/");
+            }
+            other => panic!("expected CustomRegistry, got {other:?}"),
+        }
+    }
+
+    /// Security regression (#1047 follow-up round 2, critic finding W4): a Ruby character
+    /// literal (`?'`) in an unrelated option's interpolated value must not be mistaken for a
+    /// string opener either — same mechanism as W1, different lexical construct triggering the
+    /// same `/`/`?`-predecessor gate.
+    #[test]
+    fn test_1047_round2_w4_char_literal_apostrophe_does_not_leak_source() {
+        let gemfile = r##"gem "p", require: "#{x == ?'}",  install_if: -> { ENV['CI'] }, source: "https://gems.corp/""##;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(
+            result.dependencies[0].require,
+            Some(r"#{x == ?'}".to_string())
+        );
+        match &result.dependencies[0].source {
+            DependencySource::CustomRegistry { url } => {
+                assert_eq!(url, "https://gems.corp/");
+            }
+            other => panic!("expected CustomRegistry, got {other:?}"),
+        }
+    }
 }
