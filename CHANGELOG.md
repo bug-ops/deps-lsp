@@ -44,6 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-go**: `test_get_versions_from_plain_registry_source_unchanged`, `test_complete_versions_unknown_package`, and `test_generate_hover_on_module_path` now run against a mockito server instead of live `proxy.golang.org` (resolves #1034) (#1037)
 - **deps-core**: `capture_tracing_output`/`_at`/`_async`/`_async_at` no longer silently return empty output when an untraced sibling test touches the same tracing callsite first under a shared-process test run (resolves #1006) (#1042)
 - **deps-bundler**: inline option values with same-quote Ruby string interpolation (e.g. `source: "https://#{ENV["TOKEN"]}@..."`) no longer truncate or leak a private source to the public registry (resolves #1041) (#1046)
+- **deps-pypi**: a requirements `-r`/`-c` document-link target is no longer resolved when it's an absolute path (POSIX, or any Windows drive-letter/drive-relative form) — workspace-root containment for `../`-escape targets is also implemented but stays dormant until pypi gains workspace-root discovery (resolves #937) (#1050)
 
 ## [1.0.0] - 2026-09-14
 
