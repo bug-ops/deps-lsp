@@ -88,6 +88,38 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+  feature-matrix:
+    name: Feature Matrix Check
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3  # v1
+        with:
+          components: clippy
+          cache-extra-identifier: feature-matrix
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
+        with:
+          tool: cargo-hack
+
+      - name: Check each feature individually
+        # `clippy` above only lints --all-features, which hides lints that only surface
+        # under a reduced feature set (issue #975) — `--each-feature` is linear in feature
+        # count (41 invocations here), not the 2^n a full --feature-powerset would cost.
+        # `cargo hack clippy` (not `check`) so this catches the same clippy-level lints as
+        # the `clippy` job, just per individual feature. `--no-dev-deps` is required: deps-lsp's
+        # `#[cfg(test)]` test module does not compile under reduced feature sets at all
+        # (pre-existing bug, out of scope here — will be tracked in a follow-up issue) and would
+        # otherwise fail this gate for an unrelated reason.
+        run: cargo hack clippy --workspace --each-feature --no-dev-deps -- -D warnings
+
   doc-and-hygiene:
     name: Doc + Hygiene
     needs: changes
@@ -679,6 +711,7 @@ jobs:
         changes,
         fmt,
         clippy,
+        feature-matrix,
         doc-and-hygiene,
         security,
         test,
@@ -711,6 +744,7 @@ jobs:
           failed=0
           check_job "${{ needs.fmt.result }}" "fmt" || failed=1
           check_job "${{ needs.clippy.result }}" "clippy" || failed=1
+          check_job "${{ needs.feature-matrix.result }}" "feature-matrix" || failed=1
           check_job "${{ needs.doc-and-hygiene.result }}" "doc-and-hygiene" || failed=1
           check_job "${{ needs.security.result }}" "security" || failed=1
           check_job "${{ needs.test.result }}" "test" || failed=1
