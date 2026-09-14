@@ -129,127 +129,40 @@ static SOURCE_BLOCK_SUFFIX: LazyLock<Regex> =
 /// Quote-aware (#1019): the `regex` crate has no backreferences, so a single regex capture group
 /// like `['"]([^'"]+)['"]` stops at the *first* quote character it meets — which fails on a URL
 /// literal containing Ruby string interpolation with a different quote type nested inside, e.g.
-/// `source "https://#{ENV['CREDS']}@gems.contribsys.com/" do`. Scanning by hand with
-/// [`scan_quoted_literal`] tracks only the *outer* quote type, so the nested single quote around
-/// `'CREDS'` is treated as ordinary content instead of a premature closing delimiter.
-// `prefix_end` is a regex match end and `consumed` is derived from `char_indices()` plus a
-// char's UTF-8 length — both always land on char boundaries.
+/// `source "https://#{ENV['CREDS']}@gems.contribsys.com/" do`. Reads the literal via the shared,
+/// interpolation-aware [`deps_core::quote_scan::read_string_literal`] (#1041: this used to be a
+/// hand-rolled scanner local to this function, duplicating the same interpolation-depth and
+/// nested-quote tracking [`option_string_value`] independently needed for inline option values —
+/// now a single implementation in `deps-core` backs both call sites).
+// `prefix_end` is a regex match end, always a char boundary; `literal.content`/`literal.end`
+// come from `read_string_literal`, likewise always char-boundary bounds.
 #[allow(clippy::string_slice)]
 fn parse_source_block_start(line: &str) -> Option<&str> {
     let prefix_end = SOURCE_BLOCK_PREFIX.find(line)?.end();
     let rest = &line[prefix_end..];
-    let (url, consumed) = scan_quoted_literal(rest)?;
-    // Reject an empty URL (`source "" do`) — correctness-gate finding F6: `scan_quoted_literal`
+    let first = rest.chars().next()?;
+    if first != '\'' && first != '"' {
+        return None;
+    }
+    let literal = deps_core::quote_scan::read_string_literal(
+        rest,
+        0,
+        deps_core::quote_scan::ScanSyntax::Ruby,
+    )?;
+    // Reject an empty URL (`source "" do`) — correctness-gate finding F6: `read_string_literal`
     // itself accepts a zero-length literal (`""`/`''`), but the regex this hand-scan replaced
     // (`['"]([^'"]+)['"]`, one-or-more) never did, so an empty source URL used to fall through
     // this check entirely and stay untracked. Matching that pre-existing behavior here keeps a
     // classification regression out of scope: a `CustomRegistry("")` block is not a plausible
     // real Gemfile shape this fix should newly start accepting.
-    if url.is_empty() {
+    if literal.content.is_empty() {
         return None;
     }
-    if SOURCE_BLOCK_SUFFIX.is_match(&rest[consumed..]) {
-        Some(url)
+    if SOURCE_BLOCK_SUFFIX.is_match(&rest[literal.end..]) {
+        Some(&rest[literal.content])
     } else {
         None
     }
-}
-
-/// Scans a single- or double-quoted string literal starting at byte 0 of `s` (`s[0]` must be `'`
-/// or `"`), returning its content and the total byte length consumed (including both quotes).
-/// Tracks only the literal's own *outer* quote character as the closing delimiter — a different
-/// quote type appearing inside (e.g. a single-quoted `ENV['CREDS']` nested via Ruby string
-/// interpolation inside a double-quoted URL) is ordinary content, not a delimiter. The `regex`
-/// crate supports no backreferences, so this can't be expressed as a single regex capture group
-/// (#1019); used only where a full literal must be captured with interpolation-depth tracking,
-/// not where plain quote-aware skipping over unrelated content is enough (see
-/// [`deps_core::quote_scan::CodeSpans`] for that case, e.g. [`apply_bracket_delta`]).
-///
-/// Interpolation-aware (critic finding S1, #1019 follow-up): tracks `#{` … `}` interpolation
-/// spans and suspends the outer-quote-delimiter check for their entire extent, since Ruby
-/// interpolation can nest a string literal using the *same* quote type as the outer literal
-/// (`"https://#{ENV["CREDS"]}@..." do` — a different, "mirror-image" case from the cross-type
-/// nesting `ENV['CREDS']` above; both must be tolerated). Any `{`/`}` seen while already inside
-/// an interpolation span (e.g. a nested hash literal) is tracked too, so the span only truly
-/// closes on its matching `}`.
-///
-/// Nested-string-aware within an interpolation span (correctness-gate finding F2): a `{`/`}`
-/// occurring inside a quoted literal *nested inside* `#{...}` is content of that nested literal,
-/// not an interpolation-depth marker, and must not be counted as one — e.g.
-/// `source "https://#{ENV["A}B"]}@x.com/" do`, where the `}` inside the nested `"A}B"` string
-/// would otherwise drop `interpolation_depth` back to 0 one `}` early; the next `"` (the nested
-/// string's own closing quote) is then misread as the *outer* literal's terminator, truncating
-/// the scan before `SOURCE_BLOCK_SUFFIX` ever sees the real ` do` suffix — the block never opens
-/// and every gem inside falls through to the public registry, the exact #1019 leak class this
-/// function exists to close. While inside such a nested literal, `{`/`}` are ignored entirely
-/// (not tracked, not treated as terminators) until its own matching quote is seen; a backslash
-/// there escapes the next character the same way the depth-0 case below does.
-///
-/// Falls back to a plain (non-nested-quote-aware) rescan on failure (correctness-gate M1,
-/// verified against real Ruby, `ruby -c`): nested-quote tracking assumes every `'`/`"` inside
-/// `#{...}` opens a *string*, which is false for a regex literal (`t.sub(/'/, "")`) or a
-/// character literal (`?'`) — there the tracked-open latch never finds a matching close, every
-/// later `}` (including the interpolation's real terminator) is swallowed while latched, and the
-/// scan runs off the end returning `None` for input that is valid Ruby and worked before F2. The
-/// plain rescan (interpolation-depth-only, no nested-quote awareness — `main`'s pre-F2 behavior)
-/// is tried only when the first pass fails, so F2's nested-string improvement still applies
-/// whenever it correctly identifies a nested string, and this fallback recovers exactly the cases
-/// where it doesn't, without reintroducing F2's own bug for legitimate nested strings.
-fn scan_quoted_literal(s: &str) -> Option<(&str, usize)> {
-    scan_quoted_literal_impl(s, true).or_else(|| scan_quoted_literal_impl(s, false))
-}
-
-/// Core scan behind [`scan_quoted_literal`]; see its doc for the full contract.
-/// `track_nested_quotes` selects between the nested-string-aware pass (F2) and the plain
-/// interpolation-depth-only fallback (M1) — the only difference between the two is whether a
-/// `'`/`"` seen inside an interpolation span is treated as a nested string delimiter at all.
-#[allow(clippy::string_slice)]
-fn scan_quoted_literal_impl(s: &str, track_nested_quotes: bool) -> Option<(&str, usize)> {
-    let mut chars = s.char_indices().peekable();
-    let (_, quote) = chars.next()?;
-    if quote != '\'' && quote != '"' {
-        return None;
-    }
-    let quote_len = quote.len_utf8();
-    let mut interpolation_depth: u32 = 0;
-    let mut nested_quote: Option<char> = None;
-    while let Some((idx, ch)) = chars.next() {
-        if interpolation_depth > 0 {
-            if track_nested_quotes {
-                if let Some(nq) = nested_quote {
-                    if ch == '\\' {
-                        chars.next();
-                    } else if ch == nq {
-                        nested_quote = None;
-                    }
-                    continue;
-                }
-                if ch == '\'' || ch == '"' {
-                    nested_quote = Some(ch);
-                    continue;
-                }
-            }
-            match ch {
-                '{' => interpolation_depth += 1,
-                '}' => interpolation_depth -= 1,
-                _ => {}
-            }
-            continue;
-        }
-        if ch == '\\' {
-            chars.next();
-            continue;
-        }
-        if ch == '#' && chars.peek().is_some_and(|&(_, next)| next == '{') {
-            chars.next();
-            interpolation_depth = 1;
-            continue;
-        }
-        if ch == quote {
-            return Some((&s[quote_len..idx], idx + ch.len_utf8()));
-        }
-    }
-    None
 }
 
 /// Builds the key-delimiter portion shared by every Bundler per-gem inline option, matching
@@ -3874,5 +3787,109 @@ gem "innocent-gem", install_if: { a: } , source: "https://evil.example.com" }"#;
         let result = parse_gemfile(gemfile, &test_uri()).unwrap();
         assert_eq!(result.dependencies.len(), 1);
         assert_eq!(result.dependencies[0].source, DependencySource::Registry);
+    }
+
+    /// Security regression (#1041 repro 1): an inline `source:` option value with Ruby
+    /// interpolation nesting the outer literal's own quote type must resolve to the full,
+    /// untruncated URL — mirroring the block-form coverage already in place
+    /// (`test_source_block_url_with_same_type_nested_interpolated_quote_still_opens`) for the
+    /// inline-option path (`option_string_value` -> `deps_core::quote_scan::read_string_literal`),
+    /// which had no interpolation awareness before this fix.
+    #[test]
+    fn test_1041_inline_source_option_with_same_type_nested_interpolated_quote_not_truncated() {
+        let gemfile =
+            r#"gem "sidekiq-pro", source: "https://#{ENV["TOKEN"]}@gems.contribsys.com/""#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        match &result.dependencies[0].source {
+            DependencySource::CustomRegistry { url } => {
+                assert_eq!(url, r#"https://#{ENV["TOKEN"]}@gems.contribsys.com/"#);
+            }
+            other => panic!("expected CustomRegistry, got {other:?}"),
+        }
+    }
+
+    /// Security regression (#1041 repro 2, the #991 leak class): nested same-type interpolation
+    /// in an *unrelated* option's value (`require:`) must not desync the quote/comment scanner
+    /// and swallow a later `source:` option on the same line — before this fix, the inner `#` of
+    /// the nested `#{c}` interpolation was misread as starting a line comment, discarding the
+    /// rest of the line (including `source:`) and silently falling through to the public
+    /// registry.
+    #[test]
+    fn test_1041_nested_interpolation_in_unrelated_option_does_not_leak_source() {
+        let gemfile = r##"gem "p", require: "#{a["b#{c}"]}", source: "https://gems.corp/""##;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(
+            result.dependencies[0].require,
+            Some(r#"#{a["b#{c}"]}"#.to_string())
+        );
+        match &result.dependencies[0].source {
+            DependencySource::CustomRegistry { url } => {
+                assert_eq!(url, "https://gems.corp/");
+            }
+            other => panic!("expected CustomRegistry, got {other:?}"),
+        }
+    }
+
+    /// Security regression (impl-critic finding S1 on the #1041 fix): a single-quoted Ruby
+    /// literal never interpolates, so an unbalanced `#{` inside one (`require: '#{'`) must not
+    /// be treated as opening an interpolation span — doing so misreads the literal's own very
+    /// next `'` as still inside an unclosed interpolation, making the whole `require` value
+    /// look unterminated, absorbing the rest of the line (the real `source:` option included)
+    /// into it, and silently falling through to the public registry. Exact repro from the
+    /// critic (`ruby -c` confirmed valid).
+    #[test]
+    fn test_1041_critic_s1_single_quoted_unbalanced_interpolation_does_not_leak_source() {
+        let gemfile = r"gem 'p', require: '#{', source: 'https://gems.corp/'";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].require, Some("#{".to_string()));
+        match &result.dependencies[0].source {
+            DependencySource::CustomRegistry { url } => {
+                assert_eq!(url, "https://gems.corp/");
+            }
+            other => panic!("expected CustomRegistry, got {other:?}"),
+        }
+    }
+
+    /// Security regression (impl-critic finding S1 on the #1041 fix): the same single-quoted,
+    /// no-interpolation rule applies when the unbalanced `#{` sits in the `source:` value
+    /// itself — the literal `#{` is just two ordinary characters of the URL, not the start of
+    /// an interpolation span, and the source must still resolve (to that literal value) rather
+    /// than looking unterminated.
+    #[test]
+    fn test_1041_critic_s1_single_quoted_source_with_hash_brace_content() {
+        let gemfile = r"gem 'p', source: 'https://gems.corp/#{', platforms: :ruby";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        match &result.dependencies[0].source {
+            DependencySource::CustomRegistry { url } => {
+                assert_eq!(url, "https://gems.corp/#{");
+            }
+            other => panic!("expected CustomRegistry, got {other:?}"),
+        }
+    }
+
+    /// Security regression (impl-critic finding S2 on the #1041 fix): a regex-literal apostrophe
+    /// inside an *unrelated* option's interpolated value (`require:`) must not latch onto a
+    /// *later, unrelated* apostrophe elsewhere on the line (here, inside the `source:` URL
+    /// itself) and swallow everything in between — including the real `source:` option — as
+    /// misidentified "nested string content". Exact repro from the critic.
+    #[test]
+    fn test_1041_critic_s2_regex_apostrophe_does_not_swallow_later_source_option() {
+        let gemfile = r##"gem "p", require: "#{x =~ /'/}", source: "https://a'b}c", extra: "d""##;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(
+            result.dependencies[0].require,
+            Some(r"#{x =~ /'/}".to_string())
+        );
+        match &result.dependencies[0].source {
+            DependencySource::CustomRegistry { url } => {
+                assert_eq!(url, "https://a'b}c");
+            }
+            other => panic!("expected CustomRegistry, got {other:?}"),
+        }
     }
 }

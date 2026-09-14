@@ -12,11 +12,15 @@
 //!
 //! The skip-scan delegates all escape-aware closing-quote search to
 //! [`crate::fallback_completion::find_closing_quote`] rather than re-implementing it, so
-//! there is exactly one escape rule in the workspace. **Use `find_closing_quote` directly**
-//! when a string is already known to be open and only its closing quote is needed (e.g.
-//! completing inside a string the cursor sits in). **Use this module** when comments are
-//! also in play, or when the string's start position is not already known and must be
-//! found by scanning.
+//! there is exactly one escape rule in the workspace, with one exception: a
+//! [`crate::quote_scan::ScanSyntax::Ruby`] `"..."` literal is scanned via a dedicated `#{...}`
+//! interpolation-aware helper instead, since Ruby interpolation can nest a string literal using
+//! the same quote type as the outer literal — see [`crate::quote_scan::read_string_literal`]'s
+//! doc for the full contract and [`crate::quote_scan::ScanSyntax::Ruby`]'s doc for which
+//! literals this applies to. **Use `find_closing_quote` directly** when a string is already
+//! known to be open and only its closing quote is needed (e.g. completing inside a string the
+//! cursor sits in). **Use this module** when comments are also in play, or when the string's
+//! start position is not already known and must be found by scanning.
 
 use crate::fallback_completion::find_closing_quote;
 use std::ops::Range;
@@ -42,8 +46,11 @@ use std::ops::Range;
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanSyntax {
-    /// Ruby (Gemfile) syntax: `"` and `'` string literals, both backslash-escaped;
-    /// `#` starts a line comment.
+    /// Ruby (Gemfile) syntax: `"` and `'` string literals, both backslash-escaped; `#` starts
+    /// a line comment. Only `"..."` literals interpolate (`#{...}`, tracked by
+    /// [`read_string_literal`] via a dedicated helper) — Ruby's `'...'` literals never
+    /// interpolate, so `#{` inside one is just literal text, scanned like any other
+    /// backslash-escaped content.
     Ruby,
     /// Swift (Package.swift) syntax: `"` string literals, backslash-escaped; `//` starts
     /// a line comment and `/* ... */` a block comment.
@@ -212,12 +219,117 @@ fn scan_spans(text: &str, syntax: ScanSyntax) -> Vec<Span> {
     spans
 }
 
+/// Finds the byte length of a Ruby string literal's content, given `rest` (the text
+/// immediately after the opening `quote`) — interpolation-aware, unlike the generic
+/// [`find_closing_quote`], since Ruby's `#{...}` interpolation can embed a nested string
+/// literal using the *same* quote type as the outer literal (`"https://#{ENV["CREDS"]}@..."`
+/// — closing on the first same-type quote, as a naive scan would, truncates the value right
+/// there (#1041)).
+///
+/// Tracks `#{` … `}` interpolation-depth (as a counter, so nested interpolation like
+/// `#{a["b#{c}"]}` closes correctly) and suspends the outer-quote check for its extent. While
+/// inside an interpolation span, a `'`/`"` opens a *nested* string whose own `{`/`}` are then
+/// content, not depth markers (`#{ENV["A}B"]}`) — otherwise the nested string's `}` would drop
+/// `interpolation_depth` early and its own closing quote would be misread as the outer
+/// literal's terminator (the same #1041 leak class via a different construct). Falls back to
+/// a plain, interpolation-depth-only rescan (no nested-quote tracking) when the nested-quote
+/// pass finds no close: nested-quote tracking assumes every quote inside `#{...}` opens a
+/// string, which is false for a regex literal (`/'/`) or a character literal (`?'`) — there
+/// the tracked-open latch would swallow every later `}`, including the interpolation's real
+/// terminator.
+fn find_ruby_closing_quote(rest: &str, quote: char) -> Option<usize> {
+    find_ruby_closing_quote_impl(rest, quote, true)
+        .or_else(|| find_ruby_closing_quote_impl(rest, quote, false))
+}
+
+/// Core scan behind [`find_ruby_closing_quote`]; `track_nested_quotes` selects between the
+/// nested-string-aware pass and the plain interpolation-depth-only fallback — see that
+/// function's doc for why both passes exist.
+///
+/// Security regression (critic finding S2, #1041 follow-up): a cross-type nested "string"
+/// (`nested_quote` holding the *other* quote character from `quote`) that is actually a regex
+/// or character literal's lone quote-shaped byte (`/'/`, `?'`) does not reliably fail to close
+/// — if a *later, unrelated* occurrence of that same character happens to appear further down
+/// `rest` (e.g. inside a completely different option's value on the same line), the latch
+/// closes there instead, silently absorbing everything in between (including a real `}` that
+/// should have ended the interpolation) as swallowed "nested string content". The result was a
+/// `Some` too far past the literal's true end rather than a clean scan failure, so the
+/// `find_ruby_closing_quote` fallback (triggered only by `None`) never engaged. Guarded here by
+/// aborting the nested-quote-aware pass — returning `None` so the fallback pass takes over —
+/// the moment `quote` itself (the *outer* literal's own delimiter) is seen while a
+/// *cross-type* nested quote is still open: a well-formed cross-type nested string (`ENV['X']`
+/// inside a `"..."` literal) has no structural reason to contain the outer literal's own quote
+/// character before its own close, so seeing one there is treated as proof the nested-quote
+/// assumption doesn't hold. This can never misfire for a *same-type* nested string
+/// (`nq == quote`): there, any occurrence of `quote` always satisfies the `ch == nq` arm first
+/// and closes the nested span normally instead of reaching this check.
+fn find_ruby_closing_quote_impl(
+    rest: &str,
+    quote: char,
+    track_nested_quotes: bool,
+) -> Option<usize> {
+    let mut chars = rest.char_indices().peekable();
+    let mut interpolation_depth: u32 = 0;
+    let mut nested_quote: Option<char> = None;
+    while let Some((idx, ch)) = chars.next() {
+        if interpolation_depth > 0 {
+            if track_nested_quotes {
+                if let Some(nq) = nested_quote {
+                    if ch == '\\' {
+                        chars.next();
+                    } else if ch == nq {
+                        nested_quote = None;
+                    } else if ch == quote {
+                        return None;
+                    }
+                    continue;
+                }
+                if ch == '\'' || ch == '"' {
+                    nested_quote = Some(ch);
+                    continue;
+                }
+            }
+            match ch {
+                '{' => interpolation_depth += 1,
+                '}' => interpolation_depth -= 1,
+                _ => {}
+            }
+            continue;
+        }
+        if ch == '\\' {
+            chars.next();
+            continue;
+        }
+        if ch == '#' && chars.peek().is_some_and(|&(_, next)| next == '{') {
+            chars.next();
+            interpolation_depth = 1;
+            continue;
+        }
+        if ch == quote {
+            return Some(idx);
+        }
+    }
+    None
+}
+
 /// Reads the string literal starting at `text[at]`, per `syntax`'s quoting rules.
 ///
 /// `text[at]` must be a delimiter character for `syntax` — a precondition, not validated
 /// here; callers only reach this from a position already known to be an opening quote
 /// (a caller-known-open-quote position, or a delimiter [`is_code_byte`]/`scan_spans` found
 /// by scanning). Returns `None` if the literal never closes before `text` ends.
+///
+/// A `ScanSyntax::Ruby` literal is scanned via a dedicated interpolation-aware helper only
+/// when `quote == '"'` — Ruby's `'...'` literals never interpolate (`'#{x}'` is the literal
+/// four-character-plus text `#{x}`, not an expression), so treating `#{` specially inside one
+/// would misparse valid Ruby (critic finding S1, #1041 follow-up): an unbalanced `#{` in a
+/// single-quoted value (e.g. `require: '#{'`) has no matching `}` to close on, so the
+/// interpolation-aware scan never finds the literal's real (very next) closing `'`, and the
+/// resulting "unterminated literal" absorbs the rest of the line — including any later
+/// `source:` option — into one string span, the same public-registry-leak direction #1041
+/// itself fixes, via a different construct. Single-quoted Ruby literals, and Swift/TOML (which
+/// have no interpolation syntax at all), keep the plain escape-aware (Swift, Ruby's `'...'`,
+/// and TOML's `"..."`) or verbatim (TOML's `'...'`) scan via the generic [`find_closing_quote`].
 ///
 /// # Examples
 ///
@@ -227,16 +339,21 @@ fn scan_spans(text: &str, syntax: ScanSyntax) -> Vec<Span> {
 /// let text = r#"path: 'vendor/git: "cache"', git: "https://real.example/r""#;
 /// let literal = read_string_literal(text, 6, ScanSyntax::Ruby).unwrap();
 /// assert_eq!(&text[literal.content], r#"vendor/git: "cache""#);
+///
+/// // Ruby interpolation nesting the outer literal's own quote type (#1041).
+/// let text = r#"source: "https://#{ENV["TOKEN"]}@gems.corp/""#;
+/// let literal = read_string_literal(text, 8, ScanSyntax::Ruby).unwrap();
+/// assert_eq!(&text[literal.content], r#"https://#{ENV["TOKEN"]}@gems.corp/"#);
 /// ```
 #[must_use]
 pub fn read_string_literal(text: &str, at: usize, syntax: ScanSyntax) -> Option<StringLiteral> {
     let quote = text.get(at..)?.chars().next()?;
     let content_start = at + quote.len_utf8();
     let rest = text.get(content_start..)?;
-    let content_len = if is_escaped(syntax, quote) {
-        find_closing_quote(rest, quote)?
-    } else {
-        rest.find(quote)?
+    let content_len = match syntax {
+        ScanSyntax::Ruby if quote == '"' => find_ruby_closing_quote(rest, quote)?,
+        _ if is_escaped(syntax, quote) => find_closing_quote(rest, quote)?,
+        _ => rest.find(quote)?,
     };
     let content_end = content_start + content_len;
     Some(StringLiteral {
@@ -461,6 +578,88 @@ mod tests {
         let text = r"'C:\Users\x'";
         let literal = read_string_literal(text, 0, ScanSyntax::Toml).unwrap();
         assert_eq!(&text[literal.content], r"C:\Users\x");
+    }
+
+    #[test]
+    fn read_string_literal_ruby_interpolation_same_type_nested_quote_not_truncated() {
+        // #1041: a naive scan closes on the first same-type quote it meets, which sits
+        // inside the `#{...}` interpolation span here, truncating the value.
+        let text = r#""https://#{ENV["TOKEN"]}@gems.corp/""#;
+        let literal = read_string_literal(text, 0, ScanSyntax::Ruby).unwrap();
+        assert_eq!(
+            &text[literal.content],
+            r#"https://#{ENV["TOKEN"]}@gems.corp/"#
+        );
+    }
+
+    #[test]
+    fn read_string_literal_ruby_nested_interpolation_closes_correctly() {
+        // #1041 repro 2: interpolation-depth must be a counter, not a boolean, so a nested
+        // `#{c}` inside the outer `#{a["b#{c}"]}` doesn't close the span one `}` early.
+        let text = r##""#{a["b#{c}"]}""##;
+        let literal = read_string_literal(text, 0, ScanSyntax::Ruby).unwrap();
+        assert_eq!(&text[literal.content], r#"#{a["b#{c}"]}"#);
+    }
+
+    #[test]
+    fn read_string_literal_ruby_interpolation_regex_apostrophe_falls_back_correctly() {
+        // A `'` inside `#{...}` that isn't a string delimiter (here, a regex literal) must not
+        // latch the nested-quote tracker open forever — the fallback rescan recovers this.
+        let text = r##""#{x =~ /'/}""##;
+        let literal = read_string_literal(text, 0, ScanSyntax::Ruby).unwrap();
+        assert_eq!(&text[literal.content], r"#{x =~ /'/}");
+    }
+
+    /// Security regression (critic finding S1, #1041 follow-up): a regex/char-literal quote
+    /// stranded inside `#{...}` can also close the nested-quote latch on a *later, unrelated*
+    /// occurrence of the same character further down the text (here, another double-quoted
+    /// value's own delimiter), rather than failing to close at all — in which case the
+    /// nested-quote-aware pass returns a `Some` that reaches (and swallows) past the literal's
+    /// true end, instead of the clean `None` the `.or_else` fallback in
+    /// [`find_ruby_closing_quote`] is triggered by. Guarded in `find_ruby_closing_quote_impl` by
+    /// aborting the moment the *outer* delimiter is seen while a *cross-type* nested quote is
+    /// still open.
+    #[test]
+    fn read_string_literal_ruby_interpolation_regex_apostrophe_does_not_swallow_later_value() {
+        let text = r##""#{x =~ /'/}", "https://a'b}c""##;
+        let literal = read_string_literal(text, 0, ScanSyntax::Ruby).unwrap();
+        assert_eq!(&text[literal.content], r"#{x =~ /'/}");
+    }
+
+    /// Security regression (critic finding S1, #1041 follow-up): Ruby's `'...'` literals never
+    /// interpolate (`'#{x}'` is the literal text `#{x}`, not an expression), so an unbalanced
+    /// `#{` inside a single-quoted value (which has no matching `}` to close on) must not be
+    /// treated as opening an interpolation span — that misreads the literal's own very next `'`
+    /// as still being inside an unclosed interpolation, making the whole literal look
+    /// unterminated.
+    #[test]
+    fn read_string_literal_ruby_single_quoted_never_interpolates() {
+        let text = r"'#{'";
+        let literal = read_string_literal(text, 0, ScanSyntax::Ruby).unwrap();
+        assert_eq!(&text[literal.content], "#{");
+    }
+
+    /// Regression (critic finding M3, #1041 follow-up): a single-quoted Ruby literal containing
+    /// a same-type nested quote is not itself a case interpolation-awareness applies to (there
+    /// is no interpolation to nest inside), so it must keep resolving via the plain
+    /// escape-aware path exactly as before this fix.
+    #[test]
+    fn read_string_literal_ruby_single_quoted_ignores_hash_brace_content() {
+        let text = r"'a #{ b'";
+        let literal = read_string_literal(text, 0, ScanSyntax::Ruby).unwrap();
+        assert_eq!(&text[literal.content], "a #{ b");
+    }
+
+    /// Known limitation, pinned (critic finding M1, #1041 follow-up): an unterminated `#{`
+    /// interpolation (invalid Ruby — `ruby -c` rejects it) has no matching `}`, so the
+    /// interpolation-aware scan never finds a close and `read_string_literal` reports the
+    /// literal as unterminated. Acceptable since the input isn't valid Ruby to begin with; pinned
+    /// here so a future change to this area doesn't silently alter the (documented) behavior for
+    /// malformed input.
+    #[test]
+    fn read_string_literal_ruby_unterminated_interpolation_is_none() {
+        let text = r##""#{""##;
+        assert!(read_string_literal(text, 0, ScanSyntax::Ruby).is_none());
     }
 
     #[test]
