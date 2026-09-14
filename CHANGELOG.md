@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-09-14
+
+First stable release. All six original "1.0.0 stabilization" milestone entry criteria (B1, B3-B6,
+`constitution.md` post-1.0 policy) plus the emergent feature-matrix follow-ups (#975, #998, #1000)
+are closed. The B2 calendar gate ("one full minor cycle with zero pre-1.0 Breaking entries") was
+consciously waived: this cycle still carries two pre-1.0 breaking changes (see Removed, below).
+From this release onward, `specs/constitution.md` principle 8's post-1.0 breaking-change policy
+(major version bump per crate, a labeled "Breaking" CHANGELOG entry, `cargo-semver-checks` as the
+CI catch-net) is in effect.
+
 ### Added
 - **deps-core**: `LockFileCache::with_capacity` and `DEFAULT_MAX_CACHED_LOCKFILES` — a custom-capacity constructor and the new default entry-count bound (resolves #962) (#971)
 
@@ -963,7 +973,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TLS enforced via rustls
 - cargo-deny configured for vulnerability scanning
 
-[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/bug-ops/deps-lsp/compare/v0.14.0...v1.0.0
 [0.14.0]: https://github.com/bug-ops/deps-lsp/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/bug-ops/deps-lsp/compare/v0.12.1...v0.13.0
 [0.12.1]: https://github.com/bug-ops/deps-lsp/compare/v0.12.0...v0.12.1

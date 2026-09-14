@@ -12,8 +12,8 @@ deps-lsp provides comprehensive LSP support for 14 package ecosystems:
 | **npm** | JavaScript/TypeScript | `package.json` | `package-lock.json`, `pnpm-lock.yaml` | Hover, inlay hints, completion, code actions, diagnostics, code lens, custom/private registry resolution via `.npmrc`, pnpm workspace catalog (`catalog:`/`catalog:<name>`) resolution via `pnpm-workspace.yaml` (see below) |
 | **PyPI** | Python | `pyproject.toml`, `requirements.txt`, `constraints.txt` (also recognized under a `requirements/` directory, e.g. `requirements/base.txt`) | `poetry.lock`, `uv.lock` | Hover with PEP 508 environment marker display ("Active when: `<marker>`"), inlay hints, completion, code actions, diagnostics, code lens, document links for `-r`/`-c`/`--requirement`/`--constraint` file references, private/custom index resolution via `--index-url`/`--extra-index-url`, Poetry `[[tool.poetry.source]]`, and uv `[tool.uv.index]`/`[tool.uv.sources]` (see below) |
 | **Go** | Go | `go.mod` | `go.sum` | Hover, inlay hints, completion, code actions, diagnostics, code lens, pseudo-version support, `$GOENV` `GOPROXY`/`GOPRIVATE` proxy-chain resolution (see below) |
-| **Bundler** | Ruby | `Gemfile` | `Gemfile.lock` | Hover, inlay hints, completion, code actions, diagnostics, code lens |
-| **Dart** | Dart | `pubspec.yaml` | `pubspec.lock` | Hover with corrected version ordering (prereleases sort below base release — see below), inlay hints, completion, code actions, diagnostics, code lens, YAML anchor/alias resolution for whole dependency sections and `environment:` (see below) |
+| **Bundler** | Ruby | `Gemfile` | `Gemfile.lock` | Hover, inlay hints, completion, code actions, diagnostics, code lens, custom-source classification (`source`/`git`/`path` blocks and per-gem options, modern and legacy hash-rocket syntax — see below) |
+| **Dart** | Dart | `pubspec.yaml` | `pubspec.lock` | Hover with corrected version ordering (prereleases sort below base release — see below), inlay hints, completion, code actions, diagnostics, code lens, YAML anchor/alias resolution for whole dependency sections and `environment:`, `hosted:` custom-registry classification (see below) |
 | **Maven** | Java | `pom.xml` | `maven-metadata.xml` (CDN) | Hover with corrected version ordering (numeric segments outrank qualifiers, prereleases sort below base release), inlay hints, completion, code actions, diagnostics, code lens (property-versioned dependencies not covered — see below) |
 | **Gradle** | Kotlin/Groovy | `build.gradle`, `build.gradle.kts`, `gradle/libs.versions.toml` | — | Hover with corrected version ordering (same as Maven), inlay hints, completion, code actions, diagnostics, code lens (variable/catalog-versioned dependencies not covered — see below), variable resolution (`gradle.properties`) |
 | **Composer** | PHP | `composer.json` | `composer.lock` | Hover, inlay hints, completion, code actions, diagnostics, code lens (requirement matching and "latest version" selection both use corrected stability-qualifier ordering — see below) |
@@ -132,13 +132,15 @@ workspace-declared registry index (the `registry`/`registry-index` alias path, o
 `[source]` mirror) is checked against this setting before it is ever fetched — a
 hostile cloned repository can write both, and this LSP parses on file open, before
 any build runs. This setting is shared with npm's `.npmrc` resolution, PyPI's
-custom-index resolution, and NuGet's `NuGet.Config` resolution below (one
-process-wide `HttpCache` policy governs every ecosystem's workspace-declared
-registry fetches — see
-[npm Custom/Private Registries](#npm-customprivate-registries),
-[PyPI Custom/Private Indexes](#pypi-customprivate-indexes), and
-[NuGet Private/Custom Feeds](#nuget-privatecustom-feeds) for what that sharing
-means in practice). Three values:
+custom-index resolution, NuGet's `NuGet.Config` resolution below, Go's `GOPROXY`
+chain, and GitLab CI/CD's self-hosted-instance resolution (one process-wide
+`HttpCache` policy governs every ecosystem's workspace-declared registry fetches —
+see [npm Custom/Private Registries](#npm-customprivate-registries),
+[PyPI Custom/Private Indexes](#pypi-customprivate-indexes),
+[NuGet Private/Custom Feeds](#nuget-privatecustom-feeds),
+[Go GOPROXY/GOPRIVATE Support](#go-goproxygoprivate-support), and
+[GitLab CI/CD Self-Hosted Instances](#gitlab-cicd-self-hosted-instances) for what
+that sharing means in practice). Three values:
 
 | Value | Behavior |
 |-------|----------|
@@ -157,7 +159,12 @@ dependency line). This diagnostic is not Cargo-specific (issue #925): npm's
 `source =`/uv `index =` resolution, and NuGet's `NuGet.Config`
 `<packageSources>`/`<packageSourceMapping>` resolution all surface the same
 informational diagnostic on the affected dependency's own line when a declared
-registry is blocked, instead of degrading silently to the public registry.
+registry is blocked, instead of degrading silently to the public registry. Go's
+`GOPROXY` chain and GitLab CI/CD's `registries.gitlab_instance_host`/`component:`
+host resolution (see below) were the last two ecosystems to close this gap
+(issues #967, #968) — every ecosystem with a workspace-declared, policy-gated
+registry host now surfaces the same kind of diagnostic instead of leaving the
+block visible only in the server log.
 
 Beyond that initial URL-string check, `public_only` (and `off`/`all`) is also
 enforced at **connect time**: the address a workspace-declared index's hostname
@@ -514,7 +521,12 @@ turned out invalid.
 setting documented above for Cargo/npm/PyPI. The default public chain
 (`https://proxy.golang.org,direct`) used when `$GOENV` declares no
 `GOPROXY` override is never subject to this gate — it is the same
-ungated public-tier client `deps-go` already uses today.
+ungated public-tier client `deps-go` already uses today. A hop blocked by the
+policy surfaces the same informational diagnostic every other ecosystem's
+blocked registry does (issue #958), naming the blocked host class independently
+of any other invalid hop earlier in the chain — one diagnostic per document,
+since `GOPROXY` is a single config-global declaration rather than a
+per-dependency one.
 
 **Known limitations**:
 - Editing `$GOENV` does not take effect until the affected `go.mod` is next
@@ -716,6 +728,52 @@ now closed, not accepted risk:
   `api.nuget.org` — the typed string is a prefix, not a resolved private
   package name, so this is safe but not feed-aware (mirrors npm's/PyPI's
   identical choice).
+
+### Bundler and Dart Custom/Private Registries (issue #980)
+
+Unlike Cargo/npm/PyPI/Go/NuGet above, `deps-bundler` and `deps-dart` do not fetch
+version data from a declared custom registry — they only *classify* a dependency
+as `DependencySource::CustomRegistry` instead of `Registry` so it stops being
+queried against the public registry under its real name and stops rendering a
+misleading public-registry hover link.
+
+**Bundler (`Gemfile`)**: a `source "<url>" do ... end` block (a comment after
+`do` is tolerated), and the per-gem inline `source:`/`git:`/`path:` options
+(modern `key:` and legacy hash-rocket `:key =>` forms both recognized — see
+below), classify the gems they cover as `CustomRegistry`/`Git`/`Path` instead of
+falling through to `Registry` and leaking the gem's name to rubygems.org. A gem
+with no declared source still resolves against rubygems.org (`Registry`)
+unchanged.
+
+**Dart (`pubspec.yaml`)**: a dependency's `hosted:` value — either the
+`hosted: <url>` shorthand or the `hosted: {name, url}` map form — classifies it
+as `CustomRegistry`, mirroring Bundler's `source "..."` and Cargo's
+`registry = "..."` handling (#248). An explicit `hosted: https://pub.dev` (or its
+legacy `pub.dartlang.org` alias) is recognized as the *default* registry and
+stays `Registry` rather than being misclassified as custom just because
+`hosted:` was written out explicitly.
+
+**Known limitation**: neither ecosystem fetches version data from the declared
+custom source — a `CustomRegistry` dependency gets no hover version list,
+diagnostics, completion, or code lens, the same degraded-but-honest behavior a
+declared-but-unqueried registry has always had, just now applied to the correct
+dependencies instead of silently querying the wrong ones. `suppress_package_url`
+(Bundler's `PackageRendering` impl) hides the rubygems.org hover link for any
+non-`Registry` source, since rendering it would falsely imply the gem is
+published there.
+
+### Bundler: Legacy Hash-Rocket Option Syntax (issues #987, #988, #990)
+
+Ruby's older `:key => value` option syntax is now recognized everywhere the
+modern `key: value` form already was — per-gem `source:`/`git:`/`path:`/`github:`
+options (classification above), `group:`, `require:`, and `platforms:`. A gem
+declared with hash-rocket syntax previously fell through to `Registry` (for the
+routing options) or was silently dropped (for `group:`/`require:`/`platforms:`)
+instead of being recognized. A left word boundary on the key match also stops
+`subgroup:`/`autorequire:`-style keys from being mistaken for `group:`/`require:`.
+`VERSION_PATTERN` additionally tolerates a trailing comment after the closing
+quote (`gem "rails", "~> 7.0" # pinned`), so a version requirement is no longer
+silently dropped just because the line ends with a comment.
 
 ### License Hover
 
@@ -1101,6 +1159,25 @@ render `❌ <version>` on a dependency with no matching diagnostic and no lens �
 in that case is regenerating the lock file, which only the package manager can do, so
 there is nothing for the lens to edit. Unifying the two definitions is tracked as a
 follow-up.
+
+### Swift: Non-GitHub Package Hosts (issues #979, #983, #924)
+
+A registry-form `.package(url: "...")` dependency is only ever resolved against
+GitHub's API (`deps-swift` has no other registry client), so `url_to_identity`
+now parses the URL's host and produces a GitHub `owner/repo` identity **only**
+when the host is `github.com`/`www.github.com`. A dependency declared against
+any other host — GitLab, a self-hosted git server, or any private host,
+including `git@host:path` SSH-form URLs — falls back to a visible
+`DependencySource::Git` with the raw URL (matching the existing
+`.branch`/`.revision` behavior) instead of vanishing from parse results or,
+worse, being silently resolved against an unrelated, attacker-nameable GitHub
+repository with the user's `GITHUB_TOKEN` attached to the request.
+
+Because this source is a non-resolvable `Git` dependency, no diagnostic fires
+for it at all — `validate_package_name` accepts non-GitHub URLs (mirroring
+`deps-github-actions`' precedent for non-resolvable sources) instead of showing
+a misleading "name must be a GitHub `owner/repo` identifier" error that implied
+the manifest itself was wrong.
 
 ### Code Action: Fix Vulnerability
 
@@ -1514,6 +1591,22 @@ diagnostic.
 - **Diagnostics**: the package is recognized as resolvable, not reported as "Unknown package" — this is a real action, just not one with a conventional semver release train.
 - **Literal-named tags** (non-version-like names): are now recognized as actual tags (when confirmed by the registry) and qualify for the mutable-ref-pin diagnostic, even though they don't follow the `major.minor.patch` or `v\d+` patterns the parser heuristic would normally detect.
 
+### GitHub Actions: SHA-Pin Comment Tag Freshness (issue #907)
+
+A SHA-pinned step commonly carries a human-readable trailing comment naming the
+tag it was pinned from (`uses: actions/checkout@<sha> # v4`). This comment is
+now accepted at **partial precision** too — `# v6`, `# v2.9` — not just a full
+`major.minor.patch` tag; `is_partial_semver_shaped` (`deps-core`'s `git_ref`
+module) is the acceptance gate, stricter than the git-ref-oriented
+`is_tag_shaped` so free-text comments (a date, an issue number) aren't mistaken
+for a tag.
+
+The comment is treated as a hint, not ground truth: hover, diagnostics, inlay
+hints, and the bulk "update outdated" code lens all resolve the pin's actual
+freshness against `TagIndex.sha_to_tag` (which SHA the tag *really* points at
+today), so a comment that has drifted from the pinned SHA no longer produces a
+false "up to date" result just because the comment text looked current.
+
 ### GitLab CI/CD Self-Hosted Instances
 
 `.gitlab-ci.yml`'s `include:` directive supports two version-pinnable forms:
@@ -1549,6 +1642,14 @@ Left unset, both forms are parsed (the include reference is still shown in hover
 not version-resolved — an informational diagnostic explains why and names this setting
 as the remedy. No default host is ever guessed and no git-remote inference is performed:
 an incorrect guess would show version data from the wrong GitLab instance.
+
+**Blocked by policy is a distinct diagnostic from unset.** When the configured
+instance host (or an inline `component:` host) is rejected by
+`registries.workspace_registries` (issue #967), the diagnostic names the blocked
+host class instead of the generic "set `registries.gitlab_instance_host`" message
+— the setting is already correct in that case, so telling the user to set it would
+be wrong advice. Two `component:` hosts differing only in letter case are grouped
+under one diagnostic, since hostnames are case-insensitive.
 
 **The one host `GITLAB_TOKEN` is ever sent to.** `registries.gitlab_instance_host`
 *replaces*, not joins, `gitlab.com` as the token's destination — a `component:` include's
