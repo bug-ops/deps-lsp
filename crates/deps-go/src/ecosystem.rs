@@ -672,10 +672,30 @@ mod tests {
         assert!(hover.is_none());
     }
 
+    /// #1014: backed by a mockito server (rather than a live `proxy.golang.org` request)
+    /// so this exercises the same `generate_code_actions` / REFACTOR-action-building code
+    /// path deterministically, without network flakiness (the sibling
+    /// `test_generate_diagnostics_basic` documents why that live-network shape is
+    /// otherwise `#[ignore]`d). `DependencySource::Registry` (the default from
+    /// `mock_dependency`) routes through `GoRegistry`'s `Public` tier, so
+    /// `with_public_base_for_test` — not the `WorkspaceDeclared`-tier `with_base` the
+    /// alternate-registry tests above use — is the matching mock entry point.
     #[tokio::test]
     async fn test_generate_code_actions_on_module() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/github.com/gin-gonic/gin/@v/list")
+            .with_status(200)
+            .with_body("v1.9.0\nv1.9.1\nv1.10.0\n")
+            .create_async()
+            .await;
+
         let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = GoEcosystem::new(cache);
+        let registry = Arc::new(GoRegistry::with_public_base_for_test(
+            Arc::clone(&cache),
+            server.url(),
+        ));
+        let ecosystem = GoEcosystem::with_context(registry, GoParseContext::default());
 
         let uri = deps_core::test_util::test_uri("/test/go.mod");
         let parse_result = MockParseResult {
@@ -706,8 +726,27 @@ mod tests {
             )
             .await;
 
-        // Returns actions (open documentation link)
-        assert!(!actions.is_empty());
+        // Actions are registry-derived "update to version" REFACTOR edits, one per
+        // candidate version; exactly one is marked preferred (the highest matching).
+        assert!(
+            actions.iter().any(|action| {
+                action
+                    .edit
+                    .as_ref()
+                    .and_then(|edit| edit.changes.as_ref())
+                    .and_then(|changes| changes.get(&uri))
+                    .is_some_and(|edits| edits.iter().any(|e| e.new_text.contains("v1.10.0")))
+            }),
+            "expected an action whose edit updates the dependency to v1.10.0, got: {actions:?}"
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| action.is_preferred == Some(true))
+                .count(),
+            1,
+            "expected exactly one preferred action, got: {actions:?}"
+        );
     }
 
     #[tokio::test]
