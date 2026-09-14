@@ -631,15 +631,40 @@ mod tests {
         assert!(results.iter().all(|r| r.label.starts_with("4.")));
     }
 
+    /// Sentinel package name for a package that does not exist in the registry (#1038): every
+    /// "unknown package" completion test below shares it, resolved against a mockito 404 via
+    /// [`mock_unknown_package_ecosystem`] rather than the live registry.
+    const UNKNOWN_PACKAGE: &str = "this-package-does-not-exist-12345";
+
+    /// Builds an [`NpmEcosystem`] wired to a mockito server that 404s [`UNKNOWN_PACKAGE`]
+    /// (#1038), plus the `Mock`/`ServerGuard` handles the caller must keep alive and assert
+    /// on — shared by every "unknown package" completion test below to avoid repeating the
+    /// same live-registry-avoiding wiring per test. A regression that makes zero requests
+    /// (and so also produces an empty result) can no longer pass vacuously, since
+    /// `mock.assert_async()` requires the request to actually have been made.
+    async fn mock_unknown_package_ecosystem() -> (mockito::ServerGuard, mockito::Mock, NpmEcosystem)
+    {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", format!("/{UNKNOWN_PACKAGE}").as_str())
+            .with_status(404)
+            .create_async()
+            .await;
+        let registry = NpmRegistry::with_public_base_for_test(
+            Arc::new(deps_core::HttpCache::new()),
+            server.url(),
+        );
+        (
+            server,
+            mock,
+            NpmEcosystem::with_registry(Arc::new(registry)),
+        )
+    }
+
     #[tokio::test]
     async fn test_complete_versions_unknown_package() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = NpmEcosystem::new(cache);
-        let dep = dep_with_source(
-            "this-package-does-not-exist-12345",
-            DependencySource::Registry,
-            0,
-        );
+        let (_server, mock, ecosystem) = mock_unknown_package_ecosystem().await;
+        let dep = dep_with_source(UNKNOWN_PACKAGE, DependencySource::Registry, 0);
         let position = dep.version_range.unwrap().start;
         let parse_result = MockParseResult {
             dependencies: vec![dep],
@@ -654,6 +679,7 @@ mod tests {
                 deps_core::FreshnessSettings::default(),
             )
             .await;
+        mock.assert_async().await;
         assert!(results.is_empty());
     }
 
@@ -994,15 +1020,14 @@ mod tests {
         assert!(diagnostics.is_empty());
     }
 
+    /// #1038: was a live-registry round-trip against [`UNKNOWN_PACKAGE`] asserting only
+    /// `results.is_empty()` — vacuous under a dead network, since a regression that made zero
+    /// requests would produce the same empty result. Now mocked, with `mock.assert_async()`
+    /// requiring the request to actually have been made.
     #[tokio::test]
     async fn test_complete_versions_empty_prefix() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = NpmEcosystem::new(cache);
-        let dep = dep_with_source(
-            "this-package-does-not-exist-12345",
-            DependencySource::Registry,
-            0,
-        );
+        let (_server, mock, ecosystem) = mock_unknown_package_ecosystem().await;
+        let dep = dep_with_source(UNKNOWN_PACKAGE, DependencySource::Registry, 0);
         let position = dep.version_range.unwrap().start;
         let parse_result = MockParseResult {
             dependencies: vec![dep],
@@ -1017,19 +1042,16 @@ mod tests {
                 deps_core::FreshnessSettings::default(),
             )
             .await;
+        mock.assert_async().await;
         // Should not panic, returns empty for unknown package
         assert!(results.is_empty());
     }
 
+    /// #1038: see [`test_complete_versions_empty_prefix`]'s doc for why this is now mocked.
     #[tokio::test]
     async fn test_complete_versions_with_tilde_operator() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = NpmEcosystem::new(cache);
-        let dep = dep_with_source(
-            "this-package-does-not-exist-12345",
-            DependencySource::Registry,
-            0,
-        );
+        let (_server, mock, ecosystem) = mock_unknown_package_ecosystem().await;
+        let dep = dep_with_source(UNKNOWN_PACKAGE, DependencySource::Registry, 0);
         let position = dep.version_range.unwrap().start;
         let parse_result = MockParseResult {
             dependencies: vec![dep],
@@ -1044,18 +1066,15 @@ mod tests {
                 deps_core::FreshnessSettings::default(),
             )
             .await;
+        mock.assert_async().await;
         assert!(results.is_empty());
     }
 
+    /// #1038: see [`test_complete_versions_empty_prefix`]'s doc for why this is now mocked.
     #[tokio::test]
     async fn test_complete_versions_with_wildcard() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = NpmEcosystem::new(cache);
-        let dep = dep_with_source(
-            "this-package-does-not-exist-12345",
-            DependencySource::Registry,
-            0,
-        );
+        let (_server, mock, ecosystem) = mock_unknown_package_ecosystem().await;
+        let dep = dep_with_source(UNKNOWN_PACKAGE, DependencySource::Registry, 0);
         let position = dep.version_range.unwrap().start;
         let parse_result = MockParseResult {
             dependencies: vec![dep],
@@ -1070,18 +1089,15 @@ mod tests {
                 deps_core::FreshnessSettings::default(),
             )
             .await;
+        mock.assert_async().await;
         assert!(results.is_empty());
     }
 
+    /// #1038: see [`test_complete_versions_empty_prefix`]'s doc for why this is now mocked.
     #[tokio::test]
     async fn test_complete_versions_with_less_than_operator() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = NpmEcosystem::new(cache);
-        let dep = dep_with_source(
-            "this-package-does-not-exist-12345",
-            DependencySource::Registry,
-            0,
-        );
+        let (_server, mock, ecosystem) = mock_unknown_package_ecosystem().await;
+        let dep = dep_with_source(UNKNOWN_PACKAGE, DependencySource::Registry, 0);
         let position = dep.version_range.unwrap().start;
         let parse_result = MockParseResult {
             dependencies: vec![dep],
@@ -1096,6 +1112,7 @@ mod tests {
                 deps_core::FreshnessSettings::default(),
             )
             .await;
+        mock.assert_async().await;
         assert!(results.is_empty());
     }
 

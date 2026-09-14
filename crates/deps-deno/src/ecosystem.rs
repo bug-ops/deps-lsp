@@ -66,6 +66,18 @@ impl DenoEcosystem {
         }
     }
 
+    /// Test-only: wraps an already-constructed [`DenoRegistry`] (e.g. one built via
+    /// [`DenoRegistry::with_bases_for_test`](crate::registry::DenoRegistry::with_bases_for_test)
+    /// pointed at a mock server) instead of building a live-registry one (#1038).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_registry_for_test(registry: DenoRegistry) -> Self {
+        Self {
+            registry: Arc::new(registry),
+            formatter: DenoFormatter,
+        }
+    }
+
     /// Completes package names by searching whichever registry the typed scheme prefix
     /// (`jsr:`/`npm:`) selects.
     async fn complete_package_names(&self, prefix: &str, range: Range) -> Vec<CompletionItem> {
@@ -319,10 +331,32 @@ mod tests {
         assert!(completions.items.is_empty());
     }
 
+    /// #1038: uses a mockito 404 instead of the live `jsr.io`, so a regression that makes
+    /// zero requests (and so also produces an empty result) can no longer pass vacuously —
+    /// `mock.assert_async()` requires the request to actually have been made.
     #[tokio::test]
     async fn test_complete_versions_unknown_package() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/@this-scope/does-not-exist-12345/meta.json")
+            .with_status(404)
+            .create_async()
+            .await;
+        // A `jsr:`-scheme package must never fall through to the `npm:` half (#1038 M3):
+        // a separate mock server with `.expect(0)` pins that, rather than the previous
+        // unexplained `http://127.0.0.1:1` sentinel, which would have silently turned a
+        // jsr->npm-fallback regression into a connect-refused error instead of a test failure.
+        let mut npm_server = mockito::Server::new_async().await;
+        let npm_mock = npm_server
+            .mock("GET", mockito::Matcher::Any)
+            .expect(0)
+            .create_async()
+            .await;
         let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = DenoEcosystem::new(cache);
+        let npm = NpmRegistry::with_public_base_for_test(Arc::clone(&cache), npm_server.url());
+        let registry =
+            DenoRegistry::with_bases_for_test(Arc::clone(&cache), npm, server.url(), server.url());
+        let ecosystem = DenoEcosystem::with_registry_for_test(registry);
 
         let results = ecosystem
             .complete_versions(
@@ -331,6 +365,8 @@ mod tests {
                 deps_core::FreshnessSettings::default(),
             )
             .await;
+        mock.assert_async().await;
+        npm_mock.assert_async().await;
         assert!(results.is_empty());
     }
 

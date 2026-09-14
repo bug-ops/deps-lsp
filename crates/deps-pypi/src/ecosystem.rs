@@ -1110,14 +1110,43 @@ mod tests {
         assert!(results.iter().all(|r| r.label.starts_with("2.")));
     }
 
+    /// Sentinel package name for a package that does not exist in the registry (#1038): every
+    /// "unknown package" completion test below shares it, resolved against a mockito 404 via
+    /// [`mock_unknown_package_ecosystem`] rather than the live `pypi.org`.
+    const UNKNOWN_PACKAGE: &str = "this-package-does-not-exist-12345";
+
+    /// Builds a [`PypiEcosystem`] wired to a mockito server that 404s `name` (#1038), plus the
+    /// `Mock`/`ServerGuard` handles the caller must keep alive and assert on — shared by every
+    /// "unknown package" completion test below to avoid repeating the same
+    /// live-registry-avoiding wiring per test. A regression that makes zero requests (and so
+    /// also produces an empty result) can no longer pass vacuously, since
+    /// `mock.assert_async()` requires the request to actually have been made.
+    async fn mock_unknown_package_ecosystem(
+        name: &str,
+    ) -> (mockito::ServerGuard, mockito::Mock, PypiEcosystem) {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", format!("/simple/{name}/").as_str())
+            .with_status(404)
+            .create_async()
+            .await;
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let registry = PypiRegistry::with_public_base_for_test(
+            Arc::clone(&cache),
+            format!("{}/simple", server.url()),
+        );
+        let ecosystem = PypiEcosystem::with_policy(
+            Arc::new(registry),
+            Arc::new(deps_core::net_policy::RegistryAccessPolicy::default()),
+        );
+        (server, mock, ecosystem)
+    }
+
     #[tokio::test]
     async fn test_complete_versions_unknown_package() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = PypiEcosystem::new(cache);
-        let parse_result = parse_result_with_dependency(
-            "this-package-does-not-exist-12345",
-            DependencySource::Registry,
-        );
+        let (_server, mock, ecosystem) = mock_unknown_package_ecosystem(UNKNOWN_PACKAGE).await;
+        let parse_result =
+            parse_result_with_dependency(UNKNOWN_PACKAGE, DependencySource::Registry);
 
         // Unknown package should return empty (graceful degradation)
         let results = ecosystem
@@ -1128,6 +1157,7 @@ mod tests {
                 deps_core::FreshnessSettings::default(),
             )
             .await;
+        mock.assert_async().await;
         assert!(results.is_empty());
     }
 
@@ -1613,10 +1643,14 @@ dependencies = []
         assert!(diagnostics.is_empty());
     }
 
+    /// #1038: was a live-registry round-trip asserting only `results.is_empty()` — vacuous
+    /// under a dead network, since a regression that made zero requests would produce the
+    /// same empty result. Now mocked, with `mock.assert_async()` requiring the request to
+    /// actually have been made.
     #[tokio::test]
     async fn test_complete_versions_empty_prefix() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = PypiEcosystem::new(cache);
+        let (_server, mock, ecosystem) =
+            mock_unknown_package_ecosystem("nonexistent-package").await;
         let parse_result =
             parse_result_with_dependency("nonexistent-package", DependencySource::Registry);
 
@@ -1629,14 +1663,15 @@ dependencies = []
                 deps_core::FreshnessSettings::default(),
             )
             .await;
+        mock.assert_async().await;
         // Should not panic, returns empty for unknown package
         assert!(results.is_empty());
     }
 
+    /// #1038: see [`test_complete_versions_empty_prefix`]'s doc for why this is now mocked.
     #[tokio::test]
     async fn test_complete_versions_with_tilde_operator() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = PypiEcosystem::new(cache);
+        let (_server, mock, ecosystem) = mock_unknown_package_ecosystem("nonexistent-pkg").await;
         let parse_result =
             parse_result_with_dependency("nonexistent-pkg", DependencySource::Registry);
 
@@ -1649,13 +1684,14 @@ dependencies = []
                 deps_core::FreshnessSettings::default(),
             )
             .await;
+        mock.assert_async().await;
         assert!(results.is_empty());
     }
 
+    /// #1038: see [`test_complete_versions_empty_prefix`]'s doc for why this is now mocked.
     #[tokio::test]
     async fn test_complete_versions_with_not_equal_operator() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = PypiEcosystem::new(cache);
+        let (_server, mock, ecosystem) = mock_unknown_package_ecosystem("nonexistent-pkg").await;
         let parse_result =
             parse_result_with_dependency("nonexistent-pkg", DependencySource::Registry);
 
@@ -1668,6 +1704,7 @@ dependencies = []
                 deps_core::FreshnessSettings::default(),
             )
             .await;
+        mock.assert_async().await;
         assert!(results.is_empty());
     }
 

@@ -27,6 +27,18 @@ impl DartEcosystem {
         }
     }
 
+    /// Test-only: wraps an already-constructed [`PubDevRegistry`] (e.g. one built via
+    /// [`PubDevRegistry::with_base`](crate::registry::PubDevRegistry::with_base) pointed at a
+    /// mock server) instead of building a live-registry one (#1038).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_registry_for_test(registry: PubDevRegistry) -> Self {
+        Self {
+            registry: Arc::new(registry),
+            formatter: DartFormatter,
+        }
+    }
+
     async fn complete_package_names(&self, prefix: &str, range: Range) -> Vec<CompletionItem> {
         deps_core::completion::complete_package_names_generic(
             self.registry.as_ref(),
@@ -410,17 +422,31 @@ mod tests {
         assert_eq!(result, Completions::default());
     }
 
-    /// CI-enforced (not `#[ignore]`d) counterpart to the happy-path test below, closing the
-    /// gap that pub.dev has no offline mock seam: an unknown package name still round-trips
-    /// through the real registry (mirroring `deps_cargo::ecosystem::tests::
-    /// test_complete_versions_unknown_package`'s identical convention), and its 404 fails
-    /// closed to an empty result — exercising the same dispatch path (`package_name`/`prefix`
-    /// threaded from the resolved `Version` context to `complete_versions`) the ignored test
-    /// below leaves uncovered in an ordinary CI run.
+    /// CI-enforced (not `#[ignore]`d) counterpart to the happy-path test below: exercises the
+    /// same dispatch path (`package_name`/`prefix` threaded from the resolved `Version`
+    /// context to `complete_versions`) the ignored test below leaves uncovered in an ordinary
+    /// CI run, but against a mocked 404 rather than the live `pub.dev` (#1038) — a regression
+    /// that makes zero requests (and so also produces an empty result) can no longer pass
+    /// vacuously, since `mock.assert_async()` requires the request to actually have been made.
+    ///
+    /// `.expect(2)`, not `.expect_at_least(1)`: this test calls both `complete_versions`
+    /// directly and `generate_completions` (which must dispatch to the same
+    /// `complete_versions`), and `HttpCache` never caches a non-2xx response (a 404 becomes
+    /// `DepsError::HttpStatus`, never stored) — so exactly 2 requests reach the mock on the
+    /// unregressed path. A regression that dropped the `generate_completions` dispatch would
+    /// leave the mock at 1 hit, which `.expect_at_least(1)` alone would not catch.
     #[tokio::test]
     async fn test_generate_completions_version_context_unknown_package_is_empty() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/packages/this_package_does_not_exist_12345")
+            .with_status(404)
+            .expect(2)
+            .create_async()
+            .await;
         let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = DartEcosystem::new(cache);
+        let registry = PubDevRegistry::with_base(Arc::clone(&cache), server.url());
+        let eco = DartEcosystem::with_registry_for_test(registry);
         let content = "name: my_app\ndependencies:\n  this_package_does_not_exist_12345: ^1.0.0\n";
         let uri = deps_core::test_util::test_uri("/test/pubspec.yaml");
         let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
@@ -448,6 +474,7 @@ mod tests {
         let via_dispatch = eco
             .generate_completions(parse_result.as_ref(), position, content, freshness)
             .await;
+        mock.assert_async().await;
         assert_eq!(via_dispatch.items, direct);
         assert!(direct.is_empty());
     }

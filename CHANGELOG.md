@@ -28,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **CI**: `cargo-semver-checks` is advisory-only on PR/push again (was a blocking gate since #945), reverted after it blocked a routine bug-fix PR over an incidental non-breaking `#[must_use]` addition; the weekly scheduled sweep still hard-fails and tracks genuine breaks (resolves #1048) (#1049)
 
 ### Fixed
+- **deps-npm, deps-pypi, deps-deno, deps-bundler, deps-dart**: unknown-package completion tests now run against a mockito server instead of the live registry, so a network outage or a real zero-request regression no longer passes vacuously (resolves #1038) (#1044)
 - **deps-core**: `HttpCache::cache_key` no longer collapses an unauthenticated `Pinned`-tier fetch and an authenticated one whose credential digest happens to hash to `0` onto the same cache key (resolves #1025)
 - **CI**: the `cross-check` job's i686 leg now builds and tests natively via `gcc-multilib` on `ubuntu-latest` instead of through `cross`'s musl Docker container, dropping the associated apt-get/Docker overhead and the `--test-threads=1` workaround (now uses `cargo nextest`) (#1027)
 - **CI**: `cargo-semver-checks` is now a blocking gate on PR/push and part of `ci-success` (was advisory-only, milestone criterion B3) (resolves #945) (#1012)
