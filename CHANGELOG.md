@@ -9,13 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.0.0] - 2026-09-14
 
-First stable release. All six original "1.0.0 stabilization" milestone entry criteria (B1, B3-B6,
-`constitution.md` post-1.0 policy) plus the emergent feature-matrix follow-ups (#975, #998, #1000)
-are closed. The B2 calendar gate ("one full minor cycle with zero pre-1.0 Breaking entries") was
-consciously waived: this cycle still carries two pre-1.0 breaking changes (see Removed, below).
+First stable release. Of the six original "1.0.0 stabilization" milestone entry criteria, B1, B5,
+B6, and the `constitution.md` post-1.0 policy update are done, along with the emergent
+feature-matrix follow-ups (#975, #998, #1000). Three criteria are consciously waived rather than
+met, all decided 2026-09-14 during release prep:
+
+- **B2** (one full minor cycle with zero pre-1.0 Breaking entries): not met — this cycle still
+  carries two pre-1.0 breaking changes (see Removed, below).
+- **B3** (`cargo-semver-checks` as a blocking CI gate): not met — the `semver` CI job remains
+  `continue-on-error` on PR/push and is not part of `ci-success`. Issue #945 had been closed
+  `NOT_PLANNED` with no decision recorded; reopened to track this as a post-1.0 follow-up.
+- **B4** (decision on `reqwest`/`yaml_rust2`/`tower-lsp-server`/`semver::VersionReq` leaking into
+  `deps-core`'s public API): not met — `deps-core` still re-exports all three crates and
+  `deps-gitlab-ci` still returns `semver::VersionReq` directly, with no accept/wrap/feature-gate
+  decision implemented. Issue #851 had also been closed `NOT_PLANNED` with no decision recorded;
+  reopened to track this as a post-1.0 follow-up.
+
 From this release onward, `specs/constitution.md` principle 8's post-1.0 breaking-change policy
 (major version bump per crate, a labeled "Breaking" CHANGELOG entry, `cargo-semver-checks` as the
-CI catch-net) is in effect.
+CI catch-net once B3 actually lands) is in effect.
 
 ### Added
 - **deps-core**: `LockFileCache::with_capacity` and `DEFAULT_MAX_CACHED_LOCKFILES` — a custom-capacity constructor and the new default entry-count bound (resolves #962) (#971)
