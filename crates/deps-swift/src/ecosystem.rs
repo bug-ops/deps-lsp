@@ -656,7 +656,11 @@ mod tests {
         let dep = crate::types::SwiftDependency {
             name: "apple/swift-nio".into(),
             name_range,
-            version_req: Some("1.0.0".into()),
+            // Must agree with the text at `version_range` below (`"2.0.0"` on line 2 of
+            // `content`) — #924: a mismatched `version_req` here doesn't fail this
+            // `#[ignore]`d test itself, but silently makes the fixture no longer represent
+            // a real Version-context dispatch.
+            version_req: Some("2.0.0".into()),
             version_range: Some(LspRange::new(Position::new(1, 0), Position::new(1, 5))),
             version_literal: None,
             url: "https://github.com/apple/swift-nio".to_string(),
@@ -689,6 +693,14 @@ mod tests {
         let via_dispatch = eco
             .generate_completions(&parse_result, position, content, freshness)
             .await;
+        // #924 critic S3: without this, a rate-limited/offline run where the live GitHub
+        // API returns nothing would make `direct` and `via_dispatch` both trivially empty,
+        // and the route-equivalence assertion below would pass without ever having
+        // exercised the dispatch it's meant to check.
+        assert!(
+            !direct.is_empty(),
+            "expected non-empty version list from registry"
+        );
         // Route equivalence, not a specific live-data assertion: the point is that
         // `generate_completions`'s `Version` arm threads the same `package_name`/`prefix`
         // to the same `complete_versions` call the pre-#793 match did — not what GitHub's

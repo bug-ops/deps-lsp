@@ -124,19 +124,7 @@ static RE_PATH: LazyLock<Regex> = LazyLock::new(|| {
 /// GitHub API, so silently mapping a non-GitHub URL onto an `owner/repo` pair would query an
 /// unrelated, attacker-nameable GitHub repository with the user's `GITHUB_TOKEN` attached).
 pub fn url_to_identity(url: &str) -> Option<String> {
-    // Normalize SSH-style URLs (git@host:owner/repo[.git]) to an https URL so the rest of
-    // this function only ever deals with one shape.
-    let normalized = if let Some(rest) = url.strip_prefix("git@") {
-        let (host, path) = rest.split_once(':')?;
-        format!("https://{host}/{path}")
-    } else {
-        url.to_string()
-    };
-
-    // `reqwest::Url` re-exports `url::Url` — reuse it rather than adding a second URL-parsing
-    // dependency (`deps-swift` already depends on `reqwest`, and `formatter::osv_package_name`
-    // parses the same way).
-    let parsed = reqwest::Url::parse(&normalized).ok()?;
+    let parsed = parse_git_url(url)?;
     let host = parsed.host_str()?;
     if !crate::is_github_host(host) {
         return None;
@@ -150,6 +138,32 @@ pub fn url_to_identity(url: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Normalizes an SSH-style Git URL (`git@host:owner/repo[.git]`) to an `https://` URL and
+/// parses it, so every caller that needs a dependency URL's host handles both URL shapes
+/// the same way.
+///
+/// Shared by [`url_to_identity`] above and `formatter::is_non_github_registry_url` (#983
+/// critic S2): both need "what host does this dependency URL point at," and deriving that
+/// twice — once here, once in the formatter — let the formatter's copy silently miss the
+/// SSH shape (`Url::parse` fails outright on a raw `git@host:path` string with no scheme).
+/// Sharing this step means the two call sites can no longer drift on which URL shapes they
+/// recognize.
+pub(crate) fn parse_git_url(url: &str) -> Option<reqwest::Url> {
+    // Normalize SSH-style URLs (git@host:owner/repo[.git]) to an https URL so the rest of
+    // this function only ever deals with one shape.
+    let normalized = if let Some(rest) = url.strip_prefix("git@") {
+        let (host, path) = rest.split_once(':')?;
+        format!("https://{host}/{path}")
+    } else {
+        url.to_string()
+    };
+
+    // `reqwest::Url` re-exports `url::Url` — reuse it rather than adding a second URL-parsing
+    // dependency (`deps-swift` already depends on `reqwest`, and `formatter::osv_package_name`
+    // parses the same way).
+    reqwest::Url::parse(&normalized).ok()
 }
 
 /// Resolves the display name and [`DependencySource`] for a registry-form (`from:`,
