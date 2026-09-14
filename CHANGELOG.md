@@ -34,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **docs**: corrected README.md's and ECOSYSTEM_GUIDE.md's contradictory `license_policy` diagnostic ecosystem-scope claims — the diagnostic actually fires for five ecosystems (Composer, Dart, Swift, Deno, Gradle), not "all 14" or the previously listed four (resolves #1004) (#1013)
 - **deps-go**: `test_generate_code_actions_on_module` now runs against a mockito server instead of live `proxy.golang.org`, removing an intermittent CI failure (resolves #1014) (#1032)
 - **deps-bundler**: `source:`/`git:`/`path:`/`github:` inline option values no longer truncate at an embedded quote of the opposite kind (e.g. an escaped or unescaped `'` inside a `"`-delimited value) (resolves #1020) (#1036)
+- **deps-go**: `test_get_versions_from_plain_registry_source_unchanged`, `test_complete_versions_unknown_package`, and `test_generate_hover_on_module_path` now run against a mockito server instead of live `proxy.golang.org` (resolves #1034) (#1037)
 
 ## [1.0.0] - 2026-09-14
 
