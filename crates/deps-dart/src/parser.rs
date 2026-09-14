@@ -30,7 +30,7 @@
 //! version/source info — see `test_aliased_dependency_to_unresolvable_anchor_still_present`.
 
 use crate::types::{DartDependency, DependencySection, DependencySource};
-use deps_core::lsp_helpers::{LineOffsetTable, MarkedScalar};
+use deps_core::lsp_helpers::{LineOffsetTable, MarkedScalar, is_plain_null};
 use deps_core::yaml_anchor::{AnchorLimits, ScalarAnchorTable};
 use deps_core::yaml_walk::{FrameKind, FrameStack, ScalarPosition};
 use deps_core::{DependencyBudget, DepsError, Result};
@@ -71,54 +71,6 @@ fn scalar_field(
     } else {
         FieldValue::Positioned(MarkedScalar::new(value, style, marker))
     }
-}
-
-/// Whether a plain (unquoted) scalar's text denotes an absent value.
-///
-/// A completely empty plain scalar (`pkg:` with nothing after the colon — the normal
-/// mid-typing state in a live editor) is *always* absent, regardless of any tag: `!!str` on
-/// no text still means no text was given, not the literal empty string (which needs an
-/// actual quoted `""` to express — see the `style == Plain` guard below). For non-empty text
-/// (`~`/`null`), an explicit tag matters: untagged or explicitly `tag:yaml.org,2002:null`
-/// tagged text still resolves to absent, but any *other* explicit tag (e.g. `!!str`) forces
-/// the scalar to that type instead — `!!str null` is the literal string `"null"`, not an
-/// absent value.
-///
-/// Loosely mirrors `yaml_rust2::YamlLoader`'s own scalar resolution (`Yaml::from_str`'s
-/// `"" | "~" | "null" => Yaml::Null` rule for an untagged plain scalar, and the `null` tag
-/// arm's own `"~" | "null" => Yaml::Null` check) without replicating it exactly: the loader
-/// resolves a `tag:yaml.org,2002:null`-tagged scalar with *other* text (`!!null foo`) to
-/// `Yaml::BadValue` (itself effectively absent), whereas this treats it as present text
-/// `"foo"` — a deliberate, harmless divergence rather than a bug to fix, since a manifest
-/// author writing `!!null foo` should see it as a real (if malformed) value rather than have
-/// it silently vanish.
-///
-/// A *quoted* empty string (`pkg: ""`) is a real, if unusual, explicit value and must not be
-/// treated as absent, matching `Yaml::from_str`'s check applying only when `style == Plain`.
-fn is_plain_null(style: TScalarStyle, tag: Option<&Tag>, value: &str) -> bool {
-    if style != TScalarStyle::Plain {
-        return false;
-    }
-    if value.is_empty() {
-        return true;
-    }
-    match tag {
-        None => matches!(value, "~" | "null"),
-        Some(tag) => is_null_tag(tag) && matches!(value, "~" | "null"),
-    }
-}
-
-/// Whether `tag` is YAML's `null` tag, in either of the two forms `yaml-rust2`'s scanner
-/// produces: the `!!null` shorthand resolves to `Tag { handle: "tag:yaml.org,2002:", suffix:
-/// "null" }`, but the equivalent verbatim form `!<tag:yaml.org,2002:null>` resolves to `Tag {
-/// handle: "", suffix: "tag:yaml.org,2002:null" }` — the whole URI lands in `suffix` with an
-/// empty `handle`, since verbatim tags bypass handle resolution entirely (measured directly
-/// against the scanner; verified empirically, not assumed from reading it). Checking only the
-/// shorthand form left `version: !<tag:yaml.org,2002:null> null` resolving to the literal
-/// string `"null"` instead of absent.
-fn is_null_tag(tag: &Tag) -> bool {
-    (tag.handle == "tag:yaml.org,2002:" && tag.suffix == "null")
-        || (tag.handle.is_empty() && tag.suffix == "tag:yaml.org,2002:null")
 }
 
 /// A field's resolved text, plus its position in `content` when one genuinely exists.
@@ -2494,6 +2446,21 @@ flutter:
         let result = parse_pubspec_yaml(yaml, &test_uri()).unwrap();
         assert_eq!(result.dependencies.len(), 1);
         assert!(result.dependencies[0].version_req.is_none());
+    }
+
+    /// `is_plain_null` was promoted into `deps-core` and widened there to also recognize
+    /// `Null`/`NULL` (case-insensitive), driven by `deps-gitlab-ci`'s Psych oracle — this
+    /// pins the same widened behavior for `deps-dart`'s own ecosystem specifically. Dart's
+    /// own YAML implementation (`package:yaml`, YAML 1.2 core schema) also resolves
+    /// `Null`/`NULL` as null, so an untagged `Null`/`NULL` scalar must resolve to absent
+    /// here too, not the literal text.
+    #[test]
+    fn test_capitalized_null_spellings_are_treated_as_absent() {
+        let yaml = "dependencies:\n  pkg:\n    version: Null\n  other:\n    version: NULL\n";
+        let result = parse_pubspec_yaml(yaml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 2, "{:?}", result.dependencies);
+        assert!(result.dependencies[0].version_req.is_none());
+        assert!(result.dependencies[1].version_req.is_none());
     }
 
     #[test]
