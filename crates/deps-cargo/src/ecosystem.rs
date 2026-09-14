@@ -955,17 +955,37 @@ mod tests {
         assert!(results.is_empty());
     }
 
+    /// #1052: uses a mockito search endpoint instead of the live crates.io search API, so a
+    /// regression that makes zero requests (and so also produces an empty result) can no
+    /// longer pass vacuously — `mock.assert_async()` requires the request to actually have
+    /// been made, and the assertion checks a real, specific completion item instead of the
+    /// old `results.is_empty() || !results.is_empty()` tautology.
     #[tokio::test]
     async fn test_complete_package_names_special_characters() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/crates?q=tokio-ut&per_page=20&sort=downloads")
+            .with_status(200)
+            .with_body(
+                r#"{"crates":[{"name":"tokio-util","description":null,"repository":null,"documentation":null,"max_version":"0.7.10"}]}"#,
+            )
+            .create_async()
+            .await;
+
         let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = CargoEcosystem::new(cache);
+        let crates_io = CratesIoRegistry::with_base_for_test(Arc::clone(&cache), &server.url());
+        let registry = CargoRegistry::with_crates_io_for_test(Arc::clone(&cache), crates_io);
+        let ecosystem = CargoEcosystem::with_registry_for_test(registry);
 
         // Package names with hyphens and underscores should work
         let results = ecosystem
             .complete_package_names("tokio-ut", Range::default())
             .await;
-        // Should not panic or error
-        assert!(results.is_empty() || !results.is_empty());
+
+        mock.assert_async().await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].label, "tokio-util");
+        assert_eq!(results[0].detail.as_deref(), Some("v0.7.10"));
     }
 
     #[tokio::test]

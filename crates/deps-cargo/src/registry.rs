@@ -66,6 +66,10 @@ pub fn crate_url(name: &str) -> String {
 pub struct CratesIoRegistry {
     sparse: SparseIndexClient,
     cache: Arc<HttpCache>,
+    /// Search API base URL — [`SEARCH_API_BASE`] in production, overridden to a mockito
+    /// server URL in tests via [`Self::with_base_for_test`] (mirrors `deps-dart`'s
+    /// `PubDevRegistry::with_base`, #1052).
+    search_base: String,
 }
 
 impl CratesIoRegistry {
@@ -77,18 +81,17 @@ impl CratesIoRegistry {
                 Arc::clone(&cache),
             ),
             cache,
+            search_base: SEARCH_API_BASE.to_string(),
         }
     }
 
-    /// Test-only: constructs a registry client with the sparse-index base pointed at `base`
-    /// (e.g. a `mockito::Server` URL) instead of the live crates.io sparse index (#1045),
-    /// mirroring `deps_dart::registry::PubDevRegistry::with_base`. Lets an unknown-package
-    /// test assert the mock was actually requested, so a zero-request regression can no
-    /// longer pass vacuously by coincidentally also returning an empty result.
-    ///
-    /// Redirects the sparse index only — [`Self::search`] still targets the live
-    /// `SEARCH_API_BASE`, so a test built on this seam is not fully mocked if it exercises
-    /// package-name search.
+    /// Test-only: constructs a registry client with both the sparse-index base and the
+    /// search-API base pointed at `base` (e.g. a `mockito::Server` URL) instead of the live
+    /// crates.io endpoints (#1045, #1052), mirroring
+    /// `deps_dart::registry::PubDevRegistry::with_base`. Lets an unknown-package or
+    /// package-search test assert the mock was actually requested, so a zero-request
+    /// regression can no longer pass vacuously by coincidentally also returning an empty
+    /// result.
     ///
     /// `#[cfg(test)]`, not `#[cfg(feature = "test-util")]`: the `expect` below only succeeds
     /// because `deps-core`'s `test-util` feature relaxes `RegistryIndex::new`'s https-only
@@ -107,6 +110,7 @@ impl CratesIoRegistry {
         Self {
             sparse: SparseIndexClient::new(index, Arc::clone(&cache)),
             cache,
+            search_base: base.to_string(),
         }
     }
 
@@ -204,7 +208,7 @@ impl CratesIoRegistry {
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<CrateInfo>> {
         let url = format!(
             "{}/crates?q={}&per_page={}&sort=downloads",
-            SEARCH_API_BASE,
+            self.search_base,
             urlencoding::encode(query),
             limit
         );
@@ -932,6 +936,7 @@ mod tests {
             crates_io: CratesIoRegistry {
                 sparse,
                 cache: Arc::clone(&cache),
+                search_base: mockito_url.to_string(),
             },
             alternates: dashmap::DashMap::new(),
             cache,
