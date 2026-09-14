@@ -27,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-bundler**: multi-line `gem` declarations (continuation-line `:source =>`/`source:`, backslash continuation, or a commented-out option) no longer leak private gem names to the public rubygems.org registry, and the parser's block/group state tracking is now O(1) per line instead of O(block depth) (resolves #991, #1009) (#1016)
 - **deps-lsp**: gated 4 tests that panicked (not just failed to compile) under a reduced ecosystem feature set, and fixed the crate's remaining unused-import/dead-code warnings across the feature matrix; CI now lints deps-lsp's test targets with `-D warnings` and runs `cargo hack nextest run -p deps-lsp --each-feature` on every individual feature (resolves #1005, #1001) (#1011)
 - **docs**: corrected README.md's and ECOSYSTEM_GUIDE.md's contradictory `license_policy` diagnostic ecosystem-scope claims — the diagnostic actually fires for five ecosystems (Composer, Dart, Swift, Deno, Gradle), not "all 14" or the previously listed four (resolves #1004) (#1013)
+- **deps-go**: `test_generate_code_actions_on_module` now runs against a mockito server instead of live `proxy.golang.org`, removing an intermittent CI failure (resolves #1014) (#1032)
 
 ## [1.0.0] - 2026-09-14
 

@@ -241,6 +241,34 @@ impl GoRegistry {
         }
     }
 
+    /// Creates a `Public`-tier [`GoRegistry`] client pointed at a custom proxy base URL, for
+    /// pointing at a mockito server in tests.
+    ///
+    /// `Public`-tier (not `WorkspaceDeclared`) so it fetches through the ungated
+    /// `HttpCache::get_cached` transport, exercising the exact same routing a plain
+    /// `DependencySource::Registry` dependency uses in production — unlike
+    /// [`Self::with_base`], which is `WorkspaceDeclared`-tier and requires opting the cache
+    /// into `WorkspaceRegistryAccess::All` first (that constructor exists specifically to
+    /// exercise the `$GOENV`-declared `GOPROXY`-hop path, not the plain public-registry
+    /// path this mirrors — deps-npm's `NpmRegistry::with_public_base_for_test` is the
+    /// analogous constructor there).
+    ///
+    /// `#[cfg(test)]` only, not gated behind a `test-util` feature: unlike `deps-npm`
+    /// (consumed by `deps-deno`'s own test builds), no other workspace crate depends on
+    /// `deps-go` as a library, so this never needs to be reachable outside this crate's own
+    /// tests.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_public_base_for_test(cache: Arc<HttpCache>, proxy_base: String) -> Self {
+        Self {
+            cache,
+            proxy_base,
+            tier: GoRegistryTier::Public,
+            alternates: Arc::new(DashMap::new()),
+            fallback_chain: Vec::new(),
+        }
+    }
+
     /// Creates a [`GoRegistry`] client for one resolved `$GOENV`-declared `GOPROXY` hop —
     /// `WorkspaceDeclared`-tier so it fetches through `HttpCache::get_cached_workspace`
     /// (FR-011's redirect-hop gating) instead of the ungated public transport.
