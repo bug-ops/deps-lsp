@@ -109,10 +109,10 @@ pub async fn handle_diagnostics(
     let (freshness, offline, fetch_timeout_secs, max_concurrent_fetches) = {
         let full_config = full_config.read().await;
         (
-            full_config.freshness.to_settings(),
-            full_config.network.offline,
-            full_config.cache.fetch_timeout_secs,
-            full_config.cache.max_concurrent_fetches,
+            full_config.policy.freshness.to_settings(),
+            full_config.policy.network.offline,
+            full_config.policy.cache.fetch_timeout_secs,
+            full_config.policy.cache.max_concurrent_fetches,
         )
     };
     let dep_count = document_dependency_count(&state, uri);
@@ -1474,7 +1474,7 @@ dependencies = ["requests>=2.0.0"]
             let (client, full_config) = create_test_client_and_config();
             let policy_config = LicensePolicyConfig { allow, deny };
             state.set_license_policy(policy_config.to_policy());
-            full_config.write().await.license_policy = policy_config;
+            full_config.write().await.policy.license_policy = policy_config;
 
             (state, uri, client, full_config)
         }
@@ -1567,7 +1567,7 @@ dependencies = ["requests>=2.0.0"]
                 deny: Vec::new(),
             };
             state.set_license_policy(policy_config.to_policy());
-            full_config.write().await.license_policy = policy_config;
+            full_config.write().await.policy.license_policy = policy_config;
             let config = DiagnosticsConfig::default();
 
             let result = handle_diagnostics(state, &uri, &config, client, full_config).await;

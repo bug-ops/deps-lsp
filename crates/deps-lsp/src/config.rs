@@ -1,5 +1,11 @@
+/// Re-exported so `deps_lsp::config::{DiagnosticsConfig, CacheConfig, ...}` keeps resolving
+/// for existing callers (in this crate and downstream) after these types moved to
+/// `deps-core` — see [`deps_core::policy_config`] for the canonical, shared definitions.
+pub use deps_core::policy_config::{
+    CacheConfig, DiagnosticsConfig, FreshnessConfig, LicensePolicyConfig, NetworkConfig,
+    PolicyConfig, RegistriesConfig, SupplyChainConfig, WorkspaceRegistriesSetting,
+};
 use serde::Deserialize;
-use tower_lsp_server::ls_types::DiagnosticSeverity;
 
 /// Root configuration for the deps-lsp server.
 ///
@@ -37,12 +43,6 @@ pub struct DepsConfig {
     /// Inline version-annotation settings.
     #[serde(default)]
     pub inlay_hints: InlayHintsConfig,
-    /// Diagnostic severity and behavior settings.
-    #[serde(default)]
-    pub diagnostics: DiagnosticsConfig,
-    /// HTTP response cache settings.
-    #[serde(default)]
-    pub cache: CacheConfig,
     /// Cold-start disk-load behavior settings.
     #[serde(default)]
     pub cold_start: ColdStartConfig,
@@ -52,21 +52,14 @@ pub struct DepsConfig {
     /// Code lens (update-all action) settings.
     #[serde(default)]
     pub code_lens: CodeLensConfig,
-    /// Release-cooldown / freshness-window settings.
-    #[serde(default)]
-    pub freshness: FreshnessConfig,
-    /// Supply-chain trust signal (Scorecard/SLSA) settings.
-    #[serde(default)]
-    pub supply_chain: SupplyChainConfig,
-    /// Custom/alternate registry settings.
-    #[serde(default)]
-    pub registries: RegistriesConfig,
-    /// Network access and offline-mode settings.
-    #[serde(default)]
-    pub network: NetworkConfig,
-    /// License policy (allow/deny list) settings.
-    #[serde(default)]
-    pub license_policy: LicensePolicyConfig,
+    /// The policy-relevant sections (diagnostics, cache, freshness, supply_chain, registries,
+    /// network, license_policy) shared with `deps-cli` — see [`deps_core::policy_config`].
+    /// `#[serde(flatten)]` keeps this crate's accepted JSON shape flat at the top level
+    /// (`{"cache": {...}, "network": {...}}`), exactly as before this type moved to
+    /// `deps-core` — verified empirically to still combine correctly with this struct's own
+    /// `deny_unknown_fields` (see `tests::test_flatten_preserves_deny_unknown_fields_rejection`).
+    #[serde(flatten)]
+    pub policy: PolicyConfig,
 }
 
 /// Configuration for inlay hints (inline version annotations).
@@ -157,352 +150,6 @@ impl InlayHintsConfig {
     }
 }
 
-/// Configuration for diagnostic severity levels.
-///
-/// Controls the severity level reported for different types of dependency issues.
-/// This allows users to customize whether issues appear as errors, warnings, hints, etc.
-///
-/// # Defaults
-///
-/// - `outdated_severity`: `HINT` - Dependencies with available updates
-/// - `unknown_severity`: `WARNING` - Dependencies not found in registry
-/// - `yanked_severity`: `WARNING` - Dependencies using yanked versions
-/// - `unsatisfiable_severity`: `WARNING` - Dependencies whose requirement matches zero published versions
-/// - `deprecated_severity`: `WARNING` - Dependencies on a package the registry reports as deprecated/abandoned
-/// - `mutable_ref_pin_severity`: `HINT` - Dependencies pinned to a mutable ref (tag/branch) instead of a commit SHA (GitHub Actions `uses:` steps, GitLab CI `project:`/`component:` includes)
-/// - `mutable_ref_pin_enabled`: `true` - Whether the mutable-ref-pin diagnostic runs at all
-///
-/// # Examples
-///
-/// ```
-/// use deps_lsp::config::DiagnosticsConfig;
-/// use tower_lsp_server::ls_types::DiagnosticSeverity;
-///
-/// let config = DiagnosticsConfig::new()
-///     .with_outdated_severity(DiagnosticSeverity::INFORMATION)
-///     .with_unknown_severity(DiagnosticSeverity::ERROR)
-///     .with_yanked_severity(DiagnosticSeverity::ERROR)
-///     .with_unsatisfiable_severity(DiagnosticSeverity::ERROR)
-///     .with_deprecated_severity(DiagnosticSeverity::ERROR)
-///     .with_mutable_ref_pin_severity(DiagnosticSeverity::ERROR)
-///     .with_mutable_ref_pin_enabled(true)
-///     .with_vulnerabilities_enabled(true);
-///
-/// assert_eq!(config.unknown_severity, DiagnosticSeverity::ERROR);
-/// ```
-#[non_exhaustive]
-#[derive(Debug, Clone, Deserialize)]
-pub struct DiagnosticsConfig {
-    /// Severity for a dependency with a newer version available.
-    #[serde(default = "default_outdated_severity")]
-    pub outdated_severity: DiagnosticSeverity,
-    /// Severity for a dependency not found in the registry.
-    #[serde(default = "default_unknown_severity")]
-    pub unknown_severity: DiagnosticSeverity,
-    /// Severity for a dependency pinned to a yanked/retracted version.
-    #[serde(default = "default_yanked_severity")]
-    pub yanked_severity: DiagnosticSeverity,
-    /// Severity for a dependency whose requirement matches zero published versions.
-    #[serde(default = "default_unsatisfiable_severity")]
-    pub unsatisfiable_severity: DiagnosticSeverity,
-    /// Severity for a dependency on a package the registry reports as
-    /// deprecated/abandoned (issue #205). No corresponding `deprecated_enabled`
-    /// toggle: unlike `vulnerabilities_enabled`, this signal is derived from
-    /// already-fetched data (zero new registry requests — see #205's plan §1
-    /// D2), so a boolean would gate only string formatting, not a network
-    /// call. Matches the severity-only precedent set by the four fields above.
-    #[serde(default = "default_deprecated_severity")]
-    pub deprecated_severity: DiagnosticSeverity,
-    /// Severity for a dependency pinned to a mutable ref (a tag/branch) instead of a
-    /// full commit SHA — a GitHub Actions `uses:` step (issue #473) or a GitLab CI
-    /// `project:`/`component:` include (issue #634). Tunes loudness only; see
-    /// `mutable_ref_pin_enabled` for the on/off toggle.
-    #[serde(default = "default_mutable_ref_pin_severity")]
-    pub mutable_ref_pin_severity: DiagnosticSeverity,
-    /// Whether the mutable-ref-pin diagnostic (issue #473, extended to GitLab CI by
-    /// issue #634) runs at all. Default
-    /// `true`. **Corrected during implementation review (spec 031 FR-009)**: unlike
-    /// `deprecated_severity`, this diagnostic *does* need a real `_enabled` toggle —
-    /// `DiagnosticSeverity` has no suppression value, and severity is never treated
-    /// as a suppression input anywhere in this codebase, so without this boolean the
-    /// diagnostic would be permanent and unremovable on every tag-pinned `uses:` step
-    /// (the dominant pinning style), even for teams that intentionally reject
-    /// SHA-pinning. Mirrors `vulnerabilities_enabled`'s exact shape.
-    #[serde(default = "default_true")]
-    pub mutable_ref_pin_enabled: bool,
-    /// Whether to run the OSV.dev vulnerability scan and render its
-    /// diagnostics/hover content. Default `true` (opt-out): `cargo audit`/
-    /// `npm audit` run by default, and an opt-in gate would undercut the
-    /// feature (approved Q5).
-    #[serde(default = "default_true")]
-    pub vulnerabilities_enabled: bool,
-}
-
-impl Default for DiagnosticsConfig {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl DiagnosticsConfig {
-    /// Builds the default configuration (mirrors [`Self::default`]).
-    ///
-    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
-    /// this crate, so every other crate must chain the `with_*` setters onto this
-    /// constructor instead.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use deps_lsp::config::DiagnosticsConfig;
-    /// use tower_lsp_server::ls_types::DiagnosticSeverity;
-    ///
-    /// let config = DiagnosticsConfig::new();
-    /// assert_eq!(config.outdated_severity, DiagnosticSeverity::HINT);
-    /// ```
-    #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            outdated_severity: default_outdated_severity(),
-            unknown_severity: default_unknown_severity(),
-            yanked_severity: default_yanked_severity(),
-            unsatisfiable_severity: default_unsatisfiable_severity(),
-            deprecated_severity: default_deprecated_severity(),
-            mutable_ref_pin_severity: default_mutable_ref_pin_severity(),
-            mutable_ref_pin_enabled: true,
-            vulnerabilities_enabled: true,
-        }
-    }
-
-    /// Overrides [`Self::outdated_severity`]. See [`Self::new`].
-    #[must_use]
-    pub const fn with_outdated_severity(mut self, outdated_severity: DiagnosticSeverity) -> Self {
-        self.outdated_severity = outdated_severity;
-        self
-    }
-
-    /// Overrides [`Self::unknown_severity`]. See [`Self::new`].
-    #[must_use]
-    pub const fn with_unknown_severity(mut self, unknown_severity: DiagnosticSeverity) -> Self {
-        self.unknown_severity = unknown_severity;
-        self
-    }
-
-    /// Overrides [`Self::yanked_severity`]. See [`Self::new`].
-    #[must_use]
-    pub const fn with_yanked_severity(mut self, yanked_severity: DiagnosticSeverity) -> Self {
-        self.yanked_severity = yanked_severity;
-        self
-    }
-
-    /// Overrides [`Self::unsatisfiable_severity`]. See [`Self::new`].
-    #[must_use]
-    pub const fn with_unsatisfiable_severity(
-        mut self,
-        unsatisfiable_severity: DiagnosticSeverity,
-    ) -> Self {
-        self.unsatisfiable_severity = unsatisfiable_severity;
-        self
-    }
-
-    /// Overrides [`Self::deprecated_severity`]. See [`Self::new`].
-    #[must_use]
-    pub const fn with_deprecated_severity(
-        mut self,
-        deprecated_severity: DiagnosticSeverity,
-    ) -> Self {
-        self.deprecated_severity = deprecated_severity;
-        self
-    }
-
-    /// Overrides [`Self::mutable_ref_pin_severity`]. See [`Self::new`].
-    #[must_use]
-    pub const fn with_mutable_ref_pin_severity(
-        mut self,
-        mutable_ref_pin_severity: DiagnosticSeverity,
-    ) -> Self {
-        self.mutable_ref_pin_severity = mutable_ref_pin_severity;
-        self
-    }
-
-    /// Overrides [`Self::mutable_ref_pin_enabled`]. See [`Self::new`].
-    #[must_use]
-    pub const fn with_mutable_ref_pin_enabled(mut self, mutable_ref_pin_enabled: bool) -> Self {
-        self.mutable_ref_pin_enabled = mutable_ref_pin_enabled;
-        self
-    }
-
-    /// Overrides [`Self::vulnerabilities_enabled`]. See [`Self::new`].
-    #[must_use]
-    pub const fn with_vulnerabilities_enabled(mut self, vulnerabilities_enabled: bool) -> Self {
-        self.vulnerabilities_enabled = vulnerabilities_enabled;
-        self
-    }
-
-    /// Converts this LSP-facing config into the `deps-core` DTO threaded
-    /// through `Ecosystem::generate_diagnostics`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use deps_lsp::config::DiagnosticsConfig;
-    ///
-    /// let config = DiagnosticsConfig::default();
-    /// let severities = config.to_severities();
-    /// assert_eq!(severities.outdated, config.outdated_severity);
-    /// assert_eq!(severities.unknown, config.unknown_severity);
-    /// assert_eq!(severities.yanked, config.yanked_severity);
-    /// assert_eq!(severities.unsatisfiable, config.unsatisfiable_severity);
-    /// assert_eq!(severities.deprecated, config.deprecated_severity);
-    /// assert_eq!(severities.mutable_ref_pin, config.mutable_ref_pin_severity);
-    /// assert_eq!(severities.mutable_ref_pin_enabled, config.mutable_ref_pin_enabled);
-    /// ```
-    #[must_use]
-    pub const fn to_severities(&self) -> deps_core::DiagnosticSeverities {
-        deps_core::DiagnosticSeverities::new()
-            .with_outdated(self.outdated_severity)
-            .with_unknown(self.unknown_severity)
-            .with_yanked(self.yanked_severity)
-            .with_unsatisfiable(self.unsatisfiable_severity)
-            .with_deprecated(self.deprecated_severity)
-            .with_mutable_ref_pin(self.mutable_ref_pin_severity)
-            .with_mutable_ref_pin_enabled(self.mutable_ref_pin_enabled)
-    }
-}
-
-/// Configuration for HTTP caching behavior.
-///
-/// Controls cache settings for registry requests. The cache uses ETag and
-/// Last-Modified headers for validation, minimizing network traffic.
-///
-/// # Defaults
-///
-/// - `enabled`: `true`
-/// - `fetch_timeout_secs`: `10` (10 seconds per package)
-/// - `max_concurrent_fetches`: `20` (20 concurrent requests)
-///
-/// # Examples
-///
-/// ```
-/// use deps_lsp::config::CacheConfig;
-///
-/// let config = CacheConfig::new()
-///     .with_fetch_timeout_secs(5)
-///     .with_max_concurrent_fetches(20);
-///
-/// assert_eq!(config.fetch_timeout_secs, 5);
-/// ```
-#[non_exhaustive]
-#[derive(Debug, Clone, Deserialize)]
-pub struct CacheConfig {
-    /// Whether `deps_core::cache::HttpCache`'s entry map is used at all (issue #482):
-    /// `false` bypasses it entirely (fetch fresh every time, never store).
-    ///
-    /// **Offline override**: while `network.offline` (see [`NetworkConfig::offline`]) is
-    /// set, this flag's `false` value is overridden and treated as `true` — otherwise a
-    /// warm entry fetched before going offline could never survive an online→offline
-    /// transition, since nothing would have been stored while online in the first place.
-    ///
-    /// **Maven exception**: `deps-maven`'s `peek_cached`-based stale-data fallback
-    /// (`crates/deps-maven/src/registry.rs`) behaves differently from every other
-    /// ecosystem under `enabled: false`, which has no equivalent second-layer fallback to
-    /// diverge on. This only "always misses" for a process that started cold with the
-    /// flag already off — `peek_cached` reads the entry map directly and
-    /// `set_cache_enabled` never clears it, so a *live* `true` -> `false` toggle leaves
-    /// every already-stored entry servable through this fallback indefinitely.
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    /// Timeout for fetching a single package's versions (default: 10 seconds)
-    #[serde(
-        default = "default_fetch_timeout_secs",
-        deserialize_with = "deserialize_fetch_timeout"
-    )]
-    pub fetch_timeout_secs: u64,
-    /// Maximum concurrent package fetches (default: 20)
-    #[serde(
-        default = "default_max_concurrent_fetches",
-        deserialize_with = "deserialize_max_concurrent"
-    )]
-    pub max_concurrent_fetches: usize,
-}
-
-impl Default for CacheConfig {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl CacheConfig {
-    /// Builds the default configuration (mirrors [`Self::default`]).
-    ///
-    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
-    /// this crate, so every other crate must chain the `with_*` setters onto this
-    /// constructor instead.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use deps_lsp::config::CacheConfig;
-    ///
-    /// let config = CacheConfig::new();
-    /// assert!(config.enabled);
-    /// ```
-    #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            enabled: true,
-            fetch_timeout_secs: default_fetch_timeout_secs(),
-            max_concurrent_fetches: default_max_concurrent_fetches(),
-        }
-    }
-
-    /// Overrides [`Self::enabled`]. See [`Self::new`].
-    #[must_use]
-    pub const fn with_enabled(mut self, enabled: bool) -> Self {
-        self.enabled = enabled;
-        self
-    }
-
-    /// Overrides [`Self::fetch_timeout_secs`]. See [`Self::new`]. Not clamped to the
-    /// bounds `deserialize_fetch_timeout` enforces — that validation only guards
-    /// untrusted LSP-client input, not construction from trusted Rust code.
-    #[must_use]
-    pub const fn with_fetch_timeout_secs(mut self, fetch_timeout_secs: u64) -> Self {
-        self.fetch_timeout_secs = fetch_timeout_secs;
-        self
-    }
-
-    /// Overrides [`Self::max_concurrent_fetches`]. See [`Self::new`]. Enforces the same
-    /// `>= 1` floor (`MIN_CONCURRENT_FETCHES`) that `deserialize_max_concurrent` enforces
-    /// on untrusted LSP-client input — but, unlike that deserializer, does not also cap the
-    /// `MAX_CONCURRENT_FETCHES` ceiling, so a very large value passes through uncapped: this
-    /// value is used directly as `futures::StreamExt::buffer_unordered`'s concurrency limit
-    /// (`document::fetch`), and `buffer_unordered(0)` never polls its source stream, hanging
-    /// the fetch forever instead of erroring (issue #833) — unlike
-    /// [`Self::with_fetch_timeout_secs`], `0` here is not a merely degenerate value, so this
-    /// setter enforces the floor itself rather than relying on a downstream re-guard
-    /// (`handlers::diagnostics::loading_ceiling` also re-guards its own divisor, but that is
-    /// a second, independent consumer, not a safety net for this one).
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use deps_lsp::config::CacheConfig;
-    ///
-    /// let config = CacheConfig::new().with_max_concurrent_fetches(0);
-    /// assert_eq!(config.max_concurrent_fetches, 1);
-    /// ```
-    #[must_use]
-    pub const fn with_max_concurrent_fetches(mut self, max_concurrent_fetches: usize) -> Self {
-        self.max_concurrent_fetches = if max_concurrent_fetches == 0 {
-            MIN_CONCURRENT_FETCHES
-        } else {
-            max_concurrent_fetches
-        };
-        self
-    }
-}
-
 /// Configuration for loading indicator behavior.
 ///
 /// Controls how the server shows loading feedback when fetching registry data.
@@ -584,86 +231,6 @@ where
 {
     let text = String::deserialize(deserializer)?;
     Ok(validate_loading_text(text))
-}
-
-const fn default_outdated_severity() -> DiagnosticSeverity {
-    DiagnosticSeverity::HINT
-}
-
-const fn default_unknown_severity() -> DiagnosticSeverity {
-    DiagnosticSeverity::WARNING
-}
-
-const fn default_yanked_severity() -> DiagnosticSeverity {
-    DiagnosticSeverity::WARNING
-}
-
-const fn default_unsatisfiable_severity() -> DiagnosticSeverity {
-    DiagnosticSeverity::WARNING
-}
-
-const fn default_deprecated_severity() -> DiagnosticSeverity {
-    DiagnosticSeverity::WARNING
-}
-
-const fn default_mutable_ref_pin_severity() -> DiagnosticSeverity {
-    DiagnosticSeverity::HINT
-}
-
-const fn default_fetch_timeout_secs() -> u64 {
-    5
-}
-
-const fn default_max_concurrent_fetches() -> usize {
-    20
-}
-
-/// Minimum timeout (seconds) to prevent zero-timeout edge case
-const MIN_FETCH_TIMEOUT_SECS: u64 = 1;
-/// Maximum timeout (seconds) - 5 minutes is generous
-const MAX_FETCH_TIMEOUT_SECS: u64 = 300;
-
-/// Minimum concurrent fetches (must be at least 1)
-const MIN_CONCURRENT_FETCHES: usize = 1;
-/// Maximum concurrent fetches
-const MAX_CONCURRENT_FETCHES: usize = 100;
-
-/// Custom deserializer for fetch_timeout_secs that validates bounds
-fn deserialize_fetch_timeout<'de, D>(deserializer: D) -> Result<u64, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let secs = u64::deserialize(deserializer)?;
-    let clamped = secs.clamp(MIN_FETCH_TIMEOUT_SECS, MAX_FETCH_TIMEOUT_SECS);
-    if clamped != secs {
-        tracing::warn!(
-            "fetch_timeout_secs {} clamped to {} (valid range: {}-{})",
-            secs,
-            clamped,
-            MIN_FETCH_TIMEOUT_SECS,
-            MAX_FETCH_TIMEOUT_SECS
-        );
-    }
-    Ok(clamped)
-}
-
-/// Custom deserializer for max_concurrent_fetches that validates bounds
-fn deserialize_max_concurrent<'de, D>(deserializer: D) -> Result<usize, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let count = usize::deserialize(deserializer)?;
-    let clamped = count.clamp(MIN_CONCURRENT_FETCHES, MAX_CONCURRENT_FETCHES);
-    if clamped != count {
-        tracing::warn!(
-            "max_concurrent_fetches {} clamped to {} (valid range: {}-{})",
-            count,
-            clamped,
-            MIN_CONCURRENT_FETCHES,
-            MAX_CONCURRENT_FETCHES
-        );
-    }
-    Ok(clamped)
 }
 
 /// Configuration for cold start behavior.
@@ -780,466 +347,6 @@ impl Default for CodeLensConfig {
     }
 }
 
-/// Configuration for the release-freshness signal (issue #145).
-///
-/// Controls whether a recently published "latest" version is flagged as
-/// still within a cooldown window, mirroring GitHub Dependabot's default
-/// 3-day package cooldown. Applied uniformly across all ecosystems — no
-/// per-ecosystem override.
-///
-/// # Defaults
-///
-/// - `enabled`: `true`
-/// - `cooldown_secs`: `259200` (3 days)
-///
-/// # Examples
-///
-/// ```
-/// use deps_lsp::config::FreshnessConfig;
-///
-/// let config = FreshnessConfig::new().with_cooldown_secs(3600);
-///
-/// assert_eq!(config.cooldown_secs, 3600);
-/// ```
-#[non_exhaustive]
-#[derive(Debug, Clone, Deserialize)]
-pub struct FreshnessConfig {
-    /// Whether the release-cooldown freshness signal is enabled at all.
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    /// Cooldown window in seconds, clamped to 0..=30 days (default: 3 days)
-    #[serde(
-        default = "default_cooldown_secs",
-        deserialize_with = "deserialize_cooldown_secs"
-    )]
-    pub cooldown_secs: u64,
-}
-
-impl Default for FreshnessConfig {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl FreshnessConfig {
-    /// Builds the default configuration (mirrors [`Self::default`]).
-    ///
-    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
-    /// this crate, so every other crate must chain the `with_*` setters onto this
-    /// constructor instead.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use deps_lsp::config::FreshnessConfig;
-    ///
-    /// let config = FreshnessConfig::new();
-    /// assert!(config.enabled);
-    /// ```
-    #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            enabled: true,
-            cooldown_secs: default_cooldown_secs(),
-        }
-    }
-
-    /// Overrides [`Self::enabled`]. See [`Self::new`].
-    #[must_use]
-    pub const fn with_enabled(mut self, enabled: bool) -> Self {
-        self.enabled = enabled;
-        self
-    }
-
-    /// Overrides [`Self::cooldown_secs`]. See [`Self::new`]. Not clamped to the bounds
-    /// `deserialize_cooldown_secs` enforces — that validation only guards untrusted
-    /// LSP-client input, not construction from trusted Rust code.
-    #[must_use]
-    pub const fn with_cooldown_secs(mut self, cooldown_secs: u64) -> Self {
-        self.cooldown_secs = cooldown_secs;
-        self
-    }
-
-    /// Converts this LSP-facing config into the `deps-core` DTO threaded
-    /// through `Ecosystem::generate_hover`/`generate_diagnostics`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use deps_lsp::config::FreshnessConfig;
-    ///
-    /// let config = FreshnessConfig::default();
-    /// let settings = config.to_settings();
-    /// assert!(settings.enabled);
-    /// ```
-    #[must_use]
-    pub const fn to_settings(&self) -> deps_core::FreshnessSettings {
-        deps_core::FreshnessSettings {
-            enabled: self.enabled,
-            cooldown_secs: self.cooldown_secs,
-        }
-    }
-}
-
-const fn default_cooldown_secs() -> u64 {
-    deps_core::DEFAULT_COOLDOWN_SECS
-}
-
-/// Configuration for the supply-chain trust signal (spec 037, issue #543).
-///
-/// Controls whether hover attempts a deps.dev OpenSSF Scorecard / SLSA
-/// provenance lookup for the hovered dependency. This is the first feature
-/// to send package names to a third party that is not the package's own
-/// registry, so it gets an off switch like every other opt-out-able signal
-/// in this server (`diagnostics.vulnerabilities_enabled`), rather than
-/// requiring a user on a locked-down network to go fully offline.
-///
-/// # Defaults
-///
-/// - `enabled`: `true`
-///
-/// # Examples
-///
-/// ```
-/// use deps_lsp::config::SupplyChainConfig;
-///
-/// let config = SupplyChainConfig::default();
-/// assert!(config.enabled);
-/// ```
-#[non_exhaustive]
-#[derive(Debug, Clone, Deserialize)]
-pub struct SupplyChainConfig {
-    /// Whether supply-chain trust signals (OpenSSF Scorecard/SLSA provenance) are fetched.
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-}
-
-// Deliberately hand-written, mirroring `CodeLensConfig`'s rationale: a derived
-// `Default` would silently ship the feature disabled.
-impl Default for SupplyChainConfig {
-    fn default() -> Self {
-        Self { enabled: true }
-    }
-}
-
-/// Minimum cooldown window (seconds) — 0 disables the cooldown callout
-/// while keeping age display.
-const MIN_COOLDOWN_SECS: u64 = 0;
-/// Maximum cooldown window (seconds) — 30 days.
-const MAX_COOLDOWN_SECS: u64 = 30 * 24 * 60 * 60;
-
-/// Custom deserializer for `cooldown_secs` that validates bounds.
-fn deserialize_cooldown_secs<'de, D>(deserializer: D) -> Result<u64, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let secs = u64::deserialize(deserializer)?;
-    let clamped = secs.clamp(MIN_COOLDOWN_SECS, MAX_COOLDOWN_SECS);
-    if clamped != secs {
-        tracing::warn!(
-            "freshness.cooldown_secs {} clamped to {} (valid range: {}-{})",
-            secs,
-            clamped,
-            MIN_COOLDOWN_SECS,
-            MAX_COOLDOWN_SECS
-        );
-    }
-    Ok(clamped)
-}
-
-/// Cross-ecosystem workspace-declared registry settings (spec #443/plan-1b §1.7, renamed
-/// from `cargo.workspace_registries` by `032-npm-npmrc-registry-support` FR-008/C2).
-///
-/// **Breaking, pre-1.0, no alias.** `HttpCache` holds exactly one global
-/// `Arc<RegistryAccessPolicy>`, so this setting was never actually Cargo-scoped — it already
-/// governed every ecosystem's workspace-declared registry fetches (the npm `.npmrc`
-/// `registry=`/`@scope:registry=` path included, once that feature also reads it). A client
-/// still sending the old `cargo` key fails `DepsConfig`'s top-level `deny_unknown_fields`
-/// parse — since that attribute sits on `DepsConfig` itself, not on this section, the
-/// rejection takes the **whole** settings payload with it, not just this one setting. Sent at
-/// `initialize` (the common case) that means every setting reverts to its default — safely,
-/// for the security-relevant one here, since `WorkspaceRegistriesSetting::default()` is
-/// `PublicOnly` and `HttpCache::new` already starts there; sent later via
-/// `workspace/didChangeConfiguration` the previously applied configuration is kept instead.
-/// Either way the failure is logged (`tracing::warn!`), just not surfaced by most editors.
-///
-/// # Examples
-///
-/// ```
-/// use deps_lsp::config::{RegistriesConfig, WorkspaceRegistriesSetting};
-///
-/// let config = RegistriesConfig::default();
-/// assert_eq!(config.workspace_registries, WorkspaceRegistriesSetting::PublicOnly);
-/// ```
-#[non_exhaustive]
-#[derive(Clone, Deserialize, Default)]
-pub struct RegistriesConfig {
-    /// Whether workspace-declared registry hosts (e.g. a manifest's own custom index
-    /// URLs) may be reached at all, or only the default public registry.
-    #[serde(default)]
-    pub workspace_registries: WorkspaceRegistriesSetting,
-    /// Issue #561, FR-006: whether a NuGet user-profile-tier `NuGet.Config` `<add>` with no
-    /// repo-declared counterpart becomes a routing hop (`AlternateRegistry`-sourced, so
-    /// OSV/deps.dev/hover-trust are suppressed for it — spec 035 §5a), not just a credential
-    /// source for a repo-declared entry at the same URL. `#[serde(default)]`: additive-safe,
-    /// since `RegistriesConfig` itself is not under `DepsConfig`'s top-level
-    /// `deny_unknown_fields`. Default `false` — zero routing effect from any user-profile file
-    /// unless explicitly opted in.
-    #[serde(default)]
-    pub nuget_user_profile_sources: bool,
-    /// Issue #466, spec FR-005a/FR-011a: the GitLab instance host that `project:` includes
-    /// and `$CI_SERVER_FQDN`-relative `component:` includes resolve against, and — replacing,
-    /// not joined with, `gitlab.com` — the *only* host `GITLAB_TOKEN` may be sent to.
-    /// `#[serde(default)]`: additive-safe, same rationale as `nuget_user_profile_sources`
-    /// above. Default `""` (unset); an empty string is written through as `None` into the
-    /// shared `Arc<RwLock<Option<String>>>` handle. **No validation happens here** —
-    /// `deps-lsp` must not depend on `deps-gitlab-ci` for host semantics; an invalid value is
-    /// rejected on read by `deps_gitlab_ci::host::GitlabInstanceHost::get`, which also
-    /// documents the already-open-document limitation of a live change to this setting.
-    #[serde(default)]
-    pub gitlab_instance_host: String,
-}
-
-/// Hand-written, not derived (#936): `gitlab_instance_host` is a raw, unvalidated host
-/// literal that can be credential-shaped (e.g. `user:hunter2@gitlab.corp`) since **no
-/// validation happens here** (see the field's own doc) — a derived `Debug` would print it
-/// verbatim into `server.rs`'s `tracing::debug!("loaded configuration: {:?}", config)` at
-/// `RUST_LOG=debug`, before `deps_gitlab_ci::host::GitlabInstanceHost::get` ever gets a
-/// chance to reject it. Every field is still shown (this is not a summary); only
-/// `gitlab_instance_host` is routed through [`deps_core::net_policy::RedactedUrl`] first.
-impl std::fmt::Debug for RegistriesConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RegistriesConfig")
-            .field("workspace_registries", &self.workspace_registries)
-            .field(
-                "nuget_user_profile_sources",
-                &self.nuget_user_profile_sources,
-            )
-            .field(
-                "gitlab_instance_host",
-                &deps_core::net_policy::RedactedUrl::new(&self.gitlab_instance_host),
-            )
-            .finish()
-    }
-}
-
-/// Controls which workspace-declared registry index hosts this LSP will ever fetch.
-///
-/// Shared by every ecosystem with a workspace-declared-registry concept (spec #443,
-/// plan-1b §1.1/§1.7; `032-npm-npmrc-registry-support` FR-008 widened this from Cargo-only
-/// to cross-ecosystem).
-///
-/// Applies to Cargo's `registry`/`registry-index` alias path (#440), a
-/// `[source.crates-io] replace-with` chain (1b), and npm's `.npmrc` `registry=`/
-/// `@scope:registry=` resolution alike. Never affects a `$CARGO_HOME/config.toml`-configured
-/// Cargo registry, which is the user's own trusted configuration, not something a cloned
-/// repository controls — npm's `.npmrc` has no equivalent always-trusted tier (both its
-/// project and user tiers are policy-symmetric, since phase 1 carries no credential
-/// provenance to protect).
-///
-/// # Defaults
-///
-/// `"public_only"` — blocking the observed attack shape (an IP literal in a metadata/RFC1918
-/// range) without breaking a legitimate corporate `https://index.mycorp.dev` registry (a DNS
-/// name cannot be classified as internal without resolving it — see
-/// [`deps_core::net_policy`]'s module docs for the residual risk this leaves and why `off`
-/// is the only complete boundary).
-///
-/// # Examples
-///
-/// ```
-/// use deps_lsp::config::WorkspaceRegistriesSetting;
-///
-/// let setting: WorkspaceRegistriesSetting = serde_json::from_str("\"off\"").unwrap();
-/// assert_eq!(setting, WorkspaceRegistriesSetting::Off);
-/// ```
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkspaceRegistriesSetting {
-    /// Block every workspace-declared registry index — the only complete boundary. This
-    /// blocks the `registry`/`registry-index` alias path as well as `[source]`; it does
-    /// **not** affect `$CARGO_HOME`-configured registries, which keep working.
-    Off,
-    /// Allow only a host classified as public (spec `deps_core::net_policy::HostClass::Global`).
-    #[default]
-    PublicOnly,
-    /// Allow every workspace-declared index, including loopback/RFC1918/metadata-range
-    /// hosts — today's pre-#443 behavior, the escape hatch for a workspace that legitimately
-    /// points at one.
-    All,
-}
-
-impl WorkspaceRegistriesSetting {
-    /// Converts this LSP-facing setting into the `deps-core` policy value threaded through
-    /// `deps_cargo::config::RegistryIndex::new`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use deps_core::net_policy::WorkspaceRegistryAccess;
-    /// use deps_lsp::config::WorkspaceRegistriesSetting;
-    ///
-    /// assert_eq!(
-    ///     WorkspaceRegistriesSetting::Off.to_policy(),
-    ///     WorkspaceRegistryAccess::Off
-    /// );
-    /// ```
-    #[must_use]
-    pub const fn to_policy(self) -> deps_core::net_policy::WorkspaceRegistryAccess {
-        match self {
-            Self::Off => deps_core::net_policy::WorkspaceRegistryAccess::Off,
-            Self::PublicOnly => deps_core::net_policy::WorkspaceRegistryAccess::PublicOnly,
-            Self::All => deps_core::net_policy::WorkspaceRegistryAccess::All,
-        }
-    }
-}
-
-/// Configuration for outbound network access (issue #483).
-///
-/// # Defaults
-///
-/// - `offline`: `false`
-///
-/// # Examples
-///
-/// ```
-/// use deps_lsp::config::NetworkConfig;
-///
-/// let config = NetworkConfig::default();
-/// assert!(!config.offline);
-/// ```
-#[non_exhaustive]
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct NetworkConfig {
-    /// When `true`, blocks every *new* outbound registry/OSV/GitHub-tags request
-    /// (`deps_core::cache::HttpCache`'s 4 send sites) instead of making it, serving
-    /// already-cached data where available and returning `deps_core::DepsError::Offline`
-    /// otherwise. Also forces `cache.enabled` semantics to `true` for the duration (see
-    /// [`CacheConfig::enabled`]'s doc comment), so a warm entry keeps serving through an
-    /// online→offline transition even if caching was explicitly disabled.
-    ///
-    /// `HttpCache::set_offline` is a bare atomic store: a request already past its
-    /// `ensure_online` check and awaiting a response completes normally, and toggling
-    /// this flag never cancels in-flight requests.
-    #[serde(default)]
-    pub offline: bool,
-}
-
-/// SPDX allow-list/deny-list policy for the license-policy diagnostic (issue #661, spec 010
-/// Phase 2).
-///
-/// Both lists are independently optional; an empty/default policy produces no diagnostics.
-/// Not parse-affecting (see `reparse_scope`): a change here is picked up the next time
-/// diagnostics are pulled, without forcing a document reparse, since policy evaluation reads
-/// the current config fresh on every diagnostics request rather than being baked into
-/// parse-time state.
-///
-/// # Defaults
-///
-/// - `allow`: `[]`
-/// - `deny`: `[]`
-///
-/// # Examples
-///
-/// ```
-/// use deps_lsp::config::LicensePolicyConfig;
-///
-/// let config = LicensePolicyConfig::default();
-/// assert!(config.to_policy().is_empty());
-/// ```
-#[non_exhaustive]
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct LicensePolicyConfig {
-    /// SPDX identifiers a dependency's license must include at least one of, when non-empty.
-    #[serde(default, deserialize_with = "deserialize_spdx_list")]
-    pub allow: Vec<String>,
-    /// SPDX identifiers a dependency's license must not include any of.
-    #[serde(default, deserialize_with = "deserialize_spdx_list")]
-    pub deny: Vec<String>,
-}
-
-impl LicensePolicyConfig {
-    /// Builds an empty allow/deny policy (mirrors [`Self::default`]).
-    ///
-    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
-    /// this crate, so every other crate must chain the `with_*` setters onto this
-    /// constructor instead.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use deps_lsp::config::LicensePolicyConfig;
-    ///
-    /// let config = LicensePolicyConfig::new();
-    /// assert!(config.allow.is_empty());
-    /// ```
-    #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            allow: Vec::new(),
-            deny: Vec::new(),
-        }
-    }
-
-    /// Overrides [`Self::allow`]. See [`Self::new`]. Takes `Vec<String>` rather than
-    /// `impl Into<String>` — this field is a list, not a single string — mirroring
-    /// `deps_core::ResolvedPackage::with_dependencies`'s existing precedent for a `Vec<String>`
-    /// field, not this module's single-`String`-field setters (e.g.
-    /// [`InlayHintsConfig::with_up_to_date_text`]).
-    #[must_use]
-    pub fn with_allow(mut self, allow: Vec<String>) -> Self {
-        self.allow = allow;
-        self
-    }
-
-    /// Overrides [`Self::deny`]. See [`Self::new`] and [`Self::with_allow`]'s note on this
-    /// setter's parameter type.
-    #[must_use]
-    pub fn with_deny(mut self, deny: Vec<String>) -> Self {
-        self.deny = deny;
-        self
-    }
-
-    /// Converts this LSP-facing config into the `deps-core` policy threaded through
-    /// [`deps_core::licenses::evaluate`].
-    ///
-    /// Both fields already went through `deserialize_spdx_list` at config-load time, so
-    /// this never drops entries or logs a warning of its own — [`deps_core::LicensePolicy::new`]
-    /// simply re-validates already-clean data, which is a no-op.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use deps_lsp::config::LicensePolicyConfig;
-    ///
-    /// let config = LicensePolicyConfig::new()
-    ///     .with_allow(vec!["MIT".to_string()])
-    ///     .with_deny(vec!["GPL-3.0".to_string()]);
-    /// let policy = config.to_policy();
-    /// assert_eq!(policy.allow, vec!["MIT".to_string()]);
-    /// ```
-    #[must_use]
-    pub fn to_policy(&self) -> deps_core::LicensePolicy {
-        deps_core::LicensePolicy::new(self.allow.clone(), self.deny.clone())
-    }
-}
-
-/// Custom deserializer for `LicensePolicyConfig`'s `allow`/`deny` lists: drops (and warns
-/// about, via [`deps_core::licenses::filter_valid_spdx_ids`]) any entry that isn't
-/// syntactically a plausible single SPDX identifier, exactly once at config-load time —
-/// same "warn, never crash" contract as every other custom deserializer in this module (spec
-/// 010 plan.md's "Invalid SPDX identifier in policy" decision: `initializationOptions` has no
-/// document URI to anchor an LSP diagnostic to, so a log warning is the only feedback
-/// channel).
-fn deserialize_spdx_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let raw = Vec::<String>::deserialize(deserializer)?;
-    Ok(deps_core::licenses::filter_valid_spdx_ids(raw))
-}
-
 /// Which open documents a config change invalidates and must reparse (issue #592).
 ///
 /// `All` and a named `Ecosystems` set both exist so a change with a narrow, known blast
@@ -1339,17 +446,20 @@ pub(crate) fn reparse_scope(
 ) -> Option<ReparseScope> {
     let DepsConfig {
         inlay_hints: new_inlay_hints,
-        diagnostics: new_diagnostics,
-        cache: new_cache,
         cold_start: new_cold_start,
         loading_indicator: new_loading_indicator,
         code_lens: new_code_lens,
+        policy: new_policy,
+    } = new;
+    let PolicyConfig {
+        diagnostics: new_diagnostics,
+        cache: new_cache,
         freshness: new_freshness,
         supply_chain: new_supply_chain,
         registries: new_registries,
         network: new_network,
         license_policy: new_license_policy,
-    } = new;
+    } = new_policy;
 
     // Not parse-affecting: every field is named (never `..`), so its value is simply
     // unused here rather than compared, but a new field on any of these sections still
@@ -1402,7 +512,7 @@ pub(crate) fn reparse_scope(
         workspace_registries: old_workspace_registries,
         nuget_user_profile_sources: old_nuget_user_profile_sources,
         gitlab_instance_host: old_gitlab_instance_host,
-    } = &old.registries;
+    } = &old.policy.registries;
 
     let mut scope: Option<ReparseScope> = None;
     let union_in = |scope: &mut Option<ReparseScope>, addition: ReparseScope| {
@@ -1437,6 +547,7 @@ pub(crate) fn reparse_scope(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tower_lsp_server::ls_types::DiagnosticSeverity;
 
     #[test]
     fn test_default_config() {
@@ -1445,7 +556,7 @@ mod tests {
         assert_eq!(config.inlay_hints.up_to_date_text, "✅");
         assert_eq!(config.inlay_hints.needs_update_text, "❌ {}");
         assert_eq!(
-            config.registries.workspace_registries,
+            config.policy.registries.workspace_registries,
             WorkspaceRegistriesSetting::PublicOnly
         );
     }
@@ -1471,7 +582,7 @@ mod tests {
         let json = r#"{"registries": {"workspace_registries": "off"}}"#;
         let config: DepsConfig = serde_json::from_str(json).unwrap();
         assert_eq!(
-            config.registries.workspace_registries,
+            config.policy.registries.workspace_registries,
             WorkspaceRegistriesSetting::Off
         );
     }
@@ -1481,11 +592,14 @@ mod tests {
     #[test]
     fn test_gitlab_instance_host_defaults_to_empty_and_deserializes() {
         let default_config: DepsConfig = serde_json::from_str("{}").unwrap();
-        assert_eq!(default_config.registries.gitlab_instance_host, "");
+        assert_eq!(default_config.policy.registries.gitlab_instance_host, "");
 
         let json = r#"{"registries": {"gitlab_instance_host": "gitlab.mycorp.dev"}}"#;
         let config: DepsConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(config.registries.gitlab_instance_host, "gitlab.mycorp.dev");
+        assert_eq!(
+            config.policy.registries.gitlab_instance_host,
+            "gitlab.mycorp.dev"
+        );
     }
 
     /// #936: `RegistriesConfig`'s hand-written `Debug` impl must redact a credential-shaped
@@ -1499,7 +613,7 @@ mod tests {
         let json = r#"{"registries": {"gitlab_instance_host": "user:hunter2@gitlab.corp"}}"#;
         let config: DepsConfig = serde_json::from_str(json).unwrap();
 
-        let section_debug = format!("{:?}", config.registries);
+        let section_debug = format!("{:?}", config.policy.registries);
         assert!(!section_debug.contains("hunter2"), "{section_debug}");
         assert!(section_debug.contains("gitlab.corp"), "{section_debug}");
 
@@ -1521,6 +635,92 @@ mod tests {
     fn test_old_cargo_config_key_is_rejected_not_silently_ignored() {
         let json = r#"{"cargo": {"workspace_registries": "off"}}"#;
         assert!(serde_json::from_str::<DepsConfig>(json).is_err());
+    }
+
+    /// T003 regression gate (spec 062 plan §3/§11): `#[serde(flatten)]` on `DepsConfig::policy`
+    /// must still combine with `DepsConfig`'s own top-level `#[serde(deny_unknown_fields)]`
+    /// exactly as the pre-refactor flat struct did — an unrecognized top-level key must reject
+    /// the *whole* payload, never fall through and silently reset every unmentioned section to
+    /// its default. `test_old_cargo_config_key_is_rejected_not_silently_ignored` above and
+    /// `server::tests::parse_config_tests::test_parse_config_rejects_mixed_blob_with_one_recognized_key_and_unknown_siblings`
+    /// already exercise this from a different call path; this test is the direct, minimal
+    /// case naming the mechanism itself.
+    #[test]
+    fn test_flatten_preserves_deny_unknown_fields_rejection() {
+        let json = r#"{"diagnostics": {"outdated_severity": 1}, "totally_unknown_key": true}"#;
+        assert!(
+            serde_json::from_str::<DepsConfig>(json).is_err(),
+            "an unknown top-level key alongside a recognized flattened section must still \
+             reject the whole payload"
+        );
+    }
+
+    /// Companion to the test above: an unknown key *nested inside* a known section must stay
+    /// tolerated (forward-compat for keys added inside a section later) — `deny_unknown_fields`
+    /// applies only to `DepsConfig`'s own top-level shape, never to the section structs
+    /// flattened into it, exactly as before this module's fields moved into
+    /// `deps_core::policy_config`.
+    #[test]
+    fn test_flatten_still_tolerates_unknown_key_nested_inside_a_known_section() {
+        let json = r#"{"diagnostics": {"outdated_severity": 1, "future_field": "ignored"}}"#;
+        let config: DepsConfig =
+            serde_json::from_str(json).expect("a nested unknown key must not reject the payload");
+        assert_eq!(
+            config.policy.diagnostics.outdated_severity,
+            DiagnosticSeverity::ERROR
+        );
+    }
+
+    /// T003 regression gate: a realistic `initializationOptions` payload covering every
+    /// section — the editor-only fields `DepsConfig` still owns directly, and every
+    /// policy-relevant section now composed from `deps_core::policy_config::PolicyConfig` via
+    /// `#[serde(flatten)]` — parses to the exact values sent, at the same flat top-level JSON
+    /// shape LSP clients already use (`{"cache": {...}, "network": {...}}`, not a nested
+    /// `{"policy": {"cache": {...}}}`).
+    #[test]
+    fn test_full_initialization_options_payload_parses_through_flatten() {
+        let json = r#"{
+            "inlay_hints": { "enabled": false, "up_to_date_text": "OK" },
+            "cold_start": { "enabled": false, "rate_limit_ms": 250 },
+            "loading_indicator": { "enabled": false },
+            "code_lens": { "enabled": false },
+            "diagnostics": { "outdated_severity": 1, "vulnerabilities_enabled": false },
+            "cache": { "enabled": false, "max_concurrent_fetches": 5 },
+            "freshness": { "enabled": false, "cooldown_secs": 60 },
+            "supply_chain": { "enabled": false },
+            "registries": { "workspace_registries": "off" },
+            "network": { "offline": true },
+            "license_policy": { "allow": ["MIT"], "deny": ["GPL-3.0"] }
+        }"#;
+
+        let config: DepsConfig = serde_json::from_str(json).unwrap();
+
+        assert!(!config.inlay_hints.enabled);
+        assert_eq!(config.inlay_hints.up_to_date_text, "OK");
+        assert!(!config.cold_start.enabled);
+        assert_eq!(config.cold_start.rate_limit_ms, 250);
+        assert!(!config.loading_indicator.enabled);
+        assert!(!config.code_lens.enabled);
+        assert_eq!(
+            config.policy.diagnostics.outdated_severity,
+            DiagnosticSeverity::ERROR
+        );
+        assert!(!config.policy.diagnostics.vulnerabilities_enabled);
+        assert!(!config.policy.cache.enabled);
+        assert_eq!(config.policy.cache.max_concurrent_fetches, 5);
+        assert!(!config.policy.freshness.enabled);
+        assert_eq!(config.policy.freshness.cooldown_secs, 60);
+        assert!(!config.policy.supply_chain.enabled);
+        assert_eq!(
+            config.policy.registries.workspace_registries,
+            WorkspaceRegistriesSetting::Off
+        );
+        assert!(config.policy.network.offline);
+        assert_eq!(config.policy.license_policy.allow, vec!["MIT".to_string()]);
+        assert_eq!(
+            config.policy.license_policy.deny,
+            vec!["GPL-3.0".to_string()]
+        );
     }
 
     #[test]
@@ -1679,7 +879,7 @@ mod tests {
         // Regression test for issue #833: `buffer_unordered(0)` never completes, so
         // this setter must not let a `0` reach `document::fetch`.
         let config = CacheConfig::new().with_max_concurrent_fetches(0);
-        assert_eq!(config.max_concurrent_fetches, MIN_CONCURRENT_FETCHES);
+        assert_eq!(config.max_concurrent_fetches, 1);
     }
 
     #[test]
@@ -1717,10 +917,10 @@ mod tests {
         let config: DepsConfig = serde_json::from_str(json).unwrap();
         assert!(config.inlay_hints.enabled);
         assert_eq!(
-            config.diagnostics.outdated_severity,
+            config.policy.diagnostics.outdated_severity,
             DiagnosticSeverity::HINT
         );
-        assert!(config.cache.enabled);
+        assert!(config.policy.cache.enabled);
     }
 
     #[test]
@@ -1736,7 +936,7 @@ mod tests {
         // Other fields should use defaults
         assert_eq!(config.inlay_hints.up_to_date_text, "✅");
         assert_eq!(
-            config.diagnostics.outdated_severity,
+            config.policy.diagnostics.outdated_severity,
             DiagnosticSeverity::HINT
         );
     }
@@ -1747,7 +947,7 @@ mod tests {
         let config: DepsConfig = serde_json::from_str(json).unwrap();
         // All fields should use defaults
         assert!(config.inlay_hints.enabled);
-        assert!(config.cache.enabled);
+        assert!(config.policy.cache.enabled);
     }
 
     #[test]
@@ -1968,7 +1168,7 @@ mod tests {
         // Regression guard: DepsConfig derives Default, which would silently produce
         // `enabled: false` if SupplyChainConfig ever switched to a derived Default.
         let config = DepsConfig::default();
-        assert!(config.supply_chain.enabled);
+        assert!(config.policy.supply_chain.enabled);
     }
 
     #[test]
@@ -2032,15 +1232,15 @@ mod tests {
     #[test]
     fn test_deps_config_includes_freshness_default() {
         let config = DepsConfig::default();
-        assert!(config.freshness.enabled);
-        assert_eq!(config.freshness.cooldown_secs, 259_200);
+        assert!(config.policy.freshness.enabled);
+        assert_eq!(config.policy.freshness.cooldown_secs, 259_200);
     }
 
     #[test]
     fn test_deps_config_empty_json_includes_freshness_default() {
         let config: DepsConfig = serde_json::from_str("{}").unwrap();
-        assert!(config.freshness.enabled);
-        assert_eq!(config.freshness.cooldown_secs, 259_200);
+        assert!(config.policy.freshness.enabled);
+        assert_eq!(config.policy.freshness.cooldown_secs, 259_200);
     }
 
     #[test]
@@ -2049,14 +1249,14 @@ mod tests {
         assert!(!config.offline);
 
         let config: DepsConfig = serde_json::from_str("{}").unwrap();
-        assert!(!config.network.offline);
+        assert!(!config.policy.network.offline);
     }
 
     #[test]
     fn test_network_config_accepts_offline_true() {
         let json = r#"{"network":{"offline":true}}"#;
         let config: DepsConfig = serde_json::from_str(json).unwrap();
-        assert!(config.network.offline);
+        assert!(config.policy.network.offline);
     }
 
     // =========================================================================
@@ -2082,8 +1282,8 @@ mod tests {
         fn test_inert_field_change_returns_none() {
             let old = DepsConfig::default();
             let mut new = DepsConfig::default();
-            new.freshness.cooldown_secs = 60;
-            new.network.offline = true;
+            new.policy.freshness.cooldown_secs = 60;
+            new.policy.network.offline = true;
             new.cold_start.rate_limit_ms = 0;
             assert!(
                 reparse_scope(&old, &new, TEST_WORKSPACE_REGISTRY_ECOSYSTEMS).is_none(),
@@ -2095,7 +1295,7 @@ mod tests {
         fn test_workspace_registries_change_scopes_to_workspace_ecosystems() {
             let old = DepsConfig::default();
             let mut new = DepsConfig::default();
-            new.registries.workspace_registries = WorkspaceRegistriesSetting::Off;
+            new.policy.registries.workspace_registries = WorkspaceRegistriesSetting::Off;
 
             let scope = reparse_scope(&old, &new, TEST_WORKSPACE_REGISTRY_ECOSYSTEMS)
                 .expect("must trigger a reparse");
@@ -2116,7 +1316,7 @@ mod tests {
         fn test_workspace_registries_change_scope_reflects_caller_supplied_list() {
             let old = DepsConfig::default();
             let mut new = DepsConfig::default();
-            new.registries.workspace_registries = WorkspaceRegistriesSetting::Off;
+            new.policy.registries.workspace_registries = WorkspaceRegistriesSetting::Off;
 
             let scope =
                 reparse_scope(&old, &new, &["only-this-one"]).expect("must trigger a reparse");
@@ -2128,7 +1328,7 @@ mod tests {
         fn test_nuget_user_profile_sources_change_scopes_to_nuget_only() {
             let old = DepsConfig::default();
             let mut new = DepsConfig::default();
-            new.registries.nuget_user_profile_sources = true;
+            new.policy.registries.nuget_user_profile_sources = true;
 
             let scope = reparse_scope(&old, &new, TEST_WORKSPACE_REGISTRY_ECOSYSTEMS)
                 .expect("must trigger a reparse");
@@ -2144,7 +1344,7 @@ mod tests {
         fn test_gitlab_instance_host_change_scopes_to_gitlab_ci_only() {
             let old = DepsConfig::default();
             let mut new = DepsConfig::default();
-            new.registries.gitlab_instance_host = "gitlab.mycorp.dev".to_string();
+            new.policy.registries.gitlab_instance_host = "gitlab.mycorp.dev".to_string();
 
             let scope = reparse_scope(&old, &new, TEST_WORKSPACE_REGISTRY_ECOSYSTEMS)
                 .expect("must trigger a reparse");
@@ -2161,8 +1361,8 @@ mod tests {
         fn test_both_registry_fields_changed_unions_scopes() {
             let old = DepsConfig::default();
             let mut new = DepsConfig::default();
-            new.registries.workspace_registries = WorkspaceRegistriesSetting::Off;
-            new.registries.nuget_user_profile_sources = true;
+            new.policy.registries.workspace_registries = WorkspaceRegistriesSetting::Off;
+            new.policy.registries.nuget_user_profile_sources = true;
 
             let scope = reparse_scope(&old, &new, TEST_WORKSPACE_REGISTRY_ECOSYSTEMS)
                 .expect("must trigger a reparse");

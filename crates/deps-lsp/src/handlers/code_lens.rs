@@ -51,7 +51,10 @@ pub async fn handle_code_lens(
 
     let (offline, severities) = {
         let config = config.read().await;
-        (config.network.offline, config.diagnostics.to_severities())
+        (
+            config.policy.network.offline,
+            config.policy.diagnostics.to_severities(),
+        )
     };
 
     // Own everything `generate_code_lenses` needs and release the DashMap shard `Ref`
@@ -1070,10 +1073,15 @@ let package = Package(
             state.update_document(uri.clone(), doc_state);
 
             let (client, config) = create_test_client_and_config();
-            // `handle_code_lens` derives severities from `config.diagnostics.to_severities()`,
+            // `handle_code_lens` derives severities from `config.policy.diagnostics.to_severities()`,
             // not a hand-built `DiagnosticSeverities` — drive the flag through the config
             // the test helper already hands out.
-            config.write().await.diagnostics.mutable_ref_pin_enabled = false;
+            config
+                .write()
+                .await
+                .policy
+                .diagnostics
+                .mutable_ref_pin_enabled = false;
             let result = handle_code_lens(state, params(uri), true, client, config).await;
 
             assert!(

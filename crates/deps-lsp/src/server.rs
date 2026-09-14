@@ -300,11 +300,11 @@ impl Backend {
         let (freshness, severities, offline, fetch_timeout_secs, max_concurrent_fetches) = {
             let config = self.config.read().await;
             (
-                config.freshness.to_settings(),
-                config.diagnostics.to_severities(),
-                config.network.offline,
-                config.cache.fetch_timeout_secs,
-                config.cache.max_concurrent_fetches,
+                config.policy.freshness.to_settings(),
+                config.policy.diagnostics.to_severities(),
+                config.policy.network.offline,
+                config.policy.cache.fetch_timeout_secs,
+                config.policy.cache.max_concurrent_fetches,
             )
         };
 
@@ -520,13 +520,13 @@ impl LanguageServer for Backend {
             tracing::debug!("loaded configuration: {:?}", config);
             self.state
                 .cache
-                .set_registry_policy(config.registries.workspace_registries.to_policy());
+                .set_registry_policy(config.policy.registries.workspace_registries.to_policy());
             self.state.nuget_user_profile_sources.store(
-                config.registries.nuget_user_profile_sources,
+                config.policy.registries.nuget_user_profile_sources,
                 std::sync::atomic::Ordering::Relaxed,
             );
-            let gitlab_instance_host = (!config.registries.gitlab_instance_host.is_empty())
-                .then(|| config.registries.gitlab_instance_host.clone());
+            let gitlab_instance_host = (!config.policy.registries.gitlab_instance_host.is_empty())
+                .then(|| config.policy.registries.gitlab_instance_host.clone());
             #[cfg(feature = "gitlab-ci")]
             if let Some(raw) = &gitlab_instance_host {
                 warn_if_gitlab_instance_host_invalid(
@@ -544,8 +544,10 @@ impl LanguageServer for Backend {
                 // never actually be poisoned; recover rather than propagate for
                 // defense in depth.
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = gitlab_instance_host;
-            self.state.cache.set_offline(config.network.offline);
-            self.state.cache.set_cache_enabled(config.cache.enabled);
+            self.state.cache.set_offline(config.policy.network.offline);
+            self.state
+                .cache
+                .set_cache_enabled(config.policy.cache.enabled);
             self.state
                 .cold_start_limiter
                 .set_min_interval(std::time::Duration::from_millis(
@@ -555,7 +557,7 @@ impl LanguageServer for Backend {
             // generation call site (push and pull) reads the same resolved policy — see
             // `ServerState::license_policy`'s doc.
             self.state
-                .set_license_policy(config.license_policy.to_policy());
+                .set_license_policy(config.policy.license_policy.to_policy());
             *self.config.write().await = config;
         }
 
@@ -706,15 +708,15 @@ impl LanguageServer for Backend {
         // update, no other task can observe `self.config` already reflecting the new
         // value while the policy `Arc` (the thing that actually gates a fetch) still
         // reflects the old one.
-        let workspace_registries_policy = config.registries.workspace_registries.to_policy();
-        let nuget_user_profile_sources = config.registries.nuget_user_profile_sources;
-        let offline = config.network.offline;
-        let cache_enabled = config.cache.enabled;
+        let workspace_registries_policy = config.policy.registries.workspace_registries.to_policy();
+        let nuget_user_profile_sources = config.policy.registries.nuget_user_profile_sources;
+        let offline = config.policy.network.offline;
+        let cache_enabled = config.policy.cache.enabled;
         let cold_start_rate_limit_ms = config.cold_start.rate_limit_ms;
-        let gitlab_instance_host = (!config.registries.gitlab_instance_host.is_empty())
-            .then(|| config.registries.gitlab_instance_host.clone());
+        let gitlab_instance_host = (!config.policy.registries.gitlab_instance_host.is_empty())
+            .then(|| config.policy.registries.gitlab_instance_host.clone());
         // Issue #660/#661 critic C1: see the mirroring call after the config swap below.
-        let license_policy = config.license_policy.to_policy();
+        let license_policy = config.policy.license_policy.to_policy();
 
         // Diff the old vs new config for parse-affecting changes (issue #592) and swap in
         // the new config under one write-guard acquisition — `DepsConfig` has no `Clone`,
@@ -1027,7 +1029,7 @@ impl LanguageServer for Backend {
         tracing::info!("diagnostic request for: {:?}", uri);
 
         // Clone config before async call to release lock early
-        let diagnostics_config = { self.config.read().await.diagnostics.clone() };
+        let diagnostics_config = { self.config.read().await.policy.diagnostics.clone() };
 
         let items = diagnostics::handle_diagnostics(
             Arc::clone(&self.state),
@@ -1688,8 +1690,8 @@ mod tests {
         let backend = service.inner();
         {
             let mut config = backend.config.write().await;
-            config.cache.fetch_timeout_secs = 5;
-            config.cache.max_concurrent_fetches = 1;
+            config.policy.cache.fetch_timeout_secs = 5;
+            config.policy.cache.max_concurrent_fetches = 1;
         }
 
         let ecosystem = backend.state.ecosystem_registry.get("cargo").unwrap();
@@ -1923,7 +1925,7 @@ mod tests {
         #[test]
         fn test_parse_config_accepts_empty_object() {
             let config = parse_config(serde_json::json!({})).expect("empty object is valid");
-            assert!(config.freshness.enabled);
+            assert!(config.policy.freshness.enabled);
         }
 
         #[test]
@@ -1932,7 +1934,7 @@ mod tests {
                 "freshness": { "cooldown_secs": 60 }
             }))
             .expect("payload with a recognized key is valid");
-            assert_eq!(config.freshness.cooldown_secs, 60);
+            assert_eq!(config.policy.freshness.cooldown_secs, 60);
         }
 
         /// C2 regression: a section-wrapped payload (a real shape some clients send)
@@ -2162,7 +2164,10 @@ mod tests {
                 .await;
 
             assert!(result.is_ok());
-            assert_eq!(backend.config.read().await.freshness.cooldown_secs, 60);
+            assert_eq!(
+                backend.config.read().await.policy.freshness.cooldown_secs,
+                60
+            );
         }
 
         /// C2 through `initialize`: a section-wrapped payload (`deny_unknown_fields`
@@ -2185,7 +2190,7 @@ mod tests {
 
             assert!(result.is_ok());
             assert_eq!(
-                backend.config.read().await.freshness.cooldown_secs,
+                backend.config.read().await.policy.freshness.cooldown_secs,
                 deps_core::DEFAULT_COOLDOWN_SECS,
                 "malformed initializationOptions must not silently change the config"
             );
@@ -2199,7 +2204,7 @@ mod tests {
             let result = backend.initialize(InitializeParams::default()).await;
 
             assert!(result.is_ok());
-            assert!(backend.config.read().await.freshness.enabled);
+            assert!(backend.config.read().await.policy.freshness.enabled);
         }
 
         /// Tester gap (issue #660/#661): `initializationOptions.license_policy` had no
@@ -2224,10 +2229,13 @@ mod tests {
             assert!(result.is_ok());
             let config = backend.config.read().await;
             assert_eq!(
-                config.license_policy.allow,
+                config.policy.license_policy.allow,
                 vec!["MIT".to_string(), "Apache-2.0".to_string()]
             );
-            assert_eq!(config.license_policy.deny, vec!["GPL-3.0".to_string()]);
+            assert_eq!(
+                config.policy.license_policy.deny,
+                vec!["GPL-3.0".to_string()]
+            );
             drop(config);
 
             let mirrored = backend.state.license_policy();
@@ -2259,12 +2267,12 @@ mod tests {
             assert!(result.is_ok());
             let config = backend.config.read().await;
             assert_eq!(
-                config.license_policy.allow,
+                config.policy.license_policy.allow,
                 vec!["MIT".to_string()],
                 "the invalid entry must be dropped, not reject the whole payload"
             );
             assert_eq!(
-                config.freshness.cooldown_secs, 60,
+                config.policy.freshness.cooldown_secs, 60,
                 "the rest of the config must still apply"
             );
         }
@@ -2285,7 +2293,10 @@ mod tests {
                 })
                 .await;
 
-            assert_eq!(backend.config.read().await.freshness.cooldown_secs, 60);
+            assert_eq!(
+                backend.config.read().await.policy.freshness.cooldown_secs,
+                60
+            );
         }
 
         /// C2 end-to-end: a section-wrapped payload must never wipe the previously
@@ -2300,7 +2311,10 @@ mod tests {
                     settings: serde_json::json!({ "freshness": { "cooldown_secs": 60 } }),
                 })
                 .await;
-            assert_eq!(backend.config.read().await.freshness.cooldown_secs, 60);
+            assert_eq!(
+                backend.config.read().await.policy.freshness.cooldown_secs,
+                60
+            );
 
             backend
                 .did_change_configuration(DidChangeConfigurationParams {
@@ -2309,7 +2323,7 @@ mod tests {
                 .await;
 
             assert_eq!(
-                backend.config.read().await.freshness.cooldown_secs,
+                backend.config.read().await.policy.freshness.cooldown_secs,
                 60,
                 "a malformed/unrecognized payload must not overwrite the previous configuration"
             );
@@ -2328,7 +2342,10 @@ mod tests {
                     settings: serde_json::json!({ "freshness": { "cooldown_secs": 60 } }),
                 })
                 .await;
-            assert_eq!(backend.config.read().await.freshness.cooldown_secs, 60);
+            assert_eq!(
+                backend.config.read().await.policy.freshness.cooldown_secs,
+                60
+            );
 
             backend
                 .did_change_configuration(DidChangeConfigurationParams {
@@ -2336,7 +2353,10 @@ mod tests {
                 })
                 .await;
 
-            assert_eq!(backend.config.read().await.freshness.cooldown_secs, 60);
+            assert_eq!(
+                backend.config.read().await.policy.freshness.cooldown_secs,
+                60
+            );
         }
 
         /// Tester gap (issue #660/#661): mirrors `initialize_tests::
@@ -2359,9 +2379,9 @@ mod tests {
                 .await;
 
             let config = backend.config.read().await;
-            assert_eq!(config.license_policy.allow, vec!["MIT".to_string()]);
+            assert_eq!(config.policy.license_policy.allow, vec!["MIT".to_string()]);
             assert_eq!(
-                config.license_policy.deny,
+                config.policy.license_policy.deny,
                 vec!["GPL-3.0".to_string(), "AGPL-3.0".to_string()]
             );
             drop(config);
@@ -2521,7 +2541,8 @@ mod tests {
                 }
             });
 
-            let diagnostics_config_snapshot = { backend.config.read().await.diagnostics.clone() };
+            let diagnostics_config_snapshot =
+                { backend.config.read().await.policy.diagnostics.clone() };
             let diagnostics_task = tokio::spawn({
                 let state = Arc::clone(&backend.state);
                 let config = Arc::clone(&backend.config);
@@ -2558,7 +2579,10 @@ mod tests {
 
             outcome.0.expect("hover task panicked");
             outcome.1.expect("diagnostics task panicked");
-            assert_eq!(backend.config.read().await.freshness.cooldown_secs, 42);
+            assert_eq!(
+                backend.config.read().await.policy.freshness.cooldown_secs,
+                42
+            );
         }
 
         /// Issue #592 S1 regression: two rapid `didChangeConfiguration` notifications, each

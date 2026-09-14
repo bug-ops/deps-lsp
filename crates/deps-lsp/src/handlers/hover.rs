@@ -33,9 +33,9 @@ pub async fn handle_hover(
     let (freshness, offline, supply_chain_enabled) = {
         let config = config.read().await;
         (
-            config.freshness.to_settings(),
-            config.network.offline,
-            config.supply_chain.enabled,
+            config.policy.freshness.to_settings(),
+            config.policy.network.offline,
+            config.policy.supply_chain.enabled,
         )
     };
 
