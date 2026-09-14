@@ -1023,28 +1023,48 @@ reading the parsed dependency list. A single dependency's own value aliasing a w
 (`pkg: *shared_entry`, as opposed to the section or `environment:` key itself) is not
 resolved at all — the dependency appears with a real name but no version/source info.
 
-### GitLab CI/CD: YAML Scalar Anchor/Alias Resolution
+### GitLab CI/CD: YAML Anchor/Alias Resolution
 
 `.gitlab-ci.yml` supports YAML anchors (`&name`) and aliases (`*name`) for reuse — GitLab's
 own docs recommend anchor-based templates as the standard way to reduce duplication across
-jobs. Within the `include:` subtree, a scalar anchor used as a `ref:`, `project:`, or
-`component:` value and aliased elsewhere in the same file now resolves correctly, with
-hover/diagnostics/inlay hints positioned at the **alias token** (not the anchor's definition
-site).
+jobs. Within the `include:` subtree, both **scalar** anchors (a `ref:`, `project:`, or
+`component:` value aliased elsewhere) and **mapping-shaped** anchors (a whole `include:`
+entry reused via `- *tpl`, `include: *tpl`, `- <<: *tpl`, or `- <<: [*a, *b]`) resolve
+correctly, with hover/diagnostics/inlay hints positioned at the **alias token** (not the
+anchor's definition site).
+
+**Merge-key (`<<:`) precedence matches what GitLab's own YAML loader (Ruby Psych) actually
+resolves**, not the abstract YAML 1.1 merge-key spec's "explicit keys always win" reading —
+the two disagree in several cases: `<<:` is applied *positionally*, like any other key, so an
+own key written **before** `<<:` loses to the merged value, while one written **after** wins;
+`<<: [*a, *b]` is first-wins when both templates define the same key; two separate `<<:` keys
+in one mapping are last-wins (a different result from the sequence form); and a template
+reached through a chain of merges (`.c: &c {<<: *b}` where `.b` itself merges `*a`) resolves
+transitively with the same rules at each level, no special-casing.
 
 **SHA-pin quickfix and version completion are withheld at the alias site itself**, scoped to
 whichever field actually backs `version_range` (`ref:` for a `project:` include, `component:`'s
-own field) — resolving an alias produces a value with no editable literal span at that
-position, since rewriting it would need to edit the anchor definition instead. An aliased
-`project:` next to a literal `ref:` is unaffected: only the field that is itself an alias
-loses its quickfix/completion.
+own field) — resolving an alias (scalar or container) produces a value with no editable
+literal span at that position, since rewriting it would need to edit the anchor definition
+instead. This is tracked per-field, not per-entry: a merged/aliased `project:` next to a
+literal `ref:` is unaffected — only the field that is itself alias-derived loses its
+quickfix/completion.
 
-**Known limitation — container anchors are out of scope.** A whole `include:` entry reused
-via `- *tpl` / `- <<: *tpl` (mapping-shaped) or `include: *incs` (sequence-shaped) is not
-detected — only a *scalar* anchor aliased as one field's value within an otherwise-literal
-`include:` entry is resolved. Mapping-shaped container anchors are tracked as a follow-up
-(#916); sequence-shaped container anchors are a structural won't-fix (#917) since one alias
-token cannot back N distinct entries' `name_range`/`version_range`.
+**Two documented, deliberate divergences from Psych** (both accepted rather than fixed — see
+the linked spec for the full rationale):
+- A doubly-nested explicit `null` inside a merge chain (e.g. `- {ref: v9, <<: *b}` where `*b`
+  is `{<<: *a, ref: ~}`) resolves to the entry's earlier literal value instead of Psych's
+  `nil`, since this crate's field representation cannot distinguish "key absent" from "key
+  present but null" the way Ruby's `Hash` can.
+- A **scalar**-anchor alias resolved *through* a merge (e.g. `ref: *pin` where `*pin`'s own
+  anchor text is null-like) is not re-checked for null-ness the way a directly-typed null
+  scalar is, so it is captured as literal text rather than treated as absent.
+
+**Remaining known limitation.** `include: *incs` — aliasing a whole **sequence** of N
+entries from one alias token — is a structural won't-fix (#917): one alias token cannot back
+N distinct entries' `name_range`/`version_range`, so this shape is deliberately never
+detected (0 records, matching today's silent-drop behavior rather than a misleading partial
+one).
 
 ### Maven/Gradle Version Range Matching
 

@@ -27,7 +27,7 @@ status: moc
 | 044 | [[044-precommit-hooks-ecosystem/spec\|New ecosystem: pre-commit hooks (.pre-commit-config.yaml repo/rev pins)]] | specify | draft — research/new ecosystem, P4, 6 open `[NEEDS CLARIFICATION]` items, tracked in issue #575 |
 | 047 | [[047-elixir-hex-ecosystem/spec\|New ecosystem: Elixir Hex (mix.exs dependency version hints)]] | specify | draft — research/new-ecosystem, P4, 6 open `[NEEDS CLARIFICATION]` items, issue #642 |
 | 051 | [[051-disk-persistent-registry-cache/spec\|Disk-persistent registry cache]] | specify | draft — research/enhancement, P4, 9 open `[NEEDS CLARIFICATION]` items, tracked in issue #700 |
-| 058 | [[058-gitlab-ci-mapping-container-anchor/spec\|Mapping-shaped container anchor support for include: entries]] | specify | draft — enhancement, P3, 0 open `[NEEDS CLARIFICATION]` items, unblocked now that #912 shipped (PR #941) but not yet implemented (issue #916 open; branch `feat/916-deps-gitlab-ci-mapping-shaped` exists, not merged) |
+| 058 | [[058-gitlab-ci-mapping-container-anchor/spec\|Mapping-shaped container anchor support for include: entries]] | specify | shipped — replay-through-live-dispatch mapping-anchor/merge-key support for `include:` entries, Psych-precedence-verified (PR #1028, issues #933, #916) |
 | 060 | [[060-osv-informational-advisory-category/spec\|OSV informational-advisory category (RUSTSEC unmaintained and other `informational` records)]] | specify | draft — enhancement, P3, 4 open `[NEEDS CLARIFICATION]` items, issue #1007 |
 
 ## Completed Specs

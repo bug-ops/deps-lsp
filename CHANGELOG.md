@@ -7,12 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **deps-gitlab-ci**: mapping-shaped YAML container-anchor support for `include:` entries aliased as a whole mapping (`- *tpl`, `include: *tpl`, `- <<: *tpl`, `- <<: [*a, *b]`), resolved per GitLab's actual Psych merge-key precedence rather than the abstract YAML 1.1 spec (resolves #933, #916) (#1028)
+- **deps-core**: promoted `is_plain_null`/`is_null_tag` (originally `deps-dart`-private) into `lsp_helpers`, now shared by `deps-dart` and `deps-gitlab-ci` (#1028)
+
 ### Changed
 - **ci**: moved `Cross.toml` to `.github/Cross.toml` to declutter the repo root; `cross` steps now set `CROSS_CONFIG` explicitly since `cross` only auto-discovers a root-level file
 - **CI**: split the `feature-matrix` job's test execution into a separate `feature-matrix-test` job so it runs in parallel with the clippy/lint checks instead of sequentially on one runner
 - **CI**: `feature-matrix-test` now shards across a 4-leg matrix and drops the redundant `--features default` slice (identical coverage to `--all-features`), cutting its wall-clock time from ~10m47s to an expected few minutes (resolves #1030) (#1031)
 - **deps-core, deps-gitlab-ci, deps-github-actions, deps-npm**: consolidated `deps-gitlab-ci`/`deps-github-actions`/`deps-npm`'s near-duplicate `DashMap` eviction helpers into `deps_core::cache_policy::evict_arbitrary_if_full`/`evict_expired_then_clear_all` (resolves #996) (#1024)
 - **deps-core, deps-gitlab-ci, deps-nuget**: consolidated `deps-gitlab-ci`/`deps-nuget`'s near-duplicate salted credential-digest helpers into `deps_core::secret::digest_salt`/`auth_digest` (resolves #1003) (#1024)
+- **deps-gitlab-ci**: a literal inline `<<: {...}` merge key (no anchor/alias involved) now folds into the `include:` entry, matching GitLab's actual YAML loader — previously `<<` was treated as an unrecognized key and silently ignored (#1028)
+- **deps-gitlab-ci**: an empty/null-like `ref:` on an ordinary, anchor-free `include:` entry now ships no version at all, instead of `version_req = Some("")` with a zero-width range (#1028)
+- **deps-core, deps-dart**: `is_plain_null` now recognizes `Null`/`NULL` in addition to `~`/`null` — the four spellings GitLab's Psych YAML loader treats as null (#1028)
 
 ### Fixed
 - **CI**: the `cross-check` job's i686 leg now builds and tests natively via `gcc-multilib` on `ubuntu-latest` instead of through `cross`'s musl Docker container, dropping the associated apt-get/Docker overhead and the `--test-threads=1` workaround (now uses `cargo nextest`) (#1027)

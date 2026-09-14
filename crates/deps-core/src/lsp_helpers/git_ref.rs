@@ -6,6 +6,7 @@
 
 use super::LineOffsetTable;
 use tower_lsp_server::ls_types::Range;
+use yaml_rust2::parser::Tag;
 use yaml_rust2::scanner::{Marker, TScalarStyle};
 
 /// Length of a full, lowercase-or-not hex commit SHA (git's SHA-1 object id).
@@ -129,6 +130,92 @@ pub fn match_v_prefix_style(current: &str, tag: &str) -> String {
         (false, true) => tag[1..].to_string(),
         _ => tag.to_string(),
     }
+}
+
+/// Whether a plain (unquoted) scalar's text denotes an absent value.
+///
+/// A completely empty plain scalar (`ref:` with nothing after the colon — the normal
+/// mid-typing state in a live editor) is *always* absent, regardless of any tag: `!!str` on
+/// no text still means no text was given, not the literal empty string (which needs an
+/// actual quoted `""` to express — see the `style == Plain` guard below). For non-empty text
+/// (`~`/`null`), an explicit tag matters: untagged or explicitly `tag:yaml.org,2002:null`
+/// tagged text still resolves to absent, but any *other* explicit tag (e.g. `!!str`) forces
+/// the scalar to that type instead — `!!str null` is the literal string `"null"`, not an
+/// absent value.
+///
+/// The four spellings GitLab's Psych loader treats as null (verified against Ruby Psych
+/// 5.3.1 — GitLab's own YAML loader and this function's binding oracle since
+/// `deps-gitlab-ci`'s mapping-shaped container-anchor support (spec 058 FR-015) became this
+/// function's second consumer): `~`, `null`, `Null`, `NULL`. This is a fixed enumeration, not
+/// true case-insensitive matching — `nULL` or `nUll` do **not** match, mirroring Psych's own
+/// behavior exactly. Gating on `"~" | "null"` alone (this function's original, `deps-dart`-only,
+/// `yaml_rust2::YamlLoader`-mirroring behavior) let a merged-template `ref: NULL` resolve to
+/// the literal version string `"NULL"` instead of absent — a plausible-looking wrong
+/// version, worse than none (P0).
+///
+/// A *quoted* empty string (`ref: ""`) is a real, if unusual, explicit value and must not be
+/// treated as absent — enforced by the `style == Plain` guard below, not by this list.
+///
+/// Promoted from `deps-dart/src/parser.rs` (originally private to that crate, and originally
+/// scoped only to `yaml_rust2::YamlLoader`'s narrower `"" | "~" | "null"` rule) to
+/// `deps-core` once `deps-gitlab-ci`'s mapping-shaped container-anchor support (spec 058
+/// FR-015) became its second consumer; `deps-dart` now imports this shared version too,
+/// rather than keeping its own duplicate.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::is_plain_null;
+/// use yaml_rust2::scanner::TScalarStyle;
+///
+/// assert!(is_plain_null(TScalarStyle::Plain, None, ""));
+/// assert!(is_plain_null(TScalarStyle::Plain, None, "~"));
+/// assert!(is_plain_null(TScalarStyle::Plain, None, "null"));
+/// assert!(is_plain_null(TScalarStyle::Plain, None, "Null"));
+/// assert!(is_plain_null(TScalarStyle::Plain, None, "NULL"));
+/// assert!(!is_plain_null(TScalarStyle::DoubleQuoted, None, ""));
+/// assert!(!is_plain_null(TScalarStyle::Plain, None, "v1.0.0"));
+/// ```
+#[must_use]
+pub fn is_plain_null(style: TScalarStyle, tag: Option<&Tag>, value: &str) -> bool {
+    if style != TScalarStyle::Plain {
+        return false;
+    }
+    if value.is_empty() {
+        return true;
+    }
+    match tag {
+        None => matches!(value, "~" | "null" | "Null" | "NULL"),
+        Some(tag) => is_null_tag(tag) && matches!(value, "~" | "null" | "Null" | "NULL"),
+    }
+}
+
+/// Whether `tag` is YAML's `null` tag, in either form `yaml-rust2`'s scanner produces.
+///
+/// The `!!null` shorthand resolves to `Tag { handle: "tag:yaml.org,2002:", suffix: "null"
+/// }`, but the equivalent verbatim form `!<tag:yaml.org,2002:null>` resolves to `Tag {
+/// handle: "", suffix: "tag:yaml.org,2002:null" }` — the whole URI lands in `suffix` with an
+/// empty `handle`, since verbatim tags bypass handle resolution entirely.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::is_null_tag;
+/// use yaml_rust2::parser::Tag;
+///
+/// assert!(is_null_tag(&Tag {
+///     handle: "tag:yaml.org,2002:".to_string(),
+///     suffix: "null".to_string(),
+/// }));
+/// assert!(!is_null_tag(&Tag {
+///     handle: "tag:yaml.org,2002:".to_string(),
+///     suffix: "str".to_string(),
+/// }));
+/// ```
+#[must_use]
+pub fn is_null_tag(tag: &Tag) -> bool {
+    (tag.handle == "tag:yaml.org,2002:" && tag.suffix == "null")
+        || (tag.handle.is_empty() && tag.suffix == "tag:yaml.org,2002:null")
 }
 
 /// Resolves a `yaml-rust2` scanner marker's `(line, col)` position into a byte offset in

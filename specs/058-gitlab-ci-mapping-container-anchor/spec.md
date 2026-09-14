@@ -211,7 +211,7 @@ against, extended to mapping-anchor fields.
 
 **Acceptance criteria:**
 ```
-GIVEN a dependency record where version_from_alias = true for the version field
+GIVEN a dependency record where is_alias_occurrence = true for the version field
   but the entry also has a local, non-alias-derived project field
 WHEN sha_pin_quickfix_kind, generate_code_actions, collect_pin_all_to_sha_edits,
   or complete_version runs over that record
@@ -282,29 +282,30 @@ THEN no edit and no version-completion item is produced for the alias-derived
 
 | ID | Requirement | Priority |
 |----|------------|----------|
-| FR-017 | THE SYSTEM SHALL maintain `alias_site: Vec<Marker>` parallel to the `replay_depth` stack. Any field captured while `replay_depth > 0` SHALL be built from the **innermost** alias marker (i.e. the marker of the `Event::Alias` that triggered the currently-innermost active replay), flagged as alias-derived, rather than from the anchor definition's own marker — a replayed scalar's `Marker` otherwise points at the template's own literal, which would collapse every alias site onto one identical range (the `HashMap<Range, String>` collision documented at `deps-core/src/osv/types.rs:851-856`) | must |
-| FR-018 | THE SYSTEM SHALL introduce a new shared helper `deps_core::lsp_helpers::alias_token_span(...)` (does not exist in `deps-core` or `deps-gitlab-ci` today) that computes an alias token's span as: start = `marker_byte_offset` of the alias marker; end = forward scan over yaml-rust2's actual anchor-name charset (every character except space, tab, `\n`, `\r`, NUL, `,`, `[`, `]`, `{`, `}` — not an identifier-charset guess), line-bounded, char-boundary-safe (`char_indices().take_while(...)`, never a byte-indexed slice), **including the leading `*`**. This promotes #912's inline locator into a shared helper both crates use, since #912 and #916 both need it | must |
+| FR-017 | THE SYSTEM SHALL maintain `alias_site: Option<Marker>`, set when `replay_depth` transitions 0→1 and cleared on the way back to 0. Any field captured while a replay is active SHALL be built from that **outermost** alias marker (the live-document `Event::Alias` that started the chain), flagged as alias-derived, rather than from the anchor definition's own marker — a replayed scalar's `Marker` otherwise points at the template's own literal, which would collapse every alias site onto one identical range (the `HashMap<Range, String>` collision documented at `deps-core/src/osv/types.rs:851-856`). **The marker must be the outermost, not the innermost** (critic S1, 2026-09-14): for a transitive merge (`- <<: *b` where `.b: &b {<<: *a, ref: v2}`) a field arriving at `replay_depth == 2` would otherwise take `*a`'s marker *inside the `.b:` definition* — `locate_alias_span` finds a real `*` there and returns `Some`, so no range check rejects it and the record ships with a range pointing outside `include:`, reintroducing the very collision this requirement exists to prevent. An `Option` rather than a stack makes that error unrepresentable. Any test for a transitive-merge row (§3 row 9) MUST assert the resulting **range**, not only the resolved value — the value is identical either way | must |
+| FR-018 | THE SYSTEM SHALL introduce a new shared helper `deps_core::lsp_helpers::alias_token_span(...)` (does not exist in `deps-core` or `deps-gitlab-ci` today) that computes an alias token's span as: start = `marker_byte_offset` of the alias marker; end = forward scan over yaml-rust2's actual anchor-name charset (every character except space, tab, `\n`, `\r`, NUL, `,`, `[`, `]`, `{`, `}` — not an identifier-charset guess), line-bounded, char-boundary-safe (`char_indices().take_while(...)`, never a byte-indexed slice), **including the leading `*`**. This promotes #912's inline locator into a shared helper both crates use, since #912 and #916 both need it. **SUPERSEDED by lead ruling B3 (2026-09-14) — do not implement.** The stated rationale no longer holds: #912 shipped this as `locate_alias_span` (`deps-gitlab-ci/src/parser.rs:440`) and `deps-dart` does not consume it (it uses `FieldValue::Unpositioned` instead), so promoting a one-consumer helper would be premature sharing. Keep it local; revisit if #909 lands a GitHub Actions consumer. See `.local/handoff/2026-09-14T14-31-46-architect.md` | superseded |
 | FR-019 | A replayed `component:` field SHALL bypass `build_component_dependency`'s normal offset arithmetic (`name_end = raw_start + prefix.len()`, which assumes literal underlying text) and collapse **both** `name_range` and `version_range` onto the alias token span — the underlying text at an alias site is `*x` (2+ characters), not the component literal that arithmetic assumes | must |
-| FR-020 | WHEN `alias_token_span` returns `None` (locator miss) THE SYSTEM SHALL degrade to a synthetic-range fallback (mirroring `deps-dart`'s `name_range_is_synthetic()`) rather than emitting a wrong range. `name_range_is_synthetic` is **not** overridden in `deps-gitlab-ci` today (trait default `false`, `deps-core/src/ecosystem.rs:410`) — this feature requires a new `impl` for this crate, not just calling an existing one | must |
+| FR-020 | WHEN `alias_token_span` returns `None` (locator miss) THE SYSTEM SHALL degrade to a synthetic-range fallback (mirroring `deps-dart`'s `name_range_is_synthetic()`) rather than emitting a wrong range. `name_range_is_synthetic` is **not** overridden in `deps-gitlab-ci` today (trait default `false`, `deps-core/src/ecosystem.rs:410`) — this feature requires a new `impl` for this crate, not just calling an existing one. **SUPERSEDED by lead ruling B2 (2026-09-14) — do not implement.** A locator miss requires a non-`*` byte at a real `Event::Alias` marker, which is structurally unreachable; the shipped behavior is to drop the record (the `?` at `parser.rs:613`/`:722`), which already satisfies EC-017's actual requirement of never emitting a misleading range. Implementing it would cost a new `pub` field on a `#[non_exhaustive]` struct plus abandoning `deps_core::impl_dependency!` for a hand-written impl. Note for anyone reopening this: `name_range_is_synthetic() == true` *suppresses* hover (`lsp_helpers/hover.rs:88`) and diagnostics (`diagnostics.rs:664`), so it must never be set for alias-derived records generally — that would silently defeat US-001. See `.local/handoff/2026-09-14T14-31-46-architect.md` | superseded |
 | FR-021 | Mixed provenance within one dependency record is expected and correct: e.g. in `- <<: *tpl` with a local `ref: v2`, `name_range` (from the merged `project:`) sits on `*tpl`'s alias token while `version_range` (from the local live scalar) sits on the real literal `v2` — the two ranges are independently alias-derived or not, per field | should |
 
 ### Mechanism 7 — Edit/Completion Withholding
 
 | ID | Requirement | Priority |
 |----|------------|----------|
-| FR-022 | THE SYSTEM SHALL add a new field `version_from_alias: bool` to `GitlabCiDependency`, set `true` when the field(s) contributing to `version_range` were captured while `replay_depth > 0` at any point in their fold chain (i.e. the final value traces back through at least one alias, whether or not a later literal overwrote it — see FR-021: only the field whose *final* write was alias-derived carries the flag) | must |
-| FR-023 | THE SYSTEM SHALL gate `sha_pin_quickfix_kind` (`ecosystem.rs`) with a **new first arm**: `version_from_alias == true` → return `None`, evaluated before any other match arm. This single predicate is the complete withholding gate for all three SHA-pin call sites (`build_sha_pin_action`, `build_dynamic_component_pin_action`, `bulk_sha_pin_text_edit_for` reached via `collect_pin_all_to_sha_edits`) and is also what `mutable_ref_pin_diagnostics` reads for its `has_quickfix` suffix decision — mirrors #912's FR-010 pattern exactly, preserving issue #643's single-funnel invariant | must |
-| FR-024 | THE SYSTEM SHALL gate `complete_version` **independently** — it is not reached through `sha_pin_quickfix_kind` — returning `Completions::default()` when the resolved dependency's `version_from_alias == true`, rather than proceeding to `complete_versions_generic_from` | must |
+| FR-022 | THE SYSTEM SHALL add a new field `version_from_alias: bool` to `GitlabCiDependency`, set `true` when the field(s) contributing to `version_range` were captured while `replay_depth > 0` at any point in their fold chain (i.e. the final value traces back through at least one alias, whether or not a later literal overwrote it — see FR-021: only the field whose *final* write was alias-derived carries the flag) | superseded |
+| | **SUPERSEDED by lead ruling B1 (2026-09-14) — do not add a new field.** #912 shipped `GitlabCiDependency::is_alias_occurrence` with precisely these semantics already, scoped to the field backing `version_range` (`types.rs:183`, `parser.rs:621-644`) — which is verbatim FR-025 — and it already gates both call sites (`ecosystem.rs:97` and `:290-296`). Because a replayed field becomes `RawField::Alias` and `fold_merged` moves whole `Option<RawField>`s, provenance travels with the value and FR-022-FR-025 hold with zero new state. A second parallel flag would recreate the two-guards-that-drift shape issue #643's single-funnel invariant exists to prevent. **Read `version_from_alias` as `is_alias_occurrence` throughout this spec.** Add tests only. See `.local/handoff/2026-09-14T14-31-46-architect.md` | |
+| FR-023 | THE SYSTEM SHALL gate `sha_pin_quickfix_kind` (`ecosystem.rs`) with a first arm `is_alias_occurrence == true` → return `None`, evaluated before any other match arm — **already shipped by #912 at `ecosystem.rs:97`** (ruling B1), so this requirement is satisfied by existing code and needs tests, not a new arm. This single predicate is the complete withholding gate for all three SHA-pin call sites (`build_sha_pin_action`, `build_dynamic_component_pin_action`, `bulk_sha_pin_text_edit_for` reached via `collect_pin_all_to_sha_edits`) and is also what `mutable_ref_pin_diagnostics` reads for its `has_quickfix` suffix decision — mirrors #912's FR-010 pattern exactly, preserving issue #643's single-funnel invariant | must |
+| FR-024 | THE SYSTEM SHALL gate `complete_version` **independently** — it is not reached through `sha_pin_quickfix_kind` — returning `Completions::default()` when the resolved dependency's `is_alias_occurrence == true`, rather than proceeding to `complete_versions_generic_from` — **already shipped by #912 at `ecosystem.rs:290-296`** (ruling B1); tests only | must |
 | FR-025 | This gate SHALL be a **refinement over #912's whole-dependency `is_alias_occurrence`**: in `- <<: *tpl` with a local `ref:`, the local `ref:` is a real editable literal (its final write is a live scalar, not alias-derived) and **keeps** its quickfix and completion, even though the same entry also has an alias-derived `project:`. Withholding is per the field that backs `version_range`/`name_range`, not per whole dependency | must |
 
 ### Mechanism 8 — Replay Budget and Safe Abandonment
 
 | ID | Requirement | Priority |
 |----|------------|----------|
-| FR-026 | THE SYSTEM SHALL bound total dispatched replayed events with a single **document-scoped** `MAX_REPLAYED_EVENTS = 20_000` counter on the receiver, decremented once per event **inside** the replay loop and checked **before** each `self.on_event(...)` call — shared across all replays in the document (nested/repeated replays decrement the same counter), so a fanout-driven exponential blow-up is capped flat rather than per-replay. `20_000` sits ~9x above the ~2,200-event legitimate worst case (a 100-entry `include:` section where every entry merges a 10-key template) and well below the ~131,070-event bomb a 400-byte adversarial file can dispatch (critic's measured worst case) | must |
+| FR-026 | THE SYSTEM SHALL bound total dispatched replayed events with a single **stream-scoped** `MAX_REPLAYED_EVENTS = 20_000` counter on the receiver, decremented once per event **inside** the replay loop and checked **before** each `self.on_event(...)` call — shared across all replays in the whole parse (nested/repeated replays decrement the same counter), so a fanout-driven exponential blow-up is capped flat rather than per-replay. **Stream-scoped, not per-document** (critic M3, 2026-09-14): this crate genuinely parses multi-document files (the `spec:` header form), and a per-document reset would let a 1,000-document stream spend 20,000 events each. The counter is therefore never reset at `Event::DocumentStart`/`DocumentEnd` — only `stack` and `recording` are per-document. `20_000` sits ~9x above the ~2,200-event legitimate worst case (a 100-entry `include:` section where every entry merges a 10-key template) and well below the ~131,070-event bomb a 400-byte adversarial file can dispatch (critic's measured worst case) | must |
 | FR-027 | THE SYSTEM SHALL capture `depth_before = self.stack.depth()` **before** `push_container` on **every** replay, unconditionally — not only on the replay that ends up tripping the budget. ON budget exhaustion THE SYSTEM SHALL then: (1) unwind with **raw `self.stack.pop()`** — never `pop_container`, which would fold a half-built payload into the parent — repeated until `self.stack.depth() == depth_before`; (2) set `replay_disabled = true`; (3) return, and **not** call `consume_value()` on this abandon path (the unwind's final `pop()` already performs that transition; a second one would desync the parent in the opposite direction) | must |
 | FR-028 | THE SYSTEM SHALL assert `debug_assert_eq!(self.stack.depth(), depth_before)` after **every** replay, successful or abandoned — this is the acceptance property that a tripped budget can only ever degrade to today's zero-record path for the alias it interrupts, and must never corrupt the parse state for any other, unrelated entry in the same document | must |
-| FR-029 | ONCE `replay_disabled` is set for a document THE SYSTEM SHALL route every subsequent `Event::Alias` in that document through today's `consume_value()` path (no further replay attempts), so both the successful and abandoned paths converge on identical, well-defined parent state | must |
+| FR-029 | ONCE `replay_disabled` is set THE SYSTEM SHALL route every subsequent `Event::Alias` **for the rest of the stream** through today's `consume_value()` path (no further replay attempts), so both the successful and abandoned paths converge on identical, well-defined parent state. Stream-scoped, matching FR-026's counter (critic M3, 2026-09-14): a bomb in document 1 therefore also disables this feature's detection for document 2, the deliberate safe-side trade | must |
 
 ### Mechanism 9 — Non-Regression of #912's `? *k` Fix
 
@@ -319,7 +320,7 @@ THEN no edit and no version-completion item is produced for the alias-derived
 | NFR-001 | Correctness/oracle | Every precedence-sensitive requirement's correctness is defined by the Psych acceptance table (§3, FR-006/FR-014), not by prose reasoning about the YAML 1.1 merge-key spec. A future change to this feature's fold logic MUST be checked against all 10 rows before merging |
 | NFR-002 | Resource bounds (correct quantity) | The bound that matters is **dispatched (replayed) events**, not source-text length or replay depth — both of those were independently measured to undercount the actual cost by 2-3 orders of magnitude for a fanout-driven bomb. `MAX_REPLAYED_EVENTS` (FR-026) is the only primary bound; a depth cap may exist only as a cheap secondary guard that trips before the event budget on pathological nesting, never as the primary bound |
 | NFR-003 | Resource bounds (behavior-preservation guarantee) | Exceeding `MAX_REPLAYED_EVENTS` can only ever withhold *this feature's* detection for the alias that trips it — it must never regress, corrupt, or drop a dependency record for any other entry in the same document (FR-027/FR-028's unwind is what makes this true; a naive "stop the loop and call `pop_container` once" implementation does **not** satisfy this NFR, verified to drop an entire document's dependencies) |
-| NFR-004 | Correctness/safety | No code path may allow an edit-producing action or a version-completion item to be produced for any field whose final write was alias-derived (`version_from_alias == true`). This must hold independently for both `sha_pin_quickfix_kind`'s three funneled call sites (FR-023) and `complete_version` (FR-024) |
+| NFR-004 | Correctness/safety | No code path may allow an edit-producing action or a version-completion item to be produced for any field whose final write was alias-derived (`is_alias_occurrence == true` — flag renamed per ruling B1). This must hold independently for both `sha_pin_quickfix_kind`'s three funneled call sites (FR-023) and `complete_version` (FR-024) |
 | NFR-005 | Recording invariant | `replay_depth == 0` is load-bearing for both `event_log` appends and `recording.push` (FR-003) — this must remain a single, shared guard, not duplicated or reimplemented per call site, so it cannot drift out of sync |
 | NFR-006 | Structural (not conventional) scope enforcement | The exclusion of sequence-shaped container anchors (#917) is enforced by recording `FrameKind::Mapping` only (FR-002) — a future change MUST NOT introduce an alternate runtime check for this exclusion; if sequence-shaped support is ever wanted, it must change FR-002 itself, in a new spec |
 | NFR-007 | Compatibility | This feature must not change the record count, position, or precedence result for any `.gitlab-ci.yml` document already covered by #912's scalar-alias fix or by today's literal-entry parsing — every existing passing fixture with no mapping-anchor-in-`include:` shape stays byte-for-byte unaffected |
@@ -338,12 +339,12 @@ THEN no edit and no version-completion item is produced for the alias-derived
 | `FoldMode` | `{Overwrite, FillIfAbsent}` — selects `fold_merged`'s behavior, chosen by the **parent** of the frame being folded (FR-011) | — |
 | `fold_merged(&mut RawEntry, RawEntry, FoldMode)` | The entire precedence algorithm, unit-testable in isolation against the Psych table | `Overwrite`: writes only present merged values (FR-012); `FillIfAbsent`: writes only into empty slots. Boolean flags always `\|=` (FR-013) |
 | `replay_depth` | Counter, incremented/decremented around each entry- or merge-replay | Guards recording (FR-003) and determines whether a captured field is alias-derived (FR-022) |
-| `alias_site: Vec<Marker>` | Parallel stack to `replay_depth`, one marker per active replay | Innermost entry is the marker used for range provenance (FR-017) |
-| `MAX_REPLAYED_EVENTS` | `20_000`, document-scoped budget (FR-026) | Decremented per dispatched event inside every replay loop, shared across nested replays |
-| `replay_disabled: bool` | Set on budget exhaustion (FR-027); once set, no further replay is attempted for the rest of the document (FR-029) | — |
+| `alias_site: Option<Marker>` | The outermost active replay's alias marker — set on the `replay_depth` 0→1 transition, cleared on the way back (FR-017) | The single marker used for range provenance; an `Option` rather than a stack so an inner marker is unrepresentable (critic S1) |
+| `MAX_REPLAYED_EVENTS` | `20_000`, stream-scoped budget (FR-026) | Decremented per dispatched event inside every replay loop, shared across nested replays and across documents |
+| `replay_disabled: bool` | Set on budget exhaustion (FR-027); once set, no further replay is attempted for the rest of the stream (FR-029) | — |
 | `depth_before: usize` | Captured before each replay's `push_container`, used for the raw-`pop()` unwind on abandonment (FR-027) and the `debug_assert_eq!` check (FR-028) | — |
-| `alias_token_span` | New `deps_core::lsp_helpers` helper (FR-018), shared with #912 | Computes an alias token's byte-range span from its `Marker`, including the leading `*` |
-| `GitlabCiDependency::version_from_alias: bool` | New field, per-record, set when the field backing `version_range` (and/or `name_range` for a `component:` alias) was last written by a replay (FR-022) | Gates FR-023/FR-024; refinement over #912's whole-dependency `is_alias_occurrence` (FR-025) |
+| `locate_alias_span` | #912's existing local helper (`deps-gitlab-ci/src/parser.rs:440`); the FR-018 promotion into `deps-core` is superseded by ruling B3 | Computes an alias token's byte-range span from its `Marker`, including the leading `*` |
+| `GitlabCiDependency::is_alias_occurrence: bool` | #912's existing field — reused, not duplicated, per ruling B1 (FR-022 superseded). Becomes `true` for a replayed field because the capture builds a `RawField::Alias` | Gates FR-023/FR-024; already scoped to the field backing `version_range`, which is FR-025 |
 
 ## 6. Edge Cases and Error Handling
 
@@ -363,9 +364,9 @@ THEN no edit and no version-completion item is produced for the alias-derived
 | EC-012 | An adversarial document engineered to exceed `MAX_REPLAYED_EVENTS` via nested/fanned-out merges | The alias that trips the budget degrades to zero records for itself; every other entry in the same document — including ones that never touch an anchor — is parsed identically to a document with `replay_disabled` compiled out (FR-027/FR-028's acceptance property) |
 | EC-013 | An anchor defined *during* a replay (nested anchor definition inside an already-anchored mapping, e.g. `&i` nested inside `&o`) | Not (re-)recorded — `replay_depth == 0` guard (FR-003); this is a load-bearing, easy-to-omit invariant, not an incidental detail |
 | EC-014 | Two separate `- *tpl` items aliasing the same anchor | Two distinct dependency records with two distinct `version_range`s, each anchored at its own alias site's own `Marker` — never collapsed onto one range (FR-017) |
-| EC-015 | `- <<: *tpl` with a local `ref:` also present in the same entry | Mixed provenance is correct: `name_range` (from the merged `project:`) may be alias-derived while `version_range` (from the local literal `ref:`) is not, or vice versa — `version_from_alias` reflects only the field it gates (FR-021, FR-025) |
+| EC-015 | `- <<: *tpl` with a local `ref:` also present in the same entry | Mixed provenance is correct: `name_range` (from the merged `project:`) may be alias-derived while `version_range` (from the local literal `ref:`) is not, or vice versa — `is_alias_occurrence` reflects only the field it gates (FR-021, FR-025) |
 | EC-016 | A replayed mapping anchor supplies `component:` | Both `name_range` and `version_range` collapse onto the alias token span; `build_component_dependency`'s literal-text offset arithmetic is bypassed entirely for this site (FR-019) |
-| EC-017 | `alias_token_span` returns `None` (locator miss, e.g. a marker at a document boundary) | Degrades to a synthetic-range fallback via a new `name_range_is_synthetic` impl for this crate (FR-020) — never a wrong, misleading range |
+| EC-017 | `locate_alias_span` returns `None` (locator miss, e.g. a marker at a document boundary) | The dependency record is **dropped** — `build_project_dependency`/`build_component_dependency`'s existing `?` on the span already does this, and it satisfies the requirement that matters: never a wrong, misleading range. The synthetic-range fallback FR-020 originally specified is superseded by lead ruling B2 (2026-09-14) as unreachable-in-practice; see that row |
 | EC-018 | `&e1` anchored on a *live* `include:` entry, then a separate `- *e1` elsewhere | **2 dependency records is correct** — GitLab genuinely includes the template twice. Not a duplicate to suppress (resolved: architect's original OQ-4, confirmed by direct probe) |
 | EC-019 | An explicit null/empty scalar (e.g. `ref:` with nothing after it) positioned AFTER a `<<:` that supplied a value for the same key | The slot becomes `None` (positional write of absence, FR-016), not "keep the merged value" — one keystroke of less-helpful-but-honest output while `ref:` is mid-typing, a deliberate, P0-faithful choice, not a bug |
 | EC-020 | `include: *incs` where `*incs` is a **sequence** anchor | Out of scope by construction (#917): `container_anchors` has no entry for a sequence-kind anchor id (FR-002), so this falls through to today's zero-record path, unaffected by this feature |
@@ -380,7 +381,7 @@ THEN no edit and no version-completion item is produced for the alias-derived
 | SC-003 | Budget/abandonment safety (FR-026-FR-029) | A document engineered to trip `MAX_REPLAYED_EVENTS` produces correct records for every entry that does not touch the tripping alias — verified by a dedicated test with ≥1 anchor-free entry alongside the pathological one, asserting the anchor-free entry's record is unaffected |
 | SC-004 | #917 non-regression | `include: *incs` (sequence-shaped) continues to produce 0 records, verified by a dedicated regression test, not only by code inspection of FR-002 |
 | SC-005 | #912 `? *k` non-regression (FR-030) | Both the scalar-hit and container-miss `? *k` variants from #912's suite pass unmodified under this feature's code |
-| SC-006 | Edit/completion withholding (US-004) | 0 edits via `sha_pin_quickfix_kind`'s three funneled call sites and 0 completion items via `complete_version` for every field with `version_from_alias == true`; a mixed-provenance entry (EC-015) keeps its quickfix/completion for the field that is *not* alias-derived |
+| SC-006 | Edit/completion withholding (US-004) | 0 edits via `sha_pin_quickfix_kind`'s three funneled call sites and 0 completion items via `complete_version` for every field with `is_alias_occurrence == true` (flag renamed per ruling B1); a mixed-provenance entry (EC-015) keeps its quickfix/completion for the field that is *not* alias-derived |
 | SC-007 | NFR-007 compatibility | 0 changes to dependency count, position, or precedence result for every existing passing test fixture with no mapping-anchor-in-`include:` shape |
 
 ## 8. Agent Boundaries
@@ -394,8 +395,10 @@ THEN no edit and no version-completion item is produced for the alias-derived
   edit/completion withholding (FR-022-FR-025), and the replay budget (FR-026-FR-029) inside
   `crates/deps-gitlab-ci/src/parser.rs`, `crates/deps-gitlab-ci/src/types.rs`, and
   `crates/deps-gitlab-ci/src/ecosystem.rs`
-- Add the new `alias_token_span` helper (FR-018) to `crates/deps-core/src/lsp_helpers`, shared with
-  #912's own locator
+- ~~Add the new `alias_token_span` helper (FR-018) to `crates/deps-core/src/lsp_helpers`~~ —
+  withdrawn by ruling B3; reuse #912's local `locate_alias_span` instead. The one `deps-core` change
+  that *is* wanted: promote `is_plain_null`/`is_null_tag` out of `deps-dart/src/parser.rs:98-122`,
+  since FR-015 makes this crate their second consumer
 - Write all 10 Psych-table rows (§3) as dedicated regression tests, using the table's stated expected
   values, not a naive YAML-1.1 reading
 - Write the FR-027/FR-028 abandonment-safety test with an anchor-free entry alongside the pathological
@@ -407,8 +410,9 @@ THEN no edit and no version-completion item is produced for the alias-derived
 ### Ask First
 - Any change to `MAX_REPLAYED_EVENTS` (20,000) — FR-026's rationale (~9x headroom over the legitimate
   worst case, far below the measured bomb) establishes this as deliberately chosen, not a placeholder
-- Extracting recording/replay machinery further, beyond the `alias_token_span` sharing already
-  specified (FR-018), into a fully shared `deps-core` module — this crate's `MergeSource`/
+- Extracting recording/replay machinery into a fully shared `deps-core` module (FR-018's
+  `alias_token_span` sharing is withdrawn by ruling B3, so this boundary now covers everything
+  beyond the `is_plain_null` promotion named above) — this crate's `MergeSource`/
   `MergeSequence` roles are GitLab-CI-specific (merge-key semantics); premature sharing risks forcing
   an ill-fitting abstraction on `deps-dart`'s simpler (no-merge) replay
 - Re-opening any of §9's resolved S1-S5/C1/M1-M4 findings without new empirical evidence against
@@ -465,7 +469,7 @@ not as an open question.
 - **S3 (round-1) — neither of the original two bounds (`MAX_RECORDED_ANCHOR_EVENTS`,
   `MAX_MERGE_REPLAY_DEPTH`) bounded the actual threat.** Measured: a 400-byte adversarial file
   dispatches 131,070 events via fanout, while depth stays shallow (7) and `event_log` length stays
-  small (~130) — neither original constant ever trips. Replaced with one document-scoped
+  small (~130) — neither original constant ever trips. Replaced with one stream-scoped
   `MAX_REPLAYED_EVENTS` budget decremented per dispatched event (FR-026), which caps the actual
   quantity that matters regardless of fanout or nesting shape.
 - **S4 (round-1) — `? *k` already silently drops the whole `include:` block today, in the exact arm
@@ -542,18 +546,21 @@ this spec's scope decisions (Non-Goal, Out of Scope above) reaffirm rather than 
 - GitHub `#909` — the GitHub Actions sibling gap and the source of the guard-context-bypass
   antipattern this feature's replay-through-dispatch design (FR-004) is verified not to repeat
 - GitHub `#910` — `deps-dart`'s merged `RecordingFrame`/replay-through-dispatch precedent, lifted and
-  extended (with merge-key precedence and a document-scoped budget added) for this feature
+  extended (with merge-key precedence and a stream-scoped budget added) for this feature
 - GitHub `#643` — introduced `sha_pin_quickfix_kind` as the single funnel this feature's FR-023
   extends with a new first arm, preserving the message/dispatch anti-drift invariant
 - `crates/deps-gitlab-ci/src/parser.rs` — `key_for`, `push_container`, the `Event::Alias` arm this
   feature extends (shared with #912)
-- `crates/deps-gitlab-ci/src/types.rs` — `GitlabCiDependency`, where `version_from_alias` is added
+- `crates/deps-gitlab-ci/src/types.rs` — `GitlabCiDependency`, whose existing `is_alias_occurrence`
+  is reused rather than joined by a second flag (ruling B1)
 - `crates/deps-gitlab-ci/src/ecosystem.rs` — `sha_pin_quickfix_kind`, `mutable_ref_pin_diagnostics`,
   `complete_version`
-- `crates/deps-core/src/yaml_walk.rs` — `FrameStack`, extended with `FrameRole::MergeSequence`/
-  `MergeSource` and `PendingKey::Merge`
-- `crates/deps-core/src/lsp_helpers` — target module for the new shared `alias_token_span` helper
-  (FR-018)
+- `crates/deps-core/src/yaml_walk.rs` — `FrameStack`, driven **unchanged**: `pop`, `depth`, and
+  `is_complex_key_position` are already `pub` and suffice. `FrameRole::MergeSequence`/`MergeSource`
+  and `PendingKey::Merge` are `deps-gitlab-ci`'s own `R`/`K` generic parameters, not `deps-core`
+  types — an earlier draft of this line wrongly implied otherwise
+- `crates/deps-core/src/lsp_helpers` — target module for the `is_plain_null`/`is_null_tag`
+  promotion (FR-015); the FR-018 `alias_token_span` promotion is withdrawn (ruling B3)
 - `crates/deps-dart/src/parser.rs` — `RecordingFrame`, `on_alias`, `is_plain_null` — the shipped #910
   precedent this feature's recording and null-guard mechanisms are lifted from
 - `crates/deps-core/src/osv/types.rs` — the `HashMap<Range, String>` identity constraint that makes
