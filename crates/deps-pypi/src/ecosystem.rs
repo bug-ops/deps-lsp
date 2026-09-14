@@ -352,6 +352,19 @@ impl Ecosystem for PypiEcosystem {
             return Vec::new();
         };
 
+        // No workspace-root discovery exists for pypi today (`ParseResult::workspace_root`
+        // is always `None` — see its field doc), so the containment check below is a no-op
+        // until that lands; it activates automatically once a root is ever populated. Only
+        // an absolute root is usable: `lexically_normalize` assumes an absolute input (see
+        // its doc), and a relative root (e.g. `".."`) would normalize to `""`, against
+        // which every path spuriously `starts_with` — silently defeating the containment
+        // check instead of the intended skip-if-unknown fallback (#937 finding R2).
+        let workspace_root = result
+            .workspace_root
+            .as_deref()
+            .filter(|root| root.is_absolute())
+            .map(lexically_normalize);
+
         result
             .document_links
             .iter()
@@ -370,7 +383,33 @@ impl Ecosystem for PypiEcosystem {
                     );
                     return None;
                 }
-                let target_path = base_dir.join(&link.target);
+                // An absolute target (`/etc/shadow`, `C:\...`) silently discards
+                // `base_dir` on join and is never a meaningful pip relative include
+                // (#937) — checked on the raw string, not `Path::is_absolute()`,
+                // since that's platform-dependent and a Windows-style prefix must be
+                // rejected even when deps-lsp itself runs on a POSIX host.
+                if is_absolute_document_link_target(&link.target) {
+                    deps_core::lsp_helpers::warn_rejected_value(
+                        "is_absolute_document_link_target",
+                        "pypi requirements -r/-c document link target",
+                        &link.target,
+                    );
+                    return None;
+                }
+                let target_path = lexically_normalize(&base_dir.join(&link.target));
+                // `../requirements-base.txt` is a standard, legitimate pip layout
+                // (#937) — only reject once normalization proves the target escaped
+                // the workspace root entirely, not merely for containing `..`.
+                if let Some(root) = &workspace_root
+                    && !target_path.starts_with(root)
+                {
+                    deps_core::lsp_helpers::warn_rejected_value(
+                        "workspace_root_containment",
+                        "pypi requirements -r/-c document link target",
+                        &link.target,
+                    );
+                    return None;
+                }
                 let target_uri = Uri::from_file_path(&target_path)?;
                 // Tooltip is derived from the URI's own round-tripped path, not
                 // `target_path` directly: on Windows, `Uri::to_file_path` builds its
@@ -597,6 +636,56 @@ fn is_safe_document_link_target(target: &str) -> bool {
         })
 }
 
+/// Whether `target` is written as an absolute filesystem path — a POSIX-style
+/// `/...`/`\...` root, or a Windows drive prefix (`C:\...`, `C:/...`, or the
+/// drive-*relative* `C:evil.txt`/bare `C:` forms).
+///
+/// Checked on the raw string rather than `std::path::Path::is_absolute()`: that method's
+/// notion of "absolute" is platform-dependent (a Windows drive prefix is not absolute per
+/// `Path` on a POSIX host), but `link.target` is manifest text that could name either
+/// path style regardless of which OS `deps-lsp` itself runs on. The drive-letter check
+/// deliberately has no separator requirement after the colon: per `std::path`'s own docs,
+/// `Path::join`ing a "prefix but no root" path (Windows' term for exactly this
+/// `C:evil.txt`/`C:` shape) onto any base discards the base entirely, same as a fully
+/// separator-rooted `C:\...` — requiring a separator here would let that variant silently
+/// bypass the whole guard on Windows (#937 finding C1). That base-discard is
+/// Windows-specific — on POSIX, `Path::join` treats `C:evil.txt` as an ordinary relative
+/// segment (`Path::new("/project").join("C:x") == "/project/C:x"`) — but this function has
+/// no way to know which platform authored the requirements file, so it rejects the shape
+/// uniformly rather than trusting the host OS's own `Path::join` semantics.
+fn is_absolute_document_link_target(target: &str) -> bool {
+    target.starts_with('/')
+        || target.starts_with('\\')
+        || matches!(target.as_bytes(), [drive, b':', ..] if drive.is_ascii_alphabetic())
+}
+
+/// Lexically resolves `.`/`..` components in `path` without touching the filesystem — no
+/// `canonicalize`, no symlink resolution, since `generate_document_links` never opens the
+/// target, only publishes it as a clickable `DocumentLink`.
+///
+/// Assumes `path` is absolute: a `..` with nothing left to pop is simply dropped rather
+/// than kept as a literal component — the same clamp-at-root behavior a real filesystem
+/// gives `/..`. Keeping it (a prior version of this function did) produces a non-canonical
+/// path like `/../etc/shadow`: still rejected by the workspace-root containment check
+/// today, but a misleading tooltip if that check is ever skipped (#937 finding C2). Every
+/// call site upholds the assumption: the join-target call always sees `base_dir.join(...)`
+/// (absolute, since `base_dir` comes from the manifest's own file URI), and the
+/// workspace-root call site filters to `Path::is_absolute()` first (#937 finding R2) — a
+/// relative `path` isn't rejected here, it just won't clamp to a meaningful root.
+fn lexically_normalize(path: &std::path::Path) -> std::path::PathBuf {
+    let mut result = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                result.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => result.push(other),
+        }
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -736,6 +825,159 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_generate_document_links_rejects_absolute_target() {
+        // #937: an absolute `-r`/`-c` target silently discards `base_dir` on
+        // `Path::join`, resolving to the absolute path verbatim instead of
+        // anything under the manifest's own directory.
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = PypiEcosystem::new(cache);
+        let uri = deps_core::test_util::test_uri("/project/requirements.txt");
+
+        let parse_result = ecosystem
+            .parse_manifest("-r /etc/shadow\n", &uri)
+            .await
+            .unwrap();
+
+        let links = ecosystem.generate_document_links(parse_result.as_ref(), &uri);
+        assert!(links.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_generate_document_links_rejects_windows_style_absolute_target() {
+        // #937: a Windows drive-letter prefix must be rejected even when
+        // `deps-lsp` itself runs on a POSIX host, where `Path::is_absolute()`
+        // would not recognize it as absolute.
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = PypiEcosystem::new(cache);
+        let uri = deps_core::test_util::test_uri("/project/requirements.txt");
+
+        let parse_result = ecosystem
+            .parse_manifest("-r C:\\Windows\\System32\\config\\SAM\n", &uri)
+            .await
+            .unwrap();
+
+        let links = ecosystem.generate_document_links(parse_result.as_ref(), &uri);
+        assert!(links.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_generate_document_links_allows_parent_dir_without_workspace_root() {
+        // `-r ../requirements-base.txt` is a standard, legitimate multi-directory pip
+        // layout (#937) — it must not be rejected outright the way an absolute path is,
+        // and with no workspace root known (pypi's `ParseResult::workspace_root` is
+        // always `None` today) there is nothing to contain it against.
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = PypiEcosystem::new(cache);
+        let uri = deps_core::test_util::test_uri("/project/sub/requirements.txt");
+
+        let parse_result = ecosystem
+            .parse_manifest("-r ../requirements-base.txt\n", &uri)
+            .await
+            .unwrap();
+
+        let links = ecosystem.generate_document_links(parse_result.as_ref(), &uri);
+        assert_eq!(links.len(), 1);
+        let target = links[0].target.as_ref().unwrap();
+        assert!(
+            target
+                .path()
+                .as_str()
+                .ends_with("/project/requirements-base.txt")
+        );
+    }
+
+    /// A single-document-link `ParseResult` with an explicit `workspace_root`, used to
+    /// exercise the containment check directly (`parse_manifest` never produces a
+    /// non-`None` `workspace_root` for pypi today — see the field's own doc).
+    fn parse_result_with_document_link(
+        uri: Uri,
+        workspace_root: Option<std::path::PathBuf>,
+        target: &str,
+    ) -> crate::parser::ParseResult {
+        use tower_lsp_server::ls_types::Range;
+        crate::parser::ParseResult {
+            dependencies: Vec::new(),
+            workspace_root,
+            uri,
+            document_links: vec![crate::parser::RequirementRef {
+                range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+                target: target.to_string(),
+            }],
+            resolved_chains: Vec::new(),
+            blocked_registries: Vec::new(),
+            dependency_truncation: None,
+        }
+    }
+
+    #[test]
+    fn test_generate_document_links_rejects_escape_past_workspace_root() {
+        // #937: once a workspace root is known, a relative target with enough `../`
+        // segments to climb out of it entirely must be rejected — unlike a `..` that
+        // stays within the root (covered above), this is a real containment escape.
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = PypiEcosystem::new(cache);
+        let uri = deps_core::test_util::test_uri("/project/sub/deep/requirements.txt");
+
+        let parse_result = parse_result_with_document_link(
+            uri.clone(),
+            Some(std::path::PathBuf::from("/project")),
+            "../../../../etc/shadow",
+        );
+
+        let links = ecosystem.generate_document_links(&parse_result, &uri);
+        assert!(links.is_empty());
+    }
+
+    #[test]
+    fn test_generate_document_links_accepts_path_that_climbs_to_root_then_reenters() {
+        // #937 (impl-critic C2/second pass): discriminates `lexically_normalize`'s
+        // pop-vs-push-back behavior on an unpoppable `..`, which the escape test above
+        // does not — both variants reject every input there. Base `/project/sub`, root
+        // `/project`, target `../../../project/x.txt`: after climbing past the root, the
+        // current (pop/drop) implementation normalizes to the clean, contained
+        // `/project/x.txt` (accepted, correctly — this genuinely resolves inside the
+        // root). The prior (push-back) implementation would instead have left a stray
+        // `..` component, normalizing to the non-canonical `/../project/x.txt`, which
+        // fails `starts_with("/project")` and gets wrongly rejected.
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = PypiEcosystem::new(cache);
+        let uri = deps_core::test_util::test_uri("/project/sub/requirements.txt");
+
+        let parse_result = parse_result_with_document_link(
+            uri.clone(),
+            Some(std::path::PathBuf::from("/project")),
+            "../../../project/x.txt",
+        );
+
+        let links = ecosystem.generate_document_links(&parse_result, &uri);
+        assert_eq!(links.len(), 1);
+        let target = links[0].target.as_ref().unwrap();
+        assert!(target.path().as_str().ends_with("/project/x.txt"));
+    }
+
+    #[test]
+    fn test_generate_document_links_allows_parent_dir_with_workspace_root_set() {
+        // #937 (impl-critic C4): a legitimate `../` include that stays inside the
+        // workspace root must still be accepted once a root is known — the only other
+        // legitimate-`../` test (`..._allows_parent_dir_without_workspace_root`) runs with
+        // `workspace_root: None`, which skips the containment branch entirely.
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = PypiEcosystem::new(cache);
+        let uri = deps_core::test_util::test_uri("/project/sub/requirements.txt");
+
+        let parse_result = parse_result_with_document_link(
+            uri.clone(),
+            Some(std::path::PathBuf::from("/project")),
+            "../shared/req.txt",
+        );
+
+        let links = ecosystem.generate_document_links(&parse_result, &uri);
+        assert_eq!(links.len(), 1);
+        let target = links[0].target.as_ref().unwrap();
+        assert!(target.path().as_str().ends_with("/project/shared/req.txt"));
+    }
+
+    #[tokio::test]
     async fn test_generate_document_links_rejects_bidi_override_target() {
         // #452 S2 (security): a bidi override in the target text could make the
         // rendered requirements.txt line read as an innocuous filename while the
@@ -777,6 +1019,39 @@ mod tests {
             "dev-requirements.txt",
         ] {
             assert!(is_safe_document_link_target(good));
+        }
+    }
+
+    #[test]
+    fn test_is_absolute_document_link_target_detects_every_absolute_form() {
+        // #937 (impl-critic C1/C4): `C:evil.txt` and bare `C:` are Windows
+        // *drive-relative* paths — no separator after the colon — that still discard
+        // `base_dir` on `Path::join` exactly like a fully separator-rooted `C:\...` does.
+        for bad in [
+            "/etc/shadow",
+            "\\Windows\\System32",
+            "C:\\Windows\\System32\\config\\SAM",
+            "c:/Windows/System32",
+            "C:evil.txt",
+            "C:",
+            "\\\\server\\share\\secret.txt",
+            "//server/share/secret.txt",
+        ] {
+            assert!(
+                is_absolute_document_link_target(bad),
+                "expected {bad:?} to be treated as absolute"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_absolute_document_link_target_accepts_relative_paths() {
+        for good in [
+            "base.txt",
+            "../shared/constraints.txt",
+            "dev-requirements.txt",
+        ] {
+            assert!(!is_absolute_document_link_target(good));
         }
     }
 
