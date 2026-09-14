@@ -166,6 +166,9 @@ enum FrameRole {
     /// A dependency entry's `git:` value, when given as its own nested map (as opposed to the
     /// `git: <url>` shorthand).
     GitValue,
+    /// A dependency entry's `hosted:` value, when given as its own nested map (`hosted: {name,
+    /// url}`) as opposed to the `hosted: <url>` shorthand.
+    HostedValue,
     /// Anything else — `name:`, `flutter:`, `rules:`, or any other structure this parser does
     /// not need to look inside. Also covers a complex YAML key's subtree (`? <mapping>`/`?
     /// <sequence>`) used where a plain scalar key is normally expected —
@@ -190,9 +193,12 @@ enum PendingKey {
     EntryGit,
     EntryPath,
     EntrySdk,
+    EntryHosted,
     GitUrl,
     GitRef,
     GitPath,
+    HostedName,
+    HostedUrl,
 }
 
 fn key_for(role: FrameRole, text: &str) -> PendingKey {
@@ -216,12 +222,18 @@ fn key_for(role: FrameRole, text: &str) -> PendingKey {
             "git" => PendingKey::EntryGit,
             "path" => PendingKey::EntryPath,
             "sdk" => PendingKey::EntrySdk,
+            "hosted" => PendingKey::EntryHosted,
             _ => PendingKey::None,
         },
         FrameRole::GitValue => match text {
             "url" => PendingKey::GitUrl,
             "ref" => PendingKey::GitRef,
             "path" => PendingKey::GitPath,
+            _ => PendingKey::None,
+        },
+        FrameRole::HostedValue => match text {
+            "name" => PendingKey::HostedName,
+            "url" => PendingKey::HostedUrl,
             _ => PendingKey::None,
         },
         FrameRole::DependencySectionValue | FrameRole::Irrelevant => PendingKey::None,
@@ -239,6 +251,23 @@ enum RawGitValue {
     },
 }
 
+/// A `hosted:` sub-value, either the `hosted: <url>` shorthand (remote package name is the
+/// manifest's own dependency key) or the `hosted: {name, url}` map form (remote name may
+/// differ from the key; a legacy `url`-only map form is also valid pub syntax). `build_dependency`
+/// reads `name` only to decide whether the public-registry URL normalization in
+/// [`classify_hosted_url`] is safe to apply (critic finding N3) — this LSP has no client
+/// wiring to query a registry under a name other than the manifest's own dependency key, so a
+/// `name` that disagrees with the key must keep the dependency classified as `CustomRegistry`
+/// even when `url` is the public registry, or a renamed package would falsely resolve as
+/// "unknown package".
+enum RawHostedValue {
+    Scalar(FieldValue),
+    Map {
+        name: Option<FieldValue>,
+        url: Option<FieldValue>,
+    },
+}
+
 /// One dependency's value shape, as accumulated from the event stream.
 enum RawDependencyValue {
     /// `pkg: ^1.0.0` — a plain version-requirement string.
@@ -249,6 +278,7 @@ enum RawDependencyValue {
         git: Option<Box<RawGitValue>>,
         path: Option<FieldValue>,
         sdk: Option<FieldValue>,
+        hosted: Option<Box<RawHostedValue>>,
     },
     /// The value's shape could not be resolved to a concrete field (e.g. an alias to a
     /// mapping, or a sequence) — still emitted as a `Registry`-source, position-only entry,
@@ -291,18 +321,22 @@ struct FramePayload {
     git: Option<Box<RawGitValue>>,
     path: Option<FieldValue>,
     sdk: Option<FieldValue>,
+    hosted: Option<Box<RawHostedValue>>,
     /// `GitValue` only: fields accumulated so far.
     git_url: Option<FieldValue>,
     git_ref: Option<FieldValue>,
     git_path: Option<FieldValue>,
+    /// `HostedValue` only: fields accumulated so far.
+    hosted_name: Option<FieldValue>,
+    hosted_url: Option<FieldValue>,
 }
 
 impl FramePayload {
     /// Assigns `value` to whichever field `key` designates — the single point where
     /// `on_scalar`'s (`FieldValue::Positioned`) and `on_alias`'s
-    /// (`FieldValue::Unpositioned`) otherwise-identical `DependencyEntryValue`/`GitValue`
-    /// field dispatch converge, differing only in which `FieldValue` constructor the caller
-    /// passes in. Both roles' keys are handled unconditionally since a frame's `pending_key`
+    /// (`FieldValue::Unpositioned`) otherwise-identical `DependencyEntryValue`/`GitValue`/
+    /// `HostedValue` field dispatch converge, differing only in which `FieldValue`
+    /// constructor the caller passes in. Every role's keys are handled unconditionally since a frame's `pending_key`
     /// only ever holds a key valid for its own role — an unrecognized key (`PendingKey::None`
     /// or a root/environment key that reached here by construction error) is a silent no-op.
     fn assign_field(&mut self, key: PendingKey, value: FieldValue) {
@@ -311,9 +345,12 @@ impl FramePayload {
             PendingKey::EntryGit => self.git = Some(Box::new(RawGitValue::Scalar(value))),
             PendingKey::EntryPath => self.path = Some(value),
             PendingKey::EntrySdk => self.sdk = Some(value),
+            PendingKey::EntryHosted => self.hosted = Some(Box::new(RawHostedValue::Scalar(value))),
             PendingKey::GitUrl => self.git_url = Some(value),
             PendingKey::GitRef => self.git_ref = Some(value),
             PendingKey::GitPath => self.git_path = Some(value),
+            PendingKey::HostedName => self.hosted_name = Some(value),
+            PendingKey::HostedUrl => self.hosted_url = Some(value),
             PendingKey::None
             | PendingKey::Environment
             | PendingKey::Section(_)
@@ -527,6 +564,11 @@ impl PubspecReceiver {
                 FrameRole::DependencyEntryValue if *top.pending_key() == PendingKey::EntryGit => {
                     return (FrameRole::GitValue, None);
                 }
+                FrameRole::DependencyEntryValue
+                    if *top.pending_key() == PendingKey::EntryHosted =>
+                {
+                    return (FrameRole::HostedValue, None);
+                }
                 _ => {}
             }
         }
@@ -596,6 +638,7 @@ impl PubspecReceiver {
                             git: frame.payload.git,
                             path: frame.payload.path,
                             sdk: frame.payload.sdk,
+                            hosted: frame.payload.hosted,
                         }
                     });
                 }
@@ -608,6 +651,16 @@ impl PubspecReceiver {
                         url: frame.payload.git_url,
                         rev: frame.payload.git_ref,
                         path: frame.payload.git_path,
+                    }));
+                }
+            }
+            FrameRole::HostedValue => {
+                if let Some(parent) = stack.top_mut()
+                    && *parent.role() == FrameRole::DependencyEntryValue
+                {
+                    parent.payload.hosted = Some(Box::new(RawHostedValue::Map {
+                        name: frame.payload.hosted_name,
+                        url: frame.payload.hosted_url,
                     }));
                 }
             }
@@ -693,14 +746,20 @@ impl PubspecReceiver {
                             *sdk = Some(value);
                         }
                     }
-                    FrameRole::DependencyEntryValue | FrameRole::GitValue if !is_null => {
+                    FrameRole::DependencyEntryValue
+                    | FrameRole::GitValue
+                    | FrameRole::HostedValue
+                        if !is_null =>
+                    {
                         let key = *top.pending_key();
                         top.payload
                             .assign_field(key, scalar_field(replay_depth, value, style, marker));
                     }
                     // A null value for one of the keys above — treated the same as the key
                     // being absent entirely.
-                    FrameRole::DependencyEntryValue | FrameRole::GitValue => {}
+                    FrameRole::DependencyEntryValue
+                    | FrameRole::GitValue
+                    | FrameRole::HostedValue => {}
                 }
                 stack.consume_value();
             }
@@ -835,7 +894,9 @@ impl PubspecReceiver {
                             );
                         }
                     }
-                    FrameRole::DependencyEntryValue | FrameRole::GitValue => {
+                    FrameRole::DependencyEntryValue
+                    | FrameRole::GitValue
+                    | FrameRole::HostedValue => {
                         if let Some((text, _style)) = resolved {
                             let key = *top.pending_key();
                             top.payload
@@ -910,6 +971,27 @@ impl MarkedEventReceiver for PubspecReceiver {
     }
 }
 
+/// pub's implicit default package source.
+const DEFAULT_PUB_SOURCE: &str = "https://pub.dev";
+
+/// pub's legacy default source alias — still accepted as an explicit `hosted:` value.
+const LEGACY_PUB_SOURCE: &str = "https://pub.dartlang.org";
+
+/// Classifies a `hosted:` URL: the implicit default (`pub.dev`, or its legacy
+/// `pub.dartlang.org` alias) resolves as `Registry`; anything else has no client this LSP can
+/// query, so it becomes `CustomRegistry` — mirroring Bundler's `source "..."` and Cargo's
+/// `registry = "..."` handling (#248/#980). Thin wrapper around the shared
+/// `deps_core::classify_default_registry_url` (code-review finding #2: this was
+/// byte-identical logic duplicated with `deps-bundler`'s `classify_registry_url`).
+///
+/// Critic finding S3: without this, an explicit `hosted: https://pub.dev` (a legal pubspec
+/// pinning the public registry by name rather than relying on the implicit default) was
+/// unconditionally classified as `CustomRegistry`, silently losing hover/version-data/
+/// diagnostics/OSV for a package that is genuinely on the public registry.
+fn classify_hosted_url(url: String) -> DependencySource {
+    deps_core::classify_default_registry_url(url, &[DEFAULT_PUB_SOURCE, LEGACY_PUB_SOURCE])
+}
+
 fn build_dependency(
     content: &str,
     line_table: &LineOffsetTable,
@@ -949,6 +1031,7 @@ fn build_dependency(
             git,
             path,
             sdk,
+            hosted,
         } => {
             let (version_req, version_range) = match version {
                 Some(field) => {
@@ -972,20 +1055,54 @@ fn build_dependency(
                     },
                     path.map(FieldValue::into_text),
                 ),
-                None => match (path, sdk) {
-                    (Some(path), _) => (
-                        DependencySource::Path {
-                            path: path.into_text(),
-                        },
-                        None,
-                    ),
-                    (None, Some(sdk)) => (
-                        DependencySource::Sdk {
-                            sdk: sdk.into_text(),
-                        },
-                        None,
-                    ),
-                    (None, None) => (DependencySource::Registry, None),
+                // `hosted:` declares a non-default pub registry — no client this LSP can
+                // query, so it becomes `CustomRegistry` (mirroring Bundler's `source "..."`
+                // and Cargo's `registry = "..."` handling, #248/#980) rather than silently
+                // falling through to the public `Registry` and leaking a private package
+                // name to pub.dev.
+                None => match hosted.map(|boxed| *boxed) {
+                    Some(RawHostedValue::Scalar(url_field)) => {
+                        (classify_hosted_url(url_field.into_text()), None)
+                    }
+                    Some(RawHostedValue::Map {
+                        name: hosted_name,
+                        url,
+                    }) => {
+                        let url_text = url.map_or_else(String::new, FieldValue::into_text);
+                        // Critic finding N3: the map form's `name` (if present) is the
+                        // *remote* package name, which may differ from the manifest's own
+                        // dependency key. Normalizing to `Registry` here would make every
+                        // later lookup query pub.dev under the manifest key, not `name` —
+                        // this LSP has no client wiring to query under a different remote
+                        // name (`hosted.name` is captured but unread, see `RawHostedValue`),
+                        // so a renamed package would falsely resolve as "unknown package".
+                        // Only normalize when there is no remote-name override, or it agrees
+                        // with the manifest key.
+                        let remote_name_matches_key = hosted_name
+                            .map(FieldValue::into_text)
+                            .is_none_or(|remote_name| remote_name == name);
+                        let source = if remote_name_matches_key {
+                            classify_hosted_url(url_text)
+                        } else {
+                            DependencySource::CustomRegistry { url: url_text }
+                        };
+                        (source, None)
+                    }
+                    None => match (path, sdk) {
+                        (Some(path), _) => (
+                            DependencySource::Path {
+                                path: path.into_text(),
+                            },
+                            None,
+                        ),
+                        (None, Some(sdk)) => (
+                            DependencySource::Sdk {
+                                sdk: sdk.into_text(),
+                            },
+                            None,
+                        ),
+                        (None, None) => (DependencySource::Registry, None),
+                    },
                 },
             };
             DartDependency {
@@ -1233,6 +1350,9 @@ dependency_overrides:
         assert!(overridden.version_range.is_some());
     }
 
+    /// Security regression (#980): the `hosted:` shorthand was previously unparsed at any
+    /// layer, so a `hosted:` dependency fell through to `Registry` — leaking the private
+    /// package name to pub.dev via hover/OSV/completion.
     #[test]
     fn test_parse_hosted_with_version() {
         let yaml = r"
@@ -1245,6 +1365,173 @@ dependencies:
         let result = parse_pubspec_yaml(yaml, &test_uri()).unwrap();
         assert_eq!(result.dependencies.len(), 1);
         assert_eq!(result.dependencies[0].version_req, Some("^1.0.0".into()));
+        match &result.dependencies[0].source {
+            DependencySource::CustomRegistry { url } => {
+                assert_eq!(url, "https://custom-registry.example.com");
+            }
+            other => panic!("expected CustomRegistry, got {other:?}"),
+        }
+    }
+
+    /// The map form `hosted: {name, url}` — the remote package name may differ from the
+    /// manifest's own dependency key.
+    #[test]
+    fn test_parse_hosted_map_form_with_differing_name() {
+        let yaml = r"
+name: my_app
+dependencies:
+  custom_pkg:
+    hosted:
+      name: internal_custom_pkg
+      url: https://custom-registry.example.com
+    version: ^1.0.0
+";
+        let result = parse_pubspec_yaml(yaml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "custom_pkg");
+        assert_eq!(result.dependencies[0].version_req, Some("^1.0.0".into()));
+        match &result.dependencies[0].source {
+            DependencySource::CustomRegistry { url } => {
+                assert_eq!(url, "https://custom-registry.example.com");
+            }
+            other => panic!("expected CustomRegistry, got {other:?}"),
+        }
+    }
+
+    /// The legacy `url`-only map form (no `name:`) is also valid pub syntax.
+    #[test]
+    fn test_parse_hosted_map_form_url_only() {
+        let yaml = r"
+name: my_app
+dependencies:
+  custom_pkg:
+    hosted:
+      url: https://custom-registry.example.com
+    version: ^1.0.0
+";
+        let result = parse_pubspec_yaml(yaml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        match &result.dependencies[0].source {
+            DependencySource::CustomRegistry { url } => {
+                assert_eq!(url, "https://custom-registry.example.com");
+            }
+            other => panic!("expected CustomRegistry, got {other:?}"),
+        }
+    }
+
+    /// `hosted:` must still lose to an explicit `git:` option, mirroring the existing
+    /// `git`/`path`/`sdk` precedence in `build_dependency`.
+    #[test]
+    fn test_hosted_does_not_override_explicit_git_source() {
+        let yaml = r"
+name: my_app
+dependencies:
+  my_pkg:
+    git: https://github.com/user/repo.git
+    hosted: https://custom-registry.example.com
+";
+        let result = parse_pubspec_yaml(yaml, &test_uri()).unwrap();
+        assert_matches!(result.dependencies[0].source, DependencySource::Git { .. });
+    }
+
+    /// Security/functional regression (impl-critic S3): an explicit `hosted:` value naming the
+    /// public registry itself (a legal pubspec pattern for pinning the default explicitly)
+    /// must classify as `Registry`, not `CustomRegistry` — otherwise the package silently
+    /// loses hover/version-data/diagnostics/OSV even though it genuinely is on pub.dev.
+    #[test]
+    fn test_hosted_public_registry_url_classified_as_registry() {
+        let yaml = r"
+name: my_app
+dependencies:
+  provider:
+    hosted: https://pub.dev
+    version: ^6.0.0
+";
+        let result = parse_pubspec_yaml(yaml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies[0].source, DependencySource::Registry);
+    }
+
+    /// The legacy `pub.dartlang.org` alias for the public registry must also classify as
+    /// `Registry`.
+    #[test]
+    fn test_hosted_legacy_public_registry_url_classified_as_registry() {
+        let yaml = r"
+name: my_app
+dependencies:
+  provider:
+    hosted: https://pub.dartlang.org
+";
+        let result = parse_pubspec_yaml(yaml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies[0].source, DependencySource::Registry);
+    }
+
+    /// The map form of `hosted:` must apply the same public-registry normalization as the
+    /// shorthand.
+    #[test]
+    fn test_hosted_map_form_public_registry_url_classified_as_registry() {
+        let yaml = r"
+name: my_app
+dependencies:
+  provider:
+    hosted:
+      url: https://pub.dev
+";
+        let result = parse_pubspec_yaml(yaml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies[0].source, DependencySource::Registry);
+    }
+
+    /// The map form's `name` matching the manifest key is the common, correct case for an
+    /// explicit public-registry pin and must still normalize to `Registry`.
+    #[test]
+    fn test_hosted_map_form_public_registry_with_matching_name_classified_as_registry() {
+        let yaml = r"
+name: my_app
+dependencies:
+  provider:
+    hosted:
+      name: provider
+      url: https://pub.dev
+";
+        let result = parse_pubspec_yaml(yaml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies[0].source, DependencySource::Registry);
+    }
+
+    /// Regression (impl-critic N3): a `hosted:` map whose `name` differs from the manifest
+    /// key must stay `CustomRegistry` even when `url` is the public registry — this LSP has
+    /// no client wiring to query pub.dev under a name other than the manifest key, so
+    /// normalizing to `Registry` here would cause a false "unknown package" lookup under the
+    /// wrong (local) name.
+    #[test]
+    fn test_hosted_map_form_public_registry_with_differing_name_stays_custom_registry() {
+        let yaml = r"
+name: my_app
+dependencies:
+  provider:
+    hosted:
+      name: other_pkg
+      url: https://pub.dev
+";
+        let result = parse_pubspec_yaml(yaml, &test_uri()).unwrap();
+        match &result.dependencies[0].source {
+            DependencySource::CustomRegistry { url } => {
+                assert_eq!(url, "https://pub.dev");
+            }
+            other => panic!("expected CustomRegistry, got {other:?}"),
+        }
+    }
+
+    /// impl-critic M1: a trailing slash on the public registry URL must not cause a
+    /// misclassification as `CustomRegistry`.
+    #[test]
+    fn test_hosted_public_registry_url_ignores_trailing_slash() {
+        let yaml = r"
+name: my_app
+dependencies:
+  provider:
+    hosted: https://pub.dev/
+";
+        let result = parse_pubspec_yaml(yaml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies[0].source, DependencySource::Registry);
     }
 
     #[test]

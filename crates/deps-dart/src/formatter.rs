@@ -71,6 +71,12 @@ impl PackageRendering for DartFormatter {
     fn package_url(&self, name: &PackageName) -> String {
         crate::registry::package_url(name.as_str())
     }
+
+    /// Suppresses the pub.dev hover link for a package resolved from a non-default
+    /// `hosted:` source — rendering it would falsely imply the package is published there.
+    fn suppress_package_url(&self, source: &deps_core::DependencySource) -> bool {
+        !self.source_is_public_registry_content(source)
+    }
 }
 
 impl RequirementResolution for DartFormatter {
@@ -129,6 +135,17 @@ mod tests {
             "1.5.0", "^1.0.0" => true,
             "2.0.0", "^1.0.0" => false
         ];
+    }
+
+    #[test]
+    fn test_suppress_package_url() {
+        let f = DartFormatter;
+        assert!(!f.suppress_package_url(&deps_core::DependencySource::Registry));
+        assert!(
+            f.suppress_package_url(&deps_core::DependencySource::CustomRegistry {
+                url: "https://gems.mycorp.com".into(),
+            })
+        );
     }
 
     #[test]
