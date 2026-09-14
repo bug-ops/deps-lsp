@@ -359,12 +359,18 @@ jobs:
           - os: ubuntu-latest
             # 32-bit leg: gives `#[cfg(target_pointer_width = "32")]` fail-closed guards
             # (e.g. crates/deps-core/src/xml_bounds.rs) a real 32-bit target to build
-            # and test against, since every other leg here is 64-bit. i686 binaries run
-            # natively on the x86_64 runner under `cross`'s musl container (no QEMU
-            # needed), so this leg alone also runs its test suite, not just a build.
-            target: i686-unknown-linux-musl
-            use_cross_tool: true
+            # and test against, since every other leg here is 64-bit. Built natively
+            # (gcc-multilib, no `cross`/Docker) rather than via musl-cross like the
+            # other Linux legs below: i686 binaries already run natively on this
+            # x86_64 runner (no QEMU needed either way), and glibc's multilib support
+            # lets the toolchain cross-compile directly, avoiding cross's musl-container
+            # apt-get/Docker overhead (see #815) for a leg that exists purely to
+            # exercise one guard. This leg alone also runs its test suite via
+            # `cargo nextest`, not just a build.
+            target: i686-unknown-linux-gnu
+            use_cross_tool: false
             run_tests: true
+            native_multilib: true
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -379,6 +385,19 @@ jobs:
       - name: Install cross
         if: matrix.use_cross_tool
         uses: taiki-e/install-action@a82845735191974ac374fc0472388c6df0a158ca  # cross
+
+      # i686-unknown-linux-gnu builds natively on this x86_64 runner via glibc
+      # multilib support instead of `cross`/Docker (see the matrix comment above).
+      # gcc-multilib/libc6-dev-i386 provide the 32-bit C runtime and linker support
+      # rustc needs; cmake (for aws-lc-sys, pulled in transitively via reqwest's
+      # rustls/aws-lc-rs backend) already ships on the `ubuntu-latest` image.
+      - name: Install 32-bit multilib toolchain
+        if: matrix.native_multilib
+        run: sudo apt-get update && sudo apt-get install -y gcc-multilib libc6-dev-i386
+
+      - name: Install nextest
+        if: matrix.run_tests && matrix.native_multilib
+        uses: taiki-e/install-action@ef6302df50adb496d123b03ae2b53322d688ffa1  # nextest
 
       # `cross`'s `pre-build` steps for the musl targets (.github/Cross.toml) run `apt-get
       # update && apt-get install cmake` inside a fresh Docker image build on every
@@ -422,10 +441,9 @@ jobs:
 
       # Populates the cache path for the `actions/cache` step above to pick up and
       # upload at job end (its automatic post-step). Skipped on a cache hit (no new
-      # image was built, nothing changed to save) and on i686, which has no
-      # `pre-build` entry in .github/Cross.toml and so builds no custom image at all — the
-      # glob simply matches nothing there. `always()` so a cargo-level build failure
-      # (unrelated to the image) doesn't discard the already-paid-for apt-get work.
+      # image was built, nothing changed to save). `always()` so a cargo-level build
+      # failure (unrelated to the image) doesn't discard the already-paid-for
+      # apt-get work.
       - name: Save cross custom Docker image to cache
         if: always() && matrix.use_cross_tool && steps.cross-image-cache.outputs.cache-hit != 'true'
         run: |
@@ -436,21 +454,15 @@ jobs:
           fi
 
       - name: Run tests for cross-compile target (exercises pointer-width guards)
-        # Plain `cargo test` via `cross`, not `cargo nextest`: the default cross-rs
-        # container image for this target does not ship `cargo-nextest`, and a custom
-        # image isn't worth it for a narrow, single-leg regression check.
-        #
-        # `--test-threads=1`: several tests assert on `deps_core::fs_probe`'s global
-        # stat/read counters (e.g. deps-gradle's
-        # test_load_gradle_properties_stats_exactly_once_per_ancestor), which are safe
-        # under nextest's per-test-process isolation (what every other job uses) but not
-        # under plain `cargo test`'s single shared process, where a concurrently running
-        # test can bump the same counters mid-assertion. Single-threaded here avoids that
-        # without touching the tests themselves.
-        if: matrix.run_tests
-        env:
-          CROSS_CONFIG: .github/Cross.toml
-        run: cross test --workspace --target ${{ matrix.target }} -- --test-threads=1
+        # Native build (i686-unknown-linux-gnu, matrix.native_multilib) runs via
+        # `cargo nextest`, same as the main `test` job — nextest's per-test-process
+        # isolation avoids the shared-counter races that `deps_core::fs_probe`'s
+        # global stat/read counters (e.g. deps-gradle's
+        # test_load_gradle_properties_stats_exactly_once_per_ancestor) would otherwise
+        # hit under a single-process `cargo test`, so no `--test-threads=1` workaround
+        # is needed here.
+        if: matrix.run_tests && matrix.native_multilib
+        run: cargo nextest run --workspace --all-features --no-fail-fast --target ${{ matrix.target }}
 
   coverage:
     name: Code Coverage
