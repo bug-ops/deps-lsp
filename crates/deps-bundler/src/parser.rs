@@ -31,9 +31,14 @@ pub struct BundlerParseResult {
 // Regex patterns for Gemfile parsing
 // Compile-time-constant patterns; a malformed literal is a build-visible programmer error,
 // not attacker-influenceable input.
+// Accepts either the bare `gem "name"` form or a parenthesized `gem("name")` / `gem ("name")`
+// call (#1021) — before this fix, `\s+` between `gem` and the opening quote was mandatory, so a
+// parenthesized call (top-level or nested inside any block) never matched at all and silently
+// produced no dependency, no diagnostic, no hover, and no completion.
 #[allow(clippy::expect_used)]
-static GEM_PATTERN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"^\s*gem\s+['"]([^'"]+)['"]"#).expect("Invalid regex"));
+static GEM_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^\s*gem(?:\s+|\s*\(\s*)['"]([^'"]+)['"]"#).expect("Invalid regex")
+});
 
 /// Matches a gem's version-constraint string, e.g. `gem "rails", "~> 7.0"`. Tolerant of a
 /// trailing comment after the closing quote (`"~> 7.0" # pinned for Rails 7 compat`, #988) —
@@ -44,19 +49,143 @@ static VERSION_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"['"]([~>=<!\d][^'"]*)['"]\s*(?:,|(?:#.*)?$)"#).expect("Invalid regex")
 });
 
+/// Same as [`VERSION_PATTERN`] but also accepts a closing `)` as a terminator, for a
+/// parenthesized `gem("rails", "~> 7.0")` call (#1021). Deliberately a *separate* pattern rather
+/// than folding `)` into `VERSION_PATTERN` itself (critic finding S3): a bare, non-parenthesized
+/// `gem "x" if Gem::Version.new(RUBY_VERSION) >= Gem::Version.new("3.1")` line also ends in a
+/// `)` — from the `if`-modifier's condition, not the gem call — so accepting `)` unconditionally
+/// let an unrelated quoted string inside that condition be misread as the gem's version. Callers
+/// use this pattern only once they know the call itself opened with `(` (see `is_paren_call` in
+/// [`parse_gemfile`]/[`PendingGem`]).
+// Same guarantee as GEM_PATTERN above.
+#[allow(clippy::expect_used)]
+static VERSION_PATTERN_PAREN_TERMINATED: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"['"]([~>=<!\d][^'"]*)['"]\s*(?:,|\)|(?:#.*)?$)"#).expect("Invalid regex")
+});
+
+/// Matches a statement-modifier `if`/`unless` keyword (`gem "x" if COND`, `gem "x" unless
+/// COND`). [`extract_version`] stops its positional-version search before this keyword, so a
+/// quoted string inside the modifier's condition (e.g. `Gem::Version.new("3.1")`) is never
+/// mistaken for the gem's own version constraint (critic finding S3 for #1021) — otherwise a
+/// version-shaped literal in the condition either gets reported as a phantom version constraint
+/// on a gem that declares none, or shadows a real version constraint earlier in the same call.
+// Same guarantee as GEM_PATTERN above.
+#[allow(clippy::expect_used)]
+static STATEMENT_MODIFIER_KEYWORD: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b(?:if|unless)\b").expect("Invalid regex"));
+
+/// Matches a colon directly followed (only whitespace between) by a closing `]`/`}`/`)` — a
+/// dangling, empty value position such as `a: ]` or `a: }`. Used by [`bracket_depths`] (critic
+/// finding, 8th vector round 2) to force-poison a closer even when it type-matches the innermost
+/// open bracket: a well-formed Gemfile never has a hash/array value that's simply empty like
+/// this, so it's treated as broken/mid-edit content, same as a genuinely mismatched closer.
+// Same guarantee as GEM_PATTERN above.
+#[allow(clippy::expect_used)]
+static DANGLING_VALUE_BEFORE_CLOSER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r":\s*([\]}\)])").expect("Invalid regex"));
+
 // Same guarantee as GEM_PATTERN above.
 #[allow(clippy::expect_used)]
 static SOURCE_PATTERN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"^\s*source\s+['"]([^'"]+)['"]\s*$"#).expect("Invalid regex"));
 
-/// Matches a `source "..." do` block opener, e.g. `source "https://gems.corp" do`. Tolerates
-/// a trailing comment (`... do # internal mirror`) — critic finding S2: without this, the
-/// block never opens and every gem inside it silently resolves against the file-level source.
+/// Matches the `source\s+` keyword prefix of a `source "..." do` block opener — the fixed part
+/// [`parse_source_block_start`] anchors on before hand-scanning the URL literal itself.
 // Same guarantee as GEM_PATTERN above.
 #[allow(clippy::expect_used)]
-static SOURCE_BLOCK_START: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"^\s*source\s+['"]([^'"]+)['"]\s+do\s*(#.*)?$"#).expect("Invalid regex")
-});
+static SOURCE_BLOCK_PREFIX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*source\s+").expect("Invalid regex"));
+
+/// Matches what must follow a `source "..." do` block opener's URL literal: whitespace, `do`,
+/// and an optional trailing comment. Tolerates the comment (`... do # internal mirror`) — critic
+/// finding S2: without this, the block never opens and every gem inside it silently resolves
+/// against the file-level source.
+// Same guarantee as GEM_PATTERN above.
+#[allow(clippy::expect_used)]
+static SOURCE_BLOCK_SUFFIX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s+do\s*(#.*)?$").expect("Invalid regex"));
+
+/// Matches a `source "..." do` block opener, e.g. `source "https://gems.corp" do`, returning the
+/// URL literal's content.
+///
+/// Quote-aware (#1019): the `regex` crate has no backreferences, so a single regex capture group
+/// like `['"]([^'"]+)['"]` stops at the *first* quote character it meets — which fails on a URL
+/// literal containing Ruby string interpolation with a different quote type nested inside, e.g.
+/// `source "https://#{ENV['CREDS']}@gems.contribsys.com/" do`. Scanning by hand with
+/// [`scan_quoted_literal`] tracks only the *outer* quote type, so the nested single quote around
+/// `'CREDS'` is treated as ordinary content instead of a premature closing delimiter.
+// `prefix_end` is a regex match end and `consumed` is derived from `char_indices()` plus a
+// char's UTF-8 length — both always land on char boundaries.
+#[allow(clippy::string_slice)]
+fn parse_source_block_start(line: &str) -> Option<&str> {
+    let prefix_end = SOURCE_BLOCK_PREFIX.find(line)?.end();
+    let rest = &line[prefix_end..];
+    let (url, consumed) = scan_quoted_literal(rest)?;
+    if SOURCE_BLOCK_SUFFIX.is_match(&rest[consumed..]) {
+        Some(url)
+    } else {
+        None
+    }
+}
+
+/// Scans a single- or double-quoted string literal starting at byte 0 of `s` (`s[0]` must be `'`
+/// or `"`), returning its content and the total byte length consumed (including both quotes).
+/// Tracks only the literal's own *outer* quote character as the closing delimiter — a different
+/// quote type appearing inside (e.g. a single-quoted `ENV['CREDS']` nested via Ruby string
+/// interpolation inside a double-quoted URL) is ordinary content, not a delimiter. The `regex`
+/// crate supports no backreferences, so this can't be expressed as a single regex capture group
+/// (#1019); used only where a full literal must be captured with interpolation-depth tracking,
+/// not where plain quote-aware skipping over unrelated content is enough (see
+/// [`deps_core::quote_scan::CodeSpans`] for that case, e.g. [`apply_bracket_delta`]).
+///
+/// Interpolation-aware (critic finding S1, #1019 follow-up): tracks `#{` … `}` interpolation
+/// spans and suspends the outer-quote-delimiter check for their entire extent, since Ruby
+/// interpolation can nest a string literal using the *same* quote type as the outer literal
+/// (`"https://#{ENV["CREDS"]}@..." do` — a different, "mirror-image" case from the cross-type
+/// nesting `ENV['CREDS']` above; both must be tolerated). Any `{`/`}` seen while already inside
+/// an interpolation span (e.g. a nested hash literal) is tracked too, so the span only truly
+/// closes on its matching `}`.
+///
+/// Escape-aware outside interpolation (#1036 follow-up): a backslash there escapes the next
+/// character generically, matching [`deps_core::quote_scan::ScanSyntax::Ruby`]'s escaping rule —
+/// without this, a URL literal containing a backslash-escaped instance of its own outer quote
+/// (e.g. `"https://a\"b" do`) would truncate early at the escaped quote, the same #1020 class
+/// main's `quote_scan` consolidation fixed for inline option values. Escaping only applies at
+/// interpolation depth 0: inside `#{...}` the content is Ruby code, not string-literal content,
+/// so a backslash there has no such meaning.
+#[allow(clippy::string_slice)]
+fn scan_quoted_literal(s: &str) -> Option<(&str, usize)> {
+    let mut chars = s.char_indices().peekable();
+    let (_, quote) = chars.next()?;
+    if quote != '\'' && quote != '"' {
+        return None;
+    }
+    let quote_len = quote.len_utf8();
+    let mut interpolation_depth: u32 = 0;
+    while let Some((idx, ch)) = chars.next() {
+        if interpolation_depth > 0 {
+            match ch {
+                '{' => interpolation_depth += 1,
+                '}' => interpolation_depth -= 1,
+                _ => {}
+            }
+            continue;
+        }
+        if ch == '\\' {
+            chars.next();
+            continue;
+        }
+        if ch == '#' && chars.peek().is_some_and(|&(_, next)| next == '{') {
+            chars.next();
+            interpolation_depth = 1;
+            continue;
+        }
+        if ch == quote {
+            return Some((&s[quote_len..idx], idx + ch.len_utf8()));
+        }
+    }
+    None
+}
 
 /// Builds the key-delimiter portion shared by every Bundler per-gem inline option, matching
 /// either the modern `key:` syntax or Ruby's legacy hash-rocket `:key =>` syntax. Independent
@@ -87,10 +216,12 @@ static SOURCE_OPTION: LazyLock<Regex> =
 
 /// Matches any recognized per-gem inline option's *key* alone (`source:`/`:source =>`,
 /// `group:`/`:group =>`, `git:`/`:git =>`, `path:`/`:path =>`, `github:`/`:github =>`,
-/// `require:`/`:require =>`, `platforms:`/`:platforms =>`) — used by `extract_version` to find
-/// where a `gem` call's keyword-argument territory begins, so a quoted option value (e.g.
-/// `require: "5.x_bridge"`) is never mistaken for a positional version constraint (code-review
-/// finding).
+/// `require:`/`:require =>`, `platforms:`/`:platforms =>`, `install_if:`/`:install_if =>`) —
+/// used by `extract_version` to find where a `gem` call's keyword-argument territory begins, so
+/// a quoted option value (e.g. `require: "5.x_bridge"`) is never mistaken for a positional
+/// version constraint (code-review finding). `install_if` was added per critic finding S3
+/// (#1021): its value is commonly a lambda (`install_if: -> { ... }`) that can itself contain a
+/// version-shaped quoted string, which must not be scanned as this gem's version either.
 // Same guarantee as GEM_PATTERN above.
 #[allow(clippy::expect_used)]
 static ANY_OPTION_KEY: LazyLock<Regex> = LazyLock::new(|| {
@@ -102,6 +233,7 @@ static ANY_OPTION_KEY: LazyLock<Regex> = LazyLock::new(|| {
         "github",
         "require",
         "platforms",
+        "install_if",
     ]
     .iter()
     .map(|key| option_key_pattern(key))
@@ -116,7 +248,7 @@ static RUBY_VERSION_PATTERN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"^\s*ruby\s+['"]([^'"]+)['"]\s*$"#).expect("Invalid regex"));
 
 // Same guarantee as GEM_PATTERN above. Comment-tolerant for the same reason as
-// SOURCE_BLOCK_START.
+// SOURCE_BLOCK_SUFFIX (`parse_source_block_start`).
 #[allow(clippy::expect_used)]
 static GROUP_BLOCK_START: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*group\s+(.+?)\s+do\s*(#.*)?$").expect("Invalid regex"));
@@ -226,62 +358,14 @@ static PLATFORMS_OPTION: LazyLock<Regex> = LazyLock::new(|| {
 /// impl-critic C1: the latter made a single lookup O(candidates × line length), quadratic
 /// once the `*_OPTION` regexes went key-only (a decoy key can now match anywhere on the
 /// line, not just right before a quote) against an adversarial line packed with decoys.
+///
+/// Used by [`extract_version`] to locate `ANY_OPTION_KEY`/`STATEMENT_MODIFIER_KEYWORD` on a
+/// single, not-yet-joined physical line (each with its own LSP-range-bearing offset, #991) —
+/// the per-`gem`-call option lookups instead go through [`OptionScan`], which additionally
+/// gates on bracket depth 0 over the whole joined call text (#1039).
 fn first_code_match<'a>(line: &'a str, re: &Regex) -> Option<regex::Match<'a>> {
     let code = deps_core::quote_scan::CodeSpans::new(line, deps_core::quote_scan::ScanSyntax::Ruby);
     re.find_iter(line).find(|m| code.is_code_byte(m.start()))
-}
-
-/// Same as [`first_code_match`], but for a regex with capture groups the caller needs:
-/// returns the first code-positioned match's full [`regex::Captures`] directly (via
-/// `captures_iter`, one regex pass), instead of the caller having to re-run `captures` on
-/// the matched substring to recover groups after the fact — impl-critic m1, folded in
-/// while already touching this code for C1.
-fn first_code_captures<'a>(line: &'a str, re: &Regex) -> Option<regex::Captures<'a>> {
-    let code = deps_core::quote_scan::CodeSpans::new(line, deps_core::quote_scan::ScanSyntax::Ruby);
-    re.captures_iter(line)
-        .find(|caps| code.is_code_byte(caps.get(0).map_or(0, |m| m.start())))
-}
-
-/// Reads a Bundler inline option's string value: finds `key_re`'s first code-positioned
-/// match ([`first_code_match`]), skips whitespace, and reads the string literal that
-/// follows via [`deps_core::quote_scan::read_string_literal`] — escape-aware, so an
-/// embedded escaped quote of the *other* kind (e.g. `\'` inside a `"`-delimited value)
-/// no longer truncates the value early (#1020).
-///
-/// Returns `None` for a missing key, a value that is not a string literal at all, an
-/// unterminated one, or an **empty** one — S2: mirrors the `+` (one-or-more) that the
-/// value regex this replaces used, so `source: ""` / `github: ""` / `git: ""` /
-/// `path: ""` keep falling through to the next-lower-precedence source instead of
-/// resolving to e.g. `CustomRegistry("")`. [`extract_require`] does not use this helper
-/// precisely because `require: ""` must keep parsing (its value regex used `*`, not `+`).
-///
-/// Only ever tries the *first* code-positioned key: on an (invalid, duplicated-key) line
-/// like `git: SOME_CONST, git: "..."`, this returns `None` rather than backtracking to the
-/// second `git:` the way the old single key+value regex would have via its own internal
-/// backtracking (impl-critic m2). Not reachable from valid Ruby (a duplicate keyword
-/// argument is itself a syntax error), and the fallthrough direction is the same safe one
-/// as every other `None` case above.
-// `key_match.end()` is a regex match-end offset, always a char boundary; `rest.trim_start()`
-// only trims whitespace, itself always single-byte ASCII, so `at` stays a char boundary;
-// `literal.content` comes from `read_string_literal`, likewise always char-boundary bounds.
-#[allow(clippy::string_slice)]
-fn option_string_value<'a>(line: &'a str, key_re: &Regex) -> Option<&'a str> {
-    let key_match = first_code_match(line, key_re)?;
-    let rest = &line[key_match.end()..];
-    let at = key_match.end() + (rest.len() - rest.trim_start().len());
-    let quote = line[at..].chars().next()?;
-    if quote != '"' && quote != '\'' {
-        return None;
-    }
-    let literal = deps_core::quote_scan::read_string_literal(
-        line,
-        at,
-        deps_core::quote_scan::ScanSyntax::Ruby,
-    )?;
-    if literal.content.is_empty() {
-        return None;
-    }
-    Some(&line[literal.content])
 }
 
 /// Which kind of `group ... do`, `source ... do`, or other Bundler DSL `... do ... end` block
@@ -337,6 +421,24 @@ struct PendingGem<'a> {
     /// each continuation line in full) together with its absolute byte offset in the source, so
     /// an option value on any line still gets a correct LSP range.
     segments: Vec<(&'a str, usize)>,
+    /// Stack of currently-unclosed `[`/`{` characters across every accumulated segment, each
+    /// popped by a later `]`/`}` (see [`apply_bracket_delta`]) — a non-empty stack means an
+    /// array/hash literal (e.g. `platforms: [`) opened on an earlier line is still unclosed,
+    /// which keeps the call open even without a trailing comma or backslash (#1017). A stack
+    /// (rather than a signed depth counter) structurally rules out the negative-depth bug a
+    /// counter had (critic finding M1: an unmatched closing bracket earlier in the call could
+    /// drive a counter negative and then mask a later, legitimate literal opening) — popping an
+    /// empty stack is simply a no-op — and lets [`bracket_only_should_stop`] tell an array (`[`)
+    /// context apart from a hash (`{`) context via the top element (critic finding, correctness
+    /// gate re-check: an anchored option-key-shaped line like `source: "..."` is plausible hash
+    /// content but not array element content, so whether to trust it depends on bracket *kind*,
+    /// not just depth).
+    bracket_stack: Vec<char>,
+    /// Whether the call opened with `gem(...)` rather than the bare `gem ...` form — threaded
+    /// through to [`extract_version`] so its `)`-as-terminator tolerance (#1021) only applies
+    /// when there's an actual enclosing `gem(...)` paren to terminate against, not any unrelated
+    /// trailing `)` on the line (critic finding S3).
+    is_paren_call: bool,
 }
 
 /// Hard cap on how many physical lines a single [`PendingGem`] may accumulate before being
@@ -347,6 +449,15 @@ struct PendingGem<'a> {
 /// Generous enough for any real Gemfile's multi-line `gem` call (which rarely exceeds a
 /// handful of option lines).
 const MAX_PENDING_GEM_SEGMENTS: usize = 256;
+
+/// Hard cap on segments while a [`PendingGem`]'s bracket depth is positive — deliberately far
+/// below [`MAX_PENDING_GEM_SEGMENTS`] (critic finding S2 for #1017): an unclosed `[`/`{` is a
+/// routine transient state while editing (the LSP's normal operating condition, not a corner
+/// case), so a call relying solely on bracket depth to stay open — no trailing comma or
+/// backslash signal — must not be allowed to run nearly as long as one with an explicit
+/// continuation signal, or it silently absorbs later, unrelated statements. Generous enough for
+/// any real multi-line array/hash literal (which rarely exceeds a handful of elements).
+const MAX_BRACKET_ONLY_CONTINUATION_SEGMENTS: usize = 20;
 
 /// Strips a Gemfile line's trailing `# comment`, skipping any `#` that appears inside a
 /// single- or double-quoted string — in particular Ruby string interpolation like `#{...}`
@@ -364,6 +475,88 @@ const MAX_PENDING_GEM_SEGMENTS: usize = 256;
 /// quote-aware stripping, stays attached to it.
 fn strip_trailing_comment(line: &str) -> &str {
     deps_core::quote_scan::strip_line_comment(line, deps_core::quote_scan::ScanSyntax::Ruby)
+}
+
+/// Applies the `[`/`{`/`]`/`}` characters `line` contributes to `stack`, quote-aware (ignoring
+/// bracket characters inside a string literal or comment) via the shared
+/// [`deps_core::quote_scan::CodeSpans`] (#1022/#1036: the hand-rolled quote/escape state
+/// machine this used before duplicated the same rules `strip_trailing_comment` now delegates to
+/// `deps_core::quote_scan` for) — pushing each opener, popping on each closer (a closer on an
+/// empty stack is a no-op) — so a `platforms: [` (or any other array/hash literal) opened on one
+/// line keeps a [`PendingGem`] open across every line until the literal actually closes, even
+/// when a line doesn't end in a trailing comma or backslash (#1017). A stack instead of a signed
+/// counter means an unmatched closer can never leave a negative balance (critic finding M1) and
+/// lets callers recover the *kind* of the innermost still-open literal via `stack.last()`, not
+/// just whether one is open (needed by [`bracket_only_should_stop`]). Callers pass an already
+/// comment-stripped line (via [`strip_trailing_comment`]) so a bracket inside a trailing comment
+/// is never counted — though `CodeSpans` would also exclude one on its own.
+fn apply_bracket_delta(line: &str, stack: &mut Vec<char>) {
+    let code = deps_core::quote_scan::CodeSpans::new(line, deps_core::quote_scan::ScanSyntax::Ruby);
+    for (idx, ch) in line.char_indices() {
+        if !code.is_code_byte(idx) {
+            continue;
+        }
+        match ch {
+            '[' | '{' => stack.push(ch),
+            ']' | '}' => {
+                stack.pop();
+            }
+            _ => {}
+        }
+    }
+}
+
+/// True when a comment-stripped, trimmed, non-empty line looks like array/hash literal element
+/// content for the innermost currently-open bracket `current_kind` (`Some('[')`/`Some('{')`) — a
+/// bare symbol (`:mri`), a quoted string, a closing `]`/`}`, or a leading `,` (all valid inside
+/// either kind), or, *only* while `current_kind` is `Some('{')`, a recognized per-gem option key
+/// anchored at the start of the line ([`ANY_OPTION_KEY`], e.g. `source: "..."` — plausible
+/// content for a hash literal like `gem "x", { source: "..." }`, but never for an array element:
+/// `[source: "..."]` isn't valid Ruby array content). Used only to decide whether such a line may
+/// be absorbed into a still bracket-open [`PendingGem`] (see [`bracket_only_should_stop`]).
+///
+/// Gating the option-key branch on bracket kind matters (correctness-gate re-check after critic
+/// findings S2/S2b): an anchored option-key match alone is indistinguishable from a genuinely new
+/// top-level declaration when the open bracket is `[` — `gem "x", platforms: [` followed by a
+/// bare `source: "https://evil.example.com"` line must NOT adopt that `source:` merely because it
+/// is anchored-option-key-shaped, since array element content can never look like that. Also
+/// anchoring the check at position 0 (critic finding S2b): `ANY_OPTION_KEY` also matches `git:`
+/// *inside* `Bundler.require(git: "...")` as a substring, so an unanchored check would still let
+/// that unrelated statement through.
+fn looks_like_option_or_array_content(stripped: &str, current_kind: Option<char>) -> bool {
+    let array_element_shaped = stripped.starts_with(':')
+        || stripped.starts_with('\'')
+        || stripped.starts_with('"')
+        || stripped.starts_with(']')
+        || stripped.starts_with('}')
+        || stripped.starts_with(',');
+    array_element_shaped
+        || (current_kind == Some('{')
+            && ANY_OPTION_KEY
+                .find(stripped)
+                .is_some_and(|m| m.start() == 0))
+}
+
+/// True when `line` must not be absorbed into a [`PendingGem`] that is currently open *only*
+/// because of an unclosed bracket/brace literal (no trailing comma or backslash signal) —
+/// because it doesn't look like array/hash literal element content for `current_kind`, the
+/// innermost currently-open bracket (critic findings S2/S2b/correctness-gate re-check for
+/// #1017). Allowlisting the shapes Ruby's array/hash grammar actually produces for the bracket
+/// kind actually open, rather than blocklisting unrelated-statement shapes or allowlisting by
+/// shape alone, is the conservative direction: a blocklist is open-ended and was still
+/// bypassable (e.g. `x = { source: "..." }` isn't `identifier(`-shaped but still leaks a fake
+/// `source:`), and a kind-blind allowlist let an anchored `source:`/`git:`-shaped line through
+/// even while the open bracket was an array (`[`), where such a line can never be legitimate
+/// content.
+///
+/// A blank/comment-only line is deliberately *not* a boundary on its own (critic finding S2a):
+/// it carries no statement content, so it can't be the unrelated line this guard exists to
+/// catch, and [`MAX_BRACKET_ONLY_CONTINUATION_SEGMENTS`] already bounds a run of them — this
+/// also keeps parity with the comma-continued path, which already tolerates blank lines between
+/// continuation options.
+fn bracket_only_should_stop(line: &str, current_kind: Option<char>) -> bool {
+    let stripped = strip_trailing_comment(line).trim();
+    !stripped.is_empty() && !looks_like_option_or_array_content(stripped, current_kind)
 }
 
 /// True when a comment-stripped, trimmed line ends with one of Ruby's two implicit
@@ -402,7 +595,7 @@ fn continues_gem_declaration(line: &str) -> bool {
 /// silently dropped that gem's declaration entirely (the same "gem disappears" leak class
 /// #991 itself fixes, just with a different trigger).
 fn starts_new_top_level_construct(line: &str) -> bool {
-    SOURCE_BLOCK_START.is_match(line)
+    parse_source_block_start(line).is_some()
         || SOURCE_PATTERN.is_match(line)
         || RUBY_VERSION_PATTERN.is_match(line)
         || GROUP_BLOCK_START.is_match(line)
@@ -434,12 +627,20 @@ fn finalize_pending_gem(
         .iter()
         .map(|(text, offset)| (strip_trailing_comment(text), *offset))
         .collect();
-    let (version_req, version_range) = extract_version(&stripped_segments, content, line_table);
-    let group = extract_group(&stripped_segments)
-        .unwrap_or_else(|| block_group.unwrap_or(DependencyGroup::Default));
-    let source = extract_source(&stripped_segments, gemfile_source_url, block_source_url);
-    let platforms = extract_platforms(&stripped_segments);
-    let require = extract_require(&stripped_segments);
+    let (version_req, version_range) = extract_version(
+        &stripped_segments,
+        content,
+        line_table,
+        pending.is_paren_call,
+    );
+    let lines: Vec<&str> = stripped_segments.iter().map(|(text, _)| *text).collect();
+    let joined = joined_lines(&lines);
+    let scan = OptionScan::new(&joined);
+    let group =
+        extract_group(&scan).unwrap_or_else(|| block_group.unwrap_or(DependencyGroup::Default));
+    let source = extract_source(&scan, gemfile_source_url, block_source_url);
+    let platforms = extract_platforms(&scan);
+    let require = extract_require(&scan);
 
     BundlerDependency {
         name: pending.name.into(),
@@ -482,7 +683,14 @@ pub fn parse_gemfile(content: &str, doc_uri: &Uri) -> Result<BundlerParseResult>
         // before every other line-level pattern below, since its content usually belongs to
         // the `gem` call's argument list, not to a new top-level construct.
         if let Some(pending) = pending_gem.take() {
-            if starts_new_top_level_construct(line) {
+            // #1017 follow-up (critic findings S2/S2b): while an array/hash literal opened by
+            // this call is still unclosed, a line that doesn't look like content for the
+            // innermost open bracket's *kind* must not be silently absorbed either — an unclosed
+            // bracket is a routine transient mid-edit state, not license to swallow everything up
+            // to the next recognized top-level construct or the segment cap.
+            let bracket_only_boundary = !pending.bracket_stack.is_empty()
+                && bracket_only_should_stop(line, pending.bracket_stack.last().copied());
+            if starts_new_top_level_construct(line) || bracket_only_boundary {
                 // This line is not actually part of the pending call's argument list — it
                 // independently opens/closes/declares something else (a new `gem`, a block
                 // opener/closer, `source`, `ruby`, ...). Finalize the pending gem from what
@@ -502,9 +710,18 @@ pub fn parse_gemfile(content: &str, doc_uri: &Uri) -> Result<BundlerParseResult>
                 // Falls through — `line` is reprocessed by the checks below.
             } else {
                 let mut pending = pending;
+                apply_bracket_delta(strip_trailing_comment(line), &mut pending.bracket_stack);
                 pending.segments.push((line, line_start));
-                let still_open = continues_gem_declaration(line)
-                    && pending.segments.len() < MAX_PENDING_GEM_SEGMENTS;
+                // A call relying solely on bracket depth to stay open (no trailing comma or
+                // backslash signal) is capped far below the general limit (critic finding S2).
+                let segment_cap = if pending.bracket_stack.is_empty() {
+                    MAX_PENDING_GEM_SEGMENTS
+                } else {
+                    MAX_BRACKET_ONLY_CONTINUATION_SEGMENTS
+                };
+                let still_open = (continues_gem_declaration(line)
+                    || !pending.bracket_stack.is_empty())
+                    && pending.segments.len() < segment_cap;
                 if still_open {
                     pending_gem = Some(pending);
                 } else {
@@ -524,8 +741,8 @@ pub fn parse_gemfile(content: &str, doc_uri: &Uri) -> Result<BundlerParseResult>
         // Check for source block start (must precede the single-line SOURCE_PATTERN check:
         // SOURCE_PATTERN is `$`-anchored and never matches a `... do` opener, but checking
         // this first keeps the precedence explicit).
-        if let Some(caps) = SOURCE_BLOCK_START.captures(line) {
-            source_stack.push(caps[1].to_string());
+        if let Some(url) = parse_source_block_start(line) {
+            source_stack.push(url.to_string());
             open_blocks.push(OpenBlockKind::Source);
             continue;
         }
@@ -601,41 +818,61 @@ pub fn parse_gemfile(content: &str, doc_uri: &Uri) -> Result<BundlerParseResult>
             let rest_offset = line_start + caps.get(0).unwrap().end();
             let rest_of_line = &line[caps.get(0).unwrap().end()..];
 
-            // A `gem` call whose argument list is still open (e.g. a trailing comma before an
-            // option on its own line, #991) — accumulate rather than resolve now.
-            if ends_with_trailing_comma(rest_of_line) {
-                pending_gem = Some(PendingGem {
-                    name,
-                    name_range,
-                    segments: vec![(rest_of_line, rest_offset)],
-                });
-                continue;
-            }
+            // Whether the call opened with `gem(...)` rather than bare `gem ...` — checked only
+            // against the *prefix* before the captured name (between the match start and
+            // `name_match.start()`), not the whole match (correctness-gate re-check, finding #2):
+            // using the whole match wrongly flipped this to `true` whenever the gem name itself
+            // contained a literal `(`, e.g. `gem "weird(name)"`. Gates `extract_version`'s
+            // `)`-as-terminator tolerance (critic finding S3 for #1021).
+            let match_start = caps.get(0).unwrap().start();
+            let is_paren_call = line[match_start..name_match.start()].contains('(');
 
             // Comment-stripped (impl-critic S5) before option extraction, so a trailing
             // comment mentioning an option-like string is never mistaken for an active one.
             let stripped_rest = strip_trailing_comment(rest_of_line);
 
+            // A `gem` call whose argument list is still open — either a trailing comma before an
+            // option on its own line (#991), or an array/hash literal opened but not yet closed
+            // on this line, e.g. `gem "x", platforms: [` (#1017) — accumulate rather than
+            // resolve now.
+            let mut opening_bracket_stack: Vec<char> = Vec::new();
+            apply_bracket_delta(stripped_rest, &mut opening_bracket_stack);
+            if ends_with_trailing_comma(rest_of_line) || !opening_bracket_stack.is_empty() {
+                pending_gem = Some(PendingGem {
+                    name,
+                    name_range,
+                    segments: vec![(rest_of_line, rest_offset)],
+                    bracket_stack: opening_bracket_stack,
+                    is_paren_call,
+                });
+                continue;
+            }
+
             // Extract version if present
-            let (version_req, version_range) =
-                extract_version(&[(stripped_rest, rest_offset)], content, &line_table);
+            let (version_req, version_range) = extract_version(
+                &[(stripped_rest, rest_offset)],
+                content,
+                &line_table,
+                is_paren_call,
+            );
 
             // Extract group from inline option or current block
-            let group = extract_group(&[(stripped_rest, rest_offset)])
+            let scan = OptionScan::new(stripped_rest);
+            let group = extract_group(&scan)
                 .unwrap_or_else(|| current_group(&group_stack).unwrap_or(DependencyGroup::Default));
 
             // Extract source
             let source = extract_source(
-                &[(stripped_rest, rest_offset)],
+                &scan,
                 source_url.as_deref(),
                 current_source_block(&source_stack),
             );
 
             // Extract platforms
-            let platforms = extract_platforms(&[(stripped_rest, rest_offset)]);
+            let platforms = extract_platforms(&scan);
 
             // Extract require option
-            let require = extract_require(&[(stripped_rest, rest_offset)]);
+            let require = extract_require(&scan);
 
             dependencies.push(BundlerDependency {
                 name: name.into(),
@@ -687,20 +924,44 @@ pub fn parse_gemfile(content: &str, doc_uri: &Uri) -> Result<BundlerParseResult>
 /// matches any quoted string starting with a version-ish character — could match an unrelated
 /// option's value on a later line (e.g. `require: "5.x_bridge"`) and misreport it as the
 /// version constraint, while the real one further down was never reached (code-review finding).
-// Group 1 is mandatory in `VERSION_PATTERN`; `key_match.start()` is a regex match-start offset,
-// always a char boundary.
+///
+/// Each segment's search area is also truncated at a trailing `if`/`unless` statement-modifier
+/// keyword ([`STATEMENT_MODIFIER_KEYWORD`], critic finding S3 for #1021): a quoted,
+/// version-shaped string in the modifier's condition (e.g. `Gem::Version.new("3.1")`) must never
+/// be mistaken for the gem's own version constraint.
+///
+/// `allow_paren_terminator` selects [`VERSION_PATTERN_PAREN_TERMINATED`] over the base
+/// [`VERSION_PATTERN`] — pass `true` only when the `gem` call itself opened with `(` (see
+/// `is_paren_call`), since a `)` terminator is otherwise ambiguous with an unrelated nested call
+/// later on the same line (critic finding S3).
+// Group 1 is mandatory in both version patterns; `key_match.start()`/`modifier_match.start()`
+// are regex match-start offsets, always char boundaries.
 #[allow(clippy::unwrap_used, clippy::string_slice)]
 fn extract_version(
     lines: &[(&str, usize)],
     content: &str,
     line_table: &LineOffsetTable,
+    allow_paren_terminator: bool,
 ) -> (Option<String>, Option<Range>) {
+    let version_pattern: &Regex = if allow_paren_terminator {
+        &VERSION_PATTERN_PAREN_TERMINATED
+    } else {
+        &VERSION_PATTERN
+    };
+
     for (line, base_offset) in lines {
         let line: &str = line;
         let key_match = first_code_match(line, &ANY_OPTION_KEY);
-        let search_area = key_match.map_or(line, |m| &line[..m.start()]);
+        let modifier_match = first_code_match(line, &STATEMENT_MODIFIER_KEYWORD);
+        let boundary = key_match
+            .map(|m| m.start())
+            .into_iter()
+            .chain(modifier_match.map(|m| m.start()))
+            .min()
+            .unwrap_or(line.len());
+        let search_area = &line[..boundary];
 
-        if let Some(caps) = VERSION_PATTERN.captures(search_area) {
+        if let Some(caps) = version_pattern.captures(search_area) {
             let version = caps[1].to_string();
             let version_match = caps.get(1).unwrap();
             let version_start = base_offset + version_match.start();
@@ -720,15 +981,242 @@ fn extract_version(
     (None, None)
 }
 
-/// Scans each accumulated line for the inline `group:` option, returning the first
-/// code-positioned match (N1: `GROUP_OPTION.captures(line)` alone would also match a
-/// `group:`-shaped decoy inside an already-open quoted value, same hazard [`first_code_match`]
-/// guards against for the other six `*_OPTION` lookups).
-fn extract_group(lines: &[(&str, usize)]) -> Option<DependencyGroup> {
-    lines.iter().find_map(|(line, _)| {
-        let caps = first_code_captures(line, &GROUP_OPTION)?;
-        Some(parse_group_symbols(&caps[1]))
+/// Joins every accumulated physical line of a (possibly multi-line) `gem` call into one search
+/// string, so a bracket/comma-held value that itself spans multiple lines — e.g. a `platforms:
+/// [` array literal not closed until a later line (#1017) — can still be matched by a single,
+/// line-oriented `Regex` instead of requiring the whole value to sit on one physical line. This
+/// only reunites lines the parser already accumulated into one [`PendingGem`]; a bare `key:` on
+/// one line whose value sits on the next with no bracket/comma linking them is not itself
+/// treated as a continuation (see `ends_with_trailing_comma`/`apply_bracket_delta`) and so never
+/// reaches here.
+///
+/// Callers join once and build one [`OptionScan`] from the result, shared by
+/// `extract_group`/`extract_source`/`extract_platforms`/`extract_require` (correctness-gate
+/// re-check, finding #4: those four previously each joined/rescanned the same text
+/// independently — up to 4x redundant allocation per multi-line `gem` call). For a single-line
+/// call, the caller passes that line directly instead of joining a one-element slice.
+fn joined_lines(lines: &[&str]) -> String {
+    lines.join(" ")
+}
+
+/// Computes, for every byte offset in `text`, the unmatched `[`/`{`/`(` nesting depth strictly
+/// before that offset — quote-aware (ignoring bracket characters inside a string literal or
+/// comment) via `code`, the shared [`deps_core::quote_scan::CodeSpans`] classification built
+/// once by [`OptionScan::new`] — scanned in one continuous pass over the *whole* joined text.
+///
+/// This is the structural fix for the #1017 leak class surviving repeated absorption-guard
+/// tweaks (S2/S2b, correctness-gate finding #1): `extract_source`/`group`/`platforms`/`require`
+/// previously matched an option-key pattern *anywhere* in the joined text with no notion of
+/// nesting at all, so any `source:`/`git:`-shaped text became the gem's source regardless of
+/// where it actually sat — e.g. `install_if: { source: "evil" }` leaks on a *single* line, no
+/// continuation or absorption involved. The absorption guard only filters what text gets
+/// *joined*; the sink accepting anything nested is the actual defect. [`OptionScan`]'s helpers
+/// use this table so only a match whose key starts at depth 0 — a *direct* keyword argument of
+/// the `gem` call, not nested inside another option's value — is trusted. This defends against a
+/// distinct vector from `code`, which instead catches a decoy match inside an already-open
+/// quoted *value* on the same line (e.g. `path: 'vendor/git: "cache"'`, #1022) — no bracket is
+/// involved there at all, so bracket depth alone would not exclude it; both checks are required
+/// together (see [`first_code_match_at_depth_zero`]).
+///
+/// **Scope of the guarantee**: this is sound for *well-formed* Ruby — a `source:` (or other
+/// option key) genuinely at depth 0 in syntactically valid text is correctly a direct keyword
+/// argument of the `gem` call, and one genuinely nested is correctly rejected. It is best-effort
+/// and fail-closed, not exhaustive, against text containing *invalid* Ruby: depth is a proxy for
+/// real structure, which is undefined once the text isn't structurally valid to begin with. An
+/// odd quote run can still hide a bracket from `code`, a balanced inner pair (`({})`) can still
+/// restore an empty stack ahead of a later excess closer, and the comma-continuation path (kept
+/// open by a trailing comma alone, no bracket involved) is untouched by any of this. Closing
+/// those requires a real bracket/string-aware scanner, tracked as its own follow-up
+/// (bug-ops/deps-lsp#1039, sibling scope to #1022) rather than further pattern-matching here —
+/// every such vector requires the Gemfile to already contain invalid Ruby, so it grants no
+/// capability beyond what a valid `source: "evil"` already would.
+///
+/// A closer that doesn't match the innermost currently-open bracket — either the *type* is
+/// wrong (e.g. a stray `]` while only a `{` is open) or there's nothing open at all — makes the
+/// text structurally broken from that point on: **fail-closed poisoning** (critic finding, 8th
+/// vector / correctness-gate re-check round 5) marks every later position untrusted (a sentinel
+/// depth that can never compare equal to 0) rather than the earlier `.max(0)` clamp, which let
+/// such a stray closer silently reset nesting to 0 and made everything after it read as a direct
+/// depth-0 keyword argument again — the same malformed/mid-edit class (a file mid-edit is an
+/// LSP's normal operating condition, not a rare adversarial-only shape) the team already ruled
+/// unacceptable for the original S2.
+///
+/// A *matched* closer (type and nesting both correct) behaves normally — pops the stack, depth
+/// decreases — so a real `platforms: [ :mri ], source: "..."` still resolves `source:` at depth
+/// 0 after the array legitimately closes; only a genuinely mismatched or excess closer poisons.
+///
+/// The gem call's own trailing `)` surviving into the joined text for a parenthesized call is
+/// itself such an unmatched closer (its opening `(` sits before the captured name and is
+/// excluded from `text`), but it always comes *after* all the options, so poisoning starting
+/// there has no effect on anything already matched — verified for both single- and multi-line
+/// paren calls.
+///
+/// Scanning the *joined* text in one continuous pass — rather than per original physical line —
+/// also closes the #1017/#3 per-line reset gap for this specific sink: a string literal that
+/// spans a line boundary and is later closed still tracks correctly here, because there are no
+/// independent per-line resets once the lines are joined into one string.
+///
+/// A closer that *does* type-match the innermost open bracket is additionally forced to poison
+/// anyway when it directly follows a bare `key:` with nothing but whitespace in between — e.g.
+/// `install_if: { a: } , source: "evil" }` (critic finding, 8th vector round 2). Here the first
+/// `}` properly closes the `{` by pure type-matched counting, so `source:` — found *before* the
+/// text's later, genuinely-unmatched second `}` — would otherwise still read as a legitimate
+/// depth-0 match despite the text being just as structurally broken. A hash/array value is never
+/// genuinely empty like this in a well-formed Gemfile, so [`DANGLING_VALUE_BEFORE_CLOSER`] flags
+/// it as broken/mid-edit content too, the same conservative direction as every other stray-closer
+/// shape.
+// `idx` comes from `char_indices()` over `text`, always < `text.len()` and thus a valid index
+// into `depths` (sized `text.len() + 1`).
+#[allow(clippy::indexing_slicing)]
+fn bracket_depths(text: &str, code: &deps_core::quote_scan::CodeSpans<'_>) -> Vec<i32> {
+    let mut depths = vec![0i32; text.len() + 1];
+    let mut stack: Vec<char> = Vec::new();
+    let mut poisoned = false;
+    let dangling_closers: Vec<usize> = DANGLING_VALUE_BEFORE_CLOSER
+        .captures_iter(text)
+        .filter_map(|caps| caps.get(1).map(|m| m.start()))
+        .collect();
+    for (idx, ch) in text.char_indices() {
+        if poisoned {
+            depths[idx] = i32::MAX;
+            continue;
+        }
+        // Written before `ch` is processed below, so a closer that poisons *this* position
+        // still leaves it (and everything before it) trusted — only later positions are
+        // affected.
+        depths[idx] = i32::try_from(stack.len()).unwrap_or(i32::MAX);
+        if code.is_code_byte(idx) {
+            let dangling = dangling_closers.contains(&idx);
+            match ch {
+                '[' | '{' | '(' => stack.push(ch),
+                ']' if !dangling && stack.last() == Some(&'[') => {
+                    stack.pop();
+                }
+                '}' if !dangling && stack.last() == Some(&'{') => {
+                    stack.pop();
+                }
+                ')' if !dangling && stack.last() == Some(&'(') => {
+                    stack.pop();
+                }
+                ']' | '}' | ')' => poisoned = true,
+                _ => {}
+            }
+        }
+    }
+    if let Some(last) = depths.last_mut() {
+        *last = if poisoned {
+            i32::MAX
+        } else {
+            i32::try_from(stack.len()).unwrap_or(i32::MAX)
+        };
+    }
+    depths
+}
+
+/// Precomputed, shared classification of a (possibly multi-line, already [`joined_lines`])
+/// `gem` call's option text — built once and reused by `extract_group`/`extract_source`/
+/// `extract_platforms`/`extract_require`, each of which needs *both* independent defenses on
+/// every candidate match: `code` (is this position outside every string literal and comment —
+/// #1022's defense against a decoy match inside an already-open quoted value) and `depths` (is
+/// this position at bracket depth 0 — #1039's defense against an option key nested inside
+/// another option's value, see [`bracket_depths`]). Neither alone is sufficient — a decoy key
+/// inside an already-open quoted value (`path: 'vendor/git: "cache"'`) sits at depth 0 (no
+/// bracket involved) but is not code; an option key genuinely nested inside another option's
+/// hash value (`install_if: { source: "evil" }`) is code (not inside any string) but sits at
+/// depth > 0.
+struct OptionScan<'a> {
+    text: &'a str,
+    code: deps_core::quote_scan::CodeSpans<'a>,
+    depths: Vec<i32>,
+}
+
+impl<'a> OptionScan<'a> {
+    fn new(text: &'a str) -> Self {
+        let code =
+            deps_core::quote_scan::CodeSpans::new(text, deps_core::quote_scan::ScanSyntax::Ruby);
+        let depths = bracket_depths(text, &code);
+        Self { text, code, depths }
+    }
+}
+
+/// Returns the first match of `re` in `scan`'s text that is both code-positioned and at bracket
+/// depth 0 (see [`OptionScan`]) — a direct keyword argument of the `gem` call, not a decoy match
+/// inside an already-open quoted value and not nested inside another option's value.
+// A match's start is always a valid `scan.text` offset (at most `scan.text.len()`), and
+// `scan.depths` is sized `scan.text.len() + 1` (see `bracket_depths`), so indexing it at a
+// match start never panics.
+#[allow(clippy::indexing_slicing)]
+fn first_code_match_at_depth_zero<'a>(
+    scan: &OptionScan<'a>,
+    re: &Regex,
+) -> Option<regex::Match<'a>> {
+    re.find_iter(scan.text)
+        .find(|m| scan.code.is_code_byte(m.start()) && scan.depths[m.start()] == 0)
+}
+
+/// Same as [`first_code_match_at_depth_zero`], but for a regex with capture groups the caller
+/// needs: returns the first eligible match's full [`regex::Captures`] directly (via
+/// `captures_iter`, one regex pass), instead of the caller having to re-run `captures` on the
+/// matched substring to recover groups after the fact.
+// Same guarantee as `first_code_match_at_depth_zero` above.
+#[allow(clippy::indexing_slicing)]
+fn first_code_captures_at_depth_zero<'a>(
+    scan: &OptionScan<'a>,
+    re: &Regex,
+) -> Option<regex::Captures<'a>> {
+    re.captures_iter(scan.text).find(|caps| {
+        let start = caps.get(0).map_or(0, |m| m.start());
+        scan.code.is_code_byte(start) && scan.depths[start] == 0
     })
+}
+
+/// Reads a Bundler inline option's string value: finds `key_re`'s first eligible match
+/// ([`first_code_match_at_depth_zero`]), skips whitespace, and reads the string literal that
+/// follows via [`deps_core::quote_scan::read_string_literal`] — escape-aware, so an embedded
+/// escaped quote of the *other* kind (e.g. `\'` inside a `"`-delimited value) no longer
+/// truncates the value early (#1020).
+///
+/// Returns `None` for a missing key, a value that is not a string literal at all, an
+/// unterminated one, or an **empty** one — S2: mirrors the `+` (one-or-more) that the value
+/// regex this replaces used, so `source: ""` / `github: ""` / `git: ""` / `path: ""` keep
+/// falling through to the next-lower-precedence source instead of resolving to e.g.
+/// `CustomRegistry("")`. [`extract_require`] does not use this helper precisely because
+/// `require: ""` must keep parsing (its value regex used `*`, not `+`).
+///
+/// Only ever tries the *first* eligible key: on an (invalid, duplicated-key) line like `git:
+/// SOME_CONST, git: "..."`, this returns `None` rather than backtracking to the second `git:`
+/// the way the old single key+value regex would have via its own internal backtracking
+/// (impl-critic m2). Not reachable from valid Ruby (a duplicate keyword argument is itself a
+/// syntax error), and the fallthrough direction is the same safe one as every other `None` case
+/// above.
+// `key_match.end()` is a regex match-end offset, always a char boundary; `rest.trim_start()`
+// only trims whitespace, itself always single-byte ASCII, so `at` stays a char boundary;
+// `literal.content` comes from `read_string_literal`, likewise always char-boundary bounds.
+#[allow(clippy::string_slice)]
+fn option_string_value<'a>(scan: &OptionScan<'a>, key_re: &Regex) -> Option<&'a str> {
+    let key_match = first_code_match_at_depth_zero(scan, key_re)?;
+    let rest = &scan.text[key_match.end()..];
+    let at = key_match.end() + (rest.len() - rest.trim_start().len());
+    let quote = scan.text[at..].chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let literal = deps_core::quote_scan::read_string_literal(
+        scan.text,
+        at,
+        deps_core::quote_scan::ScanSyntax::Ruby,
+    )?;
+    if literal.content.is_empty() {
+        return None;
+    }
+    Some(&scan.text[literal.content])
+}
+
+/// Scans `scan`'s text for the inline `group:` option at bracket depth 0 and outside every
+/// string literal/comment (see [`OptionScan`]), returning the first match.
+fn extract_group(scan: &OptionScan<'_>) -> Option<DependencyGroup> {
+    let caps = first_code_captures_at_depth_zero(scan, &GROUP_OPTION)?;
+    Some(parse_group_symbols(&caps[1]))
 }
 
 fn parse_group_symbols(text: &str) -> DependencyGroup {
@@ -761,11 +1249,14 @@ fn classify_registry_url(url: &str) -> DependencySource {
 
 /// Classifies a gem's dependency source.
 ///
-/// `lines` is every physical line belonging to this `gem` call (just the one line for a
-/// single-line declaration; the post-name remainder plus every continuation line for a
-/// multi-line one, #991) — each option pattern is checked against every line in order, so an
-/// option on any continuation line is still found regardless of which line the eventual match
-/// comes from.
+/// `scan` wraps every physical line belonging to this `gem` call, already joined by
+/// [`joined_lines`] (just that one line for a single-line declaration; the post-name remainder
+/// plus every continuation line for a multi-line one, #991) — each option pattern is checked
+/// against it in order at bracket depth 0 and outside every string/comment (see [`OptionScan`]),
+/// so an option on any continuation line is still found regardless of which line the eventual
+/// match comes from, while a decoy match inside an already-open quoted value or an
+/// option-key-shaped match nested inside another option's value (e.g. `install_if: { source:
+/// "..." }`) are both correctly ignored.
 ///
 /// `gemfile_source_url` is the Gemfile-level, single-line `source "..."` declaration (if
 /// any); `block_source_url` is the innermost enclosing `source "..." do ... end` block's URL
@@ -776,43 +1267,31 @@ fn classify_registry_url(url: &str) -> DependencySource {
 /// Precedence: `git:`/`github:`/`path:` (explicit non-registry source) → inline `source:`
 /// option → enclosing `source ... do` block → file-level `source` → `Registry`.
 fn extract_source(
-    lines: &[(&str, usize)],
+    scan: &OptionScan<'_>,
     gemfile_source_url: Option<&str>,
     block_source_url: Option<&str>,
 ) -> DependencySource {
-    if let Some(value) = lines
-        .iter()
-        .find_map(|(line, _)| option_string_value(line, &GIT_OPTION))
-    {
+    if let Some(value) = option_string_value(scan, &GIT_OPTION) {
         return DependencySource::Git {
             url: value.to_string(),
             rev: None,
         };
     }
 
-    if let Some(value) = lines
-        .iter()
-        .find_map(|(line, _)| option_string_value(line, &GITHUB_OPTION))
-    {
+    if let Some(value) = option_string_value(scan, &GITHUB_OPTION) {
         return DependencySource::Git {
             url: format!("https://github.com/{value}"),
             rev: None,
         };
     }
 
-    if let Some(value) = lines
-        .iter()
-        .find_map(|(line, _)| option_string_value(line, &PATH_OPTION))
-    {
+    if let Some(value) = option_string_value(scan, &PATH_OPTION) {
         return DependencySource::Path {
             path: value.to_string(),
         };
     }
 
-    if let Some(value) = lines
-        .iter()
-        .find_map(|(line, _)| option_string_value(line, &SOURCE_OPTION))
-    {
+    if let Some(value) = option_string_value(scan, &SOURCE_OPTION) {
         return classify_registry_url(value);
     }
 
@@ -823,15 +1302,14 @@ fn extract_source(
     gemfile_source_url.map_or(DependencySource::Registry, classify_registry_url)
 }
 
-/// Scans each accumulated line for the inline `platforms:` option, returning the first
-/// code-positioned match (N1, same reasoning as [`extract_group`]).
-fn extract_platforms(lines: &[(&str, usize)]) -> Vec<String> {
-    let Some(platforms_str) = lines.iter().find_map(|(line, _)| {
-        let caps = first_code_captures(line, &PLATFORMS_OPTION)?;
-        Some(caps[1].to_string())
-    }) else {
+/// Scans `scan`'s text — every accumulated line already joined by [`joined_lines`] (so a value
+/// may itself span lines, #1017) — for the inline `platforms:` option at bracket depth 0 and
+/// outside every string literal/comment (see [`OptionScan`]), returning the first match.
+fn extract_platforms(scan: &OptionScan<'_>) -> Vec<String> {
+    let Some(caps) = first_code_captures_at_depth_zero(scan, &PLATFORMS_OPTION) else {
         return vec![];
     };
+    let platforms_str = &caps[1];
     if platforms_str.starts_with('[') {
         // Parse array: [:mingw, :mswin]
         platforms_str
@@ -846,8 +1324,9 @@ fn extract_platforms(lines: &[(&str, usize)]) -> Vec<String> {
     }
 }
 
-/// Scans each accumulated line for the inline `require:` option, returning the first
-/// code-positioned match.
+/// Scans `scan`'s text — every accumulated line already joined by [`joined_lines`] (so a value
+/// may itself span lines, #1017) — for the inline `require:` option at bracket depth 0 and
+/// outside every string literal/comment (see [`OptionScan`]), returning the first match.
 ///
 /// Unlike [`extract_source`]'s options, `require`'s value is not always a string
 /// (`require: false`), so it is parsed directly here rather than through
@@ -860,38 +1339,33 @@ fn extract_platforms(lines: &[(&str, usize)]) -> Vec<String> {
 /// `require: false_thing` are option-value-shaped text that happens to start with `false`,
 /// not the boolean literal — a bug in the regex this replaces, `(false|...)`, which matched
 /// on the `false` prefix alone; fixed here since this line is being rewritten anyway).
-fn extract_require(lines: &[(&str, usize)]) -> Option<String> {
-    lines.iter().find_map(|(line, _)| {
-        let key_match = first_code_match(line, &REQUIRE_OPTION)?;
-        // `key_match.end()` and `rest.trim_start()`'s skip are always char boundaries — see
-        // `option_string_value`'s identical justification.
-        #[allow(clippy::string_slice)]
-        let rest = &line[key_match.end()..];
-        let trimmed = rest.trim_start();
-        if let Some(after_false) = trimmed.strip_prefix("false") {
-            let is_word_boundary = after_false
-                .chars()
-                .next()
-                .is_none_or(|c| !c.is_alphanumeric() && c != '_');
-            if is_word_boundary {
-                return Some("false".to_string());
-            }
+// `key_match.end()` and `rest.trim_start()`'s skip are always char boundaries — see
+// `option_string_value`'s identical justification.
+#[allow(clippy::string_slice)]
+fn extract_require(scan: &OptionScan<'_>) -> Option<String> {
+    let key_match = first_code_match_at_depth_zero(scan, &REQUIRE_OPTION)?;
+    let rest = &scan.text[key_match.end()..];
+    let trimmed = rest.trim_start();
+    if let Some(after_false) = trimmed.strip_prefix("false") {
+        let is_word_boundary = after_false
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+        if is_word_boundary {
+            return Some("false".to_string());
         }
-        let at = key_match.end() + (rest.len() - trimmed.len());
-        #[allow(clippy::string_slice)]
-        let quote = line[at..].chars().next()?;
-        if quote != '"' && quote != '\'' {
-            return None;
-        }
-        let literal = deps_core::quote_scan::read_string_literal(
-            line,
-            at,
-            deps_core::quote_scan::ScanSyntax::Ruby,
-        )?;
-        #[allow(clippy::string_slice)]
-        let value = &line[literal.content];
-        Some(value.to_string())
-    })
+    }
+    let at = key_match.end() + (rest.len() - trimmed.len());
+    let quote = scan.text[at..].chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let literal = deps_core::quote_scan::read_string_literal(
+        scan.text,
+        at,
+        deps_core::quote_scan::ScanSyntax::Ruby,
+    )?;
+    Some(scan.text[literal.content].to_string())
 }
 
 /// Parser for Gemfile manifests.
@@ -2553,5 +3027,471 @@ gem "x", source: "https://h/group: [:test]""#;
                 deps_core::MAX_DEPENDENCIES_PER_DOCUMENT + 1
             ))
         );
+    }
+
+    /// Security regression (#1019): a `source ... do` block URL containing Ruby string
+    /// interpolation with a single-quoted literal nested inside (`ENV['CREDS']`) must still
+    /// open the block — before the fix, `SOURCE_BLOCK_START`'s single regex capture group
+    /// stopped at the first quote it met (the nested `'` before `CREDS`), so the block never
+    /// opened and `sidekiq-pro` silently fell through to the public rubygems.org registry.
+    #[test]
+    fn test_source_block_url_with_nested_interpolated_quote_still_opens() {
+        let gemfile = r#"source "https://#{ENV['CREDS']}@gems.contribsys.com/" do
+  gem "sidekiq-pro"
+end"#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        match &result.dependencies[0].source {
+            DependencySource::CustomRegistry { url } => {
+                assert_eq!(url, "https://#{ENV['CREDS']}@gems.contribsys.com/");
+            }
+            other => panic!("expected CustomRegistry, got {other:?}"),
+        }
+    }
+
+    /// Security regression (#1017): a multi-line `gem` call whose continuation opens an
+    /// array literal (`platforms: [`) rather than ending in a trailing comma must still be
+    /// tracked as open across every line until the literal closes — before the bracket-depth
+    /// fix, `source:` on the fourth line was dropped entirely (never associated with `foo`)
+    /// and `platforms` stayed empty, since `[`-signaled continuation matched none of this
+    /// parser's line-level patterns.
+    #[test]
+    fn test_multiline_gem_continuation_via_open_bracket() {
+        let gemfile = "source \"https://rubygems.org\"\ngem \"foo\", platforms: [\n  :mri\n],\n   source: \"https://gems.corp\"";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "foo");
+        assert_eq!(result.dependencies[0].platforms, vec!["mri"]);
+        match &result.dependencies[0].source {
+            DependencySource::CustomRegistry { url } => {
+                assert_eq!(url, "https://gems.corp");
+            }
+            other => panic!("expected CustomRegistry, got {other:?}"),
+        }
+    }
+
+    /// Regression (#1021): a parenthesized `gem(...)` call at the top level must be recognized
+    /// as a dependency — before the fix, `GEM_PATTERN` required whitespace (never a `(`)
+    /// between `gem` and the opening quote, so this line matched nothing at all: no
+    /// diagnostic, no hover, no completion.
+    #[test]
+    fn test_parenthesized_gem_call_top_level() {
+        let gemfile = r#"source "https://rubygems.org"
+gem("rails")"#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "rails");
+    }
+
+    /// Regression (#1021): a parenthesized `gem(...)` call nested inside a block (`group`
+    /// here) must also be recognized — the same gap applied regardless of nesting, since
+    /// `GEM_PATTERN` is checked identically at every nesting depth.
+    #[test]
+    fn test_parenthesized_gem_call_inside_block() {
+        let gemfile = r#"source "https://rubygems.org"
+group :test do
+  gem("rspec")
+end"#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "rspec");
+        assert_matches!(result.dependencies[0].group, DependencyGroup::Test);
+    }
+
+    /// A parenthesized `gem(...)` call with a version constraint must still resolve it — the
+    /// closing `)` right after the version's quote is a valid terminator, not just a comma or
+    /// end-of-line/comment.
+    #[test]
+    fn test_parenthesized_gem_call_with_version() {
+        let gemfile = r#"source "https://rubygems.org"
+gem("rails", "~> 7.0")"#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies[0].version_req, Some("~> 7.0".into()));
+    }
+
+    /// Interaction check across #1019/#1017/#1021: a `source ... do` block whose URL has a
+    /// nested interpolated quote, opened with a parenthesized `gem(...)` call whose bracketed
+    /// `platforms:` array spans multiple lines and closes on the same line as the call's own
+    /// closing `)`. All three fixes must compose correctly — the block must still open, the
+    /// call must still be recognized, the array must resolve fully, and the bracket-depth
+    /// tracking must not consume the gem call's closing `)` as part of the array.
+    #[test]
+    fn test_source_block_paren_gem_and_bracket_continuation_compose() {
+        let gemfile = "source \"https://#{ENV['CREDS']}@gems.contribsys.com/\" do\n  gem(\"sidekiq-pro\", platforms: [\n    :mri\n  ])\nend";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "sidekiq-pro");
+        assert_eq!(result.dependencies[0].platforms, vec!["mri"]);
+        match &result.dependencies[0].source {
+            DependencySource::CustomRegistry { url } => {
+                assert_eq!(url, "https://#{ENV['CREDS']}@gems.contribsys.com/");
+            }
+            other => panic!("expected CustomRegistry, got {other:?}"),
+        }
+    }
+
+    /// Security regression (critic finding S1, #1019 follow-up): the *mirror-image* nested-quote
+    /// case — a `source ... do` URL interpolating a value with the *same* quote type as the
+    /// outer literal (`"https://#{ENV["CREDS"]}@..."` vs. the cross-type `ENV['CREDS']` already
+    /// covered) — must also still open the block instead of silently leaking to the public
+    /// registry.
+    #[test]
+    fn test_source_block_url_with_same_type_nested_interpolated_quote_still_opens() {
+        let gemfile = "source \"https://#{ENV[\"CREDS\"]}@gems.contribsys.com/\" do\n  gem \"sidekiq-pro\"\nend";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        match &result.dependencies[0].source {
+            DependencySource::CustomRegistry { url } => {
+                assert_eq!(url, "https://#{ENV[\"CREDS\"]}@gems.contribsys.com/");
+            }
+            other => panic!("expected CustomRegistry, got {other:?}"),
+        }
+    }
+
+    /// Security regression (critic finding S2, #1017 follow-up): an unclosed `[` with no
+    /// trailing comma — a routine transient state while editing — must not let the pending gem
+    /// silently absorb a later, unrelated statement and adopt its `git:`-looking keyword
+    /// argument. Exact repro from the reviewer.
+    #[test]
+    fn test_bracket_only_continuation_does_not_absorb_unrelated_statement() {
+        let gemfile = r#"source "https://rubygems.org"
+gem "public-gem", platforms: [:mri
+Bundler.require(git: "https://github.com/attacker/repo")"#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "public-gem");
+        assert_eq!(result.dependencies[0].source, DependencySource::Registry);
+    }
+
+    /// Regression (critic finding S2a, #1017 follow-up): a blank line *inside* a legitimate
+    /// multi-line `platforms: [ … ]` array is valid Ruby and must not truncate the continuation
+    /// — both the array's remaining elements and a `source:` option after the array closes must
+    /// still be found. (An earlier version of the S2 fix wrongly treated any blank line as a
+    /// boundary, dropping both.)
+    #[test]
+    fn test_bracket_only_continuation_tolerates_blank_line_inside_array() {
+        let gemfile = "source \"https://rubygems.org\"\ngem \"foo\", platforms: [\n  :mri,\n\n  :mswin\n],\n  source: \"https://gems.corp\"";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "foo");
+        assert_eq!(result.dependencies[0].platforms, vec!["mri", "mswin"]);
+        match &result.dependencies[0].source {
+            DependencySource::CustomRegistry { url } => {
+                assert_eq!(url, "https://gems.corp");
+            }
+            other => panic!("expected CustomRegistry, got {other:?}"),
+        }
+    }
+
+    /// Security regression (critic finding S2b, #1017 follow-up): a line that isn't shaped like
+    /// array/hash literal content must still be rejected even when it doesn't match the
+    /// `identifier(`-shaped blocklist the original S2 fix used — e.g. a hash-literal assignment
+    /// whose braces don't open with `(`. The allowlist-based fix must reject this on its own
+    /// terms (it doesn't start with `:`/a quote/`]`/`}`/`,`, and no option key is anchored at
+    /// its start), not because it happens to also look like a method call.
+    #[test]
+    fn test_bracket_only_continuation_rejects_non_option_shaped_line() {
+        let gemfile = r#"source "https://rubygems.org"
+gem "public-gem", platforms: [:mri
+x = { source: "https://sneaky.example" }"#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "public-gem");
+        assert_eq!(result.dependencies[0].source, DependencySource::Registry);
+    }
+
+    /// M1 (continuation tracking): an unmatched closing bracket earlier in the call
+    /// (`require: ]],`) must not corrupt `PendingGem::bracket_stack`'s tracking of a later
+    /// `platforms: [` array — a stray `]`/`}` pops an already-empty stack as a no-op rather than
+    /// driving a counter negative, so `foo` is still recognized as one dependency spanning every
+    /// line down to `source:` (not split or truncated early).
+    ///
+    /// Superseded for the *sink* by the 8th-vector fix (`bracket_depths`' fail-closed
+    /// poisoning): `require: ]],`'s own stray `]` (nothing open yet to match it) is exactly the
+    /// malformed/mid-edit shape that now poisons the sink's trust in the rest of the text, so
+    /// `platforms`/`source` are conservatively *not* extracted here — this is intentional
+    /// (matches every other stray-closer test in this module), not a regression of M1's own
+    /// continuation-tracking guarantee, which this test still exercises via `dependencies.len()`.
+    #[test]
+    fn test_bracket_depth_clamped_at_zero_does_not_mask_later_array() {
+        let gemfile = "source \"https://rubygems.org\"\ngem \"foo\", require: ]],\n  platforms: [\n    :mri\n  ],\n  source: \"https://gems.corp\"";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "foo");
+        assert_eq!(result.dependencies[0].platforms, Vec::<String>::new());
+        assert_eq!(result.dependencies[0].source, DependencySource::Registry);
+    }
+
+    /// M1 sibling (correctness-gate re-check, critic's own follow-up): the test above no longer
+    /// discriminates `PendingGem::bracket_stack`'s actual fix, since its malformed fixture is now
+    /// *also* caught by the 8th-vector sink poisoning — `platforms == []` and `source ==
+    /// Registry` are exactly the poisoned-sink symptoms, so that assertion would still pass even
+    /// if the stack fix itself were reverted back to a signed, clampable counter.
+    ///
+    /// This variant puts the same-looking `]]` text *inside a quoted string*
+    /// (`require: "]]",`) instead of as bare syntax — quote-aware, it never reaches either
+    /// bracket tracker as real brackets, so nothing is malformed here at all: the array and
+    /// `source:` that follow are genuinely well-formed Ruby and must resolve normally. This
+    /// specifically exercises the stack's ability to keep tracking correctly through a call that
+    /// merely *looks* similar to the M1 fixture, rather than through actually-malformed input.
+    #[test]
+    fn test_bracket_like_text_inside_string_does_not_trigger_poisoning() {
+        let gemfile = "source \"https://rubygems.org\"\ngem \"foo\", require: \"]]\",\n  platforms: [\n    :mri\n  ],\n  source: \"https://gems.corp\"";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "foo");
+        assert_eq!(result.dependencies[0].platforms, vec!["mri"]);
+        match &result.dependencies[0].source {
+            DependencySource::CustomRegistry { url } => {
+                assert_eq!(url, "https://gems.corp");
+            }
+            other => panic!("expected CustomRegistry, got {other:?}"),
+        }
+    }
+
+    /// Regression (critic finding S3, #1021 follow-up): a bare (non-parenthesized) `gem` call
+    /// with a trailing `if` statement-modifier whose condition contains a version-shaped quoted
+    /// string must not report that string as the gem's version constraint — this gem declares
+    /// none.
+    #[test]
+    fn test_statement_modifier_condition_not_mistaken_for_version() {
+        let gemfile = r#"source "https://rubygems.org"
+gem "nokogiri" if Gem::Version.new(RUBY_VERSION) >= Gem::Version.new("3.1")"#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies[0].version_req, None);
+    }
+
+    /// Regression (critic finding S3, #1021 follow-up): the real version constraint before an
+    /// `if` statement-modifier must still be found, not shadowed by a version-shaped quoted
+    /// string inside the modifier's condition.
+    #[test]
+    fn test_real_version_before_statement_modifier_not_shadowed() {
+        let gemfile = r#"source "https://rubygems.org"
+gem "nokogiri", "~> 1.16" if Gem::Version.new(RUBY_VERSION) >= Gem::Version.new("3.1")"#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies[0].version_req, Some("~> 1.16".into()));
+    }
+
+    /// Regression (critic finding S3, #1021 follow-up): an `install_if:` lambda containing a
+    /// version-shaped quoted string must not be mistaken for the gem's version constraint.
+    #[test]
+    fn test_install_if_lambda_condition_not_mistaken_for_version() {
+        let gemfile = r#"source "https://rubygems.org"
+gem "pg", install_if: -> { ENV.fetch("DB", "1") == "1" }"#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies[0].version_req, None);
+    }
+
+    /// Security regression (correctness-gate re-check, finding #1 — S2's leak class reintroduced
+    /// via a new vector): an anchored `source:`-shaped line must NOT be absorbed while the
+    /// innermost open bracket is an array (`[`) — such a line can never be legitimate array
+    /// element content, so it's indistinguishable from a genuinely new, unrelated top-level
+    /// declaration. Exact repro from the reviewer: `innocent-gem`'s `platforms: [` is left open
+    /// (never closed), and the very next line looks like an anchored `source:` option — it must
+    /// not be adopted.
+    #[test]
+    fn test_bracket_only_continuation_rejects_option_key_line_inside_array_bracket() {
+        let gemfile = "source \"https://rubygems.org\"\ngem \"innocent-gem\", platforms: [\nsource: \"https://evil.example.com\"";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "innocent-gem");
+        assert_eq!(result.dependencies[0].source, DependencySource::Registry);
+    }
+
+    /// Trade-off accompanying the depth-zero sink fix (correctness-gate structural fix,
+    /// root-cause round): a `gem` call whose entire option list is wrapped in an explicit hash
+    /// literal (`gem "foo", { source: "..." }` — valid but unusual Ruby, since bare keyword args
+    /// without the braces are equivalent and far more common) is no longer treated as a source
+    /// override, even though the `{` immediately follows the gem name with no intervening option
+    /// key. The absorption guard still lets this line join the pending call's text (it's
+    /// plausible hash content), but the sink now requires an option key to sit at true bracket
+    /// depth 0, and this `source:` sits at depth 1 (nested inside the `{`) either way.
+    /// Distinguishing "this brace is the whole options hash" from "this brace is another
+    /// option's nested value" (e.g. `install_if: { source: ... }`, the actual attack shape)
+    /// reliably would need real Ruby parsing; the security-conservative choice applies the same
+    /// rule to both.
+    #[test]
+    fn test_hash_wrapped_options_no_longer_treated_as_direct_kwargs() {
+        let gemfile =
+            "source \"https://rubygems.org\"\ngem \"foo\", {\n  source: \"https://gems.corp\"\n}";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "foo");
+        assert_eq!(result.dependencies[0].source, DependencySource::Registry);
+    }
+
+    /// Regression (correctness-gate re-check, finding #2): `is_paren_call` must be computed only
+    /// from the prefix before the captured gem name, not the whole `GEM_PATTERN` match — a gem
+    /// name that itself contains a literal `(` (highly unusual, but not invalid Ruby syntax for
+    /// a string) must not flip a bare, non-parenthesized call into "paren call" and pick up an
+    /// unrelated later call's closing `)` as a version terminator.
+    #[test]
+    fn test_gem_name_containing_paren_does_not_enable_paren_version_terminator() {
+        let gemfile = r#"source "https://rubygems.org"
+gem "weird(name)", check(RUBY_VERSION, "~> 1.0")"#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies[0].name, "weird(name)");
+        assert_eq!(result.dependencies[0].version_req, None);
+    }
+
+    /// Control case for the test above: a normal parenthesized call still resolves its version
+    /// correctly — confirms the fix didn't disable `is_paren_call` altogether.
+    #[test]
+    fn test_normal_gem_name_with_paren_call_still_resolves_version() {
+        let gemfile = r#"source "https://rubygems.org"
+gem("rails", "~> 7.0")"#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies[0].name, "rails");
+        assert_eq!(result.dependencies[0].version_req, Some("~> 7.0".into()));
+    }
+
+    /// Security regression — root-cause round (correctness-gate re-check): decisive proof the
+    /// leak class lives in the *sink* (`extract_source` et al.), not the absorption guard. This
+    /// leaks on a SINGLE line with no continuation or absorption involved at all — `source:`
+    /// nested inside `install_if:`'s hash-literal value must not be treated as the gem's own
+    /// source. Exact repro from the reviewer.
+    #[test]
+    fn test_source_key_nested_in_install_if_hash_value_not_treated_as_gem_source() {
+        let gemfile = r#"source "https://rubygems.org"
+gem "innocent-gem", install_if: { source: "https://evil.example.com" }"#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "innocent-gem");
+        assert_eq!(result.dependencies[0].source, DependencySource::Registry);
+    }
+
+    /// Security regression — root-cause round: a leading-comma-shaped line absorbed into an
+    /// unclosed array must still be rejected by the sink's depth-zero gate, regardless of the
+    /// absorption guard's `array_element_shaped` allowance for a leading `,`.
+    #[test]
+    fn test_leading_comma_source_nested_in_array_not_treated_as_gem_source() {
+        let gemfile = "source \"https://rubygems.org\"\ngem \"innocent-gem\", platforms: [\n, source: \"https://evil.example.com\"\n]";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "innocent-gem");
+        assert_eq!(result.dependencies[0].source, DependencySource::Registry);
+    }
+
+    /// Security regression — root-cause round: the hash-rocket option spelling (`:source =>`)
+    /// nested inside an unclosed array must also be rejected by the depth-zero gate — the sink
+    /// fix isn't specific to the modern `key:` syntax.
+    #[test]
+    fn test_hash_rocket_source_nested_in_array_not_treated_as_gem_source() {
+        let gemfile = "source \"https://rubygems.org\"\ngem \"innocent-gem\", platforms: [\n:source => \"https://evil.example.com\"\n]";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "innocent-gem");
+        assert_eq!(result.dependencies[0].source, DependencySource::Registry);
+    }
+
+    /// Security regression — root-cause round: a leading-quote-shaped line (a plausible array
+    /// string element) that also happens to contain `source:` further along must still be
+    /// rejected by the depth-zero gate while nested inside an unclosed array.
+    #[test]
+    fn test_leading_quote_source_nested_in_array_not_treated_as_gem_source() {
+        let gemfile = "source \"https://rubygems.org\"\ngem \"innocent-gem\", platforms: [\n\"x\", source: \"https://evil.example.com\"\n]";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "innocent-gem");
+        assert_eq!(result.dependencies[0].source, DependencySource::Registry);
+    }
+
+    /// Security regression — root-cause round: `platforms: [{ ... }]` — a hash nested two levels
+    /// deep (array containing a hash) — must not let a `source:` key inside it leak through,
+    /// even though the absorption guard's hash-kind allowance lets the line join (current open
+    /// bracket is `{`, the innermost one). Depth 0 means direct keyword argument of `gem`, not
+    /// "nested inside anything that happens to look like a hash".
+    #[test]
+    fn test_source_nested_two_levels_deep_in_array_of_hashes_not_treated_as_gem_source() {
+        let gemfile = "source \"https://rubygems.org\"\ngem \"innocent-gem\", platforms: [{\nsource: \"https://evil.example.com\"\n}]";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "innocent-gem");
+        assert_eq!(result.dependencies[0].source, DependencySource::Registry);
+    }
+
+    /// Security regression — root-cause round: `platforms: { ... }` (a bare hash, not an array)
+    /// as the option's value must also keep a nested `source:` from leaking.
+    #[test]
+    fn test_source_nested_in_platforms_hash_value_not_treated_as_gem_source() {
+        let gemfile = "source \"https://rubygems.org\"\ngem \"innocent-gem\", platforms: {\nsource: \"https://evil.example.com\"\n}";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "innocent-gem");
+        assert_eq!(result.dependencies[0].source, DependencySource::Registry);
+    }
+
+    /// Security regression — root-cause round, #3 interaction: a string literal that spans a
+    /// physical line boundary and is later closed must not desync the sink's bracket-depth
+    /// tracking into treating a genuinely-nested `source:` as depth 0. Unlike the per-physical-
+    /// line `apply_bracket_delta` used for the absorption guard's continuation decisions (which
+    /// still has the per-line `CodeSpans`-reset gap, #3, deferred alongside #1022), the sink's
+    /// [`bracket_depths`] rescans the fully-joined text in one continuous pass, so the `]`
+    /// embedded in the still-open string is correctly recognized as string content, not a real
+    /// closer — the array never actually closes, so the trailing `source:` stays nested.
+    #[test]
+    fn test_multiline_string_spanning_line_boundary_does_not_desync_sink_depth_tracking() {
+        let gemfile = "source \"https://rubygems.org\"\ngem \"innocent-gem\", platforms: [\"a string that never closes\n], source: \"https://evil.example.com\"";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "innocent-gem");
+        assert_eq!(result.dependencies[0].source, DependencySource::Registry);
+    }
+
+    /// Security regression — 8th-vector round (critic re-check 5): a bracket-*typed* stray
+    /// closer (`]`) inside `install_if:`'s hash value, mismatched against the open `{`, must
+    /// poison the sink's trust in everything after it — rejecting the later `source:` instead of
+    /// letting the old `.max(0)` clamp silently reset nesting back to 0.
+    #[test]
+    fn test_mismatched_bracket_type_poisons_later_source() {
+        let gemfile = r#"source "https://rubygems.org"
+gem "innocent-gem", install_if: { a: ] , source: "https://evil.example.com" }"#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies[0].source, DependencySource::Registry);
+    }
+
+    /// Security regression — 8th-vector round: same as above with a mismatched `)` instead of
+    /// `]` — parens must poison on mismatch too, not just brackets/braces.
+    #[test]
+    fn test_mismatched_paren_poisons_later_source() {
+        let gemfile = r#"source "https://rubygems.org"
+gem "innocent-gem", install_if: { a: ) , source: "https://evil.example.com" }"#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies[0].source, DependencySource::Registry);
+    }
+
+    /// Security regression — 8th-vector round: a closer that *does* type-match the open bracket
+    /// (`}` properly closing `{`) still must not re-trust the text after it, because it directly
+    /// follows a dangling `a:` value with nothing between the colon and the closer —
+    /// [`DANGLING_VALUE_BEFORE_CLOSER`]'s force-poison, since pure type-matching alone can't
+    /// catch this (the later, genuinely-unmatched second `}` comes *after* `source:`, too late
+    /// for forward-only poisoning to help on its own).
+    #[test]
+    fn test_dangling_value_before_matched_closer_still_poisons() {
+        let gemfile = r#"source "https://rubygems.org"
+gem "innocent-gem", install_if: { a: } , source: "https://evil.example.com" }"#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies[0].source, DependencySource::Registry);
+    }
+
+    /// Security regression — 8th-vector round: multi-line form of the mismatched-bracket-type
+    /// case — a `]` on its own continuation line, mismatched against `install_if:`'s open `{`.
+    #[test]
+    fn test_mismatched_bracket_type_poisons_across_multiple_lines() {
+        let gemfile = "source \"https://rubygems.org\"\ngem \"innocent-gem\", install_if: {\n],\nsource: \"https://evil.example.com\"";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].source, DependencySource::Registry);
+    }
+
+    /// Security regression — 8th-vector round: multi-line form with a doubled closer (`]]`) —
+    /// the second `]` has nothing left to match once the first legitimately closes `platforms:
+    /// [`, so it poisons the trailing `source:`.
+    #[test]
+    fn test_doubled_closer_poisons_across_multiple_lines() {
+        let gemfile = "source \"https://rubygems.org\"\ngem \"innocent-gem\", platforms: [\n]],\nsource: \"https://evil.example.com\"";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].source, DependencySource::Registry);
     }
 }
