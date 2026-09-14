@@ -385,9 +385,15 @@ pub fn register_ecosystems(
     runtime: &EcosystemRuntime,
 ) -> Vec<&'static str> {
     let policy = Arc::clone(&runtime.policy);
-    // Keeps `policy` used even when the `cargo` feature (its only consumer) is compiled out.
+    // Keeps `policy` used even when none of its consumers (cargo, npm, pypi, go, nuget,
+    // gitlab-ci) are compiled in.
     let _ = &policy;
+    // Keeps `registry`/`cache` used even when every ecosystem feature is compiled out.
+    let _ = (&registry, &cache);
     let mut workspace_registry_ecosystems = Vec::new();
+    // Keeps `mut` used even when none of the five features that push into this vec below
+    // (cargo, npm, pypi, go, nuget) are enabled.
+    let _ = &mut workspace_registry_ecosystems;
 
     #[cfg(feature = "cargo")]
     {
