@@ -831,6 +831,13 @@ fn push_offline_footer_hover_section(markdown: &mut String, resolvable: bool, of
 /// carrying no urgency signal of its own) and every graded label
 /// (`critical`/`high`/`medium`/`low`), since a confirmed-malicious-package
 /// finding is categorically different from a graded-but-uncertain risk.
+///
+/// `Informational` renders as `"maintenance-status notice, not a
+/// vulnerability"` — deliberately not `"unknown severity"` and not any
+/// graded label (FR-003, issue #1007): a maintenance-status notice (e.g.
+/// RUSTSEC's `"unmaintained"`) stands alone as a comprehensible category
+/// even when the advisory has no `summary`, which "unknown severity" alone
+/// would not convey.
 const fn severity_label(severity: crate::osv::VulnSeverity) -> &'static str {
     match severity {
         crate::osv::VulnSeverity::Critical => "critical",
@@ -839,6 +846,7 @@ const fn severity_label(severity: crate::osv::VulnSeverity) -> &'static str {
         crate::osv::VulnSeverity::Low => "low",
         crate::osv::VulnSeverity::Unknown => "unknown severity",
         crate::osv::VulnSeverity::Malicious => "confirmed malicious package",
+        crate::osv::VulnSeverity::Informational => "maintenance-status notice, not a vulnerability",
     }
 }
 
@@ -877,6 +885,58 @@ fn push_deprecation_hover_section(
             markdown_code_span(replacement)
         );
     }
+}
+
+/// Whether the "Latest version is also affected" hover line should render
+/// for a [`crate::osv::UpgradeStatus::CandidateVulnerable`] result (FR-008,
+/// issue #1007, revised architecture per impl-critic findings S1/S2):
+/// `check_candidates()` and `UpgradeStatus` themselves stay entirely
+/// unchanged by this spec (they have no [`crate::osv::VulnSeverity`] to read
+/// — `advisory_ids` is just a list of ids), so the informational-only
+/// suppression is applied purely at render time here, by looking each
+/// candidate id's severity up in `known_advisories` — the *current*
+/// version's own already-fetched, already-severity-classified advisory
+/// list, which in practice shares ids with the candidate's own vulnerable
+/// set (the same advisory typically covers both versions' ranges).
+///
+/// The line is suppressed only when `candidate_ids` is [`crate::osv::Capped::is_complete`]
+/// (see below) AND EVERY id in it is found in `known_advisories` AND
+/// classified [`crate::osv::VulnSeverity::Informational`]. An id this crate
+/// cannot find a severity for (not present in `known_advisories` — e.g.
+/// beyond `ADVISORY_DISPLAY_CAP`, or genuinely a different advisory set for
+/// the candidate version) is conservatively treated as "not informational",
+/// so a real vulnerability signal is never silently dropped just because
+/// its severity could not be confirmed at render time.
+///
+/// `candidate_ids` takes [`crate::osv::Capped::is_complete`] as a fail-open
+/// gate, checked before anything else (FR-010, security finding L2): if
+/// `check_candidates()`'s own scan was truncated (more advisories exist on
+/// the candidate than the displayed/fetched slice reports), an undisplayed
+/// advisory beyond the cap could be a real, non-`Informational` finding this
+/// function has no way to see — so an incomplete set always renders the
+/// line, regardless of what the displayed ids classify as.
+///
+/// An EMPTY (and complete) `candidate_ids` also fails open (impl-critic
+/// finding N1): `CandidateVulnerable` with a zero-length `advisory_ids` is
+/// reachable — `check_candidates()`'s inner scan can produce
+/// `Capped::new(vec![], total)` with `total > 0` when every matched record's
+/// detail fetch failed or failed `into_advisory` validation, i.e. "the
+/// candidate is affected by something, but we could not confirm what it
+/// is." Treating that as "nothing to report" would silently drop a real
+/// signal this feature must never suppress.
+fn candidate_vulnerable_line_should_render(
+    candidate_ids: &crate::osv::Capped<String>,
+    known_advisories: &[Arc<crate::osv::Advisory>],
+) -> bool {
+    if !candidate_ids.is_complete() || candidate_ids.items().is_empty() {
+        return true;
+    }
+    !candidate_ids.items().iter().all(|id| {
+        known_advisories
+            .iter()
+            .find(|advisory| &advisory.id == id)
+            .is_some_and(|advisory| advisory.severity == crate::osv::VulnSeverity::Informational)
+    })
 }
 
 /// Appends the hover "Security advisories" section, gated strictly on the
@@ -934,8 +994,11 @@ fn push_vulnerability_hover_section(markdown: &mut String, outcome: Option<&Scan
                 let _ = writeln!(markdown, "- *(+{remaining} more advisories)*");
             }
 
-            if let crate::osv::UpgradeStatus::CandidateVulnerable { version, .. } =
-                &dv.upgrade_status
+            if let crate::osv::UpgradeStatus::CandidateVulnerable {
+                version,
+                advisory_ids,
+            } = &dv.upgrade_status
+                && candidate_vulnerable_line_should_render(advisory_ids, dv.advisories.items())
             {
                 let _ = writeln!(
                     markdown,
@@ -1868,6 +1931,81 @@ mod tests {
         ] {
             assert_ne!(malicious, severity_label(graded));
         }
+    }
+
+    #[test]
+    fn severity_label_for_informational_is_distinct_from_unknown_and_every_graded_label() {
+        // FR-003 (issue #1007): a maintenance-status notice must never
+        // render as "unknown severity" or any graded label.
+        let informational = severity_label(crate::osv::VulnSeverity::Informational);
+        assert_ne!(informational, "unknown severity");
+        assert_ne!(
+            informational,
+            severity_label(crate::osv::VulnSeverity::Malicious)
+        );
+        for graded in [
+            crate::osv::VulnSeverity::Critical,
+            crate::osv::VulnSeverity::High,
+            crate::osv::VulnSeverity::Medium,
+            crate::osv::VulnSeverity::Low,
+        ] {
+            assert_ne!(informational, severity_label(graded));
+        }
+    }
+
+    #[test]
+    fn candidate_vulnerable_line_suppressed_only_when_every_id_is_known_informational() {
+        use crate::osv::{Capped, VulnSeverity};
+
+        let informational = sample_advisory("RUSTSEC-2024-0320", VulnSeverity::Informational);
+        let graded = sample_advisory("RUSTSEC-2020-0071", VulnSeverity::High);
+
+        assert!(
+            !candidate_vulnerable_line_should_render(
+                &Capped::new(vec!["RUSTSEC-2024-0320".to_string()], 1),
+                std::slice::from_ref(&informational)
+            ),
+            "all-known-Informational, complete set must suppress the line"
+        );
+        assert!(
+            candidate_vulnerable_line_should_render(
+                &Capped::new(
+                    vec![
+                        "RUSTSEC-2024-0320".to_string(),
+                        "RUSTSEC-2020-0071".to_string()
+                    ],
+                    2
+                ),
+                &[informational.clone(), graded]
+            ),
+            "mixed set must still render the line"
+        );
+        assert!(
+            candidate_vulnerable_line_should_render(
+                &Capped::new(vec!["RUSTSEC-UNKNOWN-ID".to_string()], 1),
+                std::slice::from_ref(&informational)
+            ),
+            "an id with no known severity must default to rendering the line, not suppressing it"
+        );
+        assert!(
+            candidate_vulnerable_line_should_render(
+                &Capped::new(vec![], 0),
+                std::slice::from_ref(&informational)
+            ),
+            "N1: an empty (and complete) candidate_ids set is reachable (a real \
+             advisory whose detail fetch/into_advisory validation failed) and \
+             must fail open — rendering the line, not silently suppressing a \
+             real signal"
+        );
+        assert!(
+            candidate_vulnerable_line_should_render(
+                &Capped::new(vec!["RUSTSEC-2024-0320".to_string()], 2),
+                std::slice::from_ref(&informational)
+            ),
+            "L2/FR-010: an all-known-Informational but INCOMPLETE (truncated) set \
+             must still fail open — an undisplayed advisory beyond the cap could \
+             be a real, non-Informational finding"
+        );
     }
 
     #[tokio::test]
@@ -3755,6 +3893,195 @@ mod tests {
         assert!(content.value.contains("MAL-2025-47141"));
         assert!(content.value.contains("confirmed malicious package"));
         assert!(!content.value.contains("unknown severity"));
+    }
+
+    #[tokio::test]
+    async fn test_generate_hover_informational_advisory_never_renders_unknown_severity() {
+        // SC-001 (issue #1007): the live RUSTSEC-2024-0320 (yaml-rust)
+        // "unmaintained" record must never render as "unknown severity",
+        // and must stand alone as a comprehensible notice even without a
+        // `summary` (FR-003 edge case).
+        use crate::osv::{
+            Advisory, Capped, DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity,
+            VulnerabilityMap,
+        };
+
+        let parse_result = MockParseResult {
+            deps: vec![dep_at("yaml-rust")],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+
+        // Deliberately not `sample_advisory` here (unlike the other tests in
+        // this module): this test needs `summary: None`, which
+        // `sample_advisory` always sets to `Some(...)`.
+        let advisory = Advisory::new(
+            "RUSTSEC-2024-0320".to_string(),
+            "2024-11-01T12:31:51Z".to_string(),
+            VulnSeverity::Informational,
+            "https://osv.dev/vulnerability/RUSTSEC-2024-0320".to_string(),
+        );
+
+        let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
+        vulns.insert(
+            "yaml-rust".to_string(),
+            ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                advisories: Capped::new(vec![std::sync::Arc::new(advisory)], 1),
+                fix_target_status: UpgradeStatus::NotChecked,
+                upgrade_status: UpgradeStatus::NotChecked,
+            }),
+        );
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
+            &MockRegistry,
+            &MockFormatter,
+            crate::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(content.value.contains("RUSTSEC-2024-0320"));
+        assert!(!content.value.contains("unknown severity"));
+        // FR-003: even with no `summary`, the label itself must read as a
+        // self-contained notice — not a bare category word that only makes
+        // sense alongside prose the advisory doesn't have here.
+        assert!(
+            content
+                .value
+                .contains(severity_label(VulnSeverity::Informational)),
+            "label must stand alone as a comprehensible notice: {}",
+            content.value
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_hover_suppresses_also_affected_when_candidate_is_all_informational() {
+        // FR-008 (revised architecture, issue #1007): `check_candidates()`
+        // and `UpgradeStatus` are untouched by this spec — the suppression
+        // happens purely at hover-render time by looking the candidate's
+        // advisory ids up in the dependency's own already-classified
+        // advisory list. Every id in the candidate-vulnerable set here maps
+        // to an `Informational` advisory, so the line must not render.
+        use crate::osv::{
+            Capped, DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity,
+            VulnerabilityMap,
+        };
+
+        let parse_result = MockParseResult {
+            deps: vec![dep_at("yaml-rust")],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+
+        let advisory = sample_advisory("RUSTSEC-2024-0320", VulnSeverity::Informational);
+
+        let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
+        vulns.insert(
+            "yaml-rust".to_string(),
+            ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                advisories: Capped::new(vec![advisory], 1),
+                fix_target_status: UpgradeStatus::NotChecked,
+                upgrade_status: UpgradeStatus::CandidateVulnerable {
+                    version: "0.5.0".to_string(),
+                    advisory_ids: Capped::new(vec!["RUSTSEC-2024-0320".to_string()], 1),
+                },
+            }),
+        );
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
+            &MockRegistry,
+            &MockFormatter,
+            crate::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            !content.value.contains("also affected"),
+            "an all-Informational candidate-vulnerable set must not render the \
+             misleading 'also affected' line: {}",
+            content.value
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_hover_still_shows_also_affected_when_candidate_is_mixed() {
+        // FR-008 edge case (M5, revised architecture): when the
+        // candidate-vulnerable set mixes an Informational id with a real
+        // (non-Informational) one, the line must still render — a real
+        // vulnerability signal must never be silently dropped.
+        use crate::osv::{
+            Capped, DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity,
+            VulnerabilityMap,
+        };
+
+        let parse_result = MockParseResult {
+            deps: vec![dep_at("mixed-pkg")],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+
+        let informational_advisory =
+            sample_advisory("RUSTSEC-2024-0320", VulnSeverity::Informational);
+        let graded_advisory = sample_advisory("RUSTSEC-2020-0071", VulnSeverity::High);
+
+        let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
+        vulns.insert(
+            "mixed-pkg".to_string(),
+            ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                advisories: Capped::new(vec![informational_advisory, graded_advisory], 2),
+                fix_target_status: UpgradeStatus::NotChecked,
+                upgrade_status: UpgradeStatus::CandidateVulnerable {
+                    version: "2.0.0".to_string(),
+                    advisory_ids: Capped::new(
+                        vec![
+                            "RUSTSEC-2024-0320".to_string(),
+                            "RUSTSEC-2020-0071".to_string(),
+                        ],
+                        2,
+                    ),
+                },
+            }),
+        );
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
+            &MockRegistry,
+            &MockFormatter,
+            crate::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            content.value.contains("also affected"),
+            "a mixed informational+graded candidate-vulnerable set must still \
+             render the line: {}",
+            content.value
+        );
     }
 
     #[tokio::test]

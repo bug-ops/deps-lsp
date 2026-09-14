@@ -28,7 +28,7 @@ status: moc
 | 047 | [[047-elixir-hex-ecosystem/spec\|New ecosystem: Elixir Hex (mix.exs dependency version hints)]] | specify | draft — research/new-ecosystem, P4, 6 open `[NEEDS CLARIFICATION]` items, issue #642 |
 | 051 | [[051-disk-persistent-registry-cache/spec\|Disk-persistent registry cache]] | specify | draft — research/enhancement, P4, 9 open `[NEEDS CLARIFICATION]` items, tracked in issue #700 |
 | 058 | [[058-gitlab-ci-mapping-container-anchor/spec\|Mapping-shaped container anchor support for include: entries]] | specify | shipped — replay-through-live-dispatch mapping-anchor/merge-key support for `include:` entries, Psych-precedence-verified (PR #1028, issues #933, #916) |
-| 060 | [[060-osv-informational-advisory-category/spec\|OSV informational-advisory category (RUSTSEC unmaintained and other `informational` records)]] | specify | draft — enhancement, P3, 4 open `[NEEDS CLARIFICATION]` items, issue #1007 |
+| 060 | [[060-osv-informational-advisory-category/spec\|OSV informational-advisory category (RUSTSEC unmaintained and other `informational` records)]] | specify | shipped — new VulnSeverity::Informational category for OSV "unmaintained" advisories, distinct hover/diagnostic treatment (PR #1043, issue #1007) |
 
 ## Completed Specs
 

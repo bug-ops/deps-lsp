@@ -1773,6 +1773,13 @@ fn push_deprecation_diagnostic(
 /// recognize the `MAL-` id convention (or an alias to one — see `severity::classify`) to
 /// tell the two apart. `severity` itself stays capped at `WARNING` either way
 /// (`diagnostic_severity_for`).
+///
+/// A [`crate::osv::VulnSeverity::Informational`] advisory's message gets the analogous
+/// `"[INFORMATIONAL]"` prefix (FR-004, issue #1007) — the additional signal for a user
+/// filtering/reading by message text or diagnostic code rather than by severity icon,
+/// since `INFORMATION` severity alone (`diagnostic_severity_for`) already separates it
+/// from an ordinary unscored CVE's `WARNING` severity but may not render distinctly in
+/// every client's UI chrome.
 fn push_vulnerability_diagnostics(
     diagnostics: &mut Vec<Diagnostic>,
     dep: &dyn Dependency,
@@ -1791,10 +1798,16 @@ fn push_vulnerability_diagnostics(
             .summary
             .as_deref()
             .unwrap_or("(no summary provided)");
-        let message = if advisory.severity == crate::osv::VulnSeverity::Malicious {
-            format!("{}: [MALWARE] {summary}", advisory.id)
-        } else {
-            format!("{}: {summary}", advisory.id)
+        let message = match advisory.severity {
+            crate::osv::VulnSeverity::Malicious => format!("{}: [MALWARE] {summary}", advisory.id),
+            crate::osv::VulnSeverity::Informational => {
+                format!("{}: [INFORMATIONAL] {summary}", advisory.id)
+            }
+            crate::osv::VulnSeverity::Critical
+            | crate::osv::VulnSeverity::High
+            | crate::osv::VulnSeverity::Medium
+            | crate::osv::VulnSeverity::Low
+            | crate::osv::VulnSeverity::Unknown => format!("{}: {summary}", advisory.id),
         };
 
         diagnostics.push(Diagnostic {
@@ -5067,6 +5080,71 @@ mod tests {
         assert_ne!(malicious_diag.code, unknown_diag.code);
         assert!(malicious_diag.message.contains("[MALWARE]"));
         assert!(!unknown_diag.message.contains("[MALWARE]"));
+    }
+
+    #[test]
+    fn test_generate_diagnostics_informational_advisory_is_distinguishable_from_unknown() {
+        // US-002/SC-002 (issue #1007): an Informational advisory (e.g. an
+        // "unmaintained" notice) and an ordinary Unknown-severity advisory on
+        // the same dependency must be distinguishable without opening hover —
+        // via severity (INFORMATION vs WARNING) and the [INFORMATIONAL] tag.
+        use crate::osv::{
+            Capped, DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity,
+            VulnerabilityMap,
+        };
+
+        let formatter = MockFormatter;
+        let parse_result = MockParseResult {
+            deps: vec![dep_at("vulnerable-pkg")],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+
+        let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
+        vulns.insert(
+            "vulnerable-pkg".to_string(),
+            ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                advisories: Capped::new(
+                    vec![
+                        sample_advisory("RUSTSEC-2024-0320", VulnSeverity::Informational),
+                        sample_advisory("RUSTSEC-2020-0071", VulnSeverity::Unknown),
+                    ],
+                    2,
+                ),
+                fix_target_status: UpgradeStatus::NotChecked,
+                upgrade_status: UpgradeStatus::NotChecked,
+            }),
+        );
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
+            &formatter,
+            parse_result.uri(),
+            crate::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        let informational_diag = diagnostics
+            .iter()
+            .find(|d| d.message.contains("RUSTSEC-2024-0320"))
+            .expect("informational advisory diagnostic must be emitted");
+        let unknown_diag = diagnostics
+            .iter()
+            .find(|d| d.message.contains("RUSTSEC-2020-0071"))
+            .expect("unknown-severity advisory diagnostic must be emitted");
+
+        assert_ne!(informational_diag.message, unknown_diag.message);
+        assert_ne!(informational_diag.severity, unknown_diag.severity);
+        assert_eq!(
+            informational_diag.severity,
+            Some(DiagnosticSeverity::INFORMATION)
+        );
+        assert_eq!(unknown_diag.severity, Some(DiagnosticSeverity::WARNING));
+        assert!(informational_diag.message.contains("[INFORMATIONAL]"));
+        assert!(!unknown_diag.message.contains("[INFORMATIONAL]"));
     }
 
     #[test]
