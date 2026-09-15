@@ -190,8 +190,8 @@ on these types and signatures existing.
 **Context**: FR-004 requires this to be machine-verified, not just true by construction — mirrors the existing #1073/#1079 guard for ecosystem crates not being direct `deps-lsp`/`deps-cli` dependencies. **Descoped from `deps-cli`** (originally FR-005) after discovering during T000 that `deps-cli` already directly uses `ls_types` independent of `deps-core`'s domain model, and that `deps-core` itself keeps `tower-lsp-server` unconditionally for `lsp_helpers` — see spec's "Out of Scope".
 **Spec reference**: [[spec#FR-004]], [[spec#SC-001]]
 **Acceptance criteria**:
-- [ ] New (or extended) CI step running `cargo tree -p deps-engine -e features,no-dev` and failing if `tower-lsp-server` appears
-- [ ] Step documented in `.github/workflows/ci.yml` with a comment linking issue #1071, matching this project's existing convention for such guards
+- [ ] New (or extended) CI step running `cargo tree -p deps-engine -e no-dev --depth 1` and failing if `tower-lsp-server` appears — a **direct**-dependency check. Do NOT use a full transitive `cargo tree` grep: `deps-engine` still pulls `tower-lsp-server` transitively via `deps-core` (accepted per spec's descoped FR-005), so a transitive check would always fail
+- [ ] Step documented in `.github/workflows/ci.yml` with a comment linking issue #1071, matching this project's existing convention for such guards, and noting the direct-vs-transitive distinction so a future contributor doesn't "fix" it into a transitive check
 **Dependencies**: T005, T006-T019 (the tree must actually be clean before the guard is added, or CI red)
 **Files**: `.github/workflows/ci.yml`
 **Complexity**: low

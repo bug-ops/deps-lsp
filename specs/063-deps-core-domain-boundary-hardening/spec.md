@@ -208,7 +208,7 @@ THEN only a minor bump is required (not major), because the struct's field addit
 
 | ID | Metric | Target |
 |----|--------|--------|
-| SC-001 | `cargo tree -p deps-engine -e features,no-dev \| grep tower-lsp-server` (descoped from `deps-cli` — see FR-005) | No match |
+| SC-001 | `cargo tree -p deps-engine -e no-dev --depth 1 \| grep tower-lsp-server` (a **direct**-dependency check, not a full transitive one — `deps-engine` still pulls `tower-lsp-server` transitively via `deps-core`, which is expected and accepted per FR-005's descope; confirmed via `cargo tree -i tower-lsp-server -p deps-engine` showing the only path is through `deps-core`) | No match |
 | SC-002 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | Passes with zero warnings after both changes land |
 | SC-003 | `cargo nextest run --workspace --all-features --no-fail-fast` | All existing tests pass; `reparse_scope_tests` (or its renamed/relocated equivalent) still proves the fail-closed property |
 | SC-004 | A compile-fail test/trybuild case (or equivalent) proves an unclassified new `policy_config` field breaks the build | Present and passing |
