@@ -32,6 +32,7 @@ jobs:
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
       workflows: ${{ steps.filter.outputs.workflows }}
+      tooling: ${{ steps.filter.outputs.tooling }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -48,6 +49,9 @@ jobs:
               - '.github/Cross.toml'
             workflows:
               - '.github/workflows/**'
+            tooling:
+              - '.pre-commit-hooks.yaml'
+              - 'crates/github-action/action.yml'
 
   fmt:
     name: Format
@@ -385,6 +389,99 @@ jobs:
             fi
           done
           exit 0
+
+  tooling-lint:
+    name: Tooling Lint (action.yml + pre-commit-hooks.yaml)
+    needs: changes
+    # #1076: neither crates/github-action/action.yml nor .pre-commit-hooks.yaml had any
+    # automated verification before this job. Re-runs on any `workflows` change too, since
+    # this job's own definition lives in that path.
+    if: needs.changes.outputs.tooling == 'true' || needs.changes.outputs.workflows == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install shellcheck
+        uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
+        with:
+          tool: shellcheck
+
+      - name: Cache fy and action-validator binaries
+        # Neither fy (fast-yaml, this project's mandated YAML tool) nor action-validator has
+        # a taiki-e/install-action manifest, so both are fetched directly from their GitHub
+        # Releases below and cached the same way the `fuzz-tool` job caches cargo-fuzz.
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: tooling-bin-cache
+        with:
+          path: ${{ runner.temp }}/tooling-bin
+          key: tooling-lint-bin-fy0.6.6-action-validator0.9.0-v1
+
+      - name: Install fy (fast-yaml) and action-validator
+        # fy publishes a .sha256 checksum file alongside each release asset. action-validator
+        # (mpalmer/action-validator) does not, so its checksum was computed once from the
+        # v0.9.0 linux_amd64 release asset and is pinned here.
+        if: steps.tooling-bin-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "${{ runner.temp }}/tooling-bin"
+          cd "${{ runner.temp }}/tooling-bin"
+
+          curl -sSLO https://github.com/bug-ops/fast-yaml/releases/download/v0.6.6/fy-v0.6.6-x86_64-unknown-linux-gnu.tar.gz
+          echo "d11b4a7964adf3dcffa2db71ea82bf3b12a41a77eba52d23f24c8b959c1d19c0  fy-v0.6.6-x86_64-unknown-linux-gnu.tar.gz" | sha256sum -c -
+          tar xzf fy-v0.6.6-x86_64-unknown-linux-gnu.tar.gz --strip-components=1 fy-v0.6.6-x86_64-unknown-linux-gnu/fy
+          rm fy-v0.6.6-x86_64-unknown-linux-gnu.tar.gz
+
+          curl -sSLO https://github.com/mpalmer/action-validator/releases/download/v0.9.0/action-validator_linux_amd64
+          echo "9f42f94fca5b8d04c13bccfbb331104b37a9250650d89ae58dc888d46206f9b9  action-validator_linux_amd64" | sha256sum -c -
+          mv action-validator_linux_amd64 action-validator
+
+      - name: Add fy and action-validator to PATH
+        run: |
+          chmod +x "${{ runner.temp }}/tooling-bin/fy" "${{ runner.temp }}/tooling-bin/action-validator"
+          echo "${{ runner.temp }}/tooling-bin" >> "$GITHUB_PATH"
+
+      - name: Validate YAML syntax
+        run: |
+          fy parse .pre-commit-hooks.yaml
+          fy parse crates/github-action/action.yml
+
+      - name: Validate action.yml against the GitHub Actions metadata schema
+        run: action-validator crates/github-action/action.yml
+
+      - name: "Guard against language: rust regressing into the pre-commit hook (#1074)"
+        # pre-commit's `language: rust` support always runs `cargo install --path .` from
+        # this repo's root, a virtual workspace manifest with no [package] — it cannot
+        # install there (see .pre-commit-hooks.yaml's own comment and
+        # crates/deps-cli/README.md's "Pre-commit hook" section for the full
+        # reproduction). Structural check via fy+jq, not a regex grep, so it survives
+        # reformatting of the surrounding YAML.
+        run: |
+          fy convert json .pre-commit-hooks.yaml -o "${{ runner.temp }}/pre-commit-hooks.json"
+          lang=$(jq -r '.[0].language' "${{ runner.temp }}/pre-commit-hooks.json")
+          if [ "$lang" != "system" ]; then
+            echo "::error::.pre-commit-hooks.yaml's deps-lsp-check hook has language: $lang, expected language: system — language: rust cannot install from this repo's virtual workspace root (#1074)."
+            exit 1
+          fi
+
+      - name: Shellcheck action.yml's embedded bash steps
+        run: |
+          set -euo pipefail
+          fy convert json crates/github-action/action.yml -o "${{ runner.temp }}/action.json"
+          # Index into the already shell==bash-filtered array below, not the raw
+          # runs.steps array — re-indexing raw steps by the filtered count silently
+          # misaligns (skips or shellchecks the wrong script) as soon as any
+          # non-bash step exists anywhere in action.yml.
+          count=$(jq '[.runs.steps[] | select(.shell == "bash")] | length' "${{ runner.temp }}/action.json")
+          status=0
+          if [ "$count" -gt 0 ]; then
+            for i in $(seq 0 $((count - 1))); do
+              script="${{ runner.temp }}/action-step-${i}.sh"
+              { echo '#!/usr/bin/env bash'; jq -r "[.runs.steps[] | select(.shell == \"bash\")][$i].run" "${{ runner.temp }}/action.json"; } > "$script"
+              shellcheck -s bash "$script" || status=1
+            done
+          fi
+          exit "$status"
 
   semver:
     name: Semver Check
@@ -954,6 +1051,7 @@ jobs:
         feature-matrix,
         feature-matrix-test,
         doc-and-hygiene,
+        tooling-lint,
         security,
         test,
         cross-check,
@@ -967,7 +1065,7 @@ jobs:
     steps:
       - name: Check all jobs
         run: |
-          if [[ "${{ needs.changes.outputs.rust }}" != "true" && "${{ needs.changes.outputs.workflows }}" != "true" ]]; then
+          if [[ "${{ needs.changes.outputs.rust }}" != "true" && "${{ needs.changes.outputs.workflows }}" != "true" && "${{ needs.changes.outputs.tooling }}" != "true" ]]; then
             echo "No relevant changes - skipped jobs are OK"
             exit 0
           fi
@@ -988,6 +1086,7 @@ jobs:
           check_job "${{ needs.feature-matrix.result }}" "feature-matrix" || failed=1
           check_job "${{ needs.feature-matrix-test.result }}" "feature-matrix-test" || failed=1
           check_job "${{ needs.doc-and-hygiene.result }}" "doc-and-hygiene" || failed=1
+          check_job "${{ needs.tooling-lint.result }}" "tooling-lint" || failed=1
           check_job "${{ needs.security.result }}" "security" || failed=1
           check_job "${{ needs.test.result }}" "test" || failed=1
           check_job "${{ needs.cross-check.result }}" "cross-check" || failed=1
