@@ -112,6 +112,39 @@ impl EcosystemRuntime {
     }
 }
 
+/// Validates a `registries.gitlab_instance_host` value against the live registry-access
+/// policy, without the caller needing to name `deps_gitlab_ci` directly.
+///
+/// Exists so `deps-lsp` (and any future adapter) can validate this value while depending only
+/// on `deps-engine` — per `specs/062-cli-check-mode/architecture-decision.md` §3.3's placement
+/// rule, code that must name a concrete ecosystem type belongs in `deps-engine`, not in an
+/// adapter crate.
+///
+/// # Errors
+///
+/// Returns [`deps_core::net_policy::IndexUrlError`] under the same conditions as
+/// [`deps_gitlab_ci::GitlabHost::parse`] — `raw` contains a URL-structural character, fails to
+/// parse, is not `https`-eligible, carries userinfo, round-trips to a different host, or
+/// resolves to a [`deps_core::net_policy::HostClass`] the current policy blocks.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::net_policy::{RegistryAccessPolicy, WorkspaceRegistryAccess};
+/// use deps_engine::setup::validate_gitlab_instance_host;
+///
+/// let policy = RegistryAccessPolicy::new(WorkspaceRegistryAccess::PublicOnly);
+/// assert!(validate_gitlab_instance_host("gitlab.com", &policy).is_ok());
+/// assert!(validate_gitlab_instance_host("gitlab.com/evil", &policy).is_err());
+/// ```
+#[cfg(feature = "gitlab-ci")]
+pub fn validate_gitlab_instance_host(
+    raw: &str,
+    policy: &deps_core::net_policy::RegistryAccessPolicy,
+) -> Result<(), deps_core::net_policy::IndexUrlError> {
+    deps_gitlab_ci::GitlabHost::parse(raw, policy).map(|_| ())
+}
+
 /// Declares an ecosystem: re-exports types and registers at runtime.
 ///
 /// `$types` re-export rule (#834 §6 last bullet — the list used to be asymmetric with no
@@ -602,6 +635,30 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .as_deref(),
             Some("gitlab.corp")
+        );
+    }
+
+    /// Direct `cargo nextest` coverage for [`validate_gitlab_instance_host`] — its doctest
+    /// exercises the same two cases inline, but only as a doctest (tester finding, issue
+    /// #1073). Also checks the rejected-host error never leaks the raw credential, mirroring
+    /// `deps-lsp`'s `test_gitlab_instance_host_invalid_message_redacts_credential`, since
+    /// [`deps_core::net_policy::IndexUrlError::InvalidUrl`] wraps an already-redacted
+    /// [`deps_core::net_policy::RedactedUrl`].
+    #[cfg(feature = "gitlab-ci")]
+    #[test]
+    fn test_validate_gitlab_instance_host_accepts_valid_rejects_invalid() {
+        use deps_core::net_policy::{RegistryAccessPolicy, WorkspaceRegistryAccess};
+
+        let policy = RegistryAccessPolicy::new(WorkspaceRegistryAccess::PublicOnly);
+
+        assert!(validate_gitlab_instance_host("gitlab.com", &policy).is_ok());
+
+        let raw = "user:hunter2@gitlab.corp";
+        let error = validate_gitlab_instance_host(raw, &policy)
+            .expect_err("credential-shaped host must be rejected");
+        assert!(
+            !error.to_string().contains("hunter2"),
+            "rejected-host error must not leak the raw credential: {error}"
         );
     }
 

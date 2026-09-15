@@ -23,7 +23,7 @@ path = "src/lib.rs"
 [features]
 default = ["cargo", "npm", "pypi", "go", "bundler", "dart", "maven", "gradle", "swift", "composer", "nuget", "deno", "github-actions", "gitlab-ci"]
 cargo = ["deps-engine/cargo"]
-npm = ["dep:deps-npm", "deps-engine/npm"]
+npm = ["deps-engine/npm"]
 pypi = ["deps-engine/pypi"]
 go = ["deps-engine/go"]
 bundler = ["deps-engine/bundler"]
@@ -33,20 +33,16 @@ gradle = ["deps-engine/gradle"]
 swift = ["deps-engine/swift"]
 composer = ["deps-engine/composer"]
 nuget = ["deps-engine/nuget"]
-github-actions = ["dep:deps-github-actions", "deps-engine/github-actions"]
-gitlab-ci = ["dep:deps-gitlab-ci", "deps-engine/gitlab-ci"]
+github-actions = ["deps-engine/github-actions"]
+gitlab-ci = ["deps-engine/gitlab-ci"]
 # Pulls in deps-npm transitively (DenoRegistry delegates npm: specifiers to it, D3) even
 # when the "npm" feature itself is disabled.
-deno = ["dep:deps-deno", "deps-engine/deno"]
+deno = ["deps-engine/deno"]
 
 [dependencies]
 # Internal crates
 deps-core = { workspace = true }
-deps-deno = { workspace = true, optional = true }
 deps-engine = { workspace = true }
-deps-github-actions = { workspace = true, optional = true }
-deps-gitlab-ci = { workspace = true, optional = true }
-deps-npm = { workspace = true, optional = true }
 
 # External dependencies
 dashmap = { workspace = true }
@@ -61,6 +57,10 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 [dev-dependencies]
 criterion = { workspace = true }
 deps-core = { workspace = true, features = ["test-util"] }
+deps-deno = { workspace = true }
+deps-github-actions = { workspace = true }
+deps-gitlab-ci = { workspace = true }
+deps-npm = { workspace = true }
 insta = { workspace = true, features = ["json"] }
 mockito = { workspace = true }
 tempfile = { workspace = true }

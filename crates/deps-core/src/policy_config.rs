@@ -677,10 +677,13 @@ pub struct RegistriesConfig {
     /// not joined with, `gitlab.com` — the *only* host `GITLAB_TOKEN` may be sent to.
     /// `#[serde(default)]`: additive-safe, same rationale as `nuget_user_profile_sources`
     /// above. Default `""` (unset); an empty string is written through as `None` into the
-    /// shared `Arc<RwLock<Option<String>>>` handle. **No validation happens here** —
-    /// `deps-lsp` must not depend on `deps-gitlab-ci` for host semantics; an invalid value is
-    /// rejected on read by `deps_gitlab_ci::host::GitlabInstanceHost::get`, which also
-    /// documents the already-open-document limitation of a live change to this setting.
+    /// shared `Arc<RwLock<Option<String>>>` handle. **No validation happens at deserialization
+    /// time** — `deps-lsp` must not depend on `deps-gitlab-ci` for host semantics, so this
+    /// type accepts any string. Two validation points exist downstream instead: once per
+    /// config update, via `deps_engine::setup::validate_gitlab_instance_host` (which surfaces
+    /// a rejection to the user); and lazily on every read, via
+    /// `deps_gitlab_ci::host::GitlabInstanceHost::get`, which also documents the
+    /// already-open-document limitation of a live change to this setting.
     #[serde(default)]
     pub gitlab_instance_host: String,
 }
