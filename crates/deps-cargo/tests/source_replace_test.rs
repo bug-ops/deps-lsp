@@ -22,16 +22,16 @@ use deps_cargo::{CargoFormatter, DependencySource};
 use deps_core::lsp_helpers::{PackageRendering, SourcePolicy};
 use deps_core::net_policy::{RegistryAccessPolicy, WorkspaceRegistryAccess};
 use std::sync::Arc;
-use tower_lsp_server::ls_types::Uri;
+use url::Url;
 
 fn test_policy() -> RegistryAccessPolicy {
     RegistryAccessPolicy::new(WorkspaceRegistryAccess::All)
 }
 
-fn write_manifest(dir: &std::path::Path, content: &str) -> Uri {
+fn write_manifest(dir: &std::path::Path, content: &str) -> Url {
     let path = dir.join("Cargo.toml");
     std::fs::write(&path, content).unwrap();
-    Uri::from_file_path(&path).unwrap()
+    Url::from_file_path(&path).unwrap()
 }
 
 /// (a) plain dependencies carry `mirrors_crates_io: true`, and (b) the mirror index is the
@@ -201,12 +201,13 @@ fn test_mirror_counts_as_public_registry_content_for_osv_gating() {
 /// stale `DependencySource::Registry`-equality gate instead of `source_is_public_registry_content`.
 #[test]
 fn test_mirror_distinct_pinned_versions_produce_distinct_vulnerability_keys() {
+    use deps_core::position::{Position, Range};
     use deps_core::{
         ConcreteVersion, Dependency, EcosystemId, PackageName, ParseResult, VersionReq,
     };
     use std::any::Any;
     use std::collections::HashMap;
-    use tower_lsp_server::ls_types::{Position, Range};
+    use url::Url;
 
     struct MirrorDep {
         version_req: VersionReq,
@@ -240,7 +241,7 @@ fn test_mirror_distinct_pinned_versions_produce_distinct_vulnerability_keys() {
 
     struct MirrorParseResult {
         deps: Vec<MirrorDep>,
-        uri: Uri,
+        uri: Url,
     }
     impl ParseResult for MirrorParseResult {
         fn dependencies(&self) -> Vec<&dyn Dependency> {
@@ -249,7 +250,7 @@ fn test_mirror_distinct_pinned_versions_produce_distinct_vulnerability_keys() {
         fn workspace_root(&self) -> Option<&std::path::Path> {
             None
         }
-        fn uri(&self) -> &Uri {
+        fn uri(&self) -> &Url {
             &self.uri
         }
         fn as_any(&self) -> &dyn Any {

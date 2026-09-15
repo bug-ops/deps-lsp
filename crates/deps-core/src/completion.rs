@@ -240,7 +240,7 @@ pub fn detect_completion_context(
         }
 
         // Check if position is within the dependency name range
-        let name_range = dep.name_range();
+        let name_range: Range = dep.name_range().into();
         // `position_in_range` tolerates a request position one column past
         // `name_range.end` (a convenience for firing completion right after the
         // last typed character), but the manifest text immediately following the
@@ -264,7 +264,7 @@ pub fn detect_completion_context(
         }
 
         // Check if position is within the version range
-        if let Some(version_range) = dep.version_range()
+        if let Some(version_range) = dep.version_range().map(Into::into)
             && position_in_range(position, version_range)
         {
             // #919: `version_range` can span a non-literal token (Maven `${property}`
@@ -286,7 +286,7 @@ pub fn detect_completion_context(
         }
 
         // Check if position is within the features array range
-        if let Some(features_range) = dep.features_range()
+        if let Some(features_range) = dep.features_range().map(Into::into)
             && position_in_range(position, features_range)
         {
             let prefix = extract_feature_prefix(content, position);
@@ -1246,7 +1246,7 @@ pub async fn complete_versions_at_position(
 ) -> Vec<CompletionItem> {
     let Some(dep) = parse_result.dependencies().into_iter().find(|d| {
         d.version_range()
-            .is_some_and(|r| position_in_range(position, r))
+            .is_some_and(|r| position_in_range(position, r.into()))
     }) else {
         return vec![];
     };
@@ -1281,9 +1281,9 @@ mod tests {
 
     struct MockDependency {
         name: crate::PackageName,
-        name_range: Range,
-        version_range: Option<Range>,
-        features_range: Option<Range>,
+        name_range: crate::position::Range,
+        version_range: Option<crate::position::Range>,
+        features_range: Option<crate::position::Range>,
     }
 
     impl crate::ecosystem::Dependency for MockDependency {
@@ -1291,7 +1291,7 @@ mod tests {
             &self.name
         }
 
-        fn name_range(&self) -> Range {
+        fn name_range(&self) -> crate::position::Range {
             self.name_range
         }
 
@@ -1301,11 +1301,11 @@ mod tests {
             Some(&VERSION_REQ)
         }
 
-        fn version_range(&self) -> Option<Range> {
+        fn version_range(&self) -> Option<crate::position::Range> {
             self.version_range
         }
 
-        fn features_range(&self) -> Option<Range> {
+        fn features_range(&self) -> Option<crate::position::Range> {
             self.features_range
         }
 
@@ -1334,8 +1334,8 @@ mod tests {
             None
         }
 
-        fn uri(&self) -> &tower_lsp_server::ls_types::Uri {
-            static URL: std::sync::LazyLock<tower_lsp_server::ls_types::Uri> =
+        fn uri(&self) -> &url::Url {
+            static URL: std::sync::LazyLock<url::Url> =
                 std::sync::LazyLock::new(|| "file:///test/Cargo.toml".parse().unwrap());
             &URL
         }
@@ -1693,7 +1693,8 @@ mod tests {
                         line: 0,
                         character: 5,
                     },
-                },
+                }
+                .into(),
                 version_range: None,
                 features_range: None,
             }],
@@ -1743,13 +1744,13 @@ mod tests {
             fn name(&self) -> &crate::PackageName {
                 &self.name
             }
-            fn name_range(&self) -> Range {
-                Range::default()
+            fn name_range(&self) -> crate::position::Range {
+                crate::position::Range::default()
             }
             fn version_requirement(&self) -> Option<&crate::VersionReq> {
                 None
             }
-            fn version_range(&self) -> Option<Range> {
+            fn version_range(&self) -> Option<crate::position::Range> {
                 None
             }
             fn source(&self) -> crate::parser::DependencySource {
@@ -1774,8 +1775,8 @@ mod tests {
             fn workspace_root(&self) -> Option<&std::path::Path> {
                 None
             }
-            fn uri(&self) -> &tower_lsp_server::ls_types::Uri {
-                static URI: std::sync::LazyLock<tower_lsp_server::ls_types::Uri> =
+            fn uri(&self) -> &url::Url {
+                static URI: std::sync::LazyLock<url::Url> =
                     std::sync::LazyLock::new(|| crate::test_util::test_uri("/test/pubspec.yaml"));
                 &URI
             }
@@ -1816,7 +1817,8 @@ mod tests {
                         line: 0,
                         character: 5,
                     },
-                },
+                }
+                .into(),
                 version_range: None,
                 features_range: None,
             }],
@@ -1872,7 +1874,8 @@ mod tests {
                         line: 0,
                         character: 5,
                     },
-                },
+                }
+                .into(),
                 version_range: None,
                 features_range: None,
             }],
@@ -1906,7 +1909,8 @@ mod tests {
                         line: 0,
                         character: 5,
                     },
-                },
+                }
+                .into(),
                 version_range: None,
                 features_range: None,
             }],
@@ -1964,7 +1968,8 @@ mod tests {
                         line: 0,
                         character: 9,
                     },
-                },
+                }
+                .into(),
                 version_range: None,
                 features_range: None,
             }],
@@ -1981,7 +1986,7 @@ mod tests {
         match context {
             CompletionContext::PackageName { prefix, range } => {
                 assert_eq!(prefix, "jsr:@std/");
-                assert_eq!(range, parse_result.dependencies[0].name_range);
+                assert_eq!(range, parse_result.dependencies[0].name_range.into());
             }
             other => panic!("Expected PackageName context, got {other:?}"),
         }
@@ -2001,21 +2006,25 @@ mod tests {
                         line: 0,
                         character: 5,
                     },
-                },
+                }
+                .into(),
                 // `MockDependency::version_requirement()` always reports "1.0" (see its
                 // impl below) — `version_range` must slice to exactly that literal text
                 // for the #919 literal-span guard in `detect_completion_context` to admit
                 // a `Version` context at all.
-                version_range: Some(Range {
-                    start: Position {
-                        line: 0,
-                        character: 9,
-                    },
-                    end: Position {
-                        line: 0,
-                        character: 12,
-                    },
-                }),
+                version_range: Some(
+                    Range {
+                        start: Position {
+                            line: 0,
+                            character: 9,
+                        },
+                        end: Position {
+                            line: 0,
+                            character: 12,
+                        },
+                    }
+                    .into(),
+                ),
                 features_range: None,
             }],
         };
@@ -2058,17 +2067,21 @@ mod tests {
                         line: 0,
                         character: 9,
                     },
-                },
-                version_range: Some(Range {
-                    start: Position {
-                        line: 0,
-                        character: 13,
-                    },
-                    end: Position {
-                        line: 0,
-                        character: 29,
-                    },
-                }),
+                }
+                .into(),
+                version_range: Some(
+                    Range {
+                        start: Position {
+                            line: 0,
+                            character: 13,
+                        },
+                        end: Position {
+                            line: 0,
+                            character: 29,
+                        },
+                    }
+                    .into(),
+                ),
                 features_range: None,
             }],
         };
@@ -2102,17 +2115,21 @@ mod tests {
                         line: 0,
                         character: 6,
                     },
-                },
-                version_range: Some(Range {
-                    start: Position {
-                        line: 0,
-                        character: 7,
-                    },
-                    end: Position {
-                        line: 0,
-                        character: 11,
-                    },
-                }),
+                }
+                .into(),
+                version_range: Some(
+                    Range {
+                        start: Position {
+                            line: 0,
+                            character: 7,
+                        },
+                        end: Position {
+                            line: 0,
+                            character: 11,
+                        },
+                    }
+                    .into(),
+                ),
                 features_range: None,
             }],
         };
@@ -2142,7 +2159,8 @@ mod tests {
                         line: 5,
                         character: 5,
                     },
-                },
+                }
+                .into(),
                 version_range: None,
                 features_range: None,
             }],
@@ -4282,9 +4300,9 @@ mod tests {
     ) -> MockDependency {
         MockDependency {
             name: name.into(),
-            name_range,
+            name_range: name_range.into(),
             version_range: None,
-            features_range: Some(features_range),
+            features_range: Some(features_range.into()),
         }
     }
 

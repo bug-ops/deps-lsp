@@ -8,6 +8,7 @@
 use std::any::Any;
 use std::sync::Arc;
 use tower_lsp_server::ls_types::{CompletionItem, DocumentLink, Position, Range, Uri};
+use url::Url;
 
 use deps_core::{
     Ecosystem, ParseResult as ParseResultTrait, Registry, Result, completion::Completions,
@@ -28,8 +29,8 @@ enum PypiManifestKind {
 }
 
 impl PypiManifestKind {
-    fn from_uri(uri: &Uri) -> Self {
-        let basename = uri.path().as_str().rsplit('/').next().unwrap_or_default();
+    fn from_uri(uri: &Url) -> Self {
+        let basename = uri.path().rsplit('/').next().unwrap_or_default();
         if basename == "pyproject.toml" {
             Self::PyProject
         } else {
@@ -142,8 +143,8 @@ impl PypiEcosystem {
     /// correct as long as this ecosystem's directory-pattern fallback is only
     /// ever reached after both basename stages miss (true by construction in
     /// [`deps_core::EcosystemRegistry::for_uri`]).
-    fn matched_only_via_directory_pattern(&self, uri: &Uri) -> bool {
-        let basename = uri.path().as_str().rsplit('/').next().unwrap_or_default();
+    fn matched_only_via_directory_pattern(&self, uri: &Url) -> bool {
+        let basename = uri.path().rsplit('/').next().unwrap_or_default();
         if self.manifest_filenames().contains(&basename) {
             return false;
         }
@@ -223,7 +224,7 @@ impl Ecosystem for PypiEcosystem {
     fn parse_manifest<'a>(
         &'a self,
         content: &'a str,
-        uri: &'a Uri,
+        uri: &'a Url,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Box<dyn ParseResultTrait>>> {
         Box::pin(async move {
             let kind = PypiManifestKind::from_uri(uri);
@@ -333,7 +334,7 @@ impl Ecosystem for PypiEcosystem {
     fn generate_document_links(
         &self,
         parse_result: &dyn ParseResultTrait,
-        uri: &Uri,
+        uri: &Url,
     ) -> Vec<DocumentLink> {
         let Some(result) = parse_result
             .as_any()
@@ -849,7 +850,7 @@ mod tests {
         let path_part = file_uri.as_str().strip_prefix("file://").unwrap();
 
         for prefix in ["https://attacker.example", "file://attacker.example"] {
-            let uri: Uri = format!("{prefix}{path_part}").parse().unwrap();
+            let uri: Url = format!("{prefix}{path_part}").parse().unwrap();
 
             let parse_result = ecosystem
                 .parse_manifest("-r base.txt\n", &uri)
@@ -950,7 +951,7 @@ mod tests {
     /// exercise the containment check directly (`parse_manifest` never produces a
     /// non-`None` `workspace_root` for pypi today — see the field's own doc).
     fn parse_result_with_document_link(
-        uri: Uri,
+        uri: Url,
         workspace_root: Option<std::path::PathBuf>,
         target: &str,
     ) -> crate::parser::ParseResult {
@@ -1513,13 +1514,13 @@ mod tests {
         name: &str,
         source: DependencySource,
     ) -> crate::parser::ParseResult {
-        use tower_lsp_server::ls_types::Range;
+        use deps_core::position::{Position as DomainPosition, Range};
         crate::parser::ParseResult {
             dependencies: vec![crate::types::PypiDependency {
                 name: pkg(name),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+                name_range: Range::new(DomainPosition::new(0, 0), DomainPosition::new(0, 0)),
                 version_req: None,
-                version_range: Some(Range::new(DEP_POSITION, Position::new(0, 10))),
+                version_range: Some(Range::new(DEP_POSITION.into(), DomainPosition::new(0, 10))),
                 extras: Vec::new(),
                 extras_range: None,
                 markers: None,
@@ -1653,12 +1654,18 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = PypiEcosystem::new(cache);
 
+        use deps_core::position::{Position as DomainPosition, Range as DomainRange};
+
         let mut registry_dep =
             parse_result_with_dependency("shared-name", DependencySource::Registry)
                 .dependencies
                 .remove(0);
-        registry_dep.name_range = Range::new(Position::new(0, 0), Position::new(0, 0));
-        registry_dep.version_range = Some(Range::new(Position::new(0, 0), Position::new(0, 10)));
+        registry_dep.name_range =
+            DomainRange::new(DomainPosition::new(0, 0), DomainPosition::new(0, 0));
+        registry_dep.version_range = Some(DomainRange::new(
+            DomainPosition::new(0, 0),
+            DomainPosition::new(0, 10),
+        ));
 
         let mut alternate_dep = parse_result_with_dependency(
             "shared-name",
@@ -1669,8 +1676,12 @@ mod tests {
         )
         .dependencies
         .remove(0);
-        alternate_dep.name_range = Range::new(Position::new(1, 0), Position::new(1, 0));
-        alternate_dep.version_range = Some(Range::new(Position::new(1, 0), Position::new(1, 10)));
+        alternate_dep.name_range =
+            DomainRange::new(DomainPosition::new(1, 0), DomainPosition::new(1, 0));
+        alternate_dep.version_range = Some(DomainRange::new(
+            DomainPosition::new(1, 0),
+            DomainPosition::new(1, 10),
+        ));
         let alternate_position = alternate_dep.version_range.unwrap().start;
 
         let parse_result = crate::parser::ParseResult {
@@ -1690,7 +1701,7 @@ mod tests {
         let results = ecosystem
             .complete_versions(
                 &parse_result,
-                alternate_position,
+                alternate_position.into(),
                 "1",
                 deps_core::FreshnessSettings::default(),
             )
@@ -2217,7 +2228,7 @@ dependencies = []
 
             let hover = deps_core::lsp_helpers::generate_hover(
                 &parse_result,
-                dep_position,
+                dep_position.into(),
                 versions,
                 &EmptyOkRegistry,
                 &formatter,

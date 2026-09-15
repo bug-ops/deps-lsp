@@ -9,7 +9,7 @@ use crate::types::GradleDependency;
 use deps_core::Result;
 use regex::Regex;
 use std::sync::LazyLock;
-use tower_lsp_server::ls_types::Uri;
+use url::Url;
 
 /// Matches: implementation('group:artifact:version') or implementation("group:artifact:version")
 /// (optional whitespace between the configuration word and the opening paren)
@@ -115,7 +115,7 @@ fn extract_matches(
 /// # Errors
 ///
 /// Infallible by construction: this function never returns `Err`.
-pub fn parse_groovy_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
+pub fn parse_groovy_dsl(content: &str, uri: &Url) -> Result<GradleParseResult> {
     let mut dependencies = Vec::new();
 
     let mut brace_depth: i32 = 0;
@@ -251,7 +251,7 @@ pub fn parse_groovy_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
 mod tests {
     use super::*;
 
-    fn make_uri() -> Uri {
+    fn make_uri() -> Url {
         deps_core::test_util::test_uri("/project/build.gradle")
     }
 

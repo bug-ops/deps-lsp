@@ -2,7 +2,8 @@
 
 use std::any::Any;
 use std::sync::Arc;
-use tower_lsp_server::ls_types::{CompletionItem, Position, Range, Uri};
+use tower_lsp_server::ls_types::{CompletionItem, Position, Range};
+use url::Url;
 
 use deps_core::{
     Ecosystem, ParseResult as ParseResultTrait, Registry, Result, completion::Completions,
@@ -113,7 +114,7 @@ impl GradleEcosystem {
     fn detect_completion_context<'a>(
         content: &'a str,
         position: Position,
-        uri: &Uri,
+        uri: &Url,
     ) -> (GradleCompletionContext, &'a str, Range) {
         let path = uri.path().to_string();
         let lines: Vec<&str> = content.lines().collect();
@@ -415,7 +416,7 @@ impl Ecosystem for GradleEcosystem {
     fn parse_manifest<'a>(
         &'a self,
         content: &'a str,
-        uri: &'a Uri,
+        uri: &'a Url,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Box<dyn ParseResultTrait>>> {
         Box::pin(async move {
             let result = crate::parser::parse_gradle(content, uri)?;
@@ -456,7 +457,7 @@ impl Ecosystem for GradleEcosystem {
                 GradleCompletionContext::Version => {
                     let dep = parse_result.dependencies().into_iter().find(|d| {
                         d.version_range()
-                            .is_some_and(|r| position_in_range(position, r))
+                            .is_some_and(|r| position_in_range(position, r.into()))
                             || d.name_range().start.line == position.line
                     });
                     // #919: `detect_completion_context` only checks that the cursor sits
@@ -1203,7 +1204,7 @@ mod tests {
             Some("$libVersion"),
             "fixture no longer exercises the unresolved-variable shape: {content}"
         );
-        let position = dep.version_range().unwrap().start;
+        let position: Position = dep.version_range().unwrap().start.into();
         let freshness = deps_core::FreshnessSettings::default();
 
         // M4 (critic follow-up): `Completions::default()` below is also what the
@@ -1216,7 +1217,7 @@ mod tests {
             !deps_core::lsp_helpers::dependency_version_range_is_literal(
                 *dep,
                 content,
-                dep.version_range().unwrap(),
+                dep.version_range().unwrap().into(),
             )
         );
 
@@ -1240,7 +1241,7 @@ mod tests {
         let uri = deps_core::test_util::test_uri("/project/build.gradle");
         let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
         let dep = &parse_result.dependencies()[0];
-        let position = dep.version_range().unwrap().start;
+        let position: Position = dep.version_range().unwrap().start.into();
 
         let (ctx, _, range) = GradleEcosystem::detect_completion_context(content, position, &uri);
         assert_eq!(ctx, GradleCompletionContext::Version);
@@ -1261,7 +1262,7 @@ mod tests {
         let uri = deps_core::test_util::test_uri("/project/libs.versions.toml");
         let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
         let dep = &parse_result.dependencies()[0];
-        let position = dep.version_range().unwrap().start;
+        let position: Position = dep.version_range().unwrap().start.into();
 
         let (ctx, _, range) = GradleEcosystem::detect_completion_context(content, position, &uri);
         assert_eq!(ctx, GradleCompletionContext::Version);
@@ -1283,7 +1284,7 @@ mod tests {
         let uri = deps_core::test_util::test_uri("/project/build.gradle.kts");
         let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
         let dep = &parse_result.dependencies()[0];
-        let position = dep.version_range().unwrap().start;
+        let position: Position = dep.version_range().unwrap().start.into();
         let freshness = deps_core::FreshnessSettings::default();
 
         let direct = eco.complete_versions(dep.name(), "", freshness).await;

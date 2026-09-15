@@ -711,10 +711,11 @@ pub type VulnerabilityMap = HashMap<String, ScanOutcome>;
 ///     RequirementResolution, SourcePolicy,
 /// };
 /// use deps_core::osv::vulnerability_keys;
+/// use deps_core::position::{Position, Range};
 /// use deps_core::{ConcreteVersion, Dependency, EcosystemId, PackageName, ParseResult, VersionReq};
 /// use std::any::Any;
 /// use std::collections::HashMap;
-/// use tower_lsp_server::ls_types::{Position, Range, Uri};
+/// use url::Url;
 ///
 /// struct SimpleDep {
 ///     name: PackageName,
@@ -745,7 +746,7 @@ pub type VulnerabilityMap = HashMap<String, ScanOutcome>;
 ///
 /// struct SimpleParseResult {
 ///     deps: Vec<SimpleDep>,
-///     uri: Uri,
+///     uri: Url,
 /// }
 ///
 /// impl ParseResult for SimpleParseResult {
@@ -755,7 +756,7 @@ pub type VulnerabilityMap = HashMap<String, ScanOutcome>;
 ///     fn workspace_root(&self) -> Option<&std::path::Path> {
 ///         None
 ///     }
-///     fn uri(&self) -> &Uri {
+///     fn uri(&self) -> &Url {
 ///         &self.uri
 ///     }
 ///     fn as_any(&self) -> &dyn Any {
@@ -785,12 +786,12 @@ pub type VulnerabilityMap = HashMap<String, ScanOutcome>;
 ///         SimpleDep {
 ///             name: PackageName::new("time"),
 ///             version_req: Some(VersionReq::new("=0.1.43")),
-///             name_range: Range::new(Position::new(0, 0), Position::new(0, 4)),
+///             name_range: Range::new(Position::new(0, 0), Position::new(0, 4)).into(),
 ///         },
 ///         SimpleDep {
 ///             name: PackageName::new("time"),
 ///             version_req: Some(VersionReq::new("=0.1.44")),
-///             name_range: Range::new(Position::new(3, 0), Position::new(3, 4)),
+///             name_range: Range::new(Position::new(3, 0), Position::new(3, 4)).into(),
 ///         },
 ///     ],
 ///     uri: deps_core::test_util::test_uri("/test/Cargo.toml"),
@@ -809,7 +810,7 @@ pub fn vulnerability_keys(
     resolved_candidates: Option<&HashMap<crate::PackageName, Vec<crate::ConcreteVersion>>>,
     formatter: &dyn crate::lsp_helpers::EcosystemFormatter,
     ecosystem: crate::EcosystemId,
-) -> HashMap<tower_lsp_server::ls_types::Range, String> {
+) -> HashMap<crate::position::Range, String> {
     use crate::lsp_helpers::resolve_in_use_version;
 
     let deps = parse_result.dependencies();
@@ -1615,19 +1616,19 @@ mod vulnerability_keys_candidates_tests {
         let current_major = MockDep {
             name: PackageName::new("serde"),
             version_req: VersionReq::new("1.0"),
-            version_range: Range::new(Position::new(0, 0), Position::new(0, 4)),
-            name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            version_range: Range::new(Position::new(0, 0), Position::new(0, 4)).into(),
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
         };
         let renamed_old_major = MockDep {
             name: PackageName::new("serde"),
             version_req: VersionReq::new("0.9"),
-            version_range: Range::new(Position::new(1, 0), Position::new(1, 4)),
-            name_range: Range::new(Position::new(1, 0), Position::new(1, 9)),
+            version_range: Range::new(Position::new(1, 0), Position::new(1, 4)).into(),
+            name_range: Range::new(Position::new(1, 0), Position::new(1, 9)).into(),
         };
 
         struct TwoOccurrenceParseResult {
             deps: Vec<MockDep>,
-            uri: tower_lsp_server::ls_types::Uri,
+            uri: url::Url,
         }
         impl crate::ParseResult for TwoOccurrenceParseResult {
             fn dependencies(&self) -> Vec<&dyn crate::Dependency> {
@@ -1639,7 +1640,7 @@ mod vulnerability_keys_candidates_tests {
             fn workspace_root(&self) -> Option<&std::path::Path> {
                 None
             }
-            fn uri(&self) -> &tower_lsp_server::ls_types::Uri {
+            fn uri(&self) -> &url::Url {
                 &self.uri
             }
             fn as_any(&self) -> &dyn std::any::Any {
@@ -1707,8 +1708,8 @@ mod vulnerability_keys_candidates_tests {
                 Box::new(MockDep {
                     name: PackageName::new("real-pkg"),
                     version_req: VersionReq::new("1.0.0"),
-                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                    name_range: Range::new(Position::new(0, 0), Position::new(0, 8)),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 8)).into(),
                 }),
             ],
             uri: crate::test_util::test_uri("/test/pubspec.yaml"),

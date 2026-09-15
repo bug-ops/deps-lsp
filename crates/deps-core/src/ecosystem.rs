@@ -2,13 +2,14 @@ use std::any::Any;
 use std::pin::Pin;
 use std::sync::Arc;
 use tower_lsp_server::ls_types::{
-    CodeAction, CodeLens, Diagnostic, DocumentLink, Hover, InlayHint, Position, TextEdit, Uri,
+    CodeAction, CodeLens, Diagnostic, DocumentLink, Hover, InlayHint, Position, TextEdit,
 };
 
 use crate::{
     Registry,
     completion::Completions,
     lsp_helpers::{EcosystemFormatter, VersionData},
+    position::Range,
     registry::Metadata,
 };
 
@@ -78,9 +79,9 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send +
 /// ```no_run
 /// use deps_core::Ecosystem;
 /// use std::sync::Arc;
-/// use tower_lsp_server::ls_types::Uri;
+/// use url::Url;
 ///
-/// # async fn example(ecosystem: Arc<dyn Ecosystem>, uri: Uri) -> deps_core::error::Result<()> {
+/// # async fn example(ecosystem: Arc<dyn Ecosystem>, uri: Url) -> deps_core::error::Result<()> {
 /// let parsed = deps_core::ecosystem::parse_manifest_blocking(&ecosystem, "content", &uri).await?;
 /// println!("{} dependencies", parsed.dependencies().len());
 /// # Ok(())
@@ -89,7 +90,7 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send +
 pub async fn parse_manifest_blocking(
     ecosystem: &Arc<dyn Ecosystem>,
     content: &str,
-    uri: &Uri,
+    uri: &url::Url,
 ) -> crate::error::Result<Box<dyn ParseResult>> {
     let ecosystem = Arc::clone(ecosystem);
     let owned_content = content.to_owned();
@@ -272,8 +273,8 @@ impl std::fmt::Display for EcosystemId {
 /// mixup this type exists to rule out.
 #[derive(Debug, Clone)]
 pub struct BlockedRegistryOccurrence {
-    /// LSP range of the affected dependency's name in the manifest.
-    pub range: tower_lsp_server::ls_types::Range,
+    /// Range of the affected dependency's name in the manifest.
+    pub range: Range,
     /// The blocked host's classification.
     pub class: crate::net_policy::HostClass,
     /// The exact `registry`/`registry-index` alias or URL the dependency declared, so two
@@ -322,7 +323,7 @@ impl BlockedSourceClass {
     /// ```
     /// use deps_core::net_policy::HostClass;
     /// use deps_core::BlockedSourceClass;
-    /// use deps_core::tower_lsp_server::ls_types::{Position, Range};
+    /// use deps_core::position::{Position, Range};
     ///
     /// let class = BlockedSourceClass {
     ///     class: HostClass::Loopback,
@@ -334,10 +335,7 @@ impl BlockedSourceClass {
     /// assert_eq!(occurrence.declaration_key, "primary");
     /// ```
     #[must_use]
-    pub fn into_occurrence(
-        self,
-        range: tower_lsp_server::ls_types::Range,
-    ) -> BlockedRegistryOccurrence {
+    pub fn into_occurrence(self, range: Range) -> BlockedRegistryOccurrence {
         BlockedRegistryOccurrence {
             range,
             class: self.class,
@@ -359,7 +357,7 @@ pub trait ParseResult: Send + Sync {
     fn workspace_root(&self) -> Option<&std::path::Path>;
 
     /// Document URI
-    fn uri(&self) -> &Uri;
+    fn uri(&self) -> &url::Url;
 
     /// Dependency lines whose registry-index resolution was blocked by a workspace-registry
     /// reachability policy (spec `.local/specs/023-cargo-custom-registries/plan-1b.md` §1.7,
@@ -414,14 +412,14 @@ pub trait Dependency: Send + Sync {
     /// Package name
     fn name(&self) -> &crate::PackageName;
 
-    /// LSP range of the dependency name
-    fn name_range(&self) -> tower_lsp_server::ls_types::Range;
+    /// Range of the dependency name
+    fn name_range(&self) -> Range;
 
     /// Version requirement string (e.g., "^1.0", ">=2.0")
     fn version_requirement(&self) -> Option<&crate::VersionReq>;
 
-    /// LSP range of the version string
-    fn version_range(&self) -> Option<tower_lsp_server::ls_types::Range>;
+    /// Range of the version string
+    fn version_range(&self) -> Option<Range>;
 
     /// Dependency source (registry, git, path)
     fn source(&self) -> crate::parser::DependencySource;
@@ -431,8 +429,8 @@ pub trait Dependency: Send + Sync {
         &[]
     }
 
-    /// LSP range of the features array (ecosystem-specific, None if not supported)
-    fn features_range(&self) -> Option<tower_lsp_server::ls_types::Range> {
+    /// Range of the features array (ecosystem-specific, None if not supported)
+    fn features_range(&self) -> Option<Range> {
         None
     }
 
@@ -443,9 +441,9 @@ pub trait Dependency: Send + Sync {
         None
     }
 
-    /// LSP range of the environment marker expression (ecosystem-specific,
+    /// Range of the environment marker expression (ecosystem-specific,
     /// `None` if not supported or not present).
-    fn markers_range(&self) -> Option<tower_lsp_server::ls_types::Range> {
+    fn markers_range(&self) -> Option<Range> {
         None
     }
 
@@ -717,8 +715,9 @@ impl LicenseSource {
 /// use std::sync::Arc;
 /// use std::any::Any;
 /// use tower_lsp_server::ls_types::{
-///     Uri, CompletionItem, CompletionTextEdit, Position, Range, TextEdit,
+///     CompletionItem, CompletionTextEdit, Position, Range, TextEdit,
 /// };
+/// use url::Url;
 ///
 /// struct MyFormatter;
 /// impl PackageNaming for MyFormatter {}
@@ -752,7 +751,7 @@ impl LicenseSource {
 ///     fn parse_manifest<'a>(
 ///         &'a self,
 ///         _content: &'a str,
-///         _uri: &'a Uri,
+///         _uri: &'a Url,
 ///     ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::error::Result<Box<dyn ParseResult>>> {
 ///         Box::pin(async move { todo!() })
 ///     }
@@ -955,7 +954,7 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     fn parse_manifest<'a>(
         &'a self,
         content: &'a str,
-        uri: &'a Uri,
+        uri: &'a url::Url,
     ) -> BoxFuture<'a, crate::error::Result<Box<dyn ParseResult>>>;
 
     /// Get the registry client for this ecosystem
@@ -1043,7 +1042,7 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
         &'a self,
         parse_result: &'a dyn ParseResult,
         position: Position,
-        uri: &'a Uri,
+        uri: &'a url::Url,
         versions: VersionData<'a>,
         content: &'a str,
     ) -> BoxFuture<'a, Vec<CodeAction>> {
@@ -1072,7 +1071,7 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
         &'a self,
         parse_result: &'a dyn ParseResult,
         versions: VersionData<'a>,
-        uri: &'a Uri,
+        uri: &'a url::Url,
         freshness: crate::freshness::FreshnessSettings,
         severities: crate::lsp_helpers::DiagnosticSeverities,
     ) -> BoxFuture<'a, Vec<Diagnostic>> {
@@ -1101,7 +1100,7 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     fn generate_document_links(
         &self,
         _parse_result: &dyn ParseResult,
-        _uri: &Uri,
+        _uri: &url::Url,
     ) -> Vec<DocumentLink> {
         Vec::new()
     }
@@ -1122,7 +1121,7 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
         parse_result: &'a dyn ParseResult,
         content: &'a str,
         versions: VersionData<'a>,
-        uri: &'a Uri,
+        uri: &'a url::Url,
         command_id: &'a str,
     ) -> BoxFuture<'a, Vec<CodeLens>> {
         Box::pin(async move {
@@ -1583,13 +1582,13 @@ mod tests {
                     std::sync::LazyLock::new(|| crate::PackageName::new("test"));
                 &NAME
             }
-            fn name_range(&self) -> tower_lsp_server::ls_types::Range {
-                tower_lsp_server::ls_types::Range::default()
+            fn name_range(&self) -> Range {
+                Range::default()
             }
             fn version_requirement(&self) -> Option<&crate::VersionReq> {
                 None
             }
-            fn version_range(&self) -> Option<tower_lsp_server::ls_types::Range> {
+            fn version_range(&self) -> Option<Range> {
                 None
             }
             fn source(&self) -> crate::parser::DependencySource {
@@ -1616,13 +1615,13 @@ mod tests {
                 std::sync::LazyLock::new(|| crate::PackageName::new("stub-dep"));
             &NAME
         }
-        fn name_range(&self) -> tower_lsp_server::ls_types::Range {
-            tower_lsp_server::ls_types::Range::default()
+        fn name_range(&self) -> Range {
+            Range::default()
         }
         fn version_requirement(&self) -> Option<&crate::VersionReq> {
             None
         }
-        fn version_range(&self) -> Option<tower_lsp_server::ls_types::Range> {
+        fn version_range(&self) -> Option<Range> {
             None
         }
         fn source(&self) -> crate::parser::DependencySource {
@@ -1637,7 +1636,7 @@ mod tests {
     /// only [`parse_manifest_blocking`] tests need it, so it carries nothing beyond a URI
     /// and a synthetic dependency count.
     struct StubParseResult {
-        uri: Uri,
+        uri: url::Url,
         dep_count: usize,
     }
 
@@ -1651,7 +1650,7 @@ mod tests {
             None
         }
 
-        fn uri(&self) -> &Uri {
+        fn uri(&self) -> &url::Url {
             &self.uri
         }
 
@@ -1692,7 +1691,7 @@ mod tests {
         fn parse_manifest<'a>(
             &'a self,
             _content: &'a str,
-            uri: &'a Uri,
+            uri: &'a url::Url,
         ) -> BoxFuture<'a, crate::error::Result<Box<dyn ParseResult>>> {
             Box::pin(async move {
                 assert!(!self.should_panic, "boom");

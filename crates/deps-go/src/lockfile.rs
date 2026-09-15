@@ -31,7 +31,7 @@ use deps_core::lockfile::{
     locate_lockfile_for_manifest, read_and_parse_lockfile,
 };
 use std::path::{Path, PathBuf};
-use tower_lsp_server::ls_types::Uri;
+use url::Url;
 
 /// go.sum file parser.
 ///
@@ -49,11 +49,11 @@ use tower_lsp_server::ls_types::Uri;
 /// ```no_run
 /// use deps_go::lockfile::GoSumParser;
 /// use deps_core::lockfile::LockFileProvider;
-/// use tower_lsp_server::ls_types::Uri;
+/// use url::Url;
 ///
 /// # async fn example() -> deps_core::error::Result<()> {
 /// let parser = GoSumParser;
-/// let manifest_uri = Uri::from_file_path("/path/to/go.mod").unwrap();
+/// let manifest_uri = Url::from_file_path("/path/to/go.mod").unwrap();
 ///
 /// if let Some(lockfile_path) = parser.locate_lockfile(&manifest_uri) {
 ///     let resolved = parser.parse_lockfile(&lockfile_path).await?;
@@ -70,7 +70,7 @@ impl GoSumParser {
 }
 
 impl LockFileProvider for GoSumParser {
-    fn locate_lockfile(&self, manifest_uri: &Uri) -> Option<PathBuf> {
+    fn locate_lockfile(&self, manifest_uri: &Url) -> Option<PathBuf> {
         locate_lockfile_for_manifest(manifest_uri, Self::LOCKFILE_NAMES)
     }
 
@@ -341,7 +341,7 @@ golang.org/x/sync v0.5.0/go.mod h1:RxMgew5V=
         std::fs::write(&workspace_lock, "").unwrap();
         std::fs::write(&member_manifest, "module member").unwrap();
 
-        let manifest_uri = Uri::from_file_path(&member_manifest).unwrap();
+        let manifest_uri = Url::from_file_path(&member_manifest).unwrap();
         let parser = GoSumParser;
 
         let located = parser.locate_lockfile(&manifest_uri);

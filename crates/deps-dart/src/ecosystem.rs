@@ -2,7 +2,8 @@
 
 use std::any::Any;
 use std::sync::Arc;
-use tower_lsp_server::ls_types::{CompletionItem, Position, Range, Uri};
+use tower_lsp_server::ls_types::{CompletionItem, Position, Range};
+use url::Url;
 
 use deps_core::{
     Ecosystem, ParseResult as ParseResultTrait, Registry, Result, completion::Completions,
@@ -88,7 +89,7 @@ impl Ecosystem for DartEcosystem {
     fn parse_manifest<'a>(
         &'a self,
         content: &'a str,
-        uri: &'a Uri,
+        uri: &'a Url,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Box<dyn ParseResultTrait>>> {
         Box::pin(async move {
             let result = crate::parser::parse_pubspec_yaml(content, uri)?;
@@ -297,7 +298,7 @@ mod tests {
         let path = "C:/test/pubspec.yaml";
         #[cfg(not(windows))]
         let path = "/test/pubspec.yaml";
-        let uri = Uri::from_file_path(path).unwrap();
+        let uri = Url::from_file_path(path).unwrap();
 
         let result = eco.parse_manifest(yaml, &uri).await.unwrap();
         assert_eq!(result.dependencies().len(), 1);
@@ -450,10 +451,11 @@ mod tests {
         let content = "name: my_app\ndependencies:\n  this_package_does_not_exist_12345: ^1.0.0\n";
         let uri = deps_core::test_util::test_uri("/test/pubspec.yaml");
         let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-        let position = parse_result.dependencies()[0]
+        let position: Position = parse_result.dependencies()[0]
             .version_range()
             .unwrap()
-            .start;
+            .start
+            .into();
         let freshness = deps_core::FreshnessSettings::default();
 
         let context = deps_core::completion::detect_completion_context(
@@ -491,10 +493,11 @@ mod tests {
         let content = "name: my_app\ndependencies:\n  http: ^1.0.0\n";
         let uri = deps_core::test_util::test_uri("/test/pubspec.yaml");
         let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-        let position = parse_result.dependencies()[0]
+        let position: Position = parse_result.dependencies()[0]
             .version_range()
             .unwrap()
-            .start;
+            .start
+            .into();
         let freshness = deps_core::FreshnessSettings::default();
 
         let context = deps_core::completion::detect_completion_context(

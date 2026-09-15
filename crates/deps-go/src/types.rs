@@ -1,8 +1,8 @@
 //! Types for Go module dependency management.
 
 use deps_core::parser::DependencySource;
+use deps_core::position::Range;
 use std::any::Any;
-use tower_lsp_server::ls_types::Range;
 
 /// A dependency from a go.mod file.
 #[non_exhaustive]
@@ -185,9 +185,9 @@ deps_core::impl_metadata!(GoMetadata {
 mod tests {
     use super::*;
     use deps_core::ecosystem::Dependency;
+    use deps_core::position::Position;
     use deps_core::registry::{Metadata, Version};
     use std::assert_matches;
-    use tower_lsp_server::ls_types::Position;
 
     #[test]
     fn test_go_dependency_trait() {

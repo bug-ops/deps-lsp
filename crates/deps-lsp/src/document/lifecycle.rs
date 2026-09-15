@@ -88,8 +88,17 @@ pub async fn handle_document_open(
     client: Client,
     config: Arc<RwLock<DepsConfig>>,
 ) -> Result<JoinHandle<()>> {
+    // `from_lsp_uri` returning `None` (a URI shape `url::Url` rejects) is treated the
+    // same as "no ecosystem handles this URI" — see its own doc for why this happens.
+    let Some(domain_uri) = crate::lsp_types_interop::from_lsp_uri(&uri) else {
+        tracing::debug!("URI is not representable as a url::Url: {:?}", uri);
+        return Err(deps_core::error::DepsError::UnsupportedEcosystem(format!(
+            "{uri:?}"
+        )));
+    };
+
     // Find appropriate ecosystem for this URI
-    let ecosystem = match state.ecosystem_registry.for_uri(&uri) {
+    let ecosystem = match state.ecosystem_registry.for_uri(&domain_uri) {
         Some(e) => e,
         None => {
             tracing::debug!("No ecosystem handler for {:?}", uri);
@@ -109,15 +118,16 @@ pub async fn handle_document_open(
     );
 
     // Try to parse manifest (may fail for incomplete syntax)
-    let parse_result = deps_core::ecosystem::parse_manifest_blocking(&ecosystem, &content, &uri)
-        .await
-        .inspect_err(|e| {
-            tracing::debug!(
-                error = %e,
-                "Failed to parse manifest, storing document without parse result"
-            );
-        })
-        .ok();
+    let parse_result =
+        deps_core::ecosystem::parse_manifest_blocking(&ecosystem, &content, &domain_uri)
+            .await
+            .inspect_err(|e| {
+                tracing::debug!(
+                    error = %e,
+                    "Failed to parse manifest, storing document without parse result"
+                );
+            })
+            .ok();
 
     // Create document state (parse_result may be None)
     let mut doc_state = if let Some(pr) = parse_result {
@@ -191,9 +201,20 @@ async fn run_document_open_background_task(
 ) {
     tracing::debug!("background task started");
 
+    // `handle_document_open` already validated this exact `uri` converts successfully
+    // before spawning this task, so `None` here is unreachable in practice — handled
+    // defensively rather than unwrapped.
+    let Some(domain_uri) = crate::lsp_types_interop::from_lsp_uri(&uri) else {
+        tracing::warn!(
+            "URI is not representable as a url::Url, aborting fetch: {:?}",
+            uri
+        );
+        return;
+    };
+
     // Load resolved versions from lock file first (instant, no network)
     let (resolved_versions, resolved_version_candidates) =
-        load_resolved_versions(&uri, &state.lockfile_cache, ecosystem.as_ref()).await;
+        load_resolved_versions(&domain_uri, &state.lockfile_cache, ecosystem.as_ref()).await;
 
     // Update document state with resolved versions immediately
     if !resolved_versions.is_empty()
@@ -513,16 +534,25 @@ async fn parse_and_diff_manifest(
                 .unwrap_or_default()
         });
 
-    // Try to parse manifest (may fail for incomplete syntax)
-    let parse_result = deps_core::ecosystem::parse_manifest_blocking(ecosystem, content, uri)
-        .await
-        .inspect_err(|e| {
-            tracing::debug!(
-                error = %e,
-                "Failed to parse manifest, storing document without parse result"
-            );
-        })
-        .ok();
+    // Try to parse manifest (may fail for incomplete syntax, or for a URI shape
+    // `url::Url` rejects — both are treated the same as "no parse result").
+    let parse_result = match crate::lsp_types_interop::from_lsp_uri(uri) {
+        Some(domain_uri) => {
+            deps_core::ecosystem::parse_manifest_blocking(ecosystem, content, &domain_uri)
+                .await
+                .inspect_err(|e| {
+                    tracing::debug!(
+                        error = %e,
+                        "Failed to parse manifest, storing document without parse result"
+                    );
+                })
+                .ok()
+        }
+        None => {
+            tracing::debug!("URI is not representable as a url::Url: {:?}", uri);
+            None
+        }
+    };
 
     // Extract new dependency name -> version_requirement map for diff
     let new_deps: HashMap<PackageName, Vec<Option<VersionReq>>> = parse_result
@@ -735,8 +765,15 @@ pub(crate) async fn handle_document_change_guarded(
     client: Client,
     config: Arc<RwLock<DepsConfig>>,
 ) -> Result<Option<JoinHandle<()>>> {
-    // Find appropriate ecosystem for this URI
-    let ecosystem = match state.ecosystem_registry.for_uri(&uri) {
+    // Find appropriate ecosystem for this URI. `from_lsp_uri` returning `None` (a URI
+    // shape `url::Url` rejects) is treated the same as "no ecosystem handles this URI".
+    let Some(domain_uri) = crate::lsp_types_interop::from_lsp_uri(&uri) else {
+        tracing::debug!("URI is not representable as a url::Url: {:?}", uri);
+        return Err(deps_core::error::DepsError::UnsupportedEcosystem(format!(
+            "{uri:?}"
+        )));
+    };
+    let ecosystem = match state.ecosystem_registry.for_uri(&domain_uri) {
         Some(e) => e,
         None => {
             tracing::debug!("No ecosystem handler for {:?}", uri);
@@ -861,9 +898,20 @@ async fn run_document_change_task(
     // Small debounce delay
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
+    // `handle_document_change_guarded` already validated this exact `uri` converts
+    // successfully before spawning this task, so `None` here is unreachable in
+    // practice — handled defensively rather than unwrapped.
+    let Some(domain_uri) = crate::lsp_types_interop::from_lsp_uri(&uri) else {
+        tracing::warn!(
+            "URI is not representable as a url::Url, aborting fetch: {:?}",
+            uri
+        );
+        return;
+    };
+
     // Load resolved versions from lock file first (instant, no network)
     let (resolved_versions, resolved_version_candidates) =
-        load_resolved_versions(&uri, &state.lockfile_cache, ecosystem.as_ref()).await;
+        load_resolved_versions(&domain_uri, &state.lockfile_cache, ecosystem.as_ref()).await;
 
     // Update document state with resolved versions only
     // Do NOT touch cached_versions - they contain latest registry versions
@@ -1183,15 +1231,20 @@ pub async fn ensure_document_loaded(
         return false;
     }
 
-    // Check if we support this file type
-    if state.ecosystem_registry.for_uri(uri).is_none() {
+    // Check if we support this file type. `from_lsp_uri` returning `None` (a URI shape
+    // `url::Url` rejects) is treated the same as "no ecosystem handles this URI".
+    let Some(domain_uri) = crate::lsp_types_interop::from_lsp_uri(uri) else {
+        tracing::debug!("URI is not representable as a url::Url: {:?}", uri);
+        return false;
+    };
+    if state.ecosystem_registry.for_uri(&domain_uri).is_none() {
         tracing::debug!("Unsupported file type: {:?}", uri);
         return false;
     }
 
     // Load from disk
     tracing::info!("Loading document from disk (cold start): {:?}", uri);
-    let content = match load_document_from_disk(uri).await {
+    let content = match load_document_from_disk(&domain_uri).await {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!("Failed to load document {:?}: {}", uri, e);
@@ -1255,7 +1308,8 @@ mod tests {
         // runs in the same binary as `document/loader.rs`'s diffing test.
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let state = Arc::new(ServerState::new());
-        let uri = deps_core::test_util::test_uri("/test/over-ceiling/Cargo.toml");
+        let url = deps_core::test_util::test_uri("/test/over-ceiling/Cargo.toml");
+        let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
         let cap = deps_core::MAX_DEPENDENCIES_PER_DOCUMENT;
         let mut content = String::from("[dependencies]\n");
@@ -1264,7 +1318,7 @@ mod tests {
         }
 
         let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
-        let parse_result = deps_core::parse_manifest_blocking(&ecosystem, &content, &uri)
+        let parse_result = deps_core::parse_manifest_blocking(&ecosystem, &content, &url)
             .await
             .unwrap();
         assert_eq!(
@@ -1311,7 +1365,8 @@ mod tests {
         // on why this guard is needed here.
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let state = Arc::new(ServerState::new());
-        let uri = deps_core::test_util::test_uri("/test/at-ceiling/Cargo.toml");
+        let url = deps_core::test_util::test_uri("/test/at-ceiling/Cargo.toml");
+        let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
         let cap = deps_core::MAX_DEPENDENCIES_PER_DOCUMENT;
         let mut content = String::from("[dependencies]\n");
@@ -1320,7 +1375,7 @@ mod tests {
         }
 
         let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
-        let parse_result = deps_core::parse_manifest_blocking(&ecosystem, &content, &uri)
+        let parse_result = deps_core::parse_manifest_blocking(&ecosystem, &content, &url)
             .await
             .unwrap();
         assert_eq!(
@@ -1470,11 +1525,12 @@ mod tests {
             // `document/loader.rs`'s diffing test.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
 
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
-            let parse_result = ecosystem.parse_manifest(&content, &uri).await.unwrap();
+            let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
             let mut doc_state =
                 DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
             doc_state.set_version(Some(1));
@@ -1572,11 +1628,12 @@ mod tests {
             // `handlers::diagnostics` must not be what's saving this test; it's specifically
             // exercising the case that guard cannot help with (NuGet `.csproj`, a fresh
             // Cargo checkout without `Cargo.lock`, a lock-less `package.json`/`pyproject.toml`).
-            let uri = deps_core::test_util::test_uri("/test/no-lockfile/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/no-lockfile/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
 
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
-            let parse_result = ecosystem.parse_manifest(&content, &uri).await.unwrap();
+            let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
             let mut doc_state = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content.clone(),
@@ -1666,7 +1723,7 @@ mod tests {
         use std::path::Path;
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use tokio::sync::Barrier;
-        use tower_lsp_server::ls_types::{CodeLens, Diagnostic, InlayHint, Position, Range};
+        use tower_lsp_server::ls_types::{CodeLens, Diagnostic, InlayHint, Position};
 
         struct NoopFormatter;
         impl PackageNaming for NoopFormatter {}
@@ -1692,13 +1749,16 @@ mod tests {
             fn name(&self) -> &PackageName {
                 &self.name
             }
-            fn name_range(&self) -> Range {
-                Range::new(Position::new(0, 0), Position::new(0, 1))
+            fn name_range(&self) -> deps_core::position::Range {
+                deps_core::position::Range::new(
+                    deps_core::position::Position::new(0, 0),
+                    deps_core::position::Position::new(0, 1),
+                )
             }
             fn version_requirement(&self) -> Option<&VersionReq> {
                 Some(&self.version_requirement)
             }
-            fn version_range(&self) -> Option<Range> {
+            fn version_range(&self) -> Option<deps_core::position::Range> {
                 None
             }
             fn source(&self) -> deps_core::parser::DependencySource {
@@ -1710,7 +1770,7 @@ mod tests {
         }
 
         struct FakeParseResult {
-            uri: Uri,
+            uri: url::Url,
             dep: FakeDependency,
         }
         impl deps_core::ParseResult for FakeParseResult {
@@ -1720,7 +1780,7 @@ mod tests {
             fn workspace_root(&self) -> Option<&Path> {
                 None
             }
-            fn uri(&self) -> &Uri {
+            fn uri(&self) -> &url::Url {
                 &self.uri
             }
             fn as_any(&self) -> &dyn Any {
@@ -1793,7 +1853,7 @@ mod tests {
             fn parse_manifest<'a>(
                 &'a self,
                 _content: &'a str,
-                uri: &'a Uri,
+                uri: &'a url::Url,
             ) -> BoxFuture<'a, deps_core::Result<Box<dyn deps_core::ParseResult>>> {
                 let uri = uri.clone();
                 Box::pin(async move {
@@ -1826,7 +1886,7 @@ mod tests {
                 &'a self,
                 _parse_result: &'a dyn deps_core::ParseResult,
                 _versions: VersionData<'a>,
-                _uri: &'a Uri,
+                _uri: &'a url::Url,
                 _freshness: FreshnessSettings,
                 _severities: DiagnosticSeverities,
             ) -> BoxFuture<'a, Vec<Diagnostic>> {
@@ -1837,7 +1897,7 @@ mod tests {
                 _parse_result: &'a dyn deps_core::ParseResult,
                 _content: &'a str,
                 _versions: VersionData<'a>,
-                _uri: &'a Uri,
+                _uri: &'a url::Url,
                 _command_id: &'a str,
             ) -> BoxFuture<'a, Vec<CodeLens>> {
                 Box::pin(async move { vec![] })
@@ -1901,7 +1961,11 @@ mod tests {
             let (client, config) = crate::test_utils::test_helpers::create_test_client_and_config();
 
             let uris: Vec<Uri> = (0..N)
-                .map(|i| deps_core::test_util::test_uri(&format!("/test/pkg{i}/Cargo.toml")))
+                .map(|i| {
+                    crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(&format!(
+                        "/test/pkg{i}/Cargo.toml"
+                    )))
+                })
                 .collect();
 
             // Polls `state.documents` for as long as fetches are in flight, tracking the
@@ -2001,14 +2065,16 @@ mod tests {
 
     #[test]
     fn test_check_content_size_accepts_content_within_limit() {
-        let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let uri = crate::lsp_types_interop::to_lsp_uri(&url);
         let content = "a".repeat(MAX_FILE_SIZE as usize);
         assert!(check_content_size(&content, &uri).is_ok());
     }
 
     #[test]
     fn test_check_content_size_rejects_content_over_limit() {
-        let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let uri = crate::lsp_types_interop::to_lsp_uri(&url);
         let content = "a".repeat(MAX_FILE_SIZE as usize + 1);
         let result = check_content_size(&content, &uri);
         match result {
@@ -2033,14 +2099,15 @@ mod tests {
         // See the comment in `test_forced_refetch_total_failure_renders_lookup_failed_not_unknown_package` on why this guard is needed here.
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let state = Arc::new(ServerState::new());
-        let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
         let content1 = r#"[dependencies]
 serde = "1.0"
 anyhow = "1.0"
 "#;
         let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
-        let parse_result1 = ecosystem.parse_manifest(content1, &uri).await.unwrap();
+        let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
         let doc_state1 = DocumentState::new_from_parse_result(
             EcosystemId::Cargo,
             content1.to_string(),
@@ -2068,7 +2135,7 @@ anyhow = "1.0"
         let diff = DependencyDiff::compute(&old_deps, &new_deps);
         assert_eq!(diff.removed, vec![PackageName::new("anyhow")]);
 
-        let parse_result2 = ecosystem.parse_manifest(content2, &uri).await.unwrap();
+        let parse_result2 = ecosystem.parse_manifest(content2, &url).await.unwrap();
         let committed = commit_parsed_document(
             &uri,
             ecosystem.as_ref(),
@@ -2100,11 +2167,11 @@ anyhow = "1.0"
     async fn test_ensure_document_loaded_unsupported_file_check() {
         // Returns false for unknown file types (e.g., README.md)
         let state = Arc::new(ServerState::new());
-        let uri = deps_core::test_util::test_uri("/test/README.md");
+        let url = deps_core::test_util::test_uri("/test/README.md");
 
         // Verify ecosystem registry correctly identifies unsupported files
         assert!(
-            state.ecosystem_registry.for_uri(&uri).is_none(),
+            state.ecosystem_registry.for_uri(&url).is_none(),
             "README.md should not have an ecosystem handler"
         );
 
@@ -2120,8 +2187,8 @@ anyhow = "1.0"
         // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this
         // binary must hold it, not just document/loader.rs's own diffing test.
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;
-        let uri = deps_core::test_util::test_uri("/nonexistent/Cargo.toml");
-        let result = load_document_from_disk(&uri).await;
+        let url = deps_core::test_util::test_uri("/nonexistent/Cargo.toml");
+        let result = load_document_from_disk(&url).await;
 
         assert!(result.is_err(), "Should fail for missing files");
 
@@ -2147,17 +2214,18 @@ anyhow = "1.0"
             // `document/loader.rs`'s diffing test.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let content = r#"[dependencies]
 serde = "1.0"
 "#;
 
             let ecosystem = state
                 .ecosystem_registry
-                .for_uri(&uri)
+                .for_uri(&url)
                 .expect("Cargo ecosystem not found");
 
-            let parse_result = ecosystem.parse_manifest(content, &uri).await;
+            let parse_result = ecosystem.parse_manifest(content, &url).await;
             assert!(parse_result.is_ok());
 
             let doc_state = DocumentState::new_from_parse_result(
@@ -2177,7 +2245,8 @@ serde = "1.0"
             // See the comment in `test_document_parsing` on why this guard is needed here.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             // Invalid TOML that will fail parsing
             let content = r#"[dependencies
 serde = "1.0"
@@ -2185,11 +2254,11 @@ serde = "1.0"
 
             let ecosystem = state
                 .ecosystem_registry
-                .for_uri(&uri)
+                .for_uri(&url)
                 .expect("Cargo ecosystem not found");
 
             // Try to parse (will fail)
-            let parse_result = ecosystem.parse_manifest(content, &uri).await.ok();
+            let parse_result = ecosystem.parse_manifest(content, &url).await.ok();
             assert!(
                 parse_result.is_none(),
                 "Parsing should fail for invalid TOML"
@@ -2226,16 +2295,17 @@ serde = "1.0"
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             // Fast path: document already loaded, should return true without loading
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let content = r#"[dependencies]
 serde = "1.0""#;
 
             // Pre-populate state with document
             let ecosystem = state
                 .ecosystem_registry
-                .for_uri(&uri)
+                .for_uri(&url)
                 .expect("Cargo ecosystem");
-            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = ecosystem.parse_manifest(content, &url).await.unwrap();
             let doc_state = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content.to_string(),
@@ -2279,18 +2349,19 @@ serde = "1.0"
             fs::write(&cargo_toml_path, content).unwrap();
 
             let uri = Uri::from_file_path(&cargo_toml_path).unwrap();
+            let url = crate::lsp_types_interop::from_lsp_uri(&uri).unwrap();
 
             // Test that load_document_from_disk succeeds
-            let loaded_content = load_document_from_disk(&uri).await.unwrap();
+            let loaded_content = load_document_from_disk(&url).await.unwrap();
             assert_eq!(loaded_content, content);
 
             // Test that parsing succeeds
             let state = Arc::new(ServerState::new());
             let ecosystem = state
                 .ecosystem_registry
-                .for_uri(&uri)
+                .for_uri(&url)
                 .expect("Cargo ecosystem");
-            let parse_result = ecosystem.parse_manifest(&loaded_content, &uri).await;
+            let parse_result = ecosystem.parse_manifest(&loaded_content, &url).await;
             assert!(parse_result.is_ok(), "Should parse successfully");
 
             // These successful operations are the building blocks of ensure_document_loaded
@@ -2302,18 +2373,19 @@ serde = "1.0"
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             // Test that repeated loads are idempotent at the state level
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let content = r#"[dependencies]
 serde = "1.0""#;
 
             let ecosystem = state
                 .ecosystem_registry
-                .for_uri(&uri)
+                .for_uri(&url)
                 .expect("Cargo ecosystem");
 
             // Parse twice to simulate idempotent loads
-            let parse_result1 = ecosystem.parse_manifest(content, &uri).await.unwrap();
-            let parse_result2 = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let parse_result1 = ecosystem.parse_manifest(content, &url).await.unwrap();
+            let parse_result2 = ecosystem.parse_manifest(content, &url).await.unwrap();
 
             // First update
             let doc_state1 = DocumentState::new_from_parse_result(
@@ -2343,7 +2415,8 @@ serde = "1.0""#;
             use crate::test_utils::test_helpers::create_test_client_and_config;
 
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let oversized_content = "a".repeat(MAX_FILE_SIZE as usize + 1);
             let (client, config) = create_test_client_and_config();
 
@@ -2379,7 +2452,8 @@ serde = "1.0""#;
             use crate::test_utils::test_helpers::create_test_client_and_config;
 
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let content = r#"[dependencies]
 serde = "1.0"
 "#
@@ -2399,7 +2473,8 @@ serde = "1.0"
             use crate::test_utils::test_helpers::create_test_client_and_config;
 
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let oversized_content = "a".repeat(MAX_FILE_SIZE as usize + 1);
             let (client, config) = create_test_client_and_config();
 
@@ -2436,7 +2511,8 @@ serde = "1.0"
             use crate::test_utils::test_helpers::create_test_client_and_config;
 
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let original_content = r#"[dependencies]
 serde = "1.0"
 "#
@@ -2499,7 +2575,8 @@ serde = "1.0"
             state.set_inlay_hint_refresh_supported(true);
             state.set_code_lens_refresh_supported(true);
 
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let content = r#"[dependencies]
 serde = "1.0"
 "#
@@ -2539,7 +2616,8 @@ serde = "1.0"
             state.set_inlay_hint_refresh_supported(true);
             state.set_code_lens_refresh_supported(true);
 
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let original_content = r#"[dependencies]
 serde = "1.0"
 "#
@@ -2614,15 +2692,16 @@ tokio = "1.0"
             // is needed here.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/package.json");
+            let url = deps_core::test_util::test_uri("/test/package.json");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let content = r#"{"dependencies": {"express": "^4.18.0"}}"#;
 
             let ecosystem = state
                 .ecosystem_registry
-                .for_uri(&uri)
+                .for_uri(&url)
                 .expect("npm ecosystem not found");
 
-            let parse_result = ecosystem.parse_manifest(content, &uri).await;
+            let parse_result = ecosystem.parse_manifest(content, &url).await;
             assert!(parse_result.is_ok());
 
             let doc_state = DocumentState::new_from_parse_result(
@@ -2645,7 +2724,8 @@ tokio = "1.0"
             use crate::test_utils::test_helpers::create_test_client_and_config;
 
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/package.json");
+            let url = deps_core::test_util::test_uri("/test/package.json");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let original_content = r#"{"dependencies": {"express": "^4.18.0"}}"#.to_string();
             let (client, config) = create_test_client_and_config();
 
@@ -2712,7 +2792,8 @@ tokio = "1.0"
             use crate::test_utils::test_helpers::create_test_client_and_config;
 
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/package.json");
+            let url = deps_core::test_util::test_uri("/test/package.json");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let original_content = r#"{"dependencies": {"express": "^4.18.0"}}"#.to_string();
             let (client, config) = create_test_client_and_config();
 
@@ -2760,7 +2841,8 @@ tokio = "1.0"
             use std::sync::atomic::{AtomicBool, Ordering};
 
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/package.json");
+            let url = deps_core::test_util::test_uri("/test/package.json");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let original_content = r#"{"dependencies": {"express": "^4.18.0"}}"#.to_string();
             let (client, config) = create_test_client_and_config();
 
@@ -2834,7 +2916,8 @@ tokio = "1.0"
         #[tokio::test]
         async fn test_document_parsing() {
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/go.mod");
+            let url = deps_core::test_util::test_uri("/test/go.mod");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let content = r"module example.com/mymodule
 
 go 1.21
@@ -2844,10 +2927,10 @@ require github.com/gorilla/mux v1.8.0
 
             let ecosystem = state
                 .ecosystem_registry
-                .for_uri(&uri)
+                .for_uri(&url)
                 .expect("go ecosystem not found");
 
-            let parse_result = ecosystem.parse_manifest(content, &uri).await;
+            let parse_result = ecosystem.parse_manifest(content, &url).await;
             assert!(parse_result.is_ok());
 
             let doc_state = DocumentState::new_from_parse_result(

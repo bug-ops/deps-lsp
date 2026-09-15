@@ -16,7 +16,7 @@ use crate::types::{GoDependency, GoDirective};
 use deps_core::Result;
 use deps_core::lsp_helpers::{LineOffsetTable, byte_span_to_range};
 use regex::Regex;
-use tower_lsp_server::ls_types::Uri;
+use url::Url;
 
 /// Fixed declaration key for every [`GoParseResult::blocked_registries`] entry (#958) — see
 /// that field's doc for why a single `GOPROXY` declaration must always dedupe to one
@@ -34,7 +34,7 @@ pub struct GoParseResult {
     /// Minimum Go version from `go` directive
     pub go_version: Option<String>,
     /// Document URI
-    pub uri: Uri,
+    pub uri: Url,
     /// Every `$GOENV`-resolved `GOPROXY`/`GOPRIVATE`-bypass chain this parse implies (spec
     /// 034), ready for `GoRegistry::register_alternate`. Empty when `$GOENV` declares no
     /// override (US-005).
@@ -69,7 +69,7 @@ pub struct GoParseResult {
 ///
 /// Infallible by construction: unrecognized lines are skipped rather than erroring.
 /// Returns [`Result`] only to match the shared parser signature every ecosystem implements.
-pub fn parse_go_mod(content: &str, doc_uri: &Uri) -> Result<GoParseResult> {
+pub fn parse_go_mod(content: &str, doc_uri: &Url) -> Result<GoParseResult> {
     parse_go_mod_with_context(content, doc_uri, &GoParseContext::default())
 }
 
@@ -83,7 +83,7 @@ pub fn parse_go_mod(content: &str, doc_uri: &Uri) -> Result<GoParseResult> {
 /// Same as [`parse_go_mod`].
 pub fn parse_go_mod_with_context(
     content: &str,
-    doc_uri: &Uri,
+    doc_uri: &Url,
     ctx: &GoParseContext,
 ) -> Result<GoParseResult> {
     tracing::debug!(uri = ?doc_uri, "Parsing go.mod file");
@@ -393,9 +393,8 @@ deps_core::impl_parse_result!(
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn test_uri() -> Uri {
-        use std::str::FromStr;
-        Uri::from_str("file:///test/go.mod").unwrap()
+    fn test_uri() -> Url {
+        Url::parse("file:///test/go.mod").unwrap()
     }
 
     #[test]

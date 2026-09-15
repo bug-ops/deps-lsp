@@ -10,9 +10,10 @@ pub mod settings;
 
 use crate::types::GradleDependency;
 use deps_core::Result;
+use deps_core::position::{Position, Range};
 use regex::Captures;
 use std::collections::HashMap;
-use tower_lsp_server::ls_types::{Position, Range, Uri};
+use url::Url;
 
 pub use deps_core::lsp_helpers::LineOffsetTable;
 
@@ -137,7 +138,7 @@ pub struct GradleParseResult {
     /// Dependencies found in the file.
     pub dependencies: Vec<GradleDependency>,
     /// URI of the manifest this result was parsed from.
-    pub uri: Uri,
+    pub uri: Url,
     /// `Some((kept, total))` once the manifest declared more dependencies than
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
     /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
@@ -179,7 +180,7 @@ fn resolve_variable_ref(value: &str, properties: &HashMap<String, String>) -> Op
 ///
 /// Returns an error if the file's dedicated parser fails (e.g. malformed TOML for
 /// a version catalog).
-pub fn parse_gradle(content: &str, uri: &Uri) -> Result<GradleParseResult> {
+pub fn parse_gradle(content: &str, uri: &Url) -> Result<GradleParseResult> {
     let path = uri.path().to_string();
     let mut result = if path.ends_with("libs.versions.toml") {
         catalog::parse_version_catalog(content, uri)?
@@ -306,7 +307,7 @@ pub(crate) fn find_version_range(
 mod tests {
     use super::*;
 
-    fn make_uri(path: &str) -> Uri {
+    fn make_uri(path: &str) -> Url {
         deps_core::test_util::test_uri(path)
     }
 
@@ -449,7 +450,7 @@ mod tests {
         let manifest_path = temp_dir.path().join("build.gradle");
         let content = "dependencies {\n    implementation(\"com.example:lib:$serdeVersion\")\n}\n";
 
-        let file_uri = Uri::from_file_path(&manifest_path).unwrap();
+        let file_uri = Url::from_file_path(&manifest_path).unwrap();
         let path_part = file_uri.as_str().strip_prefix("file://").unwrap();
 
         // Positive control: a real `file:` URI must resolve the variable from the real
@@ -466,7 +467,7 @@ mod tests {
             "https://attacker.example",
             "file://attacker.example",
         ] {
-            let uri: Uri = format!("{prefix}{path_part}").parse().unwrap();
+            let uri: Url = format!("{prefix}{path_part}").parse().unwrap();
             let result = parse_gradle(content, &uri).unwrap();
             assert_eq!(
                 result.dependencies[0].version_req,

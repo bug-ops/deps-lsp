@@ -125,7 +125,9 @@ mod tests {
     #[tokio::test]
     async fn test_handle_inlay_hints_disabled_returns_empty() {
         let state = Arc::new(ServerState::new());
-        let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let uri = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+            "/test/Cargo.toml",
+        ));
         let config = InlayHintsConfig {
             enabled: false,
             up_to_date_text: "✅".to_string(),
@@ -149,7 +151,9 @@ mod tests {
     #[tokio::test]
     async fn test_handle_inlay_hints_missing_document() {
         let state = Arc::new(ServerState::new());
-        let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let uri = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+            "/test/Cargo.toml",
+        ));
         let config = InlayHintsConfig {
             enabled: true,
             up_to_date_text: "✅".to_string(),
@@ -198,9 +202,10 @@ mod tests {
                 hook: BlockingHook::InlayHints,
             }));
 
-        let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let uri = crate::lsp_types_interop::to_lsp_uri(&url);
         let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
-        let parse_result: Box<dyn ParseResult> = Box::new(MockParseResult { uri: uri.clone() });
+        let parse_result: Box<dyn ParseResult> = Box::new(MockParseResult { uri: url });
         let doc = crate::document::DocumentState::new_from_parse_result(
             EcosystemId::Cargo,
             content,
@@ -275,7 +280,8 @@ mod tests {
             // `document/loader.rs`'s diffing test.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let config = InlayHintsConfig {
                 enabled: true,
                 up_to_date_text: "✅".to_string(),
@@ -289,7 +295,7 @@ serde = "1.0.0"
             .to_string();
 
             let parse_result = ecosystem
-                .parse_manifest(&content, &uri)
+                .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
 
@@ -314,7 +320,9 @@ serde = "1.0.0"
         #[tokio::test]
         async fn test_handle_inlay_hints_no_parse_result() {
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+                "/test/Cargo.toml",
+            ));
             let config = InlayHintsConfig {
                 enabled: true,
                 up_to_date_text: "✅".to_string(),
@@ -344,7 +352,8 @@ serde = "1.0.0"
             // See the comment in `test_handle_inlay_hints` on why this guard is needed here.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let config = InlayHintsConfig {
                 enabled: true,
                 up_to_date_text: "OK".to_string(),
@@ -358,7 +367,7 @@ serde = "1.0.0"
             .to_string();
 
             let parse_result = ecosystem
-                .parse_manifest(&content, &uri)
+                .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
 
@@ -392,7 +401,8 @@ serde = "1.0.0"
             // See the comment in `test_handle_inlay_hints` on why this guard is needed here.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/package.json");
+            let url = deps_core::test_util::test_uri("/test/package.json");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let config = InlayHintsConfig {
                 enabled: true,
                 up_to_date_text: "✅".to_string(),
@@ -403,7 +413,7 @@ serde = "1.0.0"
             let content = r#"{"dependencies": {"express": "4.0.0"}}"#.to_string();
 
             let parse_result = ecosystem
-                .parse_manifest(&content, &uri)
+                .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
 
@@ -435,7 +445,8 @@ serde = "1.0.0"
         #[tokio::test]
         async fn test_handle_inlay_hints() {
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
+            let url = deps_core::test_util::test_uri("/test/pyproject.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let config = InlayHintsConfig {
                 enabled: true,
                 up_to_date_text: "✅".to_string(),
@@ -449,7 +460,7 @@ dependencies = ["requests>=2.0.0"]
             .to_string();
 
             let parse_result = ecosystem
-                .parse_manifest(&content, &uri)
+                .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
 

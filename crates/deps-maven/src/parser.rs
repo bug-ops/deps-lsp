@@ -9,11 +9,12 @@
 
 use crate::types::{MavenDependency, MavenScope};
 use deps_core::lsp_helpers::{LineOffsetTable, byte_span_to_range};
+use deps_core::position::Range;
 use deps_core::{DepsError, Result};
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use std::collections::HashMap;
-use tower_lsp_server::ls_types::{Range, Uri};
+use url::Url;
 
 /// Result of parsing a `pom.xml` file.
 #[non_exhaustive]
@@ -24,7 +25,7 @@ pub struct MavenParseResult {
     /// The `<properties>` section, for resolving `${...}` version placeholders.
     pub properties: HashMap<String, String>,
     /// URI of the manifest this result was parsed from.
-    pub uri: Uri,
+    pub uri: Url,
     /// `Some((kept, total))` once the manifest declared more dependencies than
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
     /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
@@ -61,7 +62,7 @@ struct DepAccum {
 /// # Errors
 ///
 /// Returns an error if the content is not well-formed XML.
-pub fn parse_pom_xml(content: &str, doc_uri: &Uri) -> Result<MavenParseResult> {
+pub fn parse_pom_xml(content: &str, doc_uri: &Url) -> Result<MavenParseResult> {
     let line_table = LineOffsetTable::new(content);
     let mut dependencies = Vec::new();
     let mut properties = HashMap::new();
@@ -347,12 +348,8 @@ mod tests {
 
     use std::assert_matches;
 
-    fn test_uri() -> Uri {
-        #[cfg(windows)]
-        let path = "C:/test/pom.xml";
-        #[cfg(not(windows))]
-        let path = "/test/pom.xml";
-        Uri::from_file_path(path).unwrap()
+    fn test_uri() -> Url {
+        deps_core::test_util::test_uri("/test/pom.xml")
     }
 
     #[test]

@@ -20,10 +20,10 @@ use deps_nuget::parser::{
 use deps_nuget::registry::parse_flat_container_for_bench;
 use deps_nuget::version::{compare_versions, is_prerelease, resolve_float, satisfies};
 use std::hint::black_box;
-use tower_lsp_server::ls_types::Uri;
+use url::Url;
 
-fn bench_uri() -> Uri {
-    Uri::from_file_path("/bench/App.csproj").unwrap()
+fn bench_uri() -> Url {
+    Url::from_file_path("/bench/App.csproj").unwrap()
 }
 
 /// Small `.csproj` with 5 `PackageReference` entries (attribute form).
@@ -121,7 +121,7 @@ fn bench_csproj_parsing(c: &mut Criterion) {
 }
 
 fn bench_directory_packages_props_parsing(c: &mut Criterion) {
-    let uri = Uri::from_file_path("/bench/Directory.Packages.props").unwrap();
+    let uri = Url::from_file_path("/bench/Directory.Packages.props").unwrap();
     let mut content = String::from("<Project>\n  <ItemGroup>\n");
     for i in 0..25 {
         content.push_str(&format!(
@@ -138,7 +138,7 @@ fn bench_directory_packages_props_parsing(c: &mut Criterion) {
 }
 
 fn bench_packages_config_parsing(c: &mut Criterion) {
-    let uri = Uri::from_file_path("/bench/packages.config").unwrap();
+    let uri = Url::from_file_path("/bench/packages.config").unwrap();
     let mut content = String::from("<packages>\n");
     for i in 0..25 {
         content.push_str(&format!(

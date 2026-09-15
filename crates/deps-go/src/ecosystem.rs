@@ -6,7 +6,8 @@
 use std::any::Any;
 use std::future::Future;
 use std::sync::Arc;
-use tower_lsp_server::ls_types::{CompletionItem, Position, Range, Uri};
+use tower_lsp_server::ls_types::{CompletionItem, Position, Range};
+use url::Url;
 
 use deps_core::{
     Ecosystem, ParseResult as ParseResultTrait, Registry, Result, completion::Completions,
@@ -146,7 +147,7 @@ impl Ecosystem for GoEcosystem {
     fn parse_manifest<'a>(
         &'a self,
         content: &'a str,
-        uri: &'a Uri,
+        uri: &'a Url,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Box<dyn ParseResultTrait>>> {
         Box::pin(async move {
             let result = crate::parser::parse_go_mod_with_context(content, uri, &self.context)?;
@@ -274,11 +275,12 @@ fn extract_prefix(line: &str, character: u32) -> &str {
 mod tests {
     use super::*;
     use crate::types::{GoDependency, GoDirective};
+    use deps_core::position::{Position as DomainPosition, Range as DomainRange};
     use deps_core::{
         Dependency, EcosystemConfig, PackageVersions, VersionData, parser::DependencySource,
     };
     use std::collections::HashMap;
-    use tower_lsp_server::ls_types::{InlayHintLabel, Position, Range};
+    use tower_lsp_server::ls_types::{InlayHintLabel, Position};
 
     fn pkg(s: &str) -> deps_core::PackageName {
         deps_core::PackageName::new(s)
@@ -288,13 +290,14 @@ mod tests {
     fn mock_dependency(name: &str, version: Option<&str>, line: u32) -> GoDependency {
         GoDependency {
             module_path: name.into(),
-            module_path_range: Range::new(
-                Position::new(line, 0),
-                Position::new(line, name.len() as u32),
+            module_path_range: DomainRange::new(
+                DomainPosition::new(line, 0),
+                DomainPosition::new(line, name.len() as u32),
             ),
             version: version.map(Into::into),
-            version_range: version
-                .map(|_| Range::new(Position::new(line, 0), Position::new(line, 10))),
+            version_range: version.map(|_| {
+                DomainRange::new(DomainPosition::new(line, 0), DomainPosition::new(line, 10))
+            }),
             directive: GoDirective::Require,
             indirect: false,
             source: deps_core::parser::DependencySource::Registry,
@@ -304,7 +307,7 @@ mod tests {
     /// Mock parse result for testing
     struct MockParseResult {
         dependencies: Vec<GoDependency>,
-        uri: Uri,
+        uri: Url,
     }
 
     /// A dependency on `line`, with a `version_range` there so position-based lookup
@@ -312,9 +315,15 @@ mod tests {
     fn dep_with_source(name: &str, source: DependencySource, line: u32) -> GoDependency {
         GoDependency {
             module_path: pkg(name),
-            module_path_range: Range::new(Position::new(line, 0), Position::new(line, 0)),
+            module_path_range: DomainRange::new(
+                DomainPosition::new(line, 0),
+                DomainPosition::new(line, 0),
+            ),
             version: None,
-            version_range: Some(Range::new(Position::new(line, 0), Position::new(line, 10))),
+            version_range: Some(DomainRange::new(
+                DomainPosition::new(line, 0),
+                DomainPosition::new(line, 10),
+            )),
             directive: GoDirective::Require,
             indirect: false,
             source,
@@ -333,7 +342,7 @@ mod tests {
             None
         }
 
-        fn uri(&self) -> &Uri {
+        fn uri(&self) -> &Url {
             &self.uri
         }
 
@@ -529,7 +538,7 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = GoEcosystem::new(cache);
         let dep = mock_dependency("github.com/gin-gonic/gin", Some("v1.9"), 0);
-        let position = dep.version_range.unwrap().start;
+        let position = dep.version_range.unwrap().start.into();
         let parse_result = MockParseResult {
             dependencies: vec![dep],
             uri: deps_core::test_util::test_uri("/test/go.mod"),
@@ -578,7 +587,7 @@ mod tests {
         let ecosystem = GoEcosystem::with_context(registry, GoParseContext::default());
 
         let dep = mock_dependency("github.com/nonexistent/package12345", Some("v1.0"), 0);
-        let position = dep.version_range.unwrap().start;
+        let position = dep.version_range.unwrap().start.into();
         let parse_result = MockParseResult {
             dependencies: vec![dep],
             uri: deps_core::test_util::test_uri("/test/go.mod"),
@@ -637,7 +646,7 @@ mod tests {
 
         // Test that we respect the display cap, not just some loose upper bound.
         let dep = mock_dependency("github.com/gin-gonic/gin", Some("v1.0"), 0);
-        let position = dep.version_range.unwrap().start;
+        let position = dep.version_range.unwrap().start.into();
         let parse_result = MockParseResult {
             dependencies: vec![dep],
             uri: deps_core::test_util::test_uri("/test/go.mod"),
@@ -794,6 +803,8 @@ mod tests {
             )
             .await;
 
+        let ls_uri: tower_lsp_server::ls_types::Uri = uri.as_str().parse().unwrap();
+
         // Actions are registry-derived "update to version" REFACTOR edits, one per
         // candidate version; exactly one is marked preferred (the highest matching).
         assert!(
@@ -802,7 +813,7 @@ mod tests {
                     .edit
                     .as_ref()
                     .and_then(|edit| edit.changes.as_ref())
-                    .and_then(|changes| changes.get(&uri))
+                    .and_then(|changes| changes.get(&ls_uri))
                     .is_some_and(|edits| edits.iter().any(|e| e.new_text.contains("v1.10.0")))
             }),
             "expected an action whose edit updates the dependency to v1.10.0, got: {actions:?}"
@@ -1001,7 +1012,7 @@ require github.com/gin-gonic/gin v1.9.1
             },
             1,
         );
-        let alternate_position = alternate_dep.version_range.unwrap().start;
+        let alternate_position = alternate_dep.version_range.unwrap().start.into();
         let parse_result = MockParseResult {
             dependencies: vec![registry_dep, alternate_dep],
             uri: deps_core::test_util::test_uri("/test/go.mod"),
@@ -1039,7 +1050,7 @@ require github.com/gin-gonic/gin v1.9.1
             },
             0,
         );
-        let position = dep.version_range.unwrap().start;
+        let position = dep.version_range.unwrap().start.into();
         let parse_result = MockParseResult {
             dependencies: vec![dep],
             uri: deps_core::test_util::test_uri("/test/go.mod"),
@@ -1094,7 +1105,7 @@ require github.com/gin-gonic/gin v1.9.1
             },
             0,
         );
-        let position = dep.version_range.unwrap().start;
+        let position = dep.version_range.unwrap().start.into();
         let parse_result = MockParseResult {
             dependencies: vec![dep],
             uri: deps_core::test_util::test_uri("/test/go.mod"),

@@ -1,7 +1,7 @@
 //! Swift/SPM dependency types.
 
 use deps_core::parser::DependencySource;
-use tower_lsp_server::ls_types::Range;
+use deps_core::position::Range;
 
 /// Parsed dependency from Package.swift with position tracking.
 ///
@@ -153,9 +153,9 @@ deps_core::impl_metadata!(SwiftPackage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::position::Position;
     use deps_core::{Dependency, Metadata, Version};
     use std::assert_matches;
-    use tower_lsp_server::ls_types::Position;
 
     #[test]
     fn test_swift_dependency_registry() {

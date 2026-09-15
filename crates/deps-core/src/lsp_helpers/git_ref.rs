@@ -5,7 +5,7 @@
 //! defining them locally.
 
 use super::LineOffsetTable;
-use tower_lsp_server::ls_types::Range;
+use crate::position::Range;
 use yaml_rust2::parser::Tag;
 use yaml_rust2::scanner::{Marker, TScalarStyle};
 
@@ -446,8 +446,8 @@ pub fn byte_span_to_range(
     end: usize,
 ) -> Range {
     Range::new(
-        table.byte_offset_to_position(content, start),
-        table.byte_offset_to_position(content, end),
+        table.byte_offset_to_position(content, start).into(),
+        table.byte_offset_to_position(content, end).into(),
     )
 }
 

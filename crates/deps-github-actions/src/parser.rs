@@ -26,8 +26,8 @@ use deps_core::lsp_helpers::{
 };
 use deps_core::parser::DependencySource;
 use deps_core::yaml_walk::{FrameKind, FrameStack, ScalarPosition};
-use deps_core::{DepsError, Result};
-use tower_lsp_server::ls_types::{Range, Uri};
+use deps_core::{DepsError, Range, Result};
+use url::Url;
 use yaml_rust2::parser::{Event, MarkedEventReceiver, Parser};
 use yaml_rust2::scanner::Marker;
 
@@ -676,7 +676,7 @@ fn build_dependency(
 /// assert_eq!(result.dependencies.len(), 1);
 /// assert_eq!(result.dependencies[0].name(), "actions/checkout");
 /// ```
-pub fn parse_workflow_yaml(content: &str, uri: &Uri) -> Result<GithubActionsParseResult> {
+pub fn parse_workflow_yaml(content: &str, uri: &Url) -> Result<GithubActionsParseResult> {
     if let Err(depth) =
         deps_core::check_yaml_nesting_depth(content, deps_core::MAX_YAML_NESTING_DEPTH)
     {
@@ -759,8 +759,8 @@ pub fn parse_workflow_yaml(content: &str, uri: &Uri) -> Result<GithubActionsPars
 /// directory carve-out (and its own tests) for a near-hypothetical file. Should such a
 /// workflow exist, [`parse_workflow_yaml`]'s "requires a top-level `runs:` key" guard
 /// below would misclassify it and drop its `uses:` steps until renamed.
-fn is_action_manifest_filename(uri: &Uri) -> bool {
-    let path = uri.path().as_str();
+fn is_action_manifest_filename(uri: &Url) -> bool {
+    let path = uri.path();
     let filename = path.rsplit('/').next().unwrap_or(path);
     filename == "action.yml" || filename == "action.yaml"
 }
@@ -772,7 +772,7 @@ mod tests {
     use std::assert_matches;
     use yaml_rust2::scanner::TScalarStyle;
 
-    fn test_uri() -> Uri {
+    fn test_uri() -> Url {
         deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml")
     }
 
@@ -1748,7 +1748,7 @@ mod tests {
     // confirm that already holds for `action.yml`'s own grammar; only routing
     // (`ecosystem.rs`) needed a change to reach this parser with such a file.
 
-    fn action_test_uri() -> Uri {
+    fn action_test_uri() -> Url {
         deps_core::test_util::test_uri("/repo/.github/actions/my-action/action.yml")
     }
 

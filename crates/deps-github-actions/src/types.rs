@@ -1,7 +1,8 @@
 //! GitHub Actions dependency and version types.
 
 use deps_core::parser::DependencySource;
-use tower_lsp_server::ls_types::{Range, Uri};
+use deps_core::position::Range;
+use url::Url;
 
 /// How a `uses:` step's ref is pinned, driving requirement synthesis and edit shape.
 ///
@@ -153,7 +154,7 @@ pub struct GithubActionsParseResult {
     /// filter on `version_range()`/`source()` as usual).
     pub dependencies: Vec<GithubActionsDependency>,
     /// URI of the parsed workflow file.
-    pub uri: Uri,
+    pub uri: Url,
     /// `Some((kept, total))` once the manifest declared more dependencies than
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
     /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
@@ -173,8 +174,7 @@ deps_core::impl_parse_result!(
 mod tests {
     use super::*;
     use deps_core::registry::Version;
-    use deps_core::{Dependency, ParseResult};
-    use tower_lsp_server::ls_types::Position;
+    use deps_core::{Dependency, ParseResult, Position};
 
     fn range() -> Range {
         Range::new(Position::new(0, 0), Position::new(0, 10))
@@ -261,6 +261,6 @@ mod tests {
             dependency_truncation: None,
         };
         assert_eq!(result.dependencies().len(), 1);
-        assert!(result.uri().path().as_str().ends_with("ci.yml"));
+        assert!(result.uri().path().ends_with("ci.yml"));
     }
 }

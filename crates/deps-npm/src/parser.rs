@@ -10,7 +10,7 @@ use deps_core::json_ast::{JsonAst, JsonSection};
 use deps_core::json_helpers::string_valued_entries;
 use deps_core::lsp_helpers::LineOffsetTable;
 use serde_json::Value;
-use tower_lsp_server::ls_types::Uri;
+use url::Url;
 
 /// Result of parsing a package.json file.
 ///
@@ -21,7 +21,7 @@ pub struct NpmParseResult {
     /// Dependencies found across all `package.json` sections.
     pub dependencies: Vec<NpmDependency>,
     /// URI of the manifest this result was parsed from.
-    pub uri: Uri,
+    pub uri: Url,
     /// Every `.npmrc`-resolved alternate registry this parse's dependencies reference,
     /// deduplicated (spec FR-002–004) — fed to `NpmRegistry::register_alternate` by
     /// `NpmEcosystem::parse_manifest`, the one place a per-document `.npmrc` resolution and
@@ -71,20 +71,20 @@ deps_core::impl_parse_result!(
 ///
 /// ```no_run
 /// use deps_npm::parser::parse_package_json;
-/// use tower_lsp_server::ls_types::Uri;
+/// use url::Url;
 ///
 /// let json = r#"{
 ///   "dependencies": {
 ///     "express": "^4.18.2"
 ///   }
 /// }"#;
-/// let uri = Uri::from_file_path("/project/package.json").unwrap();
+/// let uri = Url::from_file_path("/project/package.json").unwrap();
 ///
 /// let result = parse_package_json(json, &uri).unwrap();
 /// assert_eq!(result.dependencies.len(), 1);
 /// assert_eq!(result.dependencies[0].name, "express");
 /// ```
-pub fn parse_package_json(content: &str, uri: &Uri) -> Result<NpmParseResult> {
+pub fn parse_package_json(content: &str, uri: &Url) -> Result<NpmParseResult> {
     parse_package_json_with_context(content, uri, &NpmParseContext::default())
 }
 
@@ -99,7 +99,7 @@ pub fn parse_package_json(content: &str, uri: &Uri) -> Result<NpmParseResult> {
 /// Same as [`parse_package_json`].
 pub fn parse_package_json_with_context(
     content: &str,
-    uri: &Uri,
+    uri: &Url,
     ctx: &NpmParseContext,
 ) -> Result<NpmParseResult> {
     let root: Value = deps_core::parse_json_checked(content.as_bytes())?;
@@ -148,23 +148,26 @@ pub fn parse_package_json_with_context(
         }
     }
 
-    // FR-002: a non-`file:` URI (or one `Uri::to_file_path` cannot resolve) has no directory to
+    // FR-002: a non-`file:` URI (or one `Url::to_file_path` cannot resolve) has no directory to
     // walk `.npmrc`/pnpm-workspace discovery from — falls back to the empty `NpmConfig`, which
     // resolves every dependency to `DependencySource::Registry` (NFR-005: byte-identical to
     // pre-feature behavior), rather than failing the whole parse. Also the manifest directory
     // spec 046's catalog resolution walks up from (S3: `None` here is what makes a non-`file:`
     // URI land on `CatalogOutcome::NoWorkspaceFile` rather than skipping resolution).
     //
-    // Implementation-critique S2: `Uri::to_file_path` does **not** check the URI's scheme (its
-    // own doc says so) and, on non-Windows, ignores the authority/host entirely — it just
-    // decodes whatever path component is present. Left unguarded, `untitled:package.json`
-    // (VS Code's untitled-buffer form, path "package.json") would resolve `manifest_dir` to a
-    // *relative* path, and `find_workspace_file`/`.npmrc` discovery would then probe the LSP
-    // server process's own CWD instead of the workspace the document notionally belongs to; a
-    // `file://attacker.example/repo/package.json` URI would likewise resolve against a real
-    // local path despite carrying a remote host (#1090). Both `.npmrc` registry resolution and
-    // the catalog gate share this one `manifest_dir`, so gating it once here via the same
-    // scheme+host+absoluteness guard `deps-core`'s lock file discovery uses closes both.
+    // Implementation-critique S2 (originally written against `ls_types::Uri`, whose
+    // `to_file_path` does **not** check scheme and, on non-Windows, ignores the
+    // authority/host entirely — see this file's `tests` module doc comments for the exact
+    // divergence flagged to team-lead, and empirically verified by security review, during
+    // the issue #1071 `url::Url` migration): `url::Url::to_file_path` already refuses a
+    // non-empty, non-`localhost` host on its own, but resolving through
+    // `deps_core::lockfile::resolve_manifest_file_path` also makes the scheme check explicit
+    // rather than relying solely on `to_file_path`'s internal validation — left unguarded,
+    // `untitled:package.json` (VS Code's untitled-buffer form, path "package.json") would
+    // resolve `manifest_dir` to a *relative* path, and `.npmrc`/pnpm-workspace discovery would
+    // then probe the LSP server process's own CWD instead of the workspace the document
+    // notionally belongs to (#1090). Both `.npmrc` registry resolution and the catalog gate
+    // share this one `manifest_dir`, so gating it once here via the shared guard closes both.
     let manifest_dir = deps_core::lockfile::resolve_manifest_file_path(uri)
         .and_then(|path| path.parent().map(std::path::Path::to_path_buf));
 
@@ -368,10 +371,10 @@ fn parse_npm_alias(value: &str) -> Option<NpmAlias> {
 mod tests {
     use super::*;
 
+    use deps_core::Range;
     use std::assert_matches;
-    use tower_lsp_server::ls_types::Range;
 
-    fn test_uri() -> Uri {
+    fn test_uri() -> Url {
         deps_core::test_util::test_uri("/test/package.json")
     }
 
@@ -929,7 +932,7 @@ mod tests {
         )
         .unwrap();
         let manifest_path = root.path().join("package.json");
-        let uri = Uri::from_file_path(&manifest_path).unwrap();
+        let uri = Url::from_file_path(&manifest_path).unwrap();
 
         let json = r#"{"dependencies": {"express": "^4.18.2", "@myorg/internal-lib": "^2.0.0"}}"#;
         let result = parse_package_json_with_context(json, &uri, &all_policy()).unwrap();
@@ -979,7 +982,7 @@ mod tests {
         )
         .unwrap();
         let manifest_path = root.path().join("package.json");
-        let uri = Uri::from_file_path(&manifest_path).unwrap();
+        let uri = Url::from_file_path(&manifest_path).unwrap();
 
         let json = r#"{"dependencies": {"my-lib": "npm:@myorg/internal@^1.0.0"}}"#;
         let result = parse_package_json_with_context(json, &uri, &all_policy()).unwrap();
@@ -1012,7 +1015,7 @@ mod tests {
         )
         .unwrap();
         let manifest_path = root.path().join("package.json");
-        let uri = Uri::from_file_path(&manifest_path).unwrap();
+        let uri = Url::from_file_path(&manifest_path).unwrap();
 
         let json = r#"{"dependencies": {"@myorg/internal-lib": "^2.0.0"}}"#;
         let result = parse_package_json_with_context(json, &uri, &all_policy()).unwrap();
@@ -1036,7 +1039,7 @@ mod tests {
         let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         let manifest_path = root.path().join("package.json");
-        let uri = Uri::from_file_path(&manifest_path).unwrap();
+        let uri = Url::from_file_path(&manifest_path).unwrap();
 
         let json = r#"{"dependencies": {"express": "^4.18.2"}}"#;
         let result = parse_package_json_with_context(json, &uri, &all_policy()).unwrap();
@@ -1067,7 +1070,7 @@ mod tests {
         )
         .unwrap();
         let manifest_path = root.path().join("package.json");
-        let uri = Uri::from_file_path(&manifest_path).unwrap();
+        let uri = Url::from_file_path(&manifest_path).unwrap();
 
         let json = r#"{"dependencies": {"express": "^4.18.2"}}"#;
         let ctx = NpmParseContext::default(); // default policy is `public_only`
@@ -1101,20 +1104,20 @@ mod tests {
 
     /// S3 regression: a manifest URI with no filesystem path at all (e.g. a bare virtual-host
     /// URI with nothing after the authority) has no directory to search for
-    /// `pnpm-workspace.yaml` from — `Uri::to_file_path` returns `None` for it (verified by the
-    /// `assert!` below, so this test fails loudly rather than silently degrading into an
-    /// ordinary no-workspace-file case if a future `Uri` version starts resolving it). The
+    /// `pnpm-workspace.yaml` from — `Url::to_file_path` returns `Err(())` for it (verified by
+    /// the `assert!` below, so this test fails loudly rather than silently degrading into an
+    /// ordinary no-workspace-file case if a future `url` version starts resolving it). The
     /// catalog post-pass must still land this on `CatalogOutcome::NoWorkspaceFile` — never
     /// leave the raw `catalog:` specifier in `version_req`, which would re-arm the destructive
     /// "Update all outdated dependencies" rewrite (spec §6's totality invariant).
     #[test]
     fn test_parse_with_context_uri_with_no_file_path_catalog_dep_has_no_requirement() {
-        let uri: Uri = "vscode-vfs://host"
+        let uri: Url = "vscode-vfs://host"
             .parse()
-            .expect("a non-file scheme must still parse as a valid Uri");
+            .expect("a non-file scheme must still parse as a valid Url");
         assert!(
-            uri.to_file_path().is_none(),
-            "test premise: this Uri must not resolve to any filesystem path"
+            uri.to_file_path().is_err(),
+            "test premise: this Url must not resolve to any filesystem path"
         );
 
         let json = r#"{"dependencies": {"react": "catalog:"}}"#;
@@ -1128,20 +1131,23 @@ mod tests {
         );
     }
 
-    /// A companion regression for a virtual-filesystem URI that *does* carry a path
-    /// component (`Uri::to_file_path` resolves it to `Some`, since — per its own doc — it
-    /// never checks the scheme). Implementation-critique S2: without the `scheme() == "file"`
-    /// guard added to `manifest_dir`'s computation, this would walk up to 64 real ancestors of
-    /// `/nonexistent-mount/repo` on *this* machine's filesystem — a `vscode-vfs://`/
-    /// `vscode-remote://` path that happens to mirror a real local path could then silently
-    /// resolve against an unrelated local `pnpm-workspace.yaml`/`.npmrc`. With the guard, the
-    /// non-`file` scheme collapses `manifest_dir` to `None` directly, with no filesystem probe
-    /// at all — deterministic, not merely "happens not to exist on this machine".
+    /// A companion regression for a virtual-filesystem URI that carries a path component.
+    /// Implementation-critique S2: without the `scheme() == "file"` guard added to
+    /// `manifest_dir`'s computation, a `Uri` type that resolves `to_file_path` without
+    /// checking the scheme would walk up to 64 real ancestors of `/nonexistent-mount/repo` on
+    /// *this* machine's filesystem — a `vscode-vfs://`/`vscode-remote://` path that happens to
+    /// mirror a real local path could then silently resolve against an unrelated local
+    /// `pnpm-workspace.yaml`/`.npmrc`. With the guard, the non-`file` scheme collapses
+    /// `manifest_dir` to `None` directly, with no filesystem probe at all — deterministic, not
+    /// merely "happens not to exist on this machine". (`url::Url::to_file_path` additionally
+    /// refuses this specific URI on its own, since its host `"host"` is neither absent nor
+    /// `localhost` — belt-and-suspenders with the explicit scheme guard, not a substitute for
+    /// it.)
     #[test]
     fn test_parse_with_context_virtual_fs_uri_scheme_guard_skips_filesystem_probe_entirely() {
-        let uri: Uri = "vscode-vfs://host/nonexistent-mount/repo/package.json"
+        let uri: Url = "vscode-vfs://host/nonexistent-mount/repo/package.json"
             .parse()
-            .expect("a non-file scheme must still parse as a valid Uri");
+            .expect("a non-file scheme must still parse as a valid Url");
 
         let json = r#"{"dependencies": {"react": "catalog:"}}"#;
         let result = parse_package_json_with_context(json, &uri, &all_policy()).unwrap();
@@ -1154,20 +1160,28 @@ mod tests {
         );
     }
 
-    /// S2 regression: `Uri::to_file_path` does not check scheme, so an `untitled:` URI (VS
-    /// Code's unsaved-buffer form, e.g. `untitled:package.json`) resolves to the *relative*
-    /// path `"package.json"`. Unguarded, `.parent()` of that is the empty relative path `""`,
-    /// and `find_workspace_file`/`.npmrc` discovery would then probe the **LSP server
-    /// process's own current working directory** instead of failing closed. The `is_absolute()`
-    /// filter must reject this before any ancestor walk starts.
+    /// S2 regression, originally written against `ls_types::Uri` (whose `to_file_path` does not
+    /// check scheme and resolves `untitled:package.json` — VS Code's unsaved-buffer form — to
+    /// the *relative* path `"package.json"`, making the explicit `scheme() == "file"` guard
+    /// load-bearing to keep `.parent()`/`find_workspace_file`/`.npmrc` discovery from probing
+    /// the **LSP server process's own current working directory**).
+    ///
+    /// FLAG (issue #1071 migration, url::Url substitution): `url::Url::to_file_path` treats
+    /// `untitled:package.json` as an opaque (non-hierarchical) URL and returns `Err(())`
+    /// unconditionally, regardless of scheme — so this premise no longer holds verbatim under
+    /// `url::Url`. The outcome this test guards (never resolving `manifest_dir` from a
+    /// non-`file` scheme) still holds, and by construction even more strongly (`Url` never
+    /// yields a *relative* `PathBuf` from `to_file_path` for any scheme), but this is a
+    /// behavioral divergence between the two URI types, not a pure mechanical substitution —
+    /// flagged to team-lead per T016 handoff instructions rather than silently reinterpreted.
     #[test]
     fn test_parse_with_context_untitled_scheme_relative_path_does_not_probe_process_cwd() {
-        let uri: Uri = "untitled:package.json"
+        let uri: Url = "untitled:package.json"
             .parse()
-            .expect("untitled: must still parse as a valid Uri");
+            .expect("untitled: must still parse as a valid Url");
         assert!(
-            uri.to_file_path().is_some_and(|p| p.is_relative()),
-            "test premise: to_file_path resolves this to a relative path, not None"
+            uri.to_file_path().is_err(),
+            "test premise (url::Url): to_file_path resolves this to Err, not a relative path"
         );
 
         let json = r#"{"dependencies": {"react": "catalog:"}}"#;
@@ -1183,18 +1197,38 @@ mod tests {
         assert_eq!(react.source, deps_core::parser::DependencySource::Registry);
     }
 
-    /// S2 regression, absolute-path form: a `file:` URI whose path is written relative (not
-    /// RFC 3986-conformant for `file:`, but not rejected by a generic URI parser either) must
-    /// not resolve `manifest_dir` to a relative directory either — the `is_absolute()` filter
-    /// applies regardless of scheme.
+    /// Deterministic pin (security review, `.local/handoff/2026-09-15T16-50-50-security.md`):
+    /// unlike bare `untitled:package.json` above (where `to_file_path` itself already fails,
+    /// so this test alone can't distinguish "blocked by the scheme guard" from "blocked
+    /// because `to_file_path` had nothing to resolve"), a hierarchical `untitled:` URI with an
+    /// absolute-looking path *does* resolve via `to_file_path` under `url::Url` — so this
+    /// dependency landing on `NoWorkspaceFile` here proves the explicit `scheme() == "file"`
+    /// check in `manifest_dir`'s computation is what blocks it, not an incidental parse failure.
     #[test]
-    fn test_parse_with_context_file_scheme_relative_path_is_rejected() {
-        let uri: Uri = "file:relative/path/package.json"
+    fn test_parse_with_context_untitled_scheme_hierarchical_path_blocked_by_scheme_guard() {
+        // `to_file_path` needs a drive-letter-shaped first path segment to resolve on
+        // Windows (it does not check the scheme — see the security handoff above), so
+        // the raw URI and expected path are platform-conditional to keep this test's
+        // actual premise (to_file_path succeeds, so the scheme guard is what blocks
+        // manifest_dir) true on both platforms.
+        #[cfg(windows)]
+        let (raw, expected): (&str, &std::path::Path) = (
+            "untitled:/C:/nonexistent/repo/package.json",
+            std::path::Path::new(r"C:\nonexistent\repo\package.json"),
+        );
+        #[cfg(not(windows))]
+        let (raw, expected): (&str, &std::path::Path) = (
+            "untitled:/nonexistent/repo/package.json",
+            std::path::Path::new("/nonexistent/repo/package.json"),
+        );
+        let uri: Url = raw
             .parse()
-            .expect("a relative-looking file: URI must still parse as a valid Uri");
-        assert!(
-            uri.to_file_path().is_some_and(|p| p.is_relative()),
-            "test premise: to_file_path resolves this to a relative path"
+            .expect("untitled: must still parse as a valid Url");
+        assert_eq!(
+            uri.to_file_path().as_deref(),
+            Ok(expected),
+            "test premise: to_file_path resolves this to a real absolute path, not Err — so \
+             the scheme guard, not to_file_path failing, must be what blocks manifest_dir"
         );
 
         let json = r#"{"dependencies": {"react": "catalog:"}}"#;
@@ -1208,8 +1242,7 @@ mod tests {
         );
     }
 
-    /// #1090 regression: `Uri::to_file_path` ignores the authority/host on non-Windows
-    /// entirely — the pre-fix hand-rolled `manifest_dir` guard only checked
+    /// #1090 regression: the pre-fix hand-rolled `manifest_dir` guard only checked
     /// `scheme() == "file"` and `is_absolute()`, missing a `file://` URI carrying a remote
     /// host. Uses a real on-disk `pnpm-workspace.yaml` that a bypass would have found, to
     /// prove the guard — not just an absent-directory coincidence — is what blocks it.
@@ -1225,9 +1258,9 @@ mod tests {
         )
         .unwrap();
         let manifest_path = root.path().join("package.json");
-        let file_uri = Uri::from_file_path(&manifest_path).unwrap();
+        let file_uri = Url::from_file_path(&manifest_path).unwrap();
         let path_part = file_uri.as_str().strip_prefix("file://").unwrap();
-        let uri: Uri = format!("file://attacker.example{path_part}")
+        let uri: Url = format!("file://attacker.example{path_part}")
             .parse()
             .unwrap();
 
@@ -1246,6 +1279,36 @@ mod tests {
         assert_eq!(react.source, deps_core::parser::DependencySource::Registry);
     }
 
+    /// S2 regression, originally written against `ls_types::Uri`: a `file:` URI whose path is
+    /// written relative (not RFC 3986-conformant for `file:`, but not rejected by a generic URI
+    /// parser either) must not resolve `manifest_dir` to a relative directory either — the
+    /// `is_absolute()` filter applies regardless of scheme.
+    ///
+    /// Reworked for the issue #1071 `url::Url` migration (security review, `.local/handoff/
+    /// 2026-09-15T16-50-50-security.md`): under `ls_types::Uri` (fluent_uri, RFC 3986-literal),
+    /// `"file:relative/path/package.json"` resolved to the *relative* `PathBuf`
+    /// `"relative/path/package.json"`. Under `url::Url` (WHATWG URL Standard), the same string
+    /// is normalized at parse time to `file:///relative/path/package.json` and root-anchored to
+    /// the *absolute* path `/relative/path/package.json` on Unix — verified not exploitable
+    /// (`url::Url::to_file_path` never yields a CWD-relative path or a `..`-traversal escape;
+    /// the old guard never restricted *which* absolute directory anyway). On Windows,
+    /// `url`'s file-path decoding additionally requires a drive-letter first segment, so this
+    /// same input instead yields `Err(())` there — the premise below is deliberately
+    /// platform-conditional rather than a bare `assert!` to avoid breaking Windows CI.
+    #[test]
+    fn test_parse_with_context_authority_less_file_uri_never_resolves_against_process_cwd() {
+        let uri: Url = "file:relative/path/package.json"
+            .parse()
+            .expect("a relative-looking file: URI must still parse as a valid Url");
+        if let Ok(path) = uri.to_file_path() {
+            assert_eq!(
+                path,
+                std::path::Path::new("/relative/path/package.json"),
+                "authority-less file: URIs must root-anchor, never resolve against the process CWD"
+            );
+        }
+    }
+
     #[test]
     fn test_parse_with_context_default_catalog_resolves_end_to_end() {
         // See the comment in `test_parse_with_context_top_level_override_and_scope_override_coexist`
@@ -1258,7 +1321,7 @@ mod tests {
         )
         .unwrap();
         let manifest_path = root.path().join("package.json");
-        let uri = Uri::from_file_path(&manifest_path).unwrap();
+        let uri = Url::from_file_path(&manifest_path).unwrap();
 
         let json = r#"{"dependencies": {"react": "catalog:"}}"#;
         let result = parse_package_json_with_context(json, &uri, &all_policy()).unwrap();
@@ -1285,7 +1348,7 @@ mod tests {
         )
         .unwrap();
         let manifest_path = root.path().join("package.json");
-        let uri = Uri::from_file_path(&manifest_path).unwrap();
+        let uri = Url::from_file_path(&manifest_path).unwrap();
 
         let content = r#"{"dependencies": {"react": "catalog:"}}"#;
         let result = parse_package_json_with_context(content, &uri, &all_policy()).unwrap();

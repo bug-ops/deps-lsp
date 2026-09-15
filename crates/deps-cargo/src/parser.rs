@@ -16,14 +16,14 @@
 //!
 //! ```no_run
 //! use deps_cargo::parse_cargo_toml;
-//! use tower_lsp_server::ls_types::Uri;
+//! use url::Url;
 //!
 //! let toml = r#"
 //! [dependencies]
 //! serde = "1.0"
 //! "#;
 //!
-//! let url = Uri::from_file_path("/test/Cargo.toml").unwrap();
+//! let url = Url::from_file_path("/test/Cargo.toml").unwrap();
 //! let result = parse_cargo_toml(toml, &url).unwrap();
 //! assert_eq!(result.dependencies.len(), 1);
 //! assert_eq!(result.dependencies[0].name, "serde");
@@ -34,12 +34,13 @@ use crate::config::{
 };
 use crate::types::{CargoDependency, CargoDependencySection, DependencySource};
 use deps_core::net_policy::RegistryAccessPolicy;
+use deps_core::position::Range;
 use deps_core::{DepsError, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use toml_span::value::{Table, Value};
-use tower_lsp_server::ls_types::{Range, Uri};
+use url::Url;
 
 pub use deps_core::lsp_helpers::LineOffsetTable;
 
@@ -55,7 +56,7 @@ pub struct CargoParseResult {
     /// Workspace root path if this is a workspace member
     pub workspace_root: Option<PathBuf>,
     /// Document URI
-    pub uri: Uri,
+    pub uri: Url,
     /// Every alternate-registry index this parse resolved (spec FR-002), paired with the
     /// credential (if any) to attach to requests against it.
     ///
@@ -98,7 +99,7 @@ pub struct CargoParseResult {
 ///
 /// ```no_run
 /// use deps_cargo::parse_cargo_toml;
-/// use tower_lsp_server::ls_types::Uri;
+/// use url::Url;
 ///
 /// let toml = r#"
 /// [dependencies]
@@ -106,11 +107,11 @@ pub struct CargoParseResult {
 /// tokio = { version = "1.0", features = ["full"] }
 /// "#;
 ///
-/// let url = Uri::from_file_path("/test/Cargo.toml").unwrap();
+/// let url = Url::from_file_path("/test/Cargo.toml").unwrap();
 /// let result = parse_cargo_toml(toml, &url).unwrap();
 /// assert_eq!(result.dependencies.len(), 2);
 /// ```
-pub fn parse_cargo_toml(content: &str, doc_uri: &Uri) -> Result<CargoParseResult> {
+pub fn parse_cargo_toml(content: &str, doc_uri: &Url) -> Result<CargoParseResult> {
     parse_cargo_toml_with_context(content, doc_uri, &CargoParseContext::default())
 }
 
@@ -188,7 +189,7 @@ impl CargoParseContext {
 /// - File path cannot be converted from URL
 pub fn parse_cargo_toml_with_context(
     content: &str,
-    doc_uri: &Uri,
+    doc_uri: &Url,
     ctx: &CargoParseContext,
 ) -> Result<CargoParseResult> {
     if let Err(depth) =
@@ -697,7 +698,7 @@ struct WorkspaceDiscovery {
 /// and — only while the workspace root is still unresolved — one for `Cargo.toml`'s
 /// existence (plus a read+parse on a hit). Once the workspace root is found, every further
 /// ancestor costs exactly one stat.
-fn discover_workspace(doc_uri: &Uri) -> Result<WorkspaceDiscovery> {
+fn discover_workspace(doc_uri: &Url) -> Result<WorkspaceDiscovery> {
     let path = deps_core::lockfile::resolve_manifest_file_path(doc_uri)
         .ok_or_else(|| DepsError::InvalidUri(format!("{doc_uri:?}")))?;
 
@@ -818,21 +819,21 @@ mod tests {
 
     use std::assert_matches;
 
-    fn test_url() -> Uri {
+    fn test_url() -> Url {
         #[cfg(windows)]
         let path = "C:/test/Cargo.toml";
         #[cfg(not(windows))]
         let path = "/test/Cargo.toml";
-        Uri::from_file_path(path).unwrap()
+        Url::from_file_path(path).unwrap()
     }
 
     /// Builds a URI whose path component is `manifest_path`'s real, absolute path, with the
-    /// `file://` prefix `Uri::from_file_path` would produce replaced by `prefix` (e.g.
+    /// `file://` prefix `Url::from_file_path` would produce replaced by `prefix` (e.g.
     /// `"https://attacker.example"` or `"file://attacker.example"`).
     ///
     /// Mirrors `deps_core::lockfile`'s test helper of the same name/purpose.
-    fn non_file_uri(prefix: &str, manifest_path: &std::path::Path) -> Uri {
-        let file_uri = Uri::from_file_path(manifest_path).unwrap();
+    fn non_file_uri(prefix: &str, manifest_path: &std::path::Path) -> Url {
+        let file_uri = Url::from_file_path(manifest_path).unwrap();
         let path_part = file_uri.as_str().strip_prefix("file://").unwrap();
         format!("{prefix}{path_part}").parse().unwrap()
     }
@@ -855,7 +856,7 @@ mod tests {
 
     /// #1090: a non-`file:`-scheme URI whose path component is non-empty and names a real,
     /// existing manifest must still be rejected — `https://example.com`'s empty path is the
-    /// one case `Uri::to_file_path` already refuses regardless of any scheme guard, so it
+    /// one case `Url::to_file_path` already refuses regardless of any scheme guard, so it
     /// doesn't prove `discover_workspace` checks the scheme at all. This uses a real on-disk
     /// `Cargo.toml` so a pre-fix (unguarded) `to_file_path` would have resolved it fine.
     #[test]
@@ -875,9 +876,10 @@ mod tests {
         );
     }
 
-    /// #1090: `ls-types`' `Uri::to_file_path` ignores the authority/host on non-Windows
-    /// entirely — a `file://` URI carrying a non-`localhost` host must still be rejected,
-    /// not resolved against the local filesystem as if the host were not there.
+    /// #1090: `url::Url::to_file_path` already refuses a non-empty, non-`localhost` host on
+    /// its own, but `resolve_manifest_file_path`'s explicit host check is kept as
+    /// defense-in-depth — this exercises it against a real on-disk manifest so a regression
+    /// in either layer is caught.
     #[test]
     fn test_find_workspace_root_rejects_remote_host_file_uri() {
         // See the comment in `test_find_workspace_root_rejects_non_file_uri` on why this
@@ -1274,7 +1276,7 @@ internal-crate = { version = "1.0", registry-index = "https://169.254.169.254/in
         let manifest_content =
             "[dependencies]\ninternal-crate = { version = \"1.0\", registry = \"my-corp\" }\n";
         std::fs::write(&manifest_path, manifest_content).unwrap();
-        let uri = Uri::from_file_path(&manifest_path).unwrap();
+        let uri = Url::from_file_path(&manifest_path).unwrap();
 
         let ctx = CargoParseContext::default();
         let result = parse_cargo_toml_with_context(manifest_content, &uri, &ctx).unwrap();
@@ -1418,7 +1420,7 @@ internal-crate = { version = "1.0", registry = "my-corp" }"#;
 
         let manifest_path = root.path().join("Cargo.toml");
         std::fs::write(&manifest_path, "").unwrap();
-        let uri = Uri::from_file_path(&manifest_path).unwrap();
+        let uri = Url::from_file_path(&manifest_path).unwrap();
 
         let toml = r#"[dependencies]
 internal-crate = { version = "1.0", registry = "my-corp" }"#;
@@ -1475,7 +1477,7 @@ serde = "1.0""#;
         let manifest_content = "[dependencies]\nserde = \"1.0\"\n";
         let manifest_path = root.path().join("Cargo.toml");
         std::fs::write(&manifest_path, manifest_content).unwrap();
-        let uri = Uri::from_file_path(&manifest_path).unwrap();
+        let uri = Url::from_file_path(&manifest_path).unwrap();
 
         let result = parse_cargo_toml(manifest_content, &uri).unwrap();
         assert_eq!(result.dependencies.len(), 1);
@@ -1512,7 +1514,7 @@ serde = "1.0""#;
         let manifest_content = "[dependencies]\nserde = \"1.0\"\n";
         let manifest_path = root.path().join("Cargo.toml");
         std::fs::write(&manifest_path, manifest_content).unwrap();
-        let uri = Uri::from_file_path(&manifest_path).unwrap();
+        let uri = Url::from_file_path(&manifest_path).unwrap();
 
         let result = parse_cargo_toml(manifest_content, &uri).unwrap();
         assert_eq!(result.dependencies.len(), 1);
@@ -1854,7 +1856,7 @@ tokio = "1.0"
         let opened_path = pkg_dir.join("Cargo.toml");
         std::fs::write(&opened_path, opened_content).unwrap();
 
-        let doc_uri = Uri::from_file_path(&opened_path).unwrap();
+        let doc_uri = Url::from_file_path(&opened_path).unwrap();
         let result = parse_cargo_toml(opened_content, &doc_uri).unwrap();
 
         assert_eq!(result.dependencies.len(), 1);
@@ -1901,7 +1903,7 @@ tokio = "1.0"
         let manifest_path = pkg_dir.join("Cargo.toml");
         std::fs::write(&manifest_path, manifest_content).unwrap();
 
-        let doc_uri = Uri::from_file_path(&manifest_path).unwrap();
+        let doc_uri = Url::from_file_path(&manifest_path).unwrap();
         let result = parse_cargo_toml(manifest_content, &doc_uri).unwrap();
 
         assert_eq!(result.workspace_root, Some(workspace_dir));
@@ -1946,7 +1948,7 @@ tokio = "1.0"
         let opened_path = current.join("Cargo.toml");
         std::fs::write(&opened_path, opened_content).unwrap();
 
-        let doc_uri = Uri::from_file_path(&opened_path).unwrap();
+        let doc_uri = Url::from_file_path(&opened_path).unwrap();
         let result = parse_cargo_toml(opened_content, &doc_uri).unwrap();
 
         assert_eq!(
@@ -1993,7 +1995,7 @@ tokio = "1.0"
         let opened_content = "[dependencies]\nserde = \"1.0\"\n";
         let opened_path = current.join("Cargo.toml");
         std::fs::write(&opened_path, opened_content).unwrap();
-        let doc_uri = Uri::from_file_path(&opened_path).unwrap();
+        let doc_uri = Url::from_file_path(&opened_path).unwrap();
 
         let _guard = deps_core::fs_probe::snapshot_guard();
         let (_, reads_before) = deps_core::fs_probe::snapshot();
@@ -2033,7 +2035,7 @@ tokio = "1.0"
         let opened_content = "[dependencies]\nserde = \"1.0\"\n";
         let opened_path = current.join("Cargo.toml");
         std::fs::write(&opened_path, opened_content).unwrap();
-        let doc_uri = Uri::from_file_path(&opened_path).unwrap();
+        let doc_uri = Url::from_file_path(&opened_path).unwrap();
 
         // Calls `discover_workspace` directly, not `parse_cargo_toml` — this bounds the
         // merged ancestor walk itself (parser.rs's own two stat sites), independent of
@@ -2069,7 +2071,7 @@ tokio = "1.0"
         let opened_content = "[dependencies]\nserde = \"1.0\"\n";
         let opened_path = project_dir.join("Cargo.toml");
         std::fs::write(&opened_path, opened_content).unwrap();
-        let doc_uri = Uri::from_file_path(&opened_path).unwrap();
+        let doc_uri = Url::from_file_path(&opened_path).unwrap();
 
         let unreadable_manifest = root.path().join("Cargo.toml");
         std::fs::write(&unreadable_manifest, "[workspace]\nmembers = [\"proj\"]\n").unwrap();

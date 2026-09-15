@@ -1,7 +1,7 @@
 //! Domain types for NuGet/.NET project dependencies.
 
+use deps_core::position::Range;
 use std::any::Any;
-use tower_lsp_server::ls_types::Range;
 
 /// A single `PackageReference` / `PackageVersion` / `package` entry from a manifest.
 #[non_exhaustive]
@@ -154,8 +154,8 @@ deps_core::impl_metadata!(PackageInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::position::Position;
     use std::assert_matches;
-    use tower_lsp_server::ls_types::Position;
 
     fn test_dep() -> NuGetDependency {
         NuGetDependency {

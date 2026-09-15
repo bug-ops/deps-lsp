@@ -45,7 +45,7 @@ use deps_core::lockfile::{
 };
 use std::path::{Path, PathBuf};
 use toml_span::value::Table;
-use tower_lsp_server::ls_types::Uri;
+use url::Url;
 
 /// PyPI lock file parser.
 ///
@@ -65,11 +65,11 @@ use tower_lsp_server::ls_types::Uri;
 /// ```no_run
 /// use deps_pypi::lockfile::PypiLockParser;
 /// use deps_core::lockfile::LockFileProvider;
-/// use tower_lsp_server::ls_types::Uri;
+/// use url::Url;
 ///
 /// # async fn example() -> deps_core::error::Result<()> {
 /// let parser = PypiLockParser;
-/// let manifest_uri = Uri::from_file_path("/path/to/pyproject.toml").unwrap();
+/// let manifest_uri = Url::from_file_path("/path/to/pyproject.toml").unwrap();
 ///
 /// if let Some(lockfile_path) = parser.locate_lockfile(&manifest_uri) {
 ///     let resolved = parser.parse_lockfile(&lockfile_path).await?;
@@ -86,7 +86,7 @@ impl PypiLockParser {
 }
 
 impl LockFileProvider for PypiLockParser {
-    fn locate_lockfile(&self, manifest_uri: &Uri) -> Option<PathBuf> {
+    fn locate_lockfile(&self, manifest_uri: &Url) -> Option<PathBuf> {
         locate_lockfile_for_manifest(manifest_uri, Self::LOCKFILE_NAMES)
     }
 
@@ -602,7 +602,7 @@ version = 1
         std::fs::write(&poetry_lock, "# poetry.lock").unwrap();
         std::fs::write(&uv_lock, "# uv.lock").unwrap();
 
-        let manifest_uri = Uri::from_file_path(&manifest_path).unwrap();
+        let manifest_uri = Url::from_file_path(&manifest_path).unwrap();
         let parser = PypiLockParser;
 
         let located = parser.locate_lockfile(&manifest_uri);
@@ -623,7 +623,7 @@ version = 1
         std::fs::write(&manifest_path, "[project]\nname = \"test\"").unwrap();
         std::fs::write(&uv_lock, "# uv.lock").unwrap();
 
-        let manifest_uri = Uri::from_file_path(&manifest_path).unwrap();
+        let manifest_uri = Url::from_file_path(&manifest_path).unwrap();
         let parser = PypiLockParser;
 
         let located = parser.locate_lockfile(&manifest_uri);
@@ -648,12 +648,12 @@ version = 1
         std::fs::write(&manifest_path, "[project]\nname = \"test\"").unwrap();
         std::fs::write(&poetry_lock, "# poetry.lock").unwrap();
 
-        // Built from `Uri::from_file_path` rather than `format!("untitled:{}", path.display())`
+        // Built from `Url::from_file_path` rather than `format!("untitled:{}", path.display())`
         // to stay valid on Windows: `Path::display()` there uses `\` separators and an
         // unescaped drive letter, neither of which is a legal URI path character.
-        let file_uri = Uri::from_file_path(&manifest_path).unwrap();
+        let file_uri = Url::from_file_path(&manifest_path).unwrap();
         let path_part = file_uri.as_str().strip_prefix("file://").unwrap();
-        let manifest_uri: Uri = format!("untitled:{path_part}").parse().unwrap();
+        let manifest_uri: Url = format!("untitled:{path_part}").parse().unwrap();
         let parser = PypiLockParser;
 
         assert_eq!(

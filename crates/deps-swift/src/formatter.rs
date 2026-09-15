@@ -386,7 +386,7 @@ mod tests {
 
     fn dep_with_url(name: &str, url: &str) -> SwiftDependency {
         use deps_core::parser::DependencySource;
-        use tower_lsp_server::ls_types::{Position, Range};
+        use deps_core::position::{Position, Range};
 
         SwiftDependency {
             name: name.into(),

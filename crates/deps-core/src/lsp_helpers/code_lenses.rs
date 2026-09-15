@@ -1,4 +1,4 @@
-use tower_lsp_server::ls_types::{CodeLens, Command, Position, Range, TextEdit, Uri};
+use tower_lsp_server::ls_types::{CodeLens, Command, Position, Range, TextEdit};
 
 use crate::ParseResult;
 #[cfg(test)]
@@ -70,7 +70,7 @@ pub struct PinNoun {
 /// use deps_core::{ConcreteVersion, Dependency, ParseResult, PackageName, VersionReq};
 /// use std::any::Any;
 /// use std::collections::HashMap;
-/// use tower_lsp_server::ls_types::{Position, Range, Uri};
+/// use tower_lsp_server::ls_types::{Position, Range};
 ///
 /// struct MockFormatter;
 /// impl PackageNaming for MockFormatter {}
@@ -91,27 +91,27 @@ pub struct PinNoun {
 /// struct MockDep {
 ///     name: PackageName,
 ///     version_req: VersionReq,
-///     version_range: Range,
-///     name_range: Range,
+///     version_range: deps_core::position::Range,
+///     name_range: deps_core::position::Range,
 /// }
 /// impl Dependency for MockDep {
 ///     fn name(&self) -> &PackageName { &self.name }
-///     fn name_range(&self) -> Range { self.name_range }
+///     fn name_range(&self) -> deps_core::position::Range { self.name_range }
 ///     fn version_requirement(&self) -> Option<&VersionReq> { Some(&self.version_req) }
-///     fn version_range(&self) -> Option<Range> { Some(self.version_range) }
+///     fn version_range(&self) -> Option<deps_core::position::Range> { Some(self.version_range) }
 ///     fn source(&self) -> deps_core::parser::DependencySource {
 ///         deps_core::parser::DependencySource::Registry
 ///     }
 ///     fn as_any(&self) -> &dyn Any { self }
 /// }
 ///
-/// struct MockParseResult { deps: Vec<MockDep>, uri: Uri }
+/// struct MockParseResult { deps: Vec<MockDep>, uri: url::Url }
 /// impl ParseResult for MockParseResult {
 ///     fn dependencies(&self) -> Vec<&dyn Dependency> {
 ///         self.deps.iter().map(|d| d as &dyn Dependency).collect()
 ///     }
 ///     fn workspace_root(&self) -> Option<&std::path::Path> { None }
-///     fn uri(&self) -> &Uri { &self.uri }
+///     fn uri(&self) -> &url::Url { &self.uri }
 ///     fn as_any(&self) -> &dyn Any { self }
 /// }
 ///
@@ -120,8 +120,8 @@ pub struct PinNoun {
 ///     deps: vec![MockDep {
 ///         name: PackageName::new("serde"),
 ///         version_req: VersionReq::new("1.0.0"),
-///         version_range: Range::new(Position::new(0, 9), Position::new(0, 14)),
-///         name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+///         version_range: Range::new(Position::new(0, 9), Position::new(0, 14)).into(),
+///         name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
 ///     }],
 ///     uri: deps_core::test_util::test_uri("/test/Cargo.toml"),
 /// };
@@ -156,6 +156,7 @@ pub fn collect_update_all_edits(
         let Some(version_range) = dep.version_range() else {
             continue;
         };
+        let version_range: Range = version_range.into();
 
         let normalized_name = formatter.normalize_package_name(dep.name());
         let Some(latest) = versions
@@ -304,11 +305,11 @@ pub fn dedup_overlapping_edits(mut edits: Vec<TextEdit>, caller: &str) -> Vec<Te
 /// impl OsvNaming for MockFormatter {}
 ///
 /// // An empty parse result yields no outdated dependencies, so no lens is generated.
-/// # struct EmptyParseResult { uri: tower_lsp_server::ls_types::Uri }
+/// # struct EmptyParseResult { uri: url::Url }
 /// # impl deps_core::ParseResult for EmptyParseResult {
 /// #     fn dependencies(&self) -> Vec<&dyn deps_core::Dependency> { vec![] }
 /// #     fn workspace_root(&self) -> Option<&std::path::Path> { None }
-/// #     fn uri(&self) -> &tower_lsp_server::ls_types::Uri { &self.uri }
+/// #     fn uri(&self) -> &url::Url { &self.uri }
 /// #     fn as_any(&self) -> &dyn std::any::Any { self }
 /// # }
 /// let parse_result = EmptyParseResult { uri: deps_core::test_util::test_uri("/test/Cargo.toml") };
@@ -331,7 +332,7 @@ pub fn generate_code_lenses(
     content: &str,
     versions: VersionData<'_>,
     formatter: &dyn EcosystemFormatter,
-    uri: &Uri,
+    uri: &url::Url,
     command_id: &str,
 ) -> Vec<CodeLens> {
     let edits = collect_update_all_edits(parse_result, content, versions, formatter);
@@ -351,7 +352,7 @@ pub fn generate_code_lenses(
         command: Some(Command {
             title,
             command: command_id.to_string(),
-            arguments: Some(vec![serde_json::json!({ "uri": uri })]),
+            arguments: Some(vec![serde_json::json!({ "uri": uri.as_str() })]),
         }),
         data: None,
     }]
@@ -385,7 +386,7 @@ pub fn generate_code_lenses(
 /// assert_eq!(lens.command.unwrap().title, "Pin 3 actions to commit SHA");
 /// ```
 #[must_use]
-pub fn build_pin_all_to_sha_lens(count: usize, noun: PinNoun, uri: &Uri) -> Option<CodeLens> {
+pub fn build_pin_all_to_sha_lens(count: usize, noun: PinNoun, uri: &url::Url) -> Option<CodeLens> {
     if count == 0 {
         return None;
     }
@@ -401,7 +402,7 @@ pub fn build_pin_all_to_sha_lens(count: usize, noun: PinNoun, uri: &Uri) -> Opti
         command: Some(Command {
             title,
             command: PIN_ALL_TO_SHA_COMMAND_ID.to_string(),
-            arguments: Some(vec![serde_json::json!({ "uri": uri })]),
+            arguments: Some(vec![serde_json::json!({ "uri": uri.as_str() })]),
         }),
         data: None,
     })
@@ -430,14 +431,14 @@ mod tests {
             fn name(&self) -> &PackageName {
                 &self.name
             }
-            fn name_range(&self) -> Range {
-                Range::default()
+            fn name_range(&self) -> crate::position::Range {
+                Range::default().into()
             }
             fn version_requirement(&self) -> Option<&VersionReq> {
                 self.version_req.as_ref()
             }
-            fn version_range(&self) -> Option<Range> {
-                self.version_range
+            fn version_range(&self) -> Option<crate::position::Range> {
+                self.version_range.map(Into::into)
             }
             fn source(&self) -> crate::parser::DependencySource {
                 crate::parser::DependencySource::Registry
@@ -449,7 +450,7 @@ mod tests {
 
         struct UaeParseResult {
             deps: Vec<UaeDep>,
-            uri: Uri,
+            uri: url::Url,
         }
 
         impl ParseResult for UaeParseResult {
@@ -459,7 +460,7 @@ mod tests {
             fn workspace_root(&self) -> Option<&std::path::Path> {
                 None
             }
-            fn uri(&self) -> &Uri {
+            fn uri(&self) -> &url::Url {
                 &self.uri
             }
             fn as_any(&self) -> &dyn Any {
@@ -1161,7 +1162,7 @@ mod tests {
                 fn parse_manifest<'a>(
                     &'a self,
                     _content: &'a str,
-                    _uri: &'a Uri,
+                    _uri: &'a url::Url,
                 ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Box<dyn ParseResult>>>
                 {
                     unimplemented!()
@@ -1207,7 +1208,7 @@ mod tests {
             let cached = std::collections::HashMap::new();
             let resolved = std::collections::HashMap::new();
             struct EmptyParseResult {
-                uri: Uri,
+                uri: url::Url,
             }
             impl ParseResult for EmptyParseResult {
                 fn dependencies(&self) -> Vec<&dyn crate::Dependency> {
@@ -1216,7 +1217,7 @@ mod tests {
                 fn workspace_root(&self) -> Option<&std::path::Path> {
                     None
                 }
-                fn uri(&self) -> &Uri {
+                fn uri(&self) -> &url::Url {
                     &self.uri
                 }
                 fn as_any(&self) -> &dyn std::any::Any {

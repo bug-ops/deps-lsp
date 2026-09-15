@@ -5,8 +5,9 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tower_lsp_server::ls_types::{
     CodeAction, CodeActionKind, Diagnostic, DiagnosticSeverity, Hover, HoverContents,
-    NumberOrString, Position, TextEdit, Uri, WorkspaceEdit,
+    NumberOrString, Position, TextEdit, WorkspaceEdit,
 };
+use url::Url;
 
 use deps_core::net_policy::RegistryAccessPolicy;
 use deps_core::{
@@ -206,7 +207,7 @@ impl Ecosystem for GitlabCiEcosystem {
     fn parse_manifest<'a>(
         &'a self,
         content: &'a str,
-        uri: &'a Uri,
+        uri: &'a Url,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Box<dyn ParseResultTrait>>> {
         Box::pin(async move {
             let mut result = crate::parser::parse_gitlab_ci_yaml(
@@ -272,7 +273,7 @@ impl Ecosystem for GitlabCiEcosystem {
         Box::pin(async move {
             let Some(dep) = request.parse_result.dependencies().into_iter().find(|d| {
                 d.version_range()
-                    .is_some_and(|r| deps_core::position_in_range(request.position, r))
+                    .is_some_and(|r| deps_core::position_in_range(request.position, r.into()))
             }) else {
                 return Completions::default();
             };
@@ -319,7 +320,7 @@ impl Ecosystem for GitlabCiEcosystem {
         &'a self,
         parse_result: &'a dyn ParseResultTrait,
         versions: deps_core::VersionData<'a>,
-        uri: &'a Uri,
+        uri: &'a Url,
         freshness: deps_core::FreshnessSettings,
         severities: deps_core::lsp_helpers::DiagnosticSeverities,
     ) -> deps_core::ecosystem::BoxFuture<'a, Vec<Diagnostic>> {
@@ -359,7 +360,7 @@ impl Ecosystem for GitlabCiEcosystem {
         &'a self,
         parse_result: &'a dyn ParseResultTrait,
         position: Position,
-        uri: &'a Uri,
+        uri: &'a Url,
         versions: deps_core::VersionData<'a>,
         content: &'a str,
     ) -> deps_core::ecosystem::BoxFuture<'a, Vec<CodeAction>> {
@@ -421,9 +422,9 @@ impl Ecosystem for GitlabCiEcosystem {
             let mut hover = base_hover?;
 
             let dep = parse_result.dependencies().into_iter().find(|d| {
-                deps_core::position_in_range(position, d.name_range())
+                deps_core::position_in_range(position, d.name_range().into())
                     || d.version_range()
-                        .is_some_and(|r| deps_core::position_in_range(position, r))
+                        .is_some_and(|r| deps_core::position_in_range(position, r.into()))
             });
             let Some(dep) = dep else {
                 return Some(hover);
@@ -575,7 +576,7 @@ fn unresolved_host_diagnostics(parse_result: &dyn ParseResultTrait) -> Vec<Diagn
                 HostRef::Literal(_) | HostRef::PolicyBlocked { .. } => return None,
             };
             Some(Diagnostic {
-                range: gl_dep.name_range,
+                range: gl_dep.name_range.into(),
                 severity: Some(DiagnosticSeverity::INFORMATION),
                 message,
                 code: Some(NumberOrString::String(
@@ -629,7 +630,7 @@ fn mutable_ref_pin_diagnostics(
                 // version span to anchor on or edit — anchor on the `project:` value
                 // itself, mirroring the FR-012 unresolved-host diagnostic's convention.
                 return Some(Diagnostic {
-                    range: gl_dep.name_range,
+                    range: gl_dep.name_range.into(),
                     severity: Some(severity),
                     message: format!(
                         "{name} project has no `ref:`; GitLab CI defaults to the project's \
@@ -696,7 +697,7 @@ fn mutable_ref_pin_diagnostics(
                 )
             };
             Some(Diagnostic {
-                range,
+                range: range.into(),
                 severity: Some(severity),
                 message,
                 code: Some(NumberOrString::String(
@@ -728,7 +729,7 @@ fn mutable_ref_pin_diagnostics(
 fn build_sha_pin_action(
     parse_result: &dyn ParseResultTrait,
     position: Position,
-    uri: &Uri,
+    uri: &Url,
     formatter: &GitlabCiFormatter,
 ) -> Option<CodeAction> {
     // Same lookup convention every other deps-lsp code action goes through (critic S2) —
@@ -752,14 +753,7 @@ fn build_sha_pin_action(
         .map(deps_core::VersionReq::as_str)?;
     let new_text = formatter.sha_pin_replacement_for(gl_dep.kind.endpoint(), &gl_dep.name, tag)?;
 
-    let mut changes = std::collections::HashMap::new();
-    changes.insert(
-        uri.clone(),
-        vec![TextEdit {
-            range: version_range,
-            new_text,
-        }],
-    );
+    let changes = deps_core::single_file_edit(uri, version_range.into(), new_text);
 
     Some(CodeAction {
         title: format!("Pin {} to commit SHA", gl_dep.name),
@@ -770,7 +764,7 @@ fn build_sha_pin_action(
         }),
         data: Some(serde_json::json!({
             "diagnostic_codes": [MUTABLE_REF_PIN_DIAGNOSTIC_CODE],
-            "diagnostic_range": version_range,
+            "diagnostic_range": tower_lsp_server::ls_types::Range::from(version_range),
         })),
         ..Default::default()
     })
@@ -796,7 +790,7 @@ fn build_sha_pin_action(
 async fn build_dynamic_component_pin_action(
     parse_result: &dyn ParseResultTrait,
     position: Position,
-    uri: &Uri,
+    uri: &Url,
     formatter: &GitlabCiFormatter,
     registry: &GitlabCiRegistry,
 ) -> Option<CodeAction> {
@@ -843,14 +837,7 @@ async fn build_dynamic_component_pin_action(
         }
     };
 
-    let mut changes = std::collections::HashMap::new();
-    changes.insert(
-        uri.clone(),
-        vec![TextEdit {
-            range: version_range,
-            new_text: resolved.sha,
-        }],
-    );
+    let changes = deps_core::single_file_edit(uri, version_range.into(), resolved.sha);
 
     Some(CodeAction {
         title: format!("Pin {} to commit SHA", gl_dep.name),
@@ -861,7 +848,7 @@ async fn build_dynamic_component_pin_action(
         }),
         data: Some(serde_json::json!({
             "diagnostic_codes": [MUTABLE_REF_PIN_DIAGNOSTIC_CODE],
-            "diagnostic_range": version_range,
+            "diagnostic_range": tower_lsp_server::ls_types::Range::from(version_range),
         })),
         ..Default::default()
     })
@@ -915,7 +902,7 @@ fn bulk_sha_pin_text_edit_for(
             let new_text =
                 formatter.sha_pin_replacement_for(gl_dep.kind.endpoint(), &gl_dep.name, tag)?;
             Some(TextEdit {
-                range: version_range,
+                range: version_range.into(),
                 new_text,
             })
         }
@@ -935,7 +922,7 @@ fn bulk_sha_pin_text_edit_for(
                 return None;
             }
             Some(TextEdit {
-                range: version_range,
+                range: version_range.into(),
                 new_text: resolved.sha,
             })
         }
@@ -1127,7 +1114,7 @@ mod tests {
     #[test]
     fn test_unresolved_host_diagnostics_distinguishes_capacity_refusal_from_unresolved() {
         let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
-        let range = tower_lsp_server::ls_types::Range::default();
+        let range = deps_core::position::Range::default();
         let make_dep = |host: HostRef| crate::types::GitlabCiDependency {
             name: "org/proj/comp".into(),
             name_range: range,
@@ -1319,7 +1306,7 @@ mod tests {
         NumberOrString::String(MUTABLE_REF_PIN_DIAGNOSTIC_CODE.into())
     }
 
-    async fn diagnostics_for(content: &str, uri: &Uri) -> Vec<Diagnostic> {
+    async fn diagnostics_for(content: &str, uri: &Url) -> Vec<Diagnostic> {
         let cache = Arc::new(HttpCache::new());
         let eco = GitlabCiEcosystem::new(cache);
         let parse_result = eco.parse_manifest(content, uri).await.unwrap();
@@ -1420,7 +1407,7 @@ mod tests {
             .unwrap()
             .start;
         assert!(
-            build_sha_pin_action(&parse_result, position, &uri, &formatter).is_none(),
+            build_sha_pin_action(&parse_result, position.into(), &uri, &formatter).is_none(),
             "a cold TagIndex must still withhold the quickfix even though the message \
              omits the suffix — the one accepted message/quickfix divergence"
         );
@@ -1551,11 +1538,16 @@ mod tests {
             .unwrap()
             .start;
 
-        let action = build_sha_pin_action(&parse_result, position, &uri, &formatter)
+        let action = build_sha_pin_action(&parse_result, position.into(), &uri, &formatter)
             .expect("expected a Pin-to-commit-SHA quickfix");
         assert!(action.title.contains("Pin") && action.title.contains("commit SHA"));
         let edit = action.edit.as_ref().unwrap();
-        let text_edits = edit.changes.as_ref().unwrap().get(&uri).unwrap();
+        let text_edits = edit
+            .changes
+            .as_ref()
+            .unwrap()
+            .get(&deps_core::to_ls_uri(&uri))
+            .unwrap();
         assert_eq!(text_edits.len(), 1);
         assert_eq!(text_edits[0].new_text, sha);
     }
@@ -1579,7 +1571,7 @@ mod tests {
             .unwrap()
             .start;
 
-        assert!(build_sha_pin_action(&parse_result, position, &uri, &formatter).is_none());
+        assert!(build_sha_pin_action(&parse_result, position.into(), &uri, &formatter).is_none());
     }
 
     /// Mirrors `deps_github_actions`'s identical guard: a `PinStyle::Branch` include must
@@ -1613,7 +1605,7 @@ mod tests {
             .unwrap()
             .start;
 
-        assert!(build_sha_pin_action(&parse_result, position, &uri, &formatter).is_none());
+        assert!(build_sha_pin_action(&parse_result, position.into(), &uri, &formatter).is_none());
     }
 
     // --- validation finding C3: always-mutable pin forms with no explicit ref/tag text ---
@@ -1824,15 +1816,16 @@ mod tests {
             .unwrap()
             .start;
 
-        let action0 = build_sha_pin_action(&parse_result, position0, &uri, &formatter)
+        let action0 = build_sha_pin_action(&parse_result, position0.into(), &uri, &formatter)
             .expect("expected a quickfix for the first include");
-        let action1 = build_sha_pin_action(&parse_result, position1, &uri, &formatter)
+        let action1 = build_sha_pin_action(&parse_result, position1.into(), &uri, &formatter)
             .expect("expected a quickfix for the second include");
 
         let edit0 = action0.edit.as_ref().unwrap();
         let edit1 = action1.edit.as_ref().unwrap();
-        assert_eq!(edit0.changes.as_ref().unwrap()[&uri][0].new_text, sha1);
-        assert_eq!(edit1.changes.as_ref().unwrap()[&uri][0].new_text, sha2);
+        let ls_uri = deps_core::to_ls_uri(&uri);
+        assert_eq!(edit0.changes.as_ref().unwrap()[&ls_uri][0].new_text, sha1);
+        assert_eq!(edit1.changes.as_ref().unwrap()[&ls_uri][0].new_text, sha2);
     }
 
     /// Validation Fix 2 regression, exercised at the actual quickfix-production boundary
@@ -1899,18 +1892,19 @@ mod tests {
             .unwrap()
             .start;
 
-        let action0 = build_sha_pin_action(&parse_result, position0, &uri, &formatter)
+        let action0 = build_sha_pin_action(&parse_result, position0.into(), &uri, &formatter)
             .expect("expected a quickfix for the project: include");
-        let action1 = build_sha_pin_action(&parse_result, position1, &uri, &formatter)
+        let action1 = build_sha_pin_action(&parse_result, position1.into(), &uri, &formatter)
             .expect("expected a quickfix for the component: include");
+        let ls_uri = deps_core::to_ls_uri(&uri);
 
         assert_eq!(
-            action0.edit.as_ref().unwrap().changes.as_ref().unwrap()[&uri][0].new_text,
+            action0.edit.as_ref().unwrap().changes.as_ref().unwrap()[&ls_uri][0].new_text,
             project_sha,
             "the project: include must resolve its own Tags-route SHA, not the component's"
         );
         assert_eq!(
-            action1.edit.as_ref().unwrap().changes.as_ref().unwrap()[&uri][0].new_text,
+            action1.edit.as_ref().unwrap().changes.as_ref().unwrap()[&ls_uri][0].new_text,
             component_sha,
             "the component: include must resolve its own Releases-route SHA, not the project's"
         );
@@ -1926,7 +1920,7 @@ mod tests {
         GitlabCiRegistry,
         GitlabCiFormatter,
         crate::types::GitlabCiParseResult,
-        Uri,
+        Url,
         Position,
     ) {
         let policy = Arc::new(deps_core::net_policy::RegistryAccessPolicy::default());
@@ -1958,9 +1952,9 @@ mod tests {
         );
         let dep = GitlabCiDependency {
             name,
-            name_range: range,
+            name_range: range.into(),
             version_req: Some(version_req.into()),
-            version_range: Some(range),
+            version_range: Some(range.into()),
             version_literal: None,
             source: deps_core::parser::DependencySource::AlternateRegistry {
                 index,
@@ -2032,7 +2026,8 @@ mod tests {
              it must actually exist",
         );
         assert_eq!(
-            action.edit.as_ref().unwrap().changes.as_ref().unwrap()[&uri][0].new_text,
+            action.edit.as_ref().unwrap().changes.as_ref().unwrap()[&deps_core::to_ls_uri(&uri)][0]
+                .new_text,
             sha
         );
     }
@@ -2064,7 +2059,8 @@ mod tests {
         .await
         .expect("expected a quickfix resolving ~latest to a concrete SHA");
         assert_eq!(
-            action.edit.as_ref().unwrap().changes.as_ref().unwrap()[&uri][0].new_text,
+            action.edit.as_ref().unwrap().changes.as_ref().unwrap()[&deps_core::to_ls_uri(&uri)][0]
+                .new_text,
             sha
         );
     }
@@ -2096,7 +2092,8 @@ mod tests {
         .await
         .expect("expected a quickfix resolving the partial pin to a concrete SHA");
         assert_eq!(
-            action.edit.as_ref().unwrap().changes.as_ref().unwrap()[&uri][0].new_text,
+            action.edit.as_ref().unwrap().changes.as_ref().unwrap()[&deps_core::to_ls_uri(&uri)][0]
+                .new_text,
             sha
         );
     }
@@ -2163,7 +2160,7 @@ mod tests {
     /// `DependencySource::CustomRegistry` rather than `AlternateRegistry`.
     #[test]
     fn test_sha_pin_quickfix_kind_classification_table() {
-        let range = tower_lsp_server::ls_types::Range::default();
+        let range = deps_core::position::Range::default();
         let routes: Arc<DashMap<String, crate::types::GitlabRoute>> = Arc::new(DashMap::new());
         routes.insert(
             "resolved-route".to_string(),
@@ -2647,8 +2644,8 @@ mod tests {
     /// YAML parser so `name_range`/`version_range`/`source` are exactly what the test wants,
     /// with no risk of a real parse resolving `source` to a live, network-reachable host.
     fn dispatch_test_dep(
-        name_range: tower_lsp_server::ls_types::Range,
-        version_range: tower_lsp_server::ls_types::Range,
+        name_range: deps_core::position::Range,
+        version_range: deps_core::position::Range,
         source: deps_core::parser::DependencySource,
     ) -> crate::types::GitlabCiDependency {
         crate::types::GitlabCiDependency {
@@ -2675,8 +2672,8 @@ mod tests {
         let version_range =
             tower_lsp_server::ls_types::Range::new(Position::new(2, 9), Position::new(2, 15));
         let dep = dispatch_test_dep(
-            name_range,
-            version_range,
+            name_range.into(),
+            version_range.into(),
             deps_core::parser::DependencySource::CustomRegistry {
                 url: "https://gitlab.example".into(),
             },
@@ -2711,8 +2708,8 @@ mod tests {
         let version_range =
             tower_lsp_server::ls_types::Range::new(Position::new(2, 9), Position::new(2, 15));
         let dep = dispatch_test_dep(
-            name_range,
-            version_range,
+            name_range.into(),
+            version_range.into(),
             deps_core::parser::DependencySource::CustomRegistry {
                 url: "https://gitlab.example".into(),
             },
@@ -2755,7 +2752,7 @@ mod tests {
         let source = deps_core::parser::DependencySource::CustomRegistry {
             url: "https://gitlab.example".into(),
         };
-        let dep = dispatch_test_dep(name_range, version_range, source.clone());
+        let dep = dispatch_test_dep(name_range.into(), version_range.into(), source.clone());
         let parse_result = crate::types::GitlabCiParseResult {
             dependencies: vec![dep],
             routes: vec![],
@@ -2792,8 +2789,8 @@ mod tests {
     /// used for an FR-011 test, since `CompletionContext::Version` is unreachable there
     /// regardless of FR-011 — see spec §9 P2/EC-017) but with `is_alias_occurrence: true`.
     fn alias_dispatch_test_dep(
-        name_range: tower_lsp_server::ls_types::Range,
-        version_range: tower_lsp_server::ls_types::Range,
+        name_range: deps_core::position::Range,
+        version_range: deps_core::position::Range,
         pin: Option<PinStyle>,
     ) -> crate::types::GitlabCiDependency {
         crate::types::GitlabCiDependency {
@@ -2820,7 +2817,7 @@ mod tests {
     #[test]
     fn test_sha_pin_quickfix_kind_withholds_for_alias_occurrence() {
         let formatter = GitlabCiFormatter::new(Arc::new(DashMap::new()), Arc::new(DashMap::new()));
-        let range = tower_lsp_server::ls_types::Range::default();
+        let range = deps_core::position::Range::default();
         let gl_dep = alias_dispatch_test_dep(range, range, Some(PinStyle::Tag));
         assert!(sha_pin_quickfix_kind(&gl_dep, &gl_dep, &formatter).is_none());
     }
@@ -2834,7 +2831,8 @@ mod tests {
             tower_lsp_server::ls_types::Range::new(Position::new(2, 9), Position::new(2, 13));
         let name_range =
             tower_lsp_server::ls_types::Range::new(Position::new(1, 4), Position::new(1, 12));
-        let gl_dep = alias_dispatch_test_dep(name_range, version_range, Some(PinStyle::Tag));
+        let gl_dep =
+            alias_dispatch_test_dep(name_range.into(), version_range.into(), Some(PinStyle::Tag));
         let parse_result = crate::types::GitlabCiParseResult {
             dependencies: vec![gl_dep],
             routes: vec![],
@@ -2874,7 +2872,8 @@ mod tests {
             tower_lsp_server::ls_types::Range::new(Position::new(1, 4), Position::new(1, 12));
         let version_range =
             tower_lsp_server::ls_types::Range::new(Position::new(2, 9), Position::new(2, 13));
-        let dep = alias_dispatch_test_dep(name_range, version_range, Some(PinStyle::Tag));
+        let dep =
+            alias_dispatch_test_dep(name_range.into(), version_range.into(), Some(PinStyle::Tag));
         let parse_result = crate::types::GitlabCiParseResult {
             dependencies: vec![dep],
             routes: vec![],
@@ -2911,7 +2910,8 @@ mod tests {
             tower_lsp_server::ls_types::Range::new(Position::new(1, 4), Position::new(1, 12));
         let version_range =
             tower_lsp_server::ls_types::Range::new(Position::new(2, 9), Position::new(2, 13));
-        let dep = alias_dispatch_test_dep(name_range, version_range, Some(PinStyle::Tag));
+        let dep =
+            alias_dispatch_test_dep(name_range.into(), version_range.into(), Some(PinStyle::Tag));
         let parse_result = crate::types::GitlabCiParseResult {
             dependencies: vec![dep],
             routes: vec![],
@@ -2938,8 +2938,10 @@ mod tests {
     #[test]
     fn test_collect_pin_all_to_sha_edits_withholds_for_alias_occurrence() {
         let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
-        let range =
-            tower_lsp_server::ls_types::Range::new(Position::new(0, 0), Position::new(0, 4));
+        let range = deps_core::position::Range::new(
+            deps_core::position::Position::new(0, 0),
+            deps_core::position::Position::new(0, 4),
+        );
         let gl_dep = alias_dispatch_test_dep(range, range, Some(PinStyle::Tag));
         let parse_result = crate::types::GitlabCiParseResult {
             dependencies: vec![gl_dep],

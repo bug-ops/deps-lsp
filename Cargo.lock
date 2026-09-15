@@ -624,6 +624,7 @@ dependencies = [
  "tower-lsp-server",
  "tracing",
  "tracing-subscriber",
+ "url",
  "urlencoding",
 ]
 
@@ -731,8 +732,8 @@ dependencies = [
  "deps-swift",
  "futures",
  "tokio",
- "tower-lsp-server",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -748,6 +749,7 @@ dependencies = [
  "tokio-test",
  "tower-lsp-server",
  "tracing",
+ "url",
  "yaml-rust2",
 ]
 
@@ -810,6 +812,7 @@ dependencies = [
  "toml-span",
  "tower-lsp-server",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -835,6 +838,7 @@ dependencies = [
  "tower-lsp-server",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
@@ -947,6 +951,7 @@ dependencies = [
  "tokio-test",
  "tower-lsp-server",
  "tracing",
+ "url",
  "urlencoding",
 ]
 

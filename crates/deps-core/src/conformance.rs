@@ -43,7 +43,7 @@
 
 use std::any::Any;
 
-use tower_lsp_server::ls_types::{CompletionItem, Uri};
+use tower_lsp_server::ls_types::CompletionItem;
 
 use crate::lockfile::LockFileProvider;
 use crate::lsp_helpers::EcosystemFormatter;
@@ -316,7 +316,7 @@ pub fn assert_locate_lockfile_not_found(
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let manifest_path = temp_dir.path().join(manifest_name);
     std::fs::write(&manifest_path, manifest_content).expect("write manifest");
-    let manifest_uri = Uri::from_file_path(&manifest_path).expect("valid file uri");
+    let manifest_uri = url::Url::from_file_path(&manifest_path).expect("valid file uri");
 
     assert!(
         parser.locate_lockfile(&manifest_uri).is_none(),
@@ -339,7 +339,7 @@ pub fn assert_locate_lockfile_same_directory(
     let lock_path = temp_dir.path().join(lock_name);
     std::fs::write(&manifest_path, manifest_content).expect("write manifest");
     std::fs::write(&lock_path, lock_content).expect("write lockfile");
-    let manifest_uri = Uri::from_file_path(&manifest_path).expect("valid file uri");
+    let manifest_uri = url::Url::from_file_path(&manifest_path).expect("valid file uri");
 
     assert_eq!(
         parser.locate_lockfile(&manifest_uri),
@@ -663,7 +663,7 @@ impl<T: ?Sized> NotInherent for T {}
 /// #     fn manifest_filenames(&self) -> &[&'static str] { &["fake.toml"] }
 /// #     fn registry(&self) -> Arc<dyn deps_core::Registry> { self.registry.clone() }
 /// #     fn formatter(&self) -> &dyn deps_core::lsp_helpers::EcosystemFormatter { unimplemented!() }
-/// #     fn parse_manifest<'a>(&'a self, _content: &'a str, _uri: &'a tower_lsp_server::ls_types::Uri)
+/// #     fn parse_manifest<'a>(&'a self, _content: &'a str, _uri: &'a url::Url)
 /// #         -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Box<dyn deps_core::ParseResult>>> {
 /// #         unimplemented!()
 /// #     }
@@ -973,10 +973,10 @@ macro_rules! formatter_conformance {
 /// mod example {
 /// # use deps_core::lockfile::{LockFileProvider, ResolvedPackages, locate_lockfile_for_manifest, read_and_parse_lockfile};
 /// # use std::path::{Path, PathBuf};
-/// # use tower_lsp_server::ls_types::Uri;
+/// # use url::Url;
 /// struct FakeLockParser;
 /// impl LockFileProvider for FakeLockParser {
-///     fn locate_lockfile(&self, manifest_uri: &Uri) -> Option<PathBuf> {
+///     fn locate_lockfile(&self, manifest_uri: &Url) -> Option<PathBuf> {
 ///         locate_lockfile_for_manifest(manifest_uri, &["fake.lock", "fake-alt.lock"])
 ///     }
 ///     fn parse_lockfile<'a>(&'a self, path: &'a Path)

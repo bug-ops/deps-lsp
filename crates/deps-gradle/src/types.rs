@@ -1,6 +1,6 @@
 //! Domain types for Gradle dependencies.
 
-use tower_lsp_server::ls_types::Range;
+use deps_core::position::Range;
 
 pub use deps_maven::MavenVersion as GradleVersion;
 
@@ -34,8 +34,8 @@ deps_core::impl_dependency!(GradleDependency {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::position::Position;
     use std::assert_matches;
-    use tower_lsp_server::ls_types::Position;
 
     fn test_dep() -> GradleDependency {
         GradleDependency {

@@ -1,7 +1,8 @@
 //! GitLab CI dependency and version types.
 
 use deps_core::parser::DependencySource;
-use tower_lsp_server::ls_types::{Range, Uri};
+use deps_core::position::Range;
+use url::Url;
 
 use crate::host::GitlabHost;
 
@@ -280,7 +281,7 @@ pub struct GitlabCiParseResult {
     /// before this result is returned (spec §3.2/§4.6's downgrade pass).
     pub routes: Vec<(String, GitlabRoute)>,
     /// URI of the parsed file.
-    pub uri: Uri,
+    pub uri: Url,
     /// `Some((kept, total))` once the manifest declared more dependencies than
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
     /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
@@ -309,7 +310,7 @@ impl deps_core::ParseResult for GitlabCiParseResult {
         None
     }
 
-    fn uri(&self) -> &Uri {
+    fn uri(&self) -> &Url {
         &self.uri
     }
 
@@ -329,9 +330,9 @@ impl deps_core::ParseResult for GitlabCiParseResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::position::Position;
     use deps_core::registry::Version;
     use deps_core::{Dependency, ParseResult};
-    use tower_lsp_server::ls_types::Position;
 
     fn range() -> Range {
         Range::new(Position::new(0, 0), Position::new(0, 10))
@@ -411,7 +412,7 @@ mod tests {
             blocked_registries: Vec::new(),
         };
         assert_eq!(result.dependencies().len(), 1);
-        assert!(result.uri().path().as_str().ends_with(".gitlab-ci.yml"));
+        assert!(result.uri().path().ends_with(".gitlab-ci.yml"));
     }
 
     #[test]

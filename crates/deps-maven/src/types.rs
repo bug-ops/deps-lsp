@@ -1,7 +1,7 @@
 //! Domain types for Maven/pom.xml dependencies.
 
+use deps_core::position::Range;
 use std::any::Any;
-use tower_lsp_server::ls_types::Range;
 
 /// A single `<dependency>` declaration parsed from a `pom.xml`.
 #[non_exhaustive]
@@ -243,8 +243,8 @@ impl deps_core::Metadata for ArtifactInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::position::Position;
     use std::assert_matches;
-    use tower_lsp_server::ls_types::Position;
 
     fn test_dep() -> MavenDependency {
         MavenDependency {

@@ -1,6 +1,6 @@
 //! Domain types for Bundler dependencies.
 
-use tower_lsp_server::ls_types::Range;
+use deps_core::position::Range;
 
 /// Parsed dependency from Gemfile with position tracking.
 #[non_exhaustive]
@@ -191,8 +191,8 @@ deps_core::impl_dependency!(BundlerDependency {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::position::Position;
     use std::assert_matches;
-    use tower_lsp_server::ls_types::Position;
 
     fn create_test_dependency(source: DependencySource) -> BundlerDependency {
         BundlerDependency {

@@ -8,14 +8,14 @@
 
 use deps_maven::parse_pom_xml;
 use std::assert_matches;
-use tower_lsp_server::ls_types::Uri;
+use url::Url;
 
-fn fixture_uri(name: &str) -> Uri {
+fn fixture_uri(name: &str) -> Url {
     #[cfg(windows)]
     let path = format!("C:/test/{name}");
     #[cfg(not(windows))]
     let path = format!("/test/{name}");
-    Uri::from_file_path(path).unwrap()
+    Url::from_file_path(path).unwrap()
 }
 
 fn load_fixture(name: &str) -> String {

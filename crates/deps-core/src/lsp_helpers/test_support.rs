@@ -179,7 +179,7 @@ impl OsvNaming for RejectingFormatter {}
 
 pub(crate) struct MockParseResult {
     pub(crate) deps: Vec<MockDep>,
-    pub(crate) uri: Uri,
+    pub(crate) uri: url::Url,
 }
 
 impl ParseResult for MockParseResult {
@@ -189,7 +189,7 @@ impl ParseResult for MockParseResult {
     fn workspace_root(&self) -> Option<&std::path::Path> {
         None
     }
-    fn uri(&self) -> &Uri {
+    fn uri(&self) -> &url::Url {
         &self.uri
     }
     fn as_any(&self) -> &dyn Any {
@@ -202,7 +202,7 @@ impl ParseResult for MockParseResult {
 /// homogeneous `Vec<MockDep>` can't express.
 pub(crate) struct MockMixedParseResult {
     pub(crate) deps: Vec<Box<dyn Dependency>>,
-    pub(crate) uri: Uri,
+    pub(crate) uri: url::Url,
 }
 
 impl ParseResult for MockMixedParseResult {
@@ -212,7 +212,7 @@ impl ParseResult for MockMixedParseResult {
     fn workspace_root(&self) -> Option<&std::path::Path> {
         None
     }
-    fn uri(&self) -> &Uri {
+    fn uri(&self) -> &url::Url {
         &self.uri
     }
     fn as_any(&self) -> &dyn Any {
@@ -223,21 +223,21 @@ impl ParseResult for MockMixedParseResult {
 pub(crate) struct MockDep {
     pub(crate) name: PackageName,
     pub(crate) version_req: VersionReq,
-    pub(crate) version_range: Range,
-    pub(crate) name_range: Range,
+    pub(crate) version_range: crate::position::Range,
+    pub(crate) name_range: crate::position::Range,
 }
 
 impl Dependency for MockDep {
     fn name(&self) -> &PackageName {
         &self.name
     }
-    fn name_range(&self) -> Range {
+    fn name_range(&self) -> crate::position::Range {
         self.name_range
     }
     fn version_requirement(&self) -> Option<&VersionReq> {
         Some(&self.version_req)
     }
-    fn version_range(&self) -> Option<Range> {
+    fn version_range(&self) -> Option<crate::position::Range> {
         Some(self.version_range)
     }
     fn source(&self) -> crate::parser::DependencySource {
@@ -263,13 +263,13 @@ impl Dependency for MockSyntheticRangeDep {
     fn name(&self) -> &PackageName {
         &self.name
     }
-    fn name_range(&self) -> Range {
-        Range::default()
+    fn name_range(&self) -> crate::position::Range {
+        crate::position::Range::default()
     }
     fn version_requirement(&self) -> Option<&VersionReq> {
         None
     }
-    fn version_range(&self) -> Option<Range> {
+    fn version_range(&self) -> Option<crate::position::Range> {
         None
     }
     fn source(&self) -> crate::parser::DependencySource {
@@ -285,7 +285,7 @@ impl Dependency for MockSyntheticRangeDep {
 
 pub(crate) struct MockMarkedDep {
     pub(crate) name: PackageName,
-    pub(crate) name_range: Range,
+    pub(crate) name_range: crate::position::Range,
     pub(crate) markers: Option<String>,
 }
 
@@ -293,13 +293,13 @@ impl Dependency for MockMarkedDep {
     fn name(&self) -> &PackageName {
         &self.name
     }
-    fn name_range(&self) -> Range {
+    fn name_range(&self) -> crate::position::Range {
         self.name_range
     }
     fn version_requirement(&self) -> Option<&VersionReq> {
         None
     }
-    fn version_range(&self) -> Option<Range> {
+    fn version_range(&self) -> Option<crate::position::Range> {
         None
     }
     fn source(&self) -> crate::parser::DependencySource {
@@ -315,7 +315,7 @@ impl Dependency for MockMarkedDep {
 
 pub(crate) struct MockMarkedParseResult {
     pub(crate) dep: MockMarkedDep,
-    pub(crate) uri: Uri,
+    pub(crate) uri: url::Url,
 }
 
 impl ParseResult for MockMarkedParseResult {
@@ -325,7 +325,7 @@ impl ParseResult for MockMarkedParseResult {
     fn workspace_root(&self) -> Option<&std::path::Path> {
         None
     }
-    fn uri(&self) -> &Uri {
+    fn uri(&self) -> &url::Url {
         &self.uri
     }
     fn as_any(&self) -> &dyn Any {
@@ -851,8 +851,8 @@ pub(crate) fn freshness_test_parse_result(name: &str) -> MockParseResult {
         deps: vec![MockDep {
             name: name.into(),
             version_req: "1.0.0".into(),
-            version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-            name_range: Range::new(Position::new(0, 0), Position::new(0, name.len() as u32)),
+            version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+            name_range: Range::new(Position::new(0, 0), Position::new(0, name.len() as u32)).into(),
         }],
         uri: crate::test_util::test_uri("/test/Cargo.toml"),
     }
@@ -966,8 +966,8 @@ pub(crate) fn vulnerable_dep(
         MockDep {
             name: pkg("pkg"),
             version_req: VersionReq::new(version_req),
-            version_range,
-            name_range: Range::new(Position::new(0, 0), Position::new(0, 3)),
+            version_range: version_range.into(),
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 3)).into(),
         },
         version_range,
         content,
@@ -1074,8 +1074,8 @@ pub(crate) fn dep_at(name: &str) -> MockDep {
     MockDep {
         name: PackageName::new(name),
         version_req: VersionReq::new("1.0.0"),
-        version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-        name_range: Range::new(Position::new(0, 0), Position::new(0, name.len() as u32)),
+        version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+        name_range: Range::new(Position::new(0, 0), Position::new(0, name.len() as u32)).into(),
     }
 }
 
@@ -1090,13 +1090,13 @@ impl Dependency for NonRegistryDep {
     fn name(&self) -> &PackageName {
         self.0.name()
     }
-    fn name_range(&self) -> Range {
+    fn name_range(&self) -> crate::position::Range {
         self.0.name_range()
     }
     fn version_requirement(&self) -> Option<&VersionReq> {
         self.0.version_requirement()
     }
-    fn version_range(&self) -> Option<Range> {
+    fn version_range(&self) -> Option<crate::position::Range> {
         self.0.version_range()
     }
     fn source(&self) -> crate::parser::DependencySource {
@@ -1111,7 +1111,7 @@ impl Dependency for NonRegistryDep {
 /// type, so single-dependency tests aren't forced to use `MockDep`/`MockParseResult`.
 pub(crate) struct SingleDepParseResult<D> {
     pub(crate) dep: D,
-    pub(crate) uri: Uri,
+    pub(crate) uri: url::Url,
 }
 
 impl<D: Dependency + 'static> ParseResult for SingleDepParseResult<D> {
@@ -1121,7 +1121,7 @@ impl<D: Dependency + 'static> ParseResult for SingleDepParseResult<D> {
     fn workspace_root(&self) -> Option<&std::path::Path> {
         None
     }
-    fn uri(&self) -> &Uri {
+    fn uri(&self) -> &url::Url {
         &self.uri
     }
     fn as_any(&self) -> &dyn Any {

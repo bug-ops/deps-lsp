@@ -4,7 +4,8 @@ use std::any::Any;
 use std::sync::Arc;
 #[cfg(test)]
 use tower_lsp_server::ls_types::Position;
-use tower_lsp_server::ls_types::{CompletionItem, Range, Uri};
+use tower_lsp_server::ls_types::{CompletionItem, Range};
+use url::Url;
 
 use deps_core::{
     Ecosystem, ParseResult as ParseResultTrait, Registry, Result, completion::Completions,
@@ -98,7 +99,7 @@ impl Ecosystem for BundlerEcosystem {
     fn parse_manifest<'a>(
         &'a self,
         content: &'a str,
-        uri: &'a Uri,
+        uri: &'a Url,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Box<dyn ParseResultTrait>>> {
         Box::pin(async move {
             let result = crate::parser::parse_gemfile(content, uri)?;
@@ -235,7 +236,7 @@ gem 'rails', '~> 7.0'";
         let path = "C:/test/Gemfile";
         #[cfg(not(windows))]
         let path = "/test/Gemfile";
-        let uri = Uri::from_file_path(path).unwrap();
+        let uri = Url::from_file_path(path).unwrap();
 
         let result = ecosystem.parse_manifest(gemfile, &uri).await.unwrap();
         assert_eq!(result.dependencies().len(), 1);
@@ -302,7 +303,7 @@ gem 'rails', '~> 7.0'";
         let content = "gem 'r'";
         let uri = deps_core::test_util::test_uri("/test/Gemfile");
         let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
-        let position = parse_result.dependencies()[0].name_range().end;
+        let position: Position = parse_result.dependencies()[0].name_range().end.into();
         let freshness = deps_core::FreshnessSettings::default();
 
         let context = deps_core::completion::detect_completion_context(
@@ -369,10 +370,11 @@ gem 'rails', '~> 7.0'";
         let content = "gem \"this-gem-does-not-exist-12345\", \"~> 1.0\"";
         let uri = deps_core::test_util::test_uri("/test/Gemfile");
         let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
-        let position = parse_result.dependencies()[0]
+        let position: Position = parse_result.dependencies()[0]
             .version_range()
             .unwrap()
-            .start;
+            .start
+            .into();
         let freshness = deps_core::FreshnessSettings::default();
 
         let context = deps_core::completion::detect_completion_context(
@@ -411,10 +413,11 @@ gem 'rails', '~> 7.0'";
         let content = "gem \"rails\", \"~> 7.0\"";
         let uri = deps_core::test_util::test_uri("/test/Gemfile");
         let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
-        let position = parse_result.dependencies()[0]
+        let position: Position = parse_result.dependencies()[0]
             .version_range()
             .unwrap()
-            .start;
+            .start
+            .into();
         let freshness = deps_core::FreshnessSettings::default();
 
         let context = deps_core::completion::detect_completion_context(

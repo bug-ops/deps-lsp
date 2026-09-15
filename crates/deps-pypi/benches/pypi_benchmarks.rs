@@ -15,10 +15,10 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use deps_pypi::parser::PypiParser;
 use std::hint::black_box;
-use tower_lsp_server::ls_types::Uri;
+use url::Url;
 
-fn bench_uri() -> Uri {
-    Uri::from_file_path("/bench/pyproject.toml").unwrap()
+fn bench_uri() -> Url {
+    Url::from_file_path("/bench/pyproject.toml").unwrap()
 }
 
 /// Small pyproject.toml with PEP 621 format.

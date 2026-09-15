@@ -14,6 +14,23 @@ use common::LspClient;
 #[cfg(feature = "cargo")]
 use std::time::Duration;
 
+/// Builds a platform-portable absolute `file://` URI string for a test fixture:
+/// `url::Url::to_file_path` (which `parse_manifest`'s workspace-root discovery calls
+/// internally) requires a drive-letter path segment to succeed on Windows, so a bare
+/// `file:///test/...` fixture (valid on Unix) fails there — mirrors
+/// `deps_core::test_util::test_uri`'s pattern for the `Url`-typed equivalent.
+#[cfg(feature = "cargo")]
+fn fixture_uri(name: &str) -> String {
+    #[cfg(windows)]
+    {
+        format!("file:///C:/test/{name}")
+    }
+    #[cfg(not(windows))]
+    {
+        format!("file:///test/{name}")
+    }
+}
+
 /// Verifies notification capture infrastructure works correctly.
 ///
 /// NOTE: This is a placeholder test. The full notification ordering test
@@ -49,7 +66,7 @@ serde = "1.0.0"
 tokio = { version = "1.0", features = ["full"] }
 "#;
 
-    client.did_open("file:///test/Cargo.toml", "toml", cargo_toml);
+    client.did_open(&fixture_uri("Cargo.toml"), "toml", cargo_toml);
 
     // Flush notifications to capture any server-sent messages
     for _ in 0..3 {
@@ -114,12 +131,12 @@ edition = "2021"
 serde = "1.0.0"
 "#;
 
-    client.did_open("file:///test/Cargo.toml", "toml", cargo_toml);
+    client.did_open(&fixture_uri("Cargo.toml"), "toml", cargo_toml);
 
     let _diagnostics = client
         .wait_for_notification(20, |n| {
             n.method == "textDocument/publishDiagnostics"
-                && n.params["uri"] == "file:///test/Cargo.toml"
+                && n.params["uri"] == fixture_uri("Cargo.toml").as_str()
         })
         .expect(
             "Server must publish diagnostics even though the client never answers \
@@ -171,7 +188,7 @@ edition = "2021"
 serde = "1.0.0"
 "#;
 
-    client.did_open("file:///test/Cargo.toml", "toml", cargo_toml);
+    client.did_open(&fixture_uri("Cargo.toml"), "toml", cargo_toml);
 
     // `begin` is sent right after the progress token is created, before any
     // registry network call, so it should arrive quickly.
@@ -226,7 +243,7 @@ edition = "2021"
 serde = "1.0.0"
 "#;
 
-    client.did_open("file:///test/Cargo.toml", "toml", cargo_toml);
+    client.did_open(&fixture_uri("Cargo.toml"), "toml", cargo_toml);
 
     // Positive liveness proof: `publishDiagnostics` for this URI is only sent
     // after the background registry fetch completes (see `lifecycle.rs`), so
@@ -236,7 +253,7 @@ serde = "1.0.0"
     let _diagnostics = client
         .wait_for_notification(20, |n| {
             n.method == "textDocument/publishDiagnostics"
-                && n.params["uri"] == "file:///test/Cargo.toml"
+                && n.params["uri"] == fixture_uri("Cargo.toml").as_str()
         })
         .expect(
             "Server should publish diagnostics for the opened document once the fetch completes",
@@ -303,7 +320,7 @@ edition = "2021"
 serde = "1.0.0"
 "#;
 
-    client.did_open("file:///test/Cargo1.toml", "toml", cargo_toml_1);
+    client.did_open(&fixture_uri("Cargo1.toml"), "toml", cargo_toml_1);
     std::thread::sleep(Duration::from_millis(500));
     client.flush_notifications();
 
@@ -317,7 +334,7 @@ edition = "2021"
 tokio = "1.0"
 "#;
 
-    client.did_open("file:///test/Cargo2.toml", "toml", cargo_toml_2);
+    client.did_open(&fixture_uri("Cargo2.toml"), "toml", cargo_toml_2);
     std::thread::sleep(Duration::from_millis(500));
     client.flush_notifications();
 

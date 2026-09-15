@@ -13,15 +13,15 @@ use deps_nuget::parser::{
 };
 use libfuzzer_sys::fuzz_target;
 use std::sync::LazyLock;
-use tower_lsp_server::ls_types::Uri;
+use url::Url;
 
-static CSPROJ_URI: LazyLock<Uri> =
-    LazyLock::new(|| Uri::from_file_path("/fuzz/App.csproj").expect("static fixture path"));
-static DIRECTORY_PACKAGES_URI: LazyLock<Uri> = LazyLock::new(|| {
-    Uri::from_file_path("/fuzz/Directory.Packages.props").expect("static fixture path")
+static CSPROJ_URI: LazyLock<Url> =
+    LazyLock::new(|| Url::from_file_path("/fuzz/App.csproj").expect("static fixture path"));
+static DIRECTORY_PACKAGES_URI: LazyLock<Url> = LazyLock::new(|| {
+    Url::from_file_path("/fuzz/Directory.Packages.props").expect("static fixture path")
 });
-static PACKAGES_CONFIG_URI: LazyLock<Uri> =
-    LazyLock::new(|| Uri::from_file_path("/fuzz/packages.config").expect("static fixture path"));
+static PACKAGES_CONFIG_URI: LazyLock<Url> =
+    LazyLock::new(|| Url::from_file_path("/fuzz/packages.config").expect("static fixture path"));
 
 fuzz_target!(|data: &[u8]| {
     let Ok(content) = std::str::from_utf8(data) else {

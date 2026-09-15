@@ -565,8 +565,8 @@ mod tests {
     mod is_position_on_dependency_tests {
         use super::*;
         use deps_core::parser::DependencySource;
+        use deps_core::position::{Position as DomainPosition, Range};
         use std::any::Any;
-        use tower_lsp_server::ls_types::Range;
 
         struct MockDep {
             name_range: Range,
@@ -602,8 +602,11 @@ mod tests {
         fn test_position_on_name() {
             let formatter = PypiFormatter;
             let dep = MockDep {
-                name_range: Range::new(Position::new(5, 10), Position::new(5, 20)),
-                version_range: Some(Range::new(Position::new(5, 25), Position::new(5, 35))),
+                name_range: Range::new(DomainPosition::new(5, 10), DomainPosition::new(5, 20)),
+                version_range: Some(Range::new(
+                    DomainPosition::new(5, 25),
+                    DomainPosition::new(5, 35),
+                )),
             };
             // Position on package name
             assert!(formatter.is_position_on_dependency(&dep, Position::new(5, 15)));
@@ -613,8 +616,11 @@ mod tests {
         fn test_position_in_padding_before() {
             let formatter = PypiFormatter;
             let dep = MockDep {
-                name_range: Range::new(Position::new(5, 10), Position::new(5, 20)),
-                version_range: Some(Range::new(Position::new(5, 25), Position::new(5, 35))),
+                name_range: Range::new(DomainPosition::new(5, 10), DomainPosition::new(5, 20)),
+                version_range: Some(Range::new(
+                    DomainPosition::new(5, 25),
+                    DomainPosition::new(5, 35),
+                )),
             };
             // Position in padding before name (character - 2)
             assert!(formatter.is_position_on_dependency(&dep, Position::new(5, 8)));
@@ -624,8 +630,11 @@ mod tests {
         fn test_position_after_version_padding() {
             let formatter = PypiFormatter;
             let dep = MockDep {
-                name_range: Range::new(Position::new(5, 10), Position::new(5, 20)),
-                version_range: Some(Range::new(Position::new(5, 25), Position::new(5, 35))),
+                name_range: Range::new(DomainPosition::new(5, 10), DomainPosition::new(5, 20)),
+                version_range: Some(Range::new(
+                    DomainPosition::new(5, 25),
+                    DomainPosition::new(5, 35),
+                )),
             };
             // Position after version range (character + 2)
             assert!(formatter.is_position_on_dependency(&dep, Position::new(5, 37)));
@@ -635,8 +644,11 @@ mod tests {
         fn test_position_too_far_before() {
             let formatter = PypiFormatter;
             let dep = MockDep {
-                name_range: Range::new(Position::new(5, 10), Position::new(5, 20)),
-                version_range: Some(Range::new(Position::new(5, 25), Position::new(5, 35))),
+                name_range: Range::new(DomainPosition::new(5, 10), DomainPosition::new(5, 20)),
+                version_range: Some(Range::new(
+                    DomainPosition::new(5, 25),
+                    DomainPosition::new(5, 35),
+                )),
             };
             // Position too far before (outside padding)
             assert!(!formatter.is_position_on_dependency(&dep, Position::new(5, 5)));
@@ -646,8 +658,11 @@ mod tests {
         fn test_position_too_far_after() {
             let formatter = PypiFormatter;
             let dep = MockDep {
-                name_range: Range::new(Position::new(5, 10), Position::new(5, 20)),
-                version_range: Some(Range::new(Position::new(5, 25), Position::new(5, 35))),
+                name_range: Range::new(DomainPosition::new(5, 10), DomainPosition::new(5, 20)),
+                version_range: Some(Range::new(
+                    DomainPosition::new(5, 25),
+                    DomainPosition::new(5, 35),
+                )),
             };
             // Position too far after (outside padding)
             assert!(!formatter.is_position_on_dependency(&dep, Position::new(5, 40)));
@@ -657,8 +672,11 @@ mod tests {
         fn test_position_different_line() {
             let formatter = PypiFormatter;
             let dep = MockDep {
-                name_range: Range::new(Position::new(5, 10), Position::new(5, 20)),
-                version_range: Some(Range::new(Position::new(5, 25), Position::new(5, 35))),
+                name_range: Range::new(DomainPosition::new(5, 10), DomainPosition::new(5, 20)),
+                version_range: Some(Range::new(
+                    DomainPosition::new(5, 25),
+                    DomainPosition::new(5, 35),
+                )),
             };
             // Different line
             assert!(!formatter.is_position_on_dependency(&dep, Position::new(4, 15)));
@@ -669,7 +687,7 @@ mod tests {
         fn test_position_without_version_range() {
             let formatter = PypiFormatter;
             let dep = MockDep {
-                name_range: Range::new(Position::new(5, 10), Position::new(5, 20)),
+                name_range: Range::new(DomainPosition::new(5, 10), DomainPosition::new(5, 20)),
                 version_range: None,
             };
             // Should use name_range.end for calculation
@@ -682,7 +700,7 @@ mod tests {
             let formatter = PypiFormatter;
             // Edge case: character 0 with saturating_sub(2)
             let dep = MockDep {
-                name_range: Range::new(Position::new(5, 0), Position::new(5, 10)),
+                name_range: Range::new(DomainPosition::new(5, 0), DomainPosition::new(5, 10)),
                 version_range: None,
             };
             // saturating_sub(2) should give 0, not underflow

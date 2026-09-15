@@ -318,7 +318,7 @@ impl OsvNaming for GitlabCiFormatter {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tower_lsp_server::ls_types::{Position, Range};
+    use deps_core::position::{Position, Range};
 
     fn formatter() -> GitlabCiFormatter {
         GitlabCiFormatter::new(Arc::new(DashMap::new()), Arc::new(DashMap::new()))
@@ -553,13 +553,13 @@ mod tests {
             fn name(&self) -> &PackageName {
                 unimplemented!()
             }
-            fn name_range(&self) -> tower_lsp_server::ls_types::Range {
+            fn name_range(&self) -> Range {
                 Range::default()
             }
             fn version_requirement(&self) -> Option<&VersionReq> {
                 None
             }
-            fn version_range(&self) -> Option<tower_lsp_server::ls_types::Range> {
+            fn version_range(&self) -> Option<Range> {
                 None
             }
             fn source(&self) -> DependencySource {

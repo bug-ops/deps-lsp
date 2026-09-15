@@ -427,8 +427,8 @@ mod tests {
             RequirementResolution, SourcePolicy,
         };
         use deps_core::parser::DependencySource;
+        use deps_core::position::{Position, Range};
         use std::any::Any;
-        use tower_lsp_server::ls_types::{Position, Range, Uri};
 
         struct MockFormatter;
         impl PackageNaming for MockFormatter {}
@@ -498,8 +498,8 @@ mod tests {
             fn workspace_root(&self) -> Option<&std::path::Path> {
                 None
             }
-            fn uri(&self) -> &Uri {
-                static URI: std::sync::OnceLock<Uri> = std::sync::OnceLock::new();
+            fn uri(&self) -> &url::Url {
+                static URI: std::sync::OnceLock<url::Url> = std::sync::OnceLock::new();
                 URI.get_or_init(|| deps_core::test_util::test_uri("/test/Cargo.toml"))
             }
             fn as_any(&self) -> &dyn Any {

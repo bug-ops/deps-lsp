@@ -5,7 +5,8 @@
 
 use std::any::Any;
 use std::sync::Arc;
-use tower_lsp_server::ls_types::{CompletionItem, Position, Range, Uri};
+use tower_lsp_server::ls_types::{CompletionItem, Position, Range};
+use url::Url;
 
 use deps_core::parser::DependencySource;
 use deps_core::{
@@ -247,7 +248,7 @@ impl Ecosystem for CargoEcosystem {
     fn parse_manifest<'a>(
         &'a self,
         content: &'a str,
-        uri: &'a Uri,
+        uri: &'a Url,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Box<dyn ParseResultTrait>>> {
         Box::pin(async move {
             let result = crate::parser::parse_cargo_toml_with_context(content, uri, &self.context)?;
@@ -424,13 +425,15 @@ mod tests {
             name_range: Range::new(
                 Position::new(name_line, 0),
                 Position::new(name_line, name.len() as u32),
-            ),
+            )
+            .into(),
             version_req: version.map(Into::into),
             version_range: version.map(|_| {
                 Range::new(
                     Position::new(version_line, 0),
                     Position::new(version_line, 10),
                 )
+                .into()
             }),
             features: vec![],
             features_range: None,
@@ -457,8 +460,8 @@ mod tests {
             None
         }
 
-        fn uri(&self) -> &Uri {
-            static URI: std::sync::LazyLock<Uri> =
+        fn uri(&self) -> &Url {
+            static URI: std::sync::LazyLock<Url> =
                 std::sync::LazyLock::new(|| deps_core::test_util::test_uri("/test/Cargo.toml"));
             &URI
         }
@@ -704,7 +707,7 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = CargoEcosystem::new(cache);
         let dep = mock_dependency("serde", Some("1.0"), 0, 0);
-        let position = dep.version_range.unwrap().start;
+        let position = dep.version_range.unwrap().start.into();
         let parse_result = MockParseResult {
             dependencies: vec![dep],
         };
@@ -727,7 +730,7 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = CargoEcosystem::new(cache);
         let dep = mock_dependency("serde", Some("^1.0"), 0, 0);
-        let position = dep.version_range.unwrap().start;
+        let position = dep.version_range.unwrap().start.into();
         let parse_result = MockParseResult {
             dependencies: vec![dep],
         };
@@ -786,7 +789,7 @@ mod tests {
             index: "https://index.mycorp.dev/never-registered".into(),
             mirrors_crates_io: false,
         };
-        let alternate_position = alternate_dep.version_range.unwrap().start;
+        let alternate_position = alternate_dep.version_range.unwrap().start.into();
         let parse_result = MockParseResult {
             dependencies: vec![registry_dep, alternate_dep],
         };
@@ -845,7 +848,7 @@ mod tests {
             index: index_key,
             mirrors_crates_io: false,
         };
-        let position = dep.version_range.unwrap().start;
+        let position = dep.version_range.unwrap().start.into();
         let parse_result = MockParseResult {
             dependencies: vec![dep],
         };
@@ -908,7 +911,7 @@ mod tests {
         let registry = CargoRegistry::with_crates_io_for_test(Arc::clone(&cache), crates_io);
         let ecosystem = CargoEcosystem::with_registry_for_test(registry);
         let dep = mock_dependency("this-package-does-not-exist-12345", Some("1.0"), 0, 0);
-        let position = dep.version_range.unwrap().start;
+        let position = dep.version_range.unwrap().start.into();
         let parse_result = MockParseResult {
             dependencies: vec![dep],
         };
@@ -1013,7 +1016,7 @@ mod tests {
 
         // Test that we respect the display cap, not just some loose upper bound.
         let dep = mock_dependency("serde", Some("1.0"), 0, 0);
-        let position = dep.version_range.unwrap().start;
+        let position = dep.version_range.unwrap().start.into();
         let parse_result = MockParseResult {
             dependencies: vec![dep],
         };
@@ -1246,7 +1249,7 @@ mod tests {
             index: "https://index.mycorp.dev/never-registered".into(),
             mirrors_crates_io: false,
         };
-        let position = dep.version_range.unwrap().start;
+        let position = dep.version_range.unwrap().start.into();
         let parse_result = MockParseResult {
             dependencies: vec![dep],
         };
@@ -1288,7 +1291,8 @@ mod tests {
         };
         // A distinct line so this doesn't fall inside `alternate_dep`'s own name/version
         // range (both on line 1) and get misdetected as `PackageName`/`Version`.
-        alternate_dep.features_range = Some(Range::new(Position::new(2, 0), Position::new(2, 5)));
+        alternate_dep.features_range =
+            Some(Range::new(Position::new(2, 0), Position::new(2, 5)).into());
         let position = Position::new(2, 2);
         let parse_result = MockParseResult {
             dependencies: vec![registry_dep, alternate_dep],

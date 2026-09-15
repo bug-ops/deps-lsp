@@ -19,6 +19,22 @@ pub(crate) mod test_helpers {
         let config = Arc::new(RwLock::new(DepsConfig::default()));
         (client, config)
     }
+
+    /// Prefixes a Windows drive letter onto a Unix-shaped path literal so it is a valid
+    /// absolute path on Windows too, mirroring `deps_core::test_util::test_uri`'s pattern —
+    /// `ls_types::Uri::from_file_path`/`url::Url::from_file_path`/`Url::to_file_path` all
+    /// require a drive letter for an absolute path on Windows, so a bare `/foo/bar` fixture
+    /// (valid on Unix) fails there without this.
+    pub(crate) fn platform_path(unix_path: &str) -> String {
+        #[cfg(windows)]
+        {
+            format!("C:{unix_path}")
+        }
+        #[cfg(not(windows))]
+        {
+            unix_path.to_string()
+        }
+    }
 }
 
 /// Shared scaffolding for the `#319`/`#333` DashMap-Ref-across-await regression tests in
@@ -41,7 +57,7 @@ pub(crate) mod blocking_ecosystem {
     use std::path::Path;
     use std::sync::Arc;
     use tokio::sync::Barrier;
-    use tower_lsp_server::ls_types::{CodeLens, Diagnostic, InlayHint, Position, Uri};
+    use tower_lsp_server::ls_types::{CodeLens, Diagnostic, InlayHint, Position};
 
     pub(crate) struct NoopRegistry;
     impl Registry for NoopRegistry {
@@ -94,7 +110,7 @@ pub(crate) mod blocking_ecosystem {
     impl OsvNaming for NoopFormatter {}
 
     pub(crate) struct MockParseResult {
-        pub(crate) uri: Uri,
+        pub(crate) uri: url::Url,
     }
     impl ParseResult for MockParseResult {
         fn dependencies(&self) -> Vec<&dyn Dependency> {
@@ -103,7 +119,7 @@ pub(crate) mod blocking_ecosystem {
         fn workspace_root(&self) -> Option<&Path> {
             None
         }
-        fn uri(&self) -> &Uri {
+        fn uri(&self) -> &url::Url {
             &self.uri
         }
         fn as_any(&self) -> &dyn Any {
@@ -139,7 +155,7 @@ pub(crate) mod blocking_ecosystem {
         fn parse_manifest<'a>(
             &'a self,
             _content: &'a str,
-            _uri: &'a Uri,
+            _uri: &'a url::Url,
         ) -> BoxFuture<'a, deps_core::Result<Box<dyn ParseResult>>> {
             Box::pin(async move { unimplemented!() })
         }
@@ -169,7 +185,7 @@ pub(crate) mod blocking_ecosystem {
             &'a self,
             _parse_result: &'a dyn ParseResult,
             _versions: VersionData<'a>,
-            _uri: &'a Uri,
+            _uri: &'a url::Url,
             _freshness: FreshnessSettings,
             _severities: DiagnosticSeverities,
         ) -> BoxFuture<'a, Vec<Diagnostic>> {
@@ -187,7 +203,7 @@ pub(crate) mod blocking_ecosystem {
             _parse_result: &'a dyn ParseResult,
             _content: &'a str,
             _versions: VersionData<'a>,
-            _uri: &'a Uri,
+            _uri: &'a url::Url,
             _command_id: &'a str,
         ) -> BoxFuture<'a, Vec<CodeLens>> {
             Box::pin(async move {

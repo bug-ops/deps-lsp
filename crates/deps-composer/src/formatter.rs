@@ -118,12 +118,12 @@ impl PackageRendering for ComposerFormatter {
     fn is_position_on_dependency(&self, dep: &dyn Dependency, position: Position) -> bool {
         let name_range = dep.name_range();
         if name_range.start != name_range.end
-            && deps_core::lsp_helpers::position_in_range(position, name_range)
+            && deps_core::lsp_helpers::position_in_range(position, name_range.into())
         {
             return true;
         }
         dep.version_range()
-            .is_some_and(|r| deps_core::lsp_helpers::position_in_range(position, r))
+            .is_some_and(|r| deps_core::lsp_helpers::position_in_range(position, r.into()))
     }
 }
 
@@ -576,8 +576,8 @@ fn compare_versions(a: &str, b: &str) -> i32 {
 mod tests {
     use super::*;
     use crate::types::{ComposerDependency, ComposerSection};
+    use deps_core::position::{Position as DomainPosition, Range};
     use std::collections::HashMap;
-    use tower_lsp_server::ls_types::Range;
 
     #[test]
     fn test_normalize_package_name() {
@@ -818,7 +818,7 @@ mod tests {
     #[test]
     fn test_osv_package_name_lowercases_unlike_normalize_used_elsewhere() {
         use crate::types::{ComposerDependency, ComposerSection};
-        use tower_lsp_server::ls_types::{Position, Range};
+        use deps_core::position::{Position, Range};
 
         let f = ComposerFormatter;
         let dep = ComposerDependency {
@@ -1122,13 +1122,14 @@ mod tests {
     /// resting on the file's opening `{`, reopening the C2 `Range::default()` hazard.
     #[test]
     fn test_is_position_on_dependency_rejects_zero_width_name_range() {
-        use tower_lsp_server::ls_types::Position;
-
         let dep = ComposerDependency {
             name: "vendor/package".into(),
             name_range: Range::default(),
             version_req: Some("^1.0".into()),
-            version_range: Some(Range::new(Position::new(1, 20), Position::new(1, 25))),
+            version_range: Some(Range::new(
+                DomainPosition::new(1, 20),
+                DomainPosition::new(1, 25),
+            )),
             section: ComposerSection::Require,
         };
 
@@ -1145,13 +1146,14 @@ mod tests {
     /// range — the whole point of overriding the shared default.
     #[test]
     fn test_is_position_on_dependency_accepts_real_name_range() {
-        use tower_lsp_server::ls_types::Position;
-
         let dep = ComposerDependency {
             name: "vendor/package".into(),
-            name_range: Range::new(Position::new(1, 4), Position::new(1, 20)),
+            name_range: Range::new(DomainPosition::new(1, 4), DomainPosition::new(1, 20)),
             version_req: Some("^1.0".into()),
-            version_range: Some(Range::new(Position::new(1, 23), Position::new(1, 28))),
+            version_range: Some(Range::new(
+                DomainPosition::new(1, 23),
+                DomainPosition::new(1, 28),
+            )),
             section: ComposerSection::Require,
         };
 
@@ -1229,7 +1231,10 @@ mod tests {
             name: "vendor/package".into(),
             name_range: Range::default(),
             version_req: Some("^1.0".into()),
-            version_range: Some(Range::new(Position::new(0, 33), Position::new(0, 37))),
+            version_range: Some(Range::new(
+                DomainPosition::new(0, 33),
+                DomainPosition::new(0, 37),
+            )),
             section: ComposerSection::Require,
         };
         let corrupted_result = crate::parser::ComposerParseResult {
@@ -1279,7 +1284,7 @@ mod tests {
 
         let actions = deps_core::lsp_helpers::generate_code_actions(
             &parse_result,
-            version_range.start,
+            version_range.start.into(),
             &uri,
             versions,
             json,
@@ -1288,6 +1293,7 @@ mod tests {
         )
         .await;
 
+        let ls_uri = deps_core::to_ls_uri(&uri);
         let rename = actions
             .iter()
             .find(|a| a.title == "Replace with other/package")
@@ -1296,10 +1302,10 @@ mod tests {
             .edit
             .as_ref()
             .and_then(|e| e.changes.as_ref())
-            .and_then(|c| c.get(&uri))
+            .and_then(|c| c.get(&ls_uri))
             .expect("rename action must carry a WorkspaceEdit for this URI");
         assert_eq!(edits.len(), 1);
-        assert_eq!(edits[0].range, dep.name_range);
+        assert_eq!(edits[0].range, dep.name_range.into());
         assert_eq!(edits[0].new_text, "other/package");
     }
 

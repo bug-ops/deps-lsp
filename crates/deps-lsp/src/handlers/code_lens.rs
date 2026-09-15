@@ -90,9 +90,22 @@ pub async fn handle_code_lens(
 
     tracing::Span::current().record("ecosystem", ecosystem.id());
 
+    // Unreachable in practice: a document only reaches `with_document` above once its
+    // URI already converted successfully (see `ensure_document_loaded`), but handled
+    // defensively rather than unwrapped.
+    let Some(domain_uri) = crate::lsp_types_interop::from_lsp_uri(uri) else {
+        tracing::warn!("URI is not representable as a url::Url: {:?}", uri);
+        return vec![];
+    };
     let versions = VersionData::new(&cached_versions, &resolved_versions).with_offline(offline);
     let mut lenses = ecosystem
-        .generate_code_lenses(parse_result.as_ref(), &content, versions, uri, COMMAND_ID)
+        .generate_code_lenses(
+            parse_result.as_ref(),
+            &content,
+            versions,
+            &domain_uri,
+            COMMAND_ID,
+        )
         .await;
 
     // M4 (#640): the bulk "Pin N {noun} to commit SHA" lens lives here, not as an
@@ -107,11 +120,51 @@ pub async fn handle_code_lens(
         lenses.extend(deps_core::lsp_helpers::build_pin_all_to_sha_lens(
             count,
             ecosystem.pin_all_to_sha_noun(),
-            uri,
+            &domain_uri,
         ));
     }
 
+    rekey_lens_command_uri(&mut lenses, uri);
     lenses
+}
+
+/// Re-keys every lens's `command.arguments[].uri` field onto `original_uri`, the exact
+/// `Uri` the client sent in this request.
+///
+/// `deps_core::lsp_helpers::generate_code_lenses`/`build_pin_all_to_sha_lens` serialize
+/// their `uri: &url::Url` parameter's string form directly into the command's JSON
+/// argument (`{"uri": ...}`) — a round trip through `url::Url` that can normalize a
+/// non-canonical URI spelling into a different string (see
+/// `crate::lsp_types_interop::from_lsp_uri`'s doc). The client echoes this argument back
+/// verbatim on click (`workspace/executeCommand`), and `execute_update_all_outdated`/
+/// `execute_pin_all_to_sha` (`server.rs`) look it up in `ServerState::documents`, which is
+/// keyed on the *original* client `Uri` from `did_open` — a normalized argument therefore
+/// misses that lookup entirely and the user sees a `window/showMessage` refusal on a lens
+/// they just clicked (issue #1071 S3, worse than the original finding: this was an actual
+/// regression PR A introduced, not a pre-existing gap). Every argument object this
+/// codebase's own code-lens builders produce has exactly one field, `uri` — no lens
+/// construction path here embeds a second, unrelated field also named `uri`, so
+/// unconditionally overwriting it is always correct.
+fn rekey_lens_command_uri(lenses: &mut [CodeLens], original_uri: &tower_lsp_server::ls_types::Uri) {
+    for lens in lenses.iter_mut() {
+        let Some(arguments) = lens
+            .command
+            .as_mut()
+            .and_then(|command| command.arguments.as_mut())
+        else {
+            continue;
+        };
+        for argument in arguments.iter_mut() {
+            if let Some(object) = argument.as_object_mut()
+                && object.contains_key("uri")
+            {
+                object.insert(
+                    "uri".to_string(),
+                    serde_json::Value::String(original_uri.as_str().to_string()),
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -149,7 +202,9 @@ mod tests {
     #[tokio::test]
     async fn test_handle_code_lens_disabled_returns_empty() {
         let state = Arc::new(ServerState::new());
-        let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let uri = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+            "/test/Cargo.toml",
+        ));
         let (client, config) = create_test_client_and_config();
 
         let result = handle_code_lens(state, params(uri), false, client, config).await;
@@ -159,11 +214,69 @@ mod tests {
     #[tokio::test]
     async fn test_handle_code_lens_missing_document_returns_empty() {
         let state = Arc::new(ServerState::new());
-        let uri = deps_core::test_util::test_uri("/test/unknown.txt");
+        let uri = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+            "/test/unknown.txt",
+        ));
         let (client, config) = create_test_client_and_config();
 
         let result = handle_code_lens(state, params(uri), true, client, config).await;
         assert!(result.is_empty());
+    }
+
+    /// S3 (issue #1071): `rekey_lens_command_uri` is ecosystem-agnostic — it only
+    /// inspects each lens's `command.arguments[].uri` field structurally, never
+    /// downcasting to an ecosystem-specific type. This proves its contract directly
+    /// against a hand-built lens shaped exactly like both of the codebase's lens
+    /// builders (`deps_core::lsp_helpers::generate_code_lenses`/
+    /// `build_pin_all_to_sha_lens`, both of which serialize `{"uri": ...}`).
+    #[test]
+    fn test_rekey_lens_command_uri_replaces_uri_argument() {
+        let normalized_uri: tower_lsp_server::ls_types::Uri =
+            "file:///normalized/x.toml".parse().unwrap();
+        let original_uri: tower_lsp_server::ls_types::Uri =
+            "file://localhost/normalized/x.toml".parse().unwrap();
+        let mut lenses = vec![CodeLens {
+            range: tower_lsp_server::ls_types::Range::new(
+                tower_lsp_server::ls_types::Position::new(0, 0),
+                tower_lsp_server::ls_types::Position::new(0, 0),
+            ),
+            command: Some(tower_lsp_server::ls_types::Command {
+                title: "test".to_string(),
+                command: COMMAND_ID.to_string(),
+                arguments: Some(vec![serde_json::json!({ "uri": normalized_uri.as_str() })]),
+            }),
+            data: None,
+        }];
+
+        rekey_lens_command_uri(&mut lenses, &original_uri);
+
+        let arguments = lenses[0]
+            .command
+            .as_ref()
+            .unwrap()
+            .arguments
+            .as_ref()
+            .unwrap();
+        assert_eq!(arguments[0]["uri"], original_uri.as_str());
+    }
+
+    /// Guards against a future lens shape without a `command` silently panicking
+    /// instead of being left untouched.
+    #[test]
+    fn test_rekey_lens_command_uri_leaves_lens_without_command_untouched() {
+        let uri: tower_lsp_server::ls_types::Uri = "file:///x.toml".parse().unwrap();
+        let mut lenses = vec![CodeLens {
+            range: tower_lsp_server::ls_types::Range::new(
+                tower_lsp_server::ls_types::Position::new(0, 0),
+                tower_lsp_server::ls_types::Position::new(0, 0),
+            ),
+            command: None,
+            data: None,
+        }];
+
+        rekey_lens_command_uri(&mut lenses, &uri);
+
+        assert!(lenses[0].command.is_none());
     }
 
     /// #333 liveness regression: `handle_code_lens` must release the DashMap shard
@@ -195,9 +308,10 @@ mod tests {
                 hook: BlockingHook::CodeLenses,
             }));
 
-        let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let uri = crate::lsp_types_interop::to_lsp_uri(&url);
         let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
-        let parse_result: Box<dyn ParseResult> = Box::new(MockParseResult { uri: uri.clone() });
+        let parse_result: Box<dyn ParseResult> = Box::new(MockParseResult { uri: url.clone() });
         let mut doc =
             DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
         doc.set_version(Some(1));
@@ -259,7 +373,10 @@ mod tests {
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
             let parse_result = ecosystem
-                .parse_manifest(content, uri)
+                .parse_manifest(
+                    content,
+                    &crate::lsp_types_interop::from_lsp_uri(uri).unwrap(),
+                )
                 .await
                 .expect("failed to parse manifest");
             let mut doc_state = DocumentState::new_from_parse_result(
@@ -276,7 +393,9 @@ mod tests {
         #[tokio::test]
         async fn test_handle_code_lens_no_parse_result_returns_empty() {
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+                "/test/Cargo.toml",
+            ));
             let doc_state =
                 DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
             state.update_document(uri.clone(), doc_state);
@@ -289,7 +408,9 @@ mod tests {
         #[tokio::test]
         async fn test_handle_code_lens_loading_returns_empty() {
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+                "/test/Cargo.toml",
+            ));
             let content = "[dependencies]\nserde = \"1.0.0\"\n";
             let mut cached = std::collections::HashMap::new();
             cached.insert("serde".into(), PackageVersions::latest_only("1.2.0"));
@@ -307,7 +428,9 @@ mod tests {
             // disk after a missed didOpen) must not render a lens that
             // `execute_update_all_outdated` would then always refuse on click.
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+                "/test/Cargo.toml",
+            ));
             let content = "[dependencies]\nserde = \"1.0.0\"\n";
             let mut cached = std::collections::HashMap::new();
             cached.insert("serde".into(), PackageVersions::latest_only("1.2.0"));
@@ -322,7 +445,9 @@ mod tests {
         #[tokio::test]
         async fn test_handle_code_lens_up_to_date_fixture_returns_no_lens() {
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+                "/test/Cargo.toml",
+            ));
             let content = "[dependencies]\nserde = \"1.0.0\"\n";
             let mut cached = std::collections::HashMap::new();
             cached.insert("serde".into(), PackageVersions::latest_only("1.0.0"));
@@ -336,7 +461,9 @@ mod tests {
         #[tokio::test]
         async fn test_handle_code_lens_outdated_fixture_returns_one_lens() {
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+                "/test/Cargo.toml",
+            ));
             let content = "[dependencies]\nserde = \"1.0.0\"\n";
             let mut cached = std::collections::HashMap::new();
             cached.insert("serde".into(), PackageVersions::latest_only("1.2.0"));
@@ -356,6 +483,58 @@ mod tests {
                 .first()
                 .expect("command has one argument");
             assert_eq!(args["uri"], uri.as_str());
+        }
+
+        /// S3 regression (issue #1071), round 2: the "Update N outdated dependencies"
+        /// lens's `executeCommand` argument must carry the exact `Uri` the client sent,
+        /// not the `url::Url`-normalized form — `execute_update_all_outdated` looks the
+        /// argument up in `ServerState::documents`, which is keyed on the *original*
+        /// client `Uri`, so a normalized argument would miss that lookup and the user
+        /// would see a refusal on a lens they just clicked. Uses a raw client-style
+        /// string (not `ls_types::Uri::from_file_path`, which is always already
+        /// canonical) to actually exercise the divergence.
+        ///
+        /// Unix-only: the fixture path is drive-letter-less, so `url::Url::to_file_path`
+        /// (which `parse_manifest`'s workspace-root discovery calls internally, via
+        /// `seed`) always fails on Windows regardless of the URI's spelling — a
+        /// fixture-portability limit, not a difference in the rekey mechanism under
+        /// test, which the cross-platform `lsp_types_interop` round-trip tests already
+        /// cover on Windows.
+        #[tokio::test]
+        #[cfg(not(windows))]
+        async fn test_handle_code_lens_command_argument_uses_original_non_canonical_uri() {
+            let state = Arc::new(ServerState::new());
+            let uri: tower_lsp_server::ls_types::Uri =
+                "file://localhost/test/Cargo.toml".parse().unwrap();
+            assert_ne!(
+                crate::lsp_types_interop::from_lsp_uri(&uri)
+                    .unwrap()
+                    .as_str(),
+                uri.as_str(),
+                "expected this URI shape to be normalized by url::Url::parse"
+            );
+            let content = "[dependencies]\nserde = \"1.0.0\"\n";
+            let mut cached = std::collections::HashMap::new();
+            cached.insert("serde".into(), PackageVersions::latest_only("1.2.0"));
+            seed(&state, &uri, content, cached).await;
+
+            let (client, config) = create_test_client_and_config();
+            let result = handle_code_lens(state, params(uri.clone()), true, client, config).await;
+
+            assert_eq!(result.len(), 1);
+            let command = result[0].command.as_ref().expect("lens has a command");
+            let args = command
+                .arguments
+                .as_ref()
+                .expect("command has arguments")
+                .first()
+                .expect("command has one argument");
+            assert_eq!(
+                args["uri"],
+                uri.as_str(),
+                "command argument must carry the client's original URI, not a \
+                 url::Url-normalized one"
+            );
         }
     }
 
@@ -446,7 +625,7 @@ mod tests {
         ))]
         async fn assert_single_edit_produces_valid_declaration(
             ecosystem: &dyn deps_core::Ecosystem,
-            uri: &tower_lsp_server::ls_types::Uri,
+            uri: &url::Url,
             content: &str,
             cached: HashMap<deps_core::PackageName, deps_core::PackageVersions>,
             expected_fragment: &str,
@@ -489,7 +668,7 @@ mod tests {
         ))]
         async fn assert_guard_skips(
             ecosystem: &dyn deps_core::Ecosystem,
-            uri: &tower_lsp_server::ls_types::Uri,
+            uri: &url::Url,
             content: &str,
             cached: HashMap<deps_core::PackageName, deps_core::PackageVersions>,
         ) {
@@ -765,7 +944,7 @@ mod tests {
             )
             .unwrap();
 
-            let uri = tower_lsp_server::ls_types::Uri::from_file_path(&build_gradle_path).unwrap();
+            let uri = url::Url::from_file_path(&build_gradle_path).unwrap();
             let state = ServerState::new();
             let ecosystem = state.ecosystem_registry.get("gradle").unwrap();
 
@@ -1003,7 +1182,8 @@ let package = Package(
         #[tokio::test]
         async fn test_pin_all_to_sha_lens_present_when_mutable_ref_pin_enabled() {
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let url = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let content = "steps:\n  - uses: actions/checkout@v4\n".to_string();
 
             let ecosystem = state.ecosystem_registry.get("github-actions").unwrap();
@@ -1013,7 +1193,7 @@ let package = Package(
                 "v4",
                 &"a".repeat(40),
             );
-            let parse_result = ecosystem.parse_manifest(&content, &uri).await.unwrap();
+            let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
             let mut doc_state = crate::document::DocumentState::new_from_parse_result(
                 deps_core::EcosystemId::GithubActions,
                 content.clone(),
@@ -1046,7 +1226,8 @@ let package = Package(
         #[tokio::test]
         async fn test_pin_all_to_sha_lens_absent_when_mutable_ref_pin_disabled() {
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let url = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let content = "steps:\n  - uses: actions/checkout@v3\n".to_string();
 
             let ecosystem = state.ecosystem_registry.get("github-actions").unwrap();
@@ -1056,7 +1237,7 @@ let package = Package(
                 "v3",
                 &"a".repeat(40),
             );
-            let parse_result = ecosystem.parse_manifest(&content, &uri).await.unwrap();
+            let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
             let mut doc_state = crate::document::DocumentState::new_from_parse_result(
                 deps_core::EcosystemId::GithubActions,
                 content.clone(),

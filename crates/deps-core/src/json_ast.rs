@@ -22,9 +22,9 @@
 use jsonc_parser::ast::{Object, ObjectProp, ObjectPropName, Value};
 use jsonc_parser::{CollectOptions, ParseOptions, parse_to_ast};
 use std::collections::HashMap;
-use tower_lsp_server::ls_types::Range;
 
 use crate::lsp_helpers::{LineOffsetTable, byte_span_to_range};
+use crate::position::Range;
 
 /// Finds the property named `key` among `object`'s own direct children, taking the *last* one
 /// if `key` occurs more than once.

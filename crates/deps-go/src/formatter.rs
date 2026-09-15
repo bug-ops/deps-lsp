@@ -193,7 +193,7 @@ impl OsvNaming for GoFormatter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tower_lsp_server::ls_types::{Position, Range};
+    use deps_core::position::{Position, Range};
 
     fn go_dep(directive: GoDirective, version: &str) -> GoDependency {
         GoDependency {

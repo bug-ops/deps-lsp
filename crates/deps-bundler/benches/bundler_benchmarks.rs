@@ -15,10 +15,10 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use deps_bundler::lockfile::parse_gemfile_lock;
 use deps_bundler::parser::parse_gemfile;
 use std::hint::black_box;
-use tower_lsp_server::ls_types::Uri;
+use url::Url;
 
-fn bench_uri() -> Uri {
-    Uri::from_file_path("/bench/Gemfile").unwrap()
+fn bench_uri() -> Url {
+    Url::from_file_path("/bench/Gemfile").unwrap()
 }
 
 /// Small Gemfile with 5 dependencies.

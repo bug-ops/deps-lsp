@@ -21,7 +21,7 @@
 //!
 //! ```no_run
 //! use deps_go::parse_go_mod;
-//! use tower_lsp_server::ls_types::Uri;
+//! use url::Url;
 //!
 //! let content = r#"
 //! module example.com/myapp
@@ -31,7 +31,7 @@
 //! require github.com/gin-gonic/gin v1.9.1
 //! "#;
 //!
-//! let uri = Uri::from_file_path("/test/go.mod").unwrap();
+//! let uri = Url::from_file_path("/test/go.mod").unwrap();
 //! let result = parse_go_mod(content, &uri).unwrap();
 //! assert_eq!(result.dependencies.len(), 1);
 //! ```

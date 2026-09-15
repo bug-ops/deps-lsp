@@ -1,6 +1,6 @@
 //! Domain types for Dart/Pub dependencies.
 
-use tower_lsp_server::ls_types::Range;
+use deps_core::position::Range;
 
 /// A single dependency declaration parsed from a `pubspec.yaml`.
 #[non_exhaustive]
@@ -184,8 +184,8 @@ impl deps_core::Dependency for DartDependency {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::position::Position;
     use std::assert_matches;
-    use tower_lsp_server::ls_types::Position;
 
     fn test_dep(source: DependencySource) -> DartDependency {
         DartDependency {

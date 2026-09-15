@@ -6,8 +6,9 @@
 use std::any::Any;
 use std::sync::Arc;
 use tower_lsp_server::ls_types::{
-    CompletionItem, Diagnostic, DiagnosticSeverity, Hover, HoverContents, Position, Range, Uri,
+    CompletionItem, Diagnostic, DiagnosticSeverity, Hover, HoverContents, Position, Range,
 };
+use url::Url;
 
 use deps_core::{
     Ecosystem, ParseResult as ParseResultTrait, Registry, Result,
@@ -157,7 +158,7 @@ impl Ecosystem for NpmEcosystem {
     fn parse_manifest<'a>(
         &'a self,
         content: &'a str,
-        uri: &'a Uri,
+        uri: &'a Url,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Box<dyn ParseResultTrait>>> {
         Box::pin(async move {
             let result =
@@ -239,10 +240,10 @@ impl Ecosystem for NpmEcosystem {
                 .dependencies()
                 .into_iter()
                 .find(|dep| {
-                    deps_core::position_in_range(position, dep.name_range())
+                    deps_core::position_in_range(position, dep.name_range().into())
                         || dep
                             .version_range()
-                            .is_some_and(|r| deps_core::position_in_range(position, r))
+                            .is_some_and(|r| deps_core::position_in_range(position, r.into()))
                 })
                 .and_then(|dep| dep.as_any().downcast_ref::<NpmDependency>())
                 .and_then(catalog_hover_line);
@@ -265,7 +266,7 @@ impl Ecosystem for NpmEcosystem {
         &'a self,
         parse_result: &'a dyn ParseResultTrait,
         versions: deps_core::VersionData<'a>,
-        uri: &'a Uri,
+        uri: &'a Url,
         freshness: deps_core::FreshnessSettings,
         severities: DiagnosticSeverities,
     ) -> deps_core::ecosystem::BoxFuture<'a, Vec<Diagnostic>> {
@@ -396,7 +397,7 @@ fn catalog_diagnostics(
             let range = npm_dep.version_range?;
             let message = origin.diagnostic_message(npm_dep.name.as_str())?;
             Some(Diagnostic {
-                range,
+                range: range.into(),
                 severity: Some(severity),
                 message,
                 source: Some("deps-lsp".into()),
@@ -433,8 +434,8 @@ mod tests {
             None
         }
 
-        fn uri(&self) -> &Uri {
-            static URI: std::sync::LazyLock<Uri> =
+        fn uri(&self) -> &Url {
+            static URI: std::sync::LazyLock<Url> =
                 std::sync::LazyLock::new(|| deps_core::test_util::test_uri("/test/package.json"));
             &URI
         }
@@ -453,9 +454,9 @@ mod tests {
     ) -> crate::types::NpmDependency {
         crate::types::NpmDependency {
             name: pkg(name),
-            name_range: Range::default(),
+            name_range: Range::default().into(),
             version_req: None,
-            version_range: Some(Range::new(Position::new(line, 0), Position::new(line, 10))),
+            version_range: Some(Range::new(Position::new(line, 0), Position::new(line, 10)).into()),
             section: crate::types::NpmDependencySection::Dependencies,
             source,
             catalog: None,
@@ -591,7 +592,7 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = NpmEcosystem::new(cache);
         let dep = dep_with_source("express", DependencySource::Registry, 0);
-        let position = dep.version_range.unwrap().start;
+        let position = dep.version_range.unwrap().start.into();
         let parse_result = MockParseResult {
             dependencies: vec![dep],
         };
@@ -614,7 +615,7 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = NpmEcosystem::new(cache);
         let dep = dep_with_source("express", DependencySource::Registry, 0);
-        let position = dep.version_range.unwrap().start;
+        let position = dep.version_range.unwrap().start.into();
         let parse_result = MockParseResult {
             dependencies: vec![dep],
         };
@@ -665,7 +666,7 @@ mod tests {
     async fn test_complete_versions_unknown_package() {
         let (_server, mock, ecosystem) = mock_unknown_package_ecosystem().await;
         let dep = dep_with_source(UNKNOWN_PACKAGE, DependencySource::Registry, 0);
-        let position = dep.version_range.unwrap().start;
+        let position = dep.version_range.unwrap().start.into();
         let parse_result = MockParseResult {
             dependencies: vec![dep],
         };
@@ -745,7 +746,7 @@ mod tests {
         );
         let ecosystem = NpmEcosystem::with_registry(Arc::new(registry));
         let dep = dep_with_source("express", DependencySource::Registry, 0);
-        let position = dep.version_range.unwrap().start;
+        let position = dep.version_range.unwrap().start.into();
         let parse_result = MockParseResult {
             dependencies: vec![dep],
         };
@@ -1084,7 +1085,7 @@ mod tests {
     async fn test_complete_versions_empty_prefix() {
         let (_server, mock, ecosystem) = mock_unknown_package_ecosystem().await;
         let dep = dep_with_source(UNKNOWN_PACKAGE, DependencySource::Registry, 0);
-        let position = dep.version_range.unwrap().start;
+        let position = dep.version_range.unwrap().start.into();
         let parse_result = MockParseResult {
             dependencies: vec![dep],
         };
@@ -1108,7 +1109,7 @@ mod tests {
     async fn test_complete_versions_with_tilde_operator() {
         let (_server, mock, ecosystem) = mock_unknown_package_ecosystem().await;
         let dep = dep_with_source(UNKNOWN_PACKAGE, DependencySource::Registry, 0);
-        let position = dep.version_range.unwrap().start;
+        let position = dep.version_range.unwrap().start.into();
         let parse_result = MockParseResult {
             dependencies: vec![dep],
         };
@@ -1131,7 +1132,7 @@ mod tests {
     async fn test_complete_versions_with_wildcard() {
         let (_server, mock, ecosystem) = mock_unknown_package_ecosystem().await;
         let dep = dep_with_source(UNKNOWN_PACKAGE, DependencySource::Registry, 0);
-        let position = dep.version_range.unwrap().start;
+        let position = dep.version_range.unwrap().start.into();
         let parse_result = MockParseResult {
             dependencies: vec![dep],
         };
@@ -1154,7 +1155,7 @@ mod tests {
     async fn test_complete_versions_with_less_than_operator() {
         let (_server, mock, ecosystem) = mock_unknown_package_ecosystem().await;
         let dep = dep_with_source(UNKNOWN_PACKAGE, DependencySource::Registry, 0);
-        let position = dep.version_range.unwrap().start;
+        let position = dep.version_range.unwrap().start.into();
         let parse_result = MockParseResult {
             dependencies: vec![dep],
         };
@@ -1203,7 +1204,7 @@ mod tests {
         let ecosystem = NpmEcosystem::with_registry(Arc::new(registry));
 
         let registry_dep = dep_with_source("@myorg/pkg", DependencySource::Registry, 0);
-        let registry_position = registry_dep.version_range.unwrap().start;
+        let registry_position = registry_dep.version_range.unwrap().start.into();
         let alternate_dep = dep_with_source(
             "@myorg/pkg",
             DependencySource::AlternateRegistry {
@@ -1212,7 +1213,7 @@ mod tests {
             },
             1,
         );
-        let alternate_position = alternate_dep.version_range.unwrap().start;
+        let alternate_position = alternate_dep.version_range.unwrap().start.into();
         let parse_result = MockParseResult {
             dependencies: vec![registry_dep, alternate_dep],
         };
@@ -1283,7 +1284,7 @@ mod tests {
             },
             0,
         );
-        let position = dep.version_range.unwrap().start;
+        let position = dep.version_range.unwrap().start.into();
         let parse_result = MockParseResult {
             dependencies: vec![dep],
         };
@@ -1328,7 +1329,7 @@ mod tests {
             },
             0,
         );
-        let position = dep.version_range.unwrap().start;
+        let position = dep.version_range.unwrap().start.into();
         let parse_result = MockParseResult {
             dependencies: vec![dep],
         };
@@ -1374,7 +1375,7 @@ mod tests {
             },
             0,
         );
-        let position = dep.version_range.unwrap().start;
+        let position = dep.version_range.unwrap().start.into();
         let parse_result = MockParseResult {
             dependencies: vec![dep],
         };
@@ -1403,7 +1404,7 @@ mod tests {
         )
         .unwrap();
         let manifest_path = root.path().join("package.json");
-        let uri = Uri::from_file_path(&manifest_path).unwrap();
+        let uri = Url::from_file_path(&manifest_path).unwrap();
 
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = NpmEcosystem::new(cache);
@@ -1448,7 +1449,7 @@ mod tests {
         )
         .unwrap();
         let manifest_path = root.path().join("package.json");
-        let uri = Uri::from_file_path(&manifest_path).unwrap();
+        let uri = Url::from_file_path(&manifest_path).unwrap();
 
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = NpmEcosystem::new(cache);

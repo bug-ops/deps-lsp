@@ -8,10 +8,10 @@
 use deps_swift::parser::parse_package_swift;
 use libfuzzer_sys::fuzz_target;
 use std::sync::LazyLock;
-use tower_lsp_server::ls_types::Uri;
+use url::Url;
 
-static FUZZ_URI: LazyLock<Uri> =
-    LazyLock::new(|| Uri::from_file_path("/fuzz/Package.swift").expect("static fixture path"));
+static FUZZ_URI: LazyLock<Url> =
+    LazyLock::new(|| Url::from_file_path("/fuzz/Package.swift").expect("static fixture path"));
 
 fuzz_target!(|data: &[u8]| {
     let Ok(content) = std::str::from_utf8(data) else {

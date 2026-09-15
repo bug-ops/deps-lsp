@@ -1618,16 +1618,84 @@ pub fn dot_segment_rejection_error(
     }
 }
 
+/// Converts a domain [`url::Url`] back into a `tower_lsp_server::ls_types::Uri` for
+/// embedding into an actual LSP response object (`WorkspaceEdit`, `Location`, a code-lens
+/// command argument, ...).
+///
+/// This is the one blessed conversion path from `deps-core`'s internal `url::Url` domain
+/// type to `tower_lsp_server`'s `Uri` — ecosystem crates and `deps-core` itself must route
+/// through it rather than re-deriving the conversion (e.g. `uri.as_str().parse()`) locally,
+/// so a future change to how URLs round-trip through the LSP wire format only needs fixing
+/// in one place. It mirrors `deps-lsp`'s own `lsp_types_interop::to_lsp_uri` (issue #1071):
+/// `deps-core` cannot reuse that function (the dependency direction points the other way)
+/// or express this as a `From` impl (neither `url::Url` nor `ls_types::Uri` is local to
+/// `deps-core` — the same orphan-rule constraint that makes the `deps-lsp` boundary a pair
+/// of free functions instead of a trait impl), so this is `deps-core`'s independent
+/// counterpart, needed because `lsp_helpers` still builds real `ls_types` response objects
+/// directly even though `Dependency`/`ParseResult` no longer carry an `ls_types::Uri` (see
+/// `lib.rs`'s "LSP type stability" doc section).
+///
+/// # Panics
+///
+/// Panics if `url`'s string form does not round-trip into an [`Uri`]. In practice this
+/// never happens: every `url::Url` reaching `lsp_helpers` originates from a real
+/// editor-opened document (an `ls_types::Uri` converted to `Url` at the `deps-lsp`
+/// boundary), so failing to convert it back indicates upstream corruption, not
+/// attacker-controlled manifest content.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::to_ls_uri;
+/// use url::Url;
+///
+/// let url = Url::parse("file:///tmp/Cargo.toml").unwrap();
+/// let uri = to_ls_uri(&url);
+/// assert_eq!(uri.as_str(), "file:///tmp/Cargo.toml");
+/// ```
+#[must_use]
+pub fn to_ls_uri(url: &url::Url) -> Uri {
+    url.as_str()
+        .parse()
+        .unwrap_or_else(|e| panic!("document URL {url} did not round-trip to an LSP Uri: {e}"))
+}
+
 /// Builds a single-entry [`tower_lsp_server::ls_types::WorkspaceEdit::changes`] map replacing `range` in `uri`
 /// with `new_text`.
 ///
 /// Shared by every quickfix/refactor code action in `code_actions` that edits exactly
 /// one span in the current document (`build_vulnerability_fix_action`,
 /// `build_unsatisfiable_fix_action`, and the plain "update to `<version>`" loop in
-/// [`generate_code_actions`]).
-fn single_file_edit(uri: &Uri, range: Range, new_text: String) -> HashMap<Uri, Vec<TextEdit>> {
+/// [`generate_code_actions`]) — and by any ecosystem crate hand-building a
+/// `WorkspaceEdit` for a single-span fix instead of reimplementing this map shape
+/// locally.
+///
+/// # Panics
+///
+/// Panics if `uri` does not round-trip through [`to_ls_uri`] — see that function's own
+/// `# Panics` section.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::single_file_edit;
+/// use tower_lsp_server::ls_types::{Position, Range};
+/// use url::Url;
+///
+/// let url = Url::parse("file:///tmp/Cargo.toml").unwrap();
+/// let range = Range::new(Position::new(0, 0), Position::new(0, 5));
+/// let edits = single_file_edit(&url, range, "1.2.3".to_string());
+///
+/// assert_eq!(edits.len(), 1);
+/// ```
+#[must_use]
+pub fn single_file_edit(
+    uri: &url::Url,
+    range: Range,
+    new_text: String,
+) -> HashMap<Uri, Vec<TextEdit>> {
     let mut edits = HashMap::new();
-    edits.insert(uri.clone(), vec![TextEdit { range, new_text }]);
+    edits.insert(to_ls_uri(uri), vec![TextEdit { range, new_text }]);
     edits
 }
 
@@ -1740,19 +1808,19 @@ fn literal_span_matches(slice: &str, requirement: &str) -> bool {
 /// struct MockDep {
 ///     name: PackageName,
 ///     version_req: VersionReq,
-///     version_range: Range,
+///     version_range: deps_core::position::Range,
 /// }
 /// impl Dependency for MockDep {
 ///     fn name(&self) -> &PackageName {
 ///         &self.name
 ///     }
-///     fn name_range(&self) -> Range {
-///         Range::default()
+///     fn name_range(&self) -> deps_core::position::Range {
+///         deps_core::position::Range::default()
 ///     }
 ///     fn version_requirement(&self) -> Option<&VersionReq> {
 ///         Some(&self.version_req)
 ///     }
-///     fn version_range(&self) -> Option<Range> {
+///     fn version_range(&self) -> Option<deps_core::position::Range> {
 ///         Some(self.version_range)
 ///     }
 ///     fn source(&self) -> deps_core::parser::DependencySource {
@@ -1768,9 +1836,9 @@ fn literal_span_matches(slice: &str, requirement: &str) -> bool {
 /// let dep = MockDep {
 ///     name: PackageName::new("serde"),
 ///     version_req: VersionReq::new("1.0.0"),
-///     version_range: Range::new(Position::new(0, 9), Position::new(0, 14)),
+///     version_range: Range::new(Position::new(0, 9), Position::new(0, 14)).into(),
 /// };
-/// assert!(dependency_version_range_is_literal(&dep, content, dep.version_range));
+/// assert!(dependency_version_range_is_literal(&dep, content, dep.version_range.into()));
 ///
 /// // A Maven `${property}` interpolation is rejected even when unresolved — slice and
 /// // requirement are byte-identical raw reference text, which the shape check catches
@@ -1779,9 +1847,9 @@ fn literal_span_matches(slice: &str, requirement: &str) -> bool {
 /// let dep = MockDep {
 ///     name: PackageName::new("slf4j-api"),
 ///     version_req: VersionReq::new("${slf4j.version}"),
-///     version_range: Range::new(Position::new(0, 9), Position::new(0, 25)),
+///     version_range: Range::new(Position::new(0, 9), Position::new(0, 25)).into(),
 /// };
-/// assert!(!dependency_version_range_is_literal(&dep, content, dep.version_range));
+/// assert!(!dependency_version_range_is_literal(&dep, content, dep.version_range.into()));
 /// ```
 #[must_use]
 pub fn dependency_version_range_is_literal(
@@ -1822,14 +1890,14 @@ mod tests {
         let dep = MockDep {
             name: PackageName::new("serde"),
             version_req: VersionReq::new("1.0.0"),
-            version_range: Range::new(Position::new(0, 9), Position::new(0, 14)),
-            name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            version_range: Range::new(Position::new(0, 9), Position::new(0, 14)).into(),
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
         };
 
         assert!(dependency_version_range_is_literal(
             &dep,
             content,
-            dep.version_range,
+            dep.version_range.into(),
         ));
     }
 
@@ -1843,14 +1911,14 @@ mod tests {
         let dep = MockDep {
             name: PackageName::new("slf4j-api"),
             version_req: VersionReq::new("2.0.16"), // resolved property value
-            version_range: Range::new(Position::new(0, 9), Position::new(0, 25)), // "${slf4j.version}"
-            name_range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+            version_range: Range::new(Position::new(0, 9), Position::new(0, 25)).into(), // "${slf4j.version}"
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 0)).into(),
         };
 
         assert!(!dependency_version_range_is_literal(
             &dep,
             content,
-            dep.version_range,
+            dep.version_range.into(),
         ));
     }
 
@@ -1863,14 +1931,14 @@ mod tests {
         let dep = MockDep {
             name: PackageName::new("job"),
             version_req: VersionReq::new("1.0.0"),
-            version_range: Range::new(Position::new(0, 5), Position::new(0, 9)), // "*pin"
-            name_range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+            version_range: Range::new(Position::new(0, 5), Position::new(0, 9)).into(), // "*pin"
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 0)).into(),
         };
 
         assert!(!dependency_version_range_is_literal(
             &dep,
             content,
-            dep.version_range,
+            dep.version_range.into(),
         ));
     }
 
@@ -1885,14 +1953,14 @@ mod tests {
         let dep = MockDep {
             name: PackageName::new("serde"),
             version_req: VersionReq::new(""),
-            version_range: Range::new(Position::new(0, 9), Position::new(0, 9)),
-            name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            version_range: Range::new(Position::new(0, 9), Position::new(0, 9)).into(),
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
         };
 
         assert!(dependency_version_range_is_literal(
             &dep,
             content,
-            dep.version_range,
+            dep.version_range.into(),
         ));
     }
 
@@ -1906,14 +1974,14 @@ mod tests {
         let dep = MockDep {
             name: PackageName::new("x"),
             version_req: VersionReq::new(""),
-            version_range: Range::new(Position::new(0, 5), Position::new(0, 8)), // "1.0"
-            name_range: Range::new(Position::new(0, 0), Position::new(0, 1)),
+            version_range: Range::new(Position::new(0, 5), Position::new(0, 8)).into(), // "1.0"
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 1)).into(),
         };
 
         assert!(!dependency_version_range_is_literal(
             &dep,
             content,
-            dep.version_range,
+            dep.version_range.into(),
         ));
     }
 
@@ -1928,14 +1996,14 @@ mod tests {
         let dep = MockDep {
             name: PackageName::new("slf4j-api"),
             version_req: VersionReq::new("${slf4j.version}"), // left unresolved by the parser
-            version_range: Range::new(Position::new(0, 9), Position::new(0, 25)), // "${slf4j.version}"
-            name_range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+            version_range: Range::new(Position::new(0, 9), Position::new(0, 25)).into(), // "${slf4j.version}"
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 0)).into(),
         };
 
         assert!(!dependency_version_range_is_literal(
             &dep,
             content,
-            dep.version_range,
+            dep.version_range.into(),
         ));
     }
 
@@ -1948,14 +2016,14 @@ mod tests {
         let dep = MockDep {
             name: PackageName::new("com.example:lib"),
             version_req: VersionReq::new("$libVersion"), // left unresolved by the parser
-            version_range: Range::new(Position::new(0, 32), Position::new(0, 43)), // "$libVersion"
-            name_range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+            version_range: Range::new(Position::new(0, 32), Position::new(0, 43)).into(), // "$libVersion"
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 0)).into(),
         };
 
         assert!(!dependency_version_range_is_literal(
             &dep,
             content,
-            dep.version_range,
+            dep.version_range.into(),
         ));
     }
 
@@ -1968,14 +2036,14 @@ mod tests {
         let dep = MockDep {
             name: PackageName::new("x"),
             version_req: VersionReq::new("1.0-${suffix}"),
-            version_range: Range::new(Position::new(0, 5), Position::new(0, 18)), // "1.0-${suffix}"
-            name_range: Range::new(Position::new(0, 0), Position::new(0, 1)),
+            version_range: Range::new(Position::new(0, 5), Position::new(0, 18)).into(), // "1.0-${suffix}"
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 1)).into(),
         };
 
         assert!(!dependency_version_range_is_literal(
             &dep,
             content,
-            dep.version_range,
+            dep.version_range.into(),
         ));
     }
 
@@ -1990,14 +2058,14 @@ mod tests {
         let dep = MockDep {
             name: PackageName::new("x"),
             version_req: VersionReq::new("*"),
-            version_range: Range::new(Position::new(0, 5), Position::new(0, 6)), // "*"
-            name_range: Range::new(Position::new(0, 0), Position::new(0, 1)),
+            version_range: Range::new(Position::new(0, 5), Position::new(0, 6)).into(), // "*"
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 1)).into(),
         };
 
         assert!(dependency_version_range_is_literal(
             &dep,
             content,
-            dep.version_range,
+            dep.version_range.into(),
         ));
     }
 
@@ -2011,14 +2079,14 @@ mod tests {
         let dep = MockDep {
             name: PackageName::new("job"),
             version_req: VersionReq::new("1.0.0"),
-            version_range: Range::new(Position::new(0, 5), Position::new(0, 19)), // "*pinned-anchor"
-            name_range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+            version_range: Range::new(Position::new(0, 5), Position::new(0, 19)).into(), // "*pinned-anchor"
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 0)).into(),
         };
 
         assert!(!dependency_version_range_is_literal(
             &dep,
             content,
-            dep.version_range,
+            dep.version_range.into(),
         ));
     }
 
@@ -2033,14 +2101,14 @@ mod tests {
         let dep = MockDep {
             name: PackageName::new("com.example:lib"),
             version_req: VersionReq::new("1.0.$patch"), // left unresolved by the parser
-            version_range: Range::new(Position::new(0, 32), Position::new(0, 42)), // "1.0.$patch"
-            name_range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+            version_range: Range::new(Position::new(0, 32), Position::new(0, 42)).into(), // "1.0.$patch"
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 0)).into(),
         };
 
         assert!(!dependency_version_range_is_literal(
             &dep,
             content,
-            dep.version_range,
+            dep.version_range.into(),
         ));
     }
 
@@ -2781,8 +2849,8 @@ mod tests {
         let dep = MockDep {
             name: pkg("test-pkg"),
             version_req: VersionReq::new("1.0.0"),
-            version_range: Range::default(),
-            name_range: Range::default(),
+            version_range: Range::default().into(),
+            name_range: Range::default().into(),
         };
         assert_eq!(
             formatter.format_version_replacing_for(&dep, &ConcreteVersion::new("1.2.3"), "1.0.0"),
