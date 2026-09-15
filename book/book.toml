@@ -1,0 +1,16 @@
+[book]
+authors = ["Andrei G"]
+language = "en"
+src = "src"
+title = "deps-lsp Guide"
+description = "Ecosystem feature reference and contributor guide for deps-lsp"
+
+[output.html]
+git-repository-url = "https://github.com/bug-ops/deps-lsp"
+edit-url-template = "https://github.com/bug-ops/deps-lsp/edit/main/book/{path}"
+default-theme = "light"
+preferred-dark-theme = "navy"
+
+[output.html.fold]
+enable = true
+level = 1

@@ -33,8 +33,8 @@ This directory contains template files for creating new ecosystem support in dep
    `is_in_dependencies_section`/`create_package_completion_item`, and
    `crates/deps-lsp/src/document/state.rs`'s ecosystem-id resolution test table
 10. Update docs: root `README.md`, `crates/deps-lsp/README.md` (ecosystem count in the intro
-    sentence), `docs/ECOSYSTEM_GUIDE.md`, `CHANGELOG.md` `[Unreleased]`, and your new crate's own
-    `README.md`
+    sentence), the `book/` mdBook (add a new chapter under `book/src/ecosystems/` and a row in
+    `book/src/SUMMARY.md`), `CHANGELOG.md` `[Unreleased]`, and your new crate's own `README.md`
 
 ## File Structure
 
@@ -75,7 +75,7 @@ deps-ecosystem/
 
 ## Documentation
 
-See [ECOSYSTEM_GUIDE.md](../docs/ECOSYSTEM_GUIDE.md) for detailed implementation instructions.
+See the [deps-lsp book's "Adding a New Ecosystem" chapter](https://bug-ops.github.io/deps-lsp/book/contributing/index.html) for detailed implementation instructions, or `book/src/contributing/` in this repository.
 
 ## Testing
 

@@ -49,6 +49,7 @@ jobs:
               - '.github/Cross.toml'
             workflows:
               - '.github/workflows/**'
+              - '!.github/workflows/mdbook.yml'
             tooling:
               - '.pre-commit-hooks.yaml'
               - 'crates/github-action/action.yml'

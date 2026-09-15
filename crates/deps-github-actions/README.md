@@ -39,7 +39,7 @@ or `.github/actions/<name>/`, issue #706), and implements `deps_core::Ecosystem`
   freshness rendering is enabled) attaches GitHub Release publish timestamps to
   tag-derived versions via the shared `deps_core::github::ReleaseDatesCache` (also used
   by `deps-swift`), memoized behind a TTL; requires `GITHUB_TOKEN` and covers only
-  versions with a matching GitHub Release (see `ECOSYSTEM_GUIDE.md`)
+  versions with a matching GitHub Release (see the [deps-lsp book](https://bug-ops.github.io/deps-lsp/book/ecosystems/github-actions.html#release-freshness-coverage-shared-with-swift))
 
 ## Installation
 
