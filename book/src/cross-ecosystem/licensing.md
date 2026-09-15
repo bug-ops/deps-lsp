@@ -15,7 +15,7 @@ Dart, Swift, Gradle, and Deno (issue #660) are covered via a per-ecosystem
 background pre-fetch (mirroring the OSV vulnerability-scan pattern — never
 blocking hover latency) instead of the deps.dev/Packagist hot-path call above.
 This pre-fetch has its own **10-second timeout floor**, independent of a lower
-configured [`fetch_timeout_secs`](https://github.com/bug-ops/deps-lsp/blob/main/README.md#configuration-reference)
+configured [`fetch_timeout_secs`](../configuration.md#configuration-reference)
 (which can be set as low as 1s): Gradle's `<parent>` POM traversal (below) may need up
 to a few sequential HTTPS round trips for one dependency, so clamping the
 pre-fetch's timeout down to a very low `fetch_timeout_secs` would silently
@@ -61,7 +61,7 @@ to look up, even though the data itself isn't version-specific).
 ## License Policy Diagnostic (issue #661)
 
 Configuring `license_policy.allow`/`license_policy.deny` (see the
-[Configuration reference](https://github.com/bug-ops/deps-lsp/blob/main/README.md#configuration-reference))
+[Configuration reference](../configuration.md#configuration-reference))
 produces a diagnostic for a dependency whose known license violates the policy, anchored at the
 same manifest line as the outdated/vulnerability diagnostics. Both lists take exact,
 case-insensitive SPDX identifiers only — no `AND`/`OR`/`WITH` expression-operator
