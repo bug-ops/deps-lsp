@@ -30,9 +30,28 @@ use tower_lsp_server::ls_types;
 /// `Uri`) but `Url::parse` rejects it, since a port is illegal for WHATWG's special `file`
 /// scheme. Every caller must treat `None` the same as "no ecosystem handles this URI" — see
 /// `EcosystemRegistry::for_uri`'s callers in this crate for the pattern.
+///
+/// Also returns `None` when parsing raises [`url::SyntaxViolation::FileWithHostAndWindowsDrive`]
+/// (issue #1090's guard gap): for a `file:` URI with a non-empty host whose first path segment
+/// is shaped like a Windows drive letter (e.g. `file://attacker.example/C:/x`), the WHATWG
+/// parser silently discards the host and returns a `Url` that looks like a legitimate
+/// host-less `file:///C:/x` URI — indistinguishable, after the fact, from a trusted local
+/// path. This is not `cfg!(windows)`-gated; it reproduces on every host OS because it depends
+/// only on the shape of the input string. This function is the last point with access to the
+/// original, unparsed string, so it is the only place that can still detect the violation and
+/// reject the URI instead of silently downgrading a remote-host reference to a local one.
 #[must_use]
 pub fn from_lsp_uri(uri: &ls_types::Uri) -> Option<url::Url> {
-    uri.as_str().parse().ok()
+    let host_stripped_by_windows_drive_rule = std::cell::Cell::new(false);
+    let url = url::Url::options()
+        .syntax_violation_callback(Some(&|violation| {
+            if violation == url::SyntaxViolation::FileWithHostAndWindowsDrive {
+                host_stripped_by_windows_drive_rule.set(true);
+            }
+        }))
+        .parse(uri.as_str())
+        .ok()?;
+    (!host_stripped_by_windows_drive_rule.get()).then_some(url)
 }
 
 /// Converts a domain `url::Url` back into the `tower_lsp_server::ls_types::Uri` an LSP
@@ -183,6 +202,42 @@ mod tests {
                 back.as_str()
             );
         }
+    }
+
+    /// Issue #1090 guard-gap regression: `url::Url`'s WHATWG parser silently discards a
+    /// `file:` URI's host when the first path segment is a literal, unencoded Windows drive
+    /// letter (`SyntaxViolation::FileWithHostAndWindowsDrive`), turning
+    /// `file://attacker.example/C:/real/path` into a host-less `file:///C:/real/path` — a
+    /// shape indistinguishable, once parsed, from a trusted local URI. This reproduces on
+    /// every host OS (it depends only on input shape, not `cfg!(windows)`), so this test
+    /// needs no Windows runner: the malicious value is built directly as a raw string with a
+    /// literal, unencoded colon (mirroring an actual malicious wire-format LSP request from a
+    /// client, which is not obligated to percent-encode it) rather than via
+    /// `Uri::from_file_path`, which always percent-encodes the colon as `%3A` and therefore
+    /// never reproduces this exact bypass — see `server::tests::
+    /// test_did_change_watched_files_rejects_malicious_uri`'s doc comment for why its
+    /// `from_file_path`-derived malicious case does not exercise this shape either.
+    #[test]
+    fn test_from_lsp_uri_rejects_windows_drive_host_bypass() {
+        let malicious: ls_types::Uri = "file://attacker.example/C:/real/temp/dir/Cargo.toml"
+            .parse()
+            .expect("a literal-colon drive-letter path is valid RFC 3986");
+        assert!(
+            from_lsp_uri(&malicious).is_none(),
+            "a file: URI with a non-empty host and a Windows-drive-letter-shaped path must be \
+             rejected, not silently downgraded to a host-less local path"
+        );
+
+        // Positive control: an equivalent legitimate URI (no host) for a real file must still
+        // convert successfully and resolve to a usable path — the guard above must not be
+        // overbroad and reject ordinary `file:` URIs.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let real_path = temp_dir.path().join("Cargo.toml");
+        std::fs::write(&real_path, "[package]\n").unwrap();
+        let legitimate = ls_types::Uri::from_file_path(&real_path).unwrap();
+        let url = from_lsp_uri(&legitimate)
+            .expect("a legitimate, host-less file: URI must still convert to a Url");
+        assert_eq!(url.to_file_path().unwrap(), real_path);
     }
 
     #[test]

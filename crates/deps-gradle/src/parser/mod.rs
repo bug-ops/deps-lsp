@@ -462,11 +462,22 @@ mod tests {
             "test premise: the real file: URI must resolve $serdeVersion from disk"
         );
 
-        for prefix in [
-            "untitled:",
-            "https://attacker.example",
-            "file://attacker.example",
-        ] {
+        // `"file://attacker.example"` used to be a third prefix in this loop. It was removed
+        // (#1090 guard-gap follow-up): when this test's real temp-dir path is
+        // Windows-drive-letter-shaped (`C:\...`, as `tempfile::tempdir()` produces on a real
+        // Windows machine), a `file:` URI with a non-empty host and that path cannot be
+        // represented by a parsed `url::Url` at all — the WHATWG URL Standard's file-host
+        // parsing rule (`SyntaxViolation::FileWithHostAndWindowsDrive`) strips the host
+        // before this test's `parse_gradle` call (or any code holding only a `&Url`) can see
+        // it, so that sub-case asserted an unreachable invariant and failed on
+        // `windows-latest` CI. On Unix the path is never drive-letter-shaped, so the host
+        // survives parsing and the per-layer host guard stays live and testable there — this
+        // comment only concerns the Windows-shaped case, not a claim that the guard is dead
+        // on every platform. This exact bypass is guarded and tested platform-independently
+        // at the point where untrusted URIs are first parsed:
+        // `deps_lsp::lsp_types_interop::from_lsp_uri`, see its test
+        // `test_from_lsp_uri_rejects_windows_drive_host_bypass`.
+        for prefix in ["untitled:", "https://attacker.example"] {
             let uri: Url = format!("{prefix}{path_part}").parse().unwrap();
             let result = parse_gradle(content, &uri).unwrap();
             assert_eq!(

@@ -849,21 +849,34 @@ mod tests {
         let file_uri = deps_core::test_util::test_uri("/project/requirements.txt");
         let path_part = file_uri.as_str().strip_prefix("file://").unwrap();
 
-        for prefix in ["https://attacker.example", "file://attacker.example"] {
-            let uri: Url = format!("{prefix}{path_part}").parse().unwrap();
+        // `"file://attacker.example"` used to be a second prefix here. It was removed (#1090
+        // guard-gap follow-up): `deps_core::test_util::test_uri` builds a Windows-shaped
+        // absolute path (`C:/...`) on Windows CI, and when the path is
+        // Windows-drive-letter-shaped like that, a `file:` URI with a non-empty host cannot
+        // be represented by a parsed `url::Url` at all — the WHATWG URL Standard's file-host
+        // parsing rule (`SyntaxViolation::FileWithHostAndWindowsDrive`) strips the host
+        // before `generate_document_links` (or any code holding only a `&Url`) can see it, so
+        // that sub-case asserted an unreachable invariant and failed on `windows-latest` CI.
+        // On Unix the path is never drive-letter-shaped, so the host survives parsing and the
+        // per-layer host guard stays live and testable there — this comment only concerns the
+        // Windows-shaped case, not a claim that the guard is dead on every platform. This
+        // exact bypass is guarded and tested platform-independently at the point where
+        // untrusted URIs are first parsed: `deps_lsp::lsp_types_interop::from_lsp_uri`, see
+        // its test `test_from_lsp_uri_rejects_windows_drive_host_bypass`.
+        let prefix = "https://attacker.example";
+        let uri: Url = format!("{prefix}{path_part}").parse().unwrap();
 
-            let parse_result = ecosystem
-                .parse_manifest("-r base.txt\n", &uri)
-                .await
-                .unwrap();
+        let parse_result = ecosystem
+            .parse_manifest("-r base.txt\n", &uri)
+            .await
+            .unwrap();
 
-            let links = ecosystem.generate_document_links(parse_result.as_ref(), &uri);
-            assert!(
-                links.is_empty(),
-                "a malicious-scheme/host URI ({prefix}) must not resolve document link \
-                 targets against a real directory"
-            );
-        }
+        let links = ecosystem.generate_document_links(parse_result.as_ref(), &uri);
+        assert!(
+            links.is_empty(),
+            "a malicious-scheme/host URI ({prefix}) must not resolve document link targets \
+             against a real directory"
+        );
     }
 
     #[tokio::test]

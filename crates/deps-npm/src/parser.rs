@@ -1246,6 +1246,21 @@ mod tests {
     /// `scheme() == "file"` and `is_absolute()`, missing a `file://` URI carrying a remote
     /// host. Uses a real on-disk `pnpm-workspace.yaml` that a bypass would have found, to
     /// prove the guard — not just an absent-directory coincidence — is what blocks it.
+    ///
+    /// `#[cfg(unix)]` (guard-gap follow-up): when the manifest's real absolute path is
+    /// Windows-drive-letter-shaped (`C:\...`, as `tempfile::tempdir()` produces on a real
+    /// Windows machine), a `file:` URI with a non-empty host and that path cannot be
+    /// represented by a parsed `url::Url` at all — the WHATWG URL Standard's file-host
+    /// parsing rule (`SyntaxViolation::FileWithHostAndWindowsDrive`) strips the host before
+    /// `manifest_dir`'s scheme/host check (or any code holding only a `&Url`) can see it, so
+    /// this exact fixture asserted an unreachable invariant and failed on `windows-latest`
+    /// CI. On Unix the path is never drive-letter-shaped, so the host survives parsing and
+    /// this test still protects the guard from silently regressing (wiring-drift coverage).
+    /// The drive-letter bypass itself is guarded and tested platform-independently at the
+    /// point where untrusted URIs are first parsed:
+    /// `deps_lsp::lsp_types_interop::from_lsp_uri`, see its test
+    /// `test_from_lsp_uri_rejects_windows_drive_host_bypass`.
+    #[cfg(unix)]
     #[test]
     fn test_parse_with_context_file_scheme_remote_host_is_rejected() {
         // See the comment in `test_parse_with_context_top_level_override_and_scope_override_coexist`

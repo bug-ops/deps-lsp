@@ -880,6 +880,21 @@ mod tests {
     /// its own, but `resolve_manifest_file_path`'s explicit host check is kept as
     /// defense-in-depth — this exercises it against a real on-disk manifest so a regression
     /// in either layer is caught.
+    ///
+    /// `#[cfg(unix)]` (guard-gap follow-up): when the manifest's real absolute path is
+    /// Windows-drive-letter-shaped (`C:\...`, as `tempfile::tempdir()` produces on a real
+    /// Windows machine), a `file:` URI with a non-empty host and that path cannot be
+    /// represented by a parsed `url::Url` at all — the WHATWG URL Standard's file-host
+    /// parsing rule (`SyntaxViolation::FileWithHostAndWindowsDrive`) strips the host before
+    /// `resolve_manifest_file_path` (or any code holding only a `&Url`) can see it, so this
+    /// exact fixture asserted an unreachable invariant and failed on `windows-latest` CI. On
+    /// Unix the path is never drive-letter-shaped, so the host survives parsing and this test
+    /// still protects `resolve_manifest_file_path`'s host check from silently regressing
+    /// (wiring-drift coverage). The drive-letter bypass itself is guarded and tested
+    /// platform-independently at the point where untrusted URIs are first parsed:
+    /// `deps_lsp::lsp_types_interop::from_lsp_uri`, see its test
+    /// `test_from_lsp_uri_rejects_windows_drive_host_bypass`.
+    #[cfg(unix)]
     #[test]
     fn test_find_workspace_root_rejects_remote_host_file_uri() {
         // See the comment in `test_find_workspace_root_rejects_non_file_uri` on why this

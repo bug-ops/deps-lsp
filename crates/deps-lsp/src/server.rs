@@ -1585,6 +1585,24 @@ mod tests {
     /// then proves a malicious-scheme/host `FileEvent` naming the same real path does not
     /// invalidate it, while an ordinary `file:` event for the same path does (positive
     /// control proving the fixture itself is live).
+    ///
+    /// Note on this test's `"file://attacker.example"` case and the guard-gap follow-up fix
+    /// in `lsp_types_interop::from_lsp_uri`: this case's malicious `Uri` is built via
+    /// `Uri::from_file_path(&lockfile_path).as_str().strip_prefix("file://")`, and
+    /// `ls_types::Uri::from_file_path` always percent-encodes a Windows drive letter's colon
+    /// (`C:` becomes `C%3A`, verified against `ls-types` 0.0.6's `ASCII_SET`/`from_file_path`
+    /// source). A percent-encoded colon is never a bare 2-character `is_windows_drive_letter`
+    /// segment, so this construction never reproduces
+    /// `SyntaxViolation::FileWithHostAndWindowsDrive` and this case would not have failed on
+    /// `windows-latest` CI even before `from_lsp_uri` was hardened — it is not a false
+    /// negative, it is simply the wrong construction to exercise that specific bypass. It is
+    /// kept as-is because it still verifies the ordinary "remote host with an intact path is
+    /// rejected" case that `from_lsp_uri` also covers. The drive-letter bypass itself (a raw,
+    /// unencoded-colon wire-format URI, which a malicious client is not obligated to
+    /// percent-encode) is covered platform-independently by
+    /// `lsp_types_interop::tests::test_from_lsp_uri_rejects_windows_drive_host_bypass`, which
+    /// `did_change_watched_files` transitively relies on since it calls `from_lsp_uri` before
+    /// this cache-invalidation logic ever runs.
     #[cfg(feature = "cargo")]
     #[tokio::test]
     async fn test_did_change_watched_files_rejects_malicious_uri() {
