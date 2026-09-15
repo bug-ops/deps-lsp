@@ -24,7 +24,7 @@ use deps_core::lockfile::{
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use tower_lsp_server::ls_types::Uri;
+use url::Url;
 
 /// Mirrors `deps_core::lockfile::locate_lockfile_for_manifest`'s workspace-root search
 /// depth, so the multi-project fallback below walks exactly the same directories the
@@ -48,7 +48,7 @@ impl NuGetLockParser {
 /// `packages.*.lock.json` in the directory": a directory shared by multiple projects can
 /// hold several per-project lock files, and picking the wrong one would silently attach an
 /// unrelated project's resolved versions (#451 follow-up regression).
-fn locate_multi_project_lockfile(manifest_uri: &Uri) -> Option<PathBuf> {
+fn locate_multi_project_lockfile(manifest_uri: &Url) -> Option<PathBuf> {
     // See `resolve_manifest_file_path`'s doc (#1084/#1085): without this guard a non-`file:`
     // or remote-host URI shaped like a real path would resolve against the real filesystem
     // here, same as `deps_core::lockfile::locate_lockfile_for_manifest`'s own guard.
@@ -95,7 +95,7 @@ struct LockEntry {
 }
 
 impl LockFileProvider for NuGetLockParser {
-    fn locate_lockfile(&self, manifest_uri: &Uri) -> Option<PathBuf> {
+    fn locate_lockfile(&self, manifest_uri: &Url) -> Option<PathBuf> {
         locate_lockfile_for_manifest(manifest_uri, Self::LOCKFILE_NAMES)
             .or_else(|| locate_multi_project_lockfile(manifest_uri))
     }
@@ -383,11 +383,11 @@ mod tests {
 
         let parser = NuGetLockParser;
         assert_eq!(
-            parser.locate_lockfile(&Uri::from_file_path(&app1_manifest).unwrap()),
+            parser.locate_lockfile(&Url::from_file_path(&app1_manifest).unwrap()),
             Some(app1_lock)
         );
         assert_eq!(
-            parser.locate_lockfile(&Uri::from_file_path(&app2_manifest).unwrap()),
+            parser.locate_lockfile(&Url::from_file_path(&app2_manifest).unwrap()),
             Some(app2_lock)
         );
     }
@@ -405,7 +405,7 @@ mod tests {
         std::fs::write(&app1_manifest, "<Project></Project>").unwrap();
         std::fs::write(&app2_lock, "{}").unwrap();
 
-        let manifest_uri = Uri::from_file_path(&app1_manifest).unwrap();
+        let manifest_uri = Url::from_file_path(&app1_manifest).unwrap();
         let parser = NuGetLockParser;
         assert_eq!(parser.locate_lockfile(&manifest_uri), None);
     }
@@ -421,7 +421,7 @@ mod tests {
         std::fs::write(&manifest_path, "<Project></Project>").unwrap();
         std::fs::write(&lock_path, "{}").unwrap();
 
-        let manifest_uri = Uri::from_file_path(&manifest_path).unwrap();
+        let manifest_uri = Url::from_file_path(&manifest_path).unwrap();
         let parser = NuGetLockParser;
         assert_eq!(parser.locate_lockfile(&manifest_uri), Some(lock_path));
     }
@@ -439,7 +439,7 @@ mod tests {
         std::fs::write(&exact_lock_path, "{}").unwrap();
         std::fs::write(&multi_lock_path, "{}").unwrap();
 
-        let manifest_uri = Uri::from_file_path(&manifest_path).unwrap();
+        let manifest_uri = Url::from_file_path(&manifest_path).unwrap();
         let parser = NuGetLockParser;
         assert_eq!(parser.locate_lockfile(&manifest_uri), Some(exact_lock_path));
     }
@@ -457,7 +457,7 @@ mod tests {
         std::fs::write(&manifest_path, "<Project></Project>").unwrap();
         std::fs::write(&lock_path, "{}").unwrap();
 
-        let manifest_uri = Uri::from_file_path(&manifest_path).unwrap();
+        let manifest_uri = Url::from_file_path(&manifest_path).unwrap();
         let parser = NuGetLockParser;
         assert_eq!(parser.locate_lockfile(&manifest_uri), Some(lock_path));
     }
@@ -477,12 +477,12 @@ mod tests {
         std::fs::write(&manifest_path, "<Project></Project>").unwrap();
         std::fs::write(&lock_path, "{}").unwrap();
 
-        // Built from `Uri::from_file_path` rather than `format!("untitled:{}", path.display())`
+        // Built from `Url::from_file_path` rather than `format!("untitled:{}", path.display())`
         // to stay valid on Windows: `Path::display()` there uses `\` separators and an
         // unescaped drive letter, neither of which is a legal URI path character.
-        let file_uri = Uri::from_file_path(&manifest_path).unwrap();
+        let file_uri = Url::from_file_path(&manifest_path).unwrap();
         let path_part = file_uri.as_str().strip_prefix("file://").unwrap();
-        let manifest_uri: Uri = format!("untitled:{path_part}").parse().unwrap();
+        let manifest_uri: Url = format!("untitled:{path_part}").parse().unwrap();
         let parser = NuGetLockParser;
 
         assert_eq!(
@@ -504,7 +504,7 @@ mod tests {
         std::fs::write(temp_dir.path().join("packages.json"), "{}").unwrap();
         std::fs::write(temp_dir.path().join("packages..lock.json"), "{}").unwrap();
 
-        let manifest_uri = Uri::from_file_path(&manifest_path).unwrap();
+        let manifest_uri = Url::from_file_path(&manifest_path).unwrap();
         let parser = NuGetLockParser;
         assert_eq!(parser.locate_lockfile(&manifest_uri), None);
     }

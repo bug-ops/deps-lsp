@@ -10,7 +10,6 @@ use deps_core::lockfile::LockFileCache;
 use deps_core::lsp_helpers::resolve_in_use_version;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tower_lsp_server::ls_types::Uri;
 
 /// Builds `dep_name -> [in_use_version, ...]` (§4.5/§4.6) for every dependency with a known
 /// in-use version, for the yanked-check probe in `fetch_latest_versions_parallel`.
@@ -271,7 +270,7 @@ pub fn split_resolved_packages(
 /// }
 /// ```
 pub async fn load_resolved_versions(
-    uri: &Uri,
+    uri: &url::Url,
     lockfile_cache: &Arc<LockFileCache>,
     ecosystem: &dyn Ecosystem,
 ) -> (

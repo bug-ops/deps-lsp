@@ -5,8 +5,9 @@ use std::any::Any;
 use std::sync::Arc;
 use tower_lsp_server::ls_types::{
     CodeAction, CodeActionKind, Diagnostic, Hover, HoverContents, NumberOrString, Position,
-    TextEdit, Uri, WorkspaceEdit,
+    TextEdit, WorkspaceEdit,
 };
+use url::Url;
 
 use deps_core::{
     Ecosystem, PackageName, ParseResult as ParseResultTrait, Registry, Result,
@@ -125,7 +126,7 @@ impl Ecosystem for GithubActionsEcosystem {
     fn parse_manifest<'a>(
         &'a self,
         content: &'a str,
-        uri: &'a Uri,
+        uri: &'a Url,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Box<dyn ParseResultTrait>>> {
         Box::pin(async move {
             let result = crate::parser::parse_workflow_yaml(content, uri)?;
@@ -176,7 +177,7 @@ impl Ecosystem for GithubActionsEcosystem {
         &'a self,
         parse_result: &'a dyn ParseResultTrait,
         versions: deps_core::VersionData<'a>,
-        uri: &'a Uri,
+        uri: &'a Url,
         freshness: deps_core::FreshnessSettings,
         severities: deps_core::lsp_helpers::DiagnosticSeverities,
     ) -> deps_core::ecosystem::BoxFuture<'a, Vec<Diagnostic>> {
@@ -208,7 +209,7 @@ impl Ecosystem for GithubActionsEcosystem {
         &'a self,
         parse_result: &'a dyn ParseResultTrait,
         position: Position,
-        uri: &'a Uri,
+        uri: &'a Url,
         versions: deps_core::VersionData<'a>,
         content: &'a str,
     ) -> deps_core::ecosystem::BoxFuture<'a, Vec<CodeAction>> {
@@ -274,9 +275,9 @@ impl Ecosystem for GithubActionsEcosystem {
             let mut hover = base_hover?;
 
             let dep = parse_result.dependencies().into_iter().find(|d| {
-                deps_core::position_in_range(position, d.name_range())
+                deps_core::position_in_range(position, d.name_range().into())
                     || d.version_range()
-                        .is_some_and(|r| deps_core::position_in_range(position, r))
+                        .is_some_and(|r| deps_core::position_in_range(position, r.into()))
             });
             let Some(dep) = dep else {
                 return Some(hover);
@@ -535,7 +536,7 @@ fn mutable_ref_pin_diagnostics(
                 )
             };
             Some(Diagnostic {
-                range,
+                range: range.into(),
                 severity: Some(severity),
                 message,
                 code: Some(NumberOrString::String(
@@ -569,7 +570,7 @@ fn mutable_ref_pin_diagnostics(
 fn build_sha_pin_action(
     parse_result: &dyn ParseResultTrait,
     position: Position,
-    uri: &Uri,
+    uri: &Url,
     formatter: &GithubActionsFormatter,
 ) -> Option<CodeAction> {
     // Same lookup convention every other deps-lsp code action goes through (critic S2) —
@@ -586,7 +587,7 @@ fn build_sha_pin_action(
     let diagnostic_range = text_edit.range;
 
     let mut changes = std::collections::HashMap::new();
-    changes.insert(uri.clone(), vec![text_edit]);
+    changes.insert(deps_core::to_ls_uri(uri), vec![text_edit]);
 
     Some(CodeAction {
         title: format!("Pin {} to commit SHA", gha_dep.name),
@@ -639,7 +640,7 @@ fn sha_pin_text_edit_for(
         .map(deps_core::VersionReq::as_str)?;
     let new_text = formatter.sha_pin_replacement_for(&gha_dep.name, tag)?;
     Some(TextEdit {
-        range: version_range,
+        range: version_range.into(),
         new_text,
     })
 }
@@ -1014,13 +1015,19 @@ mod tests {
         let position = deps_core::ParseResult::dependencies(&parse_result)[0]
             .version_range()
             .unwrap()
-            .start;
+            .start
+            .into();
 
         let action = build_sha_pin_action(&parse_result, position, &uri, &formatter)
             .expect("expected a Pin-to-commit-SHA quickfix");
         assert!(action.title.contains("Pin") && action.title.contains("commit SHA"));
         let edit = action.edit.as_ref().unwrap();
-        let text_edits = edit.changes.as_ref().unwrap().get(&uri).unwrap();
+        let text_edits = edit
+            .changes
+            .as_ref()
+            .unwrap()
+            .get(&deps_core::to_ls_uri(&uri))
+            .unwrap();
         assert_eq!(text_edits.len(), 1);
         assert_eq!(text_edits[0].new_text, format!("{} # v4", "a".repeat(40)));
     }
@@ -1047,7 +1054,8 @@ mod tests {
 
         let position = deps_core::ParseResult::dependencies(&parse_result)[0]
             .name_range()
-            .start;
+            .start
+            .into();
 
         assert!(build_sha_pin_action(&parse_result, position, &uri, &formatter).is_none());
     }
@@ -1066,7 +1074,8 @@ mod tests {
         let position = deps_core::ParseResult::dependencies(&parse_result)[0]
             .version_range()
             .unwrap()
-            .start;
+            .start
+            .into();
 
         assert!(build_sha_pin_action(&parse_result, position, &uri, &formatter).is_none());
     }
@@ -1092,7 +1101,8 @@ mod tests {
         let position = deps_core::ParseResult::dependencies(&parse_result)[0]
             .version_range()
             .unwrap()
-            .start;
+            .start
+            .into();
 
         assert!(build_sha_pin_action(&parse_result, position, &uri, &formatter).is_none());
     }
@@ -1120,7 +1130,8 @@ mod tests {
         let position = deps_core::ParseResult::dependencies(&parse_result)[0]
             .version_range()
             .unwrap()
-            .start;
+            .start
+            .into();
 
         assert!(
             build_sha_pin_action(&parse_result, position, &uri, &formatter).is_none(),
@@ -1153,7 +1164,8 @@ mod tests {
         let position = deps_core::ParseResult::dependencies(&parse_result)[0]
             .version_range()
             .unwrap()
-            .start;
+            .start
+            .into();
 
         assert!(
             build_sha_pin_action(&parse_result, position, &uri, &formatter).is_none(),
@@ -1290,7 +1302,7 @@ mod tests {
             Arc::new(index),
         );
 
-        let position = parse_result.dependencies()[0].name_range().start;
+        let position = parse_result.dependencies()[0].name_range().start.into();
         let cached = HashMap::new();
         let resolved = HashMap::new();
 
@@ -1327,7 +1339,7 @@ mod tests {
         let content = "steps:\n  - uses: actions/checkout@v4\n";
         let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
 
-        let position = parse_result.dependencies()[0].name_range().start;
+        let position = parse_result.dependencies()[0].name_range().start.into();
         let cached = HashMap::new();
         let resolved = HashMap::new();
 
@@ -1390,7 +1402,7 @@ mod tests {
         let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
         let content = "steps:\n  - uses: actions/checkout@v4\n";
         let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-        let position = parse_result.dependencies()[0].name_range().start;
+        let position = parse_result.dependencies()[0].name_range().start.into();
         let cached = HashMap::new();
         let resolved = HashMap::new();
 
@@ -1444,7 +1456,7 @@ mod tests {
             Arc::new(index),
         );
 
-        let position = parse_result.dependencies()[0].name_range().start;
+        let position = parse_result.dependencies()[0].name_range().start.into();
         let cached = HashMap::new();
         let resolved = HashMap::new();
 
@@ -1695,12 +1707,12 @@ mod tests {
             .iter()
             .find(|e| e.new_text == format!("{sha1} # v4"))
             .expect("expected an edit for actions/checkout");
-        assert_eq!(checkout_edit.range, checkout_range);
+        assert_eq!(checkout_edit.range, checkout_range.into());
         let setup_node_edit = edits
             .iter()
             .find(|e| e.new_text == format!("{sha2} # v3"))
             .expect("expected an edit for actions/setup-node");
-        assert_eq!(setup_node_edit.range, setup_node_range);
+        assert_eq!(setup_node_edit.range, setup_node_range.into());
     }
 
     #[tokio::test]
@@ -1808,7 +1820,8 @@ mod tests {
         let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
         let name_position = deps_core::ParseResult::dependencies(parse_result.as_ref())[0]
             .name_range()
-            .start;
+            .start
+            .into();
         let (cached, resolved) = empty_versions();
 
         let hover = eco
@@ -1944,7 +1957,7 @@ mod tests {
         let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
         let content = "steps:\n  - uses: actions/checkout@v4\n";
         let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-        let position = parse_result.dependencies()[0].name_range().start;
+        let position = parse_result.dependencies()[0].name_range().start.into();
 
         let result = eco
             .generate_completions(
@@ -1993,7 +2006,8 @@ mod tests {
         let position = parse_result.dependencies()[0]
             .version_range()
             .unwrap()
-            .start;
+            .start
+            .into();
         let freshness = deps_core::FreshnessSettings::default();
 
         let context = deps_core::completion::detect_completion_context(

@@ -375,7 +375,7 @@ mod tests {
         // scanning, and this is the test that would catch it (critique #10).
         use deps_core::Dependency;
         use deps_core::parser::DependencySource;
-        use tower_lsp_server::ls_types::{Position, Range};
+        use deps_core::position::{Position, Range};
 
         let dep = crate::types::NuGetDependency {
             name: "Newtonsoft.Json".into(),

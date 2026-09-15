@@ -16,12 +16,12 @@ use deps_cargo::config::{
 use deps_cargo::parse_cargo_toml;
 use deps_core::net_policy::RegistryAccessPolicy;
 use std::collections::HashSet;
-use tower_lsp_server::ls_types::Uri;
+use url::Url;
 
-fn write_manifest(dir: &std::path::Path, content: &str) -> Uri {
+fn write_manifest(dir: &std::path::Path, content: &str) -> Url {
     let path = dir.join("Cargo.toml");
     std::fs::write(&path, content).unwrap();
-    Uri::from_file_path(&path).unwrap()
+    Url::from_file_path(&path).unwrap()
 }
 
 fn test_policy() -> RegistryAccessPolicy {

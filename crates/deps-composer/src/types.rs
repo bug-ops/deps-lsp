@@ -1,4 +1,4 @@
-use tower_lsp_server::ls_types::Range;
+use deps_core::position::Range;
 
 /// Parsed dependency from composer.json with position tracking.
 ///
@@ -10,10 +10,10 @@ use tower_lsp_server::ls_types::Range;
 /// ```no_run
 /// use deps_composer::parser::parse_composer_json;
 /// use deps_composer::types::ComposerSection;
-/// use tower_lsp_server::ls_types::Uri;
+/// use url::Url;
 ///
 /// let json = r#"{ "require": { "symfony/console": "^6.0" } }"#;
-/// let uri = Uri::from_file_path("/test/composer.json").unwrap();
+/// let uri = Url::from_file_path("/test/composer.json").unwrap();
 /// let result = parse_composer_json(json, &uri).unwrap();
 /// let dep = &result.dependencies[0];
 ///
@@ -396,9 +396,9 @@ deps_core::impl_metadata!(ComposerPackage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::position::Position;
     use deps_core::{Metadata, Version};
     use std::assert_matches;
-    use tower_lsp_server::ls_types::Position;
 
     #[test]
     fn test_composer_dependency_creation() {

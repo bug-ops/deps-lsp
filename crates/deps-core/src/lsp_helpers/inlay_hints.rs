@@ -24,6 +24,7 @@ pub fn generate_inlay_hints(
         let Some(version_range) = dep.version_range() else {
             continue;
         };
+        let version_range: tower_lsp_server::ls_types::Range = version_range.into();
 
         let normalized_name = formatter.normalize_package_name(dep.name());
         let latest_version = versions
@@ -199,8 +200,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "serde".into(),
                 version_req: "=2.0.12".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -247,8 +248,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "serde".into(),
                 version_req: "^2.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -299,8 +300,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "example.com/mod".into(),
                 version_req: "v0.8.1".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
             }],
             uri: crate::test_util::test_uri("/test/go.mod"),
         };
@@ -359,8 +360,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "serde".into(),
                 version_req: "1.0.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -414,8 +415,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "tokio".into(),
                 version_req: "1.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -465,8 +466,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "tokio".into(),
                 version_req: "1.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -546,8 +547,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "serde".into(),
                 version_req: "1.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -599,8 +600,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "criterion".into(),
                 version_req: "0.5".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 9)),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 9)).into(),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -651,8 +652,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "criterion".into(),
                 version_req: "0.4".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 9)),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 9)).into(),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -703,8 +704,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "spring-boot-starter".into(),
                 version_req: "$missing".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
             }],
             uri: crate::test_util::test_uri("/test/libs.versions.toml"),
         };
@@ -755,8 +756,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "serde".into(),
                 version_req: "^2.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -801,8 +802,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "serde".into(),
                 version_req: "^2.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -849,8 +850,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "serde".into(),
                 version_req: "=2.0.12".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };

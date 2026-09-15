@@ -230,6 +230,14 @@ pub(crate) async fn generate_diagnostics_internal(
     // function's doc comment. `apply_license_policy_rule` is a no-op for an empty policy
     // (the default until config is first loaded), so attaching it unconditionally costs
     // nothing when no policy is configured.
+    // Unreachable in practice: a document only reaches this point once its URI already
+    // converted successfully (see `ensure_document_loaded`), but handled defensively
+    // rather than unwrapped.
+    let Some(domain_uri) = crate::lsp_types_interop::from_lsp_uri(uri) else {
+        tracing::warn!("URI is not representable as a url::Url: {:?}", uri);
+        return vec![];
+    };
+
     let policy = state.license_policy();
     let version_data = VersionData::new(&cached_versions, &resolved_versions)
         .with_resolved_version_candidates(&resolved_version_candidates)
@@ -241,15 +249,45 @@ pub(crate) async fn generate_diagnostics_internal(
         .with_license_policy(&policy)
         .with_license_prefetch(&licenses);
 
-    ecosystem
+    let mut diagnostics = ecosystem
         .generate_diagnostics(
             parse_result.as_ref(),
             version_data,
-            uri,
+            &domain_uri,
             freshness,
             severities,
         )
-        .await
+        .await;
+    rekey_related_information_to_original_uri(&mut diagnostics, uri);
+    diagnostics
+}
+
+/// Re-keys every diagnostic's `related_information[].location.uri` onto `original_uri`,
+/// the exact `Uri` the client sent in this request.
+///
+/// `deps_core::lsp_helpers::diagnostics`' collapsed-batch builders
+/// (`push_collapsed_blocked_registries`/`push_collapsed_fetch_failures`) build each
+/// related-info `Location.uri` via `to_ls_uri` from the normalized `url::Url` — a round
+/// trip that can normalize a non-canonical URI spelling into a different string (see
+/// `crate::lsp_types_interop::from_lsp_uri`'s doc). There are exactly 3 non-test
+/// `DiagnosticRelatedInformation` construction sites in this codebase, all in
+/// `deps-core/src/lsp_helpers/diagnostics.rs`: `push_collapsed_blocked_registries`'s
+/// per-sibling entries (`:1053`) and its trailing "and N more" entry (`:1068`), and
+/// `push_collapsed_fetch_failures`'s per-entry "also failed" location (`:1709`). All 3
+/// anchor back into the *same* document being diagnosed, never a different file (each
+/// reuses one `ls_uri` local built from the same `uri: &url::Url` this function's own
+/// document is diagnosed under), so overwriting every entry's URI unconditionally is
+/// always correct (issue #1071 S3, round 2: the "jump to related occurrence" affordance
+/// could otherwise target a URI the client doesn't have open).
+fn rekey_related_information_to_original_uri(diagnostics: &mut [Diagnostic], original_uri: &Uri) {
+    for diagnostic in diagnostics.iter_mut() {
+        let Some(related_information) = diagnostic.related_information.as_mut() else {
+            continue;
+        };
+        for related in related_information.iter_mut() {
+            related.location.uri = original_uri.clone();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -310,12 +348,60 @@ mod tests {
     #[tokio::test]
     async fn test_handle_diagnostics_missing_document() {
         let state = Arc::new(ServerState::new());
-        let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let uri = crate::lsp_types_interop::to_lsp_uri(&url);
         let config = DiagnosticsConfig::default();
 
         let (client, full_config) = create_test_client_and_config();
         let result = handle_diagnostics(state, &uri, &config, client, full_config).await;
         assert!(result.is_empty());
+    }
+
+    /// S3 (issue #1071), round 2: `rekey_related_information_to_original_uri` is
+    /// ecosystem-agnostic — it only inspects each diagnostic's
+    /// `related_information[].location.uri` structurally. This proves its contract
+    /// directly against a hand-built diagnostic shaped exactly like
+    /// `push_collapsed_blocked_registries`/`push_collapsed_fetch_failures`'s output,
+    /// without needing to orchestrate the 2+-occurrence collapse those functions require
+    /// to produce `related_information` at all.
+    #[test]
+    fn test_rekey_related_information_to_original_uri_replaces_all_locations() {
+        let normalized_uri: Uri = "file:///normalized/x.toml".parse().unwrap();
+        let original_uri: Uri = "file://localhost/normalized/x.toml".parse().unwrap();
+        let mut diagnostics = vec![Diagnostic {
+            related_information: Some(vec![
+                tower_lsp_server::ls_types::DiagnosticRelatedInformation {
+                    location: tower_lsp_server::ls_types::Location {
+                        uri: normalized_uri.clone(),
+                        range: tower_lsp_server::ls_types::Range::new(
+                            tower_lsp_server::ls_types::Position::new(0, 0),
+                            tower_lsp_server::ls_types::Position::new(0, 1),
+                        ),
+                    },
+                    message: "also blocked".to_string(),
+                },
+            ]),
+            ..Default::default()
+        }];
+
+        rekey_related_information_to_original_uri(&mut diagnostics, &original_uri);
+
+        let related = diagnostics[0].related_information.as_ref().unwrap();
+        assert_eq!(related[0].location.uri, original_uri);
+        assert_ne!(related[0].location.uri, normalized_uri);
+    }
+
+    /// Guards against a future diagnostic without `related_information` silently
+    /// panicking instead of being left untouched.
+    #[test]
+    fn test_rekey_related_information_to_original_uri_leaves_diagnostics_without_related_info_untouched()
+     {
+        let uri: Uri = "file:///x.toml".parse().unwrap();
+        let mut diagnostics = vec![Diagnostic::default()];
+
+        rekey_related_information_to_original_uri(&mut diagnostics, &uri);
+
+        assert!(diagnostics[0].related_information.is_none());
     }
 
     /// #333 liveness regression: `handle_diagnostics` must release the DashMap shard
@@ -347,9 +433,11 @@ mod tests {
                 hook: BlockingHook::Diagnostics,
             }));
 
-        let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+
+        let uri = crate::lsp_types_interop::to_lsp_uri(&url);
         let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
-        let parse_result: Box<dyn ParseResult> = Box::new(MockParseResult { uri: uri.clone() });
+        let parse_result: Box<dyn ParseResult> = Box::new(MockParseResult { uri: url.clone() });
         let doc = DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
         state.update_document(uri.clone(), doc);
 
@@ -410,7 +498,8 @@ mod tests {
             // `document/loader.rs`'s diffing test.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let config = DiagnosticsConfig {
                 unknown_severity: DiagnosticSeverity::ERROR,
                 ..DiagnosticsConfig::default()
@@ -422,7 +511,7 @@ serde = "1.0.0"
 "#
             .to_string();
             let parse_result = ecosystem
-                .parse_manifest(&content, &uri)
+                .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
 
@@ -442,7 +531,8 @@ serde = "1.0.0"
             // See the comment in `test_unknown_package_uses_configured_severity` on why this guard is needed here.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let config = DiagnosticsConfig::default();
 
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
@@ -451,7 +541,7 @@ serde = "1.0.0"
 "#
             .to_string();
             let parse_result = ecosystem
-                .parse_manifest(&content, &uri)
+                .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
 
@@ -471,7 +561,8 @@ serde = "1.0.0"
             // See the comment in `test_unknown_package_uses_configured_severity` on why this guard is needed here.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let config = DiagnosticsConfig {
                 outdated_severity: DiagnosticSeverity::ERROR,
                 ..DiagnosticsConfig::default()
@@ -483,7 +574,7 @@ serde = "1.0.0"
 "#
             .to_string();
             let parse_result = ecosystem
-                .parse_manifest(&content, &uri)
+                .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
 
@@ -517,7 +608,8 @@ serde = "1.0.0"
             // See the comment in `test_unknown_package_uses_configured_severity` on why this guard is needed here.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let config = DiagnosticsConfig::default();
 
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
@@ -526,7 +618,7 @@ serde = "1.0.0"
 "#
             .to_string();
             let parse_result = ecosystem
-                .parse_manifest(&content, &uri)
+                .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
 
@@ -557,7 +649,8 @@ serde = "1.0.0"
             // See the comment in `test_unknown_package_uses_configured_severity` on why this guard is needed here.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let config = DiagnosticsConfig {
                 unsatisfiable_severity: DiagnosticSeverity::ERROR,
                 ..DiagnosticsConfig::default()
@@ -566,7 +659,7 @@ serde = "1.0.0"
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
             let content = "[dependencies]\nserde = \"99\"\n".to_string();
             let parse_result = ecosystem
-                .parse_manifest(&content, &uri)
+                .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
 
@@ -606,12 +699,13 @@ serde = "1.0.0"
             // See the comment in `test_unknown_package_uses_configured_severity` on why this guard is needed here.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
             let content =
                 "[dependencies]\nserde = \"1.0\"\ntokio = \"1.0\"\nanyhow = \"1.0\"\n".to_string();
             let parse_result = ecosystem
-                .parse_manifest(&content, &uri)
+                .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
             let doc_state =
@@ -624,14 +718,16 @@ serde = "1.0.0"
         #[tokio::test]
         async fn test_document_dependency_count_missing_document_is_zero() {
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             assert_eq!(document_dependency_count(&state, &uri), 0);
         }
 
         #[tokio::test]
         async fn test_document_dependency_count_no_parse_result_is_zero() {
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let doc_state =
                 DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
             state.update_document(uri.clone(), doc_state);
@@ -644,7 +740,8 @@ serde = "1.0.0"
             // See the comment in `test_unknown_package_uses_configured_severity` on why this guard is needed here.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let config = DiagnosticsConfig::default();
 
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
@@ -654,7 +751,7 @@ serde = "1.0.0"
             .to_string();
 
             let parse_result = ecosystem
-                .parse_manifest(&content, &uri)
+                .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
 
@@ -670,7 +767,8 @@ serde = "1.0.0"
         #[tokio::test]
         async fn test_handle_diagnostics_no_parse_result() {
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let config = DiagnosticsConfig::default();
 
             let doc_state =
@@ -691,12 +789,13 @@ serde = "1.0.0"
             // See the comment in `test_unknown_package_uses_configured_severity` on why this guard is needed here.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
             let content = "[dependencies]\nserde = \"1.0.0\"\n".to_string();
             let parse_result = ecosystem
-                .parse_manifest(&content, &uri)
+                .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
 
@@ -753,14 +852,15 @@ serde = "1.0.0"
             // See the comment in `test_unknown_package_uses_configured_severity` on why this guard is needed here.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
             // No cached_versions/resolved_versions seeded for "serde" at all — the exact
             // "never actually fetched" shape S2 covers.
             let content = "[dependencies]\nserde = \"1.0.0\"\n".to_string();
             let parse_result = ecosystem
-                .parse_manifest(&content, &uri)
+                .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
 
@@ -810,12 +910,13 @@ serde = "1.0.0"
             // See the comment in `test_unknown_package_uses_configured_severity` on why this guard is needed here.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
             let content = "[dependencies]\nserde = \"1.0.0\"\n".to_string();
             let parse_result = ecosystem
-                .parse_manifest(&content, &uri)
+                .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
 
@@ -850,13 +951,14 @@ serde = "1.0.0"
             // See the comment in `test_unknown_package_uses_configured_severity` on why this guard is needed here.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let config = DiagnosticsConfig::default();
 
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
             let content = "[dependencies]\nserde = \"99\"\n".to_string();
             let parse_result = ecosystem
-                .parse_manifest(&content, &uri)
+                .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
 
@@ -899,13 +1001,14 @@ serde = "1.0.0"
             // See the comment in `test_unknown_package_uses_configured_severity` on why this guard is needed here.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let config = DiagnosticsConfig::default();
 
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
             let content = "[dependencies]\nserde = \"99\"\n".to_string();
             let parse_result = ecosystem
-                .parse_manifest(&content, &uri)
+                .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
 
@@ -936,13 +1039,14 @@ serde = "1.0.0"
             // See the comment in `test_unknown_package_uses_configured_severity` on why this guard is needed here.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let config = DiagnosticsConfig::default();
 
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
             let content = "[dependencies]\nserde = \"99\"\ntokio = \"1.0\"\n".to_string();
             let parse_result = ecosystem
-                .parse_manifest(&content, &uri)
+                .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
 
@@ -997,13 +1101,14 @@ serde = "1.0.0"
             // See the comment in `test_unknown_package_uses_configured_severity` on why this guard is needed here.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let config = DiagnosticsConfig::default();
 
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
             let content = "[dependencies]\nserde = \"=1.0.213\"\n".to_string();
             let parse_result = ecosystem
-                .parse_manifest(&content, &uri)
+                .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
 
@@ -1051,14 +1156,15 @@ serde = "1.0.0"
             // See the comment in `test_unknown_package_uses_configured_severity` on why this guard is needed here.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/package.json");
+            let url = deps_core::test_util::test_uri("/test/package.json");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let config = DiagnosticsConfig::default();
 
             let ecosystem = state.ecosystem_registry.get("npm").unwrap();
             let content = r#"{"dependencies": {"express": "4.0.0"}}"#.to_string();
 
             let parse_result = ecosystem
-                .parse_manifest(&content, &uri)
+                .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
 
@@ -1089,13 +1195,14 @@ serde = "1.0.0"
             // See the comment in `test_unknown_package_uses_configured_severity` on why this guard is needed here.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/package.json");
+            let url = deps_core::test_util::test_uri("/test/package.json");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let config = DiagnosticsConfig::default();
 
             let ecosystem = state.ecosystem_registry.get("npm").unwrap();
             let content = r#"{"dependencies": {"left-pad": "^1.0.0"}}"#.to_string();
             let parse_result = ecosystem
-                .parse_manifest(&content, &uri)
+                .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
 
@@ -1157,7 +1264,8 @@ serde = "1.0.0"
             // See the comment in `test_unknown_package_uses_configured_severity` on why this guard is needed here.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/package.json");
+            let url = deps_core::test_util::test_uri("/test/package.json");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let config = DiagnosticsConfig::default();
 
             let ecosystem = state.ecosystem_registry.get("npm").unwrap();
@@ -1165,7 +1273,7 @@ serde = "1.0.0"
             // shape `yanked_diagnostic_applies_to` still allowed through pre-#436.
             let content = r#"{"dependencies": {"old-pkg": "1.0.1"}}"#.to_string();
             let parse_result = ecosystem
-                .parse_manifest(&content, &uri)
+                .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
 
@@ -1220,13 +1328,14 @@ serde = "1.0.0"
         #[tokio::test]
         async fn test_handle_diagnostics_npm_scheme_exact_pin_yanked_stays_suppressed() {
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/deno.json");
+            let url = deps_core::test_util::test_uri("/test/deno.json");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let config = DiagnosticsConfig::default();
 
             let ecosystem = state.ecosystem_registry.get("deno").unwrap();
             let content = r#"{"imports": {"lodash": "npm:lodash@4.17.20"}}"#.to_string();
             let parse_result = ecosystem
-                .parse_manifest(&content, &uri)
+                .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
 
@@ -1270,13 +1379,14 @@ serde = "1.0.0"
         #[tokio::test]
         async fn test_handle_diagnostics_jsr_scheme_exact_pin_yanked_still_fires() {
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/deno.json");
+            let url = deps_core::test_util::test_uri("/test/deno.json");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let config = DiagnosticsConfig::default();
 
             let ecosystem = state.ecosystem_registry.get("deno").unwrap();
             let content = r#"{"imports": {"@std/fs": "jsr:@std/fs@1.0.0"}}"#.to_string();
             let parse_result = ecosystem
-                .parse_manifest(&content, &uri)
+                .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
 
@@ -1326,13 +1436,14 @@ serde = "1.0.0"
         #[tokio::test]
         async fn test_handle_diagnostics_jsr_scheme_range_yanked_only_now_fires() {
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/deno.json");
+            let url = deps_core::test_util::test_uri("/test/deno.json");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let config = DiagnosticsConfig::default();
 
             let ecosystem = state.ecosystem_registry.get("deno").unwrap();
             let content = r#"{"imports": {"@std/fs": "jsr:@std/fs@^1.0.0"}}"#.to_string();
             let parse_result = ecosystem
-                .parse_manifest(&content, &uri)
+                .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
 
@@ -1386,7 +1497,8 @@ serde = "1.0.0"
         #[tokio::test]
         async fn test_handle_diagnostics() {
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
+            let url = deps_core::test_util::test_uri("/test/pyproject.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let config = DiagnosticsConfig::default();
 
             let ecosystem = state.ecosystem_registry.get("pypi").unwrap();
@@ -1396,7 +1508,7 @@ dependencies = ["requests>=2.0.0"]
             .to_string();
 
             let parse_result = ecosystem
-                .parse_manifest(&content, &uri)
+                .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
 
@@ -1422,7 +1534,7 @@ dependencies = ["requests>=2.0.0"]
 
         async fn cargo_parse_result(
             state: &ServerState,
-            uri: &Uri,
+            uri: &url::Url,
             content: &str,
         ) -> Box<dyn ParseResult> {
             // See the comment in `test_unknown_package_uses_configured_severity` on why this guard is needed here.
@@ -1454,9 +1566,10 @@ dependencies = ["requests>=2.0.0"]
             deny: Vec<String>,
         ) -> (Arc<ServerState>, Uri, Client, Arc<RwLock<DepsConfig>>) {
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
-            let parse_result = cargo_parse_result(&state, &uri, &content).await;
+            let parse_result = cargo_parse_result(&state, &url, &content).await;
 
             let mut doc_state =
                 DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
@@ -1547,9 +1660,10 @@ dependencies = ["requests>=2.0.0"]
         #[tokio::test]
         async fn dependency_with_no_known_license_produces_no_diagnostic() {
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
-            let parse_result = cargo_parse_result(&state, &uri, &content).await;
+            let parse_result = cargo_parse_result(&state, &url, &content).await;
             let mut doc_state =
                 DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
             let mut cached_versions = HashMap::new();
@@ -1583,9 +1697,10 @@ dependencies = ["requests>=2.0.0"]
         #[tokio::test]
         async fn push_path_also_evaluates_license_policy() {
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
-            let parse_result = cargo_parse_result(&state, &uri, &content).await;
+            let parse_result = cargo_parse_result(&state, &url, &content).await;
 
             let mut doc_state =
                 DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);

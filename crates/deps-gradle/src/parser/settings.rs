@@ -5,9 +5,10 @@
 use crate::parser::{GradleParseResult, utf16_len};
 use crate::types::GradleDependency;
 use deps_core::Result;
+use deps_core::position::{Position, Range};
 use regex::Regex;
 use std::sync::LazyLock;
-use tower_lsp_server::ls_types::{Position, Range, Uri};
+use url::Url;
 
 /// Matches: id "plugin.id" version "1.0.0" (Groovy) or id("plugin.id") version "1.0.0" (Kotlin DSL)
 // Compile-time-constant pattern; a malformed literal is a build-visible programmer error,
@@ -62,7 +63,7 @@ fn find_plugin_version_range(line: &str, line_idx: u32, version: &str) -> Range 
 ///
 /// Infallible by construction: unrecognized lines are skipped rather than erroring.
 /// Returns [`Result`] only to match the shared parser signature every ecosystem implements.
-pub fn parse_settings(content: &str, uri: &Uri) -> Result<GradleParseResult> {
+pub fn parse_settings(content: &str, uri: &Url) -> Result<GradleParseResult> {
     let mut dependencies = Vec::new();
     let mut brace_depth: i32 = 0;
     let mut in_plugin_management = false;
@@ -151,7 +152,7 @@ pub fn parse_settings(content: &str, uri: &Uri) -> Result<GradleParseResult> {
 mod tests {
     use super::*;
 
-    fn make_uri(name: &str) -> Uri {
+    fn make_uri(name: &str) -> Url {
         deps_core::test_util::test_uri(&format!("/project/{name}"))
     }
 

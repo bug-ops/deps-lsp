@@ -18,10 +18,10 @@ use deps_go::lockfile::parse_go_sum;
 use deps_go::parser::parse_go_mod;
 use deps_go::{compare_versions, escape_module_path, is_pseudo_version};
 use std::hint::black_box;
-use tower_lsp_server::ls_types::Uri;
+use url::Url;
 
-fn bench_uri() -> Uri {
-    Uri::from_file_path("/bench/go.mod").unwrap()
+fn bench_uri() -> Url {
+    Url::from_file_path("/bench/go.mod").unwrap()
 }
 
 /// Small go.mod file with 5 dependencies.

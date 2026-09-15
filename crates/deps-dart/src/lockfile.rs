@@ -6,7 +6,7 @@ use deps_core::lockfile::{
     locate_lockfile_for_manifest, read_and_parse_lockfile,
 };
 use std::path::{Path, PathBuf};
-use tower_lsp_server::ls_types::Uri;
+use url::Url;
 use yaml_rust2::{Yaml, YamlLoader};
 
 /// [`LockFileProvider`] implementation for `pubspec.lock`.
@@ -17,7 +17,7 @@ impl PubspecLockParser {
 }
 
 impl LockFileProvider for PubspecLockParser {
-    fn locate_lockfile(&self, manifest_uri: &Uri) -> Option<PathBuf> {
+    fn locate_lockfile(&self, manifest_uri: &Url) -> Option<PathBuf> {
         locate_lockfile_for_manifest(manifest_uri, Self::LOCKFILE_NAMES)
     }
 

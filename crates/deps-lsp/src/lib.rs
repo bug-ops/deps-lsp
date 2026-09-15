@@ -7,9 +7,10 @@
 // class of fix as deps-cargo (#745), deps-nuget (#696), deps-swift (#673), deps-composer.
 #![recursion_limit = "256"]
 
-//! The `deps-lsp` binary crate: wires a running `tower-lsp-server`
-//! [`LanguageServer`](tower_lsp_server::LanguageServer) implementation on top of the
-//! [`deps_engine`] composition root.
+//! The `deps-lsp` binary crate.
+//!
+//! Wires a running `tower-lsp-server` [`LanguageServer`](tower_lsp_server::LanguageServer)
+//! implementation on top of the [`deps_engine`] composition root.
 //!
 //! [`deps_engine::setup::register_ecosystems`] (re-exported here at the crate root — see
 //! below) registers every feature-enabled ecosystem crate against an [`EcosystemRegistry`],
@@ -25,6 +26,12 @@ pub mod config;
 pub mod document;
 pub mod file_watcher;
 pub mod handlers;
+/// Domain-type ⇄ LSP-protocol-type conversions.
+///
+/// `url::Url`/`deps_core::position::{Position, Range}` ⇄ `tower_lsp_server::ls_types`
+/// conversions — the sole adapter boundary between deps-core's domain types and the LSP
+/// protocol (issue #1071).
+pub mod lsp_types_interop;
 pub mod progress;
 /// The `tower-lsp-server` [`LanguageServer`](tower_lsp_server::LanguageServer) implementation.
 pub mod server;

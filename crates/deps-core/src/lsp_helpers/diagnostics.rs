@@ -618,7 +618,7 @@ pub fn generate_diagnostics_from_cache(
     parse_result: &dyn ParseResult,
     versions: VersionData<'_>,
     formatter: &dyn EcosystemFormatter,
-    uri: &Uri,
+    uri: &url::Url,
     freshness: crate::freshness::FreshnessSettings,
     severities: DiagnosticSeverities,
     now: PublishTime,
@@ -695,6 +695,7 @@ pub fn generate_diagnostics_from_cache(
         let Some(version_range) = dep.version_range() else {
             continue;
         };
+        let version_range: Range = version_range.into();
         let resolved = ResolvedData {
             package_versions,
             version_range,
@@ -935,8 +936,10 @@ fn blocked_registry_diagnostics(
     }
 
     // Built once, not per sibling occurrence (#944 M3) — feeds
-    // [`push_collapsed_blocked_registries`]'s `related_information` naming.
-    let dependency_names: HashMap<Range, &str> = deps
+    // [`push_collapsed_blocked_registries`]'s `related_information` naming. Keyed on
+    // `deps_core::position::Range` directly, matching `BlockedRegistryOccurrence::range`'s
+    // and `dep.name_range()`'s type (#1071 S2).
+    let dependency_names: HashMap<crate::position::Range, &str> = deps
         .iter()
         .map(|dep| (dep.name_range(), dep.name().as_str()))
         .collect();
@@ -1007,7 +1010,7 @@ fn build_blocked_registry_diagnostic(occurrence: &BlockedRegistryOccurrence) -> 
             .to_string()
     };
     Diagnostic {
-        range: occurrence.range,
+        range: occurrence.range.into(),
         severity: Some(DiagnosticSeverity::INFORMATION),
         message: format!(
             "registry index \"{}\" blocked by registries.workspace_registries policy \
@@ -1030,8 +1033,8 @@ fn build_blocked_registry_diagnostic(occurrence: &BlockedRegistryOccurrence) -> 
 fn push_collapsed_blocked_registries(
     diagnostics: &mut Vec<Diagnostic>,
     entries: Vec<BlockedRegistryOccurrence>,
-    uri: &Uri,
-    dependency_names: &HashMap<Range, &str>,
+    uri: &url::Url,
+    dependency_names: &HashMap<crate::position::Range, &str>,
 ) {
     // The `0`/`1` arms are matched separately, so this arm only runs with `len() >= 2`,
     // making both `entries[0]` and the `entries[1..]` slice below valid.
@@ -1043,13 +1046,14 @@ fn push_collapsed_blocked_registries(
             let diagnostic = build_blocked_registry_diagnostic(&entries[0]);
             let siblings = &entries[1..];
             let shown = siblings.len().min(MAX_BLOCKED_REGISTRY_RELATED_INFO);
+            let ls_uri = super::to_ls_uri(uri);
             #[allow(clippy::indexing_slicing)]
             let mut related_information: Vec<DiagnosticRelatedInformation> = siblings[..shown]
                 .iter()
                 .map(|occurrence| DiagnosticRelatedInformation {
                     location: Location {
-                        uri: uri.clone(),
-                        range: occurrence.range,
+                        uri: ls_uri.clone(),
+                        range: occurrence.range.into(),
                     },
                     message: match dependency_names.get(&occurrence.range) {
                         Some(name) => {
@@ -1063,7 +1067,7 @@ fn push_collapsed_blocked_registries(
             if remaining > 0 {
                 related_information.push(DiagnosticRelatedInformation {
                     location: Location {
-                        uri: uri.clone(),
+                        uri: ls_uri,
                         range: diagnostic.range,
                     },
                     message: format!(
@@ -1096,7 +1100,7 @@ fn push_collapsed_blocked_registries(
 fn apply_vulnerability_rule(
     diagnostics: &mut Vec<Diagnostic>,
     ctx: &RuleContext<'_>,
-    vuln_keys: Option<&HashMap<Range, String>>,
+    vuln_keys: Option<&HashMap<crate::position::Range, String>>,
 ) {
     if let Some(vulnerabilities) = ctx.versions.vulnerabilities
         && let Some(ScanOutcome::Vulnerable(dv)) = vuln_keys
@@ -1172,7 +1176,7 @@ fn apply_license_policy_rule(diagnostics: &mut Vec<Diagnostic>, ctx: &RuleContex
         ViolationReason::NotAllowed => DiagnosticSeverity::WARNING,
     };
     diagnostics.push(Diagnostic {
-        range: ctx.dep.name_range(),
+        range: ctx.dep.name_range().into(),
         severity: Some(severity),
         message: format!(
             "{}: {} {}",
@@ -1323,7 +1327,8 @@ fn apply_in_use_yanked_rule(
             range: ctx
                 .dep
                 .version_range()
-                .unwrap_or_else(|| ctx.dep.name_range()),
+                .unwrap_or_else(|| ctx.dep.name_range())
+                .into(),
             severity: Some(ctx.severities.yanked),
             message: format!("{} ({})", ctx.formatter.yanked_message(), yanked_version),
             source: Some("deps-lsp".into()),
@@ -1398,7 +1403,7 @@ fn apply_unknown_package_rule(
     match ctx.formatter.validate_package_name(dep.name().as_str()) {
         Err(reason) => {
             diagnostics.push(Diagnostic {
-                range: dep.name_range(),
+                range: dep.name_range().into(),
                 severity: Some(ctx.severities.unknown),
                 message: format!("Invalid package name '{}': {reason}", dep.name()),
                 source: Some("deps-lsp".into()),
@@ -1421,7 +1426,7 @@ fn apply_unknown_package_rule(
             fetch_failed.push(FetchFailureEntry {
                 name: dep.name().to_string(),
                 diagnostic: Diagnostic {
-                    range: dep.name_range(),
+                    range: dep.name_range().into(),
                     severity: Some(ctx.severities.unknown),
                     message,
                     source: Some("deps-lsp".into()),
@@ -1433,7 +1438,7 @@ fn apply_unknown_package_rule(
         Ok(()) if no_comparable_versions => {}
         Ok(()) if can_resolve_source => {
             diagnostics.push(Diagnostic {
-                range: dep.name_range(),
+                range: dep.name_range().into(),
                 severity: Some(ctx.severities.unknown),
                 message: format!("Unknown package '{}'", dep.name()),
                 source: Some("deps-lsp".into()),
@@ -1672,7 +1677,7 @@ fn apply_outdated_rule(
 fn push_collapsed_fetch_failures(
     diagnostics: &mut Vec<Diagnostic>,
     fetch_failed: Vec<FetchFailureEntry>,
-    uri: &Uri,
+    uri: &url::Url,
 ) {
     // The `0`/`1` arms are matched separately, so this arm only runs with `len() >= 2`,
     // making both `fetch_failed[0]` and the `fetch_failed[1..]` slice below valid.
@@ -1698,11 +1703,12 @@ fn push_collapsed_fetch_failures(
                     "Registry lookup failed for {n} packages; package status could not be determined"
                 ),
             };
+            let ls_uri = super::to_ls_uri(uri);
             let related_information = fetch_failed[1..]
                 .iter()
                 .map(|entry| DiagnosticRelatedInformation {
                     location: Location {
-                        uri: uri.clone(),
+                        uri: ls_uri.clone(),
                         range: entry.diagnostic.range,
                     },
                     message: format!("'{}' also failed", entry.name),
@@ -1735,7 +1741,10 @@ fn push_deprecation_diagnostic(
 ) {
     use std::fmt::Write as _;
 
-    let range = dep.version_range().unwrap_or_else(|| dep.name_range());
+    let range: Range = dep
+        .version_range()
+        .unwrap_or_else(|| dep.name_range())
+        .into();
 
     let mut message = formatter.deprecated_message().to_string();
     if let Some(reason) = deprecation.reason.as_deref().filter(|r| !r.is_empty()) {
@@ -1785,7 +1794,10 @@ fn push_vulnerability_diagnostics(
     dep: &dyn Dependency,
     dv: &crate::osv::DependencyVulnerabilities,
 ) {
-    let range = dep.version_range().unwrap_or_else(|| dep.name_range());
+    let range: Range = dep
+        .version_range()
+        .unwrap_or_else(|| dep.name_range())
+        .into();
 
     for advisory in dv.advisories.items() {
         let code_description = advisory
@@ -1854,8 +1866,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "unknown-pkg".into(),
                 version_req: "1.0.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 11)),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 11)).into(),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -1898,8 +1910,8 @@ mod tests {
                 Box::new(MockDep {
                     name: "unknown-pkg".into(),
                     version_req: "1.0.0".into(),
-                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                    name_range: Range::new(Position::new(0, 0), Position::new(0, 11)),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 11)).into(),
                 }),
             ],
             uri: crate::test_util::test_uri("/test/pubspec.yaml"),
@@ -2019,8 +2031,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "dtolnay/rust-toolchain".into(),
                 version_req: "stable".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 23)),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 23)).into(),
             }],
             uri: crate::test_util::test_uri("/repo/.github/workflows/ci.yml"),
         };
@@ -2056,7 +2068,7 @@ mod tests {
 
         struct BlockedRegistryParseResult {
             deps: Vec<MockDep>,
-            uri: Uri,
+            uri: url::Url,
             blocked: Vec<BlockedRegistryOccurrence>,
         }
 
@@ -2067,7 +2079,7 @@ mod tests {
             fn workspace_root(&self) -> Option<&std::path::Path> {
                 None
             }
-            fn uri(&self) -> &Uri {
+            fn uri(&self) -> &url::Url {
                 &self.uri
             }
             fn blocked_registries(&self) -> Vec<BlockedRegistryOccurrence> {
@@ -2084,12 +2096,12 @@ mod tests {
             deps: vec![MockDep {
                 name: "internal-crate".into(),
                 version_req: "1.0.0".into(),
-                version_range: Range::new(Position::new(0, 20), Position::new(0, 25)),
-                name_range,
+                version_range: Range::new(Position::new(0, 20), Position::new(0, 25)).into(),
+                name_range: name_range.into(),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
             blocked: vec![BlockedRegistryOccurrence {
-                range: name_range,
+                range: name_range.into(),
                 class: HostClass::CloudMetadata,
                 raw_value: "https://169.254.169.254/index".to_string(),
                 declaration_key: "https://169.254.169.254/index".to_string(),
@@ -2138,7 +2150,7 @@ mod tests {
 
         struct BlockedRegistryParseResult {
             deps: Vec<MockDep>,
-            uri: Uri,
+            uri: url::Url,
             blocked: Vec<BlockedRegistryOccurrence>,
         }
 
@@ -2149,7 +2161,7 @@ mod tests {
             fn workspace_root(&self) -> Option<&std::path::Path> {
                 None
             }
-            fn uri(&self) -> &Uri {
+            fn uri(&self) -> &url::Url {
                 &self.uri
             }
             fn blocked_registries(&self) -> Vec<BlockedRegistryOccurrence> {
@@ -2166,12 +2178,12 @@ mod tests {
             deps: vec![MockDep {
                 name: "internal-crate".into(),
                 version_req: "1.0.0".into(),
-                version_range: Range::new(Position::new(0, 20), Position::new(0, 25)),
-                name_range,
+                version_range: Range::new(Position::new(0, 20), Position::new(0, 25)).into(),
+                name_range: name_range.into(),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
             blocked: vec![BlockedRegistryOccurrence {
-                range: name_range,
+                range: name_range.into(),
                 class: HostClass::CloudMetadata,
                 raw_value: "https://index.mycorp.dev/api?api_key=SECRET".to_string(),
                 declaration_key: "https://index.mycorp.dev/api?api_key=SECRET".to_string(),
@@ -2218,7 +2230,7 @@ mod tests {
 
         struct BlockedRegistryParseResult {
             deps: Vec<MockDep>,
-            uri: Uri,
+            uri: url::Url,
             blocked: Vec<BlockedRegistryOccurrence>,
         }
 
@@ -2229,7 +2241,7 @@ mod tests {
             fn workspace_root(&self) -> Option<&std::path::Path> {
                 None
             }
-            fn uri(&self) -> &Uri {
+            fn uri(&self) -> &url::Url {
                 &self.uri
             }
             fn blocked_registries(&self) -> Vec<BlockedRegistryOccurrence> {
@@ -2247,12 +2259,12 @@ mod tests {
             deps: vec![MockDep {
                 name: "internal-crate".into(),
                 version_req: "1.0.0".into(),
-                version_range: Range::new(Position::new(0, 20), Position::new(0, 25)),
-                name_range,
+                version_range: Range::new(Position::new(0, 20), Position::new(0, 25)).into(),
+                name_range: name_range.into(),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
             blocked: vec![BlockedRegistryOccurrence {
-                range: name_range,
+                range: name_range.into(),
                 class: HostClass::CloudMetadata,
                 raw_value: slash_less.clone(),
                 declaration_key: slash_less,
@@ -2299,7 +2311,7 @@ mod tests {
 
         struct BlockedRegistryParseResult {
             deps: Vec<MockDep>,
-            uri: Uri,
+            uri: url::Url,
             blocked: Vec<BlockedRegistryOccurrence>,
         }
 
@@ -2310,7 +2322,7 @@ mod tests {
             fn workspace_root(&self) -> Option<&std::path::Path> {
                 None
             }
-            fn uri(&self) -> &Uri {
+            fn uri(&self) -> &url::Url {
                 &self.uri
             }
             fn blocked_registries(&self) -> Vec<BlockedRegistryOccurrence> {
@@ -2328,12 +2340,12 @@ mod tests {
             deps: vec![MockDep {
                 name: "internal-crate".into(),
                 version_req: "1.0.0".into(),
-                version_range: Range::new(Position::new(0, 20), Position::new(0, 25)),
-                name_range,
+                version_range: Range::new(Position::new(0, 20), Position::new(0, 25)).into(),
+                name_range: name_range.into(),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
             blocked: vec![BlockedRegistryOccurrence {
-                range: name_range,
+                range: name_range.into(),
                 class: HostClass::CloudMetadata,
                 raw_value: slash_less_credential.clone(),
                 declaration_key: slash_less_credential,
@@ -2380,7 +2392,7 @@ mod tests {
 
         struct BlockedRegistryParseResult {
             deps: Vec<MockDep>,
-            uri: Uri,
+            uri: url::Url,
             blocked: Vec<BlockedRegistryOccurrence>,
         }
 
@@ -2391,7 +2403,7 @@ mod tests {
             fn workspace_root(&self) -> Option<&std::path::Path> {
                 None
             }
-            fn uri(&self) -> &Uri {
+            fn uri(&self) -> &url::Url {
                 &self.uri
             }
             fn blocked_registries(&self) -> Vec<BlockedRegistryOccurrence> {
@@ -2418,12 +2430,12 @@ mod tests {
                 deps: vec![MockDep {
                     name: "internal-crate".into(),
                     version_req: "1.0.0".into(),
-                    version_range: Range::new(Position::new(0, 20), Position::new(0, 25)),
-                    name_range,
+                    version_range: Range::new(Position::new(0, 20), Position::new(0, 25)).into(),
+                    name_range: name_range.into(),
                 }],
                 uri: crate::test_util::test_uri("/test/Cargo.toml"),
                 blocked: vec![BlockedRegistryOccurrence {
-                    range: name_range,
+                    range: name_range.into(),
                     class: HostClass::CloudMetadata,
                     raw_value: "https://169.254.169.254/index".to_string(),
                     declaration_key: opaque_key.to_string(),
@@ -2471,7 +2483,7 @@ mod tests {
 
         struct BlockedRegistryParseResult {
             deps: Vec<MockDep>,
-            uri: Uri,
+            uri: url::Url,
             blocked: Vec<BlockedRegistryOccurrence>,
         }
 
@@ -2482,7 +2494,7 @@ mod tests {
             fn workspace_root(&self) -> Option<&std::path::Path> {
                 None
             }
-            fn uri(&self) -> &Uri {
+            fn uri(&self) -> &url::Url {
                 &self.uri
             }
             fn blocked_registries(&self) -> Vec<BlockedRegistryOccurrence> {
@@ -2500,12 +2512,12 @@ mod tests {
             deps: vec![MockDep {
                 name: "internal-crate".into(),
                 version_req: "1.0.0".into(),
-                version_range: Range::new(Position::new(0, 20), Position::new(0, 25)),
-                name_range,
+                version_range: Range::new(Position::new(0, 20), Position::new(0, 25)).into(),
+                name_range: name_range.into(),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
             blocked: vec![BlockedRegistryOccurrence {
-                range: name_range,
+                range: name_range.into(),
                 class: HostClass::CloudMetadata,
                 raw_value: "https://10.0.0.1/v3/index.json".to_string(),
                 declaration_key: opaque_prefixed_url,
@@ -2555,7 +2567,7 @@ mod tests {
 
         struct BlockedRegistryParseResult {
             deps: Vec<MockDep>,
-            uri: Uri,
+            uri: url::Url,
             blocked: Vec<BlockedRegistryOccurrence>,
         }
 
@@ -2566,7 +2578,7 @@ mod tests {
             fn workspace_root(&self) -> Option<&std::path::Path> {
                 None
             }
-            fn uri(&self) -> &Uri {
+            fn uri(&self) -> &url::Url {
                 &self.uri
             }
             fn blocked_registries(&self) -> Vec<BlockedRegistryOccurrence> {
@@ -2586,20 +2598,20 @@ mod tests {
                 MockDep {
                     name: "first-crate".into(),
                     version_req: "1.0.0".into(),
-                    version_range: Range::new(Position::new(0, 20), Position::new(0, 25)),
-                    name_range: first_range,
+                    version_range: Range::new(Position::new(0, 20), Position::new(0, 25)).into(),
+                    name_range: first_range.into(),
                 },
                 MockDep {
                     name: "second-crate".into(),
                     version_req: "1.0.0".into(),
-                    version_range: Range::new(Position::new(1, 20), Position::new(1, 25)),
-                    name_range: second_range,
+                    version_range: Range::new(Position::new(1, 20), Position::new(1, 25)).into(),
+                    name_range: second_range.into(),
                 },
                 MockDep {
                     name: "third-crate".into(),
                     version_req: "1.0.0".into(),
-                    version_range: Range::new(Position::new(2, 20), Position::new(2, 25)),
-                    name_range: third_range,
+                    version_range: Range::new(Position::new(2, 20), Position::new(2, 25)).into(),
+                    name_range: third_range.into(),
                 },
             ],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
@@ -2607,13 +2619,13 @@ mod tests {
                 // Same declaration ("top-level"), same value — genuinely the same config-wide
                 // block, referenced by two dependencies. Must collapse to one diagnostic.
                 BlockedRegistryOccurrence {
-                    range: first_range,
+                    range: first_range.into(),
                     class: HostClass::CloudMetadata,
                     raw_value: "https://169.254.169.254/index".to_string(),
                     declaration_key: "top-level".to_string(),
                 },
                 BlockedRegistryOccurrence {
-                    range: second_range,
+                    range: second_range.into(),
                     class: HostClass::CloudMetadata,
                     raw_value: "https://169.254.169.254/index".to_string(),
                     declaration_key: "top-level".to_string(),
@@ -2621,7 +2633,7 @@ mod tests {
                 // A different declaration ("scope:@myorg") that happens to share the exact
                 // same (class, raw_value) — must NOT be swallowed by the dedup above.
                 BlockedRegistryOccurrence {
-                    range: third_range,
+                    range: third_range.into(),
                     class: HostClass::CloudMetadata,
                     raw_value: "https://169.254.169.254/index".to_string(),
                     declaration_key: "scope:@myorg".to_string(),
@@ -2712,7 +2724,7 @@ mod tests {
 
         struct BlockedRegistryParseResult {
             deps: Vec<MockDep>,
-            uri: Uri,
+            uri: url::Url,
             blocked: Vec<BlockedRegistryOccurrence>,
         }
 
@@ -2723,7 +2735,7 @@ mod tests {
             fn workspace_root(&self) -> Option<&std::path::Path> {
                 None
             }
-            fn uri(&self) -> &Uri {
+            fn uri(&self) -> &url::Url {
                 &self.uri
             }
             fn blocked_registries(&self) -> Vec<BlockedRegistryOccurrence> {
@@ -2747,14 +2759,15 @@ mod tests {
                 version_range: Range::new(
                     Position::new(range.start.line, 20),
                     Position::new(range.start.line, 25),
-                ),
-                name_range: range,
+                )
+                .into(),
+                name_range: range.into(),
             })
             .collect();
         let blocked: Vec<BlockedRegistryOccurrence> = ranges
             .iter()
             .map(|&range| BlockedRegistryOccurrence {
-                range,
+                range: range.into(),
                 class: HostClass::CloudMetadata,
                 raw_value: "https://169.254.169.254/index".to_string(),
                 declaration_key: "top-level".to_string(),
@@ -2849,7 +2862,7 @@ mod tests {
 
         struct BlockedRegistryParseResult {
             deps: Vec<MockDep>,
-            uri: Uri,
+            uri: url::Url,
             blocked: Vec<BlockedRegistryOccurrence>,
         }
 
@@ -2860,7 +2873,7 @@ mod tests {
             fn workspace_root(&self) -> Option<&std::path::Path> {
                 None
             }
-            fn uri(&self) -> &Uri {
+            fn uri(&self) -> &url::Url {
                 &self.uri
             }
             fn blocked_registries(&self) -> Vec<BlockedRegistryOccurrence> {
@@ -2878,12 +2891,12 @@ mod tests {
             deps: vec![MockDep {
                 name: "internal-crate".into(),
                 version_req: "1.0.0".into(),
-                version_range: Range::new(Position::new(0, 20), Position::new(0, 25)),
-                name_range,
+                version_range: Range::new(Position::new(0, 20), Position::new(0, 25)).into(),
+                name_range: name_range.into(),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
             blocked: vec![BlockedRegistryOccurrence {
-                range: name_range,
+                range: name_range.into(),
                 class: HostClass::InternalName,
                 raw_value: long_alias.clone(),
                 declaration_key: long_alias.clone(),
@@ -2929,8 +2942,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "flaky-pkg".into(),
                 version_req: "1.0.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 11)),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 11)).into(),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -2972,14 +2985,14 @@ mod tests {
                 MockDep {
                     name: "flaky-pkg-a".into(),
                     version_req: "1.0.0".into(),
-                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                    name_range: Range::new(Position::new(0, 0), Position::new(0, 11)),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 11)).into(),
                 },
                 MockDep {
                     name: "flaky-pkg-b".into(),
                     version_req: "1.0.0".into(),
-                    version_range: Range::new(Position::new(1, 10), Position::new(1, 20)),
-                    name_range: Range::new(Position::new(1, 0), Position::new(1, 11)),
+                    version_range: Range::new(Position::new(1, 10), Position::new(1, 20)).into(),
+                    name_range: Range::new(Position::new(1, 0), Position::new(1, 11)).into(),
                 },
             ],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
@@ -3037,8 +3050,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "serde".into(),
                 version_req: "=1.0.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -3080,8 +3093,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "rate-limited-pkg".into(),
                 version_req: "1.0.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 16)),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 16)).into(),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -3134,20 +3147,20 @@ mod tests {
                 MockDep {
                     name: "flaky-1".into(),
                     version_req: "1.0.0".into(),
-                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                    name_range: name_range_1,
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                    name_range: name_range_1.into(),
                 },
                 MockDep {
                     name: "flaky-2".into(),
                     version_req: "1.0.0".into(),
-                    version_range: Range::new(Position::new(1, 10), Position::new(1, 20)),
-                    name_range: name_range_2,
+                    version_range: Range::new(Position::new(1, 10), Position::new(1, 20)).into(),
+                    name_range: name_range_2.into(),
                 },
                 MockDep {
                     name: "flaky-3".into(),
                     version_req: "1.0.0".into(),
-                    version_range: Range::new(Position::new(2, 10), Position::new(2, 20)),
-                    name_range: name_range_3,
+                    version_range: Range::new(Position::new(2, 10), Position::new(2, 20)).into(),
+                    name_range: name_range_3.into(),
                 },
             ],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
@@ -3198,10 +3211,16 @@ mod tests {
             "expected one related_information entry per additional failing dependency (n - 1)"
         );
         assert_eq!(related_information[0].location.range, name_range_2);
-        assert_eq!(related_information[0].location.uri, *parse_result.uri());
+        assert_eq!(
+            related_information[0].location.uri,
+            crate::lsp_helpers::to_ls_uri(parse_result.uri())
+        );
         assert!(related_information[0].message.contains("flaky-2"));
         assert_eq!(related_information[1].location.range, name_range_3);
-        assert_eq!(related_information[1].location.uri, *parse_result.uri());
+        assert_eq!(
+            related_information[1].location.uri,
+            crate::lsp_helpers::to_ls_uri(parse_result.uri())
+        );
         assert!(related_information[1].message.contains("flaky-3"));
     }
 
@@ -3224,14 +3243,14 @@ mod tests {
                 MockDep {
                     name: "flaky-1".into(),
                     version_req: "1.0.0".into(),
-                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                    name_range: name_range_1,
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                    name_range: name_range_1.into(),
                 },
                 MockDep {
                     name: "flaky-2".into(),
                     version_req: "1.0.0".into(),
-                    version_range: Range::new(Position::new(1, 10), Position::new(1, 20)),
-                    name_range: name_range_2,
+                    version_range: Range::new(Position::new(1, 10), Position::new(1, 20)).into(),
+                    name_range: name_range_2.into(),
                 },
             ],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
@@ -3273,7 +3292,10 @@ mod tests {
             "n==2 collapse must carry exactly one related_information entry (n - 1)"
         );
         assert_eq!(related_information[0].location.range, name_range_2);
-        assert_eq!(related_information[0].location.uri, *parse_result.uri());
+        assert_eq!(
+            related_information[0].location.uri,
+            crate::lsp_helpers::to_ls_uri(parse_result.uri())
+        );
         assert!(related_information[0].message.contains("flaky-2"));
     }
 
@@ -3297,20 +3319,20 @@ mod tests {
                 MockDep {
                     name: "flaky-1".into(),
                     version_req: "1.0.0".into(),
-                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                    name_range: name_range_1,
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                    name_range: name_range_1.into(),
                 },
                 MockDep {
                     name: "flaky-2".into(),
                     version_req: "1.0.0".into(),
-                    version_range: Range::new(Position::new(1, 10), Position::new(1, 20)),
-                    name_range: name_range_2,
+                    version_range: Range::new(Position::new(1, 10), Position::new(1, 20)).into(),
+                    name_range: name_range_2.into(),
                 },
                 MockDep {
                     name: "flaky-3".into(),
                     version_req: "1.0.0".into(),
-                    version_range: Range::new(Position::new(2, 10), Position::new(2, 20)),
-                    name_range: name_range_3,
+                    version_range: Range::new(Position::new(2, 10), Position::new(2, 20)).into(),
+                    name_range: name_range_3.into(),
                 },
             ],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
@@ -3375,8 +3397,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "transient-pkg".into(),
                 version_req: "1.0.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 13)),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 13)).into(),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -3420,8 +3442,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "collided-pkg".into(),
                 version_req: "1.0.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 12)),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 12)).into(),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -3464,8 +3486,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "bad name".into(),
                 version_req: "1.0.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 11)),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 11)).into(),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -3503,8 +3525,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "bad-pkg".into(),
                 version_req: "1.0.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 7)),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 7)).into(),
             }],
             uri: crate::test_util::test_uri("/test/package.json"),
         };
@@ -3539,8 +3561,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "serde".into(),
                 version_req: "1.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -3579,8 +3601,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "serde".into(),
                 version_req: "1.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -3634,8 +3656,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "serde".into(),
                 version_req: "1.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -3682,8 +3704,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "serde".into(),
                 version_req: "1.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -3738,8 +3760,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "serde".into(),
                 version_req: "1.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -3792,8 +3814,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "serde".into(),
                 version_req: "1.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -3842,8 +3864,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "serde".into(),
                 version_req: "^1.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -3881,20 +3903,20 @@ mod tests {
                 MockDep {
                     name: "serde".into(),
                     version_req: "^1.0".into(),
-                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
                 },
                 MockDep {
                     name: "tokio".into(),
                     version_req: "1.0".into(),
-                    version_range: Range::new(Position::new(1, 10), Position::new(1, 20)),
-                    name_range: Range::new(Position::new(1, 0), Position::new(1, 5)),
+                    version_range: Range::new(Position::new(1, 10), Position::new(1, 20)).into(),
+                    name_range: Range::new(Position::new(1, 0), Position::new(1, 5)).into(),
                 },
                 MockDep {
                     name: "unknown".into(),
                     version_req: "1.0".into(),
-                    version_range: Range::new(Position::new(2, 10), Position::new(2, 20)),
-                    name_range: Range::new(Position::new(2, 0), Position::new(2, 7)),
+                    version_range: Range::new(Position::new(2, 10), Position::new(2, 20)).into(),
+                    name_range: Range::new(Position::new(2, 0), Position::new(2, 7)).into(),
                 },
             ],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
@@ -3938,8 +3960,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "spring-boot-starter".into(),
                 version_req: "$missing".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
             }],
             uri: crate::test_util::test_uri("/test/libs.versions.toml"),
         };
@@ -3979,8 +4001,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "serde".into(),
                 version_req: "1.0.5".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -4024,8 +4046,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "serde".into(),
                 version_req: "1.0.5".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -4066,8 +4088,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "serde".into(),
                 version_req: "1.0.5".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -4108,8 +4130,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "serde".into(),
                 version_req: "1.0.5".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -4163,8 +4185,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "left-pad".into(),
                 version_req: "1.3.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
             }],
             uri: crate::test_util::test_uri("/test/package.json"),
         };
@@ -4222,8 +4244,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "pkg".into(),
                 version_req: "1.0.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
             }],
             uri: crate::test_util::test_uri("/test/pyproject.toml"),
         };
@@ -4289,8 +4311,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "left-pad".into(),
                 version_req: "1.3.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
             }],
             uri: crate::test_util::test_uri("/test/package.json"),
         };
@@ -4432,7 +4454,7 @@ mod tests {
         let parse_result = MockMarkedParseResult {
             dep: MockMarkedDep {
                 name: "serde".into(),
-                name_range,
+                name_range: name_range.into(),
                 markers: None,
             },
             uri: crate::test_util::test_uri("/test/pyproject.toml"),
@@ -4500,8 +4522,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "Newtonsoft.Json".into(),
                 version_req: "13.0.1".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
             }],
             uri: crate::test_util::test_uri("/test/project.csproj"),
         };
@@ -4548,14 +4570,14 @@ mod tests {
                 MockDep {
                     name: "time".into(),
                     version_req: "=0.1.43".into(),
-                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
                 },
                 MockDep {
                     name: "time".into(),
                     version_req: "=0.1.44".into(),
-                    version_range: Range::new(Position::new(3, 10), Position::new(3, 20)),
-                    name_range: Range::new(Position::new(3, 0), Position::new(3, 5)),
+                    version_range: Range::new(Position::new(3, 10), Position::new(3, 20)).into(),
+                    name_range: Range::new(Position::new(3, 0), Position::new(3, 5)).into(),
                 },
             ],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
@@ -4611,14 +4633,14 @@ mod tests {
                 MockDep {
                     name: "time".into(),
                     version_req: "=0.1.43".into(),
-                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
                 },
                 MockDep {
                     name: "time".into(),
                     version_req: "=0.1.44".into(),
-                    version_range: Range::new(Position::new(3, 10), Position::new(3, 20)),
-                    name_range: Range::new(Position::new(3, 0), Position::new(3, 5)),
+                    version_range: Range::new(Position::new(3, 10), Position::new(3, 20)).into(),
+                    name_range: Range::new(Position::new(3, 0), Position::new(3, 5)).into(),
                 },
             ],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
@@ -5283,14 +5305,14 @@ mod tests {
         let vulnerable_dep = MockDep {
             name: "pkg".into(),
             version_req: "=1.0.0".into(),
-            version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-            name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
         };
         let patched_dep = MockDep {
             name: "pkg".into(),
             version_req: "=2.0.0".into(),
-            version_range: Range::new(Position::new(3, 10), Position::new(3, 20)),
-            name_range: Range::new(Position::new(3, 0), Position::new(3, 5)),
+            version_range: Range::new(Position::new(3, 10), Position::new(3, 20)).into(),
+            name_range: Range::new(Position::new(3, 0), Position::new(3, 5)).into(),
         };
         let parse_result = MockParseResult {
             deps: vec![vulnerable_dep, patched_dep],
@@ -5378,14 +5400,14 @@ mod tests {
         let current_major = MockDep {
             name: "serde".into(),
             version_req: "1.0".into(),
-            version_range: Range::new(Position::new(0, 8), Position::new(0, 13)),
-            name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            version_range: Range::new(Position::new(0, 8), Position::new(0, 13)).into(),
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
         };
         let renamed_old_major = MockDep {
             name: "serde".into(),
             version_req: "0.9".into(),
-            version_range: Range::new(Position::new(1, 8), Position::new(1, 13)),
-            name_range: Range::new(Position::new(1, 0), Position::new(1, 9)),
+            version_range: Range::new(Position::new(1, 8), Position::new(1, 13)).into(),
+            name_range: Range::new(Position::new(1, 0), Position::new(1, 9)).into(),
         };
         let parse_result = MockParseResult {
             deps: vec![current_major, renamed_old_major],
@@ -6210,8 +6232,8 @@ mod tests {
                 deps: vec![MockDep {
                     name: "serde".into(),
                     version_req: "modelled".into(),
-                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
                 }],
                 uri: crate::test_util::test_uri("/test/Cargo.toml"),
             };
@@ -6264,8 +6286,8 @@ mod tests {
                 deps: vec![MockDep {
                     name: "serde".into(),
                     version_req: "modelled".into(),
-                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
                 }],
                 uri: crate::test_util::test_uri("/test/Cargo.toml"),
             };
@@ -6341,8 +6363,8 @@ mod tests {
                 deps: vec![MockDep {
                     name: "serde".into(),
                     version_req: "modelled".into(),
-                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
                 }],
                 uri: crate::test_util::test_uri("/test/Cargo.toml"),
             };
@@ -6412,8 +6434,8 @@ mod tests {
                 deps: vec![MockDep {
                     name: "serde".into(),
                     version_req: "modelled".into(),
-                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
                 }],
                 uri: crate::test_util::test_uri("/test/Cargo.toml"),
             };
@@ -6494,8 +6516,8 @@ mod tests {
                 deps: vec![MockDep {
                     name: "serde".into(),
                     version_req: "modelled".into(),
-                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
                 }],
                 uri: crate::test_util::test_uri("/test/Cargo.toml"),
             };
@@ -6565,8 +6587,8 @@ mod tests {
                 deps: vec![MockDep {
                     name: "serde".into(),
                     version_req: "modelled".into(),
-                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
                 }],
                 uri: crate::test_util::test_uri("/test/Cargo.toml"),
             };
@@ -6613,8 +6635,8 @@ mod tests {
                 deps: vec![MockDep {
                     name: "serde".into(),
                     version_req: "modelled".into(),
-                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
                 }],
                 uri: crate::test_util::test_uri("/test/Cargo.toml"),
             };
@@ -6731,8 +6753,8 @@ mod tests {
             let dep = MockDep {
                 name: "dep".into(),
                 version_req: "modelled".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 3)),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 3)).into(),
             };
             let parse_result = SingleDepParseResult {
                 dep: NonRegistryDep(
@@ -6773,8 +6795,8 @@ mod tests {
                 deps: vec![MockDep {
                     name: "serde".into(),
                     version_req: "modelled".into(),
-                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
                 }],
                 uri: crate::test_util::test_uri("/test/Cargo.toml"),
             };
@@ -6821,8 +6843,8 @@ mod tests {
                 deps: vec![MockDep {
                     name: "serde".into(),
                     version_req: "1.0.0".into(),
-                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
                 }],
                 uri: crate::test_util::test_uri("/test/Cargo.toml"),
             }

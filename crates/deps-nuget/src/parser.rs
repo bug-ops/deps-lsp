@@ -29,10 +29,11 @@
 
 use crate::types::NuGetDependency;
 use deps_core::lsp_helpers::LineOffsetTable;
+use deps_core::position::Range;
 use deps_core::{DepsError, Result};
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, BytesText, Event};
-use tower_lsp_server::ls_types::{Range, Uri};
+use url::Url;
 
 /// Parsed result of a single manifest file (`.csproj`, `Directory.Packages.props`,
 /// `packages.config`).
@@ -42,7 +43,7 @@ pub struct NuGetParseResult {
     /// Dependencies found in the manifest.
     pub dependencies: Vec<NuGetDependency>,
     /// URI of the manifest this result was parsed from.
-    pub uri: Uri,
+    pub uri: Url,
     /// Every routing chain this manifest's resolved `NuGet.Config` implies (issue #523) — one
     /// per distinct `<packageSourceMapping>` hop-set, or the single plain accumulated chain
     /// when no mapping is declared. Registered against the shared `NuGetRegistry` by
@@ -84,7 +85,7 @@ deps_core::impl_parse_result!(
 /// # Errors
 ///
 /// Returns a [`DepsError::ParseError`] if `content` is not well-formed XML.
-pub fn parse_project_file(content: &str, doc_uri: &Uri) -> Result<NuGetParseResult> {
+pub fn parse_project_file(content: &str, doc_uri: &Url) -> Result<NuGetParseResult> {
     parse_reference_elements(content, doc_uri, "PackageReference")
 }
 
@@ -94,7 +95,7 @@ pub fn parse_project_file(content: &str, doc_uri: &Uri) -> Result<NuGetParseResu
 /// # Errors
 ///
 /// Same as [`parse_project_file`].
-pub fn parse_directory_packages_props(content: &str, doc_uri: &Uri) -> Result<NuGetParseResult> {
+pub fn parse_directory_packages_props(content: &str, doc_uri: &Url) -> Result<NuGetParseResult> {
     parse_reference_elements(content, doc_uri, "PackageVersion")
 }
 
@@ -108,7 +109,7 @@ pub fn parse_directory_packages_props(content: &str, doc_uri: &Uri) -> Result<Nu
 /// # Errors
 ///
 /// Same as [`parse_project_file`].
-pub fn parse_packages_config(content: &str, doc_uri: &Uri) -> Result<NuGetParseResult> {
+pub fn parse_packages_config(content: &str, doc_uri: &Url) -> Result<NuGetParseResult> {
     let line_table = LineOffsetTable::new(content);
     let mut reader = Reader::from_str(content);
     reader.config_mut().trim_text(true);
@@ -203,7 +204,7 @@ struct DepAccum {
 
 fn parse_reference_elements(
     content: &str,
-    doc_uri: &Uri,
+    doc_uri: &Url,
     tag_name: &str,
 ) -> Result<NuGetParseResult> {
     let line_table = LineOffsetTable::new(content);
@@ -368,7 +369,7 @@ mod tests {
 
     use std::assert_matches;
 
-    fn test_uri() -> Uri {
+    fn test_uri() -> Url {
         deps_core::test_util::test_uri("/test/App.csproj")
     }
 

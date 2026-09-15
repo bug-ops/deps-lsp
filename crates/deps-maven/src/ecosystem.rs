@@ -3,8 +3,9 @@
 use std::any::Any;
 use std::sync::Arc;
 use tower_lsp_server::ls_types::{
-    CompletionItem, CompletionTextEdit, Position, Range as LspRange, TextEdit, Uri,
+    CompletionItem, CompletionTextEdit, Position, Range as LspRange, TextEdit,
 };
+use url::Url;
 
 use deps_core::{
     Ecosystem, ParseResult as ParseResultTrait, Registry, Result,
@@ -286,7 +287,7 @@ impl Ecosystem for MavenEcosystem {
     fn parse_manifest<'a>(
         &'a self,
         content: &'a str,
-        uri: &'a Uri,
+        uri: &'a Url,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Box<dyn ParseResultTrait>>> {
         Box::pin(async move {
             let result = crate::parser::parse_pom_xml(content, uri)?;
@@ -327,7 +328,7 @@ impl Ecosystem for MavenEcosystem {
                 MavenXmlContext::Version => {
                     let dep = parse_result.dependencies().into_iter().find(|d| {
                         d.version_range()
-                            .is_some_and(|r| position_in_range(position, r))
+                            .is_some_and(|r| position_in_range(position, r.into()))
                             || d.name_range().start.line == position.line
                     });
                     // #919: `detect_xml_context` only checks that the cursor sits inside a
@@ -567,7 +568,7 @@ mod tests {
         fn workspace_root(&self) -> Option<&std::path::Path> {
             None
         }
-        fn uri(&self) -> &tower_lsp_server::ls_types::Uri {
+        fn uri(&self) -> &url::Url {
             unimplemented!()
         }
         fn as_any(&self) -> &dyn std::any::Any {
@@ -1049,7 +1050,7 @@ mod tests {
         let path = "C:/test/pom.xml";
         #[cfg(not(windows))]
         let path = "/test/pom.xml";
-        let uri = Uri::from_file_path(path).unwrap();
+        let uri = Url::from_file_path(path).unwrap();
 
         let result = eco.parse_manifest(xml, &uri).await.unwrap();
         assert_eq!(result.dependencies().len(), 1);
@@ -1365,7 +1366,7 @@ mod tests {
             Some("${slf4j.version}"),
             "fixture no longer exercises the unresolved-property shape: {xml}"
         );
-        let position = dep.version_range().unwrap().start;
+        let position: Position = dep.version_range().unwrap().start.into();
         let freshness = deps_core::FreshnessSettings::default();
 
         // M4 (critic follow-up): `Completions::default()` below is also what the
@@ -1378,7 +1379,7 @@ mod tests {
             !deps_core::lsp_helpers::dependency_version_range_is_literal(
                 *dep,
                 xml,
-                dep.version_range().unwrap(),
+                dep.version_range().unwrap().into(),
             )
         );
 
@@ -1409,7 +1410,7 @@ mod tests {
         let uri = deps_core::test_util::test_uri("/test/pom.xml");
         let parse_result = eco.parse_manifest(xml, &uri).await.unwrap();
         let dep = &parse_result.dependencies()[0];
-        let position = dep.version_range().unwrap().start;
+        let position: Position = dep.version_range().unwrap().start.into();
         let freshness = deps_core::FreshnessSettings::default();
 
         let direct = eco.complete_versions(dep.name(), "", freshness).await;

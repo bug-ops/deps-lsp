@@ -71,11 +71,18 @@ pub async fn handle_code_actions(
 
     tracing::Span::current().record("ecosystem", ecosystem_id.id());
 
+    // Unreachable in practice: a document only reaches `with_document` above once its
+    // URI already converted successfully (see `ensure_document_loaded`), but handled
+    // defensively rather than unwrapped.
+    let Some(domain_uri) = crate::lsp_types_interop::from_lsp_uri(uri) else {
+        tracing::warn!("URI is not representable as a url::Url: {:?}", uri);
+        return vec![];
+    };
     let mut actions = ecosystem
         .generate_code_actions(
             parse_result.as_ref(),
             position,
-            uri,
+            &domain_uri,
             VersionData::new(&cached_versions, &resolved_versions)
                 .with_resolved_version_candidates(&resolved_version_candidates)
                 .with_vulnerabilities(&vulnerabilities)
@@ -86,6 +93,7 @@ pub async fn handle_code_actions(
         )
         .await;
 
+    rekey_edits_to_original_uri(&mut actions, uri);
     bind_diagnostics(&mut actions, &params.context.diagnostics);
 
     let actions = match params.context.only.as_deref() {
@@ -97,6 +105,63 @@ pub async fn handle_code_actions(
         .into_iter()
         .map(CodeActionOrCommand::CodeAction)
         .collect()
+}
+
+/// Re-keys every action's single-file `WorkspaceEdit.changes` entry onto `original_uri`,
+/// the exact `Uri` the client sent in this request.
+///
+/// `deps_core::lsp_helpers::generate_code_actions` builds each edit's map key via
+/// [`crate::lsp_types_interop::from_lsp_uri`] followed by `deps_core::to_ls_uri` (through
+/// `single_file_edit`) — a round trip through `url::Url` that can normalize a
+/// non-canonical URI spelling into a different string (e.g. `file://localhost/x` becomes
+/// `file:///x`, `FILE:///x` is lowercased, `.`/`..` segments collapse). Every such edit is
+/// scoped to this single document (`single_file_edit`'s own contract — never a foreign
+/// file), so overwriting its one key with the client's original `Uri` is always correct,
+/// and is required: an editor keys its open documents by the exact string the client
+/// itself sent, so a normalized key lands on a document the client doesn't have open and
+/// the edit is silently dropped (issue #1071 S3).
+///
+/// Silently no-ops (does not re-key) for an empty or absent `changes` map — nothing to
+/// re-key — but a `changes` map with more than one entry, or `document_changes` set
+/// instead of `changes`, are both currently unreachable by construction (every one of
+/// this codebase's 7 `WorkspaceEdit`-building call sites goes through
+/// `deps_core::single_file_edit`, directly or via a hand-rolled equivalent, which always
+/// builds exactly one `changes` entry and never sets `document_changes`), asserted in
+/// debug builds below so a future change to that invariant is caught by tests instead of
+/// silently leaking a normalized URI onto the wire again.
+fn rekey_edits_to_original_uri(
+    actions: &mut [CodeAction],
+    original_uri: &tower_lsp_server::ls_types::Uri,
+) {
+    for action in actions.iter_mut() {
+        let Some(edit) = action.edit.as_mut() else {
+            continue;
+        };
+        debug_assert!(
+            edit.document_changes.is_none(),
+            "no code-action builder in this codebase sets WorkspaceEdit::document_changes \
+             today (only `changes`) — if one starts to, this function must be extended to \
+             re-key it too"
+        );
+        let Some(changes) = edit.changes.as_mut() else {
+            continue;
+        };
+        debug_assert!(
+            changes.len() <= 1,
+            "every code-action builder in this codebase produces a single-file edit \
+             (single_file_edit's own contract) — a multi-entry `changes` map means that \
+             invariant broke, and this function's single-key rekey is no longer correct \
+             for it: {changes:?}"
+        );
+        if changes.len() != 1 {
+            continue;
+        }
+        let Some(edits) = changes.values().next().cloned() else {
+            continue;
+        };
+        changes.clear();
+        changes.insert(original_uri.clone(), edits);
+    }
 }
 
 /// Binds a code action to the client-supplied diagnostics it resolves, so editors can
@@ -296,6 +361,82 @@ mod tests {
         assert!(filtered.is_empty());
     }
 
+    /// S3 (issue #1071): `rekey_edits_to_original_uri` is ecosystem-agnostic — it
+    /// operates structurally on any `CodeAction.edit.changes` single-entry map, never
+    /// downcasting to an ecosystem-specific type. This proves its contract directly
+    /// against a hand-built `CodeAction` shaped exactly like every one of the 7
+    /// `WorkspaceEdit`-building call sites in this codebase (the shared
+    /// `deps_core::lsp_helpers::generate_code_actions`'s 4 sites, and the 3 hand-rolled
+    /// ones in `deps-github-actions`/`deps-gitlab-ci`, all of which build a single-entry
+    /// `changes` map via `deps_core::single_file_edit`/`to_ls_uri`) — so the
+    /// `cargo_tests`-only end-to-end coverage below does not need to be duplicated per
+    /// ecosystem for this function's own correctness to be established.
+    #[test]
+    fn test_rekey_edits_to_original_uri_replaces_single_entry_key() {
+        let normalized_uri: tower_lsp_server::ls_types::Uri =
+            "file:///normalized/x.toml".parse().unwrap();
+        let original_uri: tower_lsp_server::ls_types::Uri =
+            "file://localhost/normalized/x.toml".parse().unwrap();
+        let text_edits = vec![tower_lsp_server::ls_types::TextEdit {
+            range: Range::new(Position::new(0, 0), Position::new(0, 1)),
+            new_text: "x".to_string(),
+        }];
+        let mut changes = std::collections::HashMap::new();
+        changes.insert(normalized_uri.clone(), text_edits.clone());
+        let mut actions = vec![CodeAction {
+            title: "test".to_string(),
+            edit: Some(tower_lsp_server::ls_types::WorkspaceEdit {
+                changes: Some(changes),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }];
+
+        rekey_edits_to_original_uri(&mut actions, &original_uri);
+
+        let changes = actions[0].edit.as_ref().unwrap().changes.as_ref().unwrap();
+        assert_eq!(changes.len(), 1);
+        assert!(!changes.contains_key(&normalized_uri));
+        assert_eq!(changes.get(&original_uri), Some(&text_edits));
+    }
+
+    /// Guards against a future edit-shape change (e.g. a real multi-file
+    /// `WorkspaceEdit`) silently corrupting an edit this function does not understand:
+    /// anything other than exactly one `changes` entry is left untouched rather than
+    /// guessed at.
+    #[test]
+    fn test_rekey_edits_to_original_uri_leaves_non_single_entry_edits_untouched() {
+        let original_uri: tower_lsp_server::ls_types::Uri = "file:///x.toml".parse().unwrap();
+        let mut actions = vec![
+            CodeAction {
+                title: "no edit at all".to_string(),
+                ..Default::default()
+            },
+            CodeAction {
+                title: "empty changes map".to_string(),
+                edit: Some(tower_lsp_server::ls_types::WorkspaceEdit {
+                    changes: Some(std::collections::HashMap::new()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        ];
+
+        rekey_edits_to_original_uri(&mut actions, &original_uri);
+
+        assert!(actions[0].edit.is_none());
+        assert!(
+            actions[1]
+                .edit
+                .as_ref()
+                .unwrap()
+                .changes
+                .as_ref()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     fn vuln_diagnostic(source: Option<&str>, code: Option<&str>) -> Diagnostic {
         Diagnostic {
             source: source.map(str::to_string),
@@ -463,7 +604,9 @@ mod tests {
     #[tokio::test]
     async fn test_handle_code_actions_missing_document() {
         let state = Arc::new(ServerState::new());
-        let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let uri = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+            "/test/Cargo.toml",
+        ));
 
         let params = CodeActionParams {
             text_document: TextDocumentIdentifier { uri },
@@ -491,7 +634,8 @@ mod tests {
             // `document/loader.rs`'s diffing test.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
             let content = r#"[dependencies]
@@ -500,7 +644,7 @@ serde = "1.0.0"
             .to_string();
 
             let parse_result = ecosystem
-                .parse_manifest(&content, &uri)
+                .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
 
@@ -536,7 +680,8 @@ serde = "1.0.0"
             use tower_lsp_server::ls_types::{CodeActionContext, Diagnostic};
 
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
             let content = r#"[dependencies]
@@ -545,7 +690,7 @@ serde = "1.0.0"
             .to_string();
 
             let parse_result = ecosystem
-                .parse_manifest(&content, &uri)
+                .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
 
@@ -619,7 +764,9 @@ serde = "1.0.0"
         #[tokio::test]
         async fn test_handle_code_actions_no_parse_result() {
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+                "/test/Cargo.toml",
+            ));
 
             let doc_state =
                 DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
@@ -637,6 +784,82 @@ serde = "1.0.0"
             let result = handle_code_actions(state, params, client, config).await;
             assert!(result.is_empty());
         }
+
+        /// S3 regression (issue #1071): a client can hold a document open under any of
+        /// several raw URI spellings `url::Url::parse` normalizes to a different string
+        /// — the returned `WorkspaceEdit.changes` key must match the exact `Uri` the
+        /// client sent, not the round-tripped-through-`Url` form, or the editor
+        /// silently drops the edit. Covers the four forms empirically confirmed to
+        /// diverge (critic evidence): an explicit `localhost` authority, an uppercase
+        /// scheme, a `.`/`..`-segment path, and a four-slash UNC-like authority. Each
+        /// case is built from a raw client-style string (not
+        /// `ls_types::Uri::from_file_path`, which is always already canonical and so
+        /// cannot exercise this divergence).
+        #[tokio::test]
+        async fn test_handle_code_actions_rekeys_edit_to_original_non_canonical_uri() {
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let raw_uris = [
+                "file://localhost/test/Cargo.toml",
+                "FILE:///test/Cargo.toml",
+                "file:///test/./a/../Cargo.toml",
+                "file:////server/share/Cargo.toml",
+            ];
+
+            for raw in raw_uris {
+                let state = Arc::new(ServerState::new());
+                let uri: tower_lsp_server::ls_types::Uri = raw
+                    .parse()
+                    .unwrap_or_else(|e| panic!("{raw:?} must parse as an ls_types::Uri: {e}"));
+                let url = crate::lsp_types_interop::from_lsp_uri(&uri)
+                    .unwrap_or_else(|| panic!("{raw:?} must parse as a url::Url"));
+                // Sanity: each of these is exactly a shape `url::Url` normalizes away,
+                // otherwise this case would pass vacuously.
+                assert_ne!(
+                    url.as_str(),
+                    uri.as_str(),
+                    "expected {raw:?} to be normalized by url::Url::parse"
+                );
+
+                let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+                let content = "[dependencies]\nserde = \"1.0.0\"\n".to_string();
+                let parse_result = ecosystem
+                    .parse_manifest(&content, &url)
+                    .await
+                    .unwrap_or_else(|e| panic!("{raw:?}: failed to parse manifest: {e}"));
+
+                let doc_state =
+                    DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+                state.update_document(uri.clone(), doc_state);
+
+                let params = CodeActionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    range: Range::new(Position::new(1, 9), Position::new(1, 16)),
+                    context: Default::default(),
+                    work_done_progress_params: Default::default(),
+                    partial_result_params: Default::default(),
+                };
+
+                let (client, config) = create_test_client_and_config();
+                let result = handle_code_actions(state, params, client, config).await;
+
+                let has_correctly_keyed_edit = result.iter().any(|action| {
+                    let CodeActionOrCommand::CodeAction(action) = action else {
+                        return false;
+                    };
+                    action
+                        .edit
+                        .as_ref()
+                        .and_then(|e| e.changes.as_ref())
+                        .is_some_and(|changes| changes.contains_key(&uri))
+                });
+                assert!(
+                    has_correctly_keyed_edit,
+                    "for input {raw:?}: expected at least one action whose edit is keyed \
+                     by the client's original URI, not a url::Url-normalized one: \
+                     {result:?}"
+                );
+            }
+        }
     }
 
     // npm-specific tests
@@ -650,13 +873,14 @@ serde = "1.0.0"
             // See the comment in `test_handle_code_actions` on why this guard is needed here.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/package.json");
+            let url = deps_core::test_util::test_uri("/test/package.json");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
             let ecosystem = state.ecosystem_registry.get("npm").unwrap();
             let content = r#"{"dependencies": {"express": "4.0.0"}}"#.to_string();
 
             let parse_result = ecosystem
-                .parse_manifest(&content, &uri)
+                .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
 
@@ -702,7 +926,8 @@ serde = "1.0.0"
             use tower_lsp_server::ls_types::{CodeActionContext, Diagnostic};
 
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Package.swift");
+            let url = deps_core::test_util::test_uri("/test/Package.swift");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
             let ecosystem = state.ecosystem_registry.get("swift").unwrap();
             let content =
@@ -710,7 +935,7 @@ serde = "1.0.0"
             let version_col = content.find("4.50.0").unwrap() as u32;
 
             let parse_result = ecosystem
-                .parse_manifest(&content, &uri)
+                .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
 

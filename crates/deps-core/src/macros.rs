@@ -59,7 +59,7 @@ macro_rules! impl_dependency {
                 &self.$name
             }
 
-            fn name_range(&self) -> ::tower_lsp_server::ls_types::Range {
+            fn name_range(&self) -> $crate::position::Range {
                 self.$name_range
             }
 
@@ -67,7 +67,7 @@ macro_rules! impl_dependency {
                 self.$version.as_ref()
             }
 
-            fn version_range(&self) -> Option<::tower_lsp_server::ls_types::Range> {
+            fn version_range(&self) -> Option<$crate::position::Range> {
                 self.$version_range
             }
 
@@ -92,7 +92,7 @@ macro_rules! impl_dependency {
                 &self.$name
             }
 
-            fn name_range(&self) -> ::tower_lsp_server::ls_types::Range {
+            fn name_range(&self) -> $crate::position::Range {
                 self.$name_range
             }
 
@@ -100,7 +100,7 @@ macro_rules! impl_dependency {
                 self.$version.as_ref()
             }
 
-            fn version_range(&self) -> Option<::tower_lsp_server::ls_types::Range> {
+            fn version_range(&self) -> Option<$crate::position::Range> {
                 self.$version_range
             }
 
@@ -126,7 +126,7 @@ macro_rules! impl_dependency {
                 &self.$name
             }
 
-            fn name_range(&self) -> ::tower_lsp_server::ls_types::Range {
+            fn name_range(&self) -> $crate::position::Range {
                 self.$name_range
             }
 
@@ -134,7 +134,7 @@ macro_rules! impl_dependency {
                 self.$version.as_ref()
             }
 
-            fn version_range(&self) -> Option<::tower_lsp_server::ls_types::Range> {
+            fn version_range(&self) -> Option<$crate::position::Range> {
                 self.$version_range
             }
 
@@ -502,7 +502,7 @@ macro_rules! impl_metadata {
 ///
 /// pub struct MyParseResult {
 ///     pub dependencies: Vec<MyDependency>,
-///     pub uri: Uri,
+///     pub uri: Url,
 ///     pub dependency_truncation: Option<(usize, usize)>,
 /// }
 ///
@@ -545,7 +545,7 @@ macro_rules! impl_parse_result {
                 None
             }
 
-            fn uri(&self) -> &::tower_lsp_server::ls_types::Uri {
+            fn uri(&self) -> &::url::Url {
                 &self.$uri
             }
 
@@ -571,7 +571,7 @@ macro_rules! impl_parse_result {
                 self.$workspace_root.as_deref()
             }
 
-            fn uri(&self) -> &::tower_lsp_server::ls_types::Uri {
+            fn uri(&self) -> &::url::Url {
                 &self.$uri
             }
 
@@ -597,7 +597,7 @@ macro_rules! impl_parse_result {
                 None
             }
 
-            fn uri(&self) -> &::tower_lsp_server::ls_types::Uri {
+            fn uri(&self) -> &::url::Url {
                 &self.$uri
             }
 
@@ -628,7 +628,7 @@ macro_rules! impl_parse_result {
                 self.$workspace_root.as_deref()
             }
 
-            fn uri(&self) -> &::tower_lsp_server::ls_types::Uri {
+            fn uri(&self) -> &::url::Url {
                 &self.$uri
             }
 
@@ -658,7 +658,7 @@ macro_rules! impl_parse_result {
                 None
             }
 
-            fn uri(&self) -> &::tower_lsp_server::ls_types::Uri {
+            fn uri(&self) -> &::url::Url {
                 &self.$uri
             }
 
@@ -689,7 +689,7 @@ macro_rules! impl_parse_result {
                 self.$workspace_root.as_deref()
             }
 
-            fn uri(&self) -> &::tower_lsp_server::ls_types::Uri {
+            fn uri(&self) -> &::url::Url {
                 &self.$uri
             }
 
@@ -720,7 +720,7 @@ macro_rules! impl_parse_result {
                 None
             }
 
-            fn uri(&self) -> &::tower_lsp_server::ls_types::Uri {
+            fn uri(&self) -> &::url::Url {
                 &self.$uri
             }
 
@@ -756,7 +756,7 @@ macro_rules! impl_parse_result {
                 self.$workspace_root.as_deref()
             }
 
-            fn uri(&self) -> &::tower_lsp_server::ls_types::Uri {
+            fn uri(&self) -> &::url::Url {
                 &self.$uri
             }
 
@@ -891,7 +891,7 @@ macro_rules! impl_get_versions_with_passthrough {
 #[cfg(test)]
 mod tests {
     use crate::ConcreteVersion;
-    use tower_lsp_server::ls_types::{Position, Range, Uri};
+    use crate::position::{Position, Range};
 
     // Test structs
     #[derive(Debug, Clone)]
@@ -950,7 +950,7 @@ mod tests {
     #[derive(Debug)]
     struct TestParseResult {
         dependencies: Vec<TestDependency>,
-        uri: Uri,
+        uri: url::Url,
     }
 
     // Apply macros

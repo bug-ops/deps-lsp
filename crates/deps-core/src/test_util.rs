@@ -7,11 +7,11 @@
 //! Test fixtures and helpers shared across ecosystem crates.
 //!
 //! Test fixtures throughout the workspace write absolute paths in Unix
-//! style (e.g. `/project/Cargo.toml`) for readability. `Uri::from_file_path`
+//! style (e.g. `/project/Cargo.toml`) for readability. `Url::from_file_path`
 //! requires a platform-absolute path, and a Unix-style path is not
 //! recognized as absolute on Windows (no drive letter), so calling it
 //! directly with such a literal panics on Windows only. [`test_uri`]
-//! normalizes the path per host platform before constructing the [`Uri`].
+//! normalizes the path per host platform before constructing the [`url::Url`].
 //!
 //! [`assert_dot_segment_gated_or_contained`]/[`assert_dot_segment_gated_or_contained_transformed`]
 //! guard the recurring dot-segment / unvalidated-URL-sink defect class (#337, #341, #349,
@@ -25,16 +25,14 @@
 //! `tracing-core` `Interest` cache before the capturing test's own subscriber was installed
 //! (#1006).
 
-use tower_lsp_server::ls_types::Uri;
-
-/// Builds a [`Uri`] from a Unix-style absolute test path.
+/// Builds a [`url::Url`] from a Unix-style absolute test path.
 ///
 /// On Windows, a synthetic `C:` drive is prefixed so the path is
 /// recognized as absolute; on other platforms the path is used as-is.
 ///
 /// # Panics
 ///
-/// Panics if the resulting path is not a valid file URI. This is a test
+/// Panics if the resulting path is not a valid file URL. This is a test
 /// helper: fixture paths are expected to always be well-formed.
 ///
 /// # Examples
@@ -43,10 +41,10 @@ use tower_lsp_server::ls_types::Uri;
 /// use deps_core::test_util::test_uri;
 ///
 /// let uri = test_uri("/project/Cargo.toml");
-/// assert!(uri.path().as_str().ends_with("Cargo.toml"));
+/// assert!(uri.path().ends_with("Cargo.toml"));
 /// ```
 #[must_use]
-pub fn test_uri(unix_path: &str) -> Uri {
+pub fn test_uri(unix_path: &str) -> url::Url {
     #[cfg(windows)]
     let owned;
     #[cfg(windows)]
@@ -57,7 +55,7 @@ pub fn test_uri(unix_path: &str) -> Uri {
     #[cfg(not(windows))]
     let path: &str = unix_path;
 
-    Uri::from_file_path(path).expect("test_uri: fixture path must be a valid file URI")
+    url::Url::from_file_path(path).expect("test_uri: fixture path must be a valid file URL")
 }
 
 /// Minimal [`crate::Metadata`] fixture for tests that only care about a package's name and
@@ -574,15 +572,15 @@ impl crate::Dependency for StubDependency {
         &self.name
     }
 
-    fn name_range(&self) -> tower_lsp_server::ls_types::Range {
-        tower_lsp_server::ls_types::Range::default()
+    fn name_range(&self) -> crate::position::Range {
+        crate::position::Range::default()
     }
 
     fn version_requirement(&self) -> Option<&crate::VersionReq> {
         None
     }
 
-    fn version_range(&self) -> Option<tower_lsp_server::ls_types::Range> {
+    fn version_range(&self) -> Option<crate::position::Range> {
         None
     }
 
@@ -598,7 +596,7 @@ impl crate::Dependency for StubDependency {
 /// Minimal [`crate::ParseResult`] fixture built by [`stub_parse_result_with_dependencies`].
 struct StubParseResult {
     dependencies: Vec<StubDependency>,
-    uri: Uri,
+    uri: url::Url,
 }
 
 impl crate::ParseResult for StubParseResult {
@@ -613,7 +611,7 @@ impl crate::ParseResult for StubParseResult {
         None
     }
 
-    fn uri(&self) -> &Uri {
+    fn uri(&self) -> &url::Url {
         &self.uri
     }
 

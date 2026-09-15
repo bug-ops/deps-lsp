@@ -591,8 +591,8 @@ pub fn apply(deps: &mut [NpmDependency], config: Option<&PnpmWorkspaceConfig>) {
 mod tests {
     use super::*;
     use crate::types::NpmDependencySection;
+    use deps_core::Range;
     use std::assert_matches;
-    use tower_lsp_server::ls_types::Range;
 
     fn dep(name: &str, version_req: &str) -> NpmDependency {
         NpmDependency {

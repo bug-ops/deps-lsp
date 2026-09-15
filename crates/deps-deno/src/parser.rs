@@ -22,7 +22,7 @@ use jsonc_parser::ast::{Object, StringLit, Value};
 use jsonc_parser::{CollectOptions, ParseOptions, parse_to_ast};
 use std::borrow::Cow;
 use std::collections::HashSet;
-use tower_lsp_server::ls_types::Uri;
+use url::Url;
 
 /// Result of parsing a `deno.json`/`deno.jsonc` file.
 #[non_exhaustive]
@@ -31,7 +31,7 @@ pub struct DenoParseResult {
     /// All dependencies found in the `imports` map.
     pub dependencies: Vec<DenoDependency>,
     /// Document URI.
-    pub uri: Uri,
+    pub uri: Url,
     /// `Some((kept, total))` once the manifest declared more dependencies than
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796).
     pub dependency_truncation: Option<(usize, usize)>,
@@ -61,20 +61,20 @@ deps_core::impl_parse_result!(
 ///
 /// ```no_run
 /// use deps_deno::parser::parse_deno_json;
-/// use tower_lsp_server::ls_types::Uri;
+/// use url::Url;
 ///
 /// let json = r#"{
 ///   "imports": {
 ///     "@std/fs": "jsr:@std/fs@^1.0"
 ///   }
 /// }"#;
-/// let uri = Uri::from_file_path("/project/deno.json").unwrap();
+/// let uri = Url::from_file_path("/project/deno.json").unwrap();
 ///
 /// let result = parse_deno_json(json, &uri).unwrap();
 /// assert_eq!(result.dependencies.len(), 1);
 /// assert_eq!(result.dependencies[0].name, "jsr:@std/fs");
 /// ```
-pub fn parse_deno_json(content: &str, uri: &Uri) -> Result<DenoParseResult> {
+pub fn parse_deno_json(content: &str, uri: &Url) -> Result<DenoParseResult> {
     let ast = parse_to_ast(
         content,
         &CollectOptions::default(),
@@ -298,7 +298,7 @@ mod tests {
 
     use std::assert_matches;
 
-    fn test_uri() -> Uri {
+    fn test_uri() -> Url {
         deps_core::test_util::test_uri("/test/deno.json")
     }
 
@@ -574,7 +574,7 @@ mod tests {
 
             let name_range = result.dependencies[0].name_range;
             let cursor = name_range.end; // cursor right after the last typed character
-            let context = detect_completion_context(&result, cursor, &content);
+            let context = detect_completion_context(&result, cursor.into(), &content);
 
             match context {
                 CompletionContext::PackageName { prefix, .. } => {

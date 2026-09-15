@@ -28,7 +28,7 @@ use deps_core::lockfile::{
     locate_lockfile_for_manifest, read_and_parse_lockfile,
 };
 use std::path::{Path, PathBuf};
-use tower_lsp_server::ls_types::Uri;
+use url::Url;
 
 /// Cargo.lock file parser.
 ///
@@ -46,11 +46,11 @@ use tower_lsp_server::ls_types::Uri;
 /// ```no_run
 /// use deps_cargo::lockfile::CargoLockParser;
 /// use deps_core::lockfile::LockFileProvider;
-/// use tower_lsp_server::ls_types::Uri;
+/// use url::Url;
 ///
 /// # async fn example() -> deps_core::error::Result<()> {
 /// let parser = CargoLockParser;
-/// let manifest_uri = Uri::from_file_path("/path/to/Cargo.toml").unwrap();
+/// let manifest_uri = Url::from_file_path("/path/to/Cargo.toml").unwrap();
 ///
 /// if let Some(lockfile_path) = parser.locate_lockfile(&manifest_uri) {
 ///     let resolved = parser.parse_lockfile(&lockfile_path).await?;
@@ -67,7 +67,7 @@ impl CargoLockParser {
 }
 
 impl LockFileProvider for CargoLockParser {
-    fn locate_lockfile(&self, manifest_uri: &Uri) -> Option<PathBuf> {
+    fn locate_lockfile(&self, manifest_uri: &Url) -> Option<PathBuf> {
         locate_lockfile_for_manifest(manifest_uri, Self::LOCKFILE_NAMES)
     }
 
@@ -497,7 +497,7 @@ version = 4
         std::fs::write(&workspace_lock, "version = 4").unwrap();
         std::fs::write(&member_manifest, "[package]\nname = \"member\"").unwrap();
 
-        let manifest_uri = Uri::from_file_path(&member_manifest).unwrap();
+        let manifest_uri = Url::from_file_path(&member_manifest).unwrap();
         let parser = CargoLockParser;
 
         let located = parser.locate_lockfile(&manifest_uri);

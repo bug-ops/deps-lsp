@@ -41,7 +41,7 @@ pub(crate) mod blocking_ecosystem {
     use std::path::Path;
     use std::sync::Arc;
     use tokio::sync::Barrier;
-    use tower_lsp_server::ls_types::{CodeLens, Diagnostic, InlayHint, Position, Uri};
+    use tower_lsp_server::ls_types::{CodeLens, Diagnostic, InlayHint, Position};
 
     pub(crate) struct NoopRegistry;
     impl Registry for NoopRegistry {
@@ -94,7 +94,7 @@ pub(crate) mod blocking_ecosystem {
     impl OsvNaming for NoopFormatter {}
 
     pub(crate) struct MockParseResult {
-        pub(crate) uri: Uri,
+        pub(crate) uri: url::Url,
     }
     impl ParseResult for MockParseResult {
         fn dependencies(&self) -> Vec<&dyn Dependency> {
@@ -103,7 +103,7 @@ pub(crate) mod blocking_ecosystem {
         fn workspace_root(&self) -> Option<&Path> {
             None
         }
-        fn uri(&self) -> &Uri {
+        fn uri(&self) -> &url::Url {
             &self.uri
         }
         fn as_any(&self) -> &dyn Any {
@@ -139,7 +139,7 @@ pub(crate) mod blocking_ecosystem {
         fn parse_manifest<'a>(
             &'a self,
             _content: &'a str,
-            _uri: &'a Uri,
+            _uri: &'a url::Url,
         ) -> BoxFuture<'a, deps_core::Result<Box<dyn ParseResult>>> {
             Box::pin(async move { unimplemented!() })
         }
@@ -169,7 +169,7 @@ pub(crate) mod blocking_ecosystem {
             &'a self,
             _parse_result: &'a dyn ParseResult,
             _versions: VersionData<'a>,
-            _uri: &'a Uri,
+            _uri: &'a url::Url,
             _freshness: FreshnessSettings,
             _severities: DiagnosticSeverities,
         ) -> BoxFuture<'a, Vec<Diagnostic>> {
@@ -187,7 +187,7 @@ pub(crate) mod blocking_ecosystem {
             _parse_result: &'a dyn ParseResult,
             _content: &'a str,
             _versions: VersionData<'a>,
-            _uri: &'a Uri,
+            _uri: &'a url::Url,
             _command_id: &'a str,
         ) -> BoxFuture<'a, Vec<CodeLens>> {
             Box::pin(async move {

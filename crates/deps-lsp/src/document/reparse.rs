@@ -185,11 +185,12 @@ mod tests {
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let state = Arc::new(ServerState::new());
         let (client, config) = create_test_client_and_config();
-        let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let uri = crate::lsp_types_interop::to_lsp_uri(&url);
         let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
 
         let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
-        let parse_result = ecosystem.parse_manifest(&content, &uri).await.unwrap();
+        let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
         let mut doc_state =
             DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
         doc_state.set_version(Some(1));

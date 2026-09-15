@@ -978,7 +978,6 @@ pub fn apply_fetch_outcomes(
 mod tests {
     use super::*;
     use deps_core::parser::DependencySource;
-    use tower_lsp_server::ls_types::Uri;
 
     /// Pairs every name with the plain `Registry` source — the shape every pre-existing
     /// `fetch_latest_versions_parallel` test used before that function became source-aware
@@ -1076,8 +1075,8 @@ mod tests {
             DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
             RequirementResolution, SourcePolicy,
         };
+        use deps_core::position::{Position, Range};
         use std::any::Any;
-        use tower_lsp_server::ls_types::{Position, Range};
 
         /// Unlike the real `CargoFormatter`, treats *both* `Registry` and
         /// `AlternateRegistry` as resolvable — needed so two distinct source values can
@@ -1153,8 +1152,8 @@ mod tests {
             fn workspace_root(&self) -> Option<&std::path::Path> {
                 None
             }
-            fn uri(&self) -> &Uri {
-                static URI: std::sync::OnceLock<Uri> = std::sync::OnceLock::new();
+            fn uri(&self) -> &url::Url {
+                static URI: std::sync::OnceLock<url::Url> = std::sync::OnceLock::new();
                 URI.get_or_init(|| deps_core::test_util::test_uri("/test/Cargo.toml"))
             }
             fn as_any(&self) -> &dyn Any {
@@ -3387,7 +3386,7 @@ mod tests {
                 fn workspace_root(&self) -> Option<&std::path::Path> {
                     None
                 }
-                fn uri(&self) -> &Uri {
+                fn uri(&self) -> &url::Url {
                     unimplemented!("not exercised by this test")
                 }
                 fn as_any(&self) -> &dyn std::any::Any {

@@ -1,4 +1,4 @@
-use tower_lsp_server::ls_types::Range;
+use deps_core::position::Range;
 
 use crate::catalog::CatalogOrigin;
 
@@ -13,10 +13,10 @@ use crate::catalog::CatalogOrigin;
 /// ```no_run
 /// use deps_npm::parser::parse_package_json;
 /// use deps_npm::types::NpmDependencySection;
-/// use tower_lsp_server::ls_types::Uri;
+/// use url::Url;
 ///
 /// let json = r#"{ "dependencies": { "express": "^4.18.2" } }"#;
-/// let uri = Uri::from_file_path("/test/package.json").unwrap();
+/// let uri = Url::from_file_path("/test/package.json").unwrap();
 /// let result = parse_package_json(json, &uri).unwrap();
 /// let dep = &result.dependencies[0];
 ///
@@ -314,9 +314,9 @@ deps_core::impl_metadata!(NpmPackage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::Position;
     use deps_core::{Metadata, Version};
     use std::assert_matches;
-    use tower_lsp_server::ls_types::Position;
 
     #[test]
     fn test_npm_dependency_creation() {

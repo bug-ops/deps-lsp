@@ -439,7 +439,7 @@ mod tests {
             // where `requirement` is always `dep.version_requirement().unwrap()`.
             let dep = NpmDependency {
                 name: PackageName::new("lodash"),
-                name_range: tower_lsp_server::ls_types::Range::default(),
+                name_range: deps_core::Range::default(),
                 version_req: Some(VersionReq::new(requirement)),
                 version_range: None,
                 section: NpmDependencySection::Dependencies,

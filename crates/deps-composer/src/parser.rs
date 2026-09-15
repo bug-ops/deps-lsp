@@ -10,7 +10,7 @@ use deps_core::json_ast::{JsonAst, JsonSection};
 use deps_core::json_helpers::string_valued_entries;
 use deps_core::lsp_helpers::LineOffsetTable;
 use serde_json::Value;
-use tower_lsp_server::ls_types::Uri;
+use url::Url;
 
 /// Result of parsing a composer.json file.
 ///
@@ -21,7 +21,7 @@ pub struct ComposerParseResult {
     /// Non-platform dependencies found in the manifest.
     pub dependencies: Vec<ComposerDependency>,
     /// URI of the manifest this result was parsed from.
-    pub uri: Uri,
+    pub uri: Url,
     /// Raw value of the manifest's own top-level `minimum-stability` field (e.g. `"beta"`),
     /// if present — Composer's project-wide default stability floor, one of `dev`, `alpha`,
     /// `beta`, `RC`, `stable` (case-insensitive). `None` when the field is absent, which
@@ -98,20 +98,20 @@ pub fn is_platform_package(name: &str) -> bool {
 ///
 /// ```no_run
 /// use deps_composer::parser::parse_composer_json;
-/// use tower_lsp_server::ls_types::Uri;
+/// use url::Url;
 ///
 /// let json = r#"{
 ///   "require": {
 ///     "symfony/console": "^6.0"
 ///   }
 /// }"#;
-/// let uri = Uri::from_file_path("/project/composer.json").unwrap();
+/// let uri = Url::from_file_path("/project/composer.json").unwrap();
 ///
 /// let result = parse_composer_json(json, &uri).unwrap();
 /// assert_eq!(result.dependencies.len(), 1);
 /// assert_eq!(result.dependencies[0].name, "symfony/console");
 /// ```
-pub fn parse_composer_json(content: &str, uri: &Uri) -> Result<ComposerParseResult> {
+pub fn parse_composer_json(content: &str, uri: &Url) -> Result<ComposerParseResult> {
     let root: Value = deps_core::parse_json_checked(content.as_bytes())?;
 
     let line_table = LineOffsetTable::new(content);
@@ -212,10 +212,10 @@ fn parse_section(
 mod tests {
     use super::*;
 
+    use deps_core::position::Range;
     use std::assert_matches;
-    use tower_lsp_server::ls_types::Range;
 
-    fn test_uri() -> Uri {
+    fn test_uri() -> Url {
         deps_core::test_util::test_uri("/test/composer.json")
     }
 

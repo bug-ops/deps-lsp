@@ -193,7 +193,7 @@ impl Clone for DocumentState {
 /// use std::time::Duration;
 ///
 /// let limiter = ColdStartLimiter::new(Duration::from_secs(10));
-/// let uri = deps_core::test_util::test_uri("/test.toml");
+/// let uri = deps_lsp::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri("/test.toml"));
 ///
 /// assert!(limiter.allow_cold_start(&uri));
 /// assert!(!limiter.allow_cold_start(&uri)); // Rate limited
@@ -1453,7 +1453,9 @@ mod tests {
             use tokio::sync::Barrier;
 
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/concurrent-loading-test.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+                "/concurrent-loading-test.toml",
+            ));
 
             let doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
             state.update_document(uri.clone(), doc);
@@ -1833,7 +1835,8 @@ mod tests {
     #[tokio::test]
     async fn test_server_state_background_tasks() {
         let state = Arc::new(ServerState::new());
-        let uri = deps_core::test_util::test_uri("/test.toml");
+        let uri =
+            crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri("/test.toml"));
 
         let task = tokio::spawn(async {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1846,7 +1849,8 @@ mod tests {
     #[tokio::test]
     async fn test_spawn_background_task_cancels_previous() {
         let state = Arc::new(ServerState::new());
-        let uri = deps_core::test_util::test_uri("/test.toml");
+        let uri =
+            crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri("/test.toml"));
 
         let task1 = tokio::spawn(async {
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
@@ -1863,7 +1867,8 @@ mod tests {
     #[tokio::test]
     async fn test_cancel_background_task_nonexistent() {
         let state = Arc::new(ServerState::new());
-        let uri = deps_core::test_util::test_uri("/test.toml");
+        let uri =
+            crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri("/test.toml"));
         state.cancel_background_task(&uri).await;
     }
 
@@ -1891,7 +1896,8 @@ mod tests {
     #[tokio::test]
     async fn test_spawn_background_task_panic_marks_document_failed() {
         let state = Arc::new(ServerState::new());
-        let uri = deps_core::test_util::test_uri("/test.toml");
+        let uri =
+            crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri("/test.toml"));
 
         let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
         doc.set_loading();
@@ -1921,7 +1927,8 @@ mod tests {
     #[tokio::test]
     async fn test_spawn_background_task_panic_does_not_mark_idle_document_failed() {
         let state = Arc::new(ServerState::new());
-        let uri = deps_core::test_util::test_uri("/test.toml");
+        let uri =
+            crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri("/test.toml"));
 
         let doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
         assert_eq!(doc.loading_state, LoadingState::Idle);
@@ -1949,7 +1956,8 @@ mod tests {
     #[tokio::test]
     async fn test_spawn_background_task_abort_does_not_mark_document_failed() {
         let state = Arc::new(ServerState::new());
-        let uri = deps_core::test_util::test_uri("/test.toml");
+        let uri =
+            crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri("/test.toml"));
 
         let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
         doc.set_loading();
@@ -1994,7 +2002,8 @@ mod tests {
     #[tokio::test]
     async fn test_is_current_background_task_detects_supersession() {
         let state = Arc::new(ServerState::new());
-        let uri = deps_core::test_util::test_uri("/test.toml");
+        let uri =
+            crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri("/test.toml"));
 
         let task_a = tokio::spawn(std::future::pending::<()>());
         let id_a = task_a.id();
@@ -2032,7 +2041,8 @@ mod tests {
         #[test]
         fn test_allows_first_request() {
             let limiter = ColdStartLimiter::new(Duration::from_millis(100));
-            let uri = deps_core::test_util::test_uri("/test.toml");
+            let uri =
+                crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri("/test.toml"));
             assert!(
                 limiter.allow_cold_start(&uri),
                 "First request should be allowed"
@@ -2042,7 +2052,8 @@ mod tests {
         #[test]
         fn test_blocks_rapid_requests() {
             let limiter = ColdStartLimiter::new(Duration::from_millis(100));
-            let uri = deps_core::test_util::test_uri("/test.toml");
+            let uri =
+                crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri("/test.toml"));
 
             assert!(limiter.allow_cold_start(&uri), "First request allowed");
             assert!(
@@ -2054,7 +2065,8 @@ mod tests {
         #[tokio::test]
         async fn test_allows_after_interval() {
             let limiter = ColdStartLimiter::new(Duration::from_millis(50));
-            let uri = deps_core::test_util::test_uri("/test.toml");
+            let uri =
+                crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri("/test.toml"));
 
             assert!(limiter.allow_cold_start(&uri), "First request allowed");
             tokio::time::sleep(Duration::from_millis(60)).await;
@@ -2069,7 +2081,8 @@ mod tests {
         #[tokio::test]
         async fn test_set_min_interval_changes_behavior() {
             let limiter = ColdStartLimiter::new(Duration::from_millis(100));
-            let uri = deps_core::test_util::test_uri("/test.toml");
+            let uri =
+                crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri("/test.toml"));
 
             assert!(limiter.allow_cold_start(&uri), "First request allowed");
             assert!(
@@ -2095,8 +2108,12 @@ mod tests {
         #[test]
         fn test_different_uris_independent() {
             let limiter = ColdStartLimiter::new(Duration::from_millis(100));
-            let uri1 = deps_core::test_util::test_uri("/test1.toml");
-            let uri2 = deps_core::test_util::test_uri("/test2.toml");
+            let uri1 = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+                "/test1.toml",
+            ));
+            let uri2 = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+                "/test2.toml",
+            ));
 
             assert!(limiter.allow_cold_start(&uri1), "URI 1 first request");
             assert!(limiter.allow_cold_start(&uri2), "URI 2 first request");
@@ -2113,8 +2130,12 @@ mod tests {
         #[test]
         fn test_cleanup() {
             let limiter = ColdStartLimiter::new(Duration::from_millis(100));
-            let uri1 = deps_core::test_util::test_uri("/test1.toml");
-            let uri2 = deps_core::test_util::test_uri("/test2.toml");
+            let uri1 = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+                "/test1.toml",
+            ));
+            let uri2 = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+                "/test2.toml",
+            ));
 
             limiter.allow_cold_start(&uri1);
             limiter.allow_cold_start(&uri2);
@@ -2133,7 +2154,9 @@ mod tests {
             use std::sync::Arc;
 
             let limiter = Arc::new(ColdStartLimiter::new(Duration::from_millis(100)));
-            let uri = deps_core::test_util::test_uri("/concurrent-test.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+                "/concurrent-test.toml",
+            ));
 
             let mut handles = vec![];
             const CONCURRENT_TASKS: usize = 10;
@@ -2260,7 +2283,8 @@ mod tests {
         #[test]
         fn test_server_state_document_operations() {
             let state = ServerState::new();
-            let uri = deps_core::test_util::test_uri("/test.toml");
+            let uri =
+                crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri("/test.toml"));
             let doc_state =
                 DocumentState::new_without_parse_result(EcosystemId::Cargo, "test".into());
 

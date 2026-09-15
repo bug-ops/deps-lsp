@@ -30,7 +30,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Range, Uri};
+use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Range};
 
 /// Every non-`deps-core` diagnostic code constant in the workspace, mirrored here as
 /// literals rather than importing `deps-github-actions`/`deps-gitlab-ci` directly (both are
@@ -562,10 +562,10 @@ impl<'a> DependencyIndex<'a> {
         let mut by_version_range = HashMap::new();
         for dep in parse_result.dependencies() {
             if !dep.name_range_is_synthetic() {
-                by_name_range.insert(dep.name_range(), dep);
+                by_name_range.insert(dep.name_range().into(), dep);
             }
             if let Some(version_range) = dep.version_range() {
-                by_version_range.insert(version_range, dep);
+                by_version_range.insert(version_range.into(), dep);
             }
         }
         Self {
@@ -718,10 +718,13 @@ fn classify(
 }
 
 /// Builds a file URI from a filesystem path, without any path-existence check. Returns
-/// `None` when `path` cannot be represented as a file URI at all (e.g. a Windows UNC path
-/// `Uri::from_file_path` cannot express) — the caller surfaces this as
-/// [`CheckError::InvalidPath`] rather than fabricating a synthetic, unusable URI.
-fn path_to_uri(path: &Path) -> Option<Uri> {
+/// `None` when `path` cannot be represented as a file URI at all — `Url::from_file_path`
+/// requires an absolute path (this function already joins a relative one onto the current
+/// directory first) and, on Windows, a disk (`C:`) or UNC (`\\`) prefix; UNC paths
+/// themselves are supported, just not any other Windows path prefix shape. The caller
+/// surfaces a `None` here as [`CheckError::InvalidPath`] rather than fabricating a
+/// synthetic, unusable URI.
+fn path_to_uri(path: &Path) -> Option<url::Url> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -729,7 +732,7 @@ fn path_to_uri(path: &Path) -> Option<Uri> {
             .map(|cwd| cwd.join(path))
             .unwrap_or_else(|_| path.to_path_buf())
     };
-    Uri::from_file_path(&absolute)
+    url::Url::from_file_path(&absolute).ok()
 }
 
 #[cfg(test)]

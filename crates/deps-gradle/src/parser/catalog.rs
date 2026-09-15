@@ -4,10 +4,11 @@
 
 use crate::parser::{GradleParseResult, LineOffsetTable};
 use crate::types::GradleDependency;
+use deps_core::position::Range;
 use deps_core::{DepsError, Result};
 use std::collections::HashMap;
 use toml_span::value::{Table, Value};
-use tower_lsp_server::ls_types::{Range, Uri};
+use url::Url;
 
 /// Parses a Gradle version catalog (`gradle/libs.versions.toml`) into a [`GradleParseResult`].
 ///
@@ -15,7 +16,7 @@ use tower_lsp_server::ls_types::{Range, Uri};
 ///
 /// Returns [`DepsError::ParseError`] if the TOML nesting depth exceeds the
 /// configured limit or the content is not valid TOML.
-pub fn parse_version_catalog(content: &str, uri: &Uri) -> Result<GradleParseResult> {
+pub fn parse_version_catalog(content: &str, uri: &Url) -> Result<GradleParseResult> {
     if let Err(depth) =
         deps_core::check_toml_nesting_depth(content, deps_core::MAX_TOML_NESTING_DEPTH)
     {
@@ -175,7 +176,7 @@ mod tests {
 
     use std::assert_matches;
 
-    fn make_uri() -> Uri {
+    fn make_uri() -> Url {
         deps_core::test_util::test_uri("/project/gradle/libs.versions.toml")
     }
 

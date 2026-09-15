@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use tower_lsp_server::ls_types::{CodeAction, CodeActionKind, Position, Range, Uri, WorkspaceEdit};
+use tower_lsp_server::ls_types::{CodeAction, CodeActionKind, Position, Range, WorkspaceEdit};
 
 use crate::osv::{ScanOutcome, UpgradeStatus};
 use crate::{ConcreteVersion, Dependency, ParseResult, Registry, VersionReq};
@@ -97,7 +97,7 @@ fn fix_target_is_verified(
 fn build_vulnerability_fix_action(
     parse_result: &dyn ParseResult,
     dep: &dyn Dependency,
-    uri: &Uri,
+    uri: &url::Url,
     version_range: Range,
     versions: VersionData<'_>,
     version_req: &str,
@@ -269,7 +269,7 @@ struct UnsatisfiableFixAction {
 /// only "for every rewrite the ecosystem can evaluate", not unconditionally.
 fn build_unsatisfiable_fix_action(
     dep: &dyn Dependency,
-    uri: &Uri,
+    uri: &url::Url,
     version_range: Range,
     versions: VersionData<'_>,
     version_req: &VersionReq,
@@ -355,7 +355,7 @@ fn build_unsatisfiable_fix_action(
 /// `(0,0)`.
 fn build_replacement_action(
     dep: &dyn Dependency,
-    uri: &Uri,
+    uri: &url::Url,
     version_range: Range,
     versions: VersionData<'_>,
     content: &str,
@@ -377,7 +377,7 @@ fn build_replacement_action(
         return None;
     }
 
-    let name_range = dep.name_range();
+    let name_range: Range = dep.name_range().into();
     let name_slice = slice_for_range(content, line_offsets, name_range);
     // I7: reuses `literal_span_matches` rather than a name-specific equality check purely
     // for the sentinel-rejecting behavior its whitespace-insensitive comparison already
@@ -506,7 +506,7 @@ fn build_replacement_action(
 pub async fn generate_code_actions<R: Registry + ?Sized>(
     parse_result: &dyn ParseResult,
     position: Position,
-    uri: &Uri,
+    uri: &url::Url,
     versions: VersionData<'_>,
     content: &str,
     registry: &R,
@@ -527,6 +527,7 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
     let Some(version_range) = dep.version_range() else {
         return actions;
     };
+    let version_range: Range = version_range.into();
 
     let Some(version_req) = dep.version_requirement() else {
         return actions;
@@ -1652,8 +1653,9 @@ mod tests {
             version_range: Range::new(
                 Position::new(0, version_start),
                 Position::new(0, version_start + "=2.14.1".len() as u32),
-            ),
-            name_range: Range::new(Position::new(0, name_start), Position::new(0, name_end)),
+            )
+            .into(),
+            name_range: Range::new(Position::new(0, name_start), Position::new(0, name_end)).into(),
         };
         let patched_dep = MockDep {
             name: pkg("log4j-core"),
@@ -1661,8 +1663,9 @@ mod tests {
             version_range: Range::new(
                 Position::new(1, version_start),
                 Position::new(1, version_start + "=2.17.1".len() as u32),
-            ),
-            name_range: Range::new(Position::new(1, name_start), Position::new(1, name_end)),
+            )
+            .into(),
+            name_range: Range::new(Position::new(1, name_start), Position::new(1, name_end)).into(),
         };
         let parse_result = MockParseResult {
             deps: vec![vulnerable_dep, patched_dep],
@@ -1822,16 +1825,15 @@ mod tests {
             .iter()
             .filter(|a| a.kind == Some(CodeActionKind::REFACTOR))
         {
-            let edit_text = &action.edit.as_ref().unwrap().changes.as_ref().unwrap()
-                [parse_result.uri()][0]
-                .new_text;
+            let ls_uri = crate::lsp_helpers::to_ls_uri(parse_result.uri());
+            let edit_text =
+                &action.edit.as_ref().unwrap().changes.as_ref().unwrap()[&ls_uri][0].new_text;
             for other in actions.iter() {
                 if std::ptr::eq(action, other) {
                     continue;
                 }
-                let other_text = &other.edit.as_ref().unwrap().changes.as_ref().unwrap()
-                    [parse_result.uri()][0]
-                    .new_text;
+                let other_text =
+                    &other.edit.as_ref().unwrap().changes.as_ref().unwrap()[&ls_uri][0].new_text;
                 assert_ne!(
                     edit_text, other_text,
                     "no two actions may carry a byte-identical edit"
@@ -2441,7 +2443,7 @@ mod tests {
             .edit
             .as_ref()
             .and_then(|e| e.changes.as_ref())
-            .and_then(|c| c.get(&uri))
+            .and_then(|c| c.get(&crate::lsp_helpers::to_ls_uri(&uri)))
             .and_then(|edits| edits.first())
             .map(|e| e.new_text.as_str())
             .expect("quickfix should carry a TextEdit for the document uri");
@@ -2472,14 +2474,14 @@ mod tests {
             fn name(&self) -> &PackageName {
                 &self.name
             }
-            fn name_range(&self) -> Range {
-                Range::default()
+            fn name_range(&self) -> crate::position::Range {
+                Range::default().into()
             }
             fn version_requirement(&self) -> Option<&VersionReq> {
                 self.version_req.as_ref()
             }
-            fn version_range(&self) -> Option<Range> {
-                self.version_range
+            fn version_range(&self) -> Option<crate::position::Range> {
+                self.version_range.map(Into::into)
             }
             fn source(&self) -> crate::parser::DependencySource {
                 crate::parser::DependencySource::Registry
@@ -2491,7 +2493,7 @@ mod tests {
 
         struct CaParseResult {
             deps: Vec<CaDep>,
-            uri: Uri,
+            uri: url::Url,
         }
 
         impl ParseResult for CaParseResult {
@@ -2501,7 +2503,7 @@ mod tests {
             fn workspace_root(&self) -> Option<&std::path::Path> {
                 None
             }
-            fn uri(&self) -> &Uri {
+            fn uri(&self) -> &url::Url {
                 &self.uri
             }
             fn as_any(&self) -> &dyn Any {
@@ -2525,14 +2527,14 @@ mod tests {
             fn name(&self) -> &PackageName {
                 &self.name
             }
-            fn name_range(&self) -> Range {
-                Range::default()
+            fn name_range(&self) -> crate::position::Range {
+                Range::default().into()
             }
             fn version_requirement(&self) -> Option<&VersionReq> {
                 self.version_req.as_ref()
             }
-            fn version_range(&self) -> Option<Range> {
-                self.version_range
+            fn version_range(&self) -> Option<crate::position::Range> {
+                self.version_range.map(Into::into)
             }
             fn source(&self) -> crate::parser::DependencySource {
                 crate::parser::DependencySource::Registry
@@ -2547,7 +2549,7 @@ mod tests {
 
         struct CaLiteralParseResult {
             deps: Vec<CaLiteralDep>,
-            uri: Uri,
+            uri: url::Url,
         }
 
         impl ParseResult for CaLiteralParseResult {
@@ -2557,7 +2559,7 @@ mod tests {
             fn workspace_root(&self) -> Option<&std::path::Path> {
                 None
             }
-            fn uri(&self) -> &Uri {
+            fn uri(&self) -> &url::Url {
                 &self.uri
             }
             fn as_any(&self) -> &dyn Any {
@@ -3008,14 +3010,14 @@ mod tests {
             fn name(&self) -> &PackageName {
                 &self.name
             }
-            fn name_range(&self) -> Range {
-                Range::default()
+            fn name_range(&self) -> crate::position::Range {
+                Range::default().into()
             }
             fn version_requirement(&self) -> Option<&VersionReq> {
                 Some(&self.version_req)
             }
-            fn version_range(&self) -> Option<Range> {
-                Some(self.version_range)
+            fn version_range(&self) -> Option<crate::position::Range> {
+                Some(self.version_range.into())
             }
             fn source(&self) -> crate::parser::DependencySource {
                 self.source.clone()
@@ -3028,7 +3030,7 @@ mod tests {
         /// `MockParseResult` only stores `MockDep`s; wraps a single `UnsatDep` instead.
         struct UnsatParseResult {
             dep: UnsatDep,
-            uri: Uri,
+            uri: url::Url,
         }
 
         impl ParseResult for UnsatParseResult {
@@ -3038,7 +3040,7 @@ mod tests {
             fn workspace_root(&self) -> Option<&std::path::Path> {
                 None
             }
-            fn uri(&self) -> &Uri {
+            fn uri(&self) -> &url::Url {
                 &self.uri
             }
             fn as_any(&self) -> &dyn Any {

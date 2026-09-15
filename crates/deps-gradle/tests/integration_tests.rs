@@ -5,9 +5,9 @@ use deps_core::{EcosystemConfig, LoadingState, PackageVersions, VersionData};
 use deps_gradle::GradleFormatter;
 use deps_gradle::parser::{GradleParseResult, parse_gradle};
 use std::collections::HashMap;
-use tower_lsp_server::ls_types::Uri;
+use url::Url;
 
-fn make_uri(path: &str) -> Uri {
+fn make_uri(path: &str) -> Url {
     deps_core::test_util::test_uri(path)
 }
 

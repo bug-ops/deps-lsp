@@ -48,7 +48,14 @@ pub async fn handle_document_link(
 
     tracing::Span::current().record("ecosystem", ecosystem.id());
 
-    ecosystem.generate_document_links(parse_result.as_ref(), uri)
+    // Unreachable in practice: a document only reaches `with_document` above once its
+    // URI already converted successfully (see `ensure_document_loaded`), but handled
+    // defensively rather than unwrapped.
+    let Some(domain_uri) = crate::lsp_types_interop::from_lsp_uri(uri) else {
+        tracing::warn!("URI is not representable as a url::Url: {:?}", uri);
+        return vec![];
+    };
+    ecosystem.generate_document_links(parse_result.as_ref(), &domain_uri)
 }
 
 #[cfg(test)]
@@ -61,7 +68,9 @@ mod tests {
     #[tokio::test]
     async fn test_handle_document_link_missing_document() {
         let state = Arc::new(ServerState::new());
-        let uri = deps_core::test_util::test_uri("/test/requirements.txt");
+        let uri = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+            "/test/requirements.txt",
+        ));
         let (client, config) = create_test_client_and_config();
 
         let params = DocumentLinkParams {
@@ -83,13 +92,14 @@ mod tests {
         #[tokio::test]
         async fn test_handle_document_link_requirements_reference() {
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/requirements.txt");
+            let url = deps_core::test_util::test_uri("/test/requirements.txt");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
             let ecosystem = state.ecosystem_registry.get("pypi").unwrap();
             let content = "-r other-requirements.txt\nrequests==2.31.0\n".to_string();
 
             let parse_result = ecosystem
-                .parse_manifest(&content, &uri)
+                .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
 

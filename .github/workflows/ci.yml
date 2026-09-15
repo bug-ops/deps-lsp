@@ -390,6 +390,32 @@ jobs:
           done
           exit 0
 
+      - name: Guard against deps-engine directly depending on tower-lsp-server
+        # Issue #1071: deps-engine's domain data (Dependency ranges, ParseResult::uri(),
+        # LockFileProvider, etc.) was migrated off `tower_lsp_server::ls_types` onto
+        # `deps_core::position::{Position,Range}`/`url::Url`, so deps-engine's own
+        # `Cargo.toml` must never re-add `tower-lsp-server` as a direct dependency again.
+        # This is deliberately a **direct**-dependency check (`--depth 1`), not a
+        # transitive one: deps-engine still pulls tower-lsp-server transitively through
+        # deps-core (accepted — deps-core's own `lsp_helpers` module independently builds
+        # real `ls_types::{Hover,Diagnostic,CodeAction}` response objects, out of scope
+        # for this spec and tracked separately as issue #1083). A plain `cargo tree -p
+        # deps-engine | grep tower-lsp-server` would always match that expected
+        # transitive edge and fail on every run — future contributors should not "fix"
+        # this into a transitive check. Same boundary-anchored grep technique as the
+        # other dependency-tree guards above.
+        run: |
+          tree=$(cargo tree -p deps-engine -e no-dev --all-features --depth 1)
+          if ! grep -qE '(^|[^A-Za-z0-9._-])deps-core v[0-9]' <<<"$tree"; then
+            echo "::error::guard self-check failed: deps-core not found among deps-engine's direct dependencies — cargo tree output format may have changed"
+            exit 1
+          fi
+          if grep -qE '(^|[^A-Za-z0-9._-])tower-lsp-server v[0-9]' <<<"$tree"; then
+            echo "::error::deps-engine directly depends on tower-lsp-server (issue #1071 regression)"
+            exit 1
+          fi
+          exit 0
+
   tooling-lint:
     name: Tooling Lint (action.yml + pre-commit-hooks.yaml)
     needs: changes

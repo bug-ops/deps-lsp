@@ -11,7 +11,7 @@ use deps_core::net_policy::RegistryAccessPolicy;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use toml_span::value::{Table, Value};
-use tower_lsp_server::ls_types::Uri;
+use url::Url;
 
 /// Everything a `pyproject.toml` parse needs to resolve a dependency's PyPI index routing
 /// (spec FR-002/003/005/006/007/013) — built once from the TOML tree's `[[tool.poetry.source]]`
@@ -67,13 +67,13 @@ impl PypiParser {
     ///
     /// ```no_run
     /// # use deps_pypi::parser::PypiParser;
-    /// # use tower_lsp_server::ls_types::Uri;
+    /// # use url::Url;
     /// let parser = PypiParser::new();
     /// let content = std::fs::read_to_string("pyproject.toml").unwrap();
-    /// let uri = Uri::from_file_path("/project/pyproject.toml").unwrap();
+    /// let uri = Url::from_file_path("/project/pyproject.toml").unwrap();
     /// let result = parser.parse_content(&content, &uri).unwrap();
     /// ```
-    pub fn parse_content(&self, content: &str, uri: &Uri) -> Result<ParseResult> {
+    pub fn parse_content(&self, content: &str, uri: &Url) -> Result<ParseResult> {
         self.parse_content_with_policy(content, uri, &RegistryAccessPolicy::default())
     }
 
@@ -88,7 +88,7 @@ impl PypiParser {
     pub fn parse_content_with_policy(
         &self,
         content: &str,
-        uri: &Uri,
+        uri: &Url,
         policy: &RegistryAccessPolicy,
     ) -> Result<ParseResult> {
         if let Err(depth) =
@@ -570,12 +570,12 @@ impl PypiParser {
         &self,
         name: &str,
         value: &Value<'_>,
-        base_position: Option<tower_lsp_server::ls_types::Position>,
+        base_position: Option<deps_core::position::Position>,
         content: &str,
         line_table: &LineOffsetTable,
         ctx: &IndexContext<'_>,
     ) -> Result<PypiDependency> {
-        use tower_lsp_server::ls_types::{Position, Range};
+        use deps_core::position::{Position, Range};
 
         let name_range = base_position
             .map(|pos| {
@@ -861,10 +861,10 @@ mod tests {
     use super::super::{MAX_MARKER_LEN, marker_too_deep};
     use super::*;
     use crate::error::PypiError;
+    use deps_core::position::{Position, Range};
     use std::assert_matches;
-    use tower_lsp_server::ls_types::{Position, Range};
 
-    fn test_uri() -> Uri {
+    fn test_uri() -> Url {
         deps_core::test_util::test_uri("/test/pyproject.toml")
     }
 

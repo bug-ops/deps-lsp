@@ -1,5 +1,5 @@
+use deps_core::position::Range;
 use std::any::Any;
-use tower_lsp_server::ls_types::Range;
 
 /// Parsed dependency from pyproject.toml with position tracking.
 ///
@@ -12,10 +12,10 @@ use tower_lsp_server::ls_types::Range;
 /// ```no_run
 /// use deps_pypi::PypiParser;
 /// use deps_pypi::types::PypiDependencySection;
-/// use tower_lsp_server::ls_types::Uri;
+/// use url::Url;
 ///
 /// let toml = "[project]\ndependencies = [\"requests>=2.28.0,<3.0\"]";
-/// let uri = Uri::from_file_path("/test/pyproject.toml").unwrap();
+/// let uri = Url::from_file_path("/test/pyproject.toml").unwrap();
 /// let result = PypiParser::new().parse_content(toml, &uri).unwrap();
 /// let dep = &result.dependencies[0];
 ///
@@ -393,9 +393,9 @@ impl deps_core::Metadata for PypiPackage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::position::Position;
     use deps_core::{Metadata, Version};
     use std::assert_matches;
-    use tower_lsp_server::ls_types::Position;
 
     #[test]
     fn test_pypi_dependency_creation() {

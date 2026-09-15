@@ -245,7 +245,8 @@ impl Backend {
                     if doc.ecosystem_id() != ecosystem_id_owned {
                         return None;
                     }
-                    let doc_lockfile = lock_provider_for_scan.locate_lockfile(uri)?;
+                    let domain_uri = crate::lsp_types_interop::from_lsp_uri(uri)?;
+                    let doc_lockfile = lock_provider_for_scan.locate_lockfile(&domain_uri)?;
                     if doc_lockfile == lockfile_path_owned {
                         Some(uri.clone())
                     } else {
@@ -852,8 +853,14 @@ impl LanguageServer for Backend {
 
         tracing::info!("document opened: {:?}", uri);
 
-        // Use ecosystem registry to check if we support this file type
-        if self.state.ecosystem_registry.for_uri(&uri).is_none() {
+        // Use ecosystem registry to check if we support this file type. `from_lsp_uri`
+        // returning `None` (a URI shape `url::Url` rejects, e.g. a `file:` URI with a
+        // port) is treated the same as "no ecosystem handles this file type".
+        let Some(domain_uri) = crate::lsp_types_interop::from_lsp_uri(&uri) else {
+            tracing::debug!("unsupported file type: {:?}", uri);
+            return;
+        };
+        if self.state.ecosystem_registry.for_uri(&domain_uri).is_none() {
             tracing::debug!("unsupported file type: {:?}", uri);
             return;
         }
@@ -869,8 +876,14 @@ impl LanguageServer for Backend {
         if let Some(change) = params.content_changes.first() {
             let content = change.text.clone();
 
-            // Use ecosystem registry to check if we support this file type
-            if self.state.ecosystem_registry.for_uri(&uri).is_none() {
+            // Use ecosystem registry to check if we support this file type. See
+            // `did_open`'s equivalent check for why `from_lsp_uri` returning `None` is
+            // treated the same as "no ecosystem handles this file type".
+            let Some(domain_uri) = crate::lsp_types_interop::from_lsp_uri(&uri) else {
+                tracing::debug!("unsupported file type: {:?}", uri);
+                return;
+            };
+            if self.state.ecosystem_registry.for_uri(&domain_uri).is_none() {
                 tracing::debug!("unsupported file type: {:?}", uri);
                 return;
             }
@@ -1705,7 +1718,13 @@ mod tests {
 
         let ecosystem = backend.state.ecosystem_registry.get("cargo").unwrap();
         for (uri, content) in [(&small_uri, &small_content), (&large_uri, &large_content)] {
-            let parse_result = ecosystem.parse_manifest(content, uri).await.unwrap();
+            let parse_result = ecosystem
+                .parse_manifest(
+                    content,
+                    &crate::lsp_types_interop::from_lsp_uri(uri).unwrap(),
+                )
+                .await
+                .unwrap();
             let mut doc_state = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content.clone(),
@@ -1798,7 +1817,9 @@ mod tests {
 
     fn update_version_args(version: &str) -> UpdateVersionArgs {
         UpdateVersionArgs {
-            uri: deps_core::test_util::test_uri("/test/Cargo.toml"),
+            uri: crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+                "/test/Cargo.toml",
+            )),
             range: Range::default(),
             version: version.to_string(),
         }
@@ -1889,7 +1910,9 @@ mod tests {
 
     #[test]
     fn test_build_batch_workspace_edit_uses_document_changes_with_version() {
-        let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let uri = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+            "/test/Cargo.toml",
+        ));
         let edits = vec![TextEdit {
             range: Range::default(),
             new_text: "1.2.0".into(),
@@ -1911,7 +1934,9 @@ mod tests {
 
     #[test]
     fn test_build_batch_workspace_edit_falls_back_to_changes_map() {
-        let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let uri = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+            "/test/Cargo.toml",
+        ));
         let edits = vec![TextEdit {
             range: Range::default(),
             new_text: "1.2.0".into(),
@@ -2460,7 +2485,8 @@ mod tests {
         async fn test_did_change_configuration_updates_cold_start_rate_limit() {
             let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
             let backend = service.inner();
-            let uri = deps_core::test_util::test_uri("/test.toml");
+            let uri =
+                crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri("/test.toml"));
 
             assert!(backend.state.cold_start_limiter.allow_cold_start(&uri));
             assert!(
@@ -2515,13 +2541,14 @@ mod tests {
 
             let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
             let backend = service.inner();
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
             // Seed the document so `ensure_document_loaded`'s fast path (already loaded)
             // returns immediately, letting both handlers reach their own config reads.
             let ecosystem = backend.state.ecosystem_registry.get("cargo").unwrap();
             let content = "[dependencies]\nserde = \"1.0.0\"\n".to_string();
-            let parse_result = ecosystem.parse_manifest(&content, &uri).await.unwrap();
+            let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
             let doc_state =
                 DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
             backend.state.update_document(uri.clone(), doc_state);
@@ -2636,11 +2663,12 @@ mod tests {
             // cargo at all — so cargo's `cached_versions` being cleared is proof the first
             // call's scope survived the union, not an artifact of the second call's own
             // (unrelated) scope.
-            let cargo_uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let cargo_url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let cargo_uri = crate::lsp_types_interop::to_lsp_uri(&cargo_url);
             let cargo_ecosystem = backend.state.ecosystem_registry.get("cargo").unwrap();
             let cargo_content = "[dependencies]\nserde = \"1.0\"\n".to_string();
             let cargo_parse = cargo_ecosystem
-                .parse_manifest(&cargo_content, &cargo_uri)
+                .parse_manifest(&cargo_content, &cargo_url)
                 .await
                 .unwrap();
             let mut cargo_doc = DocumentState::new_from_parse_result(
@@ -2655,11 +2683,12 @@ mod tests {
             )]));
             backend.state.update_document(cargo_uri.clone(), cargo_doc);
 
-            let nuget_uri = deps_core::test_util::test_uri("/test/project.csproj");
+            let nuget_url = deps_core::test_util::test_uri("/test/project.csproj");
+            let nuget_uri = crate::lsp_types_interop::to_lsp_uri(&nuget_url);
             let nuget_ecosystem = backend.state.ecosystem_registry.get("nuget").unwrap();
             let nuget_content = r#"<Project><ItemGroup><PackageReference Include="Newtonsoft.Json" Version="12.0.3" /></ItemGroup></Project>"#.to_string();
             let nuget_parse = nuget_ecosystem
-                .parse_manifest(&nuget_content, &nuget_uri)
+                .parse_manifest(&nuget_content, &nuget_url)
                 .await
                 .unwrap();
             let mut nuget_doc = DocumentState::new_from_parse_result(
@@ -2736,7 +2765,9 @@ mod tests {
         async fn test_execute_command_update_all_outdated_closed_document_no_op() {
             let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
             let backend = service.inner();
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+                "/test/Cargo.toml",
+            ));
 
             // Pin the precondition the refusal actually depends on: no document at all.
             assert!(backend.state.get_document(&uri).is_none());
@@ -2756,11 +2787,19 @@ mod tests {
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
             let backend = service.inner();
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+                "/test/Cargo.toml",
+            ));
 
             let ecosystem = backend.state.ecosystem_registry.get("cargo").unwrap();
             let content = "[dependencies]\nserde = \"1.0.0\"\n".to_string();
-            let parse_result = ecosystem.parse_manifest(&content, &uri).await.unwrap();
+            let parse_result = ecosystem
+                .parse_manifest(
+                    &content,
+                    &crate::lsp_types_interop::from_lsp_uri(&uri).unwrap(),
+                )
+                .await
+                .unwrap();
             let mut doc_state = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content.clone(),
@@ -2792,11 +2831,19 @@ mod tests {
             // not `Loading`.
             let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
             let backend = service.inner();
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+                "/test/Cargo.toml",
+            ));
 
             let ecosystem = backend.state.ecosystem_registry.get("cargo").unwrap();
             let content = "[dependencies]\nserde = \"1.0.0\"\n".to_string();
-            let parse_result = ecosystem.parse_manifest(&content, &uri).await.unwrap();
+            let parse_result = ecosystem
+                .parse_manifest(
+                    &content,
+                    &crate::lsp_types_interop::from_lsp_uri(&uri).unwrap(),
+                )
+                .await
+                .unwrap();
             let mut doc_state =
                 DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
             doc_state.set_loaded();
@@ -2817,11 +2864,19 @@ mod tests {
             // (per its documented behavior) — exercises the failure/warning path.
             let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
             let backend = service.inner();
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+                "/test/Cargo.toml",
+            ));
 
             let ecosystem = backend.state.ecosystem_registry.get("cargo").unwrap();
             let content = "[dependencies]\nserde = \"1.0.0\"\n".to_string();
-            let parse_result = ecosystem.parse_manifest(&content, &uri).await.unwrap();
+            let parse_result = ecosystem
+                .parse_manifest(
+                    &content,
+                    &crate::lsp_types_interop::from_lsp_uri(&uri).unwrap(),
+                )
+                .await
+                .unwrap();
             let mut doc_state =
                 DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
             doc_state.set_version(Some(1));
@@ -2904,7 +2959,9 @@ mod tests {
         async fn test_execute_command_pin_all_to_sha_closed_document_no_op() {
             let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
             let backend = service.inner();
-            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+                "/repo/.github/workflows/ci.yml",
+            ));
 
             assert!(backend.state.get_document(&uri).is_none());
 
@@ -2924,7 +2981,9 @@ mod tests {
         async fn test_execute_command_pin_all_to_sha_loading_document_no_op() {
             let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
             let backend = service.inner();
-            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+                "/repo/.github/workflows/ci.yml",
+            ));
 
             let ecosystem = backend
                 .state
@@ -2932,7 +2991,13 @@ mod tests {
                 .get("github-actions")
                 .unwrap();
             let content = "steps:\n  - uses: actions/checkout@v4\n".to_string();
-            let parse_result = ecosystem.parse_manifest(&content, &uri).await.unwrap();
+            let parse_result = ecosystem
+                .parse_manifest(
+                    &content,
+                    &crate::lsp_types_interop::from_lsp_uri(&uri).unwrap(),
+                )
+                .await
+                .unwrap();
             let mut doc_state = DocumentState::new_from_parse_result(
                 EcosystemId::GithubActions,
                 content.clone(),
@@ -2963,7 +3028,9 @@ mod tests {
             // not `Loading`.
             let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
             let backend = service.inner();
-            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+                "/repo/.github/workflows/ci.yml",
+            ));
 
             let ecosystem = backend
                 .state
@@ -2971,7 +3038,13 @@ mod tests {
                 .get("github-actions")
                 .unwrap();
             let content = "steps:\n  - uses: actions/checkout@v4\n";
-            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = ecosystem
+                .parse_manifest(
+                    content,
+                    &crate::lsp_types_interop::from_lsp_uri(&uri).unwrap(),
+                )
+                .await
+                .unwrap();
             let mut doc_state = DocumentState::new_from_parse_result(
                 EcosystemId::GithubActions,
                 content.to_string(),
@@ -2993,7 +3066,9 @@ mod tests {
             // no-op (informational message, not a warning/panic).
             let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
             let backend = service.inner();
-            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+                "/repo/.github/workflows/ci.yml",
+            ));
             let content = "steps:\n  - uses: actions/checkout@v4\n";
 
             let ecosystem = backend
@@ -3001,7 +3076,13 @@ mod tests {
                 .ecosystem_registry
                 .get("github-actions")
                 .unwrap();
-            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = ecosystem
+                .parse_manifest(
+                    content,
+                    &crate::lsp_types_interop::from_lsp_uri(&uri).unwrap(),
+                )
+                .await
+                .unwrap();
             // Pin the precondition the refusal actually depends on: a genuine `TagIndex`
             // cache miss, not e.g. a wrong downcast or an empty method body.
             assert_eq!(
@@ -3026,7 +3107,9 @@ mod tests {
         async fn test_execute_command_pin_all_to_sha_applies_edit_for_resolvable_steps() {
             let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
             let backend = service.inner();
-            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+                "/repo/.github/workflows/ci.yml",
+            ));
             let content = "steps:\n\
                  \x20 - uses: actions/checkout@v4\n\
                  \x20 - uses: actions/setup-node@v3\n";
@@ -3042,7 +3125,13 @@ mod tests {
                 "v4",
                 &"a".repeat(40),
             );
-            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = ecosystem
+                .parse_manifest(
+                    content,
+                    &crate::lsp_types_interop::from_lsp_uri(&uri).unwrap(),
+                )
+                .await
+                .unwrap();
             // Pin the precondition this test actually exercises: exactly one of the two
             // steps is resolvable (the other has no seeded `TagIndex` entry) — without
             // this, the test below cannot distinguish "applied 1 edit" from "refused,
@@ -3094,11 +3183,19 @@ mod tests {
 
         let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
         let backend = service.inner();
-        let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let uri = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+            "/test/Cargo.toml",
+        ));
 
         let ecosystem = backend.state.ecosystem_registry.get("cargo").unwrap();
         let content = "[dependencies]\nserde = \"1.0.0\"\n".to_string();
-        let parse_result = ecosystem.parse_manifest(&content, &uri).await.unwrap();
+        let parse_result = ecosystem
+            .parse_manifest(
+                &content,
+                &crate::lsp_types_interop::from_lsp_uri(&uri).unwrap(),
+            )
+            .await
+            .unwrap();
         let mut doc_state =
             DocumentState::new_from_parse_result(EcosystemId::Cargo, content.clone(), parse_result);
         doc_state.set_version(Some(1));
@@ -3145,7 +3242,9 @@ mod tests {
 
         let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
         let backend = service.inner();
-        let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+        let uri = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+            "/repo/.gitlab-ci.yml",
+        ));
         let content = "include:\n  - project: org/proj\n    ref: v1.0.0\n";
 
         let ecosystem = backend.state.ecosystem_registry.get("gitlab-ci").unwrap();
@@ -3154,7 +3253,13 @@ mod tests {
             .as_any()
             .downcast_ref::<deps_gitlab_ci::GitlabCiRegistry>()
             .expect("gitlab-ci ecosystem must back onto a GitlabCiRegistry");
-        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+        let parse_result = ecosystem
+            .parse_manifest(
+                content,
+                &crate::lsp_types_interop::from_lsp_uri(&uri).unwrap(),
+            )
+            .await
+            .unwrap();
         let name = deps_core::ParseResult::dependencies(parse_result.as_ref())[0]
             .name()
             .clone();

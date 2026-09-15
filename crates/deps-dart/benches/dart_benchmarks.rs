@@ -13,14 +13,14 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use deps_dart::parse_pubspec_yaml;
 use std::hint::black_box;
-use tower_lsp_server::ls_types::Uri;
+use url::Url;
 
-fn test_uri() -> Uri {
+fn test_uri() -> Url {
     #[cfg(windows)]
     let path = "C:/test/pubspec.yaml";
     #[cfg(not(windows))]
     let path = "/test/pubspec.yaml";
-    Uri::from_file_path(path).unwrap()
+    Url::from_file_path(path).unwrap()
 }
 
 /// Builds a `pubspec.yaml` with `n` simple `dependencies` entries, for scaling benchmarks.

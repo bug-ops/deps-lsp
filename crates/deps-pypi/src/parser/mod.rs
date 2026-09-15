@@ -16,9 +16,10 @@
 use crate::error::{PypiError, Result};
 use crate::types::{PypiDependency, PypiDependencySection, PypiDependencySource};
 use deps_core::lsp_helpers::LineOffsetTable;
+use deps_core::position::{Position, Range};
 use pep508_rs::{MarkerTree, Requirement, VersionOrUrl};
 use std::str::FromStr;
-use tower_lsp_server::ls_types::{Position, Range, Uri};
+use url::Url;
 
 pub mod pyproject;
 pub mod requirements;
@@ -397,7 +398,7 @@ pub struct ParseResult {
     /// Workspace root path (None for Python - no workspace concept like Cargo)
     pub workspace_root: Option<std::path::PathBuf>,
     /// URI of the parsed file
-    pub uri: Uri,
+    pub uri: Url,
     /// `-r`/`-c` file references found in a requirements file (always empty
     /// for `pyproject.toml`).
     pub document_links: Vec<RequirementRef>,
@@ -444,7 +445,7 @@ deps_core::impl_parse_result!(
 ///
 /// ```no_run
 /// use deps_pypi::parser::PypiParser;
-/// use tower_lsp_server::ls_types::Uri;
+/// use url::Url;
 ///
 /// let content = r#"
 /// [project]
@@ -452,7 +453,7 @@ deps_core::impl_parse_result!(
 /// "#;
 ///
 /// let parser = PypiParser::new();
-/// let uri = Uri::from_file_path("/test/pyproject.toml").unwrap();
+/// let uri = Url::from_file_path("/test/pyproject.toml").unwrap();
 /// let result = parser.parse_content(content, &uri).unwrap();
 /// assert_eq!(result.dependencies.len(), 2);
 /// ```
@@ -743,7 +744,9 @@ impl Default for PypiParser {
 /// toml-span string spans exclude surrounding quotes, so the span start
 /// points directly to the first character of the string content.
 fn span_start(content: &str, line_table: &LineOffsetTable, span: toml_span::Span) -> Position {
-    line_table.byte_offset_to_position(content, span.start)
+    line_table
+        .byte_offset_to_position(content, span.start)
+        .into()
 }
 
 /// Adapts a `toml_span::Span` to [`deps_core::lsp_helpers::byte_span_to_range`].
