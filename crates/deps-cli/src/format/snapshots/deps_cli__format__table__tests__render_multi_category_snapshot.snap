@@ -1,0 +1,11 @@
+---
+source: crates/deps-cli/src/format/table.rs
+expression: render(&report)
+---
+Cargo.toml
+  [error] 5:1 serde (vulnerable) — GHSA-xxxx-yyyy-zzzz: example advisory
+  [hint] 5:1 serde (outdated) — Newer version available: 1.1.0
+package.json
+  [warning] 5:1 left-pad (license) — left-pad: GPL-3.0 denied
+
+Summary: outdated=1 vulnerable=1 license=1

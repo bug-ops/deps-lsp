@@ -1,0 +1,82 @@
+[package]
+name = "deps-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CLI for running deps-lsp's dependency-health checks in CI, pre-commit, and shell workflows"
+publish = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "deps-cli"
+path = "src/main.rs"
+
+[lib]
+name = "deps_cli"
+path = "src/lib.rs"
+
+[features]
+default = [
+    "cargo",
+    "npm",
+    "pypi",
+    "go",
+    "bundler",
+    "dart",
+    "maven",
+    "gradle",
+    "swift",
+    "composer",
+    "nuget",
+    "deno",
+    "github-actions",
+    "gitlab-ci",
+]
+cargo = ["deps-engine/cargo"]
+npm = ["deps-engine/npm"]
+pypi = ["deps-engine/pypi"]
+go = ["deps-engine/go"]
+bundler = ["deps-engine/bundler"]
+dart = ["deps-engine/dart"]
+maven = ["deps-engine/maven"]
+gradle = ["deps-engine/gradle"]
+swift = ["deps-engine/swift"]
+composer = ["deps-engine/composer"]
+nuget = ["deps-engine/nuget"]
+github-actions = ["deps-engine/github-actions"]
+gitlab-ci = ["deps-engine/gitlab-ci"]
+# Pulls in deps-npm transitively (DenoRegistry delegates npm: specifiers to it) even when
+# the "npm" feature itself is disabled — mirrors deps-lsp/deps-engine's identical carve-out.
+deno = ["deps-engine/deno"]
+
+[dependencies]
+deps-core = { workspace = true }
+deps-engine = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+ignore = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+toml-span = { workspace = true, features = ["serde"] }
+tower-lsp-server = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+[dev-dependencies]
+# deps-cli's own tests never call `deps_core::test_util` directly (they exercise real
+# ecosystem registrations with `--offline` instead). This dependency exists solely so
+# deps-core's `test-util` feature is reachable in *this* crate's dev-dependency tree, which
+# CI's "Guard against test-util leaking into the release dependency tree" step
+# (.github/workflows/ci.yml) requires as a positive control proving its grep-based leak
+# detector actually works — mirroring the identical, genuinely-used pattern in deps-engine's
+# and deps-lsp's own `[dev-dependencies]`. Do not remove as "unused" without also removing
+# deps-cli's block from that CI guard.
+deps-core = { workspace = true, features = ["test-util"] }
+insta = { workspace = true, features = ["json"] }
+tempfile = { workspace = true }
