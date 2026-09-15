@@ -1,5 +1,5 @@
 [book]
-authors = ["deps-lsp contributors"]
+authors = ["Andrei G"]
 language = "en"
 src = "src"
 title = "deps-lsp Guide"
