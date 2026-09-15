@@ -69,5 +69,14 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 [dev-dependencies]
+# deps-cli's own tests never call `deps_core::test_util` directly (they exercise real
+# ecosystem registrations with `--offline` instead). This dependency exists solely so
+# deps-core's `test-util` feature is reachable in *this* crate's dev-dependency tree, which
+# CI's "Guard against test-util leaking into the release dependency tree" step
+# (.github/workflows/ci.yml) requires as a positive control proving its grep-based leak
+# detector actually works — mirroring the identical, genuinely-used pattern in deps-engine's
+# and deps-lsp's own `[dev-dependencies]`. Do not remove as "unused" without also removing
+# deps-cli's block from that CI guard.
+deps-core = { workspace = true, features = ["test-util"] }
 insta = { workspace = true, features = ["json"] }
 tempfile = { workspace = true }
