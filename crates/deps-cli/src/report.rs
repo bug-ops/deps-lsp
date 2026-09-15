@@ -16,6 +16,7 @@ use deps_core::lsp_helpers::{
 };
 use deps_core::osv::{OsvClient, ScanOutcome, VulnSeverity, VulnerabilityMap};
 use deps_core::policy_config::PolicyConfig;
+use deps_core::position::Range as DomainRange;
 use deps_core::{Dependency, Ecosystem, EcosystemId, HttpCache, PackageName, VersionData};
 use deps_engine::classify::diff::{
     merge_deprecations_after_fetch, merge_no_comparable_versions_after_fetch,
@@ -634,7 +635,7 @@ fn to_finding(
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
     diagnostic: Diagnostic,
     advisory_severities: &HashMap<(String, String), VulnSeverity>,
-    vuln_keys: &HashMap<Range, String>,
+    vuln_keys: &HashMap<DomainRange, String>,
 ) -> CheckFinding {
     let category = classify(&diagnostic, formatter);
     let dep = dep_index.lookup(diagnostic.range);
@@ -738,6 +739,7 @@ fn path_to_uri(path: &Path) -> Option<url::Url> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tower_lsp_server::ls_types::Uri;
 
     fn finding(category: Category) -> CheckFinding {
         CheckFinding {
@@ -914,10 +916,13 @@ mod tests {
     }
 
     /// A single-dependency parse result whose one dependency ("dep-0") sits at
-    /// `Range::default()` (`deps_core::test_util::StubDependency::name_range` always returns
-    /// it) — matching `diagnostic_with`'s own hardcoded `range: Range::default()`, so
-    /// `DependencyIndex::lookup` resolves it for tests that need a real, non-`None`
-    /// dependency occurrence.
+    /// `DomainRange::default()` (`deps_core::test_util::StubDependency::name_range` always
+    /// returns it) — numerically matching `diagnostic_with`'s own hardcoded
+    /// `range: Range::default()` (the LSP-facing `tower_lsp_server::ls_types::Range`
+    /// `DependencyIndex` is keyed on), so `DependencyIndex::lookup` resolves it for tests
+    /// that need a real, non-`None` dependency occurrence. These are two distinct `Range`
+    /// types that happen to share the same zero-valued default — see `DomainRange`'s import
+    /// and `vuln_keys`' type for the domain-range side of this file's lookups.
     fn dep_index_with_one_dependency() -> Box<dyn deps_core::ParseResult> {
         deps_core::test_util::stub_parse_result_with_dependencies(1)
     }
@@ -1013,7 +1018,7 @@ mod tests {
         let diagnostic = diagnostic_with(Some("RUSTSEC-2024-0001"), "advisory summary");
 
         let mut vuln_keys = HashMap::new();
-        vuln_keys.insert(Range::default(), "dep-0".to_string());
+        vuln_keys.insert(DomainRange::default(), "dep-0".to_string());
         let mut severities = HashMap::new();
         severities.insert(
             ("dep-0".to_string(), "RUSTSEC-2024-0001".to_string()),
@@ -1038,7 +1043,7 @@ mod tests {
         let dep_index = DependencyIndex::build(parse_result.as_ref());
         let diagnostic = diagnostic_with(Some("RUSTSEC-2024-0001"), "advisory summary");
         let mut vuln_keys = HashMap::new();
-        vuln_keys.insert(Range::default(), "dep-0".to_string());
+        vuln_keys.insert(DomainRange::default(), "dep-0".to_string());
 
         let finding = to_finding(
             EcosystemId::Cargo,
