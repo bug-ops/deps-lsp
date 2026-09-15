@@ -142,6 +142,9 @@ correct and unaffected by the `deps-engine` architecture revision
       `LicensePolicyConfig`, with doc comments explaining why none of them (except
       `WorkspaceRegistriesSetting`) is `#[non_exhaustive]` (the `reparse_scope` exhaustive-
       destructuring guard, issue #592 M1)
+      **Superseded**: as of `specs/063-deps-core-domain-boundary-hardening` (issue #1064), the 7
+      leaf structs *are* now `#[non_exhaustive]` — the exhaustive-destructuring guard moved into
+      `PolicyConfig::diff` inside `deps-core`. This bullet describes the pre-#1064 state.
 - [x] `deps-core/src/lib.rs` declares `pub mod policy_config;`
 - [x] `deps-lsp/src/config.rs` no longer defines these types itself
 - [ ] `cargo doc --workspace --no-deps --all-features` (with `RUSTFLAGS="-D warnings"

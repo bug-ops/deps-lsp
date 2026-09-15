@@ -10,13 +10,24 @@ use tower_lsp_server::ls_types::DiagnosticSeverity;
 /// the identical, single-sourced type instead of each parsing its own copy (constitution
 /// principle 1).
 ///
-/// Unlike most `deps-core` structs, none of the types in this module are `#[non_exhaustive]`.
-/// `deps-lsp::config::reparse_scope` exhaustively destructures every field of every section
-/// here (issue #592 security M1): the compiler must reject the build when a new field is added
-/// without an explicit decision on whether it invalidates already-open documents. Since
-/// `deps-lsp` is a separate crate from `deps-core`, `#[non_exhaustive]` on these types would
-/// force a `..` rest pattern at that destructure site and silently defeat that guarantee, so it
-/// is deliberately omitted here even though it is `deps-core`'s general convention.
+/// Every section struct below (`DiagnosticsConfig`, `CacheConfig`, `FreshnessConfig`,
+/// `SupplyChainConfig`, `RegistriesConfig`, `NetworkConfig`, `LicensePolicyConfig`) is
+/// `#[non_exhaustive]`, matching `deps-core`'s general convention (issue #1064) — a field added
+/// to any of them no longer breaks every downstream crate that names the struct's full literal
+/// shape. `PolicyConfig` itself deliberately stays exhaustive: issue #1064/FR-006 scopes this to
+/// the 7 leaf structs specifically, since `PolicyConfig`'s own fields only change when a whole
+/// new policy *section* is added — a much rarer, more architecturally significant event than a
+/// field added to an existing section.
+///
+/// This used to cost an exhaustive-destructure security guarantee (issue #592 security M1):
+/// `deps-lsp::config::reparse_scope` used to destructure every field of every section here
+/// directly, so the compiler rejected the build when a new field was added without an explicit
+/// decision on whether it invalidates already-open documents. That guarantee now lives in
+/// [`PolicyConfig::diff`] instead: it performs the same exhaustive, `..`-free destructuring, but
+/// from inside `deps-core`, where `#[non_exhaustive]` does not restrict same-crate
+/// destructuring. Its result, `PolicyConfigDiff`, is a plain (not `#[non_exhaustive]`) struct
+/// that `deps-lsp::config::reparse_scope` destructures exhaustively in turn, carrying the same
+/// compile-time guarantee across the crate boundary.
 ///
 /// # Examples
 ///
@@ -52,6 +63,146 @@ pub struct PolicyConfig {
     pub license_policy: LicensePolicyConfig,
 }
 
+/// Which leaf fields differ between two [`PolicyConfig`] snapshots, at the exact granularity
+/// `deps-lsp::config::reparse_scope` classifies them at.
+///
+/// Deliberately **not** `#[non_exhaustive]`, unlike every section struct above:
+/// `deps-lsp::config::reparse_scope` destructures this exhaustively (no `..`) to guarantee
+/// every leaf field is mapped to a `ReparseScope` decision. Only `registries`'s three fields
+/// are individually parse-affecting today (each scopes a different set of ecosystems), so this
+/// carries one bool per leaf field of that section rather than one bool per section — see
+/// [`PolicyConfig::diff`]'s doc for why the other six sections have no fields here at all.
+///
+/// # The E0027 mechanism this design relies on (issue #1064, NFR-004)
+///
+/// [`PolicyConfig::diff`] destructures every section of [`PolicyConfig`] exhaustively — no `..`
+/// rest pattern at any level — so a field added to any of the 7 policy section structs without
+/// also naming it in that destructuring fails to compile (rustc E0027), exactly as
+/// `deps-lsp::config::reparse_scope` used to enforce directly before issue #592's guarantee
+/// moved here. The doctest below only illustrates that underlying Rust language mechanism on a
+/// synthetic, unrelated struct — an exhaustive struct-destructure pattern (no `..`) fails to
+/// compile once the struct gains a field the pattern does not name. It does **not** itself
+/// re-verify that `PolicyConfig::diff`'s or `reparse_scope`'s *real* destructuring stays
+/// `..`-free (it would keep passing even if a `..` crept into either); a CI grep step
+/// (`.github/workflows/ci.yml`'s `doc-and-hygiene` job, mirroring that job's existing
+/// `test-util` leak guard) asserts that instead, on every PR.
+///
+/// ```compile_fail
+/// struct Example {
+///     a: bool,
+///     b: bool,
+///     // A hypothetical field added later without updating the destructure below — the same
+///     // shape as adding a field to, say, `SupplyChainConfig` without updating
+///     // `PolicyConfig::diff`'s destructure of it.
+///     c: bool,
+/// }
+///
+/// let e = Example { a: true, b: false, c: true };
+/// // Missing `c` here fails with E0027.
+/// let Example { a: _, b: _ } = e;
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PolicyConfigDiff {
+    /// Whether [`RegistriesConfig::workspace_registries`] changed.
+    pub workspace_registries_changed: bool,
+    /// Whether [`RegistriesConfig::nuget_user_profile_sources`] changed.
+    pub nuget_user_profile_sources_changed: bool,
+    /// Whether [`RegistriesConfig::gitlab_instance_host`] changed.
+    pub gitlab_instance_host_changed: bool,
+}
+
+impl PolicyConfig {
+    /// Reports which leaf fields differ between `old` and `new`.
+    ///
+    /// Exhaustively destructures both snapshots' sections — no `..` rest pattern at any
+    /// level — so a field added to any of the 7 section structs forces an explicit decision
+    /// here (see [`PolicyConfigDiff`]'s compile-time guarantee). `diagnostics`, `cache`,
+    /// `freshness`, `supply_chain`, `network`, and `license_policy` are destructured
+    /// field-by-field purely to force that decision — as of today, none of their leaf fields
+    /// are parse-affecting (a config change there is picked up the next time diagnostics/hover
+    /// are requested, without invalidating already-parsed document state), so no field of
+    /// theirs appears in [`PolicyConfigDiff`] itself. Only `registries`'s three fields are
+    /// individually parse-affecting, since each scopes a different, narrower set of
+    /// ecosystems (see `deps-lsp::config::{NUGET_USER_PROFILE_SOURCES_ECOSYSTEMS,
+    /// GITLAB_INSTANCE_HOST_ECOSYSTEMS}`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::policy_config::PolicyConfig;
+    ///
+    /// let old = PolicyConfig::default();
+    /// let mut new = PolicyConfig::default();
+    /// new.registries.nuget_user_profile_sources = true;
+    ///
+    /// let diff = PolicyConfig::diff(&old, &new);
+    /// assert!(diff.nuget_user_profile_sources_changed);
+    /// assert!(!diff.workspace_registries_changed);
+    /// assert!(!diff.gitlab_instance_host_changed);
+    /// ```
+    #[must_use]
+    pub fn diff(old: &Self, new: &Self) -> PolicyConfigDiff {
+        let Self {
+            diagnostics: new_diagnostics,
+            cache: new_cache,
+            freshness: new_freshness,
+            supply_chain: new_supply_chain,
+            registries: new_registries,
+            network: new_network,
+            license_policy: new_license_policy,
+        } = new;
+
+        // Not parse-affecting: every field is named (never `..`), so its value is simply
+        // unused here rather than compared, but a new field on any of these sections still
+        // forces a decision at this line. rustc's own E0027 fix-it suggestion for that error is
+        // `field: _` — the shape every existing field below already has — but that suggestion
+        // does not itself mean `_` is the *correct* choice: if a newly added field affects
+        // already-parsed document state, add a bool to `PolicyConfigDiff` and compare it below
+        // (mirroring the `registries` block) instead of binding it to `_`.
+        let DiagnosticsConfig {
+            outdated_severity: _,
+            unknown_severity: _,
+            yanked_severity: _,
+            unsatisfiable_severity: _,
+            deprecated_severity: _,
+            mutable_ref_pin_severity: _,
+            mutable_ref_pin_enabled: _,
+            vulnerabilities_enabled: _,
+        } = new_diagnostics;
+        let CacheConfig {
+            enabled: _,
+            fetch_timeout_secs: _,
+            max_concurrent_fetches: _,
+        } = new_cache;
+        let FreshnessConfig {
+            enabled: _,
+            cooldown_secs: _,
+        } = new_freshness;
+        let SupplyChainConfig { enabled: _ } = new_supply_chain;
+        let NetworkConfig { offline: _ } = new_network;
+        let LicensePolicyConfig { allow: _, deny: _ } = new_license_policy;
+
+        // Parse-affecting: each leaf field of `registries` is individually diffed.
+        let RegistriesConfig {
+            workspace_registries: new_workspace_registries,
+            nuget_user_profile_sources: new_nuget_user_profile_sources,
+            gitlab_instance_host: new_gitlab_instance_host,
+        } = new_registries;
+        let RegistriesConfig {
+            workspace_registries: old_workspace_registries,
+            nuget_user_profile_sources: old_nuget_user_profile_sources,
+            gitlab_instance_host: old_gitlab_instance_host,
+        } = &old.registries;
+
+        PolicyConfigDiff {
+            workspace_registries_changed: old_workspace_registries != new_workspace_registries,
+            nuget_user_profile_sources_changed: old_nuget_user_profile_sources
+                != new_nuget_user_profile_sources,
+            gitlab_instance_host_changed: old_gitlab_instance_host != new_gitlab_instance_host,
+        }
+    }
+}
+
 /// Configuration for diagnostic severity levels.
 ///
 /// Controls the severity level reported for different types of dependency issues.
@@ -85,6 +236,7 @@ pub struct PolicyConfig {
 ///
 /// assert_eq!(config.unknown_severity, DiagnosticSeverity::ERROR);
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone, Deserialize)]
 pub struct DiagnosticsConfig {
     /// Severity for a dependency with a newer version available.
@@ -282,6 +434,7 @@ impl DiagnosticsConfig {
 ///
 /// assert_eq!(config.fetch_timeout_secs, 5);
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone, Deserialize)]
 pub struct CacheConfig {
     /// Whether `deps_core::cache::HttpCache`'s entry map is used at all (issue #482):
@@ -493,6 +646,7 @@ where
 ///
 /// assert_eq!(config.cooldown_secs, 3600);
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone, Deserialize)]
 pub struct FreshnessConfig {
     /// Whether the release-cooldown freshness signal is enabled at all.
@@ -593,6 +747,7 @@ const fn default_cooldown_secs() -> u64 {
 /// let config = SupplyChainConfig::default();
 /// assert!(config.enabled);
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone, Deserialize)]
 pub struct SupplyChainConfig {
     /// Whether supply-chain trust signals (OpenSSF Scorecard/SLSA provenance) are fetched.
@@ -601,10 +756,41 @@ pub struct SupplyChainConfig {
 }
 
 // Deliberately hand-written, mirroring `CodeLensConfig`'s rationale (`deps-lsp::config`): a
-// derived `Default` would silently ship the feature disabled.
+// derived `Default` would silently ship the feature disabled. Delegates to `Self::new` (rather
+// than duplicating the `enabled: true` literal) so the two can't drift — `Self` derives neither
+// `PartialEq` nor a test asserting they agree, and `new()`/`with_*` are now the only external
+// construction path.
 impl Default for SupplyChainConfig {
     fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SupplyChainConfig {
+    /// Builds the default configuration (mirrors [`Self::default`]).
+    ///
+    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
+    /// `deps-core`, so every other crate must chain the `with_*` setters onto this
+    /// constructor instead.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::policy_config::SupplyChainConfig;
+    ///
+    /// let config = SupplyChainConfig::new();
+    /// assert!(config.enabled);
+    /// ```
+    #[must_use]
+    pub const fn new() -> Self {
         Self { enabled: true }
+    }
+
+    /// Overrides [`Self::enabled`]. See [`Self::new`].
+    #[must_use]
+    pub const fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
     }
 }
 
@@ -657,7 +843,8 @@ where
 /// let config = RegistriesConfig::default();
 /// assert_eq!(config.workspace_registries, WorkspaceRegistriesSetting::PublicOnly);
 /// ```
-#[derive(Clone, Deserialize, Default)]
+#[non_exhaustive]
+#[derive(Clone, Deserialize)]
 pub struct RegistriesConfig {
     /// Whether workspace-declared registry hosts (e.g. a manifest's own custom index
     /// URLs) may be reached at all, or only the default public registry.
@@ -711,6 +898,69 @@ impl std::fmt::Debug for RegistriesConfig {
     }
 }
 
+// Hand-written rather than derived, delegating to `Self::new` so the default value has a single
+// source of truth (matching `SupplyChainConfig`'s/`NetworkConfig`'s rationale) — `new()`/`with_*`
+// are now the only external construction path once `#[non_exhaustive]` is in effect.
+impl Default for RegistriesConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RegistriesConfig {
+    /// Builds the default configuration (mirrors [`Self::default`]).
+    ///
+    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
+    /// `deps-core`, so every other crate must chain the `with_*` setters onto this
+    /// constructor instead. Not `const`, unlike `SupplyChainConfig::new`/`NetworkConfig::new` —
+    /// `gitlab_instance_host` is a `String`, the same reason `InlayHintsConfig::new`
+    /// (`deps-lsp/src/config.rs`) isn't `const` either.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::policy_config::{RegistriesConfig, WorkspaceRegistriesSetting};
+    ///
+    /// let config = RegistriesConfig::new();
+    /// assert_eq!(config.workspace_registries, WorkspaceRegistriesSetting::PublicOnly);
+    /// ```
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            workspace_registries: WorkspaceRegistriesSetting::PublicOnly,
+            nuget_user_profile_sources: false,
+            gitlab_instance_host: String::new(),
+        }
+    }
+
+    /// Overrides [`Self::workspace_registries`]. See [`Self::new`].
+    #[must_use]
+    pub const fn with_workspace_registries(
+        mut self,
+        workspace_registries: WorkspaceRegistriesSetting,
+    ) -> Self {
+        self.workspace_registries = workspace_registries;
+        self
+    }
+
+    /// Overrides [`Self::nuget_user_profile_sources`]. See [`Self::new`].
+    #[must_use]
+    pub const fn with_nuget_user_profile_sources(
+        mut self,
+        nuget_user_profile_sources: bool,
+    ) -> Self {
+        self.nuget_user_profile_sources = nuget_user_profile_sources;
+        self
+    }
+
+    /// Overrides [`Self::gitlab_instance_host`]. See [`Self::new`].
+    #[must_use]
+    pub fn with_gitlab_instance_host(mut self, gitlab_instance_host: impl Into<String>) -> Self {
+        self.gitlab_instance_host = gitlab_instance_host.into();
+        self
+    }
+}
+
 /// The three live-updatable settings [`RegistriesConfig::resolve`] derives from a config
 /// snapshot.
 ///
@@ -740,10 +990,7 @@ impl RegistriesConfig {
     /// use deps_core::net_policy::WorkspaceRegistryAccess;
     /// use deps_core::policy_config::RegistriesConfig;
     ///
-    /// let config = RegistriesConfig {
-    ///     gitlab_instance_host: "gitlab.corp".to_string(),
-    ///     ..RegistriesConfig::default()
-    /// };
+    /// let config = RegistriesConfig::new().with_gitlab_instance_host("gitlab.corp");
     /// let resolved = config.resolve();
     /// assert_eq!(resolved.workspace_registries, WorkspaceRegistryAccess::PublicOnly);
     /// assert_eq!(resolved.gitlab_instance_host.as_deref(), Some("gitlab.corp"));
@@ -845,7 +1092,8 @@ impl WorkspaceRegistriesSetting {
 /// let config = NetworkConfig::default();
 /// assert!(!config.offline);
 /// ```
-#[derive(Debug, Clone, Deserialize, Default)]
+#[non_exhaustive]
+#[derive(Debug, Clone, Deserialize)]
 pub struct NetworkConfig {
     /// When `true`, blocks every *new* outbound registry/OSV/GitHub-tags request
     /// (`deps_core::cache::HttpCache`'s 4 send sites) instead of making it, serving
@@ -859,6 +1107,43 @@ pub struct NetworkConfig {
     /// this flag never cancels in-flight requests.
     #[serde(default)]
     pub offline: bool,
+}
+
+// Hand-written rather than derived, delegating to `Self::new` so the default value has a single
+// source of truth (matching `SupplyChainConfig`'s rationale) — `new()`/`with_*` are now the only
+// external construction path once `#[non_exhaustive]` is in effect.
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl NetworkConfig {
+    /// Builds the default configuration (mirrors [`Self::default`]).
+    ///
+    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
+    /// `deps-core`, so every other crate must chain the `with_*` setters onto this
+    /// constructor instead.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::policy_config::NetworkConfig;
+    ///
+    /// let config = NetworkConfig::new();
+    /// assert!(!config.offline);
+    /// ```
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { offline: false }
+    }
+
+    /// Overrides [`Self::offline`]. See [`Self::new`].
+    #[must_use]
+    pub const fn with_offline(mut self, offline: bool) -> Self {
+        self.offline = offline;
+        self
+    }
 }
 
 /// SPDX allow-list/deny-list policy for the license-policy diagnostic (issue #661, spec 010
@@ -883,6 +1168,7 @@ pub struct NetworkConfig {
 /// let config = LicensePolicyConfig::default();
 /// assert!(config.to_policy().is_empty());
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct LicensePolicyConfig {
     /// SPDX identifiers a dependency's license must include at least one of, when non-empty.
@@ -1163,8 +1449,73 @@ mod tests {
     }
 
     #[test]
+    fn test_supply_chain_config_with_enabled() {
+        assert!(!SupplyChainConfig::new().with_enabled(false).enabled);
+    }
+
+    #[test]
     fn test_network_config_defaults() {
         assert!(!NetworkConfig::default().offline);
+    }
+
+    #[test]
+    fn test_network_config_with_offline() {
+        assert!(NetworkConfig::new().with_offline(true).offline);
+    }
+
+    #[test]
+    fn test_policy_config_diff_no_change_returns_all_false() {
+        let old = PolicyConfig::default();
+        let new = PolicyConfig::default();
+        assert_eq!(PolicyConfig::diff(&old, &new), PolicyConfigDiff::default());
+    }
+
+    #[test]
+    fn test_policy_config_diff_workspace_registries_change() {
+        let old = PolicyConfig::default();
+        let mut new = PolicyConfig::default();
+        new.registries.workspace_registries = WorkspaceRegistriesSetting::Off;
+
+        let diff = PolicyConfig::diff(&old, &new);
+        assert!(diff.workspace_registries_changed);
+        assert!(!diff.nuget_user_profile_sources_changed);
+        assert!(!diff.gitlab_instance_host_changed);
+    }
+
+    #[test]
+    fn test_policy_config_diff_nuget_user_profile_sources_change() {
+        let old = PolicyConfig::default();
+        let mut new = PolicyConfig::default();
+        new.registries.nuget_user_profile_sources = true;
+
+        let diff = PolicyConfig::diff(&old, &new);
+        assert!(!diff.workspace_registries_changed);
+        assert!(diff.nuget_user_profile_sources_changed);
+        assert!(!diff.gitlab_instance_host_changed);
+    }
+
+    #[test]
+    fn test_policy_config_diff_gitlab_instance_host_change() {
+        let old = PolicyConfig::default();
+        let mut new = PolicyConfig::default();
+        new.registries.gitlab_instance_host = "gitlab.corp".to_string();
+
+        let diff = PolicyConfig::diff(&old, &new);
+        assert!(!diff.workspace_registries_changed);
+        assert!(!diff.nuget_user_profile_sources_changed);
+        assert!(diff.gitlab_instance_host_changed);
+    }
+
+    /// A non-registries change (issue #1064) must not surface in the diff at all — this is the
+    /// same "not parse-affecting" set `reparse_scope` already ignored before this PR.
+    #[test]
+    fn test_policy_config_diff_non_registries_change_returns_all_false() {
+        let old = PolicyConfig::default();
+        let mut new = PolicyConfig::default();
+        new.network.offline = true;
+        new.freshness.cooldown_secs = 60;
+
+        assert_eq!(PolicyConfig::diff(&old, &new), PolicyConfigDiff::default());
     }
 
     #[test]

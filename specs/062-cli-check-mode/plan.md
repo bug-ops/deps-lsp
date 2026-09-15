@@ -337,6 +337,12 @@ under principle 8** (§10). This is an accepted cost, not an oversight — see
 > is sound on its own terms, but was decided before this principle-8 cost was on the table.
 > [[architecture-decision]] §9 (O-6) explicitly routes this to the user rather than deciding
 > it during architecture review — do not silently pick an answer during implementation.
+>
+> **Superseded**: resolved by `specs/063-deps-core-domain-boundary-hardening` (issue #1064) —
+> the 7 leaf structs are now `#[non_exhaustive]` with `new()`/`with_*` constructors, and the
+> exhaustive-destructure guarantee moved into `PolicyConfig::diff` inside `deps-core`. The
+> trade-off described above (as of spec 062) is historical, not current — see spec 063 for the
+> accepted design.
 
 ### Cross-crate invariant to preserve: `config::reparse_scope` (#592 security M1)
 

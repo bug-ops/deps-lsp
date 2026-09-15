@@ -5,6 +5,9 @@ pub use deps_core::policy_config::{
     CacheConfig, DiagnosticsConfig, FreshnessConfig, LicensePolicyConfig, NetworkConfig,
     PolicyConfig, RegistriesConfig, SupplyChainConfig, WorkspaceRegistriesSetting,
 };
+// Not part of the `pub use` above: `PolicyConfigDiff`'s only consumer in this crate is the
+// `pub(crate)` `reparse_scope` below — no external caller needs it.
+use deps_core::policy_config::PolicyConfigDiff;
 use serde::Deserialize;
 
 /// Root configuration for the deps-lsp server.
@@ -420,15 +423,19 @@ const GITLAB_INSTANCE_HOST_ECOSYSTEMS: &[&str] = &["gitlab-ci"];
 /// live-reloaded config change invalidates, or `None` if nothing parse-affecting changed
 /// (issue #592).
 ///
-/// Both `DepsConfig` and each of its section structs are destructured exhaustively here —
-/// **no `..` rest pattern**, at either level — so a field added to `DepsConfig` in the
-/// future is a compile error in this function until it is explicitly classified as either
-/// not parse-affecting (bound to `_`, its value never read) or mapped to a scope. A section
-/// classified not parse-affecting is still destructured field-by-field, for the same
-/// reason: classifying a whole section once would silently swallow a future field added to
-/// it. This can't catch a field whose *documented meaning* changes without changing its
-/// type (e.g. a hypothetical `network.proxy_url`) — destructuring forces a human to look at
-/// every field, it cannot make the classification decision by itself.
+/// `DepsConfig`'s own top-level sections (`inlay_hints`, `cold_start`, `loading_indicator`,
+/// `code_lens` — untouched by spec 063 PR B) are destructured exhaustively here — **no `..`
+/// rest pattern** — so a field added to `DepsConfig` itself is a compile error in this
+/// function until it is explicitly classified as either not parse-affecting (bound to `_`,
+/// its value never read) or mapped to a scope. `PolicyConfig`'s 7 sections are
+/// `#[non_exhaustive]` (issue #1064), so this function no longer destructures them directly:
+/// it delegates to [`deps_core::policy_config::PolicyConfig::diff`], which performs the same
+/// exhaustive, `..`-free destructuring from inside `deps-core` (where `#[non_exhaustive]`
+/// does not restrict same-crate destructuring), and consumes its `PolicyConfigDiff` result —
+/// itself not `#[non_exhaustive]` — exhaustively in turn. This can't catch a field whose
+/// *documented meaning* changes without changing its type (e.g. a hypothetical
+/// `network.proxy_url`) — destructuring forces a human to look at every field, it cannot make
+/// the classification decision by itself.
 ///
 /// `workspace_registry_ecosystems` — the ecosystem ids to scope a `registries.workspace_registries`
 /// change to — is a caller-supplied parameter rather than a hardcoded list in this module
@@ -451,15 +458,6 @@ pub(crate) fn reparse_scope(
         code_lens: new_code_lens,
         policy: new_policy,
     } = new;
-    let PolicyConfig {
-        diagnostics: new_diagnostics,
-        cache: new_cache,
-        freshness: new_freshness,
-        supply_chain: new_supply_chain,
-        registries: new_registries,
-        network: new_network,
-        license_policy: new_license_policy,
-    } = new_policy;
 
     // Not parse-affecting: every field is named (never `..`), so its value is simply
     // unused here rather than compared, but a new field on any of these sections still
@@ -469,21 +467,6 @@ pub(crate) fn reparse_scope(
         up_to_date_text: _,
         needs_update_text: _,
     } = new_inlay_hints;
-    let DiagnosticsConfig {
-        outdated_severity: _,
-        unknown_severity: _,
-        yanked_severity: _,
-        unsatisfiable_severity: _,
-        deprecated_severity: _,
-        mutable_ref_pin_severity: _,
-        mutable_ref_pin_enabled: _,
-        vulnerabilities_enabled: _,
-    } = new_diagnostics;
-    let CacheConfig {
-        enabled: _,
-        fetch_timeout_secs: _,
-        max_concurrent_fetches: _,
-    } = new_cache;
     let ColdStartConfig {
         enabled: _,
         rate_limit_ms: _,
@@ -494,25 +477,12 @@ pub(crate) fn reparse_scope(
         loading_text: _,
     } = new_loading_indicator;
     let CodeLensConfig { enabled: _ } = new_code_lens;
-    let FreshnessConfig {
-        enabled: _,
-        cooldown_secs: _,
-    } = new_freshness;
-    let SupplyChainConfig { enabled: _ } = new_supply_chain;
-    let NetworkConfig { offline: _ } = new_network;
-    let LicensePolicyConfig { allow: _, deny: _ } = new_license_policy;
 
-    // Parse-affecting.
-    let RegistriesConfig {
-        workspace_registries: new_workspace_registries,
-        nuget_user_profile_sources: new_nuget_user_profile_sources,
-        gitlab_instance_host: new_gitlab_instance_host,
-    } = new_registries;
-    let RegistriesConfig {
-        workspace_registries: old_workspace_registries,
-        nuget_user_profile_sources: old_nuget_user_profile_sources,
-        gitlab_instance_host: old_gitlab_instance_host,
-    } = &old.policy.registries;
+    let PolicyConfigDiff {
+        workspace_registries_changed,
+        nuget_user_profile_sources_changed,
+        gitlab_instance_host_changed,
+    } = PolicyConfig::diff(&old.policy, new_policy);
 
     let mut scope: Option<ReparseScope> = None;
     let union_in = |scope: &mut Option<ReparseScope>, addition: ReparseScope| {
@@ -522,19 +492,19 @@ pub(crate) fn reparse_scope(
         });
     };
 
-    if old_workspace_registries != new_workspace_registries {
+    if workspace_registries_changed {
         union_in(
             &mut scope,
             ReparseScope::Ecosystems(workspace_registry_ecosystems.to_vec()),
         );
     }
-    if old_nuget_user_profile_sources != new_nuget_user_profile_sources {
+    if nuget_user_profile_sources_changed {
         union_in(
             &mut scope,
             ReparseScope::Ecosystems(NUGET_USER_PROFILE_SOURCES_ECOSYSTEMS.to_vec()),
         );
     }
-    if old_gitlab_instance_host != new_gitlab_instance_host {
+    if gitlab_instance_host_changed {
         union_in(
             &mut scope,
             ReparseScope::Ecosystems(GITLAB_INSTANCE_HOST_ECOSYSTEMS.to_vec()),
@@ -1220,10 +1190,9 @@ mod tests {
 
     #[test]
     fn test_freshness_config_to_settings() {
-        let config = FreshnessConfig {
-            enabled: false,
-            cooldown_secs: 1800,
-        };
+        let config = FreshnessConfig::new()
+            .with_enabled(false)
+            .with_cooldown_secs(1800);
         let settings = config.to_settings();
         assert!(!settings.enabled);
         assert_eq!(settings.cooldown_secs, 1800);
