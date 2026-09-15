@@ -1,17 +1,9 @@
 //! LSP Work Done Progress protocol support for loading indicators.
 //!
-//! Uses a channel-based architecture to decouple progress producers (fetch tasks)
-//! from the LSP transport consumer, preventing backpressure from blocking fetches.
-//!
-//! # Architecture
-//!
-//! ```text
-//! ┌─────────────┐     mpsc channel     ┌──────────────┐     LSP transport
-//! │ fetch task 1 │──┐                   │              │──────────────────►
-//! │ fetch task 2 │──┼── ProgressUpdate ──► progress    │  send_notification
-//! │ fetch task N │──┘                   │   task       │──────────────────►
-//! └─────────────┘                       └──────────────┘
-//! ```
+//! Drives the LSP work-done-progress lifecycle (begin → report → end) from a
+//! [`deps_engine::progress`] port: [`RegistryProgress::start`] opens the port via
+//! [`deps_engine::progress::channel`] and spawns a task draining the paired receiver into
+//! `$/progress` notifications.
 //!
 //! # Protocol Flow
 //!
@@ -20,6 +12,7 @@
 //! 3. `$/progress` with `WorkDoneProgressReport` - Update progress (via channel)
 //! 4. `$/progress` with `WorkDoneProgressEnd` - Complete indicator
 
+pub use deps_engine::progress::{ProgressSender, ProgressUpdate};
 use tokio::sync::mpsc;
 use tower_lsp_server::Client;
 use tower_lsp_server::jsonrpc::Result;
@@ -27,39 +20,6 @@ use tower_lsp_server::ls_types::{
     ProgressParams, ProgressParamsValue, ProgressToken, WorkDoneProgress, WorkDoneProgressBegin,
     WorkDoneProgressEnd, WorkDoneProgressReport,
 };
-
-/// Channel capacity for progress updates.
-/// Small buffer is sufficient since updates are coalesced by the editor.
-const PROGRESS_CHANNEL_CAPACITY: usize = 8;
-
-/// Non-blocking sender for progress updates from fetch tasks.
-///
-/// Cheap to clone and safe to use from multiple concurrent futures.
-/// Dropped messages are acceptable — progress is best-effort UI feedback.
-#[derive(Clone)]
-pub struct ProgressSender {
-    tx: mpsc::Sender<ProgressUpdate>,
-    total: usize,
-}
-
-struct ProgressUpdate {
-    fetched: usize,
-    total: usize,
-}
-
-impl ProgressSender {
-    /// Send a progress update without blocking.
-    ///
-    /// Uses `try_send` — if the channel is full, the update is silently dropped.
-    /// This is intentional: progress is best-effort UI feedback, and dropping
-    /// updates is always preferable to blocking fetch tasks.
-    pub fn send(&self, fetched: usize) {
-        let _ = self.tx.try_send(ProgressUpdate {
-            fetched,
-            total: self.total,
-        });
-    }
-}
 
 /// Progress tracker for registry data fetching.
 ///
@@ -125,7 +85,7 @@ impl RegistryProgress {
             )
             .await;
 
-        let (tx, rx) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
+        let (sender, rx) = deps_engine::progress::channel(total_deps);
 
         // Spawn consumer task that drains the channel and sends LSP notifications
         let consumer_client = client.clone();
@@ -133,11 +93,6 @@ impl RegistryProgress {
         let consumer_handle = tokio::spawn(async move {
             consume_progress_updates(rx, consumer_client, consumer_token).await;
         });
-
-        let sender = ProgressSender {
-            tx,
-            total: total_deps,
-        };
 
         Ok((
             Self {
@@ -252,22 +207,6 @@ mod tests {
     }
 
     #[test]
-    fn test_percentage_calculation() {
-        let calculate = |fetched: usize, total: usize| -> u32 {
-            if total == 0 {
-                return 0;
-            }
-            ((fetched as f64 / total as f64) * 100.0) as u32
-        };
-
-        assert_eq!(calculate(0, 10), 0);
-        assert_eq!(calculate(5, 10), 50);
-        assert_eq!(calculate(10, 10), 100);
-        assert_eq!(calculate(7, 10), 70);
-        assert_eq!(calculate(0, 0), 0);
-    }
-
-    #[test]
     fn test_progress_message_format() {
         let format_message = |fetched: usize, total: usize| -> String {
             format!("Fetched {}/{} packages", fetched, total)
@@ -276,33 +215,5 @@ mod tests {
         assert_eq!(format_message(5, 10), "Fetched 5/10 packages");
         assert_eq!(format_message(0, 15), "Fetched 0/15 packages");
         assert_eq!(format_message(20, 20), "Fetched 20/20 packages");
-    }
-
-    #[tokio::test]
-    async fn test_progress_sender_try_send_on_closed_channel() {
-        use super::*;
-
-        let (tx, rx) = mpsc::channel(1);
-        let sender = ProgressSender { tx, total: 10 };
-
-        // Drop receiver — channel is closed
-        drop(rx);
-
-        // Should not panic
-        sender.send(5);
-    }
-
-    #[tokio::test]
-    async fn test_progress_sender_try_send_on_full_channel() {
-        use super::*;
-
-        let (tx, _rx) = mpsc::channel(1);
-        let sender = ProgressSender { tx, total: 10 };
-
-        // Fill the channel
-        sender.send(1);
-        // Should silently drop — channel is full
-        sender.send(2);
-        sender.send(3);
     }
 }

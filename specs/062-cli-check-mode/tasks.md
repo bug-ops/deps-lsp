@@ -49,11 +49,11 @@ mapping.
 - [ ] T008: PR 1b-i verification gate
 - [ ] T009: `EcosystemRuntime::from_policy` + de-duplicate `server.rs` wiring (PR 1b-ii)
 - [ ] T010: PR 1b-ii verification gate
-- [ ] T011: Design `deps_engine::progress` port + move `resolved.rs` pure helpers (PR 1c-i)
-- [ ] T012: Move `osv_scan.rs` pure helpers (PR 1c-ii)
-- [ ] T013: Move `fetch.rs:29-716` pure functions (PR 1c-iii)
-- [ ] T014: Move `merge_registry_fetch_result`'s pure half + `diff.rs` helpers (PR 1c-iv)
-- [ ] T015: PR 1c verification gate
+- [x] T011: Design `deps_engine::progress` port + move `resolved.rs` pure helpers (PR 1c-i) — **implemented**
+- [x] T012: Move `osv_scan.rs` pure helpers (PR 1c-ii) — **implemented**
+- [x] T013: Move `fetch.rs` pure functions (PR 1c-iii) — **implemented**
+- [x] T014: Move `merge_registry_fetch_result`'s pure half + `diff.rs` helpers (PR 1c-iv) — **implemented**
+- [x] T015: PR 1c verification gate — **implemented**
 - [ ] T016: Scaffold `deps-cli` crate
 - [ ] T017: `cli.rs` — clap argument surface
 - [ ] T018: `config.rs` — `CliConfig` + `deps.toml` loading

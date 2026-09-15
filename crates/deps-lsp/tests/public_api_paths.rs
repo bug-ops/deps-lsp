@@ -18,6 +18,7 @@
 use deps_lsp::config::{
     CodeLensConfig, ColdStartConfig, DepsConfig, InlayHintsConfig, LoadingIndicatorConfig,
 };
+use deps_lsp::progress::{ProgressSender, ProgressUpdate};
 use deps_lsp::{EcosystemRuntime, register_ecosystems};
 
 #[cfg(feature = "cargo")]

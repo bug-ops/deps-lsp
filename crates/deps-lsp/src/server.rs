@@ -278,7 +278,7 @@ impl Backend {
             .get_or_parse(lock_provider.as_ref(), lockfile_path)
             .await
         {
-            Ok(packages) => crate::document::split_resolved_packages(&packages),
+            Ok(packages) => deps_engine::classify::resolved::split_resolved_packages(&packages),
             Err(e) => {
                 tracing::error!("Failed to reload lock file: {}", e);
                 self.client
