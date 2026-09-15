@@ -713,27 +713,57 @@ mod tests {
         assert_eq!(results[0].label, "@types/node");
     }
 
+    /// #1066: was `assert!(results.len() <= 20)` against a live registry — a tautology given
+    /// the actual display cap (`MAX_COMPLETION_VERSIONS`, `deps-core`) is 5, not 20, so it
+    /// passed vacuously (even for 0 results) and could never catch a cap regression. Mocks 8
+    /// matching versions and asserts the count is exactly the real cap.
+    ///
+    /// Freshness is explicitly disabled: `NpmRegistry::get_versions_with` issues a second,
+    /// differently-`Accept`-headered request to the same packument URL when it's enabled,
+    /// which `mockito`'s default path-only matching would double-count against this single
+    /// mock — orthogonal to what this test verifies.
     #[tokio::test]
-    #[ignore] // Requires network access
-    async fn test_complete_versions_limit_20() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = NpmEcosystem::new(cache);
+    async fn test_complete_versions_capped_at_max_completion_versions() {
+        let mut server = mockito::Server::new_async().await;
+        let versions_body = format!(
+            r#"{{"versions": {{{}}}}}"#,
+            (0..8)
+                .map(|i| format!(r#""4.0.{i}": {{}}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let mock = server
+            .mock("GET", "/express")
+            .with_status(200)
+            .with_body(versions_body)
+            .create_async()
+            .await;
+
+        let registry = NpmRegistry::with_public_base_for_test(
+            Arc::new(deps_core::HttpCache::new()),
+            server.url(),
+        );
+        let ecosystem = NpmEcosystem::with_registry(Arc::new(registry));
         let dep = dep_with_source("express", DependencySource::Registry, 0);
         let position = dep.version_range.unwrap().start;
         let parse_result = MockParseResult {
             dependencies: vec![dep],
         };
 
-        // Test that we respect the 20 result limit
+        // Test that we respect the display cap, not just some loose upper bound.
         let results = ecosystem
             .complete_versions(
                 &parse_result,
                 position,
                 "4",
-                deps_core::FreshnessSettings::default(),
+                deps_core::FreshnessSettings {
+                    enabled: false,
+                    cooldown_secs: 0,
+                },
             )
             .await;
-        assert!(results.len() <= 20);
+        mock.assert_async().await;
+        assert_eq!(results.len(), 5);
     }
 
     #[tokio::test]

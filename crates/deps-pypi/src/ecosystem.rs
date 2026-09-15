@@ -1236,7 +1236,7 @@ mod tests {
     #[tokio::test]
     async fn test_complete_package_names_uses_index() {
         let mut server = mockito::Server::new_async().await;
-        let _mock = server
+        let mock = server
             .mock("GET", "/simple/")
             .with_status(200)
             .with_body(crate::search::sample_index_body(&["requests"]))
@@ -1260,6 +1260,7 @@ mod tests {
             100,
         )
         .await;
+        mock.assert_async().await;
         assert!(!results.is_empty());
         assert!(results.iter().any(|r| r.label == "requests"));
     }
@@ -1273,7 +1274,7 @@ mod tests {
     #[tokio::test]
     async fn test_complete_package_names_filter_text_matches_raw_typed_prefix() {
         let mut server = mockito::Server::new_async().await;
-        let _mock = server
+        let mock = server
             .mock("GET", "/simple/")
             .with_status(200)
             .with_body(crate::search::sample_index_body(&["zope-interface"]))
@@ -1290,6 +1291,7 @@ mod tests {
         )
         .await;
 
+        mock.assert_async().await;
         let item = results
             .iter()
             .find(|r| r.label == "zope-interface")
@@ -1669,6 +1671,13 @@ mod tests {
         );
     }
 
+    /// #1066: was `assert!(results.is_empty() || !results.is_empty())` — a tautology that
+    /// could never fail identically whether cold-start behaved correctly, the network was
+    /// down, `complete_package_names` were replaced with `vec![]` unconditionally, or the
+    /// prefix-length gate rejected before the index was ever consulted. Mirrors
+    /// `test_complete_package_names_uses_index`: a mocked index proves the cold start is
+    /// genuinely empty (not just "empty for the wrong reason"), then `poll_until_nonempty` +
+    /// `mock.assert_async()` + a concrete label prove the index actually works once built.
     #[tokio::test]
     async fn test_complete_package_names_special_characters() {
         // #1055: was a live, unmocked search index build that asserted the tautology
@@ -1688,7 +1697,15 @@ mod tests {
         let index_url = format!("{}/simple/", server.url());
         let ecosystem = ecosystem_with_index_url(cache, index_url);
 
-        // Package names with hyphens and underscores should work
+        // Package names with hyphens and underscores should work.
+        let cold_start = ecosystem
+            .complete_package_names("scikit-le", Range::default())
+            .await;
+        assert!(
+            cold_start.is_empty(),
+            "cold start must not block on the index download"
+        );
+
         let results = poll_until_nonempty(
             || ecosystem.complete_package_names("scikit-le", Range::default()),
             100,
@@ -1698,13 +1715,35 @@ mod tests {
         assert!(results.iter().any(|r| r.label == "scikit-learn"));
     }
 
+    /// #1066: was `assert!(results.len() <= 20)` against a live registry — a tautology given
+    /// the actual display cap (`MAX_COMPLETION_VERSIONS`, `deps-core`) is 5, not 20, so it
+    /// passed vacuously (even for 0 results) and could never catch a cap regression. Mocks 8
+    /// matching versions and asserts the count is exactly the real cap.
     #[tokio::test]
-    #[ignore] // Requires network access
-    async fn test_complete_versions_limit_20() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = PypiEcosystem::new(cache);
+    async fn test_complete_versions_capped_at_max_completion_versions() {
+        let mut server = mockito::Server::new_async().await;
+        let versions = (0..8)
+            .map(|i| format!(r#""2.{i}.0""#))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mock = server
+            .mock("GET", "/simple/requests/")
+            .with_status(200)
+            .with_body(format!(r#"{{"versions": [{versions}], "files": []}}"#))
+            .create_async()
+            .await;
 
-        // Test that we respect the 20 result limit
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let registry = PypiRegistry::with_public_base_for_test(
+            Arc::clone(&cache),
+            format!("{}/simple", server.url()),
+        );
+        let ecosystem = PypiEcosystem::with_policy(
+            Arc::new(registry),
+            Arc::new(deps_core::net_policy::RegistryAccessPolicy::default()),
+        );
+
+        // Test that we respect the display cap, not just some loose upper bound.
         let parse_result = parse_result_with_dependency("requests", DependencySource::Registry);
         let results = ecosystem
             .complete_versions(
@@ -1714,7 +1753,8 @@ mod tests {
                 deps_core::FreshnessSettings::default(),
             )
             .await;
-        assert!(results.len() <= 20);
+        mock.assert_async().await;
+        assert_eq!(results.len(), 5);
     }
 
     #[tokio::test]
@@ -1861,6 +1901,19 @@ dependencies = ["requests"]
             line: 1,
             character: 20,
         };
+
+        let cold_start = ecosystem
+            .generate_completions(
+                parse_result.as_ref(),
+                position,
+                content,
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
+        assert!(
+            cold_start.items.is_empty(),
+            "cold start must not block on the index download"
+        );
 
         let completions = poll_until_nonempty(
             || async {

@@ -610,13 +610,32 @@ mod tests {
         assert!(results.is_empty());
     }
 
+    /// #1066: was `assert!(results.len() <= 20)` against a live registry — a tautology given
+    /// the actual display cap (`MAX_COMPLETION_VERSIONS`, `deps-core`) is 5, not 20, so it
+    /// passed vacuously (even for 0 results) and could never catch a cap regression. Mocks 8
+    /// matching versions and asserts the count is exactly the real cap.
     #[tokio::test]
-    #[ignore] // Requires network access
-    async fn test_complete_versions_limit_20() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = GoEcosystem::new(cache);
+    async fn test_complete_versions_capped_at_max_completion_versions() {
+        let mut server = mockito::Server::new_async().await;
+        let versions_body = (0..8)
+            .map(|i| format!("v1.0.{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mock = server
+            .mock("GET", "/github.com/gin-gonic/gin/@v/list")
+            .with_status(200)
+            .with_body(versions_body)
+            .create_async()
+            .await;
 
-        // Test that we respect the 20 result limit
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let registry = Arc::new(GoRegistry::with_public_base_for_test(
+            Arc::clone(&cache),
+            server.url(),
+        ));
+        let ecosystem = GoEcosystem::with_context(registry, GoParseContext::default());
+
+        // Test that we respect the display cap, not just some loose upper bound.
         let dep = mock_dependency("github.com/gin-gonic/gin", Some("v1.0"), 0);
         let position = dep.version_range.unwrap().start;
         let parse_result = MockParseResult {
@@ -631,7 +650,8 @@ mod tests {
                 deps_core::FreshnessSettings::default(),
             )
             .await;
-        assert!(results.len() <= 20);
+        mock.assert_async().await;
+        assert_eq!(results.len(), 5);
     }
 
     /// #1034: backed by a mockito server (rather than a live `proxy.golang.org` request) so
