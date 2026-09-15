@@ -92,6 +92,35 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+  fuzz-check:
+    name: Fuzz Workspace Check
+    needs: changes
+    # `fuzz/` is a separate cargo workspace (excluded from the root workspace, see root
+    # `Cargo.toml`'s `exclude`), so `cargo check --workspace` at the repo root never type-checks
+    # it. #1088: PR #1087 changed several `Ecosystem`/`parse_*` signatures across ecosystem
+    # crates and silently broke ten fuzz harnesses, caught only by the slow, non-blocking `fuzz`
+    # job below. This fast, blocking check catches that class of break immediately.
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3  # v1
+        with:
+          cache: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+        with:
+          workspaces: fuzz -> target
+          shared-key: fuzz-check
+
+      - name: Check fuzz workspace
+        working-directory: fuzz
+        run: cargo check --workspace
+
   feature-matrix:
     name: Feature Matrix Check
     needs: changes
@@ -1074,6 +1103,7 @@ jobs:
         changes,
         fmt,
         clippy,
+        fuzz-check,
         feature-matrix,
         feature-matrix-test,
         doc-and-hygiene,
@@ -1109,6 +1139,7 @@ jobs:
           failed=0
           check_job "${{ needs.fmt.result }}" "fmt" || failed=1
           check_job "${{ needs.clippy.result }}" "clippy" || failed=1
+          check_job "${{ needs.fuzz-check.result }}" "fuzz-check" || failed=1
           check_job "${{ needs.feature-matrix.result }}" "feature-matrix" || failed=1
           check_job "${{ needs.feature-matrix-test.result }}" "feature-matrix-test" || failed=1
           check_job "${{ needs.doc-and-hygiene.result }}" "doc-and-hygiene" || failed=1
