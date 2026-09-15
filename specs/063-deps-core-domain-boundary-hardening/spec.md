@@ -96,6 +96,23 @@ compiler-forced omission.
   compile-time guarantees change.
 - Actually publishing `deps-cli`/`deps-mcp` on crates.io — this spec only
   removes the `tower-lsp-server` dependency they would otherwise inherit.
+- **Fully eliminating `tower-lsp-server` from `deps-cli`'s dependency tree**
+  (originally FR-005/SC-001 in the first draft of this spec, before
+  implementation began). Discovered empirically during T000: (a)
+  `deps-core::lsp_helpers` independently builds real
+  `ls_types::{Hover,Diagnostic,CodeAction,...}` response objects — this is
+  `deps-core`'s actual LSP-response-generation job and is not being
+  redesigned here, so `deps-core`'s `Cargo.toml` keeps `tower-lsp-server`
+  unconditionally; (b) `deps-cli` itself, independent of `deps-core`'s domain
+  model, already directly imports `ls_types::{Diagnostic,DiagnosticSeverity,
+  NumberOrString,Range,Uri}` in its own `report.rs`/`config.rs`/`exit.rs`/
+  `walk.rs` (pre-existing, shipped in PR #1072/#1078) — its `check`
+  subcommand's finding type is built directly on `ls_types::Diagnostic`.
+  Achieving the original FR-005 would require feature-gating
+  `deps-core::lsp_helpers`/the `Ecosystem` trait's `generate_*` methods AND
+  redesigning `deps-cli::report`'s already-shipped finding type — a much
+  larger, separate initiative. The user chose to descope rather than expand
+  this PR; tracked as issue #1083.
 
 ## 2. User Stories
 
@@ -150,8 +167,8 @@ THEN only a minor bump is required (not major), because the struct's field addit
 | FR-001 | THE SYSTEM SHALL define file-identity and position/range types in `deps-core` that do not name any `tower-lsp-server`/`tower_lsp_server::ls_types` type in their public signature | must |
 | FR-002 | WHEN `deps_core::Dependency`, `deps_core::lockfile::LockFileCache`, and any other public `deps-core` domain type currently typed on `ls_types::{Uri,Range,Position}` are constructed or read THE SYSTEM SHALL use the new protocol-agnostic types instead | must |
 | FR-003 | WHEN `deps-lsp` builds an LSP response (hover, diagnostic, completion, code action, code lens, inlay hint) from `deps-core`/`deps-engine` domain data THE SYSTEM SHALL convert the protocol-agnostic types to `tower_lsp_server::ls_types` at that boundary, with no observable change to the wire-level LSP response | must |
-| FR-004 | THE SYSTEM SHALL make `tower-lsp-server` an optional, non-default dependency of every crate that only needed it for the domain-type coupling this spec removes (at minimum `deps-core`; `deps-engine` if its own direct dependency, per #1071, is also resolved this way) | must |
-| FR-005 | WHEN `deps-cli` or a future `deps-mcp` depends on `deps-core`/`deps-engine` without enabling any LSP-specific feature THE SYSTEM SHALL NOT pull `tower-lsp-server` into that crate's dependency tree, verifiable via `cargo tree -e features,no-dev` | must |
+| FR-004 | THE SYSTEM SHALL remove `tower-lsp-server` from `deps-engine`'s `Cargo.toml` entirely, since `classify::{resolved,fetch,osv}`'s only use of `ls_types` was the domain-type coupling this spec removes | must |
+| FR-005 | ~~WHEN `deps-cli`... SHALL NOT pull `tower-lsp-server`~~ — **descoped** (see "Scope correction" below): `deps-core`'s `Cargo.toml` keeps `tower-lsp-server` as an unconditional dependency after this PR, because `deps-core::lsp_helpers` independently builds real `ls_types::{Hover,Diagnostic,CodeAction,...}` response objects (out of scope to redesign here), and `deps-cli` itself (pre-existing, shipped in PR #1072/#1078) already directly imports `ls_types::{Diagnostic,DiagnosticSeverity,NumberOrString,Range,Uri}` in its own `report.rs`/`config.rs`/`exit.rs`/`walk.rs` independent of `deps-core`'s domain model. Fully removing `tower-lsp-server` from `deps-cli`'s dependency tree requires feature-gating `deps-core::lsp_helpers`/the `Ecosystem` trait's `generate_*` methods AND redesigning `deps-cli::report`'s already-shipped `ls_types`-based finding type — both out of scope for #1071/#1064; tracked as a new follow-up issue instead (not a `[NEEDS CLARIFICATION]` — the user explicitly chose to descope rather than expand this PR) | descoped |
 | FR-006 | THE SYSTEM SHALL add `#[non_exhaustive]` to `DiagnosticsConfig`, `CacheConfig`, `FreshnessConfig`, `SupplyChainConfig`, `RegistriesConfig`, `NetworkConfig`, and `LicensePolicyConfig` | must |
 | FR-007 | THE SYSTEM SHALL provide a `new()` and/or `with_*` builder-style constructor for each of the 7 structs in FR-006, following this project's existing `#[non_exhaustive]` config pattern (e.g. `deps-lsp::config::InlayHintsConfig`) | must |
 | FR-008 | THE SYSTEM SHALL replace `reparse_scope`'s reliance on exhaustive-destructuring-without-`..`  as its completeness guard with an explicit mechanism that still causes a compile-time failure when a field on any of the 7 structs (or `PolicyConfig`/`DepsConfig` themselves) is added without an explicit reparse-scope classification | must |
@@ -185,13 +202,13 @@ THEN only a minor bump is required (not major), because the struct's field addit
 | A future contributor adds an 8th field to one of the 7 `policy_config` structs and does not touch `reparse_scope` at all | Compilation must fail — this is the primary regression this spec must not introduce |
 | A future contributor adds a field to `policy_config` and classifies it in the new guard mechanism, but picks the wrong `ReparseScope` (e.g. `Ecosystems(["cargo"])` for a field that actually affects all ecosystems) | Out of scope for this spec (same limitation `reparse_scope`'s doc already calls out: "the compile error forces *a* decision, it does not make the *safe* decision for you") |
 | `deps-cli`/`deps-mcp` need to construct a domain `Dependency` from a filesystem path with no LSP context at all (no editor open) | Must be possible using only the new protocol-agnostic type, with no `tower_lsp_server::ls_types::Uri` roundtrip required |
-| CI's existing `deps-lsp` "no ecosystem crate is a direct non-dev dependency" guard (added for #1073, PR #1079) | Should be joined by (or extended to cover) an equivalent guard asserting `deps-cli`/`deps-mcp` do not pull in `tower-lsp-server` transitively, per FR-005 |
+| CI's existing `deps-lsp` "no ecosystem crate is a direct non-dev dependency" guard (added for #1073, PR #1079) | Joined by an equivalent guard asserting `deps-engine` does not pull in `tower-lsp-server`, per FR-004 (descoped from `deps-cli`/`deps-mcp` — see FR-005) |
 
 ## 7. Success Criteria
 
 | ID | Metric | Target |
 |----|--------|--------|
-| SC-001 | `cargo tree -p deps-cli -e features,no-dev \| grep tower-lsp-server` | No match |
+| SC-001 | `cargo tree -p deps-engine -e features,no-dev \| grep tower-lsp-server` (descoped from `deps-cli` — see FR-005) | No match |
 | SC-002 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | Passes with zero warnings after both changes land |
 | SC-003 | `cargo nextest run --workspace --all-features --no-fail-fast` | All existing tests pass; `reparse_scope_tests` (or its renamed/relocated equivalent) still proves the fail-closed property |
 | SC-004 | A compile-fail test/trybuild case (or equivalent) proves an unclassified new `policy_config` field breaks the build | Present and passing |

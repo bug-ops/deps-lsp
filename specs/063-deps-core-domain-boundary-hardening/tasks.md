@@ -28,7 +28,7 @@ related:
 - [ ] T004: `deps-lsp` handlers + `document/*` updated to convert at the boundary
 - [ ] T005: `deps-engine::classify::{resolved,fetch,osv}` migrated; `tower-lsp-server` removed from `deps-engine`'s `Cargo.toml`
 - [ ] T006-T019: migrate each of the 14 `deps-<ecosystem>` crates (one task per crate)
-- [ ] T020: CI guard — `deps-cli` dependency tree excludes `tower-lsp-server`
+- [ ] T020: CI guard — `deps-engine` dependency tree excludes `tower-lsp-server` (descoped from `deps-cli`, see spec's "Out of Scope")
 - [ ] T021: full check suite + live manual test (≥2 ecosystems) + `CHANGELOG.md` "Breaking" entry for PR A
 - [ ] T022: `policy_config`'s 7 structs → `#[non_exhaustive]` + `new()`/`with_*` constructors
 - [ ] T023: `PolicyConfig::diff`/`PolicyConfigDiff` + `reparse_scope` rewrite + compile-fail test + `CHANGELOG.md` "Breaking" entry for PR B
@@ -185,12 +185,12 @@ on these types and signatures existing.
 
 ---
 
-### T020: CI guard — `deps-cli`/`deps-mcp` exclude `tower-lsp-server`
+### T020: CI guard — `deps-engine` excludes `tower-lsp-server`
 
-**Context**: FR-005 requires this to be machine-verified, not just true by construction — mirrors the existing #1073/#1079 guard for ecosystem crates not being direct `deps-lsp`/`deps-cli` dependencies.
-**Spec reference**: [[spec#FR-005]], [[spec#SC-001]]
+**Context**: FR-004 requires this to be machine-verified, not just true by construction — mirrors the existing #1073/#1079 guard for ecosystem crates not being direct `deps-lsp`/`deps-cli` dependencies. **Descoped from `deps-cli`** (originally FR-005) after discovering during T000 that `deps-cli` already directly uses `ls_types` independent of `deps-core`'s domain model, and that `deps-core` itself keeps `tower-lsp-server` unconditionally for `lsp_helpers` — see spec's "Out of Scope".
+**Spec reference**: [[spec#FR-004]], [[spec#SC-001]]
 **Acceptance criteria**:
-- [ ] New (or extended) CI step running `cargo tree -p deps-cli -e features,no-dev` and failing if `tower-lsp-server` appears
+- [ ] New (or extended) CI step running `cargo tree -p deps-engine -e features,no-dev` and failing if `tower-lsp-server` appears
 - [ ] Step documented in `.github/workflows/ci.yml` with a comment linking issue #1071, matching this project's existing convention for such guards
 **Dependencies**: T005, T006-T019 (the tree must actually be clean before the guard is added, or CI red)
 **Files**: `.github/workflows/ci.yml`
