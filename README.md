@@ -342,6 +342,28 @@ Add to `coc-settings.json` (`:CocConfig`). `coc.nvim` attaches every configured 
 
 </details>
 
+## CLI & CI
+
+[`deps-cli`](crates/deps-cli/README.md) runs the same dependency checks as an editor-free
+command-line tool, for CI pipelines, pre-commit hooks, and shell scripts. Every verdict comes
+from the identical classification function `deps-lsp` uses for its diagnostics, so a
+`deps-cli check` result and an editor's diagnostics for the same manifest never disagree.
+
+```bash
+cargo install deps-cli # once published to crates.io — cargo install --path crates/deps-cli today
+deps-cli check --format sarif > results.sarif
+```
+
+- **Output formats**: human-readable table (default), versioned JSON, or SARIF 2.1.0 for
+  `github/codeql-action/upload-sarif`
+- **[Pre-commit hook](.pre-commit-hooks.yaml)**: `deps-lsp-check`, runs `deps-cli check`
+  against staged files
+- **[GitHub Action](crates/github-action/README.md)**: a composite action wrapping
+  `deps-cli check --format sarif`, leaving `upload-sarif` to your own workflow
+
+See [`crates/deps-cli/README.md`](crates/deps-cli/README.md) for the full flag reference,
+`deps.toml` schema, and exit-code contract.
+
 ## Configuration
 
 ### Inlay hint icons
@@ -590,8 +612,10 @@ deps-lsp/
 │   ├── deps-deno/      # deno.json parser + JSR registry (npm: delegates to deps-npm)
 │   ├── deps-github-actions/ # workflow YAML parser + GitHub tags API registry
 │   ├── deps-gitlab-ci/ # .gitlab-ci.yml parser + GitLab tags/releases API registry
+│   ├── deps-engine/    # Internal: ecosystem registration + verdict classification, shared by deps-lsp/deps-cli
 │   ├── deps-lsp/       # Main LSP server
 │   ├── deps-cli/       # `deps-cli check` — CLI for CI/pre-commit/shell workflows
+│   ├── github-action/  # Composite GitHub Action wrapping `deps-cli check --format sarif`
 │   └── deps-zed/       # Zed extension (WASM)
 ├── .config/            # nextest configuration
 └── .github/            # CI/CD workflows

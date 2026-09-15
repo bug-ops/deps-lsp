@@ -1,6 +1,7 @@
 //! Output formatters for a [`crate::report::CheckReport`] (FR-006, FR-007).
 
 pub mod json;
+pub mod sarif;
 pub mod table;
 
 /// Renders `severity` as the lowercase token used by both output formats.

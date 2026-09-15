@@ -1,0 +1,75 @@
+---
+source: crates/deps-cli/src/format/sarif.rs
+expression: to_sarif(&report)
+---
+{
+  "$schema": "https://schemastore.azurewebsites.net/schemas/json/sarif-2.1.0.json",
+  "runs": [
+    {
+      "results": [
+        {
+          "level": "note",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "Cargo.toml"
+                },
+                "region": {
+                  "endColumn": 11,
+                  "endLine": 5,
+                  "startColumn": 1,
+                  "startLine": 5
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Newer version available: 1.1.0"
+          },
+          "ruleId": "outdated",
+          "ruleIndex": 0
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "Cargo.toml"
+                },
+                "region": {
+                  "endColumn": 11,
+                  "endLine": 5,
+                  "startColumn": 1,
+                  "startLine": 5
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Newer version available: 1.1.0"
+          },
+          "ruleId": "vulnerable",
+          "ruleIndex": 1
+        }
+      ],
+      "tool": {
+        "driver": {
+          "informationUri": "https://github.com/bug-ops/deps-lsp",
+          "name": "deps-cli",
+          "rules": [
+            {
+              "id": "outdated"
+            },
+            {
+              "id": "vulnerable"
+            }
+          ],
+          "version": "1.0.0"
+        }
+      }
+    }
+  ],
+  "version": "2.1.0"
+}

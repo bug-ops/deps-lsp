@@ -1,0 +1,35 @@
+# pre-commit hook manifest for deps-lsp's `deps-cli check` (spec 062 FR-017,
+# issue #1063).
+#
+# TODO: tracked in #1074 — `language: rust` cannot install from a virtual
+# workspace root (verified during implementation, see PR description).
+# pre-commit's `language: rust` support always runs
+# `cargo install --bins --root <env> --path .` from the root of whatever
+# `repo:` it clones (pre_commit/languages/rust.py,
+# pre_commit/repository.py). This repository's root `Cargo.toml` is a
+# virtual workspace manifest (no `[package]`), so `cargo install --path .`
+# fails there with "found a virtual manifest at ... instead of a package
+# manifest" — confirmed with a real `pre-commit try-repo` run against this
+# repository's root, not just reasoned about. There is no `rev:` today that
+# makes `repo: https://github.com/bug-ops/deps-lsp` work for this hook.
+# Until `deps-cli` is published to crates.io and/or ships from its own
+# repository (as `crates/deps-zed` already does), a consumer wanting this
+# hook today should install `deps-cli` themselves and wire it in as a
+# `repo: local` / `language: system` hook instead — see
+# `crates/deps-cli/README.md`'s "Pre-commit hook" section for a working
+# example.
+- id: deps-lsp-check
+  description: >-
+    Runs `deps-cli check` against staged manifests for
+    outdated/yanked/vulnerable/unsatisfiable dependencies.
+  entry: deps-cli check
+  language: rust
+  name: deps-lsp dependency check
+  # Keep this in sync with every `Ecosystem::manifest_filenames`/
+  # `manifest_patterns`/`manifest_extensions`/`manifest_directory_patterns`
+  # impl under `crates/deps-*/src/ecosystem.rs` (14 ecosystems as of spec
+  # 062) — this regex exists only so a commit touching hundreds of
+  # unrelated files doesn't spam one "not recognized by any ecosystem"
+  # warning per file; `deps-cli`'s own `EcosystemRegistry` remains the
+  # single source of truth for what actually gets checked.
+  files: '(^|/)(Cargo\.toml|Gemfile|composer\.json|pubspec\.yaml|deno\.jsonc?|go\.mod|package\.json|pom\.xml|pyproject\.toml|Package\.swift|Directory\.Packages\.props|packages\.config|libs\.versions\.toml|build\.gradle(\.kts)?|settings\.gradle(\.kts)?|\.gitlab-ci\.yml|action\.ya?ml|requirements[^/]*\.txt|[^/]*-requirements\.txt|[^/]*\.requirements\.txt|constraints[^/]*\.txt)$|\.(csproj|fsproj|vbproj)$|(^|/)\.github/workflows/[^/]*\.ya?ml$|(^|/)\.gitlab/ci/[^/]*\.ya?ml$|(^|/)requirements/[^/]*\.txt$'
