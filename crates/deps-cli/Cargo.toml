@@ -80,6 +80,6 @@ urlencoding = { workspace = true }
 # and deps-lsp's own `[dev-dependencies]`. Do not remove as "unused" without also removing
 # deps-cli's block from that CI guard.
 deps-core = { workspace = true, features = ["test-util"] }
-insta = { workspace = true, features = ["json"] }
+insta = { workspace = true, features = ["json", "redactions"] }
 jsonschema = { workspace = true }
 tempfile = { workspace = true }

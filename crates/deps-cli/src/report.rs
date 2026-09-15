@@ -14,7 +14,7 @@ use deps_core::lsp_helpers::{
     DEPRECATED_DIAGNOSTIC_CODE, DependencyOutcomes, LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE,
     UNSATISFIABLE_DIAGNOSTIC_CODE,
 };
-use deps_core::osv::{OsvClient, VulnerabilityMap};
+use deps_core::osv::{OsvClient, ScanOutcome, VulnSeverity, VulnerabilityMap};
 use deps_core::policy_config::PolicyConfig;
 use deps_core::{Dependency, Ecosystem, EcosystemId, HttpCache, PackageName, VersionData};
 use deps_engine::classify::diff::{
@@ -115,6 +115,47 @@ impl Category {
             Self::Other => "other",
         }
     }
+
+    /// A one-line human-readable description, longer than [`Self::as_str`]'s wire token —
+    /// used as SARIF rule metadata (`crate::format::sarif`) for a rule that only has
+    /// category-level granularity (no finer diagnostic code). Deliberately close in wording
+    /// to each variant's own doc comment above (both describe the same category, and SARIF's
+    /// `shortDescription` is meant to read like ordinary documentation prose) rather than a
+    /// genuinely distinct text written just to avoid the overlap.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_cli::report::Category;
+    ///
+    /// assert_eq!(
+    ///     Category::Vulnerable.description(),
+    ///     "A known security advisory affects the in-use version."
+    /// );
+    /// assert_eq!(
+    ///     Category::License.description(),
+    ///     "The resolved license violates the configured allow/deny policy."
+    /// );
+    /// ```
+    #[must_use]
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::Outdated => {
+                "A newer version is published for the dependency's declared requirement."
+            }
+            Self::Yanked => "The in-use version has been yanked or retracted from the registry.",
+            Self::Vulnerable => "A known security advisory affects the in-use version.",
+            Self::Unsatisfiable => "No published version satisfies the declared requirement.",
+            Self::MutableRefPin => {
+                "Pinned to a mutable ref (tag or branch) instead of a commit SHA."
+            }
+            Self::License => "The resolved license violates the configured allow/deny policy.",
+            Self::Deprecated => {
+                "The registry reports the package itself as deprecated or abandoned."
+            }
+            Self::Other => "A finding that does not map to any of the other categories.",
+        }
+    }
 }
 
 impl std::fmt::Display for Category {
@@ -138,6 +179,31 @@ pub struct CheckFinding {
     pub requirement: Option<String>,
     /// The classified category (see [`Category`]).
     pub category: Category,
+    /// The diagnostic's own `code`, when it carried a string one (spec 062 review S3,
+    /// issue #1075): a vulnerability diagnostic's code is an OSV advisory id
+    /// (`RUSTSEC-...`/`GHSA-...`), finer-grained than [`Self::category`]; the workspace's
+    /// other stable diagnostic-code constants (`UNSATISFIABLE_DIAGNOSTIC_CODE`, etc.) are
+    /// 1:1 with a category, so carrying them here changes nothing beyond echoing
+    /// `category`. `None` when `classify` fell back to matching the diagnostic's message
+    /// text instead of its code (`Outdated`/`Yanked`/`Other`).
+    pub code: Option<String>,
+    /// The advisory's own `https://osv.dev/vulnerability/{id}` page, when [`Self::code`] is
+    /// an OSV advisory id — sourced from the diagnostic's `code_description.href` (already
+    /// `Uri`-parsed and validated by `deps_core::lsp_helpers::diagnostics::
+    /// push_vulnerability_diagnostics` before it ever reaches a `Diagnostic`), not
+    /// re-derived from `code` — the authoritative URL OSV itself gave us, rather than a
+    /// second, redundant formula that could drift from it. `None` whenever `code_description`
+    /// is absent (every non-advisory finding, and the rare case where OSV's own `url` failed
+    /// `Uri` parsing upstream).
+    pub advisory_url: Option<String>,
+    /// The OSV-derived severity bucket for [`Self::code`], when it names an advisory this
+    /// manifest's OSV scan actually fetched (issue #1077 C2) — looked up by advisory id from
+    /// the same scan results `generate_diagnostics` consumed, not re-derived from
+    /// [`Self::severity`] (the three-bucket LSP [`DiagnosticSeverity`] `code` already
+    /// collapsed into is too coarse to recover a CVSS-style grade from). `None` for every
+    /// non-advisory finding, and for an advisory `code` this run's scan did not itself fetch
+    /// (e.g. a stale `code` from a formatter that does not source it from a live scan).
+    pub advisory_severity: Option<VulnSeverity>,
     /// The diagnostic's severity.
     pub severity: DiagnosticSeverity,
     /// The diagnostic's LSP range within the manifest.
@@ -172,6 +238,9 @@ impl CheckReport {
     ///         dependency_name: Some("serde".to_string()),
     ///         requirement: Some("1.0".to_string()),
     ///         category: Category::Outdated,
+    ///         code: None,
+    ///         advisory_url: None,
+    ///         advisory_severity: None,
     ///         severity: DiagnosticSeverity::HINT,
     ///         range: Range::default(),
     ///         message: "Newer version available: 1.1".to_string(),
@@ -441,6 +510,18 @@ pub async fn check_manifest(
         .await;
 
     let dep_index = DependencyIndex::build(parse_result.as_ref());
+    let advisory_severities = advisory_severity_index(vulnerabilities.as_ref());
+    // The same per-occurrence key `vulnerabilities` was itself built under — `to_finding`
+    // resolves each finding's own occurrence to this key before looking it up in
+    // `advisory_severities`, so a shared advisory id across two different dependencies can
+    // never resolve to the wrong one's severity (issue #1077 review #4).
+    let vuln_keys = deps_core::osv::vulnerability_keys(
+        parse_result.as_ref(),
+        &resolved_versions,
+        Some(&resolved_version_candidates),
+        formatter,
+        ecosystem_id,
+    );
     let findings = diagnostics
         .into_iter()
         .map(|diagnostic| {
@@ -450,6 +531,8 @@ pub async fn check_manifest(
                 &dep_index,
                 formatter,
                 diagnostic,
+                &advisory_severities,
+                &vuln_keys,
             )
         })
         .collect();
@@ -502,18 +585,73 @@ impl<'a> DependencyIndex<'a> {
     }
 }
 
+/// Indexes every advisory this manifest's OSV scan fetched, keyed by (the [`VulnerabilityMap`]
+/// key identifying the specific dependency occurrence, advisory id) rather than by advisory id
+/// alone (issue #1077 review #4), so [`to_finding`] can attach a
+/// [`CheckFinding::advisory_severity`] without re-deriving a grade from the coarser LSP
+/// [`DiagnosticSeverity`] a `Diagnostic` carries.
+///
+/// A bare `HashMap<String, VulnSeverity>` keyed only by advisory id would let one dependency's
+/// severity silently overwrite another's (unspecified `HashMap` iteration order) whenever two
+/// dependencies in this manifest shared an advisory id — OSV can legitimately report one id
+/// against several different packages in the same record. [`to_finding`] looks its own
+/// dependency occurrence's key up via [`deps_core::osv::vulnerability_keys`] — the same
+/// function `vulnerabilities` itself was keyed under — so this can never drift out of sync
+/// with how the scan actually mapped occurrences to results.
+///
+/// `None` `vulnerabilities` (scan disabled, or offline) yields an empty index, same as a
+/// (key, id) pair this index has no entry for — both resolve to
+/// `CheckFinding::advisory_severity: None`.
+fn advisory_severity_index(
+    vulnerabilities: Option<&VulnerabilityMap>,
+) -> HashMap<(String, String), VulnSeverity> {
+    let mut index = HashMap::new();
+    let Some(vulnerabilities) = vulnerabilities else {
+        return index;
+    };
+    for (dependency_key, outcome) in vulnerabilities {
+        if let ScanOutcome::Vulnerable(dv) = outcome {
+            for advisory in dv.advisories.items() {
+                index.insert(
+                    (dependency_key.clone(), advisory.id.clone()),
+                    advisory.severity,
+                );
+            }
+        }
+    }
+    index
+}
+
 /// Converts one `generate_diagnostics` [`Diagnostic`] into a [`CheckFinding`], classifying
 /// its [`Category`] (see [`classify`]) and, when its range matches a manifest occurrence
-/// (from [`DependencyIndex`]), its `dependency_name`/`requirement`.
+/// (from [`DependencyIndex`]), its `dependency_name`/`requirement`. `advisory_severities` and
+/// `vuln_keys` together resolve [`CheckFinding::advisory_severity`] — see
+/// [`advisory_severity_index`].
 fn to_finding(
     ecosystem: EcosystemId,
     display_path: &Path,
     dep_index: &DependencyIndex<'_>,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
     diagnostic: Diagnostic,
+    advisory_severities: &HashMap<(String, String), VulnSeverity>,
+    vuln_keys: &HashMap<Range, String>,
 ) -> CheckFinding {
     let category = classify(&diagnostic, formatter);
     let dep = dep_index.lookup(diagnostic.range);
+    let code = match &diagnostic.code {
+        Some(NumberOrString::String(code)) => Some(code.clone()),
+        Some(NumberOrString::Number(_)) | None => None,
+    };
+    let advisory_url = diagnostic
+        .code_description
+        .as_ref()
+        .map(|code_description| code_description.href.as_str().to_string());
+    let advisory_severity = code.as_deref().zip(dep).and_then(|(code, dep)| {
+        let dependency_key = vuln_keys.get(&dep.name_range())?;
+        advisory_severities
+            .get(&(dependency_key.clone(), code.to_string()))
+            .copied()
+    });
     CheckFinding {
         ecosystem,
         manifest_path: display_path.to_path_buf(),
@@ -522,6 +660,9 @@ fn to_finding(
             .and_then(Dependency::version_requirement)
             .map(ToString::to_string),
         category,
+        code,
+        advisory_url,
+        advisory_severity,
         severity: diagnostic.severity.unwrap_or(DiagnosticSeverity::WARNING),
         range: diagnostic.range,
         message: diagnostic.message,
@@ -602,6 +743,9 @@ mod tests {
             dependency_name: Some("serde".to_string()),
             requirement: Some("1.0".to_string()),
             category,
+            code: None,
+            advisory_url: None,
+            advisory_severity: None,
             severity: DiagnosticSeverity::WARNING,
             range: Range::default(),
             message: "test".to_string(),
@@ -764,5 +908,240 @@ mod tests {
             "registries.gitlab_instance_host is unset; skipping component/project host resolution",
         );
         assert_eq!(classify(&d, &StubFormatter), Category::Other);
+    }
+
+    /// A single-dependency parse result whose one dependency ("dep-0") sits at
+    /// `Range::default()` (`deps_core::test_util::StubDependency::name_range` always returns
+    /// it) — matching `diagnostic_with`'s own hardcoded `range: Range::default()`, so
+    /// `DependencyIndex::lookup` resolves it for tests that need a real, non-`None`
+    /// dependency occurrence.
+    fn dep_index_with_one_dependency() -> Box<dyn deps_core::ParseResult> {
+        deps_core::test_util::stub_parse_result_with_dependencies(1)
+    }
+
+    fn empty_dep_index() -> Box<dyn deps_core::ParseResult> {
+        deps_core::test_util::stub_parse_result_with_dependencies(0)
+    }
+
+    /// Regression test (issue #1077 tester must-fix #2): every other SARIF test hand-builds a
+    /// `CheckFinding` with `code` pre-set, bypassing the real `Diagnostic.code ->
+    /// CheckFinding.code` extraction this covers.
+    #[test]
+    fn test_to_finding_extracts_string_code_from_diagnostic() {
+        let parse_result = empty_dep_index();
+        let dep_index = DependencyIndex::build(parse_result.as_ref());
+        let diagnostic = diagnostic_with(Some("RUSTSEC-2024-0001"), "advisory summary");
+        let finding = to_finding(
+            EcosystemId::Cargo,
+            Path::new("Cargo.toml"),
+            &dep_index,
+            &StubFormatter,
+            diagnostic,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(finding.code.as_deref(), Some("RUSTSEC-2024-0001"));
+    }
+
+    #[test]
+    fn test_to_finding_code_is_none_without_a_diagnostic_code() {
+        let parse_result = empty_dep_index();
+        let dep_index = DependencyIndex::build(parse_result.as_ref());
+        let diagnostic = diagnostic_with(None, "Newer version available: 2.0.0");
+        let finding = to_finding(
+            EcosystemId::Cargo,
+            Path::new("Cargo.toml"),
+            &dep_index,
+            &StubFormatter,
+            diagnostic,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(finding.code.is_none());
+    }
+
+    #[test]
+    fn test_to_finding_extracts_advisory_url_from_code_description() {
+        let parse_result = empty_dep_index();
+        let dep_index = DependencyIndex::build(parse_result.as_ref());
+        let href: Uri = "https://osv.dev/vulnerability/RUSTSEC-2024-0001"
+            .parse()
+            .expect("valid URI");
+        let diagnostic = Diagnostic {
+            code_description: Some(tower_lsp_server::ls_types::CodeDescription { href }),
+            ..diagnostic_with(Some("RUSTSEC-2024-0001"), "advisory summary")
+        };
+        let finding = to_finding(
+            EcosystemId::Cargo,
+            Path::new("Cargo.toml"),
+            &dep_index,
+            &StubFormatter,
+            diagnostic,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(
+            finding.advisory_url.as_deref(),
+            Some("https://osv.dev/vulnerability/RUSTSEC-2024-0001")
+        );
+    }
+
+    #[test]
+    fn test_to_finding_advisory_url_is_none_without_code_description() {
+        let parse_result = empty_dep_index();
+        let dep_index = DependencyIndex::build(parse_result.as_ref());
+        let diagnostic = diagnostic_with(Some("RUSTSEC-2024-0001"), "advisory summary");
+        let finding = to_finding(
+            EcosystemId::Cargo,
+            Path::new("Cargo.toml"),
+            &dep_index,
+            &StubFormatter,
+            diagnostic,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(finding.advisory_url.is_none());
+    }
+
+    #[test]
+    fn test_to_finding_resolves_advisory_severity_from_index() {
+        let parse_result = dep_index_with_one_dependency();
+        let dep_index = DependencyIndex::build(parse_result.as_ref());
+        let diagnostic = diagnostic_with(Some("RUSTSEC-2024-0001"), "advisory summary");
+
+        let mut vuln_keys = HashMap::new();
+        vuln_keys.insert(Range::default(), "dep-0".to_string());
+        let mut severities = HashMap::new();
+        severities.insert(
+            ("dep-0".to_string(), "RUSTSEC-2024-0001".to_string()),
+            VulnSeverity::Critical,
+        );
+
+        let finding = to_finding(
+            EcosystemId::Cargo,
+            Path::new("Cargo.toml"),
+            &dep_index,
+            &StubFormatter,
+            diagnostic,
+            &severities,
+            &vuln_keys,
+        );
+        assert_eq!(finding.advisory_severity, Some(VulnSeverity::Critical));
+    }
+
+    #[test]
+    fn test_to_finding_advisory_severity_is_none_for_an_unindexed_code() {
+        let parse_result = dep_index_with_one_dependency();
+        let dep_index = DependencyIndex::build(parse_result.as_ref());
+        let diagnostic = diagnostic_with(Some("RUSTSEC-2024-0001"), "advisory summary");
+        let mut vuln_keys = HashMap::new();
+        vuln_keys.insert(Range::default(), "dep-0".to_string());
+
+        let finding = to_finding(
+            EcosystemId::Cargo,
+            Path::new("Cargo.toml"),
+            &dep_index,
+            &StubFormatter,
+            diagnostic,
+            &HashMap::new(),
+            &vuln_keys,
+        );
+        assert!(finding.advisory_severity.is_none());
+    }
+
+    /// Regression test for issue #1077 review #4: no matching dependency occurrence at all
+    /// (an empty `dep_index`/`vuln_keys`, e.g. a document-level diagnostic) must resolve to
+    /// `None`, not panic.
+    #[test]
+    fn test_to_finding_advisory_severity_is_none_without_a_matched_dependency() {
+        let parse_result = empty_dep_index();
+        let dep_index = DependencyIndex::build(parse_result.as_ref());
+        let diagnostic = diagnostic_with(Some("RUSTSEC-2024-0001"), "advisory summary");
+        let mut severities = HashMap::new();
+        severities.insert(
+            ("dep-0".to_string(), "RUSTSEC-2024-0001".to_string()),
+            VulnSeverity::Critical,
+        );
+
+        let finding = to_finding(
+            EcosystemId::Cargo,
+            Path::new("Cargo.toml"),
+            &dep_index,
+            &StubFormatter,
+            diagnostic,
+            &severities,
+            &HashMap::new(),
+        );
+        assert!(finding.advisory_severity.is_none());
+    }
+
+    #[test]
+    fn test_advisory_severity_index_collects_from_vulnerable_outcomes() {
+        use deps_core::osv::{Advisory, Capped, DependencyVulnerabilities};
+        use std::sync::Arc;
+
+        let advisory = Advisory::new(
+            "RUSTSEC-2024-0001".to_string(),
+            "2024-01-01T00:00:00Z".to_string(),
+            VulnSeverity::High,
+            "https://osv.dev/vulnerability/RUSTSEC-2024-0001".to_string(),
+        );
+        let dv = DependencyVulnerabilities::new(Capped::new(vec![Arc::new(advisory)], 1));
+        let mut map: VulnerabilityMap = HashMap::new();
+        map.insert("serde".to_string(), ScanOutcome::Vulnerable(dv));
+
+        let index = advisory_severity_index(Some(&map));
+        assert_eq!(
+            index.get(&("serde".to_string(), "RUSTSEC-2024-0001".to_string())),
+            Some(&VulnSeverity::High)
+        );
+    }
+
+    /// Regression test for issue #1077 review #4: two different dependencies whose OSV
+    /// records legitimately share one advisory id must not let one silently overwrite the
+    /// other's severity bucket.
+    #[test]
+    fn test_advisory_severity_index_does_not_collide_across_dependencies_sharing_an_advisory_id() {
+        use deps_core::osv::{Advisory, Capped, DependencyVulnerabilities};
+        use std::sync::Arc;
+
+        let advisory_for = |severity: VulnSeverity| {
+            Arc::new(Advisory::new(
+                "GHSA-shared-id".to_string(),
+                "2024-01-01T00:00:00Z".to_string(),
+                severity,
+                "https://osv.dev/vulnerability/GHSA-shared-id".to_string(),
+            ))
+        };
+        let mut map: VulnerabilityMap = HashMap::new();
+        map.insert(
+            "package-a".to_string(),
+            ScanOutcome::Vulnerable(DependencyVulnerabilities::new(Capped::new(
+                vec![advisory_for(VulnSeverity::Critical)],
+                1,
+            ))),
+        );
+        map.insert(
+            "package-b".to_string(),
+            ScanOutcome::Vulnerable(DependencyVulnerabilities::new(Capped::new(
+                vec![advisory_for(VulnSeverity::Low)],
+                1,
+            ))),
+        );
+
+        let index = advisory_severity_index(Some(&map));
+        assert_eq!(
+            index.get(&("package-a".to_string(), "GHSA-shared-id".to_string())),
+            Some(&VulnSeverity::Critical)
+        );
+        assert_eq!(
+            index.get(&("package-b".to_string(), "GHSA-shared-id".to_string())),
+            Some(&VulnSeverity::Low)
+        );
+    }
+
+    #[test]
+    fn test_advisory_severity_index_empty_without_vulnerabilities() {
+        assert!(advisory_severity_index(None).is_empty());
     }
 }
