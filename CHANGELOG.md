@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **docs**: new mdBook at `book/` reorganizing the former `docs/ECOSYSTEM_GUIDE.md`'s flat feature list into cross-ecosystem, per-ecosystem, and contributor-tutorial chapters, published to GitHub Pages under `/book/` by a new `.github/workflows/mdbook.yml`; `docs/ECOSYSTEM_GUIDE.md` is removed, fully superseded by the book (resolves #1095) (#1096)
+- **docs**: new mdBook at `book/` reorganizing the former `docs/ECOSYSTEM_GUIDE.md`'s flat feature list into cross-ecosystem, per-ecosystem, and contributor-tutorial chapters, published to GitHub Pages by a new `.github/workflows/mdbook.yml`; `docs/ECOSYSTEM_GUIDE.md` is removed, fully superseded by the book (resolves #1095) (#1096)
 - **deps-cli**: `deps-cli check --format sarif` SARIF 2.1.0 output, a `.pre-commit-hooks.yaml` entry, and a `crates/github-action` composite GitHub Action wrapping the SARIF check for `github/codeql-action/upload-sarif` (spec 062 PR 3, resolves #1063, #711) (#1078)
 - **deps-cli**: SARIF `tool.driver.rules` entries now get `name`/`shortDescription`, and OSV-advisory rules additionally get `helpUri`/`fullDescription`; results carry `partialFingerprints` and `run.automationDetails.id` (resolves #1077) (#1082)
 - **deps-cli**: new `deps-cli check [PATH...]` CLI subcommand — `.gitignore`-aware workspace walk, table/JSON reporting, `--fail-on`/`--offline`/`--cooldown`/`--config` flags, and CI-friendly exit codes (0 clean / 1 policy violation / 2 execution error), reusing `deps-engine`'s classification pipeline with no ecosystem-verdict logic of its own (spec 062 PR 2, resolves #1061) (#1072)
@@ -37,6 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - bumped `rustls` 0.23.44 -> 0.23.45 (RUSTSEC-2026-0285: TLS 1.3 handshake messages incorrectly accepted across encryption level boundaries) (#1036)
 - **CI**: `cargo-semver-checks` is advisory-only on PR/push again (was a blocking gate since #945), reverted after it blocked a routine bug-fix PR over an incidental non-breaking `#[must_use]` addition; the weekly scheduled sweep still hard-fails and tracks genuine breaks (resolves #1048) (#1049)
 - **deps-engine, deps-lsp, ci**: closed `deps-lsp`'s last direct dependency on `deps-gitlab-ci` via a new `deps_engine::setup::validate_gitlab_instance_host`, and added a CI guard asserting no ecosystem crate is a *direct* non-dev dependency of `deps-lsp`/`deps-cli` (resolves #1073) (#1079)
+- **docs**: mdBook now publishes to the GitHub Pages site root (`https://bug-ops.github.io/deps-lsp/`) instead of `/book/`; `mdbook.yml`'s now-dead `workflow_run` trigger for the removed `Documentation` workflow is also dropped
 
 ### Removed
 - **CI**: removed the legacy `Documentation` workflow (`.github/workflows/docs.yml`), which deployed `cargo doc` output to the `gh-pages` root with `force_orphan: true` on every Rust-touching push, wiping the mdBook site published by `mdbook.yml` (#1096) each time it ran
