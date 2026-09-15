@@ -346,9 +346,10 @@ impl Ecosystem for PypiEcosystem {
             return Vec::new();
         }
 
-        let Some(base_dir) = uri
-            .to_file_path()
-            .ok()
+        // #1090: routed through `resolve_manifest_file_path` rather than a bare
+        // `to_file_path()` so a non-`file:` scheme or remote-host URI can't resolve a
+        // document-link target against a real local directory.
+        let Some(base_dir) = deps_core::lockfile::resolve_manifest_file_path(uri)
             .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
         else {
             return Vec::new();
@@ -834,6 +835,47 @@ mod tests {
         assert_eq!(
             links[0].tooltip.as_deref(),
             target.to_file_path().unwrap().to_str()
+        );
+    }
+
+    /// #1090: a non-`file:`-scheme (or remote-host `file:`) manifest URI must not resolve a
+    /// document-link target against a real local directory — same guard gap class as
+    /// #1084/#1089's lock file fix, applied here to `generate_document_links`' base
+    /// directory resolution.
+    #[tokio::test]
+    async fn test_generate_document_links_rejects_malicious_uri() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = PypiEcosystem::new(cache);
+        let file_uri = deps_core::test_util::test_uri("/project/requirements.txt");
+        let path_part = file_uri.as_str().strip_prefix("file://").unwrap();
+
+        // `"file://attacker.example"` used to be a second prefix here. It was removed (#1090
+        // guard-gap follow-up): `deps_core::test_util::test_uri` builds a Windows-shaped
+        // absolute path (`C:/...`) on Windows CI, and when the path is
+        // Windows-drive-letter-shaped like that, a `file:` URI with a non-empty host cannot
+        // be represented by a parsed `url::Url` at all — the WHATWG URL Standard's file-host
+        // parsing rule (`SyntaxViolation::FileWithHostAndWindowsDrive`) strips the host
+        // before `generate_document_links` (or any code holding only a `&Url`) can see it, so
+        // that sub-case asserted an unreachable invariant and failed on `windows-latest` CI.
+        // On Unix the path is never drive-letter-shaped, so the host survives parsing and the
+        // per-layer host guard stays live and testable there — this comment only concerns the
+        // Windows-shaped case, not a claim that the guard is dead on every platform. This
+        // exact bypass is guarded and tested platform-independently at the point where
+        // untrusted URIs are first parsed: `deps_lsp::lsp_types_interop::from_lsp_uri`, see
+        // its test `test_from_lsp_uri_rejects_windows_drive_host_bypass`.
+        let prefix = "https://attacker.example";
+        let uri: Url = format!("{prefix}{path_part}").parse().unwrap();
+
+        let parse_result = ecosystem
+            .parse_manifest("-r base.txt\n", &uri)
+            .await
+            .unwrap();
+
+        let links = ecosystem.generate_document_links(parse_result.as_ref(), &uri);
+        assert!(
+            links.is_empty(),
+            "a malicious-scheme/host URI ({prefix}) must not resolve document link targets \
+             against a real directory"
         );
     }
 

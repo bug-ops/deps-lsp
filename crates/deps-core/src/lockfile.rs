@@ -12,6 +12,7 @@ use dashmap::DashMap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
+use url::Url;
 
 /// Maximum depth to search for workspace root lock file.
 const MAX_WORKSPACE_DEPTH: usize = 5;
@@ -190,10 +191,16 @@ where
 /// confirmed empirically: `untitled:/etc/x`, `git:/etc/x`, `vscode-remote:/etc/x` all resolve
 /// via `to_file_path`). The explicit host check here is kept as defense-in-depth alongside the
 /// scheme check, rather than relying solely on `to_file_path`'s own internal host validation,
-/// so both guards are visible at this one call site. Shared by [`locate_lockfile_for_manifest`]
-/// and every ecosystem-local lock file locator that needs the same manifest-path resolution
-/// (e.g. `deps-nuget`'s multi-project fallback) so the guard is defined once, not re-derived per
-/// call site.
+/// so both guards are visible at this one call site. The general-purpose guard for resolving
+/// any client-supplied manifest/document URI to a real filesystem path before touching disk —
+/// not limited to lock file discovery despite living in this module. Shared by
+/// [`locate_lockfile_for_manifest`] and every ecosystem-local lock file locator that needs the
+/// same manifest-path resolution (e.g. `deps-nuget`'s multi-project fallback), as well as
+/// non-lock-file call sites across `deps-cargo`, `deps-nuget`, `deps-pypi`, `deps-npm`,
+/// `deps-gradle`, and `deps-lsp` (workspace-root and config discovery, document links,
+/// cold-start document loading, and watched-file-change handling) that resolve the same kind
+/// of URI for the same reason (#1090) — so the guard is defined once, not re-derived per call
+/// site.
 ///
 /// # Examples
 ///
@@ -211,7 +218,7 @@ where
 /// assert!(resolve_manifest_file_path(&non_file_uri).is_none());
 /// ```
 #[must_use]
-pub fn resolve_manifest_file_path(manifest_uri: &url::Url) -> Option<PathBuf> {
+pub fn resolve_manifest_file_path(manifest_uri: &Url) -> Option<PathBuf> {
     if !manifest_uri.scheme().eq_ignore_ascii_case("file") {
         return None;
     }
@@ -261,7 +268,7 @@ pub fn resolve_manifest_file_path(manifest_uri: &url::Url) -> Option<PathBuf> {
 /// }
 /// ```
 pub fn locate_lockfile_for_manifest(
-    manifest_uri: &url::Url,
+    manifest_uri: &Url,
     lockfile_names: &[&str],
 ) -> Option<PathBuf> {
     let manifest_path = resolve_manifest_file_path(manifest_uri)?;
@@ -570,7 +577,7 @@ pub trait LockFileProvider: Send + Sync {
     /// # Returns
     ///
     /// Path to lock file if found
-    fn locate_lockfile(&self, manifest_uri: &url::Url) -> Option<PathBuf>;
+    fn locate_lockfile(&self, manifest_uri: &Url) -> Option<PathBuf>;
 
     /// Parses a lock file and extracts resolved packages.
     ///
@@ -813,8 +820,8 @@ mod tests {
     /// neither of which is a legal URI path character, so `.parse::<Url>()` fails. Routing
     /// through `Url::from_file_path` first reuses its own drive-letter/separator/percent-
     /// encoding handling, so the resulting string parses on every platform.
-    fn non_file_uri(prefix: &str, manifest_path: &std::path::Path) -> url::Url {
-        let file_uri = url::Url::from_file_path(manifest_path).unwrap();
+    fn non_file_uri(prefix: &str, manifest_path: &std::path::Path) -> Url {
+        let file_uri = Url::from_file_path(manifest_path).unwrap();
         let path_part = file_uri.as_str().strip_prefix("file://").unwrap();
         format!("{prefix}{path_part}").parse().unwrap()
     }
@@ -1329,7 +1336,7 @@ mod tests {
         std::fs::write(&manifest_path, "[package]\nname = \"test\"").unwrap();
         std::fs::write(&lock_path, "version = 4").unwrap();
 
-        let manifest_uri = url::Url::from_file_path(&manifest_path).unwrap();
+        let manifest_uri = Url::from_file_path(&manifest_path).unwrap();
         let located = locate_lockfile_for_manifest(&manifest_uri, &["Cargo.lock"]);
 
         assert!(located.is_some());
@@ -1350,7 +1357,7 @@ mod tests {
         std::fs::write(&workspace_lock, "version = 4").unwrap();
         std::fs::write(&member_manifest, "[package]\nname = \"member\"").unwrap();
 
-        let manifest_uri = url::Url::from_file_path(&member_manifest).unwrap();
+        let manifest_uri = Url::from_file_path(&member_manifest).unwrap();
         let located = locate_lockfile_for_manifest(&manifest_uri, &["Cargo.lock"]);
 
         assert!(located.is_some());
@@ -1373,7 +1380,7 @@ mod tests {
         std::fs::write(&manifest_path, "[package]\nname = \"test\"").unwrap();
         std::fs::create_dir(&lock_path).unwrap();
 
-        let manifest_uri = url::Url::from_file_path(&manifest_path).unwrap();
+        let manifest_uri = Url::from_file_path(&manifest_path).unwrap();
         let located = locate_lockfile_for_manifest(&manifest_uri, &["Cargo.lock"]);
 
         assert!(
@@ -1495,7 +1502,7 @@ mod tests {
         let manifest_path = temp_dir.path().join("Cargo.toml");
         std::fs::write(&manifest_path, "[package]\nname = \"test\"").unwrap();
 
-        let manifest_uri = url::Url::from_file_path(&manifest_path).unwrap();
+        let manifest_uri = Url::from_file_path(&manifest_path).unwrap();
         let located = locate_lockfile_for_manifest(&manifest_uri, &["Cargo.lock"]);
 
         assert!(located.is_none());
@@ -1513,7 +1520,7 @@ mod tests {
         std::fs::write(&manifest_path, "[project]\nname = \"test\"").unwrap();
         std::fs::write(&uv_lock, "version = 1").unwrap();
 
-        let manifest_uri = url::Url::from_file_path(&manifest_path).unwrap();
+        let manifest_uri = Url::from_file_path(&manifest_path).unwrap();
         // poetry.lock doesn't exist, but uv.lock does - should find uv.lock
         let located = locate_lockfile_for_manifest(&manifest_uri, &["poetry.lock", "uv.lock"]);
 
@@ -1541,7 +1548,7 @@ mod tests {
     }
 
     impl LockFileProvider for CountingLockFileProvider {
-        fn locate_lockfile(&self, _manifest_uri: &url::Url) -> Option<PathBuf> {
+        fn locate_lockfile(&self, _manifest_uri: &Url) -> Option<PathBuf> {
             None
         }
 
@@ -1749,7 +1756,7 @@ mod tests {
     }
 
     impl LockFileProvider for RewritingDuringParseProvider {
-        fn locate_lockfile(&self, _manifest_uri: &url::Url) -> Option<PathBuf> {
+        fn locate_lockfile(&self, _manifest_uri: &Url) -> Option<PathBuf> {
             None
         }
 
@@ -1838,7 +1845,7 @@ mod tests {
         std::fs::write(&poetry_lock, "# poetry lock").unwrap();
         std::fs::write(&uv_lock, "version = 1").unwrap();
 
-        let manifest_uri = url::Url::from_file_path(&manifest_path).unwrap();
+        let manifest_uri = Url::from_file_path(&manifest_path).unwrap();
         // Both exist, poetry.lock should be found first (listed first)
         let located = locate_lockfile_for_manifest(&manifest_uri, &["poetry.lock", "uv.lock"]);
 

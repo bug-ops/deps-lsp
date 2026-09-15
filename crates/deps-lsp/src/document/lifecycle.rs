@@ -1244,7 +1244,7 @@ pub async fn ensure_document_loaded(
 
     // Load from disk
     tracing::info!("Loading document from disk (cold start): {:?}", uri);
-    let content = match load_document_from_disk(uri).await {
+    let content = match load_document_from_disk(&domain_uri).await {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!("Failed to load document {:?}: {}", uri, e);
@@ -2188,8 +2188,7 @@ anyhow = "1.0"
         // binary must hold it, not just document/loader.rs's own diffing test.
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let url = deps_core::test_util::test_uri("/nonexistent/Cargo.toml");
-        let uri = crate::lsp_types_interop::to_lsp_uri(&url);
-        let result = load_document_from_disk(&uri).await;
+        let result = load_document_from_disk(&url).await;
 
         assert!(result.is_err(), "Should fail for missing files");
 
@@ -2353,7 +2352,7 @@ serde = "1.0"
             let url = crate::lsp_types_interop::from_lsp_uri(&uri).unwrap();
 
             // Test that load_document_from_disk succeeds
-            let loaded_content = load_document_from_disk(&uri).await.unwrap();
+            let loaded_content = load_document_from_disk(&url).await.unwrap();
             assert_eq!(loaded_content, content);
 
             // Test that parsing succeeds

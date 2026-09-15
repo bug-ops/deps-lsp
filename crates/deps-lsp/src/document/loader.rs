@@ -30,7 +30,7 @@
 //! return empty results rather than crashing).
 
 use deps_core::error::{DepsError, Result};
-use tower_lsp_server::ls_types::Uri;
+use url::Url;
 
 /// Maximum allowed file/document size in bytes (10MB).
 ///
@@ -71,21 +71,22 @@ const LARGE_FILE_THRESHOLD: u64 = 1_000_000; // 1MB
 ///
 /// ```no_run
 /// use deps_lsp::document::load_document_from_disk;
-/// use tower_lsp_server::ls_types::Uri;
+/// use url::Url;
 ///
 /// # async fn example() -> deps_core::error::Result<()> {
-/// let uri = Uri::from_file_path("/path/to/Cargo.toml").unwrap();
+/// let uri = Url::from_file_path("/path/to/Cargo.toml").unwrap();
 /// let content = load_document_from_disk(&uri).await?;
 /// println!("Loaded {} bytes", content.len());
 /// # Ok(())
 /// # }
 /// ```
 #[tracing::instrument(skip_all, fields(uri = ?uri), level = "debug")]
-pub async fn load_document_from_disk(uri: &Uri) -> Result<String> {
-    // Convert URI to filesystem path. Owned (not `Cow::Borrowed`), since the read below runs
-    // in `spawn_blocking` and needs a `'static` path.
-    let path = match uri.to_file_path() {
-        Some(p) => p.into_owned(),
+pub async fn load_document_from_disk(uri: &Url) -> Result<String> {
+    // Convert URI to filesystem path, rejecting a non-`file:` scheme or a non-local host
+    // (#1090) — a bare `to_file_path()` here would silently read real content off disk for
+    // a URI shaped like `untitled:/etc/passwd` or `file://attacker.example/etc/passwd`.
+    let path = match deps_core::lockfile::resolve_manifest_file_path(uri) {
+        Some(p) => p,
         None => {
             tracing::debug!("Cannot load non-file URI: {:?}", uri);
             return Err(DepsError::InvalidUri(format!("{uri:?}")));
@@ -217,7 +218,6 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
-    use tower_lsp_server::ls_types::Uri;
 
     #[tokio::test]
     async fn test_load_existing_file() {
@@ -229,7 +229,7 @@ mod tests {
         temp_file.write_all(content.as_bytes()).unwrap();
         temp_file.flush().unwrap();
 
-        let uri = Uri::from_file_path(temp_file.path()).unwrap();
+        let uri = Url::from_file_path(temp_file.path()).unwrap();
         let loaded = load_document_from_disk(&uri).await.unwrap();
 
         assert_eq!(loaded, content);
@@ -240,9 +240,7 @@ mod tests {
         // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
         // must hold it, not just ones that diff a snapshot.
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;
-        let uri = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
-            "/nonexistent/file/path.toml",
-        ));
+        let uri = deps_core::test_util::test_uri("/nonexistent/file/path.toml");
         let result = load_document_from_disk(&uri).await;
 
         assert!(result.is_err());
@@ -260,15 +258,48 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         // File is empty, don't write anything
 
-        let uri = Uri::from_file_path(temp_file.path()).unwrap();
+        let uri = Url::from_file_path(temp_file.path()).unwrap();
         let loaded = load_document_from_disk(&uri).await.unwrap();
 
         assert_eq!(loaded, "");
     }
 
-    // Note: Tests for non-file URIs (http://, untitled:) are covered by integration tests
-    // Creating non-file URIs in unit tests would require adding fluent_uri as a dev dependency
-    // The implementation correctly handles these cases via to_file_path() returning None
+    /// #1090: a non-`file:`-scheme (or remote-host `file:`) URI whose path names a real,
+    /// existing file must still be rejected — proves the guard, not merely that
+    /// `to_file_path()` already refuses an empty/degenerate path.
+    #[tokio::test]
+    async fn test_load_rejects_malicious_uri_for_real_file() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(b"test content").unwrap();
+        temp_file.flush().unwrap();
+
+        let file_uri = Url::from_file_path(temp_file.path()).unwrap();
+        let path_part = file_uri.as_str().strip_prefix("file://").unwrap();
+
+        // `"file://attacker.example"` used to be a second prefix in this loop. It was removed
+        // (#1090 guard-gap follow-up): when the real temp file's path is
+        // Windows-drive-letter-shaped (`C:\...`, as a real Windows machine's temp directory
+        // is), a `file:` URI with a non-empty host and that path cannot be represented by a
+        // parsed `url::Url` at all — the WHATWG URL Standard's file-host parsing rule
+        // (`SyntaxViolation::FileWithHostAndWindowsDrive`) strips the host before
+        // `load_document_from_disk` (or any code holding only a `&Url`) can see it, so that
+        // sub-case asserted an unreachable invariant and failed on `windows-latest` CI. On
+        // Unix the path is never drive-letter-shaped, so the host survives parsing and the
+        // per-layer host guard stays live and testable there — this comment only concerns the
+        // Windows-shaped case, not a claim that the guard is dead on every platform. This
+        // exact bypass is guarded and tested platform-independently at the point where
+        // untrusted URIs are first parsed: `deps_lsp::lsp_types_interop::from_lsp_uri`, see
+        // its test `test_from_lsp_uri_rejects_windows_drive_host_bypass`.
+        let uri: Url = format!("untitled:{path_part}").parse().unwrap();
+        let result = load_document_from_disk(&uri).await;
+        assert!(
+            matches!(result, Err(DepsError::InvalidUri(_))),
+            "expected InvalidUri for untitled: scheme, got {result:?}"
+        );
+    }
 
     #[tokio::test]
     async fn test_load_utf8_file() {
@@ -280,7 +311,7 @@ mod tests {
         temp_file.write_all(content.as_bytes()).unwrap();
         temp_file.flush().unwrap();
 
-        let uri = Uri::from_file_path(temp_file.path()).unwrap();
+        let uri = Url::from_file_path(temp_file.path()).unwrap();
         let loaded = load_document_from_disk(&uri).await.unwrap();
 
         assert_eq!(loaded, content);
@@ -296,7 +327,7 @@ mod tests {
         temp_file.write_all(&[0xFF, 0xFE, 0xFD]).unwrap();
         temp_file.flush().unwrap();
 
-        let uri = Uri::from_file_path(temp_file.path()).unwrap();
+        let uri = Url::from_file_path(temp_file.path()).unwrap();
         let result = load_document_from_disk(&uri).await;
 
         assert!(result.is_err());
@@ -324,7 +355,7 @@ mod tests {
         perms.set_mode(0o000);
         fs::set_permissions(temp_file.path(), perms.clone()).unwrap();
 
-        let uri = Uri::from_file_path(temp_file.path()).unwrap();
+        let uri = Url::from_file_path(temp_file.path()).unwrap();
         let result = load_document_from_disk(&uri).await;
 
         // Restore permissions for cleanup
@@ -351,7 +382,7 @@ mod tests {
         temp_file.write_all(content.as_bytes()).unwrap();
         temp_file.flush().unwrap();
 
-        let uri = Uri::from_file_path(temp_file.path()).unwrap();
+        let uri = Url::from_file_path(temp_file.path()).unwrap();
         let loaded = load_document_from_disk(&uri).await.unwrap();
 
         assert_eq!(loaded.len(), 1000);
@@ -373,7 +404,7 @@ serde = "1.0"
         temp_file.write_all(content.as_bytes()).unwrap();
         temp_file.flush().unwrap();
 
-        let uri = Uri::from_file_path(temp_file.path()).unwrap();
+        let uri = Url::from_file_path(temp_file.path()).unwrap();
         let loaded = load_document_from_disk(&uri).await.unwrap();
 
         assert_eq!(loaded, content);
@@ -403,7 +434,7 @@ serde = "1.0"
         std::fs::write(&target, "[dependencies]").unwrap();
         symlink(&target, &link).unwrap();
 
-        let uri = Uri::from_file_path(&link).unwrap();
+        let uri = Url::from_file_path(&link).unwrap();
         let content = load_document_from_disk(&uri).await.unwrap();
         assert_eq!(content, "[dependencies]");
     }
@@ -424,7 +455,7 @@ serde = "1.0"
         symlink(&link2, &link1).unwrap();
         symlink(&link1, &link2).unwrap();
 
-        let uri = Uri::from_file_path(&link1).unwrap();
+        let uri = Url::from_file_path(&link1).unwrap();
         let result = load_document_from_disk(&uri).await;
         assert!(result.is_err(), "Circular symlink should fail");
     }
@@ -452,7 +483,7 @@ serde = "1.0"
             "mkfifo must succeed for this test to be meaningful"
         );
 
-        let uri = Uri::from_file_path(&fifo_path).unwrap();
+        let uri = Url::from_file_path(&fifo_path).unwrap();
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             load_document_from_disk(&uri),
@@ -502,7 +533,7 @@ serde = "1.0"
             let beyond_limit = MAX_FILE_SIZE + 1;
             file.write_at(b"x", beyond_limit).unwrap();
 
-            let uri = Uri::from_file_path(&large_file).unwrap();
+            let uri = Url::from_file_path(&large_file).unwrap();
             let result = load_document_from_disk(&uri).await;
 
             assert!(result.is_err(), "Should reject files > MAX_FILE_SIZE");
@@ -537,7 +568,7 @@ serde = "1.0"
         let content = "a".repeat(MAX_FILE_SIZE as usize);
         std::fs::write(&path, &content).unwrap();
 
-        let uri = Uri::from_file_path(&path).unwrap();
+        let uri = Url::from_file_path(&path).unwrap();
         let loaded = load_document_from_disk(&uri).await.unwrap();
 
         assert_eq!(loaded.len(), MAX_FILE_SIZE as usize);
@@ -553,7 +584,7 @@ serde = "1.0"
         temp_file.write_all(b"test content").unwrap();
         temp_file.flush().unwrap();
 
-        let uri = Uri::from_file_path(temp_file.path()).unwrap();
+        let uri = Url::from_file_path(temp_file.path()).unwrap();
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let (_, reads_before) = deps_core::fs_probe::snapshot();
         load_document_from_disk(&uri).await.unwrap();

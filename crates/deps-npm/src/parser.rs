@@ -156,21 +156,20 @@ pub fn parse_package_json_with_context(
     // URI land on `CatalogOutcome::NoWorkspaceFile` rather than skipping resolution).
     //
     // Implementation-critique S2 (originally written against `ls_types::Uri`, whose
-    // `to_file_path` does **not** check scheme and decodes whatever path component is present
-    // regardless — see this file's `tests` module doc comments for the exact divergence flagged
-    // to team-lead, and empirically verified by security review, during the issue #1071
-    // `url::Url` migration): `url::Url::to_file_path` checks only cannot-be-a-base and host,
-    // never the scheme — so the explicit `file`-scheme check here is load-bearing, not
-    // belt-and-suspenders (`untitled:/etc/x`, `git:/etc/x`, `vscode-remote:/etc/x` all resolve
-    // to `Ok("/etc/x")` under `url::Url`, scheme notwithstanding). `is_absolute()` is retained
-    // because it still rejects the Windows authority-less non-drive-letter form.
-    let manifest_dir = uri
-        .scheme()
-        .eq_ignore_ascii_case("file")
-        .then(|| uri.to_file_path().ok())
-        .flatten()
-        .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
-        .filter(|dir| dir.is_absolute());
+    // `to_file_path` does **not** check scheme and, on non-Windows, ignores the
+    // authority/host entirely — see this file's `tests` module doc comments for the exact
+    // divergence flagged to team-lead, and empirically verified by security review, during
+    // the issue #1071 `url::Url` migration): `url::Url::to_file_path` already refuses a
+    // non-empty, non-`localhost` host on its own, but resolving through
+    // `deps_core::lockfile::resolve_manifest_file_path` also makes the scheme check explicit
+    // rather than relying solely on `to_file_path`'s internal validation — left unguarded,
+    // `untitled:package.json` (VS Code's untitled-buffer form, path "package.json") would
+    // resolve `manifest_dir` to a *relative* path, and `.npmrc`/pnpm-workspace discovery would
+    // then probe the LSP server process's own CWD instead of the workspace the document
+    // notionally belongs to (#1090). Both `.npmrc` registry resolution and the catalog gate
+    // share this one `manifest_dir`, so gating it once here via the shared guard closes both.
+    let manifest_dir = deps_core::lockfile::resolve_manifest_file_path(uri)
+        .and_then(|path| path.parent().map(std::path::Path::to_path_buf));
 
     let npm_config: NpmConfig = manifest_dir
         .as_deref()
@@ -1241,6 +1240,58 @@ mod tests {
             react.catalog.as_ref().map(|origin| &origin.outcome),
             Some(crate::catalog::CatalogOutcome::NoWorkspaceFile)
         );
+    }
+
+    /// #1090 regression: the pre-fix hand-rolled `manifest_dir` guard only checked
+    /// `scheme() == "file"` and `is_absolute()`, missing a `file://` URI carrying a remote
+    /// host. Uses a real on-disk `pnpm-workspace.yaml` that a bypass would have found, to
+    /// prove the guard — not just an absent-directory coincidence — is what blocks it.
+    ///
+    /// `#[cfg(unix)]` (guard-gap follow-up): when the manifest's real absolute path is
+    /// Windows-drive-letter-shaped (`C:\...`, as `tempfile::tempdir()` produces on a real
+    /// Windows machine), a `file:` URI with a non-empty host and that path cannot be
+    /// represented by a parsed `url::Url` at all — the WHATWG URL Standard's file-host
+    /// parsing rule (`SyntaxViolation::FileWithHostAndWindowsDrive`) strips the host before
+    /// `manifest_dir`'s scheme/host check (or any code holding only a `&Url`) can see it, so
+    /// this exact fixture asserted an unreachable invariant and failed on `windows-latest`
+    /// CI. On Unix the path is never drive-letter-shaped, so the host survives parsing and
+    /// this test still protects the guard from silently regressing (wiring-drift coverage).
+    /// The drive-letter bypass itself is guarded and tested platform-independently at the
+    /// point where untrusted URIs are first parsed:
+    /// `deps_lsp::lsp_types_interop::from_lsp_uri`, see its test
+    /// `test_from_lsp_uri_rejects_windows_drive_host_bypass`.
+    #[cfg(unix)]
+    #[test]
+    fn test_parse_with_context_file_scheme_remote_host_is_rejected() {
+        // See the comment in `test_parse_with_context_top_level_override_and_scope_override_coexist`
+        // on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("pnpm-workspace.yaml"),
+            "catalog:\n  react: ^18.3.0\n",
+        )
+        .unwrap();
+        let manifest_path = root.path().join("package.json");
+        let file_uri = Url::from_file_path(&manifest_path).unwrap();
+        let path_part = file_uri.as_str().strip_prefix("file://").unwrap();
+        let uri: Url = format!("file://attacker.example{path_part}")
+            .parse()
+            .unwrap();
+
+        let json = r#"{"dependencies": {"react": "catalog:"}}"#;
+        let result = parse_package_json_with_context(json, &uri, &all_policy()).unwrap();
+
+        let react = &result.dependencies[0];
+        assert_eq!(
+            react.version_req, None,
+            "a remote-host file: URI must never resolve a real workspace file"
+        );
+        assert_matches!(
+            react.catalog.as_ref().map(|origin| &origin.outcome),
+            Some(crate::catalog::CatalogOutcome::NoWorkspaceFile)
+        );
+        assert_eq!(react.source, deps_core::parser::DependencySource::Registry);
     }
 
     /// S2 regression, originally written against `ls_types::Uri`: a `file:` URI whose path is
