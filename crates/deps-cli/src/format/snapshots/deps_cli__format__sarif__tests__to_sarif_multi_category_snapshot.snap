@@ -6,6 +6,9 @@ expression: to_sarif(&report)
   "$schema": "https://schemastore.azurewebsites.net/schemas/json/sarif-2.1.0.json",
   "runs": [
     {
+      "automationDetails": {
+        "id": "[automation_id]"
+      },
       "results": [
         {
           "level": "note",
@@ -26,6 +29,9 @@ expression: to_sarif(&report)
           ],
           "message": {
             "text": "Newer version available: 1.1.0"
+          },
+          "partialFingerprints": {
+            "depsCli/v1": "Cargo.toml|serde|outdated|0"
           },
           "ruleId": "outdated",
           "ruleIndex": 0
@@ -50,6 +56,9 @@ expression: to_sarif(&report)
           "message": {
             "text": "Newer version available: 1.1.0"
           },
+          "partialFingerprints": {
+            "depsCli/v1": "Cargo.toml|serde|vulnerable|0"
+          },
           "ruleId": "vulnerable",
           "ruleIndex": 1
         }
@@ -60,10 +69,18 @@ expression: to_sarif(&report)
           "name": "deps-cli",
           "rules": [
             {
-              "id": "outdated"
+              "id": "outdated",
+              "name": "outdated",
+              "shortDescription": {
+                "text": "A newer version is published for the dependency's declared requirement."
+              }
             },
             {
-              "id": "vulnerable"
+              "id": "vulnerable",
+              "name": "vulnerable",
+              "shortDescription": {
+                "text": "A known security advisory affects the in-use version."
+              }
             }
           ],
           "version": "1.0.0"

@@ -999,8 +999,9 @@ pub(super) struct OsvEvent {
 }
 
 /// Returns `true` if `id` matches OSV's advisory id grammar
-/// (`[A-Za-z0-9._-]+`, non-empty, capped at 128 bytes) — the same alphabet
-/// every real id scheme in this space uses (`RUSTSEC-2020-0071`,
+/// (`[A-Za-z0-9._-]+`, non-empty, capped at 128 bytes).
+///
+/// The same alphabet every real id scheme in this space uses (`RUSTSEC-2020-0071`,
 /// `GHSA-xxxx-yyyy-zzzz`, `CVE-2020-26235`); real ids are a few dozen
 /// characters, so the cap exists only to bound how much of a record-supplied
 /// string can ride along into `Diagnostic.code`, hover markdown, and a
@@ -1010,12 +1011,36 @@ pub(super) struct OsvEvent {
 /// ever reaching either — rejecting it here means every downstream consumer
 /// can treat `Advisory.id` as inherently safe, rather than needing to
 /// sanitize it again at each render site.
-fn is_valid_osv_id(id: &str) -> bool {
+///
+/// The bare character class alone is not sufficient (issue #1077 review): `.` is an allowed
+/// character (real ids can contain it), so a lone `id` of exactly `"."` or `".."` — RFC 3986's
+/// two dot-segments — would otherwise still pass, and `https://osv.dev/vulnerability/..`
+/// normalizes (`remove_dot_segments`) to `https://osv.dev/`, walking a consumer's link up and
+/// out of `/vulnerability/` without `id` ever containing a literal `/`. Both are rejected as an
+/// explicit special case.
+pub fn is_valid_osv_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
+        && id != "."
+        && id != ".."
         && id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// Builds `https://osv.dev/vulnerability/{id}`, or `None` if `id` fails [`is_valid_osv_id`].
+///
+/// The single validated construction path for this URL (issue #1077 review): used by
+/// `OsvVulnRecord::into_advisory` to build [`Advisory::url`], and reusable by any downstream
+/// consumer that only has a bare advisory-id *string* (not a whole [`Advisory`]) and needs to
+/// independently confirm it is safe to embed as a URI path segment before doing so — e.g.
+/// `deps-cli`'s SARIF `helpUri`, which cannot assume every `code` string it sees necessarily
+/// went through this crate's own OSV-response parsing (`crate::report::classify`'s documented
+/// "any unrecognized diagnostic code -> Vulnerable" fallback can hand it a string this crate
+/// never validated at all).
+#[must_use]
+pub fn validated_osv_url(id: &str) -> Option<String> {
+    is_valid_osv_id(id).then(|| format!("https://osv.dev/vulnerability/{id}"))
 }
 
 impl OsvVulnRecord {
@@ -1106,7 +1131,11 @@ impl OsvVulnRecord {
         fixed_versions.sort_by(|a, b| super::compare_version_strings(a, b));
         fixed_versions.dedup();
 
-        let url = format!("https://osv.dev/vulnerability/{}", self.id);
+        // `is_valid_osv_id(&self.id)` already passed (the early return above), so this can
+        // never actually fail — going through the shared `validated_osv_url` anyway keeps one
+        // single formula for this URL rather than a second, independent `format!` that could
+        // drift out of sync with it.
+        let url = validated_osv_url(&self.id)?;
 
         Some(Advisory {
             id: self.id,
@@ -1309,6 +1338,54 @@ mod osv_version_validation_tests {
         let long_id = "A".repeat(129);
         assert!(!is_valid_osv_id(&long_id));
         assert!(is_valid_osv_id(&"A".repeat(128)));
+    }
+
+    /// Regression test for issue #1077 review: `.`/`..` pass the bare character-class
+    /// allowlist (`.` is an allowed character) but are RFC 3986 dot-segments that would
+    /// normalize `https://osv.dev/vulnerability/{id}` up and out of `/vulnerability/`.
+    #[test]
+    fn is_valid_osv_id_rejects_dot_segments() {
+        assert!(!is_valid_osv_id("."));
+        assert!(!is_valid_osv_id(".."));
+        // A real id containing dots (but not equal to a bare dot-segment) is still valid.
+        assert!(is_valid_osv_id("RUSTSEC-2020-0071"));
+    }
+
+    #[test]
+    fn validated_osv_url_builds_the_expected_url_for_a_valid_id() {
+        assert_eq!(
+            validated_osv_url("RUSTSEC-2020-0071"),
+            Some("https://osv.dev/vulnerability/RUSTSEC-2020-0071".to_string())
+        );
+    }
+
+    #[test]
+    fn validated_osv_url_rejects_a_dot_segment_id() {
+        assert_eq!(validated_osv_url(".."), None);
+    }
+
+    #[test]
+    fn validated_osv_url_rejects_an_id_containing_a_slash() {
+        // A `/` is not in the allowlist, so a multi-segment traversal attempt embedded in the
+        // id (e.g. `../evil`) can never reach `Uri` parsing in the first place.
+        assert_eq!(validated_osv_url("../evil"), None);
+    }
+
+    /// Regression test for issue #1077 review: a record whose id is a dot-segment must be
+    /// dropped by `into_advisory` itself (same as any other malformed id), not merely have a
+    /// bad `helpUri` built from it somewhere downstream.
+    #[test]
+    fn into_advisory_drops_a_record_whose_id_is_a_dot_segment() {
+        let record = OsvVulnRecord {
+            id: "..".to_string(),
+            modified: "2023-01-01T00:00:00Z".to_string(),
+            summary: None,
+            aliases: vec![],
+            severity: vec![],
+            database_specific: None,
+            affected: vec![],
+        };
+        assert!(record.into_advisory("pkg", "crates.io").is_none());
     }
 
     #[test]

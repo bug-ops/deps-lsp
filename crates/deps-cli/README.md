@@ -150,6 +150,15 @@ workflow's decision — shown above — whether to fail the build on it. See
 [`crates/github-action/README.md`](../github-action/README.md) for the full input/output
 reference.
 
+> [!NOTE]
+> Piping stdout directly to a file, as in `deps-cli check --format sarif > results.sarif`
+> above, is at risk of truncation if `deps-cli` crashes mid-write — a partial SARIF file handed
+> to `upload-sarif` fails confusingly rather than cleanly. The GitHub Action wrapper does not
+> have this risk: it captures `deps-cli`'s exit code before deciding whether `sarif-file` is
+> set, so a crash (exit code `2`) leaves `sarif-file` unset instead of pointing at a truncated
+> file (#1063). Prefer the Action, or apply the same exit-code check yourself, when scripting
+> the CLI form directly in CI.
+
 ## Configuration
 
 `deps-cli` reuses `deps-lsp`'s own [`PolicyConfig`](../deps-core/src/policy_config.rs) schema,

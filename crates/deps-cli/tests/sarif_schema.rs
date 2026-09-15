@@ -11,6 +11,7 @@
 use deps_cli::format::sarif::to_sarif;
 use deps_cli::report::{Category, CheckFinding, CheckReport};
 use deps_core::EcosystemId;
+use deps_core::osv::VulnSeverity;
 use std::path::PathBuf;
 use tower_lsp_server::ls_types::{DiagnosticSeverity, Position, Range};
 
@@ -62,6 +63,9 @@ fn finding(category: Category, severity: DiagnosticSeverity) -> CheckFinding {
         dependency_name: Some("serde".to_string()),
         requirement: Some("1.0".to_string()),
         category,
+        code: None,
+        advisory_url: None,
+        advisory_severity: None,
         severity,
         range: Range::new(Position::new(4, 0), Position::new(4, 10)),
         message: "Newer version available: 1.1.0".to_string(),
@@ -100,5 +104,29 @@ fn test_multi_category_report_produces_schema_valid_sarif() {
             finding(Category::License, DiagnosticSeverity::WARNING),
             finding(Category::Other, DiagnosticSeverity::INFORMATION),
         ],
+    });
+}
+
+#[test]
+fn test_advisory_coded_finding_produces_schema_valid_sarif() {
+    let mut vulnerable = finding(Category::Vulnerable, DiagnosticSeverity::ERROR);
+    vulnerable.code = Some("RUSTSEC-2020-0071".to_string());
+    vulnerable.message = "RUSTSEC-2020-0071: Potential segfault in the time crate".to_string();
+    vulnerable.advisory_url = Some("https://osv.dev/vulnerability/RUSTSEC-2020-0071".to_string());
+    vulnerable.advisory_severity = Some(VulnSeverity::High);
+    assert_valid_sarif(&CheckReport {
+        findings: vec![vulnerable],
+    });
+}
+
+/// Regression test for issue #1077 MEDIUM security review: a malformed advisory `code` (one
+/// that would produce an invalid `helpUri`) must not break the *whole* SARIF document's
+/// schema validation — the offending `helpUri` must be omitted, not emitted unvalidated.
+#[test]
+fn test_malformed_advisory_id_does_not_break_schema_validation() {
+    let mut vulnerable = finding(Category::Vulnerable, DiagnosticSeverity::ERROR);
+    vulnerable.code = Some("evil id\nwith\"quotes and spaces".to_string());
+    assert_valid_sarif(&CheckReport {
+        findings: vec![vulnerable],
     });
 }
