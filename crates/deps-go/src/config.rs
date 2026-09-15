@@ -925,7 +925,7 @@ pub struct GoParseContext {
     /// The resolved `$GOENV` path to consult, if any — resolved once by the caller rather
     /// than looked up internally, so nothing in this crate reads the live host environment
     /// implicitly (spec 034 follow-up C3/C4, issue #559). Production callers
-    /// (`crate::lib::register_ecosystems`) pass [`goenv_path`]'s result; tests pass a fixture
+    /// (`deps_engine::setup::register_ecosystems`) pass [`goenv_path`]'s result; tests pass a fixture
     /// path. `None` — the [`Default`] value — means "no `$GOENV` file", the same hermetic,
     /// zero-host-read behavior [`crate::parser::parse_go_mod`]'s doc already promises.
     pub goenv_path: Option<PathBuf>,

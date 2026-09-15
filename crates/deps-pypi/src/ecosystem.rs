@@ -61,7 +61,7 @@ pub struct PypiEcosystem {
     /// The reachability policy every `parse_manifest` call threads through to
     /// [`PypiParser::parse_content_with_policy`]/[`PypiParser::parse_requirements_with_policy`]
     /// (spec FR-008). Defaulted to `RegistryAccessPolicy::default()` by [`Self::new`]; set
-    /// explicitly by [`Self::with_policy`] so `crate::lib::register_ecosystems`-equivalent
+    /// explicitly by [`Self::with_policy`] so `deps_engine::setup::register_ecosystems`-equivalent
     /// wiring in `deps-lsp` can share one process-wide `Arc<RegistryAccessPolicy>` handle
     /// with `ServerState`, mirroring `deps_npm::ecosystem::NpmEcosystem`'s identical `context`
     /// field.
@@ -81,7 +81,7 @@ impl PypiEcosystem {
 
     /// Creates a new PyPI ecosystem around an existing [`PypiRegistry`] instance, sharing
     /// `policy`'s live reachability setting — the production constructor, used by
-    /// `deps-lsp`'s `register_ecosystems` so `initialize`/`workspace/didChangeConfiguration`
+    /// `deps_engine::setup::register_ecosystems` so `initialize`/`workspace/didChangeConfiguration`
     /// updating the same `Arc<RegistryAccessPolicy>` takes effect immediately, with no need
     /// to reconstruct the ecosystem.
     #[must_use]

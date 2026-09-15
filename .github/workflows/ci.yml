@@ -229,11 +229,52 @@ jobs:
         # The `ctl` self-check (test-util IS expected with dev-deps included) guards
         # against a `cargo tree` failure or output-format drift silently no-op'ing
         # this step: without it, an empty `tree` on either branch would pass.
+        #
+        # deps-engine (issue #1058) sits between the driving adapters and the ecosystem
+        # crates and is a new potential leak path for the same carve-out, so it gets the
+        # identical pair of checks.
         run: |
           tree=$(cargo tree -p deps-lsp -e features,no-dev)
           ctl=$(cargo tree -p deps-lsp -e features)
           grep -q 'feature "test-util"' <<<"$ctl" || { echo "::error::guard self-check failed"; exit 1; }
           grep -q 'feature "test-util"' <<<"$tree" && { echo "::error::deps-core's test-util feature is reachable from deps-lsp's non-dev dependency tree"; exit 1; }
+
+          engine_tree=$(cargo tree -p deps-engine -e features,no-dev)
+          engine_ctl=$(cargo tree -p deps-engine -e features)
+          grep -q 'feature "test-util"' <<<"$engine_ctl" || { echo "::error::guard self-check failed for deps-engine"; exit 1; }
+          grep -q 'feature "test-util"' <<<"$engine_tree" && { echo "::error::deps-core's test-util feature is reachable from deps-engine's non-dev dependency tree"; exit 1; }
+
+          exit 0
+
+      - name: Guard against driving-adapter crates depending on each other
+        # The design's core invariant (issue #1058, architecture-decision.md §3.1): no
+        # driving-adapter crate (deps-lsp today; deps-cli/deps-mcp once they exist) may
+        # appear in another driving adapter's dependency tree. deps-cli/deps-mcp don't
+        # exist yet — added by later PRs — so only the checkable half of the invariant
+        # (deps-lsp's own tree) runs today; add each new adapter crate to `adapters` below,
+        # and its own symmetric `cargo tree -p <adapter> -e no-dev` check, once it exists.
+        #
+        # The positive control (mirroring the test-util guard above) proves this detection
+        # mechanism actually works, using a crate name (`deps-core`) known to be in the tree
+        # today — an empty/malformed `cargo tree` output must not silently pass this guard.
+        # The match itself is boundary-anchored on non-identifier characters (not `grep -w`'s
+        # `\b`, which treats `-` as a boundary) so `deps-cli` cannot false-positive on a
+        # hypothetical `deps-cli-utils` crate.
+        run: |
+          adapters=(deps-cli deps-mcp)
+          tree=$(cargo tree -p deps-lsp -e no-dev)
+
+          if ! grep -qE '(^|[^A-Za-z0-9._-])deps-core([^A-Za-z0-9._-]|$)' <<<"$tree"; then
+            echo "::error::guard self-check failed: deps-core not found in deps-lsp's own tree"
+            exit 1
+          fi
+
+          for adapter in "${adapters[@]}"; do
+            if grep -qE "(^|[^A-Za-z0-9._-])${adapter}([^A-Za-z0-9._-]|\$)" <<<"$tree"; then
+              echo "::error::deps-lsp's dependency tree unexpectedly includes driving adapter $adapter"
+              exit 1
+            fi
+          done
           exit 0
 
   semver:

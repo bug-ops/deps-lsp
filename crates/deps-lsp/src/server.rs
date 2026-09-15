@@ -518,17 +518,21 @@ impl LanguageServer for Backend {
             && let Some(config) = parse_config(init_options)
         {
             tracing::debug!("loaded configuration: {:?}", config);
+            // `resolve()` (issue #1058 T009) is the single derivation of these three values,
+            // shared with `did_change_configuration` below and with
+            // `deps_engine::setup::EcosystemRuntime::from_policy` — only the side-effect
+            // application here (state/cache writes, the gitlab warning) is adapter-specific
+            // and stays.
+            let resolved = config.policy.registries.resolve();
             self.state
                 .cache
-                .set_registry_policy(config.policy.registries.workspace_registries.to_policy());
+                .set_registry_policy(resolved.workspace_registries);
             self.state.nuget_user_profile_sources.store(
-                config.policy.registries.nuget_user_profile_sources,
+                resolved.nuget_user_profile_sources,
                 std::sync::atomic::Ordering::Relaxed,
             );
-            let gitlab_instance_host = (!config.policy.registries.gitlab_instance_host.is_empty())
-                .then(|| config.policy.registries.gitlab_instance_host.clone());
             #[cfg(feature = "gitlab-ci")]
-            if let Some(raw) = &gitlab_instance_host {
+            if let Some(raw) = &resolved.gitlab_instance_host {
                 warn_if_gitlab_instance_host_invalid(
                     &self.client,
                     raw,
@@ -543,7 +547,7 @@ impl LanguageServer for Backend {
                 // The write below is a single infallible assignment, so this lock can
                 // never actually be poisoned; recover rather than propagate for
                 // defense in depth.
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = gitlab_instance_host;
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = resolved.gitlab_instance_host;
             self.state.cache.set_offline(config.policy.network.offline);
             self.state
                 .cache
@@ -708,13 +712,16 @@ impl LanguageServer for Backend {
         // update, no other task can observe `self.config` already reflecting the new
         // value while the policy `Arc` (the thing that actually gates a fetch) still
         // reflects the old one.
-        let workspace_registries_policy = config.policy.registries.workspace_registries.to_policy();
-        let nuget_user_profile_sources = config.policy.registries.nuget_user_profile_sources;
+        //
+        // `resolve()` (issue #1058 T009) is the single derivation of the three
+        // registry-related values, shared with `initialize` above and with
+        // `deps_engine::setup::EcosystemRuntime::from_policy` — only the side-effect
+        // application below (state/cache writes, the gitlab warning) is adapter-specific
+        // and stays.
+        let resolved = config.policy.registries.resolve();
         let offline = config.policy.network.offline;
         let cache_enabled = config.policy.cache.enabled;
         let cold_start_rate_limit_ms = config.cold_start.rate_limit_ms;
-        let gitlab_instance_host = (!config.policy.registries.gitlab_instance_host.is_empty())
-            .then(|| config.policy.registries.gitlab_instance_host.clone());
         // Issue #660/#661 critic C1: see the mirroring call after the config swap below.
         let license_policy = config.policy.license_policy.to_policy();
 
@@ -735,13 +742,13 @@ impl LanguageServer for Backend {
 
         self.state
             .cache
-            .set_registry_policy(workspace_registries_policy);
+            .set_registry_policy(resolved.workspace_registries);
         self.state.nuget_user_profile_sources.store(
-            nuget_user_profile_sources,
+            resolved.nuget_user_profile_sources,
             std::sync::atomic::Ordering::Relaxed,
         );
         #[cfg(feature = "gitlab-ci")]
-        if let Some(raw) = &gitlab_instance_host {
+        if let Some(raw) = &resolved.gitlab_instance_host {
             warn_if_gitlab_instance_host_invalid(&self.client, raw, &self.state.registry_policy)
                 .await;
         }
@@ -752,7 +759,7 @@ impl LanguageServer for Backend {
             // The write below is a single infallible assignment, so this lock can
             // never actually be poisoned; recover rather than propagate for defense
             // in depth.
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = gitlab_instance_host;
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = resolved.gitlab_instance_host;
         // Must land before either refresh notification below, or the refresh re-renders
         // diagnostics under the stale flag values (critic M5).
         self.state.cache.set_offline(offline);

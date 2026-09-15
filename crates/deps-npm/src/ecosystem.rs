@@ -35,7 +35,7 @@ pub struct NpmEcosystem {
     /// The reachability policy and `.npmrc` memoization cache (spec FR-012) every
     /// `parse_manifest` call threads through to
     /// [`crate::parser::parse_package_json_with_context`]. Defaulted by [`Self::new`]; set
-    /// explicitly by [`Self::with_context`] so `crate::lib::register_ecosystems` can share
+    /// explicitly by [`Self::with_context`] so `deps_engine::setup::register_ecosystems` can share
     /// one process-wide policy handle with `ServerState` (mirrors
     /// `deps_cargo::ecosystem::CargoEcosystem`'s identical `context` field).
     context: NpmParseContext,
@@ -64,7 +64,7 @@ impl NpmEcosystem {
 
     /// Creates a new npm ecosystem sharing `ctx`'s reachability policy and `.npmrc`
     /// memoization cache, around an existing [`NpmRegistry`] instance (#312) — the production
-    /// constructor, used by `crate::lib::register_ecosystems` so
+    /// constructor, used by `deps_engine::setup::register_ecosystems` so
     /// `initialize`/`workspace/didChangeConfiguration` can update the same
     /// `Arc<RegistryAccessPolicy>` this ecosystem's every parse reads, and so `deps-deno` can
     /// share one `NpmRegistry` (and thus one freshness-path publish-time cache) with this

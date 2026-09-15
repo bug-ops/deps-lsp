@@ -696,7 +696,17 @@ struct PendingReparse {
 impl ServerState {
     /// Creates a new server state with default configuration.
     pub fn new() -> Self {
-        let registry_policy = Arc::new(RegistryAccessPolicy::default());
+        // `EcosystemRuntime::from_policy` (issue #1058 T009) replaces this constructor's own
+        // hand-built `EcosystemRuntime::new(...)` call; `PolicyConfig::default()` reproduces
+        // the exact same defaults (`RegistryAccessPolicy`'s own `Default` resolves to the same
+        // `WorkspaceRegistryAccess::PublicOnly` as `PolicyConfig::default()`'s
+        // `registries.workspace_registries`).
+        let runtime = crate::EcosystemRuntime::from_policy(
+            &deps_core::policy_config::PolicyConfig::default(),
+        );
+        let registry_policy = Arc::clone(&runtime.policy);
+        let nuget_user_profile_sources = Arc::clone(&runtime.nuget_user_profile_sources);
+        let gitlab_instance_host = Arc::clone(&runtime.gitlab_instance_host);
         // `HttpCache::with_policy` (not `HttpCache::new`) so this server's one long-lived cache
         // shares the same policy handle `register_ecosystems` hands to `CargoEcosystem` below —
         // issue #455's workspace-tier connect-time guard needs the live policy, not a
@@ -706,19 +716,10 @@ impl ServerState {
         let deps_dev = Arc::new(DepsDevClient::new(Arc::clone(&cache)));
         let lockfile_cache = Arc::new(LockFileCache::new());
         let ecosystem_registry = Arc::new(EcosystemRegistry::new());
-        let nuget_user_profile_sources = Arc::new(AtomicBool::new(false));
-        let gitlab_instance_host = Arc::new(RwLock::new(None));
 
         // Register ecosystems based on enabled features
-        let workspace_registry_ecosystems = crate::register_ecosystems(
-            &ecosystem_registry,
-            Arc::clone(&cache),
-            &crate::EcosystemRuntime::new(
-                Arc::clone(&registry_policy),
-                Arc::clone(&nuget_user_profile_sources),
-                Arc::clone(&gitlab_instance_host),
-            ),
-        );
+        let workspace_registry_ecosystems =
+            crate::register_ecosystems(&ecosystem_registry, Arc::clone(&cache), &runtime);
 
         // Default interval, live-updated by `set_min_interval` once `initialize`/
         // `did_change_configuration` parses a real `cold_start.rate_limit_ms` (issue

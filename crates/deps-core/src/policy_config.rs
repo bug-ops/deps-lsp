@@ -708,6 +708,54 @@ impl std::fmt::Debug for RegistriesConfig {
     }
 }
 
+/// The three live-updatable settings [`RegistriesConfig::resolve`] derives from a config
+/// snapshot.
+///
+/// Every consumer that needs to turn a [`RegistriesConfig`] into runtime-usable values
+/// (`deps_engine::setup::EcosystemRuntime::from_policy`, and `deps-lsp`'s two config-reload
+/// call sites in `initialize`/`did_change_configuration`) shares this one derivation instead
+/// of each re-deriving `gitlab_instance_host`'s empty-string-to-`None` normalization
+/// independently — three copies of that normalization is exactly the kind of drift-prone
+/// duplication issue #1058 (T009) found and closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistryRuntimeSettings {
+    /// Resolved workspace-registry access policy — see [`WorkspaceRegistriesSetting::to_policy`].
+    pub workspace_registries: crate::net_policy::WorkspaceRegistryAccess,
+    /// See [`RegistriesConfig::nuget_user_profile_sources`].
+    pub nuget_user_profile_sources: bool,
+    /// See [`RegistriesConfig::gitlab_instance_host`] — normalized from an empty string to
+    /// `None`.
+    pub gitlab_instance_host: Option<String>,
+}
+
+impl RegistriesConfig {
+    /// Derives the three live-updatable settings this section resolves into.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::net_policy::WorkspaceRegistryAccess;
+    /// use deps_core::policy_config::RegistriesConfig;
+    ///
+    /// let config = RegistriesConfig {
+    ///     gitlab_instance_host: "gitlab.corp".to_string(),
+    ///     ..RegistriesConfig::default()
+    /// };
+    /// let resolved = config.resolve();
+    /// assert_eq!(resolved.workspace_registries, WorkspaceRegistryAccess::PublicOnly);
+    /// assert_eq!(resolved.gitlab_instance_host.as_deref(), Some("gitlab.corp"));
+    /// ```
+    #[must_use]
+    pub fn resolve(&self) -> RegistryRuntimeSettings {
+        RegistryRuntimeSettings {
+            workspace_registries: self.workspace_registries.to_policy(),
+            nuget_user_profile_sources: self.nuget_user_profile_sources,
+            gitlab_instance_host: (!self.gitlab_instance_host.is_empty())
+                .then(|| self.gitlab_instance_host.clone()),
+        }
+    }
+}
+
 /// Controls which workspace-declared registry index hosts this LSP will ever fetch.
 ///
 /// Shared by every ecosystem with a workspace-declared-registry concept (spec #443,
@@ -979,6 +1027,46 @@ mod tests {
         assert_eq!(
             WorkspaceRegistriesSetting::All.to_policy(),
             WorkspaceRegistryAccess::All
+        );
+    }
+
+    /// #1058 M1: `WorkspaceRegistryAccess::default()` (`net_policy.rs`) and
+    /// `WorkspaceRegistriesSetting::default()` (this module) are two independent `#[default]`
+    /// derives that must resolve to the same policy — `ServerState::new`'s
+    /// `EcosystemRuntime::from_policy(&PolicyConfig::default())` relies on this equivalence to
+    /// reproduce the same defaults its old hand-built `RegistryAccessPolicy::default()` call
+    /// had. Nothing else catches the two drifting apart; this test does.
+    #[test]
+    fn test_workspace_registry_access_default_matches_workspace_registries_setting_default() {
+        assert_eq!(
+            crate::net_policy::WorkspaceRegistryAccess::default(),
+            WorkspaceRegistriesSetting::default().to_policy()
+        );
+    }
+
+    #[test]
+    fn test_registries_config_resolve_normalizes_empty_gitlab_instance_host_to_none() {
+        let resolved = RegistriesConfig::default().resolve();
+        assert_eq!(resolved.gitlab_instance_host, None);
+        assert!(!resolved.nuget_user_profile_sources);
+    }
+
+    #[test]
+    fn test_registries_config_resolve_carries_non_default_settings() {
+        use crate::net_policy::WorkspaceRegistryAccess;
+
+        let config = RegistriesConfig {
+            workspace_registries: WorkspaceRegistriesSetting::All,
+            nuget_user_profile_sources: true,
+            gitlab_instance_host: "gitlab.corp".to_string(),
+        };
+
+        let resolved = config.resolve();
+        assert_eq!(resolved.workspace_registries, WorkspaceRegistryAccess::All);
+        assert!(resolved.nuget_user_profile_sources);
+        assert_eq!(
+            resolved.gitlab_instance_host.as_deref(),
+            Some("gitlab.corp")
         );
     }
 

@@ -32,7 +32,7 @@ pub struct GoEcosystem {
     /// The reachability policy and `$GOENV` memoization cache (spec 034) every
     /// `parse_manifest` call threads through to [`crate::parser::parse_go_mod_with_context`].
     /// Defaulted by [`Self::new`]; set explicitly by [`Self::with_context`] so
-    /// `crate::lib::register_ecosystems` can share one process-wide policy handle with
+    /// `deps_engine::setup::register_ecosystems` can share one process-wide policy handle with
     /// `ServerState` (mirrors `deps_npm::ecosystem::NpmEcosystem`'s identical `context`
     /// field).
     context: GoParseContext,
@@ -48,7 +48,7 @@ impl GoEcosystem {
 
     /// Creates a new Go ecosystem sharing `ctx`'s reachability policy and `$GOENV`
     /// memoization cache, around an existing [`GoRegistry`] instance — the production
-    /// constructor, used by `crate::lib::register_ecosystems` so `initialize`/
+    /// constructor, used by `deps_engine::setup::register_ecosystems` so `initialize`/
     /// `workspace/didChangeConfiguration` can update the same `Arc<RegistryAccessPolicy>`
     /// every parse reads.
     #[must_use]
