@@ -8,7 +8,7 @@ tags:
   - cli
   - ci
 created: 2026-09-14
-status: draft
+status: shipped
 related:
   - "[[constitution]]"
   - "[[architecture-decision]]"
