@@ -345,8 +345,10 @@ impl Ecosystem for PypiEcosystem {
             return Vec::new();
         }
 
-        let Some(base_dir) = uri
-            .to_file_path()
+        // #1090: routed through `resolve_manifest_file_path` rather than a bare
+        // `to_file_path()` so a non-`file:` scheme or remote-host URI can't resolve a
+        // document-link target against a real local directory.
+        let Some(base_dir) = deps_core::lockfile::resolve_manifest_file_path(uri)
             .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
         else {
             return Vec::new();
@@ -833,6 +835,34 @@ mod tests {
             links[0].tooltip.as_deref(),
             target.to_file_path().unwrap().to_str()
         );
+    }
+
+    /// #1090: a non-`file:`-scheme (or remote-host `file:`) manifest URI must not resolve a
+    /// document-link target against a real local directory — same guard gap class as
+    /// #1084/#1089's lock file fix, applied here to `generate_document_links`' base
+    /// directory resolution.
+    #[tokio::test]
+    async fn test_generate_document_links_rejects_malicious_uri() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = PypiEcosystem::new(cache);
+        let file_uri = deps_core::test_util::test_uri("/project/requirements.txt");
+        let path_part = file_uri.as_str().strip_prefix("file://").unwrap();
+
+        for prefix in ["https://attacker.example", "file://attacker.example"] {
+            let uri: Uri = format!("{prefix}{path_part}").parse().unwrap();
+
+            let parse_result = ecosystem
+                .parse_manifest("-r base.txt\n", &uri)
+                .await
+                .unwrap();
+
+            let links = ecosystem.generate_document_links(parse_result.as_ref(), &uri);
+            assert!(
+                links.is_empty(),
+                "a malicious-scheme/host URI ({prefix}) must not resolve document link \
+                 targets against a real directory"
+            );
+        }
     }
 
     #[tokio::test]

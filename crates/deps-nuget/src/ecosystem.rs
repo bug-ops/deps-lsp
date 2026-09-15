@@ -191,9 +191,11 @@ impl Ecosystem for NuGetEcosystem {
             // directory to walk `NuGet.Config` discovery from — falls back to the default
             // (empty) `NuGetConfig`, which resolves every dependency to
             // `DependencySource::Registry` (byte-identical to pre-feature behavior), rather
-            // than failing the whole parse.
-            let config = uri
-                .to_file_path()
+            // than failing the whole parse. Routed through `resolve_manifest_file_path`
+            // (#1090) so a non-`file:` scheme or remote-host URI falls back the same way,
+            // instead of silently walking a real ancestor directory derived from an
+            // unguarded `to_file_path`.
+            let config = deps_core::lockfile::resolve_manifest_file_path(uri)
                 .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
                 .map(|dir| {
                     crate::config::resolve_with_context(
@@ -1526,6 +1528,85 @@ mod tests {
             "https://169.254.169.254/v3/index.json"
         );
         assert_eq!(occurrence.declaration_key, "source:Blocked");
+    }
+
+    /// #1090: a non-`file:`-scheme (or remote-host `file:`) manifest URI must not resolve to
+    /// a real ancestor directory for `NuGet.Config` discovery — same guard gap class as
+    /// #1084/#1089's lock file fix, applied here to `parse_manifest`'s config lookup. Builds
+    /// a real `NuGet.Config` that would have blocked the dependency's source if discovery
+    /// ran, then proves a malicious-scheme/host URI pointing at the same real path falls back
+    /// to the default (empty) config instead of walking the real directory.
+    #[tokio::test]
+    async fn test_parse_manifest_skips_nuget_config_discovery_for_malicious_uri() {
+        // See the comment in `test_package_name_completion_context_has_real_range` on why
+        // this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("NuGet.Config"),
+            r#"<configuration><packageSources>
+                <clear />
+                <add key="Blocked" value="https://169.254.169.254/v3/index.json" />
+            </packageSources></configuration>"#,
+        )
+        .unwrap();
+        let manifest_path = dir.path().join("App.csproj");
+        let content = r#"<Project><ItemGroup><PackageReference Include="MyCompany.Internal" Version="1.0.0" /></ItemGroup></Project>"#;
+        std::fs::write(&manifest_path, content).unwrap();
+
+        let file_uri = tower_lsp_server::ls_types::Uri::from_file_path(&manifest_path).unwrap();
+        let path_part = file_uri.as_str().strip_prefix("file://").unwrap();
+
+        let policy = Arc::new(deps_core::net_policy::RegistryAccessPolicy::new(
+            deps_core::net_policy::WorkspaceRegistryAccess::PublicOnly,
+        ));
+
+        // `("file://", true)` is a positive control: a plain, unmodified `file:` URI for the
+        // same real path *must* find the real `NuGet.Config` and populate `blocked_registries`
+        // — pinning in-tree that the fixture itself is live, not just externally verified.
+        for (prefix, expect_blocked) in [
+            ("file://", true),
+            ("https://attacker.example", false),
+            ("file://attacker.example", false),
+        ] {
+            let uri: tower_lsp_server::ls_types::Uri =
+                format!("{prefix}{path_part}").parse().unwrap();
+            let context = crate::config::NuGetParseContext {
+                policy: Arc::clone(&policy),
+                config_cache: Arc::new(crate::config::NuGetConfigCache::new()),
+                user_profile_config: None,
+                user_profile_sources: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            };
+            let eco = NuGetEcosystem::with_context(
+                Arc::new(NuGetRegistry::new(Arc::new(deps_core::HttpCache::new()))),
+                context,
+            );
+
+            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let dep = parse_result
+                .dependencies()
+                .into_iter()
+                .find(|d| d.name().as_str() == "MyCompany.Internal")
+                .expect("dependency must be present");
+            if expect_blocked {
+                assert_eq!(
+                    dep.source(),
+                    DependencySource::CustomRegistry {
+                        url: "https://169.254.169.254/v3/index.json".to_string(),
+                    },
+                    "test premise: a real file: URI must resolve the real NuGet.Config"
+                );
+                assert_eq!(parse_result.blocked_registries().len(), 1);
+            } else {
+                assert_eq!(
+                    dep.source(),
+                    DependencySource::Registry,
+                    "a malicious-scheme/host URI ({prefix}) must never resolve NuGet.Config \
+                     discovery against a real ancestor directory"
+                );
+                assert!(parse_result.blocked_registries().is_empty());
+            }
+        }
     }
 
     /// C1 regression (impl-critic): `generate_hover`'s unlisted-versions decoration must

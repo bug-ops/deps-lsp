@@ -197,9 +197,16 @@ pub fn parse_gradle(content: &str, uri: &Uri) -> Result<GradleParseResult> {
         });
     };
 
-    // Resolve variable references for build files (not catalogs or settings)
+    // Resolve variable references for build files (not catalogs or settings). Directory is
+    // derived via `resolve_manifest_file_path` (#1090), not the raw `uri.path()` string used
+    // for the filename dispatch above: `uri.path()` is the URI's own path component, with no
+    // scheme or host check at all, so joining it straight onto `load_gradle_properties` would
+    // let a non-`file:` scheme or remote-host URI walk and read a real
+    // `gradle.properties` from this process's local filesystem.
     if (path.ends_with("build.gradle.kts") || path.ends_with("build.gradle"))
-        && let Some(dir) = std::path::Path::new(&path).parent()
+        && let Some(dir) = deps_core::lockfile::resolve_manifest_file_path(uri)
+            .as_deref()
+            .and_then(std::path::Path::parent)
     {
         let props = properties::load_gradle_properties(dir);
         if !props.is_empty() {
@@ -421,6 +428,53 @@ mod tests {
         }];
         resolve_variables(&mut deps, &props);
         assert_eq!(deps[0].version_req, Some("1.2.3".into()));
+    }
+
+    /// #1090 S1: `parse_gradle` derived the `gradle.properties` search directory from the raw
+    /// `uri.path()` string, never `to_file_path()`/a scheme+host guard — a non-`file:` scheme
+    /// or remote-host `file:` URI would still walk and read a real on-disk `gradle.properties`
+    /// as long as its path component looked like a real directory. Uses a real
+    /// `gradle.properties` a bypass would resolve `$serdeVersion` from, to prove the guard
+    /// (not merely a missing-directory coincidence) blocks it.
+    #[test]
+    fn test_parse_gradle_rejects_malicious_uri_for_property_resolution() {
+        // See the comment in `test_dispatch_kotlin` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp_dir.path().join("gradle.properties"),
+            "serdeVersion=1.0.0\n",
+        )
+        .unwrap();
+        let manifest_path = temp_dir.path().join("build.gradle");
+        let content = "dependencies {\n    implementation(\"com.example:lib:$serdeVersion\")\n}\n";
+
+        let file_uri = Uri::from_file_path(&manifest_path).unwrap();
+        let path_part = file_uri.as_str().strip_prefix("file://").unwrap();
+
+        // Positive control: a real `file:` URI must resolve the variable from the real
+        // `gradle.properties` — proves the fixture itself is live.
+        let good_result = parse_gradle(content, &file_uri).unwrap();
+        assert_eq!(
+            good_result.dependencies[0].version_req,
+            Some("1.0.0".into()),
+            "test premise: the real file: URI must resolve $serdeVersion from disk"
+        );
+
+        for prefix in [
+            "untitled:",
+            "https://attacker.example",
+            "file://attacker.example",
+        ] {
+            let uri: Uri = format!("{prefix}{path_part}").parse().unwrap();
+            let result = parse_gradle(content, &uri).unwrap();
+            assert_eq!(
+                result.dependencies[0].version_req,
+                Some("$serdeVersion".into()),
+                "a malicious-scheme/host URI ({prefix}) must not resolve gradle.properties \
+                 from a real directory"
+            );
+        }
     }
 
     #[test]

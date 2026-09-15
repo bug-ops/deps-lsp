@@ -156,23 +156,17 @@ pub fn parse_package_json_with_context(
     // URI land on `CatalogOutcome::NoWorkspaceFile` rather than skipping resolution).
     //
     // Implementation-critique S2: `Uri::to_file_path` does **not** check the URI's scheme (its
-    // own doc says so) — it just decodes whatever path component is present. Left unguarded,
-    // `untitled:package.json` (VS Code's untitled-buffer form, path "package.json") would
-    // resolve `manifest_dir` to a *relative* path, and `find_workspace_file`/`.npmrc` discovery
-    // would then probe the LSP server process's own CWD instead of the workspace the document
-    // notionally belongs to; a `vscode-vfs://`/`vscode-remote://` URI whose path happens to
-    // mirror a real local path could likewise resolve against an unrelated local
-    // `pnpm-workspace.yaml`/`.npmrc`. Both `.npmrc` registry resolution and the catalog gate
-    // share this one `manifest_dir`, so gating it once here closes both: require the `file`
-    // scheme (case-insensitive per RFC 3986) and an absolute resulting directory.
-    let manifest_dir = uri
-        .scheme()
-        .as_str()
-        .eq_ignore_ascii_case("file")
-        .then(|| uri.to_file_path())
-        .flatten()
-        .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
-        .filter(|dir| dir.is_absolute());
+    // own doc says so) and, on non-Windows, ignores the authority/host entirely — it just
+    // decodes whatever path component is present. Left unguarded, `untitled:package.json`
+    // (VS Code's untitled-buffer form, path "package.json") would resolve `manifest_dir` to a
+    // *relative* path, and `find_workspace_file`/`.npmrc` discovery would then probe the LSP
+    // server process's own CWD instead of the workspace the document notionally belongs to; a
+    // `file://attacker.example/repo/package.json` URI would likewise resolve against a real
+    // local path despite carrying a remote host (#1090). Both `.npmrc` registry resolution and
+    // the catalog gate share this one `manifest_dir`, so gating it once here via the same
+    // scheme+host+absoluteness guard `deps-core`'s lock file discovery uses closes both.
+    let manifest_dir = deps_core::lockfile::resolve_manifest_file_path(uri)
+        .and_then(|path| path.parent().map(std::path::Path::to_path_buf));
 
     let npm_config: NpmConfig = manifest_dir
         .as_deref()
@@ -1212,6 +1206,44 @@ mod tests {
             react.catalog.as_ref().map(|origin| &origin.outcome),
             Some(crate::catalog::CatalogOutcome::NoWorkspaceFile)
         );
+    }
+
+    /// #1090 regression: `Uri::to_file_path` ignores the authority/host on non-Windows
+    /// entirely — the pre-fix hand-rolled `manifest_dir` guard only checked
+    /// `scheme() == "file"` and `is_absolute()`, missing a `file://` URI carrying a remote
+    /// host. Uses a real on-disk `pnpm-workspace.yaml` that a bypass would have found, to
+    /// prove the guard — not just an absent-directory coincidence — is what blocks it.
+    #[test]
+    fn test_parse_with_context_file_scheme_remote_host_is_rejected() {
+        // See the comment in `test_parse_with_context_top_level_override_and_scope_override_coexist`
+        // on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("pnpm-workspace.yaml"),
+            "catalog:\n  react: ^18.3.0\n",
+        )
+        .unwrap();
+        let manifest_path = root.path().join("package.json");
+        let file_uri = Uri::from_file_path(&manifest_path).unwrap();
+        let path_part = file_uri.as_str().strip_prefix("file://").unwrap();
+        let uri: Uri = format!("file://attacker.example{path_part}")
+            .parse()
+            .unwrap();
+
+        let json = r#"{"dependencies": {"react": "catalog:"}}"#;
+        let result = parse_package_json_with_context(json, &uri, &all_policy()).unwrap();
+
+        let react = &result.dependencies[0];
+        assert_eq!(
+            react.version_req, None,
+            "a remote-host file: URI must never resolve a real workspace file"
+        );
+        assert_matches!(
+            react.catalog.as_ref().map(|origin| &origin.outcome),
+            Some(crate::catalog::CatalogOutcome::NoWorkspaceFile)
+        );
+        assert_eq!(react.source, deps_core::parser::DependencySource::Registry);
     }
 
     #[test]

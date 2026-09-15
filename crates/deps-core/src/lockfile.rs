@@ -190,9 +190,15 @@ where
 /// guard, both a non-`file:` URI shaped like a real path (e.g. `untitled:/etc/passwd`, VS
 /// Code's untitled-buffer scheme) and a `file://` URI carrying a remote host (e.g.
 /// `file://attacker.example/etc/passwd`) would silently resolve to a real local path (#1084).
-/// Shared by [`locate_lockfile_for_manifest`] and every ecosystem-local lock file locator that
-/// needs the same manifest-path resolution (e.g. `deps-nuget`'s multi-project fallback) so the
-/// guard is defined once, not re-derived per call site.
+/// The general-purpose guard for resolving any client-supplied manifest/document `Uri` to a
+/// real filesystem path before touching disk — not limited to lock file discovery despite
+/// living in this module. Shared by [`locate_lockfile_for_manifest`] and every ecosystem-local
+/// lock file locator that needs the same manifest-path resolution (e.g. `deps-nuget`'s
+/// multi-project fallback), as well as non-lock-file call sites across `deps-cargo`,
+/// `deps-nuget`, `deps-pypi`, `deps-npm`, `deps-gradle`, and `deps-lsp` (workspace-root and
+/// config discovery, document links, cold-start document loading, and watched-file-change
+/// handling) that resolve the same kind of URI for the same reason (#1090) — so the guard is
+/// defined once, not re-derived per call site.
 ///
 /// # Examples
 ///

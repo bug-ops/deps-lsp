@@ -698,8 +698,7 @@ struct WorkspaceDiscovery {
 /// existence (plus a read+parse on a hit). Once the workspace root is found, every further
 /// ancestor costs exactly one stat.
 fn discover_workspace(doc_uri: &Uri) -> Result<WorkspaceDiscovery> {
-    let path = doc_uri
-        .to_file_path()
+    let path = deps_core::lockfile::resolve_manifest_file_path(doc_uri)
         .ok_or_else(|| DepsError::InvalidUri(format!("{doc_uri:?}")))?;
 
     let mut workspace_root = None;
@@ -827,6 +826,17 @@ mod tests {
         Uri::from_file_path(path).unwrap()
     }
 
+    /// Builds a URI whose path component is `manifest_path`'s real, absolute path, with the
+    /// `file://` prefix `Uri::from_file_path` would produce replaced by `prefix` (e.g.
+    /// `"https://attacker.example"` or `"file://attacker.example"`).
+    ///
+    /// Mirrors `deps_core::lockfile`'s test helper of the same name/purpose.
+    fn non_file_uri(prefix: &str, manifest_path: &std::path::Path) -> Uri {
+        let file_uri = Uri::from_file_path(manifest_path).unwrap();
+        let path_part = file_uri.as_str().strip_prefix("file://").unwrap();
+        format!("{prefix}{path_part}").parse().unwrap()
+    }
+
     #[test]
     fn test_parse_cargo_toml_rejects_excessive_nesting() {
         // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
@@ -843,16 +853,41 @@ mod tests {
         );
     }
 
+    /// #1090: a non-`file:`-scheme URI whose path component is non-empty and names a real,
+    /// existing manifest must still be rejected — `https://example.com`'s empty path is the
+    /// one case `Uri::to_file_path` already refuses regardless of any scheme guard, so it
+    /// doesn't prove `discover_workspace` checks the scheme at all. This uses a real on-disk
+    /// `Cargo.toml` so a pre-fix (unguarded) `to_file_path` would have resolved it fine.
     #[test]
     fn test_find_workspace_root_rejects_non_file_uri() {
         // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
         // must hold it, not just ones that diff a snapshot.
         let _guard = deps_core::fs_probe::snapshot_guard();
-        // Empty path (`Uri::to_file_path` returns `None` only when the path is
-        // empty, not merely for a non-file scheme) is what actually drives the
-        // `InvalidUri` branch — this pins that call site to `DepsError::InvalidUri`
-        // rather than the pre-fix `DepsError::CacheError`.
-        let uri: Uri = "https://example.com".parse().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manifest_path = temp_dir.path().join("Cargo.toml");
+        std::fs::write(&manifest_path, "[package]\nname = \"test\"").unwrap();
+
+        let uri = non_file_uri("https://attacker.example", &manifest_path);
+        let result = parse_cargo_toml("[dependencies]\nserde = \"1.0\"", &uri);
+        assert!(
+            matches!(result, Err(DepsError::InvalidUri(_))),
+            "expected InvalidUri, got {result:?}"
+        );
+    }
+
+    /// #1090: `ls-types`' `Uri::to_file_path` ignores the authority/host on non-Windows
+    /// entirely — a `file://` URI carrying a non-`localhost` host must still be rejected,
+    /// not resolved against the local filesystem as if the host were not there.
+    #[test]
+    fn test_find_workspace_root_rejects_remote_host_file_uri() {
+        // See the comment in `test_find_workspace_root_rejects_non_file_uri` on why this
+        // guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manifest_path = temp_dir.path().join("Cargo.toml");
+        std::fs::write(&manifest_path, "[package]\nname = \"test\"").unwrap();
+
+        let uri = non_file_uri("file://attacker.example", &manifest_path);
         let result = parse_cargo_toml("[dependencies]\nserde = \"1.0\"", &uri);
         assert!(
             matches!(result, Err(DepsError::InvalidUri(_))),

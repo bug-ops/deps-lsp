@@ -82,10 +82,11 @@ const LARGE_FILE_THRESHOLD: u64 = 1_000_000; // 1MB
 /// ```
 #[tracing::instrument(skip_all, fields(uri = ?uri), level = "debug")]
 pub async fn load_document_from_disk(uri: &Uri) -> Result<String> {
-    // Convert URI to filesystem path. Owned (not `Cow::Borrowed`), since the read below runs
-    // in `spawn_blocking` and needs a `'static` path.
-    let path = match uri.to_file_path() {
-        Some(p) => p.into_owned(),
+    // Convert URI to filesystem path, rejecting a non-`file:` scheme or a non-local host
+    // (#1090) — a bare `to_file_path()` here would silently read real content off disk for
+    // a URI shaped like `untitled:/etc/passwd` or `file://attacker.example/etc/passwd`.
+    let path = match deps_core::lockfile::resolve_manifest_file_path(uri) {
+        Some(p) => p,
         None => {
             tracing::debug!("Cannot load non-file URI: {:?}", uri);
             return Err(DepsError::InvalidUri(format!("{uri:?}")));
@@ -264,9 +265,30 @@ mod tests {
         assert_eq!(loaded, "");
     }
 
-    // Note: Tests for non-file URIs (http://, untitled:) are covered by integration tests
-    // Creating non-file URIs in unit tests would require adding fluent_uri as a dev dependency
-    // The implementation correctly handles these cases via to_file_path() returning None
+    /// #1090: a non-`file:`-scheme (or remote-host `file:`) URI whose path names a real,
+    /// existing file must still be rejected — proves the guard, not merely that
+    /// `to_file_path()` already refuses an empty/degenerate path.
+    #[tokio::test]
+    async fn test_load_rejects_malicious_uri_for_real_file() {
+        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
+        // must hold it, not just ones that diff a snapshot.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(b"test content").unwrap();
+        temp_file.flush().unwrap();
+
+        let file_uri = Uri::from_file_path(temp_file.path()).unwrap();
+        let path_part = file_uri.as_str().strip_prefix("file://").unwrap();
+
+        for prefix in ["untitled:", "file://attacker.example"] {
+            let uri: Uri = format!("{prefix}{path_part}").parse().unwrap();
+            let result = load_document_from_disk(&uri).await;
+            assert!(
+                matches!(result, Err(DepsError::InvalidUri(_))),
+                "expected InvalidUri for {prefix}, got {result:?}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn test_load_utf8_file() {
