@@ -297,9 +297,31 @@ mod tests {
         assert_eq!(manifest_uri(&path), "crates/deps-cli/Cargo.toml");
     }
 
+    // `/tmp/...` has a `RootDir` component but no `Prefix`, so `Path::is_absolute()` on
+    // Windows reports it as *not* absolute (Windows requires a drive prefix) — hence the
+    // separate `cfg(windows)` fixture below using a drive-rooted path instead of gating this
+    // whole test to `cfg(unix)` and losing Windows coverage of the fix (spec 062 review R1).
+    #[cfg(unix)]
     #[test]
     fn test_manifest_uri_drops_leading_root_dir_for_an_absolute_unix_path() {
         let path = Path::new("/tmp/deps-cli-manual-test/Cargo.toml");
+        assert!(
+            path.is_absolute(),
+            "test setup bug: fixture path must be absolute"
+        );
+        let uri = manifest_uri(path);
+        assert_eq!(uri, "tmp/deps-cli-manual-test/Cargo.toml");
+        assert!(
+            !Path::new(&uri).is_absolute(),
+            "an absolute manifest_path must not leak into an absolute artifactLocation.uri \
+             (spec 062 review R1)"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_manifest_uri_drops_leading_prefix_and_root_dir_for_an_absolute_windows_path() {
+        let path = Path::new(r"C:\tmp\deps-cli-manual-test\Cargo.toml");
         assert!(
             path.is_absolute(),
             "test setup bug: fixture path must be absolute"
