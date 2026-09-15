@@ -500,10 +500,7 @@ mod tests {
             let state = Arc::new(ServerState::new());
             let url = deps_core::test_util::test_uri("/test/Cargo.toml");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
-            let config = DiagnosticsConfig {
-                unknown_severity: DiagnosticSeverity::ERROR,
-                ..DiagnosticsConfig::default()
-            };
+            let config = DiagnosticsConfig::new().with_unknown_severity(DiagnosticSeverity::ERROR);
 
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
             let content = r#"[dependencies]
@@ -563,10 +560,7 @@ serde = "1.0.0"
             let state = Arc::new(ServerState::new());
             let url = deps_core::test_util::test_uri("/test/Cargo.toml");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
-            let config = DiagnosticsConfig {
-                outdated_severity: DiagnosticSeverity::ERROR,
-                ..DiagnosticsConfig::default()
-            };
+            let config = DiagnosticsConfig::new().with_outdated_severity(DiagnosticSeverity::ERROR);
 
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
             let content = r#"[dependencies]
@@ -651,10 +645,8 @@ serde = "1.0.0"
             let state = Arc::new(ServerState::new());
             let url = deps_core::test_util::test_uri("/test/Cargo.toml");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
-            let config = DiagnosticsConfig {
-                unsatisfiable_severity: DiagnosticSeverity::ERROR,
-                ..DiagnosticsConfig::default()
-            };
+            let config =
+                DiagnosticsConfig::new().with_unsatisfiable_severity(DiagnosticSeverity::ERROR);
 
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
             let content = "[dependencies]\nserde = \"99\"\n".to_string();
@@ -1585,7 +1577,7 @@ dependencies = ["requests>=2.0.0"]
             state.update_document(uri.clone(), doc_state);
 
             let (client, full_config) = create_test_client_and_config();
-            let policy_config = LicensePolicyConfig { allow, deny };
+            let policy_config = LicensePolicyConfig::new().with_allow(allow).with_deny(deny);
             state.set_license_policy(policy_config.to_policy());
             full_config.write().await.policy.license_policy = policy_config;
 
@@ -1676,10 +1668,7 @@ dependencies = ["requests>=2.0.0"]
             state.update_document(uri.clone(), doc_state);
 
             let (client, full_config) = create_test_client_and_config();
-            let policy_config = LicensePolicyConfig {
-                allow: vec!["MIT".to_string()],
-                deny: Vec::new(),
-            };
+            let policy_config = LicensePolicyConfig::new().with_allow(vec!["MIT".to_string()]);
             state.set_license_policy(policy_config.to_policy());
             full_config.write().await.policy.license_policy = policy_config;
             let config = DiagnosticsConfig::default();

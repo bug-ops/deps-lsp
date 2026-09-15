@@ -162,15 +162,13 @@ pub fn load(explicit_path: Option<&Path>, default_dir: &Path) -> Result<CliConfi
 #[must_use]
 pub fn safe_auto_discovered_policy(parsed: PolicyConfig) -> PolicyConfig {
     PolicyConfig {
-        diagnostics: DiagnosticsConfig {
-            outdated_severity: parsed.diagnostics.outdated_severity,
-            unknown_severity: parsed.diagnostics.unknown_severity,
-            yanked_severity: parsed.diagnostics.yanked_severity,
-            unsatisfiable_severity: parsed.diagnostics.unsatisfiable_severity,
-            deprecated_severity: parsed.diagnostics.deprecated_severity,
-            mutable_ref_pin_severity: parsed.diagnostics.mutable_ref_pin_severity,
-            ..DiagnosticsConfig::default()
-        },
+        diagnostics: DiagnosticsConfig::new()
+            .with_outdated_severity(parsed.diagnostics.outdated_severity)
+            .with_unknown_severity(parsed.diagnostics.unknown_severity)
+            .with_yanked_severity(parsed.diagnostics.yanked_severity)
+            .with_unsatisfiable_severity(parsed.diagnostics.unsatisfiable_severity)
+            .with_deprecated_severity(parsed.diagnostics.deprecated_severity)
+            .with_mutable_ref_pin_severity(parsed.diagnostics.mutable_ref_pin_severity),
         ..PolicyConfig::default()
     }
 }

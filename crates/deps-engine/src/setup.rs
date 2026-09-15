@@ -612,11 +612,10 @@ mod tests {
         };
 
         let policy = PolicyConfig {
-            registries: RegistriesConfig {
-                workspace_registries: WorkspaceRegistriesSetting::All,
-                nuget_user_profile_sources: true,
-                gitlab_instance_host: "gitlab.corp".to_string(),
-            },
+            registries: RegistriesConfig::new()
+                .with_workspace_registries(WorkspaceRegistriesSetting::All)
+                .with_nuget_user_profile_sources(true)
+                .with_gitlab_instance_host("gitlab.corp"),
             ..PolicyConfig::default()
         };
 

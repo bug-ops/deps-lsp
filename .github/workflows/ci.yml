@@ -445,6 +445,97 @@ jobs:
           fi
           exit 0
 
+      - name: Guard against a `..` rest pattern in PolicyConfig::diff / reparse_scope (#1064)
+        # Issue #1064/#592 M1: `PolicyConfig::diff` (deps-core) and `reparse_scope` (deps-lsp)
+        # must destructure every field of every `policy_config` section exhaustively — no `..`
+        # rest pattern at any level — so a field added to any of the 7 `#[non_exhaustive]`
+        # policy section structs forces a compile-time decision (rustc E0027) instead of being
+        # silently ignored. `policy_config.rs`'s `PolicyConfigDiff` doctest only illustrates
+        # that underlying language mechanism on a synthetic, unrelated struct (see its own doc
+        # comment) — it does NOT re-verify these two real function bodies stay `..`-free. This
+        # step does, on every PR, by isolating each function's body (from its signature to its
+        # own closing brace, found by indentation) and scanning it for a rest pattern.
+        #
+        # Detection matches, each anchored on the left by start-of-line, `,`, or `{` (the only
+        # three positions a struct-pattern/literal's rest element can follow) so a plain range
+        # or slice expression (`0..len`, `&s[..end]`) can never false-positive: a `..` rest
+        # pattern on its own line (the common multi-line rustfmt shape); `, ..`/`{ ..`
+        # immediately followed by `,`/`}` (the single-line bare rest-pattern shape); and `..`
+        # immediately followed by an identifier in any of those same three left contexts (the
+        # functional-record-update shape, e.g. `..Default::default()` or `..old` — legal today
+        # because `PolicyConfigDiff` derives `Default`, and just as capable of silently
+        # dropping a field as a bare `..` is). reviewer-prB caught two gaps in earlier versions
+        # of this guard by actually running it, not just reading it: the functional-update
+        # shape being undetected at all, and then the first fix for that being unanchored and
+        # false-positive-prone on ranges — both are what the left-context anchoring above
+        # closes. Comment lines are excluded first so a doc comment's own `` `..` `` prose (as
+        # in this file's module docs) can't false-positive — this only strips lines *starting*
+        # with `//`, not a trailing inline comment; no such line exists in either function
+        # today, so this is a known, accepted limitation rather than a fix. The positive/
+        # negative controls below (mirroring this job's other tree-based guards) prove the
+        # isolation + detection actually catches each real shape and ignores each range/slice
+        # shape, using synthetic snippets — a change to either function's signature/indentation
+        # that silently empties the isolated body, or a detection regex that regresses in
+        # either direction, must not silently pass this guard.
+        run: |
+          dotdot_pattern='(^[[:space:]]*\.\.[[:space:]]*$)|(,[[:space:]]*\.\.[[:space:]]*[,}])|(\{[[:space:]]*\.\.[[:space:]]*[,}])|(^[[:space:]]*\.\.[A-Za-z_])|(,[[:space:]]*\.\.[A-Za-z_])|(\{[[:space:]]*\.\.[A-Za-z_])'
+
+          check_no_dotdot() {
+            # `-v` names avoid awk's builtin `close()` function (using it as a plain variable
+            # name is a syntax error on some awk implementations, e.g. macOS's default awk) —
+            # discovered while writing this guard, not a hypothetical. Patterns use `\\(`/`\\{`
+            # (double backslash), not `\(`/`\{`: awk's `-v` assignment itself unescapes one
+            # level of backslash before the regex engine ever sees it.
+            local file="$1" start_pattern="$2" closeln="$3" label="$4"
+            local body
+            body=$(awk -v start="$start_pattern" -v closeln="$closeln" '
+              $0 ~ start { found=1 }
+              found { print }
+              found && $0 == closeln { exit }
+            ' "$file")
+            if [ -z "$body" ]; then
+              echo "::error::guard self-check failed: could not isolate $label's body in $file — its signature or indentation may have changed"
+              exit 1
+            fi
+            if grep -vE '^[[:space:]]*//' <<<"$body" | grep -qE "$dotdot_pattern"; then
+              echo "::error::$label contains a '..' rest pattern — this defeats issue #1064/#592's exhaustive-destructure guarantee"
+              exit 1
+            fi
+          }
+
+          check_no_dotdot "crates/deps-core/src/policy_config.rs" 'pub fn diff\\(old: &Self, new: &Self\\) -> PolicyConfigDiff \\{' '    }' "PolicyConfig::diff"
+          check_no_dotdot "crates/deps-lsp/src/config.rs" 'pub\\(crate\\) fn reparse_scope\\(' '}' "reparse_scope"
+
+          # Positive controls: both the single-line and multi-line rest-pattern shapes must
+          # be caught, and a doc comment merely mentioning `..` in prose must not be.
+          if ! grep -vE '^[[:space:]]*//' <<<'let Example { a: _, .. } = e;' | grep -qE "$dotdot_pattern"; then
+            echo "::error::guard self-check failed: the '..' detection regex does not fire on a single-line rest pattern"
+            exit 1
+          fi
+          if ! grep -vE '^[[:space:]]*//' <<<$'let Example {\n    a: _,\n    ..\n} = e;' | grep -qE "$dotdot_pattern"; then
+            echo "::error::guard self-check failed: the '..' detection regex does not fire on a multi-line rest pattern"
+            exit 1
+          fi
+          if ! grep -vE '^[[:space:]]*//' <<<'PolicyConfigDiff { workspace_registries_changed: x, ..Default::default() }' | grep -qE "$dotdot_pattern"; then
+            echo "::error::guard self-check failed: the '..' detection regex does not fire on a functional-record-update expression (..Default::default())"
+            exit 1
+          fi
+          if grep -vE '^[[:space:]]*//' <<<'    // mentions `..` in prose only' | grep -qE "$dotdot_pattern"; then
+            echo "::error::guard self-check failed: the '..' detection regex false-positives on a comment"
+            exit 1
+          fi
+
+          # Negative controls: ordinary range/slice expressions unrelated to a struct rest
+          # pattern must NOT be flagged (reviewer-prB caught this false-positive class in an
+          # earlier, unanchored version of the identifier alternative).
+          for range_expr in 'for i in 0..len {' '&s[..end]' 'for i in start..end {' 'Foo { field: 0..len }'; do
+            if grep -vE '^[[:space:]]*//' <<<"$range_expr" | grep -qE "$dotdot_pattern"; then
+              echo "::error::guard self-check failed: the '..' detection regex false-positives on range/slice expression: $range_expr"
+              exit 1
+            fi
+          done
+          exit 0
+
   tooling-lint:
     name: Tooling Lint (action.yml + pre-commit-hooks.yaml)
     needs: changes
