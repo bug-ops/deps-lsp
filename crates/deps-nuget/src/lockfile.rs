@@ -19,7 +19,7 @@
 use deps_core::error::{DepsError, Result};
 use deps_core::lockfile::{
     LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource,
-    locate_lockfile_for_manifest, read_and_parse_lockfile,
+    locate_lockfile_for_manifest, read_and_parse_lockfile, resolve_manifest_file_path,
 };
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -49,7 +49,10 @@ impl NuGetLockParser {
 /// hold several per-project lock files, and picking the wrong one would silently attach an
 /// unrelated project's resolved versions (#451 follow-up regression).
 fn locate_multi_project_lockfile(manifest_uri: &Uri) -> Option<PathBuf> {
-    let manifest_path = manifest_uri.to_file_path()?;
+    // See `resolve_manifest_file_path`'s doc (#1084/#1085): without this guard a non-`file:`
+    // or remote-host URI shaped like a real path would resolve against the real filesystem
+    // here, same as `deps_core::lockfile::locate_lockfile_for_manifest`'s own guard.
+    let manifest_path = resolve_manifest_file_path(manifest_uri)?;
     let project_name = manifest_path.file_stem()?.to_str()?;
     if project_name.is_empty() {
         return None;
@@ -457,6 +460,37 @@ mod tests {
         let manifest_uri = Uri::from_file_path(&manifest_path).unwrap();
         let parser = NuGetLockParser;
         assert_eq!(parser.locate_lockfile(&manifest_uri), Some(lock_path));
+    }
+
+    /// #1085 regression: `locate_multi_project_lockfile`'s own `to_file_path()` call (the
+    /// multi-project fallback, separate from `deps_core::lockfile::locate_lockfile_for_manifest`)
+    /// previously had no scheme guard either. Empirically confirmed before the fix: a
+    /// `untitled:` URI whose path component names a real manifest resolved
+    /// `parser.locate_lockfile` to that manifest's real `packages.<project>.lock.json`
+    /// despite the non-`file:` scheme — this pins the fixed, safe behavior.
+    #[test]
+    fn test_locate_lockfile_multi_project_fallback_rejects_non_file_uri() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manifest_path = temp_dir.path().join("MyApp.csproj");
+        let lock_path = temp_dir.path().join("packages.MyApp.lock.json");
+        std::fs::write(&manifest_path, "<Project></Project>").unwrap();
+        std::fs::write(&lock_path, "{}").unwrap();
+
+        // Built from `Uri::from_file_path` rather than `format!("untitled:{}", path.display())`
+        // to stay valid on Windows: `Path::display()` there uses `\` separators and an
+        // unescaped drive letter, neither of which is a legal URI path character.
+        let file_uri = Uri::from_file_path(&manifest_path).unwrap();
+        let path_part = file_uri.as_str().strip_prefix("file://").unwrap();
+        let manifest_uri: Uri = format!("untitled:{path_part}").parse().unwrap();
+        let parser = NuGetLockParser;
+
+        assert_eq!(
+            parser.locate_lockfile(&manifest_uri),
+            None,
+            "a non-file-scheme URI must never resolve to a filesystem path, even via the \
+             multi-project fallback"
+        );
     }
 
     #[test]
