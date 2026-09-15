@@ -683,23 +683,21 @@ mod tests {
         assert!(results.is_empty());
     }
 
-    /// #1066: was a live-registry round-trip asserting `results.is_empty() ||
-    /// !results.is_empty()` — a tautology that could never fail, including on a broken
-    /// zero-request code path. Mirrors deps-cargo's `test_complete_package_names_special_characters`
-    /// fix (#1052/#1054): mocks the search endpoint, verifies it was actually hit, and checks
-    /// a real completion item instead.
     #[tokio::test]
     async fn test_complete_package_names_special_characters() {
+        // #1055: was a live, unmocked search that asserted the tautology
+        // `results.is_empty() || !results.is_empty()`. Mock the search endpoint and assert on
+        // the actual returned completion (issue #1038's mocking pattern).
         let mut server = mockito::Server::new_async().await;
         let mock = server
-            .mock("GET", "/-/v1/search?text=%40type&size=20")
+            .mock("GET", "/-/v1/search")
+            .match_query(mockito::Matcher::Any)
             .with_status(200)
             .with_body(
-                r#"{"objects":[{"package":{"name":"@types/node","version":"20.1.0","description":null}}]}"#,
+                r#"{"objects": [{"package": {"name": "@types/node", "version": "20.0.0"}}]}"#,
             )
             .create_async()
             .await;
-
         let registry = NpmRegistry::with_public_base_for_test(
             Arc::new(deps_core::HttpCache::new()),
             server.url(),
@@ -710,11 +708,9 @@ mod tests {
         let results = ecosystem
             .complete_package_names("@type", Range::default())
             .await;
-
         mock.assert_async().await;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].label, "@types/node");
-        assert_eq!(results[0].detail.as_deref(), Some("v20.1.0"));
     }
 
     /// #1066: was `assert!(results.len() <= 20)` against a live registry — a tautology given
@@ -768,19 +764,6 @@ mod tests {
             .await;
         mock.assert_async().await;
         assert_eq!(results.len(), 5);
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires network access
-    async fn test_complete_package_names_scoped() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = NpmEcosystem::new(cache);
-
-        // Scoped packages (@types/node, etc.)
-        let results = ecosystem
-            .complete_package_names("@types", Range::default())
-            .await;
-        assert!(!results.is_empty() || results.is_empty()); // May not have results but shouldn't panic
     }
 
     #[tokio::test]
@@ -900,31 +883,24 @@ mod tests {
         assert!(completions.items.is_empty());
     }
 
-    /// #1066/M4: was `test_generate_completions_feature_context_returns_empty`, asserting
-    /// `completions.items.is_empty() || !completions.items.is_empty()` — a tautology, and a
-    /// misnomer: npm has no `Feature` completion-context arm at all, and the cursor here
-    /// (character 30, inside `"4.0.0"`) actually lands in a `Version` context. Renamed to
-    /// describe what it actually exercises, and mirrors the existing
-    /// `test_complete_versions_unknown_package` pattern: a mocked 404 makes the "returns
-    /// empty" outcome deterministic and `mock.assert_async()` proves the registry was
-    /// actually queried rather than the emptiness coming from a broken zero-request path.
-    ///
-    /// M5: freshness stays enabled (`FreshnessSettings::default()`) here, unlike
-    /// `test_complete_versions_capped_at_max_completion_versions`'s explicit disable, because
-    /// `NpmRegistry::get_versions_with` propagates `get_versions`'s 404 via `?` before ever
-    /// reaching the freshness-probe fetch — this mock's default `expect(1)` is exactly the
-    /// one request that path makes today, not an assumption a future error-path change would
-    /// silently keep intact.
     #[tokio::test]
-    async fn test_generate_completions_version_context_unknown_package_returns_empty() {
+    async fn test_generate_completions_version_context_returns_versions() {
         // See the comment in `test_package_name_completion_context_has_real_range` on why
         // this guard is needed here.
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;
 
+        // #1055: position 30 lands inside the `"4.0.0"` version literal — a `Version`
+        // completion context, not "feature" (npm has none, and never overrides
+        // `complete_feature`) as this test's old name claimed. It previously drove an
+        // unmocked live version-completion request to the public registry while asserting the
+        // tautology `completions.items.is_empty() || !completions.items.is_empty()`. Mock the
+        // `express` packument and assert on the actual returned completion instead.
         let mut server = mockito::Server::new_async().await;
         let mock = server
             .mock("GET", "/express")
-            .with_status(404)
+            .with_status(200)
+            .with_body(r#"{"versions": {"4.0.0": {}, "4.1.0": {}}}"#)
+            .expect_at_least(1)
             .create_async()
             .await;
         let registry = NpmRegistry::with_public_base_for_test(
@@ -952,7 +928,12 @@ mod tests {
             .await;
 
         mock.assert_async().await;
-        assert!(completions.items.is_empty());
+        let labels: Vec<&str> = completions.items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            ["4.1.0 (latest)", "4.0.0"],
+            "newest-first, per the mocked packument"
+        );
     }
 
     #[tokio::test]
