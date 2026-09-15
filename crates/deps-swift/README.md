@@ -18,7 +18,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 - **All version forms** — `from`, `upToNextMajor`, `upToNextMinor`, `exact`, half-open range, closed range, `branch`, `revision`, `path`
 - **GITHUB_TOKEN support** — Authenticated requests raise the rate limit from 60 to 5,000 requests/hour
 - **License hover** — SPDX license for the resolved and latest version via background pre-fetch, flagging a "License changed" when they differ
-- **Release-freshness signal (partial)** — `SwiftRegistry::get_versions_with` (invoked by the `Registry` trait impl of the same name when freshness rendering is enabled) attaches GitHub Release publish timestamps to tag-derived versions, memoized behind a TTL; requires `GITHUB_TOKEN` and covers only versions with a matching GitHub Release (see the [deps-lsp book](https://bug-ops.github.io/deps-lsp/book/ecosystems/swift.html#release-freshness-coverage-shared-with-github-actions))
+- **Release-freshness signal (partial)** — `SwiftRegistry::get_versions_with` (invoked by the `Registry` trait impl of the same name when freshness rendering is enabled) attaches GitHub Release publish timestamps to tag-derived versions, memoized behind a TTL; requires `GITHUB_TOKEN` and covers only versions with a matching GitHub Release (see the [deps-lsp book](https://bug-ops.github.io/deps-lsp/ecosystems/swift.html#release-freshness-coverage-shared-with-github-actions))
 
 > [!TIP]
 > Set `GITHUB_TOKEN` in your environment to avoid GitHub API rate limits when working with many Swift dependencies.

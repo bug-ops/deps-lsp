@@ -75,7 +75,7 @@ deps-ecosystem/
 
 ## Documentation
 
-See the [deps-lsp book's "Adding a New Ecosystem" chapter](https://bug-ops.github.io/deps-lsp/book/contributing/index.html) for detailed implementation instructions, or `book/src/contributing/` in this repository.
+See the [deps-lsp book's "Adding a New Ecosystem" chapter](https://bug-ops.github.io/deps-lsp/contributing/index.html) for detailed implementation instructions, or `book/src/contributing/` in this repository.
 
 ## Testing
 
