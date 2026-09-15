@@ -289,29 +289,38 @@ jobs:
         # today — an empty/malformed `cargo tree` output must not silently pass this guard.
         # The match itself is boundary-anchored on non-identifier characters (not `grep -w`'s
         # `\b`, which treats `-` as a boundary) so `deps-cli` cannot false-positive on a
-        # hypothetical `deps-cli-utils` crate.
+        # hypothetical `deps-cli-utils` crate, AND requires the literal ` v<digit>` that
+        # immediately follows a crate name in `cargo tree`'s own node format (`name vX.Y.Z
+        # (path)`) — without this, the match also catches the substring "deps-lsp" inside a
+        # checked-out *path*, not just the crate name: GitHub Actions' default checkout
+        # directory for this repo is `/home/runner/work/deps-lsp/deps-lsp/...`, which every
+        # local path-dependency line's `(...)` suffix embeds verbatim, so a plain substring
+        # match against "deps-lsp" spuriously fires on every single tree entry in CI even
+        # though "deps-lsp" the crate is nowhere in `deps-cli`'s actual dependency graph
+        # (caught after the fact — this guard never ran in this PR's CI until the unrelated
+        # test-util guard above it was fixed, since a step failure skips the rest of the job).
         run: |
           adapters=(deps-cli deps-mcp)
           tree=$(cargo tree -p deps-lsp -e no-dev)
 
-          if ! grep -qE '(^|[^A-Za-z0-9._-])deps-core([^A-Za-z0-9._-]|$)' <<<"$tree"; then
+          if ! grep -qE '(^|[^A-Za-z0-9._-])deps-core v[0-9]' <<<"$tree"; then
             echo "::error::guard self-check failed: deps-core not found in deps-lsp's own tree"
             exit 1
           fi
 
           for adapter in "${adapters[@]}"; do
-            if grep -qE "(^|[^A-Za-z0-9._-])${adapter}([^A-Za-z0-9._-]|\$)" <<<"$tree"; then
+            if grep -qE "(^|[^A-Za-z0-9._-])${adapter} v[0-9]" <<<"$tree"; then
               echo "::error::deps-lsp's dependency tree unexpectedly includes driving adapter $adapter"
               exit 1
             fi
           done
 
           cli_tree=$(cargo tree -p deps-cli -e no-dev)
-          if ! grep -qE '(^|[^A-Za-z0-9._-])deps-core([^A-Za-z0-9._-]|$)' <<<"$cli_tree"; then
+          if ! grep -qE '(^|[^A-Za-z0-9._-])deps-core v[0-9]' <<<"$cli_tree"; then
             echo "::error::guard self-check failed: deps-core not found in deps-cli's own tree"
             exit 1
           fi
-          if grep -qE '(^|[^A-Za-z0-9._-])deps-lsp([^A-Za-z0-9._-]|$)' <<<"$cli_tree"; then
+          if grep -qE '(^|[^A-Za-z0-9._-])deps-lsp v[0-9]' <<<"$cli_tree"; then
             echo "::error::deps-cli's dependency tree unexpectedly includes driving adapter deps-lsp"
             exit 1
           fi
