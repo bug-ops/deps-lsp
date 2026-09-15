@@ -180,7 +180,7 @@ first-ever (cold-cache) deps.dev lookup never delays or blocks any other hover c
 over-budget fetch still finishes into an in-process cache so the *next* hover on that dependency
 is instant. Set `supply_chain.enabled` to `false` to turn the signal (and every deps.dev
 request) off entirely — see the
-[Configuration reference](https://github.com/bug-ops/deps-lsp/blob/main/README.md#configuration-reference).
+[Configuration reference](../configuration.md#configuration-reference).
 
 Informational only, permanently: a low Scorecard score never becomes a diagnostic, warning, or
 blocking behavior, matching the release-freshness signal's precedent for a

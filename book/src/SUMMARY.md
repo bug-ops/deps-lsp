@@ -4,6 +4,8 @@
 
 # Getting Started
 
+- [Editor Setup](editor-setup.md)
+- [Configuration](configuration.md)
 - [Architecture Overview](architecture.md)
 - [API Documentation](api-docs.md)
 

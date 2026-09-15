@@ -70,3 +70,70 @@ crates/deps-{ecosystem}/
 
 The [Adding a New Ecosystem](contributing/index.md) chapters walk through building one of these
 crates from scratch, step by step.
+
+## Project Structure
+
+```text
+deps-lsp/
+├── crates/
+│   ├── deps-core/      # Shared traits, cache, generic handlers
+│   ├── deps-cargo/     # Cargo.toml parser + crates.io registry
+│   ├── deps-npm/       # package.json parser + npm registry
+│   ├── deps-pypi/      # pyproject.toml/requirements.txt parser + PyPI registry
+│   ├── deps-go/        # go.mod parser + proxy.golang.org
+│   ├── deps-bundler/   # Gemfile parser + rubygems.org registry
+│   ├── deps-dart/      # pubspec.yaml parser + pub.dev registry
+│   ├── deps-maven/     # pom.xml parser + Maven Central registry
+│   ├── deps-gradle/    # Gradle parser (Version Catalog, Kotlin/Groovy DSL)
+│   ├── deps-swift/     # Package.swift parser + GitHub API registry
+│   ├── deps-composer/  # composer.json parser + Packagist registry
+│   ├── deps-nuget/     # .csproj/packages.config parser + NuGet V3 registry
+│   ├── deps-deno/      # deno.json parser + JSR registry (npm: delegates to deps-npm)
+│   ├── deps-github-actions/ # workflow YAML parser + GitHub tags API registry
+│   ├── deps-gitlab-ci/ # .gitlab-ci.yml parser + GitLab tags/releases API registry
+│   ├── deps-engine/    # Internal: ecosystem registration + verdict classification, shared by deps-lsp/deps-cli
+│   ├── deps-lsp/       # Main LSP server
+│   ├── deps-cli/       # `deps-cli check` — CLI for CI/pre-commit/shell workflows
+│   ├── github-action/  # Composite GitHub Action wrapping `deps-cli check --format sarif`
+│   └── deps-zed/       # Zed extension (WASM)
+├── .config/            # nextest configuration
+└── .github/            # CI/CD workflows
+```
+
+## Performance
+
+`deps-lsp` is optimized for responsiveness — parallel per-dependency fetching, aggressive
+caching, and non-blocking handlers keep the interactive paths fast even on a manifest with
+hundreds of dependencies:
+
+| Operation | Latency | Notes |
+| ----------- | --------- | ------- |
+| Document open (50 deps) | ~150ms | Parallel registry fetching |
+| Inlay hints | <100ms | Cached version lookups |
+| Hover | <50ms | Pre-fetched metadata |
+| Code actions | <50ms | No network calls |
+| Code lens | <50ms | No network calls; in-memory only |
+
+Lock file support provides instant resolved versions without network requests.
+
+Run performance benchmarks with criterion:
+
+```bash
+cargo bench --workspace
+```
+
+View the HTML report at `target/criterion/report/index.html`.
+
+## Versioning Policy
+
+`deps-core`'s public trait signatures (`Ecosystem`, `Dependency`, `ParseResult`,
+`EcosystemFormatter`) — and its public `lsp_helpers` / `completion` helper functions — are typed
+directly against `tower_lsp_server::ls_types` types. `tower-lsp-server` is pinned pre-1.0, so a
+`tower-lsp-server` minor bump (e.g. 0.23 → 0.24) is not an implementation detail `deps-core` can
+absorb silently — it forces a breaking release of `deps-core`: a minor version bump while
+`deps-core` itself remains pre-1.0, a major version bump once `deps-core` reaches 1.0.
+
+If you implement `Ecosystem` outside this workspace, depend on the exact matching
+`tower-lsp-server` version via `deps_core::tower_lsp_server` rather than adding your own separate
+direct dependency on `tower-lsp-server`, to avoid it drifting out of sync with the version
+`deps-core` was built against.
