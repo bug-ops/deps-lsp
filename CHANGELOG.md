@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **docs**: new mdBook at `book/` reorganizing `docs/ECOSYSTEM_GUIDE.md`'s flat feature list into cross-ecosystem, per-ecosystem, and contributor-tutorial chapters, published to GitHub Pages under `/book/` by a new `.github/workflows/mdbook.yml`; `docs/ECOSYSTEM_GUIDE.md` is now a short stub pointing at the published book (resolves #1095)
+- **docs**: new mdBook at `book/` reorganizing the former `docs/ECOSYSTEM_GUIDE.md`'s flat feature list into cross-ecosystem, per-ecosystem, and contributor-tutorial chapters, published to GitHub Pages under `/book/` by a new `.github/workflows/mdbook.yml`; `docs/ECOSYSTEM_GUIDE.md` is removed, fully superseded by the book (resolves #1095)
 - **deps-cli**: `deps-cli check --format sarif` SARIF 2.1.0 output, a `.pre-commit-hooks.yaml` entry, and a `crates/github-action` composite GitHub Action wrapping the SARIF check for `github/codeql-action/upload-sarif` (spec 062 PR 3, resolves #1063, #711) (#1078)
 - **deps-cli**: SARIF `tool.driver.rules` entries now get `name`/`shortDescription`, and OSV-advisory rules additionally get `helpUri`/`fullDescription`; results carry `partialFingerprints` and `run.automationDetails.id` (resolves #1077) (#1082)
 - **deps-cli**: new `deps-cli check [PATH...]` CLI subcommand — `.gitignore`-aware workspace walk, table/JSON reporting, `--fail-on`/`--offline`/`--cooldown`/`--config` flags, and CI-friendly exit codes (0 clean / 1 policy violation / 2 execution error), reusing `deps-engine`'s classification pipeline with no ecosystem-verdict logic of its own (spec 062 PR 2, resolves #1061) (#1072)
