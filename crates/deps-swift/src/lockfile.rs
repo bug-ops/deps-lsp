@@ -15,7 +15,7 @@ use deps_core::lockfile::{
 };
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
-use tower_lsp_server::ls_types::Uri;
+use url::Url;
 
 /// Package.resolved file parser.
 pub struct SwiftLockParser;
@@ -65,7 +65,7 @@ struct PinState {
 }
 
 impl LockFileProvider for SwiftLockParser {
-    fn locate_lockfile(&self, manifest_uri: &Uri) -> Option<PathBuf> {
+    fn locate_lockfile(&self, manifest_uri: &Url) -> Option<PathBuf> {
         locate_lockfile_for_manifest(manifest_uri, Self::LOCKFILE_NAMES)
     }
 

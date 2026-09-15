@@ -44,7 +44,7 @@ use deps_core::yaml_anchor::{AnchorLimits, ScalarAnchorTable};
 use deps_core::yaml_walk::{FrameKind, FrameStack, ScalarPosition};
 use deps_core::{DepsError, Result};
 use std::collections::{HashMap, HashSet};
-use tower_lsp_server::ls_types::Uri;
+use url::Url;
 use yaml_rust2::parser::{Event, MarkedEventReceiver, Parser, Tag};
 use yaml_rust2::scanner::{Marker, TScalarStyle};
 
@@ -1396,7 +1396,7 @@ fn build_dependency(
 /// ```
 pub fn parse_gitlab_ci_yaml(
     content: &str,
-    uri: &Uri,
+    uri: &Url,
     policy: &RegistryAccessPolicy,
     instance_host: &GitlabInstanceHost,
 ) -> Result<GitlabCiParseResult> {
@@ -1505,10 +1505,10 @@ mod tests {
     use super::*;
     use deps_core::Dependency;
     use deps_core::net_policy::WorkspaceRegistryAccess;
+    use deps_core::position::Range;
     use std::sync::{Arc, RwLock};
-    use tower_lsp_server::ls_types::Range;
 
-    fn test_uri() -> Uri {
+    fn test_uri() -> Url {
         deps_core::test_util::test_uri("/repo/.gitlab-ci.yml")
     }
 

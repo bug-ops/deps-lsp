@@ -329,7 +329,7 @@ mod tests {
     fn test_dep(name: &str, requirement: &str) -> crate::types::DenoDependency {
         crate::types::DenoDependency {
             name: PackageName::new(name),
-            name_range: tower_lsp_server::ls_types::Range::default(),
+            name_range: deps_core::position::Range::default(),
             version_req: Some(VersionReq::new(requirement)),
             version_range: None,
             section: crate::types::DenoDependencySection::Imports,
@@ -375,13 +375,13 @@ mod tests {
             fn name(&self) -> &deps_core::PackageName {
                 &self.0
             }
-            fn name_range(&self) -> tower_lsp_server::ls_types::Range {
-                tower_lsp_server::ls_types::Range::default()
+            fn name_range(&self) -> deps_core::position::Range {
+                deps_core::position::Range::default()
             }
             fn version_requirement(&self) -> Option<&VersionReq> {
                 None
             }
-            fn version_range(&self) -> Option<tower_lsp_server::ls_types::Range> {
+            fn version_range(&self) -> Option<deps_core::position::Range> {
                 None
             }
             fn source(&self) -> deps_core::parser::DependencySource {

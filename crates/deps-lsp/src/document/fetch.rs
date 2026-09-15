@@ -415,17 +415,18 @@ mod tests {
         #[tokio::test]
         async fn test_document_parsing() {
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
+            let url = deps_core::test_util::test_uri("/test/pyproject.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let content = r#"[project]
 dependencies = ["requests>=2.0.0"]
 "#;
 
             let ecosystem = state
                 .ecosystem_registry
-                .for_uri(&uri)
+                .for_uri(&url)
                 .expect("pypi ecosystem not found");
 
-            let parse_result = ecosystem.parse_manifest(content, &uri).await;
+            let parse_result = ecosystem.parse_manifest(content, &url).await;
             assert!(parse_result.is_ok());
 
             let doc_state = DocumentState::new_from_parse_result(
@@ -548,7 +549,8 @@ dependencies = ["requests>=2.0.0"]
             HashMap<String, (ConcreteVersion, RemovalStatus)>,
         ) {
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
+            let url = deps_core::test_util::test_uri("/test/pyproject.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             // The TOML key is quoted so a dotted name (e.g. `zope.interface`)
             // is a literal key rather than TOML's dotted-key table-nesting
             // syntax.
@@ -557,12 +559,12 @@ dependencies = ["requests>=2.0.0"]
 
             let ecosystem = state
                 .ecosystem_registry
-                .for_uri(&uri)
+                .for_uri(&url)
                 .expect("pypi ecosystem not found");
             let formatter = ecosystem.formatter();
 
             let parse_result = ecosystem
-                .parse_manifest(&content, &uri)
+                .parse_manifest(&content, &url)
                 .await
                 .expect("a single Poetry table-key dependency must parse");
             assert_eq!(
@@ -633,7 +635,7 @@ dependencies = ["requests>=2.0.0"]
                 VersionData::new(&doc.cached_versions, &doc.resolved_versions)
                     .with_outcomes(&doc.outcomes),
                 formatter,
-                &uri,
+                &url,
                 deps_core::freshness::FreshnessSettings::default(),
                 DiagnosticSeverities::default(),
                 deps_core::PublishTime::now(),

@@ -34,7 +34,7 @@ use deps_core::yaml_scalar_string;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use tower_lsp_server::ls_types::Uri;
+use url::Url;
 use yaml_rust2::{Yaml, YamlLoader};
 
 /// package-lock.json file parser.
@@ -53,11 +53,11 @@ use yaml_rust2::{Yaml, YamlLoader};
 /// ```no_run
 /// use deps_npm::lockfile::NpmLockParser;
 /// use deps_core::lockfile::LockFileProvider;
-/// use tower_lsp_server::ls_types::Uri;
+/// use url::Url;
 ///
 /// # async fn example() -> deps_core::error::Result<()> {
 /// let parser = NpmLockParser;
-/// let manifest_uri = Uri::from_file_path("/path/to/package.json").unwrap();
+/// let manifest_uri = Url::from_file_path("/path/to/package.json").unwrap();
 ///
 /// if let Some(lockfile_path) = parser.locate_lockfile(&manifest_uri) {
 ///     let resolved = parser.parse_lockfile(&lockfile_path).await?;
@@ -111,7 +111,7 @@ struct PackageEntry {
 }
 
 impl LockFileProvider for NpmLockParser {
-    fn locate_lockfile(&self, manifest_uri: &Uri) -> Option<PathBuf> {
+    fn locate_lockfile(&self, manifest_uri: &Url) -> Option<PathBuf> {
         locate_lockfile_for_manifest(manifest_uri, Self::LOCKFILE_NAMES)
     }
 
@@ -860,7 +860,7 @@ mod tests {
         std::fs::write(&workspace_lock, r#"{"lockfileVersion": 3}"#).unwrap();
         std::fs::write(&member_manifest, r#"{"name": "member"}"#).unwrap();
 
-        let manifest_uri = Uri::from_file_path(&member_manifest).unwrap();
+        let manifest_uri = Url::from_file_path(&member_manifest).unwrap();
         let parser = NpmLockParser;
 
         let located = parser.locate_lockfile(&manifest_uri);
@@ -1353,7 +1353,7 @@ importers:
         std::fs::write(&npm_lock, r#"{"lockfileVersion": 3}"#).unwrap();
         std::fs::write(&pnpm_lock, "lockfileVersion: '9.0'\n").unwrap();
 
-        let manifest_uri = Uri::from_file_path(&manifest_path).unwrap();
+        let manifest_uri = Url::from_file_path(&manifest_path).unwrap();
         let parser = NpmLockParser;
 
         assert_eq!(parser.locate_lockfile(&manifest_uri).unwrap(), npm_lock);
@@ -1370,7 +1370,7 @@ importers:
         std::fs::write(&manifest_path, r#"{"name": "test"}"#).unwrap();
         std::fs::write(&pnpm_lock, "lockfileVersion: '9.0'\n").unwrap();
 
-        let manifest_uri = Uri::from_file_path(&manifest_path).unwrap();
+        let manifest_uri = Url::from_file_path(&manifest_path).unwrap();
         let parser = NpmLockParser;
 
         assert_eq!(parser.locate_lockfile(&manifest_uri).unwrap(), pnpm_lock);

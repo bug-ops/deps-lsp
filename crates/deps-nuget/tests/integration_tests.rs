@@ -10,14 +10,14 @@ use deps_core::lockfile::LockFileProvider;
 use deps_nuget::{
     NuGetLockParser, parse_directory_packages_props, parse_packages_config, parse_project_file,
 };
-use tower_lsp_server::ls_types::Uri;
+use url::Url;
 
-fn fixture_uri(name: &str) -> Uri {
+fn fixture_uri(name: &str) -> Url {
     #[cfg(windows)]
     let path = format!("C:/test/{name}");
     #[cfg(not(windows))]
     let path = format!("/test/{name}");
-    Uri::from_file_path(path).unwrap()
+    Url::from_file_path(path).unwrap()
 }
 
 fn load_fixture(name: &str) -> String {

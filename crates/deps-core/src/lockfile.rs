@@ -12,7 +12,6 @@ use dashmap::DashMap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
-use tower_lsp_server::ls_types::Uri;
 
 /// Maximum depth to search for workspace root lock file.
 const MAX_WORKSPACE_DEPTH: usize = 5;
@@ -184,43 +183,45 @@ where
 /// Resolves a manifest URI to an absolute local filesystem path, rejecting a non-`file:`
 /// scheme, a relative path, or a non-local host.
 ///
-/// The `ls-types` `Uri::to_file_path` this crate builds on (unlike `url::Url::to_file_path`)
-/// does not check the URI's scheme at all, and on non-Windows platforms ignores the URI's
-/// authority/host entirely rather than refusing a non-empty, non-`localhost` one. Without this
-/// guard, both a non-`file:` URI shaped like a real path (e.g. `untitled:/etc/passwd`, VS
-/// Code's untitled-buffer scheme) and a `file://` URI carrying a remote host (e.g.
-/// `file://attacker.example/etc/passwd`) would silently resolve to a real local path (#1084).
-/// Shared by [`locate_lockfile_for_manifest`] and every ecosystem-local lock file locator that
-/// needs the same manifest-path resolution (e.g. `deps-nuget`'s multi-project fallback) so the
-/// guard is defined once, not re-derived per call site.
+/// `url::Url::to_file_path` on its own already refuses a non-empty, non-`localhost` host (it
+/// checks cannot-be-a-base and host) — but it does **not** check the URI's scheme at all, so a
+/// non-`file:` URI shaped like a real path (e.g. `untitled:/etc/passwd`, VS Code's
+/// untitled-buffer scheme) would otherwise silently resolve to a real local path (#1084,
+/// confirmed empirically: `untitled:/etc/x`, `git:/etc/x`, `vscode-remote:/etc/x` all resolve
+/// via `to_file_path`). The explicit host check here is kept as defense-in-depth alongside the
+/// scheme check, rather than relying solely on `to_file_path`'s own internal host validation,
+/// so both guards are visible at this one call site. Shared by [`locate_lockfile_for_manifest`]
+/// and every ecosystem-local lock file locator that needs the same manifest-path resolution
+/// (e.g. `deps-nuget`'s multi-project fallback) so the guard is defined once, not re-derived per
+/// call site.
 ///
 /// # Examples
 ///
 /// ```no_run
 /// use deps_core::lockfile::resolve_manifest_file_path;
-/// use tower_lsp_server::ls_types::Uri;
+/// use url::Url;
 ///
 /// // `no_run`: `/path/to/Cargo.toml` is not absolute on Windows (no drive prefix), so
-/// // `Uri::from_file_path` would return `None` there — same reason the example right
+/// // `Url::from_file_path` would return `Err` there — same reason the example right
 /// // below (`locate_lockfile_for_manifest`'s) is also `no_run`.
-/// let file_uri = Uri::from_file_path("/path/to/Cargo.toml").unwrap();
+/// let file_uri = Url::from_file_path("/path/to/Cargo.toml").unwrap();
 /// assert!(resolve_manifest_file_path(&file_uri).is_some());
 ///
-/// let non_file_uri: Uri = "untitled:/path/to/Cargo.toml".parse().unwrap();
+/// let non_file_uri: Url = "untitled:/path/to/Cargo.toml".parse().unwrap();
 /// assert!(resolve_manifest_file_path(&non_file_uri).is_none());
 /// ```
 #[must_use]
-pub fn resolve_manifest_file_path(manifest_uri: &Uri) -> Option<PathBuf> {
-    if !manifest_uri.scheme().as_str().eq_ignore_ascii_case("file") {
+pub fn resolve_manifest_file_path(manifest_uri: &url::Url) -> Option<PathBuf> {
+    if !manifest_uri.scheme().eq_ignore_ascii_case("file") {
         return None;
     }
-    if let Some(authority) = manifest_uri.authority() {
-        let host = authority.host();
-        if !host.is_empty() && !host.eq_ignore_ascii_case("localhost") {
-            return None;
-        }
+    if let Some(host) = manifest_uri.host_str()
+        && !host.is_empty()
+        && !host.eq_ignore_ascii_case("localhost")
+    {
+        return None;
     }
-    let manifest_path = manifest_uri.to_file_path()?.into_owned();
+    let manifest_path = manifest_uri.to_file_path().ok()?;
     manifest_path.is_absolute().then_some(manifest_path)
 }
 
@@ -250,9 +251,9 @@ pub fn resolve_manifest_file_path(manifest_uri: &Uri) -> Option<PathBuf> {
 ///
 /// ```no_run
 /// use deps_core::lockfile::locate_lockfile_for_manifest;
-/// use tower_lsp_server::ls_types::Uri;
+/// use url::Url;
 ///
-/// let manifest_uri = Uri::from_file_path("/path/to/Cargo.toml").unwrap();
+/// let manifest_uri = Url::from_file_path("/path/to/Cargo.toml").unwrap();
 /// let lockfile_names = &["Cargo.lock"];
 ///
 /// if let Some(path) = locate_lockfile_for_manifest(&manifest_uri, lockfile_names) {
@@ -260,7 +261,7 @@ pub fn resolve_manifest_file_path(manifest_uri: &Uri) -> Option<PathBuf> {
 /// }
 /// ```
 pub fn locate_lockfile_for_manifest(
-    manifest_uri: &Uri,
+    manifest_uri: &url::Url,
     lockfile_names: &[&str],
 ) -> Option<PathBuf> {
     let manifest_path = resolve_manifest_file_path(manifest_uri)?;
@@ -535,13 +536,13 @@ impl ResolvedPackages {
 /// ```no_run
 /// use deps_core::lockfile::{LockFileProvider, ResolvedPackages};
 /// use std::path::{Path, PathBuf};
-/// use tower_lsp_server::ls_types::Uri;
+/// use url::Url;
 ///
 /// struct MyLockParser;
 ///
 /// impl LockFileProvider for MyLockParser {
-///     fn locate_lockfile(&self, manifest_uri: &Uri) -> Option<PathBuf> {
-///         let manifest_path = manifest_uri.to_file_path()?;
+///     fn locate_lockfile(&self, manifest_uri: &Url) -> Option<PathBuf> {
+///         let manifest_path = manifest_uri.to_file_path().ok()?;
 ///         let lock_path = manifest_path.with_file_name("my.lock");
 ///         lock_path.exists().then_some(lock_path)
 ///     }
@@ -569,7 +570,7 @@ pub trait LockFileProvider: Send + Sync {
     /// # Returns
     ///
     /// Path to lock file if found
-    fn locate_lockfile(&self, manifest_uri: &Uri) -> Option<PathBuf>;
+    fn locate_lockfile(&self, manifest_uri: &url::Url) -> Option<PathBuf>;
 
     /// Parses a lock file and extracts resolved packages.
     ///
@@ -804,16 +805,16 @@ mod tests {
     use super::*;
 
     /// Builds a URI whose path component is `manifest_path`'s real, absolute path, with the
-    /// `file://` prefix `Uri::from_file_path` would produce replaced by `prefix` (e.g.
+    /// `file://` prefix `Url::from_file_path` would produce replaced by `prefix` (e.g.
     /// `"untitled:"` or `"file://attacker.example"`).
     ///
     /// Building this via `format!("{prefix}{}", manifest_path.display())` would panic on
     /// Windows: `Path::display()` there uses `\` separators and an unescaped drive letter,
-    /// neither of which is a legal URI path character, so `.parse::<Uri>()` fails. Routing
-    /// through `Uri::from_file_path` first reuses its own drive-letter/separator/percent-
+    /// neither of which is a legal URI path character, so `.parse::<Url>()` fails. Routing
+    /// through `Url::from_file_path` first reuses its own drive-letter/separator/percent-
     /// encoding handling, so the resulting string parses on every platform.
-    fn non_file_uri(prefix: &str, manifest_path: &std::path::Path) -> Uri {
-        let file_uri = Uri::from_file_path(manifest_path).unwrap();
+    fn non_file_uri(prefix: &str, manifest_path: &std::path::Path) -> url::Url {
+        let file_uri = url::Url::from_file_path(manifest_path).unwrap();
         let path_part = file_uri.as_str().strip_prefix("file://").unwrap();
         format!("{prefix}{path_part}").parse().unwrap()
     }
@@ -1328,7 +1329,7 @@ mod tests {
         std::fs::write(&manifest_path, "[package]\nname = \"test\"").unwrap();
         std::fs::write(&lock_path, "version = 4").unwrap();
 
-        let manifest_uri = Uri::from_file_path(&manifest_path).unwrap();
+        let manifest_uri = url::Url::from_file_path(&manifest_path).unwrap();
         let located = locate_lockfile_for_manifest(&manifest_uri, &["Cargo.lock"]);
 
         assert!(located.is_some());
@@ -1349,7 +1350,7 @@ mod tests {
         std::fs::write(&workspace_lock, "version = 4").unwrap();
         std::fs::write(&member_manifest, "[package]\nname = \"member\"").unwrap();
 
-        let manifest_uri = Uri::from_file_path(&member_manifest).unwrap();
+        let manifest_uri = url::Url::from_file_path(&member_manifest).unwrap();
         let located = locate_lockfile_for_manifest(&manifest_uri, &["Cargo.lock"]);
 
         assert!(located.is_some());
@@ -1372,7 +1373,7 @@ mod tests {
         std::fs::write(&manifest_path, "[package]\nname = \"test\"").unwrap();
         std::fs::create_dir(&lock_path).unwrap();
 
-        let manifest_uri = Uri::from_file_path(&manifest_path).unwrap();
+        let manifest_uri = url::Url::from_file_path(&manifest_path).unwrap();
         let located = locate_lockfile_for_manifest(&manifest_uri, &["Cargo.lock"]);
 
         assert!(
@@ -1381,7 +1382,7 @@ mod tests {
         );
     }
 
-    /// #1084 regression: `Uri::to_file_path` does not check the URI's scheme, so a
+    /// #1084 regression: `url::Url::to_file_path` does not check the URI's scheme, so a
     /// hierarchical non-`file:` URI shaped like a real path (e.g. VS Code's `untitled:`
     /// scheme) must be rejected before any filesystem resolution is attempted, never
     /// resolved against the real filesystem.
@@ -1412,11 +1413,30 @@ mod tests {
         );
     }
 
-    /// #1084 S3: `Uri::to_file_path` (the `ls-types` implementation this crate uses, unlike
-    /// `url::Url::to_file_path`) ignores the authority/host on non-Windows entirely — a
-    /// `file://` URI carrying a non-`localhost` host must still be rejected by
+    /// #1084 S3: a `file://` URI carrying a non-`localhost` host must be rejected by
     /// [`resolve_manifest_file_path`], not resolved against the local filesystem as if the
-    /// host were not there.
+    /// host were not there. `url::Url::to_file_path` already refuses this internally
+    /// (verified empirically: it checks cannot-be-a-base and host), but the explicit host
+    /// check in `resolve_manifest_file_path` pins the behavior at this call site regardless
+    /// of that internal detail, so this test protects against either implementation
+    /// drifting silently.
+    ///
+    /// `#[cfg(unix)]`: the WHATWG URL Standard's file-host parsing unconditionally drops a
+    /// `file://` URL's host whenever the path immediately following it looks like a Windows
+    /// drive letter (`url` crate's `parser.rs`: "For file URLs that have a host and whose
+    /// path starts with the windows drive letter we just remove the host" — this is
+    /// spec-mandated parsing behavior, not an OS-gated code path, but it only *triggers* on
+    /// a real Windows machine, where `tempfile::tempdir()`'s absolute path is drive-lettered;
+    /// on Unix the path never looks like a drive letter, so the host survives parsing).
+    /// Concretely: `file://attacker.example/C:/x` parses with `host: None`, not
+    /// `Some("attacker.example")`, on Windows — the malicious host is discarded before
+    /// `resolve_manifest_file_path` ever sees it, and the URI resolves to the local
+    /// drive-letter path directly, same as if no host had been specified at all. This is
+    /// safe (the "remote host" never actually gets treated as a target), just not what this
+    /// test's `assert!(located.is_none())` expects, so it is Unix-only rather than adjusted
+    /// to a different, weaker assertion guessed at without a Windows environment to verify
+    /// the exact resulting behavior against.
+    #[cfg(unix)]
     #[test]
     fn test_locate_lockfile_for_manifest_rejects_remote_host_file_uri() {
         // See the comment in `test_locate_lockfile_for_manifest_same_directory` on why this
@@ -1441,11 +1461,12 @@ mod tests {
     /// A `file:` URI with an empty or `localhost` host must still resolve normally — the
     /// host guard in [`resolve_manifest_file_path`] must not reject the common, safe case.
     ///
-    /// `#[cfg(unix)]`: on Windows, `ls-types`' own `Uri::to_file_path` folds a `localhost`
-    /// authority into the returned path in a way that is not itself `is_absolute()` (its
-    /// UNC-like `server:/...` construction, see `to_file_path`'s Windows branch), so the
-    /// (correct, fail-closed) `is_absolute()` filter rejects it there too — a Windows-only
-    /// quirk of the underlying `to_file_path`, not something this guard should special-case.
+    /// `#[cfg(unix)]`: this crate's other Windows-path tests (see `deps_core::test_util::
+    /// test_uri` and the `#1071` migration handoffs) establish that `url::Url::to_file_path`
+    /// needs a drive-letter-shaped first path segment to resolve on Windows at all; a bare
+    /// `file://localhost/tmp/...`-style fixture with no drive letter is not a portable test
+    /// input there, so this is kept Unix-only rather than guessed at without a Windows
+    /// environment to verify against.
     #[cfg(unix)]
     #[test]
     fn test_locate_lockfile_for_manifest_accepts_localhost_file_uri() {
@@ -1474,7 +1495,7 @@ mod tests {
         let manifest_path = temp_dir.path().join("Cargo.toml");
         std::fs::write(&manifest_path, "[package]\nname = \"test\"").unwrap();
 
-        let manifest_uri = Uri::from_file_path(&manifest_path).unwrap();
+        let manifest_uri = url::Url::from_file_path(&manifest_path).unwrap();
         let located = locate_lockfile_for_manifest(&manifest_uri, &["Cargo.lock"]);
 
         assert!(located.is_none());
@@ -1492,7 +1513,7 @@ mod tests {
         std::fs::write(&manifest_path, "[project]\nname = \"test\"").unwrap();
         std::fs::write(&uv_lock, "version = 1").unwrap();
 
-        let manifest_uri = Uri::from_file_path(&manifest_path).unwrap();
+        let manifest_uri = url::Url::from_file_path(&manifest_path).unwrap();
         // poetry.lock doesn't exist, but uv.lock does - should find uv.lock
         let located = locate_lockfile_for_manifest(&manifest_uri, &["poetry.lock", "uv.lock"]);
 
@@ -1520,7 +1541,7 @@ mod tests {
     }
 
     impl LockFileProvider for CountingLockFileProvider {
-        fn locate_lockfile(&self, _manifest_uri: &Uri) -> Option<PathBuf> {
+        fn locate_lockfile(&self, _manifest_uri: &url::Url) -> Option<PathBuf> {
             None
         }
 
@@ -1728,7 +1749,7 @@ mod tests {
     }
 
     impl LockFileProvider for RewritingDuringParseProvider {
-        fn locate_lockfile(&self, _manifest_uri: &Uri) -> Option<PathBuf> {
+        fn locate_lockfile(&self, _manifest_uri: &url::Url) -> Option<PathBuf> {
             None
         }
 
@@ -1817,7 +1838,7 @@ mod tests {
         std::fs::write(&poetry_lock, "# poetry lock").unwrap();
         std::fs::write(&uv_lock, "version = 1").unwrap();
 
-        let manifest_uri = Uri::from_file_path(&manifest_path).unwrap();
+        let manifest_uri = url::Url::from_file_path(&manifest_path).unwrap();
         // Both exist, poetry.lock should be found first (listed first)
         let located = locate_lockfile_for_manifest(&manifest_uri, &["poetry.lock", "uv.lock"]);
 

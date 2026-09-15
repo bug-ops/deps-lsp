@@ -1,6 +1,5 @@
 use dashmap::DashMap;
 use std::sync::Arc;
-use tower_lsp_server::ls_types::Uri;
 
 use crate::Ecosystem;
 
@@ -283,17 +282,17 @@ impl EcosystemRegistry {
     ///
     /// ```no_run
     /// use deps_core::EcosystemRegistry;
-    /// use tower_lsp_server::ls_types::Uri;
+    /// use url::Url;
     ///
     /// let registry = EcosystemRegistry::new();
-    /// let uri = Uri::from_file_path("/home/user/project/Cargo.toml").unwrap();
+    /// let uri = Url::from_file_path("/home/user/project/Cargo.toml").unwrap();
     ///
     /// if let Some(ecosystem) = registry.for_uri(&uri) {
     ///     println!("File handled by: {}", ecosystem.display_name());
     /// }
     /// ```
-    pub fn for_uri(&self, uri: &Uri) -> Option<Arc<dyn Ecosystem>> {
-        let path = uri.path().as_str();
+    pub fn for_uri(&self, uri: &url::Url) -> Option<Arc<dyn Ecosystem>> {
+        let path = uri.path();
         let filename = path.rsplit('/').next()?;
         let by_filename = self.for_filename(filename);
         let by_directory = self.get_for_directory_pattern(path, filename);
@@ -680,7 +679,7 @@ mod tests {
         fn parse_manifest<'a>(
             &'a self,
             _content: &'a str,
-            _uri: &'a Uri,
+            _uri: &'a url::Url,
         ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Box<dyn ParseResult>>> {
             Box::pin(async move { unimplemented!() })
         }
@@ -754,7 +753,7 @@ mod tests {
         fn parse_manifest<'a>(
             &'a self,
             _content: &'a str,
-            _uri: &'a Uri,
+            _uri: &'a url::Url,
         ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Box<dyn ParseResult>>> {
             Box::pin(async move { unimplemented!() })
         }
@@ -835,7 +834,7 @@ mod tests {
         fn parse_manifest<'a>(
             &'a self,
             _content: &'a str,
-            _uri: &'a Uri,
+            _uri: &'a url::Url,
         ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Box<dyn ParseResult>>> {
             Box::pin(async move { unimplemented!() })
         }

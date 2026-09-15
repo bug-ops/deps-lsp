@@ -32,8 +32,6 @@
 use std::any::Any;
 use std::path::Path;
 
-use tower_lsp_server::ls_types::Uri;
-
 use crate::ecosystem::{BlockedRegistryOccurrence, Dependency, ParseResult};
 
 /// Maximum number of dependencies [`ParseResult::dependencies`] returns for one open
@@ -189,7 +187,7 @@ impl ParseResult for DependencyCappedParseResult {
         self.inner.workspace_root()
     }
 
-    fn uri(&self) -> &Uri {
+    fn uri(&self) -> &url::Url {
         self.inner.uri()
     }
 

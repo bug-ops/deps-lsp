@@ -560,10 +560,11 @@ mod tests {
         #[tokio::test]
         async fn run_license_prefetch_no_op_for_non_tier3_ecosystem() {
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let ecosystem = state
                 .ecosystem_registry
-                .for_uri(&uri)
+                .for_uri(&url)
                 .expect("Cargo ecosystem not found");
 
             // No document inserted for `uri` at all — if the ecosystem gate didn't
@@ -584,14 +585,15 @@ mod tests {
         #[ignore = "hits the real pub.dev API"]
         async fn run_license_prefetch_live_dart_populates_document_licenses() {
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/pubspec.yaml");
+            let url = deps_core::test_util::test_uri("/test/pubspec.yaml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let content = "dependencies:\n  http: ^1.0.0\n";
 
             let ecosystem = state
                 .ecosystem_registry
-                .for_uri(&uri)
+                .for_uri(&url)
                 .expect("Dart ecosystem not found");
-            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = ecosystem.parse_manifest(content, &url).await.unwrap();
             let mut doc_state = DocumentState::new_from_parse_result(
                 EcosystemId::Dart,
                 content.to_string(),
@@ -626,14 +628,15 @@ mod tests {
         #[ignore = "hits the real GitHub API"]
         async fn run_license_prefetch_live_swift_populates_document_licenses() {
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Package.swift");
+            let url = deps_core::test_util::test_uri("/test/Package.swift");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let content = r#".package(url: "https://github.com/apple/swift-nio.git", .upToNextMajor(from: "2.0.0"))"#;
 
             let ecosystem = state
                 .ecosystem_registry
-                .for_uri(&uri)
+                .for_uri(&url)
                 .expect("Swift ecosystem not found");
-            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = ecosystem.parse_manifest(content, &url).await.unwrap();
             let mut doc_state = DocumentState::new_from_parse_result(
                 EcosystemId::Swift,
                 content.to_string(),
@@ -668,15 +671,16 @@ mod tests {
             // `document/loader.rs`'s diffing test.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/build.gradle.kts");
+            let url = deps_core::test_util::test_uri("/test/build.gradle.kts");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let content =
                 "dependencies {\n    implementation(\"com.squareup.okhttp3:okhttp:4.12.0\")\n}\n";
 
             let ecosystem = state
                 .ecosystem_registry
-                .for_uri(&uri)
+                .for_uri(&url)
                 .expect("Gradle ecosystem not found");
-            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = ecosystem.parse_manifest(content, &url).await.unwrap();
             let mut doc_state = DocumentState::new_from_parse_result(
                 EcosystemId::Gradle,
                 content.to_string(),
@@ -715,15 +719,16 @@ mod tests {
             // on why this guard is needed here.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/build.gradle.kts");
+            let url = deps_core::test_util::test_uri("/test/build.gradle.kts");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let content =
                 "dependencies {\n    implementation(\"com.google.guava:guava:32.0.1-jre\")\n}\n";
 
             let ecosystem = state
                 .ecosystem_registry
-                .for_uri(&uri)
+                .for_uri(&url)
                 .expect("Gradle ecosystem not found");
-            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = ecosystem.parse_manifest(content, &url).await.unwrap();
             let mut doc_state = DocumentState::new_from_parse_result(
                 EcosystemId::Gradle,
                 content.to_string(),
@@ -760,14 +765,15 @@ mod tests {
         #[ignore = "hits the real JSR API"]
         async fn run_license_prefetch_live_deno_populates_document_licenses() {
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/deno.json");
+            let url = deps_core::test_util::test_uri("/test/deno.json");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let content = r#"{"imports": {"@std/fs": "jsr:@std/fs@^1.0"}}"#;
 
             let ecosystem = state
                 .ecosystem_registry
-                .for_uri(&uri)
+                .for_uri(&url)
                 .expect("Deno ecosystem not found");
-            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = ecosystem.parse_manifest(content, &url).await.unwrap();
             let mut doc_state = DocumentState::new_from_parse_result(
                 EcosystemId::Deno,
                 content.to_string(),

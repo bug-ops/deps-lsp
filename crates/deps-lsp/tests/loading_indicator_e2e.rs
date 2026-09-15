@@ -16,14 +16,15 @@ use std::time::Duration;
 #[tokio::test]
 async fn test_loading_state_lifecycle_cargo() {
     let state = Arc::new(ServerState::new());
-    let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+    let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+    let uri = deps_lsp::lsp_types_interop::to_lsp_uri(&url);
     let content = r#"[dependencies]
 serde = "1.0.0"
 tokio = { version = "1.0", features = ["full"] }
 "#;
 
     let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
-    let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+    let parse_result = ecosystem.parse_manifest(content, &url).await.unwrap();
 
     // Phase 1: Initial state - document created with Idle loading state
     let doc =
@@ -130,8 +131,10 @@ fn test_progress_only_mode() {
 async fn test_concurrent_loading_multiple_documents() {
     let state = Arc::new(ServerState::new());
 
-    let uri1 = deps_core::test_util::test_uri("/test/Cargo1.toml");
-    let uri2 = deps_core::test_util::test_uri("/test/Cargo2.toml");
+    let url1 = deps_core::test_util::test_uri("/test/Cargo1.toml");
+    let url2 = deps_core::test_util::test_uri("/test/Cargo2.toml");
+    let uri1 = deps_lsp::lsp_types_interop::to_lsp_uri(&url1);
+    let uri2 = deps_lsp::lsp_types_interop::to_lsp_uri(&url2);
 
     let content = r#"[dependencies]
 serde = "1.0.0"
@@ -140,8 +143,8 @@ serde = "1.0.0"
     let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
 
     // Create two documents
-    let parse1 = ecosystem.parse_manifest(content, &uri1).await.unwrap();
-    let parse2 = ecosystem.parse_manifest(content, &uri2).await.unwrap();
+    let parse1 = ecosystem.parse_manifest(content, &url1).await.unwrap();
+    let parse2 = ecosystem.parse_manifest(content, &url2).await.unwrap();
 
     let mut doc1 =
         DocumentState::new_from_parse_result(EcosystemId::Cargo, content.to_string(), parse1);
@@ -376,7 +379,9 @@ fn test_combined_config() {
 #[test]
 fn test_server_state_document_has_loading_state() {
     let state = ServerState::new();
-    let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+    let uri = deps_lsp::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+        "/test/Cargo.toml",
+    ));
 
     let doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
 
@@ -458,7 +463,9 @@ async fn test_loading_timeout_scenario() {
 #[tokio::test]
 async fn test_rapid_set_loading_calls() {
     let state = Arc::new(ServerState::new());
-    let uri = deps_core::test_util::test_uri("/test/rapid.toml");
+    let uri = deps_lsp::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+        "/test/rapid.toml",
+    ));
 
     let doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
     state.update_document(uri.clone(), doc);

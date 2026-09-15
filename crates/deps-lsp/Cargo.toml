@@ -53,6 +53,7 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "ti
 tower-lsp-server = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
+url = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

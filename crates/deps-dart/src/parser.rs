@@ -31,11 +31,12 @@
 
 use crate::types::{DartDependency, DependencySection, DependencySource};
 use deps_core::lsp_helpers::{LineOffsetTable, MarkedScalar, is_plain_null};
+use deps_core::position::Range;
 use deps_core::yaml_anchor::{AnchorLimits, ScalarAnchorTable};
 use deps_core::yaml_walk::{FrameKind, FrameStack, ScalarPosition};
 use deps_core::{DependencyBudget, DepsError, Result};
 use std::collections::HashMap;
-use tower_lsp_server::ls_types::{Range, Uri};
+use url::Url;
 use yaml_rust2::parser::{Event, MarkedEventReceiver, Parser, Tag};
 use yaml_rust2::scanner::{Marker, TScalarStyle};
 
@@ -48,7 +49,7 @@ pub struct DartParseResult {
     /// The `environment: sdk:` constraint string, if declared.
     pub sdk_constraint: Option<String>,
     /// URI of the manifest this result was parsed from.
-    pub uri: Uri,
+    pub uri: Url,
     /// `Some((kept, total))` once the manifest declared more dependencies than
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
     /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
@@ -1101,7 +1102,7 @@ fn build_dependency(
 /// assert_eq!(result.dependencies[0].name, "http");
 /// assert_eq!(result.dependencies[0].version_req, Some("^1.0.0".into()));
 /// ```
-pub fn parse_pubspec_yaml(content: &str, doc_uri: &Uri) -> Result<DartParseResult> {
+pub fn parse_pubspec_yaml(content: &str, doc_uri: &Url) -> Result<DartParseResult> {
     if let Err(depth) =
         deps_core::check_yaml_nesting_depth(content, deps_core::MAX_YAML_NESTING_DEPTH)
     {
@@ -1167,12 +1168,12 @@ mod tests {
 
     use std::assert_matches;
 
-    fn test_uri() -> Uri {
+    fn test_uri() -> Url {
         #[cfg(windows)]
         let path = "C:/test/pubspec.yaml";
         #[cfg(not(windows))]
         let path = "/test/pubspec.yaml";
-        Uri::from_file_path(path).unwrap()
+        Url::from_file_path(path).unwrap()
     }
 
     #[test]

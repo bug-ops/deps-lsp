@@ -142,21 +142,69 @@ CHANGELOG.md                       (two "Breaking" entries, one per PR)
 /// identical to `tower_lsp_server::ls_types::Position` but carrying no
 /// dependency on `tower-lsp-server`.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Position {
     pub line: u32,
     pub character: u32,
 }
 
+impl Position {
+    #[must_use]
+    pub fn new(line: u32, character: u32) -> Self { Self { line, character } }
+}
+
 /// A `[start, end)` span over `Position`s, field-for-field identical to
 /// `tower_lsp_server::ls_types::Range`.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Range {
     pub start: Position,
     pub end: Position,
 }
+
+impl Range {
+    #[must_use]
+    pub fn new(start: Position, end: Position) -> Self { Self { start, end } }
+}
+
+// `Hash` is required: `osv::vulnerability_keys` returns `HashMap<Range, String>`
+// keyed by `dep.name_range()` — found during T000 implementation, not anticipated
+// in this plan's first draft.
+//
+// `From`/`Into` conversions to/from `ls_types::{Position,Range}` are legal *here*,
+// inside deps-core — unlike the deps-lsp boundary case below, `Position`/`Range`
+// are local to deps-core, so `impl From<ls_types::Position> for Position` (+
+// reverse) satisfies the orphan rule. These exist so deps-core's own
+// `lsp_helpers` (hover.rs, diagnostics.rs, code_actions.rs, ...) — which still
+// builds real `ls_types::{Hover,Diagnostic,CodeAction,...}` response objects
+// internally, see the note on `Ecosystem`'s `generate_*` methods below — can
+// convert without a second free-function layer duplicating deps-lsp's T003
+// module.
 ```
+
+> [!important] Scope correction (found during T000 implementation, not in the
+> first draft of this plan)
+>
+> `Ecosystem::generate_code_actions` / `generate_diagnostics` /
+> `generate_code_lenses` / `generate_document_links` each take their own
+> `uri: &tower_lsp_server::ls_types::Uri` parameter, always fed
+> `parse_result.uri()` at every real call site. These 4 methods are retyped to
+> `&url::Url` alongside `ParseResult::uri()` — otherwise every call site
+> (~150+ across `lsp_helpers/{diagnostics,code_actions,code_lenses}.rs`'s own
+> tests) stops compiling with no legal `From` impl available to bridge it (both
+> `url::Url` and `ls_types::Uri` are foreign to `deps-core`).
+>
+> More importantly: `deps-core::lsp_helpers` (hover.rs, diagnostics.rs,
+> code_actions.rs, code_lenses.rs, inlay_hints.rs) directly constructs real
+> `ls_types::{Hover, Diagnostic, CodeAction, WorkspaceEdit, CodeLens,
+> InlayHint}` response objects from `Dependency`/`ParseResult` data — this is
+> `deps-core`'s actual job as an "LSP-first" crate (per its own module docs)
+> and is explicitly **not** being redesigned by this spec. Since these
+> response-construction functions need `ls_types` types to exist at all,
+> **`deps-core`'s `Cargo.toml` keeps `tower-lsp-server` as an unconditional
+> dependency** even after this PR — only the *domain model*
+> (`Dependency`/`ParseResult`/`LockFileCache`) sheds it. See §11 (Success
+> Criteria correction) for what this means for FR-004/FR-005/SC-001.
 
 ```rust
 // crates/deps-core/src/ecosystem.rs (signature changes only — bodies unaffected)

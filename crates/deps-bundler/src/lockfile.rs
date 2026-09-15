@@ -10,7 +10,7 @@ use deps_core::lockfile::{
 use regex::Regex;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
-use tower_lsp_server::ls_types::Uri;
+use url::Url;
 
 /// Gemfile.lock parser.
 pub struct GemfileLockParser;
@@ -39,7 +39,7 @@ enum Section {
 }
 
 impl LockFileProvider for GemfileLockParser {
-    fn locate_lockfile(&self, manifest_uri: &Uri) -> Option<PathBuf> {
+    fn locate_lockfile(&self, manifest_uri: &Url) -> Option<PathBuf> {
         locate_lockfile_for_manifest(manifest_uri, Self::LOCKFILE_NAMES)
     }
 

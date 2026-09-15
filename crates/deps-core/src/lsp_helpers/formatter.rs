@@ -154,7 +154,7 @@ pub trait PackageRendering: Send + Sync {
     /// Detect if cursor position is on a dependency for code actions.
     fn is_position_on_dependency(&self, dep: &dyn Dependency, position: Position) -> bool {
         dep.version_range()
-            .is_some_and(|r| position_in_range(position, r))
+            .is_some_and(|r| position_in_range(position, r.into()))
     }
 }
 
@@ -581,13 +581,13 @@ pub trait DiagnosticPolicy: Send + Sync {
     /// #     fn name(&self) -> &PackageName {
     /// #         &self.0
     /// #     }
-    /// #     fn name_range(&self) -> tower_lsp_server::ls_types::Range {
-    /// #         tower_lsp_server::ls_types::Range::default()
+    /// #     fn name_range(&self) -> deps_core::position::Range {
+    /// #         deps_core::position::Range::default()
     /// #     }
     /// #     fn version_requirement(&self) -> Option<&VersionReq> {
     /// #         None
     /// #     }
-    /// #     fn version_range(&self) -> Option<tower_lsp_server::ls_types::Range> {
+    /// #     fn version_range(&self) -> Option<deps_core::position::Range> {
     /// #         None
     /// #     }
     /// #     fn source(&self) -> deps_core::parser::DependencySource {

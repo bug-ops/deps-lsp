@@ -10,9 +10,10 @@ pub mod settings;
 
 use crate::types::GradleDependency;
 use deps_core::Result;
+use deps_core::position::{Position, Range};
 use regex::Captures;
 use std::collections::HashMap;
-use tower_lsp_server::ls_types::{Position, Range, Uri};
+use url::Url;
 
 pub use deps_core::lsp_helpers::LineOffsetTable;
 
@@ -137,7 +138,7 @@ pub struct GradleParseResult {
     /// Dependencies found in the file.
     pub dependencies: Vec<GradleDependency>,
     /// URI of the manifest this result was parsed from.
-    pub uri: Uri,
+    pub uri: Url,
     /// `Some((kept, total))` once the manifest declared more dependencies than
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
     /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
@@ -179,7 +180,7 @@ fn resolve_variable_ref(value: &str, properties: &HashMap<String, String>) -> Op
 ///
 /// Returns an error if the file's dedicated parser fails (e.g. malformed TOML for
 /// a version catalog).
-pub fn parse_gradle(content: &str, uri: &Uri) -> Result<GradleParseResult> {
+pub fn parse_gradle(content: &str, uri: &Url) -> Result<GradleParseResult> {
     let path = uri.path().to_string();
     let mut result = if path.ends_with("libs.versions.toml") {
         catalog::parse_version_catalog(content, uri)?
@@ -299,7 +300,7 @@ pub(crate) fn find_version_range(
 mod tests {
     use super::*;
 
-    fn make_uri(path: &str) -> Uri {
+    fn make_uri(path: &str) -> Url {
         deps_core::test_util::test_uri(path)
     }
 

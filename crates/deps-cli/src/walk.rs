@@ -5,7 +5,6 @@ use ignore::WalkBuilder;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tower_lsp_server::ls_types::Uri;
 
 /// Upper bound on the number of files a single `check` invocation inspects across every
 /// walked root (FR-004).
@@ -224,7 +223,7 @@ fn route_file(
     registry: &EcosystemRegistry,
     outcome: &mut WalkOutcome,
 ) {
-    let Some(uri) = Uri::from_file_path(path) else {
+    let Ok(uri) = url::Url::from_file_path(path) else {
         return;
     };
     if let Some(ecosystem) = registry.for_uri(&uri) {

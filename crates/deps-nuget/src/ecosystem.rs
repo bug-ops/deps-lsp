@@ -20,7 +20,8 @@
 use std::any::Any;
 use std::collections::HashSet;
 use std::sync::Arc;
-use tower_lsp_server::ls_types::{CompletionItem, Hover, HoverContents, Position, Range, Uri};
+use tower_lsp_server::ls_types::{CompletionItem, Hover, HoverContents, Position, Range};
+use url::Url;
 
 use deps_core::{
     Ecosystem, ParseResult as ParseResultTrait, Registry, Result, completion::Completions,
@@ -137,8 +138,8 @@ impl NuGetEcosystem {
     /// `.csproj`/`.fsproj`/`.vbproj` (routed to this ecosystem via `manifest_extensions`)
     /// all share the `PackageReference` MSBuild schema, so anything not matching one of the
     /// two fixed filenames falls through to the project-file parser.
-    fn parse_by_filename(content: &str, uri: &Uri) -> Result<NuGetParseResult> {
-        let path = uri.path().as_str();
+    fn parse_by_filename(content: &str, uri: &Url) -> Result<NuGetParseResult> {
+        let path = uri.path();
         let filename = path.rsplit('/').next().unwrap_or(path);
 
         match filename.to_lowercase().as_str() {
@@ -182,18 +183,19 @@ impl Ecosystem for NuGetEcosystem {
     fn parse_manifest<'a>(
         &'a self,
         content: &'a str,
-        uri: &'a Uri,
+        uri: &'a Url,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Box<dyn ParseResultTrait>>> {
         Box::pin(async move {
             let mut result = Self::parse_by_filename(content, uri)?;
 
-            // Issue #523: a non-file URI (or one `Uri::to_file_path` cannot resolve) has no
+            // Issue #523: a non-file URI (or one `Url::to_file_path` cannot resolve) has no
             // directory to walk `NuGet.Config` discovery from — falls back to the default
             // (empty) `NuGetConfig`, which resolves every dependency to
             // `DependencySource::Registry` (byte-identical to pre-feature behavior), rather
             // than failing the whole parse.
             let config = uri
                 .to_file_path()
+                .ok()
                 .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
                 .map(|dir| {
                     crate::config::resolve_with_context(
@@ -315,9 +317,9 @@ impl Ecosystem for NuGetEcosystem {
             // it finds none, the render above resolves to `None` too, so the unlisted fetch
             // is skipped rather than issued for a hover that will be empty anyway.
             let dep = parse_result.dependencies().into_iter().find(|d| {
-                deps_core::position_in_range(position, d.name_range())
+                deps_core::position_in_range(position, d.name_range().into())
                     || d.version_range()
-                        .is_some_and(|r| deps_core::position_in_range(position, r))
+                        .is_some_and(|r| deps_core::position_in_range(position, r.into()))
             });
             let Some(dep) = dep else {
                 return base_hover.await;
@@ -644,9 +646,15 @@ mod tests {
     fn dep_with_source(name: &str, source: DependencySource, line: u32) -> NuGetDependency {
         NuGetDependency {
             name: name.into(),
-            name_range: Range::new(Position::new(line, 0), Position::new(line, 0)),
+            name_range: deps_core::Range::new(
+                deps_core::Position::new(line, 0),
+                deps_core::Position::new(line, 0),
+            ),
             version_requirement: Some("1.0.0".into()),
-            version_range: Some(Range::new(Position::new(line, 0), Position::new(line, 10))),
+            version_range: Some(deps_core::Range::new(
+                deps_core::Position::new(line, 0),
+                deps_core::Position::new(line, 10),
+            )),
             source,
         }
     }
@@ -691,7 +699,7 @@ mod tests {
         let results = eco
             .complete_versions(
                 &parse_result,
-                target_position,
+                target_position.into(),
                 "1",
                 deps_core::FreshnessSettings::default(),
             )
@@ -765,7 +773,7 @@ mod tests {
         let results = eco
             .complete_versions(
                 &parse_result,
-                position,
+                position.into(),
                 "1",
                 deps_core::FreshnessSettings::default(),
             )
@@ -815,7 +823,7 @@ mod tests {
         let results = eco
             .complete_versions(
                 &parse_result,
-                position,
+                position.into(),
                 "1.",
                 deps_core::FreshnessSettings::default(),
             )
@@ -903,7 +911,7 @@ mod tests {
         let results = eco
             .complete_versions(
                 &parse_result,
-                position,
+                position.into(),
                 "1.",
                 deps_core::FreshnessSettings::default(),
             )
@@ -959,7 +967,7 @@ mod tests {
         let results = eco
             .complete_versions(
                 &parse_result,
-                alternate_position,
+                alternate_position.into(),
                 "1",
                 deps_core::FreshnessSettings::default(),
             )
@@ -978,7 +986,7 @@ mod tests {
     async fn inlay_hint_labels(
         eco: &NuGetEcosystem,
         content: &str,
-        uri: &tower_lsp_server::ls_types::Uri,
+        uri: &Url,
         latest: &str,
     ) -> Vec<String> {
         use deps_core::lsp_helpers::VersionData;
@@ -1073,7 +1081,7 @@ mod tests {
     async fn diagnostic_messages(
         eco: &NuGetEcosystem,
         content: &str,
-        uri: &tower_lsp_server::ls_types::Uri,
+        uri: &Url,
         latest: &str,
     ) -> Vec<String> {
         use deps_core::PackageVersions;
@@ -1418,7 +1426,7 @@ mod tests {
         let manifest_path = dir.path().join("App.csproj");
         let content = r#"<Project><ItemGroup><PackageReference Include="MyCompany.Internal" Version="1.0.0" /></ItemGroup></Project>"#;
         std::fs::write(&manifest_path, content).unwrap();
-        let uri = tower_lsp_server::ls_types::Uri::from_file_path(&manifest_path).unwrap();
+        let uri = Url::from_file_path(&manifest_path).unwrap();
 
         let registry = NuGetRegistry::with_service_index_url(
             Arc::new(deps_core::HttpCache::new()),
@@ -1483,7 +1491,7 @@ mod tests {
         let manifest_path = dir.path().join("App.csproj");
         let content = r#"<Project><ItemGroup><PackageReference Include="MyCompany.Internal" Version="1.0.0" /></ItemGroup></Project>"#;
         std::fs::write(&manifest_path, content).unwrap();
-        let uri = tower_lsp_server::ls_types::Uri::from_file_path(&manifest_path).unwrap();
+        let uri = Url::from_file_path(&manifest_path).unwrap();
 
         let policy = Arc::new(deps_core::net_policy::RegistryAccessPolicy::new(
             deps_core::net_policy::WorkspaceRegistryAccess::PublicOnly,
@@ -1575,7 +1583,7 @@ mod tests {
         let manifest_path = dir.path().join("App.csproj");
         let content = r#"<Project><ItemGroup><PackageReference Include="MyCompany.Internal" Version="1.0.0" /></ItemGroup></Project>"#;
         std::fs::write(&manifest_path, content).unwrap();
-        let uri = tower_lsp_server::ls_types::Uri::from_file_path(&manifest_path).unwrap();
+        let uri = Url::from_file_path(&manifest_path).unwrap();
 
         let registry = NuGetRegistry::with_service_index_url(
             Arc::new(deps_core::HttpCache::new()),
@@ -1666,7 +1674,7 @@ mod tests {
         let manifest_path = dir.path().join("App.csproj");
         let content = r#"<Project><ItemGroup><PackageReference Include="MyCompany.Internal" Version="1.2.3" /></ItemGroup></Project>"#;
         std::fs::write(&manifest_path, content).unwrap();
-        let uri = tower_lsp_server::ls_types::Uri::from_file_path(&manifest_path).unwrap();
+        let uri = Url::from_file_path(&manifest_path).unwrap();
 
         let registry = NuGetRegistry::with_service_index_url(
             Arc::new(deps_core::HttpCache::new()),
@@ -1993,7 +2001,10 @@ mod tests {
         let content = "F";
         let dep = NuGetDependency {
             name: "F".into(),
-            name_range: Range::new(Position::new(0, 0), Position::new(0, 1)),
+            name_range: deps_core::Range::new(
+                deps_core::Position::new(0, 0),
+                deps_core::Position::new(0, 1),
+            ),
             version_requirement: None,
             version_range: None,
             source: DependencySource::Registry,

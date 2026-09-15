@@ -7,10 +7,10 @@
 use deps_dart::parse_pubspec_yaml;
 use libfuzzer_sys::fuzz_target;
 use std::sync::LazyLock;
-use tower_lsp_server::ls_types::Uri;
+use url::Url;
 
-static PUBSPEC_URI: LazyLock<Uri> =
-    LazyLock::new(|| Uri::from_file_path("/fuzz/pubspec.yaml").expect("static fixture path"));
+static PUBSPEC_URI: LazyLock<Url> =
+    LazyLock::new(|| Url::from_file_path("/fuzz/pubspec.yaml").expect("static fixture path"));
 
 fuzz_target!(|data: &[u8]| {
     let Ok(content) = std::str::from_utf8(data) else {

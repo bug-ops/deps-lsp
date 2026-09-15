@@ -240,7 +240,9 @@ mod tests {
         // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
         // must hold it, not just ones that diff a snapshot.
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;
-        let uri = deps_core::test_util::test_uri("/nonexistent/file/path.toml");
+        let uri = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+            "/nonexistent/file/path.toml",
+        ));
         let result = load_document_from_disk(&uri).await;
 
         assert!(result.is_err());

@@ -58,9 +58,8 @@ pub async fn handle_completion(
     // document-lookup early returns below. `is_some_and` (not `?`) so an
     // unrecognized URI falls through to `false` (matching every ecosystem's
     // default) rather than short-circuiting this function.
-    let package_search_is_incomplete = state
-        .ecosystem_registry
-        .for_uri(uri)
+    let package_search_is_incomplete = crate::lsp_types_interop::from_lsp_uri(uri)
+        .and_then(|domain_uri| state.ecosystem_registry.for_uri(&domain_uri))
         .is_some_and(|e| e.package_search_is_incomplete());
 
     // Shared by the document-load and document-lookup early returns below, so
@@ -475,7 +474,7 @@ mod tests {
         fn parse_manifest<'a>(
             &'a self,
             _content: &'a str,
-            _uri: &'a tower_lsp_server::ls_types::Uri,
+            _uri: &'a url::Url,
         ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Box<dyn deps_core::ParseResult>>>
         {
             Box::pin(async move { unimplemented!() })
@@ -574,7 +573,9 @@ mod tests {
     #[tokio::test]
     async fn test_completion_returns_empty_for_missing_document() {
         let state = Arc::new(ServerState::new());
-        let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let uri = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+            "/test/Cargo.toml",
+        ));
 
         let params = CompletionParams {
             text_document_position: TextDocumentPositionParams {
@@ -612,7 +613,6 @@ mod tests {
             RequirementResolution, SourcePolicy, Version,
         };
         use std::any::Any;
-        use tower_lsp_server::ls_types::Uri;
 
         struct NoopRegistry;
         impl Registry for NoopRegistry {
@@ -685,7 +685,7 @@ mod tests {
             fn parse_manifest<'a>(
                 &'a self,
                 _content: &'a str,
-                _uri: &'a Uri,
+                _uri: &'a url::Url,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Box<dyn ParseResult>>>
             {
                 Box::pin(async move { unimplemented!() })
@@ -734,7 +734,9 @@ mod tests {
         // Deliberately never inserted into `state.documents` — the document-load
         // path below must time out/fail against a nonexistent file, exactly the
         // `test_completion_returns_empty_for_missing_document` shape.
-        let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let uri = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+            "/test/Cargo.toml",
+        ));
 
         let params = CompletionParams {
             text_document_position: TextDocumentPositionParams {
@@ -765,13 +767,14 @@ mod tests {
         // `document/loader.rs`'s diffing test.
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let state = Arc::new(ServerState::new());
-        let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
         let content = "[dependencies]\nserde = \"1.0\"".to_string();
 
         // Parse the manifest to get a proper parse result
         let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
-        let parse_result = ecosystem.parse_manifest(&content, &uri).await.unwrap();
+        let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
 
         let doc = DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
         state.update_document(uri.clone(), doc);
@@ -826,9 +829,10 @@ mod tests {
                 hook: BlockingHook::Completions,
             }));
 
-        let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let uri = crate::lsp_types_interop::to_lsp_uri(&url);
         let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
-        let parse_result: Box<dyn ParseResult> = Box::new(MockParseResult { uri: uri.clone() });
+        let parse_result: Box<dyn ParseResult> = Box::new(MockParseResult { uri: url });
         let doc = DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
         state.update_document(uri.clone(), doc);
 
@@ -902,7 +906,7 @@ mod tests {
         };
         use std::any::Any;
         use std::path::Path;
-        use tower_lsp_server::ls_types::{CompletionItemLabelDetails, Uri};
+        use tower_lsp_server::ls_types::CompletionItemLabelDetails;
 
         struct NoopRegistry;
         impl Registry for NoopRegistry {
@@ -976,7 +980,7 @@ mod tests {
             fn parse_manifest<'a>(
                 &'a self,
                 _content: &'a str,
-                _uri: &'a Uri,
+                _uri: &'a url::Url,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Box<dyn ParseResult>>>
             {
                 Box::pin(async move { unimplemented!() })
@@ -1029,7 +1033,7 @@ mod tests {
         }
 
         struct MockParseResult {
-            uri: Uri,
+            uri: url::Url,
         }
         impl ParseResult for MockParseResult {
             fn dependencies(&self) -> Vec<&dyn Dependency> {
@@ -1038,7 +1042,7 @@ mod tests {
             fn workspace_root(&self) -> Option<&Path> {
                 None
             }
-            fn uri(&self) -> &Uri {
+            fn uri(&self) -> &url::Url {
                 &self.uri
             }
             fn as_any(&self) -> &dyn Any {
@@ -1051,10 +1055,11 @@ mod tests {
         state
             .ecosystem_registry
             .register(Arc::new(FreshnessEchoEcosystem));
-        let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
         let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
-        let parse_result: Box<dyn ParseResult> = Box::new(MockParseResult { uri: uri.clone() });
+        let parse_result: Box<dyn ParseResult> = Box::new(MockParseResult { uri: url });
         let doc = DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
         state.update_document(uri.clone(), doc);
 
@@ -1110,7 +1115,9 @@ mod tests {
     #[tokio::test]
     async fn test_fallback_triggered_when_parse_fails() {
         let state = Arc::new(ServerState::new());
-        let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let uri = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+            "/test/Cargo.toml",
+        ));
 
         // Malformed content that will fail to parse
         let content = r"[dependencies]
@@ -1901,7 +1908,6 @@ ser"
         use std::any::Any;
         use std::path::Path;
         use std::time::Duration;
-        use tower_lsp_server::ls_types::Uri;
 
         struct MockFormatter;
         impl PackageNaming for MockFormatter {}
@@ -1944,7 +1950,7 @@ ser"
             fn parse_manifest<'a>(
                 &'a self,
                 _content: &'a str,
-                _uri: &'a Uri,
+                _uri: &'a url::Url,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Box<dyn ParseResult>>>
             {
                 Box::pin(async move { unimplemented!() })
@@ -1991,7 +1997,7 @@ ser"
         }
 
         struct MockParseResult {
-            uri: Uri,
+            uri: url::Url,
         }
         impl ParseResult for MockParseResult {
             fn dependencies(&self) -> Vec<&dyn Dependency> {
@@ -2000,7 +2006,7 @@ ser"
             fn workspace_root(&self) -> Option<&Path> {
                 None
             }
-            fn uri(&self) -> &Uri {
+            fn uri(&self) -> &url::Url {
                 &self.uri
             }
             fn as_any(&self) -> &dyn Any {
@@ -2009,13 +2015,14 @@ ser"
         }
 
         let state = Arc::new(ServerState::new());
-        let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
         // Overwrites the real Cargo ecosystem for this state instance only.
         state.ecosystem_registry.register(Arc::new(SlowEcosystem));
 
         let content = "[dependencies]\nserde = \"1\"\n".to_string();
-        let parse_result: Box<dyn ParseResult> = Box::new(MockParseResult { uri: uri.clone() });
+        let parse_result: Box<dyn ParseResult> = Box::new(MockParseResult { uri: url });
         let doc = DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
         state.update_document(uri.clone(), doc);
 
@@ -2058,7 +2065,6 @@ ser"
             RequirementResolution, SourcePolicy, Version,
         };
         use std::any::Any;
-        use tower_lsp_server::ls_types::Uri;
 
         struct NoopRegistry;
         impl Registry for NoopRegistry {
@@ -2132,7 +2138,7 @@ ser"
             fn parse_manifest<'a>(
                 &'a self,
                 _content: &'a str,
-                _uri: &'a Uri,
+                _uri: &'a url::Url,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Box<dyn ParseResult>>>
             {
                 Box::pin(async move { unimplemented!() })
@@ -2180,7 +2186,7 @@ ser"
         }
 
         struct MockParseResult {
-            uri: Uri,
+            uri: url::Url,
         }
         impl ParseResult for MockParseResult {
             fn dependencies(&self) -> Vec<&dyn Dependency> {
@@ -2189,7 +2195,7 @@ ser"
             fn workspace_root(&self) -> Option<&std::path::Path> {
                 None
             }
-            fn uri(&self) -> &Uri {
+            fn uri(&self) -> &url::Url {
                 &self.uri
             }
             fn as_any(&self) -> &dyn Any {
@@ -2203,9 +2209,10 @@ ser"
                 .ecosystem_registry
                 .register(Arc::new(IncompleteEcosystem { has_item }));
 
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
-            let parse_result: Box<dyn ParseResult> = Box::new(MockParseResult { uri: uri.clone() });
+            let parse_result: Box<dyn ParseResult> = Box::new(MockParseResult { uri: url });
             let doc =
                 DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
             state.update_document(uri.clone(), doc);

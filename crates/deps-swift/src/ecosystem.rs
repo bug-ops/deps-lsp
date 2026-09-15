@@ -4,9 +4,8 @@ use std::any::Any;
 use std::sync::Arc;
 #[cfg(test)]
 use tower_lsp_server::ls_types::Position;
-use tower_lsp_server::ls_types::{
-    CompletionItem, CompletionTextEdit, Range as LspRange, TextEdit, Uri,
-};
+use tower_lsp_server::ls_types::{CompletionItem, CompletionTextEdit, Range as LspRange, TextEdit};
+use url::Url;
 
 use deps_core::{
     Ecosystem, ParseResult as ParseResultTrait, Registry, Result,
@@ -162,7 +161,7 @@ impl Ecosystem for SwiftEcosystem {
     fn parse_manifest<'a>(
         &'a self,
         content: &'a str,
-        uri: &'a Uri,
+        uri: &'a Url,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Box<dyn ParseResultTrait>>> {
         Box::pin(async move {
             let result = crate::parser::parse_package_swift(content, uri)?;
@@ -585,7 +584,10 @@ mod tests {
         // `let x = "https://github.com/a"` — name_range spans the quoted content
         // (excluding quotes), byte-for-byte (ASCII, so UTF-16 offsets equal byte offsets).
         let content = "let x = \"https://github.com/a\"";
-        let name_range = LspRange::new(Position::new(0, 9), Position::new(0, 29));
+        let name_range = deps_core::position::Range::new(
+            deps_core::position::Position::new(0, 9),
+            deps_core::position::Position::new(0, 29),
+        );
         let dep = crate::types::SwiftDependency {
             name: "unresolved/a".into(),
             name_range,
@@ -652,7 +654,10 @@ mod tests {
     #[tokio::test]
     #[ignore] // Requires network access
     async fn test_generate_completions_version_context_dispatches_to_registry() {
-        let name_range = LspRange::new(Position::new(0, 9), Position::new(0, 40));
+        let name_range = deps_core::position::Range::new(
+            deps_core::position::Position::new(0, 9),
+            deps_core::position::Position::new(0, 40),
+        );
         let dep = crate::types::SwiftDependency {
             name: "apple/swift-nio".into(),
             name_range,
@@ -661,7 +666,10 @@ mod tests {
             // `#[ignore]`d test itself, but silently makes the fixture no longer represent
             // a real Version-context dispatch.
             version_req: Some("2.0.0".into()),
-            version_range: Some(LspRange::new(Position::new(1, 0), Position::new(1, 5))),
+            version_range: Some(deps_core::position::Range::new(
+                deps_core::position::Position::new(1, 0),
+                deps_core::position::Position::new(1, 5),
+            )),
             version_literal: None,
             url: "https://github.com/apple/swift-nio".to_string(),
             source: deps_core::parser::DependencySource::Registry,
@@ -730,7 +738,7 @@ mod tests {
             dep.version_literal, None,
             "fixture no longer exercises the #367 range-form shape: {content}"
         );
-        let position = dep.version_range.unwrap().start;
+        let position: Position = dep.version_range.unwrap().start.into();
 
         let context =
             deps_core::completion::detect_completion_context(&parse_result, position, content);

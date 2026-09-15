@@ -21,10 +21,10 @@ use deps_core::net_policy::RegistryAccessPolicy;
 use deps_gitlab_ci::{GitlabInstanceHost, parse_gitlab_ci_yaml};
 use libfuzzer_sys::fuzz_target;
 use std::sync::{Arc, LazyLock, RwLock};
-use tower_lsp_server::ls_types::Uri;
+use url::Url;
 
-static FUZZ_URI: LazyLock<Uri> =
-    LazyLock::new(|| Uri::from_file_path("/fuzz/.gitlab-ci.yml").expect("static fixture path"));
+static FUZZ_URI: LazyLock<Url> =
+    LazyLock::new(|| Url::from_file_path("/fuzz/.gitlab-ci.yml").expect("static fixture path"));
 static POLICY: LazyLock<RegistryAccessPolicy> = LazyLock::new(RegistryAccessPolicy::default);
 static INSTANCE_HOST_UNSET: LazyLock<GitlabInstanceHost> = LazyLock::new(|| {
     GitlabInstanceHost::new(

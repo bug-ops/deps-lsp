@@ -17,7 +17,7 @@ use crate::error::Result;
 use crate::types::{PypiDependencySection, PypiDependencySource};
 use deps_core::lsp_helpers::{LineOffsetTable, byte_span_to_range};
 use deps_core::net_policy::RegistryAccessPolicy;
-use tower_lsp_server::ls_types::Uri;
+use url::Url;
 
 /// Pip option tokens recognized on an option line (a line whose first
 /// whitespace-delimited token starts with `-`). Matched by exact equality
@@ -104,10 +104,10 @@ impl PypiParser {
     ///
     /// ```no_run
     /// use deps_pypi::parser::PypiParser;
-    /// use tower_lsp_server::ls_types::Uri;
+    /// use url::Url;
     ///
     /// let parser = PypiParser::new();
-    /// let uri = Uri::from_file_path("/project/requirements.txt").unwrap();
+    /// let uri = Url::from_file_path("/project/requirements.txt").unwrap();
     /// let result = parser
     ///     .parse_requirements("requests==2.31.0\nflask>=3.0\n", &uri, false)
     ///     .unwrap();
@@ -116,7 +116,7 @@ impl PypiParser {
     pub fn parse_requirements(
         &self,
         content: &str,
-        uri: &Uri,
+        uri: &Url,
         require_strong_signal: bool,
     ) -> Result<ParseResult> {
         self.parse_requirements_with_policy(
@@ -138,7 +138,7 @@ impl PypiParser {
     pub fn parse_requirements_with_policy(
         &self,
         content: &str,
-        uri: &Uri,
+        uri: &Url,
         require_strong_signal: bool,
         policy: &RegistryAccessPolicy,
     ) -> Result<ParseResult> {
@@ -235,7 +235,8 @@ impl PypiParser {
                                 &line_table,
                                 target_abs_start,
                                 target_abs_end,
-                            ),
+                            )
+                            .into(),
                             target: target.to_string(),
                         });
                     }
@@ -503,7 +504,7 @@ mod tests {
 
     use std::assert_matches;
 
-    fn test_uri() -> Uri {
+    fn test_uri() -> Url {
         deps_core::test_util::test_uri("/test/requirements.txt")
     }
 
@@ -594,10 +595,10 @@ mod tests {
 
     // --- Spaced extras (S3): version_range must slice to exactly the source text ---
 
-    fn slice(content: &str, range: tower_lsp_server::ls_types::Range) -> String {
+    fn slice(content: &str, range: deps_core::position::Range) -> String {
         let table = LineOffsetTable::new(content);
-        let start = table.position_to_byte_offset(content, range.start);
-        let end = table.position_to_byte_offset(content, range.end);
+        let start = table.position_to_byte_offset(content, range.start.into());
+        let end = table.position_to_byte_offset(content, range.end.into());
         content[start..end].to_string()
     }
 
@@ -1042,7 +1043,7 @@ mod tests {
         let content = "-r other-requirements.txt\n";
         let result = parse(content);
         let link = &result.document_links[0];
-        assert_eq!(slice(content, link.range), "other-requirements.txt");
+        assert_eq!(slice(content, link.range.into()), "other-requirements.txt");
     }
 
     #[test]

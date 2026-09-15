@@ -201,7 +201,8 @@ mod tests {
             // `document/loader.rs`'s diffing test.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
             // Initial document with 2 dependencies
             let content1 = r#"[dependencies]
@@ -210,7 +211,7 @@ tokio = "1.0"
 "#;
 
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
-            let parse_result1 = ecosystem.parse_manifest(content1, &uri).await.unwrap();
+            let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content1.to_string(),
@@ -244,7 +245,7 @@ serde = "1.0.210"
 tokio = "1.0"
 "#;
 
-            let parse_result2 = ecosystem.parse_manifest(content2, &uri).await.unwrap();
+            let parse_result2 = ecosystem.parse_manifest(content2, &url).await.unwrap();
             let mut doc_state2 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content2.to_string(),
@@ -293,7 +294,8 @@ tokio = "1.0"
             // See the comment in `test_preserve_cached_versions_on_change` on why this guard is needed here.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
             let content1 = r#"[dependencies]
 serde = "1.0"
@@ -301,7 +303,7 @@ serde_old = { package = "serde", version = "0.9" }
 "#;
 
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
-            let parse_result1 = ecosystem.parse_manifest(content1, &uri).await.unwrap();
+            let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content1.to_string(),
@@ -324,7 +326,7 @@ serde = "1.0"
 serde_old = { package = "serde", version = "0.9" }
 
 "#;
-            let parse_result2 = ecosystem.parse_manifest(content2, &uri).await.unwrap();
+            let parse_result2 = ecosystem.parse_manifest(content2, &url).await.unwrap();
             let mut doc_state2 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content2.to_string(),
@@ -352,13 +354,14 @@ serde_old = { package = "serde", version = "0.9" }
             use deps_core::osv::{ScanOutcome, VulnerabilityMap};
 
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
             let content1 = r#"[dependencies]
 time = "0.1.43"
 "#;
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
-            let parse_result1 = ecosystem.parse_manifest(content1, &uri).await.unwrap();
+            let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content1.to_string(),
@@ -380,7 +383,7 @@ time = "0.1.43"
 time = "0.1.43"
 
 "#;
-            let parse_result2 = ecosystem.parse_manifest(content2, &uri).await.unwrap();
+            let parse_result2 = ecosystem.parse_manifest(content2, &url).await.unwrap();
             let mut doc_state2 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content2.to_string(),
@@ -401,13 +404,14 @@ time = "0.1.43"
             // See the comment in `test_preserve_cached_versions_on_change` on why this guard is needed here.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
             let content1 = r#"[dependencies]
 time = "0.1.43"
 "#;
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
-            let parse_result1 = ecosystem.parse_manifest(content1, &uri).await.unwrap();
+            let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content1.to_string(),
@@ -430,7 +434,7 @@ time = "0.1.43"
 time = "0.1.43"
 
 "#;
-            let parse_result2 = ecosystem.parse_manifest(content2, &uri).await.unwrap();
+            let parse_result2 = ecosystem.parse_manifest(content2, &url).await.unwrap();
             let mut doc_state2 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content2.to_string(),
@@ -454,13 +458,14 @@ time = "0.1.43"
             // See the comment in `test_preserve_cached_versions_on_change` on why this guard is needed here.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
             let content1 = r#"[dependencies]
 time = "0.1.43"
 "#;
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
-            let parse_result1 = ecosystem.parse_manifest(content1, &uri).await.unwrap();
+            let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content1.to_string(),
@@ -486,7 +491,7 @@ time = "0.1.43"
 time = "0.1.43"
 
 "#;
-            let parse_result2 = ecosystem.parse_manifest(content2, &uri).await.unwrap();
+            let parse_result2 = ecosystem.parse_manifest(content2, &url).await.unwrap();
             let mut doc_state2 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content2.to_string(),
@@ -513,14 +518,15 @@ time = "0.1.43"
             // See the comment in `test_preserve_cached_versions_on_change` on why this guard is needed here.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
             let content1 = r#"[dependencies]
 serde = "1.0"
 time = "0.1.43"
 "#;
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
-            let parse_result1 = ecosystem.parse_manifest(content1, &uri).await.unwrap();
+            let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content1.to_string(),
@@ -552,7 +558,7 @@ serde = "1.0"
             let diff = DependencyDiff::compute(&old_deps, &new_deps);
             assert_eq!(diff.removed, vec![PackageName::new("time")]);
 
-            let parse_result2 = ecosystem.parse_manifest(content2, &uri).await.unwrap();
+            let parse_result2 = ecosystem.parse_manifest(content2, &url).await.unwrap();
             let mut doc_state2 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content2.to_string(),
@@ -588,14 +594,15 @@ serde = "1.0"
             // See the comment in `test_preserve_cached_versions_on_change` on why this guard is needed here.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
             let content1 = r#"[dependencies]
 serde = "1.0"
 serde_old = { package = "serde", version = "0.9" }
 "#;
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
-            let parse_result1 = ecosystem.parse_manifest(content1, &uri).await.unwrap();
+            let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content1.to_string(),
@@ -620,7 +627,7 @@ serde_old = { package = "serde", version = "0.9" }
             let diff = DependencyDiff::compute(&old_deps, &new_deps);
             assert_eq!(diff.removed, vec![PackageName::new("serde")]);
 
-            let parse_result2 = ecosystem.parse_manifest(content2, &uri).await.unwrap();
+            let parse_result2 = ecosystem.parse_manifest(content2, &url).await.unwrap();
             let mut doc_state2 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content2.to_string(),
@@ -651,13 +658,14 @@ serde_old = { package = "serde", version = "0.9" }
             // See the comment in `test_preserve_cached_versions_on_change` on why this guard is needed here.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
             let content1 = r#"[dependencies]
 time = "0.1.44"
 "#;
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
-            let parse_result1 = ecosystem.parse_manifest(content1, &uri).await.unwrap();
+            let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content1.to_string(),
@@ -686,7 +694,7 @@ time = "0.1.44"
             let content2 = r#"[dependencies]
 time = "0.1.43"
 "#;
-            let parse_result2 = ecosystem.parse_manifest(content2, &uri).await.unwrap();
+            let parse_result2 = ecosystem.parse_manifest(content2, &url).await.unwrap();
             let mut doc_state2 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content2.to_string(),
@@ -726,13 +734,14 @@ time = "0.1.43"
             // See the comment in `test_preserve_cached_versions_on_change` on why this guard is needed here.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
             let content1 = r#"[dependencies]
 time = "0.1.44"
 "#;
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
-            let parse_result1 = ecosystem.parse_manifest(content1, &uri).await.unwrap();
+            let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content1.to_string(),
@@ -761,14 +770,14 @@ time = "0.1.43"
 "#;
             let old_deps = dependency_version_map(
                 ecosystem
-                    .parse_manifest(content1, &uri)
+                    .parse_manifest(content1, &url)
                     .await
                     .unwrap()
                     .as_ref(),
             );
             let new_deps = dependency_version_map(
                 ecosystem
-                    .parse_manifest(content2, &uri)
+                    .parse_manifest(content2, &url)
                     .await
                     .unwrap()
                     .as_ref(),
@@ -776,7 +785,7 @@ time = "0.1.43"
             let diff = DependencyDiff::compute(&old_deps, &new_deps);
             assert_eq!(diff.version_changed, vec![PackageName::new("time")]);
 
-            let parse_result2 = ecosystem.parse_manifest(content2, &uri).await.unwrap();
+            let parse_result2 = ecosystem.parse_manifest(content2, &url).await.unwrap();
             let mut doc_state2 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content2.to_string(),
@@ -820,14 +829,15 @@ time = "0.1.43"
             // See the comment in `test_preserve_cached_versions_on_change` on why this guard is needed here.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
             let content1 = r#"[dependencies]
 serde = "1.0"
 time = "0.1.43"
 "#;
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
-            let parse_result1 = ecosystem.parse_manifest(content1, &uri).await.unwrap();
+            let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content1.to_string(),
@@ -856,7 +866,7 @@ serde = "1.0"
             let diff = DependencyDiff::compute(&old_deps, &new_deps);
             assert_eq!(diff.removed, vec![PackageName::new("time")]);
 
-            let parse_result2 = ecosystem.parse_manifest(content2, &uri).await.unwrap();
+            let parse_result2 = ecosystem.parse_manifest(content2, &url).await.unwrap();
             let mut doc_state2 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content2.to_string(),
@@ -895,13 +905,14 @@ serde = "1.0"
             // would miss this — the name never leaves `diff.removed`, it's
             // in `diff.version_changed` instead.
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
             let content1 = r#"[dependencies]
 time = "=0.1.43"
 "#;
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
-            let parse_result1 = ecosystem.parse_manifest(content1, &uri).await.unwrap();
+            let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content1.to_string(),
@@ -924,14 +935,14 @@ time = "=0.1.44"
 "#;
             let old_deps = dependency_version_map(
                 ecosystem
-                    .parse_manifest(content1, &uri)
+                    .parse_manifest(content1, &url)
                     .await
                     .unwrap()
                     .as_ref(),
             );
             let new_deps = dependency_version_map(
                 ecosystem
-                    .parse_manifest(content2, &uri)
+                    .parse_manifest(content2, &url)
                     .await
                     .unwrap()
                     .as_ref(),
@@ -941,7 +952,7 @@ time = "=0.1.44"
             assert!(diff.removed.is_empty());
             assert_eq!(diff.version_changed, vec![PackageName::new("time")]);
 
-            let parse_result2 = ecosystem.parse_manifest(content2, &uri).await.unwrap();
+            let parse_result2 = ecosystem.parse_manifest(content2, &url).await.unwrap();
             let mut doc_state2 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content2.to_string(),
@@ -976,14 +987,15 @@ time = "=0.1.44"
             // for `fetch_failed` (#267): a stale fetch-error marker for a
             // dependency the user has since deleted must not linger.
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
             let content1 = r#"[dependencies]
 serde = "1.0"
 time = "0.1.43"
 "#;
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
-            let parse_result1 = ecosystem.parse_manifest(content1, &uri).await.unwrap();
+            let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content1.to_string(),
@@ -1011,7 +1023,7 @@ serde = "1.0"
             let diff = DependencyDiff::compute(&old_deps, &new_deps);
             assert_eq!(diff.removed, vec![PackageName::new("time")]);
 
-            let parse_result2 = ecosystem.parse_manifest(content2, &uri).await.unwrap();
+            let parse_result2 = ecosystem.parse_manifest(content2, &url).await.unwrap();
             let mut doc_state2 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content2.to_string(),
@@ -1088,13 +1100,14 @@ serde = "1.0"
             // changed the answer. This documents the existing behavior,
             // identical to `cached_versions`' staleness.
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
             let content = r#"[dependencies]
 time = "0.1.43"
 "#;
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
-            let parse_result1 = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let parse_result1 = ecosystem.parse_manifest(content, &url).await.unwrap();
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content.to_string(),
@@ -1116,7 +1129,7 @@ time = "0.1.43"
             // manifest text) — no dependency added or removed, so the real
             // handler would skip the registry fetch and never re-run the
             // yanked probe.
-            let parse_result2 = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let parse_result2 = ecosystem.parse_manifest(content, &url).await.unwrap();
             let mut doc_state2 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content.to_string(),
@@ -1142,14 +1155,15 @@ time = "0.1.43"
             // See the comment in `test_preserve_cached_versions_on_change` on why this guard is needed here.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
             let content = r#"[dependencies]
 serde = "1.0"
 "#;
 
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
-            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = ecosystem.parse_manifest(content, &url).await.unwrap();
             let doc_state = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content.to_string(),
@@ -1171,7 +1185,8 @@ serde = "1.0"
             // See the comment in `test_preserve_cached_versions_on_change` on why this guard is needed here.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
             // Valid initial document
             let content1 = r#"[dependencies]
@@ -1179,7 +1194,7 @@ serde = "1.0"
 "#;
 
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
-            let parse_result1 = ecosystem.parse_manifest(content1, &uri).await.unwrap();
+            let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content1.to_string(),
@@ -1199,7 +1214,7 @@ serde = "1.0"
 serde = "1.0"
 "#;
 
-            let parse_result2 = ecosystem.parse_manifest(content2, &uri).await.ok();
+            let parse_result2 = ecosystem.parse_manifest(content2, &url).await.ok();
             assert!(
                 parse_result2.is_none(),
                 "Parse should fail for invalid TOML"
@@ -1332,7 +1347,7 @@ serde = "1.0"
             // entry iterates last); `dependency_version_map` must instead
             // keep one requirement per occurrence.
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
 
             let content = r#"[dependencies]
@@ -1341,7 +1356,7 @@ time = "0.1.43"
 [dev-dependencies]
 time = "0.1.44"
 "#;
-            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = ecosystem.parse_manifest(content, &url).await.unwrap();
             assert_eq!(
                 parse_result.dependencies().len(),
                 2,
@@ -1374,7 +1389,7 @@ time = "0.1.44"
             // old and new maps, so this edit was silently invisible to
             // `DependencyDiff` — the registry fetch and OSV rescan never ran.
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
 
             let content1 = r#"[dependencies]
@@ -1385,7 +1400,7 @@ time = "0.1.44"
 "#;
             let old_deps = dependency_version_map(
                 ecosystem
-                    .parse_manifest(content1, &uri)
+                    .parse_manifest(content1, &url)
                     .await
                     .unwrap()
                     .as_ref(),
@@ -1399,7 +1414,7 @@ time = "0.1.44"
 "#;
             let new_deps = dependency_version_map(
                 ecosystem
-                    .parse_manifest(content2, &uri)
+                    .parse_manifest(content2, &url)
                     .await
                     .unwrap()
                     .as_ref(),
@@ -1426,7 +1441,7 @@ time = "0.1.44"
             // (`[dependencies]`) occurrence unchanged, must also be detected
             // — confirming the fix is not merely order-dependent.
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
 
             let content1 = r#"[dependencies]
@@ -1437,7 +1452,7 @@ time = "0.1.44"
 "#;
             let old_deps = dependency_version_map(
                 ecosystem
-                    .parse_manifest(content1, &uri)
+                    .parse_manifest(content1, &url)
                     .await
                     .unwrap()
                     .as_ref(),
@@ -1451,7 +1466,7 @@ time = "0.1.60"
 "#;
             let new_deps = dependency_version_map(
                 ecosystem
-                    .parse_manifest(content2, &uri)
+                    .parse_manifest(content2, &url)
                     .await
                     .unwrap()
                     .as_ref(),
@@ -1483,7 +1498,7 @@ time = "0.1.60"
             // `pr.dependencies()` — the fix must not depend on occurrences
             // appearing in source order to detect the edit correctly.
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
 
             let content1 = r#"[target.'cfg(windows)'.dependencies]
@@ -1492,7 +1507,7 @@ time = "0.1.44"
 [target.'cfg(unix)'.dependencies]
 time = "0.1.43"
 "#;
-            let parse_result1 = ecosystem.parse_manifest(content1, &uri).await.unwrap();
+            let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
             assert_eq!(
                 parse_result1.dependencies().len(),
                 2,
@@ -1515,7 +1530,7 @@ time = "0.1.50"
 "#;
             let new_deps = dependency_version_map(
                 ecosystem
-                    .parse_manifest(content2, &uri)
+                    .parse_manifest(content2, &url)
                     .await
                     .unwrap()
                     .as_ref(),
@@ -1540,7 +1555,8 @@ time = "0.1.50"
             // See the comment in `test_preserve_cached_versions_on_change` on why this guard is needed here.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
             // Initial document with 3 dependencies
             let content1 = r#"[dependencies]
@@ -1550,7 +1566,7 @@ anyhow = "1.0"
 "#;
 
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
-            let parse_result1 = ecosystem.parse_manifest(content1, &uri).await.unwrap();
+            let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content1.to_string(),
@@ -1593,7 +1609,7 @@ tokio = "1.0"
                 .collect();
             let diff = DependencyDiff::compute(&old_deps, &new_deps);
 
-            let parse_result2 = ecosystem.parse_manifest(content2, &uri).await.unwrap();
+            let parse_result2 = ecosystem.parse_manifest(content2, &url).await.unwrap();
             let mut doc_state2 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content2.to_string(),

@@ -6,10 +6,11 @@
 use crate::types::{BundlerDependency, DependencyGroup, DependencySource};
 use deps_core::Result;
 use deps_core::lsp_helpers::{LineOffsetTable, byte_span_to_range};
+use deps_core::position::Range;
 use regex::Regex;
 use std::collections::HashSet;
 use std::sync::LazyLock;
-use tower_lsp_server::ls_types::{Range, Uri};
+use url::Url;
 
 /// Result of parsing a Gemfile.
 #[non_exhaustive]
@@ -22,7 +23,7 @@ pub struct BundlerParseResult {
     /// The top-level `source` URL, if declared.
     pub source_url: Option<String>,
     /// URI of the manifest this result was parsed from.
-    pub uri: Uri,
+    pub uri: Url,
     /// `Some((kept, total))` once the manifest declared more dependencies than
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
     /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
@@ -865,7 +866,7 @@ fn finalize_pending_gem(
 // The `caps.get(0).unwrap().end()` offset is a regex match end, always a char boundary.
 // Group 1 is mandatory in `GEM_PATTERN` and group 0 always exists on a successful match.
 #[allow(clippy::string_slice, clippy::unwrap_used)]
-pub fn parse_gemfile(content: &str, doc_uri: &Uri) -> Result<BundlerParseResult> {
+pub fn parse_gemfile(content: &str, doc_uri: &Url) -> Result<BundlerParseResult> {
     let line_table = LineOffsetTable::new(content);
     let mut dependencies = Vec::new();
     let mut ruby_version = None;
@@ -1774,12 +1775,12 @@ mod tests {
 
     use std::assert_matches;
 
-    fn test_uri() -> Uri {
+    fn test_uri() -> Url {
         #[cfg(windows)]
         let path = "C:/test/Gemfile";
         #[cfg(not(windows))]
         let path = "/test/Gemfile";
-        Uri::from_file_path(path).unwrap()
+        Url::from_file_path(path).unwrap()
     }
 
     #[test]

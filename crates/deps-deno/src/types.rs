@@ -1,7 +1,7 @@
 //! Deno-specific dependency, version, and metadata types.
 
+use deps_core::position::Range;
 use std::any::Any;
-use tower_lsp_server::ls_types::Range;
 
 /// A parsed Deno import, scheme-qualified (D2).
 ///
@@ -13,10 +13,10 @@ use tower_lsp_server::ls_types::Range;
 ///
 /// ```no_run
 /// use deps_deno::parser::parse_deno_json;
-/// use tower_lsp_server::ls_types::Uri;
+/// use url::Url;
 ///
 /// let json = r#"{ "imports": { "jsr:@std/fs": "jsr:@std/fs@^1.0" } }"#;
-/// let uri = Uri::from_file_path("/test/deno.json").unwrap();
+/// let uri = Url::from_file_path("/test/deno.json").unwrap();
 /// let result = parse_deno_json(json, &uri).unwrap();
 /// let dep = &result.dependencies[0];
 ///
@@ -275,8 +275,8 @@ impl deps_core::Metadata for DenoMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::position::Position;
     use deps_core::{Metadata, Version};
-    use tower_lsp_server::ls_types::Position;
 
     #[test]
     fn test_deno_dependency_creation() {

@@ -10,10 +10,10 @@
 use deps_pypi::parser::PypiParser;
 use libfuzzer_sys::fuzz_target;
 use std::sync::LazyLock;
-use tower_lsp_server::ls_types::Uri;
+use url::Url;
 
-static FUZZ_URI: LazyLock<Uri> =
-    LazyLock::new(|| Uri::from_file_path("/fuzz/requirements.txt").expect("static fixture path"));
+static FUZZ_URI: LazyLock<Url> =
+    LazyLock::new(|| Url::from_file_path("/fuzz/requirements.txt").expect("static fixture path"));
 
 fuzz_target!(|data: &[u8]| {
     let Ok(content) = std::str::from_utf8(data) else {

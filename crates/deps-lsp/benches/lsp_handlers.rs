@@ -72,7 +72,10 @@ async fn setup_document(state: &ServerState, uri: &Uri, content: &str) {
         .expect("Cargo ecosystem not found");
 
     let parse_result = ecosystem
-        .parse_manifest(content, uri)
+        .parse_manifest(
+            content,
+            &deps_lsp::lsp_types_interop::from_lsp_uri(uri).unwrap(),
+        )
         .await
         .expect("Parse failed");
 
@@ -380,7 +383,7 @@ fn bench_cold_start_loading(c: &mut Criterion) {
             b.iter(|| {
                 rt.block_on(async {
                     let state = ServerState::new();
-                    let uri = Uri::from_file_path("/bench/cold/Cargo.toml").unwrap();
+                    let uri = url::Url::from_file_path("/bench/cold/Cargo.toml").unwrap();
 
                     let ecosystem = state
                         .ecosystem_registry

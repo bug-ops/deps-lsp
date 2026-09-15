@@ -249,7 +249,7 @@ async fn test_end_to_end_parse_register_and_fetch() {
     let manifest_content =
         "[dependencies]\ninternal-crate = { version = \"1.0\", registry = \"my-corp\" }\n";
     std::fs::write(&manifest_path, manifest_content).unwrap();
-    let uri = tower_lsp_server::ls_types::Uri::from_file_path(&manifest_path).unwrap();
+    let uri = url::Url::from_file_path(&manifest_path).unwrap();
 
     // `All` policy: this test exercises the parse -> register -> fetch pipeline, not
     // #443's policy gate (covered separately) — a mockito loopback URL is otherwise

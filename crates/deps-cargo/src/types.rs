@@ -1,6 +1,6 @@
+use deps_core::position::Range;
 use std::any::Any;
 use std::collections::HashMap;
-use tower_lsp_server::ls_types::Range;
 
 pub use deps_core::parser::DependencySource;
 
@@ -15,10 +15,10 @@ pub use deps_core::parser::DependencySource;
 /// ```no_run
 /// use deps_cargo::DependencySource;
 /// use deps_cargo::parse_cargo_toml;
-/// use tower_lsp_server::ls_types::Uri;
+/// use url::Url;
 ///
 /// let toml = "[dependencies]\nserde = { version = \"1.0\", features = [\"derive\"] }";
-/// let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
+/// let uri = Url::from_file_path("/test/Cargo.toml").unwrap();
 /// let result = parse_cargo_toml(toml, &uri).unwrap();
 /// let dep = &result.dependencies[0];
 ///

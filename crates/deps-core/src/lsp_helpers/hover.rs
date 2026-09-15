@@ -85,10 +85,11 @@ pub async fn generate_hover<R: Registry + ?Sized>(
         // (the typical `Range::default()` sentinel) would match whichever such dependency
         // `dependencies()` happens to list first, showing hover info for an arbitrary
         // unrelated package.
-        let on_name = !d.name_range_is_synthetic() && position_in_range(position, d.name_range());
+        let on_name =
+            !d.name_range_is_synthetic() && position_in_range(position, d.name_range().into());
         let on_version = d
             .version_range()
-            .is_some_and(|r| position_in_range(position, r));
+            .is_some_and(|r| position_in_range(position, r.into()));
         on_name || on_version
     })?;
 
@@ -501,7 +502,7 @@ pub async fn generate_hover<R: Registry + ?Sized>(
             kind: MarkupKind::Markdown,
             value: markdown,
         }),
-        range: Some(dep.name_range()),
+        range: Some(dep.name_range().into()),
     })
 }
 
@@ -1391,8 +1392,8 @@ mod tests {
                 Box::new(MockDep {
                     name: "real-pkg".into(),
                     version_req: "1.0.0".into(),
-                    version_range: Range::new(Position::new(3, 10), Position::new(3, 20)),
-                    name_range: Range::new(Position::new(3, 0), Position::new(3, 8)),
+                    version_range: Range::new(Position::new(3, 10), Position::new(3, 20)).into(),
+                    name_range: Range::new(Position::new(3, 0), Position::new(3, 8)).into(),
                 }),
             ],
             uri: crate::test_util::test_uri("/test/pubspec.yaml"),
@@ -1484,8 +1485,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "example".into(),
                 version_req: "=1.0.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 7)),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 7)).into(),
             }],
             uri: crate::test_util::test_uri("/test/composer.json"),
         };
@@ -1867,8 +1868,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "express".into(),
                 version_req: "=4.19.2".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 7)),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 7)).into(),
             }],
             uri: crate::test_util::test_uri("/test/package.json"),
         };
@@ -2629,8 +2630,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "example.com/mod".into(),
                 version_req: "v0.8.1".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 16)),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 16)).into(),
             }],
             uri: crate::test_util::test_uri("/test/go.mod"),
         };
@@ -2678,8 +2679,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "serde".into(),
                 version_req: "1.0.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -3437,7 +3438,7 @@ mod tests {
         let parse_result = MockMarkedParseResult {
             dep: MockMarkedDep {
                 name: "numpy".into(),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
                 markers: Some("python_full_version >= '3.9'".to_string()),
             },
             uri: crate::test_util::test_uri("/test/pyproject.toml"),
@@ -3473,7 +3474,7 @@ mod tests {
         let parse_result = MockMarkedParseResult {
             dep: MockMarkedDep {
                 name: "requests".into(),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 8)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 8)).into(),
                 markers: None,
             },
             uri: crate::test_util::test_uri("/test/pyproject.toml"),
@@ -3508,11 +3509,12 @@ mod tests {
             deps: vec![MockDep {
                 name: malicious_name.into(),
                 version_req: "1.0.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
                 name_range: Range::new(
                     Position::new(0, 0),
                     Position::new(0, malicious_name.len() as u32),
-                ),
+                )
+                .into(),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -3566,11 +3568,12 @@ mod tests {
             deps: vec![MockDep {
                 name: malicious_name.into(),
                 version_req: "1.0.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
                 name_range: Range::new(
                     Position::new(0, 0),
                     Position::new(0, malicious_name.len() as u32),
-                ),
+                )
+                .into(),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -3622,7 +3625,7 @@ mod tests {
         let parse_result = MockMarkedParseResult {
             dep: MockMarkedDep {
                 name: "numpy".into(),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
                 markers: Some(marker.to_string()),
             },
             uri: crate::test_util::test_uri("/test/pyproject.toml"),
@@ -4097,14 +4100,14 @@ mod tests {
         let vulnerable_dep = MockDep {
             name: "pkg".into(),
             version_req: "=1.0.0".into(),
-            version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-            name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
         };
         let patched_dep = MockDep {
             name: "pkg".into(),
             version_req: "=2.0.0".into(),
-            version_range: Range::new(Position::new(3, 10), Position::new(3, 20)),
-            name_range: Range::new(Position::new(3, 0), Position::new(3, 5)),
+            version_range: Range::new(Position::new(3, 10), Position::new(3, 20)).into(),
+            name_range: Range::new(Position::new(3, 0), Position::new(3, 5)).into(),
         };
         let parse_result = MockParseResult {
             deps: vec![vulnerable_dep, patched_dep],
@@ -4199,14 +4202,14 @@ mod tests {
         let current_major = MockDep {
             name: "serde".into(),
             version_req: "1.0".into(),
-            version_range: Range::new(Position::new(0, 8), Position::new(0, 13)),
-            name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            version_range: Range::new(Position::new(0, 8), Position::new(0, 13)).into(),
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
         };
         let renamed_old_major = MockDep {
             name: "serde".into(),
             version_req: "0.9".into(),
-            version_range: Range::new(Position::new(1, 8), Position::new(1, 13)),
-            name_range: Range::new(Position::new(1, 0), Position::new(1, 9)),
+            version_range: Range::new(Position::new(1, 8), Position::new(1, 13)).into(),
+            name_range: Range::new(Position::new(1, 0), Position::new(1, 9)).into(),
         };
         let parse_result = MockParseResult {
             deps: vec![current_major, renamed_old_major],

@@ -16,6 +16,7 @@ use deps_core::lsp_helpers::{
 };
 use deps_core::osv::{OsvClient, ScanOutcome, VulnSeverity, VulnerabilityMap};
 use deps_core::policy_config::PolicyConfig;
+use deps_core::position::Range as DomainRange;
 use deps_core::{Dependency, Ecosystem, EcosystemId, HttpCache, PackageName, VersionData};
 use deps_engine::classify::diff::{
     merge_deprecations_after_fetch, merge_no_comparable_versions_after_fetch,
@@ -30,7 +31,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Range, Uri};
+use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Range};
 
 /// Every non-`deps-core` diagnostic code constant in the workspace, mirrored here as
 /// literals rather than importing `deps-github-actions`/`deps-gitlab-ci` directly (both are
@@ -562,10 +563,10 @@ impl<'a> DependencyIndex<'a> {
         let mut by_version_range = HashMap::new();
         for dep in parse_result.dependencies() {
             if !dep.name_range_is_synthetic() {
-                by_name_range.insert(dep.name_range(), dep);
+                by_name_range.insert(dep.name_range().into(), dep);
             }
             if let Some(version_range) = dep.version_range() {
-                by_version_range.insert(version_range, dep);
+                by_version_range.insert(version_range.into(), dep);
             }
         }
         Self {
@@ -634,7 +635,7 @@ fn to_finding(
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
     diagnostic: Diagnostic,
     advisory_severities: &HashMap<(String, String), VulnSeverity>,
-    vuln_keys: &HashMap<Range, String>,
+    vuln_keys: &HashMap<DomainRange, String>,
 ) -> CheckFinding {
     let category = classify(&diagnostic, formatter);
     let dep = dep_index.lookup(diagnostic.range);
@@ -718,10 +719,13 @@ fn classify(
 }
 
 /// Builds a file URI from a filesystem path, without any path-existence check. Returns
-/// `None` when `path` cannot be represented as a file URI at all (e.g. a Windows UNC path
-/// `Uri::from_file_path` cannot express) — the caller surfaces this as
-/// [`CheckError::InvalidPath`] rather than fabricating a synthetic, unusable URI.
-fn path_to_uri(path: &Path) -> Option<Uri> {
+/// `None` when `path` cannot be represented as a file URI at all — `Url::from_file_path`
+/// requires an absolute path (this function already joins a relative one onto the current
+/// directory first) and, on Windows, a disk (`C:`) or UNC (`\\`) prefix; UNC paths
+/// themselves are supported, just not any other Windows path prefix shape. The caller
+/// surfaces a `None` here as [`CheckError::InvalidPath`] rather than fabricating a
+/// synthetic, unusable URI.
+fn path_to_uri(path: &Path) -> Option<url::Url> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -729,12 +733,13 @@ fn path_to_uri(path: &Path) -> Option<Uri> {
             .map(|cwd| cwd.join(path))
             .unwrap_or_else(|_| path.to_path_buf())
     };
-    Uri::from_file_path(&absolute)
+    url::Url::from_file_path(&absolute).ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tower_lsp_server::ls_types::Uri;
 
     fn finding(category: Category) -> CheckFinding {
         CheckFinding {
@@ -911,10 +916,13 @@ mod tests {
     }
 
     /// A single-dependency parse result whose one dependency ("dep-0") sits at
-    /// `Range::default()` (`deps_core::test_util::StubDependency::name_range` always returns
-    /// it) — matching `diagnostic_with`'s own hardcoded `range: Range::default()`, so
-    /// `DependencyIndex::lookup` resolves it for tests that need a real, non-`None`
-    /// dependency occurrence.
+    /// `DomainRange::default()` (`deps_core::test_util::StubDependency::name_range` always
+    /// returns it) — numerically matching `diagnostic_with`'s own hardcoded
+    /// `range: Range::default()` (the LSP-facing `tower_lsp_server::ls_types::Range`
+    /// `DependencyIndex` is keyed on), so `DependencyIndex::lookup` resolves it for tests
+    /// that need a real, non-`None` dependency occurrence. These are two distinct `Range`
+    /// types that happen to share the same zero-valued default — see `DomainRange`'s import
+    /// and `vuln_keys`' type for the domain-range side of this file's lookups.
     fn dep_index_with_one_dependency() -> Box<dyn deps_core::ParseResult> {
         deps_core::test_util::stub_parse_result_with_dependencies(1)
     }
@@ -1010,7 +1018,7 @@ mod tests {
         let diagnostic = diagnostic_with(Some("RUSTSEC-2024-0001"), "advisory summary");
 
         let mut vuln_keys = HashMap::new();
-        vuln_keys.insert(Range::default(), "dep-0".to_string());
+        vuln_keys.insert(DomainRange::default(), "dep-0".to_string());
         let mut severities = HashMap::new();
         severities.insert(
             ("dep-0".to_string(), "RUSTSEC-2024-0001".to_string()),
@@ -1035,7 +1043,7 @@ mod tests {
         let dep_index = DependencyIndex::build(parse_result.as_ref());
         let diagnostic = diagnostic_with(Some("RUSTSEC-2024-0001"), "advisory summary");
         let mut vuln_keys = HashMap::new();
-        vuln_keys.insert(Range::default(), "dep-0".to_string());
+        vuln_keys.insert(DomainRange::default(), "dep-0".to_string());
 
         let finding = to_finding(
             EcosystemId::Cargo,

@@ -8,7 +8,7 @@ use crate::parser::{
 use deps_core::Result;
 use regex::Regex;
 use std::sync::LazyLock;
-use tower_lsp_server::ls_types::Uri;
+use url::Url;
 
 /// Matches: implementation("group:artifact:version")
 /// (optional whitespace between the configuration word and the opening paren)
@@ -50,7 +50,7 @@ static RE_PLATFORM_NO_VERSION: LazyLock<Regex> = LazyLock::new(|| {
 /// # Errors
 ///
 /// Infallible by construction: this function never returns `Err`.
-pub fn parse_kotlin_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
+pub fn parse_kotlin_dsl(content: &str, uri: &Url) -> Result<GradleParseResult> {
     let mut dependencies = Vec::new();
 
     // Track brace depth to detect dependencies { } block
@@ -173,7 +173,7 @@ pub fn parse_kotlin_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
 mod tests {
     use super::*;
 
-    fn make_uri() -> Uri {
+    fn make_uri() -> Url {
         deps_core::test_util::test_uri("/project/build.gradle.kts")
     }
 

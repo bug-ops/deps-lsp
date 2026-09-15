@@ -8,9 +8,10 @@ use crate::types::SwiftDependency;
 use deps_core::Result;
 use deps_core::lsp_helpers::{LineOffsetTable, byte_span_to_range};
 use deps_core::parser::DependencySource;
+use deps_core::position::Range;
 use regex::Regex;
 use std::sync::LazyLock;
-use tower_lsp_server::ls_types::{Range, Uri};
+use url::Url;
 
 /// Result of parsing a Package.swift file.
 #[non_exhaustive]
@@ -19,7 +20,7 @@ pub struct SwiftParseResult {
     /// Dependencies found in the `Package.swift` manifest.
     pub dependencies: Vec<SwiftDependency>,
     /// URI of the manifest this result was parsed from.
-    pub uri: Uri,
+    pub uri: Url,
     /// `Some((kept, total))` once the manifest declared more dependencies than
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
     /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
@@ -231,7 +232,7 @@ fn next_minor(major: &str, minor: &str) -> String {
 // always exists on a successful match and every numbered group in these patterns is
 // mandatory (never `?`-optional), so `cap.get(N).unwrap()` is always `Some`.
 #[allow(clippy::string_slice, clippy::unwrap_used)]
-pub fn parse_package_swift(content: &str, uri: &Uri) -> Result<SwiftParseResult> {
+pub fn parse_package_swift(content: &str, uri: &Url) -> Result<SwiftParseResult> {
     let stripped = strip_comments(content);
     let line_table = LineOffsetTable::new(content);
     let mut dependencies = Vec::new();
@@ -571,7 +572,7 @@ mod tests {
     use deps_core::Dependency;
     use std::assert_matches;
 
-    fn test_uri() -> Uri {
+    fn test_uri() -> Url {
         deps_core::test_util::test_uri("/test/Package.swift")
     }
 

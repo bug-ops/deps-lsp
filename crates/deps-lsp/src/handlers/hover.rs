@@ -111,7 +111,9 @@ mod tests {
     #[tokio::test]
     async fn test_handle_hover_missing_document() {
         let state = Arc::new(ServerState::new());
-        let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let uri = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+            "/test/Cargo.toml",
+        ));
         let (client, config) = create_test_client_and_config();
 
         let params = HoverParams {
@@ -139,7 +141,8 @@ mod tests {
             // `document/loader.rs`'s diffing test.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
             let content = r#"[dependencies]
@@ -148,7 +151,7 @@ serde = "1.0.0"
             .to_string();
 
             let parse_result = ecosystem
-                .parse_manifest(&content, &uri)
+                .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
 
@@ -172,7 +175,9 @@ serde = "1.0.0"
         #[tokio::test]
         async fn test_handle_hover_no_parse_result() {
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+                "/test/Cargo.toml",
+            ));
 
             let doc_state =
                 DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
@@ -203,13 +208,14 @@ serde = "1.0.0"
             // See the comment in `test_handle_hover` on why this guard is needed here.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
-            let uri = deps_core::test_util::test_uri("/test/package.json");
+            let url = deps_core::test_util::test_uri("/test/package.json");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
             let ecosystem = state.ecosystem_registry.get("npm").unwrap();
             let content = r#"{"dependencies": {"express": "4.0.0"}}"#.to_string();
 
             let parse_result = ecosystem
-                .parse_manifest(&content, &uri)
+                .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
 

@@ -61,6 +61,22 @@
 //! matching `tower-lsp-server` version through the [`tower_lsp_server`] re-export rather than
 //! adding their own separate direct dependency, which could otherwise drift out of sync with
 //! the version `deps-core` was built against.
+//!
+//! As of issue #1071, this coupling no longer covers a dependency's own *domain* data:
+//! [`ecosystem::Dependency`]'s range accessors return [`position::Range`], and
+//! [`ecosystem::ParseResult::uri`] / [`ecosystem::Ecosystem::parse_manifest`] use `url::Url`
+//! — neither names a `tower-lsp-server` type. A consumer that only needs parsed-dependency
+//! data (e.g. `deps-cli`, `deps-engine`) can read [`ecosystem::Dependency`]/
+//! [`ecosystem::ParseResult`] without linking `tower-lsp-server` at all. The *response*-shaped
+//! methods this section otherwise describes (`generate_hover`, `generate_diagnostics`,
+//! `generate_code_actions`, `generate_code_lenses`, `generate_document_links`) still build
+//! real `ls_types` objects and remain coupled as described above — `deps-lsp` is the only
+//! crate expected to call them; `deps-core`'s own `lsp_helpers` converts a
+//! [`position::Position`]/[`position::Range`] into its `ls_types` equivalent internally via
+//! [`position::Position`]'s and [`position::Range`]'s `From` impls wherever one must be
+//! embedded in such a response. Whether the *rest* of `deps-core`'s public API should stop
+//! naming third-party dependency types generally (`reqwest::Error`, `yaml_rust2::Yaml`, ...)
+//! is issue #851's broader, still-open question — out of scope for #1071.
 
 // #673: re-enable the three cast-safety pedantic lints the workspace allows by default
 // (`Cargo.toml`'s `[workspace.lints.clippy]`), specifically for this crate — deps-core
@@ -126,6 +142,11 @@ pub mod parser;
 /// policy — shared with `deps-cli` so both compose the same type instead of each parsing its
 /// own copy.
 pub mod policy_config;
+/// Protocol-agnostic [`position::Position`]/[`position::Range`] types (issue #1071).
+///
+/// The domain-level replacement for `tower_lsp_server::ls_types::{Position, Range}` in
+/// [`ecosystem::Dependency`]'s range accessors.
+pub mod position;
 /// Shared escape-aware string-literal and comment scanning.
 ///
 /// [`quote_scan::read_string_literal`], [`quote_scan::strip_line_comment`],
@@ -184,7 +205,7 @@ pub use lsp_helpers::{
     generate_inlay_hints as lsp_generate_inlay_hints, is_dot_segment,
     is_safe_maven_coordinate_segment, is_safe_package_name, is_safe_registry_url,
     is_safe_version_string, is_same_major_minor, maven_coordinate_path, position_in_range,
-    requirement_is_unsatisfiable, warn_rejected_value,
+    requirement_is_unsatisfiable, single_file_edit, to_ls_uri, warn_rejected_value,
 };
 pub use mtime_cache::{DEFAULT_MAX_CACHED_FILES, MAX_CACHED_FILE_BYTES, MtimeFileCache};
 pub use package::{ConcreteVersion, InvalidPackageName, PackageName, VersionReq};
@@ -194,6 +215,7 @@ pub use parser::{
     check_toml_nesting_depth, check_yaml_expansion, check_yaml_nesting_depth,
     json_depth_error_message, parse_json_checked, yaml_scalar_string,
 };
+pub use position::{Position, Range};
 pub use registry::{
     Deprecation, Metadata, Registry, RemovalStatus, Version, classify_default_registry_url,
     existence_wildcard_req, find_latest_stable, has_default_prerelease_marker, hash_routing_key,

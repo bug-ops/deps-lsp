@@ -1536,7 +1536,7 @@ token = "secret-token"
     fn test_referenced_aliases_collects_custom_registry_urls() {
         use crate::types::{CargoDependency, CargoDependencySection};
         use deps_core::parser::DependencySource;
-        use tower_lsp_server::ls_types::Range;
+        use deps_core::position::Range;
 
         let deps = vec![
             CargoDependency {

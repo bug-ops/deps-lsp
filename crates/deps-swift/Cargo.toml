@@ -20,6 +20,7 @@ serde = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread"] }
 tower-lsp-server = { workspace = true }
 tracing = { workspace = true }
+url = { workspace = true }
 urlencoding = { workspace = true }
 
 [dev-dependencies]

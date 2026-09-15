@@ -354,7 +354,7 @@ impl OsvNaming for GithubActionsFormatter {}
 mod tests {
     use super::*;
     use deps_core::parser::DependencySource;
-    use tower_lsp_server::ls_types::{Position, Range};
+    use deps_core::{Position, Range};
 
     fn formatter() -> GithubActionsFormatter {
         GithubActionsFormatter {
@@ -475,7 +475,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            position,
+            position.into(),
             VersionData::new(&cached, &resolved),
             &EmptyRegistry,
             &fmt,
@@ -656,7 +656,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            position,
+            position.into(),
             VersionData::new(&cached, &resolved),
             &OneVersionRegistry,
             &fmt,
