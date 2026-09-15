@@ -87,9 +87,15 @@ mod tests {
         let ls_uri =
             ls_types::Uri::from_file_path(platform_path("/home/user/project/Cargo.toml")).unwrap();
         let url = from_lsp_uri(&ls_uri).unwrap();
+        // `url.to_file_path()` returns a decoded native path (e.g. `C:\...` on Windows),
+        // while `ls_uri.path()` is the raw, still-percent-encoded URI path component (a
+        // Windows drive-letter colon is encoded as `%3A` there) — comparing those two
+        // directly diverges on Windows even for a correct round-trip, so this checks the
+        // decoded path against the original filesystem path instead, then verifies the
+        // full URI round-trip below the same way the other tests in this module do.
         assert_eq!(
-            url.to_file_path().unwrap().to_str().unwrap(),
-            ls_uri.path().as_str()
+            url.to_file_path().unwrap(),
+            std::path::PathBuf::from(platform_path("/home/user/project/Cargo.toml"))
         );
         let back = to_lsp_uri(&url);
         assert_eq!(back, ls_uri);
