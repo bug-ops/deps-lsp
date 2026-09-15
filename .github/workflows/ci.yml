@@ -129,6 +129,18 @@ jobs:
         # `-D warnings` strictness as the workspace-wide `clippy` job above).
         run: cargo hack clippy -p deps-lsp --each-feature --all-targets --keep-going -- -D warnings
 
+      - name: Check deps-engine test compilation and lints across the feature matrix
+        # deps-engine (issue #1059): the classification-layer extraction moved ~2000 lines
+        # of feature-gated test code out of deps-lsp (already covered by the step above) into
+        # this crate, which had no equivalent per-feature coverage — the workspace-wide
+        # `--no-dev-deps` sweep above skips test-target compilation entirely, so a
+        # feature-gated `#[cfg(feature = "...")]` import/module dropped or mis-scoped during a
+        # future move would compile clean under --all-features and still slip through review
+        # (exactly how a dropped `#[cfg(feature = "pypi")]` on deps-lsp's own `mod pypi_tests`
+        # was first caught for this crate's sibling). Mirrors the deps-lsp step immediately
+        # above at the same `-D warnings` strictness.
+        run: cargo hack clippy -p deps-engine --each-feature --all-targets --keep-going -- -D warnings
+
   feature-matrix-test:
     name: Feature Matrix Test (${{ matrix.name }})
     needs: changes
@@ -163,6 +175,16 @@ jobs:
             run: cargo hack nextest run -p deps-lsp --each-feature --include-features "github-actions, gitlab-ci, go, gradle, maven" --keep-going --profile ci --no-fail-fast
           - name: ecosystems-3
             run: cargo hack nextest run -p deps-lsp --each-feature --include-features "npm, nuget, pypi, swift" --keep-going --profile ci --no-fail-fast
+          - name: deps-engine
+            # deps-engine (issue #1059): small enough (80 tests as of the classification-layer
+            # move) to run every feature slice in one shard rather than splitting like
+            # deps-lsp's `ecosystems-*` legs above — revisit if its test count grows enough to
+            # dominate this leg's wall-clock time. No separate `--all-features` line: unlike
+            # the `ecosystems-*` shards above, this `--each-feature` invocation uses neither
+            # `--include-features` nor `--exclude-features`, so cargo-hack already runs the
+            # all-features case as one of its slices (`cargo hack --help`) — a standalone line
+            # would duplicate that slice for zero extra coverage.
+            run: cargo hack nextest run -p deps-engine --each-feature --keep-going --profile ci --no-fail-fast
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -177,7 +199,7 @@ jobs:
         with:
           tool: cargo-hack, cargo-nextest
 
-      - name: Run deps-lsp tests for this shard
+      - name: Run tests for this shard
         # issue #1005: a hardcoded ecosystem-name lookup (e.g. `ecosystem_registry.get("cargo")`)
         # in a test can compile fine yet panic at runtime once that ecosystem's feature is
         # disabled — the `feature-matrix` job's clippy steps only prove compilation, not that
@@ -185,7 +207,10 @@ jobs:
         # nextest's default target set (lib + bins + tests) also covers the `tests/`
         # integration suites, which hardcode ecosystem names just as easily as unit tests do.
         # `--no-fail-fast`/`--keep-going` so one bad slice doesn't hide failures in the rest of
-        # its shard, and `fail-fast: false` above does the same across shards.
+        # its shard, and `fail-fast: false` above does the same across shards. Generic name
+        # (not "deps-lsp tests"): the `deps-engine` matrix leg (issue #1059) runs `matrix.run`
+        # against `deps-engine`, not `deps-lsp` — a crate-specific title here would misattribute
+        # that leg's failures in the Actions UI.
         run: ${{ matrix.run }}
 
   doc-and-hygiene:

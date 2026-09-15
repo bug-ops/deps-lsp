@@ -5,18 +5,13 @@
 
 use super::diff::{DependencyDiff, preserve_cache};
 use super::fetch::{
-    DepSources, composer_minimum_stability, dedup_dependencies_by_source, fetch_failure_toast,
-    fetch_latest_versions_parallel, fetch_registry_versions_for_change,
-    merge_registry_fetch_result,
+    fetch_failure_toast, fetch_registry_versions_for_change, merge_registry_fetch_result,
 };
 use super::loader::{MAX_FILE_SIZE, load_document_from_disk};
 use super::osv_scan::{
     OsvScanResult, run_license_prefetch, run_osv_phase_b_and_commit, run_osv_scan_phase_a,
 };
-use super::resolved::{
-    RefetchPolicy, cached_versions_from_lockfile, collect_in_use_versions, dependency_version_map,
-    load_resolved_versions,
-};
+use super::resolved::RefetchPolicy;
 use super::state::{DocumentState, ServerState};
 use crate::config::DepsConfig;
 use crate::handlers::diagnostics;
@@ -28,6 +23,14 @@ use deps_core::FetchFailure;
 use deps_core::PackageName;
 use deps_core::Result;
 use deps_core::VersionReq;
+use deps_engine::classify::fetch::{
+    DepSources, composer_minimum_stability, dedup_dependencies_by_source,
+    fetch_latest_versions_parallel,
+};
+use deps_engine::classify::resolved::{
+    cached_versions_from_lockfile, collect_in_use_versions, dependency_version_map,
+    load_resolved_versions,
+};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -190,7 +193,7 @@ async fn run_document_open_background_task(
 
     // Load resolved versions from lock file first (instant, no network)
     let (resolved_versions, resolved_version_candidates) =
-        load_resolved_versions(&uri, &state, ecosystem.as_ref()).await;
+        load_resolved_versions(&uri, &state.lockfile_cache, ecosystem.as_ref()).await;
 
     // Update document state with resolved versions immediately
     if !resolved_versions.is_empty()
@@ -860,7 +863,7 @@ async fn run_document_change_task(
 
     // Load resolved versions from lock file first (instant, no network)
     let (resolved_versions, resolved_version_candidates) =
-        load_resolved_versions(&uri, &state, ecosystem.as_ref()).await;
+        load_resolved_versions(&uri, &state.lockfile_cache, ecosystem.as_ref()).await;
 
     // Update document state with resolved versions only
     // Do NOT touch cached_versions - they contain latest registry versions
@@ -1227,13 +1230,13 @@ pub async fn ensure_document_loaded(
 #[cfg(test)]
 mod tests {
     use super::super::diff::drop_cache_for_forced_refetch;
-    #[cfg(feature = "cargo")]
-    use super::super::fetch::FetchResult;
     use super::*;
     use deps_core::EcosystemId;
     #[cfg(feature = "cargo")]
     use deps_core::Registry;
     use deps_core::RemovalStatus;
+    #[cfg(feature = "cargo")]
+    use deps_engine::classify::fetch::FetchResult;
     // Only the cargo-gated tests below sleep or time out on a bare `Duration`
     // (go_tests imports its own `tokio::time::Duration` locally instead).
     #[cfg(feature = "cargo")]
@@ -1496,16 +1499,16 @@ mod tests {
             // Simulate a total registry outage: the one dependency in the manifest failed,
             // nothing was fetched — exactly what `ErrorRegistry` produces in
             // `fetch_latest_versions_parallel`'s own tests.
-            let fetch_result = FetchResult {
-                versions: HashMap::new(),
-                yanked_versions: HashMap::new(),
-                fetch_failed: HashMap::from([(PackageName::new("serde"), FetchFailure::Transient)]),
-                deprecations: HashMap::new(),
-                no_comparable_versions: HashSet::new(),
-                failed_count: 1,
-                first_error: Some("network down".to_string()),
-                licenses: HashMap::new(),
-            };
+            let fetch_result = FetchResult::new(
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::from([(PackageName::new("serde"), FetchFailure::Transient)]),
+                HashSet::new(),
+                1,
+                Some("network down".to_string()),
+                HashMap::new(),
+            );
 
             let (failed_count, _) = merge_registry_fetch_result(
                 &state,

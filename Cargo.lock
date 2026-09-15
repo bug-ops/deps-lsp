@@ -589,6 +589,10 @@ dependencies = [
  "deps-nuget",
  "deps-pypi",
  "deps-swift",
+ "futures",
+ "tokio",
+ "tower-lsp-server",
+ "tracing",
 ]
 
 [[package]]
