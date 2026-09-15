@@ -795,7 +795,15 @@ serde = "1.0.0"
         /// case is built from a raw client-style string (not
         /// `ls_types::Uri::from_file_path`, which is always already canonical and so
         /// cannot exercise this divergence).
+        ///
+        /// Unix-only: every fixture path here is drive-letter-less, so
+        /// `url::Url::to_file_path` (which `parse_manifest`'s workspace-root discovery
+        /// calls internally) always fails on Windows regardless of the URI's spelling —
+        /// this is a fixture-portability limit, not a difference in the rekey mechanism
+        /// under test, which the cross-platform `lsp_types_interop` round-trip tests
+        /// already cover on Windows.
         #[tokio::test]
+        #[cfg(not(windows))]
         async fn test_handle_code_actions_rekeys_edit_to_original_non_canonical_uri() {
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let raw_uris = [

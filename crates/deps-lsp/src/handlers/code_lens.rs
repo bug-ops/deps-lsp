@@ -493,7 +493,15 @@ mod tests {
         /// would see a refusal on a lens they just clicked. Uses a raw client-style
         /// string (not `ls_types::Uri::from_file_path`, which is always already
         /// canonical) to actually exercise the divergence.
+        ///
+        /// Unix-only: the fixture path is drive-letter-less, so `url::Url::to_file_path`
+        /// (which `parse_manifest`'s workspace-root discovery calls internally, via
+        /// `seed`) always fails on Windows regardless of the URI's spelling — a
+        /// fixture-portability limit, not a difference in the rekey mechanism under
+        /// test, which the cross-platform `lsp_types_interop` round-trip tests already
+        /// cover on Windows.
         #[tokio::test]
+        #[cfg(not(windows))]
         async fn test_handle_code_lens_command_argument_uses_original_non_canonical_uri() {
             let state = Arc::new(ServerState::new());
             let uri: tower_lsp_server::ls_types::Uri =

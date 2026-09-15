@@ -19,6 +19,22 @@ pub(crate) mod test_helpers {
         let config = Arc::new(RwLock::new(DepsConfig::default()));
         (client, config)
     }
+
+    /// Prefixes a Windows drive letter onto a Unix-shaped path literal so it is a valid
+    /// absolute path on Windows too, mirroring `deps_core::test_util::test_uri`'s pattern —
+    /// `ls_types::Uri::from_file_path`/`url::Url::from_file_path`/`Url::to_file_path` all
+    /// require a drive letter for an absolute path on Windows, so a bare `/foo/bar` fixture
+    /// (valid on Unix) fails there without this.
+    pub(crate) fn platform_path(unix_path: &str) -> String {
+        #[cfg(windows)]
+        {
+            format!("C:{unix_path}")
+        }
+        #[cfg(not(windows))]
+        {
+            unix_path.to_string()
+        }
+    }
 }
 
 /// Shared scaffolding for the `#319`/`#333` DashMap-Ref-across-await regression tests in

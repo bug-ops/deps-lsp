@@ -1207,12 +1207,27 @@ mod tests {
     /// check in `manifest_dir`'s computation is what blocks it, not an incidental parse failure.
     #[test]
     fn test_parse_with_context_untitled_scheme_hierarchical_path_blocked_by_scheme_guard() {
-        let uri: Url = "untitled:/nonexistent/repo/package.json"
+        // `to_file_path` needs a drive-letter-shaped first path segment to resolve on
+        // Windows (it does not check the scheme — see the security handoff above), so
+        // the raw URI and expected path are platform-conditional to keep this test's
+        // actual premise (to_file_path succeeds, so the scheme guard is what blocks
+        // manifest_dir) true on both platforms.
+        #[cfg(windows)]
+        let (raw, expected): (&str, &std::path::Path) = (
+            "untitled:/C:/nonexistent/repo/package.json",
+            std::path::Path::new(r"C:\nonexistent\repo\package.json"),
+        );
+        #[cfg(not(windows))]
+        let (raw, expected): (&str, &std::path::Path) = (
+            "untitled:/nonexistent/repo/package.json",
+            std::path::Path::new("/nonexistent/repo/package.json"),
+        );
+        let uri: Url = raw
             .parse()
             .expect("untitled: must still parse as a valid Url");
         assert_eq!(
             uri.to_file_path().as_deref(),
-            Ok(std::path::Path::new("/nonexistent/repo/package.json")),
+            Ok(expected),
             "test premise: to_file_path resolves this to a real absolute path, not Err — so \
              the scheme guard, not to_file_path failing, must be what blocks manifest_dir"
         );

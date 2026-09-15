@@ -80,10 +80,12 @@ pub fn to_lsp_range(range: deps_core::position::Range) -> ls_types::Range {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::test_helpers::platform_path;
 
     #[test]
     fn test_uri_roundtrips_unix_path() {
-        let ls_uri = ls_types::Uri::from_file_path("/home/user/project/Cargo.toml").unwrap();
+        let ls_uri =
+            ls_types::Uri::from_file_path(platform_path("/home/user/project/Cargo.toml")).unwrap();
         let url = from_lsp_uri(&ls_uri).unwrap();
         assert_eq!(
             url.to_file_path().unwrap().to_str().unwrap(),
@@ -100,7 +102,8 @@ mod tests {
     #[test]
     fn test_uri_roundtrips_non_trivial_path_shape() {
         let ls_uri =
-            ls_types::Uri::from_file_path("/home/user/My Projects/a b/Cargo.toml").unwrap();
+            ls_types::Uri::from_file_path(platform_path("/home/user/My Projects/a b/Cargo.toml"))
+                .unwrap();
         let url = from_lsp_uri(&ls_uri).unwrap();
         let back = to_lsp_uri(&url);
         assert_eq!(
@@ -115,7 +118,9 @@ mod tests {
     /// (`url::Url`/`ls_types::Uri` platform/encoding divergence).
     #[test]
     fn test_uri_roundtrips_unicode_path() {
-        let ls_uri = ls_types::Uri::from_file_path("/home/usér/prøjects/café/包.json").unwrap();
+        let ls_uri =
+            ls_types::Uri::from_file_path(platform_path("/home/usér/prøjects/café/包.json"))
+                .unwrap();
         let url = from_lsp_uri(&ls_uri).unwrap();
         let back = to_lsp_uri(&url);
         assert_eq!(
