@@ -1420,6 +1420,23 @@ mod tests {
     /// check in `resolve_manifest_file_path` pins the behavior at this call site regardless
     /// of that internal detail, so this test protects against either implementation
     /// drifting silently.
+    ///
+    /// `#[cfg(unix)]`: the WHATWG URL Standard's file-host parsing unconditionally drops a
+    /// `file://` URL's host whenever the path immediately following it looks like a Windows
+    /// drive letter (`url` crate's `parser.rs`: "For file URLs that have a host and whose
+    /// path starts with the windows drive letter we just remove the host" — this is
+    /// spec-mandated parsing behavior, not an OS-gated code path, but it only *triggers* on
+    /// a real Windows machine, where `tempfile::tempdir()`'s absolute path is drive-lettered;
+    /// on Unix the path never looks like a drive letter, so the host survives parsing).
+    /// Concretely: `file://attacker.example/C:/x` parses with `host: None`, not
+    /// `Some("attacker.example")`, on Windows — the malicious host is discarded before
+    /// `resolve_manifest_file_path` ever sees it, and the URI resolves to the local
+    /// drive-letter path directly, same as if no host had been specified at all. This is
+    /// safe (the "remote host" never actually gets treated as a target), just not what this
+    /// test's `assert!(located.is_none())` expects, so it is Unix-only rather than adjusted
+    /// to a different, weaker assertion guessed at without a Windows environment to verify
+    /// the exact resulting behavior against.
+    #[cfg(unix)]
     #[test]
     fn test_locate_lockfile_for_manifest_rejects_remote_host_file_uri() {
         // See the comment in `test_locate_lockfile_for_manifest_same_directory` on why this
