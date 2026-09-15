@@ -326,6 +326,66 @@ jobs:
           fi
           exit 0
 
+      - name: Guard against ecosystem crates leaking into an adapter's release dependency tree
+        # The design's other invariant (issue #1058, architecture-decision.md §3.1/§3.3): a
+        # driving adapter may not name a concrete `deps-<ecosystem>` crate as a *direct*
+        # non-dev dependency of its own — only `deps-engine` may. Issue #1073 was exactly
+        # this: `deps-lsp` calling `deps_gitlab_ci::GitlabHost::parse` directly. `--depth 1`
+        # is essential here, unlike the driving-adapter guard above: every ecosystem crate is
+        # a *legitimate* transitive dependency of deps-lsp/deps-cli through deps-engine, so an
+        # unbounded `cargo tree` would flag that expected transitive edge as a false positive
+        # on every run — this check only cares whether the adapter's own `Cargo.toml` names
+        # one directly. `--all-features` so the check exercises every ecosystem crate's
+        # feature flag, not just an adapter's own default selection. Same boundary-anchored
+        # grep technique as the driving-adapter guard above, and the same positive-control
+        # shape (`deps-core` known-present as a direct dependency) to prove the detection
+        # mechanism itself works.
+        #
+        # The crate list itself is derived from `deps-engine`'s own direct dependency tree
+        # (minus `deps-core`/`deps-engine`), not hand-maintained here — a 15th ecosystem crate
+        # added to `deps-engine` extends this check automatically instead of silently not
+        # being covered (impl-critic S2). The `min_expected` floor is a self-check guarding
+        # against a `cargo tree` output-format change silently emptying `ecosystems` and
+        # turning every iteration below into a no-op.
+        run: |
+          mapfile -t ecosystems < <(
+            cargo tree -p deps-engine -e no-dev --all-features --depth 1 \
+              | grep -oE '(^|[^A-Za-z0-9._-])deps-[a-z-]+ v[0-9]' \
+              | grep -oE 'deps-[a-z-]+' \
+              | grep -vE '^(deps-core|deps-engine)$' \
+              | sort -u
+          )
+          min_expected=10
+          if [ "${#ecosystems[@]}" -lt "$min_expected" ]; then
+            echo "::error::guard self-check failed: derived only ${#ecosystems[@]} ecosystem crate(s) from deps-engine's direct dependency tree (expected at least $min_expected) — cargo tree output format may have changed"
+            exit 1
+          fi
+
+          lsp_tree=$(cargo tree -p deps-lsp -e no-dev --all-features --depth 1)
+          if ! grep -qE '(^|[^A-Za-z0-9._-])deps-core v[0-9]' <<<"$lsp_tree"; then
+            echo "::error::guard self-check failed: deps-core not found among deps-lsp's direct dependencies"
+            exit 1
+          fi
+          for ecosystem in "${ecosystems[@]}"; do
+            if grep -qE "(^|[^A-Za-z0-9._-])${ecosystem} v[0-9]" <<<"$lsp_tree"; then
+              echo "::error::deps-lsp directly depends on ecosystem crate $ecosystem"
+              exit 1
+            fi
+          done
+
+          cli_tree=$(cargo tree -p deps-cli -e no-dev --all-features --depth 1)
+          if ! grep -qE '(^|[^A-Za-z0-9._-])deps-core v[0-9]' <<<"$cli_tree"; then
+            echo "::error::guard self-check failed: deps-core not found among deps-cli's direct dependencies"
+            exit 1
+          fi
+          for ecosystem in "${ecosystems[@]}"; do
+            if grep -qE "(^|[^A-Za-z0-9._-])${ecosystem} v[0-9]" <<<"$cli_tree"; then
+              echo "::error::deps-cli directly depends on ecosystem crate $ecosystem"
+              exit 1
+            fi
+          done
+          exit 0
+
   semver:
     name: Semver Check
     needs: changes

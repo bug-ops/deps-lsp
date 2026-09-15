@@ -408,7 +408,7 @@ const NUGET_USER_PROFILE_SOURCES_ECOSYSTEMS: &[&str] = &["nuget"];
 ///
 /// Same single-ecosystem-scoped shape as [`NUGET_USER_PROFILE_SOURCES_ECOSYSTEMS`], not a
 /// member of `workspace_registry_ecosystems`: `deps_gitlab_ci::parser::parse_gitlab_ci_yaml`
-/// resolves this setting into a [`deps_gitlab_ci::types::HostRef`] once, at parse time (see
+/// resolves this setting into a `deps_gitlab_ci::types::HostRef` once, at parse time (see
 /// `resolve_project_host`/`resolve_component_host`), so a changed instance host leaves
 /// already-open documents' cached `HostRef`s stale until they are re-parsed. Listed
 /// unconditionally here even though the `gitlab-ci` feature can be compiled out — `ReparseScope`

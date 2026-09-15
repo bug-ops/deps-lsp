@@ -76,7 +76,7 @@ fn parse_config(value: serde_json::Value) -> Option<DepsConfig> {
 ///
 /// `raw` is redacted via [`deps_core::net_policy::RedactedUrl`] before being interpolated
 /// (issue #808): `raw` is exactly the attacker/user-controlled config value
-/// `deps_gitlab_ci::GitlabHost::parse` rejected, which can be credential-shaped (e.g.
+/// `deps_engine::setup::validate_gitlab_instance_host` rejected, which can be credential-shaped (e.g.
 /// `user:hunter2@gitlab.corp`) — interpolating it verbatim into a message shown in the
 /// editor UI is a second, user-visible sink for the same credential leak #808 closed in the
 /// `tracing::warn!`/error-`Display` path, and arguably worse since it isn't just a log line.
@@ -102,18 +102,20 @@ fn gitlab_instance_host_invalid_message(
 /// `PRIVATE-TOKEN` to `gitlab.com` (or disabling instance-host resolution entirely) with no
 /// visible signal was the exact failure mode that review flagged.
 ///
-/// `deps_gitlab_ci::host::GitlabInstanceHost::get` re-validates (and logs at `warn`) the
-/// same value lazily on every read, since `EcosystemRuntime` is feature-agnostic and can't
-/// hold a `GitlabHost` directly (see that struct's docs) — this duplicates just the
-/// validation call, once per config update, to turn it into a one-time, user-visible
-/// notice instead of a read that never surfaces past the log.
+/// The instance host is re-validated (and logged at `warn`) lazily on every read too, via
+/// `deps_gitlab_ci::host::GitlabInstanceHost::get` — this duplicates just the validation
+/// call, once per config update, to turn it into a one-time, user-visible notice instead of
+/// a read that never surfaces past the log. The validation itself goes through
+/// `deps_engine::setup::validate_gitlab_instance_host` rather than naming `deps_gitlab_ci`
+/// directly, so this adapter-side notification does not need to depend on the concrete
+/// ecosystem crate (`specs/062-cli-check-mode/architecture-decision.md` §3.3).
 #[cfg(feature = "gitlab-ci")]
 async fn warn_if_gitlab_instance_host_invalid(
     client: &Client,
     raw: &str,
     policy: &deps_core::net_policy::RegistryAccessPolicy,
 ) {
-    if let Err(error) = deps_gitlab_ci::GitlabHost::parse(raw, policy) {
+    if let Err(error) = deps_engine::setup::validate_gitlab_instance_host(raw, policy) {
         client
             .show_message(
                 MessageType::WARNING,
@@ -3217,7 +3219,7 @@ mod tests {
             deps_core::net_policy::WorkspaceRegistryAccess::All,
         );
         let raw = "user:hunter2@gitlab.corp";
-        let error = deps_gitlab_ci::GitlabHost::parse(raw, &policy).unwrap_err();
+        let error = deps_engine::setup::validate_gitlab_instance_host(raw, &policy).unwrap_err();
 
         let message = gitlab_instance_host_invalid_message(raw, &error);
 

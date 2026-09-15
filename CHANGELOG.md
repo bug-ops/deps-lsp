@@ -31,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-bundler**: `extract_group`/`extract_source`/`extract_platforms`/`extract_require` now take the same `&[(&str, usize)]` slice as `extract_version`, dropping a redundant per-gem `Vec` allocation in `finalize_pending_gem` (resolves #1023) (#1036)
 - bumped `rustls` 0.23.44 -> 0.23.45 (RUSTSEC-2026-0285: TLS 1.3 handshake messages incorrectly accepted across encryption level boundaries) (#1036)
 - **CI**: `cargo-semver-checks` is advisory-only on PR/push again (was a blocking gate since #945), reverted after it blocked a routine bug-fix PR over an incidental non-breaking `#[must_use]` addition; the weekly scheduled sweep still hard-fails and tracks genuine breaks (resolves #1048) (#1049)
+- **deps-engine, deps-lsp, ci**: closed `deps-lsp`'s last direct dependency on `deps-gitlab-ci` via a new `deps_engine::setup::validate_gitlab_instance_host`, and added a CI guard asserting no ecosystem crate is a *direct* non-dev dependency of `deps-lsp`/`deps-cli` (resolves #1073) (#1079)
 
 ### Fixed
 - **deps-cargo, deps-go, deps-npm, deps-pypi**: the version-completion cap test now mocks more versions than the cap and asserts the exact `MAX_COMPLETION_VERSIONS` count instead of a vacuous `<= 20`; a deps-go doctest tautology and two unverified pypi mocks are fixed the same way (resolves #1066) (#1067)
