@@ -631,6 +631,39 @@ version = 1
         assert_eq!(located.unwrap(), uv_lock);
     }
 
+    /// #1085 regression: `locate_lockfile` delegates entirely to
+    /// `deps_core::lockfile::locate_lockfile_for_manifest`, which rejects any non-`file:`
+    /// scheme (#1084) — pins that a non-`file:` manifest URI (e.g. VS Code's `untitled:`
+    /// scheme) degrades safely to `None` rather than resolving against the real filesystem.
+    #[test]
+    fn test_locate_lockfile_rejects_non_file_uri() {
+        // A real manifest + lockfile pair on disk: if the (shared, deps-core) scheme guard
+        // did not fire, the pre-fix `to_file_path` would still find this lockfile, since the
+        // path component itself is real. A URI pointing at a nonexistent directory would
+        // return `None` for an unrelated reason regardless of the scheme check, so it would
+        // not actually pin the guard.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manifest_path = temp_dir.path().join("pyproject.toml");
+        let poetry_lock = temp_dir.path().join("poetry.lock");
+        std::fs::write(&manifest_path, "[project]\nname = \"test\"").unwrap();
+        std::fs::write(&poetry_lock, "# poetry.lock").unwrap();
+
+        // Built from `Uri::from_file_path` rather than `format!("untitled:{}", path.display())`
+        // to stay valid on Windows: `Path::display()` there uses `\` separators and an
+        // unescaped drive letter, neither of which is a legal URI path character.
+        let file_uri = Uri::from_file_path(&manifest_path).unwrap();
+        let path_part = file_uri.as_str().strip_prefix("file://").unwrap();
+        let manifest_uri: Uri = format!("untitled:{path_part}").parse().unwrap();
+        let parser = PypiLockParser;
+
+        assert_eq!(
+            parser.locate_lockfile(&manifest_uri),
+            None,
+            "a non-file-scheme URI must never resolve to a filesystem path, even when that \
+             path names a real, existing lock file"
+        );
+    }
+
     // #758: shared `LockFileProvider` conformance, replacing test_locate_lockfile_not_found
     // and test_parse_malformed_toml.
     // test_locate_lockfile_poetry_priority/test_locate_lockfile_uv_fallback stay hand-written:
