@@ -648,12 +648,12 @@ version = 1
         std::fs::write(&manifest_path, "[project]\nname = \"test\"").unwrap();
         std::fs::write(&poetry_lock, "# poetry.lock").unwrap();
 
-        // Built from `Uri::from_file_path` rather than `format!("untitled:{}", path.display())`
+        // Built from `Url::from_file_path` rather than `format!("untitled:{}", path.display())`
         // to stay valid on Windows: `Path::display()` there uses `\` separators and an
         // unescaped drive letter, neither of which is a legal URI path character.
-        let file_uri = Uri::from_file_path(&manifest_path).unwrap();
+        let file_uri = Url::from_file_path(&manifest_path).unwrap();
         let path_part = file_uri.as_str().strip_prefix("file://").unwrap();
-        let manifest_uri: Uri = format!("untitled:{path_part}").parse().unwrap();
+        let manifest_uri: Url = format!("untitled:{path_part}").parse().unwrap();
         let parser = PypiLockParser;
 
         assert_eq!(
