@@ -30,8 +30,8 @@ related:
 - [ ] T006-T019: migrate each of the 14 `deps-<ecosystem>` crates (one task per crate)
 - [ ] T020: CI guard — `deps-engine` dependency tree excludes `tower-lsp-server` (descoped from `deps-cli`, see spec's "Out of Scope")
 - [ ] T021: full check suite + live manual test (≥2 ecosystems) + `CHANGELOG.md` "Breaking" entry for PR A
-- [ ] T022: `policy_config`'s 7 structs → `#[non_exhaustive]` + `new()`/`with_*` constructors
-- [ ] T023: `PolicyConfig::diff`/`PolicyConfigDiff` + `reparse_scope` rewrite + compile-fail test + `CHANGELOG.md` "Breaking" entry for PR B
+- [x] T022: `policy_config`'s 7 structs → `#[non_exhaustive]` + `new()`/`with_*` constructors
+- [x] T023: `PolicyConfig::diff`/`PolicyConfigDiff` + `reparse_scope` rewrite + compile-fail test + `CHANGELOG.md` "Breaking" entry for PR B
 
 ---
 
@@ -221,10 +221,10 @@ on these types and signatures existing.
 **Context**: PR B, independent of PR A. Implements the spec's US-002 / FR-006 / FR-007.
 **Spec reference**: [[spec#FR-006]], [[spec#FR-007]]
 **Acceptance criteria**:
-- [ ] `#[non_exhaustive]` added to `DiagnosticsConfig`, `CacheConfig`, `FreshnessConfig`, `SupplyChainConfig`, `RegistriesConfig`, `NetworkConfig`, `LicensePolicyConfig`
-- [ ] Each gets a `new()` (if any field lacks a sensible default-only constructor) and/or `with_*` builder methods for every field, following `InlayHintsConfig`'s existing pattern exactly (method naming, `#[must_use]`, return-`Self` style)
-- [ ] `policy_config.rs`'s module doc (currently explaining *why* these are exhaustive) rewritten to explain the new state and point to `PolicyConfig::diff` (T023) as the replacement guarantee
-- [ ] Existing doctest in `policy_config.rs` (`PolicyConfig::default()`) still compiles
+- [x] `#[non_exhaustive]` added to `DiagnosticsConfig`, `CacheConfig`, `FreshnessConfig`, `SupplyChainConfig`, `RegistriesConfig`, `NetworkConfig`, `LicensePolicyConfig`
+- [x] Each gets a `new()` (if any field lacks a sensible default-only constructor) and/or `with_*` builder methods for every field, following `InlayHintsConfig`'s existing pattern exactly (method naming, `#[must_use]`, return-`Self` style)
+- [x] `policy_config.rs`'s module doc (currently explaining *why* these are exhaustive) rewritten to explain the new state and point to `PolicyConfig::diff` (T023) as the replacement guarantee
+- [x] Existing doctest in `policy_config.rs` (`PolicyConfig::default()`) still compiles
 **Dependencies**: none (independent of PR A)
 **Files**: `crates/deps-core/src/policy_config.rs`
 **Complexity**: medium
@@ -236,13 +236,13 @@ on these types and signatures existing.
 **Context**: The actual security-guarantee-preserving half of PR B — must land in the same PR/commit as T022, not separately, since T022 alone would silently defeat `reparse_scope`'s current guard.
 **Spec reference**: [[spec#FR-008]], [[spec#FR-009]], [[spec#NFR-004]]
 **Acceptance criteria**:
-- [ ] `PolicyConfig::diff(old, new) -> PolicyConfigDiff` implemented per [[plan#3-data-model]], using the **same field-by-field classification granularity `reparse_scope` uses today** (confirm exact leaf-field list by reading the current `reparse_scope` body in `crates/deps-lsp/src/config.rs` before writing `PolicyConfigDiff`'s fields — plan.md deliberately left this as a placeholder, not a guess)
-- [ ] `PolicyConfigDiff` is **not** `#[non_exhaustive]`
-- [ ] `deps-lsp::config::reparse_scope` rewritten to consume `PolicyConfigDiff` instead of destructuring `PolicyConfig`/its sections directly
-- [ ] All existing `reparse_scope_tests` cases pass unmodified in their assertions (only the internals being tested change)
-- [ ] New compile-fail test (or equivalent guaranteed-detection mechanism, e.g. a `trybuild` fixture) proving: adding a field to any of the 7 `policy_config` structs without updating `PolicyConfig::diff` fails to compile (NFR-004/SC-004) — this is the task's primary deliverable, not optional polish
-- [ ] `CHANGELOG.md` `[Unreleased]` gets a **Breaking** entry: `deps_core::policy_config`'s 7 structs are now `#[non_exhaustive]` (resolves #1064)
-- [ ] Full check suite (same list as T021) green
+- [x] `PolicyConfig::diff(old, new) -> PolicyConfigDiff` implemented per [[plan#3-data-model]], using the **same field-by-field classification granularity `reparse_scope` uses today** (confirm exact leaf-field list by reading the current `reparse_scope` body in `crates/deps-lsp/src/config.rs` before writing `PolicyConfigDiff`'s fields — plan.md deliberately left this as a placeholder, not a guess)
+- [x] `PolicyConfigDiff` is **not** `#[non_exhaustive]`
+- [x] `deps-lsp::config::reparse_scope` rewritten to consume `PolicyConfigDiff` instead of destructuring `PolicyConfig`/its sections directly
+- [x] All existing `reparse_scope_tests` cases pass unmodified in their assertions (only the internals being tested change)
+- [x] New compile-fail test (or equivalent guaranteed-detection mechanism, e.g. a `trybuild` fixture) proving: adding a field to any of the 7 `policy_config` structs without updating `PolicyConfig::diff` fails to compile (NFR-004/SC-004) — this is the task's primary deliverable, not optional polish (implemented as a `compile_fail` doctest — no `trybuild` dev-dependency existed in the workspace, and adding one for a single fixture was unwarranted; see `PolicyConfigDiff`'s doc comment)
+- [x] `CHANGELOG.md` `[Unreleased]` gets a **Breaking** entry: `deps_core::policy_config`'s 7 structs are now `#[non_exhaustive]` (resolves #1064)
+- [x] Full check suite (same list as T021) green
 **Dependencies**: T022
 **Files**: `crates/deps-core/src/policy_config.rs`, `crates/deps-lsp/src/config.rs`, new compile-fail test location (TBD — check whether `trybuild` is already a workspace dev-dependency before adding it), `CHANGELOG.md`
 **Complexity**: high
