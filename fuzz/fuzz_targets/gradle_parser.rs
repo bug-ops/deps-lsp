@@ -9,14 +9,14 @@
 use deps_gradle::parser::parse_gradle;
 use libfuzzer_sys::fuzz_target;
 use std::sync::LazyLock;
-use tower_lsp_server::ls_types::Uri;
+use url::Url;
 
-static GROOVY_URI: LazyLock<Uri> =
-    LazyLock::new(|| Uri::from_file_path("/fuzz/build.gradle").expect("static fixture path"));
-static KOTLIN_URI: LazyLock<Uri> =
-    LazyLock::new(|| Uri::from_file_path("/fuzz/build.gradle.kts").expect("static fixture path"));
-static CATALOG_URI: LazyLock<Uri> = LazyLock::new(|| {
-    Uri::from_file_path("/fuzz/gradle/libs.versions.toml").expect("static fixture path")
+static GROOVY_URI: LazyLock<Url> =
+    LazyLock::new(|| Url::from_file_path("/fuzz/build.gradle").expect("static fixture path"));
+static KOTLIN_URI: LazyLock<Url> =
+    LazyLock::new(|| Url::from_file_path("/fuzz/build.gradle.kts").expect("static fixture path"));
+static CATALOG_URI: LazyLock<Url> = LazyLock::new(|| {
+    Url::from_file_path("/fuzz/gradle/libs.versions.toml").expect("static fixture path")
 });
 
 fuzz_target!(|data: &[u8]| {
