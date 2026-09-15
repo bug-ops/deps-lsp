@@ -45,8 +45,8 @@ use deps_core::yaml_walk::{FrameKind, FrameStack, ScalarPosition};
 use deps_core::{DepsError, Result};
 use std::collections::{HashMap, HashSet};
 use tower_lsp_server::ls_types::Uri;
-use yaml_rust2::parser::{Event, MarkedEventReceiver, Parser};
-use yaml_rust2::scanner::Marker;
+use yaml_rust2::parser::{Event, MarkedEventReceiver, Parser, Tag};
+use yaml_rust2::scanner::{Marker, TScalarStyle};
 
 /// Bound on distinct literal `component:` hosts admitted per document (spec plan §4.6) —
 /// the bound that matters for a `didOpen` burst, protecting `HttpCache`'s unbounded
@@ -394,14 +394,17 @@ struct RecordingFrame {
 struct GitlabCiReceiver {
     stack: Stack,
     entries: Vec<RawEntry>,
-    /// Anchor id -> anchored scalar text, built during this same event-stream pass (spec
-    /// FR-001). Not scoped to `include:` — an anchor can be defined anywhere in the
-    /// document (e.g. at the document root) and aliased later inside `include:`. Bounded by
-    /// [`MAX_ANCHOR_VALUE_CHARS`]/[`MAX_ANCHOR_TABLE_ENTRIES`] (FR-002); never reset between
-    /// this crate's multi-document `spec:`-header parses, since a cross-document alias id
-    /// collision is already a whole-document load error in `yaml-rust2` before this code
-    /// runs (spec Data Model).
-    anchors: ScalarAnchorTable,
+    /// Anchor id -> anchored scalar text plus its own style/tag, built during this same
+    /// event-stream pass (spec FR-001). Not scoped to `include:` — an anchor can be defined
+    /// anywhere in the document (e.g. at the document root) and aliased later inside
+    /// `include:`. Bounded by [`MAX_ANCHOR_VALUE_CHARS`]/[`MAX_ANCHOR_TABLE_ENTRIES`]
+    /// (FR-002); never reset between this crate's multi-document `spec:`-header parses,
+    /// since a cross-document alias id collision is already a whole-document load error in
+    /// `yaml-rust2` before this code runs (spec Data Model). The style/tag metadata (mirrors
+    /// the null-filtering approach used in `deps-dart`'s shipped `on_alias`, applied here to
+    /// the value-position arm) lets `Event::Alias` re-check [`is_plain_null`] against the
+    /// anchor's own definition, matching a literal `Event::Scalar`'s handling (#1029).
+    anchors: ScalarAnchorTable<(TScalarStyle, Option<Tag>)>,
     /// Every event seen on the live pass while at least one [`RecordingFrame`] is open, in
     /// document order — the single backing store [`Self::container_anchors`]' ranges index
     /// into (spec 058 FR-001). Bounded by [`MAX_RECORDED_EVENTS`] (critic M2); stays empty
@@ -777,8 +780,12 @@ impl MarkedEventReceiver for GitlabCiReceiver {
                 // FR-001: recorded regardless of scalar position — an anchor can be
                 // defined anywhere in the document (e.g. `.pin: &pin v1.2.3` at the
                 // document root, entirely outside `include:`), and this is the only
-                // event-stream pass this parser makes.
-                self.anchors.record(anchor_id, &value, ());
+                // event-stream pass this parser makes. The style/tag are kept alongside the
+                // text so a later `Event::Alias` can re-run `is_plain_null` against the
+                // anchor's own definition (#1029).
+                if anchor_id != 0 {
+                    self.anchors.record(anchor_id, &value, (style, tag.clone()));
+                }
                 match self.stack.scalar_position() {
                     // A bare scalar sequence item (e.g. `include: - templates/x.yml`, the
                     // `local:` shorthand) carries nothing to record. Critic M4, site 2: but
@@ -877,7 +884,7 @@ impl MarkedEventReceiver for GitlabCiReceiver {
                     let key = self
                         .anchors
                         .get(id)
-                        .map_or(PendingKey::None, |(text, ())| key_for(role, text));
+                        .map_or(PendingKey::None, |(text, _)| key_for(role, text));
                     self.stack.observe_key(key);
                 }
                 ScalarPosition::Value => {
@@ -893,35 +900,40 @@ impl MarkedEventReceiver for GitlabCiReceiver {
                             *top.role(),
                             FrameRole::IncludeEntry | FrameRole::MergeSource
                         )
-                        && let Some((text, ())) = self.anchors.get(id)
+                        && let Some((text, (style, tag))) = self.anchors.get(id)
                     {
-                        // Known divergence (impl-critic finding, deferred as a P4
-                        // follow-up, same treatment as B4): unlike `deps-dart`'s `on_alias`,
-                        // this crate's `anchors` table (`ScalarAnchorTable`, keyed with `()`
-                        // metadata) does not carry the anchor's own style/tag, so a
-                        // null-like scalar anchor aliased here (`.pin: &pin ~` then `ref:
-                        // *pin`) is never re-checked against `is_plain_null` and is captured
-                        // as literal text `"~"` rather than treated as absent — a
-                        // pre-existing (#912) gap, not introduced by this feature, but more
-                        // reachable now that a scalar-anchor alias can also be nested inside
-                        // a merged template.
                         debug_assert_eq!(self.alias_site.is_some(), self.replay_depth > 0);
-                        let (line, col) = match self.alias_site {
-                            // FR-017: a nested scalar-anchor alias resolved while a
-                            // container replay is active still takes the *outermost*
-                            // marker, not this inner alias's own — see critic S1.
-                            Some(outer) => (outer.line(), outer.col()),
-                            None => (marker.line(), marker.col()),
-                        };
-                        let field = RawField::Alias {
-                            text: text.to_string(),
-                            line,
-                            col,
+                        // Re-checks `is_plain_null` against the *anchor's own* style/tag
+                        // (mirrors the null-filtering approach used in deps-dart's
+                        // `on_alias`, applied here to the value-position arm, #1029) — the
+                        // literal `Event::Scalar` arm above already filters a null-like plain
+                        // scalar
+                        // before it ever becomes a `RawField`, but that check happens at the
+                        // anchor's definition site, not at each alias resolving it, so
+                        // without re-running it here a null-like scalar anchor aliased here
+                        // (`.pin: &pin ~` then `ref: *pin`) would resolve to
+                        // `Some(Alias{text: "~"})` instead of being treated as absent like
+                        // the literal arm treats a direct null.
+                        let field = if is_plain_null(*style, tag.as_ref(), text) {
+                            None
+                        } else {
+                            let (line, col) = match self.alias_site {
+                                // FR-017: a nested scalar-anchor alias resolved while a
+                                // container replay is active still takes the *outermost*
+                                // marker, not this inner alias's own — see critic S1.
+                                Some(outer) => (outer.line(), outer.col()),
+                                None => (marker.line(), marker.col()),
+                            };
+                            Some(RawField::Alias {
+                                text: text.to_string(),
+                                line,
+                                col,
+                            })
                         };
                         match *top.pending_key() {
-                            PendingKey::Project => top.payload.project = Some(field),
-                            PendingKey::Ref => top.payload.ref_field = Some(field),
-                            PendingKey::Component => top.payload.component = Some(field),
+                            PendingKey::Project => top.payload.project = field,
+                            PendingKey::Ref => top.payload.ref_field = field,
+                            PendingKey::Component => top.payload.component = field,
                             // FR-004 scopes the capture to project/ref/component only — a
                             // `template:`/`remote:`/`local:` alias (or an unrecognized key,
                             // or `<<:`, EC-006) is left uncaptured, matching FR-005's
@@ -2265,9 +2277,12 @@ mod tests {
         assert!(result.dependencies.is_empty(), "{:?}", result.dependencies);
     }
 
-    /// EC-012: an anchored empty scalar (`x: &e` / `ref: *e`) is a table hit whose text is
-    /// `""` — must resolve without panicking and without producing a misleading non-empty
-    /// display.
+    /// EC-012 (#1029): an anchored empty scalar (`x: &e` / `ref: *e`) is a table hit whose
+    /// text is `""` — must resolve without panicking, and (since #1029, matching how
+    /// [`test_empty_ref_on_anchor_free_entry_ships_no_version`] treats the same empty text
+    /// on the literal path) without producing a misleading non-empty `Some("")` display —
+    /// `is_plain_null` is now re-checked against the anchor's own style at the alias site,
+    /// so this ships no version instead.
     #[test]
     fn test_alias_to_empty_anchor_is_safe() {
         let (policy, instance_host) = ctx();
@@ -2275,11 +2290,109 @@ mod tests {
         let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host).unwrap();
         assert_eq!(result.dependencies.len(), 1, "{:?}", result.dependencies);
         let dep = &result.dependencies[0];
+        assert!(dep.version_req.is_none());
+        assert!(dep.version_range().is_none());
+        assert!(dep.pin.is_none());
+    }
+
+    /// #1029: an alias to an anchor holding each of Psych's four null spellings (`~`,
+    /// `null`, `Null`, `NULL`) must ship no version, agreeing with how the literal path
+    /// (`is_plain_null`, see [`crate::parser`]'s `Event::Scalar` arm) treats the same text
+    /// written directly instead of through an anchor/alias.
+    #[test]
+    fn test_alias_to_each_null_spelling_anchor_ships_no_version() {
+        let (policy, instance_host) = ctx();
+        for spelling in ["~", "null", "Null", "NULL"] {
+            let content =
+                format!(".n: &n {spelling}\ninclude:\n  - project: org/proj\n    ref: *n\n");
+            let result =
+                parse_gitlab_ci_yaml(&content, &test_uri(), &policy, &instance_host).unwrap();
+            assert_eq!(
+                result.dependencies.len(),
+                1,
+                "{spelling}: {:?}",
+                result.dependencies
+            );
+            let dep = &result.dependencies[0];
+            assert!(
+                dep.version_req.is_none(),
+                "{spelling}: {:?}",
+                dep.version_req
+            );
+            assert!(
+                dep.version_range().is_none(),
+                "{spelling}: unexpected range"
+            );
+        }
+    }
+
+    /// #1029: literal and aliased paths must now agree on a null-like value — a non-null
+    /// anchor text must still resolve normally through the alias path (regression guard
+    /// against the null-check accidentally swallowing real values too).
+    #[test]
+    fn test_alias_to_non_null_anchor_still_resolves() {
+        let (policy, instance_host) = ctx();
+        let content = ".v: &v v1.2.3\ninclude:\n  - project: org/proj\n    ref: *v\n";
+        let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host).unwrap();
+        assert_eq!(result.dependencies.len(), 1, "{:?}", result.dependencies);
+        let dep = &result.dependencies[0];
         assert!(dep.is_alias_occurrence);
         assert_eq!(
             dep.version_req.as_ref().map(deps_core::VersionReq::as_str),
-            Some("")
+            Some("v1.2.3")
         );
+    }
+
+    /// #1029 cross-ecosystem parity: `is_plain_null` checks the anchor's own `style`/`tag`,
+    /// so a non-plain null-shaped scalar (here `!!str null`) must NOT be treated as null when
+    /// aliased — mirrors `deps-dart`'s sibling regression
+    /// `test_aliased_str_tagged_null_like_scalar_resolves_to_literal_text`.
+    #[test]
+    fn test_alias_to_str_tagged_null_like_anchor_resolves_to_literal_text() {
+        let (policy, instance_host) = ctx();
+        let content = ".n: &n !!str null\ninclude:\n  - project: org/proj\n    ref: *n\n";
+        let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host).unwrap();
+        assert_eq!(result.dependencies.len(), 1, "{:?}", result.dependencies);
+        let dep = &result.dependencies[0];
+        assert_eq!(
+            dep.version_req.as_ref().map(deps_core::VersionReq::as_str),
+            Some("null")
+        );
+    }
+
+    /// Critic M1: the two common shapes #1029's fix actually targets — a null alias reached
+    /// through `<<:` — had no direct regression test; every existing #1029 test used the
+    /// non-merge `ref: *n` shape. Own key AFTER a merge key still resolves through the
+    /// value-position `Event::Alias` arm with `alias_site == None` (this is the entry's own
+    /// live scalar, not a replayed one) — the null must still override the merged
+    /// `v1.0.0`, matching row 1's precedence (own key after `<<:` wins) but writing `None`.
+    #[test]
+    fn test_null_alias_as_own_key_after_merge_overrides_merged_value() {
+        let (policy, instance_host) = ctx();
+        let content = ".n: &n ~\n.t: &t {ref: v1.0.0}\ninclude:\n  - project: org/proj\n    <<: *t\n    ref: *n\n";
+        let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host).unwrap();
+        assert_eq!(result.dependencies.len(), 1, "{:?}", result.dependencies);
+        let dep = &result.dependencies[0];
+        assert!(dep.version_req.is_none());
+        assert!(dep.version_range().is_none());
+        assert!(dep.pin.is_none());
+    }
+
+    /// Critic M1, second shape: a null alias inside a *container* anchor replayed through a
+    /// merge key exercises `parser.rs`'s value-position `Event::Alias` arm with
+    /// `alias_site == Some(outer)`/`replay_depth > 0` — `*n`'s own container-anchor replay
+    /// attempt misses (it is scalar-shaped, not mapping-shaped) and falls through to the
+    /// scalar-anchor `is_plain_null` re-check, which must still suppress the version.
+    #[test]
+    fn test_null_alias_inside_container_anchor_replayed_through_merge_suppresses_version() {
+        let (policy, instance_host) = ctx();
+        let content = ".n: &n ~\n.t: &t {ref: *n}\ninclude:\n  - project: org/proj\n    <<: *t\n";
+        let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host).unwrap();
+        assert_eq!(result.dependencies.len(), 1, "{:?}", result.dependencies);
+        let dep = &result.dependencies[0];
+        assert!(dep.version_req.is_none());
+        assert!(dep.version_range().is_none());
+        assert!(dep.pin.is_none());
     }
 
     /// EC-013: two aliases to the same scalar anchor on one flow-style line each carry

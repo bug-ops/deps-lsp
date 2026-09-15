@@ -35,6 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-engine, deps-lsp, ci**: closed `deps-lsp`'s last direct dependency on `deps-gitlab-ci` via a new `deps_engine::setup::validate_gitlab_instance_host`, and added a CI guard asserting no ecosystem crate is a *direct* non-dev dependency of `deps-lsp`/`deps-cli` (resolves #1073) (#1079)
 
 ### Fixed
+- **deps-gitlab-ci**: an alias to a null-like scalar anchor (e.g. `ref: *e` where `&e` is empty/`~`/`null`/`Null`/`NULL`) now ships no version, matching how a literal null-like `ref:` is already handled (resolves #1029)
 - **deps-cli**: `.pre-commit-hooks.yaml`'s `deps-lsp-check` hook now uses `language: system` instead of `language: rust`, which could never install from this repository's virtual workspace root; the hook can now be referenced remotely (`repo: https://github.com/bug-ops/deps-lsp`) as long as `deps-cli` is already on the consumer's `PATH` (resolves #1074) (#1080)
 - **deps-cargo, deps-go, deps-npm, deps-pypi**: the version-completion cap test now mocks more versions than the cap and asserts the exact `MAX_COMPLETION_VERSIONS` count instead of a vacuous `<= 20`; a deps-go doctest tautology and two unverified pypi mocks are fixed the same way (resolves #1066) (#1067)
 - **deps-npm, deps-pypi**: the package-name search and position-based version completion tests now run against mocked registry endpoints instead of the live registry, and assert real completion items instead of a tautological `is_empty() || !is_empty()` check (resolves #1055) (#1065)
