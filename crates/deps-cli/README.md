@@ -107,36 +107,23 @@ reported in the output but can never fail a run through this flag.
 ## Pre-commit hook
 
 This repository ships a [`.pre-commit-hooks.yaml`](../../.pre-commit-hooks.yaml) at its root
-defining a `deps-lsp-check` hook (`language: rust`, `entry: deps-cli check`), per FR-017.
+defining a `deps-lsp-check` hook (`language: system`, `entry: deps-cli check`), per FR-017.
 
-> [!WARNING]
-> This hook does not yet work the normal pre-commit way — do not reference it as
-> `repo: https://github.com/bug-ops/deps-lsp` with any `rev:` today; there is no tag that
-> makes it install successfully. pre-commit's `language: rust` support always runs
-> `cargo install --bins --path .` at the exact root it clones, which is also where it looks
-> up `.pre-commit-hooks.yaml`. Because this repository's root `Cargo.toml` is a virtual
-> workspace manifest (no `[package]`), that install step fails there — verified with a real
-> `pre-commit try-repo` run against this repository, not just reasoned about. See
-> [#1063](https://github.com/bug-ops/deps-lsp/issues/1063) for the tracked follow-up (likely
-> publishing `deps-cli` to crates.io and switching to `language: system`, or moving `deps-cli`
-> to its own repository the way `crates/deps-zed` already is).
->
-> Until then, install `deps-cli` yourself and wire it in as a `local` hook instead:
->
-> ```yaml
-> # .pre-commit-config.yaml
-> repos:
->   - repo: local
->     hooks:
->       - id: deps-lsp-check
->         name: deps-lsp dependency check
->         entry: deps-cli check
->         language: system
->         pass_filenames: true
-> ```
->
-> This requires `deps-cli` (`cargo install deps-cli`, once published, or `cargo install
-> --path crates/deps-cli` from a checkout today) to already be on `PATH`.
+> [!NOTE]
+> `language: system` means pre-commit does not install anything for this hook — `deps-cli`
+> must already be on your `PATH` (`cargo install deps-cli`, once published to crates.io, or
+> `cargo install --path crates/deps-cli` from a checkout today). An earlier `language: rust`
+> hook definition could not install from this repository's root at all, since it is a virtual
+> workspace manifest (no `[package]`) — see [#1074](https://github.com/bug-ops/deps-lsp/issues/1074).
+
+```yaml
+# .pre-commit-config.yaml
+repos:
+  - repo: https://github.com/bug-ops/deps-lsp
+    rev: <tag>
+    hooks:
+      - id: deps-lsp-check
+```
 
 ## GitHub Action
 

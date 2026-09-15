@@ -1,29 +1,25 @@
 # pre-commit hook manifest for deps-lsp's `deps-cli check` (spec 062 FR-017,
 # issue #1063).
 #
-# TODO: tracked in #1074 — `language: rust` cannot install from a virtual
-# workspace root (verified during implementation, see PR description).
-# pre-commit's `language: rust` support always runs
-# `cargo install --bins --root <env> --path .` from the root of whatever
-# `repo:` it clones (pre_commit/languages/rust.py,
+# `language: system` (not `rust`, fixed by #1074): pre-commit's `language:
+# rust` support always runs `cargo install --bins --root <env> --path .`
+# from the root of whatever `repo:` it clones (pre_commit/languages/rust.py,
 # pre_commit/repository.py). This repository's root `Cargo.toml` is a
-# virtual workspace manifest (no `[package]`), so `cargo install --path .`
-# fails there with "found a virtual manifest at ... instead of a package
+# virtual workspace manifest (no `[package]`), so that install step fails
+# there with "found a virtual manifest at ... instead of a package
 # manifest" — confirmed with a real `pre-commit try-repo` run against this
-# repository's root, not just reasoned about. There is no `rev:` today that
-# makes `repo: https://github.com/bug-ops/deps-lsp` work for this hook.
-# Until `deps-cli` is published to crates.io and/or ships from its own
-# repository (as `crates/deps-zed` already does), a consumer wanting this
-# hook today should install `deps-cli` themselves and wire it in as a
-# `repo: local` / `language: system` hook instead — see
-# `crates/deps-cli/README.md`'s "Pre-commit hook" section for a working
-# example.
+# repository's root, not just reasoned about. `language: system` runs
+# `entry` as-is instead, so it requires `deps-cli` to already be on the
+# consumer's `PATH` (`cargo install deps-cli`, once published to
+# crates.io, or `cargo install --path crates/deps-cli` from a checkout
+# today) — see `crates/deps-cli/README.md`'s "Pre-commit hook" section for
+# a working example.
 - id: deps-lsp-check
   description: >-
     Runs `deps-cli check` against staged manifests for
     outdated/yanked/vulnerable/unsatisfiable dependencies.
   entry: deps-cli check
-  language: rust
+  language: system
   name: deps-lsp dependency check
   # Keep this in sync with every `Ecosystem::manifest_filenames`/
   # `manifest_patterns`/`manifest_extensions`/`manifest_directory_patterns`
