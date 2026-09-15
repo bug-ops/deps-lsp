@@ -591,6 +591,7 @@ deps-lsp/
 │   ├── deps-github-actions/ # workflow YAML parser + GitHub tags API registry
 │   ├── deps-gitlab-ci/ # .gitlab-ci.yml parser + GitLab tags/releases API registry
 │   ├── deps-lsp/       # Main LSP server
+│   ├── deps-cli/       # `deps-cli check` — CLI for CI/pre-commit/shell workflows
 │   └── deps-zed/       # Zed extension (WASM)
 ├── .config/            # nextest configuration
 └── .github/            # CI/CD workflows

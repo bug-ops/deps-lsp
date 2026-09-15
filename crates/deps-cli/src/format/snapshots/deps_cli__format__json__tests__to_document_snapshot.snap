@@ -1,0 +1,51 @@
+---
+source: crates/deps-cli/src/format/json.rs
+expression: document
+---
+{
+  "schema_version": 1,
+  "findings": [
+    {
+      "ecosystem": "cargo",
+      "manifest_path": "Cargo.toml",
+      "dependency_name": "serde",
+      "requirement": "1.0",
+      "category": "outdated",
+      "severity": "hint",
+      "range": {
+        "start": {
+          "line": 4,
+          "character": 0
+        },
+        "end": {
+          "line": 4,
+          "character": 10
+        }
+      },
+      "message": "Newer version available: 1.1.0"
+    },
+    {
+      "ecosystem": "cargo",
+      "manifest_path": "package.json",
+      "dependency_name": null,
+      "requirement": null,
+      "category": "vulnerable",
+      "severity": "error",
+      "range": {
+        "start": {
+          "line": 4,
+          "character": 0
+        },
+        "end": {
+          "line": 4,
+          "character": 10
+        }
+      },
+      "message": "GHSA-xxxx-yyyy-zzzz: example advisory"
+    }
+  ],
+  "summary": {
+    "outdated": 1,
+    "vulnerable": 1
+  }
+}

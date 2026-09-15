@@ -17,10 +17,12 @@ repository = "https://github.com/bug-ops/deps-lsp"
 [workspace.dependencies]
 base64 = "0.23"
 bytes = "1"
+clap = "4.6"
 criterion = "0.8"
 dashmap = "6.2"
 deps-bundler = { version = "1.0.0", path ="crates/deps-bundler" }
 deps-cargo = { version = "1.0.0", path ="crates/deps-cargo" }
+deps-cli = { version = "1.0.0", path ="crates/deps-cli" }
 deps-composer = { version = "1.0.0", path ="crates/deps-composer" }
 deps-core = { version = "1.0.0", path ="crates/deps-core" }
 deps-dart = { version = "1.0.0", path ="crates/deps-dart" }
@@ -38,6 +40,7 @@ deps-pypi = { version = "1.0.0", path ="crates/deps-pypi" }
 deps-swift = { version = "1.0.0", path ="crates/deps-swift" }
 dirs = "7.0.0"
 futures = "0.3"
+ignore = "0.4"
 insta = "1.48"
 jsonc-parser = "0.33"
 mockito = "1"

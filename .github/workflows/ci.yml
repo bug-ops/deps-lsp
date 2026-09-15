@@ -257,7 +257,8 @@ jobs:
         #
         # deps-engine (issue #1058) sits between the driving adapters and the ecosystem
         # crates and is a new potential leak path for the same carve-out, so it gets the
-        # identical pair of checks.
+        # identical pair of checks. deps-cli (spec 062) is a second driving adapter reaching
+        # deps-engine/deps-core the same way deps-lsp does, so it gets the same pair too.
         run: |
           tree=$(cargo tree -p deps-lsp -e features,no-dev)
           ctl=$(cargo tree -p deps-lsp -e features)
@@ -269,15 +270,19 @@ jobs:
           grep -q 'feature "test-util"' <<<"$engine_ctl" || { echo "::error::guard self-check failed for deps-engine"; exit 1; }
           grep -q 'feature "test-util"' <<<"$engine_tree" && { echo "::error::deps-core's test-util feature is reachable from deps-engine's non-dev dependency tree"; exit 1; }
 
+          cli_tree=$(cargo tree -p deps-cli -e features,no-dev)
+          cli_ctl=$(cargo tree -p deps-cli -e features)
+          grep -q 'feature "test-util"' <<<"$cli_ctl" || { echo "::error::guard self-check failed for deps-cli"; exit 1; }
+          grep -q 'feature "test-util"' <<<"$cli_tree" && { echo "::error::deps-core's test-util feature is reachable from deps-cli's non-dev dependency tree"; exit 1; }
+
           exit 0
 
       - name: Guard against driving-adapter crates depending on each other
         # The design's core invariant (issue #1058, architecture-decision.md §3.1): no
-        # driving-adapter crate (deps-lsp today; deps-cli/deps-mcp once they exist) may
-        # appear in another driving adapter's dependency tree. deps-cli/deps-mcp don't
-        # exist yet — added by later PRs — so only the checkable half of the invariant
-        # (deps-lsp's own tree) runs today; add each new adapter crate to `adapters` below,
-        # and its own symmetric `cargo tree -p <adapter> -e no-dev` check, once it exists.
+        # driving-adapter crate (deps-lsp, deps-cli today; deps-mcp once it exists) may
+        # appear in another driving adapter's dependency tree. deps-mcp doesn't exist yet —
+        # added by a later PR — so its own symmetric `cargo tree -p deps-mcp -e no-dev`
+        # check is deferred until it does; add it to `adapters`/its own tree check then.
         #
         # The positive control (mirroring the test-util guard above) proves this detection
         # mechanism actually works, using a crate name (`deps-core`) known to be in the tree
@@ -300,6 +305,16 @@ jobs:
               exit 1
             fi
           done
+
+          cli_tree=$(cargo tree -p deps-cli -e no-dev)
+          if ! grep -qE '(^|[^A-Za-z0-9._-])deps-core([^A-Za-z0-9._-]|$)' <<<"$cli_tree"; then
+            echo "::error::guard self-check failed: deps-core not found in deps-cli's own tree"
+            exit 1
+          fi
+          if grep -qE '(^|[^A-Za-z0-9._-])deps-lsp([^A-Za-z0-9._-]|$)' <<<"$cli_tree"; then
+            echo "::error::deps-cli's dependency tree unexpectedly includes driving adapter deps-lsp"
+            exit 1
+          fi
           exit 0
 
   semver:
