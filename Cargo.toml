@@ -25,6 +25,7 @@ deps-composer = { version = "1.0.0", path ="crates/deps-composer" }
 deps-core = { version = "1.0.0", path ="crates/deps-core" }
 deps-dart = { version = "1.0.0", path ="crates/deps-dart" }
 deps-deno = { version = "1.0.0", path ="crates/deps-deno" }
+deps-engine = { version = "1.0.0", path ="crates/deps-engine" }
 deps-github-actions = { version = "1.0.0", path ="crates/deps-github-actions" }
 deps-gitlab-ci = { version = "1.0.0", path ="crates/deps-gitlab-ci" }
 deps-go = { version = "1.0.0", path ="crates/deps-go" }

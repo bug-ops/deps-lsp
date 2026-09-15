@@ -1,0 +1,67 @@
+[package]
+name = "deps-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Composition root wiring deps-core's Ecosystem implementations for every driving adapter (deps-lsp, deps-cli, ...)"
+publish = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "deps_engine"
+path = "src/lib.rs"
+
+[features]
+# Deliberately no `default` list (unlike `deps-lsp`'s own feature set, which this mirrors
+# otherwise): every driving adapter forwards its own feature flags explicitly
+# (`cargo = ["deps-engine/cargo"]`, ...), so this crate itself defaulting to all 14 would
+# defeat a reduced `--no-default-features --features <subset>` build of the adapter — Cargo
+# activates a path dependency's own default features independently of the consumer's
+# selected features unless the consumer opts out, and workspace-inherited dependencies
+# cannot override `default-features` per member (issue #1058).
+cargo = ["dep:deps-cargo"]
+npm = ["dep:deps-npm"]
+pypi = ["dep:deps-pypi"]
+go = ["dep:deps-go"]
+bundler = ["dep:deps-bundler"]
+dart = ["dep:deps-dart"]
+maven = ["dep:deps-maven"]
+gradle = ["dep:deps-gradle"]
+swift = ["dep:deps-swift"]
+composer = ["dep:deps-composer"]
+nuget = ["dep:deps-nuget"]
+github-actions = ["dep:deps-github-actions"]
+gitlab-ci = ["dep:deps-gitlab-ci"]
+# Pulls in deps-npm transitively (DenoRegistry delegates npm: specifiers to it, D3) even
+# when the "npm" feature itself is disabled.
+deno = ["dep:deps-deno"]
+
+# Consumed only through the `ecosystem!`/`register!` macros in `src/setup.rs`, not via direct
+# `use` statements, so cargo-machete cannot see the usage and flags them as unused.
+[package.metadata.cargo-machete]
+ignored = ["deps-bundler", "deps-composer", "deps-dart", "deps-deno", "deps-github-actions", "deps-gitlab-ci", "deps-gradle", "deps-maven", "deps-pypi", "deps-swift"]
+
+[dependencies]
+deps-bundler = { workspace = true, optional = true }
+deps-cargo = { workspace = true, optional = true }
+deps-composer = { workspace = true, optional = true }
+deps-core = { workspace = true }
+deps-dart = { workspace = true, optional = true }
+deps-deno = { workspace = true, optional = true }
+deps-github-actions = { workspace = true, optional = true }
+deps-gitlab-ci = { workspace = true, optional = true }
+deps-go = { workspace = true, optional = true }
+deps-gradle = { workspace = true, optional = true }
+deps-maven = { workspace = true, optional = true }
+deps-npm = { workspace = true, optional = true }
+deps-nuget = { workspace = true, optional = true }
+deps-pypi = { workspace = true, optional = true }
+deps-swift = { workspace = true, optional = true }
+
+[dev-dependencies]
+deps-core = { workspace = true, features = ["test-util"] }

@@ -571,6 +571,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "deps-engine"
+version = "1.0.0"
+dependencies = [
+ "deps-bundler",
+ "deps-cargo",
+ "deps-composer",
+ "deps-core",
+ "deps-dart",
+ "deps-deno",
+ "deps-github-actions",
+ "deps-gitlab-ci",
+ "deps-go",
+ "deps-gradle",
+ "deps-maven",
+ "deps-npm",
+ "deps-nuget",
+ "deps-pypi",
+ "deps-swift",
+]
+
+[[package]]
 name = "deps-github-actions"
 version = "1.0.0"
 dependencies = [
@@ -653,21 +674,12 @@ version = "1.0.0"
 dependencies = [
  "criterion",
  "dashmap",
- "deps-bundler",
- "deps-cargo",
- "deps-composer",
  "deps-core",
- "deps-dart",
  "deps-deno",
+ "deps-engine",
  "deps-github-actions",
  "deps-gitlab-ci",
- "deps-go",
- "deps-gradle",
- "deps-maven",
  "deps-npm",
- "deps-nuget",
- "deps-pypi",
- "deps-swift",
  "futures",
  "insta",
  "mockito",
