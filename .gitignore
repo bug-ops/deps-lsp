@@ -23,6 +23,9 @@ target
 .env
 .env.local
 
+# mdBook build output
+book/book/
+
 # Secrets
 *.key
 *.pem
