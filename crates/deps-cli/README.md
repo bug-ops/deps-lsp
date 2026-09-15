@@ -13,7 +13,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 check` walks a workspace, routes every manifest it finds through the same 14-ecosystem
 classification pipeline (`deps-engine`) that powers `deps-lsp`'s hover and diagnostics, and
 reports outdated/yanked/vulnerable/unsatisfiable/deprecated/license/mutable-ref-pin findings as
-a table or as JSON, with a CI-friendly exit code.
+a table, as JSON, or as SARIF 2.1.0, with a CI-friendly exit code.
 
 > [!IMPORTANT]
 > `deps-cli` implements no classification logic of its own — every verdict comes from the exact
@@ -26,8 +26,9 @@ a table or as JSON, with a CI-friendly exit code.
   `EcosystemRegistry` the LSP server uses, across all 14 supported ecosystems (Cargo, npm,
   PyPI, Go, Bundler, Dart, Maven, Gradle, Swift, Composer, NuGet, Deno, GitHub Actions,
   GitLab CI/CD)
-- **Table or JSON output** — a human-readable table (default) grouped by file and severity, or
-  a versioned JSON document for machine consumption
+- **Table, JSON, or SARIF output** — a human-readable table (default) grouped by file and
+  severity, a versioned JSON document for machine consumption, or a SARIF 2.1.0 document for
+  `github/codeql-action/upload-sarif` and other SARIF consumers
 - **Configurable failure policy** — `--fail-on` picks which finding categories make the run
   exit non-zero, so a pipeline can gate on vulnerabilities without failing on merely-outdated
   dependencies
@@ -37,11 +38,6 @@ a table or as JSON, with a CI-friendly exit code.
   [Configuration](#configuration))
 - **Offline mode** — `--offline` serves only already-cached registry data, useful for
   air-gapped CI runners or fast local iteration
-
-> [!NOTE]
-> `--format sarif`, a `.pre-commit-hooks.yaml` entry, and a GitHub Action wrapper are planned
-> as a follow-up ([#1063](https://github.com/bug-ops/deps-lsp/issues/1063)) and not yet
-> available in this release.
 
 ## Installation
 
@@ -74,6 +70,9 @@ deps-cli check --fail-on vulnerable,unsatisfiable
 # Machine-readable output for a CI step that parses results
 deps-cli check --format json
 
+# SARIF 2.1.0 output for github/codeql-action/upload-sarif
+deps-cli check --format sarif > results.sarif
+
 # CI-friendly: never touch the network, use only what's already cached
 deps-cli check --offline
 
@@ -104,6 +103,65 @@ elsewhere in the run — one malformed manifest in a large workspace never hides
 Defaults to `vulnerable,yanked,unsatisfiable` when the flag is omitted. A finding that matches
 none of these seven categories (for example, an unresolved or unknown package) is always
 reported in the output but can never fail a run through this flag.
+
+## Pre-commit hook
+
+This repository ships a [`.pre-commit-hooks.yaml`](../../.pre-commit-hooks.yaml) at its root
+defining a `deps-lsp-check` hook (`language: rust`, `entry: deps-cli check`), per FR-017.
+
+> [!WARNING]
+> This hook does not yet work the normal pre-commit way — do not reference it as
+> `repo: https://github.com/bug-ops/deps-lsp` with any `rev:` today; there is no tag that
+> makes it install successfully. pre-commit's `language: rust` support always runs
+> `cargo install --bins --path .` at the exact root it clones, which is also where it looks
+> up `.pre-commit-hooks.yaml`. Because this repository's root `Cargo.toml` is a virtual
+> workspace manifest (no `[package]`), that install step fails there — verified with a real
+> `pre-commit try-repo` run against this repository, not just reasoned about. See
+> [#1063](https://github.com/bug-ops/deps-lsp/issues/1063) for the tracked follow-up (likely
+> publishing `deps-cli` to crates.io and switching to `language: system`, or moving `deps-cli`
+> to its own repository the way `crates/deps-zed` already is).
+>
+> Until then, install `deps-cli` yourself and wire it in as a `local` hook instead:
+>
+> ```yaml
+> # .pre-commit-config.yaml
+> repos:
+>   - repo: local
+>     hooks:
+>       - id: deps-lsp-check
+>         name: deps-lsp dependency check
+>         entry: deps-cli check
+>         language: system
+>         pass_filenames: true
+> ```
+>
+> This requires `deps-cli` (`cargo install deps-cli`, once published, or `cargo install
+> --path crates/deps-cli` from a checkout today) to already be on `PATH`.
+
+## GitHub Action
+
+[`crates/github-action`](../github-action/README.md) wraps `deps-cli check --format sarif` as
+a composite action. It writes a SARIF file but does not upload it — wire
+`github/codeql-action/upload-sarif` after it in your own workflow:
+
+```yaml
+- uses: bug-ops/deps-lsp/crates/github-action@main
+  id: deps-check
+  with:
+    fail-on: vulnerable,yanked,unsatisfiable
+- uses: github/codeql-action/upload-sarif@v3
+  with:
+    sarif_file: ${{ steps.deps-check.outputs.sarif-file }}
+- name: Fail the build on a policy violation
+  if: steps.deps-check.outputs.exit-code == '1'
+  run: exit 1
+```
+
+The action itself only fails the job on `exit-code` `2` (an execution error); a `--fail-on`
+policy violation (`exit-code` `1`) still produces and uploads a SARIF file, and it is your own
+workflow's decision — shown above — whether to fail the build on it. See
+[`crates/github-action/README.md`](../github-action/README.md) for the full input/output
+reference.
 
 ## Configuration
 

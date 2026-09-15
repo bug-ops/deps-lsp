@@ -68,6 +68,13 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             }
         },
+        OutputFormat::Sarif => match format::sarif::render(&report) {
+            Ok(sarif) => sarif,
+            Err(error) => {
+                eprintln!("deps-cli: failed to render SARIF report: {error}");
+                return ExitCode::from(2);
+            }
+        },
     };
     print!("{rendered}");
 

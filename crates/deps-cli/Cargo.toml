@@ -60,6 +60,7 @@ deps-engine = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 ignore = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+serde-sarif = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
@@ -67,6 +68,7 @@ toml-span = { workspace = true, features = ["serde"] }
 tower-lsp-server = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
+urlencoding = { workspace = true }
 
 [dev-dependencies]
 # deps-cli's own tests never call `deps_core::test_util` directly (they exercise real
@@ -79,4 +81,5 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 # deps-cli's block from that CI guard.
 deps-core = { workspace = true, features = ["test-util"] }
 insta = { workspace = true, features = ["json"] }
+jsonschema = { workspace = true }
 tempfile = { workspace = true }

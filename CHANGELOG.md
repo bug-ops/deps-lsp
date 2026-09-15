@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **deps-cli**: `deps-cli check --format sarif` SARIF 2.1.0 output, a `.pre-commit-hooks.yaml` entry, and a `crates/github-action` composite GitHub Action wrapping the SARIF check for `github/codeql-action/upload-sarif` (spec 062 PR 3, resolves #1063) (PR link pending)
 - **deps-cli**: new `deps-cli check [PATH...]` CLI subcommand — `.gitignore`-aware workspace walk, table/JSON reporting, `--fail-on`/`--offline`/`--cooldown`/`--config` flags, and CI-friendly exit codes (0 clean / 1 policy violation / 2 execution error), reusing `deps-engine`'s classification pipeline with no ecosystem-verdict logic of its own (spec 062 PR 2, resolves #1061) (#1072)
 - **deps-core**: new `VulnSeverity::Informational` category for OSV advisories carrying `database_specific.informational: "unmaintained"` (e.g. RUSTSEC unmaintained-crate notices), rendered distinctly from a graded/unscored vulnerability in hover and diagnostics instead of as `"unknown severity"` (resolves #1007) (#1043)
 - **deps-gitlab-ci**: mapping-shaped YAML container-anchor support for `include:` entries aliased as a whole mapping (`- *tpl`, `include: *tpl`, `- <<: *tpl`, `- <<: [*a, *b]`), resolved per GitLab's actual Psych merge-key precedence rather than the abstract YAML 1.1 spec (resolves #933, #916) (#1028)

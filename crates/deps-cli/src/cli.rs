@@ -33,8 +33,7 @@ pub struct Cli {
     pub command: Command,
 }
 
-/// Top-level `deps-cli` subcommands. Only `check` exists in this release (spec 062 PR 2) —
-/// `--format sarif`, the pre-commit hook, and the GitHub Action wrapper are issue #1063.
+/// Top-level `deps-cli` subcommands. Only `check` exists in this release.
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Walk PATH(s), classify every discovered manifest's dependencies through the same
@@ -49,6 +48,9 @@ pub enum OutputFormat {
     Table,
     /// Versioned JSON document (see `crate::format::json`).
     Json,
+    /// SARIF 2.1.0 document (see `crate::format::sarif`), for GitHub code scanning and other
+    /// SARIF consumers.
+    Sarif,
 }
 
 /// Arguments for `deps-cli check`.
@@ -218,6 +220,13 @@ mod tests {
         let cli = Cli::parse_from(["deps-cli", "check", "--format", "json"]);
         let Command::Check(args) = cli.command;
         assert_eq!(args.format, OutputFormat::Json);
+    }
+
+    #[test]
+    fn test_format_sarif_parses() {
+        let cli = Cli::parse_from(["deps-cli", "check", "--format", "sarif"]);
+        let Command::Check(args) = cli.command;
+        assert_eq!(args.format, OutputFormat::Sarif);
     }
 
     #[test]

@@ -193,6 +193,70 @@ async fn test_table_and_json_formatters_render_the_same_pipeline_output() {
 }
 
 #[tokio::test]
+async fn test_sarif_formatter_renders_the_same_pipeline_output() {
+    // The manifest lives under a directory whose name needs percent-encoding (a literal `#`
+    // would otherwise be read as a URI fragment separator, and a space is not valid in a bare
+    // URI-reference) — the real repro this test guards against (spec 062 review S2/B3).
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let manifest_dir = dir.path().join("weird dir#name");
+    std::fs::create_dir(&manifest_dir).expect("create nested fixture dir");
+    std::fs::write(
+        manifest_dir.join("Cargo.toml"),
+        "[package]\nname = \"fixture\"\n\n[dependencies]\nserde = \"1.0\"\n",
+    )
+    .expect("write fixture manifest");
+
+    let (report, _had_error) = run_pipeline(dir.path()).await;
+    assert!(
+        !report.findings.is_empty(),
+        "serde 1.0 must produce at least one finding"
+    );
+
+    let sarif = format::sarif::to_sarif(&report);
+    let results = sarif.runs[0]
+        .results
+        .as_ref()
+        .expect("results must be present");
+    assert_eq!(results.len(), report.findings.len());
+
+    for result in results {
+        let uri = result
+            .locations
+            .as_ref()
+            .expect("locations must be present")[0]
+            .physical_location
+            .as_ref()
+            .expect("physicalLocation must be present")
+            .artifact_location
+            .as_ref()
+            .expect("artifactLocation must be present")
+            .uri
+            .as_ref()
+            .expect("uri must be present");
+        assert!(
+            !uri.contains('#'),
+            "a literal '#' in {uri:?} would be read as a URI fragment separator"
+        );
+        assert!(
+            !uri.contains(' '),
+            "a literal space in {uri:?} is not a valid URI-reference"
+        );
+        assert!(
+            !uri.contains('\\'),
+            "{uri:?} must use '/' separators, not the platform's own (possibly '\\\\') display form"
+        );
+        assert!(
+            !std::path::Path::new(uri).is_absolute(),
+            "{uri:?} must stay relative to the walked root, matching table/json's own display_path"
+        );
+    }
+
+    let json = format::sarif::render(&report).expect("sarif render must succeed");
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("sarif must round-trip");
+    assert_eq!(parsed["version"], "2.1.0");
+}
+
+#[tokio::test]
 async fn test_walk_paths_default_to_current_directory_semantics_via_single_file() {
     // Exercises the "explicit manifest path, not a directory" branch of `walk::walk` end to
     // end (FR-002's routing applies identically either way).
@@ -218,4 +282,79 @@ async fn test_walk_paths_default_to_current_directory_semantics_via_single_file(
     .expect("check_manifest must succeed");
     // `Cargo.toml` with no `[dependencies]` produces no findings at all.
     assert!(result.findings.is_empty());
+}
+
+#[tokio::test]
+async fn test_sarif_formatter_relativizes_an_absolute_single_file_path() {
+    // `deps-cli check /abs/path/Cargo.toml` (an explicit file, not a directory root) routes
+    // through `walk::walk`'s `root.is_file()` branch (`walk.rs:96-111`), which passes the
+    // absolute path through as `display_path` unchanged — `tempfile::tempdir()` paths are
+    // themselves absolute, so this fixture reproduces that without needing a real absolute
+    // path literal (spec 062 review R1: `manifest_uri` must not leak that absolute path into
+    // `artifactLocation.uri` as-is).
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let manifest = dir.path().join("Cargo.toml");
+    assert!(
+        manifest.is_absolute(),
+        "test setup bug: fixture path must be absolute"
+    );
+    std::fs::write(
+        &manifest,
+        "[package]\nname = \"fixture\"\n\n[dependencies]\nserde = \"1.0\"\n",
+    )
+    .expect("write fixture manifest");
+
+    let (registry, ctx) = offline_context();
+    let outcome = walk::walk(std::slice::from_ref(&manifest), &registry);
+    assert_eq!(outcome.manifests.len(), 1);
+    assert!(
+        outcome.manifests[0].display_path.is_absolute(),
+        "test setup bug: this must exercise the absolute-display_path branch"
+    );
+
+    let content = deps_core::fs_probe::read_to_string_capped(&manifest, 10_000_000)
+        .expect("read manifest")
+        .expect("under size cap");
+    let result = check_manifest(
+        &outcome.manifests[0].ecosystem,
+        &manifest,
+        &manifest,
+        &content,
+        &ctx,
+    )
+    .await
+    .expect("check_manifest must succeed");
+    assert!(
+        !result.findings.is_empty(),
+        "serde 1.0 must produce at least one finding"
+    );
+
+    let report = CheckReport {
+        findings: result.findings,
+    };
+    let sarif = format::sarif::to_sarif(&report);
+    let results = sarif.runs[0]
+        .results
+        .as_ref()
+        .expect("results must be present");
+    for result in results {
+        let uri = result
+            .locations
+            .as_ref()
+            .expect("locations must be present")[0]
+            .physical_location
+            .as_ref()
+            .expect("physicalLocation must be present")
+            .artifact_location
+            .as_ref()
+            .expect("artifactLocation must be present")
+            .uri
+            .as_ref()
+            .expect("uri must be present");
+        assert!(
+            !std::path::Path::new(uri).is_absolute(),
+            "{uri:?} must not stay absolute — it leaks local machine path structure into a \
+             document meant to be uploaded to GitHub code scanning"
+        );
+    }
 }
