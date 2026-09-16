@@ -2,10 +2,10 @@
 
 use std::any::Any;
 use std::sync::Arc;
-#[cfg(all(test, feature = "lsp-responses"))]
-use tower_lsp_server::ls_types::Position;
 #[cfg(feature = "lsp-responses")]
-use tower_lsp_server::ls_types::{CompletionItem, CompletionTextEdit, Range as LspRange, TextEdit};
+use tower_lsp_server::ls_types::{
+    CompletionItem, CompletionTextEdit, Position, Range as LspRange, TextEdit,
+};
 use url::Url;
 
 #[cfg(feature = "lsp-responses")]
@@ -127,16 +127,20 @@ impl SwiftEcosystem {
             .collect()
     }
 
+    // Position-based, gated: see complete_versions_at_position's own doc (#593, #1136).
     #[cfg(feature = "lsp-responses")]
     async fn complete_versions(
         &self,
-        package_name: &deps_core::PackageName,
+        parse_result: &dyn ParseResultTrait,
+        position: Position,
         prefix: &str,
         freshness: deps_core::FreshnessSettings,
     ) -> Vec<CompletionItem> {
-        deps_core::completion::complete_versions_generic(
+        deps_core::completion::complete_versions_at_position(
             self.registry.as_ref(),
-            package_name,
+            &self.formatter,
+            parse_result,
+            position,
             prefix,
             &[],
             freshness,
@@ -209,13 +213,18 @@ impl Ecosystem for SwiftEcosystem {
     fn complete_version<'a>(
         &'a self,
         request: deps_core::completion::CompletionRequest<'a>,
-        package_name: deps_core::PackageName,
+        _package_name: deps_core::PackageName,
         prefix: String,
     ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
         Box::pin(async move {
-            self.complete_versions(&package_name, &prefix, request.freshness)
-                .await
-                .into()
+            self.complete_versions(
+                request.parse_result,
+                request.position,
+                &prefix,
+                request.freshness,
+            )
+            .await
+            .into()
         })
     }
 
@@ -718,15 +727,11 @@ mod tests {
 
         let context =
             deps_core::completion::detect_completion_context(&parse_result, position, content);
-        let deps_core::completion::CompletionContext::Version {
-            package_name,
-            prefix,
-        } = context
-        else {
+        let deps_core::completion::CompletionContext::Version { prefix, .. } = context else {
             panic!("expected Version context, got {context:?}");
         };
         let direct = eco
-            .complete_versions(&package_name, &prefix, freshness)
+            .complete_versions(&parse_result, position, &prefix, freshness)
             .await;
         let via_dispatch = eco
             .generate_completions(&parse_result, position, content, freshness)

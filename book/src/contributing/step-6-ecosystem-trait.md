@@ -11,7 +11,7 @@ use tower_lsp_server::ls_types::{Range, Uri};
 
 use deps_core::{
     Ecosystem, HttpCache, PackageName, ParseResult as ParseResultTrait, Registry, Result,
-    completion::{Completions, CompletionRequest, complete_package_names_generic, complete_versions_generic},
+    completion::{Completions, CompletionRequest, complete_package_names_generic, complete_versions_at_position},
     ecosystem::BoxFuture,
     lockfile::LockFileProvider,
     lsp_helpers::EcosystemFormatter,
@@ -90,19 +90,31 @@ impl Ecosystem for {Ecosystem}Ecosystem {
     // new ecosystem crate; implement the three hooks it dispatches to instead).
 
     // Required — every ecosystem serves version completion, and this is the one hook with
-    // no default. `request.parse_result`/`request.position`/`request.freshness` are
-    // available for a hook that re-derives its own dependency lookup instead of trusting
-    // `package_name`/`prefix` (cursor-position-based routing, issue #593).
+    // no default. Resolved by cursor position, not by name (issue #593):
+    // complete_versions_at_position re-derives the dependency at `request.position` from
+    // `request.parse_result` and gates the lookup on that dependency's own
+    // `Dependency::source()` via the formatter's `SourcePolicy::can_resolve_source` — do NOT
+    // call a registry directly from `package_name`/`prefix` alone (issue #1136: doing so
+    // skips that gate and can leak a private/non-registry dependency's name to the public
+    // registry on every keystroke).
     fn complete_version<'a>(
         &'a self,
         request: CompletionRequest<'a>,
-        package_name: PackageName,
+        _package_name: PackageName,
         prefix: String,
     ) -> BoxFuture<'a, Completions> {
         Box::pin(async move {
-            complete_versions_generic(self.registry.as_ref(), &package_name, &prefix, &[], request.freshness)
-                .await
-                .into()
+            complete_versions_at_position(
+                self.registry.as_ref(),
+                &self.formatter,
+                request.parse_result,
+                request.position,
+                &prefix,
+                &[],
+                request.freshness,
+            )
+            .await
+            .into()
         })
     }
 

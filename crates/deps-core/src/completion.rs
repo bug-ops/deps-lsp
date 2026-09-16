@@ -111,7 +111,7 @@ pub struct CompletionRequest<'a> {
     /// Cursor position the completion request fired at.
     pub position: Position,
     /// Freshness display settings, threaded through to
-    /// [`complete_versions_generic`] and friends.
+    /// [`complete_versions_generic_from`] and friends.
     pub freshness: FreshnessSettings,
 }
 
@@ -273,6 +273,70 @@ pub fn detect_completion_context(
     }
 
     CompletionContext::None
+}
+
+/// Finds the dependency at `position` whose version field is a literal token, not an
+/// interpolated/variable reference (issue #1134).
+///
+/// For a raw-text-based completion context detector that has already established, from its
+/// own scan, that the cursor sits in a version-shaped position (`deps-gradle`'s
+/// `GradleCompletionContext::Version`, `deps-maven`'s `MavenXmlContext::Version`) — applying
+/// the same #919 literal-version guard [`detect_completion_context`]'s own `Version` arm
+/// does.
+///
+/// Unlike [`detect_completion_context`]'s own `Version`-arm check, this function is
+/// deliberately dependency-blind at its call site: a raw-text scanner (Gradle's DSL/catalog
+/// scanner, Maven's XML tag scanner) detects the completable position directly from
+/// `content`, independent of `parse_result.dependencies()`, so the matching [`crate::ecosystem::Dependency`]
+/// still has to be re-derived here rather than already being in hand from an enclosing loop
+/// (the two are not merged into one shared call path for this reason — see
+/// `crate::lsp_helpers::dependency_version_range_is_literal`'s own check, which both this
+/// function and [`detect_completion_context`] apply identically).
+///
+/// # Lookup
+///
+/// Finds the first dependency in `parse_result.dependencies()` whose `version_range` contains
+/// `position`, or — since a raw-text scanner's own detected span can diverge slightly from
+/// the AST's `version_range()` — whose `name_range` starts on the same line as `position`.
+/// This lenient fallback preserves `deps-gradle`/`deps-maven`'s pre-existing lookup
+/// unchanged; it is not applied to [`detect_completion_context`]'s own stricter check.
+///
+/// `value_range` is the raw-text scanner's own detected span of the version token (not
+/// necessarily identical to the found dependency's `version_range()`), checked against
+/// `content` via [`crate::lsp_helpers::dependency_version_range_is_literal`].
+///
+/// Returns `None` if no dependency matches at `position`, or if the matched dependency's
+/// version field is not a literal.
+///
+/// # Examples
+///
+/// ```no_run
+/// use deps_core::completion::literal_version_dependency;
+/// use tower_lsp_server::ls_types::{Position, Range};
+///
+/// # fn example(parse_result: &dyn deps_core::ParseResult, content: &str, value_range: Range) {
+/// let position = Position { line: 3, character: 12 };
+/// if let Some(dep) = literal_version_dependency(parse_result, position, content, value_range) {
+///     // dep.name() / dep.source() are now safe to complete a version for.
+///     let _ = dep.name();
+/// }
+/// # }
+/// ```
+#[must_use]
+pub fn literal_version_dependency<'a>(
+    parse_result: &'a dyn ParseResult,
+    position: Position,
+    content: &str,
+    value_range: Range,
+) -> Option<&'a dyn crate::ecosystem::Dependency> {
+    let dep = parse_result.dependencies().into_iter().find(|d| {
+        d.version_range()
+            .is_some_and(|r| crate::lsp_helpers::position_in_range(position.into(), r))
+            || d.name_range().start.line == position.line
+    })?;
+
+    crate::lsp_helpers::dependency_version_range_is_literal(dep, content, value_range.into())
+        .then_some(dep)
 }
 
 /// Checks if a position is within or at the end of a range.
@@ -904,15 +968,36 @@ pub async fn complete_package_names_generic(
         .collect()
 }
 
-/// Generic version completion logic used by all ecosystems.
+/// Generic version completion logic used by all ecosystems, resolved through
+/// [`crate::Registry::get_versions_from`].
 ///
 /// Filters versions by prefix (stripping ecosystem-specific operators),
 /// hides yanked/deprecated versions, returns up to 5 completion items.
 ///
+/// Routes on `source`, so a registry that routes a dependency's fetch across more than one
+/// underlying index (e.g. a per-instance-host `AlternateRegistry`, GitLab CI's
+/// `deps-gitlab-ci`) completes against the correct index instead of falling back to a
+/// source-unaware default.
+///
+/// # Source-resolvability gate
+///
+/// Returns an empty vec, without touching `registry`, when
+/// [`formatter.can_resolve_source(source)`](crate::lsp_helpers::SourcePolicy::can_resolve_source)
+/// is `false`. [`crate::Registry::get_versions_from`]'s default/documented contract does not
+/// itself fail closed for a source an ecosystem's registry does not specifically route (see
+/// that method's docs) — several concrete `Registry` implementations forward an unrecognized
+/// source (e.g. `Git`, `Path`, an unresolved `CustomRegistry`) to their default public-registry
+/// client rather than erroring. Gating here — the one function every completion entry point
+/// (this one and [`complete_versions_at_position`]) routes through — is what keeps that
+/// permissive default from leaking a private/non-registry dependency's name to a public
+/// registry on every keystroke, regardless of which entry point a caller uses (#1136).
+///
 /// # Arguments
 ///
 /// * `registry` - Package registry to fetch versions from
+/// * `formatter` - Source-resolvability policy; see the gate above
 /// * `package_name` - Name of the package
+/// * `source` - Where `package_name` actually resolves from (registry, git, path, ...)
 /// * `prefix` - Partial version string typed by user (may include operators)
 /// * `operator_chars` - Ecosystem-specific version operators to strip (e.g., `&['^', '~']`)
 ///
@@ -928,77 +1013,35 @@ pub async fn complete_package_names_generic(
 /// # Examples
 ///
 /// ```no_run
-/// use deps_core::completion::complete_versions_generic;
+/// use deps_core::completion::complete_versions_generic_from;
+/// use deps_core::lsp_helpers::SourcePolicy;
+/// use deps_core::parser::DependencySource;
 /// use deps_core::PackageName;
+///
+/// struct DefaultFormatter;
+/// impl SourcePolicy for DefaultFormatter {}
 ///
 /// # async fn example(registry: &dyn deps_core::Registry) {
 /// let freshness = deps_core::FreshnessSettings::default();
 ///
 /// // Cargo: strip ^, ~, =, <, > operators
-/// let items = complete_versions_generic(
+/// let items = complete_versions_generic_from(
 ///     registry,
+///     &DefaultFormatter,
 ///     &PackageName::new("serde"),
+///     &DependencySource::Registry,
 ///     "^1.0",
 ///     &['^', '~', '=', '<', '>'],
 ///     freshness,
 /// ).await;
 ///
 /// // Go: no operators to strip
-/// let items = complete_versions_generic(
-///     registry,
-///     &PackageName::new("github.com/gin-gonic/gin"),
-///     "v1.9",
-///     &[],
-///     freshness,
-/// ).await;
-/// # }
-/// ```
-pub async fn complete_versions_generic(
-    registry: &dyn crate::Registry,
-    package_name: &PackageName,
-    prefix: &str,
-    operator_chars: &[char],
-    freshness: FreshnessSettings,
-) -> Vec<CompletionItem> {
-    complete_versions_generic_from(
-        registry,
-        package_name,
-        &crate::parser::DependencySource::Registry,
-        prefix,
-        operator_chars,
-        freshness,
-    )
-    .await
-}
-
-/// Like [`complete_versions_generic`], but resolves through [`crate::Registry::get_versions_from`].
-///
-/// Routes on `source`, so a registry that routes a dependency's fetch across more than one
-/// underlying index (e.g. a per-instance-host `AlternateRegistry`, GitLab CI's
-/// `deps-gitlab-ci`) completes against the correct index instead of falling back to a
-/// source-unaware default.
-///
-/// [`complete_versions_generic`] delegates to this with
-/// [`crate::parser::DependencySource::Registry`] — behavior-preserving for every one of its
-/// 18 existing call sites, all of which pass a plain registry-resolved dependency: this is
-/// exactly the source [`crate::Registry::get_versions_from`]'s default implementation
-/// forwards to [`crate::Registry::get_versions_with`] for, so nothing observable changes for
-/// them.
-///
-/// # Examples
-///
-/// ```no_run
-/// use deps_core::completion::complete_versions_generic_from;
-/// use deps_core::parser::DependencySource;
-/// use deps_core::PackageName;
-///
-/// # async fn example(registry: &dyn deps_core::Registry) {
-/// let freshness = deps_core::FreshnessSettings::default();
 /// let items = complete_versions_generic_from(
 ///     registry,
-///     &PackageName::new("gitlab.com/org/proj"),
+///     &DefaultFormatter,
+///     &PackageName::new("github.com/gin-gonic/gin"),
 ///     &DependencySource::Registry,
-///     "1.",
+///     "v1.9",
 ///     &[],
 ///     freshness,
 /// ).await;
@@ -1006,12 +1049,17 @@ pub async fn complete_versions_generic(
 /// ```
 pub async fn complete_versions_generic_from(
     registry: &dyn crate::Registry,
+    formatter: &dyn crate::lsp_helpers::SourcePolicy,
     package_name: &PackageName,
     source: &crate::parser::DependencySource,
     prefix: &str,
     operator_chars: &[char],
     freshness: FreshnessSettings,
 ) -> Vec<CompletionItem> {
+    if !formatter.can_resolve_source(source) {
+        return vec![];
+    }
+
     let versions = match registry
         .get_versions_from(package_name, source, freshness)
         .await
@@ -1087,15 +1135,10 @@ pub async fn complete_versions_generic_from(
 ///
 /// # Source-resolvability gate
 ///
-/// [`crate::Registry::get_versions_from`]'s default/documented contract does not itself fail
-/// closed for a source an ecosystem's registry does not specifically route (see that method's
-/// docs) — several concrete `Registry` implementations forward an unrecognized source (e.g.
-/// `Git`, `Path`, an unresolved `CustomRegistry`) to their default public-registry client
-/// rather than erroring. Gating on `formatter`'s
-/// [`SourcePolicy::can_resolve_source`](crate::lsp_helpers::SourcePolicy::can_resolve_source)
-/// first — the same check [`crate::lsp_helpers::generate_hover`] and diagnostics/code-actions
-/// already use — is what keeps that permissive default from leaking a private/non-registry
-/// dependency's name to a public registry on every keystroke.
+/// Delegates the actual gate to [`complete_versions_generic_from`] — see its doc for why the
+/// check lives there rather than here — so this function's own contribution is purely the
+/// position-based dependency lookup: find which dependency (and therefore which `source`) the
+/// cursor is actually in, before handing off.
 ///
 /// # Examples
 ///
@@ -1137,15 +1180,11 @@ pub async fn complete_versions_at_position(
         return vec![];
     };
 
-    let source = dep.source();
-    if !formatter.can_resolve_source(&source) {
-        return vec![];
-    }
-
     complete_versions_generic_from(
         registry,
+        formatter,
         dep.name(),
-        &source,
+        &dep.source(),
         prefix,
         operator_chars,
         freshness,
@@ -1156,6 +1195,7 @@ pub async fn complete_versions_at_position(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lsp_helpers::test_support::MockFormatter;
     use std::any::Any;
     use std::assert_matches;
 
@@ -3514,9 +3554,11 @@ mod tests {
             ],
         };
 
-        let items = complete_versions_generic(
+        let items = complete_versions_generic_from(
             &registry,
+            &MockFormatter,
             &pkg("test-pkg"),
+            &crate::parser::DependencySource::Registry,
             "^1.0",
             &['^', '~', '=', '<', '>'],
             FreshnessSettings::default(),
@@ -3527,9 +3569,11 @@ mod tests {
         assert_eq!(items[0].label, "1.0.0 (latest)");
         assert_eq!(items[1].label, "1.0.1");
 
-        let items = complete_versions_generic(
+        let items = complete_versions_generic_from(
             &registry,
+            &MockFormatter,
             &pkg("test-pkg"),
+            &crate::parser::DependencySource::Registry,
             "~1.1",
             &['^', '~', '=', '<', '>'],
             FreshnessSettings::default(),
@@ -3539,9 +3583,11 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "1.1.0 (latest)");
 
-        let items = complete_versions_generic(
+        let items = complete_versions_generic_from(
             &registry,
+            &MockFormatter,
             &pkg("test-pkg"),
+            &crate::parser::DependencySource::Registry,
             "=2.0",
             &['^', '~', '=', '<', '>'],
             FreshnessSettings::default(),
@@ -3551,9 +3597,11 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "2.0.0 (latest)");
 
-        let items = complete_versions_generic(
+        let items = complete_versions_generic_from(
             &registry,
+            &MockFormatter,
             &pkg("test-pkg"),
+            &crate::parser::DependencySource::Registry,
             "1.0",
             &['^', '~', '=', '<', '>'],
             FreshnessSettings::default(),
@@ -3565,39 +3613,66 @@ mod tests {
         assert_eq!(items[1].label, "1.0.1");
     }
 
-    /// GitLab CI ecosystem plan §7a.1: `complete_versions_generic` must produce
-    /// byte-identical items before and after becoming a thin delegation to
-    /// [`complete_versions_generic_from`] with a plain [`crate::parser::DependencySource::Registry`].
+    /// #1136: a source `can_resolve_source` rejects (e.g. a Git dependency, never
+    /// resolvable against the default public-registry client) must short-circuit before
+    /// any registry call — proven here via a registry that panics if queried, not just an
+    /// empty-result assertion, so a regression that still reaches the registry fails loudly
+    /// rather than by coincidence.
     #[tokio::test]
-    async fn test_complete_versions_generic_delegates_to_from_byte_identical() {
-        let registry = MockRegistry {
-            versions: vec![MockVersion {
-                version: "1.0.0".into(),
-                yanked: false,
-                prerelease: false,
-            }],
+    async fn test_complete_versions_generic_from_gates_on_can_resolve_source() {
+        struct PanicsIfQueriedRegistry;
+
+        impl crate::Registry for PanicsIfQueriedRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a crate::PackageName,
+            ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Version>>>>
+            {
+                panic!("registry must not be queried for a non-resolvable source");
+            }
+
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a crate::PackageName,
+                _req: &'a crate::VersionReq,
+            ) -> crate::ecosystem::BoxFuture<
+                'a,
+                crate::error::Result<Option<Box<dyn crate::Version>>>,
+            > {
+                panic!("registry must not be queried for a non-resolvable source");
+            }
+
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Metadata>>>>
+            {
+                panic!("registry must not be queried for a non-resolvable source");
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let git_source = crate::parser::DependencySource::Git {
+            url: "https://example.com/private/repo.git".into(),
+            rev: None,
         };
 
-        let via_generic = complete_versions_generic(
-            &registry,
-            &pkg("test-pkg"),
-            "1.0",
-            &[],
-            FreshnessSettings::default(),
-        )
-        .await;
-        let via_from = complete_versions_generic_from(
-            &registry,
-            &pkg("test-pkg"),
-            &crate::parser::DependencySource::Registry,
+        let items = complete_versions_generic_from(
+            &PanicsIfQueriedRegistry,
+            &MockFormatter,
+            &pkg("private-pkg"),
+            &git_source,
             "1.0",
             &[],
             FreshnessSettings::default(),
         )
         .await;
 
-        assert_eq!(via_generic.len(), via_from.len());
-        assert_eq!(via_generic[0].label, via_from[0].label);
+        assert!(items.is_empty());
     }
 
     /// A registry stub whose `get_versions_from` override returns a distinct version list
@@ -3682,14 +3757,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_complete_versions_generic_from_routes_source_to_get_versions_from() {
+        use crate::lsp_helpers::test_support::MockWidenedResolveFormatter;
+
         let registry = RoutingMockRegistry;
         let alternate = crate::parser::DependencySource::AlternateRegistry {
             index: "gitlab-ci:deadbeef".into(),
             mirrors_crates_io: false,
         };
 
+        // `AlternateRegistry` is not resolvable under the default `SourcePolicy`, so this
+        // uses a formatter that widens `can_resolve_source` to accept it — otherwise the
+        // #1136 gate would return an empty vec before ever reaching `get_versions_from`.
         let items = complete_versions_generic_from(
             &registry,
+            &MockWidenedResolveFormatter,
             &pkg("test-pkg"),
             &alternate,
             "",
@@ -3731,9 +3812,11 @@ mod tests {
             ],
         };
 
-        let items = complete_versions_generic(
+        let items = complete_versions_generic_from(
             &registry,
+            &MockFormatter,
             &pkg("test-pkg"),
+            &crate::parser::DependencySource::Registry,
             "3.0",
             &['^', '~', '=', '<', '>'],
             FreshnessSettings::default(),
@@ -3746,9 +3829,11 @@ mod tests {
         assert_eq!(items[2].label, "2.0.0");
         assert!(!items.iter().any(|item| item.label == "2.1.0"));
 
-        let items = complete_versions_generic(
+        let items = complete_versions_generic_from(
             &registry,
+            &MockFormatter,
             &pkg("test-pkg"),
+            &crate::parser::DependencySource::Registry,
             "",
             &[],
             FreshnessSettings::default(),
@@ -3783,9 +3868,11 @@ mod tests {
             ],
         };
 
-        let items = complete_versions_generic(
+        let items = complete_versions_generic_from(
             &registry,
+            &MockFormatter,
             &pkg("test-pkg"),
+            &crate::parser::DependencySource::Registry,
             "1.0",
             &[],
             FreshnessSettings::default(),
@@ -3817,9 +3904,11 @@ mod tests {
             ],
         };
 
-        let items = complete_versions_generic(
+        let items = complete_versions_generic_from(
             &registry,
+            &MockFormatter,
             &pkg("test-pkg"),
+            &crate::parser::DependencySource::Registry,
             "1.0",
             &[],
             FreshnessSettings::default(),
@@ -3848,9 +3937,11 @@ mod tests {
 
         let registry = MockRegistry { versions };
 
-        let items = complete_versions_generic(
+        let items = complete_versions_generic_from(
             &registry,
+            &MockFormatter,
             &pkg("test-pkg"),
+            &crate::parser::DependencySource::Registry,
             "1.0",
             &[],
             FreshnessSettings::default(),
@@ -3885,9 +3976,11 @@ mod tests {
         };
 
         // Go has no operators, so empty array
-        let items = complete_versions_generic(
+        let items = complete_versions_generic_from(
             &registry,
+            &MockFormatter,
             &pkg("github.com/gin-gonic/gin"),
+            &crate::parser::DependencySource::Registry,
             "v1.9",
             &[],
             FreshnessSettings::default(),
@@ -3924,9 +4017,11 @@ mod tests {
             ],
         };
 
-        let items = complete_versions_generic(
+        let items = complete_versions_generic_from(
             &registry,
+            &MockFormatter,
             &pkg("Newtonsoft.Json"),
+            &crate::parser::DependencySource::Registry,
             "",
             &[],
             FreshnessSettings::default(),
@@ -3969,9 +4064,11 @@ mod tests {
             ],
         };
 
-        let items = complete_versions_generic(
+        let items = complete_versions_generic_from(
             &registry,
+            &MockFormatter,
             &pkg("test-pkg"),
+            &crate::parser::DependencySource::Registry,
             "",
             &[],
             FreshnessSettings::default(),
@@ -4006,9 +4103,11 @@ mod tests {
             ],
         };
 
-        let items = complete_versions_generic(
+        let items = complete_versions_generic_from(
             &registry,
+            &MockFormatter,
             &pkg("test-pkg"),
+            &crate::parser::DependencySource::Registry,
             "",
             &[],
             FreshnessSettings::default(),
@@ -4078,9 +4177,11 @@ mod tests {
             ],
         };
 
-        let items = complete_versions_generic(
+        let items = complete_versions_generic_from(
             &registry,
+            &MockFormatter,
             &pkg("test-pkg"),
+            &crate::parser::DependencySource::Registry,
             "2.",
             &[],
             FreshnessSettings::default(),

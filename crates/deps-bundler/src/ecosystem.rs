@@ -2,10 +2,8 @@
 
 use std::any::Any;
 use std::sync::Arc;
-#[cfg(all(test, feature = "lsp-responses"))]
-use tower_lsp_server::ls_types::Position;
 #[cfg(feature = "lsp-responses")]
-use tower_lsp_server::ls_types::{CompletionItem, Range};
+use tower_lsp_server::ls_types::{CompletionItem, Position, Range};
 use url::Url;
 
 #[cfg(feature = "lsp-responses")]
@@ -64,16 +62,20 @@ impl BundlerEcosystem {
         .await
     }
 
+    // Position-based, gated: see complete_versions_at_position's own doc (#593, #1136).
     #[cfg(feature = "lsp-responses")]
     async fn complete_versions(
         &self,
-        package_name: &deps_core::PackageName,
+        parse_result: &dyn ParseResultTrait,
+        position: Position,
         prefix: &str,
         freshness: deps_core::FreshnessSettings,
     ) -> Vec<CompletionItem> {
-        deps_core::completion::complete_versions_generic(
+        deps_core::completion::complete_versions_at_position(
             self.registry.as_ref(),
-            package_name,
+            &self.formatter,
+            parse_result,
+            position,
             prefix,
             &['~', '>', '<', '=', '!'],
             freshness,
@@ -138,13 +140,18 @@ impl Ecosystem for BundlerEcosystem {
     fn complete_version<'a>(
         &'a self,
         request: deps_core::completion::CompletionRequest<'a>,
-        package_name: deps_core::PackageName,
+        _package_name: deps_core::PackageName,
         prefix: String,
     ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
         Box::pin(async move {
-            self.complete_versions(&package_name, &prefix, request.freshness)
-                .await
-                .into()
+            self.complete_versions(
+                request.parse_result,
+                request.position,
+                &prefix,
+                request.freshness,
+            )
+            .await
+            .into()
         })
     }
 
@@ -195,6 +202,26 @@ mod tests {
                 .await
             })
         };
+    }
+
+    // #1136: a gem pinned to a per-gem inline `source:` must yield zero version completions
+    // and never reach the public RubyGems registry.
+    #[cfg(feature = "lsp-responses")]
+    deps_core::completion_source_gate_conformance! {
+        mod bundler_completion_source_gate_conformance;
+        build: async {
+            let mut server = mockito::Server::new_async().await;
+            let mock = server
+                .mock("GET", mockito::Matcher::Any)
+                .expect(0)
+                .create_async()
+                .await;
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let registry = RubyGemsRegistry::with_base_for_test(Arc::clone(&cache), server.url());
+            let eco = BundlerEcosystem::with_registry_for_test(registry);
+            (eco, mock, server)
+        };
+        manifest: "Gemfile" => "gem \"internal-gem\", \"1.0.0\", source: \"https://gems.corp\"\n";
     }
 
     #[cfg(feature = "lsp-responses")]
@@ -397,15 +424,11 @@ gem 'rails', '~> 7.0'";
             position,
             content,
         );
-        let deps_core::completion::CompletionContext::Version {
-            package_name,
-            prefix,
-        } = context
-        else {
+        let deps_core::completion::CompletionContext::Version { prefix, .. } = context else {
             panic!("expected Version context, got {context:?}");
         };
         let direct = ecosystem
-            .complete_versions(&package_name, &prefix, freshness)
+            .complete_versions(parse_result.as_ref(), position, &prefix, freshness)
             .await;
         let via_dispatch = ecosystem
             .generate_completions(parse_result.as_ref(), position, content, freshness)
@@ -441,15 +464,11 @@ gem 'rails', '~> 7.0'";
             position,
             content,
         );
-        let deps_core::completion::CompletionContext::Version {
-            package_name,
-            prefix,
-        } = context
-        else {
+        let deps_core::completion::CompletionContext::Version { prefix, .. } = context else {
             panic!("expected Version context, got {context:?}");
         };
         let direct = ecosystem
-            .complete_versions(&package_name, &prefix, freshness)
+            .complete_versions(parse_result.as_ref(), position, &prefix, freshness)
             .await;
         let via_dispatch = ecosystem
             .generate_completions(parse_result.as_ref(), position, content, freshness)

@@ -149,17 +149,20 @@ impl Ecosystem for GithubActionsEcosystem {
     // No `complete_package_name` override: GHA has no package-name search endpoint, so
     // the inherited `Completions::default()` is correct (M3, #793).
 
+    // Position-based, gated: see complete_versions_at_position's own doc (#593, #1136).
     #[cfg(feature = "lsp-responses")]
     fn complete_version<'a>(
         &'a self,
         request: deps_core::completion::CompletionRequest<'a>,
-        package_name: deps_core::PackageName,
+        _package_name: deps_core::PackageName,
         prefix: String,
     ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
         Box::pin(async move {
-            deps_core::completion::complete_versions_generic(
+            deps_core::completion::complete_versions_at_position(
                 self.registry.as_ref(),
-                &package_name,
+                &self.formatter,
+                request.parse_result,
+                request.position,
                 &prefix,
                 &[],
                 request.freshness,
@@ -1946,8 +1949,8 @@ mod tests {
     /// Drives a real (mocked) network fetch through `GithubActionsRegistry`, mirroring
     /// `test_generate_hover_restores_footer_online_for_bare_major_tag_with_empty_live_list`'s
     /// `for_test` setup, so this proves `generate_completions`'s `Version` arm actually
-    /// threads the resolved `package_name`/`prefix` through to
-    /// `complete_versions_generic` rather than just checking an empty degenerate case.
+    /// threads the resolved position/`prefix` through to
+    /// `complete_versions_at_position` rather than just checking an empty degenerate case.
     #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_completions_version_context_dispatches_to_registry() {
@@ -1989,16 +1992,14 @@ mod tests {
             position,
             content,
         );
-        let deps_core::completion::CompletionContext::Version {
-            package_name,
-            prefix,
-        } = context
-        else {
+        let deps_core::completion::CompletionContext::Version { prefix, .. } = context else {
             panic!("expected Version context, got {context:?}");
         };
-        let direct = deps_core::completion::complete_versions_generic(
+        let direct = deps_core::completion::complete_versions_at_position(
             eco.registry.as_ref(),
-            &package_name,
+            &eco.formatter,
+            parse_result.as_ref(),
+            position,
             &prefix,
             &[],
             freshness,

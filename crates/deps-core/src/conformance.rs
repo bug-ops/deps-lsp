@@ -504,6 +504,85 @@ where
     );
 }
 
+/// Asserts that `eco.generate_completions`, at the version position of the first dependency
+/// parsed from `content`, returns zero completion items (#1136).
+///
+/// Parses `content` (as `manifest_name`) through `eco.parse_manifest`, then fails loudly —
+/// before ever calling `generate_completions` — if the fixture itself is not shaped
+/// correctly: its first dependency must both (a) have a source
+/// [`crate::lsp_helpers::SourcePolicy::can_resolve_source`] rejects, so the test is actually
+/// exercising the #1136 gate rather than passing vacuously, and (b) carry a literal version
+/// field ([`crate::ecosystem::Dependency::version_range`] must be `Some`), since
+/// [`crate::completion::detect_completion_context`] only ever produces a `Version` context
+/// at such a position in the first place — a fixture without one would make this assertion
+/// trivially true without ever reaching the code path under test.
+///
+/// Returns the [`crate::completion::Completions`] so the caller can additionally assert on
+/// side effects only it can observe (e.g. that a registry double was never queried) — see
+/// `completion_source_gate_conformance!`'s doc (below, in this same module) for the intended
+/// pattern.
+///
+/// # Panics
+///
+/// Panics (via `.expect`/`assert!`) if `content` fails to parse, produces no dependencies,
+/// or the fixture-sanity checks above fail — all indicating a broken fixture, not a
+/// `generate_completions` behavior under test.
+#[cfg(feature = "lsp-responses")]
+pub async fn assert_completion_source_gate(
+    eco: &dyn Ecosystem,
+    manifest_name: &str,
+    content: &str,
+) -> crate::completion::Completions {
+    let uri = crate::test_util::test_uri(&format!("/test/{manifest_name}"));
+    let parse_result = eco
+        .parse_manifest(content, &uri)
+        .await
+        .expect("fixture manifest must parse");
+    let dep = parse_result
+        .dependencies()
+        .into_iter()
+        .next()
+        .expect("fixture manifest must produce at least one dependency");
+
+    assert!(
+        !eco.formatter().can_resolve_source(&dep.source()),
+        "fixture dependency's source ({:?}) must NOT be resolvable, or this test would pass \
+         vacuously without ever exercising the #1136 gate",
+        dep.source(),
+    );
+    let position = dep
+        .version_range()
+        .expect(
+            "fixture dependency must have a literal version field — detect_completion_context \
+             never produces a Version context without one, so the gate under test would never \
+             even be reached",
+        )
+        .start
+        .into();
+
+    // impl-critic M2: without this, an ecosystem whose context detection regressed to
+    // `CompletionContext::None` (e.g. a `manifest_name` extension the ecosystem's own
+    // `detect_completion_context` no longer recognizes) would also yield zero items and zero
+    // registry calls — passing this test vacuously without the `can_resolve_source` gate ever
+    // being reached. Pinning the context first proves the call below actually exercises it.
+    assert!(
+        matches!(
+            crate::completion::detect_completion_context(parse_result.as_ref(), position, content),
+            crate::completion::CompletionContext::Version { .. }
+        ),
+        "fixture's dependency-version position must resolve to a Version completion context, \
+         or this test cannot be exercising the #1136 gate at all"
+    );
+
+    eco.generate_completions(
+        parse_result.as_ref(),
+        position,
+        content,
+        crate::FreshnessSettings::default(),
+    )
+    .await
+}
+
 // ---------------------------------------------------------------------------------------
 // Macro 5: `json_depth_conformance!` — the shared JSON-nesting depth cap
 // (`crate::MAX_JSON_NESTING_DEPTH` / `crate::check_json_nesting_depth`).
@@ -1393,6 +1472,215 @@ macro_rules! registry_conformance {
                 let _ = <$ty>::get_versions_with;
                 let _ = <$ty>::get_latest_matching;
                 let _ = <$ty>::search;
+            }
+        }
+    };
+}
+
+/// Generates a conformance test asserting `Ecosystem::generate_completions` rejects a
+/// non-registry-resolvable source.
+///
+/// #758-shaped macro, closing #1136's coverage gap: the original bug — the old
+/// `complete_versions_generic`'s `DependencySource::Registry`-hardcoded wrapper skipping the
+/// `can_resolve_source` gate entirely — was never caught because no test drove a real
+/// ecosystem's `generate_completions` with a non-resolvable-source fixture; unit tests only
+/// ever exercised the shared helper directly with an already-`DependencySource::Registry`
+/// package name.
+///
+/// `build` must evaluate (as an `async` block) to `(impl Ecosystem, mockito::Mock, _server)`:
+/// an ecosystem instance whose registry is pointed at the mock server, a handle to a mock
+/// configured to fail its own expectation (typically `.expect(0)`) if actually queried, and
+/// the server guard itself (e.g. `mockito::ServerGuard`) kept alive alongside it — dropping
+/// the guard before the assertion below runs makes `mock.assert_async()` fail regardless of
+/// whether the gate under test actually held, so `build` must return it rather than let it
+/// drop at the end of its own block. The generated test calls `mock.assert_async().await`
+/// after [`assert_completion_source_gate`] returns, so an ecosystem whose completion wiring
+/// bypasses the gate and reaches the registry anyway fails loudly on the mock's own
+/// expectation, not just on an empty-items assertion that a coincidental network/parse
+/// failure could also produce.
+///
+/// `manifest` must parse to a first dependency that is both non-resolvable and literally
+/// versioned — see [`assert_completion_source_gate`]'s fixture-sanity checks, which fail the
+/// test explicitly (not vacuously) if either does not hold.
+///
+/// **Known gap**: not every ecosystem crate invokes this macro today — applied so far to
+/// `deps-cargo`, `deps-bundler`, `deps-dart`, `deps-pypi`. The #1136 fix itself (the
+/// `can_resolve_source` gate inside `complete_versions_generic_from`) applies uniformly to
+/// all 14 ecosystem crates regardless, and is verified for every one of them at the shared
+/// helper level by `crates/deps-core/src/completion.rs`'s own gate unit tests — this macro
+/// additionally proves the fix end-to-end, through a real `generate_completions` call, only
+/// where a fixture is actually constructible:
+///
+/// - `deps-composer`, `deps-maven`, `deps-gradle`, `deps-deno`: `Dependency::source()` is
+///   structurally always `DependencySource::Registry` in their parsers — no non-registry
+///   source exists to construct a fixture from.
+/// - `deps-github-actions`: its only non-registry sources (`Path`/`Url`, for a local
+///   composite action or a Docker image reference) never carry a `version_range`, so
+///   `detect_completion_context` can never reach a `Version` context for them.
+/// - `deps-swift`: `SwiftRegistry` has no test-mockable HTTP-base-URL constructor (its only
+///   non-network-dependent tests are `#[ignore]`d), so a discriminating `build` cannot be
+///   constructed without adding that test infrastructure first.
+/// - `deps-npm`, `deps-nuget`: their non-registry source (an unresolved custom registry
+///   alias) is only reachable through ancestor-config-file resolution (`.npmrc`/
+///   `NuGet.Config`) tied to the manifest's real on-disk directory — incompatible with
+///   [`assert_completion_source_gate`]'s synthetic, non-existent fixture URI. Both already
+///   have dedicated hand-written tests proving this exact scenario at the ecosystem level
+///   (e.g. `deps-npm`'s `test_complete_versions_custom_registry_source_offers_nothing`).
+/// - `deps-go`: a fixture is possible in principle (`DependencySource::CustomRegistry` via a
+///   blocked/private `GOPROXY` chain) but this crate already routed completion through the
+///   gated `complete_versions_at_position` entry point before #1136 — not added here,
+///   tracked as a follow-up rather than blocking this fix.
+/// - `deps-gitlab-ci`: **not** already gated before this PR — its `complete_version` hook
+///   calls `complete_versions_generic_from` directly (never `complete_versions_at_position`),
+///   and this PR had to add the missing `formatter` argument to that exact call site
+///   (`crates/deps-gitlab-ci/src/ecosystem.rs`) alongside the other 8 originally-reported
+///   ungated crates. It is still excluded from this macro specifically because
+///   `GitlabCiRegistry::get_versions_from` independently fails closed
+///   (`Err(PackageNotFound)`) for anything but a *registered* `AlternateRegistry` route,
+///   with no host to dial in the first place for `CustomRegistry` — so a mock-server
+///   `.expect(0)` here could never distinguish "the `can_resolve_source` gate held" from
+///   "the registry's own routing has no host to call regardless of the gate" (the exact
+///   vacuity this macro's own `assert_completion_source_gate` guards against for every other
+///   user). The #1136 gate is still real, verified defense-in-depth for this crate (proven at
+///   the shared-helper level, and by `test_generate_completions_version_context_dispatches_by_dependency_source`'s
+///   explicit `is_empty()` assertion at the ecosystem level) — just not independently provable
+///   via this macro's network-mock technique.
+///
+/// Must be invoked inside your own `#[cfg(test)] mod tests { ... }` — see
+/// [`ecosystem_conformance!`]'s doc for why this macro does not emit its own `#[cfg(test)]`.
+///
+/// Wrapped in an explicit `mod example` — see [`ecosystem_conformance!`]'s doc for why.
+///
+/// # Examples
+///
+/// ```
+/// mod example {
+/// # use std::any::Any;
+/// # use std::sync::Arc;
+/// # use deps_core::parser::DependencySource;
+/// # use deps_core::position::{Position, Range};
+/// # struct FakeRegistry;
+/// # impl deps_core::Registry for FakeRegistry {
+/// #     fn get_versions<'a>(&'a self, _name: &'a deps_core::PackageName)
+/// #         -> std::pin::Pin<Box<dyn std::future::Future<Output = deps_core::Result<Vec<Box<dyn deps_core::Version>>>> + Send + 'a>> {
+/// #         panic!("must not be queried: the #1136 gate should reject this fixture's source first");
+/// #     }
+/// #     fn get_latest_matching<'a>(&'a self, _name: &'a deps_core::PackageName, _req: &'a deps_core::VersionReq)
+/// #         -> std::pin::Pin<Box<dyn std::future::Future<Output = deps_core::Result<Option<Box<dyn deps_core::Version>>>> + Send + 'a>> {
+/// #         panic!("must not be queried: the #1136 gate should reject this fixture's source first");
+/// #     }
+/// #     fn search<'a>(&'a self, _query: &'a str, _limit: usize)
+/// #         -> std::pin::Pin<Box<dyn std::future::Future<Output = deps_core::Result<Vec<Box<dyn deps_core::Metadata>>>> + Send + 'a>> {
+/// #         Box::pin(async move { Ok(vec![]) })
+/// #     }
+/// #     fn as_any(&self) -> &dyn Any { self }
+/// # }
+/// # struct FakeDep { name: deps_core::PackageName }
+/// # impl deps_core::ecosystem::Dependency for FakeDep {
+/// #     fn name(&self) -> &deps_core::PackageName { &self.name }
+/// #     fn name_range(&self) -> Range { Range::default() }
+/// #     fn version_requirement(&self) -> Option<&deps_core::VersionReq> { None }
+/// #     fn version_range(&self) -> Option<Range> {
+/// #         Some(Range::new(Position::new(0, 0), Position::new(0, 3)))
+/// #     }
+/// #     fn source(&self) -> DependencySource { DependencySource::Path { path: "../local".into() } }
+/// #     fn as_any(&self) -> &dyn Any { self }
+/// # }
+/// # struct FakeParseResult { dep: FakeDep, uri: url::Url }
+/// # impl deps_core::ParseResult for FakeParseResult {
+/// #     fn dependencies(&self) -> Vec<&dyn deps_core::ecosystem::Dependency> { vec![&self.dep] }
+/// #     fn workspace_root(&self) -> Option<&std::path::Path> { None }
+/// #     fn uri(&self) -> &url::Url { &self.uri }
+/// #     fn as_any(&self) -> &dyn Any { self }
+/// # }
+/// # struct FakeFormatter;
+/// # impl deps_core::lsp_helpers::PackageNaming for FakeFormatter {}
+/// # impl deps_core::lsp_helpers::PackageRendering for FakeFormatter {
+/// #     fn format_version_for_text_edit(&self, v: &deps_core::ConcreteVersion) -> String { v.as_str().to_string() }
+/// #     fn package_url(&self, name: &deps_core::PackageName) -> String { format!("https://example.com/{name}") }
+/// # }
+/// # impl deps_core::lsp_helpers::RequirementResolution for FakeFormatter {}
+/// # impl deps_core::lsp_helpers::DiagnosticMessages for FakeFormatter {}
+/// # impl deps_core::lsp_helpers::DiagnosticPolicy for FakeFormatter {}
+/// # impl deps_core::lsp_helpers::SourcePolicy for FakeFormatter {}
+/// # impl deps_core::lsp_helpers::OsvNaming for FakeFormatter {}
+/// # struct Fake { registry: Arc<FakeRegistry>, formatter: FakeFormatter }
+/// # impl deps_core::ecosystem::private::Sealed for Fake {}
+/// # impl deps_core::Ecosystem for Fake {
+/// #     fn id(&self) -> &'static str { "fake" }
+/// #     fn ecosystem_id(&self) -> deps_core::EcosystemId { deps_core::EcosystemId::Cargo }
+/// #     fn display_name(&self) -> &'static str { "Fake" }
+/// #     fn manifest_filenames(&self) -> &[&'static str] { &["fake.toml"] }
+/// #     fn registry(&self) -> Arc<dyn deps_core::Registry> { self.registry.clone() }
+/// #     fn formatter(&self) -> &dyn deps_core::lsp_helpers::EcosystemFormatter { &self.formatter }
+/// #     fn parse_manifest<'a>(&'a self, _content: &'a str, uri: &'a url::Url)
+/// #         -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Box<dyn deps_core::ParseResult>>> {
+/// #         let dep = FakeDep { name: deps_core::PackageName::new("private-pkg") };
+/// #         let uri = uri.clone();
+/// #         Box::pin(async move { Ok(Box::new(FakeParseResult { dep, uri }) as Box<dyn deps_core::ParseResult>) })
+/// #     }
+/// #     fn complete_version<'a>(&'a self, _request: deps_core::completion::CompletionRequest<'a>, _package_name: deps_core::PackageName, _prefix: String)
+/// #         -> deps_core::ecosystem::BoxFuture<'a, deps_core::completion::Completions> {
+/// #         Box::pin(std::future::ready(deps_core::completion::Completions::default()))
+/// #     }
+/// #     fn completion_insert_text(&self, _metadata: &dyn deps_core::Metadata) -> Option<String> { None }
+/// #     fn as_any(&self) -> &dyn Any { self }
+/// # }
+/// deps_core::completion_source_gate_conformance! {
+///     mod fake_completion_source_gate_conformance;
+///     build: async {
+///         let mut server = mockito::Server::new_async().await;
+///         let mock = server
+///             .mock("GET", mockito::Matcher::Any)
+///             .expect(0)
+///             .create_async()
+///             .await;
+///         let eco = Fake { registry: Arc::new(FakeRegistry), formatter: FakeFormatter };
+///         (eco, mock, server)
+///     };
+///     manifest: "fake.toml" => "local = { path = \"../local\" }\n1.0.0";
+/// }
+/// }
+/// ```
+#[cfg(feature = "lsp-responses")]
+#[macro_export]
+macro_rules! completion_source_gate_conformance {
+    (
+        mod $mod_name:ident;
+        build: $build:expr;
+        manifest: $manifest_name:literal => $manifest_content:literal $(;)?
+    ) => {
+        mod $mod_name {
+            use super::*;
+
+            // See `ecosystem_conformance!`'s doc for why this is a plain `_impl` fn called
+            // by a thin `#[::tokio::test]` wrapper.
+            //
+            // `_server` (a `mockito::ServerGuard`, or any RAII handle `build` returns) must
+            // stay bound here, not be dropped inside `build`'s own async block: mockito's
+            // hit-count bookkeeping that `mock.assert_async()` queries lives with the
+            // server task, so dropping the guard before the assertion below runs makes
+            // `assert_async()` fail with "could not retrieve enough information about the
+            // remote mock" regardless of whether the gate under test actually held.
+            async fn completion_source_gate_rejects_non_resolvable_source_impl() {
+                let (eco, mock, _server) = { $build }.await;
+                let result = $crate::conformance::assert_completion_source_gate(
+                    &eco,
+                    $manifest_name,
+                    $manifest_content,
+                )
+                .await;
+                mock.assert_async().await;
+                assert!(
+                    result.items.is_empty(),
+                    "a dependency whose source is not version-resolvable must yield zero \
+                     completions, got: {:?}",
+                    result.items,
+                );
+            }
+            #[::tokio::test]
+            async fn completion_source_gate_rejects_non_resolvable_source() {
+                completion_source_gate_rejects_non_resolvable_source_impl().await;
             }
         }
     };

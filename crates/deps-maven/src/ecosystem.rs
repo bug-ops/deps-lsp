@@ -10,8 +10,6 @@ use url::Url;
 
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
-#[cfg(feature = "lsp-responses")]
-use deps_core::position_in_range;
 use deps_core::{
     Ecosystem, ParseResult as ParseResultTrait, Registry, Result, is_safe_maven_coordinate_segment,
     lsp_helpers::{EcosystemFormatter, warn_rejected_value},
@@ -179,6 +177,8 @@ impl MavenEcosystem {
         build_deduped_field_completions(&results, field, replace_range)
     }
 
+    // Trait-completeness path for `complete_version` (unreachable from the real `Version`-arm
+    // dispatch below, which calls `complete_versions_generic_from` directly with `dep.source()`).
     #[cfg(feature = "lsp-responses")]
     async fn complete_versions(
         &self,
@@ -186,9 +186,11 @@ impl MavenEcosystem {
         prefix: &str,
         freshness: deps_core::FreshnessSettings,
     ) -> Vec<CompletionItem> {
-        deps_core::completion::complete_versions_generic(
+        deps_core::completion::complete_versions_generic_from(
             self.registry.as_ref(),
+            &self.formatter,
             package_name,
+            &deps_core::parser::DependencySource::Registry,
             prefix,
             &[],
             freshness,
@@ -333,35 +335,26 @@ impl Ecosystem for MavenEcosystem {
             // new `MavenXmlContext` variant is a compile error right here.
             match ctx_type {
                 MavenXmlContext::Version => {
-                    let dep = parse_result.dependencies().into_iter().find(|d| {
-                        d.version_range()
-                            .is_some_and(|r| position_in_range(position.into(), r))
-                            || d.name_range().start.line == position.line
-                    });
-                    // #919: `detect_xml_context` only checks that the cursor sits inside a
-                    // `<version>` tag, not that the tag's text is a literal value — a Maven
-                    // `${property}` reference must not be offered version completion, since
-                    // accepting one would splice text into the interpolation instead of
-                    // editing a version. Guarded on `value_range` (the tag's own detected
-                    // span), matching `dep`'s declared literal/requirement.
-                    match dep {
-                        Some(dep)
-                            if deps_core::lsp_helpers::dependency_version_range_is_literal(
-                                dep,
-                                content,
-                                value_range.into(),
-                            ) =>
-                        {
-                            let request = deps_core::completion::CompletionRequest::new(
-                                parse_result,
-                                position,
+                    // #1134: finds+literal-checks the dependency; #1136: complete_versions_generic_from's own gate rejects a non-registry `dep.source()`.
+                    match deps_core::completion::literal_version_dependency(
+                        parse_result,
+                        position,
+                        content,
+                        value_range,
+                    ) {
+                        Some(dep) => {
+                            deps_core::completion::complete_versions_generic_from(
+                                self.registry.as_ref(),
+                                &self.formatter,
+                                dep.name(),
+                                &dep.source(),
+                                value,
+                                &[],
                                 freshness,
-                            );
-                            self.complete_version(request, dep.name().clone(), value.to_string())
-                                .await
-                                .items
+                            )
+                            .await
                         }
-                        _ => vec![],
+                        None => vec![],
                     }
                 }
                 MavenXmlContext::ArtifactId => {
@@ -1426,7 +1419,7 @@ mod tests {
         let freshness = deps_core::FreshnessSettings::default();
 
         // M4 (critic follow-up): `Completions::default()` below is also what the
-        // *unguarded* path would produce offline (`complete_versions_generic` returns
+        // *unguarded* path would produce offline (`complete_versions_generic_from` returns
         // `vec![]` on a registry fetch error, network-free or not) — non-discriminating on
         // its own. Assert the guard's own decision directly against the real parsed `dep`
         // first, so this test fails loudly if the guard regresses rather than passing

@@ -415,6 +415,29 @@ mod tests {
         };
     }
 
+    // #1136: a dependency whose source is an unregistered custom registry must yield zero
+    // version completions and never reach `CratesIoRegistry` — the mock's `.expect(0)`
+    // fails the test if the gate is ever bypassed, not just if the result happens to come
+    // back empty.
+    #[cfg(feature = "lsp-responses")]
+    deps_core::completion_source_gate_conformance! {
+        mod cargo_completion_source_gate_conformance;
+        build: async {
+            let mut server = mockito::Server::new_async().await;
+            let mock = server
+                .mock("GET", mockito::Matcher::Any)
+                .expect(0)
+                .create_async()
+                .await;
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let crates_io = CratesIoRegistry::with_base_for_test(Arc::clone(&cache), &server.url());
+            let registry = CargoRegistry::with_crates_io_for_test(Arc::clone(&cache), crates_io);
+            let eco = CargoEcosystem::with_registry_for_test(registry);
+            (eco, mock, server)
+        };
+        manifest: "Cargo.toml" => "[dependencies]\ninternal-crate = { version = \"1.0\", registry = \"my-corp\" }\n";
+    }
+
     fn pkg(s: &str) -> deps_core::PackageName {
         deps_core::PackageName::new(s)
     }
