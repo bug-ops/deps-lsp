@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **deps-core**: version completion now applies the `can_resolve_source` gate for every ecosystem, closing a leak where a private/non-registry dependency's name was still sent to the public registry on every keystroke (resolves #1136)
+- **deps-cli**: `check` now runs the tier-3 license pre-fetch (Dart, Swift, Gradle, Deno) before evaluating `license_policy`, matching `deps-lsp`'s diagnostics instead of silently missing license data for these ecosystems (resolves #1133)
 - **deps-cli**: `check` now reports a manifest replaced by an unresolvable or non-file symlink instead of silently skipping it (#1139, resolves #1124)
 - **ci**: `crates/github-action`'s entrypoint no longer reports success on an abnormal `deps-cli` exit or an unwritable SARIF path (#1131, #1140)
 - **ci**: `crates/github-action`'s entrypoint refuses to write the SARIF file through a symlink or directory left in the scanned checkout (#1132, #1140)

@@ -820,7 +820,6 @@ dependencies = [
  "deps-github-actions",
  "deps-gitlab-ci",
  "deps-npm",
- "futures",
  "insta",
  "mockito",
  "serde",

@@ -71,8 +71,8 @@ url = { workspace = true }
 urlencoding = { workspace = true }
 
 [dev-dependencies]
-# deps-cli's own tests never call `deps_core::test_util` directly (they exercise real
-# ecosystem registrations with `--offline` instead). This dependency exists solely so
+# `deps_core::test_util::test_uri` is used directly by the tier-3 license parity/regression
+# tests in `tests/check_integration.rs` (issue #1133). This dependency also exists so
 # deps-core's `test-util` feature is reachable in *this* crate's dev-dependency tree, which
 # CI's "Guard against test-util leaking into the release dependency tree" step
 # (.github/workflows/ci.yml) requires as a positive control proving its grep-based leak
@@ -80,6 +80,11 @@ urlencoding = { workspace = true }
 # and deps-lsp's own `[dev-dependencies]`. Do not remove as "unused" without also removing
 # deps-cli's block from that CI guard.
 deps-core = { workspace = true, features = ["test-util"] }
+# `deps_engine::test_util::TestTier3Ecosystem` — a network-free tier-3 `Ecosystem` test
+# double used by `check_integration.rs`'s `tier3_wiring_regression` test (issue #1133 critic
+# S2) to prove `check_manifest` actually reaches `prefetch_tier3_licenses`, so deleting that
+# call site fails this test instead of leaving the suite silently green.
+deps-engine = { workspace = true, features = ["test-util"] }
 insta = { workspace = true, features = ["json", "redactions"] }
 jsonschema = { workspace = true }
 tempfile = { workspace = true }
