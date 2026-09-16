@@ -3,7 +3,7 @@
 use std::any::Any;
 use std::sync::Arc;
 #[cfg(feature = "lsp-responses")]
-use tower_lsp_server::ls_types::{CompletionItem, Range};
+use tower_lsp_server::ls_types::{CompletionItem, Position, Range};
 use url::Url;
 
 #[cfg(feature = "lsp-responses")]
@@ -54,16 +54,20 @@ impl DartEcosystem {
         .await
     }
 
+    // Position-based, gated: see complete_versions_at_position's own doc (#593, #1136).
     #[cfg(feature = "lsp-responses")]
     async fn complete_versions(
         &self,
-        package_name: &deps_core::PackageName,
+        parse_result: &dyn ParseResultTrait,
+        position: Position,
         prefix: &str,
         freshness: deps_core::FreshnessSettings,
     ) -> Vec<CompletionItem> {
-        deps_core::completion::complete_versions_generic(
+        deps_core::completion::complete_versions_at_position(
             self.registry.as_ref(),
-            package_name,
+            &self.formatter,
+            parse_result,
+            position,
             prefix,
             &['^', '>', '<', '='],
             freshness,
@@ -128,13 +132,18 @@ impl Ecosystem for DartEcosystem {
     fn complete_version<'a>(
         &'a self,
         request: deps_core::completion::CompletionRequest<'a>,
-        package_name: deps_core::PackageName,
+        _package_name: deps_core::PackageName,
         prefix: String,
     ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
         Box::pin(async move {
-            self.complete_versions(&package_name, &prefix, request.freshness)
-                .await
-                .into()
+            self.complete_versions(
+                request.parse_result,
+                request.position,
+                &prefix,
+                request.freshness,
+            )
+            .await
+            .into()
         })
     }
 
@@ -226,8 +235,6 @@ fn extract_prefix(line: &str, character: u32) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "lsp-responses")]
-    use tower_lsp_server::ls_types::Position;
 
     // #758: exact-value `Ecosystem` conformance, replacing the hand-written
     // test_ecosystem_id/test_ecosystem_display_name/test_ecosystem_manifest_filenames/
@@ -261,6 +268,26 @@ mod tests {
                 .await
             })
         };
+    }
+
+    // #1136: a `hosted:` package pointing at a custom (unresolved) registry must yield zero
+    // version completions and never reach pub.dev.
+    #[cfg(feature = "lsp-responses")]
+    deps_core::completion_source_gate_conformance! {
+        mod dart_completion_source_gate_conformance;
+        build: async {
+            let mut server = mockito::Server::new_async().await;
+            let mock = server
+                .mock("GET", mockito::Matcher::Any)
+                .expect(0)
+                .create_async()
+                .await;
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let registry = PubDevRegistry::with_base(Arc::clone(&cache), server.url());
+            let eco = DartEcosystem::with_registry_for_test(registry);
+            (eco, mock, server)
+        };
+        manifest: "pubspec.yaml" => "name: my_app\ndependencies:\n  custom_pkg:\n    hosted: https://custom-registry.example.com\n    version: ^1.0.0\n";
     }
 
     #[cfg(feature = "lsp-responses")]
@@ -478,15 +505,11 @@ mod tests {
             position,
             content,
         );
-        let deps_core::completion::CompletionContext::Version {
-            package_name,
-            prefix,
-        } = context
-        else {
+        let deps_core::completion::CompletionContext::Version { prefix, .. } = context else {
             panic!("expected Version context, got {context:?}");
         };
         let direct = eco
-            .complete_versions(&package_name, &prefix, freshness)
+            .complete_versions(parse_result.as_ref(), position, &prefix, freshness)
             .await;
         let via_dispatch = eco
             .generate_completions(parse_result.as_ref(), position, content, freshness)
@@ -521,15 +544,11 @@ mod tests {
             position,
             content,
         );
-        let deps_core::completion::CompletionContext::Version {
-            package_name,
-            prefix,
-        } = context
-        else {
+        let deps_core::completion::CompletionContext::Version { prefix, .. } = context else {
             panic!("expected Version context, got {context:?}");
         };
         let direct = eco
-            .complete_versions(&package_name, &prefix, freshness)
+            .complete_versions(parse_result.as_ref(), position, &prefix, freshness)
             .await;
         let via_dispatch = eco
             .generate_completions(parse_result.as_ref(), position, content, freshness)

@@ -7,7 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking
+- **deps-core**: removed `completion::complete_versions_generic`; `completion::complete_versions_generic_from` now requires an additional `formatter: &dyn lsp_helpers::SourcePolicy` parameter (resolves #1136)
+
 ### Fixed
+- **deps-core**: version completion now applies the `can_resolve_source` gate for every ecosystem, closing a leak where a private/non-registry dependency's name was still sent to the public registry on every keystroke (resolves #1136)
 - **deps-cli**: `check` now reports a manifest replaced by an unresolvable or non-file symlink instead of silently skipping it (#1139, resolves #1124)
 - **ci**: `crates/github-action`'s entrypoint no longer reports success on an abnormal `deps-cli` exit or an unwritable SARIF path (#1131, #1140)
 - **ci**: `crates/github-action`'s entrypoint refuses to write the SARIF file through a symlink or directory left in the scanned checkout (#1132, #1140)
@@ -15,6 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **ci**: `deps-lsp-check` and `docker-build-and-scan` now block `ci-success` (#1130, #1140)
+
+### Changed
+- **deps-gradle, deps-maven**: version-completion dependency lookup deduplicated into a shared `deps-core` helper (resolves #1134)
 
 ## [1.1.0] - 2026-09-16
 

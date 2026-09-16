@@ -763,6 +763,30 @@ mod tests {
         };
     }
 
+    // #1136: a dependency whose only registry source is blocked by the default reachability
+    // policy (SSRF-class host) must yield zero version completions and never reach PyPI.
+    #[cfg(feature = "lsp-responses")]
+    deps_core::completion_source_gate_conformance! {
+        mod pypi_completion_source_gate_conformance;
+        build: async {
+            let mut server = mockito::Server::new_async().await;
+            let mock = server
+                .mock("GET", mockito::Matcher::Any)
+                .expect(0)
+                .create_async()
+                .await;
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let registry = Arc::new(PypiRegistry::with_public_base_for_test(
+                Arc::clone(&cache),
+                server.url(),
+            ));
+            let policy = Arc::new(deps_core::net_policy::RegistryAccessPolicy::default());
+            let eco = PypiEcosystem::with_policy(registry, policy);
+            (eco, mock, server)
+        };
+        manifest: "pyproject.toml" => "[[tool.poetry.source]]\nname = \"internal\"\nurl = \"https://169.254.169.254/simple\"\n\n[tool.poetry.dependencies]\nrequests = \"^2.28.0\"\n";
+    }
+
     #[test]
     fn test_ecosystem_manifest_patterns() {
         let cache = Arc::new(deps_core::HttpCache::new());

@@ -1173,7 +1173,7 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     ///
     /// `freshness.enabled` gates whether version completion items carry a
     /// relative-age `label_details` suffix (issue #145); implementations that
-    /// delegate to [`crate::completion::complete_versions_generic`] get this for
+    /// delegate to [`crate::completion::complete_versions_at_position`] get this for
     /// free by threading `freshness` through.
     ///
     /// The returned [`Completions::is_incomplete`] must reflect *this specific call*

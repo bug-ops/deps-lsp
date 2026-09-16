@@ -37,6 +37,9 @@ pub struct DenoDependency {
     pub section: DenoDependencySection,
 }
 
+// TODO(critic): classify a private `npm:@corp/*`-scope import (or any other non-public
+// source) as a non-Registry DependencySource so the #1136 gate is not inert here (follow-up
+// to #1136).
 deps_core::impl_dependency!(DenoDependency {
     name: name,
     name_range: name_range,

@@ -6,7 +6,7 @@
 use std::any::Any;
 use std::sync::Arc;
 #[cfg(feature = "lsp-responses")]
-use tower_lsp_server::ls_types::{CompletionItem, Range};
+use tower_lsp_server::ls_types::{CompletionItem, Position, Range};
 
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
@@ -51,16 +51,20 @@ impl ComposerEcosystem {
         .await
     }
 
+    // Position-based, gated (#593, #1136) — currently inert here since `ComposerDependency::source()` is hardcoded `Registry`; see the TODO on that type.
     #[cfg(feature = "lsp-responses")]
     async fn complete_versions(
         &self,
-        package_name: &deps_core::PackageName,
+        parse_result: &dyn ParseResultTrait,
+        position: Position,
         prefix: &str,
         freshness: deps_core::FreshnessSettings,
     ) -> Vec<CompletionItem> {
-        deps_core::completion::complete_versions_generic(
+        deps_core::completion::complete_versions_at_position(
             self.registry.as_ref(),
-            package_name,
+            &self.formatter,
+            parse_result,
+            position,
             prefix,
             &['^', '~', '=', '<', '>', '*'],
             freshness,
@@ -125,13 +129,18 @@ impl Ecosystem for ComposerEcosystem {
     fn complete_version<'a>(
         &'a self,
         request: deps_core::completion::CompletionRequest<'a>,
-        package_name: deps_core::PackageName,
+        _package_name: deps_core::PackageName,
         prefix: String,
     ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
         Box::pin(async move {
-            self.complete_versions(&package_name, &prefix, request.freshness)
-                .await
-                .into()
+            self.complete_versions(
+                request.parse_result,
+                request.position,
+                &prefix,
+                request.freshness,
+            )
+            .await
+            .into()
         })
     }
 
@@ -213,8 +222,6 @@ mod tests {
     use deps_core::{EcosystemConfig, VersionData};
     #[cfg(feature = "lsp-responses")]
     use std::collections::HashMap;
-    #[cfg(feature = "lsp-responses")]
-    use tower_lsp_server::ls_types::Position;
 
     // #758: exact-value `Ecosystem` conformance, replacing test_ecosystem_id,
     // test_ecosystem_manifest_filenames, and test_ecosystem_lockfile_filenames. Also closes

@@ -306,6 +306,7 @@ impl Ecosystem for GitlabCiEcosystem {
 
             deps_core::completion::complete_versions_generic_from(
                 self.registry.as_ref(),
+                &self.formatter,
                 dep.name(),
                 &dep.source(),
                 &prefix,
@@ -2768,6 +2769,13 @@ mod tests {
     /// network call — deterministic, and pins that `generate_completions` still threads the
     /// found dependency's own `name`/`source` into `complete_versions_generic_from` rather
     /// than, say, skipping the lookup or using a different dependency's source.
+    ///
+    /// tester finding #2 (post-#1136 review): the original version of this test only
+    /// asserted `via_dispatch.items == direct` — both sides independently call the *same*
+    /// gated function with the *same* args, so that equality would hold even if
+    /// `can_resolve_source` were deleted entirely (both sides would just as happily agree on
+    /// a non-empty result together). The explicit `is_empty()` assertion below is what
+    /// actually pins the observable outcome for a `CustomRegistry` source.
     #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_completions_version_context_dispatches_by_dependency_source() {
@@ -2797,6 +2805,7 @@ mod tests {
             .await;
         let direct = deps_core::completion::complete_versions_generic_from(
             eco.registry.as_ref(),
+            &eco.formatter,
             &deps_core::PackageName::new("org/proj"),
             &source,
             "v1.0",
@@ -2805,6 +2814,11 @@ mod tests {
         )
         .await;
         assert_eq!(via_dispatch.items, direct);
+        assert!(
+            via_dispatch.items.is_empty(),
+            "a CustomRegistry source must yield zero completions, got: {:?}",
+            via_dispatch.items
+        );
         assert!(!via_dispatch.is_incomplete);
     }
 

@@ -8,7 +8,7 @@
 use std::any::Any;
 use std::sync::Arc;
 #[cfg(feature = "lsp-responses")]
-use tower_lsp_server::ls_types::{CompletionItem, Range};
+use tower_lsp_server::ls_types::{CompletionItem, Position, Range};
 
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
@@ -94,16 +94,20 @@ impl DenoEcosystem {
         .await
     }
 
+    // Position-based, gated (#593, #1136) — currently inert here since `DenoDependency::source()` is hardcoded `Registry`; see the TODO on that type.
     #[cfg(feature = "lsp-responses")]
     async fn complete_versions(
         &self,
-        package_name: &deps_core::PackageName,
+        parse_result: &dyn ParseResultTrait,
+        position: Position,
         prefix: &str,
         freshness: deps_core::FreshnessSettings,
     ) -> Vec<CompletionItem> {
-        deps_core::completion::complete_versions_generic(
+        deps_core::completion::complete_versions_at_position(
             self.registry.as_ref(),
-            package_name,
+            &self.formatter,
+            parse_result,
+            position,
             prefix,
             &['^', '~', '=', '<', '>', '*'],
             freshness,
@@ -160,13 +164,18 @@ impl Ecosystem for DenoEcosystem {
     fn complete_version<'a>(
         &'a self,
         request: deps_core::completion::CompletionRequest<'a>,
-        package_name: deps_core::PackageName,
+        _package_name: deps_core::PackageName,
         prefix: String,
     ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
         Box::pin(async move {
-            self.complete_versions(&package_name, &prefix, request.freshness)
-                .await
-                .into()
+            self.complete_versions(
+                request.parse_result,
+                request.position,
+                &prefix,
+                request.freshness,
+            )
+            .await
+            .into()
         })
     }
 
@@ -251,8 +260,6 @@ fn extract_prefix(line: &str, character: u32) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "lsp-responses")]
-    use tower_lsp_server::ls_types::Position;
 
     // #758: exact-value `Ecosystem` conformance, replacing test_ecosystem_id/
     // test_ecosystem_display_name/test_ecosystem_manifest_filenames/test_as_any.
@@ -364,13 +371,20 @@ mod tests {
             DenoRegistry::with_bases_for_test(Arc::clone(&cache), npm, server.url(), server.url());
         let ecosystem = DenoEcosystem::with_registry_for_test(registry);
 
-        let results = ecosystem
-            .complete_versions(
-                &deps_core::PackageName::new("jsr:@this-scope/does-not-exist-12345"),
-                "1.0",
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
+        // Exercises `DenoRegistry`'s own jsr/npm scheme routing directly through the public
+        // `complete_versions_generic_from` entry point, rather than through
+        // `DenoEcosystem::complete_versions` (position-based since #1136, needing a real
+        // manifest fixture this test has no other reason to build).
+        let results = deps_core::completion::complete_versions_generic_from(
+            ecosystem.registry.as_ref(),
+            &DenoFormatter,
+            &deps_core::PackageName::new("jsr:@this-scope/does-not-exist-12345"),
+            &deps_core::parser::DependencySource::Registry,
+            "1.0",
+            &['^', '~', '=', '<', '>', '*'],
+            deps_core::FreshnessSettings::default(),
+        )
+        .await;
         mock.assert_async().await;
         npm_mock.assert_async().await;
         assert!(results.is_empty());

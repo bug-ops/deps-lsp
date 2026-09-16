@@ -35,6 +35,8 @@ pub struct ComposerDependency {
     pub section: ComposerSection,
 }
 
+// TODO(critic): classify VCS/path repositories (`repositories: [{ "type": "vcs", ... }]`) as
+// a non-Registry DependencySource so the #1136 gate is not inert here (follow-up to #1136).
 deps_core::impl_dependency!(ComposerDependency {
     name: name,
     name_range: name_range,
