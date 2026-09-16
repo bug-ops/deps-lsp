@@ -13,10 +13,9 @@
 
 #![no_main]
 
-use deps_core::Ecosystem;
+use deps_core::{Ecosystem, Position};
 use libfuzzer_sys::fuzz_target;
 use std::sync::{Arc, LazyLock};
-use tower_lsp_server::ls_types::Position;
 
 /// One instance per ecosystem, sharing a single [`deps_core::HttpCache`] — none of it is
 /// ever exercised here, since both fuzzed methods operate on raw text only, never on the
