@@ -57,7 +57,8 @@ fn main() -> ExitCode {
         FailOnPolicy::new(args.fail_on.clone())
     };
 
-    let (report, had_execution_error) = runtime.block_on(run_check(walk_paths, cli_config));
+    let (report, had_execution_error) =
+        runtime.block_on(run_check(walk_paths, cli_config, args.respect_gitignore));
 
     let rendered = match args.format {
         OutputFormat::Table => format::table::render(&report),
@@ -85,7 +86,11 @@ fn main() -> ExitCode {
 /// manifest, returning the assembled [`CheckReport`] and whether any manifest's registry
 /// fetch failed (offline excluded) or failed to parse — either of which makes the report
 /// incomplete, independent of `--fail-on` (FR-012).
-async fn run_check(paths: Vec<PathBuf>, cli_config: CliConfig) -> (CheckReport, bool) {
+async fn run_check(
+    paths: Vec<PathBuf>,
+    cli_config: CliConfig,
+    respect_gitignore: bool,
+) -> (CheckReport, bool) {
     let policy = cli_config.policy;
     let ecosystem_runtime = EcosystemRuntime::from_policy(&policy);
     let cache = Arc::new(HttpCache::with_policy(Arc::clone(
@@ -105,7 +110,7 @@ async fn run_check(paths: Vec<PathBuf>, cli_config: CliConfig) -> (CheckReport, 
         policy,
     };
 
-    let walk_outcome = walk::walk(&paths, &ecosystem_registry);
+    let walk_outcome = walk::walk(&paths, &ecosystem_registry, respect_gitignore);
     let mut had_execution_error = false;
     for error in &walk_outcome.walk_errors {
         eprintln!("deps-cli: warning: {error}");
@@ -125,6 +130,28 @@ async fn run_check(paths: Vec<PathBuf>, cli_config: CliConfig) -> (CheckReport, 
             "deps-cli: warning: {} is not recognized by any ecosystem",
             path.display()
         );
+    }
+    for path in &walk_outcome.ignored_manifests {
+        // #1109 / reviewer follow-up: a manifest an ecosystem would have claimed was excluded
+        // from the scan without being asked to — either an ignore rule under
+        // --respect-gitignore, or a PRUNED_DIRECTORIES match in any mode. Either way the
+        // report is incomplete, so this must not silently exit 0.
+        eprintln!(
+            "deps-cli: warning: {} looks like a manifest but was excluded from the scan (a .gitignore/.ignore rule, or a pruned directory such as vendor/build/dist)",
+            path.display()
+        );
+        had_execution_error = true;
+    }
+    if walk_outcome.manifests.is_empty() {
+        // Defensive visibility (#1108, reviewer follow-up #1): zero manifests discovered at
+        // all is operationally different from manifests found but clean — the former is far
+        // more likely to be a walk/routing bug (wrong root, every manifest pruned) than a
+        // genuinely dependency-free tree, and must not look identical to a clean exit 0 to a
+        // CI system gating on exit code alone. Must set had_execution_error, not just warn —
+        // otherwise this is the exact "broken scan looks like a clean one" failure #1108 was
+        // about, just reached a different way.
+        eprintln!("deps-cli: warning: no manifests were discovered under the given path(s)");
+        had_execution_error = true;
     }
 
     let mut findings = Vec::new();
