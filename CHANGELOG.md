@@ -11,13 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **ci**: `release.yml` now builds `deps-lsp` and `deps-cli` in separate cargo/cross invocations, preventing cargo's feature-unification from linking `tower-lsp-server` into the released `deps-cli` binary (#1110, resolves #1103)
 
 ### Changed
-- **Breaking**: `crates/github-action` now packaged as a Docker-based action (`ghcr.io/bug-ops/deps-lsp-github-action`), Trivy-scanned on every PR and before each publish, with a pre-built `deps-cli` instead of a composite `cargo install` wrapper — requires a Linux runner and drops the `version` input
+- **Breaking**: `crates/github-action` now packaged as a Docker-based action (`ghcr.io/bug-ops/deps-lsp-github-action`), Trivy-scanned on every PR and before each publish, with a pre-built `deps-cli` instead of a composite `cargo install` wrapper — requires a Linux runner and drops the `version` input (#1126, resolves #1123)
 - **Breaking (public API)**: **deps-lsp**: `lsp_types_interop` no longer exposes `from_lsp_position`/`to_lsp_position`/`from_lsp_range` (unused outside its own tests), and `to_lsp_uri` now delegates to `deps_core::to_ls_uri` instead of reimplementing the conversion (#1113)
 - **deps-core**: migrated restriction-lint `#[allow(...)]` attributes to `#[expect(..., reason = "...")]`, and removed unused dev-dependencies across 8 crates (7 ecosystem crates plus `deps-lsp`) (#1113)
 - **docs**: root `README.md` shrunk from a full reference manual back to a pitch-and-getting-started page; editor setup, the configuration option reference, performance benchmarks, project structure, and the `deps-core` versioning policy moved into new/expanded mdBook pages (`book/src/editor-setup.md`, `book/src/configuration.md`, and additions to `book/src/architecture.md`) (#1100)
 
 ### Added
-- **ci**: `crates/github-action` wired into this repo's own `ci.yml` as a SARIF gate, uploading results to Code Scanning and failing the build on a `vulnerable`/`yanked`/`unsatisfiable` policy violation
+- **ci**: `crates/github-action` wired into this repo's own `ci.yml` as a SARIF gate, uploading results to Code Scanning and failing the build on a `vulnerable`/`yanked`/`unsatisfiable` policy violation (#1126, resolves #1122)
 - **deps-cli, ci**: pre-built `deps-cli` binaries for all 8 release targets and a new `scripts/install-deps-cli.sh` install script (`curl -fsSL ... | sh`) with checksum verification (#1107)
 - **docs**: new mdBook at `book/` reorganizing the former `docs/ECOSYSTEM_GUIDE.md`'s flat feature list into cross-ecosystem, per-ecosystem, and contributor-tutorial chapters, published to GitHub Pages by a new `.github/workflows/mdbook.yml`; `docs/ECOSYSTEM_GUIDE.md` is removed, fully superseded by the book (resolves #1095) (#1096)
 - **deps-cli**: `deps-cli check --format sarif` SARIF 2.1.0 output, a `.pre-commit-hooks.yaml` entry, and a `crates/github-action` composite GitHub Action wrapping the SARIF check for `github/codeql-action/upload-sarif` (spec 062 PR 3, resolves #1063, #711) (#1078)
