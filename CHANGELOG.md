@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **ci**: `release.yml` now builds `deps-lsp` and `deps-cli` in separate cargo/cross invocations, preventing cargo's feature-unification from linking `tower-lsp-server` into the released `deps-cli` binary (resolves #1103)
+
 ### Changed
 - **docs**: root `README.md` shrunk from a full reference manual back to a pitch-and-getting-started page; editor setup, the configuration option reference, performance benchmarks, project structure, and the `deps-core` versioning policy moved into new/expanded mdBook pages (`book/src/editor-setup.md`, `book/src/configuration.md`, and additions to `book/src/architecture.md`) (#1100)
 
