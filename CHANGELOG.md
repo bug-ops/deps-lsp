@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **docs**: root `README.md` shrunk from a full reference manual back to a pitch-and-getting-started page; editor setup, the configuration option reference, performance benchmarks, project structure, and the `deps-core` versioning policy moved into new/expanded mdBook pages (`book/src/editor-setup.md`, `book/src/configuration.md`, and additions to `book/src/architecture.md`) (#1100)
 
 ### Added
-- **deps-cli, ci**: pre-built `deps-cli` binaries for all 8 release targets and a new `scripts/install-deps-cli.sh` install script (`curl -fsSL ... | sh`) with checksum verification
+- **deps-cli, ci**: pre-built `deps-cli` binaries for all 8 release targets and a new `scripts/install-deps-cli.sh` install script (`curl -fsSL ... | sh`) with checksum verification (#1107)
 - **docs**: new mdBook at `book/` reorganizing the former `docs/ECOSYSTEM_GUIDE.md`'s flat feature list into cross-ecosystem, per-ecosystem, and contributor-tutorial chapters, published to GitHub Pages by a new `.github/workflows/mdbook.yml`; `docs/ECOSYSTEM_GUIDE.md` is removed, fully superseded by the book (resolves #1095) (#1096)
 - **deps-cli**: `deps-cli check --format sarif` SARIF 2.1.0 output, a `.pre-commit-hooks.yaml` entry, and a `crates/github-action` composite GitHub Action wrapping the SARIF check for `github/codeql-action/upload-sarif` (spec 062 PR 3, resolves #1063, #711) (#1078)
 - **deps-cli**: SARIF `tool.driver.rules` entries now get `name`/`shortDescription`, and OSV-advisory rules additionally get `helpUri`/`fullDescription`; results carry `partialFingerprints` and `run.automationDetails.id` (resolves #1077) (#1082)
