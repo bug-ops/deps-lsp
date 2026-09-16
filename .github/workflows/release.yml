@@ -102,41 +102,49 @@ jobs:
 
       - name: Build release (cross)
         if: matrix.use_cross
-        run: cross build --package deps-lsp --release --target ${{ matrix.target }}
+        run: cross build --package deps-lsp --package deps-cli --release --target ${{ matrix.target }}
 
       - name: Build release (native)
         if: "!matrix.use_cross"
-        run: cargo build --package deps-lsp --release --target ${{ matrix.target }}
+        run: cargo build --package deps-lsp --package deps-cli --release --target ${{ matrix.target }}
 
-      - name: Get binary name
+      - name: Get binary names
         id: binary
         run: |
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-            echo "name=deps-lsp.exe" >> $GITHUB_OUTPUT
+            echo "lsp_name=deps-lsp.exe" >> $GITHUB_OUTPUT
+            echo "cli_name=deps-cli.exe" >> $GITHUB_OUTPUT
           else
-            echo "name=deps-lsp" >> $GITHUB_OUTPUT
+            echo "lsp_name=deps-lsp" >> $GITHUB_OUTPUT
+            echo "cli_name=deps-cli" >> $GITHUB_OUTPUT
           fi
         shell: bash
 
-      - name: Strip binary (Linux/macOS, native only)
+      - name: Strip binaries (Linux/macOS, native only)
         if: matrix.os != 'windows-latest' && !matrix.use_cross
-        run: strip target/${{ matrix.target }}/release/${{ steps.binary.outputs.name }}
+        run: |
+          strip target/${{ matrix.target }}/release/${{ steps.binary.outputs.lsp_name }}
+          strip target/${{ matrix.target }}/release/${{ steps.binary.outputs.cli_name }}
 
       - name: Create archive (Unix)
         if: matrix.archive == 'tar.gz'
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ../../../deps-lsp-${{ matrix.target }}.tar.gz ${{ steps.binary.outputs.name }}
+          tar czf ../../../deps-lsp-${{ matrix.target }}.tar.gz ${{ steps.binary.outputs.lsp_name }}
+          tar czf ../../../deps-cli-${{ matrix.target }}.tar.gz ${{ steps.binary.outputs.cli_name }}
           cd ../../..
           shasum -a 256 deps-lsp-${{ matrix.target }}.tar.gz > deps-lsp-${{ matrix.target }}.tar.gz.sha256
+          shasum -a 256 deps-cli-${{ matrix.target }}.tar.gz > deps-cli-${{ matrix.target }}.tar.gz.sha256
 
       - name: Create archive (Windows)
         if: matrix.archive == 'zip'
         run: |
           cd target/${{ matrix.target }}/release
-          7z a ../../../deps-lsp-${{ matrix.target }}.zip ${{ steps.binary.outputs.name }}
+          7z a ../../../deps-lsp-${{ matrix.target }}.zip ${{ steps.binary.outputs.lsp_name }}
+          7z a ../../../deps-cli-${{ matrix.target }}.zip ${{ steps.binary.outputs.cli_name }}
           cd ../../..
           certUtil -hashfile deps-lsp-${{ matrix.target }}.zip SHA256 > deps-lsp-${{ matrix.target }}.zip.sha256
+          certUtil -hashfile deps-cli-${{ matrix.target }}.zip SHA256 > deps-cli-${{ matrix.target }}.zip.sha256
         shell: cmd
 
       - name: Upload release archive
@@ -144,6 +152,7 @@ jobs:
         with:
           files: |
             deps-lsp-${{ matrix.target }}.*
+            deps-cli-${{ matrix.target }}.*
 
   build-wasm:
     name: Build WASM (Zed Extension)
@@ -235,7 +244,9 @@ jobs:
 
             ## Installation
 
-            ### Binary Installation
+            ### deps-lsp
+
+            #### Binary Installation
 
             Download the appropriate binary for your platform from the assets below:
 
@@ -259,15 +270,57 @@ jobs:
             deps-lsp --version
             ```
 
-            ### Cargo Installation
+            #### Cargo Installation
 
             ```bash
             cargo install deps-lsp
             ```
 
-            ### Zed Extension
+            #### Zed Extension
 
             The Zed extension will automatically download the appropriate binary from this release.
+
+            ### deps-cli
+
+            #### Install Script
+
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/bug-ops/deps-lsp/main/scripts/install-deps-cli.sh | sh
+            ```
+
+            The script detects your OS/architecture, downloads the matching release asset below,
+            verifies its SHA256 checksum, and installs `deps-cli` to `${CARGO_HOME:-~/.cargo}/bin`
+            (falling back to `~/.local/bin`). Set `DEPS_CLI_VERSION` to install a specific tag, or
+            `DEPS_CLI_INSTALL_DIR` to override the install directory. Windows is not supported by the
+            script — download the `.zip` asset below instead.
+
+            #### Binary Installation
+
+            Download the appropriate binary for your platform from the assets below:
+
+            - **Linux x86_64 (glibc)**: `deps-cli-x86_64-unknown-linux-gnu.tar.gz`
+            - **Linux aarch64 (glibc)**: `deps-cli-aarch64-unknown-linux-gnu.tar.gz`
+            - **Linux x86_64 (musl)**: `deps-cli-x86_64-unknown-linux-musl.tar.gz`
+            - **Linux aarch64 (musl)**: `deps-cli-aarch64-unknown-linux-musl.tar.gz`
+            - **macOS x86_64**: `deps-cli-x86_64-apple-darwin.tar.gz`
+            - **macOS ARM64**: `deps-cli-aarch64-apple-darwin.tar.gz`
+            - **Windows x64**: `deps-cli-x86_64-pc-windows-msvc.zip`
+            - **Windows ARM64**: `deps-cli-aarch64-pc-windows-msvc.zip`
+
+            ```bash
+            # Linux/macOS
+            tar xzf deps-cli-*.tar.gz
+            sudo mv deps-cli /usr/local/bin/
+
+            # Verify installation
+            deps-cli --version
+            ```
+
+            #### Cargo Installation
+
+            ```bash
+            cargo install deps-cli
+            ```
 
             ## Checksums
 
