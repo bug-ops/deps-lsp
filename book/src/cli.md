@@ -173,21 +173,32 @@ repos:
 ## GitHub Action
 
 [`crates/github-action`](https://github.com/bug-ops/deps-lsp/blob/main/crates/github-action)
-wraps `deps-cli check --format sarif` as a composite action. It installs `deps-cli`, runs
-the check, and writes a SARIF file — it does **not** upload it to GitHub code scanning
-itself; wire `github/codeql-action/upload-sarif` after it in your own workflow:
+is a Docker-based action wrapping `deps-cli check --format sarif`. The published image
+(`ghcr.io/bug-ops/deps-lsp-github-action`) already bundles a `deps-cli` binary — no toolchain
+setup or install step required. It runs the check and writes a SARIF file — it does **not**
+upload it to GitHub code scanning itself; wire `github/codeql-action/upload-sarif` after it in
+your own workflow. Every published image is Trivy-scanned for CRITICAL/HIGH vulnerabilities
+before publish, and on every PR touching `crates/github-action/`.
+
+> **Note:** Docker-based actions only run on Linux runners (`runs-on: ubuntu-latest` or
+> similar) — `macos-latest` and `windows-latest` are not supported.
 
 ```yaml
-- uses: bug-ops/deps-lsp/crates/github-action@main
-  id: deps-check
-  with:
-    fail-on: vulnerable,yanked,unsatisfiable
-- uses: github/codeql-action/upload-sarif@v3
-  with:
-    sarif_file: ${{ steps.deps-check.outputs.sarif-file }}
-- name: Fail the build on a policy violation
-  if: steps.deps-check.outputs.exit-code == '1'
-  run: exit 1
+jobs:
+  deps-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bug-ops/deps-lsp/crates/github-action@main
+        id: deps-check
+        with:
+          fail-on: vulnerable,yanked,unsatisfiable
+      - uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ${{ steps.deps-check.outputs.sarif-file }}
+      - name: Fail the build on a policy violation
+        if: steps.deps-check.outputs.exit-code == '1'
+        run: exit 1
 ```
 
 | Input | Description | Default |
@@ -196,7 +207,9 @@ itself; wire `github/codeql-action/upload-sarif` after it in your own workflow:
 | `fail-on` | Comma-separated categories that exit 1 | `vulnerable,yanked,unsatisfiable` |
 | `cooldown` | Overrides `freshness.cooldown_secs` (e.g. `3d`) | unset |
 | `config` | Path to a **fully-trusted** `deps.toml` — see warning below | unset |
-| `version` | `deps-cli` version to install from crates.io | latest |
+
+The `deps-cli` version is baked into the image at build time — pin a specific version via the
+image tag (`ghcr.io/bug-ops/deps-lsp-github-action:X.Y.Z`) instead of a `version` input.
 
 The action only fails the job itself on `exit-code` `2` (an execution error — `sarif-file`
 is left unset, since the file may be missing or truncated). A `--fail-on` policy violation

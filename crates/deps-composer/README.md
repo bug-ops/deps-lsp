@@ -3,7 +3,7 @@
 [![Crates.io](https://img.shields.io/crates/v/deps-composer)](https://crates.io/crates/deps-composer)
 [![docs.rs](https://img.shields.io/docsrs/deps-composer)](https://docs.rs/deps-composer)
 [![CI](https://github.com/bug-ops/deps-lsp/actions/workflows/ci.yml/badge.svg)](https://github.com/bug-ops/deps-lsp/actions)
-[![codecov](https://codecov.io/gh/bug-ops/deps-lsp/graph/badge.svg?token=S71PTINTGQ&flag=deps-composer)](https://codecov.io/gh/bug-ops/deps-lsp)
+[![codecov](https://codecov.io/gh/bug-ops/deps-lsp/graph/badge.svg?token=S71PTINTGQ&component=deps-composer)](https://codecov.io/gh/bug-ops/deps-lsp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](../../LICENSE)
 
 PHP/Composer support for deps-lsp.
@@ -29,7 +29,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 
 ```toml
 [dependencies]
-deps-composer = "1.0"
+deps-composer = "1.1"
 ```
 
 > [!IMPORTANT]

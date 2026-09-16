@@ -3,7 +3,7 @@
 [![Crates.io](https://img.shields.io/crates/v/deps-swift)](https://crates.io/crates/deps-swift)
 [![docs.rs](https://img.shields.io/docsrs/deps-swift)](https://docs.rs/deps-swift)
 [![CI](https://github.com/bug-ops/deps-lsp/actions/workflows/ci.yml/badge.svg)](https://github.com/bug-ops/deps-lsp/actions)
-[![codecov](https://codecov.io/gh/bug-ops/deps-lsp/graph/badge.svg?token=S71PTINTGQ&flag=deps-swift)](https://codecov.io/gh/bug-ops/deps-lsp)
+[![codecov](https://codecov.io/gh/bug-ops/deps-lsp/graph/badge.svg?token=S71PTINTGQ&component=deps-swift)](https://codecov.io/gh/bug-ops/deps-lsp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](../../LICENSE)
 
 Swift Package Manager support for deps-lsp.
@@ -27,7 +27,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 
 ```toml
 [dependencies]
-deps-swift = "1.0"
+deps-swift = "1.1"
 ```
 
 > [!IMPORTANT]

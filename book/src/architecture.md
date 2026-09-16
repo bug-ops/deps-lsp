@@ -94,7 +94,7 @@ deps-lsp/
 │   ├── deps-engine/    # Internal: ecosystem registration + verdict classification, shared by deps-lsp/deps-cli
 │   ├── deps-lsp/       # Main LSP server
 │   ├── deps-cli/       # `deps-cli check` — CLI for CI/pre-commit/shell workflows
-│   ├── github-action/  # Composite GitHub Action wrapping `deps-cli check --format sarif`
+│   ├── github-action/  # Docker-based GitHub Action wrapping `deps-cli check --format sarif`
 │   └── deps-zed/       # Zed extension (WASM)
 ├── .config/            # nextest configuration
 └── .github/            # CI/CD workflows

@@ -26,7 +26,7 @@ coverage:
 
 # Comment on PRs with coverage details
 comment:
-  layout: "reach,diff,flags,files"
+  layout: "reach,diff,components,files"
   behavior: default
   require_changes: false
   require_base: false
@@ -40,48 +40,84 @@ ignore:
   - "**/main.rs"
   - "crates/deps-zed/**/*"  # WASM extension has limited testing
 
-# Per-crate flags for detailed coverage tracking
-# Codecov automatically filters coverage by paths defined here
-flags:
-  overall:
-    paths:
-      - crates/
-    carryforward: true
-
-  deps-core:
-    paths:
-      - crates/deps-core/src/
-    carryforward: true
-
-  deps-cargo:
-    paths:
-      - crates/deps-cargo/src/
-    carryforward: true
-
-  deps-npm:
-    paths:
-      - crates/deps-npm/src/
-    carryforward: true
-
-  deps-pypi:
-    paths:
-      - crates/deps-pypi/src/
-    carryforward: true
-
-  deps-go:
-    paths:
-      - crates/deps-go/src/
-    carryforward: true
-
-  deps-bundler:
-    paths:
-      - crates/deps-bundler/src/
-    carryforward: true
-
-  deps-lsp:
-    paths:
-      - crates/deps-lsp/src/
-    carryforward: true
+# Per-crate components for detailed coverage tracking.
+# Unlike `flags`, components are derived from the single workspace lcov.info
+# upload via path globs below — no per-crate CI upload required. See each
+# crate README's codecov badge (?component=<component_id>).
+component_management:
+  individual_components:
+    - component_id: deps-bundler
+      name: deps-bundler
+      paths:
+        - crates/deps-bundler/**
+    - component_id: deps-cargo
+      name: deps-cargo
+      paths:
+        - crates/deps-cargo/**
+    - component_id: deps-cli
+      name: deps-cli
+      paths:
+        - crates/deps-cli/**
+    - component_id: deps-composer
+      name: deps-composer
+      paths:
+        - crates/deps-composer/**
+    - component_id: deps-core
+      name: deps-core
+      paths:
+        - crates/deps-core/**
+    - component_id: deps-dart
+      name: deps-dart
+      paths:
+        - crates/deps-dart/**
+    - component_id: deps-deno
+      name: deps-deno
+      paths:
+        - crates/deps-deno/**
+    - component_id: deps-engine
+      name: deps-engine
+      paths:
+        - crates/deps-engine/**
+    - component_id: deps-github-actions
+      name: deps-github-actions
+      paths:
+        - crates/deps-github-actions/**
+    - component_id: deps-gitlab-ci
+      name: deps-gitlab-ci
+      paths:
+        - crates/deps-gitlab-ci/**
+    - component_id: deps-go
+      name: deps-go
+      paths:
+        - crates/deps-go/**
+    - component_id: deps-gradle
+      name: deps-gradle
+      paths:
+        - crates/deps-gradle/**
+    - component_id: deps-lsp
+      name: deps-lsp
+      paths:
+        - crates/deps-lsp/**
+    - component_id: deps-maven
+      name: deps-maven
+      paths:
+        - crates/deps-maven/**
+    - component_id: deps-npm
+      name: deps-npm
+      paths:
+        - crates/deps-npm/**
+    - component_id: deps-nuget
+      name: deps-nuget
+      paths:
+        - crates/deps-nuget/**
+    - component_id: deps-pypi
+      name: deps-pypi
+      paths:
+        - crates/deps-pypi/**
+    - component_id: deps-swift
+      name: deps-swift
+      paths:
+        - crates/deps-swift/**
 
 # Codecov will wait this long for coverage reports
 codecov:
