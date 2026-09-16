@@ -1,10 +1,10 @@
 //! Derives [`VulnSeverity`] from a raw OSV record, and maps it to
-//! [`DiagnosticSeverity`].
+//! [`crate::diagnostic::Severity`].
 //!
 //! See `architecture.md` §6 for the precedence rules and the rationale for
 //! capping at `WARNING` rather than `ERROR`.
 
-use tower_lsp_server::ls_types::DiagnosticSeverity;
+use crate::diagnostic::Severity;
 
 use super::types::{OsvAffected, VulnSeverity};
 
@@ -145,7 +145,7 @@ pub(super) fn classify(
     VulnSeverity::Unknown
 }
 
-/// Maps a [`VulnSeverity`] to the [`DiagnosticSeverity`] used to render it.
+/// Maps a [`VulnSeverity`] to the [`crate::diagnostic::Severity`] used to render it.
 ///
 /// `Critical`/`High`/`Unknown`/`Malicious` all cap at `WARNING` rather than
 /// `ERROR`: `ERROR` conventionally means "this file is broken", and a valid
@@ -171,23 +171,23 @@ pub(super) fn classify(
 /// // as `deps_core::osv::diagnostic_severity_for`.
 /// use deps_core::osv::VulnSeverity;
 /// use deps_core::osv::diagnostic_severity_for as to_diagnostic_severity;
-/// use tower_lsp_server::ls_types::DiagnosticSeverity;
+/// use deps_core::diagnostic::Severity;
 ///
-/// assert_eq!(to_diagnostic_severity(VulnSeverity::Critical), DiagnosticSeverity::WARNING);
-/// assert_eq!(to_diagnostic_severity(VulnSeverity::Low), DiagnosticSeverity::INFORMATION);
-/// assert_eq!(to_diagnostic_severity(VulnSeverity::Unknown), DiagnosticSeverity::WARNING);
-/// assert_eq!(to_diagnostic_severity(VulnSeverity::Malicious), DiagnosticSeverity::WARNING);
-/// assert_eq!(to_diagnostic_severity(VulnSeverity::Informational), DiagnosticSeverity::INFORMATION);
+/// assert_eq!(to_diagnostic_severity(VulnSeverity::Critical), Severity::Warning);
+/// assert_eq!(to_diagnostic_severity(VulnSeverity::Low), Severity::Information);
+/// assert_eq!(to_diagnostic_severity(VulnSeverity::Unknown), Severity::Warning);
+/// assert_eq!(to_diagnostic_severity(VulnSeverity::Malicious), Severity::Warning);
+/// assert_eq!(to_diagnostic_severity(VulnSeverity::Informational), Severity::Information);
 /// ```
 #[must_use]
-pub const fn to_diagnostic_severity(severity: VulnSeverity) -> DiagnosticSeverity {
+pub const fn to_diagnostic_severity(severity: VulnSeverity) -> Severity {
     match severity {
         VulnSeverity::Critical
         | VulnSeverity::High
         | VulnSeverity::Unknown
-        | VulnSeverity::Malicious => DiagnosticSeverity::WARNING,
+        | VulnSeverity::Malicious => Severity::Warning,
         VulnSeverity::Medium | VulnSeverity::Low | VulnSeverity::Informational => {
-            DiagnosticSeverity::INFORMATION
+            Severity::Information
         }
     }
 }
@@ -619,31 +619,31 @@ mod tests {
     fn to_diagnostic_severity_mapping() {
         assert_eq!(
             to_diagnostic_severity(VulnSeverity::Critical),
-            DiagnosticSeverity::WARNING
+            Severity::Warning
         );
         assert_eq!(
             to_diagnostic_severity(VulnSeverity::High),
-            DiagnosticSeverity::WARNING
+            Severity::Warning
         );
         assert_eq!(
             to_diagnostic_severity(VulnSeverity::Medium),
-            DiagnosticSeverity::INFORMATION
+            Severity::Information
         );
         assert_eq!(
             to_diagnostic_severity(VulnSeverity::Low),
-            DiagnosticSeverity::INFORMATION
+            Severity::Information
         );
         assert_eq!(
             to_diagnostic_severity(VulnSeverity::Unknown),
-            DiagnosticSeverity::WARNING
+            Severity::Warning
         );
         assert_eq!(
             to_diagnostic_severity(VulnSeverity::Malicious),
-            DiagnosticSeverity::WARNING
+            Severity::Warning
         );
         assert_eq!(
             to_diagnostic_severity(VulnSeverity::Informational),
-            DiagnosticSeverity::INFORMATION
+            Severity::Information
         );
     }
 }

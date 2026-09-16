@@ -18,14 +18,19 @@
 //! package from `cached_versions`), so no special-casing is needed here.
 
 use std::any::Any;
+#[cfg(feature = "lsp-responses")]
 use std::collections::HashSet;
 use std::sync::Arc;
+#[cfg(feature = "lsp-responses")]
 use tower_lsp_server::ls_types::{CompletionItem, Hover, HoverContents, Position, Range};
 use url::Url;
 
+#[cfg(feature = "lsp-responses")]
+use deps_core::completion::Completions;
+#[cfg(feature = "lsp-responses")]
+use deps_core::parser::DependencySource;
 use deps_core::{
-    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, completion::Completions,
-    lsp_helpers::EcosystemFormatter, parser::DependencySource,
+    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, lsp_helpers::EcosystemFormatter,
 };
 
 use crate::config::NuGetParseContext;
@@ -38,6 +43,7 @@ use crate::registry::NuGetRegistry;
 /// follow-up) — mirrors `deps_core::lsp_helpers::hover`'s own private `HOVER_FALLBACK_TIMEOUT`
 /// for its analogous fallback fetch: hover responses must return quickly, and without this
 /// bound a pathological feed's registration-hive walk could run unbounded.
+#[cfg(feature = "lsp-responses")]
 const HOVER_UNLISTED_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// NuGet/.NET ecosystem implementation.
@@ -83,6 +89,7 @@ impl NuGetEcosystem {
     /// complete_package_names`'s identical rationale): the string here is a prefix the user
     /// typed into the name field, not a resolved private dependency name, so it is safe to
     /// send to api.nuget.org unconditionally — unlike [`Self::complete_versions`].
+    #[cfg(feature = "lsp-responses")]
     async fn complete_package_names(&self, prefix: &str, range: Range) -> Vec<CompletionItem> {
         deps_core::completion::complete_package_names_generic(
             self.registry.as_ref(),
@@ -108,6 +115,7 @@ impl NuGetEcosystem {
     /// `Registry::get_versions_from`'s permissive routing of an unrecognized source to the
     /// default public client (matching hover/diagnostics/code-actions' identical gate) from
     /// leaking one for completions too.
+    #[cfg(feature = "lsp-responses")]
     async fn complete_versions(
         &self,
         parse_result: &dyn ParseResultTrait,
@@ -130,6 +138,7 @@ impl NuGetEcosystem {
     /// Test-only hook to inject a [`NuGetRegistry`] pointed at a mock service index
     /// (`NuGetRegistry::new`/`Self::new` always resolve the real `api.nuget.org`).
     #[cfg(test)]
+    #[cfg(feature = "lsp-responses")]
     fn with_registry(registry: NuGetRegistry) -> Self {
         Self::with_context(Arc::new(registry), NuGetParseContext::default())
     }
@@ -240,6 +249,7 @@ impl Ecosystem for NuGetEcosystem {
         &self.formatter
     }
 
+    #[cfg(feature = "lsp-responses")]
     fn complete_package_name<'a>(
         &'a self,
         _request: deps_core::completion::CompletionRequest<'a>,
@@ -249,6 +259,7 @@ impl Ecosystem for NuGetEcosystem {
         Box::pin(async move { self.complete_package_names(&prefix, range).await.into() })
     }
 
+    #[cfg(feature = "lsp-responses")]
     fn complete_version<'a>(
         &'a self,
         request: deps_core::completion::CompletionRequest<'a>,
@@ -296,6 +307,7 @@ impl Ecosystem for NuGetEcosystem {
     /// enrichment is already skipped entirely for alternate feeds in phase 1 (see that
     /// method's own tier gate), so this loses nothing a private-feed hover would have shown
     /// anyway.
+    #[cfg(feature = "lsp-responses")]
     fn generate_hover<'a>(
         &'a self,
         parse_result: &'a dyn ParseResultTrait,
@@ -318,9 +330,9 @@ impl Ecosystem for NuGetEcosystem {
             // it finds none, the render above resolves to `None` too, so the unlisted fetch
             // is skipped rather than issued for a hover that will be empty anyway.
             let dep = parse_result.dependencies().into_iter().find(|d| {
-                deps_core::position_in_range(position, d.name_range().into())
+                deps_core::position_in_range(position.into(), d.name_range())
                     || d.version_range()
-                        .is_some_and(|r| deps_core::position_in_range(position, r.into()))
+                        .is_some_and(|r| deps_core::position_in_range(position.into(), r))
             });
             let Some(dep) = dep else {
                 return base_hover.await;
@@ -382,7 +394,7 @@ impl Ecosystem for NuGetEcosystem {
     fn fallback_completion_prefix<'a>(
         &self,
         content: &'a str,
-        position: Position,
+        position: deps_core::position::Position,
     ) -> Option<&'a str> {
         let line = deps_core::fallback_completion::line_at(content, position)?;
         if !is_in_dependencies_section(content, position.line as usize) {
@@ -391,7 +403,11 @@ impl Ecosystem for NuGetEcosystem {
         Some(extract_prefix(line, position.character))
     }
 
-    fn fallback_completion_is_bare(&self, _content: &str, _position: Position) -> bool {
+    fn fallback_completion_is_bare(
+        &self,
+        _content: &str,
+        _position: deps_core::position::Position,
+    ) -> bool {
         // `extract_prefix` (`strip_open_xml_attribute_value`) only ever produces a
         // non-empty prefix when the cursor is already inside an open `Include="`/`id="`
         // attribute value — the caller's empty-prefix guard rejects every other case
@@ -452,6 +468,7 @@ fn extract_prefix(line: &str, character: u32) -> &str {
 /// pass through unchanged.
 // `tick` comes from `find('`')`, an ASCII byte, so both slice bounds are always char
 // boundaries.
+#[cfg(feature = "lsp-responses")]
 #[allow(clippy::string_slice)]
 fn annotate_unlisted_versions(markdown: &str, unlisted: &HashSet<String>) -> String {
     let mut out = String::with_capacity(markdown.len() + unlisted.len() * 14);
@@ -480,6 +497,7 @@ fn annotate_unlisted_versions(markdown: &str, unlisted: &HashSet<String>) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "lsp-responses")]
     use crate::types::NuGetDependency;
 
     // #758: exact-value `Ecosystem` conformance, replacing the hand-written
@@ -500,6 +518,7 @@ mod tests {
 
     // #758: the shared completion-prefix-length guard, replacing
     // test_complete_package_names_min_prefix (which only checked the empty-prefix case).
+    #[cfg(feature = "lsp-responses")]
     deps_core::completion_guard_conformance! {
         mod nuget_completion_guard_conformance;
         complete: |registry: &dyn deps_core::Registry, prefix: String| -> std::pin::Pin<
@@ -534,6 +553,7 @@ mod tests {
         assert!(eco.lockfile_provider().is_some());
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_package_name_completion_context_has_real_range() {
         // Regression test for #232: the textEdit range for a package-name completion
@@ -644,6 +664,7 @@ mod tests {
 
     /// A dependency on `line`, with a `version_range` there so position-based lookup (issue
     /// #593) can find it — mirrors `deps_go::ecosystem::tests::dep_with_source`.
+    #[cfg(feature = "lsp-responses")]
     fn dep_with_source(name: &str, source: DependencySource, line: u32) -> NuGetDependency {
         NuGetDependency {
             name: name.into(),
@@ -660,6 +681,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_complete_versions_position_based_lookup_finds_correct_dependency() {
         let mut server = mockito::Server::new_async().await;
@@ -711,6 +733,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_complete_versions_no_dependency_at_position_offers_nothing() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -739,6 +762,7 @@ mod tests {
     /// `can_resolve_source`'s gate (matching hover/diagnostics/code-actions' identical check,
     /// #248 leak class) must keep an unresolvable `CustomRegistry` source from ever reaching
     /// api.nuget.org. The `.expect(0)` mock fails the test if that endpoint is hit at all.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_complete_versions_gate_blocks_unresolvable_source() {
         let mut server = mockito::Server::new_async().await;
@@ -788,6 +812,7 @@ mod tests {
 
     /// An `AlternateRegistry` source whose index has no registered client offers no
     /// completions rather than falling back to the public registry.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_complete_versions_unregistered_alternate_offers_nothing() {
         let mut server = mockito::Server::new_async().await;
@@ -838,6 +863,7 @@ mod tests {
 
     /// A registered `AlternateRegistry` chain routes `complete_versions` through its own
     /// client, never the public root registry.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_complete_versions_routes_to_registered_alternate_client() {
         let mut alt_server = mockito::Server::new_async().await;
@@ -927,6 +953,7 @@ mod tests {
     /// Two dependencies sharing one `PackageName` but resolving to different sources must
     /// route independently by cursor position, not collapse into an ambiguous "offer nothing
     /// for either" result.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_complete_versions_same_name_different_sources_routes_by_position() {
         let mut server = mockito::Server::new_async().await;
@@ -984,6 +1011,7 @@ mod tests {
     /// End-to-end regression for issue #163: a `.csproj`/`Directory.Packages.props`
     /// bare-floor `Version` pinned behind the latest registry release must render `❌
     /// {latest}`, not `✅` — see `NuGetFormatter::is_requirement_up_to_date`.
+    #[cfg(feature = "lsp-responses")]
     async fn inlay_hint_labels(
         eco: &NuGetEcosystem,
         content: &str,
@@ -1024,6 +1052,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_inlay_hint_flags_outdated_csproj_package_reference() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1035,6 +1064,7 @@ mod tests {
         assert_eq!(labels, vec!["❌ 13.0.4"]);
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_inlay_hint_marks_up_to_date_csproj_package_reference() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1046,6 +1076,7 @@ mod tests {
         assert_eq!(labels, vec!["✅"]);
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_inlay_hint_flags_outdated_directory_packages_props() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1057,6 +1088,7 @@ mod tests {
         assert_eq!(labels, vec!["❌ 13.0.4"]);
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_inlay_hint_packages_config_exact_pin_unaffected() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1140,6 +1172,7 @@ mod tests {
 
     // --- annotate_unlisted_versions (D1, #451) ---
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_annotate_unlisted_versions_tags_matching_bullet() {
         let markdown = "**Recent versions**:\n- `2.0.0` *(latest)*\n- `1.0.0`\n";
@@ -1149,6 +1182,7 @@ mod tests {
         assert!(out.contains("- `2.0.0` *(latest)*\n"));
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_annotate_unlisted_versions_preserves_existing_tags_and_age_suffix() {
         let markdown = "- `1.2.1` *(yanked)* — 5 months ago\n";
@@ -1157,6 +1191,7 @@ mod tests {
         assert_eq!(out, "- `1.2.1` *(unlisted)* *(yanked)* — 5 months ago\n");
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_annotate_unlisted_versions_untagged_line_when_no_match() {
         let markdown = "- `1.0.0`\n";
@@ -1164,6 +1199,7 @@ mod tests {
         assert_eq!(annotate_unlisted_versions(markdown, &unlisted), markdown);
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_annotate_unlisted_versions_leaves_non_bullet_lines_untouched() {
         let markdown = "**Latest**: `1.0.0`\n\n---\n⌨️ **Press `Cmd+.` to update version**";
@@ -1171,6 +1207,7 @@ mod tests {
         assert_eq!(annotate_unlisted_versions(markdown, &unlisted), markdown);
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_annotate_unlisted_versions_no_trailing_newline_preserved() {
         let markdown = "- `1.0.0`";
@@ -1183,6 +1220,7 @@ mod tests {
 
     // --- generate_hover: hover-only unlisted enrichment (D1, #451) ---
 
+    #[cfg(feature = "lsp-responses")]
     fn nuget_service_index_body(base: &str) -> String {
         format!(
             r#"{{"version": "3.0.0", "resources": [
@@ -1193,6 +1231,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_hover_marks_unlisted_recent_version() {
         // See the comment in `test_package_name_completion_context_has_real_range` on why
@@ -1270,6 +1309,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_hover_degrades_gracefully_when_registration_fetch_fails() {
         // See the comment in `test_package_name_completion_context_has_real_range` on why
@@ -1333,6 +1373,7 @@ mod tests {
     /// resolves to `None` — the unlisted-versions fetch must be skipped entirely rather than
     /// issued (and awaited) for a hover response that will end up empty anyway. The `.expect(0)`
     /// mocks fail the test if either endpoint is hit.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_hover_skips_unlisted_fetch_when_no_dependency_at_position() {
         // See the comment in `test_package_name_completion_context_has_real_range` on why
@@ -1386,6 +1427,7 @@ mod tests {
     /// production api.nuget.org stand-in here) must receive **zero** requests, proving the
     /// resurrection bug (#248 class) is closed at the real `parse_manifest`/`Registry`
     /// call path, not just at `NuGetConfig`'s own unit-test level.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_private_feed_clear_resolves_zero_requests_to_public_registry() {
         // See the comment in `test_package_name_completion_context_has_real_range` on why
@@ -1475,6 +1517,7 @@ mod tests {
     /// `NuGet.Config` source blocked by the current `registries.workspace_registries` policy
     /// must populate `ParseResult::blocked_registries` at the real `parse_manifest` call path,
     /// not just leave the dependency unresolved with no trace.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_parse_manifest_blocked_source_populates_blocked_registries() {
         // See the comment in `test_package_name_completion_context_has_real_range` on why
@@ -1543,6 +1586,7 @@ mod tests {
     /// a real `NuGet.Config` that would have blocked the dependency's source if discovery
     /// ran, then proves a malicious-scheme/host URI pointing at the same real path falls back
     /// to the default (empty) config instead of walking the real directory.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_parse_manifest_skips_nuget_config_discovery_for_malicious_uri() {
         // See the comment in `test_package_name_completion_context_has_real_range` on why
@@ -1633,6 +1677,7 @@ mod tests {
     /// on `self.registry` (always `Public`-tier), sending the private package's real name to
     /// the mocked-as-public-registry endpoint regardless of which feed it actually resolved
     /// to. The `.expect(0)` mock fails the test if that endpoint is ever hit.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_hover_skips_unlisted_fetch_for_private_feed_dependency() {
         // See the comment in `test_package_name_completion_context_has_real_range` on why
@@ -1720,6 +1765,7 @@ mod tests {
     /// (`AlternateRegistry`) feed now gets the same hover-only `*(unlisted)*` marker a
     /// public-registry dependency gets — registration-hive enrichment is no longer skipped for
     /// alternate feeds.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_hover_marks_unlisted_for_alternate_registry_dependency() {
         // See the comment in `test_package_name_completion_context_has_real_range` on why
@@ -1818,6 +1864,7 @@ mod tests {
     /// proves `line_at` + `is_in_xml_tag_section` + `strip_open_xml_attribute_value`
     /// compose correctly through the real trait method on realistic multi-line
     /// `.csproj` content.
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_fallback_completion_prefix_multi_line_composition_include_attribute() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1826,13 +1873,14 @@ mod tests {
         let line = content.lines().nth(2).unwrap();
         let position = Position::new(2, line.chars().count() as u32);
         assert_eq!(
-            eco.fallback_completion_prefix(content, position),
+            eco.fallback_completion_prefix(content, position.into()),
             Some("Newt")
         );
     }
 
     /// Same composition, `packages.config`'s `id="..."` attribute instead of
     /// `PackageReference`'s `Include="..."`.
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_fallback_completion_prefix_multi_line_composition_id_attribute() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1841,7 +1889,7 @@ mod tests {
         let line = content.lines().nth(1).unwrap();
         let position = Position::new(1, line.chars().count() as u32);
         assert_eq!(
-            eco.fallback_completion_prefix(content, position),
+            eco.fallback_completion_prefix(content, position.into()),
             Some("Newt")
         );
     }
@@ -1853,6 +1901,7 @@ mod tests {
     /// before ever calling `fallback_completion_is_bare`, the only way this method is
     /// reached at all is with a non-empty prefix, which `strip_open_xml_attribute_value`
     /// only ever produces from inside an open target attribute value (#724/#728).
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_fallback_completion_prefix_multi_line_composition_non_target_attribute() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1860,11 +1909,15 @@ mod tests {
         let content = "<ItemGroup>\n  <PackageReference Include=\"Foo\" Version=\"1.0";
         let line = content.lines().nth(1).unwrap();
         let position = Position::new(1, line.chars().count() as u32);
-        assert_eq!(eco.fallback_completion_prefix(content, position), Some(""));
+        assert_eq!(
+            eco.fallback_completion_prefix(content, position.into()),
+            Some("")
+        );
     }
 
     /// A `<PropertyGroup>` is outside `<ItemGroup>`/`<packages>` entirely — the
     /// section gate itself must reject it, composed through the real trait method.
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_fallback_completion_prefix_multi_line_composition_outside_section() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1872,7 +1925,10 @@ mod tests {
         let content = "<Project>\n  <PropertyGroup>\n    <TargetFramework>net8.0";
         let line = content.lines().nth(2).unwrap();
         let position = Position::new(2, line.chars().count() as u32);
-        assert_eq!(eco.fallback_completion_prefix(content, position), None);
+        assert_eq!(
+            eco.fallback_completion_prefix(content, position.into()),
+            None
+        );
     }
 
     /// #724/#728: whenever the raw-text fallback path reaches a completable prefix at
@@ -1880,6 +1936,7 @@ mod tests {
     /// `fallback_completion_is_bare` must always report that so the caller inserts the
     /// bare package name instead of a full `<PackageReference .../>` tag that would
     /// nest inside the attribute value it was typed into.
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_fallback_completion_is_bare_always_true() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1887,7 +1944,7 @@ mod tests {
         let content = "<Project>\n  <ItemGroup>\n    <PackageReference Include=\"Newt";
         let line = content.lines().nth(2).unwrap();
         let position = Position::new(2, line.chars().count() as u32);
-        assert!(eco.fallback_completion_is_bare(content, position));
+        assert!(eco.fallback_completion_is_bare(content, position.into()));
     }
 
     /// #724: the default `fallback_bare_insert_text` (bare `metadata.name()`) is the
@@ -2083,6 +2140,7 @@ mod tests {
     // --- #793 characterization: `generate_completions` dispatch, pinned before the
     // wildcard-match refactor moves the match into `deps-core`.
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_completions_package_name_context_below_length_guard_is_empty() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -2127,6 +2185,7 @@ mod tests {
     /// Mirrors `test_complete_versions_gate_blocks_unresolvable_source`: an unresolvable
     /// `CustomRegistry` source must never reach api.nuget.org — the `.expect(0)` mock fails
     /// the test if that endpoint is hit at all.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_completions_version_context_gate_blocks_unresolvable_source() {
         let mut server = mockito::Server::new_async().await;

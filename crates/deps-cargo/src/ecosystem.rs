@@ -5,13 +5,18 @@
 
 use std::any::Any;
 use std::sync::Arc;
+#[cfg(feature = "lsp-responses")]
 use tower_lsp_server::ls_types::{CompletionItem, Position, Range};
 use url::Url;
 
+#[cfg(feature = "lsp-responses")]
+use deps_core::Version;
+#[cfg(feature = "lsp-responses")]
+use deps_core::completion::Completions;
+#[cfg(feature = "lsp-responses")]
 use deps_core::parser::DependencySource;
 use deps_core::{
-    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, Version, completion::Completions,
-    lsp_helpers::EcosystemFormatter,
+    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, lsp_helpers::EcosystemFormatter,
 };
 
 use crate::formatter::CargoFormatter;
@@ -40,6 +45,7 @@ pub struct CargoEcosystem {
 
 /// The source(s) a `CompletionContext::Version`/`Feature`'s bare `package_name` joins back
 /// to within a manifest's already-parsed dependencies (spec FR-012).
+#[cfg(feature = "lsp-responses")]
 enum CompletionSource {
     /// No dependency in the manifest has this exact name yet — most commonly because the
     /// user is still typing a brand-new dependency line, with `registry`/`registry-index`
@@ -55,6 +61,7 @@ enum CompletionSource {
 }
 
 /// Joins `package_name` back to `parse_result.dependencies()` by name (spec FR-012).
+#[cfg(feature = "lsp-responses")]
 fn resolve_completion_source(
     parse_result: &dyn ParseResultTrait,
     package_name: &deps_core::PackageName,
@@ -105,6 +112,7 @@ impl CargoEcosystem {
     /// [`CargoRegistry::with_crates_io_for_test`] pointed at a mock server) instead of
     /// building a live-registry one (#1045).
     #[cfg(test)]
+    #[cfg(feature = "lsp-responses")]
     #[must_use]
     pub(crate) fn with_registry_for_test(registry: CargoRegistry) -> Self {
         Self {
@@ -114,6 +122,7 @@ impl CargoEcosystem {
         }
     }
 
+    #[cfg(feature = "lsp-responses")]
     async fn complete_package_names(&self, prefix: &str, range: Range) -> Vec<CompletionItem> {
         // Package-name search is crates.io-only unconditionally (spec Out of Scope: the
         // sparse index protocol has no search endpoint), so this never needs source
@@ -148,6 +157,7 @@ impl CargoEcosystem {
     /// (`registry.rs`'s `mirrors_crates_io` arm): safe, since Cargo verifies per-version
     /// checksum equality against crates.io for a `[source.crates-io] replace-with` mirror, and
     /// matches hover's identical degrade-to-public behavior for the same flag.
+    #[cfg(feature = "lsp-responses")]
     async fn complete_versions(
         &self,
         parse_result: &dyn ParseResultTrait,
@@ -176,6 +186,7 @@ impl CargoEcosystem {
     /// same-name-different-source `Ambiguous` gap #593 fixed for versions (not itself in
     /// #593's scope: `features_range`-based position routing for this method is a follow-up,
     /// not done here).
+    #[cfg(feature = "lsp-responses")]
     async fn complete_features(
         &self,
         parse_result: &dyn ParseResultTrait,
@@ -276,6 +287,7 @@ impl Ecosystem for CargoEcosystem {
         &self.formatter
     }
 
+    #[cfg(feature = "lsp-responses")]
     fn complete_package_name<'a>(
         &'a self,
         _request: deps_core::completion::CompletionRequest<'a>,
@@ -285,6 +297,7 @@ impl Ecosystem for CargoEcosystem {
         Box::pin(async move { self.complete_package_names(&prefix, range).await.into() })
     }
 
+    #[cfg(feature = "lsp-responses")]
     fn complete_version<'a>(
         &'a self,
         request: deps_core::completion::CompletionRequest<'a>,
@@ -303,6 +316,7 @@ impl Ecosystem for CargoEcosystem {
         })
     }
 
+    #[cfg(feature = "lsp-responses")]
     fn complete_feature<'a>(
         &'a self,
         request: deps_core::completion::CompletionRequest<'a>,
@@ -319,7 +333,7 @@ impl Ecosystem for CargoEcosystem {
     fn fallback_completion_prefix<'a>(
         &self,
         content: &'a str,
-        position: Position,
+        position: deps_core::position::Position,
     ) -> Option<&'a str> {
         let line = deps_core::fallback_completion::line_at(content, position)?;
         if !is_in_dependencies_section(content, position.line as usize) {
@@ -358,10 +372,15 @@ fn extract_prefix(line: &str, character: u32) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "lsp-responses")]
     use crate::registry::CratesIoRegistry;
+    #[cfg(feature = "lsp-responses")]
     use crate::types::{CargoDependency, CargoDependencySection, DependencySource};
+    #[cfg(feature = "lsp-responses")]
     use deps_core::{EcosystemConfig, PackageVersions, VersionData};
+    #[cfg(feature = "lsp-responses")]
     use std::collections::HashMap;
+    #[cfg(feature = "lsp-responses")]
     use tower_lsp_server::ls_types::{InlayHintLabel, Position, Range};
 
     // #758: exact-value `Ecosystem` conformance, replacing the hand-written
@@ -388,6 +407,7 @@ mod tests {
     // `deps_core::completion::complete_package_names_generic`), with the same `limit: 20` —
     // without it, an always-offline real registry couldn't distinguish "the guard rejected
     // this prefix" from "the network call failed" (#758 impl-critic M1).
+    #[cfg(feature = "lsp-responses")]
     deps_core::completion_guard_conformance! {
         mod cargo_completion_guard_conformance;
         complete: |registry: &dyn deps_core::Registry, prefix: String| -> std::pin::Pin<
@@ -414,6 +434,7 @@ mod tests {
     }
 
     /// Mock dependency for testing
+    #[cfg(feature = "lsp-responses")]
     fn mock_dependency(
         name: &str,
         version: Option<&str>,
@@ -444,10 +465,12 @@ mod tests {
     }
 
     /// Mock parse result for testing
+    #[cfg(feature = "lsp-responses")]
     struct MockParseResult {
         dependencies: Vec<CargoDependency>,
     }
 
+    #[cfg(feature = "lsp-responses")]
     impl deps_core::ParseResult for MockParseResult {
         fn dependencies(&self) -> Vec<&dyn deps_core::Dependency> {
             self.dependencies
@@ -475,12 +498,14 @@ mod tests {
     /// `NotInManifest` for any name against it, so `complete_features` falls back to its
     /// pre-existing crates.io-only behavior. Used by tests below that only exercise
     /// `complete_features` (`complete_versions` is now position-based; see `mock_dependency`).
+    #[cfg(feature = "lsp-responses")]
     fn empty_parse_result() -> MockParseResult {
         MockParseResult {
             dependencies: vec![],
         }
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_generate_inlay_hints_up_to_date_exact_match() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -512,6 +537,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_generate_inlay_hints_up_to_date_caret_version() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -543,6 +569,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_generate_inlay_hints_needs_update() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -572,6 +599,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_generate_inlay_hints_hide_up_to_date() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -599,6 +627,7 @@ mod tests {
         assert_eq!(hints.len(), 0);
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_generate_inlay_hints_no_version_range() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -627,6 +656,7 @@ mod tests {
         assert_eq!(hints.len(), 0);
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_generate_inlay_hints_caret_edge_case() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -656,6 +686,7 @@ mod tests {
         assert_eq!(hints.len(), 1);
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_package_name_completion_context_has_real_range() {
         // Regression test for #232: the textEdit range for a package-name completion
@@ -688,6 +719,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     #[ignore] // Requires network access
     async fn test_complete_package_names_real_search() {
@@ -701,6 +733,7 @@ mod tests {
         assert!(results.iter().any(|r| r.label == "serde"));
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     #[ignore] // Requires network access
     async fn test_complete_versions_real() {
@@ -724,6 +757,7 @@ mod tests {
         assert!(results.iter().all(|r| r.label.starts_with("1.0")));
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     #[ignore] // Requires network access
     async fn test_complete_versions_with_operator() {
@@ -747,6 +781,7 @@ mod tests {
         assert!(results.iter().all(|r| r.label.starts_with("1.0")));
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     #[ignore] // Requires network access
     async fn test_complete_features_real() {
@@ -760,6 +795,7 @@ mod tests {
         assert!(results.iter().any(|r| r.label == "derive"));
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     #[ignore] // Requires network access
     async fn test_complete_features_with_prefix() {
@@ -777,6 +813,7 @@ mod tests {
     /// sources no longer collapse into the old name-based `CompletionSource::Ambiguous`
     /// "offer nothing for either" result (review finding #6) — cursor position now
     /// identifies exactly one dependency, so each occurrence routes independently.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_complete_versions_same_name_different_sources_routes_by_position() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -817,6 +854,7 @@ mod tests {
     /// actually selects the right source's data — a *registered* alternate index's own client
     /// is hit and its versions come back — mirroring `deps-go`'s/`deps-nuget`'s equivalent
     /// `..._routes_to_registered_alternate_client` tests.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_complete_versions_routes_to_registered_alternate_client() {
         let mut server = mockito::Server::new_async().await;
@@ -869,6 +907,7 @@ mod tests {
 
     /// Same ambiguity, exercised through `complete_features` — mirrors
     /// `test_complete_versions_ambiguous_source_offers_nothing`'s routing policy.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_complete_features_ambiguous_source_offers_nothing() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -897,6 +936,7 @@ mod tests {
     /// #1045: uses a mockito 404 instead of the live crates.io sparse index, so a regression
     /// that makes zero requests (and so also produces an empty result) can no longer pass
     /// vacuously — `mock.assert_async()` requires the request to actually have been made.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_complete_versions_unknown_package() {
         let mut server = mockito::Server::new_async().await;
@@ -932,6 +972,7 @@ mod tests {
     /// #1045: uses a mockito 404 instead of the live crates.io sparse index, so a regression
     /// that makes zero requests (and so also produces an empty result) can no longer pass
     /// vacuously — `mock.assert_async()` requires the request to actually have been made.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_complete_features_unknown_package() {
         let mut server = mockito::Server::new_async().await;
@@ -963,6 +1004,7 @@ mod tests {
     /// longer pass vacuously — `mock.assert_async()` requires the request to actually have
     /// been made, and the assertion checks a real, specific completion item instead of the
     /// old `results.is_empty() || !results.is_empty()` tautology.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_complete_package_names_special_characters() {
         let mut server = mockito::Server::new_async().await;
@@ -995,6 +1037,7 @@ mod tests {
     /// the actual display cap (`MAX_COMPLETION_VERSIONS`, `deps-core`) is 5, not 20, so it
     /// passed vacuously (even for 0 results) and could never catch a cap regression. Mocks 8
     /// matching versions and asserts the count is exactly the real cap.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_complete_versions_capped_at_max_completion_versions() {
         let mut server = mockito::Server::new_async().await;
@@ -1032,6 +1075,7 @@ mod tests {
         assert_eq!(results.len(), 5);
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     #[ignore] // Requires network access
     async fn test_complete_features_empty_list() {
@@ -1046,6 +1090,7 @@ mod tests {
         assert!(results.is_empty());
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     #[ignore] // Requires network access
     async fn test_complete_package_names_special_chars_real() {
@@ -1060,6 +1105,7 @@ mod tests {
         assert!(results.iter().any(|r| r.label.contains('-')));
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_generate_inlay_hints_loading_state() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1101,6 +1147,7 @@ mod tests {
     /// `is_in_toml_dependencies` + `raw_prefix` compose correctly through the real
     /// trait method on realistic multi-line content, not just each primitive in
     /// isolation.
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_fallback_completion_prefix_multi_line_composition() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1109,7 +1156,7 @@ mod tests {
         let line = content.lines().nth(4).unwrap();
         let position = Position::new(4, line.chars().count() as u32);
         assert_eq!(
-            ecosystem.fallback_completion_prefix(content, position),
+            ecosystem.fallback_completion_prefix(content, position.into()),
             Some("ser")
         );
     }
@@ -1206,6 +1253,7 @@ mod tests {
     // the assertion is a genuine route-equivalence check against the crate's own inherent
     // `complete_*` method rather than a re-implementation of the match.
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_completions_package_name_context_below_length_guard_is_empty() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1236,6 +1284,7 @@ mod tests {
     /// Mirrors `test_complete_versions_same_name_different_sources_routes_by_position`: an
     /// unregistered `AlternateRegistry` index fails closed (`CargoRegistry::alternate_client`
     /// returns `None`) before any network call, so this is deterministic.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_completions_version_context_dispatches_by_position() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1277,6 +1326,7 @@ mod tests {
     /// Mirrors `test_complete_features_ambiguous_source_offers_nothing`: two same-named
     /// dependencies resolving to different sources deterministically offer no feature
     /// completions, with no network call.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_completions_feature_context_dispatches_by_name() {
         let cache = Arc::new(deps_core::HttpCache::new());

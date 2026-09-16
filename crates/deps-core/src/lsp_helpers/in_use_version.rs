@@ -512,6 +512,7 @@ pub fn resolve_in_use_version(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::position::Range;
 
     /// Minimal formatter with a real `compile_requirement` (Cargo-style `semver::VersionReq`
     /// semantics), for tests that must distinguish `best_candidate_for_requirement`'s
@@ -909,14 +910,14 @@ mod tests {
         let renamed_old_major = MockDep {
             name: PackageName::new("serde"),
             version_req: VersionReq::new("0.9"),
-            version_range: tower_lsp_server::ls_types::Range::default().into(),
-            name_range: tower_lsp_server::ls_types::Range::default().into(),
+            version_range: Range::default(),
+            name_range: Range::default(),
         };
         let plain_current_major = MockDep {
             name: PackageName::new("serde"),
             version_req: VersionReq::new("1.0"),
-            version_range: tower_lsp_server::ls_types::Range::default().into(),
-            name_range: tower_lsp_server::ls_types::Range::default().into(),
+            version_range: Range::default(),
+            name_range: Range::default(),
         };
 
         let mut resolved_versions = HashMap::new();
@@ -962,8 +963,8 @@ mod tests {
         let dep = MockDep {
             name: PackageName::new("serde"),
             version_req: VersionReq::new("0.9"),
-            version_range: tower_lsp_server::ls_types::Range::default().into(),
-            name_range: tower_lsp_server::ls_types::Range::default().into(),
+            version_range: Range::default(),
+            name_range: Range::default(),
         };
 
         let resolved_versions = HashMap::new();
@@ -997,7 +998,7 @@ mod tests {
 
         let dep = MockMarkedDep {
             name: PackageName::new("serde"),
-            name_range: tower_lsp_server::ls_types::Range::default().into(),
+            name_range: Range::default(),
             markers: None,
         };
 
@@ -1035,8 +1036,8 @@ mod tests {
         let dep = MockDep {
             name: PackageName::new("serde"),
             version_req: VersionReq::new("1.0"),
-            version_range: tower_lsp_server::ls_types::Range::default().into(),
-            name_range: tower_lsp_server::ls_types::Range::default().into(),
+            version_range: Range::default(),
+            name_range: Range::default(),
         };
 
         let mut resolved_versions = HashMap::new();
@@ -1151,8 +1152,8 @@ mod tests {
         let dep = MockDep {
             name: PackageName::new("pkg"),
             version_req: VersionReq::new("^1.0"),
-            version_range: tower_lsp_server::ls_types::Range::default().into(),
-            name_range: tower_lsp_server::ls_types::Range::default().into(),
+            version_range: Range::default(),
+            name_range: Range::default(),
         };
 
         let resolved_versions = HashMap::new();
@@ -1192,8 +1193,8 @@ mod tests {
         let dep = MockDep {
             name: PackageName::new("express"),
             version_req: VersionReq::new("4.17.0"),
-            version_range: tower_lsp_server::ls_types::Range::default().into(),
-            name_range: tower_lsp_server::ls_types::Range::default().into(),
+            version_range: Range::default(),
+            name_range: Range::default(),
         };
 
         let result = resolve_in_use_version(
@@ -1218,8 +1219,8 @@ mod tests {
         let dep = MockDep {
             name: PackageName::new("monolog/monolog"),
             version_req: VersionReq::new("2.0.0"),
-            version_range: tower_lsp_server::ls_types::Range::default().into(),
-            name_range: tower_lsp_server::ls_types::Range::default().into(),
+            version_range: Range::default(),
+            name_range: Range::default(),
         };
 
         let result = resolve_in_use_version(
@@ -1245,8 +1246,8 @@ mod tests {
         let dep = MockDep {
             name: PackageName::new("serde"),
             version_req: VersionReq::new("1.0.219"),
-            version_range: tower_lsp_server::ls_types::Range::default().into(),
-            name_range: tower_lsp_server::ls_types::Range::default().into(),
+            version_range: Range::default(),
+            name_range: Range::default(),
         };
 
         let result = resolve_in_use_version(
@@ -1274,8 +1275,8 @@ mod tests {
         let dep = MockDep {
             name: PackageName::new("express"),
             version_req: VersionReq::new("4.17.0"),
-            version_range: tower_lsp_server::ls_types::Range::default().into(),
-            name_range: tower_lsp_server::ls_types::Range::default().into(),
+            version_range: Range::default(),
+            name_range: Range::default(),
         };
 
         let result = resolve_in_use_version(
@@ -1310,8 +1311,8 @@ mod tests {
         let dep = MockDep {
             name: PackageName::new("Newtonsoft.Json"),
             version_req: VersionReq::new("1.0.0"),
-            version_range: tower_lsp_server::ls_types::Range::default().into(),
-            name_range: tower_lsp_server::ls_types::Range::default().into(),
+            version_range: Range::default(),
+            name_range: Range::default(),
         };
 
         let result = resolve_in_use_version(

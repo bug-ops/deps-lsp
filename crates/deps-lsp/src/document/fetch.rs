@@ -545,7 +545,7 @@ dependencies = ["requests>=2.0.0"]
             raw_name: &str,
             pinned_version: &'static str,
         ) -> (
-            Vec<tower_lsp_server::ls_types::Diagnostic>,
+            Vec<deps_core::diagnostic::Diagnostic>,
             HashMap<String, (ConcreteVersion, RemovalStatus)>,
         ) {
             let state = Arc::new(ServerState::new());

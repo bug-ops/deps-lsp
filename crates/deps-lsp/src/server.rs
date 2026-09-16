@@ -2121,6 +2121,58 @@ mod tests {
             let result = parse_config(serde_json::json!(["not", "an", "object"]));
             assert!(result.is_none());
         }
+
+        /// End-to-end regression for issue #1083 critic S1: `diagnostic::Severity`'s
+        /// `Deserialize` clamps an out-of-range integer instead of failing, so this pins
+        /// the *whole pipeline* — a raw JSON config payload with an out-of-range
+        /// `unknown_severity` value must (a) still parse successfully through
+        /// `parse_config`/`DepsConfig` rather than being rejected wholesale, and (b) the
+        /// clamped severity must actually reach a real, published diagnostic's LSP wire
+        /// representation, not just the intermediate `Severity` value.
+        #[test]
+        fn test_parse_config_clamps_out_of_range_severity_through_to_a_published_diagnostic() {
+            let config = parse_config(serde_json::json!({
+                "diagnostics": { "unknown_severity": 999 }
+            }))
+            .expect("an out-of-range severity must not fail the whole config parse");
+            assert_eq!(
+                config.policy.diagnostics.unknown_severity,
+                deps_core::diagnostic::Severity::Hint,
+                "999 must clamp to the least-severe defined variant"
+            );
+
+            let parse_result = deps_core::test_util::stub_parse_result_with_dependencies(1);
+            let cached_versions = std::collections::HashMap::new();
+            let resolved_versions = std::collections::HashMap::new();
+            let diagnostics = deps_core::lsp_helpers::generate_diagnostics_from_cache(
+                parse_result.as_ref(),
+                deps_core::VersionData::new(&cached_versions, &resolved_versions),
+                &crate::test_utils::blocking_ecosystem::NoopFormatter,
+                parse_result.uri(),
+                deps_core::FreshnessSettings::default(),
+                config.policy.diagnostics.to_severities(),
+                deps_core::PublishTime::now(),
+            );
+            let unknown_package_diagnostic = diagnostics
+                .into_iter()
+                .find(|d| d.message.contains("Unknown package"))
+                .expect(
+                    "the stub dependency has no cached versions, so it must be reported unknown",
+                );
+            assert_eq!(
+                unknown_package_diagnostic.severity,
+                Some(deps_core::diagnostic::Severity::Hint)
+            );
+
+            // The pipeline's final hop: the domain `Diagnostic` converts to the exact
+            // LSP wire severity a real client would render.
+            let ls_diagnostic =
+                crate::lsp_types_interop::to_lsp_diagnostic(unknown_package_diagnostic);
+            assert_eq!(
+                ls_diagnostic.severity,
+                Some(tower_lsp_server::ls_types::DiagnosticSeverity::HINT)
+            );
+        }
     }
 
     /// Tester gap: only the `false`/absent branch of these two capability checks was

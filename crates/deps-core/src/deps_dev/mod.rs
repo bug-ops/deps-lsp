@@ -40,6 +40,7 @@ use dashmap::{DashMap, DashSet};
 use types::{DepsDevProject, DepsDevVersionInfo, ProvenanceEntry, RelatedProject};
 pub use types::{ProvenanceStatus, ScorecardSummary, SupplyChainTrustSignal};
 
+#[cfg(feature = "lsp-responses")]
 use crate::EcosystemId;
 use crate::cache::{BodyLimit, HttpCache};
 use crate::error::DepsError;
@@ -150,6 +151,7 @@ impl Drop for InFlightGuard<'_> {
 /// someone decides which side it belongs on — stronger than a trait default
 /// that would silently opt a new ecosystem out, and this is what makes
 /// FR-005/FR-011 hold by construction rather than by convention.
+#[cfg(feature = "lsp-responses")]
 #[must_use]
 pub(crate) const fn deps_dev_system(id: EcosystemId) -> Option<&'static str> {
     match id {
@@ -582,6 +584,7 @@ mod tests {
 
     // --- deps_dev_system ---
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn deps_dev_system_covers_seven_ecosystems() {
         assert_eq!(deps_dev_system(EcosystemId::Npm), Some("npm"));
@@ -593,6 +596,7 @@ mod tests {
         assert_eq!(deps_dev_system(EcosystemId::NuGet), Some("nuget"));
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn deps_dev_system_excludes_uncovered_ecosystems() {
         assert_eq!(deps_dev_system(EcosystemId::Composer), None);

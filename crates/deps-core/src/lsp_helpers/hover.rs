@@ -86,10 +86,10 @@ pub async fn generate_hover<R: Registry + ?Sized>(
         // `dependencies()` happens to list first, showing hover info for an arbitrary
         // unrelated package.
         let on_name =
-            !d.name_range_is_synthetic() && position_in_range(position, d.name_range().into());
+            !d.name_range_is_synthetic() && position_in_range(position.into(), d.name_range());
         let on_version = d
             .version_range()
-            .is_some_and(|r| position_in_range(position, r.into()));
+            .is_some_and(|r| position_in_range(position.into(), r));
         on_name || on_version
     })?;
 
@@ -1189,6 +1189,7 @@ mod tests {
     use crate::RemovalStatus;
     use crate::lsp_helpers::test_support::*;
     use crate::lsp_helpers::*;
+    use crate::position::{Position, Range};
 
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -1350,7 +1351,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &resolved_versions),
             &registry,
             &MockFormatter,
@@ -1392,8 +1393,8 @@ mod tests {
                 Box::new(MockDep {
                     name: "real-pkg".into(),
                     version_req: "1.0.0".into(),
-                    version_range: Range::new(Position::new(3, 10), Position::new(3, 20)).into(),
-                    name_range: Range::new(Position::new(3, 0), Position::new(3, 8)).into(),
+                    version_range: Range::new(Position::new(3, 10), Position::new(3, 20)),
+                    name_range: Range::new(Position::new(3, 0), Position::new(3, 8)),
                 }),
             ],
             uri: crate::test_util::test_uri("/test/pubspec.yaml"),
@@ -1401,7 +1402,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 0),
+            Position::new(0, 0).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &MockRegistry,
             &MockFormatter,
@@ -1437,7 +1438,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &resolved_versions),
             &registry,
             &MockFormatter,
@@ -1485,15 +1486,15 @@ mod tests {
             deps: vec![MockDep {
                 name: "example".into(),
                 version_req: "=1.0.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 7)).into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 7)),
             }],
             uri: crate::test_util::test_uri("/test/composer.json"),
         };
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new())
                 .with_ecosystem(crate::EcosystemId::Composer),
             &registry,
@@ -1539,7 +1540,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &resolved_versions)
                 .with_ecosystem(crate::EcosystemId::Dart)
                 .with_license_source(crate::LicenseSource::DetectedSpdx)
@@ -1585,7 +1586,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &resolved_versions)
                 .with_ecosystem(crate::EcosystemId::Swift)
                 .with_license_source(crate::LicenseSource::DetectedSpdx)
@@ -1628,7 +1629,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &resolved_versions)
                 .with_ecosystem(crate::EcosystemId::Gradle)
                 .with_license_source(crate::LicenseSource::PomFreeText)
@@ -1675,7 +1676,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &resolved_versions)
                 .with_ecosystem(crate::EcosystemId::Gradle)
                 .with_license_source(crate::LicenseSource::PomFreeText)
@@ -1722,7 +1723,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &resolved_versions)
                 .with_ecosystem(crate::EcosystemId::Gradle)
                 .with_license_source(crate::LicenseSource::PomFreeText)
@@ -1768,7 +1769,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &resolved_versions)
                 .with_ecosystem(crate::EcosystemId::Gradle)
                 .with_license_source(crate::LicenseSource::PomFreeText)
@@ -1816,7 +1817,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &resolved_versions)
                 .with_ecosystem(crate::EcosystemId::Gradle)
                 .with_license_source(crate::LicenseSource::PomFreeText)
@@ -1868,8 +1869,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "express".into(),
                 version_req: "=4.19.2".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 7)).into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 7)),
             }],
             uri: crate::test_util::test_uri("/test/package.json"),
         };
@@ -1886,7 +1887,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new())
                 .with_ecosystem(crate::EcosystemId::Npm)
                 .with_trust(&deps_dev),
@@ -2027,7 +2028,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &registry,
             &MockFormatter,
@@ -2062,7 +2063,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &registry,
             &MockFormatter,
@@ -2105,7 +2106,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &registry,
             &MockFormatter,
@@ -2159,7 +2160,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &registry,
             &MockFormatter,
@@ -2230,7 +2231,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &registry,
             &MockFormatter,
@@ -2286,7 +2287,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &registry,
             &MockFormatter,
@@ -2350,7 +2351,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &registry,
             &MockFormatter,
@@ -2404,7 +2405,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &registry,
             &MockFormatter,
@@ -2457,7 +2458,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &HashMap::new()),
             &registry,
             &MockFormatter,
@@ -2511,7 +2512,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &registry,
             &MockFormatter,
@@ -2559,7 +2560,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &registry,
             &MockFormatter,
@@ -2597,7 +2598,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &ErrorRegistry,
             &MockFormatter,
@@ -2630,8 +2631,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "example.com/mod".into(),
                 version_req: "v0.8.1".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 16)).into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 16)),
             }],
             uri: crate::test_util::test_uri("/test/go.mod"),
         };
@@ -2646,7 +2647,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions),
             &MockRegistry,
             &MockGoFormatter,
@@ -2679,8 +2680,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "serde".into(),
                 version_req: "1.0.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -2691,7 +2692,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions),
             &MockRegistry,
             &MockFormatter,
@@ -2740,7 +2741,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &registry,
             &MockFormatter,
@@ -2779,7 +2780,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &registry,
             &MockFormatter,
@@ -2823,7 +2824,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions),
             &MockRegistry,
             &MockFormatter,
@@ -2876,7 +2877,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions),
             &MockRegistry,
             &MockFormatter,
@@ -2912,7 +2913,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions),
             &MockRegistry,
             &MockFormatter,
@@ -2953,7 +2954,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions),
             &MockRegistry,
             &MockFormatter,
@@ -3002,7 +3003,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions),
             &MockRegistry,
             &MockFormatter,
@@ -3050,7 +3051,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions),
             &MockRegistry,
             &MockFormatter,
@@ -3122,7 +3123,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions),
             &registry,
             &MockFormatter,
@@ -3191,7 +3192,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions),
             &registry,
             &MockFormatter,
@@ -3247,7 +3248,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions),
             &registry,
             &MockFormatter,
@@ -3302,7 +3303,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions),
             &registry,
             &MockFormatter,
@@ -3388,7 +3389,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
             &registry,
             &NpmLikeFormatter,
@@ -3432,13 +3433,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_generate_hover_surfaces_markers() {
+        use crate::position::{Position, Range};
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range};
 
         let parse_result = MockMarkedParseResult {
             dep: MockMarkedDep {
                 name: "numpy".into(),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
                 markers: Some("python_full_version >= '3.9'".to_string()),
             },
             uri: crate::test_util::test_uri("/test/pyproject.toml"),
@@ -3446,7 +3447,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &MockRegistry,
             &MockFormatter,
@@ -3468,13 +3469,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_generate_hover_omits_active_when_without_markers() {
+        use crate::position::{Position, Range};
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range};
 
         let parse_result = MockMarkedParseResult {
             dep: MockMarkedDep {
                 name: "requests".into(),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 8)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 8)),
                 markers: None,
             },
             uri: crate::test_util::test_uri("/test/pyproject.toml"),
@@ -3482,7 +3483,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &MockRegistry,
             &MockFormatter,
@@ -3500,8 +3501,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_generate_hover_escapes_malicious_dependency_name() {
+        use crate::position::{Position, Range};
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range};
 
         let malicious_name = "real-pkg](https://legit-looking-typosquat.example/download)[real-pkg";
 
@@ -3509,19 +3510,18 @@ mod tests {
             deps: vec![MockDep {
                 name: malicious_name.into(),
                 version_req: "1.0.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
                 name_range: Range::new(
                     Position::new(0, 0),
                     Position::new(0, malicious_name.len() as u32),
-                )
-                .into(),
+                ),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &MockRegistry,
             &MockFormatter,
@@ -3557,8 +3557,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_generate_hover_newline_in_name_cannot_forge_new_heading() {
+        use crate::position::{Position, Range};
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range};
 
         // Combines S1 (newline breaks out of the ATX heading line) with an
         // autolink payload that needs no brackets/parens at all.
@@ -3568,19 +3568,18 @@ mod tests {
             deps: vec![MockDep {
                 name: malicious_name.into(),
                 version_req: "1.0.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
                 name_range: Range::new(
                     Position::new(0, 0),
                     Position::new(0, malicious_name.len() as u32),
-                )
-                .into(),
+                ),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &MockRegistry,
             &MockFormatter,
@@ -3615,8 +3614,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_generate_hover_marker_with_parens_renders_unescaped() {
+        use crate::position::{Position, Range};
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range};
 
         // Regression guard (M4): a legitimate PEP 508 marker with parentheses must
         // render as-is inside its code span, not with visible `\(`/`\)` escapes —
@@ -3625,7 +3624,7 @@ mod tests {
         let parse_result = MockMarkedParseResult {
             dep: MockMarkedDep {
                 name: "numpy".into(),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
                 markers: Some(marker.to_string()),
             },
             uri: crate::test_util::test_uri("/test/pyproject.toml"),
@@ -3633,7 +3632,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &MockRegistry,
             &MockFormatter,
@@ -3684,7 +3683,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions),
             &registry,
             &MockFormatter,
@@ -3709,7 +3708,7 @@ mod tests {
         };
         let hover = generate_hover(
             &registry_parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions),
             &registry,
             &MockFormatter,
@@ -3741,7 +3740,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
             &MockRegistry,
             &MockFormatter,
@@ -3776,7 +3775,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
             &MockRegistry,
             &MockFormatter,
@@ -3825,7 +3824,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
             &MockRegistry,
             &MockFormatter,
@@ -3880,7 +3879,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
             &MockRegistry,
             &MockFormatter,
@@ -3938,7 +3937,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
             &MockRegistry,
             &MockFormatter,
@@ -4002,7 +4001,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
             &MockRegistry,
             &MockFormatter,
@@ -4066,7 +4065,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
             &MockRegistry,
             &MockFormatter,
@@ -4100,14 +4099,14 @@ mod tests {
         let vulnerable_dep = MockDep {
             name: "pkg".into(),
             version_req: "=1.0.0".into(),
-            version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-            name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+            version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
         };
         let patched_dep = MockDep {
             name: "pkg".into(),
             version_req: "=2.0.0".into(),
-            version_range: Range::new(Position::new(3, 10), Position::new(3, 20)).into(),
-            name_range: Range::new(Position::new(3, 0), Position::new(3, 5)).into(),
+            version_range: Range::new(Position::new(3, 10), Position::new(3, 20)),
+            name_range: Range::new(Position::new(3, 0), Position::new(3, 5)),
         };
         let parse_result = MockParseResult {
             deps: vec![vulnerable_dep, patched_dep],
@@ -4148,7 +4147,7 @@ mod tests {
 
         let hover_on_patched = generate_hover(
             &parse_result,
-            Position::new(3, 2),
+            Position::new(3, 2).into(),
             versions,
             &MockRegistry,
             &MockFormatter,
@@ -4169,7 +4168,7 @@ mod tests {
 
         let hover_on_vulnerable = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             versions,
             &MockRegistry,
             &MockFormatter,
@@ -4202,14 +4201,14 @@ mod tests {
         let current_major = MockDep {
             name: "serde".into(),
             version_req: "1.0".into(),
-            version_range: Range::new(Position::new(0, 8), Position::new(0, 13)).into(),
-            name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+            version_range: Range::new(Position::new(0, 8), Position::new(0, 13)),
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
         };
         let renamed_old_major = MockDep {
             name: "serde".into(),
             version_req: "0.9".into(),
-            version_range: Range::new(Position::new(1, 8), Position::new(1, 13)).into(),
-            name_range: Range::new(Position::new(1, 0), Position::new(1, 9)).into(),
+            version_range: Range::new(Position::new(1, 8), Position::new(1, 13)),
+            name_range: Range::new(Position::new(1, 0), Position::new(1, 9)),
         };
         let parse_result = MockParseResult {
             deps: vec![current_major, renamed_old_major],
@@ -4260,7 +4259,7 @@ mod tests {
 
         let hover_on_renamed = generate_hover(
             &parse_result,
-            Position::new(1, 2),
+            Position::new(1, 2).into(),
             versions,
             &MockRegistry,
             &MockFormatter,
@@ -4286,7 +4285,7 @@ mod tests {
 
         let hover_on_current = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             versions,
             &MockRegistry,
             &MockFormatter,
@@ -4325,7 +4324,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions),
             &NotFoundRegistry,
             &MockFormatter,
@@ -4366,7 +4365,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &registry,
             &MockFormatter,
@@ -4414,7 +4413,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions),
             &MockRegistry,
             &MockFormatter,
@@ -4463,7 +4462,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new())
                 .with_offline(true)
                 .with_vulnerabilities(&vulns),
@@ -4510,7 +4509,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()).with_offline(true),
             &registry,
             &MockFormatter,
@@ -4548,7 +4547,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&cached, &resolved).with_offline(true),
             &registry,
             &MockFormatter,
@@ -4598,7 +4597,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions).with_offline(true),
             &MockRegistry,
             &MockFormatter,
@@ -4671,7 +4670,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &resolved_versions)
                 .with_ecosystem(crate::EcosystemId::Npm)
                 .with_trust(&deps_dev),
@@ -4716,7 +4715,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &resolved_versions)
                 .with_ecosystem(crate::EcosystemId::Npm)
                 .with_trust(&deps_dev),
@@ -4765,7 +4764,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &resolved_versions)
                 .with_ecosystem(crate::EcosystemId::Npm)
                 .with_trust(&deps_dev),
@@ -4815,7 +4814,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &resolved_versions)
                 .with_ecosystem(crate::EcosystemId::Npm)
                 .with_trust(&deps_dev),
@@ -4865,7 +4864,7 @@ mod tests {
 
             let hover = generate_hover(
                 &parse_result,
-                Position::new(0, 2),
+                Position::new(0, 2).into(),
                 VersionData::new(&HashMap::new(), &resolved_versions)
                     .with_ecosystem(ecosystem)
                     .with_trust(&deps_dev),
@@ -4922,7 +4921,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &resolved_versions)
                 .with_ecosystem(crate::EcosystemId::Cargo)
                 .with_trust(&deps_dev),
@@ -4963,7 +4962,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &resolved_versions)
                 .with_ecosystem(crate::EcosystemId::Npm)
                 .with_trust(&deps_dev)
@@ -5010,7 +5009,7 @@ mod tests {
 
         let with_failing_trust = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &resolved_versions)
                 .with_ecosystem(crate::EcosystemId::Npm)
                 .with_trust(&deps_dev),
@@ -5024,7 +5023,7 @@ mod tests {
 
         let without_trust = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &resolved_versions)
                 .with_ecosystem(crate::EcosystemId::Npm),
             &registry,
@@ -5104,7 +5103,7 @@ mod tests {
 
         let first = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &resolved_versions)
                 .with_ecosystem(crate::EcosystemId::Npm)
                 .with_trust(&deps_dev),
@@ -5170,7 +5169,7 @@ mod tests {
 
         let hover = generate_hover(
             &parse_result,
-            Position::new(0, 2),
+            Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &resolved_versions)
                 .with_ecosystem(crate::EcosystemId::Npm)
                 .with_trust(&deps_dev),

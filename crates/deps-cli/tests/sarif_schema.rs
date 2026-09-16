@@ -11,9 +11,10 @@
 use deps_cli::format::sarif::to_sarif;
 use deps_cli::report::{Category, CheckFinding, CheckReport};
 use deps_core::EcosystemId;
+use deps_core::diagnostic::Severity;
 use deps_core::osv::VulnSeverity;
+use deps_core::position::{Position, Range};
 use std::path::PathBuf;
-use tower_lsp_server::ls_types::{DiagnosticSeverity, Position, Range};
 
 const SCHEMA_JSON: &str = include_str!("fixtures/sarif-2.1.0.schema.json");
 
@@ -56,7 +57,7 @@ fn schema_validator() -> jsonschema::Validator {
     jsonschema::validator_for(&schema).expect("vendored SARIF schema must itself be valid")
 }
 
-fn finding(category: Category, severity: DiagnosticSeverity) -> CheckFinding {
+fn finding(category: Category, severity: Severity) -> CheckFinding {
     CheckFinding {
         ecosystem: EcosystemId::Cargo,
         manifest_path: PathBuf::from("Cargo.toml"),
@@ -91,7 +92,7 @@ fn test_empty_report_produces_schema_valid_sarif() {
 #[test]
 fn test_single_finding_produces_schema_valid_sarif() {
     assert_valid_sarif(&CheckReport {
-        findings: vec![finding(Category::Outdated, DiagnosticSeverity::HINT)],
+        findings: vec![finding(Category::Outdated, Severity::Hint)],
     });
 }
 
@@ -99,17 +100,17 @@ fn test_single_finding_produces_schema_valid_sarif() {
 fn test_multi_category_report_produces_schema_valid_sarif() {
     assert_valid_sarif(&CheckReport {
         findings: vec![
-            finding(Category::Outdated, DiagnosticSeverity::HINT),
-            finding(Category::Vulnerable, DiagnosticSeverity::ERROR),
-            finding(Category::License, DiagnosticSeverity::WARNING),
-            finding(Category::Other, DiagnosticSeverity::INFORMATION),
+            finding(Category::Outdated, Severity::Hint),
+            finding(Category::Vulnerable, Severity::Error),
+            finding(Category::License, Severity::Warning),
+            finding(Category::Other, Severity::Information),
         ],
     });
 }
 
 #[test]
 fn test_advisory_coded_finding_produces_schema_valid_sarif() {
-    let mut vulnerable = finding(Category::Vulnerable, DiagnosticSeverity::ERROR);
+    let mut vulnerable = finding(Category::Vulnerable, Severity::Error);
     vulnerable.code = Some("RUSTSEC-2020-0071".to_string());
     vulnerable.message = "RUSTSEC-2020-0071: Potential segfault in the time crate".to_string();
     vulnerable.advisory_url = Some("https://osv.dev/vulnerability/RUSTSEC-2020-0071".to_string());
@@ -124,7 +125,7 @@ fn test_advisory_coded_finding_produces_schema_valid_sarif() {
 /// schema validation — the offending `helpUri` must be omitted, not emitted unvalidated.
 #[test]
 fn test_malformed_advisory_id_does_not_break_schema_validation() {
-    let mut vulnerable = finding(Category::Vulnerable, DiagnosticSeverity::ERROR);
+    let mut vulnerable = finding(Category::Vulnerable, Severity::Error);
     vulnerable.code = Some("evil id\nwith\"quotes and spaces".to_string());
     assert_valid_sarif(&CheckReport {
         findings: vec![vulnerable],

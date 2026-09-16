@@ -8,7 +8,7 @@
 //! implementing a subset of them (e.g. in a test mock that only needs [`PackageRendering`]) is
 //! always sufficient for calling that subset's methods directly, without pulling in the rest.
 
-use tower_lsp_server::ls_types::Position;
+use crate::position::Position;
 
 use super::{RequirementMatcher, RequirementStatus, is_same_major_minor, position_in_range};
 use crate::{ConcreteVersion, Dependency, InvalidPackageName, PackageName, VersionReq};
@@ -154,7 +154,7 @@ pub trait PackageRendering: Send + Sync {
     /// Detect if cursor position is on a dependency for code actions.
     fn is_position_on_dependency(&self, dep: &dyn Dependency, position: Position) -> bool {
         dep.version_range()
-            .is_some_and(|r| position_in_range(position, r.into()))
+            .is_some_and(|r| position_in_range(position, r))
     }
 }
 

@@ -49,8 +49,9 @@ mod tests {
     use super::*;
     use crate::report::{Category, CheckFinding};
     use deps_core::EcosystemId;
+    use deps_core::diagnostic::Severity;
+    use deps_core::position::Range;
     use std::path::PathBuf;
-    use tower_lsp_server::ls_types::{DiagnosticSeverity, Range};
 
     fn finding(category: Category) -> CheckFinding {
         CheckFinding {
@@ -62,7 +63,7 @@ mod tests {
             code: None,
             advisory_url: None,
             advisory_severity: None,
-            severity: DiagnosticSeverity::WARNING,
+            severity: Severity::Warning,
             range: Range::default(),
             message: "test".to_string(),
         }

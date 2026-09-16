@@ -517,7 +517,7 @@ pub(crate) fn reparse_scope(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tower_lsp_server::ls_types::DiagnosticSeverity;
+    use deps_core::diagnostic::Severity;
 
     #[test]
     fn test_default_config() {
@@ -635,10 +635,7 @@ mod tests {
         let json = r#"{"diagnostics": {"outdated_severity": 1, "future_field": "ignored"}}"#;
         let config: DepsConfig =
             serde_json::from_str(json).expect("a nested unknown key must not reject the payload");
-        assert_eq!(
-            config.policy.diagnostics.outdated_severity,
-            DiagnosticSeverity::ERROR
-        );
+        assert_eq!(config.policy.diagnostics.outdated_severity, Severity::Error);
     }
 
     /// T003 regression gate: a realistic `initializationOptions` payload covering every
@@ -671,10 +668,7 @@ mod tests {
         assert_eq!(config.cold_start.rate_limit_ms, 250);
         assert!(!config.loading_indicator.enabled);
         assert!(!config.code_lens.enabled);
-        assert_eq!(
-            config.policy.diagnostics.outdated_severity,
-            DiagnosticSeverity::ERROR
-        );
+        assert_eq!(config.policy.diagnostics.outdated_severity, Severity::Error);
         assert!(!config.policy.diagnostics.vulnerabilities_enabled);
         assert!(!config.policy.cache.enabled);
         assert_eq!(config.policy.cache.max_concurrent_fetches, 5);
@@ -742,21 +736,21 @@ mod tests {
         }"#;
 
         let config: DiagnosticsConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(config.outdated_severity, DiagnosticSeverity::ERROR);
-        assert_eq!(config.unknown_severity, DiagnosticSeverity::WARNING);
-        assert_eq!(config.yanked_severity, DiagnosticSeverity::WARNING);
-        assert_eq!(config.unsatisfiable_severity, DiagnosticSeverity::ERROR);
-        assert_eq!(config.deprecated_severity, DiagnosticSeverity::ERROR);
+        assert_eq!(config.outdated_severity, Severity::Error);
+        assert_eq!(config.unknown_severity, Severity::Warning);
+        assert_eq!(config.yanked_severity, Severity::Warning);
+        assert_eq!(config.unsatisfiable_severity, Severity::Error);
+        assert_eq!(config.deprecated_severity, Severity::Error);
     }
 
     #[test]
     fn test_diagnostics_config_unsatisfiable_severity_defaults_warning() {
         let config = DiagnosticsConfig::default();
-        assert_eq!(config.unsatisfiable_severity, DiagnosticSeverity::WARNING);
+        assert_eq!(config.unsatisfiable_severity, Severity::Warning);
 
         let json = r"{}";
         let config: DiagnosticsConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(config.unsatisfiable_severity, DiagnosticSeverity::WARNING);
+        assert_eq!(config.unsatisfiable_severity, Severity::Warning);
     }
 
     /// D8/O3: no `deprecated_enabled` toggle exists — severity is the only knob, matching
@@ -764,11 +758,11 @@ mod tests {
     #[test]
     fn test_diagnostics_config_deprecated_severity_defaults_warning() {
         let config = DiagnosticsConfig::default();
-        assert_eq!(config.deprecated_severity, DiagnosticSeverity::WARNING);
+        assert_eq!(config.deprecated_severity, Severity::Warning);
 
         let json = r"{}";
         let config: DiagnosticsConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(config.deprecated_severity, DiagnosticSeverity::WARNING);
+        assert_eq!(config.deprecated_severity, Severity::Warning);
     }
 
     /// Severity default (issue #473) — see `mutable_ref_pin_enabled` tests below for the
@@ -776,11 +770,11 @@ mod tests {
     #[test]
     fn test_diagnostics_config_mutable_ref_pin_severity_defaults_hint() {
         let config = DiagnosticsConfig::default();
-        assert_eq!(config.mutable_ref_pin_severity, DiagnosticSeverity::HINT);
+        assert_eq!(config.mutable_ref_pin_severity, Severity::Hint);
 
         let json = r"{}";
         let config: DiagnosticsConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(config.mutable_ref_pin_severity, DiagnosticSeverity::HINT);
+        assert_eq!(config.mutable_ref_pin_severity, Severity::Hint);
     }
 
     /// FR-009 (corrected during implementation review): mirrors
@@ -886,10 +880,7 @@ mod tests {
 
         let config: DepsConfig = serde_json::from_str(json).unwrap();
         assert!(config.inlay_hints.enabled);
-        assert_eq!(
-            config.policy.diagnostics.outdated_severity,
-            DiagnosticSeverity::HINT
-        );
+        assert_eq!(config.policy.diagnostics.outdated_severity, Severity::Hint);
         assert!(config.policy.cache.enabled);
     }
 
@@ -905,10 +896,7 @@ mod tests {
         assert!(!config.inlay_hints.enabled);
         // Other fields should use defaults
         assert_eq!(config.inlay_hints.up_to_date_text, "✅");
-        assert_eq!(
-            config.policy.diagnostics.outdated_severity,
-            DiagnosticSeverity::HINT
-        );
+        assert_eq!(config.policy.diagnostics.outdated_severity, Severity::Hint);
     }
 
     #[test]

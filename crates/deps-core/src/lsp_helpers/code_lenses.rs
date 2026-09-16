@@ -201,7 +201,7 @@ pub fn collect_update_all_edits(
         // (#919) here — empty-requirement semantics differ (edit: nothing to update;
         // completion: everything to offer), and this loop hoists its own `line_offsets`
         // across every dependency rather than rebuilding one per call.
-        let slice = slice_for_range(content, &line_offsets, version_range);
+        let slice = slice_for_range(content, &line_offsets, version_range.into());
         let literal_target = dep
             .version_literal()
             .unwrap_or_else(|| version_req.as_str());
@@ -1176,7 +1176,7 @@ mod tests {
                 fn generate_completions<'a>(
                     &'a self,
                     _parse_result: &'a dyn ParseResult,
-                    _position: Position,
+                    _position: tower_lsp_server::ls_types::Position,
                     _content: &'a str,
                     _freshness: crate::FreshnessSettings,
                 ) -> crate::ecosystem::BoxFuture<'a, crate::completion::Completions>

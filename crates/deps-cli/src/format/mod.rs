@@ -6,27 +6,26 @@ pub mod table;
 
 /// Renders `severity` as the lowercase token used by both output formats.
 #[must_use]
-pub fn severity_str(severity: tower_lsp_server::ls_types::DiagnosticSeverity) -> &'static str {
-    use tower_lsp_server::ls_types::DiagnosticSeverity;
+pub fn severity_str(severity: deps_core::diagnostic::Severity) -> &'static str {
+    use deps_core::diagnostic::Severity;
     match severity {
-        DiagnosticSeverity::ERROR => "error",
-        DiagnosticSeverity::WARNING => "warning",
-        DiagnosticSeverity::INFORMATION => "information",
-        DiagnosticSeverity::HINT => "hint",
-        _ => "unknown",
+        Severity::Error => "error",
+        Severity::Warning => "warning",
+        Severity::Information => "information",
+        Severity::Hint => "hint",
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tower_lsp_server::ls_types::DiagnosticSeverity;
+    use deps_core::diagnostic::Severity;
 
     #[test]
     fn test_severity_str_covers_every_lsp_severity() {
-        assert_eq!(severity_str(DiagnosticSeverity::ERROR), "error");
-        assert_eq!(severity_str(DiagnosticSeverity::WARNING), "warning");
-        assert_eq!(severity_str(DiagnosticSeverity::INFORMATION), "information");
-        assert_eq!(severity_str(DiagnosticSeverity::HINT), "hint");
+        assert_eq!(severity_str(Severity::Error), "error");
+        assert_eq!(severity_str(Severity::Warning), "warning");
+        assert_eq!(severity_str(Severity::Information), "information");
+        assert_eq!(severity_str(Severity::Hint), "hint");
     }
 }

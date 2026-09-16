@@ -13,6 +13,23 @@ publish = true
 workspace = true
 
 [features]
+# Gates `hover.rs`/`code_actions.rs`/`code_lenses.rs`/`inlay_hints.rs`/`generate_document_links`
+# and their `Ecosystem` trait default methods, plus the `tower-lsp-server` dependency itself
+# (issue #1083, spec 064) — the only remaining `lsp_helpers` surface that still constructs real
+# `tower_lsp_server::ls_types` response objects directly (diagnostics no longer need this
+# feature after #1083's domain `diagnostic::Diagnostic` type).
+#
+# Deliberately **not** in `default`: Cargo does not allow a `workspace = true` dependency
+# edge to override the workspace's `default-features` value (there is none declared for
+# `deps-core` in root `[workspace.dependencies]`, so it would default to `true` for every
+# consumer, and no member could opt back out — the exact problem `deps-engine`'s own
+# per-ecosystem `dep:`-optional features hit in #1058). Making this feature non-default and
+# having every consumer that wants it explicitly request `deps-core/lsp-responses` (either
+# directly, as `deps-lsp` does, or transitively through its own same-named feature, as every
+# ecosystem crate and `deps-engine` do) is the only shape that lets `deps-cli` opt out while
+# `deps-lsp` opts in — `features = [...]` can always be *added* to a workspace-inherited
+# dependency edge, only `default-features` cannot be turned off.
+lsp-responses = ["dep:tower-lsp-server"]
 # Exposes `test_util` to other workspace crates' own test builds, where
 # `cfg(test)` alone would not apply (deps-core is a normal, non-dev
 # dependency there).
@@ -40,13 +57,13 @@ futures = { workspace = true }
 jsonc-parser = { workspace = true }
 reqwest = { workspace = true, features = ["json", "gzip"] }
 semver = { workspace = true }
-serde = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tempfile = { workspace = true, optional = true }
 thiserror = { workspace = true }
 time = { workspace = true, features = ["std", "parsing"] }
 tokio = { workspace = true, features = ["sync", "time", "fs", "net"] }
-tower-lsp-server = { workspace = true }
+tower-lsp-server = { workspace = true, optional = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, optional = true }
 url = { workspace = true }

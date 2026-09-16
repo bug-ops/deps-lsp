@@ -41,8 +41,12 @@ deno = ["deps-engine/deno"]
 
 [dependencies]
 # Internal crates
-deps-core = { workspace = true }
-deps-engine = { workspace = true }
+#
+# Both request `lsp-responses` unconditionally (issue #1083, spec 064): `deps-lsp` is the
+# actual protocol server, so it always needs `deps-core`'s and every enabled ecosystem
+# crate's LSP-response-shaped surface — unlike `deps-cli`, which never enables it.
+deps-core = { workspace = true, features = ["lsp-responses"] }
+deps-engine = { workspace = true, features = ["lsp-responses"] }
 
 # External dependencies
 dashmap = { workspace = true }
@@ -58,10 +62,15 @@ url = { workspace = true }
 [dev-dependencies]
 criterion = { workspace = true }
 deps-core = { workspace = true, features = ["test-util"] }
-deps-deno = { workspace = true }
-deps-github-actions = { workspace = true }
-deps-gitlab-ci = { workspace = true }
-deps-npm = { workspace = true }
+# `features = ["lsp-responses"]` explicit on each (issue #1083): these are unconditional dev
+# dependencies, compiled for every `cargo-hack --each-feature` slice of this crate regardless
+# of which ecosystem feature is toggled on `deps-lsp` itself, so `deps-engine`'s own
+# `lsp-responses` weak-dependency forwarding (which only fires for an ecosystem `deps-engine`
+# itself optionally enabled) never reaches them.
+deps-deno = { workspace = true, features = ["lsp-responses"] }
+deps-github-actions = { workspace = true, features = ["lsp-responses"] }
+deps-gitlab-ci = { workspace = true, features = ["lsp-responses"] }
+deps-npm = { workspace = true, features = ["lsp-responses"] }
 insta = { workspace = true, features = ["json"] }
 mockito = { workspace = true }
 tempfile = { workspace = true }

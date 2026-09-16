@@ -2,28 +2,34 @@
 
 use std::any::Any;
 use std::sync::{Arc, RwLock};
+#[cfg(feature = "lsp-responses")]
 use std::time::Duration;
+#[cfg(feature = "lsp-responses")]
 use tower_lsp_server::ls_types::{
-    CodeAction, CodeActionKind, Diagnostic, DiagnosticSeverity, Hover, HoverContents,
-    NumberOrString, Position, TextEdit, WorkspaceEdit,
+    CodeAction, CodeActionKind, Hover, HoverContents, Position, TextEdit, WorkspaceEdit,
 };
 use url::Url;
 
+#[cfg(feature = "lsp-responses")]
+use deps_core::PackageName;
+#[cfg(feature = "lsp-responses")]
+use deps_core::completion::Completions;
+#[cfg(feature = "lsp-responses")]
+use deps_core::lsp_helpers::{PackageNaming, PackageRendering, markdown_code_span};
 use deps_core::net_policy::RegistryAccessPolicy;
 use deps_core::{
-    Ecosystem, HttpCache, PackageName, ParseResult as ParseResultTrait, Registry, Result,
-    completion::Completions,
-    lsp_helpers::{
-        EcosystemFormatter, PackageNaming, PackageRendering, markdown_code_span,
-        truncate_for_diagnostic,
-    },
+    Ecosystem, HttpCache, ParseResult as ParseResultTrait, Registry, Result,
+    diagnostic::{Diagnostic, Severity},
+    lsp_helpers::{EcosystemFormatter, truncate_for_diagnostic},
 };
 
 use crate::MUTABLE_REF_PIN_DIAGNOSTIC_CODE;
 use crate::UNRESOLVED_HOST_DIAGNOSTIC_CODE;
 use crate::client::GitlabApiClient;
 use crate::formatter::GitlabCiFormatter;
-use crate::host::{GitlabInstanceHost, is_valid_gitlab_coordinate};
+use crate::host::GitlabInstanceHost;
+#[cfg(feature = "lsp-responses")]
+use crate::host::is_valid_gitlab_coordinate;
 use crate::registry::GitlabCiRegistry;
 use crate::types::{GitlabCiDependency, HostRef, IncludeKind, PinStyle};
 
@@ -118,6 +124,7 @@ fn sha_pin_quickfix_kind(
 /// (H1, #466 review) — mirrors `deps_core::lsp_helpers::hover`'s `HOVER_FALLBACK_TIMEOUT`
 /// precedent for a live-fetch fallback invoked from hover generation: a failure or timeout
 /// here degrades gracefully to no `**Resolved**` line, never aborting the rest of the hover.
+#[cfg(feature = "lsp-responses")]
 const COMPONENT_PIN_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// GitLab CI ecosystem implementation.
@@ -264,6 +271,7 @@ impl Ecosystem for GitlabCiEcosystem {
     /// not by name: a `project:` and a `component:` include of the same project can share
     /// one `PackageName` (spec §3.1's documented residual collision), and a by-name lookup
     /// would risk picking the wrong one's source.
+    #[cfg(feature = "lsp-responses")]
     fn complete_version<'a>(
         &'a self,
         request: deps_core::completion::CompletionRequest<'a>,
@@ -273,7 +281,7 @@ impl Ecosystem for GitlabCiEcosystem {
         Box::pin(async move {
             let Some(dep) = request.parse_result.dependencies().into_iter().find(|d| {
                 d.version_range()
-                    .is_some_and(|r| deps_core::position_in_range(request.position, r.into()))
+                    .is_some_and(|r| deps_core::position_in_range(request.position.into(), r))
             }) else {
                 return Completions::default();
             };
@@ -356,6 +364,7 @@ impl Ecosystem for GitlabCiEcosystem {
     /// neither names a concrete version by itself, so `build_dynamic_component_pin_action`
     /// resolves it against the project's published releases through the same FR-007
     /// priority ladder `generate_hover`'s `**Resolved**` splice already drives.
+    #[cfg(feature = "lsp-responses")]
     fn generate_code_actions<'a>(
         &'a self,
         parse_result: &'a dyn ParseResultTrait,
@@ -400,6 +409,7 @@ impl Ecosystem for GitlabCiEcosystem {
     /// Splices a `**Resolved**` line for a SHA pin (via the shared tag index) and, for a
     /// `component:` include only, a `**Project**` link line — the one NFR-004 hover
     /// divergence this ecosystem has (spec §8.1/§8.2).
+    #[cfg(feature = "lsp-responses")]
     fn generate_hover<'a>(
         &'a self,
         parse_result: &'a dyn ParseResultTrait,
@@ -422,9 +432,9 @@ impl Ecosystem for GitlabCiEcosystem {
             let mut hover = base_hover?;
 
             let dep = parse_result.dependencies().into_iter().find(|d| {
-                deps_core::position_in_range(position, d.name_range().into())
+                deps_core::position_in_range(position.into(), d.name_range())
                     || d.version_range()
-                        .is_some_and(|r| deps_core::position_in_range(position, r.into()))
+                        .is_some_and(|r| deps_core::position_in_range(position.into(), r))
             });
             let Some(dep) = dep else {
                 return Some(hover);
@@ -526,6 +536,7 @@ impl Ecosystem for GitlabCiEcosystem {
     /// `Latest`/`Partial` pin needs to resolve (see the crate-private
     /// `collect_pin_all_to_sha_edits` free function this delegates to): a lens is
     /// push-based and must never itself trigger a fetch.
+    #[cfg(feature = "lsp-responses")]
     fn collect_pin_all_to_sha_edits(
         &self,
         parse_result: &dyn ParseResultTrait,
@@ -575,16 +586,11 @@ fn unresolved_host_diagnostics(parse_result: &dyn ParseResultTrait) -> Vec<Diagn
                 // to set `registries.gitlab_instance_host`) would misattribute the cause.
                 HostRef::Literal(_) | HostRef::PolicyBlocked { .. } => return None,
             };
-            Some(Diagnostic {
-                range: gl_dep.name_range.into(),
-                severity: Some(DiagnosticSeverity::INFORMATION),
-                message,
-                code: Some(NumberOrString::String(
-                    UNRESOLVED_HOST_DIAGNOSTIC_CODE.into(),
-                )),
-                source: Some("deps-lsp".into()),
-                ..Default::default()
-            })
+            Some(
+                Diagnostic::new(gl_dep.name_range, message)
+                    .with_severity(Severity::Information)
+                    .with_code(UNRESOLVED_HOST_DIAGNOSTIC_CODE),
+            )
         })
         .collect()
 }
@@ -608,7 +614,7 @@ fn unresolved_host_diagnostics(parse_result: &dyn ParseResultTrait) -> Vec<Diagn
 /// `PinStyle::Sha` and an *unconfirmed* `PinStyle::Branch` produce no diagnostic at all.
 fn mutable_ref_pin_diagnostics(
     parse_result: &dyn ParseResultTrait,
-    severity: DiagnosticSeverity,
+    severity: Severity,
     formatter: &GitlabCiFormatter,
 ) -> Vec<Diagnostic> {
     parse_result
@@ -629,20 +635,18 @@ fn mutable_ref_pin_diagnostics(
                 // Ref-less `project:` include: no `ref:` key at all, so there is no
                 // version span to anchor on or edit — anchor on the `project:` value
                 // itself, mirroring the FR-012 unresolved-host diagnostic's convention.
-                return Some(Diagnostic {
-                    range: gl_dep.name_range.into(),
-                    severity: Some(severity),
-                    message: format!(
-                        "{name} project has no `ref:`; GitLab CI defaults to the project's \
-                         default branch, which is mutable — add an explicit `ref:` pinned to \
-                         a tag or commit SHA (manual edit — no automated fix available)"
-                    ),
-                    code: Some(NumberOrString::String(
-                        MUTABLE_REF_PIN_DIAGNOSTIC_CODE.into(),
-                    )),
-                    source: Some("deps-lsp".into()),
-                    ..Default::default()
-                });
+                return Some(
+                    Diagnostic::new(
+                        gl_dep.name_range,
+                        format!(
+                            "{name} project has no `ref:`; GitLab CI defaults to the project's \
+                             default branch, which is mutable — add an explicit `ref:` pinned \
+                             to a tag or commit SHA (manual edit — no automated fix available)"
+                        ),
+                    )
+                    .with_severity(severity)
+                    .with_code(MUTABLE_REF_PIN_DIAGNOSTIC_CODE),
+                );
             };
 
             let diagnosable = match pin {
@@ -696,16 +700,11 @@ fn mutable_ref_pin_diagnostics(
                      SHA to guard against ref mutation{manual_edit_suffix}"
                 )
             };
-            Some(Diagnostic {
-                range: range.into(),
-                severity: Some(severity),
-                message,
-                code: Some(NumberOrString::String(
-                    MUTABLE_REF_PIN_DIAGNOSTIC_CODE.into(),
-                )),
-                source: Some("deps-lsp".into()),
-                ..Default::default()
-            })
+            Some(
+                Diagnostic::new(range, message)
+                    .with_severity(severity)
+                    .with_code(MUTABLE_REF_PIN_DIAGNOSTIC_CODE),
+            )
         })
         .collect()
 }
@@ -726,6 +725,7 @@ fn mutable_ref_pin_diagnostics(
 /// *automated edit* that silently pins to the tag's commit could pin to a different commit
 /// than the ref actually resolves to at run time. A diagnostic's advisory text carries no
 /// such risk, but this destructive edit keeps the stricter guard.
+#[cfg(feature = "lsp-responses")]
 fn build_sha_pin_action(
     parse_result: &dyn ParseResultTrait,
     position: Position,
@@ -737,7 +737,7 @@ fn build_sha_pin_action(
     let dep = parse_result
         .dependencies()
         .into_iter()
-        .find(|d| formatter.is_position_on_dependency(*d, position))?;
+        .find(|d| formatter.is_position_on_dependency(*d, position.into()))?;
 
     let gl_dep = dep.as_any().downcast_ref::<GitlabCiDependency>()?;
     if !matches!(
@@ -753,7 +753,7 @@ fn build_sha_pin_action(
         .map(deps_core::VersionReq::as_str)?;
     let new_text = formatter.sha_pin_replacement_for(gl_dep.kind.endpoint(), &gl_dep.name, tag)?;
 
-    let changes = deps_core::single_file_edit(uri, version_range.into(), new_text);
+    let changes = deps_core::single_file_edit(uri, version_range, new_text);
 
     Some(CodeAction {
         title: format!("Pin {} to commit SHA", gl_dep.name),
@@ -787,6 +787,7 @@ fn build_sha_pin_action(
 /// times out. The eligibility guard (kind/pin/route) is [`sha_pin_quickfix_kind`] (issue
 /// #643) — the single source of truth this and `mutable_ref_pin_diagnostics`'s message
 /// both consult, so they cannot independently drift about whether a quickfix exists.
+#[cfg(feature = "lsp-responses")]
 async fn build_dynamic_component_pin_action(
     parse_result: &dyn ParseResultTrait,
     position: Position,
@@ -800,7 +801,7 @@ async fn build_dynamic_component_pin_action(
     let dep = parse_result
         .dependencies()
         .into_iter()
-        .find(|d| formatter.is_position_on_dependency(*d, position))?;
+        .find(|d| formatter.is_position_on_dependency(*d, position.into()))?;
     let gl_dep = dep.as_any().downcast_ref::<GitlabCiDependency>()?;
     if !matches!(
         sha_pin_quickfix_kind(dep, gl_dep, formatter),
@@ -837,7 +838,7 @@ async fn build_dynamic_component_pin_action(
         }
     };
 
-    let changes = deps_core::single_file_edit(uri, version_range.into(), resolved.sha);
+    let changes = deps_core::single_file_edit(uri, version_range, resolved.sha);
 
     Some(CodeAction {
         title: format!("Pin {} to commit SHA", gl_dep.name),
@@ -867,6 +868,7 @@ async fn build_dynamic_component_pin_action(
 /// to the unmodified [`crate::component::resolve_component_pin`] ladder — see
 /// [`reconstitute_component_releases`] for why an unresolved-SHA entry is kept as a
 /// placeholder rather than dropped.
+#[cfg(feature = "lsp-responses")]
 fn collect_pin_all_to_sha_edits(
     parse_result: &dyn ParseResultTrait,
     formatter: &GitlabCiFormatter,
@@ -885,6 +887,7 @@ fn collect_pin_all_to_sha_edits(
 /// single position. `None` when the dependency is not diagnosable via either path, has no
 /// `version_range`, or (`DynamicComponentPin` only) the ladder can't resolve it from the
 /// caller's already-fetched `versions`.
+#[cfg(feature = "lsp-responses")]
 fn bulk_sha_pin_text_edit_for(
     dep: &dyn deps_core::Dependency,
     formatter: &GitlabCiFormatter,
@@ -951,6 +954,7 @@ fn bulk_sha_pin_text_edit_for(
 /// caller still verifies the *winning* release's SHA independently
 /// (`bulk_sha_pin_text_edit_for`'s [`deps_core::lsp_helpers::is_full_sha`] check) before
 /// splicing it into a `TextEdit`.
+#[cfg(feature = "lsp-responses")]
 fn reconstitute_component_releases(
     name: &PackageName,
     gl_dep: &GitlabCiDependency,
@@ -993,6 +997,7 @@ fn reconstitute_component_releases(
 // `pos`/`insert_at` come from `find("\n\n")`, an ASCII token, so both are always char
 // boundaries.
 #[allow(clippy::string_slice)]
+#[cfg(feature = "lsp-responses")]
 fn splice_project_line(markdown: &str, url: &str) -> String {
     let line = format!("**Project**: [{url}]({url})\n\n");
     if let Some(pos) = markdown.find("\n\n") {
@@ -1013,6 +1018,7 @@ fn splice_project_line(markdown: &str, url: &str) -> String {
 // `pos`/`rel_end`/`insert_at` come from `find` of ASCII anchors (`"**Current**: "`,
 // `"\n\n"`), so all are always char boundaries.
 #[allow(clippy::string_slice)]
+#[cfg(feature = "lsp-responses")]
 fn splice_resolved_line(markdown: &str, resolved_tag: &str, sha: &str) -> String {
     let short_sha = sha.get(..7).unwrap_or(sha);
     let line = format!(
@@ -1040,6 +1046,7 @@ fn splice_resolved_line(markdown: &str, resolved_tag: &str, sha: &str) -> String
 #[allow(clippy::string_slice)]
 mod tests {
     use super::*;
+    #[cfg(feature = "lsp-responses")]
     use crate::registry::TagIndex;
     use crate::types::EndpointKind;
     use dashmap::DashMap;
@@ -1089,6 +1096,7 @@ mod tests {
         assert_eq!(result.dependencies().len(), 1);
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_splice_project_line() {
         let markdown = "# gitlab.com/org/proj/comp\n\n**Requirement**: `1.0.0`\n";
@@ -1097,6 +1105,7 @@ mod tests {
         assert!(spliced.find("**Project**").unwrap() < spliced.find("**Requirement**").unwrap());
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_splice_resolved_line_after_requirement() {
         let markdown = "# org/proj\n\n**Requirement**: `v1.0.0`\n\n**Latest**: `v1.1.0`\n";
@@ -1187,14 +1196,9 @@ mod tests {
 
         let found = diagnostics
             .iter()
-            .find(|d| {
-                d.code
-                    == Some(NumberOrString::String(
-                        UNRESOLVED_HOST_DIAGNOSTIC_CODE.into(),
-                    ))
-            })
+            .find(|d| d.code == Some(UNRESOLVED_HOST_DIAGNOSTIC_CODE.to_string()))
             .expect("expected the unresolved-host diagnostic");
-        assert_eq!(found.severity, Some(DiagnosticSeverity::INFORMATION));
+        assert_eq!(found.severity, Some(Severity::Information));
         assert!(found.message.contains("gitlab_instance_host"));
     }
 
@@ -1234,12 +1238,11 @@ mod tests {
             1,
             "expected exactly one blocked-registry diagnostic, got: {diagnostics:?}"
         );
-        assert_eq!(blocked[0].severity, Some(DiagnosticSeverity::INFORMATION));
+        assert_eq!(blocked[0].severity, Some(Severity::Information));
         assert!(
-            diagnostics.iter().all(|d| d.code
-                != Some(NumberOrString::String(
-                    UNRESOLVED_HOST_DIAGNOSTIC_CODE.into()
-                ))),
+            diagnostics
+                .iter()
+                .all(|d| d.code != Some(UNRESOLVED_HOST_DIAGNOSTIC_CODE.to_string())),
             "must not surface the unresolved-host diagnostic for a policy-blocked host: \
              {diagnostics:?}"
         );
@@ -1287,10 +1290,9 @@ mod tests {
         // placeholder, which appears nowhere in this manifest or its config.
         assert!(blocked[0].message.contains("10.0.0.1"));
         assert!(
-            diagnostics.iter().all(|d| d.code
-                != Some(NumberOrString::String(
-                    UNRESOLVED_HOST_DIAGNOSTIC_CODE.into()
-                ))),
+            diagnostics
+                .iter()
+                .all(|d| d.code != Some(UNRESOLVED_HOST_DIAGNOSTIC_CODE.to_string())),
             "must not surface the unresolved-host diagnostic for a policy-blocked host: \
              {diagnostics:?}"
         );
@@ -1302,8 +1304,8 @@ mod tests {
 
     // --- issue #634: mutable-ref-pin diagnostic + "Pin to commit SHA" code action ---
 
-    fn mutable_ref_pin_code() -> NumberOrString {
-        NumberOrString::String(MUTABLE_REF_PIN_DIAGNOSTIC_CODE.into())
+    fn mutable_ref_pin_code() -> String {
+        MUTABLE_REF_PIN_DIAGNOSTIC_CODE.into()
     }
 
     async fn diagnostics_for(content: &str, uri: &Url) -> Vec<Diagnostic> {
@@ -1333,7 +1335,7 @@ mod tests {
             .iter()
             .find(|d| d.code == Some(mutable_ref_pin_code()))
             .expect("expected the mutable-ref-pin diagnostic for a PinStyle::Tag include");
-        assert_eq!(found.severity, Some(DiagnosticSeverity::HINT));
+        assert_eq!(found.severity, Some(Severity::Hint));
         assert!(found.message.contains("v1.0.0"));
         assert!(!found.message.contains("manual edit"));
     }
@@ -1374,6 +1376,7 @@ mod tests {
     /// (shared with `deps-github-actions`'s identical guard), not a regression #643
     /// introduced — this test exists so it stays a documented, deliberate fact rather than
     /// an implicit one.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_tag_pin_message_omits_suffix_on_cold_cache_while_quickfix_unavailable() {
         let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
@@ -1459,6 +1462,7 @@ mod tests {
     /// diagnostic function's isolated logic (see also
     /// `registry::tests::test_fetch_route_tags_indexes_non_semver_tag_for_registry_confirmation`
     /// for the same guarantee at the live-fetch layer).
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_mutable_ref_pin_diagnostics_fires_for_registry_confirmed_branch() {
         let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
@@ -1485,8 +1489,7 @@ mod tests {
         );
         let formatter = GitlabCiFormatter::new(Arc::new(DashMap::new()), tag_index);
 
-        let diagnostics =
-            mutable_ref_pin_diagnostics(&parse_result, DiagnosticSeverity::HINT, &formatter);
+        let diagnostics = mutable_ref_pin_diagnostics(&parse_result, Severity::Hint, &formatter);
 
         let found = diagnostics
             .iter()
@@ -1500,6 +1503,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "lsp-responses")]
     fn test_formatter() -> GitlabCiFormatter {
         GitlabCiFormatter::new(Arc::new(DashMap::new()), Arc::new(DashMap::new()))
     }
@@ -1509,6 +1513,7 @@ mod tests {
     /// delegates to first drives a *live* registry fetch (to list "Update to X" actions),
     /// which would overwrite a hand-seeded `TagIndex` fixture with real GitLab data before
     /// this function ever runs — mirrors `deps_github_actions`'s identical test rationale.
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_build_sha_pin_action_offers_quickfix_on_tag_index_hit() {
         let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
@@ -1552,6 +1557,7 @@ mod tests {
         assert_eq!(text_edits[0].new_text, sha);
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_build_sha_pin_action_no_quickfix_on_tag_index_miss() {
         let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
@@ -1577,6 +1583,7 @@ mod tests {
     /// Mirrors `deps_github_actions`'s identical guard: a `PinStyle::Branch` include must
     /// never get the SHA-pin quickfix, even if a `TagIndex` entry happens to exist for its
     /// literal ref text (a branch and a tag can share one name).
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_build_sha_pin_action_no_quickfix_for_branch_pin() {
         let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
@@ -1772,6 +1779,7 @@ mod tests {
         assert!(!found[1].message.contains("v1.0.0"));
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_build_sha_pin_action_multiple_includes_applies_matching_sha() {
         let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
@@ -1835,6 +1843,7 @@ mod tests {
     /// `PackageName` text. Before keying `TagIndex` by `(EndpointKind, PackageName)`, the
     /// second seeded entry would silently overwrite the first, and `build_sha_pin_action`
     /// would apply the wrong repository's SHA to whichever include was queried second.
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_build_sha_pin_action_no_cross_kind_collision() {
         let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
@@ -1912,6 +1921,7 @@ mod tests {
 
     // --- validation follow-up C2/S2: quickfix for Latest/Partial component pins ---
 
+    #[cfg(feature = "lsp-responses")]
     fn component_pin_test_setup(
         server: &mockito::ServerGuard,
         pin: PinStyle,
@@ -1984,6 +1994,7 @@ mod tests {
     /// in disjoint tests, so nothing previously caught a future edit that special-cased one
     /// call site without touching the shared predicate. A resolved host must both omit the
     /// diagnostic's suffix AND actually offer the quickfix.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_message_omits_suffix_iff_quickfix_actually_offered_for_resolved_latest_pin() {
         let mut server = mockito::Server::new_async().await;
@@ -2001,8 +2012,7 @@ mod tests {
         let (registry, formatter, parse_result, uri, position) =
             component_pin_test_setup(&server, PinStyle::Latest, "~latest");
 
-        let diagnostics =
-            mutable_ref_pin_diagnostics(&parse_result, DiagnosticSeverity::HINT, &formatter);
+        let diagnostics = mutable_ref_pin_diagnostics(&parse_result, Severity::Hint, &formatter);
         let found = diagnostics
             .iter()
             .find(|d| d.code == Some(mutable_ref_pin_code()))
@@ -2032,6 +2042,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_build_dynamic_component_pin_action_offers_quickfix_for_latest_pin() {
         let mut server = mockito::Server::new_async().await;
@@ -2065,6 +2076,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_build_dynamic_component_pin_action_offers_quickfix_for_partial_pin() {
         let mut server = mockito::Server::new_async().await;
@@ -2098,6 +2110,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_build_dynamic_component_pin_action_no_quickfix_when_nothing_matches() {
         let mut server = mockito::Server::new_async().await;
@@ -2127,6 +2140,7 @@ mod tests {
 
     /// Neither a `project:` include nor a `component:` `PinStyle::Tag`/`PinStyle::Branch`
     /// pin is ever resolved by this function — it exists solely for `Latest`/`Partial`.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_build_dynamic_component_pin_action_ignores_non_latest_partial_pins() {
         let server = mockito::Server::new_async().await;
@@ -2306,6 +2320,7 @@ mod tests {
 
     // --- issue #640: bulk "Pin all to SHA" collector ---
 
+    #[cfg(feature = "lsp-responses")]
     fn empty_versions() -> (
         std::collections::HashMap<PackageName, deps_core::PackageVersions>,
         std::collections::HashMap<PackageName, deps_core::ConcreteVersion>,
@@ -2316,6 +2331,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_collect_pin_all_to_sha_edits_multiple_tag_includes_produce_sorted_edits() {
         let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
@@ -2347,6 +2363,7 @@ mod tests {
         assert!(edits.iter().any(|e| e.new_text == sha2));
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_collect_pin_all_to_sha_edits_skips_sha_branch_and_refless_includes() {
         let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
@@ -2371,6 +2388,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_collect_pin_all_to_sha_edits_tag_index_miss_is_skipped() {
         let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
@@ -2386,6 +2404,7 @@ mod tests {
         assert!(edits.is_empty());
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_collect_pin_all_to_sha_edits_resolves_latest_component_pin_from_cached_versions()
     {
@@ -2414,6 +2433,7 @@ mod tests {
         assert_eq!(edits[0].new_text, sha);
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_collect_pin_all_to_sha_edits_resolves_partial_component_pin_picks_highest_matching()
      {
@@ -2460,6 +2480,7 @@ mod tests {
     /// rather than dropping it, so `Latest` still resolves to `2.0.0` and then correctly
     /// withholds the edit (since its SHA is unknown), instead of silently shifting the
     /// result down to `1.0.0` just because that one happens to have a SHA on file.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_collect_pin_all_to_sha_edits_unknown_sha_winner_is_skipped_not_shifted() {
         let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
@@ -2499,6 +2520,7 @@ mod tests {
     /// collector's reconstitution — two releases that normalize to the same semver
     /// (`1.2.0`/`v1.2.0`) must resolve by `available`'s own order, not be silently
     /// reordered/deduped by a future "tidy up" of `reconstitute_component_releases`.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_collect_pin_all_to_sha_edits_latest_tie_break_picks_last_in_available_order() {
         let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
@@ -2544,6 +2566,7 @@ mod tests {
     /// the surrounding quotes fall outside the edit and survive unmodified. Unlike
     /// `deps-github-actions`, this ecosystem has no `is_plain_scalar`/flow-mapping guard
     /// to withhold on, by design (see `build_sha_pin_action`'s doc comment).
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_collect_pin_all_to_sha_edits_quoted_scalar_tag_pin_round_trips() {
         let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
@@ -2568,8 +2591,8 @@ mod tests {
         assert_eq!(edits[0].new_text, sha);
 
         let table = deps_core::LineOffsetTable::new(content);
-        let start = table.position_to_byte_offset(content, edits[0].range.start);
-        let end = table.position_to_byte_offset(content, edits[0].range.end);
+        let start = table.position_to_byte_offset(content, edits[0].range.start.into());
+        let end = table.position_to_byte_offset(content, edits[0].range.end.into());
         let new_content = format!(
             "{}{}{}",
             &content[..start],
@@ -2587,12 +2610,13 @@ mod tests {
 
     /// `deps-gitlab-ci` never supports raw-text section detection at all (no cheap
     /// section boundary shared by `project:`/`component:` include forms) — no override.
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_fallback_completion_prefix_default_none() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let eco = GitlabCiEcosystem::new(cache);
         assert!(
-            eco.fallback_completion_prefix("anything at all\n", Position::new(0, 0))
+            eco.fallback_completion_prefix("anything at all\n", Position::new(0, 0).into())
                 .is_none()
         );
     }
@@ -2643,6 +2667,7 @@ mod tests {
     /// A minimal, fully literal `GitlabCiDependency` for dispatch tests — bypasses the real
     /// YAML parser so `name_range`/`version_range`/`source` are exactly what the test wants,
     /// with no risk of a real parse resolving `source` to a live, network-reachable host.
+    #[cfg(feature = "lsp-responses")]
     fn dispatch_test_dep(
         name_range: deps_core::position::Range,
         version_range: deps_core::position::Range,
@@ -2664,6 +2689,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_completions_package_name_context_returns_empty_non_incomplete() {
         let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
@@ -2700,6 +2726,7 @@ mod tests {
         assert_eq!(result, Completions::default());
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_completions_version_context_no_dependency_at_position_returns_empty() {
         let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
@@ -2742,6 +2769,7 @@ mod tests {
     /// network call — deterministic, and pins that `generate_completions` still threads the
     /// found dependency's own `name`/`source` into `complete_versions_generic_from` rather
     /// than, say, skipping the lookup or using a different dependency's source.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_completions_version_context_dispatches_by_dependency_source() {
         let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
@@ -2824,6 +2852,7 @@ mod tests {
 
     /// FR-010/US-002: the "Pin to commit SHA" code action must never be offered at an
     /// alias site, even when a real `TagIndex` entry would otherwise resolve one.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_code_actions_withholds_sha_pin_for_alias_occurrence() {
         let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
@@ -2865,6 +2894,7 @@ mod tests {
     /// `project:`/`ref:` shape (`name_range != version_range`) — the shape where
     /// `CompletionContext::Version` is actually reachable, so this is a meaningful test of
     /// the gate rather than a vacuous one (see [`alias_dispatch_test_dep`]'s doc comment).
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_completions_withholds_version_completion_for_alias_occurrence() {
         let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
@@ -2903,6 +2933,7 @@ mod tests {
     /// this ecosystem's own FR-011 gate — it now passes even without it. This test calls
     /// `complete_version` directly, bypassing `detect_completion_context` entirely, to pin
     /// that the local gate itself still withholds (defense-in-depth, not dead code).
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_complete_version_directly_withholds_for_alias_occurrence() {
         let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
@@ -2935,6 +2966,7 @@ mod tests {
 
     /// FR-010/US-002: the bulk "pin all to SHA" lens must not produce an edit for an
     /// alias-occurrence dependency, even when its pin would otherwise resolve one.
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_collect_pin_all_to_sha_edits_withholds_for_alias_occurrence() {
         let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");

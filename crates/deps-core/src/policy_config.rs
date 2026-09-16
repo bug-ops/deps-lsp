@@ -1,5 +1,5 @@
+use crate::diagnostic::Severity;
 use serde::Deserialize;
-use tower_lsp_server::ls_types::DiagnosticSeverity;
 
 /// The policy-relevant subset of `deps-lsp`'s configuration.
 ///
@@ -222,35 +222,35 @@ impl PolicyConfig {
 ///
 /// ```
 /// use deps_core::policy_config::DiagnosticsConfig;
-/// use tower_lsp_server::ls_types::DiagnosticSeverity;
+/// use deps_core::diagnostic::Severity;
 ///
 /// let config = DiagnosticsConfig::new()
-///     .with_outdated_severity(DiagnosticSeverity::INFORMATION)
-///     .with_unknown_severity(DiagnosticSeverity::ERROR)
-///     .with_yanked_severity(DiagnosticSeverity::ERROR)
-///     .with_unsatisfiable_severity(DiagnosticSeverity::ERROR)
-///     .with_deprecated_severity(DiagnosticSeverity::ERROR)
-///     .with_mutable_ref_pin_severity(DiagnosticSeverity::ERROR)
+///     .with_outdated_severity(Severity::Information)
+///     .with_unknown_severity(Severity::Error)
+///     .with_yanked_severity(Severity::Error)
+///     .with_unsatisfiable_severity(Severity::Error)
+///     .with_deprecated_severity(Severity::Error)
+///     .with_mutable_ref_pin_severity(Severity::Error)
 ///     .with_mutable_ref_pin_enabled(true)
 ///     .with_vulnerabilities_enabled(true);
 ///
-/// assert_eq!(config.unknown_severity, DiagnosticSeverity::ERROR);
+/// assert_eq!(config.unknown_severity, Severity::Error);
 /// ```
 #[non_exhaustive]
 #[derive(Debug, Clone, Deserialize)]
 pub struct DiagnosticsConfig {
     /// Severity for a dependency with a newer version available.
     #[serde(default = "default_outdated_severity")]
-    pub outdated_severity: DiagnosticSeverity,
+    pub outdated_severity: Severity,
     /// Severity for a dependency not found in the registry.
     #[serde(default = "default_unknown_severity")]
-    pub unknown_severity: DiagnosticSeverity,
+    pub unknown_severity: Severity,
     /// Severity for a dependency pinned to a yanked/retracted version.
     #[serde(default = "default_yanked_severity")]
-    pub yanked_severity: DiagnosticSeverity,
+    pub yanked_severity: Severity,
     /// Severity for a dependency whose requirement matches zero published versions.
     #[serde(default = "default_unsatisfiable_severity")]
-    pub unsatisfiable_severity: DiagnosticSeverity,
+    pub unsatisfiable_severity: Severity,
     /// Severity for a dependency on a package the registry reports as
     /// deprecated/abandoned (issue #205). No corresponding `deprecated_enabled`
     /// toggle: unlike `vulnerabilities_enabled`, this signal is derived from
@@ -258,18 +258,18 @@ pub struct DiagnosticsConfig {
     /// D2), so a boolean would gate only string formatting, not a network
     /// call. Matches the severity-only precedent set by the four fields above.
     #[serde(default = "default_deprecated_severity")]
-    pub deprecated_severity: DiagnosticSeverity,
+    pub deprecated_severity: Severity,
     /// Severity for a dependency pinned to a mutable ref (a tag/branch) instead of a
     /// full commit SHA — a GitHub Actions `uses:` step (issue #473) or a GitLab CI
     /// `project:`/`component:` include (issue #634). Tunes loudness only; see
     /// `mutable_ref_pin_enabled` for the on/off toggle.
     #[serde(default = "default_mutable_ref_pin_severity")]
-    pub mutable_ref_pin_severity: DiagnosticSeverity,
+    pub mutable_ref_pin_severity: Severity,
     /// Whether the mutable-ref-pin diagnostic (issue #473, extended to GitLab CI by
     /// issue #634) runs at all. Default
     /// `true`. **Corrected during implementation review (spec 031 FR-009)**: unlike
     /// `deprecated_severity`, this diagnostic *does* need a real `_enabled` toggle —
-    /// `DiagnosticSeverity` has no suppression value, and severity is never treated
+    /// `Severity` has no suppression value, and severity is never treated
     /// as a suppression input anywhere in this codebase, so without this boolean the
     /// diagnostic would be permanent and unremovable on every tag-pinned `uses:` step
     /// (the dominant pinning style), even for teams that intentionally reject
@@ -297,10 +297,10 @@ impl DiagnosticsConfig {
     ///
     /// ```
     /// use deps_core::policy_config::DiagnosticsConfig;
-    /// use tower_lsp_server::ls_types::DiagnosticSeverity;
+    /// use deps_core::diagnostic::Severity;
     ///
     /// let config = DiagnosticsConfig::new();
-    /// assert_eq!(config.outdated_severity, DiagnosticSeverity::HINT);
+    /// assert_eq!(config.outdated_severity, Severity::Hint);
     /// ```
     #[must_use]
     pub const fn new() -> Self {
@@ -318,41 +318,35 @@ impl DiagnosticsConfig {
 
     /// Overrides [`Self::outdated_severity`]. See [`Self::new`].
     #[must_use]
-    pub const fn with_outdated_severity(mut self, outdated_severity: DiagnosticSeverity) -> Self {
+    pub const fn with_outdated_severity(mut self, outdated_severity: Severity) -> Self {
         self.outdated_severity = outdated_severity;
         self
     }
 
     /// Overrides [`Self::unknown_severity`]. See [`Self::new`].
     #[must_use]
-    pub const fn with_unknown_severity(mut self, unknown_severity: DiagnosticSeverity) -> Self {
+    pub const fn with_unknown_severity(mut self, unknown_severity: Severity) -> Self {
         self.unknown_severity = unknown_severity;
         self
     }
 
     /// Overrides [`Self::yanked_severity`]. See [`Self::new`].
     #[must_use]
-    pub const fn with_yanked_severity(mut self, yanked_severity: DiagnosticSeverity) -> Self {
+    pub const fn with_yanked_severity(mut self, yanked_severity: Severity) -> Self {
         self.yanked_severity = yanked_severity;
         self
     }
 
     /// Overrides [`Self::unsatisfiable_severity`]. See [`Self::new`].
     #[must_use]
-    pub const fn with_unsatisfiable_severity(
-        mut self,
-        unsatisfiable_severity: DiagnosticSeverity,
-    ) -> Self {
+    pub const fn with_unsatisfiable_severity(mut self, unsatisfiable_severity: Severity) -> Self {
         self.unsatisfiable_severity = unsatisfiable_severity;
         self
     }
 
     /// Overrides [`Self::deprecated_severity`]. See [`Self::new`].
     #[must_use]
-    pub const fn with_deprecated_severity(
-        mut self,
-        deprecated_severity: DiagnosticSeverity,
-    ) -> Self {
+    pub const fn with_deprecated_severity(mut self, deprecated_severity: Severity) -> Self {
         self.deprecated_severity = deprecated_severity;
         self
     }
@@ -361,7 +355,7 @@ impl DiagnosticsConfig {
     #[must_use]
     pub const fn with_mutable_ref_pin_severity(
         mut self,
-        mutable_ref_pin_severity: DiagnosticSeverity,
+        mutable_ref_pin_severity: Severity,
     ) -> Self {
         self.mutable_ref_pin_severity = mutable_ref_pin_severity;
         self
@@ -545,28 +539,28 @@ const fn default_true() -> bool {
     true
 }
 
-const fn default_outdated_severity() -> DiagnosticSeverity {
-    DiagnosticSeverity::HINT
+const fn default_outdated_severity() -> Severity {
+    Severity::Hint
 }
 
-const fn default_unknown_severity() -> DiagnosticSeverity {
-    DiagnosticSeverity::WARNING
+const fn default_unknown_severity() -> Severity {
+    Severity::Warning
 }
 
-const fn default_yanked_severity() -> DiagnosticSeverity {
-    DiagnosticSeverity::WARNING
+const fn default_yanked_severity() -> Severity {
+    Severity::Warning
 }
 
-const fn default_unsatisfiable_severity() -> DiagnosticSeverity {
-    DiagnosticSeverity::WARNING
+const fn default_unsatisfiable_severity() -> Severity {
+    Severity::Warning
 }
 
-const fn default_deprecated_severity() -> DiagnosticSeverity {
-    DiagnosticSeverity::WARNING
+const fn default_deprecated_severity() -> Severity {
+    Severity::Warning
 }
 
-const fn default_mutable_ref_pin_severity() -> DiagnosticSeverity {
-    DiagnosticSeverity::HINT
+const fn default_mutable_ref_pin_severity() -> Severity {
+    Severity::Hint
 }
 
 const fn default_fetch_timeout_secs() -> u64 {
@@ -1370,11 +1364,11 @@ mod tests {
         }"#;
 
         let config: DiagnosticsConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(config.outdated_severity, DiagnosticSeverity::ERROR);
-        assert_eq!(config.unknown_severity, DiagnosticSeverity::WARNING);
-        assert_eq!(config.yanked_severity, DiagnosticSeverity::WARNING);
-        assert_eq!(config.unsatisfiable_severity, DiagnosticSeverity::ERROR);
-        assert_eq!(config.deprecated_severity, DiagnosticSeverity::ERROR);
+        assert_eq!(config.outdated_severity, Severity::Error);
+        assert_eq!(config.unknown_severity, Severity::Warning);
+        assert_eq!(config.yanked_severity, Severity::Warning);
+        assert_eq!(config.unsatisfiable_severity, Severity::Error);
+        assert_eq!(config.deprecated_severity, Severity::Error);
     }
 
     #[test]

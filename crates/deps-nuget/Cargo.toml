@@ -19,6 +19,15 @@ workspace = true
 # and `HttpCache::get_for_bench` (#835 M1). Never enabled outside a benchmark build.
 test-util = []
 
+# Gates this crate's own `tower-lsp-server` dependency and LSP-response-shaped code,
+# forwarding to `deps-core`'s identically-named feature (issue #1083, spec 064). Not
+# `default`: Cargo does not allow a `workspace = true` dependency edge to turn off a
+# default feature, so making this default here would make it inescapable for `deps-engine`
+# (see its own `lsp-responses` feature doc). `deps-lsp` requests it explicitly, directly or
+# via `deps-engine`'s own `lsp-responses`; `deps-cli` never does, keeping `tower-lsp-server`
+# out of its dependency tree.
+lsp-responses = ["dep:tower-lsp-server", "deps-core/lsp-responses"]
+
 [dependencies]
 base64 = { workspace = true }
 bytes = { workspace = true }
@@ -31,7 +40,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "macros", "sync"] }
-tower-lsp-server = { workspace = true }
+tower-lsp-server = { workspace = true, optional = true }
 tracing = { workspace = true }
 url = { workspace = true }
 urlencoding = { workspace = true }
