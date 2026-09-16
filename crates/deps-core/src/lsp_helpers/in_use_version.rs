@@ -564,9 +564,8 @@ mod tests {
         for eco in [EcosystemId::Cargo, EcosystemId::Npm, EcosystemId::Go] {
             assert!(is_concrete_version("=1.2.3", eco), "{eco:?}");
         }
-        // Go's go.mod bare `v1.9.1` style: Go is not in the
-        // range-default set, so the bare form (with its `v` prefix) is
-        // accepted without needing an explicit `=`.
+        // Go is not in the range-default set, so go.mod's bare `v1.9.1` style is accepted
+        // without needing an explicit `=`.
         assert!(is_concrete_version("v1.9.1", EcosystemId::Go));
     }
 
@@ -579,12 +578,10 @@ mod tests {
 
     #[test]
     fn is_concrete_version_bare_digit_accepted_for_non_range_default_ecosystems() {
-        // Maven/Go/Bundler/Dart/Gradle/NuGet: a bare version is already
-        // exact (or, for NuGet's PackageReference floor, resolves to
-        // exactly that version in practice). Gradle in particular has no
-        // implicit-caret default for a plain coordinate version like
-        // `"2.14.1"` — only the `+` dynamic-version suffix is a range,
-        // and that's rejected separately by `looks_like_a_single_version`.
+        // Maven/Go/Bundler/Dart/Gradle/NuGet: a bare version is already exact (or, for
+        // NuGet's PackageReference floor, resolves to exactly that version in practice).
+        // Gradle's only range shape is the `+` dynamic-version suffix, rejected separately
+        // by `looks_like_a_single_version`.
         for eco in [
             EcosystemId::Maven,
             EcosystemId::Go,
@@ -599,31 +596,20 @@ mod tests {
 
     #[test]
     fn is_concrete_version_nuget_bare_version_is_a_deliberate_pin_approximation() {
-        // #669: a bare NuGet `Version="1.0.0"` is a minimum-only floor under
-        // `PackageReference`/`PackageVersion` semantics — `NuGetFormatter`'s own
-        // `version_satisfies_requirement` accepts any version `>= 1.0.0`, not just
-        // `1.0.0` itself. `deps-core` still treats it as concrete here anyway: this is
-        // a deliberate approximation of "restore resolves a direct reference to its
-        // floor version in practice" (mirrored by `NuGetFormatter::
-        // is_requirement_up_to_date`, which treats the same bare floor as a pin for
-        // outdated-checking), not an oversight — reclassifying NuGet to always-range
-        // was tried and reverted during #669's implementation because it silently
-        // dropped OSV/hover/license resolution for the dominant bare `Version="X"`
-        // spelling with no lock file present. See this module's `Concrete` doc for
-        // the full rationale and known limitations of the approximation.
+        // #669: a bare NuGet `Version="1.0.0"` is really a minimum-only floor, but treated
+        // as concrete anyway (mirrors `NuGetFormatter::is_requirement_up_to_date`) —
+        // reclassifying to always-range was tried and reverted since it dropped OSV/hover/
+        // license resolution for the dominant bare-version spelling. See `Concrete`'s doc.
         assert!(is_concrete_version("1.0.0", EcosystemId::NuGet));
-        // An explicit exact-bracket pin is unaffected either way — it is stripped
-        // and matched before `bare_requirement_policy` is ever consulted.
+        // An explicit exact-bracket pin is stripped and matched before this policy applies.
         assert!(is_concrete_version("[1.0.0]", EcosystemId::NuGet));
     }
 
     #[test]
     fn is_concrete_version_bare_digit_rejected_for_range_default_ecosystems() {
-        // Critique C2: Cargo's bare "1.2.3" is a caret range under Cargo's
-        // own default operator, not a pin. Cargo is the sole remaining
-        // `AlwaysRange` ecosystem — npm/Composer (#664) and Deno (#667)
-        // moved to `ConcreteIfFullVersion`, since a bare *full* version is
-        // their own exact pin.
+        // Critique C2: Cargo's bare "1.2.3" is a caret range, not a pin — Cargo is the sole
+        // remaining `AlwaysRange` ecosystem (npm/Composer #664 and Deno #667 moved to
+        // `ConcreteIfFullVersion`, since a bare *full* version is their own exact pin).
         assert!(!is_concrete_version("1.2.3", EcosystemId::Cargo));
         // ...but an explicit pin is still accepted.
         assert!(is_concrete_version("=1.2.3", EcosystemId::Cargo));
@@ -631,13 +617,9 @@ mod tests {
 
     #[test]
     fn is_concrete_version_rejects_partials_and_wildcards() {
-        // Critique C2: npm/Composer "1.x"/"1.2.x" and bare partials like
-        // "1.2" are ranges, and Gradle's "1.+" is a dynamic version —
-        // "1.x"/"1.2.x" are rejected by the `x` reject-char regardless of
-        // policy, and "1.2" is rejected by `ConcreteIfFullVersion`'s
-        // `is_full_semver_shape` gate (#664: a bare partial version is
-        // still a range for npm/Composer, only a bare *full* version is
-        // now concrete).
+        // Critique C2: npm/Composer "1.x"/"1.2.x" and bare partials like "1.2" are ranges
+        // (rejected by the `x` reject-char and `ConcreteIfFullVersion`'s
+        // `is_full_semver_shape` gate respectively, #664), and Gradle's "1.+" is dynamic.
         for eco in [EcosystemId::Npm, EcosystemId::Composer] {
             assert!(!is_concrete_version("1.x", eco), "{eco:?}");
             assert!(!is_concrete_version("1.2.x", eco), "{eco:?}");
@@ -670,12 +652,9 @@ mod tests {
 
     #[test]
     fn concrete_pin_version_strips_pep440_double_equals_comparator() {
-        // Regression guard: PyPI's parser retains the pep440 comparator
-        // in `version_requirement().as_str()` (`"==4.9.0"`, not
-        // `"4.9.0"` — confirmed by deps-pypi's `test_basic_pinned`). The
-        // verbatim string was silently unusable against real registry
-        // version strings in the yanked probe; `concrete_pin_version`
-        // must strip it.
+        // Regression guard: PyPI's parser retains the pep440 comparator in
+        // `version_requirement().as_str()` (`"==4.9.0"`, not `"4.9.0"`) — the verbatim
+        // string was unusable against real registry versions in the yanked probe.
         assert_eq!(
             concrete_pin_version("==4.9.0", EcosystemId::Pypi),
             Some("4.9.0")
@@ -1074,15 +1053,11 @@ mod tests {
     /// comparison policy.
     #[test]
     fn best_candidate_for_requirement_non_semver_uses_lexicographic_tiebreak() {
-        // Testing gap 2 fix: both candidates must actually satisfy the requirement and
-        // both must fail semver parsing, so `max_by` is genuinely invoked on two elements
-        // and falls all the way to `compare_lockfile_versions`'s `(Err, Err) => a.cmp(b)`
-        // branch — a single-match case (the previous version of this test) never calls the
-        // comparator at all. `MockFormatter` has no `compile_requirement` override (default
-        // `None`), so this exercises the `version_satisfies_requirement` fallback path:
-        // requirement `"1"` is a partial-version bare requirement, and both `"1-rc1"` and
-        // `"1-rc2"` satisfy it via the `starts_with` branch (`lsp_helpers::mod::is_same_major_minor`
-        // fails for both, since neither has a `.`, but `starts_with("1")` holds for both).
+        // Testing gap 2 fix: both candidates must satisfy the requirement and both must fail
+        // semver parsing, so `max_by` falls all the way to `compare_lockfile_versions`'s
+        // `(Err, Err) => a.cmp(b)` branch — a single-match case never calls the comparator.
+        // Requirement `"1"` is a partial-version bare requirement; both `"1-rc1"`/`"1-rc2"`
+        // satisfy it via the `starts_with` fallback branch.
         let candidates = vec![
             ConcreteVersion::from("1-rc1"),
             ConcreteVersion::from("1-rc2"),

@@ -140,8 +140,7 @@ deps_core::impl_dependency!(GoDependency {
     source: source,
 });
 
-// NOTE: Cannot use impl_version! macro because GoVersion has custom is_prerelease() logic.
-// Go considers pseudo-versions as pre-releases, and has special handling for +incompatible suffix.
+// Can't use impl_version! here: GoVersion's is_prerelease() has custom pseudo-version/+incompatible logic.
 impl deps_core::registry::Version for GoVersion {
     fn version_string(&self) -> &deps_core::ConcreteVersion {
         &self.version
@@ -156,9 +155,7 @@ impl deps_core::registry::Version for GoVersion {
     }
 
     fn is_prerelease(&self) -> bool {
-        // Go considers pseudo-versions as pre-releases (they're commit-based).
-        // Regular pre-releases contain '-' (e.g., v1.0.0-beta.1).
-        // BUT: +incompatible suffix is NOT a pre-release indicator.
+        // +incompatible is never a pre-release indicator, unlike a plain '-' suffix.
         self.is_pseudo
             || (self.version.as_str().contains('-')
                 && !self.version.as_str().contains("+incompatible"))

@@ -101,7 +101,6 @@ fn bench_completion_handler(c: &mut Criterion) {
     let client = create_dummy_client();
     let config = create_test_config();
 
-    // Setup: Pre-load document with small manifest
     let uri = Uri::from_file_path("/bench/Cargo.toml").unwrap();
     rt.block_on(setup_document(&state, &uri, SMALL_CARGO));
 
@@ -129,7 +128,6 @@ fn bench_completion_handler(c: &mut Criterion) {
         });
     });
 
-    // Setup: Pre-load document with medium manifest
     let uri_medium = Uri::from_file_path("/bench/medium/Cargo.toml").unwrap();
     rt.block_on(setup_document(&state, &uri_medium, MEDIUM_CARGO));
 
@@ -215,7 +213,6 @@ fn bench_inlay_hints_handler(c: &mut Criterion) {
         });
     }
 
-    // Benchmark large manifest (100 deps)
     let large_content = generate_large_cargo(100);
     let uri_large = Uri::from_file_path("/bench/large/Cargo.toml").unwrap();
     rt.block_on(setup_document(&state, &uri_large, &large_content));
@@ -328,7 +325,6 @@ fn bench_document_state_access(c: &mut Criterion) {
 
     let state = Arc::new(ServerState::new());
 
-    // Pre-populate with 10 documents
     for i in 0..10 {
         let uri = Uri::from_file_path(format!("/bench/doc{i}/Cargo.toml")).unwrap();
         rt.block_on(setup_document(&state, &uri, SMALL_CARGO));

@@ -426,10 +426,8 @@ pub async fn check_manifest(
         minimum_stability.as_deref(),
     )
     .await;
-    // `failed_count` (unlike `fetch_failed`) also counts not-found lookups — "the registry
-    // answered 'no such package'" — which is not evidence of an unreachable registry (see
-    // `FetchResult::failed_count`'s own doc). Using it here made any repo with one
-    // private/unpublished/typo'd dependency name exit 2 on every non-offline run.
+    // `failed_count` also counts not-found lookups, which aren't evidence of an unreachable
+    // registry — using it here made any repo with one typo'd dependency exit 2 every run.
     let registry_unreachable = !ctx.policy.network.offline && !fetch_result.fetch_failed.is_empty();
 
     let mut outcomes = DependencyOutcomes::new();
@@ -454,9 +452,8 @@ pub async fn check_manifest(
         formatter,
     );
     let cached_versions = fetch_result.versions;
-    // Tier-1 license backfill (issue #660/#661 precedent, `deps-lsp/src/document/fetch.rs:206`):
-    // populated for the native-list ecosystems (PyPI, Composer) whose registry response
-    // already carries a license field; empty for every other ecosystem, same as `deps-lsp`.
+    // Tier-1 license backfill (issue #660/#661 precedent): populated for native-list
+    // ecosystems (PyPI, Composer) whose registry response carries a license field.
     let licenses = fetch_result.licenses;
 
     let vulnerabilities: Option<VulnerabilityMap> =
@@ -484,9 +481,8 @@ pub async fn check_manifest(
             None
         };
 
-    // TODO(critic): tier-3 license prefetch (spec 062 deviation #2) — tier-1 licenses now
-    // threaded via fetch_result.licenses above; Dart/Swift/Gradle/Deno's dedicated-fetch
-    // license source (`Ecosystem::fetch_license`) is still not called from this crate.
+    // TODO(critic): tier-3 license prefetch (spec 062 deviation #2) — Dart/Swift/Gradle/Deno's
+    // dedicated `Ecosystem::fetch_license` is still not called from this crate.
     let license_policy = ctx.policy.license_policy.to_policy();
     let mut version_data = VersionData::new(&cached_versions, &resolved_versions)
         .with_resolved_version_candidates(&resolved_version_candidates)
@@ -513,10 +509,8 @@ pub async fn check_manifest(
 
     let dep_index = DependencyIndex::build(parse_result.as_ref());
     let advisory_severities = advisory_severity_index(vulnerabilities.as_ref());
-    // The same per-occurrence key `vulnerabilities` was itself built under — `to_finding`
-    // resolves each finding's own occurrence to this key before looking it up in
-    // `advisory_severities`, so a shared advisory id across two different dependencies can
-    // never resolve to the wrong one's severity (issue #1077 review #4).
+    // Same per-occurrence key `vulnerabilities` was built under, so a shared advisory id
+    // across two dependencies can never resolve to the wrong one's severity (issue #1077 review #4).
     let vuln_keys = deps_core::osv::vulnerability_keys(
         parse_result.as_ref(),
         &resolved_versions,
@@ -706,10 +700,8 @@ fn classify(
     if diagnostic.message.contains(formatter.yanked_message()) {
         return Category::Yanked;
     }
-    // The advisory-overflow summary line (`push_vulnerability_diagnostics`,
-    // `deps-core/src/lsp_helpers/diagnostics.rs:1829`) carries no code either, but is still a
-    // vulnerability finding (M1, spec 062 review) — without this, a manifest whose advisory
-    // count exceeds `ADVISORY_DISPLAY_CAP` reports its overflow summary as `Other`.
+    // The advisory-overflow summary line carries no code but is still a vulnerability finding
+    // (M1, spec 062 review) — else a manifest over `ADVISORY_DISPLAY_CAP` reports it as `Other`.
     if diagnostic.message.ends_with("more advisories") {
         return Category::Vulnerable;
     }

@@ -25,16 +25,13 @@ pub async fn handle_document_link(
 ) -> Vec<DocumentLink> {
     let uri = &params.text_document.uri;
 
-    // Ensure document is loaded (cold start support)
     if !ensure_document_loaded(uri, Arc::clone(&state), client, config).await {
         tracing::warn!("Could not load document for document link: {:?}", uri);
         return vec![];
     }
 
-    // Release the DashMap shard `Ref` before calling out to the ecosystem (#333):
-    // `generate_document_links` is synchronous today, but keeping the same
-    // own-then-release shape as the other handlers avoids reintroducing the
-    // shard-blocking bug if it ever grows an async fast path.
+    // Release the DashMap shard `Ref` first (#333) — keeps the own-then-release shape used
+    // by other handlers even though `generate_document_links` is sync today.
     let Some((ecosystem, parse_result)) = state
         .with_document(uri, |doc| {
             let ecosystem = state.ecosystem_registry.get(doc.ecosystem_id())?;
@@ -48,9 +45,8 @@ pub async fn handle_document_link(
 
     tracing::Span::current().record("ecosystem", ecosystem.id());
 
-    // Unreachable in practice: a document only reaches `with_document` above once its
-    // URI already converted successfully (see `ensure_document_loaded`), but handled
-    // defensively rather than unwrapped.
+    // Unreachable in practice (the URI already converted in `ensure_document_loaded`);
+    // handled defensively rather than unwrapped.
     let Some(domain_uri) = crate::lsp_types_interop::from_lsp_uri(uri) else {
         tracing::warn!("URI is not representable as a url::Url: {:?}", uri);
         return vec![];

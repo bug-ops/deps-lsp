@@ -323,8 +323,6 @@ mod tests {
         assert!(map.contains_key("b"));
     }
 
-    // --- evict_arbitrary_if_full ---
-
     #[test]
     fn evict_arbitrary_if_full_removes_exactly_one_at_capacity() {
         let map: DashMap<u32, &str> = DashMap::new();
@@ -348,8 +346,6 @@ mod tests {
         evict_arbitrary_if_full(&map, 2);
         assert!(map.is_empty());
     }
-
-    // --- evict_expired_then_clear_all ---
 
     #[test]
     fn evict_expired_then_clear_all_drops_only_expired_entries() {

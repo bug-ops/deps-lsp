@@ -124,10 +124,9 @@ impl CargoEcosystem {
 
     #[cfg(feature = "lsp-responses")]
     async fn complete_package_names(&self, prefix: &str, range: Range) -> Vec<CompletionItem> {
-        // Package-name search is crates.io-only unconditionally (spec Out of Scope: the
-        // sparse index protocol has no search endpoint), so this never needs source
-        // awareness — `self.registry`'s source-blind `Registry::search` already means
-        // crates.io by construction (`CargoRegistry::search`).
+        // Package-name search is crates.io-only unconditionally (the sparse index protocol
+        // has no search endpoint), so `self.registry`'s source-blind `search` already means
+        // crates.io by construction.
         deps_core::completion::complete_package_names_generic(
             self.registry.as_ref(),
             prefix,
@@ -227,7 +226,6 @@ impl CargoEcosystem {
             }
         };
 
-        // Get features and filter by prefix
         let features = latest.features();
         features
             .into_iter()
@@ -263,11 +261,8 @@ impl Ecosystem for CargoEcosystem {
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Box<dyn ParseResultTrait>>> {
         Box::pin(async move {
             let result = crate::parser::parse_cargo_toml_with_context(content, uri, &self.context)?;
-            // Registers every alternate index this parse resolved (spec FR-002) into the
-            // shared router, including its credential (if any) — the only point in the
-            // whole pipeline where a `.cargo/config.toml`/`$CARGO_HOME` resolution and the
-            // long-lived `CargoRegistry` this ecosystem shares across every document ever
-            // meet. See `crate::parser::CargoParseResult::resolved_registries`'s docs.
+            // Registers every alternate index this parse resolved (FR-002), including its
+            // credential. See `CargoParseResult::resolved_registries`'s docs.
             for (index, auth) in result.resolved_registries.clone() {
                 self.registry.register_alternate(index, auth);
             }
@@ -383,11 +378,9 @@ mod tests {
     #[cfg(feature = "lsp-responses")]
     use tower_lsp_server::ls_types::{InlayHintLabel, Position, Range};
 
-    // #758: exact-value `Ecosystem` conformance, replacing the hand-written
-    // test_ecosystem_id/test_ecosystem_display_name/test_ecosystem_manifest_filenames/
-    // test_ecosystem_lockfile_filenames/test_as_any family. Does not replace registry.rs's
-    // own test_registry_creation, which constructs `CratesIoRegistry` directly — a different
-    // type from `Ecosystem::registry()`'s `Arc<dyn Registry>` return value.
+    // #758: exact-value `Ecosystem` conformance, replacing several hand-written tests. Does
+    // not replace registry.rs's `test_registry_creation`, which constructs `CratesIoRegistry`
+    // directly — a different type from `Ecosystem::registry()`'s `Arc<dyn Registry>`.
     deps_core::ecosystem_conformance! {
         mod cargo_ecosystem_conformance;
         build: CargoEcosystem::new(Arc::new(deps_core::HttpCache::new()));
@@ -398,25 +391,18 @@ mod tests {
         lockfile_filenames: &["Cargo.lock"];
     }
 
-    // #758: the shared completion-prefix-length guard
-    // (`deps_core::completion::complete_package_names_generic`), replacing
-    // test_complete_package_names_minimum_prefix/test_complete_package_names_max_length.
-    // The mock registry the macro supplies stands in for `CargoEcosystem`'s own
-    // `self.registry` here, so this calls the exact shared guard `complete_package_names`
-    // delegates to (`formatter.rs`'s `CargoEcosystem::complete_package_names`,
-    // `deps_core::completion::complete_package_names_generic`), with the same `limit: 20` —
-    // without it, an always-offline real registry couldn't distinguish "the guard rejected
-    // this prefix" from "the network call failed" (#758 impl-critic M1).
+    // #758: the shared completion-prefix-length guard, replacing two hand-written tests.
+    // The mock registry stands in for `self.registry`, calling the same shared guard with
+    // the same `limit: 20` — without it, an always-offline real registry couldn't
+    // distinguish "the guard rejected this prefix" from "the network call failed" (M1).
     #[cfg(feature = "lsp-responses")]
     deps_core::completion_guard_conformance! {
         mod cargo_completion_guard_conformance;
         complete: |registry: &dyn deps_core::Registry, prefix: String| -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Vec<tower_lsp_server::ls_types::CompletionItem>> + Send + '_>,
         > {
-            // Boxed, lifetime-parameterized future: `complete_package_names_generic`'s
-            // `impl Future` borrows `registry` across the `.await`, which a plain `Fn(..) ->
-            // Fut` associated type can't express per-call (see
-            // `deps_core::conformance::assert_completion_guard`'s doc).
+            // Boxed: `complete_package_names_generic`'s `impl Future` borrows `registry`
+            // across the `.await`, which a plain `Fn(..) -> Fut` can't express per-call.
             Box::pin(async move {
                 deps_core::completion::complete_package_names_generic(
                     registry,
@@ -520,7 +506,6 @@ mod tests {
 
         let config = EcosystemConfig::default();
 
-        // Lock file has the latest version
         let mut resolved_versions = HashMap::new();
         resolved_versions.insert("serde".into(), "1.0.214".into());
         let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
@@ -552,7 +537,6 @@ mod tests {
 
         let config = EcosystemConfig::default();
 
-        // Lock file has the latest version
         let mut resolved_versions = HashMap::new();
         resolved_versions.insert("serde".into(), "1.0.214".into());
         let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
@@ -614,7 +598,7 @@ mod tests {
 
         let config = EcosystemConfig::default().with_show_up_to_date_hints(false);
 
-        // Lock file has the latest version - but show_up_to_date_hints is false
+        // Up to date, but show_up_to_date_hints is false — hint must still be suppressed.
         let mut resolved_versions = HashMap::new();
         resolved_versions.insert("serde".into(), "1.0.214".into());
         let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
@@ -662,7 +646,7 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = CargoEcosystem::new(cache);
 
-        // Edge case: version_req is just "^" without version number
+        // "^" alone, with no version number, must not panic and must still yield a hint.
         let dep = mock_dependency("serde", Some("^"), 5, 5);
 
         let parse_result = MockParseResult {
@@ -674,7 +658,6 @@ mod tests {
 
         let config = EcosystemConfig::default();
 
-        // Should not panic, should return update hint
         let resolved_versions = HashMap::new();
         let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
             &parse_result,
@@ -692,8 +675,8 @@ mod tests {
         // Regression test for #232: the textEdit range for a package-name completion
         // must be the real name token span, not the (0,0)-(0,0) placeholder.
         //
-        // Held per `fs_probe::snapshot_guard`'s doc: `parse_manifest` transitively touches
-        // fs_probe (via `discover_workspace`), and every such test in this file must hold it.
+        // `parse_manifest` transitively touches fs_probe (via `discover_workspace`); see
+        // `fs_probe::snapshot_guard`'s doc.
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = CargoEcosystem::new(cache);
@@ -831,10 +814,8 @@ mod tests {
             dependencies: vec![registry_dep, alternate_dep],
         };
 
-        // The alternate occurrence resolves deterministically without network: its index
-        // was never registered, so `CargoRegistry::alternate_client` returns `None` and the
-        // fetch fails closed with `PackageNotFound` before any HTTP call — proving its own
-        // source, not the co-occurring `Registry`-sourced entry, drove the routing.
+        // Resolves deterministically without network: the unregistered index fails closed
+        // with `PackageNotFound` before any HTTP call, proving its own source drove routing.
         let results = ecosystem
             .complete_versions(
                 &parse_result,
@@ -956,7 +937,6 @@ mod tests {
             dependencies: vec![dep],
         };
 
-        // Unknown package should return empty (graceful degradation)
         let results = ecosystem
             .complete_versions(
                 &parse_result,
@@ -987,7 +967,6 @@ mod tests {
         let registry = CargoRegistry::with_crates_io_for_test(Arc::clone(&cache), crates_io);
         let ecosystem = CargoEcosystem::with_registry_for_test(registry);
 
-        // Unknown package should return empty (graceful degradation)
         let results = ecosystem
             .complete_features(
                 &empty_parse_result(),
@@ -1022,7 +1001,6 @@ mod tests {
         let registry = CargoRegistry::with_crates_io_for_test(Arc::clone(&cache), crates_io);
         let ecosystem = CargoEcosystem::with_registry_for_test(registry);
 
-        // Package names with hyphens and underscores should work
         let results = ecosystem
             .complete_package_names("tokio-ut", Range::default())
             .await;
@@ -1057,7 +1035,6 @@ mod tests {
         let registry = CargoRegistry::with_crates_io_for_test(Arc::clone(&cache), crates_io);
         let ecosystem = CargoEcosystem::with_registry_for_test(registry);
 
-        // Test that we respect the display cap, not just some loose upper bound.
         let dep = mock_dependency("serde", Some("1.0"), 0, 0);
         let position = dep.version_range.unwrap().start.into();
         let parse_result = MockParseResult {
@@ -1082,8 +1059,7 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = CargoEcosystem::new(cache);
 
-        // Some packages have no features - should handle gracefully
-        // (Using a package that likely has no features, or empty prefix on a small package)
+        // "nonexistent" prefix: anyhow has no feature starting with it.
         let results = ecosystem
             .complete_features(&empty_parse_result(), &pkg("anyhow"), "nonexistent")
             .await;
@@ -1097,7 +1073,6 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = CargoEcosystem::new(cache);
 
-        // Real packages with special characters
         let results = ecosystem
             .complete_package_names("tokio-ut", Range::default())
             .await;
@@ -1249,9 +1224,8 @@ mod tests {
 
     // --- #793 characterization: `generate_completions` dispatch, pinned before the
     // wildcard-match refactor moves the match into `deps-core`. Each test drives the real
-    // `detect_completion_context` on the same inputs used to call `generate_completions`, so
-    // the assertion is a genuine route-equivalence check against the crate's own inherent
-    // `complete_*` method rather than a re-implementation of the match.
+    // `detect_completion_context`, checking route-equivalence against the crate's own
+    // inherent `complete_*` method rather than a re-implementation of the match.
 
     #[cfg(feature = "lsp-responses")]
     #[tokio::test]

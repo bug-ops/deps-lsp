@@ -86,7 +86,6 @@ require (
 ",
     );
 
-    // Generate 100 dependencies
     for i in 0..100 {
         let version = format!("v{}.{}.{}", i % 10, (i % 20) + 1, (i % 5));
         content.push_str(&format!(
@@ -158,17 +157,14 @@ fn bench_position_tracking(c: &mut Criterion) {
     let mut group = c.benchmark_group("position_tracking");
     let uri = bench_uri();
 
-    // Single require line
     let single = "require github.com/gin-gonic/gin v1.9.1\n";
 
-    // Require block
     let block = r"require (
     github.com/gin-gonic/gin v1.9.1
     golang.org/x/crypto v0.17.0 // indirect
 )
 ";
 
-    // Replace directive
     let replace = "replace github.com/old/module => github.com/new/module v1.2.3\n";
 
     group.bench_function("single_require", |b| {
@@ -310,7 +306,6 @@ fn bench_version_comparison(c: &mut Criterion) {
         });
     });
 
-    // Find latest version from list
     group.bench_function("find_latest_version", |b| {
         b.iter(|| {
             versions
@@ -469,13 +464,10 @@ require (
 fn bench_go_sum_special_cases(c: &mut Criterion) {
     let mut group = c.benchmark_group("go_sum_special_cases");
 
-    // Pseudo-version in go.sum
     let pseudo_sum = "golang.org/x/tools v0.0.0-20191109021931-daa7c04131f5 h1:hash=\n";
 
-    // Incompatible version
     let incompatible_sum = "github.com/dgrijalva/jwt-go v3.2.0+incompatible h1:hash=\n";
 
-    // Multiple versions (deduplication test)
     let duplicate_sum = r"github.com/pkg/errors v0.9.1 h1:hash1=
 github.com/pkg/errors v0.9.1/go.mod h1:modhash=
 github.com/pkg/errors v0.8.0 h1:hash2=

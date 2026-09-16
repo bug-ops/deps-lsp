@@ -285,11 +285,8 @@ pub async fn load_resolved_versions(
         }
     };
 
-    // `locate_lockfile` does a synchronous ancestor-directory `stat` walk
-    // (`deps_core::lockfile::locate_lockfile_for_manifest`, up to `1 + MAX_WORKSPACE_DEPTH`
-    // levels deep, doubled for NuGet's multi-project fallback); run it in `spawn_blocking`
-    // rather than inline on the calling tokio worker, matching the read/parse path below
-    // (#963).
+    // `locate_lockfile` does a synchronous ancestor-directory stat walk; run in
+    // `spawn_blocking` rather than inline on the tokio worker (#963).
     let lock_provider_for_locate = Arc::clone(&lock_provider);
     let uri_for_locate = uri.clone();
     let located = tokio::task::spawn_blocking(move || {
@@ -355,10 +352,7 @@ mod tests {
             "lock-file-populated entries must have an empty available list, got: {:?}",
             serde.available
         );
-        // Issue #227 C3: a locked/pinned version's age is not actionable, so this
-        // instant-display path must never attach a stale `published_at` — there is no
-        // second parallel map here that could drift out of sync with `latest`, since
-        // both live on the same `PackageVersions` entry.
+        // #227 C3: a pinned version's age isn't actionable — never attach `published_at` here.
         assert_eq!(serde.published_at, None);
         let tokio = cached.get(&PackageName::new("tokio")).unwrap();
         assert_eq!(tokio.latest, "1.35.0");

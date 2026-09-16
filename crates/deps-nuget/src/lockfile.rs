@@ -79,9 +79,8 @@ fn locate_multi_project_lockfile(manifest_uri: &Url) -> Option<PathBuf> {
 
 #[derive(Deserialize)]
 struct PackagesLock {
-    // The top-level "version" field (1 or 2) is intentionally not modeled: both schema
-    // versions are accepted without gating on its value, and serde ignores unknown fields
-    // by default, so there is nothing to read it for.
+    // Top-level "version" field (1 or 2) isn't modeled: both schemas are accepted
+    // regardless of its value, and serde ignores unknown fields, so nothing reads it.
     #[serde(default)]
     dependencies: HashMap<String, HashMap<String, LockEntry>>,
 }

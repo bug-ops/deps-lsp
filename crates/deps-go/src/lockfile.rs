@@ -128,23 +128,16 @@ pub fn parse_go_sum(content: &str) -> ResolvedPackages {
             continue;
         }
 
-        // Skip /go.mod entries (we only want the h1: hash entries)
         if line.contains("/go.mod ") {
             continue;
         }
 
-        // Parse: module_path version h1:hash
-        // Valid go.sum lines must have at least 3 parts (module, version, hash)
         let parts: Vec<&str> = line.split_whitespace().collect();
         if let [module_path, version, checksum, ..] = parts.as_slice() {
-            // Validate that the hash starts with 'h1:' (standard Go checksum format)
-            // This filters out malformed lines
             if !checksum.starts_with("h1:") {
                 continue;
             }
 
-            // Always insert/overwrite (last occurrence wins)
-            // Go.sum files have older versions first, newer versions appended later
             packages.insert(ResolvedPackage::new(
                 module_path.to_string(),
                 version.to_string(),
@@ -209,7 +202,6 @@ github.com/pkg/errors v0.9.1 h1:hash2=
 ";
         let packages = parse_go_sum(content);
         assert_eq!(packages.len(), 1);
-        // Last occurrence should win (newer version added after upgrade)
         assert_eq!(packages.version("github.com/pkg/errors"), Some("v0.9.1"));
     }
 
@@ -231,7 +223,6 @@ github.com/pkg/errors v0.9.1 h1:hash2=
         let parser = GoSumParser;
         let uri = deps_core::test_util::test_uri("/test/go.mod");
 
-        // Just verify the trait methods are callable
         let _ = parser.locate_lockfile(&uri);
     }
 
@@ -263,7 +254,6 @@ invalid line with only one part
 github.com/valid/pkg v1.0.0 h1:valid_hash=
 ";
         let packages = parse_go_sum(content);
-        // Should only parse the valid lines
         assert_eq!(packages.len(), 2);
         assert_eq!(packages.version("github.com/gin-gonic/gin"), Some("v1.9.1"));
         assert_eq!(packages.version("github.com/valid/pkg"), Some("v1.0.0"));

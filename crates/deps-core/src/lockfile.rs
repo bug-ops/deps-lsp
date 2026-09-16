@@ -86,12 +86,9 @@ pub async fn read_lockfile_content(path: &Path, file_type: &str) -> Result<Strin
     let read_result = tokio::task::spawn_blocking(move || {
         let _entered = span.enter();
         // Cheap `stat` pre-filter (mirrors `MtimeFileCache::get_or_parse`): rejects a
-        // non-regular file (FIFO, socket, directory — reading one of those can block
-        // indefinitely) and an obviously oversized file before it is ever opened. The
-        // capped read below still enforces the size bound on the read itself regardless
-        // of what this reports, closing the same TOCTOU gap (CWE-367) a stat-only check
-        // alone would leave open (e.g. a symlink swapped to a FIFO, or the file growing,
-        // between this stat and the read).
+        // non-regular file (can block indefinitely) and an oversized file before opening. The
+        // capped read below still enforces the size bound regardless, closing the TOCTOU gap
+        // (CWE-367) a stat-only check would leave open.
         if let Ok(metadata) = fs_probe::metadata(&path_buf) {
             if !metadata.is_file() {
                 return Err(std::io::Error::new(
@@ -274,10 +271,8 @@ pub fn locate_lockfile_for_manifest(
     let manifest_path = resolve_manifest_file_path(manifest_uri)?;
     let manifest_dir = manifest_path.parent()?;
 
-    // Reuse single PathBuf to avoid allocations in loops
     let mut lock_path = manifest_dir.to_path_buf();
 
-    // Try same directory as manifest
     for &name in lockfile_names {
         lock_path.push(name);
         if fs_probe::is_file(&lock_path) {
@@ -738,7 +733,6 @@ impl LockFileCache {
             .get(lockfile_path)
             .map(|entry| (entry.modified_at, entry.packages.clone()));
 
-        // Check cache first
         if let Some((cached_modified_at, cached_packages)) = cached
             && let Ok(metadata) = tokio::fs::metadata(lockfile_path).await
             && let Ok(mtime) = metadata.modified()
@@ -754,13 +748,9 @@ impl LockFileCache {
             return Ok(cached_packages);
         }
 
-        // Cache miss - parse and store.
-        //
-        // Stat the file *before* parsing and use that pre-parse mtime as the cache
-        // key's freshness marker. If we stat'd after `parse_lockfile` instead, a
-        // concurrent rewrite landing mid-parse would let us store content read from
-        // the old version of the file under the new version's mtime, making the
-        // entry look fresh when it is actually stale (#359).
+        // Stat *before* parsing and use that pre-parse mtime as the cache key's freshness
+        // marker: stat'ing after would let a concurrent rewrite mid-parse store content from
+        // the old version under the new version's mtime, looking fresh when stale (#359).
         tracing::debug!("Lock file cache miss: {}", lockfile_path.display());
         let metadata = tokio::fs::metadata(lockfile_path).await?;
         let modified_at = metadata.modified()?;
@@ -1398,11 +1388,10 @@ mod tests {
         // See the comment in `test_locate_lockfile_for_manifest_same_directory` on why this
         // guard is needed here.
         let _guard = fs_probe::snapshot_guard();
-        // A real manifest + lockfile pair on disk: if the scheme guard did not fire, the
-        // pre-fix (unguarded) `to_file_path` would still find this lockfile, since the path
-        // component itself is real. This is what actually pins the guard, unlike a URI
-        // pointing at a nonexistent directory, which would return `None` for an unrelated
-        // reason regardless of the scheme check.
+        // A real manifest + lockfile pair on disk: without the scheme guard, the unguarded
+        // `to_file_path` would still find this lockfile since the path component is real —
+        // unlike a nonexistent-directory URI, which would return `None` for an unrelated
+        // reason regardless.
         let temp_dir = tempfile::tempdir().unwrap();
         let manifest_path = temp_dir.path().join("Cargo.toml");
         let lock_path = temp_dir.path().join("Cargo.lock");

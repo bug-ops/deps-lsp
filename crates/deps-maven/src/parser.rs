@@ -136,7 +136,6 @@ pub fn parse_pom_xml(content: &str, doc_uri: &Url) -> Result<MavenParseResult> {
                 let text_start = pos;
                 let text = {
                     let s = e.trim().to_string();
-                    // Unescape XML entities
                     quick_xml::escape::unescape(&s)
                         .map(|c| c.into_owned())
                         .unwrap_or(s)
@@ -279,7 +278,7 @@ fn finalize_dep(
 #[allow(clippy::string_slice)]
 fn resolve_properties(input: &str, properties: &HashMap<String, String>) -> String {
     let mut result = input.to_string();
-    // Iterate until no more replacements (handles nested, though rare)
+    // Capped at 5 to bound rare nested property references.
     for _ in 0..5 {
         let Some(start) = result.find("${") else {
             break;

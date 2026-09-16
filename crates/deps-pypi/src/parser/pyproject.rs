@@ -150,7 +150,7 @@ impl PypiParser {
             blocked_registries: RefCell::new(Vec::new()),
         };
 
-        // Parse build-system requires (PEP 517/518)
+        // PEP 517/518
         if let Some(build_system) = get_table(root_table, "build-system") {
             dependencies.extend(self.parse_build_system_requires(
                 build_system,
@@ -161,7 +161,6 @@ impl PypiParser {
             ));
         }
 
-        // Parse PEP 621 format
         if let Some(project) = get_table(root_table, "project") {
             dependencies.extend(self.parse_pep621_dependencies(
                 project,
@@ -179,7 +178,7 @@ impl PypiParser {
             ));
         }
 
-        // Parse PEP 735 dependency-groups format
+        // PEP 735
         if let Some(dep_groups) = get_table(root_table, "dependency-groups") {
             dependencies.extend(self.parse_dependency_groups(
                 dep_groups,
@@ -190,7 +189,6 @@ impl PypiParser {
             ));
         }
 
-        // Parse Poetry format
         if let Some(tool_table) = get_table(root_table, "tool")
             && let Some(poetry) = get_table(tool_table, "poetry")
         {
@@ -650,7 +648,6 @@ impl PypiParser {
             });
         }
 
-        // Table format
         if let Some(table) = value.as_table() {
             let version_req = table
                 .get("version")
@@ -945,7 +942,6 @@ requests = "^2.28.0"
         let result = parser.parse_content(content, &test_uri()).unwrap();
         let deps = &result.dependencies;
 
-        // Should skip "python"
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].name, "requests");
         assert_matches!(deps[0].section, PypiDependencySection::PoetryDependencies);
@@ -1009,7 +1005,6 @@ test = ["pytest>=8.0", "pytest-cov>=4.0"]
             .collect();
         assert_eq!(test_deps.len(), 2);
 
-        // Verify package names
         assert!(dev_deps.iter().any(|d| d.name == "pytest"));
         assert!(dev_deps.iter().any(|d| d.name == "mypy"));
         assert!(dev_deps.iter().any(|d| d.name == "ruff"));
@@ -1133,7 +1128,6 @@ name = "test"
 
     #[test]
     fn test_position_tracking_pep735() {
-        // Test that position tracking works correctly for PEP 735 dependency-groups
         let content = r#"[dependency-groups]
 dev = ["pytest>=8.0", "mypy>=1.0"]
 "#;
@@ -1434,7 +1428,6 @@ dependencies = [
         let deps = &result.dependencies;
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].name, "django");
-        // Version specifier should be preserved
         assert!(deps[0].version_req.is_some());
     }
 
@@ -1492,7 +1485,6 @@ build-backend = "setuptools.build_meta"
 
     #[test]
     fn test_parse_duplicate_dependency_positions() {
-        // Test that duplicate dependency strings get correct positions
         let toml = r#"[build-system]
 requires = ["maturin>=1.7,<2.0"]
 
@@ -1505,14 +1497,12 @@ dev = ["maturin>=1.7,<2.0"]
 
         assert_eq!(deps.len(), 2);
 
-        // First maturin in [build-system] should be on line 1
         let build_system_maturin = deps
             .iter()
             .find(|d| matches!(d.section, PypiDependencySection::BuildSystem))
             .unwrap();
         assert_eq!(build_system_maturin.name_range.start.line, 1);
 
-        // Second maturin in [dependency-groups] should be on line 4
         let dep_group_maturin = deps
             .iter()
             .find(|d| matches!(d.section, PypiDependencySection::DependencyGroup { .. }))
@@ -1522,7 +1512,6 @@ dev = ["maturin>=1.7,<2.0"]
 
     #[test]
     fn test_version_range_for_code_actions() {
-        // Test that version_range correctly covers the version specifier for code actions
         let toml = r#"[dependency-groups]
 dev = ["pytest-cov>=4.0,<8.0"]
 "#;
@@ -1543,7 +1532,6 @@ dev = ["pytest-cov>=4.0,<8.0"]
         assert_eq!(dep.name_range.start.line, 1);
         assert_eq!(dep.name_range.start.character, 8); // after `dev = ["`
 
-        // Version range should cover >=4.0,<8.0
         let version_range = dep.version_range.expect("version_range should be set");
         assert_eq!(version_range.start.line, 1);
         // pytest-cov is 10 chars, so version starts at 8 + 10 = 18
@@ -1551,7 +1539,6 @@ dev = ["pytest-cov>=4.0,<8.0"]
         // >=4.0,<8.0 is 10 chars, so version ends at 18 + 10 = 28
         assert_eq!(version_range.end.character, 28);
 
-        // Verify that cursor at position 20 (on '4') is within version_range
         let cursor_on_version = Position::new(1, 20);
         assert!(
             cursor_on_version.character >= version_range.start.character
@@ -1565,7 +1552,6 @@ dev = ["pytest-cov>=4.0,<8.0"]
 
     #[test]
     fn test_version_range_with_space_before_specifier() {
-        // Test version_range when there's a space between name and version specifier
         let toml = r#"[dependency-groups]
 dev = ["pytest-cov >=4.0,<8.0"]
 "#;
@@ -1591,7 +1577,6 @@ dev = ["pytest-cov >=4.0,<8.0"]
         // ">=4.0,<8.0" is 10 chars, so version ends at 19 + 10 = 29
         assert_eq!(version_range.end.character, 29);
 
-        // Verify that a cursor within the specifier text is within version_range
         let cursor_on_version = Position::new(1, 21);
         assert!(
             cursor_on_version.character >= version_range.start.character

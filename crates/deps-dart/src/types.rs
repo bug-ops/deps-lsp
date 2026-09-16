@@ -146,8 +146,6 @@ impl PackageInfo {
     }
 }
 
-// deps-core trait implementations
-
 // Not `impl_dependency!`: this type overrides `name_range_is_synthetic`, which the macro's
 // field-name-substitution pattern has no arm for (only one ecosystem currently needs it — see
 // that method's own docs on `Dependency`).

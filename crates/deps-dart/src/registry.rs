@@ -395,7 +395,6 @@ impl deps_core::Metadata for PackageInfo {
     }
 }
 
-// Registry trait (trait object support)
 impl deps_core::Registry for PubDevRegistry {
     deps_core::impl_registry_versions_method!(get_versions);
     deps_core::impl_registry_versions_method!(get_versions_with);

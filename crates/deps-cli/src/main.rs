@@ -91,10 +91,8 @@ async fn run_check(paths: Vec<PathBuf>, cli_config: CliConfig) -> (CheckReport, 
     let cache = Arc::new(HttpCache::with_policy(Arc::clone(
         &ecosystem_runtime.policy,
     )));
-    // FR-013/SC-004: blocks every outbound request at the shared HTTP cache itself, so
-    // `fetch_latest_versions_parallel` and the OSV client naturally degrade to
-    // already-cached-only data instead of `check_manifest` needing its own offline
-    // short-circuit around each call site.
+    // FR-013/SC-004: offline gate lives at the shared cache, so callers degrade to
+    // cached-only data without their own per-call short-circuit.
     cache.set_offline(policy.network.offline);
     let ecosystem_registry = EcosystemRegistry::new();
     let _workspace_registry_ecosystems =
@@ -111,8 +109,7 @@ async fn run_check(paths: Vec<PathBuf>, cli_config: CliConfig) -> (CheckReport, 
     let mut had_execution_error = false;
     for error in &walk_outcome.walk_errors {
         eprintln!("deps-cli: warning: {error}");
-        // S2 (spec 062 review): an unreadable path during the walk means the report may be
-        // missing manifests the run should have seen — that must not silently exit 0.
+        // S2 (spec 062 review): an unreadable path means the report may be incomplete — must not silently exit 0.
         had_execution_error = true;
     }
     if walk_outcome.truncated {
@@ -123,8 +120,7 @@ async fn run_check(paths: Vec<PathBuf>, cli_config: CliConfig) -> (CheckReport, 
         had_execution_error = true;
     }
     for path in &walk_outcome.unrecognized_explicit_paths {
-        // M4 (spec 062 review), spec §6: not fatal, and does not affect the exit code — the
-        // rest of the run proceeds normally.
+        // M4 (spec 062 review), spec §6: not fatal, does not affect the exit code.
         eprintln!(
             "deps-cli: warning: {} is not recognized by any ecosystem",
             path.display()
@@ -134,13 +130,9 @@ async fn run_check(paths: Vec<PathBuf>, cli_config: CliConfig) -> (CheckReport, 
     let mut findings = Vec::new();
 
     // TODO(deviation #4, spec 062 tasks.md T024 / spec.md NFR-004): manifests are processed
-    // sequentially here, not fanned out via `futures::stream::buffer_unordered` as T024's own
-    // checklist item still names. Deliberately deferred, not an oversight — per-manifest
-    // dependency-fetch concurrency is already bounded by `fetch_latest_versions_parallel`
-    // (`deps_engine::classify::fetch`), which is what NFR-004 actually gates; this only
-    // affects wall-clock time on a true monorepo-of-monorepos (hundreds of manifests), out of
-    // scope for this PR's target use case (perf-reviewed and signed off as non-blocking:
-    // single-repo CI runs, ~37 manifests in this workspace's own self-check).
+    // sequentially, not fanned out via `buffer_unordered`, deliberately — per-manifest fetch
+    // concurrency is already bounded by `fetch_latest_versions_parallel`, which is what NFR-004
+    // gates; only affects wall-clock time on monorepo-of-monorepos scale (perf-reviewed, non-blocking).
     for manifest in walk_outcome.manifests {
         match deps_core::fs_probe::read_to_string_capped(&manifest.path, MAX_MANIFEST_FILE_SIZE) {
             Ok(Some(content)) => {

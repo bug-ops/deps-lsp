@@ -1300,19 +1300,12 @@ cpu_load = 3.14
 
     #[test]
     fn test_check_toml_nesting_depth_dotted_key_inside_bracket_header_composes() {
-        // A `[a.b]` header (dots released at bracket depth 0 on the header's
-        // own newline) followed by a dotted key whose value is an inline
-        // table with its own dotted key (`c.d.e = {f.g = 1}`) exercises
-        // bracket-depth and dot-segment accounting interleaving on adjacent
-        // statements — the header's dots must not leak into the next
-        // statement's budget, and the inline table's dots must still stack
-        // on top of its own bracket depth correctly.
+        // A `[a.b]` header followed by `c.d.e = {f.g = 1}` exercises bracket/dot accounting
+        // across adjacent statements — the header's dots must not leak into the next
+        // statement's budget.
         let content = "[a.b]\nc.d.e = {f.g = 1}\n";
-        // Real accounting: header contributes max transient depth 2 (1
-        // bracket + 1 dot), fully released at its newline; the second line
-        // peaks at depth 4 (2 dots for c.d.e's key, +1 for the `{`, +1 for
-        // f.g's dot) — never higher, and never carrying over the header's
-        // released dots.
+        // Header peaks at depth 2 (1 bracket + 1 dot), released at its newline; the second
+        // line peaks at depth 4 (2 dots for c.d.e + 1 for `{` + 1 for f.g's dot).
         assert_eq!(check_toml_nesting_depth(content, 4), Ok(()));
         assert_eq!(check_toml_nesting_depth(content, 3), Err(4));
     }
@@ -1738,15 +1731,10 @@ dev_dependencies:
 
     #[test]
     fn test_check_yaml_expansion_at_production_boundary() {
-        // The doubling chain's charged bytes at level N are a function of
-        // `YAML_NODE_OVERHEAD_BYTES` (`size_of::<yaml_rust2::Yaml>()`), which
-        // is platform-dependent (narrower `Vec`/`String`/`BTreeMap` fields on
-        // a 32-bit target shrink `Yaml` itself), so the level that crosses
-        // `MAX_YAML_EXPANDED_BYTES` shifts by platform. Find the real
-        // boundary empirically on whatever target this runs on, instead of
-        // hardcoding a 64-bit-specific N, so the exact-edge property this
-        // test checks — the guard trips right at the budget, not with a huge
-        // slack margin in either direction — holds on every target.
+        // `YAML_NODE_OVERHEAD_BYTES` is platform-dependent (`size_of::<yaml_rust2::Yaml>()`
+        // shrinks on 32-bit targets), so the level that crosses `MAX_YAML_EXPANDED_BYTES`
+        // shifts by platform — find the real boundary empirically instead of hardcoding a
+        // 64-bit-specific N.
         let boundary = (1..=25)
             .find(|&n| check_yaml_expansion(&doubling_chain(n), MAX_YAML_EXPANDED_BYTES).is_err())
             .expect("doubling chain must cross MAX_YAML_EXPANDED_BYTES well within 25 levels");
@@ -1762,13 +1750,10 @@ dev_dependencies:
 
     #[test]
     fn test_check_yaml_expansion_large_scalar_anchor_aliased_many_times_rejected() {
-        // Regression test for the critic's CRITICAL 1 finding: a node-count
-        // budget accepted a large-scalar anchor aliased many times (linear
-        // node growth, but memory grows with anchor size x alias count).
-        // A 1 MB anchor aliased 32 times is ~33 MB of real `YamlLoader`
-        // allocation from a ~1 MB source — must be rejected under the byte
-        // budget even though it would cost only 34 nodes under a node
-        // budget.
+        // Critic CRITICAL 1: a node-count budget accepted a large-scalar anchor aliased many
+        // times (node growth is linear, but memory grows with anchor size x alias count) — a
+        // 1 MB anchor aliased 32 times is ~33 MB of real `YamlLoader` allocation, only 34
+        // nodes.
         let anchor_value = "A".repeat(1_000_000);
         let mut content = format!("s: &s \"{anchor_value}\"\nl:\n");
         for _ in 0..32 {
@@ -2143,16 +2128,11 @@ dev_dependencies:
         use proptest::prelude::*;
 
         proptest! {
-            // #673 S3: generates `String` directly (always valid UTF-8) rather than random
-            // `Vec<u8>` gated on `str::from_utf8` — random bytes are valid UTF-8 with
-            // vanishing probability (~0.05% per byte for non-ASCII-heavy input), so that
-            // gate made this property almost never actually reach the function under test.
-            // `any::<String>()` resolves to proptest's default `\PC*` string strategy, which
-            // excludes *all* Unicode category-C control characters — including `\n` — so it
-            // never exercises the `b'\n'` arm (`check_toml_nesting_depth`'s `dot_frames[0]`
-            // reset) or any of `check_yaml_nesting_depth`'s block-style path (indent_stack,
-            // `- ` sequences, `skip_to_eol`), which are only reachable via newlines. Adding
-            // `\n`/`\t` back into the character class keeps those paths in play (code review).
+            // #673 S3: generates `String` directly rather than random `Vec<u8>` gated on
+            // `str::from_utf8`, which almost never reaches the function under test. Proptest's
+            // default `\PC*` excludes control chars including `\n`, which would skip the
+            // newline-only paths (`dot_frames[0]` reset, YAML block-style scanning) — `\n`/`\t`
+            // are added back into the character class to keep those paths in play.
             #[test]
             fn check_toml_nesting_depth_never_panics(text in "(?s)[\\PC\\n\\t]{0,256}") {
                 let _ = check_toml_nesting_depth(&text, MAX_TOML_NESTING_DEPTH);

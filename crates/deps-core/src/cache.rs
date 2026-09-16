@@ -1369,9 +1369,8 @@ impl HttpCache {
         url: &str,
         extra_headers: &[(header::HeaderName, &str)],
     ) -> Result<Bytes> {
-        // Poisoned only if another thread panicked while holding the lock, at which point
-        // the process is already in an unrecoverable state — propagating via panic here
-        // matches the standard `RwLock` poisoning contract.
+        // Poisoned only if another thread already panicked holding the lock — propagate via
+        // panic, matching `RwLock`'s poisoning contract.
         #[allow(clippy::expect_used)]
         let transport = self
             .workspace
@@ -1454,42 +1453,32 @@ impl HttpCache {
         }
 
         let offline = self.is_offline();
-        // `offline` forces `cache_enabled` true on both the read and write path below (S1
-        // fix): `cache.enabled: false` otherwise means "never store", which would leave the
-        // offline early-return below with nothing to serve for a URL that was only ever
-        // fetched while caching was disabled. See `Self::set_offline`'s docs.
+        // `offline` forces `cache_enabled` true (S1 fix): otherwise `cache.enabled: false`
+        // would leave nothing to serve offline for a URL fetched while caching was disabled.
+        // See `Self::set_offline`'s docs.
         let cache_enabled = self.cache_enabled.load(Ordering::Relaxed) || offline;
 
-        // Computed once and threaded through every downstream call — never recomputed, or a
-        // policy flip mid-request would read and write under different keys (see
-        // `Self::cache_key`'s docs).
+        // Computed once and threaded through every call — recomputing mid-request could read
+        // and write under different keys (see `Self::cache_key`'s docs).
         let cache_key = self.cache_key(url, transport.tier, auth_id);
 
         if !cache_enabled {
-            // Explicit, not left `Empty`: an empty `cache` field is indistinguishable from
-            // broken instrumentation (#756 S3) — this path bypasses the entry map
-            // entirely, so it is neither a hit nor a miss.
+            // Explicit, not `Empty`: an empty `cache` field would be indistinguishable from
+            // broken instrumentation (#756 S3) on a path that's neither a hit nor a miss.
             tracing::Span::current().record("cache", "disabled");
             return self
                 .transport_only_via(url, extra_headers, BodyLimit::DEFAULT, &transport.client)
                 .await;
         }
 
-        // Clone and drop the DashMap Ref immediately to release the shard lock.
-        // Holding a Ref across .await causes deadlocks when concurrent tasks
-        // need write access to the same shard (e.g., conditional_request_with_headers → insert).
+        // Clone+drop the Ref immediately: holding it across `.await` can deadlock a concurrent
+        // task needing write access to the same shard.
         if let Some(cached) = self.entries.get(cache_key.as_ref()).map(|r| r.clone()) {
             if offline {
-                // Skip the conditional-request attempt entirely: `ensure_online` inside
-                // `conditional_request_with_headers` would block it anyway and fall back to
-                // this same cached body via the `Err` arm below, but only after a spurious
-                // `tracing::warn!` and a wasted request-builder allocation on every offline
-                // hover. Behavior is identical either way — this is purely to avoid that.
-                //
-                // The only branch below that is a genuine zero-network-request "hit" (#756
-                // S3) — every other branch that found a cache entry still issued a
-                // conditional (or full) request, so it gets its own, more accurate value
-                // rather than sharing this one.
+                // Skips the conditional-request attempt: `ensure_online` would block it and
+                // fall back to this same body anyway, just with a spurious warn + wasted
+                // allocation. The only branch below that is a genuine zero-network "hit"
+                // (#756 S3); every other branch still issued a request.
                 tracing::Span::current().record("cache", "hit");
                 return Ok(cached.body);
             }
@@ -1503,15 +1492,13 @@ impl HttpCache {
                 )
                 .await
             {
-                // The server confirmed the cached body is still current (304): a network
-                // round trip happened, but no body was re-transferred — distinct from both
-                // `hit` (no request at all) and `refreshed` (a full body re-fetch).
+                // 304: a round trip happened but no body was re-transferred — distinct from
+                // `hit` (no request) and `refreshed` (full re-fetch).
                 Ok(None) => {
                     tracing::Span::current().record("cache", "revalidated");
                     return Ok(cached.body);
                 }
-                // The entry existed but was stale: this cost a full re-fetch, the same as a
-                // `miss`, so it must not be reported as any flavor of "hit".
+                // Stale entry cost a full re-fetch, same as a miss — must not report as a hit.
                 Ok(Some(new_body)) => {
                     tracing::Span::current().record("cache", "refreshed");
                     return Ok(new_body);
@@ -1535,13 +1522,9 @@ impl HttpCache {
                                 .fetch_sub(old.body.len(), Ordering::Relaxed);
                         }
                         tracing::Span::current().record("cache", "evicted");
-                        // #756 round 2 S1: never interpolate `e`'s `Display`/`Debug` here —
-                        // both embed the raw, unredacted `url` (`DepsError::HttpStatus`'s
-                        // `Display`; the wrapped `reqwest::Error` inside `RegistryError`
-                        // appends its own request URL too), defeating this span's own
-                        // `RedactedUrl`-redacted `url` field two lines below it.
-                        // `safe_tracing_summary` extracts only the safe (non-URL-bearing)
-                        // status code plus a coarse cause discriminant.
+                        // #756 round 2 S1: never interpolate `e` — its `Display`/`Debug` embed
+                        // the raw unredacted `url`, defeating this span's `RedactedUrl` field.
+                        // `safe_tracing_summary` extracts only the safe status+cause instead.
                         let (status, cause) = e.safe_tracing_summary();
                         tracing::warn!(
                             status = ?status,
@@ -2080,12 +2063,9 @@ mod tests {
         assert!(ensure_https("http://[::1]:1234/x").is_ok());
     }
 
-    // reqwest's `Attempt` has no public constructor, so the redirect policy closure
-    // itself can't be unit-tested directly from outside the reqwest crate; this
-    // exercises the pure detection logic it delegates to instead. End-to-end coverage
-    // of an actual https->http redirect is not feasible with mockito, which is
-    // http-only (see test_get_cached_follows_same_scheme_redirect for the
-    // policy-is-wired-in regression check that mockito *can* exercise).
+    // reqwest's `Attempt` has no public constructor, so the redirect closure can't be
+    // unit-tested directly; this exercises the pure detection logic it delegates to (mockito is
+    // http-only, so an actual https->http redirect isn't testable end-to-end here).
     #[test]
     fn test_is_https_downgrade() {
         let https = Url::parse("https://example.com/a").unwrap();
@@ -2275,16 +2255,12 @@ mod tests {
         assert!(addrs.is_err());
     }
 
-    // Issue #449 critic S1: the previous version of this test called
-    // `BlockedAddrResolver::resolve` directly and never went through `build_guarded_client` at
-    // all — deleting `.dns_resolver(...)` from `build_client_inner` left it green. This
-    // version proves actual wiring behaviorally: a real mockito listener answers on
-    // `server.socket_address()`'s port, reached here through the `localhost` *name* (so the
-    // request actually reaches the configured resolver, unlike an IP literal, which
-    // hyper-util's connector parses directly and never consults the resolver — see
-    // `BlockedAddrResolver`'s `# Known limitations` doc). Without the guard wired in, this
-    // request would succeed against the real listener; with it wired in, it must fail before
-    // ever reaching the listener.
+    // Issue #449 critic S1: the prior version called `BlockedAddrResolver::resolve` directly and
+    // never went through `build_guarded_client`, so deleting `.dns_resolver(...)` from
+    // `build_client_inner` left it green. This proves actual wiring: a real mockito listener
+    // answers on `server.socket_address()`'s port, reached via the `localhost` *name* so the
+    // request actually reaches the configured resolver (unlike an IP literal — see
+    // `BlockedAddrResolver`'s `# Known limitations` doc).
     #[tokio::test]
     async fn test_build_client_wires_in_blocked_addr_resolver() {
         let mut server = mockito::Server::new_async().await;
@@ -2302,12 +2278,8 @@ mod tests {
             "expected the wired-in resolver guard to reject a loopback-resolving name even \
              though a real listener answers at this port",
         );
-        // Not just any failure: the `Debug` impl (unlike `Display`) surfaces the boxed
-        // `source` chain, so this confirms `ResolveGuardError::Blocked` itself produced the
-        // error rather than an unrelated failure (timeout, TLS, connection refused)
-        // coincidentally also erroring. `derive(Debug)` on an enum prints only the variant
-        // name, not `ResolveGuardError::`, hence checking for `Blocked`/`Loopback` together
-        // rather than the enum's own name.
+        // `Debug` (unlike `Display`) surfaces the boxed source chain, confirming
+        // `ResolveGuardError::Blocked` produced the error rather than an unrelated failure.
         let debug = format!("{err:?}");
         assert!(
             debug.contains("Blocked") && debug.contains("Loopback"),
@@ -2366,13 +2338,9 @@ mod tests {
         assert_eq!(result.as_ref(), b"redirected data");
     }
 
-    // Issue #455, test-plan item 4(a): loopback -> loopback. A `Baseline` transport follows the
-    // hop (the `hop_targets_blocked_host` test-cfg carve-out for `Loopback`); a
-    // `WorkspaceDeclared(PublicOnly)` transport stops it, since `PublicOnly.allows(Loopback) ==
-    // false` — this pins M1' and is the contrast proving the tier split is real. This is one of
-    // the tests exercising the documented zero-initial-URL-literal-protection residual: both
-    // mockito URLs are IP literals, so the *initial* connection to server A is never checked by
-    // policy — only the redirect hop is.
+    // Issue #455, test-plan item 4(a): loopback -> loopback. `Baseline` follows the hop
+    // (test-cfg carve-out for `Loopback`); `WorkspaceDeclared(PublicOnly)` stops it since
+    // `PublicOnly.allows(Loopback) == false` — the contrast proving the tier split is real.
     #[tokio::test]
     async fn test_workspace_transport_stops_loopback_redirect_baseline_follows() {
         let mut server_a = mockito::Server::new_async().await;
@@ -2414,12 +2382,9 @@ mod tests {
         );
     }
 
-    // Issue #455, test-plan item 4(b): a workspace-blocked literal. Server A 302s to an
-    // RFC1918-literal target; the workspace transport under `PublicOnly` stops before
-    // connecting (the redirect-policy tier term rejects the hop from its URL string alone, no
-    // resolver involved for a literal), so the caller sees `HttpStatus{302}` with no
-    // `HTTP_TIMEOUT_SECS` stall. Also exercises the zero-initial-URL-literal-protection
-    // residual (the initial hop to server A, an IP literal, is unchecked by policy).
+    // Issue #455, test-plan item 4(b): a workspace-blocked literal. The redirect-policy tier
+    // term rejects an RFC1918-literal target from its URL string alone (no resolver involved),
+    // so the caller sees `HttpStatus{302}` with no `HTTP_TIMEOUT_SECS` stall.
     #[tokio::test]
     async fn test_workspace_transport_stops_redirect_to_private_literal() {
         let mut server = mockito::Server::new_async().await;
@@ -2478,19 +2443,14 @@ mod tests {
             .get_cached_trusted_origin(&source_url, &trusted_origin)
             .await;
 
-        // The stopped redirect surfaces as the 302 response itself, handled like any
-        // other non-2xx status - not as a distinct "redirect blocked" error variant.
-        // Assert via `matches!` rather than debug-formatting `result` in a panic message:
-        // on the `Ok` arm that value is the raw response body, which would otherwise be
-        // written to the test log by the panic machinery.
+        // The stopped redirect surfaces as the 302 response, like any other non-2xx status.
+        // `matches!` rather than debug-formatting `result`: the `Ok` arm holds the raw body.
         assert!(
             matches!(result, Err(DepsError::HttpStatus { status: 302, .. })),
             "expected HttpStatus(302)"
         );
 
-        // Proves the security property itself (the escape origin was never contacted),
-        // not just the symptom (the result is a 302) - a client that followed the
-        // redirect and then discarded the body would still pass the assertion above.
+        // Proves the escape origin was never contacted, not just that the result is a 302.
         escape.assert_async().await;
     }
 
@@ -2664,9 +2624,7 @@ mod tests {
             .get_cached_trusted_origin(&source_url, &trusted_origin)
             .await;
 
-        // Assert via `matches!` rather than debug-formatting `result` in a panic message:
-        // on the `Ok` arm that value is the raw response body, which would otherwise be
-        // written to the test log by the panic machinery.
+        // matches! rather than debug-formatting result: the Ok arm holds the raw body.
         assert!(
             matches!(result, Err(DepsError::HttpStatus { status: 302, .. })),
             "expected HttpStatus(302)"
@@ -2702,9 +2660,7 @@ mod tests {
             .get_cached_trusted_origin(&source_url, &trusted_origin)
             .await;
 
-        // Assert via `matches!` rather than debug-formatting `result` in a panic message:
-        // on the `Ok` arm that value is the raw response body, which would otherwise be
-        // written to the test log by the panic machinery.
+        // matches! rather than debug-formatting result: the Ok arm holds the raw body.
         assert!(
             matches!(result, Err(DepsError::HttpStatus { status: 302, .. })),
             "expected HttpStatus(302)"
@@ -2739,10 +2695,8 @@ mod tests {
         assert_eq!(result.as_ref(), b"authenticated data");
     }
 
-    // The security property this method exists for: a credential header must never survive
-    // a cross-origin redirect hop, proven the same way the unauthenticated trusted-origin
-    // test proves it (the escape origin is never contacted at all) rather than by asserting
-    // the header was merely absent on a request that did land.
+    // A credential header must never survive a cross-origin redirect hop — proven by the
+    // escape origin never being contacted, not just the header being absent on a landed request.
     #[tokio::test]
     async fn test_get_cached_trusted_origin_with_headers_stops_cross_origin_redirect() {
         let mut trusted_server = mockito::Server::new_async().await;
@@ -2782,18 +2736,16 @@ mod tests {
         escape.assert_async().await;
     }
 
-    // Proves `redirect_policy`'s `Policy::default().redirect(attempt)` delegation is
-    // actually wired in and live: without it (e.g. a no-op policy that always follows),
-    // this chain would keep following past 10 hops instead of erroring. A single-hop
-    // redirect test alone can't distinguish "delegation is live" from "no policy at all".
+    // Proves `redirect_policy`'s delegation is actually wired in and live: without it, this
+    // chain would keep following past 10 hops instead of erroring — a single-hop test can't
+    // distinguish "delegation is live" from "no policy at all".
     #[tokio::test]
     async fn test_get_cached_default_client_enforces_ten_hop_redirect_limit() {
         let mut server = mockito::Server::new_async().await;
         let base = server.url();
 
-        // reqwest's default policy errors once `previous.len() > 10`, i.e. on the 11th
-        // redirect hop - so 11 redirecting steps (step/0 through step/10) are needed to
-        // trigger it; step/11 must never actually be requested.
+        // reqwest errors once `previous.len() > 10` (the 11th hop), so 11 redirecting steps
+        // (step/0..step/10) are needed to trigger it; step/11 must never be requested.
         let mut hop_mocks = Vec::new();
         for i in 0..11u32 {
             let path = format!("/step/{i}");
@@ -2815,8 +2767,7 @@ mod tests {
             .create_async()
             .await;
 
-        // Kept alive (not just built) until here: each `Mock` deregisters on drop, so
-        // dropping this early would silently turn every hop 404 instead of 302.
+        // Kept alive until here: each `Mock` deregisters on drop, turning hops 404 otherwise.
         assert_eq!(hop_mocks.len(), 11);
 
         let cache = HttpCache::new();
@@ -3245,17 +3196,13 @@ mod tests {
             other => panic!("expected ResponseTooLarge, got {other:?}"),
         }
 
-        // The oversized response must not have been cached.
         assert!(cache.entries.get(&url).is_none());
     }
 
     #[tokio::test]
     async fn test_fetch_and_store_accepts_response_at_exact_cap() {
-        // A response at MAX_RESPONSE_BYTES (32 MiB) is well over
-        // MAX_CACHEABLE_ENTRY_BYTES (8 MiB), so the network-layer cap and
-        // the cache admission cap are independent: the fetch succeeds and
-        // returns the full body, but the response is not retained in the
-        // cache (see test_store_entry_skips_caching_oversized_entry).
+        // MAX_RESPONSE_BYTES is well over MAX_CACHEABLE_ENTRY_BYTES, so the network-layer cap
+        // and the cache admission cap are independent (see test_store_entry_skips_caching_oversized_entry).
         let mut server = mockito::Server::new_async().await;
         let exact_cap_body = vec![0u8; MAX_RESPONSE_BYTES];
 
@@ -3292,9 +3239,8 @@ mod tests {
             },
         );
 
-        // Registry is down for maintenance: the conditional request gets a
-        // non-2xx, non-304 response instead of either "unchanged" or "here's
-        // the new body".
+        // Registry down for maintenance: a non-2xx, non-304 response instead of "unchanged"
+        // or "here's the new body".
         let _m = server
             .mock("GET", "/api/data")
             .match_header("if-none-match", "\"stale-etag\"")
@@ -3305,9 +3251,7 @@ mod tests {
 
         let result: Bytes = cache.get_cached(&url).await.unwrap();
 
-        // The stale-while-revalidate fallback returns the last-known-good
-        // body, and the cache entry is left untouched rather than being
-        // overwritten with the error page.
+        // Stale-while-revalidate: last-known-good body returned, entry untouched.
         assert_eq!(result.as_ref(), b"stale but good");
         let cached = cache.entries.get(&url).unwrap();
         assert_eq!(cached.etag, Some("\"stale-etag\"".into()));
@@ -3596,10 +3540,8 @@ mod tests {
     fn test_evict_entries_triggers_on_byte_budget_with_few_entries() {
         let cache = HttpCache::new();
 
-        // 9 entries, each at the per-entry admission cap: far below
-        // MAX_CACHE_ENTRIES by count, but their combined size (72 MiB)
-        // overshoots MAX_CACHE_BYTES (64 MiB), exercising the byte-only
-        // eviction path.
+        // 9 entries at the per-entry admission cap: far below MAX_CACHE_ENTRIES by count, but
+        // their combined size (72 MiB) overshoots MAX_CACHE_BYTES (64 MiB).
         for i in 0..9 {
             cache.store_entry(format!("url{i}"), dummy_response(MAX_CACHEABLE_ENTRY_BYTES));
         }
@@ -3608,10 +3550,8 @@ mod tests {
 
         cache.evict_entries();
 
-        // Only as many oldest entries as needed to clear the byte budget
-        // are removed - not a fixed count-based batch. Removing the single
-        // oldest (8 MiB) entry brings the total to exactly the 64 MiB
-        // budget, so eviction stops there.
+        // Only as many oldest entries as needed to clear the byte budget are removed, not a
+        // fixed count-based batch.
         assert!(cache.total_bytes() <= MAX_CACHE_BYTES);
         assert_eq!(cache.len(), 8);
     }
@@ -3620,11 +3560,8 @@ mod tests {
     fn test_evict_entries_removes_oldest_first_for_bytes() {
         let cache = HttpCache::new();
 
-        // 9 entries at the per-entry admission cap (8 MiB each = 72 MiB
-        // total, 8 MiB over the 64 MiB budget), so evicting just the single
-        // oldest entry restores the cache to within budget - proving
-        // eviction picks the genuinely oldest entry, not hash-iteration
-        // order (the pre-existing count-eviction bug this PR also fixes).
+        // Evicting just the single oldest entry should restore the cache to within budget,
+        // proving eviction picks the genuinely oldest entry, not hash-iteration order.
         cache.store_entry("oldest".into(), dummy_response(MAX_CACHEABLE_ENTRY_BYTES));
         std::thread::sleep(std::time::Duration::from_millis(5));
         for i in 0..8 {
@@ -3651,9 +3588,7 @@ mod tests {
 
         let cache = HttpCache::new();
 
-        // Pre-fill the cache past the byte budget with old entries, all
-        // under MAX_CACHE_ENTRIES by count and within the per-entry
-        // admission cap.
+        // Pre-fill past the byte budget, staying under MAX_CACHE_ENTRIES by count.
         for i in 0..9 {
             cache.store_entry(
                 format!("stale{i}"),
@@ -3672,8 +3607,7 @@ mod tests {
         let result: Bytes = cache.get_cached(&url).await.unwrap();
         assert_eq!(result.as_ref(), b"fresh");
 
-        // The pre-request byte-budget check evicted stale entries before
-        // fetching, so the cache never grows unbounded past the budget.
+        // The pre-request byte-budget check evicted stale entries before fetching.
         assert!(cache.total_bytes() <= MAX_CACHE_BYTES + result.len());
     }
 
@@ -3681,16 +3615,14 @@ mod tests {
     fn test_store_entry_skips_caching_oversized_entry() {
         let cache = HttpCache::new();
 
-        // A body over the per-entry admission cap is not retained, even
-        // though the caller still gets it back (store_entry's caller
-        // already holds `body` independently - see fetch_and_store_with_headers).
+        // A body over the per-entry admission cap is not retained, even though the caller
+        // still gets it back (store_entry's caller already holds `body` independently).
         cache.store_entry("big".into(), dummy_response(MAX_CACHEABLE_ENTRY_BYTES + 1));
         assert!(cache.entries.get("big").is_none());
         assert_eq!(cache.total_bytes(), 0);
 
-        // Replacing an existing small entry with an oversized one drops the
-        // stale small entry too, rather than leaving it to keep serving
-        // increasingly outdated data forever.
+        // Replacing an existing small entry with an oversized one drops the stale entry too,
+        // rather than leaving it to keep serving increasingly outdated data.
         cache.store_entry("small".into(), dummy_response(100));
         assert_eq!(cache.total_bytes(), 100);
 
@@ -3727,13 +3659,8 @@ mod tests {
         }
         cache.evict_entries();
 
-        // The regression this guards against: evict_entries used to
-        // snapshot total_bytes once and overwrite it with an absolute
-        // store at the end, silently discarding any store_entry delta
-        // that landed concurrently. That drift is undetectable from a
-        // single-threaded test - only genuine concurrent access exercises
-        // the race, so this asserts the tracked counter still matches the
-        // actual summed size of what remains in the map.
+        // Regression guard: evict_entries used to snapshot total_bytes once and overwrite it
+        // with an absolute store, silently discarding any concurrent store_entry delta.
         let actual: usize = cache
             .entries
             .iter()
@@ -3803,9 +3730,8 @@ mod tests {
             b"public-only-era body",
             "the All-era cached body must not be served after tightening to PublicOnly"
         );
-        // mockito's second mock answers request 2 regardless of which cache entry (if any) was
-        // hit, so the body assertion alone would still pass with a policy-blind cache key —
-        // this is the assertion that actually proves the two eras got distinct map entries.
+        // mockito's second mock answers regardless of which entry was hit, so the body
+        // assertion alone wouldn't prove a policy-blind key — this length check does.
         assert_eq!(cache.len(), 2);
     }
 
@@ -3840,10 +3766,8 @@ mod tests {
         assert_eq!(cache.workspace_rebuilds.load(Ordering::Relaxed), 2);
     }
 
-    // Issue #483: offline + cold, three send sites. `.expect(0)` proves nothing reached
-    // *this mock* — adequate here only because `ensure_https`'s loopback carve-out is what
-    // let a mockito server stand in for a real registry at all in this module's tests, not
-    // a general proof that zero sockets ever opened.
+    // Issue #483: `.expect(0)` proves nothing reached *this mock*, not that zero sockets
+    // ever opened — adequate only because the loopback carve-out lets mockito stand in here.
 
     #[tokio::test]
     async fn test_offline_cold_get_cached_errors_without_network() {

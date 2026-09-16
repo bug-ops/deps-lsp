@@ -47,7 +47,6 @@ pub fn generate_inlay_hints(
                 .cloned()
             };
 
-        // Show loading hint if loading and no cached version
         if loading_state == crate::LoadingState::Loading
             && config.show_loading_hints
             && latest_version.is_none()
@@ -110,9 +109,6 @@ pub fn generate_inlay_hints(
             continue;
         };
 
-        // Two-tier check for up-to-date status:
-        // 1. If lock file has the dep, check if resolved == latest
-        // 2. If NOT in lock file, check the version requirement against latest
         let status = if let Some(resolved) = &resolved_version {
             if resolved == latest {
                 RequirementStatus::UpToDate
@@ -121,11 +117,9 @@ pub fn generate_inlay_hints(
             }
         } else {
             match dep.version_requirement() {
-                // `requirement_status_for` (not the bare `requirement_status`), matching
-                // `diagnostics.rs`'s `apply_outdated_rule` (#907 review M-consistency):
-                // hands the ecosystem the dependency itself, letting e.g.
-                // `GithubActionsFormatter` prefer a SHA pin's registry-confirmed tag over
-                // trusting its own comment text when both are available.
+                // `requirement_status_for`, matching `diagnostics.rs`'s `apply_outdated_rule`
+                // (#907): lets e.g. `GithubActionsFormatter` prefer a SHA pin's
+                // registry-confirmed tag over trusting its own comment text.
                 Some(version_req) => formatter.requirement_status_for(dep, version_req, latest),
                 // No declared requirement at all (e.g. a dangling alias/reference the
                 // parser couldn't resolve to any string) — nothing was verified.
@@ -383,10 +377,8 @@ mod tests {
         assert_eq!(hints.len(), 1);
         match &hints[0].label {
             InlayHintLabel::String(text) => {
-                // Non-Go formatters must keep using the lockfile-resolved version
-                // ("1.2.0", matching latest) rather than the raw manifest requirement
-                // ("1.0.0", which would wrongly report outdated) — confirms the Go
-                // override does not leak into other ecosystems.
+                // Non-Go formatters must keep using the lockfile-resolved "1.2.0" (matching
+                // latest), not the raw "1.0.0" requirement — confirms the Go override doesn't leak.
                 assert!(
                     text.starts_with("✅"),
                     "expected up-to-date hint from resolved lockfile version, got: {text}"

@@ -622,23 +622,16 @@ pub fn generate_diagnostics_from_cache(
 ) -> Vec<Diagnostic> {
     let deps = parse_result.dependencies();
     let mut diagnostics = Vec::with_capacity(deps.len());
-    // Collected separately from `diagnostics`: buffered here so 2+ near-identical
-    // fetch failures collapse into one diagnostic instead of fanning out — but each
-    // entry keeps its own name, built message, and classification, since the
-    // collapse still needs to name every affected dependency (via
-    // `related_information`) and must never silently drop an `Actionable` hint
-    // (#478/#485's whole point) just because #479's collapse kicked in.
+    // Buffered separately (#479) so 2+ near-identical fetch failures collapse into one
+    // diagnostic while still naming every dependency and keeping any `Actionable` hint (#478/#485).
     let mut fetch_failed: Vec<FetchFailureEntry> = Vec::new();
 
     dependency_ceiling_notice(&mut diagnostics, parse_result);
     offline_notice(&mut diagnostics, versions, &deps);
     blocked_registry_diagnostics(&mut diagnostics, parse_result, &deps);
 
-    // #394 S2: version-qualified OSV lookup keys, so two occurrences of one
-    // name pinned to different versions never share a `Vulnerable`/`Clean`
-    // result. `None` when this `VersionData` carries no ecosystem (most test
-    // fixtures) — the per-dep lookup below then falls back to the plain
-    // name, unaffected.
+    // #394 S2: version-qualified OSV lookup keys, so two occurrences of one name pinned to
+    // different versions never share a `Vulnerable`/`Clean` result; `None` falls back to plain-name lookup.
     let vuln_keys = versions.ecosystem.map(|ecosystem| {
         crate::osv::vulnerability_keys(
             parse_result,
@@ -650,14 +643,8 @@ pub fn generate_diagnostics_from_cache(
     });
 
     for dep in deps {
-        // Critic finding S1 (#905): a dependency whose `name_range()` is a synthetic
-        // placeholder (`Dependency::name_range_is_synthetic`) has no real position in the
-        // document at all — every rule below anchors its diagnostic on `name_range()` or
-        // `version_range().unwrap_or_else(name_range)`, and a synthetic `name_range()` is
-        // always paired with `version_range() == None` (deps-dart never resolves one without
-        // the other for a replayed dependency), so there is no reliable range to anchor on.
-        // Skip diagnostics for it entirely rather than emit diagnostics stacked on a shared
-        // sentinel range — it still contributes parse/completion data via `dependencies()`.
+        // Critic S1 (#905): a synthetic `name_range()` has no real document position, and every
+        // rule below anchors on it — skip diagnostics entirely rather than stack on a sentinel range.
         if dep.name_range_is_synthetic() {
             continue;
         }
@@ -673,10 +660,8 @@ pub fn generate_diagnostics_from_cache(
             now,
         };
 
-        // R2, R3, R4 run before both terminal guards below (registry outage, no
-        // version range): an OSV / deprecation / in-use-yanked finding must never be
-        // hidden by an unrelated "latest" lookup failure (FR-007/US-004) — each reads
-        // an independent data source.
+        // R2, R3, R4 run before both terminal guards below: an OSV / deprecation / in-use-yanked
+        // finding must never be hidden by an unrelated "latest" lookup failure (FR-007/US-004).
         apply_vulnerability_rule(&mut diagnostics, &ctx, vuln_keys.as_ref());
         apply_license_policy_rule(&mut diagnostics, &ctx);
         let deprecation_found = apply_deprecation_rule(&mut diagnostics, &ctx);
@@ -914,10 +899,8 @@ fn blocked_registry_diagnostics(
     parse_result: &dyn ParseResult,
     deps: &[&dyn Dependency],
 ) {
-    // #944 M3: a `HashMap` index (rather than a linear `Vec::find` per occurrence) keeps
-    // grouping O(n) even when one config-global declaration affects every dependency in the
-    // document; `order` preserves first-seen declaration-key order so output stays
-    // deterministic and independent of `HashMap` iteration order.
+    // #944 M3: `HashMap` grouping keeps this O(n); `order` preserves first-seen declaration-key
+    // order so output stays deterministic independent of `HashMap` iteration order.
     let mut order: Vec<String> = Vec::new();
     let mut groups: HashMap<String, Vec<BlockedRegistryOccurrence>> = HashMap::new();
     for occurrence in parse_result.blocked_registries() {
@@ -930,10 +913,8 @@ fn blocked_registry_diagnostics(
             .push(occurrence);
     }
 
-    // Built once, not per sibling occurrence (#944 M3) — feeds
-    // [`push_collapsed_blocked_registries`]'s `related_information` naming. Keyed on
-    // `deps_core::position::Range` directly, matching `BlockedRegistryOccurrence::range`'s
-    // and `dep.name_range()`'s type (#1071 S2).
+    // Built once, not per sibling occurrence (#944 M3), for `related_information` naming;
+    // keyed on `Range` to match `BlockedRegistryOccurrence::range`'s type (#1071 S2).
     let dependency_names: HashMap<Range, &str> = deps
         .iter()
         .map(|dep| (dep.name_range(), dep.name().as_str()))
@@ -958,38 +939,14 @@ fn blocked_registry_diagnostics(
 /// see [`BlockedRegistryOccurrence::raw_value`]'s own doc — render as byte-identical messages,
 /// even though each is its own diagnostic anchored at a different declaration.
 fn build_blocked_registry_diagnostic(occurrence: &BlockedRegistryOccurrence) -> Diagnostic {
-    // #936: `raw_value` is a raw, unvalidated `registry`/`registry-index` literal that can
-    // carry a query-string credential (userinfo is rejected earlier in the pipeline, but
-    // a query string is not) — redact before truncating so host/path survive for the
-    // message to stay identifiable while the credential never reaches this
-    // client-visible diagnostic.
+    // #936: redact before truncating so host/path stay identifiable while a query-string
+    // credential never reaches this client-visible diagnostic.
     let redacted_value = RedactedUrl::new(&occurrence.raw_value).to_string();
-    // `declaration_key` is implementation-opaque (see its own doc): most implementors use a
-    // short label (`"top-level"`, `"source:Blocked"`, `"scope:@myorg"`) that `RedactedUrl`'s
-    // userinfo-scan would mangle (it is tuned for actual URLs, and a bare `label:rest` shape
-    // reads exactly like a schemeless `user:pass@host` credential to that scan) — so the
-    // userinfo-redaction step only runs when the key parses as a URL with a real host (checked
-    // via `is_authority_bearing_url`, giving `redact_userinfo` a genuine authority boundary to
-    // work from — not, as an earlier version of this comment claimed, the same "primary,
-    // authority-aware" dispatch path for every input: a host-having-but-userinfo-free URL
-    // still runs through `redact_userinfo`'s own aggressive `redact_secondary_colon_credential`
-    // text-scan, e.g. `https://10.0.0.1/v1/items:search` renders as
-    // `https://10.0.0.1/v1/items:***` despite being authority-bearing; the gate here is about
-    // whether a userinfo/tail scan is safe to run at all, not about which internal scan runs)
-    // OR the key contains `"://"` (`deps_cargo` reuses the raw value verbatim as its own key,
-    // and `file://`-style URLs, which have no host, both rely on this half). Neither condition
-    // alone is a superset of the vulnerability class: `is_authority_bearing_url` alone missed
-    // `"source:https://user:hunter2@10.0.0.1/v3/index.json"` (an opaque-label-prefixed URL —
-    // `Url::parse` treats "source" as the scheme and the whole rest as an opaque path, so
-    // `host()` is `None` even though the tail is a real credentialed URL); `"://"` alone missed
-    // a scheme-colon, slash-less credential (`"https:user:pass@10.0.0.1/index"` — never
-    // contains `"://"` yet still a genuine URL with userinfo, #981's original S1). The union of
-    // both conditions is required: every opaque label the 6 ecosystems currently emit
-    // (`"top-level"`, `"source:Blocked"`, `"scope:@myorg"`, `"primary"`, `"uv-tail"`,
-    // `"named:internal"`, the Go blocked-goproxy constant, `"component-host:<host>"`) contains
-    // neither `"://"` nor parses to an authority-bearing URL, so all still take the plain
-    // `else` branch below unmangled.
-    //
+    // `declaration_key` is opaque (e.g. "top-level") and would be mangled by RedactedUrl's
+    // userinfo-scan, so redaction only runs when the key looks like a URL: authority-bearing,
+    // or containing "://" (deps_cargo's file:// case). Neither check alone is a superset —
+    // each catches a credential shape the other misses (#981 S1) — so both are needed to
+    // cover every opaque label the 6 ecosystems emit.
     // TODO(critic): move this branch into net_policy::redact_declaration_key so the no-leak
     // guarantee is unconditional at the render site (#981 structural follow-up).
     let redacted_key = if is_authority_bearing_url(&occurrence.declaration_key)
@@ -1666,10 +1623,8 @@ fn push_collapsed_fetch_failures(
             let first = &fetch_failed[0].diagnostic;
             let range = first.range;
             let severity = first.severity;
-            // Surface a shared/first actionable hint across the batch if one exists,
-            // so collapsing 2+ failures into one diagnostic never drops the specific,
-            // pre-vetted remedy #478/#485 introduced — only fall back to the generic
-            // message when nothing in the batch has one.
+            // Surface a shared actionable hint across the batch so collapsing 2+ failures
+            // never drops the pre-vetted remedy (#478/#485); fall back to generic otherwise.
             let shared_hint = fetch_failed.iter().find_map(|entry| match &entry.failure {
                 Some(FetchFailure::Actionable(hint)) => Some(hint.clone()),
                 _ => None,
@@ -2657,12 +2612,9 @@ mod tests {
             related[0].message
         );
 
-        // Impl-critic M1 on #965/#966: the anchor (declaration "top-level") and the
-        // third-entry diagnostic (declaration "scope:@myorg") share the identical `raw_value`
-        // and `class` — without the declaration key in the message, they would render
-        // byte-identical, contradicting `BlockedRegistryOccurrence::raw_value`'s own
-        // "two different blocked aliases render as two distinguishable diagnostic messages"
-        // invariant.
+        // Impl-critic M1 (#965/#966): the anchor ("top-level") and third entry
+        // ("scope:@myorg") share the identical `raw_value`/`class` — without the
+        // declaration key in the message, they'd render byte-identical.
         let third = blocked_diagnostics
             .iter()
             .find(|d| d.range == third_range)
@@ -2895,10 +2847,8 @@ mod tests {
         use crate::position::{Position, Range};
         use std::collections::HashMap;
 
-        // A package missing from `cached` because its registry fetch errored
-        // or timed out (#267) must not be reported as "Unknown package" — the
-        // registry was never successfully asked, so absence is not evidence
-        // the package doesn't exist.
+        // A package missing from `cached` due to a fetch error/timeout (#267) must not be
+        // reported as "Unknown package" — it was never successfully asked about.
         let formatter = MockFormatter;
 
         let parse_result = MockParseResult {
@@ -3094,11 +3044,9 @@ mod tests {
         use crate::position::{Position, Range};
         use std::collections::HashMap;
 
-        // #479: a registry-wide condition (e.g. a rate limit tripped by one dependency)
-        // can fail every remaining dependency identically. N near-duplicate
-        // per-dependency "Registry lookup failed" diagnostics carry no more information
-        // than one combined diagnostic — this asserts the 2+ case actually collapses,
-        // on the first failing dependency's range, with the count in the message.
+        // #479: a registry-wide condition can fail every remaining dependency identically;
+        // asserts the 2+ case collapses onto the first failing dependency's range, with the
+        // count in the message.
         let formatter = MockFormatter;
 
         let name_range_1 = Range::new(Position::new(0, 0), Position::new(0, 8));
@@ -3186,10 +3134,9 @@ mod tests {
         use crate::position::{Position, Range};
         use std::collections::HashMap;
 
-        // n==2 is the lowest n that collapses at all (n==1 stays a plain per-dependency
-        // diagnostic — see `test_generate_diagnostics_from_cache_fetch_failed_not_reported_as_unknown`
-        // above) — this confirms `related_information` is populated right at that
-        // threshold, not just once there are 3+ failures to fold in.
+        // n==2 is the lowest n that collapses at all (n==1 stays per-dependency, see
+        // `test_generate_diagnostics_from_cache_fetch_failed_not_reported_as_unknown`);
+        // confirms `related_information` is populated right at that threshold.
         let formatter = MockFormatter;
 
         let name_range_1 = Range::new(Position::new(0, 0), Position::new(0, 8));
@@ -3258,10 +3205,8 @@ mod tests {
         use crate::position::{Position, Range};
         use std::collections::HashMap;
 
-        // #478/#485 + #479: the motivating scenario for both — a rate-limit gate trips
-        // and fails every remaining dependency with the SAME `Actionable` hint. The
-        // #479 collapse must not silently drop that hint just because 2+ failures
-        // collapsed into one diagnostic.
+        // #478/#485 + #479: a rate-limit gate fails every remaining dependency with the SAME
+        // `Actionable` hint — the #479 collapse must not silently drop it.
         let formatter = MockFormatter;
 
         let name_range_1 = Range::new(Position::new(0, 0), Position::new(0, 8));
@@ -3386,10 +3331,8 @@ mod tests {
         use crate::position::{Position, Range};
         use std::collections::HashMap;
 
-        // #478 fix (impl-critic S1): `NotAttempted` (a source-collided
-        // dependency that was deliberately never queried) must render the
-        // SAME generic message as `Transient`, never "Unknown package" — the
-        // dependency's non-fetch is not evidence it doesn't exist.
+        // #478 fix (impl-critic S1): `NotAttempted` (deliberately never queried, e.g.
+        // source-collided) must render the SAME generic message as `Transient`, never "Unknown package".
         let formatter = MockFormatter;
 
         let parse_result = MockParseResult {
@@ -4505,12 +4448,9 @@ mod tests {
 
     #[test]
     fn test_generate_diagnostics_from_cache_yanked_not_shared_across_duplicate_name_occurrences() {
-        // #394 S1: two occurrences of `time` (e.g. under `[dependencies]` and
-        // `[dev-dependencies]`) pinned to different exact versions, only one
-        // of which is actually yanked. `yanked` is name-keyed (single value),
-        // recording only "0.1.43" — the occurrence pinned to "0.1.44" must
-        // NOT also render "yanked (0.1.43)" just because it shares the name;
-        // that version string doesn't even appear on its line.
+        // #394 S1: two occurrences of `time` pinned to different versions, only one actually
+        // yanked. `yanked` is name-keyed and records only "0.1.43" — the occurrence pinned
+        // to "0.1.44" must not also render "yanked (0.1.43)" just because it shares the name.
         use crate::position::{Position, Range};
         use std::collections::HashMap;
 
@@ -4569,11 +4509,9 @@ mod tests {
 
     #[test]
     fn test_generate_diagnostics_from_cache_yanked_no_ecosystem_keeps_pre_394_behavior() {
-        // Without `with_ecosystem` (most test fixtures, and any caller that
-        // predates #394), the consistency check is skipped entirely and both
-        // occurrences render the shared name-keyed finding — the exact
-        // pre-#394 behavior, preserved deliberately for backward
-        // compatibility rather than silently tightened.
+        // Without `with_ecosystem` (predates #394), the consistency check is skipped and both
+        // occurrences render the shared name-keyed finding — the pre-#394 behavior, preserved
+        // deliberately.
         use crate::position::{Position, Range};
         use std::collections::HashMap;
 
@@ -5054,10 +4992,8 @@ mod tests {
 
     #[test]
     fn test_generate_diagnostics_informational_advisory_is_distinguishable_from_unknown() {
-        // US-002/SC-002 (issue #1007): an Informational advisory (e.g. an
-        // "unmaintained" notice) and an ordinary Unknown-severity advisory on
-        // the same dependency must be distinguishable without opening hover —
-        // via severity (INFORMATION vs WARNING) and the [INFORMATIONAL] tag.
+        // US-002/SC-002 (#1007): an Informational advisory (e.g. "unmaintained") and an
+        // ordinary Unknown-severity one must be distinguishable without opening hover.
         use crate::osv::{
             Capped, DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity,
             VulnerabilityMap,
@@ -5233,12 +5169,9 @@ mod tests {
 
     #[test]
     fn test_generate_diagnostics_vulnerability_not_shared_across_duplicate_name_occurrences() {
-        // #394 S2: two occurrences of `pkg` (e.g. under `[dependencies]` and
-        // `[dev-dependencies]`) pinned to different versions — one vulnerable,
-        // one patched. Built via `vulnerability_keys` the same way
-        // `deps-lsp`'s `build_scan_targets` would, so each occurrence's OSV
-        // result lands under its own key instead of colliding on the plain
-        // name. The patched occurrence must render no advisory diagnostic.
+        // #394 S2: two occurrences of `pkg` pinned to different versions — one vulnerable, one
+        // patched. Built via `vulnerability_keys` (as `deps-lsp`'s `build_scan_targets` would)
+        // so each occurrence's OSV result lands under its own key.
         use crate::osv::{
             Capped, DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity,
             VulnerabilityMap, vulnerability_keys,
@@ -6275,10 +6208,8 @@ mod tests {
                 "expected exactly the deprecation diagnostic plus the #247 yanked-only \
                  match, got: {diagnostics:?}"
             );
-            // R3 (deprecation) always runs before R6b (#247, yanked-only) in the
-            // orchestrator, so index 0 is the deprecation finding and index 1 is the
-            // #247 match — R6b's own status (`Yanked`) fires regardless of
-            // `deprecation_found`, unlike R4's D5 gate.
+            // R3 always runs before R6b (#247), so index 0 is deprecation and index 1 is the
+            // #247 match — R6b fires regardless of `deprecation_found`, unlike R4's D5 gate.
             assert_eq!(
                 diagnostics[0].message,
                 format!("{}: archived", formatter.deprecated_message()),
@@ -6423,10 +6354,9 @@ mod tests {
                  deprecated 2.0.0) must stay suppressed and contribute nothing, got: \
                  {diagnostics:?}"
             );
-            // R3 (deprecation) always runs before R6b (#247, yanked-only) in the
-            // orchestrator, so index 0 is the deprecation finding and index 1 is the
-            // #247 match against the genuinely Yanked 1.2.1 — fired independently of
-            // R4's D5-suppressed #263 finding for the unrelated 2.0.0 entry.
+            // R3 always runs before R6b (#247), so index 0 is deprecation and index 1 is the
+            // #247 match against the genuinely Yanked 1.2.1 — independent of R4's
+            // D5-suppressed #263 finding for the unrelated 2.0.0 entry.
             assert_eq!(
                 diagnostics[0].message,
                 format!("{}: archived", formatter.deprecated_message()),
@@ -6485,24 +6415,17 @@ mod tests {
                 PublishTime::now(),
             );
 
-            // Two diagnostics are expected, not one: the in-use-version check (#263) has
-            // no `continue`, so it co-emits alongside the ordinary "outdated" diagnostic
-            // for the same dependency (the fixture's declared requirement "modelled"
-            // does not itself equal `latest` "2.0.0", so `requirement_status` reports
-            // `Outdated`) — this is #263's deliberate, separately-tested policy, see
-            // `test_generate_diagnostics_from_cache_yanked_and_outdated_both_emitted`.
-            // What this test actually proves is narrower: exactly one *yanked*
-            // diagnostic, not two — #247's `yanked_only` check must not also fire.
+            // Two diagnostics expected: #263 (in-use-version) has no `continue`, so it
+            // co-emits with "outdated". This proves the narrower claim that #247's
+            // `yanked_only` check does not also fire.
             assert_eq!(
                 diagnostics.len(),
                 2,
                 "expected exactly the yanked diagnostic plus the co-emitted outdated \
                  diagnostic (#263's policy), got: {diagnostics:?}"
             );
-            // R4 (#263, in-use-yanked) runs before R7 (outdated); R6b (#247,
-            // yanked-only) is dedup-suppressed by R4 having already emitted, so it
-            // contributes nothing at any index. Index 0 is therefore always the
-            // in-use-version-yanked finding and index 1 the outdated finding.
+            // R4 (#263) runs before R7 (outdated); R6b (#247) is dedup-suppressed by R4
+            // having already emitted, so index 0 is in-use-yanked and index 1 is outdated.
             assert_eq!(
                 diagnostics[0].message,
                 format!("{} (1.2.1)", formatter.yanked_message()),

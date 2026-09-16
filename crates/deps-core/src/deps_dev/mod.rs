@@ -442,9 +442,8 @@ impl DepsDevClient {
                 }
             },
             Err(DepsDevFetchError::NotFound) => return (None, DEPS_DEV_SUCCESS_TTL),
-            // #756: never interpolate `e`'s `Display` — see `DepsError::safe_tracing_summary`.
-            // Currently safe (deps.dev's base URL is a fixed, credential-free constant), but
-            // kept consistent with the same invariant applied to `Self::get` above.
+            // #756: never interpolate `e`'s `Display` (`DepsError::safe_tracing_summary`) —
+            // kept consistent with `Self::get` above even though this URL is credential-free.
             Err(DepsDevFetchError::Failed(e)) => {
                 let (status, cause) = e.safe_tracing_summary();
                 tracing::debug!(status = ?status, cause, "deps.dev version fetch failed");
@@ -456,12 +455,10 @@ impl DepsDevClient {
             }
         };
 
-        // `project_ttl` is `DEPS_DEV_SUCCESS_TTL` when no project key exists at all (nothing
-        // to downgrade for) or the project call succeeded/404'd, and `DEPS_DEV_ERROR_TTL`
-        // when it genuinely failed — `.min` below then downgrades the *whole signal's* memo
-        // TTL whenever the project call was the thing that failed (review C2/critic C2): a
-        // successful version call must not paper over a transient project-call failure with
-        // a full hour of "no Scorecard".
+        // `project_ttl` is `DEPS_DEV_ERROR_TTL` only when the project call genuinely failed;
+        // `.min` below then downgrades the whole signal's memo TTL in that case (review
+        // C2/critic C2), so a successful version call can't paper over a transient
+        // project-call failure with a full hour of "no Scorecard".
         let (scorecard, project_ttl) = match choose_project_key(&related_projects) {
             Some((project_key, self_reported)) => {
                 let (raw_score, ttl) = self.fetch_scorecard(&project_key).await;
@@ -582,8 +579,6 @@ mod tests {
 
     const EXPRESS_PROJECT: &str = r#"{"scorecard": {"overallScore": 8.5}}"#;
 
-    // --- deps_dev_system ---
-
     #[cfg(feature = "lsp-responses")]
     #[test]
     fn deps_dev_system_covers_seven_ecosystems() {
@@ -607,8 +602,6 @@ mod tests {
         assert_eq!(deps_dev_system(EcosystemId::GithubActions), None);
     }
 
-    // --- is_valid_project_key ---
-
     #[test]
     fn is_valid_project_key_accepts_github_style_key() {
         assert!(is_valid_project_key("github.com/expressjs/express"));
@@ -630,8 +623,6 @@ mod tests {
         assert!(!is_valid_project_key("github.com"));
         assert!(!is_valid_project_key("github.com/a/b/c/d"));
     }
-
-    // --- classify_provenance ---
 
     #[test]
     fn classify_provenance_both_empty_is_none() {
@@ -655,8 +646,6 @@ mod tests {
             ProvenanceStatus::Unverified
         );
     }
-
-    // --- trust_signal: end-to-end against mockito ---
 
     #[tokio::test]
     async fn trust_signal_renders_score_and_verified_provenance() {

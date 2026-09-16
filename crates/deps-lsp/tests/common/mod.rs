@@ -273,8 +273,6 @@ impl LspClient {
     /// (like `did_open`) to capture server-sent notifications.
     #[allow(dead_code)] // Used in notification_ordering tests
     pub(crate) fn flush_notifications(&mut self) {
-        // Send a benign workspace/symbol request with empty query
-        // This is guaranteed to succeed and return quickly
         let _ = self.workspace_symbol(999, "");
     }
 
@@ -360,9 +358,7 @@ impl LspClient {
                 panic!("Invalid JSON: {e} in: {:?}", String::from_utf8_lossy(&body))
             });
 
-            // Check if this is a notification (no id field)
             if message.get("id").is_none() {
-                // Capture the notification
                 if let Some(method) = message.get("method").and_then(|m| m.as_str()) {
                     let params = message.get("params").cloned().unwrap_or(Value::Null);
                     let seq = self.notification_counter.fetch_add(1, Ordering::SeqCst);
@@ -377,7 +373,6 @@ impl LspClient {
                         .expect("Failed to acquire write lock")
                         .push(notification);
                 }
-                // Continue reading for response
                 continue;
             }
 
@@ -391,12 +386,10 @@ impl LspClient {
                 continue;
             }
 
-            // Check id if filter is specified
             if let Some(id) = expected_id {
                 if message.get("id") == Some(&json!(id)) {
                     return message;
                 }
-                // Wrong id, keep reading
                 continue;
             }
 
@@ -507,7 +500,6 @@ impl LspClient {
 
         let response = self.read_response(Some(1));
 
-        // Send initialized notification
         self.send(&json!({
             "jsonrpc": "2.0",
             "method": "initialized",

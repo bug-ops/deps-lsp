@@ -166,10 +166,8 @@ impl Ecosystem for NpmEcosystem {
         Box::pin(async move {
             let result =
                 crate::parser::parse_package_json_with_context(content, uri, &self.context)?;
-            // Registers every `.npmrc`-resolved alternate index this parse found (spec
-            // FR-002–004) into the shared router — the only point where a per-document
-            // `.npmrc` resolution and the long-lived `NpmRegistry` this ecosystem shares
-            // across every document ever meet. See `NpmParseResult::resolved_registries`.
+            // Registers every `.npmrc`-resolved alternate index (FR-002–004) into the shared
+            // router. See `NpmParseResult::resolved_registries`.
             for index in result.resolved_registries.clone() {
                 self.registry.register_alternate(index);
             }
@@ -301,11 +299,8 @@ impl Ecosystem for NpmEcosystem {
             return None;
         }
         let (prefix, _) = extract_prefix(line, position.character);
-        // A closed key or an open value string (see `extract_prefix`) both come back
-        // as an empty prefix — there is no safe text to offer at that position, so
-        // this suppresses the completion entirely (`None`, same as "no completable
-        // position at all") rather than relying on the caller's own `prefix.is_empty()`
-        // guard (#729).
+        // A closed key or open value (see `extract_prefix`) both yield an empty prefix — no
+        // safe text to offer, so suppress entirely rather than rely on the caller's guard (#729).
         if prefix.is_empty() {
             return None;
         }
@@ -472,9 +467,7 @@ mod tests {
         }
     }
 
-    // #758: exact-value `Ecosystem` conformance, replacing the hand-written
-    // test_ecosystem_id/test_ecosystem_display_name/test_ecosystem_manifest_filenames/
-    // test_ecosystem_lockfile_filenames/test_as_any/test_registry_returns_arc family.
+    // #758: exact-value `Ecosystem` conformance, replacing several hand-written tests.
     deps_core::ecosystem_conformance! {
         mod npm_ecosystem_conformance;
         build: NpmEcosystem::new(Arc::new(deps_core::HttpCache::new()));
@@ -485,9 +478,7 @@ mod tests {
         lockfile_filenames: &["package-lock.json", "pnpm-lock.yaml"];
     }
 
-    // #758: the shared completion-prefix-length guard
-    // (`deps_core::completion::complete_package_names_generic`), replacing
-    // test_complete_package_names_minimum_prefix/test_complete_package_names_max_length.
+    // #758: the shared completion-prefix-length guard, replacing two hand-written tests.
     #[cfg(feature = "lsp-responses")]
     deps_core::completion_guard_conformance! {
         mod npm_completion_guard_conformance;
@@ -522,8 +513,8 @@ mod tests {
         // Regression test for #232: the textEdit range for a package-name completion
         // must be the real name token span, not the (0,0)-(0,0) placeholder.
         //
-        // Held per `fs_probe::snapshot_guard`'s doc: `parse_manifest` transitively touches
-        // fs_probe (via `catalog::load`), and every such test in this file must hold it.
+        // `parse_manifest` transitively touches fs_probe (via `catalog::load`); see
+        // `fs_probe::snapshot_guard`'s doc.
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = NpmEcosystem::new(cache);
@@ -688,7 +679,6 @@ mod tests {
             dependencies: vec![dep],
         };
 
-        // Unknown package should return empty (graceful degradation)
         let results = ecosystem
             .complete_versions(
                 &parse_result,
@@ -723,7 +713,6 @@ mod tests {
         );
         let ecosystem = NpmEcosystem::with_registry(Arc::new(registry));
 
-        // Package names with special characters (@scope/package) should work
         let results = ecosystem
             .complete_package_names("@type", Range::default())
             .await;
@@ -912,12 +901,9 @@ mod tests {
         // this guard is needed here.
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;
 
-        // #1055: position 30 lands inside the `"4.0.0"` version literal — a `Version`
-        // completion context, not "feature" (npm has none, and never overrides
-        // `complete_feature`) as this test's old name claimed. It previously drove an
-        // unmocked live version-completion request to the public registry while asserting the
-        // tautology `completions.items.is_empty() || !completions.items.is_empty()`. Mock the
-        // `express` packument and assert on the actual returned completion instead.
+        // #1055: position 30 lands inside the `"4.0.0"` version literal — a `Version` context,
+        // not "feature" (npm has none) as this test's old name claimed. Mocks the `express`
+        // packument instead of the old unmocked, tautological assertion.
         let mut server = mockito::Server::new_async().await;
         let mock = server
             .mock("GET", "/express")
@@ -1126,7 +1112,6 @@ mod tests {
             )
             .await;
         mock.assert_async().await;
-        // Should not panic, returns empty for unknown package
         assert!(results.is_empty());
     }
 
@@ -1141,7 +1126,6 @@ mod tests {
             dependencies: vec![dep],
         };
 
-        // Test ~ operator stripping
         let results = ecosystem
             .complete_versions(
                 &parse_result,
@@ -1165,7 +1149,6 @@ mod tests {
             dependencies: vec![dep],
         };
 
-        // Test * wildcard stripping
         let results = ecosystem
             .complete_versions(
                 &parse_result,
@@ -1189,7 +1172,6 @@ mod tests {
             dependencies: vec![dep],
         };
 
-        // Test < and > operator stripping
         let results = ecosystem
             .complete_versions(
                 &parse_result,
@@ -1248,10 +1230,8 @@ mod tests {
             dependencies: vec![registry_dep, alternate_dep],
         };
 
-        // The alternate occurrence resolves deterministically without network: its index was
-        // never registered, so `NpmRegistry::get_versions_from` fails closed with
-        // `PackageNotFound` before any HTTP call — proving its own source, not the
-        // co-occurring `Registry`-sourced entry, drove the routing.
+        // Resolves deterministically without network: the unregistered index fails closed
+        // with `PackageNotFound` before any HTTP call, proving its own source drove routing.
         let alternate_results = ecosystem
             .complete_versions(
                 &parse_result,
@@ -1266,8 +1246,8 @@ mod tests {
         );
 
         // Discriminating assertion: the co-occurring `Registry`-sourced entry must still
-        // resolve via the mocked public registry, proving position (not the ambiguity the old
-        // name-based join would have detected) drives routing.
+        // resolve via the mocked public registry, proving position (not the old name-based
+        // ambiguity) drives routing.
         let registry_results = ecosystem
             .complete_versions(
                 &parse_result,
@@ -1490,9 +1470,8 @@ mod tests {
         let content = r#"{"dependencies": {"left-pad": "catalog:"}}"#;
         let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
 
-        // A cached entry for "left-pad" so the base diagnostics pass doesn't separately fire
-        // its own "unknown package" rule (which reads whether *any* registry data was ever
-        // cached, independent of the catalog outcome under test here).
+        // Cached entry for "left-pad" so the base pass doesn't also fire its own
+        // "unknown package" rule, independent of the catalog outcome under test.
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
             pkg("left-pad"),
@@ -1552,9 +1531,8 @@ mod tests {
 
     #[test]
     fn test_extract_prefix_closed_key_is_suppressed_not_reopened() {
-        // #729 critic S1: cursor right after an already fully-closed key (quote
-        // parity even) is NOT an open string — bare-inserting there would duplicate
-        // the closed key's quote (`"express"express`). Suppressed instead of guessed.
+        // #729 critic S1: a fully-closed key (quote parity even) is NOT an open string —
+        // bare-inserting would duplicate the quote (`"express"express`). Suppressed, not guessed.
         let line = "    \"express\"";
         assert_eq!(extract_prefix(line, line.len() as u32), ("", false));
     }

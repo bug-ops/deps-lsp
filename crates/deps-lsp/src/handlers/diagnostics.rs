@@ -92,15 +92,13 @@ pub async fn handle_diagnostics(
     client: Client,
     full_config: Arc<RwLock<DepsConfig>>,
 ) -> Vec<Diagnostic> {
-    // Ensure document is loaded (cold start support)
     if !ensure_document_loaded(uri, Arc::clone(&state), client, Arc::clone(&full_config)).await {
         tracing::warn!("Could not load document for diagnostics: {:?}", uri);
         return vec![];
     }
 
-    // Cheap: the document is already loaded at this point, so this is a single DashMap
-    // shard lookup, not a registry fetch — consistent with the other 6 handlers, which
-    // record `ecosystem` once it's known rather than force-resolving it early (#756).
+    // Cheap DashMap shard lookup, not a registry fetch — records `ecosystem` once known
+    // rather than force-resolving it early, like the other handlers (#756).
     if let Some(ecosystem_id) = state.with_document(uri, |doc| doc.ecosystem) {
         tracing::Span::current().record("ecosystem", ecosystem_id.id());
     }
@@ -146,19 +144,13 @@ pub(crate) async fn generate_diagnostics_internal(
     offline: bool,
     loading_ceiling: Duration,
 ) -> Vec<Diagnostic> {
-    // Skip diagnostics while versions are still loading to avoid false "Unknown package"
-    // warnings from empty cache — but only up to `loading_ceiling` (issue #632): if the
-    // background fetch task panicked or otherwise never reached `set_loaded`/`set_failed`,
-    // `loading_state` would otherwise stay `Loading` forever and permanently suppress
-    // diagnostics for this document. Past the ceiling, force the document to `Failed`
-    // *before* the extraction below (critic M1/S2) — a bare read-only fallthrough would
-    // leave `loading_state` stuck (re-warning on every request, and leaving inlay
-    // hints/`is_ready_for_batch_update` believing the document is still loading) and would
-    // leave `outcomes` empty, misrendering every unresolved dependency as "Unknown
-    // package" instead of "lookup could not be determined". `unwrap_or(Duration::MAX)`
-    // (critic M2) treats a `Loading` document with no recorded start time — a state the
-    // public API can't actually reach, but the fields are both `pub` — as already past the
-    // ceiling rather than never.
+    // Skip diagnostics while versions are loading, up to `loading_ceiling` (#632): if the
+    // background fetch task panicked without reaching `set_loaded`/`set_failed`, `loading_state`
+    // would stay `Loading` forever and permanently suppress diagnostics. Past the ceiling, force
+    // `Failed` *before* extraction (critic M1/S2) — a read-only fallthrough would leave
+    // `loading_state` stuck and `outcomes` empty, misrendering unresolved deps as "Unknown
+    // package" instead of "lookup could not be determined". `unwrap_or(Duration::MAX)` (critic
+    // M2) treats a `Loading` doc with no recorded start time as already past the ceiling.
     let past_ceiling = state
         .with_document(uri, |doc| {
             doc.loading_state == deps_core::LoadingState::Loading
@@ -175,9 +167,8 @@ pub(crate) async fn generate_diagnostics_internal(
         state.force_document_failed_with_not_attempted(uri);
     }
 
-    // Own everything `generate_diagnostics` needs and release the DashMap shard `Ref`
-    // before awaiting it (#333): `with_document` only ever hands `extract` a borrowed
-    // `&DocumentState` synchronously, so the guard can't leak across the `.await` below.
+    // Release the DashMap shard `Ref` before awaiting (#333): `with_document` only hands
+    // `extract` a borrowed `&DocumentState` synchronously, so it can't leak across the await below.
     let Some(extracted) = state.with_document(uri, |doc| {
         let Some(ecosystem) = state.ecosystem_registry.get(doc.ecosystem_id()) else {
             tracing::warn!(
@@ -225,14 +216,11 @@ pub(crate) async fn generate_diagnostics_internal(
         return vec![];
     };
 
-    // Issue #660/#661 critic C1: read from `ServerState` rather than a caller-supplied
-    // parameter, so every call site (push and pull) evaluates the same policy — see this
-    // function's doc comment. `apply_license_policy_rule` is a no-op for an empty policy
-    // (the default until config is first loaded), so attaching it unconditionally costs
-    // nothing when no policy is configured.
-    // Unreachable in practice: a document only reaches this point once its URI already
-    // converted successfully (see `ensure_document_loaded`), but handled defensively
-    // rather than unwrapped.
+    // Issue #660/#661 critic C1: policy is read from `ServerState`, not a caller-supplied
+    // parameter, so every call site evaluates it identically — see this function's doc comment.
+    //
+    // Unreachable in practice (the URI already converted in `ensure_document_loaded`);
+    // handled defensively rather than unwrapped.
     let Some(domain_uri) = crate::lsp_types_interop::from_lsp_uri(uri) else {
         tracing::warn!("URI is not representable as a url::Url: {:?}", uri);
         return vec![];
@@ -301,8 +289,6 @@ mod tests {
     use crate::document::ServerState;
     use crate::test_utils::test_helpers::create_test_client_and_config;
     use deps_core::EcosystemId;
-
-    // Generic tests (no feature flag required)
 
     #[test]
     fn test_loading_ceiling_small_manifest_hits_floor() {
@@ -454,17 +440,14 @@ mod tests {
             async move { handle_diagnostics(state, &uri, &config, client, full_config).await }
         });
 
-        // Block until `generate_diagnostics` has actually started executing — i.e.
-        // `handle_diagnostics` has reached (and is now inside) the await — before
-        // racing the writer below. Timeout-wrapped so a regression that makes the
-        // handler never reach the awaited call fails loudly instead of hanging forever.
+        // Block until `generate_diagnostics` has actually started (barrier) before racing
+        // the writer; timeout so a regression that never reaches the await hangs loudly instead of forever.
         tokio::time::timeout(std::time::Duration::from_secs(5), started.wait())
             .await
             .expect("handle_diagnostics did not reach generate_diagnostics within 5s");
 
-        // Spawned onto its own task (rather than awaited inline) deliberately: see
-        // `completion.rs`'s equivalent #319 regression test for why `DashMap::get_mut`
-        // needs a real async yield point to race against `tokio::time::timeout`.
+        // Spawned as its own task deliberately — see completion.rs's #319 test for why
+        // `DashMap::get_mut` needs a real async yield point to race the timeout.
         let write_task = tokio::spawn({
             let state = Arc::clone(&state);
             let uri = uri.clone();
@@ -498,9 +481,8 @@ mod tests {
 
         #[tokio::test]
         async fn test_unknown_package_uses_configured_severity() {
-            // Held per `deps_core::fs_probe::snapshot_guard`'s doc: `ecosystem.parse_manifest`
-            // (cargo/npm) transitively touches fs_probe, and this test runs in the same binary as
-            // `document/loader.rs`'s diffing test.
+            // Held per fs_probe::snapshot_guard's doc: parse_manifest touches fs_probe and
+            // this test shares a binary with document/loader.rs's diffing test.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
             let url = deps_core::test_util::test_uri("/test/Cargo.toml");
@@ -580,10 +562,8 @@ serde = "1.0.0"
             let mut doc_state =
                 DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
             let mut cached = HashMap::new();
-            // `available` must include the declared "1.0.0" alongside "2.0.0" — a
-            // `latest_only` single-element list containing only "2.0.0" would make the
-            // declared requirement look unsatisfiable (no published version matches "1.0.0")
-            // and fire the mutually-exclusive WARNING instead of this outdated HINT/ERROR.
+            // `available` must include "1.0.0" alongside "2.0.0" — a `latest_only` list with
+            // just "2.0.0" would make "1.0.0" look unsatisfiable and fire WARNING instead of HINT/ERROR.
             cached.insert(
                 "serde".into(),
                 deps_core::PackageVersions::new(
@@ -681,7 +661,6 @@ serde = "1.0.0"
         }
     }
 
-    // Cargo-specific tests
     #[cfg(feature = "cargo")]
     mod cargo_tests {
         use super::*;
@@ -757,7 +736,6 @@ serde = "1.0.0"
 
             let (client, full_config) = create_test_client_and_config();
             let _result = handle_diagnostics(state, &uri, &config, client, full_config).await;
-            // Test passes if no panic occurs
         }
 
         #[tokio::test]
@@ -829,9 +807,8 @@ serde = "1.0.0"
                  ceiling is exceeded, got: {result:?}"
             );
 
-            // Critic M1: the fallthrough must repair `loading_state`, not just read past
-            // it — otherwise inlay hints/code lens keep believing the document is still
-            // loading, and this same warning would refire on every subsequent request.
+            // Critic M1: the fallthrough must repair `loading_state`, not just read past it —
+            // otherwise other handlers keep believing it's still loading and the warning refires.
             let doc = state.get_document(&uri).unwrap();
             assert_eq!(doc.loading_state, deps_core::LoadingState::Failed);
         }
@@ -1060,10 +1037,8 @@ serde = "1.0.0"
                 "tokio".into(),
                 deps_core::PackageVersions::new(
                     "2.0.0".into(),
-                    // Includes an older version satisfying "1.0" (^1.0) so this dependency
-                    // is genuinely outdated-but-satisfiable, not unsatisfiable — an
-                    // available list containing only `latest` would make every requirement
-                    // that latest doesn't itself satisfy look unsatisfiable.
+                    // Includes an older version satisfying "^1.0" so this is genuinely
+                    // outdated-but-satisfiable, not unsatisfiable.
                     std::sync::Arc::from(vec!["2.0.0".into(), "1.5.0".into()]),
                 ),
             );
@@ -1140,7 +1115,6 @@ serde = "1.0.0"
         }
     }
 
-    // npm-specific tests
     #[cfg(feature = "npm")]
     mod npm_tests {
         use super::*;
@@ -1170,7 +1144,6 @@ serde = "1.0.0"
 
             let (client, full_config) = create_test_client_and_config();
             let _result = handle_diagnostics(state, &uri, &config, client, full_config).await;
-            // Test passes if no panic occurs
         }
 
         /// #436 S1 regression: after #436 narrowed npm's fix to only suppress the
@@ -1307,7 +1280,6 @@ serde = "1.0.0"
         }
     }
 
-    // Deno-specific tests
     #[cfg(feature = "deno")]
     mod deno_tests {
         use super::*;
@@ -1484,7 +1456,6 @@ serde = "1.0.0"
         }
     }
 
-    // PyPI-specific tests
     #[cfg(feature = "pypi")]
     mod pypi_tests {
         use super::*;
@@ -1514,7 +1485,6 @@ dependencies = ["requests>=2.0.0"]
 
             let (client, full_config) = create_test_client_and_config();
             let _result = handle_diagnostics(state, &uri, &config, client, full_config).await;
-            // Test passes if no panic occurs
         }
     }
 

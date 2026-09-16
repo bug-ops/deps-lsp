@@ -19,9 +19,7 @@ fn go_version_matches(version: &str, requirement: &str) -> bool {
         return true;
     }
 
-    // Handle pseudo-versions and +incompatible suffix
-    // Check if version starts with requirement followed by a dot, hyphen, plus, or end
-    // This prevents false positives like v1.2.30 matching v1.2.3
+    // Guards against a false-positive match like v1.2.30 satisfying v1.2.3.
     if let Some(suffix) = version.strip_prefix(requirement) {
         return suffix.is_empty()
             || suffix.starts_with('.')
@@ -83,8 +81,7 @@ impl PackageNaming for GoFormatter {
 impl PackageRendering for GoFormatter {
     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
         let version = version.as_str();
-        // Go versions in go.mod are unquoted: v1.2.3
-        // Return version as-is since it should already have "v" prefix from registry
+        // go.mod versions are unquoted and already carry the "v" prefix from the registry.
         version.to_string()
     }
 

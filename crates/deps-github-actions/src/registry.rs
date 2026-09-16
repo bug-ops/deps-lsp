@@ -201,11 +201,8 @@ impl GithubActionsRegistry {
 
     fn map_tags_error(&self, name: &str, e: DepsError) -> DepsError {
         match &e {
-            // Trip the process-wide gate only for the no-token case this cooldown
-            // exists for: a *tokened* 403 is far more likely an org-policy/SAML
-            // restriction or a genuinely inaccessible private repo, scoped to that one
-            // repository — tripping the shared gate on it would disable GHA lookups
-            // workspace-wide for every other (accessible) repository too (critic M3).
+            // Only a no-token 403 trips the shared gate: a tokened 403 is likely an
+            // org-policy/SAML restriction scoped to this one repo (critic M3).
             DepsError::HttpStatus { status: 403, .. } if self.github.has_token() => e,
             DepsError::HttpStatus { status: 403, .. } => {
                 self.rate_limit.trip();
@@ -317,12 +314,8 @@ impl GithubActionsRegistry {
             return Err(Self::rate_limited_error());
         }
 
-        // `map_tags_error` is applied to the *outcome* of `paginate_tags`, not inside the
-        // per-page closure: since `paginate_tags` fetches pages in concurrent batches, a
-        // page discarded after a partial page earlier in the same batch can still resolve
-        // to a 403 here. Mapping (and tripping the rate-limit gate) inside the closure would
-        // let that discarded error poison the shared gate even though this call still
-        // returns `Ok` overall (critic S2).
+        // Applied to the outcome, not inside the per-page closure: pages fetch concurrently,
+        // so a discarded page's 403 must not trip the gate if the batch still resolves `Ok`.
         let tags = paginate_tags("GitHub Actions", name, |page| async move {
             self.github.fetch_tags_page(name, page).await
         })
@@ -588,10 +581,8 @@ mod tests {
 
     #[test]
     fn test_tags_to_versions_sorts_mixed_v_prefix_and_bare_by_semver() {
-        // Required test-matrix row (testing handoff): sort order across a mix of
-        // `v`-prefixed and bare tags for genuinely *different* versions — distinct
+        // Sort order across different versions with mixed v-prefix/bare tags — distinct
         // from the dedupe test above, which mixes prefixes for the *same* version.
-        // Descending by parsed semver regardless of prefix: 5.0.0 > 4.0.0 > 3.0.0.
         let sha_a = "a".repeat(40);
         let sha_b = "b".repeat(40);
         let sha_c = "c".repeat(40);
@@ -631,8 +622,7 @@ mod tests {
         assert!(tags_to_versions(tags).is_empty());
     }
 
-    // `validate_owner_repo`, `page_has_more`, `warn_if_pagination_truncated`,
-    // `paginate_tags`, and `parse_tags_page` are now shared with `deps-swift` via
+    // Pagination/validation helpers are now shared with `deps-swift` via
     // `deps_core::github` (#472); their unit tests moved there.
 
     // --- RateLimitGate ---
@@ -814,28 +804,22 @@ mod tests {
 
         let registry = mock_registry(&server.url(), false);
         let err = registry.get_versions("owner/repo").await.unwrap_err();
-        // Guards the variant itself (#478), not just the rendered text: a
-        // regression that left the old, differently-classified error type in
-        // place while keeping "GITHUB_TOKEN" in its `Display` text would pass
-        // a `to_string().contains(...)` check but must fail here.
+        // Guards the variant itself (#478), not just the text: a regression keeping the old
+        // error type but the same `Display` text would pass a contains() check but fail here.
         assert!(
             matches!(err, DepsError::RateLimited { .. }),
             "expected DepsError::RateLimited, got {err:?}"
         );
         assert!(err.to_string().contains("GITHUB_TOKEN"));
 
-        // Trace the real production error all the way to the diagnostic-facing
-        // classification: a rate-limited fetch must become an `Actionable`
-        // `FetchFailure` carrying the same hint, never `Transient`.
+        // A rate-limited fetch must classify as `Actionable` with the same hint, never `Transient`.
         let failure = err.fetch_failure();
         assert!(
             matches!(&failure, deps_core::error::FetchFailure::Actionable(hint) if hint.contains("GITHUB_TOKEN")),
             "expected Actionable hint mentioning GITHUB_TOKEN, got {failure:?}"
         );
 
-        // And through the same `HashMap<String, FetchFailure>` shape
-        // `deps-lsp`'s document lifecycle threads into
-        // `generate_diagnostics_from_cache`.
+        // Same shape deps-lsp's document lifecycle threads into generate_diagnostics_from_cache.
         let fetch_failed: HashMap<String, deps_core::error::FetchFailure> =
             HashMap::from([("owner/repo".to_string(), failure)]);
         assert_matches!(
@@ -896,9 +880,8 @@ mod tests {
             .with_body(full_page)
             .create_async()
             .await;
-        // Page 2 (the true, partial last page) is slow: it must still be unresolved when
-        // page 3's fast 403 below completes, so the discarded page really does finish
-        // (and run its whole future) before pagination ends.
+        // Page 2 (partial last page) is slow so it's still unresolved when page 3's fast
+        // 403 completes, forcing the discarded page's future to run to completion regardless.
         let _page2 = server
             .mock("GET", "/repos/owner/repo/tags")
             .match_query(mockito::Matcher::UrlEncoded("page".into(), "2".into()))
@@ -911,11 +894,9 @@ mod tests {
             })
             .create_async()
             .await;
-        // Page 3 completes the batch dispatched alongside page 2, responding instantly
-        // with an untokened 403 — the exact shape that, pre-fix, calls `map_tags_error`
-        // -> `trip()` inside the per-page closure regardless of whether page 2 (once it
-        // finally resolves) turns out to end pagination before page 3's result is ever
-        // read.
+        // Page 3, in the same batch as page 2, responds instantly with an untokened 403 —
+        // pre-fix this tripped the gate from inside the per-page closure regardless of
+        // whether page 2 ends pagination before page 3's result is read.
         let page3 = server
             .mock("GET", "/repos/owner/repo/tags")
             .match_query(mockito::Matcher::UrlEncoded("page".into(), "3".into()))
@@ -924,9 +905,8 @@ mod tests {
             .expect(1)
             .create_async()
             .await;
-        // Pages 4-6 complete the batch; status/timing don't matter for this test. Mocks
-        // stay registered on `server` independent of the returned handle's lifetime, so
-        // they don't need to be kept bound to a variable.
+        // Pages 4-6 complete the batch; status/timing don't matter. Mocks stay registered
+        // on `server` regardless of the returned handle's lifetime.
         for page in 4..=6 {
             let _ = server
                 .mock("GET", "/repos/owner/repo/tags")
@@ -951,18 +931,15 @@ mod tests {
             !registry.rate_limit.is_tripped(),
             "a discarded overfetch page's 403 must not trip the shared rate-limit gate"
         );
-        // Confirms page 3 really was requested and resolved (proving this test exercises
-        // the overfetch-then-discard race, not a no-op), not merely that the gate is
-        // untripped for an unrelated reason.
+        // Confirms page 3 was actually requested, proving this exercises the
+        // overfetch-then-discard race and not a no-op.
         page3.assert_async().await;
     }
 
     #[tokio::test]
     async fn test_get_versions_403_with_token_does_not_trip_shared_gate() {
-        // Critic M3: a 403 received *despite* a valid GITHUB_TOKEN (org-policy/SAML
-        // restriction, or a genuinely inaccessible private repo) is scoped to that one
-        // repository and must not disable GHA lookups workspace-wide for every other,
-        // accessible repository.
+        // Critic M3: a 403 despite a valid GITHUB_TOKEN is scoped to this one repo and
+        // must not disable GHA lookups workspace-wide.
         let mut server = mockito::Server::new_async().await;
         let _mock = server
             .mock("GET", "/repos/owner/private-repo/tags")
@@ -1029,9 +1006,8 @@ mod tests {
         assert_eq!(registry.select_latest_matching(&versions, &req), Some(0));
     }
 
-    // #784: exercises the non-wildcard `semver::VersionReq` branch of
-    // `select_latest_matching` (above) — the wildcard/existence-ladder branch is already
-    // proven by `test_select_latest_matching_wildcard_uses_existence_ladder` above.
+    // #784: exercises the non-wildcard `semver::VersionReq` branch of select_latest_matching
+    // — the wildcard/existence-ladder branch is covered by the test above.
     deps_core::registry_conformance! {
         mod github_actions_registry_conformance;
         build: mock_registry("http://127.0.0.1:1", false);
@@ -1057,13 +1033,8 @@ mod tests {
 
     #[test]
     fn test_evict_in_flight_never_evicts_held_lock() {
-        // Deterministic, not probabilistic (critic M4): every entry but one is held
-        // (a live second `Arc` reference simulating an in-flight waiter), so exactly
-        // one entry has `strong_count() == 1` and is the only possible victim —
-        // regardless of `DashMap`'s iteration order. The old version left
-        // `MAX_IN_FLIGHT_ENTRIES` unheld entries alongside the one held entry, so a
-        // buggy implementation with no `strong_count` filter would still pick the held
-        // entry only ~1-in-257 times and pass anyway.
+        // Deterministic, not probabilistic (critic M4): every entry but one is held, so
+        // exactly one has `strong_count() == 1` — a missing filter would pass ~1-in-257 times.
         let map: DashMap<PackageName, Arc<tokio::sync::Mutex<()>>> = DashMap::new();
         let unheld_key = PackageName::new("owner/unheld");
         let mut still_held = Vec::new();
@@ -1076,9 +1047,8 @@ mod tests {
         }
         map.insert(unheld_key.clone(), Arc::new(tokio::sync::Mutex::new(())));
         assert!(map.len() >= MAX_IN_FLIGHT_ENTRIES);
-        // `still_held` must live at least this long: each pushed `Arc` clone is what
-        // keeps every "owner/heldN" entry's `strong_count() > 1` (in-flight) for the
-        // eviction call below.
+        // `still_held` must live at least this long: each pushed `Arc` clone keeps its
+        // entry's `strong_count() > 1` (in-flight) for the eviction call below.
         assert_eq!(still_held.len(), MAX_IN_FLIGHT_ENTRIES);
 
         evict_in_flight_if_full(&map);
@@ -1111,13 +1081,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_get_versions_for_same_repo_both_succeed() {
-        // `HttpCache::get_cached_with_headers_via` always sends a conditional
-        // revalidation request even on a cache hit (RFC 7232 ETag semantics), so a
-        // strict "exactly one HTTP request" assertion here would be testing a
-        // guarantee this architecture does not make. What per-repository coalescing
-        // *does* guarantee — no two callers racing to fill a cold, empty cache at
-        // once — is covered directly by `test_acquire_in_flight_lock_returns_shared_arc`
-        // below; this integration test only proves coalescing never breaks a
+        // `HttpCache` always revalidates (RFC 7232 ETag) even on a hit, so a strict "one
+        // HTTP request" assertion doesn't hold here; `test_acquire_in_flight_lock_returns_shared_arc`
+        // covers the actual coalescing guarantee — this only proves it never breaks a
         // concurrent pair of calls for the same repository.
         let mut server = mockito::Server::new_async().await;
         let _mock = server
@@ -1197,9 +1163,8 @@ mod tests {
 
     #[test]
     fn test_attach_publish_times_match_strips_v_prefix() {
-        // `version` keeps the `v` prefix as published, but `dates`'s keys are
-        // normalized (mirrors `ReleaseDatesCache`'s release-tag_name join key) — the
-        // join must strip it before looking up.
+        // `version` keeps its `v` prefix, but `dates`'s keys are normalized — the join
+        // must strip it before looking up.
         let mut versions = vec![GithubActionsVersion {
             version: "v4.2.0".into(),
             sha: "a".repeat(40),

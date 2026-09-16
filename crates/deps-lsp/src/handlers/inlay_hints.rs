@@ -32,7 +32,6 @@ pub async fn handle_inlay_hints(
 
     let uri = &params.text_document.uri;
 
-    // Ensure document is loaded (cold start support)
     if !ensure_document_loaded(uri, Arc::clone(&state), client, Arc::clone(&full_config)).await {
         tracing::warn!("Could not load document for inlay hints: {:?}", uri);
         return vec![];
@@ -47,9 +46,8 @@ pub async fn handle_inlay_hints(
         )
     };
 
-    // Own everything `generate_inlay_hints` needs and release the DashMap shard `Ref`
-    // before awaiting it (#333): `with_document` only ever hands `extract` a borrowed
-    // `&DocumentState` synchronously, so the guard can't leak across the `.await` below.
+    // Release the DashMap shard `Ref` before awaiting (#333): `with_document` only hands
+    // `extract` a borrowed `&DocumentState` synchronously, so it can't leak across the await below.
     let Some(extracted) = state.with_document(uri, |doc| {
         let Some(ecosystem) = state.ecosystem_registry.get(doc.ecosystem_id()) else {
             tracing::warn!("Ecosystem not found: {}", doc.ecosystem_id());
@@ -108,8 +106,6 @@ mod tests {
     use crate::test_utils::test_helpers::create_test_client_and_config;
     use deps_core::EcosystemId;
     use tower_lsp_server::ls_types::TextDocumentIdentifier;
-
-    // Generic tests (no feature flag required)
 
     #[test]
     fn test_handle_inlay_hints_disabled() {
@@ -236,17 +232,14 @@ mod tests {
             }
         });
 
-        // Block until `generate_inlay_hints` has actually started executing —
-        // i.e. `handle_inlay_hints` has reached (and is now inside) the await — before
-        // racing the writer below. Timeout-wrapped so a regression that makes the
-        // handler never reach the awaited call fails loudly instead of hanging forever.
+        // Block until `generate_inlay_hints` has actually started (barrier) before racing
+        // the writer; timeout so a regression that never reaches the await hangs loudly instead of forever.
         tokio::time::timeout(std::time::Duration::from_secs(5), started.wait())
             .await
             .expect("handle_inlay_hints did not reach generate_inlay_hints within 5s");
 
-        // Spawned onto its own task (rather than awaited inline) deliberately: see
-        // `completion.rs`'s equivalent #319 regression test for why `DashMap::get_mut`
-        // needs a real async yield point to race against `tokio::time::timeout`.
+        // Spawned as its own task deliberately — see completion.rs's #319 test for why
+        // `DashMap::get_mut` needs a real async yield point to race the timeout.
         let write_task = tokio::spawn({
             let state = Arc::clone(&state);
             let uri = uri.clone();
@@ -267,7 +260,6 @@ mod tests {
         );
     }
 
-    // Cargo-specific tests
     #[cfg(feature = "cargo")]
     mod cargo_tests {
         use super::*;
@@ -275,9 +267,8 @@ mod tests {
 
         #[tokio::test]
         async fn test_handle_inlay_hints() {
-            // Held per `deps_core::fs_probe::snapshot_guard`'s doc: `ecosystem.parse_manifest`
-            // (cargo/npm) transitively touches fs_probe, and this test runs in the same binary as
-            // `document/loader.rs`'s diffing test.
+            // Held per fs_probe::snapshot_guard's doc: parse_manifest touches fs_probe and
+            // this test shares a binary with document/loader.rs's diffing test.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
             let url = deps_core::test_util::test_uri("/test/Cargo.toml");
@@ -314,7 +305,6 @@ serde = "1.0.0"
 
             let (client, full_config) = create_test_client_and_config();
             let _result = handle_inlay_hints(state, params, &config, client, full_config).await;
-            // Test passes if no panic occurs
         }
 
         #[tokio::test]
@@ -386,11 +376,9 @@ serde = "1.0.0"
 
             let (client, full_config) = create_test_client_and_config();
             let _result = handle_inlay_hints(state, params, &config, client, full_config).await;
-            // Test passes if no panic occurs
         }
     }
 
-    // npm-specific tests
     #[cfg(feature = "npm")]
     mod npm_tests {
         use super::*;
@@ -432,11 +420,9 @@ serde = "1.0.0"
 
             let (client, full_config) = create_test_client_and_config();
             let _result = handle_inlay_hints(state, params, &config, client, full_config).await;
-            // Test passes if no panic occurs
         }
     }
 
-    // PyPI-specific tests
     #[cfg(feature = "pypi")]
     mod pypi_tests {
         use super::*;
@@ -479,7 +465,6 @@ dependencies = ["requests>=2.0.0"]
 
             let (client, full_config) = create_test_client_and_config();
             let _result = handle_inlay_hints(state, params, &config, client, full_config).await;
-            // Test passes if no panic occurs
         }
     }
 }

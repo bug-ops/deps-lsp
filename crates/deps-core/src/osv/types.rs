@@ -815,17 +815,13 @@ pub fn vulnerability_keys(
 
     let deps = parse_result.dependencies();
 
-    // One signature per occurrence: public-registry-content deps (crates.io itself, or a
-    // verified crates.io mirror per `source_is_public_registry_content` — F1b) carry their
-    // own in-use version (or "u" when none is determinable — a range requirement with no
-    // lock file); every other source (git/path forks, a genuinely different private
-    // registry) always carries "n", since their `ScanOutcome` is always
-    // `Skipped(NonRegistrySource)` regardless of any declared version.
+    // One signature per occurrence: public-registry-content deps (F1b) carry their own
+    // in-use version ("u" when undeterminable); every other source always carries "n"
+    // (`ScanOutcome` is always `Skipped(NonRegistrySource)` there).
     //
-    // `resolved_candidates` (issue #649) lets two occurrences of a renamed/aliased name
-    // pinned to different lock-file majors compute distinct `v:{version}` signatures
-    // instead of colliding on one collapsed value — see
-    // `crate::lsp_helpers::in_use_version::resolve_occurrence_version`.
+    // `resolved_candidates` (#649) lets two occurrences of a renamed/aliased name pinned to
+    // different lock-file majors compute distinct `v:{version}` signatures instead of
+    // colliding — see `resolve_occurrence_version`.
     let signatures: Vec<(String, String)> = deps
         .iter()
         .map(|dep| {
@@ -860,12 +856,9 @@ pub fn vulnerability_keys(
 
     deps.iter()
         .zip(&signatures)
-        // A synthetic `name_range()` (`Dependency::name_range_is_synthetic`) is not a real,
-        // stable per-dependency position — every such dependency in one document would share
-        // the exact same key, each insertion evicting the last. Excluding them here means
-        // `apply_vulnerability_rule`'s lookup misses and falls through to its own
-        // `normalized_name`/`dep.name()` fallback instead, the same degraded-but-correct path
-        // already taken whenever this map has no entry for a dependency.
+        // A synthetic `name_range()` is not a stable per-dependency position — every such
+        // dependency would share the same key, each insertion evicting the last. Excluding
+        // them here falls through to `apply_vulnerability_rule`'s own name-based fallback.
         .filter(|(dep, _)| !dep.name_range_is_synthetic())
         .map(|(dep, (name, signature))| {
             let ambiguous = distinct_signatures_by_name
@@ -1089,15 +1082,10 @@ impl OsvVulnRecord {
             relevant
         };
 
-        // FR-002b: `classify()` itself requires each candidate entry's
-        // `package` to equal `osv_name`/`osv_eco` exactly before treating
-        // its `informational` value as genuine — this rejects both a
-        // `package`-less entry (lenient for graded-severity purposes only)
-        // and every entry pulled in via the fallback-to-all-entries path
-        // above (whose entries, by construction, never equal `osv_name`/
-        // `osv_eco`), so a stranger or ambiguous entry can never downgrade
-        // this record's classification for a package it does not actually,
-        // confirmedly describe (impl-critic finding M2).
+        // FR-002b: `classify()` requires each candidate's `package` to equal
+        // `osv_name`/`osv_eco` exactly before trusting its `informational` value, so a
+        // `package`-less or fallback-pulled entry can never downgrade this classification
+        // for a package it doesn't confirmedly describe (impl-critic M2).
         let severity = super::severity::classify(
             &self.id,
             &self.aliases,
@@ -1269,12 +1257,9 @@ mod recommended_fix_tests {
 
     #[test]
     fn subtracted_advisory_with_a_higher_fix_does_not_inflate_the_recommended_version() {
-        // Critic S1 counterexample: A1 is fixed at a high version (3.0.0)
-        // but still applies at the checked candidate, so it is excluded.
-        // A2 is fixed at a much lower version (1.2.0) and is claimed. The
-        // recommended version must be 1.2.0 — computed over what is
-        // actually claimed — not 3.0.0, which A1's exclusion proves does
-        // not even resolve A1.
+        // Critic S1 counterexample: A1 (fixed 3.0.0) still applies at the candidate and is
+        // excluded; A2 (fixed 1.2.0) is claimed. Recommended version must be 1.2.0, computed
+        // over what's actually claimed — not 3.0.0, which doesn't even resolve A1.
         let vulns = dv(
             vec![
                 advisory("A1", VulnSeverity::High, &["3.0.0"]),

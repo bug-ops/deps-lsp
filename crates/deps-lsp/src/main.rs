@@ -35,7 +35,6 @@ fn print_help() {
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
 
-    // Handle CLI flags
     for arg in &args {
         match arg.as_str() {
             "--version" | "-V" => {
@@ -46,9 +45,7 @@ fn main() {
                 print_help();
                 return;
             }
-            "--stdio" => {
-                // Default mode, continue
-            }
+            "--stdio" => {}
             arg if arg.starts_with('-') => {
                 eprintln!("Unknown option: {arg}");
                 eprintln!("Run 'deps-lsp --help' for usage information.");
@@ -58,8 +55,7 @@ fn main() {
         }
     }
 
-    // Startup-time only, before any LSP traffic; a failure here means the process
-    // cannot serve at all, so there is no graceful degradation to fall back to.
+    // No fallback: startup failure before any LSP traffic is unrecoverable anyway.
     #[allow(clippy::expect_used)]
     tokio::runtime::Builder::new_multi_thread()
         .thread_stack_size(WORKER_THREAD_STACK_SIZE)
@@ -70,7 +66,7 @@ fn main() {
 }
 
 async fn serve() {
-    // Initialize tracing - write to stderr to avoid interfering with LSP on stdout
+    // stderr, not stdout — stdout carries the LSP protocol stream.
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),

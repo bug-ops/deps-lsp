@@ -145,30 +145,21 @@ fn build_vulnerability_fix_action(
         return None;
     }
 
-    // Computed before the N1 guard below against the *same* formatting the
-    // plain "update version" action uses (`format_version_replacing`), not
-    // the bare version: several ecosystems wrap or expand it (`deps-dart`'s
-    // `^`-prefix, a range), and `deps-pypi` rewrites it in place to preserve
-    // the manifest's existing pin style (`==1.0.1` -> `==1.0.2`) — the guard
-    // must compare the text that would actually be written.
+    // Uses the same formatting the plain "update version" action uses, not the bare version:
+    // several ecosystems wrap or expand it (`deps-dart`'s `^`-prefix, `deps-pypi`'s in-place
+    // pin-style rewrite) — the N1 guard below must compare the text that would actually be
+    // written.
     let new_text = formatter.format_version_replacing_for(
         dep,
         &ConcreteVersion::new(version_native.as_str()),
         version_req,
     );
 
-    // N1: skip a no-op edit — the manifest already declares exactly the text
-    // this action would write, so applying it would rewrite the text to
-    // itself. Whitespace-insensitive, mirroring `literal_span_matches`:
-    // `version_req` can be a normalized requirement string with spacing the
-    // declared text and the freshly-formatted text don't agree on (e.g.
-    // pep508's `>=1.7, <2.0` vs. a formatter's `>=1.7,<2.0`), which would
-    // otherwise let a whitespace-only edit slip past this guard. Compares
-    // against `dep.version_literal()` rather than `version_req` when the
-    // ecosystem provides one, mirroring `generate_code_actions`'s literal-span
-    // guard — for `deps-swift`, `version_req` is a synthesized comparator
-    // (`"=2.61.0"`) that never equals the bare-literal formatted text
-    // (`"2.61.0"`) even when the edit genuinely is a no-op.
+    // N1: skip a no-op edit. Whitespace-insensitive, mirroring `literal_span_matches`:
+    // `version_req` can be a normalized requirement string with spacing that disagrees with
+    // the freshly-formatted text (e.g. pep508's `>=1.7, <2.0` vs. `>=1.7,<2.0`). Compares
+    // against `dep.version_literal()` when available, since for `deps-swift` `version_req` is
+    // a synthesized comparator (`"=2.61.0"`) that never equals the bare literal (`"2.61.0"`).
     let literal_target = dep.version_literal().unwrap_or(version_req);
     if strip_whitespace(literal_target) == strip_whitespace(&new_text) {
         return None;
@@ -213,12 +204,11 @@ fn build_vulnerability_fix_action(
                 ..Default::default()
             }),
             is_preferred: None,
-            // Stashes the resolved advisory ids, plus this action's own edit range, so the
-            // `deps-lsp` handler can bind this action to the matching client-supplied
-            // diagnostics (`CodeActionContext::diagnostics`) without deps-core needing to
-            // know about LSP request context — cleared by the handler once consumed. Shape
-            // shared with `build_unsatisfiable_fix_action`'s stashed payload: `bind_diagnostics`
-            // matches on `diagnostic_codes` regardless of which producer built the action.
+            // Stashes the resolved advisory ids and edit range so the `deps-lsp` handler can
+            // bind this action to matching client-supplied diagnostics without deps-core
+            // needing to know about LSP request context. Shape shared with
+            // `build_unsatisfiable_fix_action`'s payload — `bind_diagnostics` matches on
+            // `diagnostic_codes` regardless of producer.
             data: Some(serde_json::json!({
                 "diagnostic_codes": fix.advisory_ids,
                 "diagnostic_range": version_range,
@@ -379,11 +369,9 @@ fn build_replacement_action(
 
     let name_range: Range = dep.name_range().into();
     let name_slice = slice_for_range(content, line_offsets, name_range.into());
-    // I7: reuses `literal_span_matches` rather than a name-specific equality check purely
-    // for the sentinel-rejecting behavior its whitespace-insensitive comparison already
-    // gives (see D7(a)'s doc above). Its `[{slice}] == requirement` NuGet-bracket branch
-    // is inert here — a package name never contains `[`/`]` (rejected by every
-    // ecosystem's `validate_package_name`) — so it never changes this call's outcome.
+    // I7: reuses `literal_span_matches` for its sentinel-rejecting, whitespace-insensitive
+    // comparison (see D7(a) above). Its NuGet-bracket branch is inert here — a package name
+    // never contains `[`/`]` — so it never changes this call's outcome.
     if !literal_span_matches(name_slice, dep.name().as_str()) {
         return None;
     }
@@ -544,14 +532,7 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
         .version_literal()
         .unwrap_or_else(|| version_req.as_str());
     if !literal_span_matches(slice, literal_target) {
-        // `version_range` no longer slices to the declared literal text (e.g. a Maven
-        // `${property}` or a Gradle DSL variable/alias) — writing a TextEdit there would
-        // corrupt the manifest instead of fixing it. Mirrors the guard
-        // `collect_update_all_edits` already applies on the bulk-edit path. Compares
-        // against `dep.version_literal()` rather than `version_req` when the ecosystem
-        // provides one (see that method's doc) — an ecosystem that synthesizes its
-        // requirement from a bare literal (e.g. `deps-swift`) would otherwise always fail
-        // this guard even though `version_range` correctly spans the literal.
+        // Literal-span guard — see this function's doc comment.
         return actions;
     }
 
@@ -581,12 +562,8 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
     );
 
     // Gated on `can_resolve_source` (#248/FR-001): a Git/Path/unresolved-custom-registry
-    // dependency must never have its name looked up against this ecosystem's default
-    // registry client, which would silently check an unrelated or coincidentally-named
-    // package and offer bogus "update to X" actions for it. `FreshnessSettings::enabled:
-    // false` preserves this call's original `Registry::get_versions` behavior exactly (no
-    // publish-time enrichment) now that it is routed through the freshness-aware
-    // `get_versions_from`.
+    // dependency must never be looked up against this ecosystem's default registry client,
+    // which would offer bogus "update to X" actions for an unrelated package.
     let dep_source = dep.source();
     let registry_versions = if formatter.can_resolve_source(&dep_source) {
         registry
@@ -604,12 +581,9 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
         None
     };
 
-    // A fix target that the registry reports as yanked is dropped entirely rather than
-    // offered — the surviving diagnostics carry the finding either way, and there is no
-    // comparator here to bound a search for an alternative target. On a registry outage
-    // (`registry_versions` is `None`) there is nothing to check a yank flag against, so
-    // both actions pass through unfiltered — the pre-existing vuln-fix behavior, now
-    // shared by the unsat fix too.
+    // A fix target the registry reports as yanked is dropped entirely rather than offered —
+    // the surviving diagnostics carry the finding either way. On a registry outage
+    // (`registry_versions` is `None`) both actions pass through unfiltered.
     let is_yanked_target = |version_native: &str| {
         registry_versions.as_ref().is_some_and(|versions_list| {
             versions_list
@@ -621,11 +595,10 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
     let fix = fix.filter(|f| !is_yanked_target(&f.version_native));
     let unsat_fix = unsat_fix.filter(|f| !is_yanked_target(&f.version_native));
 
-    // Yank-filtering both actions before this collision check (not after) matters: PyPI's
-    // `truncate_release_to_match` can map a yanked version and a live one to identical
-    // rewritten text, and checking collision first would drop the unsat action for a text
-    // match against a vuln fix that the yank filter above was about to drop anyway,
-    // leaving neither action behind.
+    // Yank-filtering both actions before this collision check matters: PyPI's
+    // `truncate_release_to_match` can map a yanked and a live version to identical rewritten
+    // text, so checking collision first could drop the unsat action against a vuln fix the
+    // yank filter above was about to drop anyway, leaving neither behind.
     let unsat_fix = unsat_fix.filter(|u| {
         fix.as_ref()
             .is_none_or(|f| strip_whitespace(&f.new_text) != strip_whitespace(&u.new_text))
@@ -651,20 +624,10 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
         actions.push(replacement_action);
     }
 
-    // De-duplicates every REFACTOR action's formatted edit text against the declared
-    // literal text, both fix actions' edits (if present), and every REFACTOR action already
-    // emitted below, so no two actions in the response — nor a REFACTOR action and a fix
-    // action above — ever carry a byte-identical `WorkspaceEdit`. Seeding with the
-    // declared literal text subsumes the former N1 guard (an item whose formatted text
-    // equals the declared text is a no-op); checking formatted text rather than raw
-    // version also subsumes the former `item.version == fix_version_native` check, since
-    // `format_version_replacing` is deterministic in its inputs. Whitespace-insensitive,
-    // matching every other no-op guard in this crate (see `strip_whitespace`). Seeded with
-    // `literal_target` (not `version_req`) for the same reason the guard above compares
-    // against it: for an ecosystem synthesizing its requirement from a bare literal (e.g.
-    // `deps-swift`), `version_req` never equals the formatted edit text even when the edit
-    // genuinely is a no-op (`.exact("2.61.0")` declares `version_req` `"=2.61.0"`, but the
-    // manifest text — and any freshly-formatted "update to 2.61.0" text — is `"2.61.0"`).
+    // De-dups every REFACTOR edit's formatted text against the declared literal and both fix
+    // actions', so no two actions carry a byte-identical `WorkspaceEdit`. Seeded with
+    // `literal_target` (not `version_req`) for the same reason as the guard above — e.g.
+    // `deps-swift`'s synthesized `"=2.61.0"` requirement never equals the formatted edit text.
     let mut emitted_texts: HashSet<String> = HashSet::new();
     emitted_texts.insert(strip_whitespace(literal_target));
     if let Some(fix_text) = fix_new_text {
@@ -717,13 +680,10 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
         }
     }
 
-    // Single post-pass resolving `isPreferred`: exactly one action, in priority order
-    // vuln fix -> unsat fix -> latest REFACTOR item. Runs unconditionally on every path
-    // through this function that can reach here, including the registry-outage path
-    // (`registry_versions.is_none()`), so an outage never drops `isPreferred` from an
-    // already-built fix action.
-    // Each `*_idx` was captured as `actions.len()` immediately before its matching
-    // `push`, so it is a valid index into `actions` now (nothing is removed between).
+    // Single post-pass resolving `isPreferred`, priority order vuln fix -> unsat fix -> latest
+    // REFACTOR item, run unconditionally (including the registry-outage path) so an outage
+    // never drops `isPreferred` from an already-built fix action. Each `*_idx` was captured as
+    // `actions.len()` immediately before its matching `push`, so it stays a valid index here.
     #[allow(clippy::indexing_slicing)]
     if let Some(i) = vuln_idx.or(unsat_idx).or(latest_refactor_idx) {
         actions[i].is_preferred = Some(true);
@@ -828,20 +788,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_generate_code_actions_fix_target_is_not_inflated_by_a_subtracted_advisory() {
-        // Critic S1 counterexample: A1 is fixed at a high version (3.0.0) but
-        // phase B reports it still applies at the checked candidate, so it is
-        // excluded from the claim. A2 is fixed at a much lower version
-        // (1.2.0) and is claimed. The recommended target must be 1.2.0 — the
-        // version that clears what is actually claimed — not 3.0.0, which
-        // would push the user across an unnecessary major-version boundary
-        // for a fix A1 that version does not even resolve.
+        // Critic S1 counterexample: A1 (fixed 3.0.0) still applies at the checked candidate
+        // and is excluded from the claim; A2 (fixed 1.2.0) is claimed. Recommended target
+        // must be 1.2.0 — what's actually claimed — not 3.0.0, an unnecessary major-version
+        // jump that doesn't even resolve A1.
         //
         // #462 critic S1: `fix_target_status` is deliberately `CandidateVulnerable{1.2.0,
-        // [A1]}`, not `CandidateClean` — the state a real live-check of F=1.2.0 would
-        // actually produce here, since A1 (known, fixed only at 3.0.0 > 1.2.0) still
-        // applies. Because A1 was already excluded from `claimed` (it is not in
-        // `fix.advisory_ids`), this must still be presented as a fix for A2 — the honest
-        // #216 partial-fix contract `fix_target_is_verified` preserves.
+        // [A1]}`, not `CandidateClean`, since A1 (fixed only at 3.0.0) still applies at F=1.2.0
+        // — this must still present as a fix for A2, the honest #216 partial-fix contract.
         use crate::osv::{
             Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
         };
@@ -914,14 +868,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_generate_code_actions_fix_target_is_not_suppressed_by_an_open_ended_advisory() {
-        // #462 critic re-critique: the sibling S1 scenario the fix exists to preserve — a
-        // dependency with an *open-ended* advisory (A1, no known fix at all) must not lose its
-        // quickfix. `recommended_fix()` filters A1 out of `claimed` for having no
-        // `fixed_versions` (a *different* exclusion path than the still-applying-at-latest
-        // subtraction the `..._subtracted_advisory` test above exercises), so F is computed
-        // from A2 alone (1.2.0) and `fix.advisory_ids = ["A2"]`. The live check of F=1.2.0
-        // correctly reports A1 still applies (it was never fixed) — A1 is known and unclaimed,
-        // so this must still be presented as a fix for A2, the honest #216 partial-fix contract.
+        // #462 critic re-critique: a dependency with an open-ended advisory (A1, no known fix)
+        // must not lose its quickfix. `recommended_fix()` excludes A1 from `claimed` for
+        // having no `fixed_versions` (unlike the still-applying-at-latest subtraction the
+        // `..._subtracted_advisory` test above exercises), so F is computed from A2 alone —
+        // still presented as a fix for A2, the honest #216 partial-fix contract.
         use crate::osv::{
             Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
         };
@@ -992,15 +943,12 @@ mod tests {
     #[tokio::test]
     async fn test_generate_code_actions_omits_fix_when_fix_target_status_reports_still_vulnerable()
     {
-        // #462 critic C1 repro shape (smallvec 0.6.0 -> F=0.6.13, still affected by
+        // #462 critic C1 repro (smallvec 0.6.0 -> F=0.6.13, still affected by
         // RUSTSEC-2021-0003, an advisory phase A's declared-version-only query never saw):
-        // `recommended_fix()` computes a claim (A1, fixed at 1.2.0) from the only advisory
-        // this dependency's `advisories` records, but the live verification of F reports a
-        // *different* id (A2) still applies — one this dependency's `advisories` never
-        // recorded at all. Unlike an already-known-and-excluded advisory (see the
-        // `..._subtracted_advisory` test above), a brand-new unknown advisory must always
-        // suppress the fix: it is not the honest #216 partial-fix case, it is exactly the
-        // gap #462 exists to close.
+        // the live verification of F reports an id (A2) this dependency's `advisories` never
+        // recorded at all. Unlike an already-known-and-excluded advisory, a brand-new unknown
+        // advisory must always suppress the fix — not #216's honest partial-fix case, exactly
+        // the gap #462 closes.
         use crate::osv::{
             Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
         };
@@ -1129,14 +1077,11 @@ mod tests {
     #[tokio::test]
     async fn test_generate_code_actions_omits_fix_when_fix_target_status_advisory_ids_are_truncated()
      {
-        // #462 critic M1: `check_candidates` caps `advisory_ids` at `ADVISORY_DISPLAY_CAP` the
-        // same way `DependencyVulnerabilities::advisories` is capped, so a `CandidateVulnerable`
-        // whose `advisory_ids` is shorter than `total_known` is NOT the complete list of
-        // advisories still affecting F — one of the truncated-away ids could be the claimed or
-        // unknown one that should suppress this fix. Here the single reported id (A2) is known
-        // and unclaimed — which the pre-M1-fix gate would have accepted — but `total_known: 2`
-        // proves a second, unreported advisory exists, so this must still be rejected rather
-        // than trusting a partial list as if it were exhaustive.
+        // #462 critic M1: `advisory_ids` is capped at `ADVISORY_DISPLAY_CAP`, so a shorter-than-
+        // `total_known` list is not the complete set still affecting F — a truncated-away id
+        // could be the one that should suppress this fix. Here the single reported id (A2) is
+        // known and unclaimed, but `total_known: 2` proves an unreported advisory exists, so
+        // this must still be rejected rather than trusting a partial list as exhaustive.
         use crate::osv::{
             Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
         };
@@ -1448,12 +1393,9 @@ mod tests {
     #[tokio::test]
     async fn test_generate_code_actions_refactor_loop_skips_no_op_entry_but_keeps_real_update() {
         // Regression for #238: no OSV vulnerabilities are present, isolating the plain
-        // REFACTOR loop's own no-op guard from `build_vulnerability_fix_action`'s
-        // separate N1 guard (the two prior "no_op" tests above only exercise the latter,
-        // since `MockRegistry` returns no versions and the REFACTOR loop body never
-        // runs). The registry lists the already-declared version among the top-5
-        // display items — the common case per `prepare_version_display_items`, not an
-        // edge case — plus one genuinely newer version.
+        // REFACTOR loop's own no-op guard from `build_vulnerability_fix_action`'s separate N1
+        // guard. The registry lists the already-declared version among the top-5 display
+        // items (the common case), plus one genuinely newer version.
         let (dep, version_range, content) = vulnerable_dep("1.2.0");
         let parse_result = MockParseResult {
             deps: vec![dep],
@@ -1627,14 +1569,10 @@ mod tests {
     #[tokio::test]
     async fn test_generate_code_actions_vulnerability_fix_not_offered_on_patched_duplicate_occurrence()
      {
-        // #394 S2 (critic addendum, security-relevant): the vulnerability
-        // quickfix *mutates the manifest*, so offering it on the wrong
-        // occurrence of a duplicated name is worse than a cosmetic bug.
-        // `log4j-core` appears twice with different pins — one vulnerable,
-        // one already patched. The quickfix must appear only at the
-        // vulnerable occurrence's position, never at the patched one's,
-        // regardless of which occurrence's OSV result happened to be
-        // inserted into the shared map last.
+        // #394 S2 (security-relevant): the vulnerability quickfix mutates the manifest, so
+        // offering it on the wrong occurrence of a duplicated name is worse than cosmetic.
+        // `log4j-core` appears twice — one vulnerable, one patched — the quickfix must appear
+        // only at the vulnerable occurrence's position.
         use crate::osv::{
             Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
         };
@@ -2096,15 +2034,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_generate_code_actions_latest_refactor_is_preferred_when_no_fix_exists() {
-        // Critic C1 / review "Important": the most common production path — no
-        // vulnerability, no unsatisfiable requirement, just a satisfiable
-        // dependency with newer versions available — must still mark the
-        // `item.is_latest` REFACTOR action as the editor's preferred quickfix.
-        // This moved from a construction-site expression to the shared
-        // `is_preferred` post-pass indexed by `latest_refactor_idx`; a wrong
-        // index or a broken `.or()` chain would silently strip `isPreferred`
-        // from every ordinary "update to latest" action across all 11
-        // ecosystems with a fully green suite otherwise.
+        // Critic C1: the most common production path — no vulnerability, no unsatisfiable
+        // requirement, just a satisfiable dependency with newer versions — must still mark
+        // `item.is_latest` as preferred. This moved to the shared `is_preferred` post-pass
+        // indexed by `latest_refactor_idx`; a wrong index or broken `.or()` chain would
+        // silently strip `isPreferred` from every "update to latest" action.
         let (dep, version_range, content) = vulnerable_dep("1.0.0");
         let parse_result = MockParseResult {
             deps: vec![dep],
@@ -2378,13 +2312,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_generate_code_actions_fix_uses_ecosystem_format_version_replacing_override() {
-        // Critic S3: `format_version_replacing` is overridden in exactly one
-        // place workspace-wide (`deps-pypi`); no test anywhere proved the
-        // vulnerability-fix action's `TextEdit` actually goes through such
-        // an override rather than the default delegation to
-        // `format_version_for_text_edit` — the same bug class the original
-        // #216 critique caught (a guard/edit comparing the wrong string,
-        // silently bypassed per-ecosystem).
+        // Critic S3: `format_version_replacing` is overridden only by `deps-pypi`; no test
+        // proved the vulnerability-fix action's `TextEdit` actually goes through such an
+        // override rather than the default delegation — the same bug class #216 caught.
         use crate::osv::{
             Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
         };
@@ -2663,15 +2593,11 @@ mod tests {
 
         #[tokio::test]
         async fn test_guard_rejects_span_even_with_a_pending_vulnerability_fix() {
-            // Critic S2: the guard must gate the vulnerability-fix quickfix
-            // too, not just the plain "update version" action — a future
-            // refactor moving `build_vulnerability_fix_action` above the
-            // guard would reintroduce manifest corruption on a rejected
-            // span (e.g. a Maven `${property}` reference) at P0 severity.
-            // Every other test in this module uses an empty `VersionData`,
-            // which would pass even if the guard only gated the plain
-            // action; this one carries a real OSV hit so a regression that
-            // reorders the two checks fails here.
+            // Critic S2: the guard must gate the vulnerability-fix quickfix too, not just the
+            // plain "update version" action — moving `build_vulnerability_fix_action` above
+            // the guard would reintroduce manifest corruption on a rejected span. Every other
+            // test here uses an empty `VersionData`, which would pass regardless; this one
+            // carries a real OSV hit so a reordering regression fails here.
             use crate::osv::{
                 Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
             };
@@ -3504,14 +3430,11 @@ mod tests {
 
         #[tokio::test]
         async fn test_yank_filter_runs_before_collision_check_so_neither_fix_is_lost() {
-            // Critic M7: the vuln fix targets a *yanked* version and the unsat fix
-            // targets a *different, live* version, but both format to identical
-            // text (mirroring PyPI's `truncate_release_to_match`). Yank-filtering
-            // both actions before the collision check must run first: it drops the
-            // yanked vuln fix and leaves the live unsat fix as the sole survivor.
-            // The wrong order (collision-first) would drop the unsat action for
-            // "colliding" with a vuln fix that the yank filter was about to drop
-            // anyway, leaving the user with neither action.
+            // Critic M7: the vuln fix targets a yanked version and the unsat fix a different,
+            // live one, but both format to identical text (mirroring PyPI's
+            // `truncate_release_to_match`). Yank-filtering must run before the collision
+            // check, or collision-first would drop the unsat action for "colliding" with a
+            // vuln fix the yank filter was about to drop anyway, leaving neither.
             use crate::osv::{
                 Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
             };

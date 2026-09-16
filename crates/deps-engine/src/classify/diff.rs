@@ -78,13 +78,9 @@ pub fn merge_deprecations_after_fetch(
     mut fetched_deprecations: HashMap<PackageName, Deprecation>,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
 ) {
-    // I2: decided per *normalized* name in one pass, not applied incrementally per raw
-    // name — `fetched_names` iterates a `HashMap`'s keys, so its order is unspecified,
-    // and two raw names that normalize to the same key (e.g. Composer's case-insensitive
-    // `require` keys) would otherwise let "insert B's finding, then clear it because A
-    // (processed after) had none" flip on iteration order alone. Collecting first means
-    // "any fetched raw name under this key reported a finding" wins deterministically,
-    // regardless of which one is visited first.
+    // I2: decide per normalized name in one pass, not incrementally per raw name — raw
+    // names sharing a normalized key (e.g. Composer's case-insensitive `require`) would
+    // otherwise flip the outcome based on `fetched_names`' unspecified HashMap iteration order.
     let mut per_normalized: HashMap<String, Option<Deprecation>> = HashMap::new();
     for name in fetched_names {
         let normalized = formatter.normalize_package_name(name);
@@ -169,10 +165,7 @@ pub fn merge_no_comparable_versions_after_fetch(
     mut fetched_no_comparable_versions: HashSet<PackageName>,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
 ) {
-    // Same normalized-name dedup rationale as `merge_deprecations_after_fetch` (I2):
-    // decided per normalized name in one pass so two raw names sharing a normalized
-    // key can't flip the outcome based on `attempted_names`' unspecified iteration
-    // order.
+    // Same normalized-name dedup rationale as `merge_deprecations_after_fetch` (I2).
     let mut per_normalized: HashMap<String, bool> = HashMap::new();
     for name in attempted_names {
         let normalized = formatter.normalize_package_name(name);

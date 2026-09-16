@@ -1,9 +1,7 @@
-// `PackagistRegistry::get_latest_matching`'s boxed-future coercion nests through several
-// layers of `async`/`.await?` combinators; rustc's default recursion limit is occasionally
-// insufficient to prove the resulting `Send` bound and downgrades a previously-silent
-// trait-solver retry into `recursion_depth_exceeding_limit`, which the fuzz CI job's
-// `-D warnings` nightly build turns into a hard error (rust-lang/rust#159228). Same class
-// of fix as deps-nuget (#696), deps-swift (#673), and deps-cargo (#745).
+// Boxed-future `Send`-bound proof for `get_latest_matching`'s async chain occasionally
+// exceeds rustc's default recursion limit, turning a silent trait-solver retry into a hard
+// `-D warnings` error on the fuzz CI job (rust-lang/rust#159228). Same fix as deps-nuget
+// (#696), deps-swift (#673), and deps-cargo (#745).
 #![recursion_limit = "256"]
 
 //! PHP/Composer ecosystem support for deps-lsp.

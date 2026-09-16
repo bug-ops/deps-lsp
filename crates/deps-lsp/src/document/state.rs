@@ -42,7 +42,6 @@ pub(crate) const CLIENT_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
 /// unbounded registry traffic.
 const FETCH_PERMITS: usize = 4;
 
-// Re-export LoadingState from deps-core for convenience
 pub use deps_core::LoadingState;
 
 /// State for a single open document.
@@ -234,7 +233,6 @@ impl ColdStartLimiter {
         let min_interval = Duration::from_millis(self.min_interval_ms.load(Ordering::Relaxed));
         let now = Instant::now();
 
-        // Check last attempt time
         if let Some(mut entry) = self.last_attempts.get_mut(uri) {
             let elapsed = now.duration_since(*entry);
             if elapsed < min_interval {
@@ -717,7 +715,6 @@ impl ServerState {
         let lockfile_cache = Arc::new(LockFileCache::new());
         let ecosystem_registry = Arc::new(EcosystemRegistry::new());
 
-        // Register ecosystems based on enabled features
         let workspace_registry_ecosystems =
             crate::register_ecosystems(&ecosystem_registry, Arc::clone(&cache), &runtime);
 
@@ -1078,7 +1075,6 @@ impl ServerState {
 
         {
             let mut tasks = self.tasks.write().await;
-            // Cancel existing task if any
             if let Some((_, old_task)) = tasks.insert(uri.clone(), (task_id, abort_handle)) {
                 old_task.abort();
             }
@@ -1350,24 +1346,20 @@ mod tests {
             let content = "[dependencies]\nserde = \"1.0\"".to_string();
             let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, content);
 
-            // Initial state
             assert_eq!(doc.loading_state, LoadingState::Idle);
             assert!(doc.loading_started_at.is_none());
 
-            // Transition to Loading
             doc.set_loading();
             assert_eq!(doc.loading_state, LoadingState::Loading);
             assert!(doc.loading_started_at.is_some());
 
-            // Small sleep to ensure duration is non-zero
+            // Sleep to ensure duration is non-zero.
             std::thread::sleep(Duration::from_millis(10));
 
-            // Check loading duration
             let duration = doc.loading_duration();
             assert!(duration.is_some());
             assert!(duration.unwrap() >= Duration::from_millis(10));
 
-            // Transition to Loaded
             doc.set_loaded();
             assert_eq!(doc.loading_state, LoadingState::Loaded);
             assert!(doc.loading_started_at.is_none());
@@ -1439,7 +1431,6 @@ mod tests {
 
             doc.set_loading();
 
-            // Check duration increases over time
             let duration1 = doc.loading_duration().unwrap();
             std::thread::sleep(Duration::from_millis(20));
             let duration2 = doc.loading_duration().unwrap();
@@ -1504,7 +1495,6 @@ mod tests {
             doc.set_loading();
             doc.set_loaded();
 
-            // Call again - should be safe
             doc.set_loaded();
 
             assert_eq!(doc.loading_state, LoadingState::Loaded);
@@ -1521,7 +1511,6 @@ mod tests {
 
             std::thread::sleep(std::time::Duration::from_millis(10));
 
-            // Call set_loading again - should reset timer
             doc.set_loading();
             let second_start = doc.loading_started_at.unwrap();
 
@@ -1539,7 +1528,6 @@ mod tests {
             assert_eq!(doc.loading_state, LoadingState::Failed);
             assert!(doc.loading_started_at.is_none());
 
-            // Retry
             doc.set_loading();
             assert_eq!(doc.loading_state, LoadingState::Loading);
             assert!(doc.loading_started_at.is_some());
@@ -1557,7 +1545,6 @@ mod tests {
             doc.set_loaded();
             assert_eq!(doc.loading_state, LoadingState::Loaded);
 
-            // Refresh
             doc.set_loading();
             assert_eq!(doc.loading_state, LoadingState::Loading);
             assert!(doc.loading_started_at.is_some());

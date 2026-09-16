@@ -189,7 +189,6 @@ fn parse_versions_response(data: &[u8], _gem_name: &str) -> Result<Vec<BundlerVe
         }
     }
 
-    // Sort by version descending (newest first)
     versions.sort_by(|a, b| compare_versions(b.number.as_str(), a.number.as_str()));
 
     Ok(versions)
@@ -310,7 +309,6 @@ impl deps_core::Metadata for GemInfo {
     }
 }
 
-// Implement Registry trait for trait object support
 impl deps_core::Registry for RubyGemsRegistry {
     deps_core::impl_registry_versions_method!(get_versions);
     deps_core::impl_registry_versions_method!(get_versions_with);
@@ -557,14 +555,9 @@ mod tests {
 
     #[test]
     fn test_parse_versions_response_dedup_is_order_deterministic_across_runs() {
-        // `compare_versions` (#323) correctly orders "3.7.0" above its own "pre1"/"pre2"
-        // prereleases rather than tying them, so this input no longer exercises a tie. Use
-        // a shape that still ties post-#323 instead — "1.0" and "1.0.0" zero-pad to equal —
-        // to keep covering the dedup step's first-seen-order preservation, which the later
-        // stable sort's tie-break depends on staying deterministic across hovers.
-        // Collecting via `HashMap::into_values` would randomize that order per-process
-        // instead. Run repeatedly to catch that regression, since a HashMap's random seed
-        // is fixed for the life of one process and a single run could pass by chance.
+        // Post-#323, "3.7.0"/"pre1"/"pre2" no longer tie, so use "1.0"/"1.0.0" (zero-pad
+        // equal) to keep exercising dedup's first-seen-order preservation; `HashMap::into_values`
+        // would randomize it per-process, so loop to catch that regression reliably.
         let json = r#"[
             {"number": "1.0", "prerelease": false, "yanked": false, "platform": "ruby"},
             {"number": "2.0.0", "prerelease": false, "yanked": false, "platform": "ruby"},
@@ -582,11 +575,9 @@ mod tests {
 
     #[test]
     fn test_parse_versions_response_orders_dot_notation_prerelease_below_stable() {
-        // Regression test for #323, replacing this test's old expectation (kept as
-        // `..._dedup_is_order_deterministic_across_runs` above): before the fix, mime-types'
-        // real "3.7.0"/"3.7.0.pre1"/"3.7.0.pre2" tied under `compare_versions` and this sort
-        // only preserved JSON input order by accident. It must now sort by actual version
-        // precedence.
+        // #323: mime-types' real "3.7.0"/"3.7.0.pre1"/"3.7.0.pre2" used to tie under
+        // `compare_versions` and only preserved JSON order by accident; must now sort by
+        // actual version precedence.
         let json = r#"[
             {"number": "3.7.0.pre2", "prerelease": true, "yanked": false, "platform": "ruby"},
             {"number": "3.7.0.pre1", "prerelease": true, "yanked": false, "platform": "ruby"},

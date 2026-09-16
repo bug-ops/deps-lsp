@@ -27,10 +27,8 @@
 //! identically. The live parity test above is what would actually close that gap; until it
 //! exists, non-drift rests on manual review of each `VersionData` assembly site matching.
 
-// `clippy.toml`'s `allow-expect-in-tests` only recognizes `#[test]`/`#[tokio::test]`
-// function bodies, not the plain (non-`#[test]`) `offline_context`/`run_pipeline` helpers
-// below that every test in this file calls — same situation `deps-maven`'s
-// `tests/integration_tests.rs` documents for its own `fixture_uri` helper.
+// `allow-expect-in-tests` only recognizes `#[test]` bodies, not the plain helper functions
+// (`offline_context`/`run_pipeline`) every test here calls.
 #![allow(clippy::expect_used)]
 
 use deps_cli::exit::{EXIT_CLEAN, exit_code};
@@ -194,9 +192,8 @@ async fn test_table_and_json_formatters_render_the_same_pipeline_output() {
 
 #[tokio::test]
 async fn test_sarif_formatter_renders_the_same_pipeline_output() {
-    // The manifest lives under a directory whose name needs percent-encoding (a literal `#`
-    // would otherwise be read as a URI fragment separator, and a space is not valid in a bare
-    // URI-reference) — the real repro this test guards against (spec 062 review S2/B3).
+    // Directory name needs percent-encoding (`#` reads as a URI fragment separator, space is
+    // invalid in a bare URI-reference) — the repro this test guards against (spec 062 review S2/B3).
     let dir = tempfile::tempdir().expect("create temp dir");
     let manifest_dir = dir.path().join("weird dir#name");
     std::fs::create_dir(&manifest_dir).expect("create nested fixture dir");
@@ -286,12 +283,9 @@ async fn test_walk_paths_default_to_current_directory_semantics_via_single_file(
 
 #[tokio::test]
 async fn test_sarif_formatter_relativizes_an_absolute_single_file_path() {
-    // `deps-cli check /abs/path/Cargo.toml` (an explicit file, not a directory root) routes
-    // through `walk::walk`'s `root.is_file()` branch (`walk.rs:96-111`), which passes the
-    // absolute path through as `display_path` unchanged — `tempfile::tempdir()` paths are
-    // themselves absolute, so this fixture reproduces that without needing a real absolute
-    // path literal (spec 062 review R1: `manifest_uri` must not leak that absolute path into
-    // `artifactLocation.uri` as-is).
+    // An explicit file path routes through `walk::walk`'s `root.is_file()` branch, which passes
+    // the absolute path through as `display_path` unchanged (spec 062 review R1: `manifest_uri`
+    // must not leak it into `artifactLocation.uri` as-is).
     let dir = tempfile::tempdir().expect("create temp dir");
     let manifest = dir.path().join("Cargo.toml");
     assert!(

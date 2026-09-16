@@ -30,7 +30,6 @@ pub struct BundlerParseResult {
     pub dependency_truncation: Option<(usize, usize)>,
 }
 
-// Regex patterns for Gemfile parsing
 // Compile-time-constant patterns; a malformed literal is a build-visible programmer error,
 // not attacker-influenceable input.
 // Accepts either the bare `gem "name"` form or a parenthesized `gem("name")` / `gem ("name")`
@@ -966,16 +965,15 @@ pub fn parse_gemfile(content: &str, doc_uri: &Url) -> Result<BundlerParseResult>
             }
         }
 
-        // Check for source block start (must precede the single-line SOURCE_PATTERN check:
-        // SOURCE_PATTERN is `$`-anchored and never matches a `... do` opener, but checking
-        // this first keeps the precedence explicit).
+        // Must precede the single-line SOURCE_PATTERN check below: SOURCE_PATTERN is
+        // `$`-anchored and never matches a `... do` opener, but checking this first keeps
+        // the precedence explicit.
         if let Some(url) = parse_source_block_start(line) {
             source_stack.push(url.to_string());
             open_blocks.push(OpenBlockKind::Source);
             continue;
         }
 
-        // Check for source declaration
         if let Some(caps) = SOURCE_PATTERN.captures(line) {
             if source_url.is_none() {
                 source_url = Some(caps[1].to_string());
@@ -983,23 +981,20 @@ pub fn parse_gemfile(content: &str, doc_uri: &Url) -> Result<BundlerParseResult>
             continue;
         }
 
-        // Check for ruby version
         if let Some(caps) = RUBY_VERSION_PATTERN.captures(line) {
             ruby_version = Some(caps[1].to_string());
             continue;
         }
 
-        // Check for group block start
         if let Some(caps) = GROUP_BLOCK_START.captures(line) {
             group_stack.push(parse_group_symbols(&caps[1]));
             open_blocks.push(OpenBlockKind::Group);
             continue;
         }
 
-        // Check for a block end (closes whichever block is innermost) — must precede the
-        // generic opener check below: critic finding N1, `end # nothing left to do` would
-        // otherwise match GENERIC_BLOCK_START's `do` first and be mistaken for an opener
-        // instead of the closer it actually is.
+        // Must precede the generic opener check below (critic finding N1): `end # nothing
+        // left to do` would otherwise match GENERIC_BLOCK_START's `do` first and be
+        // mistaken for an opener instead of the closer it actually is.
         if BLOCK_END.is_match(line) {
             match open_blocks.pop() {
                 Some(OpenBlockKind::Group) => {
@@ -1013,22 +1008,21 @@ pub fn parse_gemfile(content: &str, doc_uri: &Url) -> Result<BundlerParseResult>
             continue;
         }
 
-        // Check for any other `... do` block opener (platforms, install_if, git, path, env,
-        // etc.) — pushed only to keep BLOCK_END's pops balanced (critic finding S1).
+        // Any other `... do` block opener (platforms, install_if, git, path, env, etc.) —
+        // pushed only to keep BLOCK_END's pops balanced (critic finding S1).
         if GENERIC_BLOCK_START.is_match(line) {
             open_blocks.push(OpenBlockKind::Other);
             continue;
         }
 
-        // Check for a bare (no `do`) `end`-terminated block keyword (if/unless/case/begin/
-        // def/class/module/while/until/for) — pushed for the same balancing reason as
+        // A bare (no `do`) `end`-terminated block keyword (if/unless/case/begin/def/class/
+        // module/while/until/for) — pushed for the same balancing reason as
         // GENERIC_BLOCK_START above (code-review finding #1).
         if BARE_BLOCK_START.is_match(line) {
             open_blocks.push(OpenBlockKind::Other);
             continue;
         }
 
-        // Check for gem declaration
         if let Some(caps) = GEM_PATTERN.captures(line) {
             if !budget.allow() {
                 continue;
@@ -1036,7 +1030,6 @@ pub fn parse_gemfile(content: &str, doc_uri: &Url) -> Result<BundlerParseResult>
 
             let name = caps[1].to_string();
 
-            // Find name position in line
             let name_match = caps.get(1).unwrap();
             let name_start = line_start + name_match.start();
             let name_end = line_start + name_match.end();
@@ -1098,7 +1091,6 @@ pub fn parse_gemfile(content: &str, doc_uri: &Url) -> Result<BundlerParseResult>
                 continue;
             }
 
-            // Extract version if present
             let (version_req, version_range) = extract_version(
                 &[(stripped_rest, rest_offset)],
                 content,
@@ -1106,22 +1098,17 @@ pub fn parse_gemfile(content: &str, doc_uri: &Url) -> Result<BundlerParseResult>
                 is_paren_call,
             );
 
-            // Extract group from inline option or current block
             let scan = OptionScan::new(stripped_rest, is_paren_call);
             let group = extract_group(&scan)
                 .unwrap_or_else(|| current_group(&group_stack).unwrap_or(DependencyGroup::Default));
 
-            // Extract source
             let source = extract_source(
                 &scan,
                 source_url.as_deref(),
                 current_source_block(&source_stack),
             );
 
-            // Extract platforms
             let platforms = extract_platforms(&scan);
-
-            // Extract require option
             let require = extract_require(&scan);
 
             dependencies.push(BundlerDependency {
@@ -2344,9 +2331,7 @@ gem 'rails', '~> 7.0'";
         let result = parse_gemfile(gemfile, &test_uri()).unwrap();
         let dep = &result.dependencies[0];
 
-        // Name should be on line 1 (0-indexed)
         assert_eq!(dep.name_range.start.line, 1);
-        // Version should also be on line 1
         assert!(dep.version_range.is_some());
         assert_eq!(dep.version_range.unwrap().start.line, 1);
     }

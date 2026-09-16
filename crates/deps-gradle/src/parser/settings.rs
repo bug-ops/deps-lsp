@@ -41,7 +41,6 @@ fn find_plugin_name_range(line: &str, line_idx: u32, plugin_id: &str) -> Range {
 // ASCII `find`. Every slice bound is always a char boundary.
 #[allow(clippy::string_slice)]
 fn find_plugin_version_range(line: &str, line_idx: u32, version: &str) -> Range {
-    // Find "version" keyword, then locate the version string after it
     if let Some(kw_pos) = line.find("version") {
         let after_kw = &line[kw_pos + "version".len()..];
         if let Some(rel) = after_kw.find(version) {
@@ -75,14 +74,12 @@ pub fn parse_settings(content: &str, uri: &Url) -> Result<GradleParseResult> {
     for (line_idx, line) in content.lines().enumerate() {
         let trimmed = line.trim();
 
-        // Detect pluginManagement { entry
         if !in_plugin_management && trimmed.starts_with("pluginManagement") && trimmed.contains('{')
         {
             in_plugin_management = true;
             pm_depth = brace_depth + 1;
         }
 
-        // Detect plugins { entry inside pluginManagement
         if in_plugin_management
             && !in_plugins
             && trimmed.starts_with("plugins")
@@ -92,7 +89,6 @@ pub fn parse_settings(content: &str, uri: &Url) -> Result<GradleParseResult> {
             plugins_depth = brace_depth + 1;
         }
 
-        // Count braces
         for ch in line.chars() {
             match ch {
                 '{' => brace_depth += 1,

@@ -496,7 +496,6 @@ mod tests {
         let json = r#"[{"name": "v1.2.3"}, {"name": "v0.9.0"}]"#;
         let versions = parse_tags_response(json.as_bytes()).unwrap();
         assert_eq!(versions.len(), 2);
-        // Versions should have 'v' prefix stripped
         assert!(!versions[0].version.as_str().starts_with('v'));
         assert!(!versions[1].version.as_str().starts_with('v'));
     }

@@ -576,43 +576,25 @@ fn find_ruby_closing_quote_fallback(rest: &str, quote: char) -> Option<usize> {
                 prev = escaped.or(Some(ch));
                 continue;
             }
-            // Ruby decides `%`'s role by lexer state (EXPR_BEG/EXPR_ARG vs EXPR_END), the same
-            // class of ambiguity `is_char_literal_quote`'s doc documents for `?`. After a value
-            // token — an identifier/number char, `_`, or a closer (`)`, `]`, `}`, `'`, `"`) —
-            // `%` is always the modulo/format operator, never a `%`-literal opener (critic
-            // finding S1, #1060 follow-up): without this gate, `percent_literal_end` reads any
-            // non-alphanumeric byte after a bare `%` as a delimiter, so `x%=2` is misread as a
-            // literal delimited by `=` and swallows text up to a later, unrelated `=` —
-            // reopening #1060's own over-long-span leak via a different trigger. Gating on
-            // `prev` costs nothing extra — the loop already tracks it for the lexical gate
-            // below.
+            // After a value token, `%` is always modulo, never a %-literal opener (critic S1,
+            // #1060): gate on `prev` or `x%=2` misreads as a %-literal and swallows text to a
+            // later `=`.
             //
-            // `#` is deliberately **not** gated the same way (critic finding S3, second
-            // #1060 follow-up round — correcting this function's own first-round doc, which
-            // wrongly claimed `#` "cannot start a comment" after a value token): in real Ruby a
-            // `#` starts a comment even directly abutting one (`x# comment` is a comment), so
-            // gating it would wrongly re-admit an apostrophe inside that comment as a quote
-            // candidate. Measured against a Ruby/Prism oracle over 86k valid-Ruby cases, gating
-            // `#` fixes one narrow class — string content that looks like a comment once the
-            // parity gate has already rejected a nested string, e.g. `ENV["c#d"]` inside
-            // `#{...}` — at the cost of ~2193 new over-long (leak-direction) errors elsewhere,
-            // against only 406 residual if `#` is left ungated. The two failure directions are
-            // not symmetric: leaving `#` ungated fails by truncating the literal early (the
-            // safer direction — see `read_string_literal_ruby_fallback_hash_in_rejected_nested_string_is_a_documented_residual_gap`,
-            // pinned as a known residual gap alongside heredocs, not fixed here), while gating
-            // it fails by leaking text past the literal's true end into a later option (the
-            // credential-retention / `git:`-dropped path traced in the S1/S2 handoff).
+            // `#` is deliberately NOT gated the same way (critic S3, #1060 round 2 — corrects
+            // this function's earlier doc): Ruby always starts a comment after any predecessor,
+            // so gating would wrongly re-admit an apostrophe inside a real comment as a quote
+            // candidate. Oracle-verified over 86k Ruby cases: ungated `#` only ever truncates
+            // early (safer — see `..._hash_in_rejected_nested_string_is_a_documented_residual_gap`),
+            // while gating it leaks text past the literal's true end (credential-retention path,
+            // S1/S2 handoff).
             let after_value = matches!(
                 prev,
                 Some(c) if c.is_alphanumeric() || matches!(c, '_' | ')' | ']' | '}' | '\'' | '"')
             );
             if ch == '#' {
-                // `prev = None` is safe here (unlike the `%` branch below): `line_comment_end`
-                // always stops *at* the `\n` when one exists, never past it, so the very next
-                // iteration reprocesses that `\n` as an ordinary character and sets `prev =
-                // Some('\n')` before `after_value` is ever consulted again; when the comment
-                // instead runs to the end of `rest` (no trailing `\n`), the loop terminates and
-                // `prev` is never read again either way.
+                // `prev = None` is safe here: `line_comment_end` always stops at (never past)
+                // `\n`, so the next iteration reprocesses it and sets `prev` correctly before
+                // `after_value` is read again; with no trailing `\n`, the loop ends first.
                 i = line_comment_end(rest, i);
                 prev = None;
                 continue;
@@ -622,33 +604,20 @@ fn find_ruby_closing_quote_fallback(rest: &str, quote: char) -> Option<usize> {
                 && let Some(end) = percent_literal_end(rest, i)
             {
                 i = end;
-                // A `%`-literal always produces a value (a string, array, regex, or symbol),
-                // regardless of which punctuation character closed it — `)` stands in here as
-                // a synthetic "predecessor was a value" marker for the next iteration's
-                // `after_value` check, the same role it already plays for a real `)`. Code-review
-                // finding: `prev = None` here let the literal's own close be misread as a fresh
-                // EXPR_BEG position, re-admitting a `%` immediately following it (e.g. the `%` in
-                // `%w[a]%=2`) to `percent_literal_end` as if it were a literal opener again —
-                // reopening S1's leak via a new trigger. Reading back the actual closing
-                // delimiter character instead would still miss this for any delimiter outside
-                // `after_value`'s closer set (e.g. `%r|...|`'s `|`), so a fixed value-marker is
-                // used instead of the real character.
+                // A %-literal always produces a value, so `prev = Some(')')` marks it as such
+                // for the next `after_value` check (code-review finding: `prev = None` here let
+                // a %-literal's own close be misread as a fresh EXPR_BEG, re-admitting
+                // `%w[a]%=2`'s trailing `%` as a literal opener again — reopening S1's leak via
+                // a new trigger).
                 prev = Some(')');
                 continue;
             }
-            // Deliberately not `is_char_literal_quote` (#1062): the reason to keep these
-            // separate is semantic, not (as an earlier version of this comment wrongly
-            // claimed) about performance — `is_char_literal_quote` is O(1) amortized per
-            // scan, not O(n) per candidate, since its whitespace-trim only ever runs for a
-            // `?`-preceded candidate and the whitespace runs before distinct `?` positions
-            // are disjoint. The real reason: `is_char_literal_quote` also disambiguates a
-            // genuine ternary (`flag?'a'`) from a char literal, returning `false` for the
-            // ternary case — swapping it in would *narrow* this gate and re-admit that quote
-            // to `nested_span_len`, reopening the wrong-trust direction #1047 round 2 closed.
-            // Treating every unspaced `?`-predecessor as non-opening here (real char literal
-            // or not) is strictly conservative instead: it only ever widens which candidates
-            // fall through to plain brace counting, never regressing below this function's
-            // pre-#1047 baseline (see the round-2 lexical-gate doc above).
+            // Deliberately not `is_char_literal_quote` (#1062): that helper also treats a
+            // genuine ternary (`flag?'a'`) as non-opening, which would narrow this gate and
+            // re-admit the quote to `nested_span_len`, reopening the wrong-trust direction
+            // #1047 round 2 closed. Treating every unspaced `?`-predecessor as non-opening is
+            // strictly conservative instead — it only ever widens fallthrough to plain brace
+            // counting.
             let is_regex_or_char_literal_quote = matches!(prev, Some('/' | '?'));
             if (ch == '\'' || ch == '"')
                 && !is_regex_or_char_literal_quote

@@ -1,10 +1,6 @@
-// `CargoRegistry::get_latest_matching_from`'s boxed-future coercion nests through
-// `CargoRegistry::get_latest_matching_for_source`/`CratesIoRegistry::get_latest_matching`'s
-// `tokio::join!`/`MaybeDone` combinators; rustc's default recursion limit is occasionally
-// insufficient to prove the resulting `Send` bound and downgrades a previously-silent
-// trait-solver retry into `recursion_depth_exceeding_limit`, which the fuzz CI job's
-// `-D warnings` nightly build turns into a hard error (rust-lang/rust#159228). Same fix as
-// deps-nuget (#696) and deps-swift (#673).
+// Boxed-future `Send`-bound proof through `get_latest_matching_from`'s `tokio::join!`/
+// `MaybeDone` chain can exceed rustc's default recursion limit, hard-erroring under fuzz
+// CI's `-D warnings` (rust-lang/rust#159228). Same fix as deps-nuget (#696), deps-swift (#673).
 #![recursion_limit = "256"]
 
 //! Cargo.toml parsing and crates.io integration.
@@ -25,7 +21,6 @@
 //! ```
 //! use deps_cargo::{CargoDependency, CratesIoRegistry};
 //!
-//! // Types are re-exported for convenience
 //! let _deps: Vec<CargoDependency> = vec![];
 //! ```
 
@@ -40,7 +35,6 @@ pub mod sparse;
 /// Domain types for Cargo dependencies (parsed `Cargo.toml` entries, crates.io versions).
 pub mod types;
 
-// Re-export commonly used types
 pub use config::{CargoConfig, Provenance, RegistryIndex, ResolvedRegistryEntry};
 pub use ecosystem::CargoEcosystem;
 pub use formatter::CargoFormatter;

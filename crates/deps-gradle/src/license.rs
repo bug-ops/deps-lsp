@@ -194,11 +194,8 @@ async fn fetch_license_hops(
         let pom = match cache.get_cached(&url).await {
             Ok(data) => parse_pom(&data),
             Err(e) => {
-                // Logs both the requested (leaf) coordinate and the current hop's —
-                // code-review nit: a parent-hop failure logged only the reassigned
-                // parent coordinate, making it hard to correlate back to the dependency
-                // the manifest/hover actually shows (e.g. `guava-parent` instead of
-                // `guava` for a failed hop past a successfully-fetched leaf POM).
+                // Logs both the requested (leaf) coordinate and the current hop's, so a
+                // parent-hop failure can still be correlated back to what the manifest shows.
                 tracing::debug!(
                     requested_coordinate = coordinate,
                     requested_version = version,
@@ -272,10 +269,9 @@ fn parse_pom(data: &[u8]) -> PomInfo {
     let mut parent_version = String::new();
 
     loop {
-        // Shape-independent budget (impl-critic S1, through three rounds of
-        // counterexamples that each defeated a shape-keyed counter): advances on every
-        // event regardless of what it is, so it cannot be starved by a document that
-        // simply omits the element type a narrower counter was watching for.
+        // Shape-independent budget (impl-critic S1): advances on every event regardless of what
+        // it is, so it can't be starved by a document that omits the element a narrower counter
+        // watches for.
         if exhausted_with(
             licenses.len(),
             reader.buffer_position(),
@@ -578,8 +574,7 @@ mod tests {
     }
 
     // --- Tester gap: `fetch_license`'s HTTP layer had no mockito coverage, unlike
-    // Swift/Dart/Deno's equivalent tests, which exercise both a valid response and a
-    // network/parse failure through the real fetch path. ---
+    // Swift/Dart/Deno's equivalent tests. ---
 
     #[tokio::test]
     async fn fetch_license_from_success_parses_pom_response() {
@@ -876,10 +871,9 @@ mod tests {
         );
     }
 
-    // --- Issue #823 impl-critic M1: `hops` must count POM fetches actually performed
-    // (HTTP calls that happened), not loop iterations — the `pom_url` guard can reject a
-    // coordinate/version, both for the leaf and for a malformed `<parent>` hop, before any
-    // network call is made, and that iteration must not inflate the count. ---
+    // --- Issue #823 impl-critic M1: `hops` must count POM fetches actually performed, not loop
+    // iterations — the `pom_url` guard can reject a coordinate/version before any network call
+    // is made, and that iteration must not inflate the count. ---
 
     #[tokio::test]
     async fn fetch_license_hops_malformed_leaf_coordinate_records_zero_hops() {

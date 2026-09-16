@@ -2659,10 +2659,9 @@ mod tests {
         );
     }
 
-    // --- #793 characterization: `generate_completions` dispatch, pinned before the
-    // wildcard-match refactor so the migration cannot silently change which context
-    // reaches which behavior. GitLab CI serves only `Version` (no package-name search,
-    // spec NFR-002); the other two contexts must return an untouched `Completions::default()`.
+    // --- #793: `generate_completions` dispatch, pinned before the wildcard-match refactor
+    // so it can't silently change behavior. GitLab CI serves only `Version` (no
+    // package-name search, NFR-002); the other two contexts must return `Completions::default()`.
 
     /// A minimal, fully literal `GitlabCiDependency` for dispatch tests — bypasses the real
     /// YAML parser so `name_range`/`version_range`/`source` are exactly what the test wants,

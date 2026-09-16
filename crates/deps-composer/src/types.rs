@@ -277,15 +277,10 @@ pub(crate) fn is_prerelease_marker(s: &str) -> bool {
         || has_separatorless_stability_keyword(s)
 }
 
-// Packagist versions aren't strict semver, so this layers a Composer-specific
-// short-stability-alias check on the raw `version` on top of `deps-core`'s
-// default hyphen-substring heuristic instead of relying on it alone, which
-// misses that gap (#327 M2). The `version_normalized` check is defense in
-// depth, not load-bearing: `has_short_stability_alias` already covers the
-// short-alias case directly on `version`. No `dev-` branch-alias check here:
-// `expand_minified_versions` (`registry.rs`) already filters every
-// `dev-`-prefixed version before a `ComposerVersion` is ever constructed, so
-// that case never reaches `is_prerelease()` (#327 M1).
+// Layers a Composer-specific short-stability-alias check on raw `version` since Packagist
+// isn't strict semver (#327 M2); `version_normalized` here is defense in depth only, not
+// load-bearing. No `dev-` branch-alias check: `expand_minified_versions` (registry.rs)
+// filters those before construction, so `is_prerelease()` never sees them (#327 M1).
 deps_core::impl_version!(ComposerVersion {
     version: version,
     status: |v: &ComposerVersion| deps_core::RemovalStatus::from_advisory(v.abandoned),
@@ -502,9 +497,8 @@ mod tests {
 
     #[test]
     fn test_composer_version_short_stability_alias_is_prerelease() {
-        // Regression test for #327 M2: Composer's short "-a"/"-b" stability
-        // aliases, with `version_normalized` present and already expanded to
-        // "-alpha"/"-beta" the way Packagist normally returns it.
+        // #327 M2: short "-a"/"-b" aliases, with version_normalized already expanded
+        // to "-alpha"/"-beta" the way Packagist normally returns it.
         let alpha = ComposerVersion {
             version: "1.0.0-a1".into(),
             version_normalized: "1.0.0.0-alpha1".into(),
@@ -527,11 +521,9 @@ mod tests {
 
     #[test]
     fn test_composer_version_short_stability_alias_without_normalized_field() {
-        // Regression test for #327 M2: when Packagist omits
-        // `version_normalized`, `expand_minified_versions` falls back to
-        // `version.clone()` (crates/deps-composer/src/registry.rs), so the
-        // short-alias check must not depend on `version_normalized` having
-        // been expanded — it must catch the alias directly on `version`.
+        // #327 M2: when version_normalized is omitted, expand_minified_versions falls
+        // back to version.clone() (registry.rs) — the check must catch the alias
+        // directly on `version` regardless.
         for (name, is_alias) in [
             ("1.0.0-a1", true),
             ("1.0.0-b2", true),

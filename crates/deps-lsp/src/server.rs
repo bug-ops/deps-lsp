@@ -204,9 +204,8 @@ impl Backend {
             }
             Err(e) => {
                 tracing::error!("failed to process document change {:?}: {}", uri, e);
-                // Without this, a rejected change (e.g. oversized content) leaves the
-                // client editing against a stale server-side DocumentState with no
-                // indication the edit was never applied.
+                // Without this, a rejected change leaves the client editing against a
+                // stale DocumentState with no indication the edit was never applied.
                 self.client
                     .log_message(MessageType::ERROR, format!("Change rejected: {e}"))
                     .await;
@@ -225,12 +224,9 @@ impl Backend {
             return;
         };
 
-        // Find all open documents using this lock file. `locate_lockfile` does a
-        // synchronous ancestor-directory `stat` walk per candidate document (#963), so
-        // scanning every open document inline here would run one such walk per document
-        // on the calling tokio worker thread — worse than the single-document case
-        // `resolved.rs`/`lockfile.rs` already fixed. Run the whole scan in
-        // `spawn_blocking` instead.
+        // `locate_lockfile` does a synchronous ancestor-directory `stat` walk per candidate
+        // document (#963), so scanning inline would block the tokio worker thread once per
+        // document. Run the whole scan in `spawn_blocking` instead.
         let state = Arc::clone(&self.state);
         let lock_provider_for_scan = Arc::clone(&lock_provider);
         let ecosystem_id_owned = ecosystem_id.to_string();
@@ -294,12 +290,9 @@ impl Backend {
             }
         };
 
-        // Snapshot before the loop and drop the guard: `generate_diagnostics_internal`
-        // doesn't touch `self.config`, but the affected documents are already open
-        // (sourced from `self.state.documents` above), so re-loading them via
-        // `handle_diagnostics` (which re-reads `self.config` per URI) would hold this
-        // guard across a nested read of the same write-preferring `RwLock` — a writer
-        // queued in between would then block that nested read forever.
+        // Snapshot before the loop and drop the guard: re-reading `self.config` per URI
+        // inside the loop would hold this guard across a nested read of the same
+        // write-preferring `RwLock`, and a writer queued in between would block it forever.
         let (freshness, severities, offline, fetch_timeout_secs, max_concurrent_fetches) = {
             let config = self.config.read().await;
             (
@@ -319,10 +312,8 @@ impl Backend {
                 );
             }
 
-            // Issue #636 introduced `loading_ceiling`'s dependency-count parameter: before
-            // that, the ceiling had no per-document input at all, so hoisting it out of this
-            // loop (as it was) was correct. Now that each affected document can produce a
-            // different ceiling, it must be computed fresh inside the loop, per URI.
+            // Computed per URI (#636): each affected document can produce a different
+            // ceiling, so it can't be hoisted out of the loop.
             let dep_count = diagnostics::document_dependency_count(&self.state, &uri);
             let items = diagnostics::generate_diagnostics_internal(
                 Arc::clone(&self.state),
@@ -337,7 +328,7 @@ impl Backend {
             self.client.publish_diagnostics(uri, items, None).await;
         }
 
-        // Detached, capability-gated, timeout-bounded (issue #493): see
+        // Detached, capability-gated, timeout-bounded (#493): see
         // `ServerState::spawn_refresh_requests` for rationale.
         self.state.spawn_refresh_requests(&self.client);
     }
@@ -486,7 +477,6 @@ impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
         tracing::info!("initializing deps-lsp server");
 
-        // Store client capabilities
         *self.client_capabilities.write().await = Some(params.capabilities.clone());
         self.state
             .set_progress_supported(self.supports_progress().await);
@@ -496,15 +486,13 @@ impl LanguageServer for Backend {
         let code_lens_refresh_supported = self.code_lens_refresh_supported().await;
         self.state
             .set_code_lens_refresh_supported(code_lens_refresh_supported);
-        // Mirrored onto `ServerState` (issue #592) so `document::reparse::reparse_open_documents`
-        // — a free function with no access to `Backend::client_capabilities` — can gate its
-        // post-reparse `workspace/diagnostic/refresh` on it.
+        // Mirrored onto `ServerState` (#592) so `reparse_open_documents` — a free function
+        // with no access to `Backend::client_capabilities` — can gate its refresh on it.
         let diagnostic_refresh_supported = self.diagnostic_refresh_supported().await;
         self.state
             .set_diagnostic_refresh_supported(diagnostic_refresh_supported);
-        // Note (issue #493 M1): a client that implements refresh but never declares
-        // `refreshSupport` is gated off here too, and will not see hints/lenses update
-        // after a background fetch until the document is reopened.
+        // #493 M1: a client that implements refresh but never declares `refreshSupport` is
+        // gated off here too, and won't see hints/lenses update until the document is reopened.
         if !inlay_hint_refresh_supported {
             tracing::debug!(
                 "client did not declare workspace.inlayHint.refreshSupport; inlay hints won't auto-refresh after background fetches"
@@ -516,16 +504,13 @@ impl LanguageServer for Backend {
             );
         }
 
-        // Parse initialization options
         if let Some(init_options) = params.initialization_options
             && let Some(config) = parse_config(init_options)
         {
             tracing::debug!("loaded configuration: {:?}", config);
-            // `resolve()` (issue #1058 T009) is the single derivation of these three values,
-            // shared with `did_change_configuration` below and with
-            // `deps_engine::setup::EcosystemRuntime::from_policy` — only the side-effect
-            // application here (state/cache writes, the gitlab warning) is adapter-specific
-            // and stays.
+            // `resolve()` (#1058 T009) is the single derivation of these values, shared with
+            // `did_change_configuration` below and `EcosystemRuntime::from_policy` — only the
+            // side-effect application here (state/cache writes, gitlab warning) is adapter-specific.
             let resolved = config.policy.registries.resolve();
             self.state
                 .cache
@@ -547,9 +532,8 @@ impl LanguageServer for Backend {
                 .state
                 .gitlab_instance_host
                 .write()
-                // The write below is a single infallible assignment, so this lock can
-                // never actually be poisoned; recover rather than propagate for
-                // defense in depth.
+                // The write below is a single infallible assignment, so this lock can never
+                // actually be poisoned; recover rather than propagate, for defense in depth.
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = resolved.gitlab_instance_host;
             self.state.cache.set_offline(config.policy.network.offline);
             self.state
@@ -560,9 +544,8 @@ impl LanguageServer for Backend {
                 .set_min_interval(std::time::Duration::from_millis(
                     config.cold_start.rate_limit_ms,
                 ));
-            // Issue #660/#661 critic C1: mirrored onto `ServerState` so every diagnostics
-            // generation call site (push and pull) reads the same resolved policy — see
-            // `ServerState::license_policy`'s doc.
+            // #660/#661 critic C1: mirrored onto `ServerState` so every diagnostics call
+            // site (push and pull) reads the same resolved policy.
             self.state
                 .set_license_policy(config.policy.license_policy.to_policy());
             *self.config.write().await = config;
@@ -593,11 +576,9 @@ impl LanguageServer for Backend {
             )
             .await;
 
-        // Spawn background cleanup task for cold start rate limiter, supervised so a
-        // panic surfaces as an `error!` log instead of silently stopping cleanup
-        // forever. Spawned before the two registration requests below (issue #493
-        // S1) so an unresponsive client stalling those never delays this from
-        // starting.
+        // Supervised so a panic surfaces as an `error!` log instead of silently stopping
+        // cleanup forever. Spawned before the registration requests below (#493 S1) so an
+        // unresponsive client stalling those never delays this from starting.
         let state_clone = Arc::clone(&self.state);
         let cleanup_task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_mins(1));
@@ -610,18 +591,16 @@ impl LanguageServer for Backend {
             }
         });
         tokio::spawn(async move {
-            // Inner loop never returns (`JoinHandle<!>`), so `Ok` is unreachable and this pattern is irrefutable.
+            // Inner loop never returns, so `Ok` is unreachable and this pattern is irrefutable.
             let Err(e) = cleanup_task.await;
             tracing::error!("Cold start rate limiter cleanup task exited unexpectedly: {e}");
         });
 
-        // Register lock file watchers using patterns from all ecosystems, plus each
-        // ecosystem's non-lockfile watched config files (e.g. npm's pnpm-workspace.yaml
-        // and .npmrc, issue #590) — one registration, since both are just glob-pattern
-        // watches to the client. Timeout-bounded (issue #493 S1): tower-lsp-server 0.23.0
-        // dispatches handlers via `buffer_unordered(4)`, so an unresponsive client hanging
-        // this await would permanently burn one of only 4 concurrent message slots for the
-        // session.
+        // Lockfile patterns plus each ecosystem's non-lockfile watched config files (e.g.
+        // npm's pnpm-workspace.yaml/.npmrc, #590) in one registration — both are just
+        // glob-pattern watches to the client. Timeout-bounded (#493 S1): tower-lsp-server
+        // dispatches via `buffer_unordered(4)`, so a hanging client would permanently burn
+        // one of only 4 concurrent message slots.
         let mut patterns = self.state.ecosystem_registry.all_lockfile_patterns();
         patterns.extend(self.state.ecosystem_registry.all_watched_config_patterns());
         match tokio::time::timeout(
@@ -648,9 +627,8 @@ impl LanguageServer for Backend {
             }
         }
 
-        // Dynamically register for `workspace/didChangeConfiguration` so clients that
-        // gate the notification on this (M3) actually send it — without it, a changed
-        // `freshness.cooldown_secs` would never reach `did_change_configuration`.
+        // Dynamically register so clients that gate the notification on this (M3) actually
+        // send it — without it, a changed config would never reach `did_change_configuration`.
         // Timeout-bounded for the same reason as the file watcher registration above.
         if self
             .did_change_configuration_dynamic_registration_supported()
@@ -708,30 +686,23 @@ impl LanguageServer for Backend {
 
         tracing::info!("configuration updated via workspace/didChangeConfiguration");
 
-        // Captured before `config` is moved into the write guard below (`DepsConfig` has
-        // no `Clone`, see revision item 6): these shared-handle updates don't need to be
-        // atomic with the config swap itself (M4) — they're applied *after* `*guard =
-        // config` below, not before, but with no `.await` between the swap and this
-        // update, no other task can observe `self.config` already reflecting the new
-        // value while the policy `Arc` (the thing that actually gates a fetch) still
-        // reflects the old one.
+        // Captured before `config` is moved into the write guard below (`DepsConfig` has no
+        // `Clone`): applied *after* the swap but with no `.await` in between, so no other
+        // task can observe `self.config` reflecting the new value while these shared
+        // handles (M4) still reflect the old one.
         //
-        // `resolve()` (issue #1058 T009) is the single derivation of the three
-        // registry-related values, shared with `initialize` above and with
-        // `deps_engine::setup::EcosystemRuntime::from_policy` — only the side-effect
-        // application below (state/cache writes, the gitlab warning) is adapter-specific
-        // and stays.
+        // `resolve()` (#1058 T009) is the single derivation of these values, shared with
+        // `initialize` above — only the side-effect application below is adapter-specific.
         let resolved = config.policy.registries.resolve();
         let offline = config.policy.network.offline;
         let cache_enabled = config.policy.cache.enabled;
         let cold_start_rate_limit_ms = config.cold_start.rate_limit_ms;
-        // Issue #660/#661 critic C1: see the mirroring call after the config swap below.
+        // #660/#661 critic C1: see the mirroring call after the config swap below.
         let license_policy = config.policy.license_policy.to_policy();
 
-        // Diff the old vs new config for parse-affecting changes (issue #592) and swap in
-        // the new config under one write-guard acquisition — `DepsConfig` has no `Clone`,
-        // so the diff must read the not-yet-overwritten guard before `config` is moved
-        // into it.
+        // Diff old vs new for parse-affecting changes (#592) under one write-guard
+        // acquisition: `DepsConfig` has no `Clone`, so the diff must read the
+        // not-yet-overwritten guard before `config` is moved into it.
         let scope = {
             let mut guard = self.config.write().await;
             let scope = crate::config::reparse_scope(
@@ -759,9 +730,8 @@ impl LanguageServer for Backend {
             .state
             .gitlab_instance_host
             .write()
-            // The write below is a single infallible assignment, so this lock can
-            // never actually be poisoned; recover rather than propagate for defense
-            // in depth.
+            // The write below is a single infallible assignment, so this lock can never
+            // actually be poisoned; recover rather than propagate, for defense in depth.
             .unwrap_or_else(std::sync::PoisonError::into_inner) = resolved.gitlab_instance_host;
         // Must land before either refresh notification below, or the refresh re-renders
         // diagnostics under the stale flag values (critic M5).
@@ -770,16 +740,14 @@ impl LanguageServer for Backend {
         self.state
             .cold_start_limiter
             .set_min_interval(std::time::Duration::from_millis(cold_start_rate_limit_ms));
-        // Issue #660/#661 critic C1: mirrored onto `ServerState` so every diagnostics
-        // generation call site (push and pull) reads the same resolved policy — see
-        // `ServerState::license_policy`'s doc.
+        // #660/#661 critic C1: mirrored onto `ServerState` so every diagnostics call site
+        // (push and pull) reads the same resolved policy.
         self.state.set_license_policy(license_policy);
 
         match scope {
             Some(scope) => {
-                // Coalescing: union into the pending scope and bump the generation before
-                // spawning a debounced worker, so a burst of changes collapses into one
-                // reparse without losing any individual change's scope.
+                // Union into the pending scope and bump the generation before spawning a
+                // debounced worker, so a burst of changes collapses into one reparse.
                 let generation = self.state.queue_reparse(scope);
                 let state = Arc::clone(&self.state);
                 let client = self.client.clone();
@@ -787,13 +755,10 @@ impl LanguageServer for Backend {
                 tokio::spawn(async move {
                     tokio::time::sleep(crate::document::reparse::RECONFIGURE_DEBOUNCE).await;
                     let superseded = state.config_generation() != generation;
-                    // Security M3: a superseded worker normally defers to the newer one —
-                    // but under a continuous burst arriving faster than the debounce
-                    // window, every worker would see itself superseded forever, leaving a
-                    // security-relevant setting's reparse starved indefinitely while
-                    // `set_registry_policy` has already taken effect. Once the pending
-                    // scope has been waiting at least `MAX_DEBOUNCE_WAIT`, drain it
-                    // regardless of staleness.
+                    // Security M3: a superseded worker normally defers to the newer one, but
+                    // under a continuous burst every worker would see itself superseded
+                    // forever, starving the reparse indefinitely. Once the pending scope has
+                    // waited at least `MAX_DEBOUNCE_WAIT`, drain it regardless of staleness.
                     if superseded
                         && !state
                             .pending_reparse_overdue(crate::document::reparse::MAX_DEBOUNCE_WAIT)
@@ -815,12 +780,10 @@ impl LanguageServer for Backend {
                 });
             }
             None => {
-                // Nothing parse-affecting changed. Hover/completion/code actions are
-                // computed on demand and pick up the new config for free. Diagnostics are
-                // pull-based, so a pull-capable client must be told to re-request them
-                // (push-only clients are a known v1 gap, M2). Timeout-bounded (issue #493,
-                // same class as S1): capability-gated already, but an unresponsive client
-                // would otherwise hang this handler forever.
+                // Nothing parse-affecting changed. Hover/completion/code actions pick up
+                // the new config for free on demand; diagnostics are pull-based, so a
+                // pull-capable client must be told to re-request them (push-only clients
+                // are a known v1 gap, M2). Timeout-bounded (#493) against a hanging client.
                 if self.diagnostic_refresh_supported().await {
                     match tokio::time::timeout(
                         CLIENT_REFRESH_TIMEOUT,
@@ -853,9 +816,8 @@ impl LanguageServer for Backend {
 
         tracing::info!("document opened: {:?}", uri);
 
-        // Use ecosystem registry to check if we support this file type. `from_lsp_uri`
-        // returning `None` (a URI shape `url::Url` rejects, e.g. a `file:` URI with a
-        // port) is treated the same as "no ecosystem handles this file type".
+        // `from_lsp_uri` returning `None` (a URI shape `url::Url` rejects, e.g. a `file:`
+        // URI with a port) is treated the same as "no ecosystem handles this file type".
         let Some(domain_uri) = crate::lsp_types_interop::from_lsp_uri(&uri) else {
             tracing::debug!("unsupported file type: {:?}", uri);
             return;
@@ -876,9 +838,8 @@ impl LanguageServer for Backend {
         if let Some(change) = params.content_changes.first() {
             let content = change.text.clone();
 
-            // Use ecosystem registry to check if we support this file type. See
-            // `did_open`'s equivalent check for why `from_lsp_uri` returning `None` is
-            // treated the same as "no ecosystem handles this file type".
+            // See `did_open`'s equivalent check for why `from_lsp_uri` returning `None`
+            // is treated the same as "no ecosystem handles this file type".
             let Some(domain_uri) = crate::lsp_types_interop::from_lsp_uri(&uri) else {
                 tracing::debug!("unsupported file type: {:?}", uri);
                 return;
@@ -906,11 +867,9 @@ impl LanguageServer for Backend {
         tracing::debug!("Received {} file change events", params.changes.len());
 
         for change in params.changes {
-            // #1090: guard against a non-`file:` scheme or remote-host `file:` URI (and,
-            // via the `is_absolute()` check, a relative path such as `untitled:Cargo.lock`)
-            // rather than a bare `to_file_path()` on this client-supplied URI. `from_lsp_uri`
-            // returning `None` (a URI shape `url::Url` rejects outright) is treated the same
-            // as an invalid path.
+            // #1090: guards against a non-`file:` scheme, a remote-host `file:` URI, or a
+            // relative path (e.g. `untitled:Cargo.lock`) rather than a bare `to_file_path()`
+            // on this client-supplied URI.
             let Some(path) = crate::lsp_types_interop::from_lsp_uri(&change.uri)
                 .and_then(|url| deps_core::lockfile::resolve_manifest_file_path(&url))
             else {
@@ -942,9 +901,8 @@ impl LanguageServer for Backend {
                 );
 
                 // No cache invalidation here (unlike the lock-file branch above): every
-                // `MtimeFileCache`-backed config cache (e.g. `PnpmWorkspaceCache`,
-                // `NpmConfigCache`) already invalidates itself by mtime on its next
-                // `get_or_parse` — the reparse below is what triggers that next call.
+                // `MtimeFileCache`-backed config cache invalidates itself by mtime on its
+                // next `get_or_parse`, which the reparse below triggers.
                 self.handle_watched_config_change(ecosystem.id()).await;
                 continue;
             }
@@ -1162,10 +1120,9 @@ impl Backend {
     /// the remaining race for clients that support it. Clients that don't advertise the
     /// capability get the plain `changes` map instead, which carries no version; for
     /// those, this recompute-at-click-time step is the only staleness mitigation.
-    // `doc` (a DashMap shard `Ref`) is dropped via an explicit `drop(doc)` before every
-    // `.await` reachable from this point (see below) — clippy's `await_holding_invalid_type`
-    // does not recognize a manual `drop()` in this control-flow shape and flags the
-    // binding regardless. Verified as a false positive, not a real hazard: nothing to fix.
+    // `doc` is explicitly `drop`ped before every `.await` reachable from here; clippy's
+    // `await_holding_invalid_type` doesn't recognize a manual drop in this shape and flags
+    // it anyway. Verified false positive.
     #[allow(clippy::await_holding_invalid_type)]
     async fn execute_update_all_outdated(&self, uri: Uri) {
         let Some(doc) = self.state.get_document(&uri) else {
@@ -1203,10 +1160,8 @@ impl Backend {
         drop(doc);
 
         if edits.is_empty() {
-            // Not a failure — the document changed between the lens render and this
-            // click (or the client sent a stale command), so there is nothing left to
-            // apply. Still worth a message: a silent no-op after a visible click reads
-            // as a broken button (§4.6's rationale for not swallowing failures here).
+            // Not a failure — the document changed since the lens render, or the command
+            // is stale. Still worth a message: a silent no-op reads as a broken button (§4.6).
             self.client
                 .show_message(
                     MessageType::INFO,
@@ -1325,10 +1280,9 @@ impl Backend {
         drop(doc);
 
         if edits.is_empty() {
-            // M1 (#640): now that this command is advertised and dispatched
-            // unconditionally for every ecosystem, this log line is what still
-            // distinguishes "this document genuinely has nothing to pin" from a
-            // misrouted/stale command — the client-facing message can't say that.
+            // M1 (#640): dispatched unconditionally for every ecosystem, so this log line
+            // distinguishes "nothing to pin" from a misrouted/stale command — the
+            // client-facing message can't say that.
             tracing::debug!(ecosystem = ecosystem.id(), "pinAllToSha: no edits");
             self.client
                 .show_message(
@@ -1452,36 +1406,27 @@ mod tests {
     fn test_server_capabilities() {
         let caps = Backend::server_capabilities();
 
-        // Verify text document sync
         assert!(caps.text_document_sync.is_some());
 
-        // Verify completion provider
         assert!(caps.completion_provider.is_some());
         let completion = caps.completion_provider.unwrap();
-        assert!(!completion.resolve_provider.unwrap()); // resolve_provider is disabled
+        assert!(!completion.resolve_provider.unwrap());
 
-        // Verify hover provider
         assert!(caps.hover_provider.is_some());
 
-        // Verify inlay hints
         assert!(caps.inlay_hint_provider.is_some());
 
-        // Verify diagnostics
         assert!(caps.diagnostic_provider.is_some());
     }
 
     #[tokio::test]
     async fn test_backend_creation() {
         let (_service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
-        // Backend should be created successfully
-        // This is a minimal smoke test
     }
 
     #[tokio::test]
     async fn test_initialize_without_options() {
         let (_service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
-        // Should initialize successfully with default config
-        // Integration tests will test actual LSP protocol
     }
 
     #[test]
@@ -1606,8 +1551,8 @@ mod tests {
     #[cfg(feature = "cargo")]
     #[tokio::test]
     async fn test_did_change_watched_files_rejects_malicious_uri() {
-        // Held per `deps_core::fs_probe::snapshot_guard`'s doc: `get_or_parse` transitively
-        // touches fs_probe, and this test runs in the same binary as other diffing tests.
+        // Held per fs_probe::snapshot_guard's doc: get_or_parse touches fs_probe and this
+        // test shares a binary with other diffing tests.
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         use tower_lsp_server::ls_types::{FileChangeType, FileEvent};
 
@@ -1683,9 +1628,9 @@ mod tests {
     #[cfg(feature = "npm")]
     #[tokio::test]
     async fn test_watched_config_change_reparses_open_document_with_catalog_dependency() {
-        // Held per `deps_core::fs_probe::snapshot_guard`'s doc: `did_open` routes through npm's
-        // `parse_manifest` (transitively `catalog::load`/`config::resolve`), and this test runs in
-        // the same binary as `document/loader.rs`'s diffing test.
+        // Held per fs_probe::snapshot_guard's doc: did_open routes through npm's
+        // parse_manifest, which touches fs_probe, and this test shares a binary with
+        // document/loader.rs's diffing test.
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         use tower_lsp_server::ls_types::{
             FileChangeType, FileEvent, HoverContents, Position, TextDocumentIdentifier,
@@ -1776,9 +1721,8 @@ mod tests {
     #[cfg(feature = "cargo")]
     #[tokio::test]
     async fn test_handle_lockfile_change_computes_ceiling_per_uri() {
-        // Held per `deps_core::fs_probe::snapshot_guard`'s doc: `ecosystem.parse_manifest`
-        // (cargo) transitively touches fs_probe, and this test runs in the same binary as
-        // `document/loader.rs`'s diffing test.
+        // Held per fs_probe::snapshot_guard's doc: parse_manifest touches fs_probe and
+        // this test shares a binary with document/loader.rs's diffing test.
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         use crate::document::DocumentState;
         use deps_core::EcosystemId;
@@ -1891,13 +1835,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_command_update_version_with_unsafe_version_does_not_panic() {
-        // Smoke test only: `execute_command` returns `Ok(None)` on this uninitialized-
-        // backend harness whether `build_update_version_edit`'s guard fires or not
-        // (`apply_edit` itself errors out on an uninitialized client, per
-        // `test_execute_command_update_all_outdated_apply_edit_failure_does_not_panic`'s
-        // own comment) — it cannot distinguish "guard fired" from "guard absent". The
-        // actual regression coverage for the guard lives on `build_update_version_edit`
-        // directly, below.
+        // Smoke test only: on this uninitialized backend, `execute_command` returns
+        // `Ok(None)` whether the guard fired or not, so it can't distinguish the two.
+        // Real regression coverage for the guard is on `build_update_version_edit` below.
         let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
         let backend = service.inner();
 
@@ -2052,10 +1992,7 @@ mod tests {
         assert_eq!(changes.get(&uri).map(Vec::len), Some(1));
     }
 
-    // =========================================================================
     // Issue #227: `parse_config` (C2) and `did_change_configuration` live-reload
-    // =========================================================================
-
     mod parse_config_tests {
         use super::*;
 

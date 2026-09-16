@@ -452,23 +452,17 @@ impl PubspecReceiver {
         if matches!(event, Event::MappingEnd | Event::SequenceEnd)
             && let Some(frame) = self.recording.pop_if(|frame| frame.depth == 0)
         {
-            // `event_log.len()` here is the index the closing event is *about to* occupy
-            // (pushed below), so this range covers exactly the events strictly between the
-            // container's own `MappingStart`/`SequenceStart` and `MappingEnd`/`SequenceEnd` —
-            // matching what `on_alias`'s replay branch expects (it calls `push_container`/
-            // `pop_container` directly for the boundary, replaying only the inner events).
+            // `event_log.len()` here is the about-to-be-occupied index of the closing event,
+            // so this range covers exactly the events strictly between the container's own
+            // start and end — matching what `on_alias`'s replay branch expects.
             self.container_anchors.insert(
                 frame.anchor_id,
                 (frame.kind, frame.start..self.event_log.len()),
             );
         }
 
-        // Only worth logging while at least one anchor is actually being recorded — an
-        // anchor-free document (or the stretch of one after its last anchor closes) never
-        // touches `event_log` at all, so this stays O(1) space for the common case rather than
-        // buffering the entire event stream unconditionally. Index-safe: every
-        // `container_anchors` range was built exclusively from indices recorded under this
-        // same guard, so a later `.get(range)` at replay time always hits.
+        // Only logged while an anchor is being recorded, so an anchor-free document never
+        // touches `event_log` — O(1) space for the common case.
         if !self.recording.is_empty() {
             self.event_log.push((event.clone(), marker));
         }
@@ -543,13 +537,9 @@ impl PubspecReceiver {
             ..FramePayload::default()
         };
 
-        // Carries a dependency name captured as a key on the parent
-        // `DependencySectionValue` frame down into the child's own payload (if the child is
-        // its `DependencyEntryValue`), or finalizes it as an `Unresolved` entry otherwise (a
-        // dependency's value is a sequence, or some other shape this parser does not resolve
-        // a concrete field from). A no-op while the parent is awaiting a key (including a
-        // complex key's own subtree, which `FrameStack::push` handles generically) since
-        // `pending_dep_name` is `None` in that state.
+        // Carries a pending dependency name down into the child's `DependencyEntryValue`
+        // payload, or finalizes it as `Unresolved` if the child isn't one (e.g. a sequence
+        // value). No-op while the parent awaits a key, since `pending_dep_name` is `None` then.
         if let Some(top) = stack.top_mut()
             && *top.role() == FrameRole::DependencySectionValue
             && let Some(name) = top.payload.pending_dep_name.take()
@@ -632,13 +622,11 @@ impl PubspecReceiver {
         if anchor_id != 0 {
             self.anchors.record(anchor_id, &value, (style, tag.clone()));
         }
-        // A value-less key (`pkg:` with nothing after it, the normal mid-typing state in a
-        // live editor) surfaces here as an empty plain scalar — review found this otherwise
-        // yielded `version_req = Some("")` anchored on the *next* key's position (the
-        // synthesized empty-scalar event's marker lands there, and `locate_value_span`
-        // short-circuits `Some((from, from))` for an empty needle). Treated as absent instead,
-        // matching the pre-rewrite `Yaml`-AST parser's own `Yaml::Null` handling. An explicit
-        // non-null tag (`!!str null`) overrides this — see [`is_plain_null`].
+        // A value-less key (`pkg:` mid-typing) surfaces as an empty plain scalar — without this
+        // check it would resolve to `version_req = Some("")` anchored on the *next* key's
+        // position, since `locate_value_span` short-circuits for an empty needle. Treated as
+        // absent instead, matching `Yaml::Null` handling. An explicit non-null tag
+        // (`!!str null`) overrides this — see [`is_plain_null`].
         let is_null = is_plain_null(style, tag.as_ref(), &value);
         let replay_depth = self.replay_depth;
 
@@ -720,12 +708,10 @@ impl PubspecReceiver {
     }
 
     fn on_alias(&mut self, anchor_id: usize, marker: &Marker) {
-        // Re-checks `is_plain_null` against the *anchor's own* style/text — `on_scalar`
-        // filters a null-like plain scalar before it ever becomes a `FieldValue`, but that
-        // check happens at the anchor's definition site, not at each alias resolving it, so
-        // without re-running it here an aliased null (`shared: &s ~` / `pkg: *shared`) would
-        // resolve to `Some("~")` instead of being treated as absent like `on_scalar` treats a
-        // direct null (review finding #1).
+        // Re-checks `is_plain_null` against the anchor's own style/text — `on_scalar`'s null
+        // filter runs at the anchor's definition site, not per alias, so without this an
+        // aliased null (`shared: &s ~` / `pkg: *shared`) would resolve to `Some("~")` instead
+        // of absent (review finding #1).
         let resolved = self
             .anchors
             .get(anchor_id)
@@ -734,15 +720,10 @@ impl PubspecReceiver {
 
         match self.stack.scalar_position() {
             ScalarPosition::Outside => {}
-            // Mirrors `on_scalar`'s key branch. An alias in key position is unusual, but
-            // review found the previous code left `awaiting_key` unconditionally `true`
-            // afterwards (the same as it already was) instead of flipping it to `false` the
-            // way a real key does — every later scalar in the mapping was then reinterpreted
-            // alternately as a name/value, corrupting the rest of the section (review finding
-            // #2). Best-effort: an alias resolving to real text is treated exactly as a
-            // scalar key would be; an unresolvable one (e.g. a mapping-valued anchor) still
-            // flips the state correctly, just without a name to attach a value to. A
-            // container can't sensibly serve as a key, so no `container_anchors` lookup here.
+            // Mirrors `on_scalar`'s key branch. Previously left `awaiting_key` stuck `true`
+            // for an alias-as-key, reinterpreting every later scalar alternately as
+            // name/value and corrupting the rest of the section (review finding #2). An
+            // unresolvable alias still flips the state correctly, just with no name attached.
             ScalarPosition::Key => {
                 let role = self.stack.top_role_or(FrameRole::Irrelevant);
                 match (role, resolved) {
@@ -766,35 +747,23 @@ impl PubspecReceiver {
             }
             ScalarPosition::Value => {
                 // A whole-section/mapping alias (`dependencies: *shared_map`, `environment:
-                // *shared_env`) — replay the anchor's buffered subtree through the normal
-                // dispatch, so `push_container`'s `compute_child_role` routes it exactly as a
-                // live `MappingStart`/`SequenceStart` in this same position would. Scoped to
-                // `Root` only: `compute_child_role` has no `EnvironmentValue` -> child-role
-                // mapping (everything under it that isn't `sdk:` routes to `Irrelevant`
-                // regardless), so including it here would never resolve anything —
-                // `environment: *shared_env` itself fires with the *root* frame on top (the
-                // alias is the *value of the `environment:` key*, read before ever pushing an
-                // `EnvironmentValue` frame), which is exactly this branch. A single
-                // dependency's own value aliasing a whole mapping
-                // (`FrameRole::DependencySectionValue`, e.g. `pkg: *shared_entry`) is
-                // deliberately left to the scalar-only resolution below instead — see
-                // `test_aliased_dependency_to_unresolvable_anchor_still_present`.
+                // *shared_env`) — replay the anchor's buffered subtree so `push_container`'s
+                // `compute_child_role` routes it as a live start event would. Scoped to `Root`
+                // only: `environment: *shared_env` itself fires with the root frame on top (the
+                // alias is the value of the `environment:` key, before any `EnvironmentValue`
+                // frame is pushed). A dependency's own value aliasing a whole mapping
+                // (`pkg: *shared_entry`) is deliberately left to the scalar-only resolution
+                // below — see `test_aliased_dependency_to_unresolvable_anchor_still_present`.
                 let role = self.stack.top_role_or(FrameRole::Irrelevant);
                 if role == FrameRole::Root
                     && let Some((kind, range)) = self.container_anchors.get(&anchor_id).cloned()
                 {
-                    // The one clone this design pays for container-anchor replay (see
-                    // `RecordingFrame`'s docs) — a slice of the shared `event_log`, copied
-                    // only now, once per actual alias occurrence, rather than once per event
-                    // for every open anchor regardless of whether it's ever aliased.
+                    // The one clone this design pays for replay (see `RecordingFrame`'s docs) —
+                    // once per actual alias occurrence, not per event for every open anchor.
                     let Some(slice) = self.event_log.get(range) else {
-                        // Every `container_anchors` range is built from indices this same
-                        // receiver recorded into `event_log` (see `record_event`) — a miss
-                        // here means that invariant broke. Fail loudly in debug/tests rather
-                        // than silently replaying nothing, which would reproduce the exact
-                        // whole-section data loss this feature exists to fix; in release,
-                        // skip this alias (leaving it unresolved, the same graceful outcome
-                        // as an unknown anchor) rather than panicking the LSP server.
+                        // A miss means the container_anchors/event_log invariant broke. Fail
+                        // loudly in debug/tests; in release, skip the alias gracefully rather
+                        // than panicking the LSP server.
                         debug_assert!(
                             false,
                             "container_anchors[{anchor_id}] range is out of bounds for event_log"
@@ -803,11 +772,9 @@ impl PubspecReceiver {
                     };
                     let events: Vec<(Event, Marker)> = slice.to_vec();
                     self.replay_depth += 1;
-                    // The container-anchor replay path pushes/pops directly, out of band
-                    // from any live key/value position — never mistaken for a complex key's
-                    // subtree, since `is_complex_key_position` reflects the *live* stack top
-                    // at the moment of this call, which is a `Root` frame awaiting a *value*
-                    // (this whole branch only runs in `ScalarPosition::Value`), not a key.
+                    // Replay pushes/pops directly, out of band from any live key/value position
+                    // — this branch only runs in `ScalarPosition::Value`, so it can never be
+                    // mistaken for a complex key's subtree.
                     debug_assert!(!self.stack.is_complex_key_position());
                     self.push_container(kind);
                     for (event, event_marker) in events {
@@ -857,11 +824,8 @@ impl PubspecReceiver {
                         }
                     }
                     // Mirrors `on_scalar`'s `EnvironmentValue` arm (critic finding C1): an
-                    // alias to a *scalar* anchor used as `sdk:`'s value (`sdk:
-                    // *shared_version`, sharing one constraint string — the more idiomatic
-                    // of #905's two named shapes) must resolve the same way a direct scalar
-                    // does, not fall through as a no-op the way an unresolvable one
-                    // correctly does.
+                    // alias to a scalar anchor used as `sdk:`'s value must resolve like a
+                    // direct scalar, not fall through as a no-op.
                     FrameRole::EnvironmentValue => {
                         if *top.pending_key() == PendingKey::EnvSdk
                             && let Some((text, _style)) = resolved
@@ -882,11 +846,9 @@ impl PubspecReceiver {
 
 impl MarkedEventReceiver for PubspecReceiver {
     fn on_event(&mut self, event: Event, marker: Marker) {
-        // Buffer every event into any still-open container-anchor recording, and start a new
-        // recording when this event itself opens an anchored mapping/sequence — but only on the
-        // live event stream: a nested anchor inside a subtree being replayed (`replay_depth >
-        // 0`) was already fully recorded during its own earlier live definition, by YAML's
-        // forward-reference-only parse order (see `container_anchors`'s docs).
+        // Buffer every event into any open container-anchor recording, only on the live event
+        // stream — a nested anchor inside a replayed subtree was already recorded during its
+        // own earlier live definition (YAML's forward-reference-only parse order).
         if self.replay_depth == 0 {
             self.record_event(&event, marker);
             if let Event::MappingStart(id, _) | Event::SequenceStart(id, _) = &event

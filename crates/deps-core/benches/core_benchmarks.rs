@@ -26,7 +26,6 @@ fn bench_cache_lookup(c: &mut Criterion) {
     let cache = HttpCache::new();
     let url = "https://index.crates.io/se/rd/serde";
 
-    // Pre-populate cache
     let response =
         CachedResponse::new(Bytes::from_static(&[1, 2, 3, 4, 5])).with_etag("\"abc123\"");
 
@@ -103,7 +102,6 @@ fn bench_arc_cloning(c: &mut Criterion) {
         b.iter(|| Arc::clone(black_box(&large_data)));
     });
 
-    // Compare with actual Vec cloning to show the benefit
     let small_vec = vec![0u8; 100];
     let large_vec = vec![0u8; 1_000_000];
 
@@ -129,7 +127,6 @@ fn bench_concurrent_access(c: &mut Criterion) {
 
     let rt = Runtime::new().unwrap();
 
-    // Pre-populate cache with 100 entries
     let cache = StdArc::new(HttpCache::new());
     for i in 0..100 {
         let response =
@@ -164,7 +161,7 @@ fn bench_concurrent_access(c: &mut Criterion) {
 fn bench_cache_eviction(c: &mut Criterion) {
     let cache = HttpCache::new();
 
-    // Pre-populate to near capacity (MAX_CACHE_ENTRIES = 1000)
+    // Near capacity: MAX_CACHE_ENTRIES = 1000.
     for i in 0..990 {
         let response =
             CachedResponse::new(Bytes::from(vec![i as u8; 100])).with_etag(format!("\"etag-{i}\""));
@@ -190,7 +187,6 @@ fn bench_url_formatting(c: &mut Criterion) {
 
     let package_name = "serde";
 
-    // crates.io sparse index URL
     group.bench_function("crates_io_sparse_index", |b| {
         b.iter(|| {
             let path = format!(
@@ -203,17 +199,14 @@ fn bench_url_formatting(c: &mut Criterion) {
         });
     });
 
-    // npm registry URL
     group.bench_function("npm_registry", |b| {
         b.iter(|| format!("https://registry.npmjs.org/{}", black_box(package_name)));
     });
 
-    // PyPI simple API URL
     group.bench_function("pypi_simple_api", |b| {
         b.iter(|| format!("https://pypi.org/simple/{}/", black_box(package_name)));
     });
 
-    // PyPI JSON API URL
     group.bench_function("pypi_json_api", |b| {
         b.iter(|| format!("https://pypi.org/pypi/{}/json", black_box(package_name)));
     });
@@ -249,7 +242,6 @@ fn bench_json_parsing(c: &mut Criterion) {
         }
     }"#;
 
-    // Large JSON with 100 versions
     let mut large_json = String::from(r#"{"name":"pkg","versions":{"#);
     for i in 0..100 {
         large_json.push_str(&format!(
@@ -280,7 +272,6 @@ fn bench_json_parsing(c: &mut Criterion) {
 fn bench_allocations(c: &mut Criterion) {
     let mut group = c.benchmark_group("allocations");
 
-    // Pre-allocate Vec with capacity
     group.bench_function("vec_with_capacity", |b| {
         b.iter(|| {
             let mut v = Vec::with_capacity(100);
@@ -291,7 +282,6 @@ fn bench_allocations(c: &mut Criterion) {
         });
     });
 
-    // Vec without capacity (multiple reallocations)
     group.bench_function("vec_without_capacity", |b| {
         b.iter(|| {
             let mut v = Vec::new();
@@ -302,7 +292,6 @@ fn bench_allocations(c: &mut Criterion) {
         });
     });
 
-    // String with capacity
     group.bench_function("string_with_capacity", |b| {
         b.iter(|| {
             let mut s = String::with_capacity(1000);
@@ -313,7 +302,6 @@ fn bench_allocations(c: &mut Criterion) {
         });
     });
 
-    // String without capacity
     group.bench_function("string_without_capacity", |b| {
         b.iter(|| {
             let mut s = String::new();

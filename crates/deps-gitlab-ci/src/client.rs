@@ -291,10 +291,9 @@ impl GitlabApiClient {
     /// host (issue #561/#562 precedent) — attaching `PRIVATE-TOKEN` only when `host` is the
     /// single token host (spec FR-005a).
     async fn fetch_pinned(&self, host: &GitlabHost, url: &str) -> Result<Bytes> {
-        // `is_some_and`, never `.unwrap_or(...)`: an invalid `registries.gitlab_instance_host`
-        // must disable the token outright (`token_host_origin` returns `None`), not silently
-        // fall back to comparing against a default that could coincidentally match `host`
-        // (security review, issue #466).
+        // `is_some_and`, never `.unwrap_or(...)`: an invalid instance host must disable the
+        // token outright, not fall back to a default that could coincidentally match `host`
+        // (security review, #466).
         let is_token_host =
             token_host_origin(&self.instance_host).is_some_and(|origin| origin == host.origin());
         let token_value = if is_token_host {

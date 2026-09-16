@@ -19,7 +19,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-gitlab-ci**: mapping-shaped YAML container-anchor support for `include:` entries aliased as a whole mapping (`- *tpl`, `include: *tpl`, `- <<: *tpl`, `- <<: [*a, *b]`), resolved per GitLab's actual Psych merge-key precedence rather than the abstract YAML 1.1 spec (resolves #933, #916) (#1028)
 - **deps-core**: promoted `is_plain_null`/`is_null_tag` (originally `deps-dart`-private) into `lsp_helpers`, now shared by `deps-dart` and `deps-gitlab-ci` (#1028)
 - **deps-core**: new `quote_scan` module — shared escape-aware string-literal and comment scanning (`ScanSyntax`, `read_string_literal`, `strip_line_comment`, `blank_comments`, `is_code_byte`), now used by `deps-bundler`, `deps-swift`, and `deps-pypi` instead of each hand-rolling its own scanner (resolves #1022) (#1036)
-- **CI**: new `tooling-lint` job validates `.pre-commit-hooks.yaml` and `crates/github-action/action.yml` (YAML syntax, GitHub Actions metadata schema, embedded bash via shellcheck, and a regression guard for #1074), closing a prior gap where neither file had any automated verification (resolves #1076) (#1080)
 
 ### Changed
 - **Breaking (public API)**: **deps-core**: `deps_core::policy_config`'s 7 structs are now `#[non_exhaustive]`, with `new()`/`with_*` constructors added where missing; `PolicyConfig::diff` replaces `deps-lsp`'s cross-crate exhaustive-destructuring guard (resolves #1064) (#1093)
@@ -44,9 +43,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-engine, deps-lsp, ci**: closed `deps-lsp`'s last direct dependency on `deps-gitlab-ci` via a new `deps_engine::setup::validate_gitlab_instance_host`, and added a CI guard asserting no ecosystem crate is a *direct* non-dev dependency of `deps-lsp`/`deps-cli` (resolves #1073) (#1079)
 - **docs**: mdBook now publishes to the GitHub Pages site root (`https://bug-ops.github.io/deps-lsp/`) instead of `/book/`; `mdbook.yml`'s now-dead `workflow_run` trigger for the removed `Documentation` workflow is also dropped (#1098)
 - **CI**: `mdbook.yml` now deploys via the native GitHub Actions Pages flow (`actions/configure-pages`, `actions/upload-pages-artifact`, `actions/deploy-pages`) instead of `peaceiris/actions-gh-pages` pushing to a `gh-pages` branch, matching the repo's Pages source now being set to "GitHub Actions"
+- removed redundant in-code `//` comments that merely restated adjacent code across every crate; issue-referenced and invariant-documenting comments are untouched (no functional change)
 
 ### Removed
 - **CI**: removed the legacy `Documentation` workflow (`.github/workflows/docs.yml`), which deployed `cargo doc` output to the `gh-pages` root with `force_orphan: true` on every Rust-touching push, wiping the mdBook site published by `mdbook.yml` (#1096) each time it ran
+- **CI**: removed the `wasm` job — it built `crates/deps-zed`'s WASM target, but `deps-zed` is a separate git submodule with its own repository and CI; verifying it here duplicated work that belongs there
 
 ### Fixed
 - **deps-cargo, deps-nuget, deps-pypi, deps-lsp, deps-npm, deps-gradle**: client-supplied manifest/document URIs with a non-`file:` scheme or remote host no longer resolve against the real filesystem, including a Windows-only bypass where a `file:` URI's host was silently stripped by URL parsing when the path looked like a drive letter (resolves #1090) (#1091)

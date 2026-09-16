@@ -256,15 +256,12 @@ pub fn assert_dot_segment_gated_or_contained_transformed(
              (\"\".contains(\"\") is always true) and hide a real gate deletion"
         );
         if expected_fragment == "." || expected_fragment == ".." {
-            // A whole-path substring search is too weak here: a coincidental `.` baked
-            // into a static suffix the sink always appends (e.g. `.json`/`.xml`) would
-            // satisfy `contains` even if the real gate is deleted and the actual `.`/`..`
-            // segment was silently removed by dot-segment normalization, leaving no trace
-            // of it anywhere. Require a per-segment match instead: some path segment, once
-            // decoded, must itself start with the dot-segment value — `starts_with` (not
-            // exact equality) accommodates a sink that glues the identifier directly onto a
-            // static suffix with no separator (e.g. deps-bundler's `versions_url`, which
-            // decodes a `..` identifier to the segment `"..json"`).
+            // A whole-path substring search is too weak: a coincidental `.` in a static
+            // suffix (e.g. `.json`) would satisfy `contains` even if the real `.`/`..`
+            // segment was silently removed by dot-segment normalization. Require a
+            // per-segment match instead — `starts_with`, not exact equality, accommodates a
+            // sink gluing the identifier onto a static suffix with no separator (e.g.
+            // deps-bundler's `versions_url` decoding `..` to `"..json"`).
             let matched = parsed.path_segments().is_some_and(|mut segs| {
                 segs.any(|seg| {
                     urlencoding::decode(seg)
@@ -293,27 +290,18 @@ pub fn assert_dot_segment_gated_or_contained_transformed(
     }
 }
 
-// Gated separately from the rest of this module (which also compiles under plain
-// `cfg(test)`, i.e. `cargo test -p deps-core` with no explicit features): `tracing-subscriber`
-// is an *optional* dependency enabled only by the `test-util` feature, so a build that hits
-// this module via bare `cfg(test)` alone would fail to resolve it without this narrower gate.
+// Gated separately from the rest of this module (which also compiles under plain `cfg(test)`):
+// `tracing-subscriber` is optional, enabled only by `test-util`, so bare `cfg(test)` alone
+// would fail to resolve it.
 //
-// This installs exactly one process-wide subscriber (guarded by `Once`) instead of swapping in
-// a fresh scoped one per call. `tracing-core` caches a callsite's `Interest` once, for the life
-// of the process, the first time that callsite executes. With a single live dispatcher (the
-// common case), that verdict is computed against it directly — but with two or more dispatchers
-// live at once, `tracing-core` unions interest across all of them instead of asking just one.
-// That is exactly the situation concurrent tests created under the old per-call scoped-subscriber
-// design (each installing its own `Dispatch` via `with_default`/`set_default`), which is why the
-// original bug was intermittent rather than reproducible by a simple sequential repro: an
-// untraced sibling test's dispatcher could contribute `Interest::never()` to that union before
-// the capturing test's own scoped subscriber was ever installed, permanently poisoning the
-// callsite and silently emptying the capturing test's buffer regardless of its own subscriber
-// (#1006). A single global subscriber removes the multiple-live-dispatcher scenario entirely,
-// and its filter always reporting `Interest::sometimes()` (see `ThreadLocalLevelFilter` below)
-// keeps the cached verdict from ever finalizing to a terminal `never`/`always` — `sometimes` is
-// still a cached decision, just one meaning "call `enabled()` again on every occurrence" rather
-// than a permanent skip or permanent record.
+// Installs exactly one process-wide subscriber (guarded by `Once`) rather than a fresh scoped
+// one per call. `tracing-core` caches a callsite's `Interest` for the process lifetime on
+// first hit; with the old per-call design, an untraced sibling test's dispatcher could
+// contribute `Interest::never()` before the capturing subscriber installed, permanently
+// poisoning the callsite (#1006), making the bug intermittent. A single global subscriber
+// removes the multiple-dispatcher scenario; its filter always reports `Interest::sometimes()`
+// (see `ThreadLocalLevelFilter` below) so the cached verdict never finalizes to a terminal
+// `never`/`always`.
 #[cfg(feature = "test-util")]
 mod tracing_capture {
     use std::cell::{Cell, RefCell};
@@ -391,11 +379,9 @@ mod tracing_capture {
             let subscriber = tracing_subscriber::registry().with(fmt_layer);
             tracing::subscriber::set_global_default(subscriber)
                 .expect("test-capture tracing subscriber must install exactly once per process");
-            // `set_global_default` already rebuilds the interest cache as a side effect of
-            // constructing the new `Dispatch`, so any callsite a pre-existing subscriber-less
-            // default had already cached `never` for is un-poisoned before this line runs. This
-            // explicit call is defense-in-depth insurance, not the primary un-poisoning step —
-            // kept in case that internal behavior of `set_global_default` ever changes.
+            // `set_global_default` already rebuilds the interest cache as a side effect, so
+            // this explicit call is defense-in-depth insurance, kept in case that internal
+            // behavior ever changes.
             tracing::callsite::rebuild_interest_cache();
         });
     }

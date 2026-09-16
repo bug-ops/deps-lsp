@@ -137,7 +137,6 @@ fn parse_cargo_lock(content: String) -> Result<ResolvedPackages> {
             continue;
         };
 
-        // Extract required fields
         let Some(name) = table.get("name").and_then(|v| v.as_str()) else {
             tracing::warn!("Package missing name field");
             continue;
@@ -148,10 +147,7 @@ fn parse_cargo_lock(content: String) -> Result<ResolvedPackages> {
             continue;
         };
 
-        // Parse source (optional for path dependencies)
         let source = parse_cargo_source(table.get("source").and_then(|v| v.as_str()));
-
-        // Parse dependencies array (optional)
         let dependencies = parse_cargo_dependencies_from_table(table);
 
         packages.insert(
@@ -215,12 +211,11 @@ fn parse_cargo_dependencies_from_table(table: &toml_span::value::Table<'_>) -> V
     deps_array
         .iter()
         .filter_map(|item| {
-            // Simple string format (most common)
             if let Some(s) = item.as_str() {
                 return Some(s.to_string());
             }
 
-            // Table format (rare, extract "name" field)
+            // Rarer table format.
             if let Some(t) = item.as_table()
                 && let Some(name) = t.get("name").and_then(|v| v.as_str())
             {
@@ -238,10 +233,9 @@ mod tests {
 
     use std::assert_matches;
 
-    // #758: shared `LockFileProvider` conformance, replacing test_locate_lockfile_same_directory,
-    // test_locate_lockfile_not_found, and test_parse_malformed_cargo_lock.
-    // test_locate_lockfile_workspace_root stays hand-written: it exercises the
-    // ancestor-directory search, a scenario this macro doesn't cover.
+    // #758: shared `LockFileProvider` conformance, replacing three hand-written tests.
+    // `test_locate_lockfile_workspace_root` stays: it exercises the ancestor-directory
+    // search, which this macro doesn't cover.
     deps_core::lockfile_conformance! {
         mod cargo_lockfile_conformance;
         build: CargoLockParser;
@@ -306,9 +300,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_cargo_lock_rejects_excessive_nesting() {
-        // Held per `deps_core::fs_probe::snapshot_guard`'s doc: `parse_lockfile` transitively
-        // touches fs_probe (via `read_and_parse_lockfile`), and this test runs in the same
-        // binary as `deps-cargo/src/config.rs`'s diffing test.
+        // `parse_lockfile` transitively touches fs_probe (via `read_and_parse_lockfile`);
+        // shares a binary with config.rs's diffing test (snapshot_guard).
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         // Well past MAX_TOML_NESTING_DEPTH (64) but far below the depth
         // that would actually overflow the stack, so the guard is what's
@@ -484,9 +477,8 @@ version = 4
 
     #[test]
     fn test_locate_lockfile_workspace_root() {
-        // Held per `deps_core::fs_probe::snapshot_guard`'s doc: `locate_lockfile`
-        // transitively touches fs_probe (via `fs_probe::is_file`), and this test runs in the
-        // same binary as `deps-cargo/src/config.rs`'s diffing test.
+        // `locate_lockfile` transitively touches fs_probe (via `is_file`); shares a binary
+        // with config.rs's diffing test (snapshot_guard).
         let _guard = deps_core::fs_probe::snapshot_guard();
         let temp_dir = tempfile::tempdir().unwrap();
         let workspace_lock = temp_dir.path().join("Cargo.lock");

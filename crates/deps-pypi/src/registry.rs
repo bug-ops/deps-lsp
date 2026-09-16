@@ -662,7 +662,6 @@ impl PypiRegistry {
 
 deps_core::impl_get_versions_with_passthrough!(PypiRegistry, PypiVersion);
 
-// Implement Registry trait for PypiRegistry
 impl deps_core::Registry for PypiRegistry {
     fn get_versions<'a>(
         &'a self,
@@ -844,8 +843,6 @@ impl deps_core::Registry for PypiRegistry {
         self
     }
 }
-
-// JSON response types
 
 #[derive(Debug, Deserialize)]
 struct PypiResponse {
@@ -1076,7 +1073,6 @@ fn parse_simple_api_response(package_name: &str, data: &[u8]) -> Result<Vec<Pypi
         })
         .collect();
 
-    // Sort by version (newest first) using pre-parsed versions
     versions_with_parsed.sort_by(|a, b| b.1.cmp(&a.1));
 
     Ok(versions_with_parsed.into_iter().map(|(v, _)| v).collect())
@@ -1664,12 +1660,10 @@ mod tests {
 
     #[test]
     fn test_wildcard_specifier_normalization() {
-        // Test that "*" is normalized to empty string for PEP 440 compatibility
-        // The get_latest_matching method normalizes "*" to "" internally
         let normalized = if "*" == "*" { "" } else { "*" };
         assert_eq!(normalized, "");
 
-        // Verify that empty string is valid PEP 440 (matches any version)
+        // Empty string is valid PEP 440 and matches any version
         let specs = VersionSpecifiers::from_str("").unwrap();
         assert!(specs.contains(&Version::from_str("1.0.0").unwrap()));
         assert!(specs.contains(&Version::from_str("2.5.3").unwrap()));
@@ -1947,7 +1941,6 @@ mod tests {
         let index_url = format!("{}/simple/", server.url());
         let registry = PypiRegistry::with_index_url(cache, index_url);
 
-        // The very first call must not block on the download.
         let results = registry.search("reque", 10).await.unwrap();
         assert!(
             results.is_empty(),

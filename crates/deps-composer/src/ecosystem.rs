@@ -145,11 +145,8 @@ impl Ecosystem for ComposerEcosystem {
             return None;
         }
         let (prefix, _) = extract_prefix(line, position.character);
-        // A closed key or an open value string (see `extract_prefix`) both come back
-        // as an empty prefix — there is no safe text to offer at that position, so
-        // this suppresses the completion entirely (`None`, same as "no completable
-        // position at all") rather than relying on the caller's own `prefix.is_empty()`
-        // guard (#729).
+        // A closed key or open value string both yield an empty prefix (#729) — suppress
+        // explicitly rather than relying on the caller's own `prefix.is_empty()` guard.
         if prefix.is_empty() {
             return None;
         }
@@ -395,9 +392,8 @@ mod tests {
 
     #[test]
     fn test_extract_prefix_closed_key_is_suppressed_not_reopened() {
-        // #729 critic S1: cursor right after an already fully-closed key (quote
-        // parity even) is NOT an open string — bare-inserting there would duplicate
-        // the closed key's quote. Suppressed instead of guessed.
+        // #729 critic S1: a fully-closed key (quote parity even) is NOT an open string —
+        // bare-inserting there would duplicate the closed key's quote.
         let line = "    \"monolog/monolog\"";
         assert_eq!(extract_prefix(line, line.len() as u32), ("", false));
     }

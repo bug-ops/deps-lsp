@@ -15,14 +15,12 @@ use tower_lsp_server::ls_types::{
     InsertTextFormat,
 };
 
-// Completion is keystroke-driven and must stay responsive, so registry-backed
-// completion work gets its own short timeout instead of sharing the 30s HTTP client
-// timeout used elsewhere ([`COMPLETION_SEARCH_TIMEOUT`]).
+// Keystroke-driven, so completion gets its own short timeout instead of sharing the 30s
+// HTTP client timeout used elsewhere ([`COMPLETION_SEARCH_TIMEOUT`]).
 //
-// Shared with `deps_core::completion` (rather than kept local) because
-// registry-backed completion paths that retry internally on failure (e.g.
-// `deps-maven`'s `search`, #274) must size their own retry budget against
-// this same value — see `deps_core::completion::COMPLETION_SEARCH_TIMEOUT`'s doc.
+// Shared with `deps_core::completion`, not kept local: registry paths that retry
+// internally on failure (e.g. deps-maven's search, #274) size their retry budget against
+// this same value.
 
 /// Handles completion requests.
 ///
@@ -48,27 +46,20 @@ pub async fn handle_completion(
         position.character
     );
 
-    // Snapshot before any document lookup, matching hover.rs/diagnostics.rs's ordering —
-    // this acquires the config RwLock before the DashMap shard guard, never the reverse.
+    // Acquires the config RwLock before the DashMap shard guard, never the reverse
+    // (matches hover.rs/diagnostics.rs).
     let freshness = { config.read().await.policy.freshness.to_settings() };
 
-    // Resolved once, from the URI alone via `for_uri` (the same routing
-    // `handle_document_open` uses), rather than from the loaded document's
-    // `ecosystem_id` — that would only be available *after* the document-load and
-    // document-lookup early returns below. `is_some_and` (not `?`) so an
-    // unrecognized URI falls through to `false` (matching every ecosystem's
-    // default) rather than short-circuiting this function.
+    // Resolved from the URI alone via `for_uri`, not the loaded document's `ecosystem_id`
+    // (only available after the load/lookup early returns below). `is_some_and`, not `?`,
+    // so an unrecognized URI falls through to `false` instead of short-circuiting.
     let package_search_is_incomplete = crate::lsp_types_interop::from_lsp_uri(uri)
         .and_then(|domain_uri| state.ecosystem_registry.for_uri(&domain_uri))
         .is_some_and(|e| e.package_search_is_incomplete());
 
-    // Shared by the document-load and document-lookup early returns below, so
-    // both report `isIncomplete` consistently for an ecosystem whose package-name
-    // search (the only kind of completion either path could otherwise have
-    // produced, via `fallback_completion`) may be a truncated view of a larger
-    // candidate set (#419 S1) — `None` would serialize as LSP `null`, which
-    // carries no `isIncomplete` and leaves the client with nothing to invalidate
-    // on the next keystroke.
+    // Shared by the early returns below so both report `isIncomplete` consistently when
+    // `fallback_completion`'s package-name search may be truncated (#419 S1) — `None`
+    // would serialize as LSP `null`, giving the client nothing to invalidate.
     let context_less_response = || {
         if package_search_is_incomplete {
             Some(CompletionResponse::List(CompletionList {
@@ -80,12 +71,10 @@ pub async fn handle_completion(
         }
     };
 
-    // Check if document is loaded, if not try to load with short timeout
-    // Completion is latency-critical, so we use a 200ms timeout
+    // Latency-critical: the cold-start load is capped at 200ms.
     if state.get_document(uri).is_none() {
         tracing::info!("completion: document not loaded, loading from disk");
 
-        // Try to load with short timeout (200ms)
         let load_result = tokio::time::timeout(
             std::time::Duration::from_millis(200),
             ensure_document_loaded(uri, Arc::clone(&state), client.clone(), Arc::clone(&config)),
@@ -94,26 +83,19 @@ pub async fn handle_completion(
 
         match load_result {
             Ok(true) => {
-                // Document loaded successfully, continue with completion
                 tracing::debug!("completion: document loaded successfully");
             }
             Ok(false) | Err(_) => {
-                // Load failed or timed out, return empty completions
                 tracing::warn!("completion: document load failed or timed out");
                 return context_less_response();
             }
         }
     }
 
-    // Own everything needed from the document in a single shard acquisition, then
-    // release the `Ref` immediately: two separate acquisitions (one for `content`, a
-    // later one for `parse_result`) would let a concurrent `didChange` land in
-    // between, pairing a `parse_result` with `content` from a different document
-    // revision — `generate_completions` correlates the two (e.g. `extract_prefix`
-    // slicing `content` at a range taken from `parse_result`), so a torn pair risks
-    // wrong or out-of-bounds-guarded-empty completions (#319 review).
-    // `with_document` makes releasing the guard structural rather than a convention
-    // to remember (#333).
+    // A single shard acquisition, not two separate ones for `content` and `parse_result`:
+    // a concurrent `didChange` between them could pair a `parse_result` with `content` from
+    // a different revision, and `generate_completions` correlates the two (#319 review).
+    // `with_document` makes releasing the guard structural, not a convention (#333).
     let Some((ecosystem_id, ecosystem_kind, content, parse_result)) =
         state.with_document(uri, |doc| {
             (
@@ -136,23 +118,16 @@ pub async fn handle_completion(
         parse_result.is_some()
     );
 
-    // Try parse_result first, fallback to text-based detection. `is_incomplete` is
-    // the per-call signal `generate_completions` computed for the actual completion
-    // context it served (#427). Whenever `fallback_completion` actually runs — the
-    // primary result was empty, or there was no `parse_result` to call
-    // `generate_completions` with at all — it is OR'd with
-    // `ecosystem.package_search_is_incomplete()`: `fallback_completion` always
-    // performs a raw package-name search via `Registry::search` regardless of the
-    // primary context, so it inherits the primary's `is_incomplete` only by
-    // coincidence, not because the two searches share a completeness signal.
+    // Try parse_result first, fall back to text-based detection. `is_incomplete` (#427) is
+    // OR'd with `package_search_is_incomplete()` whenever `fallback_completion` actually
+    // runs: it always does a raw package-name search regardless of the primary context, so
+    // it only coincidentally inherits the primary's completeness signal.
     let (items, is_incomplete) = if let Some(parse_result) = parse_result {
         match state.ecosystem_registry.get(ecosystem_id) {
             Some(ecosystem) => {
-                // The DashMap shard `Ref` was already dropped above, before this
-                // timeout-bound await: the search can run for up to
-                // `COMPLETION_SEARCH_TIMEOUT`, and holding the guard that long would
-                // block a concurrent `documents.get_mut` on the same shard for the
-                // duration (#319).
+                // The DashMap shard `Ref` was already dropped above: holding it across
+                // this `COMPLETION_SEARCH_TIMEOUT`-bounded await would block a concurrent
+                // `documents.get_mut` on the same shard for the duration (#319).
                 let completion_result = tokio::time::timeout(
                     COMPLETION_SEARCH_TIMEOUT,
                     ecosystem.generate_completions(
@@ -165,8 +140,7 @@ pub async fn handle_completion(
                 .await;
 
                 match completion_result {
-                    // Ecosystem returned no completions: try fallback, since this
-                    // handles the case where the user is typing a NEW package name.
+                    // Try fallback: handles the case where the user is typing a new package name.
                     Ok(completions) if completions.items.is_empty() => {
                         tracing::info!("completion: ecosystem returned empty, trying fallback");
                         let fallback_items =
@@ -177,10 +151,8 @@ pub async fn handle_completion(
                         )
                     }
                     Ok(completions) => (completions.items, completions.is_incomplete),
-                    // Timed out, not genuinely empty: the registry is slow right now,
-                    // so a fallback search against the same registry would likely
-                    // time out too. Skip it instead of doubling the worst-case
-                    // latency.
+                    // Timed out, not genuinely empty: a fallback search against the same
+                    // slow registry would likely time out too, doubling the worst case.
                     Err(_) => {
                         tracing::warn!(
                             "completion: generate_completions timed out after \
@@ -197,12 +169,9 @@ pub async fn handle_completion(
             }
         }
     } else {
-        // Fallback: detect context from raw text. No `parse_result` means
-        // `generate_completions` was never called, so `package_search_is_incomplete`
-        // (already resolved for this URI's ecosystem above) is the only signal
-        // available — matches the every-`didChange`-with-a-parse-failure case
-        // (`document/lifecycle.rs`'s `new_without_parse_result`), exactly the
-        // mid-typing state for a new package name.
+        // No `parse_result`: `generate_completions` was never called, so
+        // `package_search_is_incomplete` (resolved above) is the only signal available —
+        // matches the mid-typing, parse-failed state (`new_without_parse_result`).
         (
             fallback_completion(&state, ecosystem_kind, position, &content).await,
             package_search_is_incomplete,
@@ -212,10 +181,8 @@ pub async fn handle_completion(
     tracing::info!("completion: returning {} items", items.len());
 
     if is_incomplete {
-        // Must still be a `List` when `items` is empty: `None` serializes as LSP
-        // `null`, which carries no `isIncomplete` and leaves the client with
-        // nothing to invalidate on the next keystroke (#419 C1) — this is the
-        // cold-start-returns-empty case PyPI's search index relies on.
+        // Must still be a `List` even when `items` is empty: `None` serializes as LSP
+        // `null`, giving the client nothing to invalidate (#419 C1).
         Some(CompletionResponse::List(CompletionList {
             is_incomplete: true,
             items,
@@ -257,32 +224,21 @@ async fn fallback_completion(
         return vec![];
     };
 
-    // Collapses this file's former separate "line not found" / "not in dependencies
-    // section" log lines into one — both are now internal to the ecosystem's own
-    // `fallback_completion_prefix`, which has no completable position to report either
-    // way.
     let Some(prefix) = ecosystem.fallback_completion_prefix(content, position.into()) else {
         tracing::info!("fallback_completion: no completable prefix at this position");
         return vec![];
     };
 
-    // Shares the same 2-200 char guard every primary (parsed-AST) completion path
-    // uses (`is_valid_completion_prefix_len`), rather than hand-rolling only the
-    // lower half of it: an unbounded prefix here would flow straight into the
-    // tracing logs below and into `registry.search`'s outbound request/cache key
-    // (#739).
+    // Same 2-200 char guard every primary completion path uses: an unbounded prefix here
+    // would flow into the tracing logs below and into `registry.search`'s request/cache key (#739).
     if prefix.contains('=') || !is_valid_completion_prefix_len(prefix) {
         tracing::info!("fallback_completion: prefix rejected (contains =, or invalid length)");
         return vec![];
     }
 
-    // Whether the cursor sits inside manifest markup that's already open (an XML
-    // tag or attribute value) and can only safely hold the bare candidate text,
-    // rather than `completion_insert_text`'s normal full snippet — inserting the
-    // full snippet there would nest a duplicate copy of the markup already open
-    // around the cursor (#724/#728). Decided once per call, from the same
-    // `content`/`position` `fallback_completion_prefix` used, and applied to every
-    // result.
+    // Whether the cursor sits inside already-open manifest markup (an XML tag/attribute)
+    // that can only safely hold bare candidate text — inserting the full snippet would
+    // nest a duplicate copy of the markup already open around the cursor (#724/#728).
     let bare = ecosystem.fallback_completion_is_bare(content, position.into());
 
     tracing::info!(
@@ -332,7 +288,6 @@ async fn search_packages(
             }
         };
 
-    // Convert search results to completion items
     results
         .iter()
         .filter_map(|metadata| create_package_completion_item(metadata.as_ref(), ecosystem, bare))
@@ -395,7 +350,6 @@ fn create_package_completion_item(
         ecosystem.completion_insert_text(metadata)?
     };
 
-    // Build detail text
     let detail = if latest.is_empty() {
         None
     } else {
@@ -731,9 +685,8 @@ mod tests {
         state
             .ecosystem_registry
             .register(Arc::new(IncompleteEcosystem));
-        // Deliberately never inserted into `state.documents` — the document-load
-        // path below must time out/fail against a nonexistent file, exactly the
-        // `test_completion_returns_empty_for_missing_document` shape.
+        // Deliberately never inserted into `state.documents`: the document-load below
+        // must time out/fail against a nonexistent file.
         let uri = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
             "/test/Cargo.toml",
         ));
@@ -762,9 +715,8 @@ mod tests {
     #[cfg(feature = "cargo")]
     #[tokio::test]
     async fn test_completion_delegates_to_ecosystem() {
-        // Held per `deps_core::fs_probe::snapshot_guard`'s doc: `ecosystem.parse_manifest` (cargo)
-        // transitively touches fs_probe, and this test runs in the same binary as
-        // `document/loader.rs`'s diffing test.
+        // Held per fs_probe::snapshot_guard's doc: parse_manifest touches fs_probe and
+        // this test shares a binary with document/loader.rs's diffing test.
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let state = Arc::new(ServerState::new());
         let url = deps_core::test_util::test_uri("/test/Cargo.toml");
@@ -772,7 +724,6 @@ mod tests {
 
         let content = "[dependencies]\nserde = \"1.0\"".to_string();
 
-        // Parse the manifest to get a proper parse result
         let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
         let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
 
@@ -789,11 +740,8 @@ mod tests {
             context: None,
         };
 
-        // Should return Some or None based on ecosystem implementation
-        // We don't test the actual completions here as that's ecosystem-specific
         let (client, config) = create_test_client_and_config();
         let _result = handle_completion(state, params, client, config).await;
-        // Just verify it doesn't panic - actual completion logic is in ecosystem
     }
 
     /// #319 liveness regression: `handle_completion` must release the DashMap shard
@@ -855,19 +803,15 @@ mod tests {
             }
         });
 
-        // Block until `generate_completions` has actually started executing — i.e.
-        // `handle_completion` has reached (and is now inside) the
-        // `COMPLETION_SEARCH_TIMEOUT`-bounded await — before racing the writer below.
+        // Block until `handle_completion` has actually reached the search-bound await
+        // before racing the writer below.
         started.wait().await;
 
-        // Spawned onto its own task (rather than awaited inline) deliberately:
-        // `DashMap::get_mut` blocks the OS thread synchronously on a `parking_lot`
-        // lock, with no `.await` point of its own. Wrapping that blocking call
-        // directly in `tokio::time::timeout` would not work — a `Future::poll` that
-        // never returns can't be preempted by a sibling timer that only fires between
-        // polls. Spawning it gives the *join* a real async yield point, so the
-        // `timeout` below can race against it and fire even while the spawned task
-        // sits blocked on the shard lock.
+        // Spawned as its own task deliberately: `DashMap::get_mut` blocks the OS thread
+        // synchronously on a `parking_lot` lock with no `.await` point of its own, so
+        // wrapping it directly in `tokio::time::timeout` wouldn't work — a `Future::poll`
+        // that never returns can't be preempted between polls. Spawning gives the *join*
+        // a real async yield point for the timeout below to race against.
         let write_task = tokio::spawn({
             let state = Arc::clone(&state);
             let uri = uri.clone();
@@ -1119,12 +1063,10 @@ mod tests {
             "/test/Cargo.toml",
         ));
 
-        // Malformed content that will fail to parse
         let content = r"[dependencies]
 ser"
         .to_string();
 
-        // Create document without parse result (simulating parse failure)
         let doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, content.clone());
         state.update_document(uri.clone(), doc);
 
@@ -1138,11 +1080,8 @@ ser"
             context: None,
         };
 
-        // Should use fallback completion (won't panic, may return empty if search fails)
         let (client, config) = create_test_client_and_config();
         let result = handle_completion(state, params, client, config).await;
-        // Just verify it doesn't panic - actual results depend on registry availability
-        // In a real scenario with mocked registry, we'd verify it returns search results
         drop(result);
     }
 

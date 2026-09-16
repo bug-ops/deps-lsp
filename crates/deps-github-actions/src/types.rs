@@ -136,9 +136,7 @@ pub struct GithubActionsVersion {
     pub published_at: Option<deps_core::PublishTime>,
 }
 
-// GitHub's tags API exposes no yank/deprecation signal for actions (mirroring
-// `deps-swift`'s `SwiftVersion` — see `Registry::reports_yanked` on
-// `GithubActionsRegistry`), so `status` is unconditionally `Available`.
+// No yank/deprecation signal in GitHub's tags API (mirrors deps-swift), so status is always `Available`.
 deps_core::impl_version!(GithubActionsVersion {
     version: version,
     status: |_v: &GithubActionsVersion| deps_core::RemovalStatus::Available,

@@ -99,10 +99,8 @@ mod tests {
     async fn test_progress_sender_try_send_on_closed_channel() {
         let (sender, rx) = channel(10);
 
-        // Drop receiver — channel is closed
         drop(rx);
 
-        // Should not panic
         sender.send(5);
     }
 
@@ -111,9 +109,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(1);
         let sender = ProgressSender { tx, total: 10 };
 
-        // Fill the channel
         sender.send(1);
-        // Should silently drop — channel is full
         sender.send(2);
         sender.send(3);
     }

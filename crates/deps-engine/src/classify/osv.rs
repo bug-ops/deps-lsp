@@ -138,16 +138,10 @@ pub fn build_scan_targets(
             continue;
         }
 
-        // lockfile holds the pin) — so for a Go `require` dependency the
-        // manifest itself is the authoritative version, not go.sum. go.sum is
-        // a checksum ledger that `go get`/`go build` only ever append to
-        // (only `go mod tidy` prunes it), so its last-occurrence-wins parse
-        // can yield a stale version still recorded in the file but no longer
-        // selected by Go's MVS, silently mismatching whatever's actually in
-        // use. Skipping the lockfile lookup avoids feeding that stale version
-        // to OSV (excludes/replaces fall through to the lockfile lookup below
-        // like any other ecosystem, since their `version_requirement()` is
-        // not an in-use version — see `manifest_requirement_is_resolved_version`).
+        // go.mod's `require` line, not go.sum, is authoritative for Go: go.sum is an
+        // append-only ledger (only `go mod tidy` prunes it), so its last-occurrence-wins
+        // parse can yield a stale, no-longer-selected version (see
+        // `manifest_requirement_is_resolved_version`).
         let version = resolve_in_use_version(
             dep,
             &normalized_name,
@@ -464,12 +458,9 @@ mod tests {
                 &self.name
             }
             fn name_range(&self) -> Range {
-                // Distinct per instance (not a fixed constant): `vulnerability_keys`
-                // (#394 S2) keys a `HashMap<Range, String>` by `name_range()`,
-                // requiring it to uniquely identify each occurrence the way a
-                // real parser's source-derived range always does. A hardcoded
-                // range here would make every `MockDep` in a test collide on
-                // one map entry.
+                // Distinct per instance: `vulnerability_keys` (#394 S2) keys a
+                // `HashMap<Range, String>` by `name_range()` — a fixed range would
+                // make every `MockDep` collide on one map entry.
                 let addr = std::ptr::from_ref(self) as u32;
                 Range::new(Position::new(0, addr), Position::new(0, addr + 1))
             }
@@ -628,10 +619,8 @@ mod tests {
 
         #[test]
         fn build_scan_targets_normalizes_version_via_formatter_osv_version_hook() {
-            // Go module versions carry a mandatory "v" prefix that OSV's
-            // SEMVER range matching forbids (#228) — build_scan_targets must
-            // route the resolved version through the formatter hook rather
-            // than sending the native spelling on the wire.
+            // Go's mandatory "v" prefix isn't valid OSV SEMVER (#228) — must route through
+            // the formatter hook rather than sending the native spelling on the wire.
             let parse_result = MockParseResult {
                 deps: vec![MockDep {
                     name: PackageName::new("github.com/gin-gonic/gin"),
@@ -690,15 +679,11 @@ mod tests {
 
         #[test]
         fn build_scan_targets_go_ignores_stale_lockfile_version_uses_go_mod_requirement() {
-            // go.sum is a checksum ledger that `go get`/`go build` only ever
-            // append to — a stale, no-longer-selected higher version can
-            // remain recorded there after a downgrade (only `go mod tidy`
-            // prunes it), and since go.sum is written sorted ascending by
-            // semver, that stale entry always sorts last and wins
-            // last-occurrence-wins parsing. Unlike Cargo/npm, go.mod's
-            // `require` line is already an exact pinned version, so for Go
-            // the manifest itself — not the lockfile-derived
-            // `resolved_versions` — must be authoritative for OSV scanning.
+            // go.sum is append-only (only `go mod tidy` prunes it) and sorted ascending by
+            // semver, so a stale higher version from before a downgrade can sort last and
+            // win last-occurrence-wins parsing. go.mod's `require` line is already an exact
+            // pin, so for Go the manifest — not lockfile-derived `resolved_versions` — must
+            // be authoritative for OSV scanning.
             let parse_result = MockParseResult {
                 deps: vec![MockDep {
                     name: PackageName::new("github.com/pkg/errors"),
@@ -793,12 +778,8 @@ mod tests {
 
         #[test]
         fn build_scan_targets_step2_strips_pin_marker_for_operator_prefixed_requirements() {
-            // impl-critic M2: the `concrete_pin_version` fix (originally
-            // scoped to the PyPI `==` case) also strips Cargo's `=` and
-            // NuGet's `[..]` exact-pin markers, since both callers share the
-            // same helper — a strict improvement over the old verbatim
-            // `"=1.2.3"`/`"[1.0.0]"` OSV scan targets, which would never
-            // have matched a real advisory's affected-version range anyway.
+            // impl-critic M2: `concrete_pin_version` (originally PyPI `==`-only) also
+            // strips Cargo's `=` and NuGet's `[..]` exact-pin markers via the shared helper.
             let cargo_result = MockParseResult {
                 deps: vec![MockDep {
                     name: PackageName::new("time"),
@@ -1113,13 +1094,9 @@ mod tests {
 
         #[test]
         fn collect_in_use_versions_tracks_all_occurrences_of_duplicate_name() {
-            // Regression guard for #394: two occurrences of the same
-            // dependency name (e.g. under different
-            // `[target.*.dependencies]` blocks, or `[dependencies]` +
-            // `[dev-dependencies]`) with different concrete pins and no lock
-            // file must both surface an in-use version for the yanked probe
-            // — a name-keyed `HashMap<PackageName, String>` would silently
-            // drop all but the last occurrence's pin.
+            // Regression guard for #394: two occurrences of the same name with different
+            // pins (e.g. `[dependencies]` + `[dev-dependencies]`) must both surface — a
+            // name-keyed `HashMap<PackageName, String>` would drop all but the last pin.
             let parse_result = MockParseResult {
                 deps: vec![
                     MockDep {
@@ -1246,12 +1223,10 @@ mod tests {
 
         #[test]
         fn resolve_fix_target_always_needs_live_check_when_f_differs_from_latest() {
-            // #462 critic C1: there is no data-derived shortcut. Even though every known
-            // advisory's fix (1.2.0) is already at or below F, that is a tautology — F is
-            // *computed from* these exact advisories, so this check would always pass at its
-            // only call site and prove nothing about an advisory phase A never fetched at
-            // all. F (1.2.0) differs from latest (3.0.0), so this must always queue a live
-            // check, batched under the fix-target key suffix.
+            // #462 critic C1: no data-derived shortcut — F is *computed from* these exact
+            // advisories, so "F <= advisories' fix" is a tautology that proves nothing about
+            // an advisory phase A never fetched. F (1.2.0) != latest (3.0.0) must always
+            // queue a live check.
             let dv = dv(
                 vec![advisory("A1", &["1.2.0"])],
                 UpgradeStatus::CandidateClean {

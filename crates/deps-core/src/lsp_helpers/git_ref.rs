@@ -282,11 +282,8 @@ pub fn marker_byte_offset(
     };
     let line_end = table.line_start(line).unwrap_or(content.len());
     let line_text = content.get(line_start..line_end).unwrap_or_default();
-    // #742-style fast path: an ASCII line has 1 byte per char, so `col` (a char count) is
-    // already a byte offset — skip the `char_indices()` walk entirely. Without this,
-    // `marker_byte_offset` was O(line length) per call, turning a wide single-line manifest
-    // (the exact shape `MAX_FALLBACK_SCAN_BYTES` was bounded against) back into an O(n^2)
-    // parse.
+    // #742-style fast path: an ASCII line has 1 byte per char, so `col` is already a byte
+    // offset — skip the `char_indices()` walk, which made this O(line length) per call.
     let byte_in_line = if table
         .line_is_ascii
         .get(line.saturating_sub(1))
@@ -295,10 +292,8 @@ pub fn marker_byte_offset(
     {
         col.min(line_text.len())
     } else {
-        // #882: a non-ASCII line falls back to a char-boundary walk, but a naive
-        // `char_indices().nth(col)` per call is O(line length), turning N lookups on the
-        // same wide non-ASCII line into O(N x line length). `LineOffsetTable`'s cached
-        // per-line index makes every lookup after the first on a given line O(1).
+        // #882: a naive char_indices().nth(col) walk per call is O(line length); the
+        // cached per-line index makes repeat lookups on the same line O(1).
         table.non_ascii_char_byte_offset(line.saturating_sub(1), line_text, col)
     };
     line_start + byte_in_line
@@ -347,11 +342,8 @@ pub const MAX_FALLBACK_SCAN_BYTES: usize = 1024;
 #[must_use]
 pub fn locate_value_span(content: &str, search_from: usize, value: &str) -> Option<(usize, usize)> {
     let bytes = content.as_bytes();
-    // `search_from` is a caller-supplied byte offset (`#673`: this is a `pub fn`, so its
-    // bound is not otherwise mechanically guaranteed) — reject it upfront, before the
-    // `value.is_empty()` case below, rather than letting either slice further down panic on
-    // an out-of-range start index (#673 M2: this must run first, or an empty `value` would
-    // return `Some((search_from, search_from))` unchecked for an out-of-range `search_from`).
+    // #673: reject an out-of-bounds search_from before the value.is_empty() check below
+    // (#673 M2: otherwise an empty value would return Some((search_from, search_from))).
     if search_from > bytes.len() {
         tracing::debug!(
             search_from,
@@ -373,16 +365,9 @@ pub fn locate_value_span(content: &str, search_from: usize, value: &str) -> Opti
             return Some((search_from, search_from + value.len()));
         }
     }
-    // Bound the window *before* searching for '\n', not after (issue #885 rework):
-    // searching the whole remainder of `content` for the next real newline before
-    // clamping to `MAX_FALLBACK_SCAN_BYTES` made that clamp limit only `scan_end`'s
-    // *value*, not the cost of computing it — the `position()` scan itself still ran
-    // the full remaining-line length. On a single huge physical line (#885's own
-    // shape), this reintroduced the same O(remaining-document-length)-per-call cost
-    // the cap exists to prevent. Bounding first makes `position()` itself
-    // O(`MAX_FALLBACK_SCAN_BYTES`); the resulting `scan_end` is identical either way
-    // (`min` is order-independent), so this is a pure performance fix, no behavior
-    // change. Guarded by the `search_from <= bytes.len()` check above.
+    // #885: bound the window *before* searching for '\n', not after — searching the whole
+    // remainder first reintroduces O(remaining-document-length) cost on one huge line even
+    // though the resulting scan_end value is the same either way (min is order-independent).
     #[allow(clippy::indexing_slicing)]
     let window_end = bytes
         .len()
@@ -656,10 +641,8 @@ mod tests {
 
     #[test]
     fn test_is_partial_semver_shaped_rejects_bare_unprefixed_integer() {
-        // #907 review S1: a bare all-digit token with no `v`/`V` prefix and no dot is
-        // indistinguishable from an arbitrary numeric comment annotation (a ticket
-        // number, a date) — must not be accepted as a version, unlike `is_tag_shaped`
-        // (safe only for an actual git ref, not free-text).
+        // #907 review S1: a bare all-digit token (ticket number, date) is indistinguishable
+        // from a version, so it must be rejected here unlike `is_tag_shaped`.
         assert!(!is_partial_semver_shaped("1234"));
         assert!(!is_partial_semver_shaped("20240501"));
         assert!(!is_partial_semver_shaped("0"));
@@ -712,10 +695,8 @@ mod tests {
 
     #[test]
     fn test_locate_value_span_bounded_scan_stays_fast_on_a_huge_line() {
-        // Regression guard for the quadratic blowup itself (security S-2): a
-        // several-megabyte single-line haystack (well under the crate's YAML
-        // expansion-size gate) must resolve in milliseconds, not minutes, once the scan
-        // is bounded.
+        // Regression guard (security S-2): a several-megabyte single-line haystack must
+        // resolve in milliseconds, not minutes, once the scan is bounded.
         let filler = "y".repeat(6 * 1024 * 1024);
         let value = "not-present-in-filler@v4";
         let content = format!("{filler}\n");
@@ -731,15 +712,9 @@ mod tests {
 
     #[test]
     fn test_locate_value_span_many_fallback_scans_on_one_huge_line_stay_bounded() {
-        // Regression for #885's rework (S2 finding): the pre-fix code searched the
-        // whole remainder of `content` for the next real newline *before* clamping
-        // to `MAX_FALLBACK_SCAN_BYTES`, so on a single huge physical line with no
-        // real newline nearby, each fallback-triggering call (the quoted-scalar
-        // case, where the direct-offset check misses and this scan runs) still cost
-        // O(remaining-document-length) despite the cap. Simulates many quoted
-        // `uses:`-shaped dependencies spread across one multi-megabyte single-line
-        // manifest, each forcing the fallback path since `value` never matches at
-        // its own `search_from`.
+        // Regression for #885 (S2): each fallback-triggering call on one huge physical line
+        // used to cost O(remaining-document-length) despite the cap. Simulates many
+        // fallback-forcing lookups on one multi-megabyte single-line manifest.
         let filler_segment = "z".repeat(64);
         let mut content = String::new();
         let mut offsets = Vec::new();
@@ -784,10 +759,8 @@ mod tests {
 
     #[test]
     fn test_marker_byte_offset_block_scalar_drift_regression() {
-        // #879: a non-ASCII char inside a `|` block scalar content line must not desync the
-        // byte offset resolved for a later scalar on the same document — this reproduces the
-        // upstream yaml-rust2 Marker::index() drift scenario using line/col directly, which
-        // must stay immune to it.
+        // #879: a non-ASCII char inside a `|` block scalar must not desync the byte offset
+        // resolved for a later scalar — reproduces the yaml-rust2 Marker::index() drift.
         let content = "run: |\n  echo \u{2014} hi\nuses: actions/checkout@v4\n";
         let table = LineOffsetTable::new(content);
         // Line 3, col 6 is where "actions/checkout@v4" starts (after "uses: ").
@@ -804,10 +777,8 @@ mod tests {
 
     #[test]
     fn test_marker_byte_offset_multiple_multibyte_chars_before_target_col() {
-        // Several multi-byte chars precede the target column within the same line — each
-        // must be counted as one *char*, not its own UTF-8 byte length, when walking to
-        // `col` (#879's exact failure mode, direct on the resolver rather than through a
-        // full yaml-rust2 parse).
+        // Each multi-byte char before the target col must count as one *char*, not its byte
+        // length, when walking to `col` (#879's failure mode, direct on the resolver).
         let content = "\u{2014}\u{2014}\u{3000}target";
         let table = LineOffsetTable::new(content);
         // 3 leading multi-byte chars (3 + 3 + 3 = 9 bytes), then "target" starts at char
@@ -827,11 +798,9 @@ mod tests {
 
     #[test]
     fn test_marker_byte_offset_ascii_fast_path_matches_char_indices_result() {
-        // Differential test: the `line_is_ascii` fast path (`col.min(line_text.len())`) must
-        // agree with the pre-S1 general `char_indices().nth(col)` walk (reimplemented here,
-        // verbatim, independent of `marker_byte_offset`'s own fast-path branch) for every
-        // column on an ASCII line, including an overshoot past the line's end — the exact
-        // class of desync S1's fix could silently introduce if the two arms ever diverged.
+        // Differential test: the `line_is_ascii` fast path must agree with the pre-S1
+        // general `char_indices().nth(col)` walk (reimplemented here) for every column on
+        // an ASCII line, including overshoot — the desync class S1's fix could introduce.
         fn slow_path(content: &str, table: &LineOffsetTable, line: usize, col: usize) -> usize {
             let Some(line_start) = table.line_start(line.saturating_sub(1)) else {
                 return content.len();
@@ -858,13 +827,8 @@ mod tests {
 
     #[test]
     fn test_marker_byte_offset_ascii_fast_path_stays_linear_on_a_huge_single_line() {
-        // Regression guard for S1 (impl-critic, #879 follow-up): without the `line_is_ascii`
-        // fast path, `marker_byte_offset` was O(line length) per call via
-        // `char_indices().nth(col)`, reintroducing the same O(n^2) shape
-        // `MAX_FALLBACK_SCAN_BYTES` was bounded against for a wide single-line manifest
-        // (`MAX_FALLBACK_SCAN_BYTES`'s own doc names this exact threat model). 5000 lookups
-        // at increasing columns on a several-megabyte ASCII line must stay well under a
-        // second, not tens of seconds.
+        // Regression guard (S1, impl-critic, #879 follow-up): without `line_is_ascii`,
+        // this was O(line length) per call, reintroducing the O(n^2) shape.
         let filler = "x".repeat(6 * 1024 * 1024);
         let table = LineOffsetTable::new(&filler);
         let start = std::time::Instant::now();
@@ -881,12 +845,9 @@ mod tests {
 
     #[test]
     fn test_marker_byte_offset_non_ascii_line_cache_stays_fast_on_a_huge_single_line() {
-        // Regression guard for #882: without the per-line char-boundary cache, a non-ASCII
-        // line's `char_indices().nth(col)` walk was O(line length) *per call*, so N lookups
-        // on the same wide non-ASCII line cost O(N x line length) — a several-hundred-KB
-        // line with 5000 lookups took ~500ms in a release build. 5000 lookups here (a
-        // smaller line than the perf agent's throwaway release-build bench, sized to stay
-        // fast in a debug test build too) must complete well under a second.
+        // Regression guard for #882: without the per-line char-boundary cache, N lookups on
+        // the same non-ASCII line cost O(N x line length) — ~500ms for 5000 lookups on a
+        // several-hundred-KB line in a release build.
         let filler = "x".repeat(200 * 1024);
         let content = format!("{filler}\u{2014}{filler}");
         let table = LineOffsetTable::new(&content);
@@ -935,10 +896,8 @@ mod tests {
 
     #[test]
     fn test_marker_byte_offset_multiple_non_ascii_lines_cache_isolation() {
-        // Coverage gap flagged by the #882 review: the cache is keyed by 0-indexed line
-        // number in a `HashMap`, so two or more distinct non-ASCII lines in the same document
-        // must resolve independently regardless of query order — querying line 2, then line
-        // 3, then re-querying line 2 must not leak or desync line 2's cached boundaries.
+        // Coverage gap flagged by #882 review: the per-line cache must resolve two or more
+        // non-ASCII lines independently regardless of query order, with no cross-line leak.
         fn slow_path(content: &str, table: &LineOffsetTable, line: usize, col: usize) -> usize {
             let Some(line_start) = table.line_start(line.saturating_sub(1)) else {
                 return content.len();
@@ -979,11 +938,9 @@ mod tests {
 
     #[test]
     fn test_marker_byte_offset_lone_cr_document_documented_limitation() {
-        // S2 (impl-critic, #879 follow-up): a bare-`\r` (no `\n`) document is out of scope
-        // for `LineOffsetTable`/`marker_byte_offset`, per the function's own "Line-ending
-        // assumption" doc section — `line` runs past the table's single line-start entry, so
-        // this falls back to `content.len()` rather than the true offset. Locking in the
-        // documented (not silently reverted) behavior, not asserting it is desirable.
+        // S2 (impl-critic, #879 follow-up): a bare-`\r` document is out of scope per the
+        // "Line-ending assumption" doc section, so this falls back to `content.len()`.
+        // Locks in the documented behavior, not asserting it is desirable.
         let content = "on: push\rjobs:\r  build:\r    steps:\r      - uses: actions/checkout@v4\r";
         let table = LineOffsetTable::new(content);
         // yaml-rust2 would report line 5 for the `uses:` value here; only line 1 exists in

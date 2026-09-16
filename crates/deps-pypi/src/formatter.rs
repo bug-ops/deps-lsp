@@ -472,39 +472,35 @@ mod tests {
     fn test_format_version_replacing_table() {
         let formatter = PypiFormatter;
 
-        // starts `===`
         assert_eq!(
             formatter.format_version_replacing(&ConcreteVersion::new("1.2"), "===1.0"),
             "===1.2"
         );
 
-        // starts `==`, no wildcard
         assert_eq!(
             formatter.format_version_replacing(&ConcreteVersion::new("1.2"), "==1.0"),
             "==1.2"
         );
 
-        // starts `==`, wildcard, latest has enough segments
         assert_eq!(
             formatter.format_version_replacing(&ConcreteVersion::new("1.6.2"), "==1.4.*"),
             "==1.6.*"
         );
 
-        // `~=` with >=2 release segments truncates, never over-specifies
+        // `~=` truncates to the pin's own precision, never over-specifies
         assert_eq!(
             formatter.format_version_replacing(&ConcreteVersion::new("1.26.4"), "~=1.24"),
             "~=1.26"
         );
 
-        // `~=` with a single release segment is invalid PEP 440 on its own; default
+        // `~=3` has a single release segment, invalid PEP 440 on its own; falls back to default
         assert_eq!(
             formatter.format_version_replacing(&ConcreteVersion::new("4.0.0"), "~=3"),
             ">=4.0.0,<5"
         );
 
-        // multi-specifier collapse: any comma-separated term starting with `==` wins,
-        // regardless of position (N1 fix — pep440_rs sorts specifiers by version, so
-        // `!=0.9,==1.0` in source may render sorted either way)
+        // N1 fix: an `==` term wins regardless of position, since pep440_rs sorts
+        // specifiers by version rather than preserving source order
         assert_eq!(
             formatter.format_version_replacing(&ConcreteVersion::new("1.2"), "==1.0, !=1.0.1"),
             "==1.2"
@@ -514,14 +510,12 @@ mod tests {
             "==1.2"
         );
 
-        // comma-separated, no `==`/`===`/`~=` term -> default range
         assert_eq!(
             formatter
                 .format_version_replacing(&ConcreteVersion::new("2.0.0"), ">=1.0, !=1.5, <2.0"),
             ">=2.0.0,<3"
         );
 
-        // anything else -> default
         assert_eq!(
             formatter.format_version_replacing(&ConcreteVersion::new("2.0.0"), ">=1.0"),
             ">=2.0.0,<3"
@@ -613,7 +607,6 @@ mod tests {
                     DomainPosition::new(5, 35),
                 )),
             };
-            // Position on package name
             assert!(formatter.is_position_on_dependency(&dep, Position::new(5, 15).into()));
         }
 
@@ -627,7 +620,6 @@ mod tests {
                     DomainPosition::new(5, 35),
                 )),
             };
-            // Position in padding before name (character - 2)
             assert!(formatter.is_position_on_dependency(&dep, Position::new(5, 8).into()));
         }
 
@@ -641,7 +633,6 @@ mod tests {
                     DomainPosition::new(5, 35),
                 )),
             };
-            // Position after version range (character + 2)
             assert!(formatter.is_position_on_dependency(&dep, Position::new(5, 37).into()));
         }
 
@@ -655,7 +646,6 @@ mod tests {
                     DomainPosition::new(5, 35),
                 )),
             };
-            // Position too far before (outside padding)
             assert!(!formatter.is_position_on_dependency(&dep, Position::new(5, 5).into()));
         }
 
@@ -669,7 +659,6 @@ mod tests {
                     DomainPosition::new(5, 35),
                 )),
             };
-            // Position too far after (outside padding)
             assert!(!formatter.is_position_on_dependency(&dep, Position::new(5, 40).into()));
         }
 
@@ -683,7 +672,6 @@ mod tests {
                     DomainPosition::new(5, 35),
                 )),
             };
-            // Different line
             assert!(!formatter.is_position_on_dependency(&dep, Position::new(4, 15).into()));
             assert!(!formatter.is_position_on_dependency(&dep, Position::new(6, 15).into()));
         }
@@ -703,7 +691,6 @@ mod tests {
         #[test]
         fn test_saturating_sub_at_column_zero() {
             let formatter = PypiFormatter;
-            // Edge case: character 0 with saturating_sub(2)
             let dep = MockDep {
                 name_range: Range::new(DomainPosition::new(5, 0), DomainPosition::new(5, 10)),
                 version_range: None,

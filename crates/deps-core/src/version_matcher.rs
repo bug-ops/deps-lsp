@@ -47,24 +47,20 @@ impl VersionRequirementMatcher for SemverMatcher {
         let requirement = requirement.as_str();
         let latest = latest.as_str();
 
-        // Parse the latest version
         let latest_ver = match latest.parse::<Version>() {
             Ok(v) => v,
             Err(_) => return requirement == latest,
         };
 
-        // Try to parse as a semver requirement (handles ^, ~, =, etc.)
         if let Ok(req) = requirement.parse::<VersionReq>() {
             return req.matches(&latest_ver);
         }
 
-        // If not a valid requirement, try treating it as a caret requirement
-        // (Cargo's default: "1.0" means "^1.0")
+        // Cargo's default convention: "1.0" means "^1.0"
         if let Ok(req) = format!("^{}", requirement).parse::<VersionReq>() {
             return req.matches(&latest_ver);
         }
 
-        // Fallback: string comparison
         requirement == latest
     }
 }
@@ -89,14 +85,11 @@ impl VersionRequirementMatcher for Pep440Matcher {
         let requirement = requirement.as_str();
         let latest = latest.as_str();
 
-        // Parse the latest version (normalize to three parts if needed)
         let latest_ver = match normalize_and_parse_version(latest) {
             Some(v) => v,
             None => return requirement == latest,
         };
 
-        // Extract the minimum version from the requirement
-        // Common patterns: ">=1.0", ">=1.0,<2.0", "~=1.0", "==1.0"
         let min_version = extract_pypi_min_version(requirement);
 
         let min_ver = match min_version.and_then(|v| normalize_and_parse_version(&v)) {
@@ -104,12 +97,9 @@ impl VersionRequirementMatcher for Pep440Matcher {
             None => return requirement == latest,
         };
 
-        // Check if major versions match (for major version 0, also check minor)
         if min_ver.major == 0 {
-            // For 0.x versions, both major and minor must match
             min_ver.major == latest_ver.major && min_ver.minor == latest_ver.minor
         } else {
-            // For 1.x+, just major version must match
             min_ver.major == latest_ver.major
         }
     }
@@ -128,17 +118,15 @@ impl VersionRequirementMatcher for Pep440Matcher {
 /// assert_eq!(normalize_and_parse_version("8").unwrap().to_string(), "8.0.0");
 /// ```
 pub fn normalize_and_parse_version(version: &str) -> Option<Version> {
-    // Try parsing directly first
     if let Ok(v) = version.parse::<Version>() {
         return Some(v);
     }
 
-    // Count dots to see if we need to add patch version
     let dot_count = version.chars().filter(|&c| c == '.').count();
 
     let normalized = match dot_count {
-        0 => format!("{}.0.0", version), // "8" → "8.0.0"
-        1 => format!("{}.0", version),   // "8.0" → "8.0.0"
+        0 => format!("{}.0.0", version),
+        1 => format!("{}.0", version),
         _ => version.to_string(),
     };
 
@@ -157,11 +145,9 @@ pub fn normalize_and_parse_version(version: &str) -> Option<Version> {
 /// assert_eq!(extract_pypi_min_version("==2.0.0"), Some("2.0.0".to_string()));
 /// ```
 pub fn extract_pypi_min_version(version_req: &str) -> Option<String> {
-    // Split by comma and look for >= or ~= or == specifiers
     for part in version_req.split(',') {
         let trimmed = part.trim();
 
-        // Handle different operators
         if let Some(ver) = trimmed.strip_prefix(">=") {
             return Some(ver.trim().to_string());
         }
@@ -172,13 +158,12 @@ pub fn extract_pypi_min_version(version_req: &str) -> Option<String> {
             return Some(ver.trim().to_string());
         }
         if let Some(ver) = trimmed.strip_prefix('>') {
-            // > means strictly greater, but we use this as approximation
+            // Treated as an approximation of ">=", not strict-greater-than.
             return Some(ver.trim().to_string());
         }
     }
 
-    // If no operator found, try parsing the whole string as a version
-    // (handles Poetry's "^1.0" style by stripping the ^)
+    // Poetry's "^1.0" style: strip the caret and parse the rest as a version.
     let stripped = version_req.trim_start_matches('^').trim_start_matches('~');
     if stripped.chars().next().is_some_and(|c| c.is_ascii_digit()) {
         return Some(stripped.to_string());
@@ -277,7 +262,6 @@ mod tests {
     #[test]
     fn test_semver_matcher_compatible_versions() {
         let matcher = SemverMatcher;
-        // Latest version satisfies the requirement (up-to-date)
         assert!(matcher.is_latest_satisfying(
             &ConcreteVersion::new("1.0.0"),
             &ConcreteVersion::new("1.0.5")
@@ -299,7 +283,6 @@ mod tests {
     #[test]
     fn test_semver_matcher_incompatible_versions() {
         let matcher = SemverMatcher;
-        // Latest version doesn't satisfy requirement (new major available)
         assert!(!matcher.is_latest_satisfying(
             &ConcreteVersion::new("1.0.0"),
             &ConcreteVersion::new("2.0.0")
@@ -317,7 +300,6 @@ mod tests {
     #[test]
     fn test_pep440_matcher_same_major() {
         let matcher = Pep440Matcher;
-        // Same major version = up to date
         assert!(matcher.is_latest_satisfying(
             &ConcreteVersion::new(">=8.0"),
             &ConcreteVersion::new("8.3.5")
@@ -335,7 +317,6 @@ mod tests {
     #[test]
     fn test_pep440_matcher_new_major() {
         let matcher = Pep440Matcher;
-        // New major version available = needs update
         assert!(!matcher.is_latest_satisfying(
             &ConcreteVersion::new(">=8.0"),
             &ConcreteVersion::new("9.0.2")
@@ -353,7 +334,6 @@ mod tests {
     #[test]
     fn test_pep440_matcher_zero_version() {
         let matcher = Pep440Matcher;
-        // For 0.x versions, minor must also match
         assert!(matcher.is_latest_satisfying(
             &ConcreteVersion::new(">=0.8"),
             &ConcreteVersion::new("0.8.5")

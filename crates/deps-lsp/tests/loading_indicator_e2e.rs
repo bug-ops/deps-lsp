@@ -26,21 +26,18 @@ tokio = { version = "1.0", features = ["full"] }
     let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
     let parse_result = ecosystem.parse_manifest(content, &url).await.unwrap();
 
-    // Phase 1: Initial state - document created with Idle loading state
     let doc =
         DocumentState::new_from_parse_result(EcosystemId::Cargo, content.to_string(), parse_result);
     assert_eq!(doc.loading_state, LoadingState::Idle);
     assert!(doc.loading_started_at.is_none());
     state.update_document(uri.clone(), doc);
 
-    // Phase 2: Simulate loading - transition to Loading state
     if let Some(mut doc) = state.documents.get_mut(&uri) {
         doc.set_loading();
         assert_eq!(doc.loading_state, LoadingState::Loading);
         assert!(doc.loading_started_at.is_some());
     }
 
-    // Phase 3: Simulate successful load - wait briefly then mark loaded
     tokio::time::sleep(Duration::from_millis(10)).await;
 
     if let Some(mut doc) = state.documents.get_mut(&uri) {
@@ -49,7 +46,6 @@ tokio = { version = "1.0", features = ["full"] }
         assert!(doc.loading_started_at.is_none());
     }
 
-    // Phase 4: Verify final state - document is fully loaded
     let doc = state.get_document(&uri).unwrap();
     assert_eq!(doc.loading_state, LoadingState::Loaded);
 }
@@ -90,7 +86,6 @@ fn test_loading_indicator_disabled() {
     let config: DepsConfig = serde_json::from_str(config_json).unwrap();
 
     assert!(!config.loading_indicator.enabled);
-    // Other fields should have defaults
     assert!(config.loading_indicator.fallback_to_hints);
     assert_eq!(config.loading_indicator.loading_text, "⏳");
 }
@@ -142,7 +137,6 @@ serde = "1.0.0"
 
     let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
 
-    // Create two documents
     let parse1 = ecosystem.parse_manifest(content, &url1).await.unwrap();
     let parse2 = ecosystem.parse_manifest(content, &url2).await.unwrap();
 
@@ -151,14 +145,12 @@ serde = "1.0.0"
     let mut doc2 =
         DocumentState::new_from_parse_result(EcosystemId::Cargo, content.to_string(), parse2);
 
-    // Both start loading
     doc1.set_loading();
     doc2.set_loading();
 
     state.update_document(uri1.clone(), doc1);
     state.update_document(uri2.clone(), doc2);
 
-    // Verify both are loading
     assert_eq!(
         state.get_document(&uri1).unwrap().loading_state,
         LoadingState::Loading
@@ -168,12 +160,10 @@ serde = "1.0.0"
         LoadingState::Loading
     );
 
-    // Simulate doc1 finishes first
     if let Some(mut doc) = state.documents.get_mut(&uri1) {
         doc.set_loaded();
     }
 
-    // Verify independent states - doc1 loaded, doc2 still loading
     assert_eq!(
         state.get_document(&uri1).unwrap().loading_state,
         LoadingState::Loaded
@@ -189,19 +179,15 @@ serde = "1.0.0"
 async fn test_loading_duration_tracking() {
     let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
 
-    // Not loading initially - no duration
     assert!(doc.loading_duration().is_none());
 
-    // Start loading - duration should be available
     doc.set_loading();
     assert!(doc.loading_duration().is_some());
 
-    // Wait and verify duration increases
     tokio::time::sleep(Duration::from_millis(50)).await;
     let duration = doc.loading_duration().unwrap();
     assert!(duration >= Duration::from_millis(50));
 
-    // Finish loading - duration should be None again
     doc.set_loaded();
     assert!(doc.loading_duration().is_none());
 }
@@ -214,7 +200,6 @@ async fn test_failed_loading_state() {
     doc.set_loading();
     assert_eq!(doc.loading_state, LoadingState::Loading);
 
-    // Simulate failure - state transitions to Failed
     doc.set_failed();
     assert_eq!(doc.loading_state, LoadingState::Failed);
     assert!(doc.loading_started_at.is_none());
@@ -225,7 +210,6 @@ async fn test_failed_loading_state() {
 fn test_set_loading_resets_timer() {
     let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
 
-    // Multiple set_loading calls should be safe
     doc.set_loading();
     let first_start = doc.loading_started_at;
     doc.set_loading();
@@ -233,10 +217,8 @@ fn test_set_loading_resets_timer() {
 
     assert!(first_start.is_some());
     assert!(second_start.is_some());
-    // Second call resets the timer
     assert!(second_start >= first_start);
 
-    // Multiple set_loaded calls should be safe
     doc.set_loaded();
     doc.set_loaded();
     assert_eq!(doc.loading_state, LoadingState::Loaded);
@@ -264,9 +246,7 @@ fn test_partial_loading_indicator_config() {
 
     let config: DepsConfig = serde_json::from_str(config_json).unwrap();
 
-    // Explicitly set field
     assert!(!config.loading_indicator.enabled);
-    // Default fields
     assert!(config.loading_indicator.fallback_to_hints);
     assert_eq!(config.loading_indicator.loading_text, "⏳");
 }
@@ -286,7 +266,6 @@ fn test_loading_text_truncation() {
 
     let config: DepsConfig = serde_json::from_str(&config_json).unwrap();
 
-    // Should be truncated to 100 characters
     assert_eq!(config.loading_indicator.loading_text.len(), 100);
     assert_eq!(config.loading_indicator.loading_text, "a".repeat(100));
 }
@@ -364,12 +343,10 @@ fn test_combined_config() {
 
     let config: DepsConfig = serde_json::from_str(config_json).unwrap();
 
-    // Loading indicator settings
     assert!(config.loading_indicator.enabled);
     assert!(config.loading_indicator.fallback_to_hints);
     assert_eq!(config.loading_indicator.loading_text, "⏳");
 
-    // Inlay hints settings
     assert!(config.inlay_hints.enabled);
     assert_eq!(config.inlay_hints.up_to_date_text, "✅");
     assert_eq!(config.inlay_hints.needs_update_text, "⚠️  {}");
@@ -385,7 +362,6 @@ fn test_server_state_document_has_loading_state() {
 
     let doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
 
-    // New document should start in Idle state
     assert_eq!(doc.loading_state, LoadingState::Idle);
     assert!(doc.loading_started_at.is_none());
 
@@ -412,25 +388,20 @@ fn test_document_state_clone_preserves_loading() {
 fn test_loading_state_transition_order() {
     let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
 
-    // 1. Start in Idle
     assert_eq!(doc.loading_state, LoadingState::Idle);
 
-    // 2. Transition to Loading
     doc.set_loading();
     assert_eq!(doc.loading_state, LoadingState::Loading);
     assert!(doc.loading_started_at.is_some());
 
-    // 3. Transition to Loaded
     doc.set_loaded();
     assert_eq!(doc.loading_state, LoadingState::Loaded);
     assert!(doc.loading_started_at.is_none());
 
-    // 4. Can transition back to Loading
     doc.set_loading();
     assert_eq!(doc.loading_state, LoadingState::Loading);
     assert!(doc.loading_started_at.is_some());
 
-    // 5. Can transition to Failed
     doc.set_failed();
     assert_eq!(doc.loading_state, LoadingState::Failed);
     assert!(doc.loading_started_at.is_none());
@@ -442,7 +413,6 @@ async fn test_loading_timeout_scenario() {
     let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
     doc.set_loading();
 
-    // Wait a small amount to verify duration increases
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let duration = doc.loading_duration().unwrap();
@@ -452,7 +422,6 @@ async fn test_loading_timeout_scenario() {
         duration
     );
 
-    // Mark as failed - this would happen in a real timeout scenario
     doc.set_failed();
     assert_eq!(doc.loading_state, LoadingState::Failed);
     assert!(doc.loading_started_at.is_none());
@@ -470,7 +439,6 @@ async fn test_rapid_set_loading_calls() {
     let doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
     state.update_document(uri.clone(), doc);
 
-    // Rapid fire set_loading() calls
     for _ in 0..10 {
         if let Some(mut doc) = state.documents.get_mut(&uri) {
             doc.set_loading();

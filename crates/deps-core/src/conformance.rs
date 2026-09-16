@@ -310,9 +310,8 @@ pub fn assert_locate_lockfile_not_found(
     manifest_content: &str,
 ) {
     // Held per `fs_probe::snapshot_guard`'s doc: `locate_lockfile` transitively touches
-    // fs_probe (via `locate_lockfile_for_manifest`'s `fs_probe::is_file` checks), and this
-    // helper is macro-expanded into every ecosystem crate's `lockfile.rs`, some of which
-    // (deps-cargo, deps-npm, deps-nuget) share a test binary with a diffing test.
+    // fs_probe, and this macro-expanded helper runs in test binaries some ecosystems
+    // (deps-cargo, deps-npm, deps-nuget) share with a diffing test.
     let _guard = crate::fs_probe::snapshot_guard();
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let manifest_path = temp_dir.path().join(manifest_name);
@@ -360,10 +359,8 @@ pub async fn assert_parse_malformed_lockfile_does_not_panic(
     lock_name: &str,
     malformed_content: &str,
 ) {
-    // See the comment in `assert_locate_lockfile_not_found` on why this guard is needed here
-    // — `parse_lockfile` routes through `read_and_parse_lockfile`'s `fs_probe::metadata`/
-    // `read_to_string_capped` calls. Async (this helper runs under `#[tokio::test]`), so the
-    // async guard variant.
+    // See `assert_locate_lockfile_not_found` for why this guard is needed; async variant
+    // since this helper runs under `#[tokio::test]`.
     let _guard = crate::fs_probe::snapshot_guard_async().await;
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let lockfile_path = temp_dir.path().join(lock_name);
@@ -691,11 +688,9 @@ impl<T: ?Sized> NotInherent for T {}
 /// ```
 #[macro_export]
 macro_rules! ecosystem_conformance {
-    // Rejects the mutually-exclusive combination at compile time (#782 code-review cleanup 1):
-    // an ecosystem cannot both list lock file names and declare it has no lock file support.
-    // Tried first — `macro_rules!` matches arms in order — so this only intercepts the one
-    // invalid combination; every other invocation (0 or 1 of the two fields) falls through
-    // to the real arm below unchanged.
+    // Rejects at compile time (#782 cleanup 1) an ecosystem listing lock file names while
+    // declaring no lock file support. Tried first since `macro_rules!` matches in order;
+    // every other invocation falls through to the real arm below.
     (
         mod $mod_name:ident;
         build: $build:expr;
@@ -725,13 +720,10 @@ macro_rules! ecosystem_conformance {
         mod $mod_name {
             use super::*;
 
-            // Each assertion lives in a plain (non-`#[test]`) `_impl` fn, called by a thin
-            // `#[test]` wrapper. The compiler elides a `#[test]`-attributed item's body
-            // entirely outside a real `--test` build (the same mechanism `#[cfg(test)]`
-            // uses) — a plain doctest is never built with `--test`, so an `expr`/`ty`
-            // substituted directly into a `#[test]` fn's body is never type-checked there.
-            // Splitting the substitution into a plain fn keeps it checked in every build,
-            // doctests included (#758 impl-critic S1).
+            // Each assertion lives in a plain `_impl` fn called by a thin `#[test]` wrapper:
+            // a `#[test]`-attributed item's body is elided outside a `--test` build, so a
+            // doctest's substituted `expr`/`ty` would never be type-checked there otherwise
+            // (#758 impl-critic S1).
 
             fn ecosystem_id_matches_impl() {
                 $crate::conformance::assert_ecosystem_id(&($build), $id);
@@ -768,11 +760,9 @@ macro_rules! ecosystem_conformance {
             )?
 
             $(
-                // `$no_lockfile_support` must be the literal `true` — `false` would silently
-                // generate this assertion anyway if left unchecked (`macro_rules` can only
-                // gate on the arm's *presence*, not inspect a captured literal's value), so a
-                // `const` context `assert!` rejects anything else at compile time, in every
-                // profile (unlike `debug_assert!`, which release builds strip) (#782 critic M1).
+                // `$no_lockfile_support` must be literal `true`: `macro_rules` can only gate on
+                // the arm's presence, not a captured literal's value, so a `const` `assert!`
+                // rejects anything else at compile time in every profile (#782 critic M1).
                 const _: () = assert!(
                     $no_lockfile_support,
                     "no_lockfile_support only accepts `true` — omit the field entirely for a \

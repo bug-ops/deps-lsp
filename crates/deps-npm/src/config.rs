@@ -87,9 +87,8 @@ impl From<IndexUrlError> for NpmRegistryIndexError {
             IndexUrlError::NotHttps(scheme) => Self::NotHttps(scheme),
             IndexUrlError::UserInfoPresent => Self::UserInfoPresent,
             IndexUrlError::BlockedHost { class } => Self::BlockedHost { class },
-            // `IndexUrlError` is `#[non_exhaustive]` (issue #769): a variant added upstream
-            // and not yet mapped here still surfaces, carrying its own message, rather than
-            // failing to compile.
+            // `#[non_exhaustive]` (issue #769): an unmapped upstream variant still surfaces
+            // via its own message rather than failing to compile.
             other => Self::InvalidUrl(other.to_string().into()),
         }
     }
@@ -535,10 +534,9 @@ fn resolve_with_home(
     home: Option<PathBuf>,
 ) -> NpmConfig {
     let user_npmrc_path = home.map(|h| h.join(".npmrc"));
-    // M9: a project living under `$HOME` has `$HOME` as an ancestor, so the project-tier
-    // walk below would otherwise find `~/.npmrc` a second time as a (wrongly
-    // outranking-itself) workspace-tier entry. Deduped by canonicalized path so a symlinked
-    // home is caught too, mirroring `deps-cargo::config::load_tiers`.
+    // M9: a project under `$HOME` would otherwise find `~/.npmrc` twice via the ancestor
+    // walk. Deduped by canonicalized path (catches symlinked homes too), mirroring
+    // `deps-cargo::config::load_tiers`.
     let user_canonical = user_npmrc_path
         .as_deref()
         .and_then(|p| std::fs::canonicalize(p).ok());
@@ -546,9 +544,8 @@ fn resolve_with_home(
     let mut registry_raw: Option<String> = None;
     let mut scoped_raw: HashMap<String, String> = HashMap::new();
 
-    // FR-002: this ancestor walk is a deliberate superset of npm's own behavior (which reads
-    // only the project-root `.npmrc`, not every ancestor) — chosen for monorepo ergonomics,
-    // mirroring `deps-cargo`'s `.cargo/config.toml` discovery. Closest directory wins.
+    // FR-002: deliberate superset of npm's own behavior (project-root `.npmrc` only) —
+    // chosen for monorepo ergonomics, mirroring `deps-cargo`'s config.toml discovery.
     for dir in deps_core::fs_probe::config_ancestors(manifest_dir) {
         let candidate = dir.join(".npmrc");
         let is_user_tier_duplicate =
@@ -760,15 +757,10 @@ mod tests {
         assert_eq!(raw.registry.as_deref(), Some("https://npm.example/"));
         assert!(raw.scoped.is_empty());
 
-        // Structural guarantee: `RawNpmrc` (and therefore `NpmConfig`) has no field capable
-        // of holding any of the values above at all — this assertion is the closest a test
-        // can get to proving that without reading the source, by confirming none of the
-        // secret strings appears anywhere in the parsed struct's debug output.
-        //
-        // The assert message deliberately names only the *label*, never the secret value
-        // itself — echoing the literal fixture string into a panic/format output is exactly
-        // the "secret in a log" pattern this test exists to rule out, and CodeQL's cleartext-
-        // logging query flags it even in test code that's asserting the value's *absence*.
+        // Confirms none of the secret strings appears in the parsed struct's Debug output —
+        // the closest proof, without reading source, that `RawNpmrc` has no field for them.
+        // Assert messages name only the *label*, never the secret, to avoid CodeQL's
+        // cleartext-logging flag even when asserting a value's absence.
         let debug = format!("{raw:?}");
         for (label, secret) in [
             ("_authToken", "super-secret-token"),
@@ -848,10 +840,8 @@ mod tests {
         let raw_placeholder = "${SECRET_REGISTRY_URL}";
         let policy = public_only_policy();
 
-        // `BlockedHost`'s own `Display` never carries the URL at all (only the host
-        // class) — the actual leak this guards against is the `tracing::warn!` emitted
-        // from inside `new_with_raw_for_log`, so this must inspect the captured log line
-        // itself, not just the returned error's rendering.
+        // `BlockedHost`'s `Display` never carries the URL — the actual leak this guards
+        // against is `new_with_raw_for_log`'s `tracing::warn!`, so inspect the log itself.
         let log = deps_core::test_util::capture_tracing_output(|| {
             let err =
                 NpmRegistryIndex::new_with_raw_for_log(expanded_secret, raw_placeholder, &policy)
@@ -1040,8 +1030,7 @@ mod tests {
                 mirrors_crates_io: false,
             }
         );
-        // An unrelated scope, and an unscoped name, still fall through to the top-level
-        // override (FR-005 does not apply here — that override *does* resolve).
+        // An unscoped name still falls through to the top-level override.
         assert_eq!(
             config.resolve_source_for(&pkg("express")),
             DependencySource::AlternateRegistry {
@@ -1202,8 +1191,7 @@ mod tests {
 
     #[test]
     fn test_resolve_with_home_no_npmrc_anywhere_is_default() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s contract for fs_probe-touching tests.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let dir = tempfile::tempdir().unwrap();
         let cache = NpmConfigCache::new();
@@ -1218,8 +1206,7 @@ mod tests {
 
     #[test]
     fn test_resolve_with_home_project_tier_applies() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s contract for fs_probe-touching tests.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -1242,8 +1229,7 @@ mod tests {
     /// FR-002: project tier overrides user tier.
     #[test]
     fn test_resolve_with_home_project_overrides_user() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s contract for fs_probe-touching tests.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let project_dir = tempfile::tempdir().unwrap();
         let home_dir = tempfile::tempdir().unwrap();
@@ -1276,8 +1262,7 @@ mod tests {
 
     #[test]
     fn test_resolve_with_home_user_tier_applies_when_no_project_tier() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s contract for fs_probe-touching tests.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let project_dir = tempfile::tempdir().unwrap();
         let home_dir = tempfile::tempdir().unwrap();
@@ -1308,8 +1293,7 @@ mod tests {
     /// path, so the single file is read once and applied once.
     #[test]
     fn test_resolve_with_home_dedupes_ancestor_matching_user_tier() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s contract for fs_probe-touching tests.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let home_dir = tempfile::tempdir().unwrap();
         let project_dir = home_dir.path().join("project");
@@ -1338,8 +1322,7 @@ mod tests {
 
     #[test]
     fn test_resolve_with_home_empty_npmrc_is_default() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s contract for fs_probe-touching tests.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".npmrc"), "# just a comment\n").unwrap();
@@ -1399,9 +1382,7 @@ mod tests {
 
     #[test]
     fn test_config_cache_reparses_after_mtime_change() {
-        // Held per `deps_core::fs_probe::snapshot_guard`'s doc: `NpmConfigCache::get_or_parse`
-        // transitively touches fs_probe, and this test runs in the same binary as this
-        // file's own diffing test.
+        // `NpmConfigCache::get_or_parse` transitively touches fs_probe (see snapshot_guard).
         let _guard = deps_core::fs_probe::snapshot_guard();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".npmrc");

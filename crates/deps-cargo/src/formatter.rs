@@ -175,14 +175,10 @@ impl OsvNaming for CargoFormatter {}
 mod tests {
     use super::*;
 
-    // #758: exact-value `EcosystemFormatter` conformance, replacing test_package_url,
-    // test_validate_package_name_rejects_empty, test_validate_package_name_rejects_non_ascii,
-    // test_validate_package_name_rejects_disallowed_punctuation,
-    // test_validate_package_name_rejects_leading_digit_or_hyphen,
-    // test_validate_package_name_accepts_leading_underscore, and
-    // test_version_satisfies_requirement. The remaining validate_package_name tests below stay
-    // hand-written: they assert on `InvalidPackageName::reason()`'s exact text, or on a
-    // computed (`.repeat(n)`) boundary-length name — neither fits a `literal`-only macro list.
+    // #758: exact-value `EcosystemFormatter` conformance, replacing several hand-written
+    // tests. The remaining validate_package_name tests below stay hand-written: they assert
+    // on `InvalidPackageName::reason()`'s exact text, or a computed boundary-length name —
+    // neither fits a `literal`-only macro list.
     deps_core::formatter_conformance! {
         mod cargo_formatter_conformance;
         build: CargoFormatter;
@@ -201,9 +197,8 @@ mod tests {
             // #382 repro: a non-ASCII crate name must be reported as an invalid package
             // name, not silently forwarded to the registry as an "Unknown package".
             "日本語",
-            // crates.io's first-character rule: a digit or "-" can never lead a real crate
-            // name — same "falls through to Unknown package" bug shape as #382, on a
-            // different invalid-name form.
+            // crates.io's first-character rule: a digit or "-" can never lead a real name —
+            // same "falls through to Unknown package" bug shape as #382.
             "1abc", "9serde", "-abc",
             "serde.rs", "serde/util", "serde@1.0", "serde util"
         ];

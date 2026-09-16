@@ -5,8 +5,7 @@ pub use deps_core::policy_config::{
     CacheConfig, DiagnosticsConfig, FreshnessConfig, LicensePolicyConfig, NetworkConfig,
     PolicyConfig, RegistriesConfig, SupplyChainConfig, WorkspaceRegistriesSetting,
 };
-// Not part of the `pub use` above: `PolicyConfigDiff`'s only consumer in this crate is the
-// `pub(crate)` `reparse_scope` below — no external caller needs it.
+// Not re-exported: `PolicyConfigDiff`'s only consumer here is `reparse_scope` below.
 use deps_core::policy_config::PolicyConfigDiff;
 use serde::Deserialize;
 
@@ -192,7 +191,6 @@ impl Default for LoadingIndicatorConfig {
     }
 }
 
-// Default value functions
 const fn default_true() -> bool {
     true
 }
@@ -341,9 +339,7 @@ pub struct CodeLensConfig {
     pub enabled: bool,
 }
 
-// Deliberately hand-written rather than `#[derive(Default)]`: `DepsConfig` derives
-// `Default` for its own `code_lens` field, so a derived `Default` here (`enabled: false`)
-// would silently ship the feature disabled.
+// Hand-written, not derived: a derived Default here would ship `enabled: false`, silently disabling the feature.
 impl Default for CodeLensConfig {
     fn default() -> Self {
         Self { enabled: true }
@@ -459,9 +455,8 @@ pub(crate) fn reparse_scope(
         policy: new_policy,
     } = new;
 
-    // Not parse-affecting: every field is named (never `..`), so its value is simply
-    // unused here rather than compared, but a new field on any of these sections still
-    // forces a decision at this line.
+    // Every field is named (never `..`), so a new field added to any of these sections
+    // still forces a decision at this line.
     let InlayHintsConfig {
         enabled: _,
         up_to_date_text: _,
@@ -894,7 +889,6 @@ mod tests {
 
         let config: DepsConfig = serde_json::from_str(json).unwrap();
         assert!(!config.inlay_hints.enabled);
-        // Other fields should use defaults
         assert_eq!(config.inlay_hints.up_to_date_text, "✅");
         assert_eq!(config.policy.diagnostics.outdated_severity, Severity::Hint);
     }
@@ -903,7 +897,6 @@ mod tests {
     fn test_empty_config_deserialization() {
         let json = r"{}";
         let config: DepsConfig = serde_json::from_str(json).unwrap();
-        // All fields should use defaults
         assert!(config.inlay_hints.enabled);
         assert!(config.policy.cache.enabled);
     }
@@ -1216,10 +1209,7 @@ mod tests {
         assert!(config.policy.network.offline);
     }
 
-    // =========================================================================
     // `reparse_scope` / `ReparseScope` tests (issue #592)
-    // =========================================================================
-
     mod reparse_scope_tests {
         use super::*;
 

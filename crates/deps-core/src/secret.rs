@@ -229,8 +229,6 @@ mod tests {
         assert_zeroize_on_drop::<Redacted<String>>();
     }
 
-    // --- auth_digest / digest_salt ---
-
     #[test]
     fn auth_digest_no_secret_is_none() {
         assert_eq!(super::auth_digest("https://example.com", None), None);

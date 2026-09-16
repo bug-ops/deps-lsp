@@ -402,13 +402,10 @@ mod tests {
 
     #[test]
     fn notice_value_is_not_classified_informational() {
-        // L1 (security, revised from an earlier allowlist that included
-        // "notice"): live-verified RUSTSEC-2026-0174/http-types carries
-        // `informational: "notice"` while describing a real defect (an
-        // incorrect `unsafe` justification for an ASCII-invariant
-        // guarantee) — the same failure class as H1's "unsound" finding.
-        // "notice" must fall through to Unknown/WARNING, never be
-        // downgraded to Informational.
+        // L1 (security, revised from an earlier allowlist including "notice"): live-verified
+        // RUSTSEC-2026-0174/http-types uses `informational: "notice"` while describing a
+        // real defect — same failure class as H1's "unsound" finding, so it must fall
+        // through to Unknown/WARNING, never Informational.
         let affected = informational_affected("notice");
         assert_eq!(
             classify(
@@ -425,11 +422,9 @@ mod tests {
 
     #[test]
     fn unsound_value_is_not_classified_informational() {
-        // H1 (security): RUSTSEC's "unsound" category is a real
-        // memory-safety/UB finding (live-verified: RUSTSEC-2021-0145/atty,
-        // RUSTSEC-2019-0036/failure), NOT a maintenance-status notice — it
-        // must fall through to Unknown/WARNING, never be downgraded to
-        // Informational.
+        // H1 (security): RUSTSEC's "unsound" category is a real memory-safety/UB finding
+        // (live-verified: RUSTSEC-2021-0145/atty, RUSTSEC-2019-0036/failure), not a
+        // maintenance-status notice — must fall through to Unknown/WARNING, never Informational.
         let affected = informational_affected("unsound");
         assert_eq!(
             classify(
@@ -446,11 +441,9 @@ mod tests {
 
     #[test]
     fn osv_unknown_informational_value_is_not_classified_informational() {
-        // FR-007 (revised): OSV's own `informational: "unknown"` enum value
-        // is NOT in the allowlist ("unmaintained"/"notice" only) — it falls
-        // through to VulnSeverity::Unknown exactly like a record with no
-        // `informational` field at all, sidestepping any naming-collision
-        // concern with this crate's own Unknown variant.
+        // FR-007 (revised): OSV's `informational: "unknown"` isn't in the allowlist
+        // ("unmaintained"/"notice" only), so it falls through to VulnSeverity::Unknown
+        // exactly like a record with no `informational` field at all.
         let affected = informational_affected("unknown");
         assert_eq!(
             classify(
@@ -531,11 +524,9 @@ mod tests {
 
     #[test]
     fn informational_on_fallback_all_entries_is_not_classified_informational() {
-        // FR-002b: when `relevant_affected` is the "no entry matched the
-        // queried package; using all entries" fallback set, its entries'
-        // `package` never equals the queried osv_name/osv_eco by
-        // construction — an `informational` value on one of those stranger
-        // entries must not downgrade this record's classification.
+        // FR-002b: in the "no entry matched; using all entries" fallback set, entries'
+        // `package` never equals the queried osv_name/osv_eco by construction — a stranger
+        // entry's `informational` value must not downgrade this record's classification.
         let stranger = OsvAffected {
             package: Some(OsvPackage {
                 name: "some-other-crate".to_string(),

@@ -262,58 +262,47 @@ pub fn version_matches_requirement(version: &str, requirement: &str) -> bool {
         return true;
     }
 
-    // Pessimistic operator (~>)
     if req.starts_with("~>") {
         let req_ver = req.trim_start_matches("~>").trim();
         return matches_pessimistic(version, req_ver);
     }
 
-    // Greater than or equal
     if req.starts_with(">=") {
         let req_ver = req.trim_start_matches(">=").trim();
         return compare_versions(version, req_ver) != Ordering::Less;
     }
 
-    // Greater than
     if req.starts_with('>') && !req.starts_with(">=") {
         let req_ver = req.trim_start_matches('>').trim();
         return compare_versions(version, req_ver) == Ordering::Greater;
     }
 
-    // Less than or equal
     if req.starts_with("<=") {
         let req_ver = req.trim_start_matches("<=").trim();
         return compare_versions(version, req_ver) != Ordering::Greater;
     }
 
-    // Less than
     if req.starts_with('<') && !req.starts_with("<=") {
         let req_ver = req.trim_start_matches('<').trim();
         return compare_versions(version, req_ver) == Ordering::Less;
     }
 
-    // Not equal
     if req.starts_with("!=") {
         let req_ver = req.trim_start_matches("!=").trim();
         return compare_versions(version, req_ver) != Ordering::Equal;
     }
 
-    // Exact match. `compare_versions` tolerates and skips bytes outside its token alphabet
-    // (digits/letters), so a malformed operand like `= 1.0.0!!!` must be rejected explicitly
-    // via `is_valid_rubygems_version` first — otherwise it would silently compare as if the
-    // garbage suffix were absent and match `1.0.0`, where RubyGems itself raises
-    // `BadRequirementError` (#345 M1: this branch used to fail closed for free under raw
-    // string equality, which the switch to canonical comparison no longer does on its own).
+    // `compare_versions` skips bytes outside its token alphabet, so a malformed operand like
+    // `= 1.0.0!!!` must be rejected via `is_valid_rubygems_version` first, or it would
+    // silently match `1.0.0` where RubyGems raises `BadRequirementError` (#345 M1).
     if let Some(req_ver) = req.strip_prefix('=') {
         let req_ver = req_ver.trim();
         return is_valid_rubygems_version(req_ver)
             && compare_versions(version, req_ver) == Ordering::Equal;
     }
 
-    // Default (no operator): RubyGems compiles a bare version requirement to `=`
-    // (`Gem::Requirement.create("1.6.0")` -> `["=", ...]`), so it gets the same canonical
-    // equality and the same malformed-operand rejection as the explicit `=` branch above,
-    // not a raw string/prefix match (#345).
+    // A bare requirement compiles to `=` in RubyGems (#345), so it shares that branch's
+    // canonical equality and malformed-operand rejection, not a raw string/prefix match.
     is_valid_rubygems_version(req) && compare_versions(version, req) == Ordering::Equal
 }
 
@@ -712,37 +701,29 @@ mod tests {
 
     #[test]
     fn test_version_matches_requirement() {
-        // Pessimistic operator
         assert!(version_matches_requirement("7.0.8", "~> 7.0"));
         assert!(version_matches_requirement("7.0.0", "~> 7.0"));
         assert!(!version_matches_requirement("8.0.0", "~> 7.0"));
 
-        // Greater than or equal
         assert!(version_matches_requirement("1.5.0", ">= 1.1"));
         assert!(version_matches_requirement("1.1.0", ">= 1.1"));
         assert!(!version_matches_requirement("1.0.0", ">= 1.1"));
 
-        // Greater than
         assert!(version_matches_requirement("2.0.0", "> 1.0"));
         assert!(!version_matches_requirement("1.0.0", "> 1.0"));
 
-        // Less than or equal
         assert!(version_matches_requirement("1.0.0", "<= 1.0"));
         assert!(!version_matches_requirement("1.1.0", "<= 1.0"));
 
-        // Less than
         assert!(version_matches_requirement("0.9.0", "< 1.0"));
         assert!(!version_matches_requirement("1.0.0", "< 1.0"));
 
-        // Exact match
         assert!(version_matches_requirement("1.0.0", "= 1.0.0"));
         assert!(!version_matches_requirement("1.0.1", "= 1.0.0"));
 
-        // Not equal
         assert!(version_matches_requirement("1.0.1", "!= 1.0.0"));
         assert!(!version_matches_requirement("1.0.0", "!= 1.0.0"));
 
-        // Wildcard
         assert!(version_matches_requirement("1.0.0", "*"));
         assert!(version_matches_requirement("0.0.1", "*"));
         assert!(version_matches_requirement("99.99.99", "*"));
