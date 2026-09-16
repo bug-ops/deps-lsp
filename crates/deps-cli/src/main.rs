@@ -57,8 +57,12 @@ fn main() -> ExitCode {
         FailOnPolicy::new(args.fail_on.clone())
     };
 
-    let (report, had_execution_error) =
-        runtime.block_on(run_check(walk_paths, cli_config, args.respect_gitignore));
+    let (report, had_execution_error) = runtime.block_on(run_check(
+        walk_paths,
+        cli_config,
+        args.respect_gitignore,
+        args.follow_symlinks,
+    ));
 
     let rendered = match args.format {
         OutputFormat::Table => format::table::render(&report),
@@ -90,6 +94,7 @@ async fn run_check(
     paths: Vec<PathBuf>,
     cli_config: CliConfig,
     respect_gitignore: bool,
+    follow_symlinks: bool,
 ) -> (CheckReport, bool) {
     let policy = cli_config.policy;
     let ecosystem_runtime = EcosystemRuntime::from_policy(&policy);
@@ -110,7 +115,12 @@ async fn run_check(
         policy,
     };
 
-    let walk_outcome = walk::walk(&paths, &ecosystem_registry, respect_gitignore);
+    let walk_outcome = walk::walk(
+        &paths,
+        &ecosystem_registry,
+        respect_gitignore,
+        follow_symlinks,
+    );
     let mut had_execution_error = false;
     for error in &walk_outcome.walk_errors {
         eprintln!("deps-cli: warning: {error}");
@@ -132,12 +142,13 @@ async fn run_check(
         );
     }
     for path in &walk_outcome.ignored_manifests {
-        // #1109 / reviewer follow-up: a manifest an ecosystem would have claimed was excluded
-        // from the scan without being asked to — either an ignore rule under
-        // --respect-gitignore, or a PRUNED_DIRECTORIES match in any mode. Either way the
-        // report is incomplete, so this must not silently exit 0.
+        // #1109 / reviewer follow-up / #1112: a manifest an ecosystem would have claimed was
+        // excluded from the scan without being asked to — an ignore rule under
+        // --respect-gitignore, a PRUNED_DIRECTORIES match in any mode, or a symlink reachable
+        // only by passing --follow-symlinks. Either way the report is incomplete, so this must
+        // not silently exit 0.
         eprintln!(
-            "deps-cli: warning: {} looks like a manifest but was excluded from the scan (a .gitignore/.ignore rule, or a pruned directory such as vendor/build/dist)",
+            "deps-cli: warning: {} looks like a manifest but was excluded from the scan (a .gitignore/.ignore rule, a pruned directory such as vendor/build/dist, or a symlink not followed — see --follow-symlinks)",
             path.display()
         );
         had_execution_error = true;
@@ -163,9 +174,15 @@ async fn run_check(
     for manifest in walk_outcome.manifests {
         match deps_core::fs_probe::read_to_string_capped(&manifest.path, MAX_MANIFEST_FILE_SIZE) {
             Ok(Some(content)) => {
+                // Review finding M2: `check_manifest`'s `manifest_path` drives URI derivation
+                // for both parsing and lockfile/in-use-version discovery — it must be
+                // `uri_path` (the manifest's encountered path), not `manifest.path` (the
+                // resolved real path used only for the read above), or lockfile lookup under
+                // `--follow-symlinks` silently anchors at the symlink target's directory
+                // instead of the symlink's own.
                 match check_manifest(
                     &manifest.ecosystem,
-                    &manifest.path,
+                    &manifest.uri_path,
                     &manifest.display_path,
                     &content,
                     &ctx,

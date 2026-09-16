@@ -32,7 +32,10 @@ a table, as JSON, or as SARIF 2.1.0, with a CI-friendly exit code.
   (`node_modules`, `target`, `vendor`, `.venv`, and other common dependency/build/VCS
   directories) still keeps the scan fast and on-signal without depending on either file. Pass
   `--respect-gitignore` to restore standard `.gitignore`/`.ignore` awareness when scanning a
-  target you trust as much as your own `deps.toml`.
+  target you trust as much as your own `deps.toml`. A manifest reachable only through a
+  symlink is detected and reported the same way regardless of this flag; pass
+  `--follow-symlinks` to also resolve and scan it, bounded so it can never escape the walked
+  root or loop forever.
 - **Table, JSON, or SARIF output** — a human-readable table (default) grouped by file and
   severity, a versioned JSON document for machine consumption, or a SARIF 2.1.0 document for
   `github/codeql-action/upload-sarif` and other SARIF consumers
@@ -137,6 +140,9 @@ deps-cli check --config ./ci/deps-strict.toml
 
 # Restore .gitignore/.ignore awareness (only for a fully-trusted scan target — see Features)
 deps-cli check --respect-gitignore
+
+# Resolve and scan a symlinked manifest (only for a fully-trusted scan target — see Features)
+deps-cli check --follow-symlinks
 ```
 
 ### Exit codes
