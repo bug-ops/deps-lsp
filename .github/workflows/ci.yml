@@ -32,6 +32,7 @@ jobs:
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
       workflows: ${{ steps.filter.outputs.workflows }}
+      github_action: ${{ steps.filter.outputs.github_action }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -49,6 +50,8 @@ jobs:
             workflows:
               - '.github/workflows/**'
               - '!.github/workflows/mdbook.yml'
+            github_action:
+              - 'crates/github-action/**'
 
   fmt:
     name: Format
@@ -650,6 +653,133 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITLEAKS_VERSION: 8.30.1
+
+  deps-lsp-check:
+    name: deps-lsp Check (SARIF)
+    needs: changes
+    # New vulnerability/yanked advisories can appear with no manifest change, so this also
+    # runs on the weekly schedule, same as `security` above.
+    #
+    # Deliberately not in `ci-success`'s `needs` yet (#1122): building crates/github-action's
+    # Dockerfile fetches a real deps-cli release binary at build time, but no tagged release
+    # has published deps-cli binaries yet as of this job's introduction (#1107 added the
+    # release.yml build matrix but hasn't shipped a release since) — this job will fail on
+    # every run until the next release is cut. Add it to `ci-success`'s `needs` once a release
+    # with deps-cli assets exists and this job has been observed passing on main.
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true' || needs.changes.outputs.github_action == 'true' || github.event_name == 'schedule'
+    # Regular pull_request (never pull_request_target), so this safely scans fork PRs too.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build image for self-test
+        # `action.yml`'s `image:` is a `docker://ghcr.io/...` reference (required so real
+        # consumers pull a pre-built image instead of compiling on every run) — GitHub Actions
+        # always `docker pull`s that tag for a `docker://` image reference, regardless of the
+        # git ref/path given to `uses:`, so `uses: ./crates/github-action` here would just pull
+        # the published registry tag and never build this checkout's own Dockerfile (review
+        # finding). Building+running the image directly, the same way `docker-build-and-scan`
+        # does, is the only way this job self-tests the Dockerfile/entrypoint.sh content of the
+        # branch/PR it runs on.
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: crates/github-action
+          load: true
+          push: false
+          tags: deps-lsp-github-action:selftest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run deps-lsp check
+        id: deps-check
+        # Mirrors what the GitHub Actions runtime does for a real `using: docker` action: bind
+        # -mounts the checkout as the container's working directory and gives the container
+        # write access to $GITHUB_OUTPUT (bind-mounted at the same path on both sides) so
+        # entrypoint.sh's own `>>"$GITHUB_OUTPUT"` writes land back in this step's real outputs.
+        # `-e VAR` (no `=value`) forwards the host shell's value only if set, so the optional
+        # DEPS_CLI_PATHS/COOLDOWN/CONFIG are safely omitted rather than passed as literal empty.
+        env:
+          DEPS_CLI_FAIL_ON: vulnerable,yanked,unsatisfiable
+        run: |
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE}" \
+            -w "${GITHUB_WORKSPACE}" \
+            -v "${GITHUB_OUTPUT}:${GITHUB_OUTPUT}" \
+            -e GITHUB_OUTPUT \
+            -e DEPS_CLI_FAIL_ON \
+            -e DEPS_CLI_PATHS \
+            -e DEPS_CLI_COOLDOWN \
+            -e DEPS_CLI_CONFIG \
+            deps-lsp-github-action:selftest
+
+      - name: Upload SARIF to code scanning
+        uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4.38.0
+        with:
+          sarif_file: ${{ steps.deps-check.outputs.sarif-file }}
+
+      - name: Fail the build on a policy violation
+        # Explicit choice for this repo's own gate (issue #1122): unlike the action's own
+        # generic FR-018 default (which leaves this to the consumer), deps-lsp's own CI
+        # treats a --fail-on match (vulnerable/yanked/unsatisfiable) as a real merge
+        # blocker, consistent with the `security` job's cargo-deny step above already
+        # blocking on advisory findings for this repo's own dependencies.
+        if: steps.deps-check.outputs.exit-code == '1'
+        run: exit 1
+
+  docker-build-and-scan:
+    name: Docker Build and Security Scan (github-action)
+    needs: changes
+    # Build-verification/security gate for crates/github-action's own Dockerfile, separate
+    # from deps-lsp-check above (which scans this repo's *dependencies*, not the container
+    # image). Not gated on deps-cli release binaries existing (unlike deps-lsp-check): the
+    # Dockerfile's own "latest" fallback (see its DEPS_CLI_VERSION ARG) still resolves a real
+    # tag from the GitHub API, so this job fails the same way deps-lsp-check does until a
+    # release with deps-cli assets is cut — expected for now, see deps-lsp-check's comment
+    # above for the same caveat.
+    if: needs.changes.outputs.github_action == 'true' || needs.changes.outputs.workflows == 'true' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build Docker image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: crates/github-action
+          load: true
+          tags: deps-lsp-github-action:local
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        # continue-on-error: trivy exits 1 when vulnerabilities are found; without
+        # this the upload step would be skipped and findings lost from the dashboard.
+        continue-on-error: true
+        with:
+          image-ref: deps-lsp-github-action:local
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: '1'
+          limit-severities-for-sarif: true
+
+      - name: Upload Trivy results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4.38.0
+        with:
+          sarif_file: trivy-results.sarif
 
   test:
     name: Test (${{ matrix.os }}${{ matrix.rust != 'stable' && format(' / {0}', matrix.rust) || '' }})

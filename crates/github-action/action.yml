@@ -29,10 +29,6 @@ inputs:
       pull_request_target workflows scanning a fork.
     required: false
     default: ''
-  version:
-    description: deps-cli version to install from crates.io. Defaults to the latest published version.
-    required: false
-    default: ''
 outputs:
   sarif-file:
     description: >-
@@ -41,68 +37,17 @@ outputs:
       workflow, so this step does not fail the job for it). Unset for
       exit-code 2 (execution error), since the file may be missing or
       truncated and should not be fed to upload-sarif.
-    value: ${{ steps.check.outputs.sarif-file }}
   exit-code:
     description: >-
       deps-cli check's own exit code (0 clean, 1 a --fail-on category
       matched, 2 execution error). Always set. Check this output — not the
       step's own pass/fail — to react to a policy violation; the step
       itself only fails the job on exit-code 2.
-    value: ${{ steps.check.outputs.exit-code }}
 runs:
-  using: composite
-  steps:
-    - name: Install deps-cli
-      shell: bash
-      env:
-        DEPS_CLI_VERSION: ${{ inputs.version }}
-      run: |
-        set -euo pipefail
-        if [ -n "$DEPS_CLI_VERSION" ]; then
-          cargo install deps-cli --locked --version "$DEPS_CLI_VERSION"
-        else
-          cargo install deps-cli --locked
-        fi
-    - name: Run deps-cli check
-      id: check
-      shell: bash
-      env:
-        DEPS_CLI_PATHS: ${{ inputs.paths }}
-        DEPS_CLI_FAIL_ON: ${{ inputs.fail-on }}
-        DEPS_CLI_COOLDOWN: ${{ inputs.cooldown }}
-        DEPS_CLI_CONFIG: ${{ inputs.config }}
-      run: |
-        set -uo pipefail
-        args=(check --format sarif)
-        [ -n "$DEPS_CLI_FAIL_ON" ] && args+=(--fail-on "$DEPS_CLI_FAIL_ON")
-        [ -n "$DEPS_CLI_COOLDOWN" ] && args+=(--cooldown "$DEPS_CLI_COOLDOWN")
-        [ -n "$DEPS_CLI_CONFIG" ] && args+=(--config "$DEPS_CLI_CONFIG")
-        if [ -n "$DEPS_CLI_PATHS" ]; then
-          read -r -a paths_array <<< "$DEPS_CLI_PATHS"
-          args+=("${paths_array[@]}")
-        fi
-
-        # GitHub Actions runs `shell: bash` steps as `bash --noprofile --norc
-        # -eo pipefail`, so the inherited `-e` would otherwise abort the
-        # script on deps-cli's own non-zero exit (1 = policy violation, the
-        # normal, expected outcome per FR-018) before exit_code/outputs are
-        # ever captured. Disable -e for exactly this command, then restore it.
-        set +e
-        deps-cli "${args[@]}" > deps-lsp-results.sarif
-        exit_code=$?
-        set -e
-
-        if [ "$exit_code" -eq 2 ]; then
-          # Execution error, not a policy decision (FR-018 only defers exit-1
-          # policy violations to the consumer) — the SARIF file may be
-          # missing or truncated, so leave sarif-file unset rather than hand
-          # upload-sarif a potentially bad file, and fail the step for real.
-          echo "exit-code=$exit_code" >> "$GITHUB_OUTPUT"
-          echo "::error::deps-cli check exited 2 (execution error) — no SARIF file was produced; see the job log above." >&2
-          exit 1
-        fi
-
-        {
-          echo "sarif-file=deps-lsp-results.sarif"
-          echo "exit-code=$exit_code"
-        } >> "$GITHUB_OUTPUT"
+  using: docker
+  image: docker://ghcr.io/bug-ops/deps-lsp-github-action:1
+  env:
+    DEPS_CLI_PATHS: ${{ inputs.paths }}
+    DEPS_CLI_FAIL_ON: ${{ inputs.fail-on }}
+    DEPS_CLI_COOLDOWN: ${{ inputs.cooldown }}
+    DEPS_CLI_CONFIG: ${{ inputs.config }}

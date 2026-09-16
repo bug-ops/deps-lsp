@@ -158,6 +158,119 @@ jobs:
             deps-lsp-${{ matrix.target }}.*
             deps-cli-${{ matrix.target }}.*
 
+  scan-github-action-image:
+    name: Scan GitHub Action Image
+    needs: [create-release, build-binaries]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build image locally for scanning
+        # Single-platform (no QEMU/setup-qemu-action needed here, unlike the real multi-arch
+        # publish build below): `docker/build-push-action`'s `load: true` only supports loading
+        # one platform's image into the local daemon, and this build exists purely to hand
+        # Trivy a concrete image to scan, not to publish. Fetches the deps-cli
+        # x86_64-unknown-linux-musl binary build-binaries just uploaded to this release (needs:
+        # build-binaries above), same as the real publish build.
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: crates/github-action
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: deps-lsp-github-action:local
+          build-args: |
+            DEPS_CLI_VERSION=v${{ needs.create-release.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run Trivy vulnerability scanner
+        id: trivy
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        # continue-on-error: trivy exits 1 when vulnerabilities are found; without this the
+        # upload step below would be skipped and findings lost from the Security tab. The
+        # explicit "Fail on vulnerabilities found" step further down still blocks
+        # `build-github-action-image` (via `needs`) from publishing on a CRITICAL/HIGH finding
+        # — unlike ci.yml's PR-time scan, a real image is about to be pushed to GHCR here, so
+        # this repo's own supply-chain hygiene bar (already applied to its own dependencies via
+        # the #1122 deps-lsp-check gate) applies to the image it publishes too.
+        continue-on-error: true
+        with:
+          image-ref: deps-lsp-github-action:local
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: '1'
+          limit-severities-for-sarif: true
+
+      - name: Upload Trivy results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4.38.0
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: Fail on vulnerabilities found
+        if: steps.trivy.outcome == 'failure'
+        run: |
+          echo "::error::Trivy found CRITICAL/HIGH vulnerabilities in the image — see the Security tab for details. Publishing is blocked until resolved."
+          exit 1
+
+  build-github-action-image:
+    name: Build and Publish GitHub Action Image
+    needs: [create-release, build-binaries, scan-github-action-image]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Compute image tags
+        id: tags
+        run: |
+          version="${{ needs.create-release.outputs.version }}"
+          major="${version%%.*}"
+          minor="${version%.*}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "major=$major" >> "$GITHUB_OUTPUT"
+          echo "minor=$minor" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        # Fetches the deps-cli x86_64/aarch64-unknown-linux-musl binaries that
+        # build-binaries just uploaded to this release (needs: build-binaries above) from the
+        # GitHub release download URL and verifies them by checksum (crates/github-action/
+        # Dockerfile) — it does not invoke `cargo build` a second time. Gated behind
+        # scan-github-action-image (needs above): a CRITICAL/HIGH Trivy finding there fails
+        # this job before it ever runs, so a vulnerable image is never pushed to GHCR.
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: crates/github-action
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            DEPS_CLI_VERSION=v${{ steps.tags.outputs.version }}
+          tags: |
+            ghcr.io/bug-ops/deps-lsp-github-action:${{ steps.tags.outputs.version }}
+            ghcr.io/bug-ops/deps-lsp-github-action:${{ steps.tags.outputs.minor }}
+            ghcr.io/bug-ops/deps-lsp-github-action:${{ steps.tags.outputs.major }}
+            ghcr.io/bug-ops/deps-lsp-github-action:latest
+
   build-wasm:
     name: Build WASM (Zed Extension)
     needs: create-release

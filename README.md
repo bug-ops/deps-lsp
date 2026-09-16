@@ -139,7 +139,7 @@ deps-cli check --format sarif > results.sarif
   `github/codeql-action/upload-sarif`
 - **[Pre-commit hook](.pre-commit-hooks.yaml)**: `deps-lsp-check`, runs `deps-cli check`
   against staged files
-- **[GitHub Action](crates/github-action/README.md)**: a composite action wrapping
+- **[GitHub Action](crates/github-action/README.md)**: a Docker-based action wrapping
   `deps-cli check --format sarif`, leaving `upload-sarif` to your own workflow
 
 See [`crates/deps-cli/README.md`](crates/deps-cli/README.md) for other install options
