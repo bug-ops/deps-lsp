@@ -153,6 +153,15 @@ async fn run_check(
         );
         had_execution_error = true;
     }
+    for path in &walk_outcome.broken_manifest_symlinks {
+        // #1124: distinct from `ignored_manifests` — this path produced no manifest at all
+        // (unresolvable or non-regular-file target), a stronger tampering signal.
+        eprintln!(
+            "deps-cli: warning: {} is a manifest-shaped symlink whose target could not be resolved (does not exist, a broken chain, is unreadable, or is not a regular file) — this is stronger evidence of tampering than an ordinary excluded manifest",
+            path.display()
+        );
+        had_execution_error = true;
+    }
     if walk_outcome.manifests.is_empty() {
         // Defensive visibility (#1108, reviewer follow-up #1): zero manifests discovered at
         // all is operationally different from manifests found but clean — the former is far

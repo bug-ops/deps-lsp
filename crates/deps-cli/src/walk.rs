@@ -187,6 +187,15 @@ pub struct WalkOutcome {
     /// [`unrecognized_explicit_paths`](Self::unrecognized_explicit_paths), this is a warning
     /// about data loss (a real manifest silently skipped), not a benign non-match.
     pub ignored_manifests: Vec<PathBuf>,
+    /// A manifest-shaped symlink whose target is not a manifest — unresolvable (dangling,
+    /// broken chain, unreadable) or resolves to a non-regular-file (issue #1124). Distinct from
+    /// [`ignored_manifests`](Self::ignored_manifests): that means "a real file existed and we
+    /// chose not to read it" (unfollowed symlink, `.gitignore`, pruned directory); this means
+    /// the manifest-shaped path produced no manifest at all, a stronger tampering signal.
+    /// Reported regardless of `--follow-symlinks`/`--respect-gitignore`, except a structural
+    /// ancestor loop under `--follow-symlinks`, which surfaces via `walk_errors` instead (still
+    /// a non-zero exit, just a generic message rather than this specific one).
+    pub broken_manifest_symlinks: Vec<PathBuf>,
 }
 
 /// Walks every path in `roots`.
@@ -253,6 +262,12 @@ pub struct WalkOutcome {
 /// regardless of `follow_links` — that sub-root containment check runs in every mode, not only
 /// under `follow_symlinks`. A symlink loop is detected by the underlying `ignore` crate and
 /// surfaced via [`WalkOutcome::walk_errors`].
+///
+/// **Broken symlinks (issue #1124)**: a symlink whose target is not a manifest (unresolvable,
+/// or a non-regular-file such as a directory) is classified by its own filename, not its
+/// target, and reported via [`WalkOutcome::broken_manifest_symlinks`] instead of
+/// `ignored_manifests` — unconditional across every mode, same as the resolvable case, except a
+/// structural ancestor loop under `--follow-symlinks`, which reports via `walk_errors` instead.
 #[must_use]
 pub fn walk(
     roots: &[PathBuf],
@@ -335,6 +350,32 @@ fn walk_with_limit(
                 ctx.outcome.unrecognized_explicit_paths.push(root.clone());
             }
             continue;
+        }
+
+        // Short-circuit a broken/non-file-target manifest-shaped symlink root via the same
+        // `classify_symlink` the walk uses, so it can't both fall through as a directory walk
+        // and get independently re-flagged as `Broken` at the root entry (S1/S3 contradiction).
+        if is_symlink(root) {
+            let sink = match classify_symlink(&absolute_root, registry) {
+                SymlinkClassification::Broken => Some(&mut ctx.outcome.broken_manifest_symlinks),
+                SymlinkClassification::Irrelevant if std::fs::metadata(root).is_err() => {
+                    Some(&mut ctx.outcome.unrecognized_explicit_paths)
+                }
+                SymlinkClassification::Resolvable | SymlinkClassification::Irrelevant => None,
+            };
+            if let Some(sink) = sink {
+                if ctx.entries_walked >= ctx.limit {
+                    ctx.outcome.truncated = true;
+                    tracing::warn!(
+                        limit,
+                        "walk truncated: reached the maximum number of entries per run"
+                    );
+                    break;
+                }
+                ctx.entries_walked += 1;
+                sink.push(root.clone());
+                continue;
+            }
         }
 
         // FR-004: the escape-prevention baseline, canonicalized once per root (not per entry).
@@ -466,24 +507,16 @@ fn walk_directory(
         match entry {
             Ok(entry) if entry.file_type().is_some_and(|t| t.is_file()) => {
                 let path = entry.path();
-                let display = path
-                    .strip_prefix(display_root)
-                    .unwrap_or(path)
-                    .to_path_buf();
+                let display = display_relative_path(path, display_root);
                 if respect_gitignore {
                     visited.insert(display.clone());
                 }
                 if follow_symlinks {
-                    // FR-004/FR-007 (critic finding C1): every entry is canonicalized and
-                    // containment-checked here, not only ones where the leaf itself is a
-                    // symlink — see `canonicalize_within_root`'s doc for why a leaf-only check
-                    // misses an entry reached through a followed symlinked *directory*. The
-                    // resolved path doubles as the real path routed for reading (FR-007).
+                    // FR-004/FR-007 (critic C1): canonicalize+containment-check every entry,
+                    // not only leaf symlinks — a followed symlinked *directory* ancestor needs
+                    // the same check. Resolved path doubles as the real read path (FR-007).
                     match canonicalize_within_root(path, canonical_root) {
                         Some(canonical_path) => {
-                            // Routing (basename/pattern matching) still goes through `path`
-                            // (the encountered, possibly-symlinked path) — only the content
-                            // read later uses the resolved `canonical_path` (FR-007).
                             route_file(
                                 path,
                                 &canonical_path,
@@ -492,45 +525,61 @@ fn walk_directory(
                                 &mut ctx.outcome,
                             );
                         }
+                        // S4: reachable only via a rare TOCTOU race (metadata failed here after
+                        // `is_file()` succeeded above); routed like any other unresolvable path.
                         None => {
-                            // S4: only report as an excluded manifest when the escaping/
-                            // unresolvable path is itself manifest-shaped — an arbitrary
-                            // out-of-root symlink (e.g. `notes.txt -> /etc/hosts`) must not
-                            // produce a false "looks like a manifest" warning.
-                            if symlink_is_manifest_shaped(path, ctx.registry) {
-                                ctx.outcome.ignored_manifests.push(display);
-                            }
+                            classify_symlink(path, ctx.registry).record(&mut ctx.outcome, display);
                         }
                     }
                 } else {
                     route_file(path, path, &display, ctx.registry, &mut ctx.outcome);
                 }
             }
+            // #1112/#1124: `file_type()` reports the symlink's own (unresolved) type under
+            // `follow_symlinks: false`, or `None` under `follow_symlinks: true` when the
+            // target can't be stat'd (a broken symlink) — either way this arm, not the one
+            // above, is where detection happens.
             Ok(entry) => {
-                // Issue #1112: `file_type()` reports the symlink's own type, not its target's,
-                // so a manifest reachable only through a symlink otherwise falls through here
-                // silently. Detection alone (this arm) is always on; actually resolving and
-                // scanning the target is opt-in via `follow_symlinks` (handled by `ignore`'s
-                // own `WalkBuilder::follow_links`, wired above).
-                if entry.path_is_symlink() && symlink_is_manifest_shaped(entry.path(), ctx.registry)
-                {
+                if entry.path_is_symlink() {
                     let path = entry.path();
-                    let display = path
-                        .strip_prefix(display_root)
-                        .unwrap_or(path)
-                        .to_path_buf();
-                    // Background code-review finding #1: must mirror the `is_file()` arm's
-                    // `visited` insert above — otherwise `detect_ignored_manifests`' separate
-                    // unfiltered walk (run when `respect_gitignore` is true) finds this same
-                    // symlink again, sees it missing from `visited`, and pushes a second,
-                    // duplicate `ignored_manifests` entry for it.
+                    let classification = classify_symlink(path, ctx.registry);
+                    if !matches!(classification, SymlinkClassification::Irrelevant) {
+                        let display = display_relative_path(path, display_root);
+                        // Mirrors the `is_file()` arm's `visited` insert — otherwise
+                        // `detect_ignored_manifests`'s separate unfiltered walk double-reports.
+                        if respect_gitignore {
+                            visited.insert(display.clone());
+                        }
+                        classification.record(&mut ctx.outcome, display);
+                    }
+                }
+            }
+            Err(error) => {
+                // #1124: under `follow_symlinks: true`, a broken symlink surfaces as an `Err`
+                // (walkdir must stat to resolve type) instead of the arm above. `is_io()`
+                // excludes a structurally different error sharing this path-carrying variant
+                // (e.g. a symlink `Loop`); `is_symlink` (S2) excludes a non-symlink permission
+                // error from being misreported as tampering.
+                let classified_as_broken = if let ignore::Error::WithPath { path, err } = &error
+                    && err.is_io()
+                    && is_symlink(path)
+                    && is_manifest_shaped_by_name(path, ctx.registry)
+                {
+                    let display = display_relative_path(path, display_root);
                     if respect_gitignore {
                         visited.insert(display.clone());
                     }
-                    ctx.outcome.ignored_manifests.push(display);
+                    ctx.outcome.broken_manifest_symlinks.push(display);
+                    true
+                } else {
+                    false
+                };
+                // Bug 3 (background review): don't also emit the generic IO error once the
+                // specific broken-manifest warning already covers this path.
+                if !classified_as_broken {
+                    ctx.outcome.walk_errors.push(error.to_string());
                 }
             }
-            Err(error) => ctx.outcome.walk_errors.push(error.to_string()),
         }
     }
 
@@ -553,9 +602,10 @@ fn walk_directory(
 
 /// Checks a directory [`is_not_pruned_directory`] excluded (its basename matched
 /// [`PRUNED_DIRECTORIES`]) for a manifest sitting directly at its own root, and records any
-/// found onto [`WalkOutcome::ignored_manifests`] (reviewer follow-up on issue #1109's
-/// pruning fix: an unusual monorepo layout can have a *real* subproject's manifest directly
-/// inside a directory named `vendor`/`build`/`dist`/...).
+/// found onto [`WalkOutcome::ignored_manifests`] or [`WalkOutcome::broken_manifest_symlinks`]
+/// (reviewer follow-up on issue #1109's pruning fix, extended for #1124: an unusual monorepo
+/// layout can have a *real* subproject's manifest — or a manifest-shaped, possibly broken,
+/// symlink — directly inside a directory named `vendor`/`build`/`dist`/...).
 ///
 /// Deliberately one level deep only — a full recursive re-walk of the pruned directory would
 /// reintroduce the exact cost [`PRUNED_DIRECTORIES`] exists to avoid for a large vendored tree
@@ -574,14 +624,8 @@ fn warn_on_pruned_directory_manifest(
     };
     for entry in read_dir.flatten() {
         let path = entry.path();
-        if !symlink_is_manifest_shaped(&path, ctx.registry) {
-            continue;
-        }
-        let display = path
-            .strip_prefix(display_root)
-            .unwrap_or(&path)
-            .to_path_buf();
-        ctx.outcome.ignored_manifests.push(display);
+        let display = display_relative_path(&path, display_root);
+        classify_symlink(&path, ctx.registry).record(&mut ctx.outcome, display);
     }
 }
 
@@ -639,29 +683,20 @@ fn detect_ignored_manifests(
             }
         };
         if !entry.file_type().is_some_and(|t| t.is_file()) {
-            // #1112/M5: a symlinked manifest excluded by `.gitignore`/`.ignore` never appears
-            // in the primary (filtered) walk at all — `ignore` skips a gitignored entry before
-            // yielding it, so it also never lands in `visited`. This unfiltered pass is the
-            // only place that still sees it; without this branch it silently vanished from
-            // both `manifests` and `ignored_manifests` under `--respect-gitignore`, the same
-            // fail-open class `--respect-gitignore` closes for ordinary files.
+            // #1112/M5/#1124: a gitignored symlinked (possibly broken) manifest never appears
+            // in the primary filtered walk at all, so this unfiltered pass is the only place
+            // that still sees it under `--respect-gitignore`.
             let path = entry.path();
-            if entry.path_is_symlink() && symlink_is_manifest_shaped(path, ctx.registry) {
-                let display = path
-                    .strip_prefix(display_root)
-                    .unwrap_or(path)
-                    .to_path_buf();
+            if entry.path_is_symlink() {
+                let display = display_relative_path(path, display_root);
                 if !visited.contains(&display) {
-                    ctx.outcome.ignored_manifests.push(display);
+                    classify_symlink(path, ctx.registry).record(&mut ctx.outcome, display);
                 }
             }
             continue;
         }
         let path = entry.path();
-        let display = path
-            .strip_prefix(display_root)
-            .unwrap_or(path)
-            .to_path_buf();
+        let display = display_relative_path(path, display_root);
         if visited.contains(&display) {
             continue;
         }
@@ -732,17 +767,65 @@ fn canonicalize_within_root(path: &Path, canonical_root: Option<&Path>) -> Optio
         .then_some(canonical_path)
 }
 
-/// Resolves `path` (which failed the regular `is_file()` check) as a possible symlink to a
-/// manifest-shaped file, without reading its content. Returns `false` for anything that isn't
-/// a symlink resolving to a manifest-shaped regular file — a broken symlink, a symlink to a
-/// directory, or a target no ecosystem's `for_uri` claims (issue #1112, FR-001).
-fn symlink_is_manifest_shaped(path: &Path, registry: &EcosystemRegistry) -> bool {
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
+/// The result of [`classify_symlink`] (issue #1124).
+enum SymlinkClassification {
+    /// Target resolved to a manifest-shaped regular file — not followed by choice, or resolved
+    /// but excluded for another reason (e.g. it falls outside the walked root, FR-004).
+    Resolvable,
+    /// Manifest-shaped by name, but the target is not a manifest: unresolvable (dangling,
+    /// broken chain hop, unreadable), or resolves to a non-regular-file (directory, fifo,
+    /// socket, ...) — the latter is just as much a substitute for the real manifest as a
+    /// dangling target, so it is not treated as safe merely because it "resolves".
+    Broken,
+    /// Not manifest-shaped by name — never worth a warning.
+    Irrelevant,
+}
+
+impl SymlinkClassification {
+    /// Routes `display` to the matching `outcome` sink (no-op for `Irrelevant`) — the one place
+    /// this Resolvable/Broken/Irrelevant → push/push/noop mapping lives.
+    fn record(self, outcome: &mut WalkOutcome, display: PathBuf) {
+        match self {
+            Self::Resolvable => outcome.ignored_manifests.push(display),
+            Self::Broken => outcome.broken_manifest_symlinks.push(display),
+            Self::Irrelevant => {}
+        }
     }
+}
+
+/// Classifies `path` without reading its content — gates `Broken` on `path` actually being a
+/// symlink (lstat), not merely non-regular-file, so an ordinary permission-denied directory or
+/// file that happens to share a manifest's name is never misreported as tampering.
+fn classify_symlink(path: &Path, registry: &EcosystemRegistry) -> SymlinkClassification {
+    if !is_manifest_shaped_by_name(path, registry) {
+        return SymlinkClassification::Irrelevant;
+    }
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => SymlinkClassification::Resolvable,
+        _ if is_symlink(path) => SymlinkClassification::Broken,
+        _ => SymlinkClassification::Irrelevant,
+    }
+}
+
+/// `symlink_metadata` (lstat, never follows) reporting `path` itself as a symlink — succeeds
+/// even for a dangling target, unlike [`std::fs::metadata`]/`Path::is_file`.
+fn is_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+}
+
+/// `path` relative to `display_root`; falls back to `path` itself when `strip_prefix` fails or
+/// succeeds empty (the latter whenever `path == display_root`, e.g. an explicitly-given root).
+fn display_relative_path(path: &Path, display_root: &Path) -> PathBuf {
+    let stripped = path.strip_prefix(display_root).unwrap_or(path);
+    if stripped.as_os_str().is_empty() {
+        path.to_path_buf()
+    } else {
+        stripped.to_path_buf()
+    }
+}
+
+/// `EcosystemRegistry::for_uri` on `path`'s own name, never on a resolved target.
+fn is_manifest_shaped_by_name(path: &Path, registry: &EcosystemRegistry) -> bool {
     let Ok(uri) = url::Url::from_file_path(path) else {
         return false;
     };
@@ -1095,6 +1178,115 @@ mod tests {
         assert_eq!(outcome.manifests.len(), 1);
     }
 
+    /// Critic finding S3: issue #1124's own repro command shape is `deps-cli check
+    /// path/to/Cargo.toml` where that path is itself a broken symlink — the natural
+    /// single-manifest CI-gate invocation. Before the fix, `root.is_file()` (which follows
+    /// symlinks and so is `false` here) let this fall into the directory-walk branch with
+    /// `walk_root == display_root == root`, producing an empty `display_path` once
+    /// `strip_prefix` trivially succeeded against itself. Must report the manifest's own given
+    /// path, not an empty one.
+    #[cfg(unix)]
+    #[test]
+    fn test_walk_explicit_broken_symlink_manifest_path_reports_the_given_path() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let manifest = dir.path().join("Cargo.toml");
+        std::os::unix::fs::symlink(dir.path().join("does-not-exist"), &manifest)
+            .expect("create broken symlink");
+
+        let outcome = walk(
+            std::slice::from_ref(&manifest),
+            &test_registry(),
+            false,
+            false,
+        );
+
+        assert!(outcome.manifests.is_empty());
+        assert!(outcome.ignored_manifests.is_empty());
+        assert!(outcome.unrecognized_explicit_paths.is_empty());
+        assert_eq!(outcome.broken_manifest_symlinks, vec![manifest]);
+    }
+
+    /// Companion to the above: an explicit root that is a symlink to a real *directory* must
+    /// still be walked as a directory (existing, legitimate use), not intercepted by S3's fix —
+    /// only a symlink whose target fails to resolve at all is a broken-manifest candidate.
+    #[cfg(unix)]
+    #[test]
+    fn test_walk_explicit_symlink_to_directory_root_is_still_walked() {
+        let real_dir = tempfile::tempdir().expect("create real dir");
+        fs::write(real_dir.path().join("Cargo.toml"), "[package]\n").expect("write manifest");
+
+        let link_parent = tempfile::tempdir().expect("create link parent");
+        let link = link_parent.path().join("link-to-real");
+        std::os::unix::fs::symlink(real_dir.path(), &link)
+            .expect("create symlink to a real directory");
+
+        let outcome = walk(std::slice::from_ref(&link), &test_registry(), false, false);
+
+        assert_eq!(outcome.manifests.len(), 1);
+        assert!(outcome.broken_manifest_symlinks.is_empty());
+    }
+
+    /// Critic S4 + background-review Bug 1: a manifest-shaped symlink resolving to an existing
+    /// *directory*, passed as an explicit root (`deps-cli check tree/Cargo.toml`), must be
+    /// reported with a non-empty path — and, critically, must NOT also be walked as a
+    /// directory: `real_dir` contains a real, findable manifest, so if the old fallthrough
+    /// behavior regressed, `manifests` would be non-empty here at the same time
+    /// `broken_manifest_symlinks` is populated — a self-contradictory report (found earlier by
+    /// background code review: S1's widened policy and S3's directory-walk fallthrough used to
+    /// fire simultaneously for this exact path).
+    #[cfg(unix)]
+    #[test]
+    fn test_walk_explicit_manifest_shaped_symlink_to_directory_root_reports_a_non_empty_path() {
+        let real_dir = tempfile::tempdir().expect("create real dir");
+        fs::write(real_dir.path().join("package.json"), "{}").expect("write real manifest");
+
+        let link_parent = tempfile::tempdir().expect("create link parent");
+        let link = link_parent.path().join("Cargo.toml");
+        std::os::unix::fs::symlink(real_dir.path(), &link)
+            .expect("create manifest-shaped symlink to a real directory");
+
+        let outcome = walk(std::slice::from_ref(&link), &test_registry(), false, false);
+
+        assert!(
+            outcome.manifests.is_empty(),
+            "must not also walk the target directory's contents: {:?}",
+            outcome
+                .manifests
+                .iter()
+                .map(|m| &m.display_path)
+                .collect::<Vec<_>>()
+        );
+        assert!(outcome.ignored_manifests.is_empty());
+        assert_eq!(outcome.broken_manifest_symlinks.len(), 1);
+        assert!(
+            !outcome.broken_manifest_symlinks[0].as_os_str().is_empty(),
+            "must never report an empty display path"
+        );
+        assert_eq!(
+            outcome.broken_manifest_symlinks[0].file_name(),
+            Some(std::ffi::OsStr::new("Cargo.toml")),
+            "reported path must still name the manifest: {:?}",
+            outcome.broken_manifest_symlinks
+        );
+    }
+
+    /// Explicit root that is a broken symlink whose own name is *not* manifest-shaped must be
+    /// reported as unrecognized, not as tampering — mirrors the never-warn-on-non-manifests
+    /// invariant `classify_symlink` already applies to a discovered (non-root) entry.
+    #[cfg(unix)]
+    #[test]
+    fn test_walk_explicit_broken_symlink_non_manifest_path_is_unrecognized() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let notes = dir.path().join("notes.txt");
+        std::os::unix::fs::symlink(dir.path().join("does-not-exist"), &notes)
+            .expect("create broken, non-manifest-shaped symlink");
+
+        let outcome = walk(std::slice::from_ref(&notes), &test_registry(), false, false);
+
+        assert!(outcome.broken_manifest_symlinks.is_empty());
+        assert_eq!(outcome.unrecognized_explicit_paths, vec![notes]);
+    }
+
     /// Regression test for #1108: a *relative* walk root must still find manifests —
     /// `url::Url::from_file_path` (used to route a discovered file) rejects relative paths, so
     /// before the fix every file under a relative root was silently dropped, and `deps-cli
@@ -1326,10 +1518,12 @@ mod tests {
         assert_eq!(outcome.ignored_manifests, vec![PathBuf::from("Cargo.toml")]);
     }
 
-    /// A broken symlink is not manifest-shaped by definition — no `ignored_manifests` entry.
+    /// Issue #1124's own repro: a manifest-shaped broken symlink is reported via the
+    /// dedicated `broken_manifest_symlinks` sink, not `ignored_manifests` — the two carry
+    /// different signal (see `WalkOutcome::broken_manifest_symlinks`'s doc).
     #[cfg(unix)]
     #[test]
-    fn test_walk_broken_symlink_is_not_reported_as_manifest() {
+    fn test_walk_default_detects_broken_symlinked_manifest() {
         let dir = tempfile::tempdir().expect("create temp dir");
         std::os::unix::fs::symlink(
             dir.path().join("does-not-exist"),
@@ -1341,9 +1535,208 @@ mod tests {
 
         assert!(outcome.manifests.is_empty());
         assert!(outcome.ignored_manifests.is_empty());
+        assert_eq!(
+            outcome.broken_manifest_symlinks,
+            vec![PathBuf::from("Cargo.toml")]
+        );
     }
 
-    /// A symlink to a directory is not manifest-shaped either.
+    /// A symlink whose own filename is not manifest-shaped stays silent even when broken —
+    /// the never-warn-on-non-manifests invariant applies to `broken_manifest_symlinks` too.
+    #[cfg(unix)]
+    #[test]
+    fn test_walk_broken_symlink_not_manifest_shaped_is_not_reported() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        std::os::unix::fs::symlink(
+            dir.path().join("does-not-exist"),
+            dir.path().join("notes.txt"),
+        )
+        .expect("create broken, non-manifest-shaped symlink");
+
+        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
+
+        assert!(outcome.manifests.is_empty());
+        assert!(outcome.ignored_manifests.is_empty());
+        assert!(outcome.broken_manifest_symlinks.is_empty());
+    }
+
+    /// `--follow-symlinks` does not defeat #1124's detection — a broken symlink still can't be
+    /// resolved regardless of the flag, so it must still land in `broken_manifest_symlinks`,
+    /// not silently vanish the way it did before this fix. Exercises a different code path
+    /// than the default-mode test above: under `follow_symlinks: true`, `ignore`/`walkdir`
+    /// must stat the entry to resolve its type and yields an `Err` for a broken target instead
+    /// of an `Ok(entry)` with an unresolved type — see the `Err(error)` arm's own doc in
+    /// `walk_directory`.
+    #[cfg(unix)]
+    #[test]
+    fn test_walk_follow_symlinks_still_detects_broken_symlinked_manifest() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        std::os::unix::fs::symlink(
+            dir.path().join("does-not-exist"),
+            dir.path().join("Cargo.toml"),
+        )
+        .expect("create broken symlink");
+
+        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, true);
+
+        assert!(outcome.manifests.is_empty());
+        assert!(outcome.ignored_manifests.is_empty());
+        assert_eq!(
+            outcome.broken_manifest_symlinks,
+            vec![PathBuf::from("Cargo.toml")]
+        );
+        assert!(
+            outcome.walk_errors.is_empty(),
+            "Bug 3 (background code review): a mid-walk broken symlink already classified must \
+             not also emit a duplicate generic IO walk error: {:?}",
+            outcome.walk_errors
+        );
+    }
+
+    /// A broken hop partway through a symlink chain (`Cargo.toml -> intermediate -> nothing`)
+    /// is detected the same way a directly-broken symlink is — `std::fs::metadata` follows the
+    /// whole chain, so no separate per-hop handling is needed.
+    #[cfg(unix)]
+    #[test]
+    fn test_walk_broken_symlink_chain_is_detected() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let missing = dir.path().join("does-not-exist");
+        let intermediate = dir.path().join("intermediate-link");
+        std::os::unix::fs::symlink(&missing, &intermediate)
+            .expect("create intermediate broken symlink");
+        std::os::unix::fs::symlink(&intermediate, dir.path().join("Cargo.toml"))
+            .expect("create Cargo.toml -> intermediate-link -> does-not-exist");
+
+        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
+
+        assert!(outcome.manifests.is_empty());
+        assert!(outcome.ignored_manifests.is_empty());
+        assert_eq!(
+            outcome.broken_manifest_symlinks,
+            vec![PathBuf::from("Cargo.toml")]
+        );
+    }
+
+    /// A symlink target unreadable because of an ancestor directory's permissions (`EACCES`,
+    /// not `ENOENT`) is detected the same way a dangling symlink is — `std::fs::metadata`
+    /// fails identically for both. Skips its own assertions (rather than failing) when running
+    /// with a privilege that bypasses directory permission checks (e.g. root in some CI
+    /// containers), since the permission-denied precondition this test needs doesn't hold there.
+    #[cfg(unix)]
+    #[test]
+    fn test_walk_symlink_target_permission_denied_is_detected_as_broken() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let blocked = dir.path().join("blocked");
+        fs::create_dir(&blocked).expect("mkdir blocked");
+        let target = blocked.join("manifest-data");
+        fs::write(&target, "[package]\n").expect("write target");
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).expect("chmod 000");
+        std::os::unix::fs::symlink(&target, dir.path().join("Cargo.toml"))
+            .expect("create symlink into a permission-denied directory");
+
+        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
+        let permission_check_effective = std::fs::metadata(&target).is_err();
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o755)).expect("restore perms");
+
+        if !permission_check_effective {
+            eprintln!(
+                "skipping: directory permissions did not block metadata (likely running as root)"
+            );
+            return;
+        }
+
+        assert!(outcome.manifests.is_empty());
+        assert!(outcome.ignored_manifests.is_empty());
+        assert_eq!(
+            outcome.broken_manifest_symlinks,
+            vec![PathBuf::from("Cargo.toml")]
+        );
+    }
+
+    /// Spec 065 §6 edge case, extended for #1124: a broken, manifest-shaped symlink directly
+    /// at a `PRUNED_DIRECTORIES`-excluded directory's own root is reported via
+    /// `broken_manifest_symlinks`, mirroring the existing resolvable-symlink case
+    /// (`test_walk_pruned_directory_symlinked_manifest_is_still_warned`).
+    #[cfg(unix)]
+    #[test]
+    fn test_walk_pruned_directory_broken_symlinked_manifest_is_reported_as_broken() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        fs::create_dir(dir.path().join("vendor")).expect("mkdir vendor");
+        std::os::unix::fs::symlink(
+            dir.path().join("vendor").join("does-not-exist"),
+            dir.path().join("vendor").join("Cargo.toml"),
+        )
+        .expect("create broken symlink inside pruned directory");
+
+        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
+
+        assert!(
+            outcome.manifests.is_empty(),
+            "still pruned from the primary scan"
+        );
+        assert!(outcome.ignored_manifests.is_empty());
+        assert_eq!(
+            outcome.broken_manifest_symlinks,
+            vec![PathBuf::from("vendor").join("Cargo.toml")]
+        );
+    }
+
+    /// A broken symlink excluded by `.gitignore` under `--respect-gitignore` must still be
+    /// detected — mirroring #1112/M5's own gitignored-resolvable-symlink case
+    /// (`test_walk_respect_gitignore_does_not_duplicate_symlinked_manifest_warning`), this is
+    /// only visible via `detect_ignored_manifests`'s unfiltered diff pass since the primary
+    /// (filtered) walk never yields a gitignored entry at all.
+    #[cfg(unix)]
+    #[test]
+    fn test_walk_respect_gitignore_detects_gitignored_broken_symlinked_manifest() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        fs::create_dir(dir.path().join(".git")).expect("create .git marker");
+        fs::write(dir.path().join(".gitignore"), "Cargo.toml\n").expect("write gitignore");
+        std::os::unix::fs::symlink(
+            dir.path().join("does-not-exist"),
+            dir.path().join("Cargo.toml"),
+        )
+        .expect("create broken symlink");
+
+        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), true, false);
+
+        assert!(outcome.manifests.is_empty());
+        assert!(outcome.ignored_manifests.is_empty());
+        assert_eq!(
+            outcome.broken_manifest_symlinks,
+            vec![PathBuf::from("Cargo.toml")]
+        );
+    }
+
+    /// Companion to the above: a broken symlinked manifest that is *not* gitignored must be
+    /// reported exactly once even when `--respect-gitignore`'s extra unfiltered diff pass also
+    /// runs — mirrors the existing resolvable-symlink dedup test
+    /// (`test_walk_respect_gitignore_does_not_duplicate_symlinked_manifest_warning`).
+    #[cfg(unix)]
+    #[test]
+    fn test_walk_respect_gitignore_does_not_duplicate_broken_symlink_warning() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        fs::create_dir(dir.path().join(".git")).expect("create .git marker");
+        fs::write(dir.path().join(".gitignore"), "*.log\n").expect("write gitignore");
+        std::os::unix::fs::symlink(
+            dir.path().join("does-not-exist"),
+            dir.path().join("Cargo.toml"),
+        )
+        .expect("create broken symlink");
+
+        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), true, false);
+
+        assert_eq!(
+            outcome.broken_manifest_symlinks,
+            vec![PathBuf::from("Cargo.toml")],
+            "a non-gitignored broken symlinked manifest must be reported exactly once"
+        );
+    }
+
+    /// A symlink to a directory whose own name isn't manifest-shaped is silent — unaffected by
+    /// critic finding S1, since the never-warn-on-non-manifests invariant is orthogonal to it.
     #[cfg(unix)]
     #[test]
     fn test_walk_symlink_to_directory_is_not_reported_as_manifest() {
@@ -1356,6 +1749,106 @@ mod tests {
 
         assert!(outcome.manifests.is_empty());
         assert!(outcome.ignored_manifests.is_empty());
+        assert!(outcome.broken_manifest_symlinks.is_empty());
+    }
+
+    /// Critic finding S1: a manifest-shaped symlink resolving to an existing *directory* is a
+    /// zero-cost substitute for a dangling symlink from an attacker's perspective — both are
+    /// "a manifest-shaped path that produces no manifest" — so it must land in
+    /// `broken_manifest_symlinks`, not silently pass as `Irrelevant` just because the target
+    /// technically resolves.
+    #[cfg(unix)]
+    #[test]
+    fn test_walk_symlink_to_directory_with_manifest_shaped_name_is_reported_as_broken() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        fs::create_dir(dir.path().join("real_dir")).expect("mkdir real_dir");
+        std::os::unix::fs::symlink(dir.path().join("real_dir"), dir.path().join("Cargo.toml"))
+            .expect("create manifest-shaped symlink to a directory");
+
+        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
+
+        assert!(outcome.manifests.is_empty());
+        assert!(outcome.ignored_manifests.is_empty());
+        assert_eq!(
+            outcome.broken_manifest_symlinks,
+            vec![PathBuf::from("Cargo.toml")]
+        );
+    }
+
+    /// Companion to the above: a manifest-shaped symlink resolving to a non-regular,
+    /// non-directory target (a fifo) is the same class of substitution attack and must be
+    /// reported identically. Uses the `mkfifo` binary rather than unsafe `libc::mkfifo` (this
+    /// workspace forbids `unsafe_code`); skips gracefully if the binary isn't on `PATH`.
+    #[cfg(unix)]
+    #[test]
+    fn test_walk_symlink_to_fifo_with_manifest_shaped_name_is_reported_as_broken() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let fifo = dir.path().join("a-fifo");
+        let mkfifo_ok = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .is_ok_and(|status| status.success());
+        if !mkfifo_ok {
+            eprintln!("skipping: `mkfifo` binary not available on PATH");
+            return;
+        }
+        std::os::unix::fs::symlink(&fifo, dir.path().join("Cargo.toml"))
+            .expect("create manifest-shaped symlink to a fifo");
+
+        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
+
+        assert!(outcome.manifests.is_empty());
+        assert!(outcome.ignored_manifests.is_empty());
+        assert_eq!(
+            outcome.broken_manifest_symlinks,
+            vec![PathBuf::from("Cargo.toml")]
+        );
+    }
+
+    /// Critic finding S2: an ordinary, non-symlink directory that merely shares a manifest's
+    /// name, made unreadable by permissions, must never be reported as symlink tampering — the
+    /// `is_symlink` gate in both `classify_symlink` and the walk's `Err(error)` arm must
+    /// exclude it. Skips its own assertions when running with a privilege that bypasses
+    /// directory permission checks (mirrors the existing EACCES symlink-target test).
+    #[cfg(unix)]
+    #[test]
+    fn test_walk_permission_denied_non_symlink_manifest_named_directory_is_not_reported() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let blocked = dir.path().join("app.csproj");
+        fs::create_dir(&blocked).expect("mkdir app.csproj");
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).expect("chmod 000");
+
+        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
+        // Background-review test-gap finding: `metadata()`/`stat()` on `blocked` needs only
+        // execute permission on its *ancestors*, not on `blocked` itself, so it always succeeds
+        // here regardless of the chmod above — checking it (as an earlier version of this test
+        // did) made the self-skip fire unconditionally, giving this test zero real coverage.
+        // `read_dir()` on `blocked` does need its own execute bit, matching the operation the
+        // walker actually performs (and fails) when it tries to descend into this entry.
+        let permission_check_effective = std::fs::read_dir(&blocked).is_err();
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o755)).expect("restore perms");
+
+        if !permission_check_effective {
+            eprintln!(
+                "skipping: directory permissions did not block read_dir (likely running as root)"
+            );
+            return;
+        }
+
+        assert!(
+            !outcome.walk_errors.is_empty(),
+            "sanity check: the walker's own descent into `blocked` must have failed for this \
+             test to exercise anything"
+        );
+        assert!(outcome.ignored_manifests.is_empty());
+        assert!(
+            outcome.broken_manifest_symlinks.is_empty(),
+            "a non-symlink, permission-denied directory must never be reported as symlink \
+             tampering: {:?}",
+            outcome.broken_manifest_symlinks
+        );
     }
 
     /// Spec §6 edge case: a symlink to a manifest-shaped file sitting directly at a
@@ -1589,6 +2082,62 @@ mod tests {
                 .iter()
                 .any(|m| m.display_path == Path::new("Cargo.toml")),
             "other manifests in the same tree must still be found"
+        );
+    }
+
+    /// M2 (critic follow-up): a self-referential manifest-shaped symlink (`Cargo.toml ->
+    /// Cargo.toml`) resolves via a plain OS-level `ELOOP` (`io::Error`), distinct from the
+    /// structural ancestor/descendant directory cycle `ignore`'s own `Error::Loop` variant
+    /// detects during descent (`test_walk_follow_symlinks_reports_symlink_loop_via_walk_errors`
+    /// above, whose names aren't manifest-shaped and whose `Error::Loop` isn't `is_io()`
+    /// either way). Since this *is* an IO error on a manifest-shaped symlink, it lands in
+    /// `broken_manifest_symlinks`, and — per Bug 3 (background code review) — the generic
+    /// `walk_errors` push is skipped once that specific classification already fired, so no
+    /// hang/crash but also no duplicate warning.
+    #[cfg(unix)]
+    #[test]
+    fn test_walk_follow_symlinks_self_referential_manifest_symlink_is_reported_as_broken() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        std::os::unix::fs::symlink(dir.path().join("Cargo.toml"), dir.path().join("Cargo.toml"))
+            .expect("create self-referential Cargo.toml -> Cargo.toml");
+
+        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, true);
+
+        assert_eq!(
+            outcome.broken_manifest_symlinks,
+            vec![PathBuf::from("Cargo.toml")]
+        );
+        assert!(
+            outcome.walk_errors.is_empty(),
+            "must not duplicate the specific broken-manifest classification with a generic \
+             IO walk error: {:?}",
+            outcome.walk_errors
+        );
+    }
+
+    /// M2 (critic follow-up): `--respect-gitignore` and `--follow-symlinks` combined must still
+    /// detect a broken, gitignored manifest symlink — no untested interaction between the two
+    /// opt-in flags for the broken case specifically (the resolvable case already has
+    /// `test_walk_follow_symlinks_and_respect_gitignore_together_still_honors_gitignore`).
+    #[cfg(unix)]
+    #[test]
+    fn test_walk_respect_gitignore_and_follow_symlinks_together_detect_broken_manifest() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        fs::create_dir(dir.path().join(".git")).expect("create .git marker");
+        fs::write(dir.path().join(".gitignore"), "Cargo.toml\n").expect("write gitignore");
+        std::os::unix::fs::symlink(
+            dir.path().join("does-not-exist"),
+            dir.path().join("Cargo.toml"),
+        )
+        .expect("create broken symlink");
+
+        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), true, true);
+
+        assert!(outcome.manifests.is_empty());
+        assert!(outcome.ignored_manifests.is_empty());
+        assert_eq!(
+            outcome.broken_manifest_symlinks,
+            vec![PathBuf::from("Cargo.toml")]
         );
     }
 
