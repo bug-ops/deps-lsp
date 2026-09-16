@@ -703,9 +703,21 @@ jobs:
         # write access to $GITHUB_OUTPUT (bind-mounted at the same path on both sides) so
         # entrypoint.sh's own `>>"$GITHUB_OUTPUT"` writes land back in this step's real outputs.
         # `-e VAR` (no `=value`) forwards the host shell's value only if set, so the optional
-        # DEPS_CLI_PATHS/COOLDOWN/CONFIG are safely omitted rather than passed as literal empty.
+        # DEPS_CLI_COOLDOWN/CONFIG are safely omitted rather than passed as literal empty.
+        #
+        # DEPS_CLI_PATHS is scoped to this repo's own dependency manifests (root Cargo.toml,
+        # which carries every pinned version per this project's centralized-versioning
+        # convention, plus .github/ for Actions pins) rather than the repo root: an unscoped
+        # walk also descends into crates/*/tests/fixtures/ and fuzz/seeds/, which deliberately
+        # contain vulnerable/yanked/malformed manifests to exercise ecosystem parsers and
+        # trip this job's own fail-on gate on every run.
+        #
+        # GITHUB_TOKEN raises the GitHub Actions ecosystem's registry-lookup rate limit from
+        # 60/hr (unauthenticated, shared across every job on the runner's IP) to 5000/hr.
         env:
           DEPS_CLI_FAIL_ON: vulnerable,yanked,unsatisfiable
+          DEPS_CLI_PATHS: Cargo.toml .github
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           docker run --rm \
             -v "${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE}" \
@@ -716,6 +728,7 @@ jobs:
             -e DEPS_CLI_PATHS \
             -e DEPS_CLI_COOLDOWN \
             -e DEPS_CLI_CONFIG \
+            -e GITHUB_TOKEN \
             deps-lsp-github-action:selftest
 
       - name: Upload SARIF to code scanning
