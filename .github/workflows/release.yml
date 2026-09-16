@@ -102,11 +102,15 @@ jobs:
 
       - name: Build release (cross)
         if: matrix.use_cross
-        run: cross build --package deps-lsp --package deps-cli --release --target ${{ matrix.target }}
+        run: |
+          cross build --package deps-lsp --release --target ${{ matrix.target }}
+          cross build --package deps-cli --release --target ${{ matrix.target }}
 
       - name: Build release (native)
         if: "!matrix.use_cross"
-        run: cargo build --package deps-lsp --package deps-cli --release --target ${{ matrix.target }}
+        run: |
+          cargo build --package deps-lsp --release --target ${{ matrix.target }}
+          cargo build --package deps-cli --release --target ${{ matrix.target }}
 
       - name: Get binary names
         id: binary
