@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **ci**: `crates/github-action` wired into this repo's own `ci.yml` as a SARIF gate, uploading results to Code Scanning and failing the build on a `vulnerable`/`yanked`/`unsatisfiable` policy violation (#1126, resolves #1122)
-- **docs**: new `codecov.yml` defines a Codecov component per crate, and every `crates/*/README.md` codecov badge now points at its own component instead of a never-populated flag, giving per-crate coverage visibility from the existing single workspace `lcov.info` upload (#1128)
+- **docs**: `.github/codecov.yml`'s per-crate breakdown now uses Codecov components instead of the previous `flags` section (which needed a per-flag CI upload that never happened, so every per-crate flag stayed unpopulated); every `crates/*/README.md` codecov badge now points at its own component, giving actual per-crate coverage visibility from the existing single workspace `lcov.info` upload (#1128)
 
 ### Fixed
 - **ci**: `crates/github-action`'s Dockerfile now runs `apk upgrade` before `apk add` in both build stages, so the published image no longer ships a stale `alpine:3.22` package layer with an already-patched CVE (`libssl3`/`libcrypto3` CVE-2026-14456, flagged HIGH by Trivy)

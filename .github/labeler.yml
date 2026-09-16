@@ -49,7 +49,7 @@
   - changed-files:
     - any-glob-to-any-file:
       - 'deny.toml'
-      - 'codecov.yml'
+      - '.github/codecov.yml'
       - 'rust-toolchain.toml'
       - '.cargo/**/*'
 
