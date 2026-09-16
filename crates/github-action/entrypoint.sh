@@ -10,20 +10,41 @@ if [ -n "${DEPS_CLI_PATHS:-}" ]; then
 	args+=("${paths_array[@]}")
 fi
 
-deps-cli "${args[@]}" >deps-lsp-results.sarif
+out=deps-lsp-results.sarif
+
+# cwd is the scanned checkout — attacker-controlled under pull_request_target; a committed
+# symlink would otherwise redirect this write outside it (#1132).
+if [ -e "$out" ] || [ -L "$out" ]; then
+	out_type="file"
+	[ -d "$out" ] && out_type="directory"
+	[ -L "$out" ] && out_type="symlink"
+	echo "::warning::removing pre-existing $out (type: $out_type) before running deps-cli" >&2
+fi
+rm -f -- "$out"
+if [ -e "$out" ] || [ -L "$out" ]; then
+	echo "::error::refusing to run: $out exists in the scanned checkout and could not be removed." >&2
+	exit 1
+fi
+
+deps-cli "${args[@]}" >"$out"
 exit_code=$?
 
-if [ "$exit_code" -eq 2 ]; then
-	# Execution error, not a policy decision (FR-018 only defers exit-1 policy
-	# violations to the consumer) — the SARIF file may be missing or truncated,
-	# so leave sarif-file unset rather than hand upload-sarif a potentially bad
-	# file, and fail the step for real.
+# deps-cli's contract is exactly 0/1/2; anything else (panic 101, missing binary 127,
+# OOM 137, SIGSEGV 139) means the scan never completed.
+if [ "$exit_code" -ne 0 ] && [ "$exit_code" -ne 1 ]; then
 	echo "exit-code=$exit_code" >>"$GITHUB_OUTPUT"
-	echo "::error::deps-cli check exited 2 (execution error) — no SARIF file was produced; see the job log above." >&2
+	echo "::error::deps-cli check exited $exit_code (execution error) — no usable SARIF file was produced; see the job log above." >&2
+	exit 1
+fi
+
+# Positive control: a failed redirect surfaces as exit 1 without running deps-cli at all.
+if [ ! -f "$out" ] || [ ! -s "$out" ]; then
+	echo "exit-code=$exit_code" >>"$GITHUB_OUTPUT"
+	echo "::error::deps-cli check exited $exit_code but produced no usable SARIF file; refusing to report a clean scan." >&2
 	exit 1
 fi
 
 {
-	echo "sarif-file=deps-lsp-results.sarif"
+	echo "sarif-file=$out"
 	echo "exit-code=$exit_code"
 } >>"$GITHUB_OUTPUT"

@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **deps-cli**: `check` now reports a manifest replaced by an unresolvable or non-file symlink instead of silently skipping it (#1139, resolves #1124)
+- **ci**: `crates/github-action`'s entrypoint no longer reports success on an abnormal `deps-cli` exit or an unwritable SARIF path (#1131)
+- **ci**: `crates/github-action`'s entrypoint refuses to write the SARIF file through a symlink or directory left in the scanned checkout (#1132)
+
+### Changed
+- **ci**: `deps-lsp-check` and `docker-build-and-scan` now block `ci-success` (#1130)
 
 ## [1.1.0] - 2026-09-16
 

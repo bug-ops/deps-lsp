@@ -659,13 +659,6 @@ jobs:
     needs: changes
     # New vulnerability/yanked advisories can appear with no manifest change, so this also
     # runs on the weekly schedule, same as `security` above.
-    #
-    # Deliberately not in `ci-success`'s `needs` yet (#1122): building crates/github-action's
-    # Dockerfile fetches a real deps-cli release binary at build time, but no tagged release
-    # has published deps-cli binaries yet as of this job's introduction (#1107 added the
-    # release.yml build matrix but hasn't shipped a release since) — this job will fail on
-    # every run until the next release is cut. Add it to `ci-success`'s `needs` once a release
-    # with deps-cli assets exists and this job has been observed passing on main.
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true' || needs.changes.outputs.github_action == 'true' || github.event_name == 'schedule'
     # Regular pull_request (never pull_request_target), so this safely scans fork PRs too.
     runs-on: ubuntu-latest
@@ -675,6 +668,9 @@ jobs:
       security-events: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Run entrypoint.sh regression tests
+        run: bash crates/github-action/tests/entrypoint_test.sh
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
@@ -732,6 +728,10 @@ jobs:
             deps-lsp-github-action:selftest
 
       - name: Upload SARIF to code scanning
+        # A pull_request from a fork gets a read-only GITHUB_TOKEN regardless of this job's
+        # security-events: write permission, so the upload would 403 and fail the job for
+        # every external contributor.
+        if: github.event.pull_request.head.repo.full_name == github.repository || github.event_name != 'pull_request'
         uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4.38.0
         with:
           sarif_file: ${{ steps.deps-check.outputs.sarif-file }}
@@ -750,11 +750,7 @@ jobs:
     needs: changes
     # Build-verification/security gate for crates/github-action's own Dockerfile, separate
     # from deps-lsp-check above (which scans this repo's *dependencies*, not the container
-    # image). Not gated on deps-cli release binaries existing (unlike deps-lsp-check): the
-    # Dockerfile's own "latest" fallback (see its DEPS_CLI_VERSION ARG) still resolves a real
-    # tag from the GitHub API, so this job fails the same way deps-lsp-check does until a
-    # release with deps-cli assets is cut — expected for now, see deps-lsp-check's comment
-    # above for the same caveat.
+    # image).
     if: needs.changes.outputs.github_action == 'true' || needs.changes.outputs.workflows == 'true' || github.event_name == 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -790,6 +786,10 @@ jobs:
           limit-severities-for-sarif: true
 
       - name: Upload Trivy results to GitHub Security tab
+        # A pull_request from a fork gets a read-only GITHUB_TOKEN regardless of this job's
+        # security-events: write permission, so the upload would 403 and fail the job for
+        # every external contributor.
+        if: github.event.pull_request.head.repo.full_name == github.repository || github.event_name != 'pull_request'
         uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4.38.0
         with:
           sarif_file: trivy-results.sarif
@@ -1249,13 +1249,15 @@ jobs:
         coverage,
         msrv,
         benchmark,
+        deps-lsp-check,
+        docker-build-and-scan,
       ]
     runs-on: ubuntu-latest
     if: always()
     steps:
       - name: Check all jobs
         run: |
-          if [[ "${{ needs.changes.outputs.rust }}" != "true" && "${{ needs.changes.outputs.workflows }}" != "true" ]]; then
+          if [[ "${{ needs.changes.outputs.rust }}" != "true" && "${{ needs.changes.outputs.workflows }}" != "true" && "${{ needs.changes.outputs.github_action }}" != "true" ]]; then
             echo "No relevant changes - skipped jobs are OK"
             exit 0
           fi
@@ -1283,6 +1285,8 @@ jobs:
           check_job "${{ needs.coverage.result }}" "coverage" || failed=1
           check_job "${{ needs.msrv.result }}" "msrv" || failed=1
           check_job "${{ needs.benchmark.result }}" "benchmark" || failed=1
+          check_job "${{ needs.deps-lsp-check.result }}" "deps-lsp-check" || failed=1
+          check_job "${{ needs.docker-build-and-scan.result }}" "docker-build-and-scan" || failed=1
 
           if [[ $failed -eq 1 ]]; then
             echo "One or more jobs failed"
