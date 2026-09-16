@@ -119,11 +119,9 @@ pub fn parse_package_json_with_context(
     // per-section.
     let mut budget = deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
 
-    // Parse each dependency section, reading each entry's position directly from the AST
-    // (#613) — the AST's own `Object::properties` only ever lists a given object's *direct*
-    // children, so a name repeated across sections (e.g. also present in `devDependencies`)
-    // or nested inside an unrelated value (e.g. `packageExtensions`) never gets confused with
-    // the real top-level occurrence.
+    // Reads each entry's position directly from the AST (#613) — `Object::properties` only
+    // lists a given object's *direct* children, so a name repeated across sections or nested
+    // inside an unrelated value never gets confused with the real top-level occurrence.
     const SECTIONS: [(&str, NpmDependencySection); 4] = [
         ("dependencies", NpmDependencySection::Dependencies),
         ("devDependencies", NpmDependencySection::DevDependencies),
@@ -148,26 +146,16 @@ pub fn parse_package_json_with_context(
         }
     }
 
-    // FR-002: a non-`file:` URI (or one `Url::to_file_path` cannot resolve) has no directory to
-    // walk `.npmrc`/pnpm-workspace discovery from — falls back to the empty `NpmConfig`, which
-    // resolves every dependency to `DependencySource::Registry` (NFR-005: byte-identical to
-    // pre-feature behavior), rather than failing the whole parse. Also the manifest directory
-    // spec 046's catalog resolution walks up from (S3: `None` here is what makes a non-`file:`
-    // URI land on `CatalogOutcome::NoWorkspaceFile` rather than skipping resolution).
+    // FR-002: a non-`file:` URI (or one `to_file_path` can't resolve) has no directory to walk
+    // `.npmrc`/pnpm-workspace discovery from — falls back to the empty `NpmConfig` (every
+    // dependency resolves to `Registry`, NFR-005) rather than failing the whole parse; this is
+    // also what makes catalog resolution land on `CatalogOutcome::NoWorkspaceFile` (S3).
     //
-    // Implementation-critique S2 (originally written against `ls_types::Uri`, whose
-    // `to_file_path` does **not** check scheme and, on non-Windows, ignores the
-    // authority/host entirely — see this file's `tests` module doc comments for the exact
-    // divergence flagged to team-lead, and empirically verified by security review, during
-    // the issue #1071 `url::Url` migration): `url::Url::to_file_path` already refuses a
-    // non-empty, non-`localhost` host on its own, but resolving through
-    // `deps_core::lockfile::resolve_manifest_file_path` also makes the scheme check explicit
-    // rather than relying solely on `to_file_path`'s internal validation — left unguarded,
-    // `untitled:package.json` (VS Code's untitled-buffer form, path "package.json") would
-    // resolve `manifest_dir` to a *relative* path, and `.npmrc`/pnpm-workspace discovery would
-    // then probe the LSP server process's own CWD instead of the workspace the document
-    // notionally belongs to (#1090). Both `.npmrc` registry resolution and the catalog gate
-    // share this one `manifest_dir`, so gating it once here via the shared guard closes both.
+    // #1071/#1090: resolving through `deps_core::lockfile::resolve_manifest_file_path` makes
+    // the scheme check explicit rather than relying solely on `Url::to_file_path`'s internal
+    // validation — left unguarded, `untitled:package.json` would resolve `manifest_dir` to a
+    // *relative* path, and discovery would probe the server process's own CWD instead of the
+    // document's workspace. Both `.npmrc` resolution and the catalog gate share this guard.
     let manifest_dir = deps_core::lockfile::resolve_manifest_file_path(uri)
         .and_then(|path| path.parent().map(std::path::Path::to_path_buf));
 
@@ -178,10 +166,8 @@ pub fn parse_package_json_with_context(
 
     let mut blocked_registries = Vec::new();
     for dep in &mut dependencies {
-        // Route by the real registry package name, not the manifest alias (issue #654 S2):
-        // a `.npmrc` scope entry (`@myorg:registry=...`) matches the package actually being
-        // installed, and routing by the alias instead can send a private scoped package's
-        // name to the public registry, or a public package to a private feed.
+        // Route by the real registry name, not the manifest alias (#654 S2): a `.npmrc`
+        // scope entry matches the package actually installed, not the local alias.
         let name = deps_core::Dependency::name(dep).clone();
         dep.source = npm_config.resolve_source_for(&name);
         if let Some(classification) = npm_config.blocked_class_for(&name) {
@@ -189,9 +175,9 @@ pub fn parse_package_json_with_context(
         }
     }
 
-    // Spec 046 FR-001/NFR-002: cheap fast-path — a non-pnpm manifest pays one string check per
-    // dependency and zero filesystem calls. `apply` runs unconditionally once this fires (the
-    // module's totality invariant), never short-circuited by `load` returning `None`.
+    // FR-001/NFR-002: cheap fast-path — a non-pnpm manifest pays one string check per
+    // dependency and zero filesystem calls. `apply` always runs once this fires, never
+    // short-circuited by `load` returning `None`.
     if dependencies.iter().any(|dep| {
         dep.version_req
             .as_ref()
@@ -226,9 +212,8 @@ fn parse_dependency_section(
 ) -> Vec<NpmDependency> {
     let mut result = Vec::new();
 
-    // A manifest entry whose value isn't a string (e.g. an object) is not a valid dependency
-    // declaration — `string_valued_entries` skips it rather than fabricating an entry with no
-    // `version_req` that would still be queried against the registry (#619).
+    // A non-string manifest value isn't a valid dependency declaration — `string_valued_entries`
+    // skips it rather than fabricating an entry with no `version_req` (#619).
     for (name, version_req) in string_valued_entries(deps) {
         if !budget.allow() {
             continue;
@@ -249,14 +234,10 @@ fn parse_dependency_section(
             version_req: Some(version_req.into()),
             version_range,
             section,
-            // Overwritten by `parse_package_json_with_context` once `.npmrc` resolution has
-            // run; `Registry` here is the correct value for a manifest with no `.npmrc` at
-            // all (NFR-005) and for `parse_dependency_section`'s own unit tests, which do
-            // not go through that resolution step.
+            // Overwritten once `.npmrc` resolution runs; `Registry` is correct for a
+            // manifest with none (NFR-005) and for this function's own unit tests.
             source: deps_core::parser::DependencySource::Registry,
-            // Overwritten by `parse_package_json_with_context`'s catalog post-pass when the
-            // `catalog:` gate fires; `None` here is correct for both a non-pnpm manifest and
-            // for this function's own unit tests.
+            // Overwritten by the catalog post-pass when the `catalog:` gate fires.
             catalog: None,
             package,
         });
@@ -328,9 +309,8 @@ fn parse_npm_alias(value: &str) -> Option<NpmAlias> {
     let after_name = &rest[name_len..];
     let version_req = match after_name.strip_prefix('@') {
         Some(v) => v.trim(),
-        // Empty: no version at all (`"npm:react"`). Anything else starts with `/` — Deno's
-        // subpath syntax, not valid here (see this function's doc) — reject rather than
-        // truncate.
+        // Empty: no version at all. Anything else starts with `/` — Deno's subpath syntax,
+        // not valid here — reject rather than truncate.
         None if after_name.is_empty() => "",
         None => {
             tracing::debug!(
@@ -349,12 +329,9 @@ fn parse_npm_alias(value: &str) -> Option<NpmAlias> {
         return None;
     }
 
-    // No version requirement at all, an empty one (`"npm:react@"`), or one that isn't a
-    // semver range `node_semver::Range` accepts (a dist-tag like `"beta"`/`"latest"`) is a
-    // valid, if unusual, alias: treat it as an existence wildcard rather than fabricating an
-    // invalid semver range or dropping the dependency outright — mirrors the `"*"`
-    // existence-wildcard convention `deps_core::registry::is_existence_wildcard` already
-    // recognizes for every ecosystem's version resolution.
+    // No requirement, an empty one, or a dist-tag (`"beta"`/`"latest"`) `node_semver::Range`
+    // can't parse is still a valid alias: treat it as an existence wildcard rather than
+    // fabricating an invalid range or dropping the dependency (mirrors `is_existence_wildcard`).
     let version_req = if version_req.is_empty() || node_semver::Range::parse(version_req).is_err() {
         "*"
     } else {
@@ -483,10 +460,8 @@ mod tests {
 
     #[test]
     fn test_non_string_dependency_value_is_skipped() {
-        // #619: an object-valued entry (e.g. accidentally nested config) is not a valid
-        // dependency declaration and must not be surfaced or queried against the registry.
-        // Full coverage of every non-string value kind lives in
-        // `deps_core::json_helpers::string_valued_entries`'s own tests (#624).
+        // #619: an object-valued entry is not a valid dependency declaration. Full coverage
+        // of every non-string kind lives in `string_valued_entries`'s own tests (#624).
         let json = r#"{
   "dependencies": {
     "nested-shadow": { "express": "0.0.1" },
@@ -502,9 +477,8 @@ mod tests {
 
     #[test]
     fn test_non_string_dependency_value_of_another_kind_is_skipped_end_to_end() {
-        // #619: end-to-end confirmation that a non-object non-string kind (number) is skipped
-        // too, not just objects — this only guards the parser/helper wiring; full value-kind
-        // coverage lives in `deps_core::json_helpers::string_valued_entries`'s own tests (#624).
+        // #619: confirms a non-object non-string kind (number) is skipped too, guarding only
+        // the parser/helper wiring — full value-kind coverage lives in #624's own tests.
         let json = r#"{
   "dependencies": {
     "bad-number": 1,
@@ -547,10 +521,8 @@ mod tests {
 
     #[test]
     fn test_parse_deeply_nested_json_rejected_before_parse() {
-        // #430: a deeply nested `package.json` must be rejected by the depth
-        // guard rather than handed to `serde_json::from_str`. Reported as
-        // `DepsError::Json`, the same variant a genuinely malformed
-        // `package.json` produces (unified via `deps_core::parse_json_checked`).
+        // #430: a deeply nested `package.json` must be rejected by the depth guard, reported
+        // as the same `DepsError::Json` variant a genuinely malformed manifest produces.
         let depth = deps_core::MAX_JSON_NESTING_DEPTH + 1;
         let json = format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
         let result = parse_package_json(&json, &test_uri());
@@ -580,10 +552,8 @@ mod tests {
         let result = parse_package_json(json, &test_uri()).unwrap();
         let express = &result.dependencies[0];
 
-        // Name should be on line 2 (0-indexed: line 2)
         assert_eq!(express.name_range.start.line, 2);
 
-        // Version should also be on line 2
         if let Some(version_range) = express.version_range {
             assert_eq!(version_range.start.line, 2);
         }
@@ -609,20 +579,15 @@ mod tests {
 
     #[test]
     fn test_line_offset_table_utf16() {
-        // Test UTF-16 character counting (LSP requirement)
-        // "hello 世界" where 世界 are multi-byte Unicode characters
+        // UTF-16 character counting (LSP requirement), with multi-byte "世界".
         let content = "hello 世界\nworld";
         let table = LineOffsetTable::new(content);
 
-        // Byte offset for "world" is 16 (6 bytes "hello " + 6 bytes "世界" + 1 byte "\n" + 3 bytes "wor")
-        // But we need UTF-16 character count for LSP
         let world_offset = content.find("world").unwrap();
         let pos = table.byte_offset_to_position(content, world_offset);
         assert_eq!(pos.line, 1);
         assert_eq!(pos.character, 0);
 
-        // Test character position within a line with multi-byte chars
-        // "hello " = 6 UTF-16 code units
         let world_char_offset = content.find('世').unwrap();
         let pos = table.byte_offset_to_position(content, world_char_offset);
         assert_eq!(pos.line, 0);
@@ -631,11 +596,10 @@ mod tests {
 
     #[test]
     fn test_line_offset_table_emoji() {
-        // Test with emoji (4-byte UTF-8, 2 UTF-16 code units)
+        // Emoji: 4-byte UTF-8, 2 UTF-16 code units.
         let content = "test 🚀 rocket\nline2";
         let table = LineOffsetTable::new(content);
 
-        // Find position of "rocket"
         let rocket_offset = content.find("rocket").unwrap();
         let pos = table.byte_offset_to_position(content, rocket_offset);
         assert_eq!(pos.line, 0);
@@ -829,8 +793,7 @@ mod tests {
 
     #[test]
     fn test_package_name_in_scripts_not_confused() {
-        // Regression test: "vitest" appears in scripts as a value,
-        // but should only be found as a dependency key
+        // "vitest" appears in scripts as a value, but must only be found as a dependency key.
         let json = r#"{
   "scripts": {
     "test": "vitest",
@@ -847,13 +810,10 @@ mod tests {
         let vitest = &result.dependencies[0];
         assert_eq!(vitest.name, "vitest");
         assert_eq!(vitest.version_req, Some("^3.1.4".into()));
-        // Verify version_range is found (this was the bug)
         assert!(
             vitest.version_range.is_some(),
             "vitest should have a version_range"
         );
-        // Verify position is in devDependencies, not scripts
-        // devDependencies starts at line 6
         assert!(
             vitest.name_range.start.line >= 5,
             "vitest should be found in devDependencies, not scripts"
@@ -885,7 +845,6 @@ mod tests {
             .find(|d| d.name == "vitest")
             .expect("vitest should be parsed");
 
-        // Both should have version ranges
         assert!(
             coverage.version_range.is_some(),
             "@vitest/coverage-v8 should have version_range"
@@ -895,7 +854,6 @@ mod tests {
             "vitest should have version_range"
         );
 
-        // Positions should be different
         let coverage_pos = coverage.version_range.unwrap();
         let vitest_pos = vitest.version_range.unwrap();
         assert_ne!(
@@ -920,10 +878,8 @@ mod tests {
     /// dependency, and leaves a scoped dependency with its own `@scope:registry` entry alone.
     #[test]
     fn test_parse_with_context_top_level_override_and_scope_override_coexist() {
-        // Held per `deps_core::fs_probe::snapshot_guard`'s doc: `parse_package_json_with_context`
-        // transitively touches fs_probe (via `config::resolve`, unconditionally for any absolute
-        // `file:` manifest_dir), and this test runs in the same binary as
-        // `deps-npm/src/config.rs`'s diffing test.
+        // `parse_package_json_with_context` transitively touches fs_probe (via
+        // `config::resolve`); shares a binary with config.rs's diffing test (snapshot_guard).
         let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -1206,11 +1162,9 @@ mod tests {
     /// check in `manifest_dir`'s computation is what blocks it, not an incidental parse failure.
     #[test]
     fn test_parse_with_context_untitled_scheme_hierarchical_path_blocked_by_scheme_guard() {
-        // `to_file_path` needs a drive-letter-shaped first path segment to resolve on
-        // Windows (it does not check the scheme — see the security handoff above), so
-        // the raw URI and expected path are platform-conditional to keep this test's
-        // actual premise (to_file_path succeeds, so the scheme guard is what blocks
-        // manifest_dir) true on both platforms.
+        // `to_file_path` needs a drive-letter-shaped first segment to resolve on Windows, so
+        // the raw URI and expected path are platform-conditional to keep the test's premise
+        // (to_file_path succeeds, so the scheme guard is what blocks manifest_dir) true on both.
         #[cfg(windows)]
         let (raw, expected): (&str, &std::path::Path) = (
             "untitled:/C:/nonexistent/repo/package.json",
@@ -1394,12 +1348,11 @@ mod tests {
 
     #[test]
     fn test_parse_with_context_no_catalog_dependency_skips_workspace_lookup() {
-        // `config::resolve` still runs unconditionally for this test's absolute `file:` URI even
-        // though the catalog gate itself is skipped — see the comment in
-        // `test_parse_with_context_top_level_override_and_scope_override_coexist`.
+        // `config::resolve` still runs unconditionally for this absolute `file:` URI even
+        // though the catalog gate is skipped (see the earlier snapshot_guard comment).
         let _guard = deps_core::fs_probe::snapshot_guard();
-        // FR-008/NFR-002: no `catalog:`-prefixed value anywhere in the manifest, so the
-        // gate never fires — a bogus/nonexistent workspace path must not affect the result.
+        // FR-008/NFR-002: no `catalog:` value anywhere, so the gate never fires — a bogus
+        // workspace path must not affect the result.
         let uri = deps_core::test_util::test_uri("/nonexistent/path/package.json");
         let json = r#"{"dependencies": {"express": "^4.18.2"}}"#;
         let result = parse_package_json_with_context(json, &uri, &all_policy()).unwrap();
@@ -1412,9 +1365,8 @@ mod tests {
 
     #[test]
     fn test_duplicate_name_across_two_sections_with_intervening_entries() {
-        // #605: "lodash" appears in both `dependencies` and `devDependencies`, separated by
-        // several intervening `devDependencies` entries — each occurrence must resolve to its
-        // own section's position, not both collapsing onto the first match in the file.
+        // #605: "lodash" in both sections, separated by intervening entries — each occurrence
+        // must resolve to its own position, not collapse onto the first match in the file.
         let json = r#"{
   "dependencies": {
     "lodash": "^4.17.21"
@@ -1503,9 +1455,8 @@ mod tests {
 
     #[test]
     fn test_section_range_unaffected_by_unbalanced_brace_inside_version_string() {
-        // The AST (#613) parses strings as atomic tokens, so an unbalanced `{` inside a
-        // version string can never be miscounted as real object structure — this exercises
-        // that guarantee end-to-end through the public API.
+        // The AST (#613) parses strings as atomic tokens, so an unbalanced `{` inside one
+        // can never be miscounted as real object structure.
         let json = r#"{
   "dependencies": {
     "weird": "pkg@file:../{unbalanced",
@@ -1555,10 +1506,8 @@ mod tests {
 
     #[test]
     fn test_section_key_nested_under_package_extensions_not_mistaken_for_top_level() {
-        // impl-critic C1: pnpm's `packageExtensions` can declare a nested `dependencies`
-        // object before the manifest's real top-level `dependencies`. The AST (#613) only
-        // ever looks at the root object's own direct properties, so the nested key is never
-        // visible to the top-level section lookup at all.
+        // impl-critic C1: pnpm's `packageExtensions` can nest a `dependencies` object before
+        // the real top-level one — the AST (#613) only indexes the root's direct properties.
         let json = r#"{
   "packageExtensions": {
     "some-pkg": {

@@ -43,7 +43,6 @@ pub async fn handle_code_lens(
 
     let uri = &params.text_document.uri;
 
-    // Ensure document is loaded (cold start support)
     if !ensure_document_loaded(uri, Arc::clone(&state), client, Arc::clone(&config)).await {
         tracing::warn!("Could not load document for code lens: {:?}", uri);
         return vec![];
@@ -57,19 +56,15 @@ pub async fn handle_code_lens(
         )
     };
 
-    // Own everything `generate_code_lenses` needs and release the DashMap shard `Ref`
-    // before awaiting it (#333): `with_document` only ever hands `extract` a borrowed
-    // `&DocumentState` synchronously, so the guard can't leak across the `.await` below.
+    // Release the DashMap shard `Ref` before awaiting (#333): `with_document` only hands
+    // `extract` a borrowed `&DocumentState` synchronously, so it can't leak across the await below.
     let Some((ecosystem, parse_result, content, cached_versions, resolved_versions)) = state
         .with_document(uri, |doc| {
             let ecosystem = state.ecosystem_registry.get(doc.ecosystem_id())?;
 
-            // Refuse the same conditions `execute_update_all_outdated` requires before
-            // acting, so the lens never renders a click target the command would then
-            // refuse: version data isn't `Loading` (avoids counting against an empty
-            // cache, also mirrors `diagnostics::generate_diagnostics_internal`), and the
-            // document has a known LSP version (`None` means it was loaded from disk
-            // after a missed `didOpen` — see `DocumentState::is_ready_for_batch_update`).
+            // Refuse the same conditions `execute_update_all_outdated` requires, so the lens
+            // never renders a click target the command would then refuse (see
+            // `DocumentState::is_ready_for_batch_update`).
             if !doc.is_ready_for_batch_update() {
                 return None;
             }
@@ -90,9 +85,8 @@ pub async fn handle_code_lens(
 
     tracing::Span::current().record("ecosystem", ecosystem.id());
 
-    // Unreachable in practice: a document only reaches `with_document` above once its
-    // URI already converted successfully (see `ensure_document_loaded`), but handled
-    // defensively rather than unwrapped.
+    // Unreachable in practice (the URI already converted in `ensure_document_loaded`);
+    // handled defensively rather than unwrapped.
     let Some(domain_uri) = crate::lsp_types_interop::from_lsp_uri(uri) else {
         tracing::warn!("URI is not representable as a url::Url: {:?}", uri);
         return vec![];
@@ -108,11 +102,9 @@ pub async fn handle_code_lens(
         )
         .await;
 
-    // M4 (#640): the bulk "Pin N {noun} to commit SHA" lens lives here, not as an
-    // ecosystem's own `generate_code_lenses` override, so no override can silently drop
-    // it. Same on/off toggle as the mutable-ref-pin diagnostic (issue #633): a lens is
-    // push-based/permanently rendered, unlike the pull-based per-position quickfix, so
-    // disabling the flag must suppress the lens too, not just the diagnostic.
+    // M4 (#640): the bulk pin-to-SHA lens lives here, not in an ecosystem override, so no
+    // override can silently drop it. Same on/off toggle as the pin diagnostic (#633): a
+    // lens is permanently rendered, so disabling the flag must suppress it too.
     if severities.mutable_ref_pin_enabled {
         let count = ecosystem
             .collect_pin_all_to_sha_edits(parse_result.as_ref(), versions)
@@ -325,17 +317,14 @@ mod tests {
             async move { handle_code_lens(state, params(uri), true, client, config).await }
         });
 
-        // Block until `generate_code_lenses` has actually started executing — i.e.
-        // `handle_code_lens` has reached (and is now inside) the await — before racing
-        // the writer below. Timeout-wrapped so a regression that makes the handler
-        // never reach the awaited call fails loudly instead of hanging forever.
+        // Block until `generate_code_lenses` has actually started (barrier) before racing
+        // the writer; timeout so a regression that never reaches the await hangs loudly instead of forever.
         tokio::time::timeout(std::time::Duration::from_secs(5), started.wait())
             .await
             .expect("handle_code_lens did not reach generate_code_lenses within 5s");
 
-        // Spawned onto its own task (rather than awaited inline) deliberately: see
-        // `completion.rs`'s equivalent #319 regression test for why `DashMap::get_mut`
-        // needs a real async yield point to race against `tokio::time::timeout`.
+        // Spawned as its own task deliberately — see completion.rs's #319 test for why
+        // `DashMap::get_mut` needs a real async yield point to race the timeout.
         let write_task = tokio::spawn({
             let state = Arc::clone(&state);
             let uri = uri.clone();
@@ -367,9 +356,8 @@ mod tests {
             content: &str,
             cached: std::collections::HashMap<deps_core::PackageName, deps_core::PackageVersions>,
         ) {
-            // Held per `deps_core::fs_probe::snapshot_guard`'s doc: `ecosystem.parse_manifest`
-            // transitively touches fs_probe, and this test runs in the same binary as
-            // `document/loader.rs`'s diffing test.
+            // Held per fs_probe::snapshot_guard's doc: parse_manifest touches fs_probe and
+            // this test shares a binary with document/loader.rs's diffing test.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
             let parse_result = ecosystem
@@ -424,9 +412,8 @@ mod tests {
 
         #[tokio::test]
         async fn test_handle_code_lens_no_version_returns_empty() {
-            // Regression guard (S1): a document with `version: None` (populated from
-            // disk after a missed didOpen) must not render a lens that
-            // `execute_update_all_outdated` would then always refuse on click.
+            // Regression guard (S1): a document with `version: None` (loaded from disk after
+            // a missed didOpen) must not render a lens `execute_update_all_outdated` would refuse.
             let state = Arc::new(ServerState::new());
             let uri = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
                 "/test/Cargo.toml",
@@ -630,10 +617,8 @@ mod tests {
             cached: HashMap<deps_core::PackageName, deps_core::PackageVersions>,
             expected_fragment: &str,
         ) {
-            // Held per `deps_core::fs_probe::snapshot_guard`'s doc: called with every
-            // ecosystem under test here (including cargo/npm/nuget/gradle, which
-            // transitively touch fs_probe), and this shared helper runs in the same binary
-            // as `document/loader.rs`'s diffing test.
+            // Held per fs_probe::snapshot_guard's doc: several ecosystems under test here
+            // touch fs_probe, and this helper shares a binary with document/loader.rs's diffing test.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let parse_result = ecosystem
                 .parse_manifest(content, uri)
@@ -738,10 +723,8 @@ mod tests {
             let state = ServerState::new();
             let ecosystem = state.ecosystem_registry.get("pypi").unwrap();
             let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
-            // An exact pin, not a lower bound: "==2.0.0" does not accept "2.5.0", unlike
-            // ">=2.0.0" (which the "already accepts latest" rule would correctly skip).
-            // `format_version_replacing` preserves the `==` pin style rather than
-            // widening to a range (§6.1) — the edit is "requests==2.5.0", not a range.
+            // An exact pin, not a lower bound: "==2.0.0" doesn't accept "2.5.0" like ">=2.0.0"
+            // would. `format_version_replacing` preserves the `==` style (§6.1), not a range.
             let content = "[project]\ndependencies = [\"requests==2.0.0\"]\n";
             let mut cached = HashMap::new();
             cached.insert("requests".into(), PackageVersions::latest_only("2.5.0"));
@@ -930,10 +913,8 @@ mod tests {
         #[cfg(feature = "gradle")]
         #[tokio::test]
         async fn test_gradle_dsl_variable_is_skipped() {
-            // Gradle resolves `$var`/`${var}` references only from a real
-            // `gradle.properties` file next to the build script, so this fixture is
-            // written to a temp directory (mirrors `document::lifecycle`'s own
-            // disk-based cold-start tests).
+            // Gradle resolves `$var`/`${var}` only from a real gradle.properties file next
+            // to the build script, so this fixture needs a real temp directory.
             let temp_dir = tempfile::TempDir::new().unwrap();
             let build_gradle_path = temp_dir.path().join("build.gradle");
             let content = "dependencies {\n    implementation \"org.jetbrains.kotlin:kotlin-stdlib:$kotlinVersion\"\n}\n";
@@ -976,11 +957,9 @@ mod tests {
         #[cfg(feature = "swift")]
         #[tokio::test]
         async fn test_swift_from_form_is_edited() {
-            // Regression for #367: `version_literal` now lets the literal-span guard
-            // match a Swift dependency's synthesized comparator requirement against the
-            // bare literal `version_range` spans, so this case — previously always
-            // skipped regardless of ecosystem-independent test naming — now produces an
-            // edit like every other registry-form dependency.
+            // Regression for #367: `version_literal` now matches Swift's synthesized
+            // comparator requirement against the bare `version_range` span, so this
+            // previously-always-skipped case now produces an edit.
             let state = ServerState::new();
             let ecosystem = state.ecosystem_registry.get("swift").unwrap();
             let uri = deps_core::test_util::test_uri("/test/Package.swift");
@@ -1010,13 +989,11 @@ let package = Package(
         #[cfg(feature = "swift")]
         #[tokio::test]
         async fn test_swift_range_forms_are_still_skipped() {
-            // Regression for #367 critic finding C1: `version_range` for a `..<`/`...`
-            // dependency spans only the lower-bound literal. If the guard were fooled
-            // into accepting that as `version_literal`, the edit would rewrite the lower
-            // bound alone and invert the range — SwiftPM traps on `lowerBound >
-            // upperBound`. `version_literal` stays `None` for both range forms, so this
-            // must keep producing zero edits, matching the pre-#367-fix behavior for
-            // every other unsupported-literal case (Maven `${property}`, Gradle DSL var).
+            // Regression for #367 critic C1: `version_range` for `..<`/`...` spans only the
+            // lower bound. If the guard mistook that for `version_literal`, the edit would
+            // rewrite just the lower bound and invert the range (SwiftPM traps on
+            // `lowerBound > upperBound`). Must keep producing zero edits, as for other
+            // unsupported-literal cases (Maven `${property}`, Gradle DSL var).
             let state = ServerState::new();
             let ecosystem = state.ecosystem_registry.get("swift").unwrap();
             let uri = deps_core::test_util::test_uri("/test/Package.swift");
@@ -1113,11 +1090,9 @@ let package = Package(
         #[cfg(feature = "github-actions")]
         #[tokio::test]
         async fn test_github_actions_subdirectory_action_sha_pin_is_edited_preserving_subpath() {
-            // Critic S1 regression gate: a subdirectory action's `version_range` must
-            // start right after the full `owner/repo/sub@` prefix, not after the
-            // truncated `owner/repo@` — otherwise this edit corrupts the `/init@`
-            // segment, producing a re-parseable-but-wrong bare `owner/repo` declaration
-            // with the pin silently deleted.
+            // Critic S1 regression gate: a subdirectory action's `version_range` must start
+            // after the full `owner/repo/sub@` prefix, not the truncated `owner/repo@` —
+            // otherwise the edit corrupts the `/init@` segment and silently drops the pin.
             let state = ServerState::new();
             let ecosystem = state.ecosystem_registry.get("github-actions").unwrap();
             let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
@@ -1152,15 +1127,13 @@ let package = Package(
         #[tokio::test]
         async fn test_github_actions_sha_pin_tag_index_miss_is_skipped() {
             // B1's regression gate: on a `TagIndex` miss, the formatted replacement must
-            // equal the raw declared span byte-for-byte, so the shared no-op guard
-            // suppresses the edit instead of silently downgrading the SHA pin to a bare
-            // tag.
+            // equal the raw span byte-for-byte, so the no-op guard suppresses the edit
+            // instead of silently downgrading the SHA pin to a bare tag.
             let state = ServerState::new();
             let ecosystem = state.ecosystem_registry.get("github-actions").unwrap();
             let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
             let old_sha = "a".repeat(40);
-            // No `seed_gha_tag_index` call: the index has no entry for "v4.3.0", so the
-            // formatter's `TagIndex` lookup misses.
+            // No seed_gha_tag_index call: the index has no entry for "v4.3.0", so the lookup misses.
 
             let content = format!("steps:\n  - uses: actions/checkout@{old_sha} # v4.2.0\n");
             let mut cached = HashMap::new();
@@ -1254,9 +1227,8 @@ let package = Package(
             state.update_document(uri.clone(), doc_state);
 
             let (client, config) = create_test_client_and_config();
-            // `handle_code_lens` derives severities from `config.policy.diagnostics.to_severities()`,
-            // not a hand-built `DiagnosticSeverities` — drive the flag through the config
-            // the test helper already hands out.
+            // `handle_code_lens` derives severities from the config, not a hand-built
+            // `DiagnosticSeverities`, so the flag must be driven through it.
             config
                 .write()
                 .await

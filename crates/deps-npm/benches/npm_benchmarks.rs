@@ -206,14 +206,12 @@ fn bench_position_tracking(c: &mut Criterion) {
     let mut group = c.benchmark_group("position_tracking");
     let uri = bench_uri();
 
-    // Single dependency
     let single = r#"{
   "dependencies": {
     "express": "^4.18.2"
   }
 }"#;
 
-    // Scoped package
     let scoped = r#"{
   "devDependencies": {
     "@types/node": "^20.10.0",
@@ -244,7 +242,6 @@ fn bench_registry_parsing(c: &mut Criterion) {
         });
     });
 
-    // Large registry response with 100 versions
     let mut large_response = String::from(
         r#"{
   "name": "large-package",
@@ -280,25 +277,21 @@ fn bench_version_matching(c: &mut Criterion) {
 
     let latest = Version::parse("4.18.2").unwrap();
 
-    // Caret range (most common)
     let caret_range = Range::parse("^4.18.0").unwrap();
     group.bench_function("caret_range", |b| {
         b.iter(|| caret_range.satisfies(black_box(&latest)));
     });
 
-    // Tilde range
     let tilde_range = Range::parse("~4.18.0").unwrap();
     group.bench_function("tilde_range", |b| {
         b.iter(|| tilde_range.satisfies(black_box(&latest)));
     });
 
-    // Complex range
     let complex_range = Range::parse(">=4.17.0 <5.0.0").unwrap();
     group.bench_function("complex_range", |b| {
         b.iter(|| complex_range.satisfies(black_box(&latest)));
     });
 
-    // Find latest matching version
     let versions: Vec<Version> = (0..20)
         .map(|i| Version::parse(format!("4.18.{i}")).unwrap())
         .collect();

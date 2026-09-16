@@ -1,11 +1,7 @@
-// This crate defines the `Registry`/`Ecosystem` boxed-future trait signatures (and the
-// `impl_dependency!`/`impl_version!` macros generating their `Send`-bound futures) that every
-// ecosystem crate's `get_latest_matching`-style implementation coerces into; rustc's default
-// recursion limit has proven occasionally insufficient to prove that bound for several such
-// implementations, downgrading a previously-silent trait-solver retry into
-// `recursion_depth_exceeding_limit`, which the fuzz CI job's `-D warnings` nightly build turns
-// into a hard error (rust-lang/rust#159228). Same class of fix as deps-cargo (#745),
-// deps-nuget (#696), deps-swift (#673), deps-composer.
+// rustc's default recursion limit can't always prove the `Send` bound on the boxed futures
+// `impl_dependency!`/`impl_version!` generate, turning a silent trait-solver retry into a hard
+// error under `-D warnings` (rust-lang/rust#159228). Same fix as deps-cargo #745, deps-nuget
+// #696, deps-swift #673.
 #![recursion_limit = "256"]
 
 //! Core abstractions for deps-lsp.
@@ -92,12 +88,9 @@
 //! types generally (`reqwest::Error`, `yaml_rust2::Yaml`, ...) is issue #851's broader, still-
 //! open question — out of scope for #1071/#1083.
 
-// #673: re-enable the three cast-safety pedantic lints the workspace allows by default
-// (`Cargo.toml`'s `[workspace.lints.clippy]`), specifically for this crate — deps-core
-// computes LSP offset/length/position math from parsed, attacker-influenceable input,
-// where a silent truncation/sign-loss/precision-loss cast is exactly the class of bug
-// this issue is about. Sites confirmed safe are individually `#[allow]`ed with a
-// one-line justification, not blanket-allowed.
+// #673: re-enables the cast-safety pedantic lints the workspace allows by default, since this
+// crate computes LSP offset/position math from attacker-influenceable input. Confirmed-safe
+// sites get an individual `#[allow]` with justification, not a blanket allow.
 #![warn(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
@@ -197,7 +190,6 @@ pub mod yaml_walk;
 #[cfg(feature = "lsp-responses")]
 pub use tower_lsp_server;
 
-// Re-export commonly used types
 pub use cache::{BodyLimit, CachedResponse, HttpCache};
 pub use dependency_cap::{DependencyBudget, MAX_DEPENDENCIES_PER_DOCUMENT};
 pub use deps_dev::{DepsDevClient, ProvenanceStatus, ScorecardSummary, SupplyChainTrustSignal};

@@ -237,9 +237,8 @@ fn build_rule_descriptor(id: &str, meta: &RuleMeta<'_>) -> ReportingDescriptor {
         None
     };
 
-    // An advisory rule's `name` is the advisory id itself (e.g. `RUSTSEC-2020-0071`) rather
-    // than the shared `Category::as_str()` token every advisory rule would otherwise carry
-    // identically, which would make `name` useless for telling two advisory rules apart.
+    // Advisory rules use the advisory id as `name`; the shared category token would make two
+    // advisory rules indistinguishable.
     let name = if is_advisory {
         id.to_string()
     } else {
@@ -283,8 +282,7 @@ fn security_severity_score(severity: VulnSeverity) -> Option<&'static str> {
         VulnSeverity::Medium => Some("5.5"),
         VulnSeverity::Low => Some("2.0"),
         VulnSeverity::Unknown | VulnSeverity::Informational => None,
-        // `VulnSeverity` is `#[non_exhaustive]`: a bucket this crate does not yet recognize
-        // must never guess a numeric score for it either.
+        // `VulnSeverity` is `#[non_exhaustive]` — never guess a score for an unrecognized bucket.
         _ => None,
     }
 }
@@ -359,10 +357,8 @@ struct ResultContext {
 /// (manifest, dependency, rule) triple is added, removed, or reordered — a far narrower and
 /// rarer edit than "any line shifted anywhere in the file."
 fn collect_result_contexts(findings: &[CheckFinding]) -> Vec<ResultContext> {
-    // Keyed by (`manifest_uri` — a fresh local `String` each iteration, so this map must own
-    // its own copy; `dependency`/`rule_id` — both borrowed straight from `finding`, which
-    // outlives this whole function, so no clone is needed just to build the ordinal-counting
-    // key (issue #1077 review #8)).
+    // `manifest_uri` is a fresh String per iteration (must own it); `dependency`/`rule_id` borrow
+    // from `finding`, which outlives this function, so no clone is needed (issue #1077 review #8).
     let mut seen: HashMap<(String, &str, &str), usize> = HashMap::new();
     findings
         .iter()
@@ -627,10 +623,8 @@ mod tests {
         assert_eq!(manifest_uri(&path), "crates/deps-cli/Cargo.toml");
     }
 
-    // `/tmp/...` has a `RootDir` component but no `Prefix`, so `Path::is_absolute()` on
-    // Windows reports it as *not* absolute (Windows requires a drive prefix) — hence the
-    // separate `cfg(windows)` fixture below using a drive-rooted path instead of gating this
-    // whole test to `cfg(unix)` and losing Windows coverage of the fix (spec 062 review R1).
+    // `/tmp/...` is not `is_absolute()` on Windows (no drive prefix), hence the separate
+    // `cfg(windows)` fixture below instead of gating this test to `cfg(unix)` (spec 062 review R1).
     #[cfg(unix)]
     #[test]
     fn test_manifest_uri_drops_leading_root_dir_for_an_absolute_unix_path() {
@@ -774,9 +768,8 @@ mod tests {
 
     #[test]
     fn test_to_sarif_advisory_overflow_line_falls_back_to_category_rule() {
-        // The "+N more advisories" summary line is `Category::Vulnerable` but carries no
-        // diagnostic code (`push_vulnerability_diagnostics` in `deps-core`), so it must still
-        // fall back to the category-token rule rather than panicking or producing an empty id.
+        // The "+N more advisories" summary line is `Category::Vulnerable` with no diagnostic
+        // code, so it must fall back to the category-token rule, not panic or emit an empty id.
         let report = CheckReport {
             findings: vec![finding(Category::Vulnerable, Severity::Information)],
         };

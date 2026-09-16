@@ -594,8 +594,8 @@ mod tests {
             assert!(handle.get().is_none());
         });
         assert!(!log.contains("hunter2"), "log: {log}");
-        // Critic M2 follow-up: a positive assertion, not just an absence check — this would
-        // pass vacuously if the warning were dropped from the log entirely.
+        // Critic M2: a positive assertion, not just absence — would pass vacuously if the
+        // warning were dropped entirely.
         assert!(
             log.contains(&RedactedUrl::new(raw_value).to_string()),
             "expected the redacted form to still be present: {log}"

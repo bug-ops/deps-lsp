@@ -180,8 +180,8 @@ pub trait RequirementResolution: Send + Sync {
     /// overrides that method, not this one.
     fn version_satisfies_requirement(&self, version: &ConcreteVersion, requirement: &str) -> bool {
         let version = version.as_str();
-        // Handle caret (^) - allows changes that don't modify left-most non-zero
-        // ^2.0 allows 2.x.x, ^0.2 allows 0.2.x, ^0.0.3 allows only 0.0.3
+        // Caret allows changes that don't modify the left-most non-zero component:
+        // ^2.0 -> 2.x.x, ^0.2 -> 0.2.x, ^0.0.3 -> only 0.0.3
         if let Some(req) = requirement.strip_prefix('^') {
             let req_parts: Vec<&str> = req.split('.').collect();
             let ver_parts: Vec<&str> = version.split('.').collect();
@@ -196,8 +196,7 @@ pub trait RequirementResolution: Send + Sync {
                 return true;
             }
 
-            // For ^0.Y, must have same minor
-            // Guarded by the length check on the same line.
+            // For ^0.Y, must have same minor (length checked on the same line).
             #[allow(clippy::indexing_slicing)]
             if req_parts.len() >= 2 && ver_parts.len() >= 2 {
                 return req_parts[1] == ver_parts[1];
@@ -206,8 +205,7 @@ pub trait RequirementResolution: Send + Sync {
             return true;
         }
 
-        // Handle tilde (~) - allows patch-level changes
-        // ~2.0 allows 2.0.x, ~2.0.1 allows 2.0.x where x >= 1
+        // Tilde allows patch-level changes: ~2.0 -> 2.0.x, ~2.0.1 -> 2.0.x where x >= 1
         if let Some(req) = requirement.strip_prefix('~') {
             return is_same_major_minor(req, version);
         }

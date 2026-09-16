@@ -711,8 +711,7 @@ fn parse_version_list(data: &[u8]) -> Result<Vec<GoVersion>> {
         DepsError::CacheError(format!("Invalid UTF-8 in version list response: {e}"))
     })?;
 
-    // Parse versions with precomputed sort keys (Schwartzian transform)
-    // This avoids repeated regex/semver parsing during sort comparisons
+    // Schwartzian transform: precomputes sort keys to avoid re-parsing on every comparison.
     let mut versions_with_keys: Vec<(GoVersion, Option<semver::Version>)> = content
         .lines()
         .filter(|line| !line.trim().is_empty())
@@ -731,7 +730,6 @@ fn parse_version_list(data: &[u8]) -> Result<Vec<GoVersion>> {
         })
         .collect();
 
-    // Sort by precomputed keys (descending - newest first)
     versions_with_keys.sort_by(|a, b| match (&b.1, &a.1) {
         (Some(v1), Some(v2)) => v1.cmp(v2),
         (Some(_), None) => std::cmp::Ordering::Less,
@@ -934,7 +932,6 @@ mod tests {
 
         let versions = parse_version_list(data).unwrap();
         assert_eq!(versions.len(), 4);
-        // Sorted descending (newest first)
         assert_eq!(versions[0].version, "v2.0.0");
         assert_eq!(versions[1].version, "v1.1.0");
         assert_eq!(versions[2].version, "v1.0.1");
@@ -948,7 +945,7 @@ mod tests {
 
         let versions = parse_version_list(data).unwrap();
         assert_eq!(versions.len(), 3);
-        // Sorted descending: v1.1.0, v1.0.0, v0.0.0-... (pseudo based on v0.0.0)
+        // Pseudo-version sorts by its base version (v0.0.0), last here.
         assert_eq!(versions[0].version, "v1.1.0");
         assert!(!versions[0].is_pseudo);
         assert_eq!(versions[1].version, "v1.0.0");
@@ -1315,7 +1312,6 @@ mod tests {
         let data = b"v1.0.0\nv1.1.0-0.20200101000000-abcdefabcdef\nv1.2.0\nv1.2.1-beta.1\n";
         let versions = parse_version_list(data).unwrap();
         assert_eq!(versions.len(), 4);
-        // Sorted descending: v1.2.1-beta.1, v1.2.0, v1.1.0-0...(pseudo), v1.0.0
         assert_eq!(versions[0].version, "v1.2.1-beta.1");
         assert!(!versions[0].is_pseudo); // prerelease, not pseudo
         assert_eq!(versions[1].version, "v1.2.0");
@@ -1327,14 +1323,14 @@ mod tests {
 
     #[test]
     fn test_parse_version_list_invalid_utf8() {
-        let data = &[0xFF, 0xFE, 0xFD]; // Invalid UTF-8
+        let data = &[0xFF, 0xFE, 0xFD];
         let result = parse_version_list(data);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_parse_version_info_missing_fields() {
-        let json = r#"{"Version":"v1.0.0"}"#; // Missing Time field
+        let json = r#"{"Version":"v1.0.0"}"#;
         let result = parse_version_info("github.com/gin-gonic/gin", json.as_bytes());
         assert!(result.is_err());
     }

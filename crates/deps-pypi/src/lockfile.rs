@@ -152,7 +152,6 @@ fn parse_pypi_lock(content: String) -> Result<ResolvedPackages> {
             continue;
         };
 
-        // Extract required fields
         let Some(name) = table.get("name").and_then(|v| v.as_str()) else {
             tracing::warn!("Package missing name field");
             continue;
@@ -163,10 +162,7 @@ fn parse_pypi_lock(content: String) -> Result<ResolvedPackages> {
             continue;
         };
 
-        // Parse source (format varies between poetry and uv)
         let source = parse_pypi_source(table);
-
-        // Parse dependencies (format varies between poetry and uv)
         let dependencies = parse_pypi_dependencies(table);
 
         // Normalize name for consistent lookup (PEP 503: case/`_`/`.`-insensitive)
@@ -197,7 +193,6 @@ fn parse_pypi_lock(content: String) -> Result<ResolvedPackages> {
 /// - `source.path = "..."` → Path
 fn parse_pypi_source(table: &Table<'_>) -> ResolvedSource {
     let Some(source_val) = table.get("source") else {
-        // No source field = PyPI registry (poetry default)
         return ResolvedSource::Registry {
             url: "https://pypi.org/simple".to_string(),
             checksum: String::new(),
@@ -206,7 +201,6 @@ fn parse_pypi_source(table: &Table<'_>) -> ResolvedSource {
 
     // In toml-span, both inline tables and regular tables are represented as Table
     if let Some(source_table) = source_val.as_table() {
-        // uv: source = { registry = "https://pypi.org/simple" }
         if let Some(registry) = source_table.get("registry").and_then(|v| v.as_str()) {
             return ResolvedSource::Registry {
                 url: registry.to_string(),
@@ -214,7 +208,6 @@ fn parse_pypi_source(table: &Table<'_>) -> ResolvedSource {
             };
         }
 
-        // uv: source = { git = "https://github.com/..." }
         if let Some(git_url) = source_table.get("git").and_then(|v| v.as_str()) {
             let rev = source_table
                 .get("rev")
@@ -228,14 +221,12 @@ fn parse_pypi_source(table: &Table<'_>) -> ResolvedSource {
             };
         }
 
-        // uv: source = { path = "..." }
         if let Some(path) = source_table.get("path").and_then(|v| v.as_str()) {
             return ResolvedSource::Path {
                 path: path.to_string(),
             };
         }
 
-        // poetry: [package.source] type = "git"
         if let Some(source_type) = source_table.get("type").and_then(|v| v.as_str()) {
             match source_type {
                 "git" => {
@@ -268,7 +259,6 @@ fn parse_pypi_source(table: &Table<'_>) -> ResolvedSource {
         }
     }
 
-    // Default to PyPI registry
     ResolvedSource::Registry {
         url: "https://pypi.org/simple".to_string(),
         checksum: String::new(),
@@ -300,12 +290,10 @@ fn parse_pypi_dependencies(table: &Table<'_>) -> Vec<String> {
         return vec![];
     };
 
-    // uv format: dependencies as array of inline tables [{ name = "certifi" }]
     if let Some(deps_array) = deps_val.as_array() {
         return deps_array
             .iter()
             .filter_map(|item| {
-                // uv format: { name = "certifi" }
                 if let Some(dep_table) = item.as_table() {
                     return dep_table
                         .get("name")
@@ -313,13 +301,11 @@ fn parse_pypi_dependencies(table: &Table<'_>) -> Vec<String> {
                         .map(String::from);
                 }
 
-                // Simple string format (fallback)
                 item.as_str().map(String::from)
             })
             .collect();
     }
 
-    // Poetry format: dependencies as table with package names as keys
     if let Some(deps_table) = deps_val.as_table() {
         return deps_table.keys().map(|key| key.name.to_string()).collect();
     }
@@ -395,7 +381,6 @@ python-versions = "^3.9"
                 .contains(&"charset-normalizer".to_string())
         );
 
-        // Verify it's a registry source
         match &requests_pkg.source {
             ResolvedSource::Registry { url, .. } => {
                 assert_eq!(url, "https://pypi.org/simple");
@@ -703,7 +688,6 @@ name = "missing-version"
         let parser = PypiLockParser;
         let resolved = parser.parse_lockfile(&lockfile_path).await.unwrap();
 
-        // Should only parse valid package (names are normalized: - → _)
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved.version("valid-package"), Some("1.0.0"));
         assert!(resolved.get("missing-version").is_none());

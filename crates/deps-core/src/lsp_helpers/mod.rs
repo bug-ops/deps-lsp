@@ -983,11 +983,8 @@ pub fn position_in_range(pos: Position, range: Range) -> bool {
 pub struct LineOffsetTable {
     line_starts: Vec<usize>,
     line_is_ascii: Vec<bool>,
-    // Lazily populated for non-ASCII lines, keyed by 0-indexed line number. A `HashMap` rather
-    // than a `Vec` sized to the line count so the cost is proportional to lines actually
-    // queried non-ASCII — every other `LineOffsetTable` consumer (JSON/TOML ecosystems, code
-    // lens, code actions) never touches a non-ASCII line's index and pays nothing beyond one
-    // empty `HashMap::new()` (#882).
+    // Lazily populated, keyed by line number. A `HashMap` rather than a `Vec` sized to the
+    // line count so cost is proportional to lines actually queried non-ASCII (#882).
     non_ascii_line_index_cache:
         std::cell::RefCell<std::collections::HashMap<usize, NonAsciiLineIndex>>,
 }
@@ -1072,9 +1069,8 @@ impl LineOffsetTable {
     ///
     /// Takes a closure rather than returning a `Ref` so the `RefCell` borrow never outlives one
     /// call — a caller cannot accidentally hold it open across an unrelated later borrow.
-    // `borrow_mut()` below is dropped before `borrow()` runs (single-threaded, no reentrancy
-    // between the two statements), and the entry it inserts is never removed, so the lookup
-    // always succeeds.
+    // `borrow_mut()` is dropped before `borrow()` runs, and the inserted entry is never
+    // removed, so the lookup below always succeeds.
     #[allow(clippy::expect_used)]
     fn with_non_ascii_line_index<R>(
         &self,
@@ -1123,9 +1119,8 @@ impl LineOffsetTable {
             let found = index
                 .entries
                 .binary_search_by_key(&byte_offset, |&(b, _)| b);
-            // Not a recorded char boundary on `Err` — shouldn't happen given the caller's
-            // `floor_char_boundary` guarantee, but falls back to the nearest preceding entry's
-            // cumulative count rather than panicking.
+            // `Err` shouldn't happen given the caller's `floor_char_boundary` guarantee, but
+            // falls back to the nearest preceding entry rather than panicking.
             let i = found.unwrap_or_else(|i| i.saturating_sub(1));
             index.entries.get(i).map_or(0, |&(_, units)| units)
         })
@@ -1161,12 +1156,9 @@ impl LineOffsetTable {
     #[allow(clippy::string_slice)]
     pub fn byte_offset_to_position(&self, content: &str, offset: usize) -> Position {
         let offset = offset.min(content.len());
-        // `offset` is not always a toml-span offset (boundary-safe by
-        // construction) — the requirements.txt line parser derives offsets
-        // via hand-rolled byte arithmetic, which can land inside a
-        // multi-byte character (e.g. a non-ASCII comment or marker string
-        // combined with an off-by-a-byte cut). Clamp down to the nearest
-        // char boundary rather than panicking on the slice below.
+        // The requirements.txt line parser derives offsets via hand-rolled byte arithmetic,
+        // which can land inside a multi-byte character — clamp to the nearest char boundary
+        // rather than panicking on the slice below.
         let offset = content.floor_char_boundary(offset);
         let line = self
             .line_starts
@@ -1176,23 +1168,17 @@ impl LineOffsetTable {
         // `partition_point().saturating_sub(1)` is always a valid index into it.
         #[allow(clippy::indexing_slicing)]
         let line_start = self.line_starts[line];
-        // #673 M1: `line`/`character` are NOT bounded by `fs_probe::read_to_string_capped`
-        // or `HttpCache`'s body caps for a `textDocument/didChange` full-document-sync
-        // text sent directly by the editor, so this saturates rather than assuming an
-        // upstream cap that doesn't universally hold (mirrors
-        // `completion::byte_to_utf16_offset`'s identical fix).
+        // #673 M1: `line`/`character` aren't bounded by any size cap for editor-sent
+        // full-document-sync text, so this saturates rather than assuming an upstream cap
+        // (mirrors `completion::byte_to_utf16_offset`'s identical fix).
         //
-        // #742: an ASCII-only line has 1 UTF-16 unit per byte, so the character offset is
-        // just the byte delta — no need to walk the line's `chars()` to sum `len_utf16`.
+        // #742: an ASCII-only line has 1 UTF-16 unit per byte, so no need to walk `chars()`.
         let character = if self.line_is_ascii.get(line).copied().unwrap_or(false) {
             u32::try_from(offset - line_start).unwrap_or(u32::MAX)
         } else {
             // #882: a naive `chars().map(len_utf16).sum()` per call is O(line length); N
-            // lookups on the same wide non-ASCII line (e.g. N dependency values sharing a
-            // minified manifest line) made this O(N x line length). The cached per-line
-            // index (shared with `marker_byte_offset`'s identical cost, see
-            // `with_non_ascii_line_index`) makes every lookup after the first on a given line
-            // O(1).
+            // lookups on the same wide line made this O(N x line length). The cached
+            // per-line index (`with_non_ascii_line_index`) makes repeat lookups O(1).
             let line_end = self
                 .line_starts
                 .get(line + 1)
@@ -1339,9 +1325,8 @@ pub fn is_same_major_minor(v1: &str, v2: &str) -> bool {
 /// `UpToDate`, since an unresolved requirement (e.g. a dangling Gradle version-catalog
 /// `version.ref` alias, or an unexpanded Maven `${property}`) must not render an "up to
 /// date" badge that was never actually verified.
-// Exhaustive: closed 3-way satisfies-check answer — a wildcard arm at any consuming match
-// site would silently render the wrong label for a new variant instead of failing to
-// compile (issue #769).
+// Exhaustive: a wildcard arm at any consuming match site would silently render the wrong
+// label for a new variant instead of failing to compile (#769).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequirementStatus {
     /// The latest version satisfies the declared requirement.
@@ -2672,13 +2657,11 @@ mod tests {
 
     #[test]
     fn test_markdown_code_span_backtick_payload_cannot_break_span() {
-        // A payload attempting to close the code span early and splice in a live
-        // link must not succeed regardless of backtick count in the content.
+        // A payload closing the code span early to splice in a live link must not succeed.
         let payload = "1.0` <https://evil.example>` more";
         let span = markdown_code_span(payload);
-        // The fence must be strictly longer than any backtick run in the (sanitized)
-        // content, so no substring of `span` after the opening fence can act as a
-        // closing fence before the real one.
+        // The fence must be strictly longer than any backtick run in the content, so no
+        // substring after the opening fence can act as a closing fence before the real one.
         let opening_fence_len = span.chars().take_while(|&c| c == '`').count();
         let inner = &span[opening_fence_len..span.len() - opening_fence_len];
         assert!(
@@ -2756,9 +2739,8 @@ mod tests {
 
     #[test]
     fn test_is_safe_version_string_rejects_gradle_interpolation_payload() {
-        // Regression (critic S2): `$`/`{`/`}` are outside the allowlist, so a
-        // Gradle Kotlin/Groovy `${...}` interpolation payload written into
-        // build.gradle(.kts) can never reach a version literal via this gate.
+        // Regression (critic S2): `$`/`{`/`}` are outside the allowlist, so a Gradle
+        // `${...}` interpolation payload can never reach a version literal via this gate.
         for bad in ["1.0${System.getenv(\"X\")}", "1.0$var", "${evil}"] {
             assert!(
                 !is_safe_version_string(bad),
@@ -2769,10 +2751,9 @@ mod tests {
 
     #[test]
     fn test_is_safe_version_string_rejects_invisible_unicode() {
-        // Regression (critic M1): `char::is_control()` alone only covers
-        // category Cc — format/separator characters like the bidi override
-        // U+202E, zero-width space U+200B, and the JS/JSON5 line terminators
-        // U+2028/U+2029 must also be rejected by the allowlist.
+        // Regression (critic M1): `char::is_control()` alone only covers category Cc — the
+        // bidi override U+202E, zero-width space U+200B, and JS/JSON5 line terminators
+        // U+2028/U+2029 must also be rejected.
         for bad in ["1.2.3\u{202E}", "1.2.3\u{200B}", "1.2.3\u{2028}"] {
             assert!(
                 !is_safe_version_string(bad),

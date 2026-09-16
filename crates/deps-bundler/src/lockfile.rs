@@ -19,9 +19,8 @@ impl GemfileLockParser {
     const LOCKFILE_NAMES: &'static [&'static str] = &["Gemfile.lock"];
 }
 
-// Regex for parsing gem specs: "    gemname (version)"
-// Compile-time-constant pattern; a malformed literal is a build-visible programmer error,
-// not attacker-influenceable input.
+// Matches "    gemname (version)". Compile-time-constant pattern; a malformed literal is a
+// build-visible programmer error, not attacker-influenceable input.
 #[allow(clippy::expect_used)]
 static GEM_SPEC_PATTERN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s{4}([a-zA-Z0-9_-]+)\s+\(([^)]+)\)").expect("Invalid regex"));
@@ -76,12 +75,10 @@ pub fn parse_gemfile_lock(content: &str) -> Result<ResolvedPackages> {
     let mut in_specs = false;
 
     for line in content.lines() {
-        // Check for section headers
         if let Some(section) = detect_section(line) {
             current_section = section;
             in_specs = false;
 
-            // Reset source based on section
             current_source = match section {
                 Section::Gem => ResolvedSource::Registry {
                     url: "https://rubygems.org".to_string(),
@@ -99,13 +96,11 @@ pub fn parse_gemfile_lock(content: &str) -> Result<ResolvedPackages> {
             continue;
         }
 
-        // Check for "specs:" marker
         if line.trim() == "specs:" {
             in_specs = true;
             continue;
         }
 
-        // Update source URL for GIT/PATH sections
         if line.starts_with("  remote:") {
             let url = line.trim_start_matches("  remote:").trim().to_string();
             current_source = match current_section {
@@ -123,7 +118,6 @@ pub fn parse_gemfile_lock(content: &str) -> Result<ResolvedPackages> {
             continue;
         }
 
-        // Update revision for GIT section
         if line.starts_with("  revision:") {
             if let ResolvedSource::Git { url, .. } = &current_source {
                 let rev = line.trim_start_matches("  revision:").trim().to_string();
@@ -135,7 +129,6 @@ pub fn parse_gemfile_lock(content: &str) -> Result<ResolvedPackages> {
             continue;
         }
 
-        // Parse gem specs
         if in_specs
             && matches!(current_section, Section::Gem | Section::Git | Section::Path)
             && let Some(caps) = GEM_SPEC_PATTERN.captures(line)

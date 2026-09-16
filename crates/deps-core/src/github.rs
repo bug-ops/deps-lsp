@@ -45,11 +45,9 @@ pub const GITHUB_API: &str = "https://api.github.com";
 /// subset fixes that, since the highest real versions were never fetched at all.
 pub const MAX_TAG_PAGES: u32 = 30;
 
-// [`paginate_tags`]'s page-fetch concurrency now lives in
+// [`paginate_tags`]'s page-fetch concurrency lives in
 // [`crate::pagination::paginate_pages`]'s internal `CONCURRENCY` constant, which this
-// crate's tags pagination delegates to (see that module's doc comment for the batching
-// rationale — a many-tag repo's request count/latency tradeoff, and the known limitation
-// that there is no process-wide cap on concurrent GitHub requests across dependencies).
+// crate's tags pagination delegates to.
 
 /// Whether `name` matches the `owner/repo` GitHub identifier shape every GitHub-tags-backed
 /// ecosystem accepts.
@@ -698,13 +696,9 @@ impl ReleaseDatesCache {
             return Arc::new(HashMap::new());
         }
 
-        // Keyed on `(api_base, name)`, not `name` alone: `fetch` takes an arbitrary
-        // `GithubTagsClient` per call, so one cache shared across clients pointed at
-        // different origins (a mock server beside the real API, or a future GitHub
-        // Enterprise base) must not let a hit fetched via one origin's client serve
-        // another's read (#486 critic M1). `\0` cannot occur in either half:
-        // `validate_owner_repo` already rejected `name`, and a URL cannot carry a raw
-        // NUL byte.
+        // Keyed on `(api_base, name)`, not `name` alone: a cache shared across clients
+        // pointed at different origins (mock server, GitHub Enterprise) must not let a hit
+        // from one origin serve another's read (#486 M1). `\0` cannot occur in either half.
         let key = format!("{}\0{name}", github.api_base());
 
         let now = Instant::now();
@@ -732,9 +726,8 @@ impl ReleaseDatesCache {
         .await;
         match &fetch_result {
             // #756: never interpolate `e`'s `Display` — see `DepsError::safe_tracing_summary`.
-            // Same pattern-consistency fix as `cache.rs`/`osv/mod.rs` in this same function
-            // this diff already instruments — currently safe (GitHub auth flows via header,
-            // never the URL), but keeping the invariant uniform everywhere this diff touches.
+            // Same invariant as `cache.rs`/`osv/mod.rs`, kept uniform even though GitHub auth
+            // flows via header (currently safe) rather than the URL.
             Ok(Err(e)) => {
                 let (status, cause) = e.safe_tracing_summary();
                 tracing::debug!(
@@ -915,12 +908,10 @@ mod tests {
     async fn test_paginate_tags_stops_after_partial_page() {
         use std::sync::atomic::{AtomicU32, Ordering};
 
-        // Page 2 is the partial (true last) page, but it falls inside the first batch
-        // dispatched after page 1 (pages 2-6, CONCURRENCY=5): by the time page 2's short
-        // response is processed, pages 3-6 are already in flight and get fetched too, then
-        // discarded. This is the documented, bounded overfetch tradeoff of batched
-        // concurrency (see `paginate_tags`'s doc comment) — page 7+ is a separate batch that
-        // must never be dispatched.
+        // Page 2 is the true last page, but it falls inside the first batch dispatched after
+        // page 1 (pages 2-6, CONCURRENCY=5), so pages 3-6 are already in flight and get
+        // fetched too, then discarded — the documented bounded overfetch tradeoff of batched
+        // concurrency. Page 7+ must never be dispatched.
         let calls = AtomicU32::new(0);
         let mut tags = Vec::new();
         let output = capture_tracing_output_async(async {
@@ -970,12 +961,10 @@ mod tests {
             Bytes::from(format!("[{}]", entries.join(",")))
         }
 
-        // Pages 2-5 (one batch's full pages) resolve slowest-first (page 2 waits longest,
-        // page 5 barely waits); page 6 (the partial page ending the batch) resolves
-        // instantly. If `paginate_tags` used `buffer_unordered` instead of ordered
-        // `buffered`, the output would be ordered by this completion order (6,5,4,3,2)
-        // instead of page order (1,2,3,4,5,6) — `deps-github-actions`'s tag-to-SHA
-        // "first tag wins" dedup depends on the latter.
+        // Pages 2-5 resolve slowest-first (page 2 waits longest); page 6 resolves instantly.
+        // If `paginate_tags` used `buffer_unordered` instead of ordered `buffered`, output
+        // would follow completion order (6,5,4,3,2) instead of page order — `deps-github-
+        // actions`'s tag-to-SHA "first tag wins" dedup depends on the latter.
         let result = paginate_tags("Swift", "owner/repo", |page| async move {
             match page {
                 1 => Ok(named_page("page1", 100)),

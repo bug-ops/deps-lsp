@@ -193,12 +193,8 @@ mod tests {
         let ls_uri =
             ls_types::Uri::from_file_path(platform_path("/home/user/project/Cargo.toml")).unwrap();
         let url = from_lsp_uri(&ls_uri).unwrap();
-        // `url.to_file_path()` returns a decoded native path (e.g. `C:\...` on Windows),
-        // while `ls_uri.path()` is the raw, still-percent-encoded URI path component (a
-        // Windows drive-letter colon is encoded as `%3A` there) — comparing those two
-        // directly diverges on Windows even for a correct round-trip, so this checks the
-        // decoded path against the original filesystem path instead, then verifies the
-        // full URI round-trip below the same way the other tests in this module do.
+        // Compares the decoded path, not raw `ls_uri.path()`: percent-encoding (e.g. a
+        // Windows drive-letter `:` as `%3A`) makes those diverge even on a correct round-trip.
         assert_eq!(
             url.to_file_path().unwrap(),
             std::path::PathBuf::from(platform_path("/home/user/project/Cargo.toml"))
@@ -315,9 +311,8 @@ mod tests {
              rejected, not silently downgraded to a host-less local path"
         );
 
-        // Positive control: an equivalent legitimate URI (no host) for a real file must still
-        // convert successfully and resolve to a usable path — the guard above must not be
-        // overbroad and reject ordinary `file:` URIs.
+        // Positive control: an equivalent legitimate URI must still convert — the guard above
+        // must not be overbroad and reject ordinary `file:` URIs.
         let temp_dir = tempfile::tempdir().unwrap();
         let real_path = temp_dir.path().join("Cargo.toml");
         std::fs::write(&real_path, "[package]\n").unwrap();

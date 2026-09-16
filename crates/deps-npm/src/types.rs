@@ -60,10 +60,8 @@ pub struct NpmDependency {
     pub package: Option<deps_core::PackageName>,
 }
 
-// Implemented by hand rather than via `deps_core::impl_dependency!`: `name()` resolves to
-// `package.as_ref().unwrap_or(&self.name)` (the `npm:` alias, falling back to the JSON key),
-// not a bare field — the macro only supports a direct field access for `name`. Mirrors
-// `deps-cargo`'s identical direct `impl deps_core::Dependency for CargoDependency`.
+// Hand-implemented, not via `impl_dependency!`: `name()` needs `package.unwrap_or(&name)`,
+// but the macro only supports a bare field. Mirrors deps-cargo's `CargoDependency` impl.
 impl deps_core::Dependency for NpmDependency {
     /// Returns the registry lookup name: [`Self::package`] when this dependency was
     /// aliased via an `npm:` value, otherwise the JSON key.
@@ -203,11 +201,9 @@ impl NpmVersion {
     }
 }
 
-// Use macro to implement VersionInfo and Version traits. `node_semver`
-// reliably exposes npm's own prerelease identifiers instead of falling back
-// to deps-core's default hyphen-substring heuristic (#322). The registry
-// enforces valid semver on publish, so a parse failure here (treated as
-// not-prerelease) is practically unreachable.
+// Uses `node_semver`'s prerelease detection instead of deps-core's hyphen-substring
+// heuristic (#322); parse failure (treated as not-prerelease) is unreachable in practice
+// since the registry enforces valid semver.
 deps_core::impl_version!(NpmVersion {
     version: version,
     status: |v: &NpmVersion| deps_core::RemovalStatus::from_advisory(v.deprecated),
@@ -302,7 +298,6 @@ impl NpmPackage {
     }
 }
 
-// Use macro to implement PackageMetadata and Metadata traits
 deps_core::impl_metadata!(NpmPackage {
     name: name,
     description: description,

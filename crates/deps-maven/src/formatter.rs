@@ -149,7 +149,6 @@ impl PackageNaming for MavenFormatter {
 impl PackageRendering for MavenFormatter {
     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
         let version = version.as_str();
-        // Maven uses exact versions, no prefix
         version.to_string()
     }
 

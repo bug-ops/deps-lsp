@@ -306,8 +306,6 @@ impl PypiPackage {
     }
 }
 
-// Implement deps_core traits
-
 // Implemented by hand rather than via `deps_core::impl_dependency!`: `features()` returns
 // real extras data (`&self.extras`, not the trait's empty default) and `markers()`/
 // `markers_range()` are overridden too — none of these are expressible through the macro's
@@ -616,9 +614,7 @@ mod tests {
             latest_version: "1.0.0".into(),
         };
 
-        // Should find "Source" as fallback for repository
         assert_eq!(pkg.repository(), Some("https://github.com/test/test"));
-        // Should find "Homepage" as fallback for documentation
         assert_eq!(pkg.documentation(), Some("https://example.com"));
     }
 }

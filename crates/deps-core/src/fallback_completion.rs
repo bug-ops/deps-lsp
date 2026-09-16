@@ -49,16 +49,12 @@ pub fn raw_prefix(line: &str, character: u32) -> &str {
 /// a section header at all.
 #[must_use]
 pub fn is_in_toml_dependencies(content: &str, line_number: usize) -> bool {
-    // Walk backwards from current line to find the most recent section header
-    // Collect lines up to target, then iterate backwards
     let lines: Vec<_> = content.lines().enumerate().take(line_number + 1).collect();
 
     for (_, line) in lines.iter().rev() {
         let line = line.trim();
 
-        // Check if this is a section header
         if line.starts_with('[') && line.ends_with(']') {
-            // Check if it's a dependencies section
             return line == "[dependencies]"
                 || line == "[dev-dependencies]"
                 || line == "[build-dependencies]"
@@ -83,18 +79,15 @@ pub fn is_in_toml_dependencies(content: &str, line_number: usize) -> bool {
 pub fn is_in_json_dependencies(content: &str, line_number: usize, keys: &[&str]) -> bool {
     let mut in_dependencies = false;
     let mut brace_depth = 0;
-    // Build each `"{key}":` needle once per call rather than once per line.
     let needles: Vec<String> = keys.iter().map(|key| format!("\"{key}\":")).collect();
 
     for (i, line) in content.lines().enumerate() {
-        // Early exit: stop if we've passed the target line
         if i > line_number {
             break;
         }
 
         let trimmed = line.trim();
 
-        // Check if we're entering a dependencies-like section
         if trimmed.starts_with('"')
             && needles
                 .iter()
@@ -104,14 +97,12 @@ pub fn is_in_json_dependencies(content: &str, line_number: usize, keys: &[&str])
             brace_depth = 0;
         }
 
-        // Track brace depth when in dependencies section
         if in_dependencies {
             for ch in trimmed.chars() {
                 match ch {
                     '{' => brace_depth += 1,
                     '}' => {
                         brace_depth -= 1;
-                        // If we've closed the dependencies section
                         if brace_depth <= 0 {
                             in_dependencies = false;
                         }
@@ -120,7 +111,6 @@ pub fn is_in_json_dependencies(content: &str, line_number: usize, keys: &[&str])
                 }
             }
 
-            // If we're at the target line and inside dependencies section with depth > 0
             if i == line_number && in_dependencies && brace_depth > 0 {
                 return true;
             }
@@ -149,9 +139,7 @@ pub fn is_in_xml_tag_section(content: &str, line_number: usize, tag: &str) -> bo
 
         let opens_here = count_open_tags(line, &open_prefix);
         depth += opens_here;
-        // A line with an opening tag counts as "inside" even if the same line also
-        // closes it (`<dependencies></dependencies>`), consistent with the target
-        // line being the header itself in `is_in_toml_dependencies`.
+        // Same-line open+close still counts as inside, matching the header-line handling in `is_in_toml_dependencies`.
         if i == line_number && opens_here > 0 {
             return true;
         }
@@ -168,9 +156,7 @@ pub fn is_in_xml_tag_section(content: &str, line_number: usize, tag: &str) -> bo
 /// Counts real `<{open_prefix}...>` tag occurrences on `line`, i.e. `open_prefix`
 /// followed by `>` or whitespace (an attribute) rather than more tag-name characters
 /// (so `<dependencies` doesn't also match a longer, unrelated tag name).
-// `search_from` starts at 0 and is only ever advanced to `idx + open_prefix.len()`,
-// where `idx` is a `str::find` match start (always a char boundary) and the offset
-// lands exactly at the end of that matched substring (also always a char boundary).
+// `search_from` only ever advances to `idx + open_prefix.len()`, always a char boundary.
 #[allow(clippy::string_slice)]
 fn count_open_tags(line: &str, open_prefix: &str) -> usize {
     let mut count = 0;
@@ -212,8 +198,7 @@ fn count_open_tags(line: &str, open_prefix: &str) -> usize {
 /// [`strip_open_xml_attribute_value`]'s own element extraction).
 #[must_use]
 pub fn strip_leading_xml_tag(prefix: &str) -> (&str, Option<&str>) {
-    // `>`/`<` are single-byte ASCII chars, so `gt + 1`/`lt + 1` are always valid char
-    // boundaries, and slicing at `gt`/`lt` (found via `rfind` on the byte string) is too.
+    // `>`/`<` are single-byte ASCII chars, so `gt + 1`/`lt + 1` are always valid char boundaries.
     #[allow(clippy::string_slice)]
     {
         let Some(gt) = prefix.rfind('>') else {
@@ -223,9 +208,8 @@ pub fn strip_leading_xml_tag(prefix: &str) -> (&str, Option<&str>) {
         let Some(lt) = prefix[..gt].rfind('<') else {
             return (stripped, None);
         };
-        // A closing tag's name segment (`/artifactId` for `</artifactId>`) splits to an
-        // empty first token, since `/` is itself a delimiter — that's what makes
-        // `name.is_empty()` double as the "not a closing tag" check.
+        // A closing tag's name segment (`/artifactId`) splits to an empty first token, since `/`
+        // is itself a delimiter — that's what makes `name.is_empty()` double as the check.
         let name = prefix[lt + 1..gt]
             .split(|c: char| c == '/' || c.is_whitespace())
             .next()
@@ -279,12 +263,10 @@ pub fn strip_open_xml_attribute_value<'a>(
             continue;
         }
         if ch == '<' {
-            // `idx + 1` is a char boundary: `<` is a single-byte ASCII char. Reset
-            // here too (not just on a closing quote) so `before_quote` below never
+            // Reset here too (not just on a closing quote), so `before_quote` below never
             // spans back across a *previous* element's tail.
             segment_start = idx + ch.len_utf8();
-            // char-boundary safe: `segment_start` is `idx + ch.len_utf8()` set
-            // immediately above, always a char boundary.
+            // char-boundary safe: `idx + ch.len_utf8()` always lands on one.
             #[allow(clippy::string_slice)]
             let rest = &prefix[segment_start..];
             element = rest
@@ -294,7 +276,7 @@ pub fn strip_open_xml_attribute_value<'a>(
             continue;
         }
         if ch == '"' || ch == '\'' {
-            // `idx` is a char boundary (from `char_indices`), so this slice is valid.
+            // char-boundary safe: `idx` comes from `char_indices`.
             #[allow(clippy::string_slice)]
             let before_quote = prefix[segment_start..idx].trim_end();
             let name = before_quote
@@ -310,14 +292,11 @@ pub fn strip_open_xml_attribute_value<'a>(
     }
 
     if quote.is_some() && in_target_attr {
-        // `value_start` is `idx + ch.len_utf8()` for the opening quote char, always a
-        // char boundary.
+        // char-boundary safe: `value_start` is `idx + ch.len_utf8()` for the opening quote.
         #[allow(clippy::string_slice)]
         let value = &prefix[value_start..];
-        // A package id never contains a quote character. The scan above only closes
-        // `quote` on the *matching* delimiter, so an opposite-type quote character
-        // would otherwise survive into the extracted value; stop at the first quote
-        // of either kind instead.
+        // The scan above only closes `quote` on the *matching* delimiter, so an opposite-type
+        // quote could otherwise survive into the value; stop at the first quote of either kind.
         return value.split(['"', '\'']).next().unwrap_or(value);
     }
     ""
@@ -484,8 +463,7 @@ pub fn strip_open_json_key(prefix: &str) -> (&str, bool) {
     let Some(last_quote) = last_quote else {
         return ("", false);
     };
-    // `quote_count` odd (so >= 1) guarantees `count_real_quotes` found one; `"`
-    // is a single-byte ASCII char, so `last_quote + 1` is always a char boundary.
+    // char-boundary safe: `"` is single-byte ASCII, so `last_quote + 1` always lands on one.
     #[allow(clippy::string_slice)]
     let (before_quote, after_quote) = (&prefix[..last_quote], &prefix[last_quote + 1..]);
     if before_quote.trim_end().ends_with(':') {
@@ -528,8 +506,7 @@ pub fn open_quoted_tail(segment: &str) -> Option<&str> {
     if count.is_multiple_of(2) {
         return None;
     }
-    // `last_quote` is the byte index of a `"` char (from `char_indices`), and `"` is a
-    // single-byte ASCII char, so `last_quote + 1` is always a char boundary.
+    // char-boundary safe: `"` is single-byte ASCII, so `last_quote + 1` always lands on one.
     #[allow(clippy::string_slice)]
     last_quote.map(|pos| &segment[pos + 1..])
 }
@@ -824,7 +801,6 @@ tokio
 
     #[test]
     fn test_strip_leading_xml_tag_for_maven() {
-        // Cursor right after "gua" in `<artifactId>gua`.
         assert_eq!(
             strip_leading_xml_tag("<artifactId>gua"),
             ("gua", Some("artifactId"))
@@ -964,68 +940,54 @@ tokio
 
     #[test]
     fn test_strip_open_json_key_open_key_leading_quote() {
-        // package.json / composer.json: cursor sits before the closing quote while the
-        // key is still being typed, e.g. `    "expr` with the cursor right after "expr".
         let prefix = "\"expr";
         assert_eq!(strip_open_json_key(prefix), ("expr", true));
     }
 
     #[test]
     fn test_strip_open_json_key_closed_key_is_suppressed_not_reopened() {
-        // #729 critic S1: cursor right after an already fully-closed key
-        // (`"express"`, quote parity even) is NOT an open string — a naive
-        // `ends_with('"')` check would misclassify this as open and bare-insert into
-        // it (`"express"express`, still invalid JSON). Quote parity correctly reports
-        // this as ambiguous instead, suppressing the item rather than guessing.
+        // #729 critic S1: a naive `ends_with('"')` check would misclassify a closed key as
+        // open and bare-insert into it (`"express"express`); quote parity suppresses instead.
         let prefix = "\"express\"";
         assert_eq!(strip_open_json_key(prefix), ("", false));
     }
 
     #[test]
     fn test_strip_open_json_key_open_value_string_is_suppressed_not_key() {
-        // #729 critic S2: cursor inside an open *value* string (`"express": "^4`, odd
-        // quote parity) must not be reported as an open key — a bare package-name
-        // insert there would corrupt the version string, not complete the key.
+        // #729 critic S2: cursor inside an open *value* string must not be reported as an open
+        // key — a bare package-name insert there would corrupt the version string.
         let prefix = "\"express\": \"^4";
         assert_eq!(strip_open_json_key(prefix), ("", false));
     }
 
     #[test]
     fn test_strip_open_json_key_open_key_after_prior_closed_entry_on_same_line() {
-        // A second key on the same line as an already-closed entry (`"express":
-        // "4.19.2", "look`) must still be recognized as an open key: the text right
-        // before its opening quote is `, `, not `:`, so quote parity correctly
-        // distinguishes it from the value-position case above.
+        // A second key after an already-closed entry: text before its opening quote is `, `,
+        // not `:`, so quote parity distinguishes it from the value-position case above.
         let prefix = "\"express\": \"4.19.2\", \"look";
         assert_eq!(strip_open_json_key(prefix), ("look", true));
     }
 
     #[test]
     fn test_strip_open_json_key_no_quote_survives_reports_unchanged() {
-        // No `"` typed yet at all (e.g. the user deleted the key and is retyping bare
-        // text): nothing proves a string is already open, so the normal full-pair
-        // insert is still correct here (#729).
+        // No `"` typed at all: nothing proves a string is already open, so the normal
+        // full-pair insert is still correct (#729).
         let prefix = "expr";
         assert_eq!(strip_open_json_key(prefix), ("expr", false));
     }
 
     #[test]
     fn test_strip_open_json_key_escaped_quote_in_closed_pair_is_not_open() {
-        // #729 code-review: a closed key containing one escaped quote, plus a closed
-        // value, plus trailing bare text with no opening quote yet. A naive raw `"`
-        // count sees 5 quote characters (odd) and wrongly reports this as an open key
-        // with a garbage prefix; the escape-aware count sees the real state (nothing
-        // open) and suppresses.
+        // #729: a naive raw `"` count sees 5 (odd) here and wrongly reports an open key;
+        // the escape-aware count sees the real (closed) state and suppresses.
         let prefix = "\"a\\\"b\": \"1\", lodash";
         assert_eq!(strip_open_json_key(prefix), ("", false));
     }
 
     #[test]
     fn test_strip_open_json_key_escaped_quote_inside_still_open_key() {
-        // Inverse of the above: an escaped quote inside a key that is genuinely still
-        // open. A naive raw count would see 2 quote characters (even) and wrongly
-        // suppress a valid completion; the escape-aware count correctly reports this
-        // as still open.
+        // Inverse of the above: naive raw count sees 2 (even) and wrongly suppresses;
+        // escape-aware count correctly reports this as still open.
         let prefix = "\"a\\\"b";
         assert_eq!(strip_open_json_key(prefix), ("a\\\"b", true));
     }

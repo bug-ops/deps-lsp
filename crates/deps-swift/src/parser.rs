@@ -36,8 +36,7 @@ deps_core::impl_parse_result!(
     }
 );
 
-// Regex patterns for various .package() call forms.
-// All use (?s) DOTALL flag to handle multiline calls.
+// (?s) DOTALL handles multiline .package() calls.
 
 // Compile-time-constant patterns; a malformed literal is a build-visible programmer error,
 // not attacker-influenceable input.
@@ -251,7 +250,6 @@ pub fn parse_package_swift(content: &str, uri: &Url) -> Result<SwiftParseResult>
     // per-form.
     let mut budget = deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
 
-    // Track which byte ranges have already been matched to avoid double-parsing
     let is_already_matched = |start: usize, end: usize, matched: &[std::ops::Range<usize>]| {
         matched.iter().any(|r| r.start <= start && end <= r.end)
     };
@@ -799,7 +797,6 @@ let package = Package(
 
     #[test]
     fn test_url_to_identity_single_segment_returns_none() {
-        // URL with only one path segment cannot produce owner/repo
         assert_eq!(url_to_identity("https://github.com/singlerepo"), None);
     }
 
@@ -862,7 +859,6 @@ let package = Package(
 
     #[test]
     fn test_url_to_identity_ssh_no_git_suffix() {
-        // SSH URL without .git extension
         assert_eq!(
             url_to_identity("git@github.com:apple/swift-log"),
             Some("apple/swift-log".into())
@@ -878,19 +874,17 @@ let package = Package(
 
     #[test]
     fn test_comment_inside_string_not_stripped() {
-        // A "//" inside a string literal must NOT be treated as a comment
         let content = r#".package(url: "https://github.com/foo/bar", from: "1.0.0")"#;
         let result = parse_package_swift(content, &test_uri()).unwrap();
-        // The URL contains "://" which should not confuse the comment stripper
+        // The URL's "://" should not confuse the comment stripper.
         assert_eq!(result.dependencies.len(), 1);
         assert_eq!(result.dependencies[0].name(), "foo/bar");
     }
 
     #[test]
     fn test_escaped_quote_inside_string() {
-        // Escaped quote inside string should not end the string
-        // This is an edge case — Package.swift doesn't typically use escapes in URLs,
-        // but the stripper must handle them without panicking.
+        // Package.swift doesn't typically use escapes in URLs, but the stripper must
+        // handle them without panicking.
         let content = "let s = \"hello \\\"world\\\"\"\n.package(url: \"https://github.com/a/b\", from: \"1.0.0\")";
         let result = parse_package_swift(content, &test_uri()).unwrap();
         assert_eq!(result.dependencies.len(), 1);
@@ -995,11 +989,9 @@ let package = Package(
 
     #[test]
     fn test_parse_branch_non_identity_url_uses_raw() {
-        // Branch deps fall back to raw URL string when url_to_identity returns None
         let content = r#".package(url: "https://example.com/onlyone", .branch("main"))"#;
         let result = parse_package_swift(content, &test_uri()).unwrap();
         assert_eq!(result.dependencies.len(), 1);
-        // name falls back to the raw URL
         assert_eq!(result.dependencies[0].name(), "https://example.com/onlyone");
     }
 

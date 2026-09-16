@@ -198,12 +198,10 @@ pub fn parse_gradle(content: &str, uri: &Url) -> Result<GradleParseResult> {
         });
     };
 
-    // Resolve variable references for build files (not catalogs or settings). Directory is
-    // derived via `resolve_manifest_file_path` (#1090), not the raw `uri.path()` string used
-    // for the filename dispatch above: `uri.path()` is the URI's own path component, with no
-    // scheme or host check at all, so joining it straight onto `load_gradle_properties` would
-    // let a non-`file:` scheme or remote-host URI walk and read a real
-    // `gradle.properties` from this process's local filesystem.
+    // Directory derived via `resolve_manifest_file_path` (#1090), not the raw `uri.path()`
+    // string used for dispatch above: that string has no scheme/host check, so joining it
+    // straight onto `load_gradle_properties` would let a non-file:/remote-host URI read a real
+    // gradle.properties from this process's local filesystem.
     if (path.ends_with("build.gradle.kts") || path.ends_with("build.gradle"))
         && let Some(dir) = deps_core::lockfile::resolve_manifest_file_path(uri)
             .as_deref()

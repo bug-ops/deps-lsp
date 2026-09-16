@@ -78,7 +78,6 @@ version = "0.1.0"
 "#,
     );
 
-    // Generate 100 dependencies
     for i in 0..100 {
         content.push_str(&format!("dep{} = \"1.{}.0\"\n", i, i % 20));
     }
@@ -97,14 +96,12 @@ resolver = "2"
 "#,
     );
 
-    // 50 workspace dependencies
     for i in 0..50 {
         content.push_str(&format!("workspace-dep{} = \"1.{}.0\"\n", i, i % 20));
     }
 
     content.push_str("\n[dependencies]\n");
 
-    // 50 direct dependencies
     for i in 0..50 {
         if i % 3 == 0 {
             content.push_str(&format!(
@@ -179,13 +176,11 @@ fn bench_cargo_parsing(c: &mut Criterion) {
 fn bench_position_tracking(c: &mut Criterion) {
     let mut group = c.benchmark_group("position_tracking");
 
-    // Simple inline dependency
     let inline = r#"
 [dependencies]
 serde = "1.0"
 "#;
 
-    // Complex table dependency
     let table = r#"
 [dependencies]
 serde = { version = "1.0", features = ["derive", "std"], default-features = false }
@@ -234,7 +229,6 @@ fn bench_registry_parsing(c: &mut Criterion) {
         });
     });
 
-    // Generate large sparse index response (100 versions)
     let mut large_index = String::new();
     for i in 0..100 {
         large_index.push_str(&format!(
@@ -272,19 +266,16 @@ fn bench_version_matching(c: &mut Criterion) {
         Version::parse("1.0.214").unwrap(),
     ];
 
-    // Simple version requirement
     let simple_req = VersionReq::parse("1.0").unwrap();
     group.bench_function("simple_version_req", |b| {
         b.iter(|| simple_req.matches(black_box(&latest)));
     });
 
-    // Complex version requirement (multiple constraints)
     let complex_req = VersionReq::parse(">=1.0.100, <2.0").unwrap();
     group.bench_function("complex_version_req", |b| {
         b.iter(|| complex_req.matches(black_box(&latest)));
     });
 
-    // Find latest matching version
     group.bench_function("find_latest_matching", |b| {
         b.iter(|| {
             versions

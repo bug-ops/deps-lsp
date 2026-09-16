@@ -346,11 +346,9 @@ mod tests {
         }
     }
 
-    // #758: exact-value `EcosystemFormatter` conformance, replacing
-    // test_validate_package_name_accepts_bare_and_host_qualified and test_package_url. No
-    // `version_roundtrip` — this formatter has no `version_satisfies_requirement`
-    // override, only `is_requirement_up_to_date`/`requirement_status_for`, which stay
-    // hand-written below.
+    // #758: replaces test_validate_package_name_accepts_bare_and_host_qualified/
+    // test_package_url. No `version_roundtrip` — no `version_satisfies_requirement`
+    // override here, only the hand-written methods below.
     deps_core::formatter_conformance! {
         mod gitlab_ci_formatter_conformance;
         build: formatter();

@@ -1,11 +1,7 @@
-// `NpmRegistry::get_latest_matching`'s boxed-future coercion nests through
-// `get_latest_matching_from`'s own `async fn` call chain; rustc's default recursion limit is
-// occasionally insufficient to prove the resulting `Send` bound and downgrades a
-// previously-silent trait-solver retry into `recursion_depth_exceeding_limit`, which the fuzz
-// CI job's `-D warnings` nightly build turns into a hard error (rust-lang/rust#159228). Same
-// class of fix as deps-cargo (#745), deps-nuget (#696), deps-swift (#673), deps-composer.
-// deps-deno's `DenoRegistry` delegates npm-specifier lookups to this registry and shares the
-// same exposure.
+// Boxed-future `Send`-bound proof in `get_latest_matching`'s async chain can exceed rustc's
+// default recursion limit, hard-erroring under fuzz CI's `-D warnings` (rust-lang/rust#159228).
+// Same fix as deps-cargo #745, deps-nuget #696, deps-swift #673, deps-composer; deps-deno's
+// npm-specifier lookups delegate here and share the exposure.
 #![recursion_limit = "256"]
 
 //! npm ecosystem support for deps-lsp.
@@ -29,12 +25,8 @@ pub use config::{NpmConfig, NpmConfigCache, NpmParseContext, NpmRegistryIndex};
 pub use ecosystem::NpmEcosystem;
 pub use formatter::NpmFormatter;
 pub use lockfile::NpmLockParser;
-// `parse_pnpm_lock_yaml`/`parse_pnpm_workspace` themselves stay private (mirrors
-// `deps-gradle`'s `fuzz_parse_pom_licenses` precedent): only these two wrappers are exposed,
-// and only under the non-default `fuzzing` feature (issue #727, see this crate's Cargo.toml)
-// — `fuzz/`'s `pnpm_lockfile`/`pnpm_catalog` targets reach them as
-// `deps_npm::fuzz_parse_pnpm_lock_yaml`/`deps_npm::fuzz_parse_pnpm_workspace`; the crate's
-// default public API is unaffected.
+// Wrappers exposed only under non-default `fuzzing` feature (#727) so `fuzz/`'s pnpm targets
+// can reach the otherwise-private parsers; mirrors deps-gradle's `fuzz_parse_pom_licenses`.
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub use catalog::fuzz_parse_pnpm_workspace;

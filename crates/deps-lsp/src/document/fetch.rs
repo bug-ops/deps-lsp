@@ -148,8 +148,6 @@ pub(crate) async fn fetch_registry_versions_for_change(
         None => (HashMap::new(), None, Vec::new(), HashSet::new()),
     };
 
-    // Fetch latest versions only for NEW dependencies
-    //
     // Captured before `dep_sources` is moved into the call below: every raw name a
     // fetch was actually attempted for this round, used by the #550
     // no-comparable-versions merge further down to distinguish "attempted and
@@ -400,7 +398,6 @@ mod tests {
         );
     }
 
-    // PyPI-specific tests
     #[cfg(feature = "pypi")]
     mod pypi_tests {
         use super::*;

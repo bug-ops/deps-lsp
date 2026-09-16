@@ -260,8 +260,8 @@ impl GitlabCiVersion {
     }
 }
 
-// GitLab exposes no yank/deprecation signal for either endpoint, so `status` is
-// unconditionally `Available` (mirrors `deps-github-actions`'s `GithubActionsVersion`).
+// No yank/deprecation signal from either endpoint — `status` is always `Available`
+// (mirrors `deps-github-actions`'s `GithubActionsVersion`).
 deps_core::impl_version!(GitlabCiVersion {
     version: version,
     status: |_v: &GitlabCiVersion| deps_core::RemovalStatus::Available,
@@ -295,9 +295,8 @@ pub struct GitlabCiParseResult {
     pub blocked_registries: Vec<deps_core::BlockedRegistryOccurrence>,
 }
 
-// Implemented by hand rather than via `deps_core::impl_parse_result!`: `blocked_registries()`
-// is overridden with real data (`self.blocked_registries.clone()`) — the macro has no field
-// for it, mirroring `deps_cargo`/`deps_nuget`'s own hand-written impls (#925/#967).
+// Hand-written, not `impl_parse_result!`: the macro has no field for `blocked_registries()`
+// (mirrors `deps_cargo`/`deps_nuget`'s own hand-written impls, #925/#967).
 impl deps_core::ParseResult for GitlabCiParseResult {
     fn dependencies(&self) -> Vec<&dyn deps_core::Dependency> {
         self.dependencies

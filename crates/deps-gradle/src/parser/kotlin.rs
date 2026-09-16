@@ -53,7 +53,6 @@ static RE_PLATFORM_NO_VERSION: LazyLock<Regex> = LazyLock::new(|| {
 pub fn parse_kotlin_dsl(content: &str, uri: &Url) -> Result<GradleParseResult> {
     let mut dependencies = Vec::new();
 
-    // Track brace depth to detect dependencies { } block
     let mut brace_depth: i32 = 0;
     let mut in_dependencies_block = false;
     let mut deps_brace_depth: i32 = 0;
@@ -62,13 +61,11 @@ pub fn parse_kotlin_dsl(content: &str, uri: &Url) -> Result<GradleParseResult> {
     for (line_idx, line) in content.lines().enumerate() {
         let trimmed = line.trim();
 
-        // Detect entry into dependencies { block
         if !in_dependencies_block && opens_dependencies_block(trimmed) {
             in_dependencies_block = true;
             deps_brace_depth = brace_depth + 1;
         }
 
-        // Count braces
         for ch in line.chars() {
             match ch {
                 '{' => brace_depth += 1,
@@ -88,7 +85,6 @@ pub fn parse_kotlin_dsl(content: &str, uri: &Url) -> Result<GradleParseResult> {
 
         let line_u32 = line_idx as u32;
 
-        // Try pattern with version first
         for caps in RE_WITH_VERSION.captures_iter(line) {
             let config = caps.get(1).map_or("", |m| m.as_str());
             if !is_dependency_configuration(config) {
@@ -100,8 +96,7 @@ pub fn parse_kotlin_dsl(content: &str, uri: &Url) -> Result<GradleParseResult> {
             dependencies.push(build_dependency(&caps, line, line_u32, true, config));
         }
 
-        // Try pattern without version (only if no versioned match on this line)
-        // Avoid double-matching lines that were already caught above
+        // Only match a versionless coordinate if this line has no versioned match already.
         let already_matched: Vec<_> = RE_WITH_VERSION
             .captures_iter(line)
             .filter_map(|c| {
@@ -115,7 +110,6 @@ pub fn parse_kotlin_dsl(content: &str, uri: &Url) -> Result<GradleParseResult> {
             if !is_dependency_configuration(config) {
                 continue;
             }
-            // Skip if this match overlaps with a versioned match
             let match_start = caps.get(0).map_or(0, |m| m.start());
             if already_matched.contains(&match_start) {
                 continue;
@@ -531,7 +525,6 @@ mod tests {
         let result = parse_kotlin_dsl(content, &make_uri()).unwrap();
         assert_eq!(result.dependencies.len(), 1);
         let dep = &result.dependencies[0];
-        // name_range should be on line 1
         assert_eq!(dep.name_range.start.line, 1);
         assert!(dep.version_range.is_some());
         assert_eq!(dep.version_range.unwrap().start.line, 1);

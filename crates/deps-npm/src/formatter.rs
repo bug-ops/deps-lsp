@@ -238,14 +238,8 @@ mod tests {
         assert_eq!(f.deprecated_label(), "*(deprecated)*");
     }
 
-    // #758: exact-value `EcosystemFormatter` conformance, replacing test_package_url,
-    // test_validate_package_name_accepts_hostile_but_legitimate_names,
-    // test_validate_package_name_rejects_invalid_names, test_validate_package_name_does_not_reject_star,
-    // test_validate_package_name_rejects_disallowed_char_inside_scope,
-    // test_validate_package_name_rejects_disallowed_char_inside_name_with_valid_scope, and
-    // test_version_satisfies_requirement. test_validate_package_name_length_boundary below stays
-    // hand-written: it asserts on a computed (`.repeat(n)`) boundary-length name, which doesn't
-    // fit the macro's `literal`-only accepts/rejects lists.
+    // #758: replaces several hand-written EcosystemFormatter tests. test_validate_package_name_length_boundary
+    // below stays separate: its computed (`.repeat(n)`) boundary name doesn't fit the macro's literal-only lists.
     deps_core::formatter_conformance! {
         mod npm_formatter_conformance;
         build: NpmFormatter;
@@ -256,18 +250,15 @@ mod tests {
         accepts: [
             "@types/node", "@scope/_private", "@scope/.config", "lodash.debounce", "c8", "-", "a",
             "MyLegacyPackage",
-            // npm's encodeURIComponent leaves `!'()*-._~` untouched, so `*` is a legitimate
-            // (if unusual) character in a package name.
+            // encodeURIComponent leaves `!'()*-._~` untouched, so `*` is legitimate here.
             "weird*name"
         ];
         rejects: [
             "", "node_modules", "NODE_MODULES", "favicon.ico", "foo/bar", "a\\b", ".hidden",
             "_private", "@scope", "@/pkg", "@scope/", "@scope/pkg/extra",
-            // Structurally well-formed `@scope/name` (single '/', both segments non-empty),
-            // but the scope segment itself contains a space, outside npm's unreserved set.
+            // Well-formed `@scope/name` but the scope segment contains a space.
             "@sco pe/valid-pkg",
-            // Same, but the disallowed character is in the name segment while the scope is
-            // well-formed — the asymmetric case in the other direction.
+            // Well-formed `@scope/name` but the name segment contains a space.
             "@valid-scope/pkg name"
         ];
         version_roundtrip: [
@@ -337,7 +328,6 @@ mod tests {
     #[test]
     fn test_format_version() {
         let formatter = NpmFormatter;
-        // Version should not include quotes - parser's version_range excludes them
         assert_eq!(
             formatter.format_version_for_text_edit(&ConcreteVersion::new("1.0.214")),
             "1.0.214"
@@ -435,8 +425,7 @@ mod tests {
 
         let formatter = NpmFormatter;
         for requirement in ["1.2.3", "^1.2.3", "~1.2.3", ">=1.0.0 <2.0.0", "*", "1.x"] {
-            // Mirrors the sole call site (`crate::lsp_helpers::diagnostics::generate_diagnostics_from_cache`),
-            // where `requirement` is always `dep.version_requirement().unwrap()`.
+            // Mirrors the sole call site: `requirement` is always `dep.version_requirement().unwrap()`.
             let dep = NpmDependency {
                 name: PackageName::new("lodash"),
                 name_range: deps_core::Range::default(),

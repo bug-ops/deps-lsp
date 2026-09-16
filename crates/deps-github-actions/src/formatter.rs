@@ -175,17 +175,10 @@ impl PackageRendering for GithubActionsFormatter {
         };
         match &gha_dep.pin {
             Some(PinStyle::Tag) => match_v_prefix_style(current, version.as_str()),
-            // `is_plain_scalar` guard (issue #473 sibling fix): for a quoted `uses:`
-            // scalar, `version_range` sits inside the quotes, so appending `# {tag}`
-            // would place a `#` inside the string instead of starting a YAML comment —
-            // the same corruption the mutable-ref-pin SHA-pin action guards against.
-            // `is_last_on_line` guard (issue #898 critic follow-up): for a flow-style
-            // step with real YAML content after the ref (`, with: {...}}`), appending
-            // `# {tag}` here would comment out that content, producing an unterminated
-            // flow mapping — the same corruption class #633 fixed for the bulk SHA-pin
-            // action, reached here through the version-update code action instead.
-            // Both guards fall straight to the no-op fallback without even consulting
-            // `TagIndex`, identical to a cache miss.
+            // is_plain_scalar: a quoted value has version_range inside quotes, so appending
+            // `# {tag}` would break the string, not start a comment (#473). is_last_on_line:
+            // a flow-style step has real YAML after the ref, which would get commented out
+            // too (#633/#898). Both guards fall to the no-op fallback.
             Some(PinStyle::Sha { .. }) if gha_dep.is_plain_scalar && gha_dep.is_last_on_line => {
                 self.tag_index
                     .get(dep.name())
@@ -226,11 +219,8 @@ impl PackageRendering for GithubActionsFormatter {
         match source {
             DependencySource::Path { .. } => true,
             DependencySource::Url { url } => !url.starts_with("https://github.com/"),
-            // `DependencySource` is `#[non_exhaustive]` (deps-core), so a catch-all arm is
-            // required by the compiler regardless — this crate cannot match it exhaustively
-            // by variant name. Every other source (`Registry`, `Git`, `Sdk`, `Workspace`,
-            // `CustomRegistry`, `AlternateRegistry`, and any future variant) defaults to an
-            // unsuppressed (linked) heading, same as before this override existed.
+            // `DependencySource` is `#[non_exhaustive]`, so a catch-all arm is required;
+            // every other source defaults to an unsuppressed (linked) heading.
             _ => false,
         }
     }
@@ -314,11 +304,8 @@ impl GithubActionsFormatter {
         latest: &ConcreteVersion,
     ) -> Option<RequirementStatus> {
         let gha_dep = dep.as_any().downcast_ref::<GithubActionsDependency>()?;
-        // Deliberately restricted to a *comment-annotated* SHA pin, not every SHA pin
-        // `crate::types::sha_pin_raw_sha` can resolve a raw SHA for: a commentless pin
-        // has no human-written text to distrust in the first place, so it stays on the
-        // ordinary `requirement_is_unresolved` path rather than gaining ground-truth
-        // status here (scope decision, #907 review).
+        // Restricted to comment-annotated SHA pins: a commentless pin has no human-written
+        // text to distrust, so it stays on the ordinary path instead (#907 scope decision).
         if !matches!(
             gha_dep.pin,
             Some(PinStyle::Sha {
@@ -469,9 +456,8 @@ mod tests {
         let resolved = HashMap::new();
         let fmt = formatter();
 
-        // Cursor placed at the start of the (single) parsed dependency's own name range,
-        // rather than a hardcoded line/column, so this helper works for fixtures whose
-        // `uses:` line varies in position (top-level `steps:` vs. nested `jobs:.call:`).
+        // The dependency's own name range, not a hardcoded line/column, so this works
+        // regardless of where the `uses:` line falls.
         let position = deps_core::ParseResult::dependencies(&parse_result)[0]
             .name_range()
             .start;
@@ -820,9 +806,8 @@ mod tests {
             Some(format!("{sha} # v4").as_str()),
         );
 
-        // Sanity check: the naive comment-only path (no tag_index entry) really would
-        // say "up to date" here — confirms the test is exercising a genuine divergence,
-        // not a case where both paths happen to agree.
+        // Confirms the naive comment-only path would say "up to date" here, so this test
+        // exercises a genuine divergence, not a case where both paths happen to agree.
         assert_eq!(
             fmt.requirement_status(&VersionReq::new("v4"), &ConcreteVersion::new("v4.3.1")),
             RequirementStatus::UpToDate
@@ -943,13 +928,8 @@ mod tests {
         );
     }
 
-    // #758: exact-value `EcosystemFormatter` conformance, replacing
-    // test_package_url_valid_and_invalid, test_validate_package_name_accepts_owner_repo,
-    // test_validate_package_name_accepts_local_path_action,
-    // test_validate_package_name_accepts_docker_ref, and
-    // test_validate_package_name_rejects_malformed_names (#544/#722). No
-    // `version_roundtrip` — this formatter has no `version_satisfies_requirement`
-    // override, only `is_requirement_up_to_date`/`requirement_is_unresolved`, which stay
+    // #758: exact-value `EcosystemFormatter` conformance, replacing several ad hoc tests. No
+    // `version_roundtrip` — this formatter overrides the requirement-status methods instead,
     // hand-written below.
     deps_core::formatter_conformance! {
         mod github_actions_formatter_conformance;
@@ -1117,8 +1097,7 @@ mod tests {
         );
         d.is_last_on_line = false;
 
-        // Mirrors the real caller: for a commentless flow-style SHA ref, `current` is
-        // the raw declared SHA itself (`version_req`), since `version_literal` is `None`.
+        // Commentless flow-style SHA ref: `current` is the raw SHA since `version_literal` is `None`.
         let new_text = fmt.format_version_replacing_for(&d, &ConcreteVersion::new("v5.0.0"), sha);
         assert_eq!(
             new_text, sha,
@@ -1157,10 +1136,8 @@ mod tests {
 
     #[test]
     fn test_format_version_replacing_for_sha_miss_returns_raw_literal_not_current() {
-        // B1: on a TagIndex miss, the guard must compare byte-identical to the raw
-        // literal span (`dep.version_literal()`), never to `current` (the synthesized
-        // tag requirement) — else the shared no-op guard fails to fire and the edit
-        // silently downgrades a SHA pin to a bare tag.
+        // B1: on a TagIndex miss, the guard must compare against the raw literal span, never
+        // `current` (the synthesized tag requirement), or a SHA pin silently downgrades to tag.
         let fmt = formatter();
         let d = dep(
             Some(PinStyle::Sha {

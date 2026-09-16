@@ -201,7 +201,6 @@ impl RequirementResolution for ComposerFormatter {
             });
         }
 
-        // Caret operator
         if let Some(req) = requirement.strip_prefix('^') {
             let req = req.strip_prefix(['v', 'V']).unwrap_or(req);
             return satisfies_caret(version, req);
@@ -253,7 +252,6 @@ impl RequirementResolution for ComposerFormatter {
             return version.starts_with(prefix) && version[prefix.len()..].starts_with('.');
         }
 
-        // Exact or partial version match
         let req_parts: Vec<&str> = requirement.split('.').collect();
         let ver_parts: Vec<&str> = version.split('.').collect();
 
@@ -346,14 +344,12 @@ fn satisfies_tilde_composer(version: &str, req: &str) -> bool {
 
     if req_parts.len() >= 3 {
         // ~X.Y.Z: same as default — >=X.Y.Z <X.(Y+1).0
-        // Must have same major and minor
         if req_parts.first() != ver_parts.first() {
             return false;
         }
         if req_parts.get(1) != ver_parts.get(1) {
             return false;
         }
-        // Patch must be >= req patch
         let req_patch: u64 = req_parts.get(2).and_then(|p| p.parse().ok()).unwrap_or(0);
         let ver_patch: u64 = ver_parts.get(2).and_then(|p| p.parse().ok()).unwrap_or(0);
         ver_patch >= req_patch
@@ -367,7 +363,6 @@ fn satisfies_tilde_composer(version: &str, req: &str) -> bool {
         if ver_major != req_major {
             return false;
         }
-        // Same major: minor must be >= req_minor
         ver_minor >= req_minor
     } else {
         // ~X: >=X.0.0 <(X+1).0.0 — same as caret for single segment

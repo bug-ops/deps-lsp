@@ -211,8 +211,8 @@ pub fn parse_cargo_toml_with_context(
 
     let line_table = LineOffsetTable::new(content);
     let mut dependencies = Vec::new();
-    // Shared across every section/target/workspace-deps table below (#796) — the ceiling
-    // is per-document, not per-section, so one budget bounds all of them together.
+    // Shared across every section/target/workspace-deps table below (#796) — per-document,
+    // not per-section.
     let mut budget = deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
 
     let root_table = doc.as_table().ok_or_else(|| DepsError::ParseError {
@@ -228,10 +228,8 @@ pub fn parse_cargo_toml_with_context(
         &mut budget,
     );
 
-    // Parse target-specific dependency tables: [target.<cfg-expr-or-triple>.dependencies],
-    // .dev-dependencies, .build-dependencies (#392). Each entry under [target] is keyed by a
-    // cfg expression (e.g. `cfg(unix)`) or a target triple; every such table can carry the
-    // same three dependency kinds as the top level.
+    // [target.<cfg-expr-or-triple>.dependencies/.dev-/.build-dependencies] (#392): each
+    // [target] entry, keyed by a cfg expression or triple, can carry the same three kinds.
     if let Some(target_val) = get_val(root_table, "target")
         && let Some(target_table) = target_val.as_table()
     {
@@ -248,7 +246,7 @@ pub fn parse_cargo_toml_with_context(
         }
     }
 
-    // Parse workspace dependencies (for workspace root Cargo.toml)
+    // [workspace.dependencies], for a workspace root Cargo.toml.
     if let Some(workspace_val) = get_val(root_table, "workspace")
         && let Some(workspace_table) = workspace_val.as_table()
         && let Some(workspace_deps_val) = get_val(workspace_table, "dependencies")
@@ -339,13 +337,10 @@ fn resolve_alternate_registries(
     let mut newly_resolved: Vec<(RegistryIndex, Option<AuthToken>)> = Vec::new();
 
     for value in &raw_values {
-        // A literal `registry-index` URL is workspace-declared by construction — it is a
-        // value written directly into the `Cargo.toml` being parsed. An `InvalidUrl`/
-        // `NotHttps`/`UserInfoPresent` error covers "not a URL at all" (the common case:
-        // `value` is actually an alias, not a literal index) and a genuinely-invalid literal
-        // URL alike — either way, falling through to alias resolution below is safe: an
-        // alias lookup for a URL-shaped string simply won't match any `[registries.*]` entry
-        // and stays unresolved, identical in outcome to failing here directly.
+        // A literal `registry-index` URL is workspace-declared by construction. Any
+        // validation error (not a URL at all — the common case where `value` is actually an
+        // alias — or a genuinely invalid URL) falls through to alias resolution below
+        // safely: a URL-shaped alias lookup simply won't match any `[registries.*]` entry.
         match RegistryIndex::new(value, IndexTrust::WorkspaceDeclared, &ctx.policy) {
             Ok(index) => {
                 resolved_by_raw_value.insert(value.clone(), index.clone());
@@ -376,12 +371,9 @@ fn resolve_alternate_registries(
         } else if let Some(class) = config.blocked_class(alias) {
             blocked_by_raw_value.insert(alias.clone(), class);
         } else {
-            // `alias` here is the raw `registry-index`/`registry` value from the manifest,
-            // not a config-file alias name — it may itself be a URL carrying `user:pass@`
-            // credentials or a query-string credential (e.g. `RegistryIndexError::UserInfoPresent`
-            // fell through to alias resolution). Redact before logging (see
-            // `deps_core::net_policy::RedactedUrl`, not `redact_userinfo` alone, which
-            // preserves the query string — #767 follow-up).
+            // `alias` is the raw manifest value, which may itself carry `user:pass@` or a
+            // query-string credential — redact with `RedactedUrl`, not `redact_userinfo`
+            // alone, which keeps the query string (#767).
             let redacted = deps_core::net_policy::RedactedUrl::new(alias);
             tracing::warn!(
                 alias = %redacted,
@@ -392,9 +384,8 @@ fn resolve_alternate_registries(
     }
 
     // [source] replace-with mirror rewrite (FR-005/006/007): every plain `Registry`
-    // dependency reroutes to the resolved mirror. An alias-based `AlternateRegistry` a
-    // dependency may already carry from the loop above is left untouched — a `[registries]`
-    // alias is not crates.io, so `[source.crates-io]` replacement does not apply to it.
+    // dependency reroutes to the resolved mirror. An alias-based `AlternateRegistry` from the
+    // loop above is left untouched — a `[registries]` alias is not crates.io.
     if let SourceReplacement::SparseMirror { index, auth } = source_replacement {
         newly_resolved.push((index.clone(), auth));
         for dep in dependencies.iter_mut() {
@@ -513,11 +504,9 @@ fn parse_dependencies_section(
         };
 
         if let Some(s) = value.as_str() {
-            // Simple string version: serde = "1.0"
             dep.version_req = Some(s.into());
             dep.version_range = Some(span_to_range(content, line_table, value.span));
         } else if let Some(t) = value.as_table() {
-            // Inline table or full table: serde = { version = "1.0" }
             parse_table_dependency(&mut dep, t, content, line_table);
         } else {
             continue;
@@ -536,15 +525,13 @@ fn parse_table_dependency(
     content: &str,
     line_table: &LineOffsetTable,
 ) {
-    // `toml_span::value::Table` is a `BTreeMap` keyed by field name, so it iterates
-    // in alphabetical order (`branch`, `git`, `rev`, `tag`), not TOML source order —
-    // `git` cannot be relied on to run before or after `tag`/`branch`/`rev`. The rev
-    // value is collected here and applied to `dep.source` once the whole table has
-    // been walked, so the result doesn't depend on that ordering (#393).
+    // `Table` is a `BTreeMap`, so it iterates alphabetically, not in TOML source order —
+    // `git` isn't reliably before/after `tag`/`branch`/`rev`. Collected here, applied to
+    // `dep.source` after the whole table is walked, so the result doesn't depend on
+    // iteration order (#393).
     let mut git_rev: Option<String> = None;
-    // `package` is likewise collected and applied only after the whole table has been
-    // walked, since alphabetically `"package"` (p) sorts before `"workspace"` (w) and
-    // may be visited before `workspace = true` is seen.
+    // Same reasoning: alphabetically "package" sorts before "workspace", so it may be
+    // visited before `workspace = true` is seen.
     let mut package_rename: Option<String> = None;
 
     for (key, value) in table {
@@ -591,30 +578,19 @@ fn parse_table_dependency(
                     };
                 }
             }
-            // `package = "..."` renames the dependency: the TOML table key becomes a
-            // local import alias, and `package` names the actual crate to resolve
-            // against the registry (Cargo's "renaming dependencies" feature). `dep.name`
-            // stays the alias — it anchors `name_range` for LSP positions — while
-            // `dep.package` becomes the registry lookup name via `Dependency::name()`.
-            // Applied after the loop (see `package_rename` above): combined with
-            // `workspace = true`, Cargo silently discards `package` and resolves by the
-            // table key alone (verified via `cargo metadata`), so it must not win here
-            // either.
+            // `package = "..."` renames the dependency: the TOML key becomes a local alias,
+            // `package` the real registry lookup name (via `Dependency::name()`). Applied
+            // after the loop: combined with `workspace = true`, Cargo silently discards
+            // `package` and resolves by the table key alone (verified via `cargo metadata`).
             "package" => {
                 if let Some(name) = value.as_str() {
                     package_rename = Some(name.to_string());
                 }
             }
-            // `registry = "my-corp"` names an alternative registry defined in
-            // `.cargo/config.toml`, not crates.io. deps-cargo has no client
-            // for it, so it must not stay classified as the plain `Registry`
-            // source: `CustomRegistry` opts it out of version-resolution
-            // diagnostics that would otherwise silently check it against
-            // crates.io's unrelated package of the same name (#248, known
-            // limitation until private-registry client support exists).
-            // `"crates-io"` is Cargo's reserved alias for the *public*
-            // registry (not a custom one) and must stay classified as
-            // `Registry`.
+            // `registry = "my-corp"` names an alternative registry in `.cargo/config.toml`,
+            // not crates.io — `CustomRegistry` opts it out of version-resolution diagnostics
+            // that would otherwise check it against crates.io's unrelated same-named package
+            // (#248). `"crates-io"` is Cargo's reserved public-registry alias, stays `Registry`.
             "registry" => {
                 if let Some(name) = value.as_str()
                     && name != "crates-io"
@@ -624,10 +600,8 @@ fn parse_table_dependency(
                     };
                 }
             }
-            // `registry-index = "<url>"` is the direct-URL spelling of the
-            // same concept as `registry` above. Cargo's built-in public
-            // index URLs must stay classified as `Registry`; any other URL
-            // names a private index this LSP has no client for.
+            // Direct-URL spelling of `registry` above — Cargo's built-in public index URLs
+            // stay `Registry`; any other URL is a private index with no client here.
             "registry-index" => {
                 if let Some(url) = value.as_str()
                     && !is_public_crates_io_index(url)
@@ -840,8 +814,7 @@ mod tests {
 
     #[test]
     fn test_parse_cargo_toml_rejects_excessive_nesting() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
         // Well past MAX_TOML_NESTING_DEPTH (64) but far below the depth
         // that would actually overflow the stack, so the guard is what's
@@ -861,8 +834,7 @@ mod tests {
     /// `Cargo.toml` so a pre-fix (unguarded) `to_file_path` would have resolved it fine.
     #[test]
     fn test_find_workspace_root_rejects_non_file_uri() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let temp_dir = tempfile::tempdir().unwrap();
         let manifest_path = temp_dir.path().join("Cargo.toml");
@@ -914,8 +886,7 @@ mod tests {
 
     #[test]
     fn test_parse_inline_dependency() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let toml = r#"[dependencies]
 serde = "1.0""#;
@@ -928,8 +899,7 @@ serde = "1.0""#;
 
     #[test]
     fn test_parse_table_dependency() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let toml = r#"[dependencies]
 serde = { version = "1.0", features = ["derive"] }"#;
@@ -945,8 +915,7 @@ serde = { version = "1.0", features = ["derive"] }"#;
     /// completion/code-actions key off the crate that actually exists on crates.io.
     #[test]
     fn test_parse_table_dependency_with_package_rename_resolves_registry_name() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
         use deps_core::Dependency as _;
 
@@ -976,8 +945,7 @@ totally-nonexistent-alias-xyz123 = { package = "serde", version = "1" }"#;
     /// be empty" diagnostic anchored on an otherwise-valid alias).
     #[test]
     fn test_parse_table_dependency_with_empty_package_string_is_ignored() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
         use deps_core::Dependency as _;
 
@@ -995,8 +963,7 @@ foo = { package = "", version = "1.0" }"#;
     /// `Dependency::name()` to the TOML table key, exactly as before this fix.
     #[test]
     fn test_parse_table_dependency_without_package_resolves_table_key() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
         use deps_core::Dependency as _;
 
@@ -1014,8 +981,7 @@ serde = { version = "1.0", features = ["derive"] }"#;
     /// the rename, but the registry-lookup name must still resolve to the real crate.
     #[test]
     fn test_parse_git_dependency_with_package_rename() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
         use deps_core::Dependency as _;
 
@@ -1033,8 +999,7 @@ my-fork = { package = "tower-lsp", git = "https://github.com/ebkalderon/tower-ls
     /// `package = "..."` combined with `path`.
     #[test]
     fn test_parse_path_dependency_with_package_rename() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
         use deps_core::Dependency as _;
 
@@ -1057,8 +1022,7 @@ local-alias = { package = "local-crate", path = "../local" }"#;
     /// here rather than resolve to a value Cargo itself never looks up.
     #[test]
     fn test_parse_workspace_dependency_with_package_rename_is_ignored() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
         use deps_core::Dependency as _;
 
@@ -1076,8 +1040,7 @@ ws-alias = { package = "ws-crate", workspace = true }"#;
 
     #[test]
     fn test_parse_workspace_inheritance() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let toml = r"[dependencies]
 serde = { workspace = true }";
@@ -1088,8 +1051,7 @@ serde = { workspace = true }";
 
     #[test]
     fn test_parse_git_dependency() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let toml = r#"[dependencies]
 tower-lsp = { git = "https://github.com/ebkalderon/tower-lsp", branch = "main" }"#;
@@ -1103,8 +1065,7 @@ tower-lsp = { git = "https://github.com/ebkalderon/tower-lsp", branch = "main" }
 
     #[test]
     fn test_parse_git_dependency_with_tag() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let toml = r#"[dependencies]
 helix-core = { git = "https://github.com/helix-editor/helix", tag = "25.07.1" }"#;
@@ -1118,8 +1079,7 @@ helix-core = { git = "https://github.com/helix-editor/helix", tag = "25.07.1" }"
 
     #[test]
     fn test_parse_git_dependency_with_rev() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let toml = r#"[dependencies]
 example = { git = "https://github.com/example/example", rev = "abc123" }"#;
@@ -1133,8 +1093,7 @@ example = { git = "https://github.com/example/example", rev = "abc123" }"#;
 
     #[test]
     fn test_parse_git_dependency_without_rev_stays_none() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let toml = r#"[dependencies]
 example = { git = "https://github.com/example/example" }"#;
@@ -1148,8 +1107,7 @@ example = { git = "https://github.com/example/example" }"#;
 
     #[test]
     fn test_parse_path_dependency() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let toml = r#"[dependencies]
 local = { path = "../local" }"#;
@@ -1160,8 +1118,7 @@ local = { path = "../local" }"#;
 
     #[test]
     fn test_parse_custom_registry_dependency() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let toml = r#"[dependencies]
 internal-crate = { version = "1.0", registry = "my-corp" }"#;
@@ -1176,8 +1133,7 @@ internal-crate = { version = "1.0", registry = "my-corp" }"#;
 
     #[test]
     fn test_parse_registry_crates_io_alias_stays_registry() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let toml = r#"[dependencies]
 serde = { version = "1.0", registry = "crates-io" }"#;
@@ -1189,8 +1145,7 @@ serde = { version = "1.0", registry = "crates-io" }"#;
 
     #[test]
     fn test_parse_registry_index_custom_url() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
         // A literal `registry-index` URL is already a concrete, fetchable index — it
         // resolves to `AlternateRegistry` directly, with no `.cargo/config.toml` lookup
@@ -1211,8 +1166,7 @@ internal-crate = { version = "1.0", registry-index = "https://gitlab.mycorp.com/
 
     #[test]
     fn test_parse_registry_index_invalid_url_stays_custom_registry() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
         // An http:// registry-index URL fails `RegistryIndex` validation, so it must stay
         // unresolved rather than silently downgrading to an insecure fetch.
@@ -1235,8 +1189,7 @@ internal-crate = { version = "1.0", registry-index = "http://insecure.mycorp.com
     /// can name it), not just leaving the dependency unresolved with no trace.
     #[test]
     fn test_parse_registry_index_literal_blocked_by_policy_populates_blocked_registries() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let toml = r#"[dependencies]
 internal-crate = { version = "1.0", registry-index = "https://169.254.169.254/index" }"#;
@@ -1276,8 +1229,7 @@ internal-crate = { version = "1.0", registry-index = "https://169.254.169.254/in
     /// alias name (not the resolved URL) since that is what the dependency itself declared.
     #[test]
     fn test_parse_custom_registry_alias_blocked_by_policy_populates_blocked_registries() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join(".cargo")).unwrap();
@@ -1319,8 +1271,7 @@ internal-crate = { version = "1.0", registry-index = "https://169.254.169.254/in
     /// a userinfo credential and a query-string one in the same value.
     #[test]
     fn test_parse_registry_index_userinfo_alias_fallback_redacts_credential_in_log() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let toml = r#"[dependencies]
 internal-crate = { version = "1.0", registry-index = "sparse+https://user:hunter2@index.crates.io/?token=super-secret-value" }"#;
@@ -1366,8 +1317,7 @@ internal-crate = { version = "1.0", registry-index = "sparse+https://user:hunter
     /// code-review follow-up on #767: `redact_userinfo` alone preserves the query string).
     #[test]
     fn test_parse_registry_index_env_collision_redacts_credential_in_log() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let toml = r#"[dependencies]
 a = { version = "1.0", registry-index = "sparse+https://user:hunter2@index.mycorp.dev/?token=super-secret-value" }
@@ -1402,8 +1352,7 @@ b = { version = "1.0", registry-index = "sparse+https://USER:hunter2@index.mycor
 
     #[test]
     fn test_parse_custom_registry_alias_unresolved_without_config() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
         // No `.cargo/config.toml` exists anywhere above the test fixture path, so the
         // alias stays unresolved (spec FR-003) — this is the pre-existing
@@ -1422,8 +1371,7 @@ internal-crate = { version = "1.0", registry = "my-corp" }"#;
 
     #[test]
     fn test_parse_custom_registry_alias_resolves_via_workspace_config() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join(".cargo")).unwrap();
@@ -1456,8 +1404,7 @@ internal-crate = { version = "1.0", registry = "my-corp" }"#;
 
     #[test]
     fn test_parse_no_custom_registry_dependency_resolves_nothing() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
         // With no CustomRegistry source and no `[source.crates-io] replace-with` chain
         // anywhere in scope (no `.cargo/config.toml` exists above the fixture path, and
@@ -1477,8 +1424,7 @@ serde = "1.0""#;
     /// itself.
     #[test]
     fn test_parse_plain_dependency_rewritten_via_source_replace_with_mirror() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join(".cargo")).unwrap();
@@ -1514,8 +1460,7 @@ serde = "1.0""#;
     /// fallback behavior, byte-identical.
     #[test]
     fn test_parse_plain_dependency_unchanged_when_source_replace_with_is_vendored() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join(".cargo")).unwrap();
@@ -1539,8 +1484,7 @@ serde = "1.0""#;
 
     #[test]
     fn test_parse_registry_index_public_crates_io_stays_registry() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let toml = r#"[dependencies]
 serde = { version = "1.0", registry-index = "https://github.com/rust-lang/crates.io-index" }
@@ -1554,8 +1498,7 @@ serde_json = { version = "1.0", registry-index = "sparse+https://index.crates.io
 
     #[test]
     fn test_parse_multiple_sections() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let toml = r#"
 [dependencies]
@@ -1586,8 +1529,7 @@ cc = "1.0"
 
     #[test]
     fn test_parse_target_cfg_dependencies() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let toml = "[target.'cfg(unix)'.dependencies]\nlibc = \"0.2\"";
         let result = parse_cargo_toml(toml, &test_url()).unwrap();
@@ -1607,8 +1549,7 @@ cc = "1.0"
 
     #[test]
     fn test_parse_target_cfg_dev_dependencies() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let toml = "[target.'cfg(windows)'.dev-dependencies]\nwinapi = \"0.3\"";
         let result = parse_cargo_toml(toml, &test_url()).unwrap();
@@ -1622,8 +1563,7 @@ cc = "1.0"
 
     #[test]
     fn test_parse_target_triple_build_dependencies() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let toml = "[target.x86_64-unknown-linux-gnu.build-dependencies]\ncc = \"1.0\"";
         let result = parse_cargo_toml(toml, &test_url()).unwrap();
@@ -1637,8 +1577,7 @@ cc = "1.0"
 
     #[test]
     fn test_parse_target_dependencies_alongside_top_level() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let toml = r#"
 [dependencies]
@@ -1704,8 +1643,7 @@ cc = "1.0"
 
     #[test]
     fn test_malformed_toml() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let toml = r#"[dependencies
 serde = "1.0"#;
@@ -1715,8 +1653,7 @@ serde = "1.0"#;
 
     #[test]
     fn test_empty_dependencies() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let toml = r"[dependencies]";
         let result = parse_cargo_toml(toml, &test_url()).unwrap();
@@ -1725,8 +1662,7 @@ serde = "1.0"#;
 
     #[test]
     fn test_position_tracking() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let toml = r#"[dependencies]
 serde = "1.0""#;
@@ -1736,18 +1672,14 @@ serde = "1.0""#;
         assert_eq!(dep.name, "serde");
         assert_eq!(dep.version_req, Some("1.0".into()));
 
-        // Verify name_range is on line 1 (after [dependencies])
         assert_eq!(dep.name_range.start.line, 1);
-        // serde starts at column 0 on that line
         assert_eq!(dep.name_range.start.character, 0);
-        // Verify end position is after "serde" (5 characters)
         assert_eq!(dep.name_range.end.character, 5);
     }
 
     #[test]
     fn test_name_range_tracking() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let toml = r#"[dependencies]
 serde = "1.0"
@@ -1755,7 +1687,6 @@ tokio = { version = "1.0", features = ["full"] }"#;
         let result = parse_cargo_toml(toml, &test_url()).unwrap();
 
         for dep in &result.dependencies {
-            // All dependencies should have non-default name ranges
             let is_default = dep.name_range.start.line == 0
                 && dep.name_range.start.character == 0
                 && dep.name_range.end.line == 0
@@ -1770,8 +1701,7 @@ tokio = { version = "1.0", features = ["full"] }"#;
 
     #[test]
     fn test_parse_workspace_dependencies() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let toml = r#"
 [workspace]
@@ -1792,7 +1722,6 @@ tokio = { version = "1.0", features = ["full"] }
         assert!(serde.is_some());
         let serde = serde.unwrap();
         assert_eq!(serde.version_req, Some("1.0".into()));
-        // version_range should be set for inlay hints
         assert!(
             serde.version_range.is_some(),
             "version_range should be set for serde"
@@ -1803,7 +1732,6 @@ tokio = { version = "1.0", features = ["full"] }
         let tokio = tokio.unwrap();
         assert_eq!(tokio.version_req, Some("1.0".into()));
         assert_eq!(tokio.features, vec!["full"]);
-        // version_range should be set for inlay hints
         assert!(
             tokio.version_range.is_some(),
             "version_range should be set for tokio"
@@ -1812,8 +1740,7 @@ tokio = { version = "1.0", features = ["full"] }
 
     #[test]
     fn test_parse_workspace_and_regular_dependencies() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let toml = r#"
 [workspace]
@@ -1842,8 +1769,7 @@ tokio = "1.0"
 
     #[test]
     fn test_find_workspace_root_skips_over_depth_ancestor() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
         // Directory layout:
         //   <root>/workspace/Cargo.toml        - valid, has [workspace]
@@ -1890,8 +1816,7 @@ tokio = "1.0"
     /// way (naive or correct).
     #[test]
     fn test_discover_workspace_config_above_workspace_root_still_resolves() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         let workspace_dir = root.path().join("workspace");
@@ -1937,13 +1862,11 @@ tokio = "1.0"
     /// work per parse.
     #[test]
     fn test_discover_workspace_stops_at_max_ancestor_depth() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
 
-        // Build a chain deeper than MAX_CONFIG_ANCESTOR_DEPTH, each level carrying its own
-        // `.cargo/config.toml` with a distinct alias, plus a `[workspace]`-carrying
+        // A chain deeper than MAX_CONFIG_ANCESTOR_DEPTH, with a `[workspace]`-carrying
         // `Cargo.toml` at the very top (beyond the cap) that must never be found.
         let mut current = root.path().to_path_buf();
         for i in 0..(MAX_CONFIG_ANCESTOR_DEPTH + 5) {
@@ -1951,8 +1874,6 @@ tokio = "1.0"
         }
         std::fs::create_dir_all(&current).unwrap();
 
-        // Place the far (unreachable) workspace root and a distinguishing config file at
-        // the very top of the tree.
         std::fs::write(
             root.path().join("Cargo.toml"),
             "[workspace]\nmembers = [\"*\"]\n",
@@ -1984,19 +1905,16 @@ tokio = "1.0"
     fn test_discover_workspace_skips_oversized_ancestor_cargo_toml() {
         let root = tempfile::tempdir().unwrap();
 
-        // A synthetic chain deeper than MAX_CONFIG_ANCESTOR_DEPTH, so the depth cap always
-        // stops the walk inside this tempdir — it never escapes into the real filesystem's
-        // ancestry above it (which could contain an unrelated, readable Cargo.toml and make
-        // the read-count assertion below flaky).
+        // A chain deeper than MAX_CONFIG_ANCESTOR_DEPTH, so the depth cap stops the walk
+        // inside this tempdir — never escaping into the real filesystem's ancestry, which
+        // could make the read-count assertion below flaky.
         let mut current = root.path().to_path_buf();
         for i in 0..(MAX_CONFIG_ANCESTOR_DEPTH + 5) {
             current = current.join(format!("d{i}"));
         }
         std::fs::create_dir_all(&current).unwrap();
 
-        // Sparse file, large enough to exceed the cap without allocating real disk space —
-        // content is irrelevant, since the size cap must reject it before any open/read.
-        // Placed two levels up from the opened file, well within the depth budget.
+        // Sparse file, large enough to exceed the cap without allocating real disk space.
         let oversized_manifest = current
             .parent()
             .unwrap()
@@ -2052,11 +1970,9 @@ tokio = "1.0"
         std::fs::write(&opened_path, opened_content).unwrap();
         let doc_uri = Url::from_file_path(&opened_path).unwrap();
 
-        // Calls `discover_workspace` directly, not `parse_cargo_toml` — this bounds the
-        // merged ancestor walk itself (parser.rs's own two stat sites), independent of
-        // `resolve_alternate_registries`'s downstream config resolution, which may add its
-        // own (unrelated, already-bounded) `$CARGO_HOME/config.toml` stat if the test
-        // process happens to have a real `CARGO_HOME` set.
+        // Calls `discover_workspace` directly, not `parse_cargo_toml` — bounds the merged
+        // ancestor walk itself, independent of the downstream config resolution's own
+        // (unrelated) `$CARGO_HOME/config.toml` stat.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let (stats_before, _) = deps_core::fs_probe::snapshot();
         let discovery = discover_workspace(&doc_uri).unwrap();

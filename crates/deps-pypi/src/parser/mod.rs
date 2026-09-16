@@ -137,9 +137,9 @@ fn tokenize_marker(text: &str) -> Option<Vec<MarkerToken>> {
                     i += 1;
                 }
                 if i >= bytes.len() {
-                    return None; // unterminated string literal
+                    return None;
                 }
-                i += 1; // consume closing quote
+                i += 1;
                 tokens.push(MarkerToken::Str);
             }
             b'=' | b'!' | b'<' | b'>' | b'~' => {
@@ -628,12 +628,11 @@ impl PypiParser {
                     name.len() + extras_str_len
                 });
 
-                // Calculate original version length from requirement_str, bounded
-                // at the marker section so the range never overlaps markers_range
-                // (it is the sole TextEdit target for the "update version" code
-                // action, so overlap would delete the marker on accept).
-                // pep508 normalizes version specifiers (e.g., ">=1.7,<2.0" -> ">=1.7, <2.0")
-                // We need the original length for correct position tracking
+                // Bounded at the marker section so the range never overlaps markers_range
+                // (the sole TextEdit target for the "update version" code action, so
+                // overlap would delete the marker on accept) — pep508 normalizes version
+                // specifiers (e.g. ">=1.7,<2.0" -> ">=1.7, <2.0"), so the original length
+                // must be computed here rather than taken from the parsed requirement.
                 let original_version_len = version_end.saturating_sub(start_offset);
 
                 // `start_offset` is a byte index added directly to `pos.character`,

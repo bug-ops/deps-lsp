@@ -37,7 +37,6 @@ pub fn parse_version_catalog(content: &str, uri: &Url) -> Result<GradleParseResu
     let line_table = LineOffsetTable::new(content);
     let mut version_refs: HashMap<String, String> = HashMap::new();
 
-    // Collect [versions] section: key -> version string
     if let Some(versions_table) = doc.as_table().and_then(|t| get_table_val(t, "versions"))
         && let Some(t) = versions_table.as_table()
     {
@@ -151,11 +150,9 @@ fn extract_version(
         && let Some(ref_val) = get_table_val(version_table, "ref")
         && let Some(ref_key) = ref_val.as_str()
     {
-        // A dangling alias (missing from `[versions]`, or a rich version like
-        // `{ require = "1.0" }` that isn't a plain string) resolves to `None` here — the
-        // generic deps-core diagnostics/inlay-hint/hover paths already treat a `None`
-        // requirement as "not verified" rather than comparing an empty-string fallback
-        // against the latest version.
+        // A dangling alias (missing from [versions], or a rich version like `{ require = "1.0" }`)
+        // resolves to `None` — deps-core's diagnostics/hover paths treat that as "not verified"
+        // rather than comparing an empty-string fallback against the latest version.
         let resolved = version_refs.get(ref_key).cloned();
         let range = span_to_range(content, line_table, ref_val.span);
         return (resolved, Some(range));

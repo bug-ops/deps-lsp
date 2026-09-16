@@ -665,16 +665,11 @@ mod tests {
 
     #[test]
     fn test_meta_json_url_encodes_malicious_segments() {
-        // S-L1 trap: the original version of this test asserted `!url.contains("/../")`
-        // on the *raw* string, which passed even while the bug was live, because
-        // `urlencoding::encode` never puts a literal `/../` into the raw string — the
-        // collapse happens later, inside `url::Url::parse`'s dot-segment normalization
-        // (which runs *after* percent-decoding). This test only exercises `meta_json_url`
-        // (unchanged by the S-L1 fix, which gates `JsrRegistry::get_versions` instead), so
-        // it does not itself prove the fix works — see
-        // `test_jsr_registry_get_versions_rejects_dot_prefixed_package_segment` and its
-        // siblings below for that. It still asserts on the parsed path, not the raw
-        // string, so it stays a meaningful check of `meta_json_url`'s own encoding.
+        // S-L1 trap: asserting `!url.contains("/../")` on the raw string passed even while
+        // the bug was live — the collapse only happens later, inside `url::Url::parse`'s
+        // post-percent-decode normalization. This doesn't itself prove the S-L1 fix (see
+        // `test_jsr_registry_get_versions_rejects_dot_prefixed_package_segment` for that);
+        // it only checks `meta_json_url`'s own encoding via the parsed path.
         let url = meta_json_url(JSR_BASE, "evil/../secret?x=1#frag", "pkg");
         assert!(!url.contains('?'));
         assert!(!url.contains('#'));

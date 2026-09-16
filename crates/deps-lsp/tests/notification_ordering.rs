@@ -45,17 +45,13 @@ fn fixture_uri(name: &str) -> String {
 fn test_inlay_hints_refresh_before_diagnostics() {
     let mut client = LspClient::spawn();
 
-    // Initialize LSP session
     let _init_response = client.initialize();
 
-    // Verify initialization succeeded
     assert!(_init_response.get("result").is_some());
 
-    // Clear any notifications from initialization
     client.clear_notifications();
     assert_eq!(client.get_notifications().len(), 0);
 
-    // Open a Cargo.toml document
     let cargo_toml = r#"[package]
 name = "test-package"
 version = "0.1.0"
@@ -68,13 +64,11 @@ tokio = { version = "1.0", features = ["full"] }
 
     client.did_open(&fixture_uri("Cargo.toml"), "toml", cargo_toml);
 
-    // Flush notifications to capture any server-sent messages
     for _ in 0..3 {
         std::thread::sleep(Duration::from_millis(200));
         client.flush_notifications();
     }
 
-    // Verify we can capture notifications
     let notifications = client.get_notifications();
 
     // We should see at least window/logMessage
@@ -83,7 +77,6 @@ tokio = { version = "1.0", features = ["full"] }
         "Should capture at least one notification (window/logMessage)"
     );
 
-    // Verify sequence numbers are monotonically increasing
     for i in 1..notifications.len() {
         assert!(
             notifications[i].sequence > notifications[i - 1].sequence,
@@ -96,7 +89,6 @@ tokio = { version = "1.0", features = ["full"] }
     // - Verification that textDocument/publishDiagnostics is present
     // - Verification that refresh comes before diagnostics
 
-    // Shutdown cleanly
     let _shutdown_response = client.shutdown();
 }
 
@@ -172,13 +164,10 @@ serde = "1.0.0"
 fn test_progress_notification_lifecycle() {
     let mut client = LspClient::spawn();
 
-    // Initialize LSP session
     let _init_response = client.initialize();
 
-    // Clear any notifications from initialization
     client.clear_notifications();
 
-    // Open a Cargo.toml document to trigger background processing
     let cargo_toml = r#"[package]
 name = "test-package"
 version = "0.1.0"
@@ -218,7 +207,6 @@ serde = "1.0.0"
         end.sequence
     );
 
-    // Shutdown cleanly
     let _shutdown_response = client.shutdown();
 }
 
@@ -273,20 +261,16 @@ serde = "1.0.0"
 fn test_notification_capture_basic() {
     let mut client = LspClient::spawn();
 
-    // Initialize LSP session
     let _init_response = client.initialize();
 
-    // Test clear functionality
     client.clear_notifications();
     let cleared = client.get_notifications();
     assert!(cleared.is_empty(), "Expected notifications to be cleared");
 
-    // Send a request to trigger any notifications
     let _response = client.workspace_symbol(100, "test");
 
     let notifications = client.get_notifications();
 
-    // If we have notifications, verify sequence numbers
     if notifications.len() > 1 {
         for i in 1..notifications.len() {
             assert!(
@@ -296,7 +280,6 @@ fn test_notification_capture_basic() {
         }
     }
 
-    // Shutdown cleanly
     let _shutdown_response = client.shutdown();
 }
 
@@ -306,11 +289,9 @@ fn test_notification_capture_basic() {
 fn test_multiple_documents_notification_ordering() {
     let mut client = LspClient::spawn();
 
-    // Initialize LSP session
     let _init_response = client.initialize();
     client.clear_notifications();
 
-    // Open first document
     let cargo_toml_1 = r#"[package]
 name = "package1"
 version = "0.1.0"
@@ -324,7 +305,6 @@ serde = "1.0.0"
     std::thread::sleep(Duration::from_millis(500));
     client.flush_notifications();
 
-    // Open second document
     let cargo_toml_2 = r#"[package]
 name = "package2"
 version = "0.1.0"
@@ -338,22 +318,18 @@ tokio = "1.0"
     std::thread::sleep(Duration::from_millis(500));
     client.flush_notifications();
 
-    // Get all notifications
     let notifications = client.get_notifications();
 
-    // Verify we captured some notifications
     assert!(
         !notifications.is_empty(),
         "Should have captured some notifications"
     );
 
-    // Verify all have valid sequence numbers
     if notifications.len() > 1 {
         for i in 1..notifications.len() {
             assert!(notifications[i].sequence > notifications[i - 1].sequence);
         }
     }
 
-    // Shutdown cleanly
     let _shutdown_response = client.shutdown();
 }

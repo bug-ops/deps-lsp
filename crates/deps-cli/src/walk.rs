@@ -110,12 +110,9 @@ fn walk_with_limit(roots: &[PathBuf], registry: &EcosystemRegistry, limit: usize
             continue;
         }
 
-        // Always hidden-filtered (`ignore`'s default): a `root` whose own basename happens
-        // to start with `.` — e.g. a `tempfile`-generated directory on macOS, which is
-        // exactly how this bit rotted once already during review — is not evidence the user
-        // wants dot-directory contents un-hidden; `hidden(true)` only filters entries by
-        // their *own* basename as the walk descends, so it never excludes `walk_root` itself
-        // regardless of what `walk_root`'s name looks like.
+        // Always hidden-filtered: `hidden(true)` filters entries by their own basename as the
+        // walk descends, so `walk_root` itself is never excluded even if its name starts with
+        // `.` (e.g. a tempfile dir on macOS) — that previously caused a regression.
         if !walk_directory(
             root,
             root,
@@ -278,9 +275,8 @@ mod tests {
     #[test]
     fn test_walk_skips_gitignored_manifest() {
         let dir = tempfile::tempdir().expect("create temp dir");
-        // `ignore`'s `.gitignore` support only activates inside a git repository by default
-        // (`WalkBuilder::require_git`, true by default — matches real `git`'s own behavior);
-        // an empty `.git` marker is enough for detection.
+        // `ignore`'s `.gitignore` support only activates inside a git repo by default
+        // (`require_git`); an empty `.git` marker is enough for detection.
         fs::create_dir(dir.path().join(".git")).expect("create .git marker");
         fs::write(dir.path().join(".gitignore"), "ignored/\n").expect("write gitignore");
         fs::create_dir(dir.path().join("ignored")).expect("mkdir");
@@ -426,9 +422,8 @@ mod tests {
     #[test]
     fn test_walk_with_limit_truncates_on_explicit_path_list() {
         let dir = tempfile::tempdir().expect("create temp dir");
-        // Each manifest needs its own subdirectory — `Cargo.toml` is matched by exact
-        // filename (`Ecosystem::manifest_filenames`), not a pattern, so five siblings named
-        // `Cargo0.toml`..`Cargo4.toml` in one directory would never route to any ecosystem.
+        // Each manifest needs its own subdirectory — matched by exact filename, not a
+        // pattern, so `Cargo0.toml`..`Cargo4.toml` siblings would never route to any ecosystem.
         let paths: Vec<PathBuf> = (0..5)
             .map(|i| {
                 let subdir = dir.path().join(format!("pkg{i}"));

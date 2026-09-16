@@ -253,14 +253,9 @@ impl CrateInfo {
     }
 }
 
-// Trait implementations for deps-core integration
-
-// Implemented by hand rather than via `deps_core::impl_dependency!`: `name()` resolves to
-// `package.as_ref().unwrap_or(&self.name)` (the `package = "..."` rename, falling back to the
-// TOML table key), not a bare field, and `features()`/`features_range()` return real parsed
-// data rather than the trait's empty/`None` defaults — neither is expressible through the
-// macro's fixed field set. Mirrors `deps-npm`'s identical direct
-// `impl deps_core::Dependency for NpmDependency`.
+// Hand-implemented, not via `impl_dependency!`: `name()` needs `package.unwrap_or(&name)`,
+// and `features()`/`features_range()` return real data instead of the trait's empty/`None`
+// defaults — neither fits the macro's fixed field set. Mirrors deps-npm's `NpmDependency`.
 impl deps_core::Dependency for CargoDependency {
     /// Returns the registry lookup name: [`Self::package`] when this dependency was
     /// renamed via `package = "..."`, otherwise the TOML table key.
@@ -306,11 +301,9 @@ impl deps_core::Version for CargoVersion {
         deps_core::RemovalStatus::from_yanked(self.yanked)
     }
 
-    // crates.io enforces valid semver on publish, so `semver::Version::parse`
-    // reliably exposes the `pre` component instead of relying on
-    // deps-core's default hyphen-substring heuristic (#322). A parse
-    // failure (practically unreachable given that enforcement) is treated
-    // as not-prerelease, matching the trait's other implementors.
+    // crates.io enforces valid semver on publish, so `semver::Version::parse` reliably
+    // exposes `pre` instead of deps-core's hyphen-substring heuristic (#322); a parse
+    // failure (practically unreachable) is treated as not-prerelease.
     fn is_prerelease(&self) -> bool {
         semver::Version::parse(self.num.as_str()).is_ok_and(|v| !v.pre.is_empty())
     }

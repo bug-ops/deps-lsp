@@ -97,7 +97,6 @@ pub async fn handle_document_open(
         )));
     };
 
-    // Find appropriate ecosystem for this URI
     let ecosystem = match state.ecosystem_registry.for_uri(&domain_uri) {
         Some(e) => e,
         None => {
@@ -117,7 +116,6 @@ pub async fn handle_document_open(
         ecosystem.display_name()
     );
 
-    // Try to parse manifest (may fail for incomplete syntax)
     let parse_result =
         deps_core::ecosystem::parse_manifest_blocking(&ecosystem, &content, &domain_uri)
             .await
@@ -129,7 +127,6 @@ pub async fn handle_document_open(
             })
             .ok();
 
-    // Create document state (parse_result may be None)
     let mut doc_state = if let Some(pr) = parse_result {
         DocumentState::new_from_parse_result(ecosystem.ecosystem_id(), content, pr)
     } else {
@@ -139,9 +136,8 @@ pub async fn handle_document_open(
 
     state.update_document(uri.clone(), doc_state);
 
-    // Clone cache, diagnostics, and freshness config before spawning background task
-    // (all read here, before any OSV request is built, so disabling the feature
-    // suppresses the network call itself — FR-011).
+    // Read before any OSV request is built, so disabling the feature suppresses the
+    // network call itself (FR-011).
     let (cache_config, vulnerabilities_enabled, freshness_settings, diagnostic_severities, offline) = {
         let cfg = config.read().await;
         (
@@ -212,11 +208,10 @@ async fn run_document_open_background_task(
         return;
     };
 
-    // Load resolved versions from lock file first (instant, no network)
+    // Lock file read is instant and network-free, so it runs before the registry fetch below.
     let (resolved_versions, resolved_version_candidates) =
         load_resolved_versions(&domain_uri, &state.lockfile_cache, ecosystem.as_ref()).await;
 
-    // Update document state with resolved versions immediately
     if !resolved_versions.is_empty()
         && let Some(mut doc) = state.documents.get_mut(&uri)
     {
@@ -348,7 +343,6 @@ async fn run_document_open_background_task(
         .await
         .expect("fetch_permits semaphore is never closed");
 
-    // Mark as loading and start progress
     if let Some(mut doc) = state.documents.get_mut(&uri) {
         doc.set_loading();
     }
@@ -369,7 +363,6 @@ async fn run_document_open_background_task(
 
     tracing::debug!("progress started, fetching versions");
 
-    // Fetch latest versions from registry in parallel (for update hints)
     let registry = ecosystem.registry();
     let fetch_result = fetch_latest_versions_parallel(
         registry,
@@ -392,7 +385,6 @@ async fn run_document_open_background_task(
         "registry fetch complete"
     );
 
-    // Update document state with cached versions (latest from registry)
     if let Some(mut doc) = state.documents.get_mut(&uri) {
         doc.update_cached_versions(fetch_result.versions);
         // Re-key raw -> normalized (§3.1): `FetchResult`'s three fields are
@@ -433,7 +425,6 @@ async fn run_document_open_background_task(
         }
     }
 
-    // End progress
     if let Some(progress) = progress {
         progress.end(success).await;
     }
@@ -525,8 +516,6 @@ async fn parse_and_diff_manifest(
     state: &ServerState,
     ecosystem: &Arc<dyn Ecosystem>,
 ) -> (Option<Box<dyn deps_core::ParseResult>>, DependencyDiff) {
-    // Extract old dependency name -> version_requirement map before parsing
-    // (for diff computation)
     let old_deps: HashMap<PackageName, Vec<Option<VersionReq>>> =
         state.get_document(uri).map_or_else(HashMap::new, |doc| {
             doc.parse_result()
@@ -554,13 +543,11 @@ async fn parse_and_diff_manifest(
         }
     };
 
-    // Extract new dependency name -> version_requirement map for diff
     let new_deps: HashMap<PackageName, Vec<Option<VersionReq>>> = parse_result
         .as_ref()
         .map(|pr| dependency_version_map(pr.as_ref()))
         .unwrap_or_default();
 
-    // Compute dependency diff
     let diff = DependencyDiff::compute(&old_deps, &new_deps);
     tracing::debug!(
         added = diff.added.len(),
@@ -765,8 +752,8 @@ pub(crate) async fn handle_document_change_guarded(
     client: Client,
     config: Arc<RwLock<DepsConfig>>,
 ) -> Result<Option<JoinHandle<()>>> {
-    // Find appropriate ecosystem for this URI. `from_lsp_uri` returning `None` (a URI
-    // shape `url::Url` rejects) is treated the same as "no ecosystem handles this URI".
+    // `from_lsp_uri` returning `None` (a URI shape `url::Url` rejects) is treated the
+    // same as "no ecosystem handles this URI".
     let Some(domain_uri) = crate::lsp_types_interop::from_lsp_uri(&uri) else {
         tracing::debug!("URI is not representable as a url::Url: {:?}", uri);
         return Err(deps_core::error::DepsError::UnsupportedEcosystem(format!(
@@ -813,8 +800,7 @@ pub(crate) async fn handle_document_change_guarded(
         return Ok(None);
     }
 
-    // Clone cache, diagnostics, and freshness config before spawning background task
-    // (all read here, before any OSV request is built — FR-011).
+    // Read before any OSV request is built (FR-011).
     let (cache_config, vulnerabilities_enabled, freshness_settings, diagnostic_severities, offline) = {
         let cfg = config.read().await;
         (
@@ -895,7 +881,6 @@ async fn run_document_change_task(
     needs_osv_rescan: bool,
     deps_to_fetch: Vec<PackageName>,
 ) {
-    // Small debounce delay
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     // `handle_document_change_guarded` already validated this exact `uri` converts
@@ -909,12 +894,11 @@ async fn run_document_change_task(
         return;
     };
 
-    // Load resolved versions from lock file first (instant, no network)
+    // Lock file read is instant and network-free, so it runs before the registry fetch below.
     let (resolved_versions, resolved_version_candidates) =
         load_resolved_versions(&domain_uri, &state.lockfile_cache, ecosystem.as_ref()).await;
 
-    // Update document state with resolved versions only
-    // Do NOT touch cached_versions - they contain latest registry versions
+    // Must not touch cached_versions here — it holds the latest registry versions.
     if !resolved_versions.is_empty()
         && let Some(mut doc) = state.documents.get_mut(&uri)
     {
@@ -958,9 +942,6 @@ async fn run_document_change_task(
         )
     });
 
-    // Skip registry fetch if nothing new was added and no existing
-    // dependency's version changed.
-    //
     // Known limitation (#424 N2): editing composer.json's `minimum-stability` field alone
     // adds no dependency and changes no requirement string, so `deps_to_fetch` stays empty
     // and this early-return skips the fetch — existing dependencies keep their
@@ -1026,7 +1007,6 @@ async fn run_document_change_task(
 
     let success = !fetch_result.versions.is_empty();
 
-    // Merge new versions into existing cache
     let (failed_count, first_error) = merge_registry_fetch_result(
         &state,
         &uri,
@@ -1210,7 +1190,6 @@ pub async fn ensure_document_loaded(
     client: Client,
     config: Arc<RwLock<DepsConfig>>,
 ) -> bool {
-    // Fast path: document already loaded
     if state.get_document(uri).is_some() {
         tracing::debug!("Document already loaded: {:?}", uri);
         return true;
@@ -1219,20 +1198,18 @@ pub async fn ensure_document_loaded(
     // Clone cold start config before async operations to release lock
     let cold_start_config = { config.read().await.cold_start.clone() };
 
-    // Check if cold start is enabled
     if !cold_start_config.enabled {
         tracing::debug!("Cold start disabled via configuration");
         return false;
     }
 
-    // Rate limiting check
     if !state.cold_start_limiter.allow_cold_start(uri) {
         tracing::warn!("Cold start rate limited: {:?}", uri);
         return false;
     }
 
-    // Check if we support this file type. `from_lsp_uri` returning `None` (a URI shape
-    // `url::Url` rejects) is treated the same as "no ecosystem handles this URI".
+    // `from_lsp_uri` returning `None` (a URI shape `url::Url` rejects) is treated the
+    // same as "no ecosystem handles this URI".
     let Some(domain_uri) = crate::lsp_types_interop::from_lsp_uri(uri) else {
         tracing::debug!("URI is not representable as a url::Url: {:?}", uri);
         return false;
@@ -1242,7 +1219,6 @@ pub async fn ensure_document_loaded(
         return false;
     }
 
-    // Load from disk
     tracing::info!("Loading document from disk (cold start): {:?}", uri);
     let content = match load_document_from_disk(&domain_uri).await {
         Ok(c) => c,
@@ -1255,9 +1231,9 @@ pub async fn ensure_document_loaded(
         }
     };
 
-    // Reuse existing handle_document_open logic. `version: None` — content came from
-    // disk, not an LSP didOpen, so there is no client-tracked version to record (see
-    // `DocumentState::version` and the cold-start refusal in `handlers::code_lens`).
+    // `version: None` — content came from disk, not an LSP didOpen, so there is no
+    // client-tracked version to record (see `DocumentState::version` and the
+    // cold-start refusal in `handlers::code_lens`).
     match handle_document_open(
         uri.clone(),
         content,
@@ -2165,23 +2141,20 @@ anyhow = "1.0"
 
     #[tokio::test]
     async fn test_ensure_document_loaded_unsupported_file_check() {
-        // Returns false for unknown file types (e.g., README.md)
         let state = Arc::new(ServerState::new());
         let url = deps_core::test_util::test_uri("/test/README.md");
 
-        // Verify ecosystem registry correctly identifies unsupported files
         assert!(
             state.ecosystem_registry.for_uri(&url).is_none(),
             "README.md should not have an ecosystem handler"
         );
 
-        // This would cause ensure_document_loaded to return false
-        // We test the underlying condition without needing Client
+        // ensure_document_loaded itself needs a Client, so this only exercises the
+        // underlying condition it would check.
     }
 
     #[tokio::test]
     async fn test_ensure_document_loaded_file_not_found_check() {
-        // Test that load_document_from_disk fails gracefully for missing files
         use super::load_document_from_disk;
 
         // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this
@@ -2191,11 +2164,8 @@ anyhow = "1.0"
         let result = load_document_from_disk(&url).await;
 
         assert!(result.is_err(), "Should fail for missing files");
-
-        // This error would cause ensure_document_loaded to return false
     }
 
-    // Cargo-specific tests
     #[cfg(feature = "cargo")]
     mod cargo_tests {
         use super::*;
@@ -2247,7 +2217,6 @@ serde = "1.0"
             let state = Arc::new(ServerState::new());
             let url = deps_core::test_util::test_uri("/test/Cargo.toml");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
-            // Invalid TOML that will fail parsing
             let content = r#"[dependencies
 serde = "1.0"
 "#;
@@ -2257,14 +2226,12 @@ serde = "1.0"
                 .for_uri(&url)
                 .expect("Cargo ecosystem not found");
 
-            // Try to parse (will fail)
             let parse_result = ecosystem.parse_manifest(content, &url).await.ok();
             assert!(
                 parse_result.is_none(),
                 "Parsing should fail for invalid TOML"
             );
 
-            // Create document state without parse result
             let doc_state = if let Some(pr) = parse_result {
                 DocumentState::new_from_parse_result(EcosystemId::Cargo, content.to_string(), pr)
             } else {
@@ -2273,7 +2240,6 @@ serde = "1.0"
 
             state.update_document(uri.clone(), doc_state);
 
-            // Document should be stored despite parse failure
             let doc = state.get_document(&uri);
             assert!(
                 doc.is_some(),
@@ -2293,14 +2259,12 @@ serde = "1.0"
         async fn test_ensure_document_loaded_fast_path() {
             // See the comment in `test_document_parsing` on why this guard is needed here.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
-            // Fast path: document already loaded, should return true without loading
             let state = Arc::new(ServerState::new());
             let url = deps_core::test_util::test_uri("/test/Cargo.toml");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let content = r#"[dependencies]
 serde = "1.0""#;
 
-            // Pre-populate state with document
             let ecosystem = state
                 .ecosystem_registry
                 .for_uri(&url)
@@ -2313,21 +2277,18 @@ serde = "1.0""#;
             );
             state.update_document(uri.clone(), doc_state);
 
-            // Fast path check: document exists
             assert!(
                 state.get_document(&uri).is_some(),
                 "Document should exist in state"
             );
             assert_eq!(state.document_count(), 1, "Document count should be 1");
 
-            // The fast path in ensure_document_loaded would return true here without
-            // requiring a Client. We test the condition directly since creating a test
-            // Client requires complex tower-lsp-server internals (ServerState, ClientSocket).
+            // ensure_document_loaded's fast path would return true here; tested directly
+            // since a test Client needs complex tower-lsp-server internals.
         }
 
         #[tokio::test]
         async fn test_ensure_document_loaded_successful_disk_load() {
-            // Test successful load from filesystem with temp file
             use super::super::load_document_from_disk;
             use std::fs;
             use tempfile::TempDir;
@@ -2336,7 +2297,6 @@ serde = "1.0""#;
             // binary must hold it, not just document/loader.rs's own diffing test.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
 
-            // Create a temporary directory with a Cargo.toml file
             let temp_dir = TempDir::new().unwrap();
             let cargo_toml_path = temp_dir.path().join("Cargo.toml");
             let content = r#"[package]
@@ -2351,11 +2311,9 @@ serde = "1.0"
             let uri = Uri::from_file_path(&cargo_toml_path).unwrap();
             let url = crate::lsp_types_interop::from_lsp_uri(&uri).unwrap();
 
-            // Test that load_document_from_disk succeeds
             let loaded_content = load_document_from_disk(&url).await.unwrap();
             assert_eq!(loaded_content, content);
 
-            // Test that parsing succeeds
             let state = Arc::new(ServerState::new());
             let ecosystem = state
                 .ecosystem_registry
@@ -2364,14 +2322,13 @@ serde = "1.0"
             let parse_result = ecosystem.parse_manifest(&loaded_content, &url).await;
             assert!(parse_result.is_ok(), "Should parse successfully");
 
-            // These successful operations are the building blocks of ensure_document_loaded
+            // These are the same building blocks ensure_document_loaded's disk path uses.
         }
 
         #[tokio::test]
         async fn test_ensure_document_loaded_idempotent_check() {
             // See the comment in `test_document_parsing` on why this guard is needed here.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
-            // Test that repeated loads are idempotent at the state level
             let state = Arc::new(ServerState::new());
             let url = deps_core::test_util::test_uri("/test/Cargo.toml");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
@@ -2383,11 +2340,9 @@ serde = "1.0""#;
                 .for_uri(&url)
                 .expect("Cargo ecosystem");
 
-            // Parse twice to simulate idempotent loads
             let parse_result1 = ecosystem.parse_manifest(content, &url).await.unwrap();
             let parse_result2 = ecosystem.parse_manifest(content, &url).await.unwrap();
 
-            // First update
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content.to_string(),
@@ -2396,7 +2351,6 @@ serde = "1.0""#;
             state.update_document(uri.clone(), doc_state1);
             assert_eq!(state.document_count(), 1);
 
-            // Second update (idempotent)
             let doc_state2 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content.to_string(),
@@ -2674,7 +2628,6 @@ tokio = "1.0"
         }
     }
 
-    // npm-specific tests
     #[cfg(feature = "npm")]
     mod npm_tests {
         use super::*;
@@ -2901,7 +2854,6 @@ tokio = "1.0"
         }
     }
 
-    // Go-specific tests
     #[cfg(feature = "go")]
     mod go_tests {
         use super::*;

@@ -7,9 +7,8 @@
 //! - PEP 508 parsing: < 100μs per dependency
 //! - PEP 440 version matching: < 100μs per operation
 
-// #689: workspace-level `clippy::unwrap_used` (moved from a per-crate lib.rs attribute)
-// now reaches this bench's separate crate root; benches use `unwrap()` on known-good
-// fixture data, which is idiomatic outside production parsing/registry code.
+// #689: workspace-level `clippy::unwrap_used` now reaches this bench's separate crate
+// root; unwrap() on known-good fixture data is fine here, unlike production code.
 #![allow(clippy::unwrap_used)]
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
@@ -234,26 +233,22 @@ fn bench_pep440_version_matching(c: &mut Criterion) {
 
     let latest = Version::from_str("2.28.2").unwrap();
 
-    // Simple version specifier
     let simple = VersionSpecifiers::from_str(">=2.28.0").unwrap();
     group.bench_function("simple_specifier", |b| {
         b.iter(|| simple.contains(black_box(&latest)));
     });
 
-    // Complex version specifier
     let complex = VersionSpecifiers::from_str(">=2.0,<3.0,!=2.28.1").unwrap();
     group.bench_function("complex_specifier", |b| {
         b.iter(|| complex.contains(black_box(&latest)));
     });
 
-    // Pre-release handling
     let prerelease_version = Version::from_str("3.0.0b1").unwrap();
     let prerelease_spec = VersionSpecifiers::from_str(">=3.0.0").unwrap();
     group.bench_function("prerelease_check", |b| {
         b.iter(|| prerelease_spec.contains(black_box(&prerelease_version)));
     });
 
-    // Find latest matching version
     let versions: Vec<Version> = ["2.0.0", "2.28.0", "2.28.1", "2.28.2", "2.29.0", "3.0.0b1"]
         .iter()
         .map(|v| Version::from_str(v).unwrap())
@@ -278,19 +273,16 @@ fn bench_position_tracking(c: &mut Criterion) {
     let mut group = c.benchmark_group("position_tracking");
     let uri = bench_uri();
 
-    // Simple dependency
     let simple = r#"
 [project]
 dependencies = ["requests>=2.28.0"]
 "#;
 
-    // With extras
     let with_extras = r#"
 [project]
 dependencies = ["flask[async,cors]>=3.0.0"]
 "#;
 
-    // With markers
     let with_markers = r#"
 [project]
 dependencies = ["numpy>=1.24; python_version>='3.9'"]

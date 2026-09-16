@@ -462,11 +462,10 @@ impl CargoRegistry {
     pub fn register_alternate(&self, index: RegistryIndex, auth: Option<AuthToken>) {
         let key = index.as_str().to_string();
         let incoming_trust = index.trust();
-        // Cloned unconditionally, once — the Vacant/Occupied outcome isn't known until
-        // `register_capped_with_occupied` inspects the map, and `make` below moves the
-        // original `index`, so the (rare) trust-fold replace path needs its own owned copy.
-        // `RegistryIndex` is a cheap `Clone` (a `Url` plus a `Copy` trust tag), so this is not
-        // worth avoiding via a larger redesign of the two-closure split.
+        // Cloned unconditionally: the Vacant/Occupied outcome isn't known until
+        // `register_capped_with_occupied` inspects the map, and `make` below moves `index`,
+        // so the (rare) trust-fold replace path needs its own owned copy. Cheap: a `Url`
+        // plus a `Copy` trust tag.
         let index_for_replace = index.clone();
 
         register_capped_with_occupied(
@@ -534,10 +533,9 @@ impl CargoRegistry {
                 match self.alternate_client(index) {
                     Some(client) => client.get_versions(name.as_str()).await,
                     // M2 (plan-1b §6): an unregistered *verified crates.io mirror* degrades to
-                    // crates.io rather than blanking the whole manifest — correct for a mirror
-                    // (Cargo verifies per-version checksum equality against crates.io for it),
-                    // wrong for a genuinely private/unregistered registry, which must keep
-                    // failing `PackageNotFound` below.
+                    // crates.io rather than blanking the manifest (Cargo verifies per-version
+                    // checksums against crates.io for a mirror); a genuinely private registry
+                    // still fails `PackageNotFound` below.
                     None if *mirrors_crates_io => {
                         self.crates_io
                             .get_versions_with(name.as_str(), freshness)
@@ -778,18 +776,16 @@ mod tests {
         assert_eq!(results[0].repository, None);
     }
 
-    // #758: the shared JSON-nesting-depth cap, replacing
-    // test_parse_search_response_nesting_at_max_depth_accepted/_over_max_depth_rejected.
+    // #758: the shared JSON-nesting-depth cap, replacing two hand-written tests.
     deps_core::json_depth_conformance! {
         mod cargo_json_depth_conformance;
         parse: |bytes: &[u8]| parse_search_response(bytes);
         wrap: |nested: &str| format!(r#"{{"crates": [], "extra": {nested}}}"#);
     }
 
-    // #758: exact package_url() values (which crate_url() backs) are pinned by
-    // formatter.rs's `formatter_conformance!` invocation; newline/autolink/percent safety is
-    // Layer 1's job (deps-lsp's EcosystemId::ALL loop). test_crate_url_encodes_malicious_name
-    // below stays hand-written: it checks markdown-link-bracket escaping, which neither covers.
+    // #758: exact `package_url()` values are pinned by formatter.rs's conformance macro;
+    // newline/autolink/percent safety is Layer 1's job. The test below stays hand-written:
+    // it checks markdown-link-bracket escaping, which neither covers.
     #[test]
     fn test_crate_url_encodes_malicious_name() {
         let url = crate_url("evil](https://evil.example)[pkg");
@@ -812,15 +808,11 @@ mod tests {
         let _cloned = registry;
     }
 
-    // #794 impl-critic S1: `build_arc:` against the real `Ecosystem::registry()` wiring, not
-    // `build:` against `CratesIoRegistry` directly — `CargoEcosystem::registry()` actually
-    // returns `Arc<CargoRegistry>` (a separate `Registry` impl that dispatches to
-    // `CratesIoRegistry` internally, see `registry.rs`'s `CargoRegistry` router), which has
-    // its own `select_latest_matching` override delegating to the same
-    // `select_latest_matching_impl`. A `build:` fixture on `CratesIoRegistry` alone would
-    // stay green even if `CargoRegistry`'s own override were deleted — exactly the failure
-    // mode #794 exists to close for the flagship ecosystem. Mirrors
-    // `deps-gradle/src/ecosystem.rs`'s identical `build_arc:` rationale.
+    // #794 impl-critic S1: `build_arc:` against the real `Ecosystem::registry()` wiring
+    // (`Arc<CargoRegistry>`), not `build:` against `CratesIoRegistry` directly — a
+    // `CratesIoRegistry`-only fixture would stay green even if `CargoRegistry`'s own
+    // `select_latest_matching` override were deleted. Mirrors deps-gradle's identical
+    // `build_arc:` rationale.
     deps_core::registry_conformance! {
         mod cargo_registry_conformance;
         build_arc: CargoEcosystem::new(Arc::new(HttpCache::new())).registry();

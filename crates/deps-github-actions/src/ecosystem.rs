@@ -146,9 +146,8 @@ impl Ecosystem for GithubActionsEcosystem {
         &self.formatter
     }
 
-    // No override for `complete_package_name`: GitHub Actions has no package-name search
-    // endpoint (a workflow only ever references an already-known `owner/repo` action), so
-    // the inherited default (`Completions::default()`) is correct — see M3 (#793).
+    // No `complete_package_name` override: GHA has no package-name search endpoint, so
+    // the inherited `Completions::default()` is correct (M3, #793).
 
     #[cfg(feature = "lsp-responses")]
     fn complete_version<'a>(
@@ -296,35 +295,14 @@ impl Ecosystem for GithubActionsEcosystem {
                 return Some(hover);
             };
 
-            // #501 gap (tester finding), widened by critic finding C1 (#550): the shared
-            // `has_offline_actionable_data`/footer gate in `deps_core::generate_hover` only
-            // sees `VersionData` and cannot see `formatter.tag_index` — GHA's "Pin to commit
-            // SHA" quickfix (`build_sha_pin_action`, wired into `generate_code_actions`
-            // above) is driven entirely by that separately-populated index, independent of
-            // `versions`. So a `PinStyle::Tag` step with a warm `TagIndex` entry has a real
-            // `Cmd+.` action even when the shared gate suppressed the footer for lack of any
-            // `VersionData` signal — originally observed offline (#501), but #550's
-            // empty-live-fetch footer gate reintroduced the identical gap *online* too: a
-            // bare-major tag (`@v4`) whose repo tags entirely fail the full-semver filter
-            // (`tags_to_versions`) makes `available_versions == Some([])`, which the shared
-            // gate now (correctly, for the general case) treats as "nothing to update" — but
-            // `populate_tag_index` still indexes bare-major tags (`v4 -> sha`) independent of
-            // that filter, so the quickfix is still genuinely available. Restores the footer
-            // post-hoc in both modes using the shared `CMD_DOT_FOOTER` constant (not a
-            // hand-copied literal) so the two can never drift apart; the
-            // `!content.value.contains(CMD_DOT_FOOTER)` guard below makes this idempotent
-            // when the shared gate already rendered it, so dropping the online/offline split
-            // cannot double-append.
-            // `is_plain_scalar` mirrors `build_sha_pin_action`'s own guard (FR-010, spec
-            // 031): for a quoted `uses:` scalar, `version_range` sits inside the quotes, so
-            // the quickfix withholds itself rather than corrupt the value — the footer must
-            // not advertise an action that was never actually offered.
-            //
-            // Deliberately keyed on the raw `PinStyle::Tag` check, not
-            // `is_registry_confirmed_tag` (#551 plan): this footer only ever advertises
-            // `build_sha_pin_action`, which itself stays on the stricter, pre-#551 guard
-            // (see that function's doc comment) — the footer must never promise an action
-            // that withholds itself.
+            // #501/#550: the shared footer gate only sees `VersionData`, not `tag_index` —
+            // so a `PinStyle::Tag` step with a warm `TagIndex` entry can have a real "Pin to
+            // commit SHA" quickfix even when the shared gate suppressed the footer for lack
+            // of `VersionData`. Restored post-hoc via `CMD_DOT_FOOTER`, idempotently.
+            // `is_plain_scalar` mirrors `build_sha_pin_action`'s guard (FR-010): a quoted
+            // scalar withholds its quickfix, so the footer must too. Keyed on raw
+            // `PinStyle::Tag`, not `is_registry_confirmed_tag` (#551), since this footer only
+            // ever advertises `build_sha_pin_action`'s stricter pre-#551 guard.
             if gha_dep.pin == Some(PinStyle::Tag)
                 && gha_dep.is_plain_scalar
                 && let Some(tag) = gha_dep
@@ -381,12 +359,8 @@ impl Ecosystem for GithubActionsEcosystem {
     fn completion_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
         let name = metadata.name();
         let latest = metadata.latest_version().as_str();
-        // `search()` always returns `Ok(vec![])` (MVP scope — see this ecosystem's
-        // registry docs), so this is unreachable in practice today; it exists only to
-        // keep the trait implementation total and to behave correctly if
-        // package-name search is ever added. The shape check is a plain `contains('/')`
-        // rather than the stricter `crate::is_valid_github_identity`, matching this
-        // path's pre-existing (pre-#722) behavior exactly.
+        // Unreachable today since `search()` always returns `Ok(vec![])`; kept total in case
+        // package-name search is added. Plain `contains('/')`, matching pre-#722 behavior.
         if !name.as_str().contains('/') {
             deps_core::lsp_helpers::warn_rejected_value(
                 "owner/repo shape",
@@ -458,11 +432,9 @@ fn extract_prefix(line: &str, character: u32) -> &str {
 #[allow(clippy::string_slice)]
 #[cfg(feature = "lsp-responses")]
 fn splice_resolved_line(markdown: &str, resolved_tag: &str, sha: &str) -> String {
-    // `sha` is expected to be a validated, pure-ASCII full hex SHA by the time it
-    // reaches here (`TagIndex` entries are filtered in `populate_tag_index`, security
-    // S-3), so a byte slice is normally safe — `get(..7)` is a char-boundary-safe
-    // belt-and-braces guard rather than a raw index (security S-4), falling back to
-    // the whole string on anything unexpected instead of panicking.
+    // `sha` should already be a validated, pure-ASCII full hex SHA (security S-3), so a
+    // byte slice is normally safe; `get(..7)` is a belt-and-braces char-boundary guard
+    // instead of a raw index (security S-4), falling back to the whole string.
     let short_sha = sha.get(..7).unwrap_or(sha);
     let line = format!(
         "**Resolved**: {} ({})\n\n",
@@ -525,14 +497,9 @@ fn mutable_ref_pin_diagnostics(
                 tag,
                 MAX_MUTABLE_REF_PIN_MESSAGE_VALUE_CHARS,
             );
-            // Critic finding C2 (#551): `build_sha_pin_action` deliberately stays
-            // restricted to a statically-classified `PinStyle::Tag` (FR-005/plan §11 —
-            // see that function's doc comment on the branch/tag name-collision risk), so
-            // a registry-confirmed-but-`PinStyle::Branch` ref has no automated fix behind
-            // `Cmd+.` here. The message must say so rather than imply one is a keystroke
-            // away, matching every other resolvable-but-unactionable case in this
-            // codebase (e.g. `deps_core`'s own "Registry lookup failed" wording never
-            // promises a quickfix it can't offer).
+            // Critic C2 (#551): a registry-confirmed `PinStyle::Branch` has no automated fix
+            // (`build_sha_pin_action` stays restricted to `PinStyle::Tag`, FR-005) — the
+            // message must say so, not imply one exists.
             let message = if gha_dep.pin == Some(PinStyle::Tag) {
                 format!(
                     "{name} is pinned to the mutable tag ref `{tag}`; pin to a full commit \
@@ -579,10 +546,8 @@ fn build_sha_pin_action(
     uri: &Url,
     formatter: &GithubActionsFormatter,
 ) -> Option<CodeAction> {
-    // Same lookup convention every other deps-lsp code action goes through (critic S2) —
-    // not a hand-rolled position check. The default (`version_range` only, GHA does not
-    // override it) is exactly right here: the diagnostic and the edit both anchor on
-    // `version_range`, never `name_range`.
+    // Same lookup convention every other deps-lsp code action uses (critic S2), not a
+    // hand-rolled position check — both the diagnostic and the edit anchor on `version_range`.
     let dep = parse_result
         .dependencies()
         .into_iter()
@@ -626,17 +591,13 @@ fn sha_pin_text_edit_for(
     if gha_dep.pin != Some(PinStyle::Tag) {
         return None;
     }
-    // FR-010: for a quoted `uses:` scalar, `version_range` sits inside the quotes —
-    // writing `{sha} # {tag}` there corrupts the value instead of adding a YAML comment
-    // (security audit finding, spec 031 FR-010). Withhold rather than risk that edit.
+    // FR-010: a quoted scalar's version_range sits inside the quotes, so `{sha} # {tag}`
+    // would corrupt the string instead of adding a YAML comment. Withhold rather than risk it.
     if !gha_dep.is_plain_scalar {
         return None;
     }
-    // Security audit finding (issue #633): for a `uses:` step written in YAML flow
-    // style (`{uses: actions/checkout@v4, with: {node: 20}}`), appending `# <tag>`
-    // right after the ref comments out the rest of the flow collection, producing
-    // invalid (unterminated) YAML instead of merely leaving the step unpinned.
-    // Withhold rather than risk corrupting the workflow.
+    // #633: a flow-style step has real YAML after the ref; appending `# <tag>` would
+    // comment that out too, producing invalid YAML. Withhold rather than risk it.
     if !gha_dep.is_last_on_line {
         return None;
     }
@@ -876,10 +837,9 @@ mod tests {
             .find(|m| m.contains("`v2`"))
             .expect("expected a diagnostic naming the statically-classified tag");
 
-        // Critic finding C2 (#551): `build_sha_pin_action` has no automated fix for the
-        // registry-confirmed-but-`PinStyle::Branch` case (FR-005/plan §11), so its
-        // message must say so — unlike the statically-classified `v2` tag, which does
-        // have the "Pin to commit SHA" quickfix behind `Cmd+.`.
+        // C2 (#551): `build_sha_pin_action` has no automated fix for the
+        // registry-confirmed-but-`PinStyle::Branch` case, unlike `v2`'s statically-classified
+        // tag, which does have the quickfix behind `Cmd+.`.
         assert!(
             cargo_deny_message.contains("no automated fix available"),
             "a registry-confirmed literal tag has no SHA-pin quickfix, so the message \
@@ -1186,19 +1146,10 @@ mod tests {
         );
     }
 
-    // #758: exact-value `Ecosystem` conformance, replacing
-    // test_ecosystem_id_and_display_name and test_as_any. `lockfile_filenames()` is
-    // omitted — GHA workflows have no lock file concept (no `LockFileProvider` impl in
-    // this crate); `no_lockfile_support: true;` below asserts that contract explicitly
-    // (#782 gap 2). No `completion_guard_conformance!`/`json_depth_conformance!` for this
-    // crate: GHA never performs package-name search completion
-    // (`CompletionContext::PackageName` always yields `Completions::default()` — versions
-    // resolve via the tags API only), and its tags-response parsing goes through the
-    // shared, already depth-capped `deps_core::github::parse_tags_page`, which fails open
-    // to `Ok(vec![])` rather than `Err` on excess nesting (a deliberate malformed-page
-    // tolerance) — `json_depth_conformance!`'s over-depth-rejected assertion does not hold
-    // for that call site, and the underlying cap itself is already covered by deps-core's
-    // own `parser`/`github` test suites.
+    // #758: exact-value `Ecosystem` conformance, replacing two hand-written tests.
+    // `lockfile_filenames()` omitted — GHA has no lock file concept (`no_lockfile_support`
+    // below, #782 gap 2). No completion/json-depth conformance: GHA never performs
+    // package-name search, and `parse_tags_page`'s depth cap is covered by deps-core's tests.
     deps_core::ecosystem_conformance! {
         mod github_actions_ecosystem_conformance;
         build: GithubActionsEcosystem::new(Arc::new(deps_core::HttpCache::new()));
@@ -1589,10 +1540,8 @@ mod tests {
         let sha = "a".repeat(40);
         let mut index = crate::registry::TagIndex::default();
         index.sha_to_tag.insert(sha.clone(), "v4.0.0".to_string());
-        // Also needed so `format_version_replacing_for` can produce a real (non-no-op)
-        // replacement SHA for `latest` — otherwise it falls back to the unchanged
-        // literal on a `tag_to_sha` miss and the edit is dropped by the no-op guard,
-        // independent of the `requirement_status_for` outcome this test targets.
+        // Needed so `format_version_replacing_for` produces a real replacement for `latest`,
+        // or a `tag_to_sha` miss falls back to the unchanged literal and drops the edit.
         index
             .tag_to_sha
             .insert("v4.3.1".to_string(), "b".repeat(40));
@@ -1651,8 +1600,7 @@ mod tests {
     #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_collect_pin_all_to_sha_edits_empty_when_tag_index_miss() {
-        // No `seed_tag` call: the TagIndex has no entry, so the one Tag-pinned step is a
-        // cache miss and must be skipped gracefully — not blocking, not erroring.
+        // No `seed_tag` call: the one Tag-pinned step is a cache miss, skipped gracefully.
         let cache = Arc::new(deps_core::HttpCache::new());
         let eco = GithubActionsEcosystem::new(cache);
 
@@ -1728,9 +1676,8 @@ mod tests {
 
         let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
         assert_eq!(edits.len(), 2);
-        // M1 (critic): the entire risk of this feature is writing 40+ chars at the wrong
-        // span, so the range each edit targets must be pinned, not just its text —
-        // proving the aggregator's dep-to-range mapping doesn't swap or shift.
+        // M1 (critic): the risk here is writing 40+ chars at the wrong span, so each edit's
+        // range must be pinned, not just its text — proving the mapping doesn't swap or shift.
         let checkout_edit = edits
             .iter()
             .find(|e| e.new_text == format!("{sha1} # v4"))
@@ -1746,8 +1693,7 @@ mod tests {
     #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_collect_pin_all_to_sha_edits_empty_for_branch_and_quoted_scalar() {
-        // A `PinStyle::Branch` step and a quoted-scalar `PinStyle::Tag` step must both be
-        // withheld, matching `build_sha_pin_action`'s own guards (FR-005/plan §11,
+        // Both must be withheld, matching `build_sha_pin_action`'s own guards (FR-005,
         // FR-010) — the bulk aggregator must never be laxer than the per-step quickfix.
         let cache = Arc::new(deps_core::HttpCache::new());
         let eco = GithubActionsEcosystem::new(cache);
@@ -1792,13 +1738,9 @@ mod tests {
         );
     }
 
-    // --- issue #706 review (S3): end-to-end coverage for an action.yml-routed document ---
-    //
-    // `test_manifest_routing_filenames_and_directory_patterns` and
-    // `test_action_yml_routes_via_registry_at_root_and_nested_under_github_actions` only
-    // cover routing; these exercise `generate_diagnostics`/`generate_hover` themselves
-    // against a document parsed from an `action.yml` URI, the same LSP entry points a
-    // real editor session drives.
+    // --- #706 review (S3): end-to-end coverage for an action.yml-routed document ---
+    // The routing tests above only cover routing; these exercise generate_diagnostics/
+    // generate_hover against a document parsed from an action.yml URI.
 
     #[tokio::test]
     async fn test_generate_diagnostics_for_composite_action_yml_flags_tag_pin() {
@@ -1835,10 +1777,8 @@ mod tests {
     #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_hover_for_composite_action_yml_dependency() {
-        // Offline (mirrors `test_generate_hover_restores_footer_offline_for_tag_pin_with_warm_tag_index`):
-        // the shared hover helper otherwise drives a live registry fetch, which is
-        // irrelevant to what this test actually checks (routing/parsing produced a
-        // hoverable dependency) and would outlive the test as a leaked background task.
+        // Offline: the shared hover helper otherwise drives a live registry fetch, which is
+        // irrelevant here and would outlive the test as a leaked background task.
         let cache = Arc::new(deps_core::HttpCache::new());
         cache.set_offline(true);
         let eco = GithubActionsEcosystem::new(cache);

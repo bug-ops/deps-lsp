@@ -1543,7 +1543,6 @@ mod tests {
         let parse_result =
             parse_result_with_dependency(UNKNOWN_PACKAGE, DependencySource::Registry);
 
-        // Unknown package should return empty (graceful degradation)
         let results = ecosystem
             .complete_versions(
                 &parse_result,
@@ -1802,7 +1801,6 @@ mod tests {
         let index_url = format!("{}/simple/", server.url());
         let ecosystem = ecosystem_with_index_url(cache, index_url);
 
-        // Package names with hyphens and underscores should work.
         let cold_start = ecosystem
             .complete_package_names("scikit-le", Range::default())
             .await;
@@ -1849,7 +1847,6 @@ mod tests {
             Arc::new(deps_core::net_policy::RegistryAccessPolicy::default()),
         );
 
-        // Test that we respect the display cap, not just some loose upper bound.
         let parse_result = parse_result_with_dependency("requests", DependencySource::Registry);
         let results = ecosystem
             .complete_versions(
@@ -2146,7 +2143,6 @@ dependencies = []
         let parse_result =
             parse_result_with_dependency("nonexistent-package", DependencySource::Registry);
 
-        // Empty prefix should show non-yanked versions (up to 20)
         let results = ecosystem
             .complete_versions(
                 &parse_result,
@@ -2156,7 +2152,6 @@ dependencies = []
             )
             .await;
         mock.assert_async().await;
-        // Should not panic, returns empty for unknown package
         assert!(results.is_empty());
     }
 
@@ -2168,7 +2163,6 @@ dependencies = []
         let parse_result =
             parse_result_with_dependency("nonexistent-pkg", DependencySource::Registry);
 
-        // Test PEP 440 operators are stripped correctly
         let results = ecosystem
             .complete_versions(
                 &parse_result,
@@ -2189,7 +2183,6 @@ dependencies = []
         let parse_result =
             parse_result_with_dependency("nonexistent-pkg", DependencySource::Registry);
 
-        // Test != operator stripping
         let results = ecosystem
             .complete_versions(
                 &parse_result,

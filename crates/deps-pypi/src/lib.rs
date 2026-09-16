@@ -1,9 +1,7 @@
-// `PypiRegistry::get_latest_matching`'s boxed-future coercion nests through
-// `get_latest_matching_from`'s own `async fn` call chain; rustc's default recursion limit is
-// occasionally insufficient to prove the resulting `Send` bound and downgrades a
-// previously-silent trait-solver retry into `recursion_depth_exceeding_limit`, which the fuzz
-// CI job's `-D warnings` nightly build turns into a hard error (rust-lang/rust#159228). Same
-// class of fix as deps-cargo (#745), deps-nuget (#696), deps-swift (#673), deps-composer.
+// `PypiRegistry::get_latest_matching`'s boxed-future coercion nests deep enough that rustc's
+// default recursion limit can't always prove the resulting `Send` bound, turning a silent
+// trait-solver retry into a hard `recursion_depth_exceeding_limit` error under the fuzz CI
+// job's `-D warnings` (rust-lang/rust#159228). Same fix as deps-cargo/nuget/swift/composer.
 #![recursion_limit = "256"]
 
 //! PyPI/Python support for deps-lsp.
@@ -124,7 +122,6 @@ mod search;
 /// Domain types for PyPI dependencies (parsed manifest entries, PyPI JSON API versions).
 pub mod types;
 
-// Re-export commonly used types
 pub use config::{PypiIndexConfig, PypiIndexUrl};
 pub use ecosystem::PypiEcosystem;
 pub use error::{Pep508ParseError, PypiError, Result};

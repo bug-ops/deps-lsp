@@ -25,7 +25,6 @@ pub async fn handle_code_actions(
     let uri = &params.text_document.uri;
     let position = params.range.start;
 
-    // Ensure document is loaded (cold start support)
     if !ensure_document_loaded(uri, Arc::clone(&state), client, Arc::clone(&config)).await {
         tracing::warn!("Could not load document for code actions: {:?}", uri);
         return vec![];
@@ -33,11 +32,9 @@ pub async fn handle_code_actions(
 
     let offline = { config.read().await.policy.network.offline };
 
-    // Own everything `generate_code_actions` needs and release the DashMap shard
-    // `Ref` before awaiting it: the default impl awaits a real registry fetch, so
-    // holding the guard across that await would block a concurrent
-    // `documents.get_mut` on the same shard for the duration (#319).
-    // `with_document` makes this structural rather than a convention to remember (#333).
+    // Release the DashMap shard `Ref` before awaiting `generate_code_actions`'s registry
+    // fetch — holding it across the await would block a concurrent `documents.get_mut` on
+    // the same shard (#319); `with_document` makes this structural rather than a convention (#333).
     let Some((
         ecosystem,
         ecosystem_id,
@@ -71,9 +68,8 @@ pub async fn handle_code_actions(
 
     tracing::Span::current().record("ecosystem", ecosystem_id.id());
 
-    // Unreachable in practice: a document only reaches `with_document` above once its
-    // URI already converted successfully (see `ensure_document_loaded`), but handled
-    // defensively rather than unwrapped.
+    // Unreachable in practice (the URI already converted in `ensure_document_loaded`);
+    // handled defensively rather than unwrapped.
     let Some(domain_uri) = crate::lsp_types_interop::from_lsp_uri(uri) else {
         tracing::warn!("URI is not representable as a url::Url: {:?}", uri);
         return vec![];
@@ -295,8 +291,6 @@ mod tests {
     use deps_core::EcosystemId;
     use tower_lsp_server::ls_types::{Position, Range, TextDocumentIdentifier};
 
-    // Generic tests (no feature flag required)
-
     fn action(kind: CodeActionKind) -> CodeAction {
         CodeAction {
             title: "test action".to_string(),
@@ -323,8 +317,7 @@ mod tests {
 
     #[test]
     fn test_kind_matches_rejects_unrelated_prefix() {
-        // "refactoring" must not match a filter of "refactor" just because it
-        // shares a string prefix without a `.` boundary.
+        // Must not match on a shared string prefix without a `.` boundary.
         assert!(!kind_matches(
             &CodeActionKind::from("refactoring"),
             &CodeActionKind::REFACTOR
@@ -519,11 +512,8 @@ mod tests {
 
     #[test]
     fn test_bind_diagnostics_single_candidate_binds_despite_shifted_range() {
-        // Today's behavior, must not regress (critic S2): a single code-matched candidate
-        // binds with no range check at all, even when the client-held diagnostic's range
-        // has drifted from the action's freshly-recomputed `diagnostic_range` (an in-flight
-        // edit above the dependency line shifts the client's held range but not the range
-        // recomputed from the current buffer).
+        // Must not regress (critic S2): a single code-matched candidate binds with no range
+        // check, even when the client-held diagnostic's range has drifted from the recomputed one.
         let action_range = Range::new(Position::new(5, 0), Position::new(5, 10));
         let shifted_range = Range::new(Position::new(9, 0), Position::new(9, 10));
         let mut actions = vec![action_with_data(
@@ -550,9 +540,8 @@ mod tests {
 
     #[test]
     fn test_bind_diagnostics_two_candidates_narrow_to_overlapping_one() {
-        // The anti-fan-out property `UNSATISFIABLE_DIAGNOSTIC_CODE` (a constant shared by
-        // every unsatisfiable dependency in a document) needs: with two code-matched
-        // diagnostics, only the one overlapping this action's own range binds.
+        // Anti-fan-out: with two code-matched diagnostics sharing `UNSATISFIABLE_DIAGNOSTIC_CODE`,
+        // only the one overlapping this action's own range binds.
         let action_range = Range::new(Position::new(5, 0), Position::new(5, 10));
         let overlapping = Range::new(Position::new(5, 2), Position::new(5, 8));
         let elsewhere = Range::new(Position::new(20, 0), Position::new(20, 10));
@@ -574,9 +563,8 @@ mod tests {
 
     #[test]
     fn test_bind_diagnostics_two_candidates_no_overlap_falls_back_to_full_set() {
-        // If narrowing by range leaves nothing (both client-held ranges have drifted off
-        // the freshly-recomputed range), fall back to binding the full code-matched set
-        // rather than binding nothing.
+        // If range-narrowing leaves nothing (both candidates drifted off), fall back to
+        // binding the full code-matched set rather than nothing.
         let action_range = Range::new(Position::new(5, 0), Position::new(5, 10));
         let first = Range::new(Position::new(20, 0), Position::new(20, 10));
         let second = Range::new(Position::new(30, 0), Position::new(30, 10));
@@ -621,7 +609,6 @@ mod tests {
         assert!(result.is_empty());
     }
 
-    // Cargo-specific tests
     #[cfg(feature = "cargo")]
     mod cargo_tests {
         use super::*;
@@ -629,9 +616,8 @@ mod tests {
 
         #[tokio::test]
         async fn test_handle_code_actions() {
-            // Held per `deps_core::fs_probe::snapshot_guard`'s doc: `ecosystem.parse_manifest`
-            // (cargo/npm) transitively touches fs_probe, and this test runs in the same binary as
-            // `document/loader.rs`'s diffing test.
+            // Held per fs_probe::snapshot_guard's doc: parse_manifest touches fs_probe and
+            // this test shares a binary with document/loader.rs's diffing test.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
             let url = deps_core::test_util::test_uri("/test/Cargo.toml");
@@ -662,17 +648,14 @@ serde = "1.0.0"
 
             let (client, config) = create_test_client_and_config();
             let _result = handle_code_actions(state, params, client, config).await;
-            // Test passes if no panic occurs
         }
 
         #[tokio::test]
         async fn test_handle_code_actions_end_to_end_composition() {
             // See the comment in `test_handle_code_actions` on why this guard is needed here.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
-            // Drives `handle_code_actions` itself with vulnerability data, a
-            // `context.only` filter, and matching `context.diagnostics`
-            // together, confirming the wiring order (generate -> attach ->
-            // filter) end-to-end rather than only at the helper-unit level.
+            // Confirms the wiring order (generate -> attach -> filter) end-to-end, not just
+            // at the helper-unit level.
             use deps_core::osv::{
                 Advisory, Capped, DependencyVulnerabilities, ScanOutcome, UpgradeStatus,
                 VulnSeverity, VulnerabilityMap,
@@ -870,7 +853,6 @@ serde = "1.0.0"
         }
     }
 
-    // npm-specific tests
     #[cfg(feature = "npm")]
     mod npm_tests {
         use super::*;
@@ -906,11 +888,9 @@ serde = "1.0.0"
 
             let (client, config) = create_test_client_and_config();
             let _result = handle_code_actions(state, params, client, config).await;
-            // Test passes if no panic occurs
         }
     }
 
-    // Swift-specific tests
     #[cfg(feature = "swift")]
     mod swift_tests {
         use super::*;
@@ -918,15 +898,9 @@ serde = "1.0.0"
 
         #[tokio::test]
         async fn test_handle_code_actions_exact_form_produces_vulnerability_fix() {
-            // Regression for #367, real end-to-end (`handle_code_actions` ->
-            // `SwiftEcosystem::generate_code_actions` -> the shared
-            // `deps_core::lsp_helpers::generate_code_actions`), not just the synthetic
-            // `CaLiteralDep` fixture `deps-core`'s own tests use. Reproduces the exact
-            // issue scenario: `.package(url: ..., .exact("4.50.0"))`. Uses OSV
-            // vulnerability data (registry-independent per FR-007) rather than a live
-            // registry fetch, so the assertion is deterministic and network-free —
-            // `context.only: [QUICKFIX]` additionally drops any REFACTOR items a live
-            // fetch might otherwise have produced.
+            // Regression for #367: real end-to-end through SwiftEcosystem, not the synthetic
+            // fixture deps-core's own tests use. Uses OSV data instead of a live registry
+            // fetch to keep the assertion deterministic and network-free.
             use deps_core::osv::{
                 Advisory, Capped, DependencyVulnerabilities, ScanOutcome, UpgradeStatus,
                 VulnSeverity, VulnerabilityMap,
@@ -950,10 +924,8 @@ serde = "1.0.0"
             let mut doc_state =
                 DocumentState::new_from_parse_result(EcosystemId::Swift, content, parse_result);
 
-            // Keyed by `SwiftFormatter::normalize_package_name` (lowercased `owner/repo`),
-            // the lookup `build_vulnerability_fix_action` actually uses — not
-            // `osv_package_name`'s `github.com/{owner}/{repo}` (a distinct mapping, used
-            // only for the wire request OSV itself receives).
+            // Keyed by `SwiftFormatter::normalize_package_name` (`owner/repo`) — the lookup
+            // `build_vulnerability_fix_action` uses, not `osv_package_name`'s wire-request format.
             let mut vulnerabilities = VulnerabilityMap::new();
             vulnerabilities.insert(
                 "vapor/vapor".to_string(),

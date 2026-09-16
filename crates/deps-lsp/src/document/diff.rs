@@ -190,7 +190,6 @@ mod tests {
     use std::assert_matches;
     use std::sync::Arc;
 
-    // Phase 1: Cache Preservation Tests
     mod incremental_fetch_tests {
         use super::*;
 
@@ -204,7 +203,6 @@ mod tests {
             let url = deps_core::test_util::test_uri("/test/Cargo.toml");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
-            // Initial document with 2 dependencies
             let content1 = r#"[dependencies]
 serde = "1.0"
 tokio = "1.0"
@@ -219,7 +217,6 @@ tokio = "1.0"
             );
             state.update_document(uri.clone(), doc_state1);
 
-            // Manually populate cache (simulating background fetch)
             {
                 let mut doc = state.documents.get_mut(&uri).unwrap();
                 doc.cached_versions
@@ -232,14 +229,12 @@ tokio = "1.0"
                     .insert("tokio".into(), "1.35.0".into());
             }
 
-            // Verify cache populated
             {
                 let doc = state.get_document(&uri).unwrap();
                 assert_eq!(doc.cached_versions.len(), 2);
                 assert_eq!(doc.resolved_versions.len(), 2);
             }
 
-            // Change document (modify serde version)
             let content2 = r#"[dependencies]
 serde = "1.0.210"
 tokio = "1.0"
@@ -258,7 +253,6 @@ tokio = "1.0"
 
             state.update_document(uri.clone(), doc_state2);
 
-            // Verify cache preserved after update
             {
                 let doc = state.get_document(&uri).unwrap();
                 assert_eq!(
@@ -1171,7 +1165,6 @@ serde = "1.0"
             );
             state.update_document(uri.clone(), doc_state);
 
-            // First open: cache should be empty (no old state to preserve)
             let doc = state.get_document(&uri).unwrap();
             assert_eq!(
                 doc.cached_versions.len(),
@@ -1188,7 +1181,6 @@ serde = "1.0"
             let url = deps_core::test_util::test_uri("/test/Cargo.toml");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
-            // Valid initial document
             let content1 = r#"[dependencies]
 serde = "1.0"
 "#;
@@ -1202,14 +1194,12 @@ serde = "1.0"
             );
             state.update_document(uri.clone(), doc_state1);
 
-            // Populate cache
             {
                 let mut doc = state.documents.get_mut(&uri).unwrap();
                 doc.cached_versions
                     .insert("serde".into(), PackageVersions::latest_only("1.0.210"));
             }
 
-            // Invalid TOML (parse will fail)
             let content2 = r#"[dependencies
 serde = "1.0"
 "#;
@@ -1229,7 +1219,6 @@ serde = "1.0"
 
             state.update_document(uri.clone(), doc_state2);
 
-            // Cache should be preserved despite parse failure
             let doc = state.get_document(&uri).unwrap();
             assert_eq!(
                 doc.cached_versions.len(),
@@ -1558,7 +1547,6 @@ time = "0.1.50"
             let url = deps_core::test_util::test_uri("/test/Cargo.toml");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
-            // Initial document with 3 dependencies
             let content1 = r#"[dependencies]
 serde = "1.0"
 tokio = "1.0"
@@ -1574,7 +1562,6 @@ anyhow = "1.0"
             );
             state.update_document(uri.clone(), doc_state1);
 
-            // Populate cache for all 3 deps
             {
                 let mut doc = state.documents.get_mut(&uri).unwrap();
                 doc.cached_versions.insert(
@@ -1591,13 +1578,11 @@ anyhow = "1.0"
                 );
             }
 
-            // Remove anyhow from manifest
             let content2 = r#"[dependencies]
 serde = "1.0"
 tokio = "1.0"
 "#;
 
-            // Compute diff and apply cache pruning
             let old_deps: HashMap<PackageName, Vec<Option<VersionReq>>> =
                 ["serde", "tokio", "anyhow"]
                     .iter()
@@ -1620,14 +1605,12 @@ tokio = "1.0"
                 preserve_cache(&mut doc_state2, &old_doc);
             }
 
-            // Prune removed dependencies
             for removed_dep in &diff.removed {
                 doc_state2.cached_versions.remove(removed_dep);
             }
 
             state.update_document(uri.clone(), doc_state2);
 
-            // Verify cache was pruned
             let doc = state.get_document(&uri).unwrap();
             assert_eq!(
                 doc.cached_versions.len(),

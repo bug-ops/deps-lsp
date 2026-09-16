@@ -150,9 +150,8 @@ fn ref_is_last_token_on_line(rest_of_line: &str, window: WindowCoverage) -> bool
 /// than risking a truncated-but-plausible-looking version; a token that ends before the
 /// window's edge (a terminating whitespace was actually observed) is unaffected regardless
 /// of `window`, since its boundary was genuinely seen.
-// `i` is a byte index holding ASCII `b'#'`; `token_len` from `find(char::is_whitespace)` or
-// `.len()`. Both slice bounds are always char boundaries. `bytes[i - 1]` is short-circuited
-// by the `i == 0 ||` conjunct, and `i` ranges `0..bytes.len()` from the loop.
+// `i` indexes ASCII `b'#'`; slice bounds are always char boundaries, and `bytes[i - 1]` is
+// short-circuited by the `i == 0 ||` conjunct.
 #[allow(clippy::string_slice, clippy::indexing_slicing)]
 fn extract_comment_tag(rest_of_line: &str, window: WindowCoverage) -> Option<(&str, usize)> {
     let bytes = rest_of_line.as_bytes();
@@ -166,14 +165,10 @@ fn extract_comment_tag(rest_of_line: &str, window: WindowCoverage) -> Option<(&s
         let after_hash = &rest_of_line[i + 1..];
         let after_ws = after_hash.trim_start();
         let ws_len = after_hash.len() - after_ws.len();
-        // A single `find` gives both "did a terminator turn up" and "where" — no need
-        // for a separate `contains` pass over the same text first (impl-critic-2 nit).
         let terminator = after_ws.find(char::is_whitespace);
         if terminator.is_none() && window == WindowCoverage::Truncated {
-            // The token has no observed end within the window, so its true text may
-            // continue past the edge — accepting it here risks silently recording a
-            // truncated-but-still-semver-shaped value (finding #1). Bail out rather than
-            // guess; the ref degrades to a bare, commentless pin instead of a wrong one.
+            // Token has no observed end within the window — its true text may continue
+            // past the edge, so bail rather than risk a truncated value (finding #1).
             return None;
         }
         let token_len = terminator.unwrap_or(after_ws.len());
@@ -330,9 +325,8 @@ impl WorkflowReceiver {
     }
 
     fn push_container(&mut self, kind: FrameKind) {
-        // Computed from the parent's state *before* `FrameStack::push` transitions it
-        // (a complex YAML key's subtree included) — the parent's `with:`-ancestor
-        // status must reflect its own position, not the child's freshly pushed one.
+        // Computed before `FrameStack::push` transitions state — must reflect the
+        // parent's own with:-ancestor status, not the child's freshly pushed one.
         let is_with_ancestor = self.child_is_with_ancestor();
         self.stack.push(kind, (), is_with_ancestor);
     }
@@ -371,11 +365,8 @@ impl MarkedEventReceiver for WorkflowReceiver {
                     self.stack.consume_value();
                 }
             }
-            // A `uses: *anchor` alias value must still clear the pending `uses`/`with`
-            // key slot, or the next mapping key/value pair desyncs (the following key
-            // gets consumed as if it were this `uses`'s value) — critic M5. GitHub
-            // itself does not support YAML anchors/aliases in workflow files, so this
-            // is defense-in-depth rather than a reachable real-world case.
+            // An alias value must still clear the pending key slot or the next pair
+            // desyncs (critic M5) — defense-in-depth since GHA itself rejects anchors.
             Event::Alias(_) => self.stack.consume_value(),
             Event::Nothing
             | Event::StreamStart
@@ -388,46 +379,29 @@ impl MarkedEventReceiver for WorkflowReceiver {
 
 /// Builds a [`GithubActionsDependency`] for one `uses:` candidate, or `None` if its
 /// `owner/repo` prefix does not look like a GitHub identifier (logged and skipped, FR-015).
-// `ref_start`/`ref_end` build on `span_start`, which is char-boundary-aligned in `content` via
-// `marker_byte_offset` + `locate_value_span` and then re-anchored to the trimmed value
-// (see the trim re-anchoring comment below) — plus `before_at_len`/`ref_text.len()`, both
-// whole-substring byte counts, so the arithmetic never lands mid-character. `token_end` is
-// relative to `content[ref_end..]`, windowed to at most `REST_OF_LINE_WINDOW_BYTES` past
-// `ref_end` and to the line's own end (resolved via `line_table.line_start` in O(1)), rather
-// than an unbounded `find('\n')` scan (issue #885).
+// `ref_start`/`ref_end` build on `span_start`, which is char-boundary-aligned (see the trim
+// re-anchoring comment below), plus whole-substring byte counts, so arithmetic never lands
+// mid-character. `token_end` is windowed to `REST_OF_LINE_WINDOW_BYTES`/line end via
+// `line_table` in O(1) rather than an unbounded `find('\n')` scan (issue #885).
 #[allow(clippy::string_slice)]
 fn build_dependency(
     content: &str,
     line_table: &LineOffsetTable,
     candidate: UsesCandidate,
 ) -> Option<GithubActionsDependency> {
-    // Whether the *whole* `uses:` value scalar was written unquoted. For a quoted scalar,
-    // any `Range` computed below sits inside the quotes — a SHA-pin code action (issue
-    // #473) must not write `{sha} # {tag}` there, since the `#` would land inside the
-    // string rather than starting a YAML comment (spec 031 FR-010). Read once here and
-    // carried on every constructed dependency, mirroring the existing single-purpose
-    // `TScalarStyle::Plain` gate below for the SHA-with-comment case.
+    // Whether the whole `uses:` scalar was unquoted. For a quoted scalar, any Range below
+    // sits inside the quotes, so a SHA-pin edit must not write `{sha} # {tag}` there (#473,
+    // FR-010) — read once and carried on every constructed dependency.
     let is_plain_scalar = candidate.is_plain();
 
     let (raw_start, raw_end) = candidate.span(content, line_table)?;
 
-    // `classify_uses_value` (and every offset computed below) works over the
-    // *trimmed* value, but the span located above is the raw, untrimmed scalar
-    // text ([`MarkedScalar::span`]'s own documented contract). For a quoted `uses:`
-    // value with leading/trailing whitespace (e.g. `" actions/checkout@v4"`),
-    // anchoring the downstream `name.len()`/`before_at_len`-relative arithmetic to
-    // the untrimmed start desyncs every computed offset by the trimmed byte count:
-    // on ordinary ASCII input this silently points `version_range` at the wrong
-    // text (an accepted "update version" code action then overwrites the wrong
-    // span), and on multi-byte leading whitespace (e.g. an ideographic space,
-    // U+3000) it can split a UTF-8 sequence and panic on a raw `content[..]` slice
-    // downstream (security S-1). Re-anchoring `span_start`/`span_end` to the
-    // trimmed text here — both still guaranteed char-boundary-aligned in `content`,
-    // since `str::trim_start`/`trim_end` only ever cut at `candidate`'s own text's
-    // char boundaries, and that text is byte-identical to
-    // `content[raw_start..raw_end]` by `span`'s own contract — means every
-    // reference to them downstream is already correct, with no further per-call
-    // adjustment needed.
+    // `classify_uses_value` works over the trimmed value, but the span above is the raw,
+    // untrimmed scalar text. Anchoring downstream offsets to the untrimmed start would
+    // desync `version_range` by the trimmed byte count, and on multi-byte leading
+    // whitespace (e.g. U+3000) can split a UTF-8 sequence and panic downstream (security
+    // S-1). Re-anchoring `span_start`/`span_end` to the trimmed text here keeps them
+    // char-boundary-aligned, since `trim_start`/`trim_end` only cut at existing boundaries.
     let leading_ws = candidate.text().len() - candidate.text().trim_start().len();
     let trailing_ws = candidate.text().len() - candidate.text().trim_end().len();
     let span_start = raw_start + leading_ws;
@@ -483,10 +457,8 @@ fn build_dependency(
             ref_text,
         } => {
             let name_end = span_start + name.len();
-            // Not `name_end + 1`: `name` is truncated at the second `/` for a
-            // subdirectory action or reusable-workflow call, but the `@` sits after the
-            // full pre-`@` path (`before_at_len`) — using `name_end` would place every
-            // ref offset short by the truncated subpath's length (critic S1).
+            // Not `name_end + 1`: `name` truncates at the second `/`, but `@` sits after
+            // the full pre-`@` path — using `name_end` would shift every ref offset (critic S1).
             let ref_start = span_start + before_at_len + 1; // skip the '@'
             let ref_end = ref_start + ref_text.len();
             let name_range = make_range(span_start, name_end);
@@ -507,19 +479,12 @@ fn build_dependency(
                 });
             }
 
-            // O(1) real line-end lookup via `line_table` instead of an unbounded
-            // `find('\n')` scan (issue #885): the latter scanned to end-of-document
-            // once per ref-pinned dependency, an O(N x remaining-document-length)
-            // cost on a single-line manifest with N such deps. Mirrors
-            // `marker_byte_offset`'s own use of `LineOffsetTable::line_start` — that
-            // returns the byte offset right after this line's own '\n' (0-indexed
-            // line `candidate.line()`, so passing the 1-indexed `candidate.line()`
-            // here lands on the *next* line's start), or `content.len()` if this is
-            // the last line with no trailing newline. `line_end` is always a
-            // `content` char boundary (built from a `char_indices()` walk), and
-            // stepping back one byte off it is too when that byte is the
-            // single-byte '\n' itself, so no boundary clamp is needed for it
-            // specifically.
+            // O(1) line-end lookup via `line_table` instead of an unbounded `find('\n')`
+            // scan (issue #885), which cost O(N x remaining-document-length) on a
+            // single-line manifest with N ref-pinned deps. Passing the 1-indexed
+            // `candidate.line()` to `line_start` (0-indexed) lands on the next line's
+            // start, or `content.len()` with no trailing newline; stepping back one byte
+            // is still a char boundary since that byte is the single-byte '\n'.
             let line_end = line_table
                 .line_start(candidate.line())
                 .unwrap_or(content.len());
@@ -527,19 +492,12 @@ fn build_dependency(
                 Some(i) if content.as_bytes().get(i) == Some(&b'\n') => i,
                 _ => line_end,
             };
-            // Even a correctly-located line can itself be enormous — a
-            // single-physical-line manifest with many ref-pinned dependencies and
-            // no real newline anywhere is exactly #885's threat model, and neither
-            // `ref_is_last_token_on_line` nor `extract_comment_tag` needs more than
-            // a short window after the ref. Cap the window at
-            // `REST_OF_LINE_WINDOW_BYTES` past `ref_end`; `floor_char_boundary`
-            // clamps it back to a valid boundary since (unlike `line_end`) this
-            // bound isn't guaranteed to land on one. `line_end < ref_end` is
-            // defense-in-depth for a `line_table`/`ref_end` mismatch that shouldn't
-            // occur in practice — logged distinctly below (code-review finding #8)
-            // since it's a desync bug, not routine truncation, and without this
-            // disjunct such a mismatch would silently look untruncated instead of
-            // failing safe.
+            // Even a correctly-located line can be enormous (#885's threat model), and
+            // neither downstream function needs more than a short window after the ref, so
+            // cap it at `REST_OF_LINE_WINDOW_BYTES`; `floor_char_boundary` clamps it back
+            // since this bound isn't guaranteed to land on one. `line_end < ref_end` is
+            // defense-in-depth for a desync that shouldn't occur — logged distinctly below
+            // (finding #8) so it doesn't silently look like untruncated instead of failing safe.
             let line_end_desynced = line_end < ref_end;
             if line_end_desynced {
                 tracing::debug!(
@@ -561,30 +519,18 @@ fn build_dependency(
             };
             let capped_end = content.floor_char_boundary(capped_end);
             let rest_of_line = &content[ref_end..capped_end.max(ref_end)];
-            // Security audit finding (issue #633): computed for every ref-pinned form,
-            // not just the SHA-with-comment case below, since the mutable-tag SHA-pin
-            // edit (`sha_pin_text_edit_for`) needs it for `PinStyle::Tag` too — a flow-
-            // style step (`{uses: actions/checkout@v4, with: {...}}`) has real YAML
-            // content after the ref that a trailing `# <tag>` comment would swallow.
-            // `ref_is_last_token_on_line` gives a definitive answer whenever it finds
-            // a `#` comment or real content within the (possibly truncated) window —
-            // `window` only matters as the fallback when the window is all
-            // whitespace with nothing conclusive in it, where we cannot safely assume
-            // "nothing unsafe follows" (issue #885 rework, impl-critic S1: a naive
-            // bounded window without this fallback flipped `is_last_on_line` from
-            // false to true once enough padding separated the ref from a real
-            // flow-style continuation, reopening the #633 corruption).
+            // Computed for every ref-pinned form, not just SHA-with-comment below, since
+            // `sha_pin_text_edit_for` needs it for `PinStyle::Tag` too — a flow-style step
+            // has real YAML content after the ref that a trailing `# <tag>` would swallow
+            // (#633). `window` matters only as the all-whitespace fallback, where we can't
+            // safely assume nothing unsafe follows (impl-critic S1: a naive bounded window
+            // without it flipped `is_last_on_line` false-to-true, reopening #633).
             let is_last_on_line = ref_is_last_token_on_line(rest_of_line, window);
 
             if is_full_sha(&ref_text) {
-                // `extract_comment_tag` takes the first whitespace-preceded `#` anywhere
-                // in `rest_of_line`, with no notion of whether that `#` is genuinely this
-                // ref's own trailing comment or belongs to an unrelated later token on the
-                // same flow-style line (issue #898). `is_last_on_line` already answers
-                // exactly that question (see the #633 comment above): reuse it as a gate
-                // so a flow-style continuation (`, with: {...}}`) is never misread as this
-                // ref's comment, which previously computed an over-wide `version_range`
-                // spanning real YAML content past the ref.
+                // `extract_comment_tag` can't tell this ref's own comment from an unrelated
+                // later token on a flow-style line (#898); gating on `is_last_on_line`
+                // prevents a flow-style continuation from being misread as the comment.
                 let comment = (is_plain_scalar && is_last_on_line)
                     .then(|| extract_comment_tag(rest_of_line, window))
                     .flatten();
@@ -710,12 +656,9 @@ pub fn parse_workflow_yaml(content: &str, uri: &Url) -> Result<GithubActionsPars
         });
     }
 
-    // Issue #706 review finding (security, LOW): `action.yml`/`action.yaml` is routed by
-    // bare basename (`Ecosystem::manifest_filenames`), which matches anywhere in an
-    // opened workspace — not just real GitHub Action manifests. Withhold every candidate
-    // for such a file unless it actually declares GitHub's own required top-level
-    // `runs:` key, so a coincidentally-named, unrelated `action.yml` degrades to zero
-    // dependencies instead of issuing live registry fetches and diagnostics.
+    // #706 (security, LOW): `action.yml`/`action.yaml` routes by bare basename, matching
+    // anywhere in a workspace, not just real Action manifests — withhold every candidate
+    // unless the file actually declares GitHub's required top-level `runs:` key.
     if is_action_manifest_filename(uri) && !receiver.has_top_level_runs_key {
         tracing::debug!(
             "action.yml/action.yaml with no top-level `runs:` key, treating as not a \
@@ -895,12 +838,8 @@ mod tests {
 
     #[test]
     fn test_sha_comment_partial_tag_accepted() {
-        // Issue #907: `# v4` / `# v4.2` are the overwhelmingly common real-world
-        // SHA-pin comment convention (major or major.minor, not a full patch version)
-        // — rejecting them degraded the ref to a bare, unresolvable SHA, silently
-        // dropping the inlay hint/diagnostic/hover for the vast majority of
-        // real-world workflows. Accepted at whatever precision is given
-        // (`is_partial_semver_shaped`).
+        // #907: `# v4`/`# v4.2` are the common real-world SHA-pin comment convention;
+        // rejecting them degraded most real workflows to a bare, unresolvable SHA.
         let sha = "a1b2c3d4e5a1b2c3d4e5a1b2c3d4e5a1b2c3d4e5";
         for suffix in ["v4", "v4.2"] {
             let content = format!("steps:\n  - uses: actions/checkout@{sha} # {suffix}\n");
@@ -923,11 +862,9 @@ mod tests {
 
     #[test]
     fn test_sha_comment_non_version_text_rejected_stays_bare() {
-        // #907 review finding S1: a genuine non-version SHA-pin comment (a tool name
-        // annotation, a bare ticket number, a date) must still degrade to a bare,
-        // unresolvable SHA — `is_partial_semver_shaped` must not treat free text as a
-        // version just because it starts with a digit, unlike `is_tag_shaped` (safe
-        // only for an actual git ref).
+        // #907 S1: a non-version comment (tool name, ticket number, date) must still
+        // degrade to a bare SHA — `is_partial_semver_shaped` must not treat free text as
+        // a version just because it starts with a digit.
         let sha = "a1b2c3d4e5a1b2c3d4e5a1b2c3d4e5a1b2c3d4e5";
         for suffix in ["cargo-deny", "do-not-upgrade", "main", "1234", "20240501"] {
             let content = format!("steps:\n  - uses: taiki-e/install-action@{sha} # {suffix}\n");
@@ -978,10 +915,8 @@ mod tests {
 
     #[test]
     fn test_quoted_sha_with_real_yaml_comment_outside_quotes_degrades_to_bare_sha() {
-        // B3: the comment-tag rule applies only to plain (unquoted) scalars. Here the
-        // quoted value is a clean 40-hex SHA, and `# v4.2.0` is a genuine YAML
-        // comment sitting *outside* the quotes — but since the scalar itself is
-        // quoted, no comment scan runs at all, and the pin degrades to a bare SHA.
+        // B3: the comment-tag rule applies only to plain scalars — a quoted scalar skips
+        // the comment scan entirely, even with a genuine YAML comment outside the quotes.
         let sha = "a1b2c3d4e5a1b2c3d4e5a1b2c3d4e5a1b2c3d4e5";
         let content = format!("steps:\n  - uses: \"actions/checkout@{sha}\" # v4.2.0\n");
         let result = parse_workflow_yaml(&content, &test_uri()).unwrap();
@@ -999,10 +934,8 @@ mod tests {
         let content = format!("steps:\n  - uses: \"actions/checkout@{sha} # v4.2.0\"\n");
         let result = parse_workflow_yaml(&content, &test_uri()).unwrap();
         let dep = &result.dependencies[0];
-        // For a quoted scalar, `#` is part of the value — no comment scan runs, so
-        // the ref text is `"{sha} # v4.2.0"` verbatim: not a valid 40-hex SHA (extra
-        // trailing characters), so this falls through to the branch bucket, the
-        // honest outcome for an unparseable ref shape.
+        // For a quoted scalar, `#` is part of the value, so the ref text is the literal
+        // string verbatim: not a valid 40-hex SHA, so this falls through to the branch bucket.
         assert_eq!(
             dep.version_requirement().map(deps_core::VersionReq::as_str),
             Some(format!("{sha} # v4.2.0").as_str())
@@ -1103,26 +1036,18 @@ mod tests {
     }
 
     // --- deps-lsp#908: complex YAML key (`? <mapping>`/`? <sequence>`) no longer desyncs
-    // the root mapping's key/value alternation — the shared `FrameStack` walker's fix,
-    // which `deps-dart` already had before this refactor.
+    // the root mapping's key/value alternation (shared `FrameStack` walker fix).
     //
-    // This crate's `uses:` detection itself never gates on a top-level key, so a root
-    // mapping desync is invisible to it either way — a `jobs:`-after-a-complex-key style
-    // test would pass on both the old and new code and pin nothing (verified empirically
-    // against `origin/main` during review). The one place a root-level desync IS
-    // observable here is `has_top_level_runs_key` (`Self::depth() == 1` gate, #706): with
-    // the old code, closing a complex key's subtree left the root stuck "awaiting a key",
-    // so the complex key's own *value* scalar was misread as a literal top-level key.
+    // This crate's `uses:` detection never gates on a top-level key, so a root desync is
+    // invisible to it — the one observable spot is `has_top_level_runs_key` (#706): the
+    // old code left the root stuck "awaiting a key" after a complex key's subtree closed,
+    // misreading the complex key's own value scalar as a literal top-level key.
 
     #[test]
     fn test_complex_key_value_is_not_misread_as_a_top_level_runs_key() {
-        // `runs` here is the complex key's *value*, not a real top-level key. On the old
-        // (pre-walker) code this was misread as a literal `runs:` key, incorrectly setting
-        // `has_top_level_runs_key = true` and letting `action.yml`'s `is_action_manifest_filename`
-        // gate wave the file through with 1 dependency. With the walker's fix, closing the
-        // complex key's subtree correctly leaves the root "awaiting this entry's value", so
-        // `runs` is read as a value and `has_top_level_runs_key` correctly stays `false` —
-        // `action.yml` has no genuine top-level `runs:` key, so every candidate is withheld.
+        // `runs` here is the complex key's *value*, not a real top-level key. Pre-walker
+        // this was misread as a literal `runs:` key, incorrectly waving the file through
+        // as an action manifest.
         let uri = deps_core::test_util::test_uri("/repo/action.yml");
         let content =
             "? { a: 1 }\n: runs\njobs:\n  b:\n    steps:\n      - uses: actions/checkout@v4\n";
@@ -1137,15 +1062,9 @@ mod tests {
 
     #[test]
     fn test_complex_key_before_a_real_top_level_runs_key_does_not_lose_the_action_manifest() {
-        // The false-negative counterpart to the test above: an unrelated complex key
-        // appears *before* the file's genuine top-level `runs:` key. Pre-walker, closing
-        // the complex key's subtree left the root stuck "awaiting a key" instead of
-        // "awaiting this entry's value", so the complex key's own value scalar (`unused`)
-        // was misread as the next key — desyncing the rest of the root mapping and making
-        // the real `runs:` key invisible to `has_top_level_runs_key`, which then withheld
-        // every candidate from this genuinely valid composite action manifest. With the
-        // fix, `runs:` is correctly recognized as a real top-level key, so this file's
-        // `uses:` step is found.
+        // False-negative counterpart: an unrelated complex key appears *before* the
+        // genuine top-level `runs:` key. Pre-walker this desynced the root mapping,
+        // making `runs:` invisible and withholding a genuinely valid action manifest.
         let uri = deps_core::test_util::test_uri("/repo/action.yml");
         let content = "? { a: 1 }\n: unused\nruns:\n  using: composite\n  steps:\n    - uses: actions/checkout@v4\n";
         let result = parse_workflow_yaml(content, &uri).unwrap();
@@ -1235,9 +1154,8 @@ mod tests {
 
     #[test]
     fn test_ref_is_last_token_on_line_false_for_empty_and_whitespace_only_when_window_truncated() {
-        // #885 rework: an all-whitespace window gives no definitive answer on its own
-        // when it was truncated before the line's real end — `WindowCoverage::Truncated`
-        // must be honored as the fallback in that case.
+        // #885: an all-whitespace truncated window is inconclusive, so Truncated must be
+        // honored as the fallback.
         assert!(!ref_is_last_token_on_line("", WindowCoverage::Truncated));
         assert!(!ref_is_last_token_on_line("   ", WindowCoverage::Truncated));
     }
@@ -1252,10 +1170,8 @@ mod tests {
 
     #[test]
     fn test_ref_is_last_token_on_line_true_for_trailing_comment_even_when_window_truncated() {
-        // #885 rework (impl-critic point 4): finding a `#` comment within the window
-        // is a definitive answer regardless of `WindowCoverage` — the window
-        // being truncated elsewhere in the line doesn't matter once the comment is
-        // found here.
+        // #885 (impl-critic point 4): finding a `#` within the window is definitive
+        // regardless of `WindowCoverage`.
         assert!(ref_is_last_token_on_line(
             " # my note",
             WindowCoverage::Truncated
@@ -1325,14 +1241,9 @@ mod tests {
 
     #[test]
     fn test_alias_value_does_not_desync_following_uses_key() {
-        // Critic M5: an `Event::Alias` (YAML anchor reference) filling a `uses:` value
-        // must still clear the pending-key slot, or the *next* key/value pair in the
-        // same mapping desyncs. A single step normally has only one `uses:` key, so the
-        // bug is invisible unless the alias-valued key is followed by another
-        // key/value pair in the same mapping — demonstrated here with a (syntactically
-        // valid, if unrealistic for a real workflow) duplicate `uses:` key: without the
-        // fix, the second, literal `uses:` value is never recognized as a dependency at
-        // all (it gets misread as a key with the alias's own value swallowing it).
+        // Critic M5: an alias filling a `uses:` value must still clear the pending-key
+        // slot, or the next key/value pair in the same mapping desyncs — demonstrated here
+        // with an unrealistic but syntactically valid duplicate `uses:` key.
         let content =
             "steps:\n  - uses: &a actions/checkout@v3\n  - uses: *a\n    uses: real/repo@v9\n";
         let result = parse_workflow_yaml(content, &test_uri()).unwrap();
@@ -1371,12 +1282,10 @@ mod tests {
     #[test]
     fn test_quoted_value_with_multibyte_leading_whitespace_does_not_panic() {
         // Security S-1: previously panicked ("byte index N is not a char boundary")
-        // because `build_dependency` anchored its offset math on the *untrimmed*
-        // value's start while `classify_uses_value`'s `name`/`ref_text` were derived
-        // from the *trimmed* one — a multi-byte leading whitespace character (U+3000,
-        // ideographic space, 3 bytes) inside a quoted scalar shifted every downstream
-        // offset off a char boundary. Reproduced end-to-end against the real LSP
-        // binary by the security audit; this is the minimal in-crate repro.
+        // because offset math anchored on the untrimmed value's start while
+        // `classify_uses_value`'s output was derived from the trimmed one — multi-byte
+        // leading whitespace (U+3000) inside a quoted scalar shifted every offset off a
+        // char boundary. Minimal in-crate repro of the security audit's end-to-end finding.
         let leading = "\u{3000}".repeat(15);
         let sha = "a".repeat(40);
         let content = format!("steps:\n  - uses: \"{leading}a/b@{sha}\"\n");
@@ -1389,11 +1298,8 @@ mod tests {
 
     #[test]
     fn test_quoted_value_with_leading_space_reports_correct_ref_range() {
-        // Security S-1's benign-input half: an ordinary, single-leading-space quoted
-        // value (`" actions/checkout@v4"`, valid YAML, a common formatting choice) must
-        // still resolve `version_range` to the real ref (`v4`), not a shifted
-        // substring (`@v`) — the shift the desync bug produced would corrupt the file
-        // when an "update version" code action wrote its edit at the wrong span.
+        // Security S-1's benign-input half: an ordinary single-leading-space quoted value
+        // must still resolve `version_range` to the real ref, not a shifted substring.
         let content = "steps:\n  - uses: \" actions/checkout@v4\"\n";
         let result = parse_workflow_yaml(content, &test_uri()).unwrap();
         let dep = &result.dependencies[0];
@@ -1434,10 +1340,8 @@ mod tests {
 
     #[test]
     fn test_extract_comment_tag_rejects_token_reaching_truncated_window_edge() {
-        // Code-review finding #1: a token with no observed terminating whitespace
-        // within a *truncated* window is ambiguous — it might continue past the
-        // edge — and must be rejected rather than accepted as-is, even though it
-        // otherwise has a valid semver shape.
+        // Finding #1: a token with no observed terminator in a truncated window is
+        // ambiguous and must be rejected, even with a valid semver shape.
         assert_eq!(
             extract_comment_tag(" # v4.2.10", WindowCoverage::Truncated),
             None
@@ -1473,14 +1377,9 @@ mod tests {
 
     #[test]
     fn test_flow_style_continuation_beyond_window_still_detected() {
-        // Regression for a bounded-scan-window approach previously considered for
-        // #885 (impl-critic S1): a fixed lookahead window would flip
-        // `is_last_on_line` from false to true once enough whitespace padding sat
-        // between the ref and the flow-mapping's real continuation
-        // (`, with: {...}}`), reopening the exact #633 corruption (a SHA-pin edit
-        // commenting out real YAML). The O(1) `line_table`-bounded lookup covers
-        // the whole physical line regardless of padding length, so this must stay
-        // `false` no matter how far the continuation sits.
+        // Regression for a bounded-scan-window approach previously considered for #885
+        // (impl-critic S1): a fixed lookahead would flip `is_last_on_line` to true once
+        // enough padding separated the ref from the flow continuation, reopening #633.
         let sha = "a".repeat(40);
         let padding = " ".repeat(REST_OF_LINE_WINDOW_BYTES + 100);
         let content =
@@ -1495,13 +1394,9 @@ mod tests {
 
     #[test]
     fn test_sha_comment_tag_resolves_even_with_trailing_annotation_beyond_window() {
-        // #885 rework (impl-critic point 4): a valid `# <tag>` comment found within
-        // the bounded window is a definitive answer regardless of how much more text
-        // follows on the line beyond the window — `is_last_on_line` must stay `true`
-        // (block-style, nothing unsafe to overwrite) and the tag must still resolve.
-        // A naive `!window_truncated && ...` gate would have incorrectly returned
-        // `false` here purely because of the long trailing annotation, withholding
-        // the SHA-pin quickfix on an otherwise perfectly safe line.
+        // #885 (impl-critic point 4): a valid comment found within the window is
+        // definitive regardless of trailing content beyond it — a naive
+        // `!window_truncated && ...` gate would wrongly withhold the SHA-pin quickfix here.
         let sha = "a".repeat(40);
         let trailing_annotation = "-".repeat(REST_OF_LINE_WINDOW_BYTES + 100);
         let content =
@@ -1521,19 +1416,12 @@ mod tests {
 
     #[test]
     fn test_comment_tag_truncated_at_window_boundary_is_rejected_not_shortened() {
-        // Code-review finding #1 on the #885 rework: a comment tag whose digits
-        // straddle the window boundary must not be silently recorded as the
-        // truncated-but-still-partial-semver-shaped prefix (`v4.2.100` cut to
-        // `v4.2.10`, which still passes `is_partial_semver_shaped`). Construct
-        // `rest_of_line` so
-        // the window (`REST_OF_LINE_WINDOW_BYTES` bytes past `ref_end`) ends exactly
-        // one byte into the last digit of `v4.2.100`, then confirm plenty of real
-        // content continues past the window (so this isn't just routine end-of-line
-        // truncation) and the tag is rejected as ambiguous rather than shortened.
+        // Finding #1 on #885: a comment tag whose digits straddle the window boundary
+        // must not be silently recorded as the truncated-but-still-semver-shaped prefix
+        // (`v4.2.100` cut to `v4.2.10`, which still passes `is_partial_semver_shaped`).
         let sha = "a".repeat(40);
         let tag = "v4.2.100";
-        // rest_of_line = padding + "# " + tag; window cuts after the 7th tag byte
-        // ("v4.2.10"), one byte short of the real 8-byte tag.
+        // Window cuts after the 7th tag byte ("v4.2.10"), one byte short of the real tag.
         let padding_len = REST_OF_LINE_WINDOW_BYTES - "# ".len() - (tag.len() - 1);
         let padding = " ".repeat(padding_len);
         let filler = "z".repeat(REST_OF_LINE_WINDOW_BYTES);
@@ -1555,12 +1443,8 @@ mod tests {
 
     #[test]
     fn test_comment_beyond_window_degrades_to_bare_sha_not_lost_within_window() {
-        // Code-review finding #2 on the #885 rework: sanity check that a `# <tag>`
-        // comment sitting entirely past the window is treated the same as "no
-        // comment" (degrades to a bare, commentless SHA pin) rather than panicking
-        // or misreading nearby bytes — the window is a documented, intentional
-        // limit (see `REST_OF_LINE_WINDOW_BYTES`'s doc comment), not a bug to patch
-        // around per call site.
+        // Finding #2 on #885: a comment sitting entirely past the window degrades to a
+        // bare SHA pin like "no comment", rather than panicking or misreading bytes.
         let sha = "a".repeat(40);
         let padding = " ".repeat(REST_OF_LINE_WINDOW_BYTES + 10);
         let content = format!("steps:\n  - uses: actions/checkout@{sha}{padding}# v4.2.0\n");
@@ -1571,29 +1455,20 @@ mod tests {
 
     #[test]
     fn test_build_dependency_rest_of_line_lookup_is_not_quadratic() {
-        // Direct regression test for the O(N^2) defect itself (issue #885),
-        // isolated from `yaml-rust2`'s own O(document length) tokenizing cost —
-        // a full end-to-end `parse_workflow_yaml` benchmark can't isolate this
-        // fix's effect from that unrelated, unavoidable baseline cost (an
-        // earlier version of this test measured ~1s just tokenizing an 8MB
-        // trailing YAML comment with *zero* ref-pinned dependencies present).
-        // `build_dependency` is private to this module, so this calls it
-        // directly with a synthetic candidate against one huge, newline-free
-        // "line" — exactly the shape the old `content[ref_end..].find('\n')`
-        // scanned to end-of-document on, once per call. The O(1)
-        // `line_table.line_start` lookup makes each call's cost independent of
-        // how much content follows on the line.
+        // Direct regression test for the O(N^2) defect itself (#885), isolated from
+        // `yaml-rust2`'s own O(document length) tokenizing cost, which an end-to-end
+        // benchmark can't isolate from (an earlier version measured ~1s just tokenizing
+        // an 8MB trailing comment with zero ref-pinned deps). Calls the private
+        // `build_dependency` directly against one huge, newline-free "line" — the shape
+        // the old unbounded `find('\n')` scanned to end-of-document on, once per call.
         let sha = "a".repeat(40);
         let filler = "x".repeat(8 * 1024 * 1024);
         let content = format!("uses: actions/checkout@{sha}{filler}");
         let line_table = LineOffsetTable::new(&content);
         let value = format!("actions/checkout@{sha}");
 
-        // `yaml_rust2::scanner::Marker` has no public constructor, so a real one — at
-        // exactly line 1, col `"uses: ".len()`, matching the synthetic candidate this test
-        // used to build by hand — is captured once via a short, cheap parse, entirely
-        // outside the loop below; `Marker` is `Copy`, so the same one is reused for every
-        // iteration.
+        // `Marker` has no public constructor, so a real one is captured once via a cheap
+        // parse outside the loop; `Marker` is `Copy`, so it's reused for every iteration.
         let marker = {
             struct FirstScalarMarker(Option<Marker>);
             impl MarkedEventReceiver for FirstScalarMarker {
@@ -1610,12 +1485,9 @@ mod tests {
             receiver.0.expect("marker for the uses: value scalar")
         };
 
-        // Iteration count halved from the original 2000 (finding #4/direction note):
-        // `REST_OF_LINE_WINDOW_BYTES` quadrupled from the original 1024, so each call
-        // now scans up to 4x as many bytes; keeping the wall-clock budget comparable
-        // while still swamping the old code's cost (which scanned the full 8MB tail
-        // per call, independent of iteration count) preserves a wide discrimination
-        // margin without flirting with the assertion's headroom under CI load.
+        // Iteration count halved from 2000 (finding #4) since `REST_OF_LINE_WINDOW_BYTES`
+        // quadrupled, keeping wall-clock budget comparable while still swamping the old
+        // code's per-call cost, which scanned the full 8MB tail regardless of iterations.
         let start = std::time::Instant::now();
         for _ in 0..1000 {
             let candidate = UsesCandidate::new(value.clone(), TScalarStyle::Plain, &marker);
@@ -1632,12 +1504,9 @@ mod tests {
     }
 
     // --- issue #898: comment-tag mis-attribution across sibling flow-mapping keys ---
-    //
-    // `extract_comment_tag` takes the first whitespace-preceded `#` anywhere in
-    // `rest_of_line`, with no notion of whether that `#` is genuinely the ref's own
-    // trailing comment or belongs to an unrelated later token on the same flow-style
-    // line. The fix gates the call on `is_last_on_line` (already computed for the #633
-    // guard) so a flow-style continuation is never misread as this ref's comment.
+    // `extract_comment_tag` can't tell this ref's own comment from an unrelated later
+    // token on a flow-style line; gating on `is_last_on_line` (already computed for #633)
+    // prevents a flow-style continuation from being misread as the comment.
 
     #[test]
     fn test_flow_style_sha_pin_trailing_comment_not_attributed_across_sibling_key() {
@@ -1721,13 +1590,9 @@ mod tests {
 
     #[test]
     fn test_flow_style_sha_pin_version_range_excludes_sibling_key_text() {
-        // End-to-end corruption-vector check for issue #898: every code action in this
-        // workspace writes its `TextEdit` scoped exactly to `version_range` (see
-        // `ecosystem::sha_pin_text_edit_for`/`deps_core::lsp_helpers::code_actions`'s
-        // `single_file_edit` calls). Proving `version_range` never extends past the
-        // ref's own text is therefore sufficient to prove no such edit could delete the
-        // sibling `with:` key's content — a wider integration test would need to
-        // replicate that same scoping rule to assert anything beyond this.
+        // End-to-end corruption check for #898: every code action scopes its `TextEdit`
+        // exactly to `version_range`, so proving it never extends past the ref's own text
+        // is sufficient to prove no edit could delete the sibling `with:` key's content.
         let sha = "a".repeat(40);
         let content =
             format!("steps:\n  - {{uses: actions/checkout@{sha}, with: {{node: 20}}}} # v4.2.0\n");
@@ -1741,12 +1606,9 @@ mod tests {
     }
 
     // --- issue #706: composite action.yml routing (parsing side) ---
-    //
-    // `WorkflowReceiver` is key-driven, not path-driven — it recognizes any `uses:`
-    // scalar not nested under `with:`, regardless of whether it sits under
-    // `jobs.*.steps` (a workflow) or `runs.steps` (a composite action). These tests
-    // confirm that already holds for `action.yml`'s own grammar; only routing
-    // (`ecosystem.rs`) needed a change to reach this parser with such a file.
+    // `WorkflowReceiver` is key-driven, not path-driven: it recognizes any `uses:` scalar
+    // not nested under `with:`, regardless of whether it sits under `jobs.*.steps` or
+    // `runs.steps`. These tests confirm that; only routing (`ecosystem.rs`) needed a change.
 
     fn action_test_uri() -> Url {
         deps_core::test_util::test_uri("/repo/.github/actions/my-action/action.yml")
@@ -1885,14 +1747,11 @@ mod tests {
     }
 
     // --- issue #879: yaml-rust2 block-scalar byte-offset drift ---
-    //
-    // Root cause: yaml-rust2 0.12.0's `Scanner::scan_block_scalar_content_line` advances
-    // `Marker::index()` by a content line's *byte* length, not its *char* count, once its
-    // internal 16-char lookahead buffer refills mid-line — every multi-byte char inside a
-    // block scalar (`|`/`>`) permanently desyncs `index()` for the rest of the document.
-    // These fixtures use content lines long enough (well over 16 chars around the
-    // multi-byte char) to force that refill — the actual trigger condition, not merely
-    // "any non-ASCII char present".
+    // Root cause: yaml-rust2 0.12.0's block-scalar scanner advances `Marker::index()` by
+    // byte length, not char count, once its 16-char lookahead buffer refills mid-line —
+    // any multi-byte char inside a block scalar permanently desyncs `index()` for the
+    // rest of the document. Fixtures use lines long enough to force that refill, the
+    // actual trigger, not merely "any non-ASCII char present".
 
     #[test]
     fn test_issue_879_literal_block_scalar_multibyte_then_uses_resolves() {

@@ -80,7 +80,6 @@ ruby '3.2.2'
 ",
     );
 
-    // Generate 50 regular dependencies
     for i in 0..50 {
         content.push_str(&format!("gem 'gem_{}', '~> {}.{}.0'\n", i, i % 10, i % 20));
     }
@@ -450,7 +449,6 @@ gem 'puma'
 fn bench_lockfile_sections(c: &mut Criterion) {
     let mut group = c.benchmark_group("lockfile_sections");
 
-    // GEM section only
     let gem_section = r"GEM
   remote: https://rubygems.org/
   specs:
@@ -465,7 +463,6 @@ BUNDLED WITH
    2.5.3
 ";
 
-    // GIT section
     let git_section = r"GIT
   remote: https://github.com/rails/rails.git
   revision: abc123def456
@@ -479,7 +476,6 @@ BUNDLED WITH
    2.5.3
 ";
 
-    // PATH section
     let path_section = r"PATH
   remote: ../local_gem
   specs:

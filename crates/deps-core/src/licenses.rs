@@ -310,7 +310,6 @@ pub const MAX_POM_LICENSE_NAME_RAW_CHARS: usize = 128;
 /// distinct from its plain `GPL-2.0` family — folding it into bare `GPL-2.0` would
 /// misclassify a permissively-usable (classpath-exception) artifact as plain copyleft.
 const KNOWN_POM_LICENSE_NAMES: &[(&str, &[&str])] = &[
-    // Apache-2.0
     ("The Apache Software License, Version 2.0", &["Apache-2.0"]),
     ("The Apache License, Version 2.0", &["Apache-2.0"]),
     ("Apache License, Version 2.0", &["Apache-2.0"]),
@@ -321,13 +320,12 @@ const KNOWN_POM_LICENSE_NAMES: &[(&str, &[&str])] = &[
     ("Apache 2", &["Apache-2.0"]),
     ("Apache-2.0 License", &["Apache-2.0"]),
     ("Apache-2.0", &["Apache-2.0"]),
-    // MIT
     ("MIT License", &["MIT"]),
     ("The MIT License", &["MIT"]),
     ("MIT License (MIT)", &["MIT"]),
     ("The MIT License (MIT)", &["MIT"]),
     ("MIT", &["MIT"]),
-    // BSD-3-Clause (Eclipse Distribution License is BSD-3-Clause under another name)
+    // Eclipse Distribution License is BSD-3-Clause under another name.
     ("BSD 3-Clause License", &["BSD-3-Clause"]),
     ("The BSD 3-Clause License", &["BSD-3-Clause"]),
     ("3-Clause BSD License", &["BSD-3-Clause"]),
@@ -341,13 +339,12 @@ const KNOWN_POM_LICENSE_NAMES: &[(&str, &[&str])] = &[
         &["BSD-3-Clause"],
     ),
     ("BSD-3-Clause", &["BSD-3-Clause"]),
-    // BSD-2-Clause
     ("BSD 2-Clause License", &["BSD-2-Clause"]),
     ("2-Clause BSD License", &["BSD-2-Clause"]),
     ("Simplified BSD License", &["BSD-2-Clause"]),
     ("BSD-2-Clause", &["BSD-2-Clause"]),
-    // GPL-2.0 (free text never disambiguates only/or-later — list both plus the
-    // deprecated bare id so either policy-config convention matches)
+    // Free text never disambiguates only/or-later — list both plus the deprecated bare id
+    // so either policy-config convention matches.
     (
         "GNU General Public License v2",
         &["GPL-2.0", "GPL-2.0-only", "GPL-2.0-or-later"],
@@ -367,15 +364,13 @@ const KNOWN_POM_LICENSE_NAMES: &[(&str, &[&str])] = &[
     ("GPLv2", &["GPL-2.0", "GPL-2.0-only", "GPL-2.0-or-later"]),
     ("GPL v2", &["GPL-2.0", "GPL-2.0-only", "GPL-2.0-or-later"]),
     ("GPL-2.0", &["GPL-2.0", "GPL-2.0-only", "GPL-2.0-or-later"]),
-    // GPL-2.0-with-classpath-exception — kept out of the plain GPL-2.0 family above
-    // (see the table doc comment); the bare SPDX id itself is handled by
-    // `normalize_pom_license_name`'s already-valid-id passthrough, not listed here.
+    // Kept out of the plain GPL-2.0 family above (see the table doc comment); the bare
+    // SPDX id is handled by `normalize_pom_license_name`'s valid-id passthrough instead.
     ("GPL2 w/ CPE", &["GPL-2.0-with-classpath-exception"]),
     (
         "GNU General Public License, version 2 (GPL2), with the classpath exception",
         &["GPL-2.0-with-classpath-exception"],
     ),
-    // GPL-3.0
     (
         "GNU General Public License v3",
         &["GPL-3.0", "GPL-3.0-only", "GPL-3.0-or-later"],
@@ -391,7 +386,6 @@ const KNOWN_POM_LICENSE_NAMES: &[(&str, &[&str])] = &[
     ("GPLv3", &["GPL-3.0", "GPL-3.0-only", "GPL-3.0-or-later"]),
     ("GPL v3", &["GPL-3.0", "GPL-3.0-only", "GPL-3.0-or-later"]),
     ("GPL-3.0", &["GPL-3.0", "GPL-3.0-only", "GPL-3.0-or-later"]),
-    // AGPL-3.0
     (
         "GNU Affero General Public License v3.0",
         &["AGPL-3.0", "AGPL-3.0-only", "AGPL-3.0-or-later"],
@@ -408,7 +402,6 @@ const KNOWN_POM_LICENSE_NAMES: &[(&str, &[&str])] = &[
         "AGPL-3.0",
         &["AGPL-3.0", "AGPL-3.0-only", "AGPL-3.0-or-later"],
     ),
-    // LGPL-2.1
     (
         "GNU Lesser General Public License v2.1",
         &["LGPL-2.1", "LGPL-2.1-only", "LGPL-2.1-or-later"],
@@ -429,7 +422,6 @@ const KNOWN_POM_LICENSE_NAMES: &[(&str, &[&str])] = &[
         "LGPL-2.1",
         &["LGPL-2.1", "LGPL-2.1-only", "LGPL-2.1-or-later"],
     ),
-    // LGPL-3.0
     (
         "GNU Lesser General Public License v3",
         &["LGPL-3.0", "LGPL-3.0-only", "LGPL-3.0-or-later"],
@@ -454,30 +446,25 @@ const KNOWN_POM_LICENSE_NAMES: &[(&str, &[&str])] = &[
         "LGPL-3.0",
         &["LGPL-3.0", "LGPL-3.0-only", "LGPL-3.0-or-later"],
     ),
-    // EPL-1.0
     ("Eclipse Public License - v 1.0", &["EPL-1.0"]),
     ("Eclipse Public License - Version 1.0", &["EPL-1.0"]),
     ("Eclipse Public License, Version 1.0", &["EPL-1.0"]),
     ("Eclipse Public License 1.0", &["EPL-1.0"]),
     ("Eclipse Public License v1.0", &["EPL-1.0"]),
     ("EPL-1.0", &["EPL-1.0"]),
-    // EPL-2.0
     ("Eclipse Public License - v 2.0", &["EPL-2.0"]),
     ("Eclipse Public License v. 2.0", &["EPL-2.0"]),
     ("Eclipse Public License v2.0", &["EPL-2.0"]),
     ("Eclipse Public License 2.0", &["EPL-2.0"]),
     ("EPL-2.0", &["EPL-2.0"]),
-    // MPL-2.0
     ("Mozilla Public License 2.0", &["MPL-2.0"]),
     ("Mozilla Public License Version 2.0", &["MPL-2.0"]),
     ("Mozilla Public License, Version 2.0", &["MPL-2.0"]),
     ("MPL 2.0", &["MPL-2.0"]),
     ("MPL-2.0", &["MPL-2.0"]),
-    // MPL-1.1
     ("Mozilla Public License 1.1", &["MPL-1.1"]),
     ("MPL 1.1", &["MPL-1.1"]),
     ("MPL-1.1", &["MPL-1.1"]),
-    // CDDL-1.0
     (
         "Common Development and Distribution License (CDDL) v1.0",
         &["CDDL-1.0"],
@@ -487,15 +474,12 @@ const KNOWN_POM_LICENSE_NAMES: &[(&str, &[&str])] = &[
         &["CDDL-1.0"],
     ),
     ("CDDL 1.0", &["CDDL-1.0"]),
-    // CDDL-1.1
     ("CDDL 1.1", &["CDDL-1.1"]),
-    // CDDL + GPL-2.0-with-classpath-exception dual license (see the table doc comment
-    // for why this maps to two ids, not one)
+    // Dual license, maps to two ids not one (see the table doc comment for why).
     (
         "CDDL + GPLv2 with classpath exception",
         &["CDDL-1.1", "GPL-2.0-with-classpath-exception"],
     ),
-    // ISC
     ("ISC License", &["ISC"]),
     ("ISC", &["ISC"]),
 ];

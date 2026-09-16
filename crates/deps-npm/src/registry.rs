@@ -541,10 +541,8 @@ impl NpmRegistry {
         let versions = self.get_versions(name).await?;
 
         if deps_core::is_existence_wildcard_str(req_str) {
-            // Rung 1 deliberately does not use the generic `is_stable()` (which now also
-            // accepts `AdvisoryDeprecated`, #347/#348): npm's own #338 NFR-002 wants a
-            // non-deprecated version preferred over a deprecated one whenever both exist,
-            // which is a ranking preference, not a resolvability question.
+            // Not the generic `is_stable()` (also accepts `AdvisoryDeprecated`): #338 NFR-002
+            // wants non-deprecated preferred over deprecated as a ranking, not resolvability.
             let idx =
                 deps_core::select_latest_for_existence(&versions, |v| v as &dyn deps_core::Version);
             return Ok(idx.and_then(|idx| versions.into_iter().nth(idx)));
@@ -587,13 +585,10 @@ impl NpmRegistry {
     /// ```
     #[tracing::instrument(skip_all, fields(query = ?query), level = "debug")]
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<NpmPackage>> {
-        // N-M3: an alternate registry never performs a package-*name* search. Today's
-        // routing never reaches this on a `WorkspaceDeclared` instance (`complete_package_names`
-        // always uses the root/`Public` instance, spec FR-011), but nothing else enforces
-        // that — and this method's own request would go through the **ungated** transport
-        // (`self.cache.get_cached`, below), bypassing FR-008's redirect-hop gating entirely
-        // if a future call site ever did reach it. Enforced here rather than relied on via
-        // the call graph (cf. "a gate before a match proves coverage of that function only").
+        // N-M3: an alternate registry never performs a package-*name* search. Nothing else
+        // enforces that today, and this method's request goes through the **ungated**
+        // transport below, bypassing FR-008's redirect-hop gating if a future caller reached
+        // it — so it's enforced here, not relied on via the call graph.
         if self.tier == NpmRegistryTier::WorkspaceDeclared {
             return Ok(Vec::new());
         }
@@ -644,7 +639,6 @@ fn deprecation_from_message(message: Option<&str>) -> Option<deps_core::Deprecat
 fn parse_package_metadata(data: &[u8]) -> Result<Vec<NpmVersion>> {
     let metadata: PackageMetadata = deps_core::parse_json_checked(data)?;
 
-    // Parse versions once and cache the parsed Version for sorting
     let mut versions_with_parsed: Vec<(NpmVersion, node_semver::Version)> = metadata
         .versions
         .into_iter()
@@ -662,10 +656,9 @@ fn parse_package_metadata(data: &[u8]) -> Result<Vec<NpmVersion>> {
         })
         .collect();
 
-    // Sort using already-parsed versions (newest first)
+    // Reversed cmp: newest first.
     versions_with_parsed.sort_unstable_by(|a, b| b.1.cmp(&a.1));
 
-    // Extract sorted versions
     Ok(versions_with_parsed.into_iter().map(|(v, _)| v).collect())
 }
 
@@ -895,20 +888,11 @@ impl deps_core::Registry for NpmRegistry {
         req: &deps_core::VersionReq,
     ) -> Option<usize> {
         if deps_core::is_existence_wildcard(req) {
-            // Existence/latest-for-display resolution (#338): prefer the newest
-            // non-flagged, non-prerelease version. Rung 2 (`!blocks_resolution()`) is where
-            // this ladder actually lands when rung 1 finds nothing: npm never produces
-            // `RemovalStatus::Yanked` (`types.rs` only maps `deprecated` via
-            // `from_advisory`, never a real yank), so `blocks_resolution()` is always
-            // `false` here and rung 2 always matches the very first (newest) entry. In
-            // practice this means: prefer the newest clean stable release; otherwise fall
-            // straight through to the newest release overall — deprecated, a prerelease, or
-            // both — rather than reporting "no version found" for a package that genuinely
-            // exists (#338 NFR-001). Mirrored by `get_latest_matching`'s identical wildcard
-            // branch above so the two never disagree. Hover (`deps-core`'s `generate_hover`)
-            // resolves "latest" through this exact method rather than re-deriving it with a
-            // different predicate, so hover and this ranking preference can never disagree
-            // either (#347/#348 S1).
+            // #338: prefer the newest non-flagged, non-prerelease version, falling through to
+            // the newest overall otherwise, rather than reporting "not found" for a package
+            // that exists. npm never produces `RemovalStatus::Yanked`, so rung 2
+            // (`!blocks_resolution()`) always matches the first (newest) entry here. Mirrors
+            // `get_latest_matching`'s wildcard branch so the two never disagree (#347/#348 S1).
             return deps_core::select_latest_for_existence(versions, |v| v.as_ref());
         }
         let req_str = req.as_str();
@@ -962,11 +946,9 @@ mod tests {
         assert!(!url.contains(']'));
     }
 
-    // #758: the plain (unscoped) newline/autolink/percent hostile-payload case is now covered
-    // universally by deps-lsp's `test_registered_ecosystems_universal_invariants` (Layer 1),
-    // via `deps_core::conformance::HOSTILE_DISPLAY_LINK_PAYLOAD` — this crate's own copy of
-    // that case is redundant. The scoped-name variant below stays: Layer 1 only exercises a
-    // plain name, not `@scope/pkg`'s split-and-reassemble path.
+    // #758: the plain (unscoped) case is now covered universally by deps-lsp's
+    // `test_registered_ecosystems_universal_invariants` (Layer 1). The scoped variant below
+    // stays: Layer 1 doesn't exercise `@scope/pkg`'s split-and-reassemble path.
     #[test]
     fn test_package_url_scoped_encodes_newline_and_percent() {
         let url = package_url("@evil\n<%/pkg");
@@ -1086,10 +1068,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_versions_rejects_bare_dot_dot_as_not_found() {
-        // #365 R1: asserts the exact `PackageNotFound` variant (gate rejected before any
-        // request), not the broader `is_not_found()` (also true for a live 404 `HttpStatus`)
-        // — registry.npmjs.org 404ing for this path today would make a deleted gate go
-        // undetected by this test.
+        // #365 R1: the exact `PackageNotFound` variant, not the broader `is_not_found()` —
+        // a live 404 would let a deleted gate go undetected by this test.
         let registry = NpmRegistry::new(Arc::new(HttpCache::new()));
         let err = registry.get_versions("..").await.unwrap_err();
         assert_matches!(err, DepsError::PackageNotFound { .. });
@@ -1208,8 +1188,7 @@ mod tests {
         assert_eq!(packages[0].description, None);
     }
 
-    // #758: the shared JSON-nesting-depth cap, replacing
-    // test_parse_search_response_nesting_at_max_depth_accepted/_over_max_depth_rejected.
+    // #758: the shared JSON-nesting-depth cap, replacing two hand-written tests.
     deps_core::json_depth_conformance! {
         mod npm_json_depth_conformance;
         parse: |bytes: &[u8]| parse_search_response(bytes);
@@ -1218,9 +1197,7 @@ mod tests {
 
     #[test]
     fn test_parse_abbreviated_packument() {
-        // Realistic shape of `Accept: application/vnd.npm.install-v1+json`
-        // response (captured live from `registry.npmjs.org/left-pad`):
-        // no README/changelog, per-version `dist`/`devDependencies` kept.
+        // Realistic abbreviated-packument shape, captured live from left-pad.
         let json = r#"{
   "name": "left-pad",
   "dist-tags": {
@@ -1842,8 +1819,7 @@ mod tests {
             times.get("2.0.0").copied(),
             PublishTime::parse_rfc3339("2020-06-15T12:00:00.000Z")
         );
-        // created/modified are pseudo-entries, never a real version string, so the
-        // known-versions filter (security S-2) drops them even though they parse fine.
+        // created/modified are pseudo-entries; the known-versions filter (S-2) drops them.
         assert!(!times.contains_key("created"));
         assert!(!times.contains_key("modified"));
     }
@@ -1864,12 +1840,11 @@ mod tests {
 
     #[test]
     fn test_parse_package_times_object_valued_unpublished_does_not_error() {
-        // Live-verified shape (Finding E): a fully-unpublished package's `time.unpublished`
-        // is an object, not a string. Typing the field `HashMap<String, String>` would fail
-        // deserialization of the whole document; `serde_json::Value` + `.as_str()` tolerates
-        // it by simply excluding that one entry from the map. `"unpublished"` is included in
-        // `known` here specifically to prove exclusion is due to the non-string value, not
-        // the known-versions filter.
+        // Live-verified (Finding E): a fully-unpublished package's `time.unpublished` is an
+        // object, not a string — typing the field as `HashMap<String, String>` would fail
+        // deserialization of the whole document, so `serde_json::Value` + `.as_str()`
+        // tolerates it by excluding that entry. `"unpublished"` is in `known` to prove
+        // exclusion is due to the non-string value, not the known-versions filter.
         let json = r#"{"time": {
             "1.0.0": "2015-01-02T00:00:00.000Z",
             "unpublished": {"time": "2016-03-28T22:22:57.991Z", "versions": ["1.0.0"]}
@@ -1936,13 +1911,10 @@ mod tests {
 
     #[test]
     fn test_publish_times_stale_never_reads_map_contents() {
-        // The flagship S1 regression guard: a top-8 version permanently absent from the
-        // cached map (simulated here by an empty `times`) must NOT make the predicate stale
-        // as long as the top-8 *set* is unchanged and the TTL hasn't expired — otherwise a
-        // version genuinely absent from the registry's `time` field would refetch on every
-        // call forever. `cached_times` always builds an empty `times` map, so every
-        // `publish_times_stale` call in this test file already exercises this by
-        // construction; this test makes the property explicit.
+        // S1 regression guard: a top-8 version permanently absent from the cached map
+        // (empty `times` here) must NOT make the predicate stale while the top-8 set is
+        // unchanged and TTL hasn't expired — otherwise a version absent from the registry's
+        // `time` field would refetch forever.
         let cached = cached_times(&["9.0.0-missing", "1.0.0"]);
         assert!(cached.times.is_empty());
         let current = vec!["9.0.0-missing".to_string(), "1.0.0".to_string()];
@@ -2003,9 +1975,8 @@ mod tests {
 
     // --- publish_times: cache-hit path via directly-manipulated cache state ---
     //
-    // Pre-seeding `publish_times` with a fresh, matching entry exercises the cache-hit
-    // branch without a real network fetch. The miss/refetch path is exercised end-to-end via
-    // `mockito` below, using `with_public_base_for_test`.
+    // Pre-seeded entry exercises the cache-hit branch without network; miss/refetch is
+    // covered end-to-end via mockito below.
 
     #[tokio::test]
     async fn test_publish_times_cache_hit_returns_same_arc_without_refetch() {
@@ -2061,9 +2032,8 @@ mod tests {
     #[tokio::test]
     async fn test_publish_times_end_to_end_missing_version_causes_exactly_one_fetch_across_repeated_calls()
      {
-        // The flagship S1 regression guard (plan §5): a top-8 version permanently absent
-        // from `time` (simulated here — it is simply never in the mocked body) must not
-        // cause a refetch on every call. Mock hit count must stay at 1 across 10 calls.
+        // S1 regression guard (plan §5): a top-8 version permanently absent from `time`
+        // must not cause a refetch on every call — mock hit count stays at 1 across 10 calls.
         let mut server = mockito::Server::new_async().await;
         let base = server.url();
         let registry = NpmRegistry::with_public_base_for_test(Arc::new(HttpCache::new()), base);
@@ -2102,9 +2072,8 @@ mod tests {
         let base = server.url();
         let registry = NpmRegistry::with_public_base_for_test(Arc::new(HttpCache::new()), base);
 
-        // Pre-seed a fresh, cached entry for an *old* top8 — the fetch below must happen
-        // exactly once, triggered by the top8 mismatch, never by TTL expiry (fetched_at is
-        // `now`, well inside the TTL).
+        // Pre-seed a fresh entry for an *old* top8 — the fetch below must happen exactly
+        // once, triggered by the top8 mismatch, never by TTL expiry.
         registry.publish_times.insert(
             "widget".to_string(),
             CachedTimes {
@@ -2236,10 +2205,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_versions_with_covers_version_outside_top8_window() {
-        // Regression guard: the retention filter passed to `fetch_publish_times` /
-        // `parse_package_times` must be the package's full version list, not just the
-        // top-8 slice used for TTL invalidation — otherwise npm silently regains the
-        // NuGet-style "only the newest ~8 versions get an age" tail gap.
+        // Regression guard: the retention filter must be the package's full version list,
+        // not just the top-8 TTL-invalidation slice — else npm regains NuGet's tail gap.
         use deps_core::{FreshnessSettings, PackageName, Registry};
 
         let mut server = mockito::Server::new_async().await;
@@ -2291,9 +2258,8 @@ mod tests {
         full_mock.assert_async().await;
     }
 
-    // --- #312: NpmRegistry::clone shares the publish_times cache and HttpCache, the
-    // mechanism DenoRegistry::with_npm relies on to dedupe the freshness-path
-    // full-packument fetch for a package appearing in both package.json and deno.json ---
+    // --- #312: clone shares publish_times/HttpCache, which DenoRegistry::with_npm relies
+    // on to dedupe the full-packument fetch for a package in both package.json and deno.json ---
 
     #[tokio::test]
     async fn test_clone_shares_publish_times_cache_avoiding_duplicate_full_packument_fetch() {
@@ -2330,9 +2296,8 @@ mod tests {
         .unwrap();
         assert!(first[0].published_at().is_some());
 
-        // A clone — standing in for a second ecosystem instance (e.g. DenoRegistry::npm)
-        // sharing this NpmRegistry — must reuse the cached publish-time map rather than
-        // refetching the full packument.
+        // A clone, standing in for a second ecosystem instance (e.g. DenoRegistry::npm),
+        // must reuse the cached publish-time map rather than refetching.
         let second = Registry::get_versions_with(
             &shared,
             &PackageName::new("widget"),
@@ -2668,9 +2633,8 @@ mod tests {
         assert!(registry.alternate_client(overflow.as_str()).is_none());
     }
 
-    // Issue #824: `validate_index_url` rejects userinfo but preserves the query string, so
-    // a validated `NpmRegistryIndex` can still carry `?_authToken=...`. The cap-reached warn
-    // must log through `RedactedUrl`, not the raw index string.
+    // #824: a validated `NpmRegistryIndex` can still carry `?_authToken=...` (userinfo is
+    // rejected, the query string is not) — the cap-reached warn must redact it.
     #[test]
     fn test_register_alternate_redacts_query_credential_on_cap_reached() {
         let cache = Arc::new(HttpCache::new());

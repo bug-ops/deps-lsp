@@ -59,7 +59,6 @@ impl RegistryProgress {
     ) -> Result<(Self, ProgressSender)> {
         let token = ProgressToken::String(format!("deps-fetch-{}", uri));
 
-        // Request progress token creation (blocking request to client)
         client
             .send_request::<tower_lsp_server::ls_types::request::WorkDoneProgressCreate>(
                 tower_lsp_server::ls_types::WorkDoneProgressCreateParams {
@@ -68,7 +67,6 @@ impl RegistryProgress {
             )
             .await?;
 
-        // Send begin notification
         client
             .send_notification::<tower_lsp_server::ls_types::notification::Progress>(
                 ProgressParams {
@@ -87,7 +85,6 @@ impl RegistryProgress {
 
         let (sender, rx) = deps_engine::progress::channel(total_deps);
 
-        // Spawn consumer task that drains the channel and sends LSP notifications
         let consumer_client = client.clone();
         let consumer_token = token.clone();
         let consumer_handle = tokio::spawn(async move {
@@ -113,7 +110,7 @@ impl RegistryProgress {
 
         self.active = false;
 
-        // Abort the consumer task — remaining updates are irrelevant after end
+        // Remaining updates are irrelevant after end.
         self._consumer_handle.abort();
 
         let message = if success {

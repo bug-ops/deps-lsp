@@ -47,7 +47,6 @@ fn test_fixture_complex_pom() {
     // 6 regular deps + 1 from dependencyManagement + 2 plugins
     assert!(result.dependencies.len() >= 8);
 
-    // Properties parsed
     assert_eq!(
         result.properties.get("java.version"),
         Some(&"17".to_string())
@@ -57,7 +56,6 @@ fn test_fixture_complex_pom() {
         Some(&"3.2.0".to_string())
     );
 
-    // Scope variety
     let scopes: Vec<_> = result.dependencies.iter().map(|d| &d.scope).collect();
     assert!(scopes.iter().any(|s| matches!(s, MavenScope::Test)));
     assert!(scopes.iter().any(|s| matches!(s, MavenScope::Runtime)));
@@ -77,7 +75,6 @@ fn test_fixture_property_versions() {
     let content = load_fixture("property_versions.xml");
     let result = parse_pom_xml(&content, &fixture_uri("property_versions.xml")).unwrap();
     assert_eq!(result.dependencies.len(), 2);
-    // Property references resolved from <properties> section
     assert_eq!(result.dependencies[0].version_req, Some("3.14.0".into()));
     assert_eq!(
         result.dependencies[1].version_req,

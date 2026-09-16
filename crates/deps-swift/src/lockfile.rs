@@ -397,7 +397,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_v1_fallback_to_package_name_when_url_has_no_identity() {
-        // URL with single path segment → url_to_identity returns None → fallback to package field
         let content = r#"{
   "object": {
     "pins": [

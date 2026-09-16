@@ -56,12 +56,9 @@ pub struct SwiftVersion {
     pub prerelease: bool,
 }
 
-// `prerelease` is threaded from the single semver parse `tags_to_versions`
-// already performs and discards, instead of re-parsing `version` on every
-// `is_prerelease()` call (#327 M5). GitHub release tags are parsed as strict
-// semver (the `v` prefix already stripped) there, so this reflects a
-// reliable `pre` component instead of falling back to deps-core's default
-// hyphen-substring heuristic (#322).
+// Threaded from the semver parse `tags_to_versions` already performs, instead of
+// re-parsing on every call (#327 M5) — reflects the real `pre` component rather than
+// deps-core's default hyphen-substring heuristic (#322).
 deps_core::impl_version!(SwiftVersion {
     version: version,
     status: |v: &SwiftVersion| deps_core::RemovalStatus::from_yanked(v.yanked),

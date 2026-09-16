@@ -893,7 +893,6 @@ mod tests {
     use crate::ConcreteVersion;
     use crate::position::{Position, Range};
 
-    // Test structs
     #[derive(Debug, Clone)]
     struct TestDependency {
         name: crate::PackageName,
@@ -953,7 +952,6 @@ mod tests {
         uri: url::Url,
     }
 
-    // Apply macros
     impl_dependency!(TestDependency {
         name: name,
         name_range: name_range,

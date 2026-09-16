@@ -151,7 +151,6 @@ pub fn parse_groovy_dsl(content: &str, uri: &Url) -> Result<GradleParseResult> {
         let line_u32 = line_idx as u32;
         let mut matched_positions: Vec<usize> = Vec::new();
 
-        // Pattern 1: with parens and version
         extract_matches(
             &RE_WITH_PARENS,
             line,
@@ -162,7 +161,6 @@ pub fn parse_groovy_dsl(content: &str, uri: &Url) -> Result<GradleParseResult> {
             &mut budget,
         );
 
-        // Pattern 2: without parens and with version
         extract_matches(
             &RE_WITHOUT_PARENS,
             line,
@@ -173,7 +171,6 @@ pub fn parse_groovy_dsl(content: &str, uri: &Url) -> Result<GradleParseResult> {
             &mut budget,
         );
 
-        // Pattern 3: with parens, no version
         extract_matches(
             &RE_NO_VERSION_WITH_PARENS,
             line,
@@ -184,7 +181,6 @@ pub fn parse_groovy_dsl(content: &str, uri: &Url) -> Result<GradleParseResult> {
             &mut budget,
         );
 
-        // Pattern 4: without parens, no version
         extract_matches(
             &RE_NO_VERSION_WITHOUT_PARENS,
             line,
@@ -195,7 +191,6 @@ pub fn parse_groovy_dsl(content: &str, uri: &Url) -> Result<GradleParseResult> {
             &mut budget,
         );
 
-        // Pattern 5: platform()/enforcedPlatform()-wrapped BOM coordinate, with parens, with version
         extract_matches(
             &RE_PLATFORM_WITH_PARENS,
             line,
@@ -206,7 +201,6 @@ pub fn parse_groovy_dsl(content: &str, uri: &Url) -> Result<GradleParseResult> {
             &mut budget,
         );
 
-        // Pattern 6: same, without parens around the configuration call
         extract_matches(
             &RE_PLATFORM_WITHOUT_PARENS,
             line,
@@ -217,7 +211,6 @@ pub fn parse_groovy_dsl(content: &str, uri: &Url) -> Result<GradleParseResult> {
             &mut budget,
         );
 
-        // Pattern 7: platform()/enforcedPlatform()-wrapped BOM coordinate, with parens, no version
         extract_matches(
             &RE_PLATFORM_NO_VERSION_WITH_PARENS,
             line,
@@ -228,7 +221,6 @@ pub fn parse_groovy_dsl(content: &str, uri: &Url) -> Result<GradleParseResult> {
             &mut budget,
         );
 
-        // Pattern 8: same, without parens around the configuration call
         extract_matches(
             &RE_PLATFORM_NO_VERSION_WITHOUT_PARENS,
             line,

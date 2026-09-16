@@ -164,30 +164,24 @@ fn parse_package_lock_json_content(content: String) -> Result<ResolvedPackages> 
     let mut packages = ResolvedPackages::new();
 
     for (key, entry) in lock_data.packages {
-        // Skip root package (empty key)
         if key.is_empty() {
             continue;
         }
 
-        // Prefer the entry's own `name` (npm writes this when it differs from the
-        // physical install path — always the case for an `npm:` alias, issue #654)
-        // over the key-derived basename, so an aliased dependency's lock-file entry
-        // groups under its real registry name, matching `Dependency::name()`.
+        // Prefer the entry's own `name` over the key-derived basename (npm writes it when it
+        // differs, e.g. an `npm:` alias, issue #654), so this groups under the real registry
+        // name, matching `Dependency::name()`.
         let name = entry
             .name
             .clone()
             .unwrap_or_else(|| extract_package_name(&key).to_string());
 
-        // Version is required for actual dependencies
         let Some(ref version) = entry.version else {
             tracing::debug!("Skipping package '{}' with no version", name);
             continue;
         };
 
-        // Parse source based on link, resolved, and integrity fields
         let source = parse_npm_source(&entry);
-
-        // Extract dependency names
         let dependencies: Vec<String> = entry.dependencies.keys().cloned().collect();
 
         packages.insert(
@@ -219,11 +213,8 @@ const MIN_PNPM_LOCKFILE_MAJOR_VERSION: u32 = 6;
 async fn parse_pnpm_lock(lockfile_path: &Path) -> Result<ResolvedPackages> {
     tracing::debug!("Parsing pnpm-lock.yaml: {}", lockfile_path.display());
 
-    // NFR-001: the nesting/expansion guards and the YAML parse itself are CPU-bound work on
-    // already-read, untrusted content — `read_and_parse_lockfile` runs `parse_pnpm_lock_yaml`
-    // on the blocking-thread pool (mirrors `read_lockfile_content`'s own `spawn_blocking` for
-    // the file read) rather than on the calling tokio worker, so a large `pnpm-lock.yaml` near
-    // the 32 MiB cap can't stall the async executor.
+    // NFR-001: `read_and_parse_lockfile` runs `parse_pnpm_lock_yaml` on the blocking-thread
+    // pool, not the calling tokio worker, so a large `pnpm-lock.yaml` can't stall the executor.
     let packages = read_and_parse_lockfile(lockfile_path, "pnpm-lock.yaml", |content| {
         parse_pnpm_lock_yaml(&content)
     })
@@ -263,11 +254,8 @@ fn parse_pnpm_lock_yaml(content: &str) -> Result<ResolvedPackages> {
         return Ok(ResolvedPackages::new());
     };
 
-    // FR-006/L4: an absent or explicit-null `lockfileVersion` is permitted (matches
-    // `catalog.rs`'s `Yaml::BadValue | Yaml::Null` "absent" convention) — but once the key is
-    // present with any other shape, it must resolve to a supported version or the file is
-    // rejected outright, rather than silently treating a non-scalar value (e.g. a nested
-    // mapping) the same as "absent".
+    // FR-006/L4: absent/null `lockfileVersion` is permitted (mirrors catalog.rs's convention),
+    // but once present with any other shape it must resolve to a supported version or reject.
     match &doc["lockfileVersion"] {
         Yaml::BadValue | Yaml::Null => {}
         node => {
@@ -304,9 +292,8 @@ fn parse_pnpm_lock_yaml(content: &str) -> Result<ResolvedPackages> {
                 let Some(importer_key) = name.as_str() else {
                     continue;
                 };
-                // `yaml_scalar_string` coerces an unquoted, numeric-looking `version` (e.g.
-                // `version: 1.0`, parsed as `Yaml::Real`) the same way the `lockfileVersion`
-                // gate above does — `as_str()` alone would silently drop such an entry.
+                // Coerces an unquoted numeric `version` (parsed as `Yaml::Real`) same as the
+                // `lockfileVersion` gate above — plain `as_str()` would silently drop it.
                 let Some(raw_version) = yaml_scalar_string(&entry["version"]) else {
                     tracing::debug!(
                         "Skipping pnpm entry '{importer_key}' with missing or non-scalar version field"
@@ -321,10 +308,8 @@ fn parse_pnpm_lock_yaml(content: &str) -> Result<ResolvedPackages> {
                 let (name, version) =
                     resolve_pnpm_entry_name_and_version(importer_key, &raw_version);
 
-                // S2: anything that isn't a semver-shaped resolution (`file:...`, `git+...`, a
-                // bare tarball URL, `workspace:...`, a malformed value) must not be stored as a
-                // fake "resolved version" — it would otherwise flow verbatim into hover text and
-                // OSV vulnerability-lookup queries.
+                // S2: a non-semver resolution (`file:`, `git+`, a tarball URL, `workspace:`)
+                // must not be stored as a fake version — it would leak into hover/OSV queries.
                 if node_semver::Version::parse(version).is_err() {
                     tracing::debug!(
                         "Skipping pnpm entry '{name}' with non-semver version '{version}'"
@@ -393,7 +378,6 @@ fn strip_peer_suffix(version: &str) -> &str {
 /// - `"node_modules/@babel/core"` → `"@babel/core"`
 /// - `"node_modules/express/node_modules/debug"` → `"debug"`
 fn extract_package_name(key: &str) -> &str {
-    // Find the last occurrence of "node_modules/"
     key.rsplit("node_modules/").next().unwrap_or(key)
 }
 
@@ -406,16 +390,13 @@ fn extract_package_name(key: &str) -> &str {
 /// - `resolved` git URL → Git
 /// - No `resolved` → Path (workspace dependency)
 fn parse_npm_source(entry: &PackageEntry) -> ResolvedSource {
-    // Local packages (link: true)
     if entry.link == Some(true) {
         return ResolvedSource::Path {
             path: String::new(),
         };
     }
 
-    // Parse resolved URL
     if let Some(resolved_url) = &entry.resolved {
-        // Git sources (various formats)
         if resolved_url.starts_with("git+")
             || resolved_url.starts_with("git://")
             || resolved_url.contains("github.com")
@@ -424,7 +405,6 @@ fn parse_npm_source(entry: &PackageEntry) -> ResolvedSource {
             return parse_git_source(resolved_url);
         }
 
-        // Registry source with integrity
         if let Some(integrity) = &entry.integrity {
             return ResolvedSource::Registry {
                 url: resolved_url.clone(),
@@ -432,14 +412,13 @@ fn parse_npm_source(entry: &PackageEntry) -> ResolvedSource {
             };
         }
 
-        // Registry without integrity (shouldn't happen in v2+, but handle it)
+        // Fallback: shouldn't happen in v2+, but handle it.
         return ResolvedSource::Registry {
             url: resolved_url.clone(),
             checksum: String::new(),
         };
     }
 
-    // No resolved URL means local/workspace dependency
     ResolvedSource::Path {
         path: String::new(),
     }
@@ -456,11 +435,9 @@ fn parse_npm_source(entry: &PackageEntry) -> ResolvedSource {
 // char boundaries.
 #[allow(clippy::string_slice)]
 fn parse_git_source(url: &str) -> ResolvedSource {
-    // Try to extract commit hash from URL
     let (clean_url, rev) = if let Some((base, hash)) = url.split_once('#') {
         (base.to_string(), hash.to_string())
     } else if url.contains("/tarball/") {
-        // GitHub tarball URL: .../tarball/commitish
         if let Some(idx) = url.rfind("/tarball/") {
             let base = &url[..idx];
             let hash = &url[idx + 9..]; // len("/tarball/") = 9
@@ -472,7 +449,6 @@ fn parse_git_source(url: &str) -> ResolvedSource {
         (url.to_string(), String::new())
     };
 
-    // Remove git+ prefix if present
     let clean_url = clean_url
         .strip_prefix("git+")
         .unwrap_or(&clean_url)
@@ -594,9 +570,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_simple_package_lock() {
-        // Held per `deps_core::fs_probe::snapshot_guard`'s doc: `parse_lockfile` transitively
-        // touches fs_probe, and this test runs in the same binary as `deps-npm/src/config.rs`'s
-        // diffing test.
+        // `parse_lockfile` transitively touches fs_probe; shares a binary with config.rs's
+        // diffing test (snapshot_guard).
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let lockfile_content = r#"{
   "name": "my-project",
@@ -826,14 +801,10 @@ mod tests {
         assert!(parser.parse_lockfile(&lockfile_path).await.is_err());
     }
 
-    // #758: shared `LockFileProvider` conformance, replacing test_locate_lockfile_same_directory,
-    // test_locate_lockfile_not_found, and test_parse_malformed_package_lock.
-    // test_locate_lockfile_workspace_root, test_locate_lockfile_prefers_package_lock_json_over_pnpm,
-    // test_locate_lockfile_falls_back_to_pnpm_when_no_package_lock, and
-    // test_parse_pnpm_lock_malformed_yaml_is_parse_error stay hand-written: the macro's
-    // malformed-content check only exercises LOCKFILES[0] (package-lock.json's JSON parser), so
-    // pnpm-lock.yaml's own (YAML) malformed-parsing path needs its own test, and the
-    // multi-lockfile precedence/ancestor-search scenarios aren't covered by the macro either.
+    // #758: shared `LockFileProvider` conformance. Several tests below stay hand-written: the
+    // macro's malformed-content check only exercises LOCKFILES[0] (package-lock.json's JSON
+    // parser), so pnpm-lock.yaml's own YAML parsing path and the multi-lockfile precedence/
+    // ancestor-search scenarios need their own tests.
     deps_core::lockfile_conformance! {
         mod npm_lockfile_conformance;
         build: NpmLockParser;
@@ -847,9 +818,8 @@ mod tests {
 
     #[test]
     fn test_locate_lockfile_workspace_root() {
-        // Held per `deps_core::fs_probe::snapshot_guard`'s doc: `locate_lockfile` transitively
-        // touches fs_probe (via `fs_probe::is_file`), and this test runs in the same binary as
-        // `deps-npm/src/config.rs`'s diffing test.
+        // `locate_lockfile` transitively touches fs_probe (via `is_file`); shares a binary
+        // with config.rs's diffing test (snapshot_guard).
         let _guard = deps_core::fs_probe::snapshot_guard();
         let temp_dir = tempfile::tempdir().unwrap();
         let workspace_lock = temp_dir.path().join("package-lock.json");

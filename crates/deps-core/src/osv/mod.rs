@@ -201,10 +201,8 @@ impl OsvClient {
             return HashMap::new();
         }
 
-        // Use `display_version`, not `version`: `version` is OSV's wire
-        // spelling (e.g. Go's `v`-prefix stripped), while the version
-        // surfaced back to the user via `UpgradeStatus` must stay in the
-        // ecosystem-native spelling (see `ScanTarget`'s doc).
+        // `display_version`, not `version`: the latter is OSV's wire spelling (e.g. Go's
+        // `v`-prefix stripped), but `UpgradeStatus` must surface the ecosystem-native one.
         let versions: HashMap<&str, &str> = candidates
             .iter()
             .map(|c| (c.key.as_str(), c.display_version.as_str()))
@@ -422,12 +420,9 @@ impl OsvClient {
         let budget = MAX_TRUNCATED_REQUERY_BUDGET.min(truncated.len());
         let (to_recover, exhausted) = truncated.split_at(budget);
 
-        // Cloned (not borrowed) targets: a closure borrowing both `self` and
-        // an element from `truncated`'s slice inside `stream::map` triggers
-        // a higher-ranked-lifetime inference failure ("implementation of
-        // `FnOnce` is not general enough") once this future is nested inside
-        // an outer `tokio::spawn`, as `fetch_records` already learned to
-        // avoid via `.cloned()`.
+        // Cloned, not borrowed: a closure borrowing both `self` and a `truncated` slice
+        // element triggers a higher-ranked-lifetime inference failure once nested inside an
+        // outer `tokio::spawn` — `fetch_records` hit the same issue and fixed it with `.cloned()`.
         let recovered: Vec<(String, ScanOutcome)> = stream::iter(to_recover.iter().cloned())
             .map(|target| async move {
                 let outcome = match self.query_single(osv_eco, &target).await {
@@ -836,11 +831,8 @@ mod tests {
 
     #[tokio::test]
     async fn scan_deeply_nested_batch_json_skips_whole_chunk() {
-        // #430 hardening: a `database_specific`/`ecosystem_specific`-shaped
-        // deeply nested array must be rejected by the depth guard before
-        // `serde_json::from_slice` ever sees it, degrading like any other
-        // malformed response — an earlier, cheaper rejection than
-        // `serde_json`'s own built-in recursion limit would give.
+        // #430: a deeply nested array must be rejected by the depth guard before
+        // `serde_json::from_slice` sees it — cheaper than relying on serde_json's own limit.
         let (mut server, client) = mock_client().await;
         let deeply_nested = format!(
             "{}1{}",
@@ -1062,13 +1054,10 @@ mod tests {
             .with_body(r#"{"results":[{"vulns":[{"id":"RUSTSEC-2020-0071","modified":"2023-01-01T00:00:00Z"}]}]}"#)
             .create_async()
             .await;
-        // Real shape of RUSTSEC-2020-0071's `affected[].ranges` per
-        // architecture.md §6: 8 `fixed` events spread across several
-        // ranges (one per patched branch), deliberately out of order in the
-        // JSON so a "take the last event, no sort" bug would still pass a
-        // trivially-ordered 2-event fixture but fails this one. First `fixed`
-        // in document order is `0.2.0`; the highest (the real guidance) is
-        // `0.2.23`.
+        // Real shape of RUSTSEC-2020-0071's `affected[].ranges` (architecture.md §6): 8
+        // `fixed` events across several ranges, deliberately out of order so a "take the
+        // last event, no sort" bug wouldn't be caught by a trivially-ordered fixture. First
+        // `fixed` in document order is `0.2.0`; the highest (real guidance) is `0.2.23`.
         let _record = server
             .mock("GET", "/v1/vulns/RUSTSEC-2020-0071")
             .with_status(200)
@@ -1273,11 +1262,8 @@ mod tests {
 
     #[tokio::test]
     async fn check_candidates_uses_display_version_not_wire_version() {
-        // S1 regression guard: `ScanTarget.version` is the OSV wire spelling
-        // (e.g. Go's "v" prefix stripped), but `UpgradeStatus` is rendered
-        // back to the user (hover's "Latest version {} is also affected") —
-        // it must carry `display_version`, the ecosystem-native spelling,
-        // never the wire one.
+        // S1 regression guard: `ScanTarget.version` is the OSV wire spelling, but
+        // `UpgradeStatus` is rendered to the user and must carry `display_version` instead.
         let (mut server, client) = mock_client().await;
         let _batch = server
             .mock("POST", "/v1/querybatch")
@@ -1362,7 +1348,6 @@ mod tests {
         let (mut server, client) = mock_client().await;
         let t = target("pkg", "1.0.0");
 
-        // Pre-populate the cache with an entry older than QUERY_CACHE_TTL.
         client.query_cache.insert(
             ("npm", t.osv_name.clone(), t.version.clone()),
             QueryCacheEntry {
@@ -1390,7 +1375,6 @@ mod tests {
     async fn record_cache_newer_modified_invalidates_and_refetches() {
         let (mut server, client) = mock_client().await;
 
-        // Pre-populate record_cache with a stale `modified` timestamp.
         client.record_cache.insert(
             "ADV-1".to_string(),
             RecordCacheEntry {

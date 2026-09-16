@@ -58,35 +58,19 @@ fn is_snapshot(requirement: &str) -> bool {
 /// for the "loose satisfies" question this function answers). Reordering the branches here
 /// must be checked against `compile_requirement`'s branch order and guard placement too.
 fn gradle_version_matches(version: &str, requirement: &str) -> bool {
-    // Checked on the raw string *before* stripping the `!!` marker: an unresolved
-    // Gradle variable reference can appear in the `strictlyVersion` half (e.g.
-    // `${r}!!1.7.25`), and stripping first would discard the `$` along with it,
-    // silently treating an unresolved requirement as a concrete one to compare.
-    //
-    // Deliberate, harmless asymmetry with `compile_requirement` below, which has no
-    // equivalent raw-string check: `strip_strict_marker` already returns the
-    // `strictlyVersion` half with any `$` intact, so the post-strip `is_unresolved`
-    // check a few lines down covers the same case on its own — this raw-string check
-    // is pure defense-in-depth for a caller of this loose matcher standalone. Its
-    // only observable effect is over-permissive, never under-permissive: a
-    // `preferredVersion` half containing an unresolved variable (e.g.
-    // `[1.7,1.8[!!${r}`) makes this function report "satisfied" for every version,
-    // including ones outside the strict range, whereas `compile_requirement`'s
-    // matcher (no raw-string check, and never reached with such a requirement in
-    // production since `requirement_is_unsatisfiable` gates on the raw-string
-    // `requirement_is_unresolved` first) would correctly reject an out-of-range
-    // version. Never produces a false "outdated" badge or a spurious edit, so this
-    // is not a bug — just don't "fix" the two functions back into lockstep by
-    // deleting this check without checking C3's post-strip coverage still holds.
+    // Checked on the raw string before stripping `!!`: an unresolved variable can appear in the
+    // strictlyVersion half (e.g. `${r}!!1.7.25`), and stripping first would discard the `$`.
+    // Deliberate, harmless asymmetry with `compile_requirement`, which has no equivalent
+    // raw-string check and relies on the post-strip check below instead: this makes the loose
+    // matcher over-permissive (never under-permissive) when the *preferred* half alone is
+    // unresolved, which never produces a false "outdated" badge — don't remove this without
+    // re-checking C3's post-strip coverage still holds.
     if is_unresolved(requirement) {
         return true;
     }
     let requirement = strip_strict_marker(requirement);
-    // Unresolved Gradle variable reference (`$var`/`${var}`), or an empty version-catalog
-    // entry (`[versions] foo = ""`) — skip comparison. Re-checked post-strip for the
-    // degenerate case where the `strictlyVersion` half itself is empty (a malformed
-    // bare `"!!"` requirement), which the raw check above does not catch since the raw
-    // string is `"!!"`, not empty.
+    // Re-checked post-strip for the degenerate bare "!!" requirement, whose strictlyVersion half
+    // is empty but whose raw string isn't.
     if is_unresolved(requirement) {
         return true;
     }
@@ -245,14 +229,10 @@ impl RequirementResolution for GradleFormatter {
     /// #249 review (M4): this is a separate branch-order copy from `gradle_version_matches`
     /// above — see the note on that function before reordering either one.
     fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
-        // `!!` is Gradle's rich-version strict/preferred shorthand (see
-        // `gradle_version_matches`/`strip_strict_marker`) — stripped once here, first, so
-        // every branch below (the malformed-range guard, dynamic-prefix, range, exact)
-        // operates on the `strictlyVersion` spelling underneath without needing its own
-        // separate strip. Unlike `gradle_version_matches` (re-derives everything from the raw
-        // string on every call), this matcher is pre-parsed once, so the stripped spelling must
-        // be what actually gets stored in the `GradleMatcher` variant — storing the unstripped
-        // string would make e.g. `Exact` compare against a target that includes `"!!"`.
+        // Stripped once here so every branch below operates on the strictlyVersion spelling —
+        // unlike `gradle_version_matches`, this matcher is pre-parsed once, so the stripped
+        // spelling must be what's stored in `GradleMatcher` (e.g. `Exact` must not compare
+        // against a target that still includes "!!").
         let requirement = strip_strict_marker(requirement.as_str());
         compile_requirement_unless(
             requirement,
@@ -364,14 +344,10 @@ mod tests {
         );
     }
 
-    // #758: exact-value `EcosystemFormatter` conformance, replacing test_package_url,
-    // test_version_satisfies, test_validate_package_name_accepts_valid_coordinate,
-    // test_validate_package_name_rejects_missing_colon, test_validate_package_name_rejects_invalid_group,
-    // test_validate_package_name_rejects_invalid_artifact, and
-    // test_validate_package_name_accepts_unresolved_variable. Every other
-    // version_satisfies_requirement/compile_requirement test below stays hand-written:
-    // Gradle's dynamic-prefix/range/strict-marker/snapshot rich-version semantics are
-    // extensively documented, regression-driven behavior, not simple redundant literal lists.
+    // #758: exact-value `EcosystemFormatter` conformance, replacing the individual hand-written
+    // package-name/version tests. The other version_satisfies_requirement/compile_requirement
+    // tests below stay hand-written: Gradle's rich-version semantics are regression-driven
+    // behavior, not simple redundant literal lists.
     deps_core::formatter_conformance! {
         mod gradle_formatter_conformance;
         build: GradleFormatter;

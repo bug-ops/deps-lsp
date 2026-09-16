@@ -181,8 +181,6 @@ impl ArtifactInfo {
     }
 }
 
-// deps-core trait implementations
-
 deps_core::impl_dependency!(MavenDependency {
     name: name,
     name_range: name_range,

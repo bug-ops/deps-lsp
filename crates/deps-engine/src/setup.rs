@@ -496,10 +496,8 @@ pub fn register_ecosystems(
             npm_registry.as_ref().clone(),
         )));
     }
-    // npm is written out explicitly rather than via `register!` (spec 032, S3): that macro's
-    // `NpmEcosystem::new(cache)` would give npm a default, disconnected `NpmParseContext` —
-    // its `.npmrc` reachability policy would never see a live `initialize`/
-    // `didChangeConfiguration` update.
+    // npm is explicit, not via `register!` (spec 032, S3): the macro's default
+    // `NpmParseContext` would never see a live `initialize`/`didChangeConfiguration` update.
     #[cfg(all(feature = "npm", not(feature = "deno")))]
     {
         let npm_context = deps_npm::config::NpmParseContext::new(
@@ -516,10 +514,8 @@ pub fn register_ecosystems(
     #[cfg(all(feature = "deno", not(feature = "npm")))]
     register!("deno", DenoEcosystem, registry, &cache);
 
-    // pypi is written out explicitly rather than via `register!` (spec 033, mirroring npm's
-    // spec 032 S3 precedent): that macro's `PypiEcosystem::new(cache)` would give pypi a
-    // default, disconnected `RegistryAccessPolicy` — its private-index reachability policy
-    // would never see a live `initialize`/`didChangeConfiguration` update.
+    // pypi is explicit, not via `register!` (spec 033, mirrors npm's spec 032 S3): the
+    // macro's default `RegistryAccessPolicy` would never see a live config update.
     #[cfg(feature = "pypi")]
     {
         registry.register(Arc::new(PypiEcosystem::with_policy(
@@ -529,10 +525,8 @@ pub fn register_ecosystems(
         workspace_registry_ecosystems.push("pypi");
     }
 
-    // go is written out explicitly rather than via `register!` (spec 034, mirroring npm's
-    // spec 032 S3 precedent): that macro's `GoEcosystem::new(cache)` would give Go a
-    // default, disconnected `GoParseContext` — its `$GOENV` reachability policy would never
-    // see a live `initialize`/`didChangeConfiguration` update.
+    // go is explicit, not via `register!` (spec 034, mirrors npm's spec 032 S3): the macro's
+    // default `GoParseContext` would never see a live `$GOENV` policy update.
     #[cfg(feature = "go")]
     {
         let go_context = deps_go::config::GoParseContext::new(
@@ -553,10 +547,8 @@ pub fn register_ecosystems(
     register!("swift", SwiftEcosystem, registry, &cache);
     register!("composer", ComposerEcosystem, registry, &cache);
 
-    // nuget is written out explicitly rather than via `register!` (issue #523, mirroring
-    // npm's/pypi's identical precedent): that macro's `NuGetEcosystem::new(cache)` would give
-    // nuget a default, disconnected `RegistryAccessPolicy` — its private-feed reachability
-    // policy would never see a live `initialize`/`didChangeConfiguration` update.
+    // nuget is explicit, not via `register!` (#523, mirrors npm's/pypi's precedent): the
+    // macro's default `RegistryAccessPolicy` would never see a live config update.
     #[cfg(feature = "nuget")]
     {
         let nuget_context = deps_nuget::config::NuGetParseContext::new(
@@ -573,11 +565,9 @@ pub fn register_ecosystems(
 
     register!("github-actions", GithubActionsEcosystem, registry, &cache);
 
-    // gitlab-ci is written out explicitly rather than via `register!` (issue #466, mirroring
-    // github-actions'/nuget's identical precedent): that macro's `GitlabCiEcosystem::new(cache)`
-    // would give it a default, disconnected `registries.gitlab_instance_host` — its
-    // self-hosted-instance resolution and the single token-host rule (spec FR-005a/FR-011a)
-    // would never see a live `initialize`/`didChangeConfiguration` update.
+    // gitlab-ci is explicit, not via `register!` (#466, mirrors github-actions'/nuget's
+    // precedent): the macro's default config would never see a live self-hosted-instance
+    // or single-token-host update (spec FR-005a/FR-011a).
     #[cfg(feature = "gitlab-ci")]
     registry.register(Arc::new(GitlabCiEcosystem::with_context(
         Arc::clone(&cache),
@@ -819,12 +809,9 @@ mod tests {
                 "{id:?}: lockfile_filenames()/lockfile_provider() disagree on whether a lock file format exists"
             );
 
-            // Hostile-input safety for the `package_url` *display* sink
-            // (`lsp_helpers::hover`'s `# [{name}]({url})`, destination written raw — see
-            // `HOSTILE_DISPLAY_LINK_PAYLOAD`'s doc for the full sink/hazard rationale, #758
-            // security-review). Shared with `formatter_conformance!`'s own unconditional
-            // per-crate check (#782 gap 1) — see `conformance::assert_package_url_hostile_input_safe`'s
-            // doc for why both layers call the same implementation.
+            // Hostile-input safety for the `package_url` display sink (#758 security-review),
+            // shared with `formatter_conformance!`'s per-crate check (#782 gap 1) — see
+            // `assert_package_url_hostile_input_safe`'s doc for the full rationale.
             deps_core::conformance::assert_package_url_hostile_input_safe(
                 ecosystem.formatter(),
                 &format!("{id:?}"),
@@ -997,23 +984,18 @@ mod tests {
         use BareVersionAgreementExpectation::{Checked, DeliberateApproximation, LatentOnly};
 
         match id {
-            // Cargo (caret), and the `ConcreteIfFullVersion` ecosystems (npm/Composer/Deno's
-            // X-ranges, GitHub Actions'/GitLab CI's moving-major tags): a bare *partial*
-            // version is a real, distinct requirement shape from a bare full version under
-            // these ecosystems' own grammar, so both are worth checking.
+            // Cargo and the `ConcreteIfFullVersion` ecosystems: a bare partial version is a
+            // real, distinct requirement shape from a bare full version, so both are checked.
             deps_core::EcosystemId::Cargo
             | deps_core::EcosystemId::Npm
             | deps_core::EcosystemId::Composer
             | deps_core::EcosystemId::Deno
             | deps_core::EcosystemId::GithubActions
             | deps_core::EcosystemId::GitlabCi => Checked { test_partial: true },
-            // Go/Bundler/Dart/Maven/Gradle: no partial-version requirement concept exists in
-            // these ecosystems' own manifests (a bare version is always a complete one), so a
-            // synthetic partial input like `"1.2"` isn't a meaningful requirement to compare —
-            // only the full-version case is checked. (Go's own comparator in particular
-            // treats a bare string as a version *prefix*, for pseudo-version/`+incompatible`
-            // matching, not as a partial-version range — comparing it against `"1.2"` as if it
-            // were a partial-range requirement produces a false divergence.)
+            // Go/Bundler/Dart/Maven/Gradle: no partial-version requirement concept exists (a
+            // bare version is always complete), so only the full-version case is checked. Go's
+            // comparator specifically treats a bare string as a version prefix, not a
+            // partial-range, so testing `"1.2"` there would produce a false divergence.
             deps_core::EcosystemId::Go
             | deps_core::EcosystemId::Bundler
             | deps_core::EcosystemId::Dart
@@ -1021,27 +1003,19 @@ mod tests {
             | deps_core::EcosystemId::Gradle => Checked {
                 test_partial: false,
             },
-            // Swift: `SwiftFormatter::compile_requirement` parses a requirement via
-            // `semver::VersionReq`, whose bare-string default is a caret range — the same
-            // divergence NuGet has — but `deps-swift`'s parser always emits an explicit
-            // range spelling (`">=X, <Y"`) or an exact `"=X"` pin, never a bare `"X.Y.Z"`
-            // string (see `deps-swift/src/parser.rs`'s `upToNextMajor`/`.exact(...)`
-            // handling), so this can't fire today. Re-review if the parser ever changes to
-            // emit a bare form.
+            // Swift: `compile_requirement`'s `semver::VersionReq` has the same bare-string
+            // caret-range divergence as NuGet, but `deps-swift`'s parser always emits an
+            // explicit range or exact pin, never a bare `"X.Y.Z"` — can't fire today.
+            // Re-review if the parser ever changes to emit a bare form.
             deps_core::EcosystemId::Swift => LatentOnly,
-            // PyPI: the parser retains the pep440 comparator on every requirement (e.g. an
-            // exact pin parses to `"==1.2.3"`, never bare `"1.2.3"` — see `deps-core`'s
-            // `concrete_pin_version_strips_pep440_double_equals_comparator`), so a bare
-            // requirement never reaches this check either. Re-review if the parser ever
-            // changes to emit a bare form.
+            // PyPI: the parser retains the pep440 comparator on every requirement (an exact
+            // pin parses to `"==1.2.3"`, never bare), so a bare requirement never reaches
+            // this check. Re-review if the parser ever changes to emit a bare form.
             deps_core::EcosystemId::Pypi => LatentOnly,
             // NuGet (#669): a bare `Version="X"` is really an unbounded minimum floor under
-            // `NuGetFormatter`'s own comparator, but `deps-core` deliberately still reports
-            // it as a pin — restore resolves a direct `PackageReference` to its floor
-            // version in practice, mirrored by `NuGetFormatter::is_requirement_up_to_date`
-            // treating the same bare floor as a pin for outdated-checking. See
-            // `deps-core`'s `bare_requirement_policy` doc for the full rationale, including
-            // why the alternative (an always-range policy) was tried and reverted.
+            // `NuGetFormatter`'s comparator, but `deps-core` deliberately still reports it as
+            // a pin (mirrors `is_requirement_up_to_date`) — see `bare_requirement_policy`'s
+            // doc for why the always-range alternative was tried and reverted.
             deps_core::EcosystemId::NuGet => DeliberateApproximation,
         }
     }
@@ -1209,13 +1183,10 @@ mod tests {
             ]
         }
 
-        // #421 S2: a package whose only releases so far are all prerelease must still
-        // resolve under a wildcard requirement, same as an all-`AdvisoryDeprecated` one
-        // above — a prerelease-only flag is a ranking preference for "latest", not a hard
-        // removal from existence. `is_prerelease()` is overridden directly rather than
-        // relying on a hyphenated version string, so this fixture is unambiguous regardless
-        // of which ecosystem-specific parser (if any) `select_latest_matching` re-parses
-        // `version_string()` with.
+        // #421 S2: a package whose only releases are prerelease must still resolve under a
+        // wildcard requirement — prerelease is a ranking preference, not a removal from
+        // existence. `is_prerelease()` is overridden directly so this fixture stays
+        // unambiguous regardless of ecosystem-specific version-string parsing.
         struct PrereleaseOnlyVersion {
             version: deps_core::ConcreteVersion,
         }
@@ -1271,19 +1242,14 @@ mod tests {
                  wildcard requirement (#347)"
             );
 
-            // Go is a deliberate exception to this invariant, not an #421-class bug
-            // (documented at #364): `select_latest_matching` intentionally excludes
-            // prerelease pseudo-versions unconditionally, with no wildcard fallback, so the
-            // `/@v/list`-based pick never shadows the `/@latest` fallback the fetch loop
-            // needs for a module whose only tags are prerelease. Asserting this invariant
-            // for Go would mean "fixing" behavior that was already deliberately chosen.
+            // Go is a deliberate exception, not an #421-class bug (#364): `select_latest_matching`
+            // unconditionally excludes prerelease pseudo-versions with no wildcard fallback, so
+            // the `/@v/list` pick never shadows the `/@latest` fallback a prerelease-only module
+            // needs. Asserting this invariant for Go would "fix" intentional behavior.
             //
-            // NuGet used to be excluded here too (`req = "*"` read as NuGet's own
-            // floating-version "latest stable" syntax rather than this ladder's existence
-            // check), but #423 added a fallback rung to `pick_latest_matching`/
-            // `select_latest_matching` (`deps-nuget/src/registry.rs`) so a prerelease-only
-            // package now resolves under a bare wildcard too, matching every other
-            // ecosystem — no exception needed anymore.
+            // NuGet used to be excluded too, but #423 added a fallback rung to
+            // `select_latest_matching` so a prerelease-only package now resolves under a bare
+            // wildcard too — no exception needed anymore.
             if matches!(id, "go") {
                 continue;
             }

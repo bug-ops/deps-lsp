@@ -180,27 +180,21 @@ pub fn collect_update_all_edits(
             continue;
         };
         if version_req.as_str().is_empty() {
-            // Defense-in-depth: an empty requirement would trivially satisfy the guard
-            // below (both sides normalize to ""), so without this, a future formatter
-            // whose `is_requirement_up_to_date` doesn't treat "" as up to date could
-            // emit an edit anchored on a span that was never a version literal.
+            // Defense-in-depth: an empty requirement would trivially satisfy the guard below
+            // (both sides normalize to "") and could anchor an edit on a non-literal span.
             continue;
         }
-        // `requirement_status_for` (not the bare `is_requirement_up_to_date`), matching
-        // `diagnostics.rs`'s `apply_outdated_rule` and `inlay_hints.rs` (#907 review
-        // follow-up): lets e.g. `GithubActionsFormatter` prefer a SHA pin's
-        // registry-confirmed tag over trusting its own comment text, so the "Update N
-        // outdated" count/bulk-edit agrees with what inlay hints/diagnostics show for
-        // the same dependency instead of silently excluding it.
+        // `requirement_status_for`, matching `apply_outdated_rule`/`inlay_hints.rs` (#907):
+        // lets e.g. `GithubActionsFormatter` prefer a SHA pin's registry-confirmed tag over
+        // its own comment text, so this lens agrees with what diagnostics/hints show.
         if formatter.requirement_status_for(dep, version_req, latest) != RequirementStatus::Outdated
         {
             continue;
         }
 
         // TODO(critic): intentionally not calling `dependency_version_range_is_literal`
-        // (#919) here — empty-requirement semantics differ (edit: nothing to update;
-        // completion: everything to offer), and this loop hoists its own `line_offsets`
-        // across every dependency rather than rebuilding one per call.
+        // (#919) — empty-requirement semantics differ (edit: nothing to update; completion:
+        // everything to offer).
         let slice = slice_for_range(content, &line_offsets, version_range.into());
         let literal_target = dep
             .version_literal()
@@ -210,17 +204,10 @@ pub fn collect_update_all_edits(
         }
 
         let new_text = formatter.format_version_replacing_for(dep, latest, version_req.as_str());
-        // No-op guard, mirroring the REFACTOR-loop dedup and vulnerability-fix N1
-        // guard in `code_actions`: a formatter can decide a declared
-        // requirement has no single unambiguous rewrite (e.g. `deps-gradle`'s
-        // `{strictly}!!{preferred}` shorthand, left unchanged rather than risking a
-        // destructive or misleading edit) and return it unchanged. Without this
-        // check, such a dependency would still count toward — and appear fixed
-        // by — the "Update N outdated dependencies" lens while its click applies
-        // nothing. Compares against `literal_target` (not `version_req`) for the same
-        // reason the literal-span guard above does: for `deps-swift`, `version_req` is a
-        // synthesized comparator that never equals the bare-literal formatted text even
-        // when the edit genuinely is a no-op.
+        // No-op guard, mirroring `code_actions`'s N1 guard: a formatter can return a
+        // requirement unchanged when it has no single unambiguous rewrite (e.g.
+        // `deps-gradle`'s `{strictly}!!{preferred}` shorthand) — without it such a dependency
+        // would still count toward the lens while its click applies nothing.
         if strip_whitespace(&new_text) == strip_whitespace(literal_target) {
             continue;
         }
@@ -635,9 +622,8 @@ mod tests {
         #[test]
         fn test_empty_version_requirement_is_skipped() {
             // Defense-in-depth (H2): an empty requirement would trivially satisfy
-            // `literal_span_matches` if the guard were reached (both sides normalize to
-            // "") and the span text would then be discarded and overwritten outright —
-            // this must never reach the guard in the first place.
+            // `literal_span_matches` and get its span overwritten outright, so it must
+            // never reach that guard.
             let content = "pkg = \"\"\n";
             let pr = parse_result(vec![dep("pkg", Some(""), Some(range(0, 6, 0, 6)))]);
             let mut cached = HashMap::new();
@@ -678,10 +664,8 @@ mod tests {
 
         #[test]
         fn test_empty_cached_latest_is_skipped() {
-            // Regression for #303: an empty cached `latest` must never produce an
-            // edit — the old no-op guard (comparing formatted text to the declared
-            // requirement) doesn't catch this because `"" != "1.0.0"`, so without an
-            // explicit guard the requirement gets erased instead of updated.
+            // Regression for #303: an empty cached `latest` must never produce an edit — the
+            // old no-op guard doesn't catch it (`"" != "1.0.0"`), erasing the requirement.
             let content = "serde = \"1.0.0\"\n";
             let pr = parse_result(vec![dep("serde", Some("1.0.0"), Some(range(0, 9, 0, 14)))]);
             let mut cached = HashMap::new();
@@ -781,11 +765,9 @@ mod tests {
 
         #[test]
         fn test_no_op_edit_is_excluded() {
-            // M2: a formatter can decide a declared requirement has no single
-            // unambiguous rewrite and return it unchanged (e.g. `deps-gradle`'s
-            // `{strictly}!!{preferred}` infix shorthand). Without a no-op guard, this
-            // dependency would still count toward, and be "fixed" by, the "Update N
-            // outdated dependencies" lens while applying nothing.
+            // M2: a formatter can decide a requirement has no single unambiguous rewrite and
+            // return it unchanged (e.g. `deps-gradle`'s `{strictly}!!{preferred}` shorthand).
+            // Without a no-op guard this dependency is "fixed" by the lens while applying nothing.
             struct NoOpFormatter;
             impl PackageNaming for NoOpFormatter {}
 
@@ -921,12 +903,9 @@ mod tests {
 
         #[test]
         fn test_guard_accepts_nuget_already_bracketed_source() {
-            // The real reason the guard wraps only the slice, not both operands: NuGet's
-            // parser wraps *unconditionally* — a source that is already bracketed,
-            // `Version="[1.0.0]"`, still yields a double-wrapped requirement `[[1.0.0]]`
-            // (`crates/deps-nuget/src/parser.rs`). A symmetric strip would compare
-            // `[1.0.0]` against `1.0.0` here and falsely reject an editable dependency;
-            // the asymmetric wrap-the-slice rule handles it correctly.
+            // Guard wraps only the slice, not both operands: NuGet's parser wraps
+            // unconditionally, so an already-bracketed source `Version="[1.0.0]"` still
+            // yields `[[1.0.0]]`. A symmetric strip would falsely reject this dependency.
             let content = r#"<PackageReference Include="Newtonsoft.Json" Version="[1.0.0]" />"#;
             let pr = parse_result(vec![dep(
                 "Newtonsoft.Json",
@@ -1015,12 +994,8 @@ mod tests {
 
         #[test]
         fn test_guard_rejects_bracketed_interval_against_unbracketed_requirement() {
-            // Regression guard for the OLD (broken) symmetric-strip rule: stripping
-            // brackets from *both* operands would wrongly match a Maven-style bracketed
-            // interval span `[1.0,2.0]` against an unbracketed requirement `1.0,2.0`.
-            // The corrected asymmetric rule only wraps the *slice*, so
-            // `format!("[{slice}]")` produces `[[1.0,2.0]]`, which does not equal
-            // `1.0,2.0` either — the dependency must be skipped.
+            // Regression for the old (broken) symmetric-strip rule, which would wrongly match
+            // `[1.0,2.0]` against unbracketed `1.0,2.0`; the wrap-the-slice rule still doesn't match.
             let content = "<version>[1.0,2.0]</version>";
             let pr = parse_result(vec![dep(
                 "interval-dep",

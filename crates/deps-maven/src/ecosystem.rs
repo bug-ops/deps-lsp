@@ -230,11 +230,8 @@ impl MavenEcosystem {
         let col_idx = deps_core::completion::utf16_to_byte_offset(line, position.character)
             .unwrap_or(line.len());
 
-        // Find if cursor is inside a tag value: <tag>|value|</tag>
-        // Walk back from cursor to find opening tag
         let before_cursor = &line[..col_idx];
 
-        // Check if we're inside a known element by looking for the most recent opening tag
         for (tag, ctx) in [
             ("version", MavenXmlContext::Version),
             ("artifactId", MavenXmlContext::ArtifactId),
@@ -243,7 +240,6 @@ impl MavenEcosystem {
             let open = format!("<{tag}>");
             if let Some(start) = before_cursor.rfind(&open) {
                 let value_start = start + open.len();
-                // Make sure there's no closing tag before cursor
                 let between = &before_cursor[value_start..];
                 if !between.contains("</") {
                     // Check if cursor is on a dependency line (use parse_result for context)

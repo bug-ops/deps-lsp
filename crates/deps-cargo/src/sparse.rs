@@ -178,7 +178,7 @@ fn parse_index_json(data: &[u8]) -> Result<Vec<CargoVersion>> {
     let content = std::str::from_utf8(data)
         .map_err(|e| DepsError::CacheError(format!("Invalid UTF-8: {e}")))?;
 
-    // Parse versions once and cache the parsed Version for sorting
+    // Cache each parsed Version alongside its CargoVersion to avoid re-parsing for the sort.
     let mut versions_with_parsed: Vec<(CargoVersion, Version)> = content
         .lines()
         .filter(|line| !line.trim().is_empty())
@@ -201,10 +201,9 @@ fn parse_index_json(data: &[u8]) -> Result<Vec<CargoVersion>> {
         })
         .collect();
 
-    // Sort using already-parsed versions (newest first)
+    // Newest first.
     versions_with_parsed.sort_unstable_by(|a, b| b.1.cmp(&a.1));
 
-    // Extract sorted versions
     Ok(versions_with_parsed.into_iter().map(|(v, _)| v).collect())
 }
 

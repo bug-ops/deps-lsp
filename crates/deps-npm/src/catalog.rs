@@ -469,9 +469,7 @@ fn resolve(
     };
 
     let Some(catalog) = config.catalogs.get(key) else {
-        // Spec §6: a workspace file with neither `catalog:` nor `catalogs:` at all behaves as
-        // "no entry" for the default catalog, not "unknown catalog" — there is no name to be
-        // unknown in that case.
+        // Spec §6: no `catalog:`/`catalogs:` at all is "no entry" for default, not "unknown".
         return if is_default {
             CatalogOutcome::MissingEntry
         } else {
@@ -496,11 +494,9 @@ fn resolve(
 /// algorithm and its documented single-root-per-tree design (spec §6/§9).
 fn find_workspace_file(manifest_dir: &Path) -> Option<PathBuf> {
     for dir in deps_core::fs_probe::config_ancestors(manifest_dir) {
-        // `exists()` rather than `is_file()`: a `pnpm-workspace.yaml` that exists but is a
-        // directory (or another irregular file) still counts as "found" here — the file-type
-        // check belongs to `PnpmWorkspaceCache::get_or_parse`, whose `None` `load` maps to a
-        // defective `Malformed` config rather than to a *different* ancestor's file (or none
-        // at all) being silently substituted.
+        // `exists()`, not `is_file()`: a directory named `pnpm-workspace.yaml` still counts as
+        // "found" — the file-type check belongs to `PnpmWorkspaceCache::get_or_parse`, so a
+        // different ancestor's file is never silently substituted.
         let candidate = dir.join("pnpm-workspace.yaml");
         if deps_core::fs_probe::exists(&candidate) {
             return Some(candidate);
@@ -643,8 +639,7 @@ mod tests {
 
     #[test]
     fn test_apply_default_catalog_resolves() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s contract for fs_probe-touching tests.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         workspace(root.path(), "catalog:\n  react: ^18.3.0\n");
@@ -663,8 +658,7 @@ mod tests {
 
     #[test]
     fn test_apply_named_catalog_beats_default() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s contract for fs_probe-touching tests.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         workspace(
@@ -682,8 +676,7 @@ mod tests {
 
     #[test]
     fn test_apply_catalog_default_alias_resolves_like_shorthand() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s contract for fs_probe-touching tests.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         workspace(root.path(), "catalog:\n  react: ^18.3.0\n");
@@ -698,8 +691,7 @@ mod tests {
 
     #[test]
     fn test_apply_catalogs_default_section_alone_defines_default() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s contract for fs_probe-touching tests.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         workspace(root.path(), "catalogs:\n  default:\n    react: ^18.3.0\n");
@@ -714,8 +706,7 @@ mod tests {
 
     #[test]
     fn test_apply_missing_entry() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s contract for fs_probe-touching tests.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         workspace(root.path(), "catalog:\n  react: ^18.3.0\n");
@@ -743,8 +734,7 @@ mod tests {
 
     #[test]
     fn test_apply_unknown_catalog() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s contract for fs_probe-touching tests.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         workspace(root.path(), "catalog:\n  react: ^18.3.0\n");
@@ -763,8 +753,7 @@ mod tests {
 
     #[test]
     fn test_apply_no_workspace_file_found_anywhere() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s contract for fs_probe-touching tests.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         let cache = PnpmWorkspaceCache::new();
@@ -782,8 +771,7 @@ mod tests {
 
     #[test]
     fn test_apply_no_manifest_dir_is_no_workspace_file() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s contract for fs_probe-touching tests.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let cache = PnpmWorkspaceCache::new();
         let config = load(None, &cache);
@@ -800,8 +788,7 @@ mod tests {
 
     #[test]
     fn test_apply_workspace_file_with_neither_key_is_missing_entry_not_unknown() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s contract for fs_probe-touching tests.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         workspace(root.path(), "packages:\n  - packages/*\n");
@@ -819,8 +806,7 @@ mod tests {
 
     #[test]
     fn test_apply_duplicate_default_catalog_is_workspace_wide() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s contract for fs_probe-touching tests.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         workspace(
@@ -844,8 +830,7 @@ mod tests {
 
     #[test]
     fn test_apply_non_mapping_catalog_shape_is_malformed_not_panicking() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s contract for fs_probe-touching tests.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         workspace(root.path(), "catalog: \"not-a-map\"\n");
@@ -863,8 +848,7 @@ mod tests {
 
     #[test]
     fn test_apply_non_mapping_catalogs_sequence_is_malformed() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s contract for fs_probe-touching tests.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         workspace(root.path(), "catalogs:\n  - a\n  - b\n");
@@ -882,8 +866,7 @@ mod tests {
 
     #[test]
     fn test_apply_null_top_level_catalog_is_absent_not_malformed_and_not_duplicate() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s contract for fs_probe-touching tests.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         workspace(
@@ -903,8 +886,7 @@ mod tests {
 
     #[test]
     fn test_apply_malformed_yaml_is_malformed_workspace_file() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s contract for fs_probe-touching tests.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         workspace(root.path(), "catalog: [unterminated\n");
@@ -923,8 +905,7 @@ mod tests {
 
     #[test]
     fn test_apply_non_string_entry_value_is_malformed_entry() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s contract for fs_probe-touching tests.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         workspace(root.path(), "catalog:\n  react:\n    version: \"^18\"\n");
@@ -955,8 +936,7 @@ mod tests {
     /// `MalformedEntry` the way a plain `Yaml::as_str()` read would.
     #[test]
     fn test_apply_unquoted_numeric_catalog_range_resolves() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s contract for fs_probe-touching tests.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         workspace(root.path(), "catalog:\n  react: 1.2\n");
@@ -975,8 +955,7 @@ mod tests {
 
     #[test]
     fn test_apply_non_semver_entry_is_hover_only_no_diagnostic() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s contract for fs_probe-touching tests.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         workspace(root.path(), "catalog:\n  left-pad: \"workspace:*\"\n");
@@ -1005,8 +984,7 @@ mod tests {
 
     #[test]
     fn test_apply_nested_roots_nearest_wins() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s contract for fs_probe-touching tests.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         workspace(root.path(), "catalog:\n  react: ^17.0.0\n");
@@ -1027,8 +1005,7 @@ mod tests {
 
     #[test]
     fn test_apply_literal_range_dependency_is_untouched() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s contract for fs_probe-touching tests.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         workspace(root.path(), "catalog:\n  react: ^18.3.0\n");
@@ -1047,8 +1024,7 @@ mod tests {
     /// anything but a regular file.
     #[test]
     fn test_apply_workspace_path_is_a_directory_degrades_to_malformed() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s contract for fs_probe-touching tests.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join("pnpm-workspace.yaml")).unwrap();
@@ -1067,8 +1043,7 @@ mod tests {
 
     #[test]
     fn test_apply_billion_laughs_rejected_by_guards() {
-        // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
-        // must hold it, not just ones that diff a snapshot.
+        // Per `fs_probe::snapshot_guard`'s contract for fs_probe-touching tests.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let root = tempfile::tempdir().unwrap();
         let mut content = String::from("catalog:\n");

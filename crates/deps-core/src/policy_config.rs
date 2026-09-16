@@ -152,13 +152,9 @@ impl PolicyConfig {
             license_policy: new_license_policy,
         } = new;
 
-        // Not parse-affecting: every field is named (never `..`), so its value is simply
-        // unused here rather than compared, but a new field on any of these sections still
-        // forces a decision at this line. rustc's own E0027 fix-it suggestion for that error is
-        // `field: _` — the shape every existing field below already has — but that suggestion
-        // does not itself mean `_` is the *correct* choice: if a newly added field affects
-        // already-parsed document state, add a bool to `PolicyConfigDiff` and compare it below
-        // (mirroring the `registries` block) instead of binding it to `_`.
+        // Not parse-affecting: exhaustive `_` bindings (never `..`) force a decision when a
+        // field is added. `_` is rustc's E0027 fix-it default, but if a new field affects
+        // already-parsed document state, add a diff bool instead (mirroring `registries` below).
         let DiagnosticsConfig {
             outdated_severity: _,
             unknown_severity: _,
@@ -749,11 +745,8 @@ pub struct SupplyChainConfig {
     pub enabled: bool,
 }
 
-// Deliberately hand-written, mirroring `CodeLensConfig`'s rationale (`deps-lsp::config`): a
-// derived `Default` would silently ship the feature disabled. Delegates to `Self::new` (rather
-// than duplicating the `enabled: true` literal) so the two can't drift — `Self` derives neither
-// `PartialEq` nor a test asserting they agree, and `new()`/`with_*` are now the only external
-// construction path.
+// Hand-written, not derived: a derived `Default` would silently ship this disabled. Delegates
+// to `Self::new` so the literal has one source of truth (mirrors `CodeLensConfig`).
 impl Default for SupplyChainConfig {
     fn default() -> Self {
         Self::new()
@@ -892,9 +885,8 @@ impl std::fmt::Debug for RegistriesConfig {
     }
 }
 
-// Hand-written rather than derived, delegating to `Self::new` so the default value has a single
-// source of truth (matching `SupplyChainConfig`'s/`NetworkConfig`'s rationale) — `new()`/`with_*`
-// are now the only external construction path once `#[non_exhaustive]` is in effect.
+// Hand-written, not derived, delegating to `Self::new` for a single source of truth
+// (matches `SupplyChainConfig`'s/`NetworkConfig`'s rationale).
 impl Default for RegistriesConfig {
     fn default() -> Self {
         Self::new()
@@ -1103,9 +1095,8 @@ pub struct NetworkConfig {
     pub offline: bool,
 }
 
-// Hand-written rather than derived, delegating to `Self::new` so the default value has a single
-// source of truth (matching `SupplyChainConfig`'s rationale) — `new()`/`with_*` are now the only
-// external construction path once `#[non_exhaustive]` is in effect.
+// Hand-written, not derived, delegating to `Self::new` for a single source of truth
+// (matches `SupplyChainConfig`'s rationale).
 impl Default for NetworkConfig {
     fn default() -> Self {
         Self::new()

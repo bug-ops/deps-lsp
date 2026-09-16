@@ -22,14 +22,12 @@ pub async fn handle_hover(
     let uri = &params.text_document_position_params.text_document.uri;
     let position = params.text_document_position_params.position;
 
-    // Ensure document is loaded (cold start support)
     if !ensure_document_loaded(uri, Arc::clone(&state), client, Arc::clone(&config)).await {
         tracing::warn!("Could not load document for hover: {:?}", uri);
         return None;
     }
 
-    // Snapshot before the document lookup, matching diagnostics.rs's ordering — this
-    // acquires the config RwLock before the DashMap shard guard, never the reverse.
+    // Acquires the config RwLock before the DashMap shard guard, never the reverse (matches diagnostics.rs).
     let (freshness, offline, supply_chain_enabled) = {
         let config = config.read().await;
         (
@@ -39,11 +37,9 @@ pub async fn handle_hover(
         )
     };
 
-    // Own everything `generate_hover` needs and release the DashMap shard `Ref`
-    // before awaiting it: the default impl awaits a real registry fetch
-    // (`Registry::get_versions_with`), so holding the guard across that await would
-    // block a concurrent `documents.get_mut` on the same shard for the duration (#319).
-    // `with_document` makes this structural rather than a convention to remember (#333).
+    // Release the DashMap shard `Ref` before awaiting `generate_hover`'s registry fetch —
+    // holding it across the await would block a concurrent `documents.get_mut` on the same
+    // shard (#319); `with_document` makes this structural rather than a convention (#333).
     let (
         ecosystem,
         ecosystem_id,
@@ -82,10 +78,8 @@ pub async fn handle_hover(
         .with_offline(offline)
         .with_license_source(ecosystem.license_source())
         .with_license_prefetch(&licenses);
-    // The only call site that ever sets `VersionData::trust` (deps-core's
-    // `lsp_helpers::hover` module docs) — this is what makes the supply-chain
-    // trust signal hover-only by construction (FR-010): diagnostics, code
-    // actions, inlay hints, and code lenses never reach this code path.
+    // The only call site that sets `VersionData::trust` (see lsp_helpers::hover docs) —
+    // makes the supply-chain trust signal hover-only by construction (FR-010).
     if supply_chain_enabled {
         versions = versions.with_trust(&state.deps_dev);
     }
@@ -105,8 +99,6 @@ mod tests {
     use tower_lsp_server::ls_types::{
         Position, TextDocumentIdentifier, TextDocumentPositionParams,
     };
-
-    // Generic tests (no feature flag required)
 
     #[tokio::test]
     async fn test_handle_hover_missing_document() {
@@ -128,7 +120,6 @@ mod tests {
         assert!(result.is_none());
     }
 
-    // Cargo-specific tests
     #[cfg(feature = "cargo")]
     mod cargo_tests {
         use super::*;
@@ -136,9 +127,8 @@ mod tests {
 
         #[tokio::test]
         async fn test_handle_hover() {
-            // Held per `deps_core::fs_probe::snapshot_guard`'s doc: `ecosystem.parse_manifest`
-            // (cargo/npm) transitively touches fs_probe, and this test runs in the same binary as
-            // `document/loader.rs`'s diffing test.
+            // Held per fs_probe::snapshot_guard's doc: parse_manifest touches fs_probe and
+            // this test shares a binary with document/loader.rs's diffing test.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
             let url = deps_core::test_util::test_uri("/test/Cargo.toml");
@@ -169,7 +159,6 @@ serde = "1.0.0"
 
             let (client, config) = create_test_client_and_config();
             let _result = handle_hover(state, params, client, config).await;
-            // Test passes if no panic occurs
         }
 
         #[tokio::test]
@@ -197,7 +186,6 @@ serde = "1.0.0"
         }
     }
 
-    // npm-specific tests
     #[cfg(feature = "npm")]
     mod npm_tests {
         use super::*;
@@ -233,7 +221,6 @@ serde = "1.0.0"
 
             let (client, config) = create_test_client_and_config();
             let _result = handle_hover(state, params, client, config).await;
-            // Test passes if no panic occurs
         }
     }
 }

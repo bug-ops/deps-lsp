@@ -372,13 +372,9 @@ mod tests {
         use proptest::prelude::*;
 
         proptest! {
-            // #673 S3: random bytes gated on `str::from_utf8` *and* `JsonAst::parse`
-            // returning `Some` (random text is essentially never valid JSON syntax) meant
-            // the original version of this property almost never reached `section.position`
-            // at all. Generates a manifest-shaped grammar instead — arbitrary `name`/
-            // `version` string pairs serialized through `serde_json` into a real
-            // `{"dependencies": {...}}` document — so parsing succeeds and position
-            // recovery actually runs on every case.
+            // #673 S3: random bytes almost never parse as valid JSON, so the original version
+            // of this property barely reached `section.position`. Generates a manifest-shaped
+            // grammar instead so parsing succeeds and position recovery runs every time.
             #[test]
             fn parse_and_position_never_panic(
                 pairs in proptest::collection::vec(

@@ -98,12 +98,11 @@ impl EcosystemRegistry {
     pub fn register(&self, ecosystem: Arc<dyn Ecosystem>) {
         let id = ecosystem.id();
 
-        // Register filename mappings
         for filename in ecosystem.manifest_filenames() {
             self.filename_map.insert(*filename, id);
         }
 
-        // Register extension mappings (fallback for unbounded basenames, e.g. *.csproj)
+        // Fallback for unbounded basenames, e.g. *.csproj
         for extension in ecosystem.manifest_extensions() {
             debug_assert!(
                 self.extension_map
@@ -115,7 +114,7 @@ impl EcosystemRegistry {
             self.extension_map.insert(*extension, id);
         }
 
-        // Register pattern mappings (e.g. `requirements*.txt`)
+        // e.g. `requirements*.txt`
         for &pattern in ecosystem.manifest_patterns() {
             let Some((prefix, suffix)) = pattern.split_once('*') else {
                 debug_assert!(
@@ -143,7 +142,6 @@ impl EcosystemRegistry {
             self.patterns.insert(pattern, (prefix, suffix, id));
         }
 
-        // Register ecosystem
         self.ecosystems.insert(id, ecosystem);
     }
 
@@ -639,7 +637,6 @@ mod tests {
 
     impl OsvNaming for MockFormatter {}
 
-    // Mock ecosystem for testing
     struct MockEcosystem {
         id: &'static str,
         display_name: &'static str,
@@ -724,7 +721,7 @@ mod tests {
         }
     }
 
-    // Mock ecosystem with unbounded-basename extension routing (mirrors NuGet's *.csproj)
+    // Unbounded-basename extension routing, mirrors NuGet's *.csproj
     struct MockExtEcosystem {
         id: &'static str,
         filenames: &'static [&'static str],
@@ -1332,7 +1329,6 @@ mod tests {
         assert_eq!(retrieved.id(), "cargo");
         assert_eq!(retrieved.display_name(), "Cargo");
 
-        // Unknown lockfile should return None
         assert!(registry.for_lockfile("unknown.lock").is_none());
     }
 

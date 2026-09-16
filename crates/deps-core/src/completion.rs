@@ -221,27 +221,16 @@ pub fn detect_completion_context(
     let dependencies = parse_result.dependencies();
 
     for dep in dependencies {
-        // #905 S1: a synthetic `name_range()` (`Dependency::name_range_is_synthetic`) is not a
-        // real position — worse than the hover/diagnostics cases guarded elsewhere, since
-        // *accepting* a completion here would insert text at that bogus range. Skip the
-        // dependency entirely rather than let `position_in_range` match it.
+        // #905 S1: a synthetic name_range is not a real position — accepting a completion here
+        // would insert text at a bogus range, so skip the dependency entirely.
         if dep.name_range_is_synthetic() {
             continue;
         }
 
-        // Check if position is within the dependency name range
         let name_range: Range = dep.name_range().into();
-        // `position_in_range` tolerates a request position one column past
-        // `name_range.end` (a convenience for firing completion right after the
-        // last typed character), but the manifest text immediately following the
-        // name is often structurally significant (a closing quote, the space
-        // before `=`, ...). Widening the returned range to reach that far would
-        // consume it once the client applies the edit. So this branch requires
-        // *strict* containment (`position.character <= name_range.end.character`
-        // on the end line) rather than reusing that tolerance — the boundary
-        // case (cursor exactly at `name_range.end`) is already covered without
-        // it, and a position one further past falls through to the checks below
-        // instead of matching here.
+        // Unlike `position_in_range`'s one-past-end tolerance, this needs *strict* containment:
+        // the text right after a name is often structurally significant (closing quote, space
+        // before `=`), and widening the range to reach it would consume that char on edit.
         if position_in_range(position, name_range)
             && (name_range.end.line != position.line
                 || position.character <= name_range.end.character)
@@ -253,18 +242,12 @@ pub fn detect_completion_context(
             };
         }
 
-        // Check if position is within the version range
         if let Some(version_range) = dep.version_range().map(Into::into)
             && position_in_range(position, version_range)
         {
-            // #919: `version_range` can span a non-literal token (Maven `${property}`
-            // interpolation, Gradle `$var`/`${var}` interpolation, a YAML alias) whose
-            // text differs from the dependency's own declared value — accepting a
-            // completion there would splice version text into the middle of that
-            // reference instead of editing a literal version. Withhold the `Version`
-            // context in that case rather than return it; the loop still falls through
-            // to this dependency's `features_range` check (harmless — the cursor is not
-            // there either) and then moves on to the next dependency.
+            // #919: `version_range` can span a non-literal token (Maven `${property}`, Gradle
+            // `$var`, a YAML alias) — accepting a completion there would splice version text
+            // into that reference instead of a literal, so withhold the `Version` context.
             if crate::lsp_helpers::dependency_version_range_is_literal(
                 dep,
                 content,
@@ -278,7 +261,6 @@ pub fn detect_completion_context(
             }
         }
 
-        // Check if position is within the features array range
         if let Some(features_range) = dep.features_range().map(Into::into)
             && position_in_range(position, features_range)
         {
@@ -299,7 +281,6 @@ pub fn detect_completion_context(
 /// We also consider the position to be "in range" if it's immediately
 /// after the range end (for completion after typing).
 const fn position_in_range(position: Position, range: Range) -> bool {
-    // Before range start
     if position.line < range.start.line {
         return false;
     }
@@ -308,7 +289,6 @@ const fn position_in_range(position: Position, range: Range) -> bool {
         return false;
     }
 
-    // After range end (allow one position past for completion)
     if position.line > range.end.line {
         return false;
     }
@@ -367,13 +347,11 @@ pub use crate::lsp_helpers::utf16_to_byte_offset;
 // bounds/ordering-checked above, so both are verified char boundaries.
 #[allow(clippy::string_slice)]
 pub fn extract_prefix(content: &str, position: Position, range: Range) -> String {
-    // Get the line at the position - use nth() instead of collecting all lines
     let line = match content.lines().nth(position.line as usize) {
         Some(l) => l,
         None => return String::new(),
     };
 
-    // Convert UTF-16 positions to byte offsets
     let start_byte = if position.line == range.start.line {
         match utf16_to_byte_offset(line, range.start.character) {
             Some(offset) => offset,
@@ -388,15 +366,12 @@ pub fn extract_prefix(content: &str, position: Position, range: Range) -> String
         None => return String::new(),
     };
 
-    // Safety: ensure byte offsets are within bounds
     if start_byte > line.len() || cursor_byte > line.len() || start_byte > cursor_byte {
         return String::new();
     }
 
-    // Extract substring
     let prefix = &line[start_byte..cursor_byte];
 
-    // Remove quotes and trim whitespace
     prefix
         .trim()
         .trim_matches('"')
@@ -444,9 +419,7 @@ pub fn extract_feature_prefix(content: &str, position: Position) -> String {
 
     let before_cursor = &line[..cursor_byte];
 
-    // Use the text after the last '[' on this line as the relevant segment
-    // (handles inline arrays; for multi-line arrays there is no '[' and we
-    // use the whole line up to the cursor).
+    // Text after the last '[' (inline arrays); multi-line arrays have none, so use the whole line.
     let segment_start = before_cursor.rfind('[').map_or(0, |i| i + 1);
     let segment = &before_cursor[segment_start..];
 
@@ -505,7 +478,6 @@ pub fn build_package_completion(
     }
     let latest = metadata.latest_version().as_str();
 
-    // Build markdown documentation
     let header = if latest.is_empty() {
         format!("**{}**", escape_markdown(name.as_str()))
     } else {
@@ -518,7 +490,7 @@ pub fn build_package_completion(
     let mut doc_parts = vec![header];
 
     if let Some(desc) = metadata.description() {
-        doc_parts.push(String::new()); // Empty line
+        doc_parts.push(String::new());
         // Truncate the raw description first, then escape — escaping first could
         // cut a `\`-escape sequence in half at the byte boundary.
         let truncated = if desc.len() > 200 {
@@ -530,7 +502,6 @@ pub fn build_package_completion(
         doc_parts.push(truncated);
     }
 
-    // Add links section if we have any links
     let mut links = Vec::new();
     if let Some(repo) = metadata.repository() {
         links.push(format!("[Repository]({})", escape_markdown(repo)));
@@ -540,7 +511,7 @@ pub fn build_package_completion(
     }
 
     if !links.is_empty() {
-        doc_parts.push(String::new()); // Empty line
+        doc_parts.push(String::new());
         doc_parts.push(links.join(" | "));
     }
 
@@ -621,7 +592,6 @@ pub fn build_version_completion(
     now: PublishTime,
     freshness_enabled: bool,
 ) -> CompletionItem {
-    // Simple index-based sorting (00000, 00001, etc.)
     let sort_text = format!("{:05}", display_item.index);
 
     // Greyed-out label suffix; unlike `label`, it never participates in filter matching,
@@ -800,10 +770,8 @@ pub fn prepare_version_display_items<V: AsRef<dyn Version>>(
     let mut head: Vec<(usize, &dyn Version)> =
         survivors.by_ref().take(MAX_COMPLETION_VERSIONS).collect();
 
-    // The pick falls outside the raw-order display cap: look for it in whatever remains of
-    // `survivors` (bounded by how far past the cap it sits, not by the total survivor count)
-    // and, if it survived the yanked filter, bump it in as the window's final entry instead
-    // of silently dropping it (#956).
+    // The pick fell outside the raw-order display cap: bump it in as the window's final
+    // entry instead of silently dropping it, if it survived the yanked filter (#956).
     if let Some(idx) = latest_idx
         && !head.iter().any(|(i, _)| *i == idx)
         && let Some(pick) = survivors.find(|(i, _)| *i == idx)
@@ -1068,7 +1036,6 @@ pub async fn complete_versions_generic_from(
         let latest_idx = registry.select_latest_matching(&filtered_versions, &wildcard_req);
         prepare_version_display_items(&filtered_versions, package_name, latest_idx)
     } else {
-        // Use all versions, prepare_version_display_items will handle yanked filtering
         let latest_idx = registry.select_latest_matching(&versions, &wildcard_req);
         prepare_version_display_items(&versions, package_name, latest_idx)
     };
@@ -1077,11 +1044,9 @@ pub async fn complete_versions_generic_from(
     let now = PublishTime::now();
     display_items
         .iter()
-        // A registry-reported version is exactly as untrusted as the one fed into
-        // `format_version_replacing`/`format_version_for_text_edit` (see
-        // `is_safe_version_string`'s doc comment) — a completion item's
-        // `insert_text`/`text_edit` is a manifest-write sink too, and fires on
-        // ordinary typing rather than a quickfix click.
+        // A registry-reported version is untrusted the same way `format_version_for_text_edit`'s
+        // input is (see `is_safe_version_string`'s doc comment) — this sink fires on ordinary
+        // typing rather than a quickfix click.
         .filter(|item| {
             let safe = is_safe_version_string(item.version.as_str());
             if !safe {
@@ -1500,8 +1465,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_complete_package_names_generic_drops_unsafe_names() {
-        // A registry search can return a mix of safe and malicious/compromised
-        // results (e.g. a Gradle Groovy breakout name); only the safe ones should
+        // A malicious/compromised result (e.g. a Gradle Groovy breakout name) must not
         // survive into the returned completion list.
         let registry = MockSearchRegistry {
             results: vec![
@@ -1770,13 +1734,8 @@ mod tests {
 
     #[test]
     fn test_detect_package_name_context_one_past_end_does_not_widen_range() {
-        // `position_in_range` tolerates a request one column past `name_range.end`,
-        // but the text right after a name is often structurally significant (a
-        // closing quote, the space before `=`, ...) — widening the range to reach
-        // a position past the name would consume that character once a client
-        // applies the edit, corrupting the manifest. So a one-past-end position
-        // must NOT produce a PackageName context (there is nothing else on this
-        // line for it to match either, so it falls through to `None`).
+        // Widening to a one-past-end position would consume structurally significant text
+        // (closing quote, space before `=`) on edit, so it must fall through to `None` instead.
         let parse_result = MockParseResult {
             dependencies: vec![MockDependency {
                 name: "serde".into(),
@@ -1862,15 +1821,10 @@ mod tests {
 
     #[test]
     fn test_detect_package_name_context_fires_for_ecosystem_supplied_partial_name() {
-        // #310 (deps-deno): a scheme-prefixed but structurally incomplete specifier value
-        // ("jsr:", "jsr:@", "jsr:@std", "jsr:@std/") has no complete name to parse, yet
-        // completion must still fire while the user is mid-keystroke. This is deliberately
-        // NOT solved by adding jsr:/npm:-specific logic here — `detect_completion_context`
-        // stays ecosystem-agnostic. Instead, `deps-deno`'s parser (mirroring `deps-npm`,
-        // which always builds a `Dependency` from a `dependencies` object key regardless of
-        // scope completeness) supplies a `Dependency` whose `name`/`name_range` cover the
-        // partial text directly; the existing range-containment check below requires no
-        // change to handle it. This test documents and locks in that consistency.
+        // #310 (deps-deno): a structurally incomplete specifier ("jsr:@std/") has no complete
+        // name to parse, yet completion must still fire mid-keystroke. Not solved with
+        // jsr:/npm:-specific logic here — `deps-deno`'s parser instead supplies a `Dependency`
+        // whose `name_range` covers the partial text directly, needing no change here.
         let parse_result = MockParseResult {
             dependencies: vec![MockDependency {
                 name: "jsr:@std/".into(),
@@ -2318,8 +2272,7 @@ mod tests {
 
     #[test]
     fn test_build_package_completion_escapes_repository_link_breakout() {
-        // A malicious repository URL that attempts to close the `[Repository](...)`
-        // link early and splice in a new, attacker-controlled markdown link.
+        // Attempts to close `[Repository](...)` early and splice in an attacker-controlled link.
         let malicious_repo = "https://legit.example)[Click here](https://evil.example";
         let metadata = MockMetadata {
             name: "test-pkg".into(),
@@ -2364,10 +2317,8 @@ mod tests {
 
     #[test]
     fn test_build_package_completion_truncate_then_escape_no_dangling_backslash() {
-        // A special character sitting right at the 200-char truncation boundary:
-        // truncating BEFORE escaping (correct order) keeps the escape sequence
-        // whole; escaping before truncating would risk cutting between the
-        // backslash and the character it escapes, leaving a dangling `\`.
+        // Truncating BEFORE escaping keeps an escape sequence at the boundary whole;
+        // escaping first would risk cutting between the backslash and its character.
         let mut desc = "a".repeat(199);
         desc.push('*');
         desc.push_str(&"b".repeat(50));
@@ -2398,11 +2349,8 @@ mod tests {
 
     #[test]
     fn test_build_package_completion_escapes_malicious_version_link_breakout() {
-        // A crafted latest-version string attempting to close the leading bold span
-        // and splice in a live, attacker-controlled markdown link — same injection
-        // class as description/repository/documentation. `latest_version` isn't
-        // gated by `is_safe_package_name` (that only guards `name`), so it must
-        // still be escaped in the rendered documentation.
+        // `latest_version` isn't gated by `is_safe_package_name` (that only guards `name`),
+        // so it must still be escaped to prevent the same link-breakout injection.
         let malicious_latest = "1.0.0)[click](https://evil.example";
         let metadata = MockMetadata {
             name: "test-pkg".into(),
@@ -2429,12 +2377,8 @@ mod tests {
 
     #[test]
     fn test_build_package_completion_rejects_unsafe_name() {
-        // A crafted package name attempting to close the leading bold span and
-        // splice in a live, attacker-controlled markdown link — reachable simply
-        // by typing a package-name prefix (no malicious manifest required). Such
-        // a name fails `is_safe_package_name` (structural characters like `[`,
-        // `]`, `(`, `)`, `*`, and space are not in its allowlist), so the whole
-        // completion item must be dropped rather than built with unsafe text.
+        // Reachable simply by typing a prefix (no malicious manifest required); such a name
+        // fails `is_safe_package_name`'s allowlist, so the whole item must be dropped.
         let malicious_name = "a** [Official Download](https://evil.example) **b";
         let metadata = MockMetadata {
             name: malicious_name.into(),
@@ -2450,9 +2394,8 @@ mod tests {
 
     #[test]
     fn test_build_package_completion_benign_repository_url_round_trips() {
-        // Backslash-escaping ASCII punctuation is visually inert on render (CommonMark
-        // strips the backslash for the literal character), so a normal URL must still
-        // render as the same, unmangled link once those escapes are stripped.
+        // Backslash-escaping is visually inert on render (CommonMark strips it), so a normal
+        // URL must still render unmangled once those escapes are stripped.
         let metadata = MockMetadata {
             name: "test-pkg".into(),
             description: None,
@@ -2519,11 +2462,8 @@ mod tests {
 
     #[test]
     fn test_build_package_completion_truncate_snaps_multibyte_boundary() {
-        // A 3-byte character straddling the 200-byte truncation boundary: truncation
-        // must snap back to a valid char boundary rather than panicking mid-codepoint,
-        // proving `floor_char_boundary` is exercised as a genuine non-identity op
-        // (unlike an all-ASCII description, where every byte offset is already a
-        // char boundary).
+        // A 3-byte character straddling byte 200: truncation must snap back to a valid char
+        // boundary rather than panicking mid-codepoint.
         let mut desc = "a".repeat(199);
         desc.push('日'); // 3 bytes, occupies byte offsets 199..202 — straddles byte 200
         desc.push('*');
@@ -2638,12 +2578,10 @@ mod tests {
         let item2 = build_version_completion(&display_item2, None, now, true);
         let item3 = build_version_completion(&display_item3, None, now, true);
 
-        // Simple index-based sorting
         assert_eq!(item1.sort_text.as_ref().unwrap(), "00000");
         assert_eq!(item2.sort_text.as_ref().unwrap(), "00001");
         assert_eq!(item3.sort_text.as_ref().unwrap(), "00002");
 
-        // First item should be preselected
         assert_eq!(item1.preselect, Some(true));
         assert_eq!(item2.preselect, Some(false));
         assert_eq!(item3.preselect, Some(false));
@@ -3253,7 +3191,6 @@ mod tests {
             },
         };
 
-        // Allow one character past end for completion
         let position = Position {
             line: 0,
             character: 11,
@@ -3437,7 +3374,6 @@ mod tests {
         let item = build_package_completion(&metadata, range).unwrap();
 
         if let Some(Documentation::MarkupContent(content)) = item.documentation {
-            // Should be truncated to 200 chars + "..."
             let lines: Vec<_> = content.value.lines().collect();
             assert!(lines[2].ends_with("..."));
             assert!(lines[2].len() <= 203); // 200 + "..."
@@ -3448,8 +3384,7 @@ mod tests {
 
     #[test]
     fn test_build_package_completion_long_description_unicode() {
-        // Create description with Unicode chars at the boundary
-        // Each '日' is 3 bytes, so 67 chars = 201 bytes
+        // Each '日' is 3 bytes, so 67 chars = 201 bytes, straddling the 200-byte boundary.
         let mut long_desc = String::new();
         for _ in 0..67 {
             long_desc.push('日');
@@ -3466,11 +3401,9 @@ mod tests {
         let range = Range::default();
         let item = build_package_completion(&metadata, range).unwrap();
 
-        // Should not panic on truncation
         if let Some(Documentation::MarkupContent(content)) = item.documentation {
             let lines: Vec<_> = content.value.lines().collect();
             assert!(lines[2].ends_with("..."));
-            // Truncation should happen at a char boundary
             assert!(lines[2].is_char_boundary(lines[2].len()));
         } else {
             panic!("Expected MarkupContent documentation");
@@ -3479,8 +3412,7 @@ mod tests {
 
     #[test]
     fn test_build_package_completion_long_description_emoji() {
-        // Emoji "😀" is 4 bytes each
-        // 51 emoji = 204 bytes
+        // "😀" is 4 bytes each; 51 emoji = 204 bytes, straddling the 200-byte boundary.
         let long_desc = "😀".repeat(51);
 
         let metadata = MockMetadata {
@@ -3494,11 +3426,9 @@ mod tests {
         let range = Range::default();
         let item = build_package_completion(&metadata, range).unwrap();
 
-        // Should not panic on truncation
         if let Some(Documentation::MarkupContent(content)) = item.documentation {
             let lines: Vec<_> = content.value.lines().collect();
             assert!(lines[2].ends_with("..."));
-            // Truncation should happen at a char boundary
             assert!(lines[2].is_char_boundary(lines[2].len()));
         } else {
             panic!("Expected MarkupContent documentation");
@@ -3507,7 +3437,6 @@ mod tests {
 
     #[test]
     fn test_extract_prefix_unicode_package_name() {
-        // Package name with Unicode characters
         let content = "日本語-crate = \"1.0\"";
         let position = Position {
             line: 0,
@@ -3530,7 +3459,6 @@ mod tests {
 
     #[test]
     fn test_extract_prefix_emoji_in_content() {
-        // Content with emoji (rare but should handle gracefully)
         let content = "emoji-😀-crate = \"1.0\"";
         let position = Position {
             line: 0,
@@ -3580,7 +3508,6 @@ mod tests {
             ],
         };
 
-        // Test with Cargo-style operators (^, ~, =, <, >)
         let items = complete_versions_generic(
             &registry,
             &pkg("test-pkg"),
@@ -3590,12 +3517,10 @@ mod tests {
         )
         .await;
 
-        // Should return versions starting with "1.0" (after stripping ^)
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].label, "1.0.0 (latest)");
         assert_eq!(items[1].label, "1.0.1");
 
-        // Test with tilde operator
         let items = complete_versions_generic(
             &registry,
             &pkg("test-pkg"),
@@ -3608,7 +3533,6 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "1.1.0 (latest)");
 
-        // Test with equals operator
         let items = complete_versions_generic(
             &registry,
             &pkg("test-pkg"),
@@ -3621,7 +3545,6 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "2.0.0 (latest)");
 
-        // Test with no operator (should work the same)
         let items = complete_versions_generic(
             &registry,
             &pkg("test-pkg"),
@@ -3802,7 +3725,6 @@ mod tests {
             ],
         };
 
-        // Test with prefix that doesn't match any version
         let items = complete_versions_generic(
             &registry,
             &pkg("test-pkg"),
@@ -3812,16 +3734,12 @@ mod tests {
         )
         .await;
 
-        // Should fallback to showing all non-yanked versions
         assert_eq!(items.len(), 3);
         assert_eq!(items[0].label, "1.0.0 (latest)");
         assert_eq!(items[1].label, "1.1.0");
         assert_eq!(items[2].label, "2.0.0");
-
-        // Yanked version should not be included in fallback
         assert!(!items.iter().any(|item| item.label == "2.1.0"));
 
-        // Test with empty prefix (should show all non-yanked)
         let items = complete_versions_generic(
             &registry,
             &pkg("test-pkg"),
@@ -3859,7 +3777,6 @@ mod tests {
             ],
         };
 
-        // Test that yanked versions are filtered out even when prefix matches
         let items = complete_versions_generic(
             &registry,
             &pkg("test-pkg"),
@@ -3869,22 +3786,16 @@ mod tests {
         )
         .await;
 
-        // Should only include non-yanked versions
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].label, "1.0.0 (latest)");
         assert_eq!(items[1].label, "1.0.2");
-
-        // Yanked version 1.0.1 should not be included
         assert!(!items.iter().any(|item| item.label == "1.0.1"));
     }
 
     #[tokio::test]
     async fn test_complete_versions_generic_filters_unsafe_version_string() {
-        // Regression (critic S3): `build_version_completion` writes `insert_text`/
-        // `text_edit.new_text` straight from a registry-reported version, the same
-        // untrusted data source as the REFACTOR code-action loop. An unsafe
-        // registry version must never surface as a completion item, while an
-        // ordinary safe version alongside it must still be offered.
+        // Critic S3: `build_version_completion` writes insert_text/text_edit straight from a
+        // registry-reported version, the same untrusted source as the REFACTOR code-action loop.
         let registry = MockRegistry {
             versions: vec![
                 MockVersion {
@@ -3921,7 +3832,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_complete_versions_generic_limit_5() {
-        // Create more than 5 versions
         let versions: Vec<_> = (0..10)
             .map(|i| MockVersion {
                 version: format!("1.0.{}", i).into(),
@@ -3932,7 +3842,6 @@ mod tests {
 
         let registry = MockRegistry { versions };
 
-        // Test that we only return 5 items
         let items = complete_versions_generic(
             &registry,
             &pkg("test-pkg"),
@@ -3986,12 +3895,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_complete_versions_generic_from_skips_prerelease_at_raw_top() {
-        // Regression for #952 (sibling of #313, previously hover-only): the raw
-        // registry-fetch-order top entry is a pre-release (Maven spring-boot-starter-web
-        // 4.2.0-M1, NuGet Newtonsoft.Json 13.0.5-beta1 shape). The completion dropdown's
-        // `(latest)` label AND `preselect` must land on the first stable entry, sourced from
-        // `Registry::select_latest_matching` (the same call hover delegates to), not raw
-        // index 0.
+        // #952 (sibling of #313, previously hover-only): when raw fetch-order top is a
+        // pre-release, `(latest)`/`preselect` must land on the first stable entry via
+        // `Registry::select_latest_matching`, not raw index 0.
         let registry = MockRegistry {
             versions: vec![
                 MockVersion {
@@ -4040,13 +3946,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_complete_versions_generic_from_all_prerelease_still_marks_a_latest() {
-        // Critic C1: when every fetched version is a pre-release, the completion dropdown
-        // must still agree with hover's own fallback — hover's `live_latest_idx` (via
-        // `Registry::select_latest_matching`/`select_latest_for_existence`) falls through to
-        // ranking the newest overall rather than tagging nothing, for the ~10 of 14
-        // ecosystems that share this existence ladder. Marking no entry here (the raw
-        // `is_prerelease()`-scan approach this fix replaced) would silently drop the
-        // preselected completion item hover still offers.
+        // Critic C1: when every version is a pre-release, completion must still agree with
+        // hover's fallback (ranking the newest overall) rather than tagging nothing.
         let registry = MockRegistry {
             versions: vec![
                 MockVersion {
@@ -4080,11 +3981,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_complete_versions_generic_from_prefers_non_deprecated_over_newer_deprecated() {
-        // Critic S1: the identical #952 defect class with "deprecated" substituted for
-        // "pre-release" (npm's #338 NFR-002 shape). `is_stable()` alone would still tag the
-        // newer `AdvisoryDeprecated` entry; delegating to the registry's own
-        // `select_latest_matching` (here, the shared 3-rung ladder gating on `is_flagged()`)
-        // must prefer the older, non-flagged release instead, agreeing with hover.
+        // Critic S1: same #952 defect class with "deprecated" substituted for "pre-release"
+        // (npm's #338 NFR-002 shape) — must prefer the older, non-flagged release.
         use crate::lsp_helpers::test_support::{
             MockRegistryPreferringUnflagged, MockVersionWithStatus,
         };

@@ -95,7 +95,6 @@ pub async fn load_document_from_disk(uri: &Url) -> Result<String> {
 
     tracing::debug!("Loading document from disk: {:?}", path);
 
-    // Check file metadata for size limits and warnings
     match tokio::fs::metadata(&path).await {
         Ok(metadata) => {
             // Reject anything but a regular file (FIFO, socket, character device,
@@ -114,7 +113,6 @@ pub async fn load_document_from_disk(uri: &Url) -> Result<String> {
 
             let size = metadata.len();
 
-            // Hard limit: reject files over 10MB
             if size > MAX_FILE_SIZE {
                 tracing::error!(
                     "Document exceeds maximum size: {} bytes (limit: {} bytes)",
@@ -126,7 +124,6 @@ pub async fn load_document_from_disk(uri: &Url) -> Result<String> {
                 )));
             }
 
-            // Warning for files over 1MB
             if size > LARGE_FILE_THRESHOLD {
                 tracing::warn!(
                     "Document is large: {} bytes for {:?}. Typical manifests are <100KB.",
@@ -138,7 +135,6 @@ pub async fn load_document_from_disk(uri: &Url) -> Result<String> {
             tracing::trace!("File size: {} bytes", size);
         }
         Err(e) => {
-            // Differentiate permission errors from other IO errors
             match e.kind() {
                 std::io::ErrorKind::NotFound => {
                     tracing::debug!("File not found: {:?}", path);
@@ -169,7 +165,6 @@ pub async fn load_document_from_disk(uri: &Url) -> Result<String> {
         DepsError::CacheError(format!("document read task failed: {e}"))
     })?
     .map_err(|e| {
-        // Differentiate permission errors in file read
         match e.kind() {
             std::io::ErrorKind::NotFound => {
                 tracing::debug!("File not found during read: {:?}", path);
@@ -256,7 +251,6 @@ mod tests {
         // must hold it, not just ones that diff a snapshot.
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let temp_file = NamedTempFile::new().unwrap();
-        // File is empty, don't write anything
 
         let uri = Url::from_file_path(temp_file.path()).unwrap();
         let loaded = load_document_from_disk(&uri).await.unwrap();
@@ -323,7 +317,6 @@ mod tests {
         // must hold it, not just ones that diff a snapshot.
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let mut temp_file = NamedTempFile::new().unwrap();
-        // Write invalid UTF-8 bytes
         temp_file.write_all(&[0xFF, 0xFE, 0xFD]).unwrap();
         temp_file.flush().unwrap();
 
@@ -350,7 +343,6 @@ mod tests {
         temp_file.write_all(b"test").unwrap();
         temp_file.flush().unwrap();
 
-        // Remove read permissions
         let mut perms = fs::metadata(temp_file.path()).unwrap().permissions();
         perms.set_mode(0o000);
         fs::set_permissions(temp_file.path(), perms.clone()).unwrap();
@@ -358,7 +350,6 @@ mod tests {
         let uri = Url::from_file_path(temp_file.path()).unwrap();
         let result = load_document_from_disk(&uri).await;
 
-        // Restore permissions for cleanup
         perms.set_mode(0o644);
         let _ = fs::set_permissions(temp_file.path(), perms);
 
@@ -374,9 +365,8 @@ mod tests {
         // Held per `fs_probe::snapshot_guard`'s doc: any fs_probe-touching test in this file
         // must hold it, not just ones that diff a snapshot.
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;
-        // This test verifies that large files can be loaded (with warning logged)
-        // We don't create a 10MB+ file to avoid slow tests, but we verify
-        // that normal-sized files load successfully
+        // No 10MB+ file here to avoid slow tests; a normal-sized file still exercises
+        // the warning-eligible path successfully.
         let mut temp_file = NamedTempFile::new().unwrap();
         let content = "a".repeat(1000); // 1KB, well under the warning threshold
         temp_file.write_all(content.as_bytes()).unwrap();
@@ -413,7 +403,6 @@ serde = "1.0"
 
     #[tokio::test]
     async fn test_file_size_limit_constant() {
-        // Document the limit for maintainability
         assert_eq!(MAX_FILE_SIZE, 10_000_000);
         assert_eq!(LARGE_FILE_THRESHOLD, 1_000_000);
     }
@@ -504,18 +493,12 @@ serde = "1.0"
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         use std::io::Write;
 
-        // Create a file just over MAX_FILE_SIZE (10MB)
-        // To avoid slow tests, we create a sparse file if possible
-        // Otherwise, we verify the error message format with metadata check
         let mut temp_file = NamedTempFile::new().unwrap();
 
-        // Write a small file for fast test execution
-        // We'll verify the size check logic by examining metadata
         let content = "test content";
         temp_file.write_all(content.as_bytes()).unwrap();
         temp_file.flush().unwrap();
 
-        // Verify the constant is enforced (boundary test)
         assert_eq!(MAX_FILE_SIZE, 10_000_000, "MAX_FILE_SIZE constant changed");
 
         // For platforms supporting sparse files, create a file > 10MB
@@ -527,8 +510,7 @@ serde = "1.0"
             let temp_dir = TempDir::new().unwrap();
             let large_file = temp_dir.path().join("large.toml");
 
-            // Create file and write single byte at position > 10MB
-            // This creates a sparse file without actually allocating disk space
+            // Writing one byte past the limit creates a sparse file, avoiding a real 10MB allocation.
             let file = std::fs::File::create(&large_file).unwrap();
             let beyond_limit = MAX_FILE_SIZE + 1;
             file.write_at(b"x", beyond_limit).unwrap();

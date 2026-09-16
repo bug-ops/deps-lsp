@@ -429,22 +429,17 @@ pub async fn fetch_latest_versions_parallel(
     let fetched = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let failed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let first_error: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
-    // Separate from `first_error` (#480): a not-found error is deliberately excluded
-    // from `fetch_failed` below (it isn't evidence of a registry-side problem), but
-    // without this, whichever concurrent fetch happened to finish first could still win
-    // the `first_error` race and put a misleading "not found" message in the one-time
-    // toast even when the batch's real, actionable failure is e.g. a rate limit hit by
-    // 20 other dependencies. Any error that *does* count toward `fetch_failed`
-    // (including a timeout) always wins the toast over a not-found, regardless of
-    // finishing order; only a not-found-only batch falls back to `first_error`.
+    // Separate from `first_error` (#480): not-found errors are excluded from
+    // `fetch_failed`, but without this a fast not-found could still win the `first_error`
+    // completion race over a slower, more actionable failure (e.g. a rate limit hit by
+    // 20 other dependencies). Any `fetch_failed`-counted error always wins the toast over
+    // a not-found regardless of finishing order; a not-found-only batch falls back to
+    // `first_error`.
     //
-    // Unlike `first_error`, this is not a shared `Arc<Mutex>` written from inside the
-    // four match arms below — each task instead returns its own `(name, message)` via
-    // `failed_name`, and the priority error is derived by folding those in completion
-    // order once every task has finished (see the loop below). `fetch_failed` and the
-    // priority error are thereby always in sync by construction: both come from the
-    // same `failed_name` value, so a future edit to one can no longer silently drift
-    // from the other, which two independently hand-maintained writes could (#480).
+    // Derived by folding each task's own `(name, message)` return value in completion
+    // order (see the loop below) rather than written from inside the match arms via a
+    // shared `Arc<Mutex>` like `first_error` — keeps `fetch_failed` and the priority error
+    // in sync by construction instead of via two independently hand-maintained writes (#480).
     let timeout = Duration::from_secs(timeout_secs);
     let wildcard_req = deps_core::VersionReq::new("*");
     let check_yanked = registry.reports_yanked();
@@ -477,12 +472,9 @@ pub async fn fetch_latest_versions_parallel(
                 .await
             }
         })
-        // `.max(1)`: `CacheConfig.max_concurrent_fetches` is a `pub` field, so an in-crate
-        // direct field assignment (see the test setup at `server.rs:1680`) bypasses
-        // `with_max_concurrent_fetches`'s own clamp; this is defence-in-depth against a
-        // future in-crate caller doing the same with `0`. `buffer_unordered(0)` never
-        // polls its source stream — it returns `Pending` forever instead of erroring,
-        // hanging every fetch through this document indefinitely (issue #833).
+        // `.max(1)`: defence-in-depth against a direct-field-assignment caller bypassing
+        // `with_max_concurrent_fetches`'s clamp with `0` — `buffer_unordered(0)` never
+        // polls its source stream, hanging every fetch through this document forever (#833).
         .buffer_unordered(max_concurrent.max(1))
         .collect()
         .await;
@@ -591,16 +583,11 @@ async fn fetch_and_classify_package(
     first_error: &std::sync::Mutex<Option<String>>,
     progress_sender: Option<&ProgressSender>,
 ) -> PackageFetchOutcome {
-    // Single round trip: the full version list is fetched once, and "latest"
-    // is a pure in-memory pick over it (`Registry::select_latest_matching`) —
-    // no second registry call, so the retained full list costs nothing extra
-    // over the network (see `PackageVersions`). `get_versions_from` (source-
-    // aware, spec FR-001) rather than `get_versions`: this populates
-    // `published_at` for registries that support it (#339), matching hover's
-    // existing freshness-aware call, AND routes a resolved
-    // `DependencySource::AlternateRegistry` to its own index instead of the
-    // ecosystem's default registry — registries with no override forward
-    // straight to `get_versions` at zero extra cost either way.
+    // Single round trip: the full version list is fetched once and "latest" is a pure
+    // in-memory pick over it, no second registry call. `get_versions_from` (source-aware,
+    // spec FR-001) over `get_versions`: populates `published_at` where supported (#339) and
+    // routes a resolved `AlternateRegistry` source to its own index — zero extra cost
+    // either way for registries with no override.
     let result = tokio::time::timeout(
         timeout,
         registry.get_versions_from(&name, &source, freshness),
@@ -621,14 +608,12 @@ async fn fetch_and_classify_package(
                 .iter()
                 .map(|v| v.version_string().clone())
                 .collect();
-            // Retained alongside `available` so `generate_diagnostics_from_cache`
-            // can flag a requirement satisfiable only by a yanked version — see
-            // `PackageVersions::yanked`. Gated on `check_yanked`: a registry that
-            // cannot answer `removal_status()` (§#298) must not populate this list
-            // with an untrustworthy always-`Available` signal. Carries each
-            // entry's own `RemovalStatus` (#437) so the #247 diagnostic path can
-            // gate its package-level-deprecation suppression on `AdvisoryDeprecated`
-            // specifically, never on a genuine `Yanked` finding.
+            // Retained alongside `available` so diagnostics can flag a requirement
+            // satisfiable only by a yanked version (`PackageVersions::yanked`). Gated on
+            // `check_yanked`: a registry unable to answer `removal_status()` (§#298) must
+            // not populate this with an untrustworthy always-`Available` signal. Carries
+            // each entry's `RemovalStatus` (#437) so #247's diagnostic path can gate
+            // deprecation suppression on `AdvisoryDeprecated` specifically, not `Yanked`.
             let yanked_list: Arc<[(ConcreteVersion, RemovalStatus)]> = if check_yanked {
                 versions
                     .iter()
@@ -642,13 +627,10 @@ async fn fetch_and_classify_package(
             } else {
                 Arc::from([])
             };
-            // `.get(idx)` rather than `versions[idx]`: `select_latest_matching`
-            // is a public `Registry` trait method, so an out-of-tree
-            // implementation returning a stale index must not panic this task.
-            // `_with_context` (not the plain method) so a registry with
-            // manifest-level stability state (Composer's `minimum-stability`,
-            // #424 S1) can apply it — every other registry's default
-            // implementation just forwards to the plain method unchanged.
+            // `.get(idx)` not `versions[idx]`: `select_latest_matching` is a public trait
+            // method, so an out-of-tree impl returning a stale index must not panic this
+            // task. `_with_context` so a registry with manifest-level stability state
+            // (Composer's `minimum-stability`, #424 S1) can apply it.
             let resolved = if let Some(v) = registry
                 .select_latest_matching_with_context(&versions, wildcard_req, minimum_stability)
                 .and_then(|idx| versions.get(idx))
@@ -663,17 +645,10 @@ async fn fetch_and_classify_package(
                     v.license().to_vec(),
                 ))
             } else {
-                // The pure list-based pick found nothing — for most
-                // ecosystems this genuinely means "no version found", but
-                // for a registry whose list endpoint can be incomplete
-                // (e.g. Go's `/@v/list`, which never enumerates
-                // pseudo-versions and can be entirely empty for an
-                // untagged module) it may just mean the list alone isn't
-                // enough. Fall back to the registry's own
-                // `get_latest_matching`, which some registries answer from
-                // a different, more complete source (Go's `/@latest`). This
-                // costs a second network call, but only in this already-rare
-                // "list-based pick failed" case, not the common path.
+                // The list-based pick found nothing — usually a genuine "no version", but
+                // a registry with an incomplete list endpoint (Go's `/@v/list`, which never
+                // enumerates pseudo-versions) may need the more complete `get_latest_matching`
+                // (Go's `/@latest`). Costs a second network call, only in this rare case.
                 let fallback = tokio::time::timeout(
                     timeout,
                     registry.get_latest_matching_from(
@@ -702,14 +677,10 @@ async fn fetch_and_classify_package(
                     }
                     Ok(Ok(None)) => {
                         tracing::debug!(package = %name, "no version found");
-                        // Both the list-based pick and this fallback
-                        // genuinely succeeded and found nothing — the
-                        // package demonstrably exists (the fetch itself
-                        // never errored), it just has zero versions this
-                        // registry can compare against (#550), e.g. a
-                        // repository whose only tags don't parse as full
-                        // semver. Distinct from every branch below that
-                        // sets `failed_name`.
+                        // Both the list-based pick and this fallback succeeded and found
+                        // nothing — the package exists but has zero comparable versions
+                        // (#550), e.g. tags that don't parse as full semver. Distinct from
+                        // every branch below that sets `failed_name`.
                         no_comparable_versions = true;
                         None
                     }
@@ -755,43 +726,27 @@ async fn fetch_and_classify_package(
             };
 
             if check_yanked {
-                // Row 1 (§4.7): the picked "latest" itself yanked —
-                // zero extra cost, since it's already in hand.
-                // Unreachable in production for an *enabled*
-                // registry under today's hardcoded wildcard (one
-                // never returns a yanked version for `*`), but
-                // stays correct as a defense-in-depth check.
+                // Row 1 (§4.7): the picked "latest" itself yanked — free, already in hand.
+                // Unreachable in production under today's hardcoded wildcard, but stays
+                // correct as a defense-in-depth check.
                 if let Some((latest, status, _, _, _)) = &resolved
                     && status.is_flagged()
                 {
                     yanked = Some((name.clone(), latest.clone(), *status));
                 }
 
-                // Row 2/3 (§4.7, revised under #206): `versions`
-                // is the full, already-fetched, unfiltered list —
-                // no second registry round trip is needed to
-                // check whether the in-use version was yanked,
-                // unlike the pre-#206 probe design. Checked for
-                // every dependency with a known in-use version,
-                // not just when it differs from `latest`, since
-                // it's now a free in-memory lookup either way. A
-                // yanked in-use version wins over an already
-                // -recorded yanked `latest` — it's the version
-                // the user actually has.
+                // Row 2/3 (§4.7, revised under #206): `versions` is the full, already-fetched
+                // list — no second registry round trip needed, so this runs for every
+                // dependency with a known in-use version, not just when it differs from
+                // `latest`. A yanked in-use version wins over an already-recorded yanked
+                // `latest` since it's the version the user actually has.
                 //
-                // Multiple occurrences of the same name (#394,
-                // e.g. under both `[dependencies]` and
-                // `[target.*.dependencies]`) can carry different
-                // in-use versions — every one is checked so a
-                // yanked pin on any occurrence is never missed
-                // just because another occurrence happens to
-                // share the registry lookup.
-                // Filters on `is_flagged()` inside the `find` predicate itself
-                // (not via a separate `.filter()` on the first version-string
-                // match) so a registry response with more than one entry sharing
-                // `iv`'s version string still finds a flagged one if any exists —
-                // mirroring the pre-#205 `.any(matches && flagged)` scan rather
-                // than narrowing to "is the *first* same-string entry flagged".
+                // Multiple occurrences of the same name (#394, e.g. `[dependencies]` +
+                // `[target.*.dependencies]`) can carry different in-use versions — every one
+                // is checked so a yanked pin on any occurrence is never missed. Filters on
+                // `is_flagged()` inside `find` itself (not a separate `.filter()`) so a
+                // response with multiple entries sharing `iv`'s version string still finds a
+                // flagged one if any exists (mirrors the pre-#205 `.any` scan).
                 if let Some((iv, status)) = in_use_versions.iter().find_map(|iv| {
                     versions
                         .iter()
@@ -804,24 +759,19 @@ async fn fetch_and_classify_package(
                 }
             }
 
-            // #205: the package-level deprecation finding is derived from the
-            // same `Version` `resolved` already picked as "latest" — covering
-            // the `get_latest_matching_with_context` fallback branch above too,
-            // whose returned `Version` is not a member of `versions` at all. See
-            // `FetchResult::deprecations`'s docs for why this must not instead
-            // scan `versions`.
+            // #205: the deprecation finding is derived from `resolved` (already picked as
+            // "latest"), covering the fallback branch too, whose `Version` isn't a member
+            // of `versions` at all — see `FetchResult::deprecations`'s doc for why this
+            // must not scan `versions` instead.
             if let Some((_, _, _, dep_info, _)) = &resolved
                 && let Some(dep_info) = dep_info
             {
                 deprecation = Some((name.clone(), dep_info.clone()));
             }
 
-            // Issue #660/#661 tier-1 backfill: extracted from the same `resolved` pick
-            // before `.map()` below consumes it — non-empty only for the native-list
-            // ecosystems whose `Version::license` isn't the default empty (PyPI,
-            // Composer today). Filtered here (not left to the aggregation loop) so a
-            // `Some((name, vec![]))` entry — indistinguishable from "no data" once
-            // merged into `DocumentState::licenses` — never gets inserted.
+            // #660/#661 tier-1 backfill: extracted from `resolved` before `.map()` consumes
+            // it. Filtered here so a `Some((name, vec![]))` entry — indistinguishable from
+            // "no data" once merged into `DocumentState::licenses` — never gets inserted.
             license = resolved
                 .as_ref()
                 .map(|(_, _, _, _, lic)| lic)
@@ -852,14 +802,9 @@ async fn fetch_and_classify_package(
                 *fe = Some(e.to_string());
             }
             drop(fe);
-            // A genuine not-found (the registry was successfully
-            // asked and said "no such package") is not a fetch
-            // failure — only an unanswerable request is (#267
-            // C1). Marking it `fetch_failed` here would make
-            // `generate_diagnostics_from_cache` report "Registry
-            // lookup failed" for the common typo'd-name case
-            // instead of "Unknown package", inverting the bug
-            // this field exists to fix.
+            // A genuine not-found is not a fetch failure — only an unanswerable request is
+            // (#267 C1). Marking it here would report "Registry lookup failed" for a
+            // typo'd name instead of "Unknown package", inverting the bug this fixes.
             if !e.is_not_found() {
                 failed_name = Some((name.clone(), e.fetch_failure(), e.to_string()));
             }
@@ -1302,7 +1247,6 @@ mod tests {
         use std::any::Any;
         use std::time::Duration;
 
-        // Mock registry that always times out
         struct TimeoutRegistry;
 
         impl Registry for TimeoutRegistry {
@@ -1312,7 +1256,6 @@ mod tests {
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
             {
                 Box::pin(async move {
-                    // Sleep longer than timeout (10s default)
                     tokio::time::sleep(Duration::from_secs(10)).await;
                     Ok(vec![])
                 })
@@ -1325,7 +1268,6 @@ mod tests {
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move {
-                    // Sleep longer than timeout
                     tokio::time::sleep(Duration::from_secs(10)).await;
                     Ok(None)
                 })
@@ -1348,7 +1290,6 @@ mod tests {
         let registry: Arc<dyn Registry> = Arc::new(TimeoutRegistry);
         let packages = vec![PackageName::new("slow-package")];
 
-        // Use 1 second timeout for test speed
         let result = fetch_latest_versions_parallel(
             registry,
             with_registry_source(packages),
@@ -1361,7 +1302,6 @@ mod tests {
         )
         .await;
 
-        // Should return empty (timeout, not success)
         assert!(result.versions.is_empty(), "Slow package should timeout");
         assert_eq!(result.failed_count, 1, "Should track 1 failed package");
         // #267: a timeout is also a fetch failure, not a "not found" — must
@@ -1379,7 +1319,6 @@ mod tests {
         use std::any::Any;
         use std::time::Duration;
 
-        // Mock registry with one slow, one fast package
         struct MixedRegistry;
 
         impl Registry for MixedRegistry {
@@ -1390,10 +1329,8 @@ mod tests {
             {
                 Box::pin(async move {
                     if name == "slow-package" {
-                        // Sleep longer than timeout
                         tokio::time::sleep(Duration::from_secs(10)).await;
                     }
-                    // Fast package or unknown: return immediately
                     Ok(vec![])
                 })
             }
@@ -1406,10 +1343,8 @@ mod tests {
             {
                 Box::pin(async move {
                     if name == "slow-package" {
-                        // Sleep longer than timeout
                         tokio::time::sleep(Duration::from_secs(10)).await;
                     }
-                    // Fast package or unknown: return immediately (no versions)
                     Ok(None)
                 })
             }
@@ -1448,14 +1383,12 @@ mod tests {
         .await;
         let elapsed = start.elapsed();
 
-        // Should complete in ~1s (timeout), not 10s (slow package duration)
         assert!(
             elapsed < Duration::from_secs(3),
             "Should not wait for slow package: {:?}",
             elapsed
         );
 
-        // Fast package processed (no versions), slow package timed out
         assert!(
             result.versions.is_empty(),
             "No versions returned (test registry returns empty)"
@@ -1473,7 +1406,6 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Duration;
 
-        // Mock registry that tracks concurrent requests
         struct ConcurrencyTrackingRegistry {
             current: Arc<AtomicUsize>,
             max_seen: Arc<AtomicUsize>,
@@ -1486,16 +1418,9 @@ mod tests {
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
             {
                 Box::pin(async move {
-                    // Increment concurrent counter
                     let current = self.current.fetch_add(1, Ordering::SeqCst) + 1;
-
-                    // Track max concurrent
                     self.max_seen.fetch_max(current, Ordering::SeqCst);
-
-                    // Simulate work
                     tokio::time::sleep(Duration::from_millis(50)).await;
-
-                    // Decrement counter
                     self.current.fetch_sub(1, Ordering::SeqCst);
 
                     Ok(vec![])
@@ -1509,16 +1434,9 @@ mod tests {
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move {
-                    // Increment concurrent counter
                     let current = self.current.fetch_add(1, Ordering::SeqCst) + 1;
-
-                    // Track max concurrent
                     self.max_seen.fetch_max(current, Ordering::SeqCst);
-
-                    // Simulate work
                     tokio::time::sleep(Duration::from_millis(50)).await;
-
-                    // Decrement counter
                     self.current.fetch_sub(1, Ordering::SeqCst);
 
                     Ok(None)
@@ -1547,7 +1465,6 @@ mod tests {
             max_seen: Arc::clone(&max_seen),
         });
 
-        // Create 50 packages, limit concurrency to 20
         let packages: Vec<PackageName> = (0..50)
             .map(|i| PackageName::new(format!("package-{}", i)))
             .collect();
@@ -1564,7 +1481,7 @@ mod tests {
         )
         .await;
 
-        // Max concurrent should not exceed limit (allow small margin for timing)
+        // +2 margin for timing noise around the limit of 20.
         let max = max_seen.load(Ordering::SeqCst);
         assert!(
             max <= 22,
@@ -1650,7 +1567,6 @@ mod tests {
         use std::any::Any;
         use std::time::Duration;
 
-        // Mock version for successful fetches
         #[derive(Debug)]
         struct MockVersion {
             version: ConcreteVersion,
@@ -1670,10 +1586,6 @@ mod tests {
             }
         }
 
-        // Mock registry with mixed outcomes:
-        // - "package-fast" returns quickly with version
-        // - "package-slow" times out
-        // - "package-error" returns error
         struct MixedOutcomeRegistry;
 
         impl Registry for MixedOutcomeRegistry {
@@ -1684,23 +1596,16 @@ mod tests {
             {
                 Box::pin(async move {
                     match name.as_str() {
-                        "package-fast" => {
-                            // Return immediately with a stable version
-                            Ok(vec![Box::new(MockVersion {
-                                version: "1.0.0".into(),
-                            }) as Box<dyn Version>])
-                        }
+                        "package-fast" => Ok(vec![Box::new(MockVersion {
+                            version: "1.0.0".into(),
+                        }) as Box<dyn Version>]),
                         "package-slow" => {
-                            // Sleep longer than timeout (test uses 1s timeout)
                             tokio::time::sleep(Duration::from_secs(10)).await;
                             Ok(vec![])
                         }
-                        "package-error" => {
-                            // Return cache error (simpler for testing)
-                            Err(deps_core::error::DepsError::CacheError(
-                                "Mock registry error".to_string(),
-                            ))
-                        }
+                        "package-error" => Err(deps_core::error::DepsError::CacheError(
+                            "Mock registry error".to_string(),
+                        )),
                         _ => Ok(vec![]),
                     }
                 })
@@ -1743,10 +1648,9 @@ mod tests {
                 versions: &[Box<dyn Version>],
                 _req: &deps_core::VersionReq,
             ) -> Option<usize> {
-                // The fetch loop no longer calls `get_latest_matching` — it derives
-                // "latest" from `get_versions` via this method instead, so this mock
-                // must implement it too (rather than relying on the `None` default) to
-                // keep exercising "package-fast" as a successful fetch.
+                // The fetch loop derives "latest" from `get_versions` via this method, not
+                // `get_latest_matching` — must override it (not rely on the `None` default)
+                // to keep exercising "package-fast" as a successful fetch.
                 if versions.is_empty() { None } else { Some(0) }
             }
 
@@ -1762,7 +1666,6 @@ mod tests {
             PackageName::new("package-error"),
         ];
 
-        // Use 1 second timeout for test speed
         let result = fetch_latest_versions_parallel(
             registry,
             with_registry_source(packages),
@@ -1775,7 +1678,6 @@ mod tests {
         )
         .await;
 
-        // Only the fast package should be in results
         assert_eq!(
             result.versions.len(),
             1,
@@ -2601,7 +2503,6 @@ mod tests {
         use deps_core::{Metadata, Registry, Version};
         use std::any::Any;
 
-        // Mock registry that returns errors for all packages
         struct ErrorRegistry;
 
         impl Registry for ErrorRegistry {
@@ -2653,7 +2554,6 @@ mod tests {
             PackageName::new("package-3"),
         ];
 
-        // Should not panic, just return empty result
         let result = fetch_latest_versions_parallel(
             registry,
             with_registry_source(packages),
@@ -2666,7 +2566,6 @@ mod tests {
         )
         .await;
 
-        // All packages failed, result should be empty
         assert!(
             result.versions.is_empty(),
             "All packages with errors should be omitted from results"
@@ -3057,7 +2956,6 @@ mod tests {
         let registry: Arc<dyn Registry> = Arc::new(FallbackTimeoutRegistry);
         let packages = vec![PackageName::new("slow-fallback")];
 
-        // 1s timeout for test speed.
         let result = fetch_latest_versions_parallel(
             registry,
             with_registry_source(packages),
@@ -3080,13 +2978,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_first_error_prefers_actionable_error_over_not_found_regardless_of_race_order() {
-        // #480: `first_error` is the batch's one-shot toast message. Before this fix it
-        // was simply whichever concurrent fetch finished first — so a fast not-found
-        // ("Unknown package") could outrank a slower but far more actionable error
-        // (e.g. a rate limit hit by every other package in the batch). Here the
-        // not-found resolves immediately while the actionable error resolves after a
-        // short delay, so it wins the finishing race; `priority_error` must still make
-        // the actionable error win the reported `first_error`.
+        // #480: before this fix, `first_error` was simply whichever concurrent fetch
+        // finished first, so a fast not-found could outrank a slower but more actionable
+        // error. Here not-found resolves immediately and the actionable error resolves
+        // after a delay, winning the race — `priority_error` must still make it win.
         use deps_core::{Metadata, Registry, Version};
         use std::any::Any;
         use std::time::Duration;
@@ -3247,16 +3142,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_timeout_only_batch_reports_first_error_alongside_failed_count() {
-        // #480 S1: the toast used to special-case a populated `first_error` as
-        // `format!("deps-lsp: {err}")`, entirely dropping `failed_count` from the
-        // message whenever `first_error` was `Some` — so a multi-package timeout batch
-        // (which always populates `first_error` via `priority_error`, unlike the
-        // not-found-only case) silently lost its count. The toast is now built
-        // unconditionally from both fields (`"{failed_count} package(s) could not be
-        // resolved: {first_error}"`, see #490), so this asserts the `FetchResult` data
-        // that feeds it: a batch where every package times out must report `failed_count`
-        // equal to the batch size *and* a populated, actionable `first_error` — both
-        // fields together, not one masking the other.
+        // #480 S1: the toast used to special-case a populated `first_error`, dropping
+        // `failed_count` from the message — a timeout batch silently lost its count. Now
+        // built unconditionally from both fields (#490): asserts `FetchResult` reports
+        // `failed_count` equal to batch size *and* a populated `first_error` together.
         use deps_core::{Metadata, Registry, Version};
         use std::any::Any;
         use std::time::Duration;
@@ -3928,7 +3817,6 @@ mod tests {
             let mut in_use = HashMap::new();
             in_use.insert(PackageName::new("pkg"), vec!["1.0.0".to_string()]);
 
-            // 1 second timeout for test speed.
             let result = fetch_latest_versions_parallel(
                 registry,
                 vec![(PackageName::new("pkg"), DependencySource::Registry)],

@@ -179,16 +179,10 @@ impl Ecosystem for DenoEcosystem {
         if !is_in_dependencies_section(content, position.line as usize) {
             return None;
         }
-        // No quote strip, unlike npm/Composer: the completable text at a
-        // package-name position in `deno.json` is the JSON *value* (the
-        // `jsr:`/`npm:` specifier string), not the *key* (the import alias) — the
-        // raw line-start-to-cursor text is always preceded by the alias key, colon
-        // and opening quote in real JSON (`"@std/fs": "jsr:@std/f`), so this can
-        // never coincide with a bare `jsr:`/`npm:` prefix; `DenoRegistry::search`
-        // always takes its scheme-less `None => Ok(vec![])` arm for this path, so
-        // the fallback query is effectively a no-op here rather than a source of
-        // garbage results — the primary `detect_completion_context`-based path
-        // does the real work.
+        // No quote strip, unlike npm/Composer: the completable text here is the JSON
+        // *value* (the specifier), never the alias key, so this can't coincide with a
+        // bare `jsr:`/`npm:` prefix — `DenoRegistry::search` no-ops on it harmlessly,
+        // and the real work happens via `detect_completion_context` instead.
         Some(extract_prefix(line, position.character))
     }
 

@@ -178,8 +178,6 @@ impl GemInfo {
     }
 }
 
-// Trait implementations for deps-core integration
-
 deps_core::impl_dependency!(BundlerDependency {
     name: name,
     name_range: name_range,

@@ -1,9 +1,6 @@
-// `GithubActionsRegistry::get_versions_with`'s boxed-future coercion nests
-// through several layers of `tokio::join!`/`MaybeDone` combinators; rustc's default recursion
-// limit is occasionally insufficient to prove the resulting `Send` bound and downgrades a
-// previously-silent trait-solver retry into `recursion_depth_exceeding_limit`, which the
-// fuzz CI job's `-D warnings` nightly build turns into a hard error (rust-lang/rust#159228).
-// Same fix as deps-swift (#673) and deps-nuget.
+// Nested `tokio::join!`/`MaybeDone` coercion in `get_versions_with` can exceed rustc's
+// default recursion limit proving the `Send` bound (rust-lang/rust#159228); same fix as
+// deps-swift (#673) and deps-nuget.
 #![recursion_limit = "256"]
 
 //! GitHub Actions ecosystem support for deps-lsp.

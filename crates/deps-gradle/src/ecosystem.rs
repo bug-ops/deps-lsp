@@ -115,8 +115,7 @@ impl GradleEcosystem {
     /// slicing, avoiding panics on multi-byte content preceding the cursor (e.g. an accented
     /// character in a `groupId`); the returned `range`'s `character` fields are converted
     /// back to UTF-16 units via [`deps_core::completion::byte_to_utf16_offset`].
-    // `col_idx` comes from `utf16_to_byte_offset` (char_indices-based), so it is always a
-    // char boundary.
+    // `col_idx` comes from `utf16_to_byte_offset` (char_indices-based), always a char boundary.
     #[cfg(feature = "lsp-responses")]
     #[allow(clippy::string_slice)]
     fn detect_completion_context<'a>(
@@ -172,15 +171,10 @@ fn byte_range(line: &str, line_idx: u32, start_byte: usize, end_byte: usize) -> 
 /// (e.g. treating a cursor inside `module`'s still-open value as "version" context,
 /// because "version" appears earlier on the line and the combined quote count happens
 /// to be odd).
-// Kept as its own escape-aware loop rather than calling
-// `deps_core::fallback_completion::count_real_quotes`/`find_closing_quote`: this needs
-// an `in_string` toggle interleaved with comma-boundary tracking in a *single* forward
-// pass (a comma's own `!in_string` guard depends on the running parity at that exact
-// position), which the shared helpers — built to answer "count/find real quotes over
-// the whole segment" — don't expose mid-scan. Keeps the same backslash-run escape rule
-// as those helpers (see `count_real_quotes`'s doc comment) so the two can't disagree on
-// a line containing `\"` (#738 follow-up); a future change to that rule must be mirrored
-// here too.
+// Own escape-aware loop, not the shared count_real_quotes/find_closing_quote helpers: needs an
+// in_string toggle interleaved with comma-boundary tracking in one forward pass, which those
+// whole-segment helpers don't expose mid-scan. Mirrors their backslash-run escape rule (#738
+// follow-up) — keep in sync if that rule ever changes.
 #[cfg(feature = "lsp-responses")]
 fn current_field_start(before_cursor: &str) -> usize {
     let mut in_string = false;
@@ -210,9 +204,8 @@ fn current_field_start(before_cursor: &str) -> usize {
 /// `col_idx`/`before_cursor` are byte offsets (see
 /// `GradleEcosystem::detect_completion_context`'s doc comment); the returned `Range`'s
 /// character fields are UTF-16 code unit offsets.
-// Every offset below (`field_start`, `rel_eq_pos`, `quote_start`, `value_start`/`value_end`)
-// derives from `char_indices()` or `find`/`rfind` of an ASCII token (`"`, `=`, `version`,
-// `module`), so every slice bound is always a char boundary.
+// Every offset below derives from `char_indices()` or `find`/`rfind` of an ASCII token, so every
+// slice bound is always a char boundary.
 #[cfg(feature = "lsp-responses")]
 #[allow(clippy::string_slice)]
 fn detect_catalog_context<'a>(
@@ -222,9 +215,8 @@ fn detect_catalog_context<'a>(
     line_idx: u32,
 ) -> (GradleCompletionContext, &'a str, Range) {
     let cursor = col_idx.min(line.len());
-    // Scope keyword/quote-parity detection to the current inline-table field (see
-    // `current_field_start`'s doc comment) so an earlier field on the same line can't be
-    // mistaken for the one the cursor is actually in.
+    // Scoped to the current inline-table field so an earlier field on the same line isn't
+    // mistaken for the one the cursor is in (see `current_field_start`'s doc).
     let field_start = current_field_start(before_cursor);
     let field = &before_cursor[field_start..];
 
@@ -232,28 +224,19 @@ fn detect_catalog_context<'a>(
     if let Some(rel_eq_pos) = field.rfind("version")
         && let after = &field[rel_eq_pos..]
         && after.contains('=')
-        // An odd, escape-aware (see `count_real_quotes`) quote count means the cursor
-        // sits inside an unclosed string opened by the last *real* quote in `after`.
-        // With an even count (string already closed, or no quote at all before cursor)
-        // the cursor is past this `version = "..."` entirely (e.g. a trailing comment on
-        // the same line), and this is not the right completion context.
+        // Odd escape-aware quote count means the cursor is inside an unclosed string opened by
+        // the last real quote; even means it's past this `version = "..."` entirely.
         && let (quote_count, Some(quote_start)) =
             deps_core::fallback_completion::count_real_quotes(after)
         && !quote_count.is_multiple_of(2)
     {
-        // `version.ref = "alias"` refers to a `[versions]` table alias name, not a
-        // registry version literal directly — `field.rfind("version")` above also matches
-        // this variant. Computing a real range for it here would let
-        // `dependency_version_range_is_literal` wrongly ACCEPT whenever the alias name
-        // happens to equal its own already-resolved value (critic follow-up to #931).
-        // Alias-name completion semantics are out of scope for this fix (see the spec's
-        // Edge Cases table), so this keeps the pre-#931 placeholder range, which the guard
-        // always rejects — the same safe-but-wrong behavior `version.ref` had before #931,
-        // not a regression.
-        // TOML's dotted-key syntax allows whitespace around the `.` (`version . ref = ...`
-        // is legal), so `trim_start()` before checking for the dot — a bare `starts_with`
-        // would miss that spacing and fall through to the real-range branch below,
-        // reintroducing the wrong-direction-accept bug this check exists to prevent.
+        // `version.ref = "alias"` names a `[versions]` table alias, not a registry version
+        // literal — computing a real range for it would let `dependency_version_range_is_literal`
+        // wrongly ACCEPT if the alias name equals its own resolved value (critic follow-up to
+        // #931), so this keeps the pre-#931 placeholder range instead, which the guard always
+        // rejects. `trim_start()` before the dot check because TOML allows whitespace around `.`
+        // (`version . ref = ...`); a bare `starts_with` would miss that and fall into the
+        // real-range branch, reintroducing the wrong-direction-accept bug.
         let is_version_ref = after
             .get("version".len()..)
             .is_some_and(|rest| rest.trim_start().starts_with('.'));
@@ -262,12 +245,9 @@ fn detect_catalog_context<'a>(
             let range = if is_version_ref {
                 Range::default()
             } else {
-                // Same unterminated-string fallback as the `module` arm below: bound by
-                // the cursor rather than end-of-line so an unclosed value doesn't swallow
-                // trailing line content into the range (#931 — this arm previously
-                // returned `Range::default()` unconditionally, which made
-                // `dependency_version_range_is_literal`'s content slice never match the
-                // declared version, rejecting every completion here).
+                // Bound by the cursor, not end-of-line, so an unterminated value doesn't swallow
+                // trailing line content (#931 fix; this arm previously always returned
+                // `Range::default()`, rejecting every completion here).
                 let value_end =
                     deps_core::fallback_completion::find_closing_quote(&line[value_start..], '"')
                         .map_or(cursor, |rel| value_start + rel)
@@ -292,10 +272,8 @@ fn detect_catalog_context<'a>(
     {
         let value_start = field_start + rel_eq_pos + quote_start + 1;
         if value_start <= cursor {
-            // Fall back to the cursor position (not end-of-line) when unterminated, so an
-            // unclosed string doesn't swallow unrelated trailing line content into the
-            // replace range (mirrors `MavenEcosystem::detect_xml_context`'s equivalent
-            // no-closing-tag fallback).
+            // Fall back to the cursor, not end-of-line, when unterminated (mirrors
+            // `MavenEcosystem::detect_xml_context`'s no-closing-tag fallback).
             let value_end =
                 deps_core::fallback_completion::find_closing_quote(&line[value_start..], '"')
                     .map_or(cursor, |rel| value_start + rel)
@@ -334,9 +312,8 @@ fn detect_dsl_context<'a>(
     } else {
         '\''
     };
-    // Escape-aware (see `count_real_quotes_with`) odd-parity check on the chosen quote
-    // character: an even count means the cursor sits past a closed string, or none was
-    // opened at all on this line (#738).
+    // Escape-aware odd-parity check on the chosen quote char: even means the cursor is past a
+    // closed string, or none was opened on this line (#738).
     let (quote_count, last_real_quote) =
         deps_core::fallback_completion::count_real_quotes_with(before_cursor, quote_char);
     if quote_count.is_multiple_of(2) {
@@ -350,12 +327,9 @@ fn detect_dsl_context<'a>(
 
     match colon_count {
         0 | 1 => {
-            // The package range covers "group" or "group:artifact" — up to a second
-            // colon (start of an already-typed version) if one exists, else the closing
-            // quote. If the string is unterminated on this line, the scan is bounded by
-            // the cursor instead of end-of-line, so it doesn't swallow unrelated trailing
-            // content (mirrors `MavenEcosystem::detect_xml_context`'s no-closing-tag
-            // fallback).
+            // Package range covers "group" or "group:artifact", up to a second colon (an
+            // already-typed version) if any, else the closing quote; bounded by the cursor when
+            // unterminated (mirrors `MavenEcosystem::detect_xml_context`'s fallback).
             let rest = &line[open_pos + 1..];
             let closing_quote_rel =
                 deps_core::fallback_completion::find_closing_quote(rest, quote_char);
@@ -381,9 +355,8 @@ fn detect_dsl_context<'a>(
                 .map(|(i, _)| i + 1)
                 .unwrap_or(before_cursor.len());
             // Same unterminated-string fallback as the `colon_count 0 | 1` arm above (#931 —
-            // this arm previously returned `Range::default()`, which made
-            // `dependency_version_range_is_literal`'s content slice never match the declared
-            // version, rejecting every compact-coordinate completion here).
+            // this arm previously returned `Range::default()`, rejecting every compact-coordinate
+            // completion here).
             let rest = &line[version_start..];
             let closing_quote_rel =
                 deps_core::fallback_completion::find_closing_quote(rest, quote_char);
@@ -464,8 +437,7 @@ impl Ecosystem for GradleEcosystem {
             let uri = parse_result.uri();
             let (ctx_type, value, range) = Self::detect_completion_context(content, position, uri);
 
-            // Exhaustive on purpose (#819, same bug class as #793): no wildcard arm, so a
-            // new `GradleCompletionContext` variant is a compile error right here.
+            // Exhaustive on purpose (#819, same bug class as #793): no wildcard arm.
             match ctx_type {
                 GradleCompletionContext::Version => {
                     let dep = parse_result.dependencies().into_iter().find(|d| {
@@ -473,13 +445,10 @@ impl Ecosystem for GradleEcosystem {
                             .is_some_and(|r| position_in_range(position.into(), r))
                             || d.name_range().start.line == position.line
                     });
-                    // #919: `detect_completion_context` only checks that the cursor sits
-                    // inside a coordinate's version segment, not that the segment's text is
-                    // a literal value — a `$var`/`${var}` property interpolation
-                    // (`resolve_variables`) must not be offered version completion, since
-                    // accepting one would splice text into the reference instead of editing
-                    // a version. Guarded on `range` (the segment's own detected span),
-                    // matching `dep`'s declared literal/requirement.
+                    // #919: `detect_completion_context` only checks the cursor is in a version
+                    // segment, not that it's a literal — an unresolved `$var`/`${var}` must not
+                    // get version completion, or accepting one would splice text into the
+                    // reference instead of editing a version.
                     match dep {
                         Some(dep)
                             if deps_core::lsp_helpers::dependency_version_range_is_literal(
@@ -559,8 +528,7 @@ impl Ecosystem for GradleEcosystem {
 }
 
 #[cfg(test)]
-// Fixtures are single-line ASCII (or explicitly UTF-16-tested) literals with
-// hand-computed byte offsets.
+// Fixtures are single-line ASCII (or explicitly UTF-16-tested) literals with hand-computed byte offsets.
 #[allow(clippy::string_slice)]
 mod tests {
     use super::*;
@@ -569,11 +537,8 @@ mod tests {
         Arc::new(deps_core::HttpCache::new())
     }
 
-    // #758: exact-value `Ecosystem` conformance, replacing test_ecosystem_id,
-    // test_ecosystem_display_name, test_manifest_filenames, and test_as_any. Gradle has no
-    // lock file format, so `lockfile_filenames` is omitted here; `no_lockfile_support: true;`
-    // (#782 gap 2) replaces the hand-copied test_lockfile_filenames_empty/
-    // test_lockfile_provider_none pair below.
+    // #758: exact-value `Ecosystem` conformance, replacing the individual hand-written tests.
+    // `no_lockfile_support: true;` (#782 gap 2) covers Gradle having no lock file format.
     deps_core::ecosystem_conformance! {
         mod gradle_ecosystem_conformance;
         build: GradleEcosystem::new(make_cache());
@@ -590,15 +555,10 @@ mod tests {
         no_lockfile_support: true;
     }
 
-    // #784: `build_arc:` (not `build:`) against the real `Ecosystem::registry()` wiring —
-    // `GradleEcosystem` reuses `deps_maven::MavenCentralRegistry` unchanged (#233), so a
-    // `build:` fixture constructing that type directly would only duplicate
-    // `deps-maven/src/registry.rs`'s own `test_select_latest_matching_not_default_none`
-    // and prove nothing gradle-specific; this proves the type Gradle's `registry()` hands
-    // back actually overrides the method. `req: "*"` (rather than an exact-string pin) also
-    // exercises the wildcard/existence-ladder branch both LSP fetch call sites
-    // (`deps-lsp/src/document/fetch.rs`, `deps-core/src/lsp_helpers/hover.rs`) actually take,
-    // instead of a branch production code never reaches.
+    // #784: `build_arc:` against the real `Ecosystem::registry()` wiring, not a `build:` fixture
+    // constructing `MavenCentralRegistry` directly — that would only duplicate deps-maven's own
+    // test and prove nothing gradle-specific. `req: "*"` exercises the wildcard branch the real
+    // LSP fetch call sites actually take.
     deps_core::registry_conformance! {
         mod gradle_registry_conformance;
         build_arc: GradleEcosystem::new(make_cache()).registry();
@@ -612,10 +572,8 @@ mod tests {
         };
     }
 
-    // #758: the shared completion-prefix-length guard
-    // (`deps_core::completion::complete_package_names_generic`), replacing
-    // test_complete_package_names_short_prefix — also closes the missing max-length case
-    // (issue #758 named deps-gradle as missing this).
+    // #758: shared completion-prefix-length guard conformance, also closing the missing
+    // max-length case deps-gradle previously lacked.
     #[cfg(feature = "lsp-responses")]
     deps_core::completion_guard_conformance! {
         mod gradle_completion_guard_conformance;

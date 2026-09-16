@@ -178,9 +178,8 @@ impl<T> MtimeFileCache<T> {
         let content = match fs_probe::read_to_string_capped(path, MAX_CACHED_FILE_BYTES).ok()? {
             Some(content) => content,
             None => {
-                // The stat-based pre-filter above passed, but the read itself still hit the
-                // cap — a symlink swap or concurrent growth between the two calls (CWE-367).
-                // Same outward behavior as the stat-based rejection: not cached, warned once.
+                // The stat-based pre-filter passed, but the read still hit the cap — a symlink
+                // swap or concurrent growth between the two calls (CWE-367).
                 self.warn_oversized_once(path, Some(mtime), None);
                 return None;
             }
@@ -227,11 +226,9 @@ mod tests {
         let path = dir.path().join("file.txt");
         std::fs::write(&path, "hello").unwrap();
 
-        // Held even though this test does not itself diff a snapshot: it still calls
-        // `get_or_parse`, which bumps the same process-global fs_probe counters
-        // `hit_does_zero_reads_and_exactly_one_stat` diffs elsewhere in this module —
-        // without the guard here, a concurrently running `cargo test` thread could corrupt
-        // that test's count mid-diff.
+        // Held even without diffing here: `get_or_parse` bumps the same process-global
+        // fs_probe counters `hit_does_zero_reads_and_exactly_one_stat` diffs elsewhere, which
+        // a concurrent test thread could otherwise corrupt mid-diff.
         let _guard = fs_probe::snapshot_guard();
         let cache: MtimeFileCache<Parsed> = MtimeFileCache::new(DEFAULT_MAX_CACHED_FILES, "test");
         let first = cache.get_or_parse(&path, parse_upper).unwrap();

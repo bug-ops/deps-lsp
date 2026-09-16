@@ -76,8 +76,6 @@ impl GoEcosystem {
     /// - Integration with go.sum for recently used modules
     #[cfg(feature = "lsp-responses")]
     fn complete_package_names(&self, _prefix: &str) -> impl Future<Output = Vec<CompletionItem>> {
-        // Go modules don't have a centralized search API
-        // Users typically know the full module path
         std::future::ready(vec![])
     }
 
@@ -126,7 +124,6 @@ impl GoEcosystem {
         _package_name: &deps_core::PackageName,
         _prefix: &str,
     ) -> impl Future<Output = Vec<CompletionItem>> {
-        // Go modules don't have feature flags
         std::future::ready(vec![])
     }
 }
@@ -412,7 +409,6 @@ mod tests {
 
         let config = EcosystemConfig::default();
 
-        // Lock file has the latest version
         let mut resolved_versions = HashMap::new();
         resolved_versions.insert("github.com/gin-gonic/gin".into(), "v1.9.1".into());
         let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
@@ -492,7 +488,6 @@ mod tests {
 
         let config = EcosystemConfig::default().with_show_up_to_date_hints(false);
 
-        // Lock file has the latest version - but show_up_to_date_hints is false
         let mut resolved_versions = HashMap::new();
         resolved_versions.insert("github.com/gin-gonic/gin".into(), "v1.9.1".into());
         let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
@@ -545,7 +540,6 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = GoEcosystem::new(cache);
 
-        // Go doesn't have package search, should always return empty
         let results = ecosystem.complete_package_names("github").await;
         assert!(results.is_empty());
     }
@@ -613,7 +607,6 @@ mod tests {
             uri: deps_core::test_util::test_uri("/test/go.mod"),
         };
 
-        // Unknown package should return empty (graceful degradation)
         let results = ecosystem
             .complete_versions(
                 &parse_result,
@@ -633,7 +626,6 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = GoEcosystem::new(cache);
 
-        // Go doesn't have features, should always return empty
         let results = ecosystem
             .complete_features(&pkg("github.com/gin-gonic/gin"), "")
             .await;
@@ -872,7 +864,6 @@ mod tests {
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
 
-        // Use timeout to prevent hanging
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             ecosystem.generate_diagnostics(
@@ -885,7 +876,6 @@ mod tests {
         )
         .await;
 
-        // Should complete within timeout
         assert!(result.is_ok(), "Diagnostic generation timed out");
     }
 
@@ -919,7 +909,6 @@ require github.com/
             )
             .await;
 
-        // Go doesn't support package search, should be empty
         assert!(completions.items.is_empty());
     }
 

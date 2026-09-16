@@ -462,7 +462,6 @@ fn expand_minified_versions(entries: Vec<MinifiedVersion>) -> Vec<ComposerVersio
             .as_deref()
             .and_then(deps_core::PublishTime::parse_rfc3339);
 
-        // Inherit previous state, then apply overrides
         if entry.version.is_some() {
             current.version = entry.version;
         }
@@ -480,7 +479,6 @@ fn expand_minified_versions(entries: Vec<MinifiedVersion>) -> Vec<ComposerVersio
             continue;
         };
 
-        // Filter dev versions
         if version.starts_with("dev-") || version.ends_with("-dev") {
             continue;
         }
