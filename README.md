@@ -131,7 +131,7 @@ from the identical classification function `deps-lsp` uses for its diagnostics, 
 `deps-cli check` result and an editor's diagnostics for the same manifest never disagree.
 
 ```bash
-cargo install deps-cli # once published to crates.io — cargo install --path crates/deps-cli today
+curl -fsSL https://raw.githubusercontent.com/bug-ops/deps-lsp/main/scripts/install-deps-cli.sh | sh
 deps-cli check --format sarif > results.sarif
 ```
 
@@ -142,8 +142,9 @@ deps-cli check --format sarif > results.sarif
 - **[GitHub Action](crates/github-action/README.md)**: a composite action wrapping
   `deps-cli check --format sarif`, leaving `upload-sarif` to your own workflow
 
-See [`crates/deps-cli/README.md`](crates/deps-cli/README.md) for the full flag reference,
-`deps.toml` schema, and exit-code contract.
+See [`crates/deps-cli/README.md`](crates/deps-cli/README.md) for other install options
+(`cargo install`, pre-built binaries, from source), the full flag reference, `deps.toml` schema,
+and exit-code contract.
 
 ## Configuration
 

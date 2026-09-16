@@ -41,11 +41,57 @@ a table, as JSON, or as SARIF 2.1.0, with a CI-friendly exit code.
 
 ## Installation
 
+### From crates.io
+
 ```bash
 cargo install deps-cli
 ```
 
-Or as a workspace dependency, to drive the `check` pipeline programmatically:
+> [!TIP]
+> Use `cargo binstall deps-cli` for faster installation without compilation.
+
+### Install script
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/bug-ops/deps-lsp/main/scripts/install-deps-cli.sh | sh
+```
+
+Detects your OS and CPU architecture, downloads the matching release archive, verifies its
+SHA256 checksum, and installs `deps-cli` to `${CARGO_HOME:-~/.cargo}/bin` (falling back to
+`~/.local/bin`) — no Rust toolchain required. Pin a release with `--tag <version>` (or the
+`DEPS_CLI_VERSION` env var); override the install directory with `--install-dir <dir>` (or
+`DEPS_CLI_INSTALL_DIR`).
+
+> [!IMPORTANT]
+> Windows is not supported by the script — download the `.zip` release asset from the table
+> below instead.
+
+### Pre-built binaries
+
+Download from [GitHub Releases](https://github.com/bug-ops/deps-lsp/releases/latest):
+
+| Platform | Architecture | Binary |
+| ---------- | -------------- | -------- |
+| Linux | x86_64 (glibc) | `deps-cli-x86_64-unknown-linux-gnu` |
+| Linux | aarch64 (glibc) | `deps-cli-aarch64-unknown-linux-gnu` |
+| Linux | x86_64 (musl) | `deps-cli-x86_64-unknown-linux-musl` |
+| Linux | aarch64 (musl) | `deps-cli-aarch64-unknown-linux-musl` |
+| macOS | x86_64 | `deps-cli-x86_64-apple-darwin` |
+| macOS | Apple Silicon | `deps-cli-aarch64-apple-darwin` |
+| Windows | x86_64 | `deps-cli-x86_64-pc-windows-msvc.exe` |
+| Windows | ARM64 | `deps-cli-aarch64-pc-windows-msvc.exe` |
+
+### From source
+
+```bash
+git clone https://github.com/bug-ops/deps-lsp
+cd deps-lsp
+cargo install --path crates/deps-cli
+```
+
+### As a workspace dependency
+
+To drive the `check` pipeline programmatically:
 
 ```toml
 [dependencies]
@@ -111,10 +157,12 @@ defining a `deps-lsp-check` hook (`language: system`, `entry: deps-cli check`), 
 
 > [!NOTE]
 > `language: system` means pre-commit does not install anything for this hook — `deps-cli`
-> must already be on your `PATH` (`cargo install deps-cli`, once published to crates.io, or
-> `cargo install --path crates/deps-cli` from a checkout today). An earlier `language: rust`
-> hook definition could not install from this repository's root at all, since it is a virtual
-> workspace manifest (no `[package]`) — see [#1074](https://github.com/bug-ops/deps-lsp/issues/1074).
+> must already be on your `PATH`. The fastest way to get it there is the
+> [install script](#installation) (`curl -fsSL .../install-deps-cli.sh | sh`); `cargo install
+> deps-cli` and `cargo install --path crates/deps-cli` from a checkout also work. An earlier
+> `language: rust` hook definition could not install from this repository's root at all, since
+> it is a virtual workspace manifest (no `[package]`) — see
+> [#1074](https://github.com/bug-ops/deps-lsp/issues/1074).
 
 ```yaml
 # .pre-commit-config.yaml
