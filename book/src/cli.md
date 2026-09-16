@@ -211,10 +211,13 @@ jobs:
 The `deps-cli` version is baked into the image at build time — pin a specific version via the
 image tag (`ghcr.io/bug-ops/deps-lsp-github-action:X.Y.Z`) instead of a `version` input.
 
-The action only fails the job itself on `exit-code` `2` (an execution error — `sarif-file`
-is left unset, since the file may be missing or truncated). A `--fail-on` policy violation
-(`exit-code` `1`) does not fail the step; `sarif-file` is still produced and uploaded, and
-it's your own workflow's decision whether to fail the build on it, as shown above.
+The action only fails the job itself on an execution error — any exit code other than `0`
+(clean) or `1` (a `--fail-on` category matched), including a `deps-cli` panic or a refused
+SARIF output path. `sarif-file` is left unset in that case, since the file may be missing or
+truncated, but it can also be unset at `exit-code` `0` or `1` if the output path couldn't be
+written. A `--fail-on` policy violation (`exit-code` `1`) does not fail the step; `sarif-file`
+is otherwise still produced and uploaded, and it's your own workflow's decision whether to
+fail the build on it, as shown above.
 
 > **Warning:** the `config` input is treated as fully trusted, unlike an auto-discovered
 > `deps.toml` — only point it at a file outside the scanned checkout and under your own

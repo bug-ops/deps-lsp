@@ -32,17 +32,24 @@ inputs:
 outputs:
   sarif-file:
     description: >-
-      Path to the produced SARIF file. Set for exit-code 0 (clean) and 1 (a
-      --fail-on category matched — FR-018 leaves that decision to your own
-      workflow, so this step does not fail the job for it). Unset for
-      exit-code 2 (execution error), since the file may be missing or
-      truncated and should not be fed to upload-sarif.
+      Path to the produced SARIF file. Set only when a non-empty regular
+      SARIF file was produced by the run — it may be unset even when
+      exit-code is 0 (clean) or 1 (a --fail-on category matched), e.g. when
+      the output path could not be written or the file came out empty. Also
+      unset for any other exit code (execution error, e.g. a deps-cli panic
+      or missing binary), since the file may be missing, truncated, or
+      unsafe to trust and should not be fed to upload-sarif.
   exit-code:
     description: >-
       deps-cli check's own exit code (0 clean, 1 a --fail-on category
-      matched, 2 execution error). Always set. Check this output — not the
-      step's own pass/fail — to react to a policy violation; the step
-      itself only fails the job on exit-code 2.
+      matched, 2 execution error) when the run completed; the step also
+      reports the raw exit code here for an abnormal deps-cli termination
+      (e.g. a panic). Set whenever deps-cli ran, even if it produced no
+      usable SARIF file; unset only if the action refused to start before
+      running deps-cli at all (e.g. a directory pre-placed at the SARIF
+      output path). Check this output — not the step's own pass/fail — to
+      react to a policy violation; the step itself fails the job on any
+      exit code other than 0 or 1.
 runs:
   using: docker
   image: docker://ghcr.io/bug-ops/deps-lsp-github-action:1

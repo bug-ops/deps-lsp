@@ -208,9 +208,12 @@ a composite action. It writes a SARIF file but does not upload it — wire
   run: exit 1
 ```
 
-The action itself only fails the job on `exit-code` `2` (an execution error); a `--fail-on`
-policy violation (`exit-code` `1`) still produces and uploads a SARIF file, and it is your own
-workflow's decision — shown above — whether to fail the build on it. See
+The action itself only fails the job on an execution error — any exit code other than `0`
+(clean) or `1` (a `--fail-on` category matched), including a `deps-cli` panic or a refused
+SARIF output path. A `--fail-on` policy violation (`exit-code` `1`) does not fail the step;
+`sarif-file` is usually still produced and uploaded then too, though it may be unset even at
+`exit-code` `0` or `1` if the output path couldn't be written. It is your own workflow's
+decision — shown above — whether to fail the build on a policy violation. See
 [`crates/github-action/README.md`](../github-action/README.md) for the full input/output
 reference.
 
@@ -219,8 +222,8 @@ reference.
 > above, is at risk of truncation if `deps-cli` crashes mid-write — a partial SARIF file handed
 > to `upload-sarif` fails confusingly rather than cleanly. The GitHub Action wrapper does not
 > have this risk: it captures `deps-cli`'s exit code before deciding whether `sarif-file` is
-> set, so a crash (exit code `2`) leaves `sarif-file` unset instead of pointing at a truncated
-> file (#1063). Prefer the Action, or apply the same exit-code check yourself, when scripting
+> set, so a crash leaves `sarif-file` unset instead of pointing at a truncated file (#1063).
+> Prefer the Action, or apply the same exit-code check yourself, when scripting
 > the CLI form directly in CI.
 
 ## Configuration

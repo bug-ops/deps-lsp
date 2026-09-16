@@ -40,6 +40,7 @@ jobs:
         with:
           fail-on: vulnerable,yanked,unsatisfiable
       - uses: github/codeql-action/upload-sarif@v3
+        if: steps.deps-check.outputs.sarif-file != ''
         with:
           sarif_file: ${{ steps.deps-check.outputs.sarif-file }}
       - name: Fail the build on a policy violation
@@ -59,13 +60,21 @@ vulnerabilities before it's pushed — a finding blocks the publish and is repor
 repository's Security tab. Every pull request touching `crates/github-action/` is scanned the
 same way, without publishing.
 
-Per FR-018, this action only fails the job itself on `exit-code` `2` (an execution error —
-`sarif-file` is left unset in that case, since the file may be missing or truncated, so the
-`upload-sarif` step above is skipped automatically for you). A `--fail-on` policy violation
+Per FR-018, this action only fails the job itself on an execution error — any exit code other
+than `0` (clean) or `1` (a `--fail-on` category matched), including a `deps-cli` panic, a
+missing binary, or a refused/unwritable SARIF path. `sarif-file` is left unset in that case,
+since the file may be missing, truncated, or unsafe to trust, so the `upload-sarif` step above
+is skipped automatically for you via its `if:` guard. A `--fail-on` policy violation
 (`exit-code` `1`) does **not** fail the step — `sarif-file` is still produced and uploaded,
 and it is your own workflow's decision whether to fail the build on it, as shown by the final
 step above. Drop that step if you only want the SARIF upload, not a build failure, on a
 policy violation.
+
+The SARIF output path (`deps-lsp-results.sarif`) is removed before every run — including a
+pre-existing regular file left by a prior step, and a symlink placed there by the scanned
+checkout (#1132) — so a stale or hostile file never leaks into the result. A **directory** at
+that path cannot be removed this way, so the action refuses to start before `deps-cli` even
+runs; neither `sarif-file` nor `exit-code` is set in that case.
 
 ## Inputs
 
@@ -90,5 +99,5 @@ policy violation.
 
 | Output | Description |
 |--------|-------------|
-| `sarif-file` | Path to the produced SARIF file (`deps-lsp-results.sarif`). Set for `exit-code` `0`/`1`; unset for `2` |
-| `exit-code` | `deps-cli check`'s own exit code (`0` clean, `1` a `--fail-on` category matched, `2` execution error). Always set |
+| `sarif-file` | Path to the produced SARIF file (`deps-lsp-results.sarif`). Set only when a non-empty regular SARIF file was produced by the run; it may be unset even when `exit-code` is `0` or `1` (e.g. an unwritable output path or an empty result), and is always unset for any other exit code (execution error) |
+| `exit-code` | `deps-cli check`'s own exit code (`0` clean, `1` a `--fail-on` category matched, `2` execution error), or the raw exit code from an abnormal `deps-cli` termination. Set whenever `deps-cli` ran; unset only if the action refused to start before running it (e.g. a directory pre-placed at the SARIF output path) |
