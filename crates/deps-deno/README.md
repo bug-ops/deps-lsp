@@ -3,7 +3,7 @@
 [![Crates.io](https://img.shields.io/crates/v/deps-deno)](https://crates.io/crates/deps-deno)
 [![docs.rs](https://img.shields.io/docsrs/deps-deno)](https://docs.rs/deps-deno)
 [![CI](https://github.com/bug-ops/deps-lsp/actions/workflows/ci.yml/badge.svg)](https://github.com/bug-ops/deps-lsp/actions)
-[![codecov](https://codecov.io/gh/bug-ops/deps-lsp/graph/badge.svg?token=S71PTINTGQ&flag=deps-deno)](https://codecov.io/gh/bug-ops/deps-lsp)
+[![codecov](https://codecov.io/gh/bug-ops/deps-lsp/graph/badge.svg?token=S71PTINTGQ&component=deps-deno)](https://codecov.io/gh/bug-ops/deps-lsp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](../../LICENSE)
 
 Deno/JSR support for deps-lsp.
@@ -23,7 +23,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 
 ```toml
 [dependencies]
-deps-deno = "1.0"
+deps-deno = "1.1"
 ```
 
 > [!IMPORTANT]

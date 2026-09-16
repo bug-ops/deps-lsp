@@ -3,7 +3,7 @@
 [![Crates.io](https://img.shields.io/crates/v/deps-github-actions)](https://crates.io/crates/deps-github-actions)
 [![docs.rs](https://img.shields.io/docsrs/deps-github-actions)](https://docs.rs/deps-github-actions)
 [![CI](https://github.com/bug-ops/deps-lsp/actions/workflows/ci.yml/badge.svg)](https://github.com/bug-ops/deps-lsp/actions)
-[![codecov](https://codecov.io/gh/bug-ops/deps-lsp/graph/badge.svg?token=S71PTINTGQ&flag=deps-github-actions)](https://codecov.io/gh/bug-ops/deps-lsp)
+[![codecov](https://codecov.io/gh/bug-ops/deps-lsp/graph/badge.svg?token=S71PTINTGQ&component=deps-github-actions)](https://codecov.io/gh/bug-ops/deps-lsp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](../../LICENSE)
 
 GitHub Actions workflow dependency support for deps-lsp.
@@ -45,7 +45,7 @@ or `.github/actions/<name>/`, issue #706), and implements `deps_core::Ecosystem`
 
 ```toml
 [dependencies]
-deps-github-actions = "1.0"
+deps-github-actions = "1.1"
 ```
 
 > [!IMPORTANT]

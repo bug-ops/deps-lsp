@@ -3,7 +3,7 @@
 [![Crates.io](https://img.shields.io/crates/v/deps-bundler)](https://crates.io/crates/deps-bundler)
 [![docs.rs](https://img.shields.io/docsrs/deps-bundler)](https://docs.rs/deps-bundler)
 [![CI](https://github.com/bug-ops/deps-lsp/actions/workflows/ci.yml/badge.svg)](https://github.com/bug-ops/deps-lsp/actions)
-[![codecov](https://codecov.io/gh/bug-ops/deps-lsp/graph/badge.svg?token=S71PTINTGQ&flag=deps-bundler)](https://codecov.io/gh/bug-ops/deps-lsp)
+[![codecov](https://codecov.io/gh/bug-ops/deps-lsp/graph/badge.svg?token=S71PTINTGQ&component=deps-bundler)](https://codecov.io/gh/bug-ops/deps-lsp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](../../LICENSE)
 
 Gemfile support for deps-lsp.
@@ -24,7 +24,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 
 ```toml
 [dependencies]
-deps-bundler = "1.0"
+deps-bundler = "1.1"
 ```
 
 > [!IMPORTANT]

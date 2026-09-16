@@ -3,7 +3,7 @@
 [![Crates.io](https://img.shields.io/crates/v/deps-nuget)](https://crates.io/crates/deps-nuget)
 [![docs.rs](https://img.shields.io/docsrs/deps-nuget)](https://docs.rs/deps-nuget)
 [![CI](https://github.com/bug-ops/deps-lsp/actions/workflows/ci.yml/badge.svg)](https://github.com/bug-ops/deps-lsp/actions)
-[![codecov](https://codecov.io/gh/bug-ops/deps-lsp/graph/badge.svg?token=S71PTINTGQ&flag=deps-nuget)](https://codecov.io/gh/bug-ops/deps-lsp)
+[![codecov](https://codecov.io/gh/bug-ops/deps-lsp/graph/badge.svg?token=S71PTINTGQ&component=deps-nuget)](https://codecov.io/gh/bug-ops/deps-lsp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](../../LICENSE)
 
 NuGet/.NET project file support for deps-lsp.
@@ -30,7 +30,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 
 ```toml
 [dependencies]
-deps-nuget = "1.0"
+deps-nuget = "1.1"
 ```
 
 ## Usage

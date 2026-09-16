@@ -3,7 +3,7 @@
 [![Crates.io](https://img.shields.io/crates/v/deps-go)](https://crates.io/crates/deps-go)
 [![docs.rs](https://img.shields.io/docsrs/deps-go)](https://docs.rs/deps-go)
 [![CI](https://github.com/bug-ops/deps-lsp/actions/workflows/ci.yml/badge.svg)](https://github.com/bug-ops/deps-lsp/actions)
-[![codecov](https://codecov.io/gh/bug-ops/deps-lsp/graph/badge.svg?token=S71PTINTGQ&flag=deps-go)](https://codecov.io/gh/bug-ops/deps-lsp)
+[![codecov](https://codecov.io/gh/bug-ops/deps-lsp/graph/badge.svg?token=S71PTINTGQ&component=deps-go)](https://codecov.io/gh/bug-ops/deps-lsp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](../../LICENSE)
 
 Go modules support for deps-lsp.
@@ -26,7 +26,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 
 ```toml
 [dependencies]
-deps-go = "1.0"
+deps-go = "1.1"
 ```
 
 > [!IMPORTANT]

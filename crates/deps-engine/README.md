@@ -3,7 +3,7 @@
 [![Crates.io](https://img.shields.io/crates/v/deps-engine)](https://crates.io/crates/deps-engine)
 [![docs.rs](https://img.shields.io/docsrs/deps-engine)](https://docs.rs/deps-engine)
 [![CI](https://github.com/bug-ops/deps-lsp/actions/workflows/ci.yml/badge.svg)](https://github.com/bug-ops/deps-lsp/actions)
-[![codecov](https://codecov.io/gh/bug-ops/deps-lsp/graph/badge.svg?token=S71PTINTGQ&flag=deps-engine)](https://codecov.io/gh/bug-ops/deps-lsp)
+[![codecov](https://codecov.io/gh/bug-ops/deps-lsp/graph/badge.svg?token=S71PTINTGQ&component=deps-engine)](https://codecov.io/gh/bug-ops/deps-lsp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](../../LICENSE)
 
 The composition root for the [deps-lsp](https://github.com/bug-ops/deps-lsp) workspace.

@@ -3,7 +3,7 @@
 [![Crates.io](https://img.shields.io/crates/v/deps-cli)](https://crates.io/crates/deps-cli)
 [![docs.rs](https://img.shields.io/docsrs/deps-cli)](https://docs.rs/deps-cli)
 [![CI](https://github.com/bug-ops/deps-lsp/actions/workflows/ci.yml/badge.svg)](https://github.com/bug-ops/deps-lsp/actions)
-[![codecov](https://codecov.io/gh/bug-ops/deps-lsp/graph/badge.svg?token=S71PTINTGQ&flag=deps-cli)](https://codecov.io/gh/bug-ops/deps-lsp)
+[![codecov](https://codecov.io/gh/bug-ops/deps-lsp/graph/badge.svg?token=S71PTINTGQ&component=deps-cli)](https://codecov.io/gh/bug-ops/deps-lsp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](../../LICENSE)
 
 Run deps-lsp's dependency-health checks from the command line, in CI, or in a shell script —
@@ -105,7 +105,7 @@ To drive the `check` pipeline programmatically:
 
 ```toml
 [dependencies]
-deps-cli = "1.0"
+deps-cli = "1.1"
 ```
 
 > [!IMPORTANT]

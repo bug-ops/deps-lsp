@@ -3,7 +3,7 @@
 [![Crates.io](https://img.shields.io/crates/v/deps-gitlab-ci)](https://crates.io/crates/deps-gitlab-ci)
 [![docs.rs](https://img.shields.io/docsrs/deps-gitlab-ci)](https://docs.rs/deps-gitlab-ci)
 [![CI](https://github.com/bug-ops/deps-lsp/actions/workflows/ci.yml/badge.svg)](https://github.com/bug-ops/deps-lsp/actions)
-[![codecov](https://codecov.io/gh/bug-ops/deps-lsp/graph/badge.svg?token=S71PTINTGQ&flag=deps-gitlab-ci)](https://codecov.io/gh/bug-ops/deps-lsp)
+[![codecov](https://codecov.io/gh/bug-ops/deps-lsp/graph/badge.svg?token=S71PTINTGQ&component=deps-gitlab-ci)](https://codecov.io/gh/bug-ops/deps-lsp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](../../LICENSE)
 
 GitLab CI/CD `include:` dependency support for deps-lsp.
@@ -37,7 +37,7 @@ provides parsing and registry integration for `.gitlab-ci.yml` and `.gitlab/ci/*
 
 ```toml
 [dependencies]
-deps-gitlab-ci = "1.0"
+deps-gitlab-ci = "1.1"
 ```
 
 > [!IMPORTANT]

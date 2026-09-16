@@ -3,7 +3,7 @@
 [![Crates.io](https://img.shields.io/crates/v/deps-core)](https://crates.io/crates/deps-core)
 [![docs.rs](https://img.shields.io/docsrs/deps-core)](https://docs.rs/deps-core)
 [![CI](https://github.com/bug-ops/deps-lsp/actions/workflows/ci.yml/badge.svg)](https://github.com/bug-ops/deps-lsp/actions)
-[![codecov](https://codecov.io/gh/bug-ops/deps-lsp/graph/badge.svg?token=S71PTINTGQ&flag=deps-core)](https://codecov.io/gh/bug-ops/deps-lsp)
+[![codecov](https://codecov.io/gh/bug-ops/deps-lsp/graph/badge.svg?token=S71PTINTGQ&component=deps-core)](https://codecov.io/gh/bug-ops/deps-lsp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](../../LICENSE)
 
 Core abstractions for deps-lsp: traits, caching, and generic LSP handlers.
@@ -34,7 +34,7 @@ This crate provides the shared infrastructure used by all ecosystem-specific cra
 
 ```toml
 [dependencies]
-deps-core = "1.0"
+deps-core = "1.1"
 ```
 
 > [!IMPORTANT]
