@@ -4,7 +4,9 @@
 # against its published SHA256 checksum, mirroring scripts/install-deps-cli.sh's approach.
 FROM alpine:3.22 AS fetch
 
-RUN apk add --no-cache curl tar
+# apk upgrade first: the alpine:3.22 layer can be stale relative to its own repo snapshot,
+# shipping an already-patched CVE otherwise (e.g. CVE-2026-14456 in libssl3/libcrypto3).
+RUN apk upgrade --no-cache && apk add --no-cache curl tar
 
 ARG DEPS_CLI_VERSION
 ARG TARGETARCH
@@ -38,7 +40,7 @@ RUN set -eu; \
 
 FROM alpine:3.22
 
-RUN apk add --no-cache bash ca-certificates
+RUN apk upgrade --no-cache && apk add --no-cache bash ca-certificates
 
 COPY --from=fetch /tmp/fetch/deps-cli /usr/local/bin/deps-cli
 COPY entrypoint.sh /entrypoint.sh

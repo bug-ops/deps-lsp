@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **ci**: `crates/github-action` wired into this repo's own `ci.yml` as a SARIF gate, uploading results to Code Scanning and failing the build on a `vulnerable`/`yanked`/`unsatisfiable` policy violation (#1126, resolves #1122)
 
+### Fixed
+- **ci**: `crates/github-action`'s Dockerfile now runs `apk upgrade` before `apk add` in both build stages, so the published image no longer ships a stale `alpine:3.22` package layer with an already-patched CVE (`libssl3`/`libcrypto3` CVE-2026-14456, flagged HIGH by Trivy)
+
 ## [1.0.1] - 2026-09-16
 
 ### Added
