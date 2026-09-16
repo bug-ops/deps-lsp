@@ -199,7 +199,12 @@ async fn run_check(
                 .await
                 {
                     Ok(result) => {
-                        had_execution_error |= result.registry_unreachable;
+                        // Both name genuinely different subsystems (the version registry vs.
+                        // a tier-3 license source) but feed the same exit-2 "incomplete
+                        // report" signal — see `ManifestCheckResult::license_fetch_incomplete`'s
+                        // doc (issue #1133 code-review finding #1).
+                        had_execution_error |=
+                            result.registry_unreachable || result.license_fetch_incomplete;
                         findings.extend(result.findings);
                     }
                     Err(error) => {

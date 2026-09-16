@@ -9,5 +9,6 @@
 
 pub mod diff;
 pub mod fetch;
+pub mod license;
 pub mod osv;
 pub mod resolved;

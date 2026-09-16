@@ -34,3 +34,10 @@
 pub mod classify;
 pub mod progress;
 pub mod setup;
+
+/// Minimal, network-free test doubles for [`deps_core::ecosystem::Ecosystem`].
+///
+/// See the module's own doc for what it exposes and why. Mirrors `deps-core`'s own
+/// `test_util` module's `#[cfg(any(test, feature = "test-util"))]` gate.
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_util;

@@ -26,6 +26,7 @@ use deps_engine::classify::fetch::{
     apply_fetch_outcomes, composer_minimum_stability, dedup_dependencies_by_source,
     fetch_latest_versions_parallel,
 };
+use deps_engine::classify::license::prefetch_tier3_licenses;
 use deps_engine::classify::osv::build_scan_targets;
 use deps_engine::classify::resolved::{collect_in_use_versions, load_resolved_versions};
 use std::collections::{BTreeMap, HashMap};
@@ -358,11 +359,25 @@ pub enum CheckError {
 pub struct ManifestCheckResult {
     /// Every finding produced for this manifest.
     pub findings: Vec<CheckFinding>,
-    /// Whether at least one dependency's registry fetch failed while not offline (FR-012) —
-    /// the caller uses this to decide between exit 1 (policy violation over an otherwise
-    /// complete report) and exit 2 (an incomplete report because a registry was
+    /// Whether at least one dependency's *version* registry fetch failed while not offline
+    /// (FR-012) — the caller uses this to decide between exit 1 (policy violation over an
+    /// otherwise complete report) and exit 2 (an incomplete report because a registry was
     /// unreachable).
+    ///
+    /// Deliberately does **not** cover a tier-3 license-source timeout (Dart/Swift/Gradle/
+    /// Deno) — see [`Self::license_fetch_incomplete`] — a Maven Central outage while the
+    /// version registry itself is fully reachable is a different failure with a different
+    /// remediation (issue #1133 code-review finding #1), and conflating the two would mislead
+    /// a caller inspecting this field into diagnosing the wrong system.
     pub registry_unreachable: bool,
+    /// Whether at least one dependency's tier-3 license fetch (Dart/Swift/Gradle/Deno) timed
+    /// out while not offline (issue #1133 code-review finding #1) — kept separate from
+    /// [`Self::registry_unreachable`] since the two name genuinely different subsystems (the
+    /// license source vs. the version registry), even though both feed the same exit-2
+    /// "incomplete report" signal in `main.rs`. See
+    /// `deps_engine::classify::license::TierThreeLicenseFetch::timed_out`'s doc for exactly
+    /// which failure modes this can (and cannot) detect.
+    pub license_fetch_incomplete: bool,
 }
 
 /// Classifies one already-routed manifest.
@@ -454,10 +469,47 @@ pub async fn check_manifest(
     let cached_versions = fetch_result.versions;
     // Tier-1 license backfill (issue #660/#661 precedent): populated for native-list
     // ecosystems (PyPI, Composer) whose registry response carries a license field.
-    let licenses = fetch_result.licenses;
+    let mut licenses = fetch_result.licenses;
 
-    let vulnerabilities: Option<VulnerabilityMap> =
-        if ctx.policy.diagnostics.vulnerabilities_enabled && !ctx.policy.network.offline {
+    // Hoisted so both the tier-3 gate below and `.with_license_policy(&license_policy)`
+    // further down share one computed policy (issue #1133 critic M1).
+    let license_policy = ctx.policy.license_policy.to_policy();
+
+    // Tier-3 license prefetch (issue #1133, populated for Dart/Swift/Gradle/Deno, a no-op
+    // for every other ecosystem — see `deps_engine::classify::license`'s doc) and the OSV
+    // scan are independent (OSV never reads licenses) and both make network round trips, so
+    // they run concurrently via `tokio::join!` rather than sequentially (critic M2) —
+    // mirrors `deps-lsp`, which spawns both as separate concurrent tasks.
+    //
+    // Only `!offline` is gated here — the non-empty-`license_policy` check (critic M1) is
+    // enforced *inside* `prefetch_tier3_licenses` itself (code-review finding #3), not
+    // re-derived at this call site, so it can't be silently forgotten by a future caller:
+    // `licenses`' only consumer in this crate is `apply_license_policy_rule`, a no-op when
+    // no policy is configured, so with the default (empty) policy this call would otherwise
+    // issue N network round trips for a result nothing reads — burning Swift's
+    // unauthenticated 60 req/h GitHub budget among others for nothing.
+    let run_tier3_prefetch = !ctx.policy.network.offline;
+    let tier3_license_fetch = async {
+        if run_tier3_prefetch {
+            prefetch_tier3_licenses(
+                ecosystem.as_ref(),
+                parse_result.as_ref(),
+                &resolved_versions,
+                &resolved_version_candidates,
+                &license_policy,
+                ctx.policy.cache.fetch_timeout_secs,
+                ctx.policy.cache.max_concurrent_fetches,
+            )
+            .await
+        } else {
+            deps_engine::classify::license::TierThreeLicenseFetch::default()
+        }
+    };
+
+    let run_osv_scan =
+        ctx.policy.diagnostics.vulnerabilities_enabled && !ctx.policy.network.offline;
+    let osv_scan = async {
+        if run_osv_scan {
             let (targets, skipped) = build_scan_targets(
                 parse_result.as_ref(),
                 &resolved_versions,
@@ -479,11 +531,33 @@ pub async fn check_manifest(
             Some(vulns)
         } else {
             None
-        };
+        }
+    };
 
-    // TODO(critic): tier-3 license prefetch (spec 062 deviation #2) — Dart/Swift/Gradle/Deno's
-    // dedicated `Ecosystem::fetch_license` is still not called from this crate.
-    let license_policy = ctx.policy.license_policy.to_policy();
+    let (tier3_result, vulnerabilities): (_, Option<VulnerabilityMap>) =
+        tokio::join!(tier3_license_fetch, osv_scan);
+
+    // Merged (not replaced) alongside the tier-1 backfill above via `entry().or_insert()`,
+    // not `extend` (critic nit): the two sources are disjoint today (only Composer
+    // populates `FetchResult::licenses`, and it's `RegistryDeclaredSpdx`, never a tier-3
+    // ecosystem), but `or_insert` makes the intended precedence explicit — an
+    // author-declared tier-1 license must win over a heuristic tier-3 one if that ever
+    // stops holding, rather than whichever call happened to run last.
+    for (name, license) in tier3_result.licenses {
+        licenses.entry(name).or_insert(license);
+    }
+    // A confirmed tier-3 timeout feeds `main.rs`'s same exit-2 "incomplete report" signal a
+    // registry-unreachable manifest does, but through its own field (issue #1133 code-review
+    // finding #1) — not `registry_unreachable` itself: a Maven Central outage while the
+    // version registry is fully reachable is a different failure than an unreachable
+    // registry, and a caller inspecting `registry_unreachable` must not be misled into
+    // diagnosing the wrong system. Does not catch every tier-3 failure mode:
+    // `Ecosystem::fetch_license` returns a bare `Vec<String>` with no error channel, so a
+    // network error/404/rate-limit a tier-3 implementation swallows internally (all four
+    // documented implementations do) never reaches here — see
+    // `TierThreeLicenseFetch::timed_out`'s doc for the full caveat.
+    let license_fetch_incomplete = tier3_result.timed_out > 0;
+
     let mut version_data = VersionData::new(&cached_versions, &resolved_versions)
         .with_resolved_version_candidates(&resolved_version_candidates)
         .with_outcomes(&outcomes)
@@ -535,6 +609,7 @@ pub async fn check_manifest(
     Ok(ManifestCheckResult {
         findings,
         registry_unreachable,
+        license_fetch_incomplete,
     })
 }
 

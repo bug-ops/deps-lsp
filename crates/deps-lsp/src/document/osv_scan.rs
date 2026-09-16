@@ -6,7 +6,6 @@ use super::state::ServerState;
 use deps_core::Ecosystem;
 use deps_core::EcosystemId;
 use deps_core::PackageName;
-use deps_core::lsp_helpers::resolve_in_use_version;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -152,37 +151,31 @@ pub(crate) async fn run_osv_scan_phase_a(
 /// whenever some later, unrelated event happens to regenerate diagnostics (code-review
 /// round 3 finding #3).
 ///
+/// Target selection (which dependencies to fetch a license for, at which version) is
+/// [`deps_engine::classify::license::tier3_license_targets`], and the network dispatch is
+/// [`deps_engine::classify::license::fetch_tier3_licenses`] (issue #1133) — both shared with
+/// `deps-cli` so both adapters reach the same license-policy verdict for these four
+/// ecosystems. Targets are computed synchronously while holding the document guard (mirroring
+/// [`run_osv_scan_phase_a`]'s `build_scan_targets` call), which is dropped before the network
+/// dispatch below ever awaits. This function keeps only what is genuinely `deps-lsp`'s own:
+/// the document snapshot/staleness guard and the additive `DocumentState::licenses` commit.
+///
 /// The commit at the end is staleness-guarded (`doc.content == content_snapshot`,
 /// mirroring [`run_osv_phase_b_and_commit`]'s identical guard) and merges rather than
 /// replaces (round 3 finding #1/#2): two overlapping edits can spawn two overlapping
 /// pre-fetches, and without the guard the older one finishing last could silently
 /// overwrite the newer one's results with stale data; without a merge, a transient
-/// per-dependency fetch failure this round (already filtered out below, before this
-/// point) would drop that dependency's previously-cached, still-valid license instead
-/// of just failing to refresh it. `DocumentState::merge_licenses`'s own additive
-/// contract already provides exactly this — a genuinely *removed* dependency's stale
-/// entry is reclaimed separately, by the manifest-diff pruning loop in
+/// per-dependency fetch failure this round (already filtered out by the shared function,
+/// before this point) would drop that dependency's previously-cached, still-valid
+/// license instead of just failing to refresh it. `DocumentState::merge_licenses`'s own
+/// additive contract already provides exactly this — a genuinely *removed* dependency's
+/// stale entry is reclaimed separately, by the manifest-diff pruning loop in
 /// `commit_parsed_document`, not by this function replacing the whole map.
 ///
-/// **What version each source actually reflects is per-ecosystem, not uniform**
-/// (critic S1 — corrects this doc's previous blanket "only ever targets the
-/// resolved/in-use version" claim): Gradle's POM fetch and Deno's JSR API are
-/// genuinely version-specific (fetched at the dependency's resolved/in-use version, the
-/// `version` passed into [`Ecosystem::fetch_license`]). Dart's `get_license` calls
-/// pub.dev's per-*package* `/score` endpoint, which carries no version parameter at
-/// all — it reflects pana's detection on whatever pub.dev last scored, not necessarily
-/// the resolved version. Swift's `get_license` calls GitHub's `GET /repos/{owner}/{repo}`,
-/// which reflects the repository's *default branch*, not the resolved version's tag.
-/// `resolve_in_use_version` below is still required as a *gate* for all four (no version
-/// resolved means nothing to look up), but for Dart/Swift it does not pin which
-/// version's license is actually returned.
-///
-/// Filters on [`deps_core::lsp_helpers::SourcePolicy::source_is_public_registry_content`]
-/// (critic M3/S6), the same stricter filter [`deps_engine::classify::osv::build_scan_targets`]'s OSV path already
-/// uses, not the looser [`deps_core::lsp_helpers::SourcePolicy::can_resolve_source`]: a
-/// patched git/path fork is resolvable but must never have its license misattributed to
-/// the upstream registry package it forked from — the identical "is this really the
-/// same package" problem OSV's stricter filter exists to solve.
+/// **What version each source actually reflects is per-ecosystem, not uniform** — see
+/// [`deps_engine::classify::license::prefetch_tier3_licenses`]'s doc for the full
+/// per-ecosystem breakdown (Dart/Swift's tier-3 source isn't pinned to the resolved
+/// version the way Gradle/Deno's is).
 ///
 /// No-op (returns immediately) for every ecosystem whose
 /// <code>ecosystem.[license_source](deps_core::Ecosystem::license_source)().[requires_dedicated_fetch](deps_core::LicenseSource::requires_dedicated_fetch)()</code>
@@ -193,7 +186,6 @@ pub(crate) async fn run_license_prefetch(
     ecosystem: Arc<dyn Ecosystem>,
     fetch_timeout_secs: u64,
 ) {
-    let ecosystem_id = ecosystem.ecosystem_id();
     if !ecosystem.license_source().requires_dedicated_fetch() {
         return;
     }
@@ -205,24 +197,13 @@ pub(crate) async fn run_license_prefetch(
         let Some(parse_result) = doc.parse_result() else {
             return;
         };
-        let formatter = ecosystem.formatter();
-        let targets = parse_result
-            .dependencies()
-            .into_iter()
-            .filter(|d| formatter.source_is_public_registry_content(&d.source()))
-            .filter_map(|d| {
-                let normalized = formatter.normalize_package_name(d.name());
-                let version = resolve_in_use_version(
-                    d,
-                    normalized.as_str(),
-                    &doc.resolved_versions,
-                    Some(&doc.resolved_version_candidates),
-                    formatter,
-                    ecosystem_id,
-                )?;
-                Some((d.name().clone(), version))
-            })
-            .collect();
+        let targets = deps_engine::classify::license::tier3_license_targets(
+            parse_result,
+            &doc.resolved_versions,
+            &doc.resolved_version_candidates,
+            ecosystem.formatter(),
+            ecosystem.ecosystem_id(),
+        );
         (doc.content.clone(), targets)
     };
 
@@ -230,34 +211,17 @@ pub(crate) async fn run_license_prefetch(
         return;
     }
 
-    use futures::stream::{self, StreamExt};
-
-    let timeout_duration = Duration::from_secs(fetch_timeout_secs.clamp(
-        LICENSE_PREFETCH_TIMEOUT_FLOOR_SECS,
-        LICENSE_PREFETCH_TIMEOUT_CEILING_SECS,
-    ));
-    let ecosystem = &ecosystem;
-    let licenses: HashMap<PackageName, Vec<String>> = stream::iter(targets)
-        .map(|(name, version)| async move {
-            let found = tokio::time::timeout(
-                timeout_duration,
-                ecosystem.fetch_license(name.as_str(), &version),
-            )
-            .await
-            .unwrap_or_else(|_| {
-                tracing::debug!(package = %name, "tier-3 license fetch timed out");
-                Vec::new()
-            });
-            (name, found)
-        })
-        .buffer_unordered(LICENSE_PREFETCH_CONCURRENCY)
-        .filter(|(_, found)| std::future::ready(!found.is_empty()))
-        .collect()
-        .await;
+    let result = deps_engine::classify::license::fetch_tier3_licenses(
+        ecosystem.as_ref(),
+        targets,
+        fetch_timeout_secs,
+        LICENSE_PREFETCH_CONCURRENCY,
+    )
+    .await;
 
     if let Some(mut doc) = state.documents.get_mut(&uri) {
         if doc.content == content_snapshot {
-            doc.merge_licenses(licenses);
+            doc.merge_licenses(result.licenses);
         } else {
             tracing::debug!(
                 "dropping stale tier-3 license pre-fetch result: document content changed mid-fetch"
@@ -266,36 +230,14 @@ pub(crate) async fn run_license_prefetch(
     }
 }
 
-/// Bounds how many concurrent per-dependency license fetches [`run_license_prefetch`]
-/// issues at once — same rationale as `fetch_latest_versions_parallel`'s
-/// `max_concurrent`, scaled down: tier-3 documents rarely carry more than a handful of
-/// dependencies (Dart/Swift/Gradle/Deno are all comparatively small ecosystems in this
-/// project's usage), and this pre-fetch is a background nice-to-have, not on the hover
-/// critical path, so there is no latency pressure to fan out aggressively.
+/// Bounds how many concurrent per-dependency license fetches [`run_license_prefetch`] issues
+/// at once — tier-3 documents rarely carry more than a handful of dependencies (Dart/Swift/
+/// Gradle/Deno are all comparatively small ecosystems in this project's usage), and this
+/// pre-fetch is a background nice-to-have, not on the hover critical path, so there is no
+/// latency pressure to fan out aggressively. `deps-cli`'s check-gate call passes its own,
+/// larger `cache.max_concurrent_fetches` instead (issue #1133 critic M3) — this constant is
+/// `deps-lsp`'s own tuning choice, not a shared default.
 const LICENSE_PREFETCH_CONCURRENCY: usize = 8;
-
-/// Ceiling on the per-dependency tier-3 license fetch timeout, independent of the
-/// configured `fetch_timeout_secs` (critic S4/M2: the direct `Ecosystem::fetch_license`
-/// call in [`run_license_prefetch`] previously had no bound at all, unlike every other
-/// registry call in this codebase, e.g. `fetch_and_classify_package`'s
-/// `tokio::time::timeout(timeout, ...)`). Mirrors
-/// [`OSV_SCAN_TIMEOUT_CEILING_SECS`]'s rationale: the shared `reqwest` client behind
-/// `HttpCache` already imposes its own client-wide 30s timeout, so a per-call timeout
-/// longer than that would never actually bind.
-const LICENSE_PREFETCH_TIMEOUT_CEILING_SECS: u64 = 30;
-
-/// Floor on the per-dependency tier-3 license fetch timeout, independent of the
-/// configured `fetch_timeout_secs` (issue #692 critic M2). `fetch_timeout_secs` is
-/// user-configurable down to a minimum of 1s (see `config.rs`'s validation), but
-/// `deps_gradle::license::fetch_license_from` may now perform up to
-/// `deps_gradle::license::MAX_POM_FETCHES` **sequential** HTTPS round trips inside the
-/// single `tokio::time::timeout` this budget bounds, where it previously performed one
-/// — a low `fetch_timeout_secs` would otherwise silently starve exactly the
-/// parent-chained artifacts (e.g. Guava) issue #692 exists to resolve. This pre-fetch is
-/// a background nice-to-have, never on the hover critical path (see
-/// [`run_license_prefetch`]'s doc), so raising its effective minimum costs nothing but a
-/// few extra seconds before this best-effort signal gives up.
-const LICENSE_PREFETCH_TIMEOUT_FLOOR_SECS: u64 = 10;
 
 /// Phase B: for every dependency phase A flagged [`deps_core::osv::ScanOutcome::Vulnerable`],
 /// checks whether the version currently recommended (the registry's latest,

@@ -35,7 +35,7 @@ use deps_cli::exit::{EXIT_CLEAN, exit_code};
 use deps_cli::report::{CheckContext, CheckReport, FailOnPolicy, check_manifest};
 use deps_cli::{format, walk};
 use deps_core::osv::OsvClient;
-use deps_core::policy_config::PolicyConfig;
+use deps_core::policy_config::{LicensePolicyConfig, PolicyConfig};
 use deps_core::{EcosystemRegistry, HttpCache};
 use deps_engine::setup::{EcosystemRuntime, register_ecosystems};
 use std::sync::Arc;
@@ -91,7 +91,7 @@ async fn run_pipeline(dir: &std::path::Path) -> (CheckReport, bool) {
         )
         .await
         .expect("check_manifest must not fail for a well-formed fixture");
-        had_execution_error |= result.registry_unreachable;
+        had_execution_error |= result.registry_unreachable || result.license_fetch_incomplete;
         findings.extend(result.findings);
     }
     (CheckReport { findings }, had_execution_error)
@@ -622,4 +622,264 @@ async fn test_follow_symlinks_lockfile_lookup_uses_symlinks_directory_not_target
         "check_manifest called with the resolved target path (the bug M2 fixes) must find no \
          lockfile at all, proving the two wirings genuinely diverge"
     );
+}
+
+/// Builds a real, fully-registered [`EcosystemRegistry`] plus a *non*-offline
+/// [`CheckContext`] under `license_policy` — mirrors [`offline_context`] but leaves
+/// `HttpCache` free to make real requests, for the tier-3 license-prefetch parity tests
+/// below (issue #1133).
+fn live_context(license_policy: LicensePolicyConfig) -> (EcosystemRegistry, CheckContext) {
+    let policy = PolicyConfig {
+        license_policy,
+        ..PolicyConfig::default()
+    };
+    let runtime = EcosystemRuntime::from_policy(&policy);
+    let cache = Arc::new(HttpCache::with_policy(Arc::clone(&runtime.policy)));
+    let registry = EcosystemRegistry::new();
+    let _ = register_ecosystems(&registry, Arc::clone(&cache), &runtime);
+
+    let ctx = CheckContext {
+        cache: Arc::clone(&cache),
+        osv: Arc::new(OsvClient::new(Arc::clone(&cache))),
+        lockfile_cache: Arc::new(deps_core::lockfile::LockFileCache::new()),
+        policy,
+    };
+    (registry, ctx)
+}
+
+/// Issue #1133 parity: `deps-cli check` must reach the same license-policy verdict as
+/// `deps-lsp` for the four tier-3 ecosystems (Dart, Swift, Gradle, Deno), whose license
+/// needs a dedicated [`deps_core::Ecosystem::fetch_license`] call beyond the registry's
+/// hot-path version-list response. Before this fix, `deps-cli` silently never called it
+/// (spec 062 deviation #2), so a `license_policy` never fired for these ecosystems — a
+/// dependency with a real, denied license would pass `check` cleanly instead of failing it.
+///
+/// Each test below fetches the same dependency/version `deps-lsp`'s own
+/// `document::osv_scan::tests::license_prefetch_tests` live tests use (see
+/// `crates/deps-lsp/src/document/osv_scan.rs`), so a regression that breaks tier-3 wiring in
+/// one adapter but not the other would produce a mismatch across the two test suites even
+/// though `tower_lsp_server`'s `Client` requirement keeps them from sharing one test
+/// function (see this file's module doc). The manifest requirement syntax differs from
+/// `deps-lsp`'s fixture where needed (an exact/bare pin instead of a caret range) — unlike
+/// `deps-lsp`'s test, which injects `resolved_versions` directly into `DocumentState`,
+/// `check_manifest`'s public API has no equivalent shortcut and only ever sees a real lock
+/// file (absent here) or the manifest's own already-concrete requirement.
+///
+/// `allow: ["0BSD"]` is deliberately a real SPDX id that none of these four fixture
+/// dependencies actually carry: an *unknown* license (tier-3 prefetch silently failing,
+/// e.g. from a network error) never violates a policy ([`deps_core::licenses::evaluate`]'s
+/// `evaluate_unknown_license_never_violates` contract) — so this can only produce a
+/// `Category::License` finding when a real, non-"0BSD" license genuinely reached the
+/// policy engine, which is exactly the property this test protects.
+mod tier3_license_prefetch_parity {
+    use super::*;
+    use deps_cli::report::Category;
+
+    #[cfg(feature = "dart")]
+    #[tokio::test]
+    #[ignore = "hits the real pub.dev API"]
+    async fn test_live_dart_tier3_license_feeds_check_license_policy() {
+        let (registry, ctx) =
+            live_context(LicensePolicyConfig::new().with_allow(vec!["0BSD".to_string()]));
+        let url = deps_core::test_util::test_uri("/test/pubspec.yaml");
+        let manifest_path = url.to_file_path().expect("file-scheme uri");
+        let ecosystem = registry.for_uri(&url).expect("Dart ecosystem not found");
+        // A bare exact pin (no `^`), not `deps-lsp`'s live test's `^1.0.0` — Dart is
+        // `BareRequirementPolicy::Concrete`, so this resolves without needing a lock file.
+        let content = "dependencies:\n  http: 1.2.0\n";
+
+        let result = check_manifest(&ecosystem, &manifest_path, &manifest_path, content, &ctx)
+            .await
+            .expect("check_manifest must not fail for a well-formed fixture");
+
+        assert!(
+            result
+                .findings
+                .iter()
+                .any(|f| f.category == Category::License
+                    && f.dependency_name.as_deref() == Some("http")),
+            "expected a license-policy finding for 'http', got: {:?}",
+            result.findings
+        );
+    }
+
+    #[cfg(feature = "swift")]
+    #[tokio::test]
+    #[ignore = "hits the real GitHub API"]
+    async fn test_live_swift_tier3_license_feeds_check_license_policy() {
+        let (registry, ctx) =
+            live_context(LicensePolicyConfig::new().with_allow(vec!["0BSD".to_string()]));
+        let url = deps_core::test_util::test_uri("/test/Package.swift");
+        let manifest_path = url.to_file_path().expect("file-scheme uri");
+        let ecosystem = registry.for_uri(&url).expect("Swift ecosystem not found");
+        // `.exact(...)` (parsed to an explicit `=`-pinned requirement), not `deps-lsp`'s
+        // live test's `.upToNextMajor(from:)` range — resolves without needing a lock file.
+        let content =
+            r#".package(url: "https://github.com/apple/swift-nio.git", .exact("2.65.0"))"#;
+
+        let result = check_manifest(&ecosystem, &manifest_path, &manifest_path, content, &ctx)
+            .await
+            .expect("check_manifest must not fail for a well-formed fixture");
+
+        assert!(
+            result
+                .findings
+                .iter()
+                .any(|f| f.category == Category::License
+                    && f.dependency_name.as_deref() == Some("apple/swift-nio")),
+            "expected a license-policy finding for 'apple/swift-nio', got: {:?}",
+            result.findings
+        );
+    }
+
+    #[cfg(feature = "gradle")]
+    #[tokio::test]
+    #[ignore = "hits the real Maven Central API"]
+    async fn test_live_gradle_tier3_license_feeds_check_license_policy() {
+        // Held per `deps_core::fs_probe::snapshot_guard`'s doc: gradle's `parse_manifest`
+        // transitively touches fs_probe, and other tests in this binary do too.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let (registry, ctx) =
+            live_context(LicensePolicyConfig::new().with_allow(vec!["0BSD".to_string()]));
+        let url = deps_core::test_util::test_uri("/test/build.gradle.kts");
+        let manifest_path = url.to_file_path().expect("file-scheme uri");
+        let ecosystem = registry.for_uri(&url).expect("Gradle ecosystem not found");
+        let content =
+            "dependencies {\n    implementation(\"com.squareup.okhttp3:okhttp:4.12.0\")\n}\n";
+
+        let result = check_manifest(&ecosystem, &manifest_path, &manifest_path, content, &ctx)
+            .await
+            .expect("check_manifest must not fail for a well-formed fixture");
+
+        assert!(
+            result
+                .findings
+                .iter()
+                .any(|f| f.category == Category::License
+                    && f.dependency_name.as_deref() == Some("com.squareup.okhttp3:okhttp")),
+            "expected a license-policy finding for 'com.squareup.okhttp3:okhttp', got: {:?}",
+            result.findings
+        );
+    }
+
+    #[cfg(feature = "deno")]
+    #[tokio::test]
+    #[ignore = "hits the real JSR API"]
+    async fn test_live_deno_tier3_license_feeds_check_license_policy() {
+        let (registry, ctx) =
+            live_context(LicensePolicyConfig::new().with_allow(vec!["0BSD".to_string()]));
+        let url = deps_core::test_util::test_uri("/test/deno.json");
+        let manifest_path = url.to_file_path().expect("file-scheme uri");
+        let ecosystem = registry.for_uri(&url).expect("Deno ecosystem not found");
+        // A bare *full* version (no `^`/`~` range operator), not `deps-lsp`'s live test's
+        // `^1.0` — Deno is `BareRequirementPolicy::ConcreteIfFullVersion` (#667), so this
+        // resolves to an in-use version straight from the manifest requirement, with no
+        // lock file needed (unlike `deps-lsp`'s test, which injects `resolved_versions`
+        // directly into `DocumentState`, a shortcut `check_manifest`'s public API has no
+        // equivalent for).
+        let content = r#"{"imports": {"@std/fs": "jsr:@std/fs@1.0.24"}}"#;
+
+        let result = check_manifest(&ecosystem, &manifest_path, &manifest_path, content, &ctx)
+            .await
+            .expect("check_manifest must not fail for a well-formed fixture");
+
+        assert!(
+            result
+                .findings
+                .iter()
+                .any(|f| f.category == Category::License
+                    && f.dependency_name.as_deref() == Some("jsr:@std/fs")),
+            "expected a license-policy finding for 'jsr:@std/fs', got: {:?}",
+            result.findings
+        );
+    }
+}
+
+/// Issue #1133 critic S2: a CI-executable (never `#[ignore]`) regression guard that
+/// `check_manifest` actually reaches `prefetch_tier3_licenses` — every test in
+/// `tier3_license_prefetch_parity` above is `#[ignore]`d (live network), so deleting the
+/// `licenses.extend`/`tokio::join!` wiring in `report.rs` would leave
+/// `cargo nextest run --workspace --all-features` green. This module closes that gap with a
+/// fully network-free `Ecosystem` test double
+/// ([`deps_engine::test_util::TestTier3Ecosystem`]) instead: no `#[ignore]`, no real
+/// registry, runs on every `cargo nextest run` invocation.
+mod tier3_wiring_regression {
+    use super::*;
+    use deps_cli::report::Category;
+    use deps_core::Ecosystem;
+    use deps_core::policy_config::DiagnosticsConfig;
+    use deps_engine::test_util::TestTier3Ecosystem;
+
+    /// A minimal, non-offline [`CheckContext`] under `policy` — unlike [`live_context`], the
+    /// `Ecosystem` this is paired with never touches the network regardless of the
+    /// `offline` flag, so this stays deterministic and fast without needing one.
+    fn wiring_test_context(policy: PolicyConfig) -> CheckContext {
+        let cache = Arc::new(HttpCache::new());
+        CheckContext {
+            cache: Arc::clone(&cache),
+            osv: Arc::new(OsvClient::new(cache)),
+            lockfile_cache: Arc::new(deps_core::lockfile::LockFileCache::new()),
+            policy,
+        }
+    }
+
+    #[tokio::test]
+    async fn check_manifest_reaches_tier3_prefetch_wiring_without_network() {
+        // OSV disabled so `ctx.osv.scan(..)` (a real network client) is never invoked —
+        // this test's only network-shaped call is `TestTier3Ecosystem::fetch_license`,
+        // which never touches a socket.
+        let policy = PolicyConfig {
+            diagnostics: DiagnosticsConfig::new().with_vulnerabilities_enabled(false),
+            license_policy: LicensePolicyConfig::new().with_allow(vec!["0BSD".to_string()]),
+            ..PolicyConfig::default()
+        };
+        let ctx = wiring_test_context(policy);
+
+        let ecosystem: Arc<dyn Ecosystem> =
+            Arc::new(TestTier3Ecosystem::returning(vec!["MIT".to_string()]));
+        let url = deps_core::test_util::test_uri("/test/manifest.toml");
+        let manifest_path = url.to_file_path().expect("file-scheme uri");
+
+        let result = check_manifest(&ecosystem, &manifest_path, &manifest_path, "unused", &ctx)
+            .await
+            .expect("check_manifest must not fail for this fixture");
+
+        assert!(
+            result
+                .findings
+                .iter()
+                .any(|f| f.category == Category::License
+                    && f.dependency_name.as_deref() == Some("dep-0")),
+            "check_manifest did not reach the tier-3 license prefetch wiring: {:?}",
+            result.findings
+        );
+    }
+
+    /// The M1 gate's other half: with no `license_policy` configured, `check_manifest` must
+    /// never call `Ecosystem::fetch_license` at all — a [`TestTier3Ecosystem::pending`]
+    /// would hang this test forever if the gate didn't short-circuit before it.
+    #[tokio::test]
+    async fn check_manifest_skips_tier3_prefetch_when_license_policy_is_empty() {
+        let policy = PolicyConfig {
+            diagnostics: DiagnosticsConfig::new().with_vulnerabilities_enabled(false),
+            ..PolicyConfig::default()
+        };
+        assert!(
+            policy.license_policy.to_policy().is_empty(),
+            "test setup bug: this policy must have no license_policy configured"
+        );
+        let ctx = wiring_test_context(policy);
+
+        let ecosystem: Arc<dyn Ecosystem> = Arc::new(TestTier3Ecosystem::pending());
+        let url = deps_core::test_util::test_uri("/test/manifest.toml");
+        let manifest_path = url.to_file_path().expect("file-scheme uri");
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            check_manifest(&ecosystem, &manifest_path, &manifest_path, "unused", &ctx),
+        )
+        .await
+        .expect("must not hang: an empty license_policy must skip the tier-3 fetch entirely")
+        .expect("check_manifest must not fail for this fixture");
+    }
 }
