@@ -41,6 +41,31 @@ gitlab-ci = ["dep:deps-gitlab-ci"]
 # when the "npm" feature itself is disabled.
 deno = ["dep:deps-deno"]
 
+# Forwards `deps-core`'s and every currently-enabled ecosystem crate's `lsp-responses`
+# feature (issue #1083, spec 064) — `deps-lsp` enables this explicitly, `deps-cli` does
+# not, so `deps-cargo`/etc.'s own `tower-lsp-server` dependency (and `deps-core`'s) stays
+# unlinked from `deps-cli`'s dependency tree. Uses weak-dependency-feature syntax
+# (`"deps-cargo?/lsp-responses"`): each entry only takes effect for an ecosystem already
+# enabled via its own `cargo = ["dep:deps-cargo"]`-shaped feature above, never pulling in
+# an ecosystem crate this build didn't otherwise select.
+lsp-responses = [
+    "deps-core/lsp-responses",
+    "deps-bundler?/lsp-responses",
+    "deps-cargo?/lsp-responses",
+    "deps-composer?/lsp-responses",
+    "deps-dart?/lsp-responses",
+    "deps-deno?/lsp-responses",
+    "deps-github-actions?/lsp-responses",
+    "deps-gitlab-ci?/lsp-responses",
+    "deps-go?/lsp-responses",
+    "deps-gradle?/lsp-responses",
+    "deps-maven?/lsp-responses",
+    "deps-npm?/lsp-responses",
+    "deps-nuget?/lsp-responses",
+    "deps-pypi?/lsp-responses",
+    "deps-swift?/lsp-responses",
+]
+
 # Consumed only through the `ecosystem!`/`register!` macros in `src/setup.rs`, not via direct
 # `use` statements, so cargo-machete cannot see the usage and flags them as unused.
 [package.metadata.cargo-machete]

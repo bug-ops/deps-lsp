@@ -1351,6 +1351,7 @@ mod tests {
     /// because `literal_span_matches` rejects the manifest's still-`"catalog:"` `version_range`
     /// slice against the resolved requirement. This holds only because `NpmDependency` does
     /// not override `version_literal()` — if that ever changes, this test must fail.
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_resolved_catalog_dependency_blocks_update_all_rewrite() {
         // See the comment in `test_parse_with_context_top_level_override_and_scope_override_coexist`

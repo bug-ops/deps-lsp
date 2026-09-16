@@ -43,6 +43,7 @@
 
 use std::any::Any;
 
+#[cfg(feature = "lsp-responses")]
 use tower_lsp_server::ls_types::CompletionItem;
 
 use crate::lockfile::LockFileProvider;
@@ -392,8 +393,10 @@ pub async fn assert_parse_malformed_lockfile_does_not_panic(
 /// give back, a valid-length prefix reaching it is guaranteed non-empty — so a guard that
 /// wrongly rejects a valid prefix, or a `complete` closure not wired to the guard at all,
 /// both become visible.
+#[cfg(feature = "lsp-responses")]
 struct AlwaysHasResultsRegistry;
 
+#[cfg(feature = "lsp-responses")]
 impl crate::Registry for AlwaysHasResultsRegistry {
     fn get_versions<'a>(
         &'a self,
@@ -459,6 +462,7 @@ impl crate::Registry for AlwaysHasResultsRegistry {
 /// `for<'a> Fn(&'a ..., ...) -> Pin<Box<dyn Future + 'a>>` bound can. A plain `Fn(..) -> Fut`
 /// bound compiles here but fails at every real call site with "lifetime may not live long
 /// enough" (verified: this was this function's first, broken signature).
+#[cfg(feature = "lsp-responses")]
 pub async fn assert_completion_guard<C>(complete: C)
 where
     C: for<'a> Fn(
@@ -1101,6 +1105,7 @@ macro_rules! lockfile_conformance {
 /// }
 /// }
 /// ```
+#[cfg(feature = "lsp-responses")]
 #[macro_export]
 macro_rules! completion_guard_conformance {
     (

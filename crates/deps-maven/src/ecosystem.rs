@@ -2,21 +2,24 @@
 
 use std::any::Any;
 use std::sync::Arc;
+#[cfg(feature = "lsp-responses")]
 use tower_lsp_server::ls_types::{
     CompletionItem, CompletionTextEdit, Position, Range as LspRange, TextEdit,
 };
 use url::Url;
 
+#[cfg(feature = "lsp-responses")]
+use deps_core::completion::Completions;
+#[cfg(feature = "lsp-responses")]
+use deps_core::position_in_range;
 use deps_core::{
-    Ecosystem, ParseResult as ParseResultTrait, Registry, Result,
-    completion::Completions,
-    is_safe_maven_coordinate_segment,
+    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, is_safe_maven_coordinate_segment,
     lsp_helpers::{EcosystemFormatter, warn_rejected_value},
-    position_in_range,
 };
 
 use crate::formatter::MavenFormatter;
 use crate::registry::MavenCentralRegistry;
+#[cfg(feature = "lsp-responses")]
 use crate::types::ArtifactInfo;
 
 /// [`Ecosystem`] implementation for Maven (`pom.xml`).
@@ -29,6 +32,7 @@ pub struct MavenEcosystem {
 ///
 /// A pom.xml `<groupId>`/`<artifactId>` tag only ever holds one half of the coordinate,
 /// so the completion inserted into it must not be the full "group:artifact" search result.
+#[cfg(feature = "lsp-responses")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MavenNameField {
     GroupId,
@@ -53,6 +57,7 @@ enum MavenNameField {
 /// a pom.xml coordinate splits `groupId`/`artifactId` across two separate tags, unlike
 /// `CompletionContext::PackageName`'s single combined name (see that method's default-impl
 /// doc).
+#[cfg(feature = "lsp-responses")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MavenXmlContext {
     /// Cursor is inside a `<version>` tag's value.
@@ -84,6 +89,7 @@ enum MavenXmlContext {
 /// 257 bytes, one over [`deps_core::is_safe_package_name`]'s 256-byte cap — an
 /// implausibly long but fully legitimate coordinate would be dropped here too,
 /// failing closed rather than insecurely.
+#[cfg(feature = "lsp-responses")]
 fn build_field_completion(
     artifact: &ArtifactInfo,
     field: MavenNameField,
@@ -122,6 +128,7 @@ fn build_field_completion(
 /// collapsed here to one item per distinct value, since they would otherwise insert
 /// identical text into the tag and only clutter the list. Keeps the first (highest-relevance,
 /// per the registry's own ranking) match for each value.
+#[cfg(feature = "lsp-responses")]
 fn build_deduped_field_completions(
     results: &[ArtifactInfo],
     field: MavenNameField,
@@ -150,6 +157,7 @@ impl MavenEcosystem {
         }
     }
 
+    #[cfg(feature = "lsp-responses")]
     async fn complete_package_names_for_field(
         &self,
         prefix: &str,
@@ -171,6 +179,7 @@ impl MavenEcosystem {
         build_deduped_field_completions(&results, field, replace_range)
     }
 
+    #[cfg(feature = "lsp-responses")]
     async fn complete_versions(
         &self,
         package_name: &deps_core::PackageName,
@@ -205,6 +214,7 @@ impl MavenEcosystem {
     /// for LSP clients.
     // `col_idx` comes from `utf16_to_byte_offset` (char_indices-based); tag offsets come from
     // `rfind`/`find` of ASCII `<tag>`/`</` tokens. Every slice bound is always a char boundary.
+    #[cfg(feature = "lsp-responses")]
     #[allow(clippy::string_slice)]
     fn detect_xml_context<'a>(
         content: &'a str,
@@ -311,6 +321,7 @@ impl Ecosystem for MavenEcosystem {
     /// `artifactId` having no counterpart at all, is why this crate can't reuse the shared
     /// dispatch). Opting out of it means this ecosystem takes on #793's wildcard-match
     /// obligation itself; see `deps_core::Ecosystem::generate_completions`'s doc.
+    #[cfg(feature = "lsp-responses")]
     fn generate_completions<'a>(
         &'a self,
         parse_result: &'a dyn ParseResultTrait,
@@ -328,7 +339,7 @@ impl Ecosystem for MavenEcosystem {
                 MavenXmlContext::Version => {
                     let dep = parse_result.dependencies().into_iter().find(|d| {
                         d.version_range()
-                            .is_some_and(|r| position_in_range(position, r.into()))
+                            .is_some_and(|r| position_in_range(position.into(), r))
                             || d.name_range().start.line == position.line
                     });
                     // #919: `detect_xml_context` only checks that the cursor sits inside a
@@ -342,7 +353,7 @@ impl Ecosystem for MavenEcosystem {
                             if deps_core::lsp_helpers::dependency_version_range_is_literal(
                                 dep,
                                 content,
-                                value_range,
+                                value_range.into(),
                             ) =>
                         {
                             let request = deps_core::completion::CompletionRequest::new(
@@ -382,6 +393,7 @@ impl Ecosystem for MavenEcosystem {
     /// Required by [`Ecosystem`]; called only from this crate's own
     /// [`Self::generate_completions`] override (Maven does not use the shared default
     /// dispatch — see that method's doc), for the `"version"` XML context.
+    #[cfg(feature = "lsp-responses")]
     fn complete_version<'a>(
         &'a self,
         request: deps_core::completion::CompletionRequest<'a>,
@@ -398,7 +410,7 @@ impl Ecosystem for MavenEcosystem {
     fn fallback_completion_prefix<'a>(
         &self,
         content: &'a str,
-        position: Position,
+        position: deps_core::position::Position,
     ) -> Option<&'a str> {
         let line = deps_core::fallback_completion::line_at(content, position)?;
         if !is_in_dependencies_section(content, position.line as usize) {
@@ -419,7 +431,11 @@ impl Ecosystem for MavenEcosystem {
         Some(prefix)
     }
 
-    fn fallback_completion_is_bare(&self, content: &str, position: Position) -> bool {
+    fn fallback_completion_is_bare(
+        &self,
+        content: &str,
+        position: deps_core::position::Position,
+    ) -> bool {
         let Some(line) = deps_core::fallback_completion::line_at(content, position) else {
             return false;
         };
@@ -543,6 +559,7 @@ mod tests {
     // this macro's `complete:` closure only ever receives a substituted `&dyn Registry` — the
     // fixture registry can't be threaded into `self.registry`'s concrete type without
     // widening that field to `Arc<dyn Registry>`, out of scope for this test-only change.
+    #[cfg(feature = "lsp-responses")]
     deps_core::completion_guard_conformance! {
         mod maven_completion_guard_conformance;
         complete: |registry: &dyn deps_core::Registry, prefix: String| -> std::pin::Pin<
@@ -560,7 +577,9 @@ mod tests {
         };
     }
 
+    #[cfg(feature = "lsp-responses")]
     struct NoopParseResult;
+    #[cfg(feature = "lsp-responses")]
     impl deps_core::ParseResult for NoopParseResult {
         fn dependencies(&self) -> Vec<&dyn deps_core::Dependency> {
             vec![]
@@ -576,15 +595,18 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "lsp-responses")]
     fn make_position(line: u32, character: u32) -> Position {
         Position { line, character }
     }
 
+    #[cfg(feature = "lsp-responses")]
     fn xml_context(line_content: &str, col: u32) -> (MavenXmlContext, String) {
         let (t, v, _range) = xml_context_with_range(line_content, col);
         (t, v)
     }
 
+    #[cfg(feature = "lsp-responses")]
     fn xml_context_with_range(line_content: &str, col: u32) -> (MavenXmlContext, String, LspRange) {
         let content = format!("    {line_content}\n");
         let col_in_content = col + 4; // 4 spaces indent
@@ -596,6 +618,7 @@ mod tests {
         (t, v.to_owned(), range)
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_detect_xml_context_version_cursor_at_start() {
         // <version>|4.13.2</version> — cursor right after '>'
@@ -606,6 +629,7 @@ mod tests {
         assert_eq!(v, "");
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_detect_xml_context_version_cursor_mid() {
         // <version>4.1|3.2</version>
@@ -615,6 +639,7 @@ mod tests {
         assert_eq!(v, "4.1");
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_detect_xml_context_version_cursor_at_end() {
         // <version>4.13.2|</version>
@@ -624,6 +649,7 @@ mod tests {
         assert_eq!(v, "4.13.2");
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_detect_xml_context_version_empty_value() {
         // <version>|</version>
@@ -633,6 +659,7 @@ mod tests {
         assert_eq!(v, "");
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_detect_xml_context_artifact_id_prefix() {
         // <artifactId>jun|it</artifactId>
@@ -650,6 +677,7 @@ mod tests {
     /// cursor position are kept intentionally identical to `deps-lsp`'s
     /// `test_fallback_completion_maven_query_matches_tag_value` — if either extractor's
     /// logic changes, update both tests and confirm they still agree.
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_detect_xml_context_compact_multi_tag_line_matches_completion_extractor() {
         // <dependency><groupId>com.google.guava</groupId><artifactId>gua| — cursor
@@ -665,6 +693,7 @@ mod tests {
     /// `between.contains("</")` rejects it. `deps-lsp`'s `strip_leading_xml_tag` must
     /// agree by yielding an empty string for the same position (which `fallback_completion`'s
     /// existing empty-prefix guard then rejects), not a markup-polluted search query.
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_detect_xml_context_after_closed_tag_yields_no_context() {
         let line = "<artifactId>guava</artifactId>";
@@ -673,6 +702,7 @@ mod tests {
         assert_eq!(v, "");
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_detect_xml_context_artifact_id_range_spans_full_value() {
         // <artifactId>jun|it</artifactId> — indented by 4 spaces in xml_context_with_range
@@ -688,6 +718,7 @@ mod tests {
         assert_eq!(range.end, Position::new(0, 21));
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_detect_xml_context_group_id_range_spans_full_value() {
         // <groupId>org.apache.comm|ons</groupId>
@@ -700,6 +731,7 @@ mod tests {
         assert_eq!(range.end, Position::new(0, 31));
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_detect_xml_context_surrogate_pair_value_no_panic() {
         // <artifactId>🎉|lib</artifactId> — 🎉 (U+1F389) is 4 UTF-8 bytes but a UTF-16
@@ -712,6 +744,7 @@ mod tests {
         assert_eq!(range.end, Position::new(0, 21)); // 16 + "🎉lib".len() in UTF-16 units (2+3)
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_detect_xml_context_value_end_fallback_no_closing_tag_on_line() {
         // <artifactId>jun|it — no closing tag anywhere on the line. After the S1 fix the
@@ -725,6 +758,7 @@ mod tests {
         assert_eq!(range.end, Position::new(0, 19)); // falls back to cursor: 4 + 15
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_detect_xml_context_no_closing_tag_range_excludes_trailing_comment() {
         // <artifactId>ju|    <!-- todo --> — regression for S1: the old `line.len()`
@@ -738,6 +772,7 @@ mod tests {
         assert_eq!(range.end, Position::new(0, 18)); // 4 + 14 — does not reach the comment
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_detect_xml_context_range_always_contains_cursor() {
         // <artifactId>ju|</artifactId> — cursor sits between '<' and '/' of the closing
@@ -757,6 +792,7 @@ mod tests {
         assert_eq!(range.end, Position::new(0, 19));
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_detect_xml_context_empty_value_zero_width_range() {
         // <version>|</version> — empty existing value produces a zero-width range at the
@@ -769,6 +805,7 @@ mod tests {
         assert_eq!(range.start, Position::new(0, 13)); // 4 (indent) + "<version>".len()
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_detect_xml_context_cursor_at_value_start_full_replace_range() {
         // <version>|4.13.2</version> — range must span the full existing value even
@@ -781,6 +818,7 @@ mod tests {
         assert_eq!(range.end, Position::new(0, 19)); // 13 + "4.13.2".len()
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_detect_xml_context_multibyte_value_no_panic() {
         // <artifactId>café|-lib</artifactId> — cursor positioned via UTF-16 units right
@@ -798,6 +836,7 @@ mod tests {
         assert_eq!(range.end, Position::new(0, 24));
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_complete_package_names_for_field_min_prefix() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -815,6 +854,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "lsp-responses")]
     fn test_artifact() -> ArtifactInfo {
         ArtifactInfo {
             group_id: "org.apache.commons".to_string(),
@@ -826,6 +866,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "lsp-responses")]
     fn test_range() -> LspRange {
         LspRange {
             start: Position::new(3, 12),
@@ -833,6 +874,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_build_field_completion_artifact_id() {
         let artifact = test_artifact();
@@ -853,6 +895,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_build_field_completion_group_id() {
         let artifact = test_artifact();
@@ -871,6 +914,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_build_field_completion_rejects_xml_breakout_artifact_id() {
         let mut artifact = test_artifact();
@@ -880,6 +924,7 @@ mod tests {
         assert!(build_field_completion(&artifact, MavenNameField::ArtifactId, range).is_none());
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_build_field_completion_rejects_control_character_group_id() {
         let mut artifact = test_artifact();
@@ -889,6 +934,7 @@ mod tests {
         assert!(build_field_completion(&artifact, MavenNameField::GroupId, range).is_none());
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_build_field_completion_rejects_when_base_builder_rejects_name() {
         // `build_field_completion` only validates the *requested* field via
@@ -912,6 +958,7 @@ mod tests {
         assert!(build_field_completion(&artifact, MavenNameField::GroupId, range).is_none());
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_build_deduped_field_completions_drops_unsafe_results() {
         let results = vec![
@@ -940,6 +987,7 @@ mod tests {
         assert_eq!(items[0].insert_text, Some("org.apache.commons".to_string()));
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_build_deduped_field_completions_dedupes_shared_group_id() {
         let results = vec![
@@ -976,6 +1024,7 @@ mod tests {
         assert_eq!(items[0].insert_text, Some("org.apache.commons".to_string()));
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_build_deduped_field_completions_keeps_distinct_group_ids() {
         let results = vec![
@@ -1003,6 +1052,7 @@ mod tests {
         assert_eq!(items.len(), 2);
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_build_deduped_field_completions_dedupes_shared_artifact_id() {
         let results = vec![
@@ -1061,6 +1111,7 @@ mod tests {
     /// proves `line_at` + `is_in_xml_tag_section` + `strip_leading_xml_tag` compose
     /// correctly through the real trait method on realistic multi-line pom.xml
     /// content.
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_fallback_completion_prefix_multi_line_composition() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1069,7 +1120,7 @@ mod tests {
         let line = content.lines().nth(2).unwrap();
         let position = Position::new(2, line.chars().count() as u32);
         assert_eq!(
-            eco.fallback_completion_prefix(content, position),
+            eco.fallback_completion_prefix(content, position.into()),
             Some("gua")
         );
     }
@@ -1079,6 +1130,7 @@ mod tests {
     /// safe insert at that position — which this trait method achieves by returning
     /// `None`, the same value it returns for "no completable position at all" (the
     /// caller's registry search is skipped either way).
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_fallback_completion_prefix_other_open_tag_is_suppressed() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1086,9 +1138,13 @@ mod tests {
         let content = "<dependencies>\n  <dependency>\n    <groupId>org.apa";
         let line = content.lines().nth(2).unwrap();
         let position = Position::new(2, line.chars().count() as u32);
-        assert_eq!(eco.fallback_completion_prefix(content, position), None);
+        assert_eq!(
+            eco.fallback_completion_prefix(content, position.into()),
+            None
+        );
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_fallback_completion_is_bare_inside_open_artifact_id_tag() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1096,9 +1152,10 @@ mod tests {
         let content = "<dependencies>\n  <dependency>\n    <artifactId>gua";
         let line = content.lines().nth(2).unwrap();
         let position = Position::new(2, line.chars().count() as u32);
-        assert!(eco.fallback_completion_is_bare(content, position));
+        assert!(eco.fallback_completion_is_bare(content, position.into()));
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_fallback_completion_is_bare_false_with_no_open_tag() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1106,7 +1163,7 @@ mod tests {
         let content = "<dependencies>\n  <dependency>\n    gua";
         let line = content.lines().nth(2).unwrap();
         let position = Position::new(2, line.chars().count() as u32);
-        assert!(!eco.fallback_completion_is_bare(content, position));
+        assert!(!eco.fallback_completion_is_bare(content, position.into()));
     }
 
     #[test]
@@ -1284,6 +1341,7 @@ mod tests {
     /// [`MavenXmlContext::Version`] context (`detect_xml_context` is dependency-blind), but
     /// no parsed dependency's name/version range covers this position — the arm must fail
     /// closed to `Completions::default()` without ever calling the registry.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_completions_version_context_no_dependency_at_position_returns_empty() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1313,6 +1371,7 @@ mod tests {
     /// either way); the actual #819 guarantee is compile-time (a new `MavenXmlContext`
     /// variant is a compile error at the match in `generate_completions`), which no
     /// runtime test can exercise.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_completions_none_context_returns_empty() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1345,6 +1404,7 @@ mod tests {
     /// that the cursor sits inside a `<version>` tag, so without the literal-span guard
     /// this would previously offer the full version list and, on accept, splice a version
     /// string into `${slf4j.version}`.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_completions_version_context_withheld_for_unresolved_property() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1379,7 +1439,7 @@ mod tests {
             !deps_core::lsp_helpers::dependency_version_range_is_literal(
                 *dep,
                 xml,
-                dep.version_range().unwrap().into(),
+                dep.version_range().unwrap(),
             )
         );
 
@@ -1393,6 +1453,7 @@ mod tests {
     // the "happy path" needs live Maven Central access, mirroring this codebase's existing
     // convention for such tests (e.g. `deps_maven::registry::tests`'s own `#[ignore]`d
     // network tests).
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     #[ignore] // Requires network access
     async fn test_generate_completions_version_arm_dispatches_by_position() {

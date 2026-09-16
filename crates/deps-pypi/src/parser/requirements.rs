@@ -235,8 +235,7 @@ impl PypiParser {
                                 &line_table,
                                 target_abs_start,
                                 target_abs_end,
-                            )
-                            .into(),
+                            ),
                             target: target.to_string(),
                         });
                     }
@@ -597,8 +596,8 @@ mod tests {
 
     fn slice(content: &str, range: deps_core::position::Range) -> String {
         let table = LineOffsetTable::new(content);
-        let start = table.position_to_byte_offset(content, range.start.into());
-        let end = table.position_to_byte_offset(content, range.end.into());
+        let start = table.position_to_byte_offset(content, range.start);
+        let end = table.position_to_byte_offset(content, range.end);
         content[start..end].to_string()
     }
 
@@ -1043,7 +1042,7 @@ mod tests {
         let content = "-r other-requirements.txt\n";
         let result = parse(content);
         let link = &result.document_links[0];
-        assert_eq!(slice(content, link.range.into()), "other-requirements.txt");
+        assert_eq!(slice(content, link.range), "other-requirements.txt");
     }
 
     #[test]

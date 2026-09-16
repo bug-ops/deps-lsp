@@ -12,6 +12,18 @@ publish = true
 [lints]
 workspace = true
 
+[features]
+# Gates this crate's own `tower-lsp-server` dependency and LSP-response-shaped code,
+# forwarding to `deps-core`'s and `deps-npm`'s identically-named feature (issue #1083,
+# spec 064) — `deps-npm` is a real, non-optional dependency here (DenoRegistry delegates
+# `npm:` specifiers to it), so its own `lsp-responses` must be forwarded too, not just
+# `deps-core`'s. Not `default`: Cargo does not allow a `workspace = true` dependency edge
+# to turn off a default feature, so making this default here would make it inescapable for
+# `deps-engine` (see its own `lsp-responses` feature doc). `deps-lsp` requests it
+# explicitly, directly or via `deps-engine`'s own `lsp-responses`; `deps-cli` never does,
+# keeping `tower-lsp-server` out of its dependency tree.
+lsp-responses = ["dep:tower-lsp-server", "deps-core/lsp-responses", "deps-npm/lsp-responses"]
+
 [dependencies]
 deps-core = { workspace = true }
 deps-npm = { workspace = true }
@@ -19,7 +31,7 @@ jsonc-parser = { workspace = true }
 node-semver = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 tokio = { workspace = true }
-tower-lsp-server = { workspace = true }
+tower-lsp-server = { workspace = true, optional = true }
 tracing = { workspace = true }
 url = { workspace = true }
 urlencoding = { workspace = true }

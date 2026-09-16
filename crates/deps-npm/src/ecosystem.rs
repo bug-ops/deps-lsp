@@ -5,14 +5,15 @@
 
 use std::any::Any;
 use std::sync::Arc;
-use tower_lsp_server::ls_types::{
-    CompletionItem, Diagnostic, DiagnosticSeverity, Hover, HoverContents, Position, Range,
-};
+#[cfg(feature = "lsp-responses")]
+use tower_lsp_server::ls_types::{CompletionItem, Hover, HoverContents, Position, Range};
 use url::Url;
 
+#[cfg(feature = "lsp-responses")]
+use deps_core::completion::Completions;
 use deps_core::{
     Ecosystem, ParseResult as ParseResultTrait, Registry, Result,
-    completion::Completions,
+    diagnostic::{Diagnostic, Severity},
     lsp_helpers::{DiagnosticSeverities, EcosystemFormatter},
 };
 
@@ -86,6 +87,7 @@ impl NpmEcosystem {
     /// Deliberately source-blind (spec FR-011): the string here is a prefix the user typed
     /// into the name field, not a resolved private dependency name, so it is safe to send to
     /// the public registry unconditionally — unlike [`Self::complete_versions`].
+    #[cfg(feature = "lsp-responses")]
     async fn complete_package_names(&self, prefix: &str, range: Range) -> Vec<CompletionItem> {
         deps_core::completion::complete_package_names_generic(
             self.registry.as_ref(),
@@ -112,6 +114,7 @@ impl NpmEcosystem {
     /// hover/diagnostics/code-actions); `AlternateRegistry` routing through
     /// `self.registry.alternate_client` is unchanged — it already lives inside
     /// `NpmRegistry::get_versions_from` itself, which the shared helper calls into.
+    #[cfg(feature = "lsp-responses")]
     async fn complete_versions(
         &self,
         parse_result: &dyn ParseResultTrait,
@@ -186,6 +189,7 @@ impl Ecosystem for NpmEcosystem {
         &self.formatter
     }
 
+    #[cfg(feature = "lsp-responses")]
     fn complete_package_name<'a>(
         &'a self,
         _request: deps_core::completion::CompletionRequest<'a>,
@@ -195,6 +199,7 @@ impl Ecosystem for NpmEcosystem {
         Box::pin(async move { self.complete_package_names(&prefix, range).await.into() })
     }
 
+    #[cfg(feature = "lsp-responses")]
     fn complete_version<'a>(
         &'a self,
         request: deps_core::completion::CompletionRequest<'a>,
@@ -217,6 +222,7 @@ impl Ecosystem for NpmEcosystem {
     /// `catalog:`/`catalog:<name>`-referencing dependency — the base hover already renders
     /// everything else identically to a literal-range dependency (FR-004), since a resolved
     /// catalog entry rewrites `version_req` in place before hover ever runs.
+    #[cfg(feature = "lsp-responses")]
     fn generate_hover<'a>(
         &'a self,
         parse_result: &'a dyn ParseResultTrait,
@@ -240,10 +246,10 @@ impl Ecosystem for NpmEcosystem {
                 .dependencies()
                 .into_iter()
                 .find(|dep| {
-                    deps_core::position_in_range(position, dep.name_range().into())
+                    deps_core::position_in_range(position.into(), dep.name_range())
                         || dep
                             .version_range()
-                            .is_some_and(|r| deps_core::position_in_range(position, r.into()))
+                            .is_some_and(|r| deps_core::position_in_range(position.into(), r))
                 })
                 .and_then(|dep| dep.as_any().downcast_ref::<NpmDependency>())
                 .and_then(catalog_hover_line);
@@ -288,7 +294,7 @@ impl Ecosystem for NpmEcosystem {
     fn fallback_completion_prefix<'a>(
         &self,
         content: &'a str,
-        position: Position,
+        position: deps_core::position::Position,
     ) -> Option<&'a str> {
         let line = deps_core::fallback_completion::line_at(content, position)?;
         if !is_in_dependencies_section(content, position.line as usize) {
@@ -306,7 +312,11 @@ impl Ecosystem for NpmEcosystem {
         Some(prefix)
     }
 
-    fn fallback_completion_is_bare(&self, content: &str, position: Position) -> bool {
+    fn fallback_completion_is_bare(
+        &self,
+        content: &str,
+        position: deps_core::position::Position,
+    ) -> bool {
         let Some(line) = deps_core::fallback_completion::line_at(content, position) else {
             return false;
         };
@@ -366,6 +376,7 @@ fn extract_prefix(line: &str, character: u32) -> (&str, bool) {
 /// `` `catalog:react17` → `^17.0.2` `` when resolved; the outcome's own message otherwise
 /// (including [`crate::catalog::CatalogOutcome::NonSemverEntry`], which gets no diagnostic but
 /// still deserves a hover explanation of why no version comparison ran).
+#[cfg(feature = "lsp-responses")]
 fn catalog_hover_line(dep: &NpmDependency) -> Option<String> {
     let origin = dep.catalog.as_ref()?;
     Some(format!(
@@ -384,10 +395,7 @@ fn catalog_hover_line(dep: &NpmDependency) -> Option<String> {
 /// own `let Some(version_range) = dep.version_range() else { continue };` gate) — there is
 /// simply nowhere in the document to place a diagnostic squiggle without a span, catalog or
 /// otherwise.
-fn catalog_diagnostics(
-    parse_result: &dyn ParseResultTrait,
-    severity: DiagnosticSeverity,
-) -> Vec<Diagnostic> {
+fn catalog_diagnostics(parse_result: &dyn ParseResultTrait, severity: Severity) -> Vec<Diagnostic> {
     parse_result
         .dependencies()
         .into_iter()
@@ -396,13 +404,7 @@ fn catalog_diagnostics(
             let origin = npm_dep.catalog.as_ref()?;
             let range = npm_dep.version_range?;
             let message = origin.diagnostic_message(npm_dep.name.as_str())?;
-            Some(Diagnostic {
-                range: range.into(),
-                severity: Some(severity),
-                message,
-                source: Some("deps-lsp".into()),
-                ..Default::default()
-            })
+            Some(Diagnostic::new(range, message).with_severity(severity))
         })
         .collect()
 }
@@ -410,18 +412,23 @@ fn catalog_diagnostics(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "lsp-responses")]
+    use deps_core::EcosystemConfig;
+    use deps_core::VersionData;
+    #[cfg(feature = "lsp-responses")]
     use deps_core::parser::DependencySource;
-    use deps_core::{EcosystemConfig, VersionData};
     use std::collections::HashMap;
 
     fn pkg(s: &str) -> deps_core::PackageName {
         deps_core::PackageName::new(s)
     }
 
+    #[cfg(feature = "lsp-responses")]
     struct MockParseResult {
         dependencies: Vec<crate::types::NpmDependency>,
     }
 
+    #[cfg(feature = "lsp-responses")]
     impl deps_core::ParseResult for MockParseResult {
         fn dependencies(&self) -> Vec<&dyn deps_core::Dependency> {
             self.dependencies
@@ -447,6 +454,7 @@ mod tests {
 
     /// Builds an `NpmDependency` with a `version_range` at `line`, whose start position is
     /// what `complete_versions` (position-based, issue #599) looks up `parse_result` by.
+    #[cfg(feature = "lsp-responses")]
     fn dep_with_source(
         name: &str,
         source: DependencySource,
@@ -480,6 +488,7 @@ mod tests {
     // #758: the shared completion-prefix-length guard
     // (`deps_core::completion::complete_package_names_generic`), replacing
     // test_complete_package_names_minimum_prefix/test_complete_package_names_max_length.
+    #[cfg(feature = "lsp-responses")]
     deps_core::completion_guard_conformance! {
         mod npm_completion_guard_conformance;
         complete: |registry: &dyn deps_core::Registry, prefix: String| -> std::pin::Pin<
@@ -507,6 +516,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_package_name_completion_context_has_real_range() {
         // Regression test for #232: the textEdit range for a package-name completion
@@ -539,6 +549,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_package_name_completion_context_one_past_name_end_does_not_consume_closing_quote()
     {
@@ -573,6 +584,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     #[ignore] // Requires network access
     async fn test_complete_package_names_real_search() {
@@ -586,6 +598,7 @@ mod tests {
         assert!(results.iter().any(|r| r.label == "express"));
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     #[ignore] // Requires network access
     async fn test_complete_versions_real() {
@@ -609,6 +622,7 @@ mod tests {
         assert!(results.iter().all(|r| r.label.starts_with("4.")));
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     #[ignore] // Requires network access
     async fn test_complete_versions_with_operator() {
@@ -635,6 +649,7 @@ mod tests {
     /// Sentinel package name for a package that does not exist in the registry (#1038): every
     /// "unknown package" completion test below shares it, resolved against a mockito 404 via
     /// [`mock_unknown_package_ecosystem`] rather than the live registry.
+    #[cfg(feature = "lsp-responses")]
     const UNKNOWN_PACKAGE: &str = "this-package-does-not-exist-12345";
 
     /// Builds an [`NpmEcosystem`] wired to a mockito server that 404s [`UNKNOWN_PACKAGE`]
@@ -643,6 +658,7 @@ mod tests {
     /// same live-registry-avoiding wiring per test. A regression that makes zero requests
     /// (and so also produces an empty result) can no longer pass vacuously, since
     /// `mock.assert_async()` requires the request to actually have been made.
+    #[cfg(feature = "lsp-responses")]
     async fn mock_unknown_package_ecosystem() -> (mockito::ServerGuard, mockito::Mock, NpmEcosystem)
     {
         let mut server = mockito::Server::new_async().await;
@@ -662,6 +678,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_complete_versions_unknown_package() {
         let (_server, mock, ecosystem) = mock_unknown_package_ecosystem().await;
@@ -684,6 +701,7 @@ mod tests {
         assert!(results.is_empty());
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_complete_package_names_special_characters() {
         // #1055: was a live, unmocked search that asserted the tautology
@@ -723,6 +741,7 @@ mod tests {
     /// differently-`Accept`-headered request to the same packument URL when it's enabled,
     /// which `mockito`'s default path-only matching would double-count against this single
     /// mock — orthogonal to what this test verifies.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_complete_versions_capped_at_max_completion_versions() {
         let mut server = mockito::Server::new_async().await;
@@ -827,6 +846,7 @@ mod tests {
         assert!(provider.is_some());
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_inlay_hints_empty_dependencies() {
         // See the comment in `test_package_name_completion_context_has_real_range` on why
@@ -855,6 +875,7 @@ mod tests {
         assert!(hints.is_empty());
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_completions_no_context() {
         // See the comment in `test_package_name_completion_context_has_real_range` on why
@@ -884,6 +905,7 @@ mod tests {
         assert!(completions.items.is_empty());
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_completions_version_context_returns_versions() {
         // See the comment in `test_package_name_completion_context_has_real_range` on why
@@ -937,6 +959,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_hover_no_dependency_at_position() {
         // See the comment in `test_package_name_completion_context_has_real_range` on why
@@ -968,6 +991,7 @@ mod tests {
         assert!(hover.is_none());
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_code_actions_no_actions() {
         // See the comment in `test_package_name_completion_context_has_real_range` on why
@@ -1008,6 +1032,7 @@ mod tests {
     /// alias. Pinning this here so a future change to `version_literal()`/`version_range`
     /// doesn't silently re-enable a destructive edit (see `NpmDependency`'s doc and
     /// `deps_core::lsp_helpers::code_actions::generate_code_actions`'s guard).
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_code_actions_suppressed_for_npm_alias() {
         // See the comment in `test_package_name_completion_context_has_real_range` on why
@@ -1081,6 +1106,7 @@ mod tests {
     /// `results.is_empty()` — vacuous under a dead network, since a regression that made zero
     /// requests would produce the same empty result. Now mocked, with `mock.assert_async()`
     /// requiring the request to actually have been made.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_complete_versions_empty_prefix() {
         let (_server, mock, ecosystem) = mock_unknown_package_ecosystem().await;
@@ -1105,6 +1131,7 @@ mod tests {
     }
 
     /// #1038: see [`test_complete_versions_empty_prefix`]'s doc for why this is now mocked.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_complete_versions_with_tilde_operator() {
         let (_server, mock, ecosystem) = mock_unknown_package_ecosystem().await;
@@ -1128,6 +1155,7 @@ mod tests {
     }
 
     /// #1038: see [`test_complete_versions_empty_prefix`]'s doc for why this is now mocked.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_complete_versions_with_wildcard() {
         let (_server, mock, ecosystem) = mock_unknown_package_ecosystem().await;
@@ -1151,6 +1179,7 @@ mod tests {
     }
 
     /// #1038: see [`test_complete_versions_empty_prefix`]'s doc for why this is now mocked.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_complete_versions_with_less_than_operator() {
         let (_server, mock, ecosystem) = mock_unknown_package_ecosystem().await;
@@ -1189,6 +1218,7 @@ mod tests {
     /// collapsed to `Ambiguous` and returned empty; post-fix, cursor position resolves it
     /// independently of the co-occurring `AlternateRegistry` entry and it reaches the (mocked)
     /// public registry.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_complete_versions_same_name_different_sources_routes_by_position() {
         let mut public_server = mockito::Server::new_async().await;
@@ -1263,6 +1293,7 @@ mod tests {
     /// *any* `Err` (including a 404 from a nonexistent package name), not only on the
     /// intended fail-closed arm. A mocked public registry with `.expect(0)` makes the
     /// dispatch regression itself fail the test, not just its result shape.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_complete_versions_custom_registry_source_offers_nothing() {
         let mut public_server = mockito::Server::new_async().await;
@@ -1307,6 +1338,7 @@ mod tests {
     /// `test_complete_versions_custom_registry_source_offers_nothing` above: a mocked public
     /// registry with `.expect(0)` proves no request reaches it, which `results.is_empty()`
     /// alone cannot.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_complete_versions_unregistered_alternate_offers_nothing() {
         let mut public_server = mockito::Server::new_async().await;
@@ -1346,6 +1378,7 @@ mod tests {
     }
 
     /// Issue #599 end-to-end: a registered alternate client's version completion routes there.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_complete_versions_routes_to_registered_alternate_client() {
         let mut alt_server = mockito::Server::new_async().await;
@@ -1392,6 +1425,7 @@ mod tests {
 
     // --- pnpm catalogs (spec 046): generate_hover/generate_diagnostics overrides ---
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_hover_appends_catalog_line_for_resolved_dependency() {
         // See the comment in `test_package_name_completion_context_has_real_range` on why
@@ -1477,15 +1511,13 @@ mod tests {
 
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].message.contains("left-pad"));
-        assert_eq!(
-            diagnostics[0].severity,
-            Some(tower_lsp_server::ls_types::DiagnosticSeverity::WARNING)
-        );
+        assert_eq!(diagnostics[0].severity, Some(Severity::Warning));
     }
 
     /// Composition regression guard (#390/#282 bug class): proves `line_at` +
     /// `is_in_json_dependencies` + quote-stripping compose correctly through the real
     /// trait method on realistic multi-line content.
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_fallback_completion_prefix_multi_line_composition() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1494,7 +1526,7 @@ mod tests {
         let line = content.lines().nth(3).unwrap();
         let position = Position::new(3, line.chars().count() as u32);
         assert_eq!(
-            ecosystem.fallback_completion_prefix(content, position),
+            ecosystem.fallback_completion_prefix(content, position.into()),
             Some("expr")
         );
     }
@@ -1531,6 +1563,7 @@ mod tests {
     /// completion entirely — the same "no safe text to offer" outcome as Maven's
     /// non-`artifactId` open tag — which this trait method achieves by returning
     /// `None`, same as "no completable position at all".
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_fallback_completion_prefix_closed_key_is_suppressed() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1538,9 +1571,13 @@ mod tests {
         let content = "{\n  \"dependencies\": {\n    \"express\"";
         let line = content.lines().nth(2).unwrap();
         let position = Position::new(2, line.chars().count() as u32);
-        assert_eq!(eco.fallback_completion_prefix(content, position), None);
+        assert_eq!(
+            eco.fallback_completion_prefix(content, position.into()),
+            None
+        );
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_fallback_completion_is_bare_inside_open_key() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1548,9 +1585,10 @@ mod tests {
         let content = "{\n  \"dependencies\": {\n    \"expr";
         let line = content.lines().nth(2).unwrap();
         let position = Position::new(2, line.chars().count() as u32);
-        assert!(eco.fallback_completion_is_bare(content, position));
+        assert!(eco.fallback_completion_is_bare(content, position.into()));
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_fallback_completion_is_bare_false_with_no_open_key() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1558,7 +1596,7 @@ mod tests {
         let content = "{\n  \"dependencies\": {\n    expr";
         let line = content.lines().nth(2).unwrap();
         let position = Position::new(2, line.chars().count() as u32);
-        assert!(!eco.fallback_completion_is_bare(content, position));
+        assert!(!eco.fallback_completion_is_bare(content, position.into()));
     }
 
     /// #729: `NpmEcosystem` has no `fallback_bare_insert_text` override — the default

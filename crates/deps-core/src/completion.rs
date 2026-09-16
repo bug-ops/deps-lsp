@@ -21,26 +21,16 @@ use crate::{
     ConcreteVersion, FreshnessSettings, Metadata, PackageName, ParseResult, PublishTime, Version,
     format_relative_age,
 };
-use std::time::Duration;
 use tower_lsp_server::ls_types::{
     CompletionItem, CompletionItemKind, CompletionItemLabelDetails, CompletionTextEdit,
     Documentation, MarkupContent, MarkupKind, Position, Range, TextEdit,
 };
 
-/// Wall-clock budget `deps-lsp`'s completion handler gives an ecosystem's
-/// `generate_completions` before treating it as a timeout.
-///
-/// Past this, the handler skips the fallback search rather than treating a
-/// fast-but-empty result as "genuinely no results"
-/// (`crates/deps-lsp/src/handlers/completion.rs`).
-///
-/// A registry-backed completion path that retries internally on failure (e.g.
-/// `deps-maven`'s `search`, #274) must size its own total retry budget to
-/// exceed this constant: finishing sooner with an empty/error result is
-/// indistinguishable, at the call site, from a query that legitimately has no
-/// matches, and triggers a wasted (and, for a struggling registry, likely to also
-/// fail) fallback search rather than the handler's existing skip-on-timeout path.
-pub const COMPLETION_SEARCH_TIMEOUT: Duration = Duration::from_secs(2);
+/// Re-exported from [`crate::lsp_helpers::COMPLETION_SEARCH_TIMEOUT`] — moved there (issue
+/// #1083) since a registry-backed completion path's own retry-budget constant (e.g.
+/// `deps-maven`'s `RECENT_FAILURE_TTL`) needs it independent of the `lsp-responses` feature
+/// this module is gated behind.
+pub use crate::lsp_helpers::COMPLETION_SEARCH_TIMEOUT;
 
 /// Result of [`Ecosystem::generate_completions`](crate::Ecosystem::generate_completions).
 ///
@@ -275,8 +265,11 @@ pub fn detect_completion_context(
             // context in that case rather than return it; the loop still falls through
             // to this dependency's `features_range` check (harmless — the cursor is not
             // there either) and then moves on to the next dependency.
-            if crate::lsp_helpers::dependency_version_range_is_literal(dep, content, version_range)
-            {
+            if crate::lsp_helpers::dependency_version_range_is_literal(
+                dep,
+                content,
+                version_range.into(),
+            ) {
                 let prefix = extract_prefix(content, position, version_range);
                 return CompletionContext::Version {
                     package_name: dep.name().clone(),
@@ -327,95 +320,17 @@ const fn position_in_range(position: Position, range: Range) -> bool {
     true
 }
 
-/// Converts UTF-16 offset to byte offset in a string.
-///
-/// LSP uses UTF-16 code units for character positions (for compatibility with
-/// JavaScript and other languages). This function converts from UTF-16 offset
-/// to byte offset for Rust string indexing.
-///
-/// # Arguments
-///
-/// * `s` - The string to index into
-/// * `utf16_offset` - UTF-16 code unit offset (from LSP Position.character)
-///
-/// # Returns
-///
-/// Byte offset if valid, `None` if the UTF-16 offset is out of bounds.
-///
-/// # Examples
-///
-/// ```
-/// # use deps_core::completion::utf16_to_byte_offset;
-/// // ASCII: UTF-16 offset equals byte offset
-/// assert_eq!(utf16_to_byte_offset("hello", 2), Some(2));
-///
-/// // Unicode: "日本語" - each char is 3 bytes but 1 UTF-16 code unit
-/// assert_eq!(utf16_to_byte_offset("日本語", 0), Some(0));
-/// assert_eq!(utf16_to_byte_offset("日本語", 1), Some(3));
-/// assert_eq!(utf16_to_byte_offset("日本語", 2), Some(6));
-///
-/// // Emoji: "😀" is 4 bytes but 2 UTF-16 code units (surrogate pair)
-/// assert_eq!(utf16_to_byte_offset("😀test", 2), Some(4));
-/// ```
-pub fn utf16_to_byte_offset(s: &str, utf16_offset: u32) -> Option<usize> {
-    let mut utf16_count = 0u32;
-    for (byte_idx, ch) in s.char_indices() {
-        if utf16_count >= utf16_offset {
-            return Some(byte_idx);
-        }
-        // `char::len_utf16` always returns 1 or 2, so this cast never truncates.
-        #[allow(clippy::cast_possible_truncation)]
-        {
-            utf16_count += ch.len_utf16() as u32;
-        }
-    }
-    if utf16_count == utf16_offset {
-        return Some(s.len());
-    }
-    None
-}
-
 /// Converts a byte offset within `s` to a UTF-16 code unit offset (LSP `Position.character`).
 ///
-/// `byte_offset` may be an arbitrary caller-supplied value: it is clamped to `s.len()` and
-/// floored down to the nearest UTF-8 char boundary before use, so this never panics.
+/// Re-exported from [`crate::lsp_helpers::byte_to_utf16_offset`] — see
+/// [`utf16_to_byte_offset`]'s doc for why.
+pub use crate::lsp_helpers::byte_to_utf16_offset;
+/// Converts UTF-16 offset to byte offset in a string.
 ///
-/// # Examples
-///
-/// ```
-/// # use deps_core::completion::byte_to_utf16_offset;
-/// // ASCII: byte offset equals UTF-16 offset
-/// assert_eq!(byte_to_utf16_offset("hello", 2), 2);
-///
-/// // Unicode: "日本語" - each char is 3 bytes but 1 UTF-16 code unit
-/// assert_eq!(byte_to_utf16_offset("日本語", 0), 0);
-/// assert_eq!(byte_to_utf16_offset("日本語", 3), 1);
-/// assert_eq!(byte_to_utf16_offset("日本語", 6), 2);
-///
-/// // Emoji: "😀" is 4 bytes but 2 UTF-16 code units (surrogate pair)
-/// assert_eq!(byte_to_utf16_offset("😀test", 4), 2);
-///
-/// // Never panics: an offset landing mid-character floors down to the start of that
-/// // character, and an offset past the end saturates to the string's length.
-/// assert_eq!(byte_to_utf16_offset("日本語", 1), 0); // inside the first character
-/// assert_eq!(byte_to_utf16_offset("日本語", 999), 3); // past the end
-/// ```
-// `end` is floor_char_boundary-clamped just above, mirroring the already-hardened
-// `LineOffsetTable::byte_offset_to_position` (lsp_helpers/mod.rs).
-#[allow(clippy::string_slice)]
-pub fn byte_to_utf16_offset(s: &str, byte_offset: usize) -> u32 {
-    // Saturate rather than silently wrap: an LSP `Position.character` past `u32::MAX` UTF-16
-    // units is already meaningless, but a wrapped value would be a wrong-but-plausible one
-    // (#673 — the exact offset-math bug class #244 shipped).
-    //
-    // `byte_offset` is not guaranteed to be in bounds or on a char boundary (a caller-supplied
-    // offset can be past `s.len()` or land mid-character); `floor_char_boundary` clamps both
-    // — past-the-end saturates to `s.len()` and any other in-bounds index floors to the
-    // nearest char boundary — mirroring `LineOffsetTable::byte_offset_to_position`
-    // (lsp_helpers/mod.rs).
-    let end = s.floor_char_boundary(byte_offset);
-    u32::try_from(s[..end].encode_utf16().count()).unwrap_or(u32::MAX)
-}
+/// Re-exported from [`crate::lsp_helpers::utf16_to_byte_offset`] — moved there (issue #1083)
+/// since `deps-core`'s own [`crate::lsp_helpers::LineOffsetTable`] needs it independent of the
+/// `lsp-responses` feature this module is gated behind.
+pub use crate::lsp_helpers::utf16_to_byte_offset;
 
 /// Extracts the prefix text from content at a position within a range.
 ///

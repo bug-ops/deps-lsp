@@ -602,8 +602,8 @@ mod tests {
         ))]
         fn apply_single_edit(content: &str, edit: &TextEdit) -> String {
             let table = deps_core::LineOffsetTable::new(content);
-            let start = table.position_to_byte_offset(content, edit.range.start);
-            let end = table.position_to_byte_offset(content, edit.range.end);
+            let start = table.position_to_byte_offset(content, edit.range.start.into());
+            let end = table.position_to_byte_offset(content, edit.range.end.into());
             format!("{}{}{}", &content[..start], edit.new_text, &content[end..])
         }
 

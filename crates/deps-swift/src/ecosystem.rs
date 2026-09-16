@@ -2,21 +2,23 @@
 
 use std::any::Any;
 use std::sync::Arc;
-#[cfg(test)]
+#[cfg(all(test, feature = "lsp-responses"))]
 use tower_lsp_server::ls_types::Position;
+#[cfg(feature = "lsp-responses")]
 use tower_lsp_server::ls_types::{CompletionItem, CompletionTextEdit, Range as LspRange, TextEdit};
 use url::Url;
 
+#[cfg(feature = "lsp-responses")]
+use deps_core::completion::Completions;
 use deps_core::{
-    Ecosystem, ParseResult as ParseResultTrait, Registry, Result,
-    completion::Completions,
-    is_safe_registry_url,
+    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, is_safe_registry_url,
     lsp_helpers::{EcosystemFormatter, warn_rejected_value},
 };
 
 use crate::formatter::SwiftFormatter;
 use crate::lockfile::SwiftLockParser;
 use crate::registry::SwiftRegistry;
+#[cfg(feature = "lsp-responses")]
 use crate::types::SwiftPackage;
 
 /// Builds a completion item that inserts the full GitHub URL for `.package(url: "...")`.
@@ -36,6 +38,7 @@ use crate::types::SwiftPackage;
 /// builder itself rejects `package.name` — a malicious/compromised search result must
 /// not reach the manifest as an unsanitized `TextEdit`, so the item is dropped rather
 /// than built with unsafe text.
+#[cfg(feature = "lsp-responses")]
 fn build_url_completion(
     package: &SwiftPackage,
     replace_range: Option<LspRange>,
@@ -67,6 +70,7 @@ fn build_url_completion(
 
 /// Strips a leading `https://github.com/` (or `https://github.com`) scheme from a
 /// completion prefix, leaving the search query GitHub's repository search expects.
+#[cfg(feature = "lsp-responses")]
 fn strip_github_prefix(prefix: &str) -> &str {
     prefix
         .strip_prefix("https://github.com/")
@@ -99,6 +103,7 @@ impl SwiftEcosystem {
         }
     }
 
+    #[cfg(feature = "lsp-responses")]
     async fn complete_package_urls(
         &self,
         query: &str,
@@ -122,6 +127,7 @@ impl SwiftEcosystem {
             .collect()
     }
 
+    #[cfg(feature = "lsp-responses")]
     async fn complete_versions(
         &self,
         package_name: &deps_core::PackageName,
@@ -181,6 +187,7 @@ impl Ecosystem for SwiftEcosystem {
         &self.formatter
     }
 
+    #[cfg(feature = "lsp-responses")]
     fn complete_package_name<'a>(
         &'a self,
         _request: deps_core::completion::CompletionRequest<'a>,
@@ -198,6 +205,7 @@ impl Ecosystem for SwiftEcosystem {
         })
     }
 
+    #[cfg(feature = "lsp-responses")]
     fn complete_version<'a>(
         &'a self,
         request: deps_core::completion::CompletionRequest<'a>,
@@ -260,6 +268,7 @@ impl Ecosystem for SwiftEcosystem {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "lsp-responses")]
     fn test_package(repository: Option<&str>) -> SwiftPackage {
         SwiftPackage {
             name: "apple/swift-nio".to_string().into(),
@@ -270,6 +279,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "lsp-responses")]
     fn test_range() -> LspRange {
         LspRange {
             start: Position::new(3, 20),
@@ -277,6 +287,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_build_url_completion_uses_repository_url() {
         let package = test_package(Some("https://github.com/apple/swift-nio"));
@@ -288,6 +299,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_build_url_completion_falls_back_to_constructed_url() {
         let package = test_package(None);
@@ -299,6 +311,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_build_url_completion_with_range_sets_text_edit() {
         let package = test_package(Some("https://github.com/apple/swift-nio"));
@@ -314,6 +327,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_build_url_completion_without_range_has_no_text_edit() {
         // Defensive fallback: when the containing dependency's range can't be resolved,
@@ -324,6 +338,7 @@ mod tests {
         assert_eq!(item.text_edit, None);
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_build_url_completion_clears_detail_when_latest_version_empty() {
         let package = test_package(Some("https://github.com/apple/swift-nio"));
@@ -333,6 +348,7 @@ mod tests {
         assert_eq!(item.detail, None);
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_build_url_completion_keeps_detail_when_latest_version_present() {
         let mut package = test_package(Some("https://github.com/apple/swift-nio"));
@@ -342,6 +358,7 @@ mod tests {
         assert_eq!(item.detail, Some("v2.40.0".to_string()));
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_build_url_completion_rejects_string_literal_breakout_repository() {
         let package = test_package(Some(
@@ -351,6 +368,7 @@ mod tests {
         assert!(build_url_completion(&package, None).is_none());
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_build_url_completion_rejects_non_http_scheme() {
         let package = test_package(Some("file:///etc/passwd"));
@@ -358,6 +376,7 @@ mod tests {
         assert!(build_url_completion(&package, None).is_none());
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_build_url_completion_rejects_malicious_name_in_fallback_url() {
         let mut package = test_package(None);
@@ -366,6 +385,7 @@ mod tests {
         assert!(build_url_completion(&package, None).is_none());
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_build_url_completion_rejects_when_base_builder_rejects_name() {
         // `repository` is a safe URL (passes `is_safe_registry_url`), but
@@ -378,6 +398,7 @@ mod tests {
         assert!(build_url_completion(&package, None).is_none());
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_strip_github_prefix_with_trailing_slash() {
         assert_eq!(
@@ -386,11 +407,13 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_strip_github_prefix_without_trailing_slash() {
         assert_eq!(strip_github_prefix("https://github.com"), "");
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_strip_github_prefix_no_scheme_typed_yet() {
         // Cursor is still within the scheme itself (e.g. "htt|"), so nothing to strip —
@@ -423,6 +446,7 @@ mod tests {
     // macro's `complete:` closure only ever receives a substituted `&dyn Registry` — the
     // fixture registry can't be threaded into `self.registry`'s concrete type without
     // widening that field to `Arc<dyn Registry>`, out of scope for this test-only change.
+    #[cfg(feature = "lsp-responses")]
     deps_core::completion_guard_conformance! {
         mod swift_completion_guard_conformance;
         complete: |registry: &dyn deps_core::Registry, prefix: String| -> std::pin::Pin<
@@ -476,8 +500,11 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let eco = SwiftEcosystem::new(cache);
         assert!(
-            eco.fallback_completion_prefix("anything at all\n", Position::new(0, 0))
-                .is_none()
+            eco.fallback_completion_prefix(
+                "anything at all\n",
+                deps_core::position::Position::new(0, 0)
+            )
+            .is_none()
         );
     }
 
@@ -579,6 +606,7 @@ mod tests {
     /// off the raw prefix *before* the length guard runs — a migration that dropped or
     /// reordered `strip_github_prefix` would turn this deterministic empty result into a
     /// (still deterministic, but wrong) non-empty one, or vice versa.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_completions_package_name_context_strips_github_prefix_before_dispatch() {
         // `let x = "https://github.com/a"` — name_range spans the quoted content
@@ -621,6 +649,7 @@ mod tests {
 
     /// #793 S1: the `Feature` and `None` contexts (swift has no feature-flag syntax) must
     /// still fall through to an untouched empty result.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_completions_none_context_returns_empty() {
         let uri = deps_core::test_util::test_uri("/test/Package.swift");
@@ -651,6 +680,7 @@ mod tests {
     /// `registry::tests::test_fetch_real_versions`) — an unauthenticated GitHub API call has
     /// a much tighter rate limit than crates.io/pub.dev/rubygems.org, so this crate never
     /// runs one un-ignored.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     #[ignore] // Requires network access
     async fn test_generate_completions_version_context_dispatches_to_registry() {
@@ -728,6 +758,7 @@ mod tests {
     /// range once the trailing `"..<...")` is read back). This is a deliberate decision, not
     /// an accidental side effect of the #919 guard: no single position within a two-literal
     /// range is unambiguously safe to complete into.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_completions_version_context_withheld_for_range_form() {
         let content = r#".package(url: "https://github.com/foo/bar", "1.0.0"..<"2.0.0")"#;

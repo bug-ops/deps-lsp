@@ -47,36 +47,50 @@
 //!   `&DashMap` publicly without a `pub use dashmap` — so a `dashmap` major bump is already
 //!   a breaking change here regardless of this module's visibility.
 //!
-//! ## LSP type stability (issue #832)
+//! ## LSP type stability (issue #832, narrowed by #1071 and #1083)
 //!
-//! The `Ecosystem`, `Dependency`, `ParseResult`, and `EcosystemFormatter` trait signatures
-//! — and the public `lsp_helpers` / `completion` helper functions — are typed directly
-//! against `tower_lsp_server::ls_types` types (`Hover`, `Diagnostic`, `CodeAction`, and so
-//! on). `tower-lsp-server` is pinned pre-1.0, so a `tower-lsp-server` minor bump (e.g. 0.23
-//! → 0.24) is not an implementation detail this crate can absorb silently — it forces a
+//! `tower-lsp-server` is pinned pre-1.0, so a `tower-lsp-server` minor bump (e.g. 0.23 →
+//! 0.24) is not an implementation detail this crate can absorb silently — it forces a
 //! breaking release of `deps-core`: a minor version bump while `deps-core` itself remains
-//! pre-1.0, a major version bump once `deps-core` reaches 1.0.
+//! pre-1.0, a major version bump once `deps-core` reaches 1.0. This section describes which
+//! parts of the public API still carry that coupling.
 //!
-//! Downstream consumers implementing [`ecosystem::Ecosystem`] should depend on the exact
-//! matching `tower-lsp-server` version through the [`tower_lsp_server`] re-export rather than
-//! adding their own separate direct dependency, which could otherwise drift out of sync with
-//! the version `deps-core` was built against.
-//!
-//! As of issue #1071, this coupling no longer covers a dependency's own *domain* data:
+//! As of issue #1071, a dependency's own *domain* data never carried it in the first place:
 //! [`ecosystem::Dependency`]'s range accessors return [`position::Range`], and
 //! [`ecosystem::ParseResult::uri`] / [`ecosystem::Ecosystem::parse_manifest`] use `url::Url`
-//! — neither names a `tower-lsp-server` type. A consumer that only needs parsed-dependency
-//! data (e.g. `deps-cli`, `deps-engine`) can read [`ecosystem::Dependency`]/
-//! [`ecosystem::ParseResult`] without linking `tower-lsp-server` at all. The *response*-shaped
-//! methods this section otherwise describes (`generate_hover`, `generate_diagnostics`,
-//! `generate_code_actions`, `generate_code_lenses`, `generate_document_links`) still build
-//! real `ls_types` objects and remain coupled as described above — `deps-lsp` is the only
-//! crate expected to call them; `deps-core`'s own `lsp_helpers` converts a
-//! [`position::Position`]/[`position::Range`] into its `ls_types` equivalent internally via
-//! [`position::Position`]'s and [`position::Range`]'s `From` impls wherever one must be
-//! embedded in such a response. Whether the *rest* of `deps-core`'s public API should stop
-//! naming third-party dependency types generally (`reqwest::Error`, `yaml_rust2::Yaml`, ...)
-//! is issue #851's broader, still-open question — out of scope for #1071.
+//! — neither names a `tower-lsp-server` type.
+//!
+//! As of issue #1083, the remaining *response*-shaped surface — `generate_hover`,
+//! `generate_diagnostics` (retyped to the protocol-agnostic [`diagnostic::Diagnostic`], not
+//! merely gated), `generate_code_actions`, `generate_code_lenses`, `generate_inlay_hints`,
+//! `generate_document_links`, `generate_completions`/`complete_version`/
+//! `complete_package_name`/`complete_feature`, and the [`completion`] module itself — is
+//! gated behind the `lsp-responses` Cargo feature, along with the `tower-lsp-server`
+//! dependency it requires. The feature is **not** part of this crate's `default` set:
+//! Cargo does not allow a `workspace = true` dependency edge to turn off a feature that a
+//! crate defaults on, so making it default here would make it inescapable for `deps-engine`
+//! (see `deps-engine/Cargo.toml`'s own `lsp-responses` feature doc) — every consumer that
+//! wants it, including each of the 14 `deps-<ecosystem>` crates via their own
+//! identically-named feature, must request `deps-core/lsp-responses` explicitly (`deps-lsp`
+//! does, directly and via `deps-engine`; `deps-cli` never does). Under `--no-default-features`
+//! (or with `lsp-responses` otherwise off), `deps-core` links no `tower-lsp-server` code at
+//! all, [`tower_lsp_server`] is not re-exported, and an ecosystem crate's `Ecosystem` impl
+//! simply doesn't declare the gated trait methods (the trait itself omits them when the
+//! feature is off, so there is nothing to implement) — this is FR-001/SC-001's mechanism for
+//! keeping `deps-cli`'s dependency tree free of `tower-lsp-server` entirely (verified by
+//! `cargo tree -p deps-cli -e features,no-dev` in CI).
+//!
+//! Downstream consumers implementing [`ecosystem::Ecosystem`] with `lsp-responses` enabled
+//! should depend on the exact matching `tower-lsp-server` version through the
+//! [`tower_lsp_server`] re-export rather than adding their own separate direct dependency,
+//! which could otherwise drift out of sync with the version `deps-core` was built against.
+//! `deps-core`'s own `lsp_helpers` converts a [`position::Position`]/[`position::Range`] into
+//! its `ls_types` equivalent internally via their `From` impls wherever one must be embedded
+//! in a gated response.
+//!
+//! Whether the *rest* of `deps-core`'s public API should stop naming third-party dependency
+//! types generally (`reqwest::Error`, `yaml_rust2::Yaml`, ...) is issue #851's broader, still-
+//! open question — out of scope for #1071/#1083.
 
 // #673: re-enable the three cast-safety pedantic lints the workspace allows by default
 // (`Cargo.toml`'s `[workspace.lints.clippy]`), specifically for this crate — deps-core
@@ -97,6 +111,7 @@ pub mod cache;
 /// `pub`, so ecosystem crates (`deps-gitlab-ci`, `deps-github-actions`, `deps-npm`) reach it
 /// directly too.
 pub mod cache_policy;
+#[cfg(feature = "lsp-responses")]
 pub mod completion;
 /// Shared `#[macro_export]`ed conformance-test scaffolding (#758).
 ///
@@ -108,6 +123,13 @@ pub mod conformance;
 /// [`ecosystem::parse_manifest_blocking`] for all 14 ecosystems (#796).
 pub mod dependency_cap;
 pub mod deps_dev;
+/// Protocol-agnostic [`diagnostic::Diagnostic`]/[`diagnostic::Severity`] types (issue #1083).
+///
+/// The domain-level replacement for `tower_lsp_server::ls_types::{Diagnostic,
+/// DiagnosticSeverity, DiagnosticRelatedInformation, CodeDescription}` returned by
+/// [`lsp_helpers::generate_diagnostics_from_cache`] and
+/// [`ecosystem::Ecosystem::generate_diagnostics`].
+pub mod diagnostic;
 /// The [`ecosystem::Ecosystem`] trait: the sealed extension point every package
 /// ecosystem crate implements to plug into the LSP server.
 pub mod ecosystem;
@@ -169,6 +191,10 @@ pub mod yaml_walk;
 /// signatures. `deps-core`'s version tracks `tower-lsp-server`'s: a
 /// `tower-lsp-server` bump is a breaking change here, by construction. See the
 /// "LSP type stability" section of this module's docs for detail.
+///
+/// Only present when the `lsp-responses` feature is enabled — see that feature's own
+/// doc comment in `Cargo.toml` for what it gates and why.
+#[cfg(feature = "lsp-responses")]
 pub use tower_lsp_server;
 
 // Re-export commonly used types
@@ -199,13 +225,17 @@ pub use lsp_helpers::{
     DiagnosticSeverities, EcosystemFormatter, HOVER_RECENT_VERSIONS,
     LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE, LineOffsetTable, OsvNaming, PackageNaming,
     PackageRendering, PackageVersions, RequirementMatcher, RequirementResolution,
-    RequirementStatus, SourcePolicy, UNSATISFIABLE_DIAGNOSTIC_CODE, VersionData,
-    collect_update_all_edits, generate_code_actions as lsp_generate_code_actions,
-    generate_code_lenses as lsp_generate_code_lenses, generate_hover as lsp_generate_hover,
-    generate_inlay_hints as lsp_generate_inlay_hints, is_dot_segment,
+    RequirementStatus, SourcePolicy, UNSATISFIABLE_DIAGNOSTIC_CODE, VersionData, is_dot_segment,
     is_safe_maven_coordinate_segment, is_safe_package_name, is_safe_registry_url,
     is_safe_version_string, is_same_major_minor, maven_coordinate_path, position_in_range,
-    requirement_is_unsatisfiable, single_file_edit, to_ls_uri, warn_rejected_value,
+    requirement_is_unsatisfiable, warn_rejected_value,
+};
+/// LSP-response-shaped re-exports, present only when the `lsp-responses` feature is enabled.
+#[cfg(feature = "lsp-responses")]
+pub use lsp_helpers::{
+    collect_update_all_edits, generate_code_actions as lsp_generate_code_actions,
+    generate_code_lenses as lsp_generate_code_lenses, generate_hover as lsp_generate_hover,
+    generate_inlay_hints as lsp_generate_inlay_hints, single_file_edit, to_ls_uri,
 };
 pub use mtime_cache::{DEFAULT_MAX_CACHED_FILES, MAX_CACHED_FILE_BYTES, MtimeFileCache};
 pub use package::{ConcreteVersion, InvalidPackageName, PackageName, VersionReq};

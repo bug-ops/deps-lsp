@@ -311,6 +311,31 @@ jobs:
 
           exit 0
 
+      - name: Guard against tower-lsp-server leaking into deps-cli (issue #1083, spec 064)
+        # FR-001/SC-001: deps-cli is a plain CLI/CI tool with no LSP client on the other
+        # end, so linking tower-lsp-server there is pure dead weight (and, per the spec's
+        # motivation, a supply-chain surface deps-cli has no reason to carry). `-e
+        # features,no-dev` mirrors a release build (dev-dependencies excluded), so this
+        # fails if tower-lsp-server is ever pulled into deps-cli's normal dependency graph
+        # again — e.g. a future ecosystem crate change that makes `lsp-responses` default,
+        # or a new direct dependency edge that forgets to opt out of it.
+        #
+        # The positive control uses deps-lsp instead of deps-cli itself: unlike the
+        # test-util guard above, deps-cli's own dependency tree (dev-deps included) never
+        # legitimately contains tower-lsp-server post-#1083, so there's no "expected on one
+        # branch, forbidden on the other" shape to self-check against within deps-cli alone.
+        # deps-lsp is the real LSP server and always links it, so a `cargo tree` output-
+        # format drift or command failure that would silently no-op the grep below is still
+        # caught.
+        run: |
+          lsp_ctl=$(cargo tree -p deps-lsp -e features,no-dev)
+          grep -q 'tower-lsp-server' <<<"$lsp_ctl" || { echo "::error::guard self-check failed: tower-lsp-server not found in deps-lsp's own dependency tree"; exit 1; }
+
+          cli_tree=$(cargo tree -p deps-cli -e features,no-dev)
+          grep -q 'tower-lsp-server' <<<"$cli_tree" && { echo "::error::tower-lsp-server is reachable from deps-cli's non-dev dependency tree"; exit 1; }
+
+          exit 0
+
       - name: Guard against driving-adapter crates depending on each other
         # The design's core invariant (issue #1058, architecture-decision.md §3.1): no
         # driving-adapter crate (deps-lsp, deps-cli today; deps-mcp once it exists) may

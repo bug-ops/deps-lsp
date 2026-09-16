@@ -2,12 +2,14 @@
 
 use std::any::Any;
 use std::sync::Arc;
-use tower_lsp_server::ls_types::{CompletionItem, Position, Range};
+#[cfg(feature = "lsp-responses")]
+use tower_lsp_server::ls_types::{CompletionItem, Range};
 use url::Url;
 
+#[cfg(feature = "lsp-responses")]
+use deps_core::completion::Completions;
 use deps_core::{
-    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, completion::Completions,
-    lsp_helpers::EcosystemFormatter,
+    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, lsp_helpers::EcosystemFormatter,
 };
 
 use crate::formatter::DartFormatter;
@@ -32,6 +34,7 @@ impl DartEcosystem {
     /// [`PubDevRegistry::with_base`](crate::registry::PubDevRegistry::with_base) pointed at a
     /// mock server) instead of building a live-registry one (#1038).
     #[cfg(test)]
+    #[cfg(feature = "lsp-responses")]
     #[must_use]
     pub(crate) fn with_registry_for_test(registry: PubDevRegistry) -> Self {
         Self {
@@ -40,6 +43,7 @@ impl DartEcosystem {
         }
     }
 
+    #[cfg(feature = "lsp-responses")]
     async fn complete_package_names(&self, prefix: &str, range: Range) -> Vec<CompletionItem> {
         deps_core::completion::complete_package_names_generic(
             self.registry.as_ref(),
@@ -50,6 +54,7 @@ impl DartEcosystem {
         .await
     }
 
+    #[cfg(feature = "lsp-responses")]
     async fn complete_versions(
         &self,
         package_name: &deps_core::PackageName,
@@ -109,6 +114,7 @@ impl Ecosystem for DartEcosystem {
         &self.formatter
     }
 
+    #[cfg(feature = "lsp-responses")]
     fn complete_package_name<'a>(
         &'a self,
         _request: deps_core::completion::CompletionRequest<'a>,
@@ -118,6 +124,7 @@ impl Ecosystem for DartEcosystem {
         Box::pin(async move { self.complete_package_names(&prefix, range).await.into() })
     }
 
+    #[cfg(feature = "lsp-responses")]
     fn complete_version<'a>(
         &'a self,
         request: deps_core::completion::CompletionRequest<'a>,
@@ -134,7 +141,7 @@ impl Ecosystem for DartEcosystem {
     fn fallback_completion_prefix<'a>(
         &self,
         content: &'a str,
-        position: Position,
+        position: deps_core::position::Position,
     ) -> Option<&'a str> {
         let line = deps_core::fallback_completion::line_at(content, position)?;
         if !is_in_dependencies_section(content, position.line as usize) {
@@ -219,6 +226,8 @@ fn extract_prefix(line: &str, character: u32) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "lsp-responses")]
+    use tower_lsp_server::ls_types::Position;
 
     // #758: exact-value `Ecosystem` conformance, replacing the hand-written
     // test_ecosystem_id/test_ecosystem_display_name/test_ecosystem_manifest_filenames/
@@ -236,6 +245,7 @@ mod tests {
     // #758: the shared completion-prefix-length guard
     // (`deps_core::completion::complete_package_names_generic`), replacing
     // test_complete_package_names_min_prefix/test_complete_package_names_max_length.
+    #[cfg(feature = "lsp-responses")]
     deps_core::completion_guard_conformance! {
         mod dart_completion_guard_conformance;
         complete: |registry: &dyn deps_core::Registry, prefix: String| -> std::pin::Pin<
@@ -253,6 +263,7 @@ mod tests {
         };
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_package_name_completion_context_has_real_range() {
         // Regression test for #232: the textEdit range for a package-name completion
@@ -307,6 +318,7 @@ mod tests {
     /// Composition regression guard (#390/#282 bug class): proves `line_at` +
     /// `is_in_dependencies_section`'s top-level-key scan compose correctly through
     /// the real trait method on realistic multi-line `pubspec.yaml` content.
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_fallback_completion_prefix_multi_line_composition() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -315,7 +327,7 @@ mod tests {
         let line = content.lines().nth(2).unwrap();
         let position = Position::new(2, line.chars().count() as u32);
         assert_eq!(
-            eco.fallback_completion_prefix(content, position),
+            eco.fallback_completion_prefix(content, position.into()),
             Some("pa")
         );
     }
@@ -378,6 +390,7 @@ mod tests {
     // --- #793 characterization: `generate_completions` dispatch, pinned before the
     // wildcard-match refactor.
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_completions_package_name_context_below_length_guard_is_empty() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -405,6 +418,7 @@ mod tests {
         assert!(direct.is_empty());
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_completions_none_context_returns_empty() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -436,6 +450,7 @@ mod tests {
     /// `DepsError::HttpStatus`, never stored) — so exactly 2 requests reach the mock on the
     /// unregressed path. A regression that dropped the `generate_completions` dispatch would
     /// leave the mock at 1 hit, which `.expect_at_least(1)` alone would not catch.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_completions_version_context_unknown_package_is_empty() {
         let mut server = mockito::Server::new_async().await;
@@ -485,6 +500,7 @@ mod tests {
     /// `complete_versions` — requires live network for a real, non-empty result (pub.dev has
     /// no offline test seam here), mirroring this codebase's existing convention for
     /// completion tests that need a genuine registry round-trip.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     #[ignore] // Requires network access
     async fn test_generate_completions_version_context_dispatches_to_registry() {

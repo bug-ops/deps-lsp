@@ -1,21 +1,34 @@
 //! Conversions between `deps-core`'s protocol-agnostic domain types
-//! (`url::Url`, [`deps_core::position::Position`], [`deps_core::position::Range`]) and
-//! `tower_lsp_server::ls_types`.
+//! (`url::Url`, [`deps_core::position::Position`], [`deps_core::position::Range`],
+//! [`deps_core::diagnostic::Diagnostic`] and its nested types) and `tower_lsp_server::ls_types`.
 //!
-//! `deps-lsp` is the sole adapter boundary where these two type families meet (issue
-//! #1071): `deps-core`/`deps-engine` never construct or consume an `ls_types` type for their
-//! domain data, and every handler in this crate converts at the edge, right before building
-//! an LSP response or right after reading one from a request. This is the **only** module
-//! that is allowed to perform the `url::Url` ⇄ `ls_types::Uri` conversion — keeping it in one
-//! named place means a future accidental reimplementation elsewhere is easy to spot in review.
+//! `deps-core`/`deps-engine` never construct or consume an `ls_types` type for their own
+//! domain data; every `deps-lsp` handler converts at the edge, right before building an LSP
+//! response or right after reading one from a request. This module is where the `url::Url`
+//! ⇄ `ls_types::Uri` conversion for a *request/response boundary* URI is meant to happen —
+//! but it is not, in practice, the only place a `url::Url`/`ls_types::Uri` conversion exists
+//! in the workspace: `deps_core::lsp_helpers::to_ls_uri` performs an identical one-way
+//! `Url -> Uri` conversion, called directly by `deps-github-actions`/`deps-composer`/
+//! `deps-gitlab-ci` for edits they build themselves (`WorkspaceEdit` changes, hover links) —
+//! a pre-existing duplication this module's introduction did not create and does not resolve
+//! (tracked as a follow-up, not fixed here). Likewise,
+//! [`crate::lsp_types_interop::from_lsp_position`]/
+//! [`crate::lsp_types_interop::to_lsp_position`]/[`crate::lsp_types_interop::from_lsp_range`]
+//! below are unused outside this module's own unit tests — real call sites (e.g.
+//! `handlers::completion`) convert via the bare `.into()`
+//! [`deps_core::position::Position`]/[`deps_core::position::Range`] already provide (see
+//! [`deps_core::position`]'s module doc for those `From` impls), not through these wrappers.
+//! [`crate::lsp_types_interop::to_lsp_uri`], [`crate::lsp_types_interop::to_lsp_diagnostic`],
+//! and the other `to_lsp_*`/`from_lsp_uri` functions genuinely are each's single
+//! implementation within `deps-lsp` itself.
 //!
-//! These are plain free functions, not [`From`]/[`Into`] trait impls: neither `url::Url` nor
-//! `tower_lsp_server::ls_types::Uri` is local to this crate, so a `From` impl in either
+//! The `Uri`/`Diagnostic`-shaped conversions here are plain free functions, not
+//! [`From`]/[`Into`] trait impls: neither `url::Url` nor `tower_lsp_server::ls_types::Uri` (nor
+//! `ls_types::Diagnostic` and friends) is local to this crate, so a `From` impl in either
 //! direction would violate Rust's orphan rules. [`deps_core::position::Position`]/
 //! [`deps_core::position::Range`] do not have this problem (they're local to `deps-core`, so
-//! `deps-core` itself defines `From` impls for those — see [`deps_core::position`]'s module
-//! doc) but the free-function pair here is kept for symmetry and so every conversion in this
-//! module reads the same way at a call site.
+//! `deps-core` itself defines `From` impls for those) but the free-function pair here is kept
+//! for symmetry with the `Uri`/`Diagnostic` conversions that have no other option.
 
 use tower_lsp_server::ls_types;
 
@@ -94,6 +107,80 @@ pub fn from_lsp_range(range: ls_types::Range) -> deps_core::position::Range {
 #[must_use]
 pub fn to_lsp_range(range: deps_core::position::Range) -> ls_types::Range {
     range.into()
+}
+
+/// Converts a domain [`deps_core::diagnostic::Severity`] into the LSP-protocol
+/// `DiagnosticSeverity` a response object requires.
+#[must_use]
+pub const fn to_lsp_diagnostic_severity(
+    severity: deps_core::diagnostic::Severity,
+) -> ls_types::DiagnosticSeverity {
+    match severity {
+        deps_core::diagnostic::Severity::Error => ls_types::DiagnosticSeverity::ERROR,
+        deps_core::diagnostic::Severity::Warning => ls_types::DiagnosticSeverity::WARNING,
+        deps_core::diagnostic::Severity::Information => ls_types::DiagnosticSeverity::INFORMATION,
+        deps_core::diagnostic::Severity::Hint => ls_types::DiagnosticSeverity::HINT,
+    }
+}
+
+/// Converts a domain [`deps_core::diagnostic::CodeDescription`] into the LSP-protocol
+/// `CodeDescription` a response object requires.
+///
+/// Takes `code_description` by value: every call site owns a [`deps_core::diagnostic::Diagnostic`]
+/// it's converting and discards right after, so there's no reason to clone out of a
+/// reference here.
+#[must_use]
+pub fn to_lsp_code_description(
+    code_description: deps_core::diagnostic::CodeDescription,
+) -> ls_types::CodeDescription {
+    ls_types::CodeDescription {
+        href: to_lsp_uri(&code_description.href),
+    }
+}
+
+/// Converts a domain [`deps_core::diagnostic::RelatedInformation`] into the LSP-protocol
+/// `DiagnosticRelatedInformation` a response object requires.
+///
+/// Takes `related` by value — see [`to_lsp_code_description`]'s doc for why.
+#[must_use]
+pub fn to_lsp_related_information(
+    related: deps_core::diagnostic::RelatedInformation,
+) -> ls_types::DiagnosticRelatedInformation {
+    ls_types::DiagnosticRelatedInformation {
+        location: ls_types::Location {
+            uri: to_lsp_uri(&related.uri),
+            range: to_lsp_range(related.range),
+        },
+        message: related.message,
+    }
+}
+
+/// Converts a domain [`deps_core::diagnostic::Diagnostic`] into the LSP-protocol `Diagnostic`
+/// [`crate::handlers::diagnostics`] publishes to the client.
+///
+/// The domain type is what [`deps_core::ecosystem::Ecosystem::generate_diagnostics`] returns.
+///
+/// `source` is always `"deps-lsp"`: every diagnostic this server emits carries the same
+/// constant value, so the domain type (shared with `deps-cli`, which has no use for an
+/// LSP-protocol `source` label) does not carry the field at all — this is the single place
+/// that attaches it.
+#[must_use]
+pub fn to_lsp_diagnostic(diagnostic: deps_core::diagnostic::Diagnostic) -> ls_types::Diagnostic {
+    ls_types::Diagnostic {
+        range: to_lsp_range(diagnostic.range),
+        severity: diagnostic.severity.map(to_lsp_diagnostic_severity),
+        code: diagnostic.code.map(ls_types::NumberOrString::String),
+        code_description: diagnostic.code_description.map(to_lsp_code_description),
+        source: Some("deps-lsp".into()),
+        message: diagnostic.message,
+        related_information: diagnostic.related_information.map(|related| {
+            related
+                .into_iter()
+                .map(to_lsp_related_information)
+                .collect()
+        }),
+        ..Default::default()
+    }
 }
 
 #[cfg(test)]
@@ -257,5 +344,72 @@ mod tests {
         assert_eq!(domain.start.line, 0);
         assert_eq!(domain.end.line, 2);
         assert_eq!(to_lsp_range(domain), ls_range);
+    }
+
+    #[test]
+    fn test_to_lsp_diagnostic_converts_every_field() {
+        use deps_core::diagnostic::{CodeDescription, Diagnostic, RelatedInformation, Severity};
+        use deps_core::position::{Position, Range};
+
+        let related_uri = url::Url::parse("file:///Cargo.toml").unwrap();
+        let code_href = url::Url::parse("https://osv.dev/GHSA-xxxx").unwrap();
+        let diagnostic = Diagnostic::new(
+            Range::new(Position::new(0, 0), Position::new(0, 5)),
+            "vulnerable",
+        )
+        .with_severity(Severity::Error)
+        .with_code("GHSA-xxxx")
+        .with_code_description(CodeDescription::new(code_href.clone()))
+        .with_related_information(vec![RelatedInformation::new(
+            related_uri.clone(),
+            Range::new(Position::new(1, 0), Position::new(1, 4)),
+            "also here",
+        )]);
+
+        let ls_diagnostic = to_lsp_diagnostic(diagnostic);
+        assert_eq!(
+            ls_diagnostic.range,
+            ls_types::Range::new(ls_types::Position::new(0, 0), ls_types::Position::new(0, 5))
+        );
+        assert_eq!(
+            ls_diagnostic.severity,
+            Some(ls_types::DiagnosticSeverity::ERROR)
+        );
+        assert_eq!(
+            ls_diagnostic.code,
+            Some(ls_types::NumberOrString::String("GHSA-xxxx".into()))
+        );
+        assert_eq!(
+            ls_diagnostic.code_description.unwrap().href,
+            to_lsp_uri(&code_href)
+        );
+        assert_eq!(ls_diagnostic.source.as_deref(), Some("deps-lsp"));
+        assert_eq!(ls_diagnostic.message, "vulnerable");
+        let related = ls_diagnostic.related_information.unwrap();
+        assert_eq!(related.len(), 1);
+        assert_eq!(related[0].location.uri, to_lsp_uri(&related_uri));
+        assert_eq!(related[0].message, "also here");
+    }
+
+    #[test]
+    fn test_to_lsp_diagnostic_severity_mapping() {
+        use deps_core::diagnostic::Severity;
+
+        assert_eq!(
+            to_lsp_diagnostic_severity(Severity::Error),
+            ls_types::DiagnosticSeverity::ERROR
+        );
+        assert_eq!(
+            to_lsp_diagnostic_severity(Severity::Warning),
+            ls_types::DiagnosticSeverity::WARNING
+        );
+        assert_eq!(
+            to_lsp_diagnostic_severity(Severity::Information),
+            ls_types::DiagnosticSeverity::INFORMATION
+        );
+        assert_eq!(
+            to_lsp_diagnostic_severity(Severity::Hint),
+            ls_types::DiagnosticSeverity::HINT
+        );
     }
 }

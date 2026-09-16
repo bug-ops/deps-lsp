@@ -14,7 +14,7 @@
 //! followed by [`raw_prefix`] and, where the manifest syntax wraps the completable value
 //! (a JSON string, an XML tag/attribute), a syntax-specific strip.
 
-use tower_lsp_server::ls_types::Position;
+use crate::position::Position;
 
 /// Returns the line of `content` at `position.line`, or `None` if the document has
 /// fewer lines than that (e.g. the cursor is on a not-yet-existing trailing line).
@@ -26,12 +26,13 @@ pub fn line_at(content: &str, position: Position) -> Option<&str> {
 /// Extracts what the user has typed on `line` up to the cursor (`character`, a UTF-16
 /// code unit count), trimmed of whitespace.
 ///
-/// `character` is converted via [`crate::completion::utf16_to_byte_offset`]; when the
+/// `character` is converted via [`crate::lsp_helpers::utf16_to_byte_offset`]; when the
 /// cursor sits beyond the line's UTF-16 length (`None`), this clamps to the full line
 /// rather than panicking on an out-of-bounds slice.
 #[must_use]
 pub fn raw_prefix(line: &str, character: u32) -> &str {
-    let prefix_end = crate::completion::utf16_to_byte_offset(line, character).unwrap_or(line.len());
+    let prefix_end =
+        crate::lsp_helpers::utf16_to_byte_offset(line, character).unwrap_or(line.len());
     debug_assert!(
         line.is_char_boundary(prefix_end),
         "prefix_end must be a char boundary"
@@ -536,7 +537,7 @@ pub fn open_quoted_tail(segment: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tower_lsp_server::ls_types::Position;
+    use crate::position::Position;
 
     #[test]
     fn test_raw_prefix_cursor_beyond_line() {

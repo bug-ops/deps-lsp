@@ -69,6 +69,7 @@ impl RubyGemsRegistry {
     /// (#1038), so unknown-package/error-path tests can assert a request was actually made
     /// instead of hitting the live `rubygems.org`.
     #[cfg(test)]
+    #[cfg(feature = "lsp-responses")]
     #[must_use]
     pub(crate) fn with_base_for_test(cache: Arc<HttpCache>, api_base: String) -> Self {
         Self {

@@ -4,14 +4,17 @@
 //! providing LSP functionality for `go.mod` files.
 
 use std::any::Any;
+#[cfg(feature = "lsp-responses")]
 use std::future::Future;
 use std::sync::Arc;
+#[cfg(feature = "lsp-responses")]
 use tower_lsp_server::ls_types::{CompletionItem, Position, Range};
 use url::Url;
 
+#[cfg(feature = "lsp-responses")]
+use deps_core::completion::Completions;
 use deps_core::{
-    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, completion::Completions,
-    lsp_helpers::EcosystemFormatter,
+    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, lsp_helpers::EcosystemFormatter,
 };
 
 use crate::config::GoParseContext;
@@ -71,6 +74,7 @@ impl GoEcosystem {
     /// - Popular packages database
     /// - Local workspace module paths
     /// - Integration with go.sum for recently used modules
+    #[cfg(feature = "lsp-responses")]
     fn complete_package_names(&self, _prefix: &str) -> impl Future<Output = Vec<CompletionItem>> {
         // Go modules don't have a centralized search API
         // Users typically know the full module path
@@ -92,6 +96,7 @@ impl GoEcosystem {
     /// `Registry::get_versions_from`'s permissive routing of an unrecognized source to the
     /// default public client (matching hover/diagnostics/code-actions' identical gate) from
     /// leaking one for completions too.
+    #[cfg(feature = "lsp-responses")]
     async fn complete_versions(
         &self,
         parse_result: &dyn ParseResultTrait,
@@ -115,6 +120,7 @@ impl GoEcosystem {
     ///
     /// Go modules don't have a feature flag system like Cargo.
     /// Returns empty results.
+    #[cfg(feature = "lsp-responses")]
     fn complete_features(
         &self,
         _package_name: &deps_core::PackageName,
@@ -174,6 +180,7 @@ impl Ecosystem for GoEcosystem {
         &self.formatter
     }
 
+    #[cfg(feature = "lsp-responses")]
     fn complete_package_name<'a>(
         &'a self,
         _request: deps_core::completion::CompletionRequest<'a>,
@@ -183,6 +190,7 @@ impl Ecosystem for GoEcosystem {
         Box::pin(async move { self.complete_package_names(&prefix).await.into() })
     }
 
+    #[cfg(feature = "lsp-responses")]
     fn complete_version<'a>(
         &'a self,
         request: deps_core::completion::CompletionRequest<'a>,
@@ -201,6 +209,7 @@ impl Ecosystem for GoEcosystem {
         })
     }
 
+    #[cfg(feature = "lsp-responses")]
     fn complete_feature<'a>(
         &'a self,
         _request: deps_core::completion::CompletionRequest<'a>,
@@ -213,7 +222,7 @@ impl Ecosystem for GoEcosystem {
     fn fallback_completion_prefix<'a>(
         &self,
         content: &'a str,
-        position: Position,
+        position: deps_core::position::Position,
     ) -> Option<&'a str> {
         let line = deps_core::fallback_completion::line_at(content, position)?;
         if !is_in_dependencies_section(content, position.line as usize) {
@@ -275,11 +284,14 @@ fn extract_prefix(line: &str, character: u32) -> &str {
 mod tests {
     use super::*;
     use crate::types::{GoDependency, GoDirective};
+    #[cfg(feature = "lsp-responses")]
+    use deps_core::parser::DependencySource;
     use deps_core::position::{Position as DomainPosition, Range as DomainRange};
-    use deps_core::{
-        Dependency, EcosystemConfig, PackageVersions, VersionData, parser::DependencySource,
-    };
+    use deps_core::{Dependency, VersionData};
+    #[cfg(feature = "lsp-responses")]
+    use deps_core::{EcosystemConfig, PackageVersions};
     use std::collections::HashMap;
+    #[cfg(feature = "lsp-responses")]
     use tower_lsp_server::ls_types::{InlayHintLabel, Position};
 
     fn pkg(s: &str) -> deps_core::PackageName {
@@ -312,6 +324,7 @@ mod tests {
 
     /// A dependency on `line`, with a `version_range` there so position-based lookup
     /// (issue #593) can find it — mirrors `mock_dependency`, but with an explicit `source`.
+    #[cfg(feature = "lsp-responses")]
     fn dep_with_source(name: &str, source: DependencySource, line: u32) -> GoDependency {
         GoDependency {
             module_path: pkg(name),
@@ -375,6 +388,7 @@ mod tests {
     // `deps_github_actions`/`deps_gitlab_ci`'s identical N/A for the same reason (no
     // package-name search endpoint).
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_generate_inlay_hints_up_to_date() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -415,6 +429,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_generate_inlay_hints_needs_update() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -453,6 +468,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_generate_inlay_hints_hide_up_to_date() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -489,6 +505,7 @@ mod tests {
         assert_eq!(hints.len(), 0);
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_generate_inlay_hints_no_version_range() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -522,6 +539,7 @@ mod tests {
         assert_eq!(hints.len(), 0);
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_complete_package_names_empty() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -532,6 +550,7 @@ mod tests {
         assert!(results.is_empty());
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     #[ignore] // Requires network access
     async fn test_complete_versions_real() {
@@ -570,6 +589,7 @@ mod tests {
     /// available that the empty result came from the intended mocked 404 rather than an
     /// unrelated failure (e.g. mockito's own `501` for an unmatched request, which would
     /// satisfy a bare `is_empty()` just as well).
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_complete_versions_unknown_package() {
         let mut server = mockito::Server::new_async().await;
@@ -607,6 +627,7 @@ mod tests {
         assert!(results.is_empty());
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_complete_features_always_empty() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -623,6 +644,7 @@ mod tests {
     /// the actual display cap (`MAX_COMPLETION_VERSIONS`, `deps-core`) is 5, not 20, so it
     /// passed vacuously (even for 0 results) and could never catch a cap regression. Mocks 8
     /// matching versions and asserts the count is exactly the real cap.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_complete_versions_capped_at_max_completion_versions() {
         let mut server = mockito::Server::new_async().await;
@@ -666,6 +688,7 @@ mod tests {
     /// #1034: backed by a mockito server (rather than a live `proxy.golang.org` request) so
     /// this is deterministic and fast — the sibling `test_generate_diagnostics_basic`
     /// documents why the live-network shape is otherwise `#[ignore]`d.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_hover_on_module_path() {
         let mut server = mockito::Server::new_async().await;
@@ -718,6 +741,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_hover_outside_dependency() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -757,6 +781,7 @@ mod tests {
     /// `mock_dependency`) routes through `GoRegistry`'s `Public` tier, so
     /// `with_public_base_for_test` — not the `WorkspaceDeclared`-tier `with_base` the
     /// alternate-registry tests above use — is the matching mock entry point.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_code_actions_on_module() {
         let mut server = mockito::Server::new_async().await;
@@ -864,6 +889,7 @@ mod tests {
         assert!(result.is_ok(), "Diagnostic generation timed out");
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_completions_package_name() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -897,6 +923,7 @@ require github.com/
         assert!(completions.items.is_empty());
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_completions_outside_context() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -999,6 +1026,7 @@ require github.com/gin-gonic/gin v1.9.1
     /// longer collapse into the old name-based "offer nothing for either" result (spec 034
     /// F1's `CompletionSource::Ambiguous`) — cursor position now identifies exactly one
     /// dependency, so each occurrence routes independently through its own source.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_complete_versions_same_name_different_sources_routes_by_position() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1038,6 +1066,7 @@ require github.com/gin-gonic/gin v1.9.1
 
     /// An `AlternateRegistry` source whose index has no registered client offers no
     /// completions — never a fall back to `proxy.golang.org` (the core of F1).
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_complete_versions_unregistered_alternate_offers_nothing() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1069,6 +1098,7 @@ require github.com/gin-gonic/gin v1.9.1
     /// F1 end-to-end: a registered alternate client's version completion routes there,
     /// proving completion actually consults the resolved `$GOENV` chain instead of always
     /// querying the public root.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_complete_versions_routes_to_registered_alternate_client() {
         use crate::config::{GoProxyChain, GoProxyHop, GoProxyUrl};
@@ -1124,6 +1154,7 @@ require github.com/gin-gonic/gin v1.9.1
     /// Composition regression guard (#390/#282 bug class): proves `line_at` +
     /// `is_in_dependencies_section`'s `require (...)` block scan compose correctly
     /// through the real trait method on realistic multi-line `go.mod` content.
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_fallback_completion_prefix_multi_line_composition() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1132,7 +1163,7 @@ require github.com/gin-gonic/gin v1.9.1
         let line = content.lines().nth(3).unwrap();
         let position = Position::new(3, line.chars().count() as u32);
         assert_eq!(
-            ecosystem.fallback_completion_prefix(content, position),
+            ecosystem.fallback_completion_prefix(content, position.into()),
             Some("github.com/gin-gonic/g")
         );
     }

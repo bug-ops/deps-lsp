@@ -200,7 +200,7 @@ fn build_vulnerability_fix_action(
         format!("Update to {version_native} (fixes {fixes})")
     };
 
-    let edits = single_file_edit(uri, version_range, new_text.clone());
+    let edits = single_file_edit(uri, version_range.into(), new_text.clone());
 
     Some(VulnerabilityFixAction {
         version_native,
@@ -313,7 +313,7 @@ fn build_unsatisfiable_fix_action(
         return None;
     }
 
-    let edits = single_file_edit(uri, version_range, new_text.clone());
+    let edits = single_file_edit(uri, version_range.into(), new_text.clone());
 
     Some(UnsatisfiableFixAction {
         version_native: latest.to_string(),
@@ -378,7 +378,7 @@ fn build_replacement_action(
     }
 
     let name_range: Range = dep.name_range().into();
-    let name_slice = slice_for_range(content, line_offsets, name_range);
+    let name_slice = slice_for_range(content, line_offsets, name_range.into());
     // I7: reuses `literal_span_matches` rather than a name-specific equality check purely
     // for the sentinel-rejecting behavior its whitespace-insensitive comparison already
     // gives (see D7(a)'s doc above). Its `[{slice}] == requirement` NuGet-bracket branch
@@ -388,7 +388,7 @@ fn build_replacement_action(
         return None;
     }
 
-    let edits = single_file_edit(uri, name_range, replacement.to_string());
+    let edits = single_file_edit(uri, name_range.into(), replacement.to_string());
 
     Some(CodeAction {
         title: format!("Replace with {replacement}"),
@@ -519,7 +519,7 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
 
     let Some(dep) = deps
         .into_iter()
-        .find(|d| formatter.is_position_on_dependency(*d, position))
+        .find(|d| formatter.is_position_on_dependency(*d, position.into()))
     else {
         return actions;
     };
@@ -539,7 +539,7 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
     }
 
     let line_offsets = LineOffsetTable::new(content);
-    let slice = slice_for_range(content, &line_offsets, version_range);
+    let slice = slice_for_range(content, &line_offsets, version_range.into());
     let literal_target = dep
         .version_literal()
         .unwrap_or_else(|| version_req.as_str());
@@ -698,7 +698,7 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
                 continue;
             }
 
-            let edits = single_file_edit(uri, version_range, new_text);
+            let edits = single_file_edit(uri, version_range.into(), new_text);
 
             if item.is_latest {
                 latest_refactor_idx = Some(actions.len());
@@ -741,6 +741,7 @@ mod tests {
     use super::*;
     use crate::lsp_helpers::test_support::*;
     use crate::lsp_helpers::*;
+    use crate::position::{Position, Range};
     use crate::{Dependency, PackageName, VersionReq};
     use std::any::Any;
     use std::collections::HashMap;
@@ -3011,13 +3012,13 @@ mod tests {
                 &self.name
             }
             fn name_range(&self) -> crate::position::Range {
-                Range::default().into()
+                Range::default()
             }
             fn version_requirement(&self) -> Option<&VersionReq> {
                 Some(&self.version_req)
             }
             fn version_range(&self) -> Option<crate::position::Range> {
-                Some(self.version_range.into())
+                Some(self.version_range)
             }
             fn source(&self) -> crate::parser::DependencySource {
                 self.source.clone()
@@ -3194,7 +3195,7 @@ mod tests {
 
             let actions = generate_code_actions(
                 &pr,
-                Position::new(0, 0),
+                Position::new(0, 0).into(),
                 pr.uri(),
                 versions,
                 content,

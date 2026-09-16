@@ -18,6 +18,7 @@
 //! conversion is a pair of free functions in `deps-lsp` instead (see
 //! `crates/deps-lsp/src/lsp_types_interop.rs`).
 
+#[cfg(feature = "lsp-responses")]
 use tower_lsp_server::ls_types;
 
 /// A zero-indexed line/UTF-16-code-unit-offset position, field-for-field identical to
@@ -63,6 +64,7 @@ impl Position {
     }
 }
 
+#[cfg(feature = "lsp-responses")]
 impl From<ls_types::Position> for Position {
     fn from(value: ls_types::Position) -> Self {
         Self {
@@ -72,6 +74,7 @@ impl From<ls_types::Position> for Position {
     }
 }
 
+#[cfg(feature = "lsp-responses")]
 impl From<Position> for ls_types::Position {
     fn from(value: Position) -> Self {
         Self::new(value.line, value.character)
@@ -120,6 +123,7 @@ impl Range {
     }
 }
 
+#[cfg(feature = "lsp-responses")]
 impl From<ls_types::Range> for Range {
     fn from(value: ls_types::Range) -> Self {
         Self {
@@ -129,6 +133,7 @@ impl From<ls_types::Range> for Range {
     }
 }
 
+#[cfg(feature = "lsp-responses")]
 impl From<Range> for ls_types::Range {
     fn from(value: Range) -> Self {
         Self::new(value.start.into(), value.end.into())
@@ -139,6 +144,7 @@ impl From<Range> for ls_types::Range {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_position_roundtrips_through_ls_types() {
         let original = Position::new(12, 34);
@@ -148,6 +154,7 @@ mod tests {
         assert_eq!(Position::from(ls_pos), original);
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_range_roundtrips_through_ls_types() {
         let original = Range::new(Position::new(0, 0), Position::new(2, 5));

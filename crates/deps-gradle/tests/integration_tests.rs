@@ -1,9 +1,13 @@
 //! Integration tests for deps-gradle parsers using fixture files.
 
+#[cfg(feature = "lsp-responses")]
 use deps_core::lsp_helpers::{generate_diagnostics_from_cache, generate_inlay_hints};
+#[cfg(feature = "lsp-responses")]
 use deps_core::{EcosystemConfig, LoadingState, PackageVersions, VersionData};
+#[cfg(feature = "lsp-responses")]
 use deps_gradle::GradleFormatter;
 use deps_gradle::parser::{GradleParseResult, parse_gradle};
+#[cfg(feature = "lsp-responses")]
 use std::collections::HashMap;
 use url::Url;
 
@@ -194,6 +198,7 @@ fn test_groovy_position_tracking() {
 
 // --- #190 regression: dangling `version.ref` alias ---
 
+#[cfg(feature = "lsp-responses")]
 #[test]
 fn test_dangling_version_ref_emits_no_diagnostic_or_up_to_date_hint() {
     use deps_core::ParseResult;

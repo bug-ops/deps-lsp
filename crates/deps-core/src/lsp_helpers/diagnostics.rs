@@ -1,15 +1,12 @@
 use std::collections::HashMap;
 
-use tower_lsp_server::ls_types::{
-    CodeDescription, Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, Location,
-    NumberOrString, Position, Range, Uri,
-};
-
+use crate::diagnostic::{CodeDescription, Diagnostic, RelatedInformation, Severity};
 use crate::licenses::{
     ViolationReason, evaluate as evaluate_license_policy, resolve_license_entries,
 };
 use crate::net_policy::{RedactedUrl, is_authority_bearing_url};
 use crate::osv::{ScanOutcome, diagnostic_severity_for};
+use crate::position::{Position, Range};
 use crate::{
     BlockedRegistryOccurrence, ConcreteVersion, Dependency, Deprecation, FetchFailure, ParseResult,
     PublishTime, RemovalStatus, VersionReq, format_relative_age, is_within_cooldown,
@@ -39,7 +36,7 @@ pub const LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE: &str = "license-policy-viola
 /// `Cargo.toml`/`.cargo/config.toml` — and nothing upstream in the TOML parse pipeline caps
 /// an individual string field's length (only nesting depth and table count are bounded), so
 /// this is the last chokepoint before it renders inline in the editor as a
-/// [`DiagnosticSeverity::INFORMATION`] message.
+/// [`Severity::Information`] message.
 const MAX_BLOCKED_REGISTRY_MESSAGE_VALUE_CHARS: usize = 128;
 
 /// Maximum number of sibling occurrences a collapsed blocked-registry diagnostic's
@@ -113,42 +110,42 @@ pub const DEPRECATED_DIAGNOSTIC_CODE: &str = "deprecated-package";
 ///
 /// ```
 /// use deps_core::DiagnosticSeverities;
-/// use tower_lsp_server::ls_types::DiagnosticSeverity;
+/// use deps_core::diagnostic::Severity;
 ///
 /// let severities = DiagnosticSeverities::default();
-/// assert_eq!(severities.outdated, DiagnosticSeverity::HINT);
-/// assert_eq!(severities.unknown, DiagnosticSeverity::WARNING);
-/// assert_eq!(severities.yanked, DiagnosticSeverity::WARNING);
-/// assert_eq!(severities.unsatisfiable, DiagnosticSeverity::WARNING);
-/// assert_eq!(severities.deprecated, DiagnosticSeverity::WARNING);
-/// assert_eq!(severities.mutable_ref_pin, DiagnosticSeverity::HINT);
+/// assert_eq!(severities.outdated, Severity::Hint);
+/// assert_eq!(severities.unknown, Severity::Warning);
+/// assert_eq!(severities.yanked, Severity::Warning);
+/// assert_eq!(severities.unsatisfiable, Severity::Warning);
+/// assert_eq!(severities.deprecated, Severity::Warning);
+/// assert_eq!(severities.mutable_ref_pin, Severity::Hint);
 /// assert!(severities.mutable_ref_pin_enabled);
 /// ```
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiagnosticSeverities {
     /// Severity for a dependency with a newer version available.
-    pub outdated: DiagnosticSeverity,
+    pub outdated: Severity,
     /// Severity for a dependency not found in the registry (or with an invalid name).
-    pub unknown: DiagnosticSeverity,
+    pub unknown: Severity,
     /// Severity for a dependency pinned to a yanked/deprecated version.
-    pub yanked: DiagnosticSeverity,
+    pub yanked: Severity,
     /// Severity for a dependency whose requirement matches zero published versions.
-    pub unsatisfiable: DiagnosticSeverity,
+    pub unsatisfiable: Severity,
     /// Severity for a dependency on a package the registry reports as
     /// deprecated/abandoned (issue #205).
-    pub deprecated: DiagnosticSeverity,
+    pub deprecated: Severity,
     /// Severity for a dependency pinned to a mutable ref (a tag or branch) instead of a
     /// full commit SHA (issue #473, extended to GitLab CI by issue #634). Unused except by
     /// `deps-github-actions` and `deps-gitlab-ci` today — see each crate's own
     /// `MUTABLE_REF_PIN_DIAGNOSTIC_CODE` for the diagnostic this severity gates.
     /// Tunes loudness only; see [`Self::mutable_ref_pin_enabled`] for the on/off
     /// toggle.
-    pub mutable_ref_pin: DiagnosticSeverity,
+    pub mutable_ref_pin: Severity,
     /// Whether the mutable-ref-pin diagnostic (issue #473, extended to GitLab CI by issue
     /// #634) runs at all, unused except by `deps-github-actions` and `deps-gitlab-ci`.
     /// Unlike every other field in this struct, `mutable_ref_pin` alone cannot silence the
-    /// diagnostic — `DiagnosticSeverity` has no suppression value, and severity is never
+    /// diagnostic — `Severity` has no suppression value, and severity is never
     /// treated as a suppression input anywhere in this codebase — so this diagnostic
     /// additionally needs a real presence toggle, mirroring
     /// `deps_lsp::config::DiagnosticsConfig::vulnerabilities_enabled`'s shape.
@@ -174,20 +171,20 @@ impl DiagnosticSeverities {
     ///
     /// ```
     /// use deps_core::DiagnosticSeverities;
-    /// use tower_lsp_server::ls_types::DiagnosticSeverity;
+    /// use deps_core::diagnostic::Severity;
     ///
-    /// let severities = DiagnosticSeverities::new().with_outdated(DiagnosticSeverity::ERROR);
-    /// assert_eq!(severities.outdated, DiagnosticSeverity::ERROR);
+    /// let severities = DiagnosticSeverities::new().with_outdated(Severity::Error);
+    /// assert_eq!(severities.outdated, Severity::Error);
     /// ```
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            outdated: DiagnosticSeverity::HINT,
-            unknown: DiagnosticSeverity::WARNING,
-            yanked: DiagnosticSeverity::WARNING,
-            unsatisfiable: DiagnosticSeverity::WARNING,
-            deprecated: DiagnosticSeverity::WARNING,
-            mutable_ref_pin: DiagnosticSeverity::HINT,
+            outdated: Severity::Hint,
+            unknown: Severity::Warning,
+            yanked: Severity::Warning,
+            unsatisfiable: Severity::Warning,
+            deprecated: Severity::Warning,
+            mutable_ref_pin: Severity::Hint,
             mutable_ref_pin_enabled: true,
         }
     }
@@ -195,42 +192,42 @@ impl DiagnosticSeverities {
     /// Overrides [`Self::outdated`]. See [`Self::new`] for the baseline every other
     /// field keeps unless also overridden.
     #[must_use]
-    pub const fn with_outdated(mut self, outdated: DiagnosticSeverity) -> Self {
+    pub const fn with_outdated(mut self, outdated: Severity) -> Self {
         self.outdated = outdated;
         self
     }
 
     /// Overrides [`Self::unknown`]. See [`Self::with_outdated`].
     #[must_use]
-    pub const fn with_unknown(mut self, unknown: DiagnosticSeverity) -> Self {
+    pub const fn with_unknown(mut self, unknown: Severity) -> Self {
         self.unknown = unknown;
         self
     }
 
     /// Overrides [`Self::yanked`]. See [`Self::with_outdated`].
     #[must_use]
-    pub const fn with_yanked(mut self, yanked: DiagnosticSeverity) -> Self {
+    pub const fn with_yanked(mut self, yanked: Severity) -> Self {
         self.yanked = yanked;
         self
     }
 
     /// Overrides [`Self::unsatisfiable`]. See [`Self::with_outdated`].
     #[must_use]
-    pub const fn with_unsatisfiable(mut self, unsatisfiable: DiagnosticSeverity) -> Self {
+    pub const fn with_unsatisfiable(mut self, unsatisfiable: Severity) -> Self {
         self.unsatisfiable = unsatisfiable;
         self
     }
 
     /// Overrides [`Self::deprecated`]. See [`Self::with_outdated`].
     #[must_use]
-    pub const fn with_deprecated(mut self, deprecated: DiagnosticSeverity) -> Self {
+    pub const fn with_deprecated(mut self, deprecated: Severity) -> Self {
         self.deprecated = deprecated;
         self
     }
 
     /// Overrides [`Self::mutable_ref_pin`]. See [`Self::with_outdated`].
     #[must_use]
-    pub const fn with_mutable_ref_pin(mut self, mutable_ref_pin: DiagnosticSeverity) -> Self {
+    pub const fn with_mutable_ref_pin(mut self, mutable_ref_pin: Severity) -> Self {
         self.mutable_ref_pin = mutable_ref_pin;
         self
     }
@@ -602,10 +599,10 @@ fn requirement_matches_only_yanked(
 /// * `parse_result` - Parsed dependencies from manifest
 /// * `versions` - Latest (registry) and resolved (lock file) version maps, keyed by package name
 /// * `formatter` - Ecosystem-specific formatting and comparison logic
-/// * `uri` - Document URI, used only to anchor the [`Location`] of any
-///   [`DiagnosticRelatedInformation`] entries attached to a collapsed fetch-failure
-///   diagnostic (#479/#480 S2) — every other diagnostic here is scoped to the document
-///   it's published under implicitly and doesn't need it
+/// * `uri` - Document URI, used only to anchor the [`crate::diagnostic::RelatedInformation`]
+///   entries attached to a collapsed fetch-failure diagnostic (#479/#480 S2) — every other
+///   diagnostic here is scoped to the document it's published under implicitly and doesn't
+///   need it
 /// * `freshness` - Whether to differentiate an "outdated" diagnostic still within the
 ///   release cooldown window (severity is unaffected either way — see the "Newer version
 ///   available" message below)
@@ -695,7 +692,7 @@ pub fn generate_diagnostics_from_cache(
         let Some(version_range) = dep.version_range() else {
             continue;
         };
-        let version_range: Range = version_range.into();
+        let version_range: Range = version_range;
         let resolved = ResolvedData {
             package_versions,
             version_range,
@@ -827,7 +824,7 @@ struct YankedOnlyPrior {
 /// other diagnostic in the returned `Vec`.
 ///
 /// Reads: `parse_result.dependency_truncation()`.
-/// Emits: at most one [`DiagnosticSeverity::INFORMATION`].
+/// Emits: at most one [`Severity::Information`].
 fn dependency_ceiling_notice(diagnostics: &mut Vec<Diagnostic>, parse_result: &dyn ParseResult) {
     if let Some((kept, total)) = parse_result.dependency_truncation() {
         diagnostics.push(Diagnostic {
@@ -835,13 +832,12 @@ fn dependency_ceiling_notice(diagnostics: &mut Vec<Diagnostic>, parse_result: &d
                 start: Position::new(0, 0),
                 end: Position::new(0, 0),
             },
-            severity: Some(DiagnosticSeverity::INFORMATION),
+            severity: Some(Severity::Information),
             message: format!(
                 "manifest declares {total} dependencies, exceeding deps-lsp's per-document \
                  limit of {kept}; only the first {kept} are tracked, fetched, and checked \
                  against the registry"
             ),
-            source: Some("deps-lsp".into()),
             ..Default::default()
         });
     }
@@ -861,7 +857,7 @@ fn dependency_ceiling_notice(diagnostics: &mut Vec<Diagnostic>, parse_result: &d
 ///
 /// Reads: `versions.offline`, `deps` (only to check non-emptiness — takes the slice
 /// itself, not two positional bools, so a caller can never silently swap them).
-/// Emits: at most one [`DiagnosticSeverity::INFORMATION`] at `Position(0,0)`, appended
+/// Emits: at most one [`Severity::Information`] at `Position(0,0)`, appended
 /// first so it always precedes every other diagnostic in the returned `Vec`.
 /// Suppressed by: nothing. Suppresses: R5b (see [`apply_unknown_package_rule`]).
 fn offline_notice(
@@ -875,11 +871,10 @@ fn offline_notice(
                 start: Position::new(0, 0),
                 end: Position::new(0, 0),
             },
-            severity: Some(DiagnosticSeverity::INFORMATION),
+            severity: Some(Severity::Information),
             message: "deps-lsp is offline (network.offline): dependency and vulnerability \
                       data reflects only what was already cached, not the current registry state"
                 .to_string(),
-            source: Some("deps-lsp".into()),
             ..Default::default()
         });
     }
@@ -892,7 +887,7 @@ fn offline_notice(
 /// version resolution, so it would otherwise leave no trace at all in the editor.
 ///
 /// Reads: `parse_result.blocked_registries()`.
-/// Emits: one [`DiagnosticSeverity::INFORMATION`] per **distinct declaration key**, anchored
+/// Emits: one [`Severity::Information`] per **distinct declaration key**, anchored
 /// at the first affected dependency's range — message truncated at
 /// [`MAX_BLOCKED_REGISTRY_MESSAGE_VALUE_CHARS`]. Every *other* dependency sharing that
 /// declaration key survives via `related_information` on that same diagnostic, up to
@@ -939,7 +934,7 @@ fn blocked_registry_diagnostics(
     // [`push_collapsed_blocked_registries`]'s `related_information` naming. Keyed on
     // `deps_core::position::Range` directly, matching `BlockedRegistryOccurrence::range`'s
     // and `dep.name_range()`'s type (#1071 S2).
-    let dependency_names: HashMap<crate::position::Range, &str> = deps
+    let dependency_names: HashMap<Range, &str> = deps
         .iter()
         .map(|dep| (dep.name_range(), dep.name().as_str()))
         .collect();
@@ -1010,8 +1005,8 @@ fn build_blocked_registry_diagnostic(occurrence: &BlockedRegistryOccurrence) -> 
             .to_string()
     };
     Diagnostic {
-        range: occurrence.range.into(),
-        severity: Some(DiagnosticSeverity::INFORMATION),
+        range: occurrence.range,
+        severity: Some(Severity::Information),
         message: format!(
             "registry index \"{}\" blocked by registries.workspace_registries policy \
              (host class: {}; declaration: {})",
@@ -1019,7 +1014,6 @@ fn build_blocked_registry_diagnostic(occurrence: &BlockedRegistryOccurrence) -> 
             occurrence.class,
             truncate_for_diagnostic(&redacted_key, MAX_BLOCKED_REGISTRY_MESSAGE_VALUE_CHARS),
         ),
-        source: Some("deps-lsp".into()),
         ..Default::default()
     }
 }
@@ -1034,7 +1028,7 @@ fn push_collapsed_blocked_registries(
     diagnostics: &mut Vec<Diagnostic>,
     entries: Vec<BlockedRegistryOccurrence>,
     uri: &url::Url,
-    dependency_names: &HashMap<crate::position::Range, &str>,
+    dependency_names: &HashMap<Range, &str>,
 ) {
     // The `0`/`1` arms are matched separately, so this arm only runs with `len() >= 2`,
     // making both `entries[0]` and the `entries[1..]` slice below valid.
@@ -1046,35 +1040,29 @@ fn push_collapsed_blocked_registries(
             let diagnostic = build_blocked_registry_diagnostic(&entries[0]);
             let siblings = &entries[1..];
             let shown = siblings.len().min(MAX_BLOCKED_REGISTRY_RELATED_INFO);
-            let ls_uri = super::to_ls_uri(uri);
             #[allow(clippy::indexing_slicing)]
-            let mut related_information: Vec<DiagnosticRelatedInformation> = siblings[..shown]
+            let mut related_information: Vec<RelatedInformation> = siblings[..shown]
                 .iter()
-                .map(|occurrence| DiagnosticRelatedInformation {
-                    location: Location {
-                        uri: ls_uri.clone(),
-                        range: occurrence.range.into(),
-                    },
-                    message: match dependency_names.get(&occurrence.range) {
+                .map(|occurrence| {
+                    let message = match dependency_names.get(&occurrence.range) {
                         Some(name) => {
                             format!("'{name}' also blocked by the same registry policy")
                         }
                         None => "also blocked by the same registry policy".to_string(),
-                    },
+                    };
+                    RelatedInformation::new(uri.clone(), occurrence.range, message)
                 })
                 .collect();
             let remaining = siblings.len() - shown;
             if remaining > 0 {
-                related_information.push(DiagnosticRelatedInformation {
-                    location: Location {
-                        uri: ls_uri,
-                        range: diagnostic.range,
-                    },
-                    message: format!(
+                related_information.push(RelatedInformation::new(
+                    uri.clone(),
+                    diagnostic.range,
+                    format!(
                         "and {remaining} more dependencies also blocked by the same registry \
                          policy"
                     ),
-                });
+                ));
             }
             diagnostics.push(Diagnostic {
                 related_information: Some(related_information),
@@ -1100,7 +1088,7 @@ fn push_collapsed_blocked_registries(
 fn apply_vulnerability_rule(
     diagnostics: &mut Vec<Diagnostic>,
     ctx: &RuleContext<'_>,
-    vuln_keys: Option<&HashMap<crate::position::Range, String>>,
+    vuln_keys: Option<&HashMap<Range, String>>,
 ) {
     if let Some(vulnerabilities) = ctx.versions.vulnerabilities
         && let Some(ScanOutcome::Vulnerable(dv)) = vuln_keys
@@ -1132,8 +1120,8 @@ fn apply_vulnerability_rule(
 /// which must never be treated as a violation.
 /// Emits: at most one diagnostic (`LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE`) on
 /// `ctx.dep.name_range()` via [`crate::licenses::evaluate`] — [`ViolationReason::Denied`]
-/// renders [`DiagnosticSeverity::ERROR`], [`ViolationReason::NotAllowed`]
-/// [`DiagnosticSeverity::WARNING`] (severity is not user-configurable: spec 010 plan.md's
+/// renders [`Severity::Error`], [`ViolationReason::NotAllowed`]
+/// [`Severity::Warning`] (severity is not user-configurable: spec 010 plan.md's
 /// resolved config shape is `{ allow?, deny? }` only).
 /// Suppressed by: nothing outright — a [`crate::LicenseSource::PomFreeText`] ecosystem's
 /// (Gradle's Maven Central POM) license names are free text (e.g. `"The Apache Software
@@ -1172,11 +1160,11 @@ fn apply_license_policy_rule(diagnostics: &mut Vec<Diagnostic>, ctx: &RuleContex
     }
 
     let severity = match violation.reason {
-        ViolationReason::Denied => DiagnosticSeverity::ERROR,
-        ViolationReason::NotAllowed => DiagnosticSeverity::WARNING,
+        ViolationReason::Denied => Severity::Error,
+        ViolationReason::NotAllowed => Severity::Warning,
     };
     diagnostics.push(Diagnostic {
-        range: ctx.dep.name_range().into(),
+        range: ctx.dep.name_range(),
         severity: Some(severity),
         message: format!(
             "{}: {} {}",
@@ -1187,10 +1175,7 @@ fn apply_license_policy_rule(diagnostics: &mut Vec<Diagnostic>, ctx: &RuleContex
             ),
             violation.reason
         ),
-        source: Some("deps-lsp".into()),
-        code: Some(NumberOrString::String(
-            LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE.into(),
-        )),
+        code: Some(LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE.into()),
         ..Default::default()
     });
 }
@@ -1327,11 +1312,9 @@ fn apply_in_use_yanked_rule(
             range: ctx
                 .dep
                 .version_range()
-                .unwrap_or_else(|| ctx.dep.name_range())
-                .into(),
+                .unwrap_or_else(|| ctx.dep.name_range()),
             severity: Some(ctx.severities.yanked),
             message: format!("{} ({})", ctx.formatter.yanked_message(), yanked_version),
-            source: Some("deps-lsp".into()),
             ..Default::default()
         });
         true
@@ -1403,10 +1386,9 @@ fn apply_unknown_package_rule(
     match ctx.formatter.validate_package_name(dep.name().as_str()) {
         Err(reason) => {
             diagnostics.push(Diagnostic {
-                range: dep.name_range().into(),
+                range: dep.name_range(),
                 severity: Some(ctx.severities.unknown),
                 message: format!("Invalid package name '{}': {reason}", dep.name()),
-                source: Some("deps-lsp".into()),
                 ..Default::default()
             });
         }
@@ -1426,10 +1408,9 @@ fn apply_unknown_package_rule(
             fetch_failed.push(FetchFailureEntry {
                 name: dep.name().to_string(),
                 diagnostic: Diagnostic {
-                    range: dep.name_range().into(),
+                    range: dep.name_range(),
                     severity: Some(ctx.severities.unknown),
                     message,
-                    source: Some("deps-lsp".into()),
                     ..Default::default()
                 },
                 failure: fetch_failure.cloned(),
@@ -1438,10 +1419,9 @@ fn apply_unknown_package_rule(
         Ok(()) if no_comparable_versions => {}
         Ok(()) if can_resolve_source => {
             diagnostics.push(Diagnostic {
-                range: dep.name_range().into(),
+                range: dep.name_range(),
                 severity: Some(ctx.severities.unknown),
                 message: format!("Unknown package '{}'", dep.name()),
-                source: Some("deps-lsp".into()),
                 ..Default::default()
             });
         }
@@ -1509,8 +1489,7 @@ fn apply_unsatisfiable_rule(
         range: resolved.version_range,
         severity: Some(ctx.severities.unsatisfiable),
         message,
-        source: Some("deps-lsp".into()),
-        code: Some(NumberOrString::String(UNSATISFIABLE_DIAGNOSTIC_CODE.into())),
+        code: Some(UNSATISFIABLE_DIAGNOSTIC_CODE.into()),
         ..Default::default()
     });
     RuleFlow::Stop
@@ -1589,7 +1568,6 @@ fn apply_yanked_only_rule(
         range: resolved.version_range,
         severity: Some(ctx.severities.yanked),
         message: format!("{}; latest is {latest}", ctx.formatter.yanked_message()),
-        source: Some("deps-lsp".into()),
         ..Default::default()
     });
     RuleFlow::Stop
@@ -1651,7 +1629,6 @@ fn apply_outdated_rule(
         range: resolved.version_range,
         severity: Some(ctx.severities.outdated),
         message,
-        source: Some("deps-lsp".into()),
         ..Default::default()
     });
 }
@@ -1703,22 +1680,20 @@ fn push_collapsed_fetch_failures(
                     "Registry lookup failed for {n} packages; package status could not be determined"
                 ),
             };
-            let ls_uri = super::to_ls_uri(uri);
             let related_information = fetch_failed[1..]
                 .iter()
-                .map(|entry| DiagnosticRelatedInformation {
-                    location: Location {
-                        uri: ls_uri.clone(),
-                        range: entry.diagnostic.range,
-                    },
-                    message: format!("'{}' also failed", entry.name),
+                .map(|entry| {
+                    RelatedInformation::new(
+                        uri.clone(),
+                        entry.diagnostic.range,
+                        format!("'{}' also failed", entry.name),
+                    )
                 })
                 .collect();
             diagnostics.push(Diagnostic {
                 range,
                 severity,
                 message,
-                source: Some("deps-lsp".into()),
                 related_information: Some(related_information),
                 ..Default::default()
             });
@@ -1741,10 +1716,7 @@ fn push_deprecation_diagnostic(
 ) {
     use std::fmt::Write as _;
 
-    let range: Range = dep
-        .version_range()
-        .unwrap_or_else(|| dep.name_range())
-        .into();
+    let range: Range = dep.version_range().unwrap_or_else(|| dep.name_range());
 
     let mut message = formatter.deprecated_message().to_string();
     if let Some(reason) = deprecation.reason.as_deref().filter(|r| !r.is_empty()) {
@@ -1758,8 +1730,7 @@ fn push_deprecation_diagnostic(
         range,
         severity: Some(severities.deprecated),
         message,
-        source: Some("deps-lsp".into()),
-        code: Some(NumberOrString::String(DEPRECATED_DIAGNOSTIC_CODE.into())),
+        code: Some(DEPRECATED_DIAGNOSTIC_CODE.into()),
         ..Default::default()
     });
 }
@@ -1794,17 +1765,14 @@ fn push_vulnerability_diagnostics(
     dep: &dyn Dependency,
     dv: &crate::osv::DependencyVulnerabilities,
 ) {
-    let range: Range = dep
-        .version_range()
-        .unwrap_or_else(|| dep.name_range())
-        .into();
+    let range: Range = dep.version_range().unwrap_or_else(|| dep.name_range());
 
     for advisory in dv.advisories.items() {
         let code_description = advisory
             .url
-            .parse::<Uri>()
+            .parse::<url::Url>()
             .ok()
-            .map(|href| CodeDescription { href });
+            .map(CodeDescription::new);
 
         let summary = advisory
             .summary
@@ -1826,9 +1794,8 @@ fn push_vulnerability_diagnostics(
             range,
             severity: Some(diagnostic_severity_for(advisory.severity)),
             message,
-            code: Some(NumberOrString::String(advisory.id.clone())),
+            code: Some(advisory.id.clone()),
             code_description,
-            source: Some("deps-lsp".into()),
             ..Default::default()
         });
     }
@@ -1837,9 +1804,8 @@ fn push_vulnerability_diagnostics(
     if remaining > 0 {
         diagnostics.push(Diagnostic {
             range,
-            severity: Some(DiagnosticSeverity::INFORMATION),
+            severity: Some(Severity::Information),
             message: format!("+{remaining} more advisories"),
-            source: Some("deps-lsp".into()),
             ..Default::default()
         });
     }
@@ -1850,6 +1816,7 @@ mod tests {
     use super::*;
     use crate::lsp_helpers::test_support::*;
     use crate::lsp_helpers::*;
+    use crate::position::{Position, Range};
     use crate::{PackageName, VersionReq};
 
     use std::collections::HashMap;
@@ -1857,8 +1824,8 @@ mod tests {
 
     #[test]
     fn test_generate_diagnostics_from_cache_unknown_package() {
+        use crate::position::{Position, Range};
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range};
 
         let formatter = MockFormatter;
 
@@ -1866,8 +1833,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "unknown-pkg".into(),
                 version_req: "1.0.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 11)).into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 11)),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -1886,7 +1853,7 @@ mod tests {
         );
 
         assert_eq!(diagnostics.len(), 1);
-        assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
+        assert_eq!(diagnostics[0].severity, Some(Severity::Warning));
         assert!(diagnostics[0].message.contains("Unknown package"));
         assert!(diagnostics[0].message.contains("unknown-pkg"));
     }
@@ -1898,7 +1865,7 @@ mod tests {
     /// in the same document still gets its diagnostic as usual.
     #[test]
     fn test_generate_diagnostics_from_cache_skips_synthetic_range_dependency() {
-        use tower_lsp_server::ls_types::{Position, Range};
+        use crate::position::{Position, Range};
 
         let formatter = MockFormatter;
 
@@ -1910,8 +1877,8 @@ mod tests {
                 Box::new(MockDep {
                     name: "unknown-pkg".into(),
                     version_req: "1.0.0".into(),
-                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                    name_range: Range::new(Position::new(0, 0), Position::new(0, 11)).into(),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 11)),
                 }),
             ],
             uri: crate::test_util::test_uri("/test/pubspec.yaml"),
@@ -1971,7 +1938,7 @@ mod tests {
 
         let ceiling_diagnostics: Vec<_> = diagnostics
             .iter()
-            .filter(|d| d.severity == Some(DiagnosticSeverity::INFORMATION))
+            .filter(|d| d.severity == Some(Severity::Information))
             .filter(|d| {
                 d.message
                     .contains("exceeding deps-lsp's per-document limit")
@@ -2023,7 +1990,7 @@ mod tests {
     /// outcome alone suppresses it.
     #[test]
     fn test_generate_diagnostics_from_cache_no_comparable_versions_is_not_unknown_package() {
-        use tower_lsp_server::ls_types::{Position, Range};
+        use crate::position::{Position, Range};
 
         let formatter = MockFormatter;
 
@@ -2031,8 +1998,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "dtolnay/rust-toolchain".into(),
                 version_req: "stable".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 23)).into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 23)),
             }],
             uri: crate::test_util::test_uri("/repo/.github/workflows/ci.yml"),
         };
@@ -2064,7 +2031,7 @@ mod tests {
     #[test]
     fn test_generate_diagnostics_from_cache_emits_blocked_registry_diagnostic() {
         use crate::net_policy::HostClass;
-        use tower_lsp_server::ls_types::{Position, Range};
+        use crate::position::{Position, Range};
 
         struct BlockedRegistryParseResult {
             deps: Vec<MockDep>,
@@ -2096,12 +2063,12 @@ mod tests {
             deps: vec![MockDep {
                 name: "internal-crate".into(),
                 version_req: "1.0.0".into(),
-                version_range: Range::new(Position::new(0, 20), Position::new(0, 25)).into(),
-                name_range: name_range.into(),
+                version_range: Range::new(Position::new(0, 20), Position::new(0, 25)),
+                name_range,
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
             blocked: vec![BlockedRegistryOccurrence {
-                range: name_range.into(),
+                range: name_range,
                 class: HostClass::CloudMetadata,
                 raw_value: "https://169.254.169.254/index".to_string(),
                 declaration_key: "https://169.254.169.254/index".to_string(),
@@ -2126,10 +2093,7 @@ mod tests {
             .find(|d| d.message.contains("blocked"))
             .expect("expected a blocked-registry diagnostic");
         assert_eq!(blocked_diagnostic.range, name_range);
-        assert_eq!(
-            blocked_diagnostic.severity,
-            Some(DiagnosticSeverity::INFORMATION)
-        );
+        assert_eq!(blocked_diagnostic.severity, Some(Severity::Information));
         assert!(blocked_diagnostic.message.contains("169.254.169.254"));
         assert!(blocked_diagnostic.message.contains("cloud metadata"));
         assert!(
@@ -2146,7 +2110,7 @@ mod tests {
     fn test_generate_diagnostics_from_cache_blocked_registry_message_redacts_query_string_credential()
      {
         use crate::net_policy::HostClass;
-        use tower_lsp_server::ls_types::{Position, Range};
+        use crate::position::{Position, Range};
 
         struct BlockedRegistryParseResult {
             deps: Vec<MockDep>,
@@ -2178,12 +2142,12 @@ mod tests {
             deps: vec![MockDep {
                 name: "internal-crate".into(),
                 version_req: "1.0.0".into(),
-                version_range: Range::new(Position::new(0, 20), Position::new(0, 25)).into(),
-                name_range: name_range.into(),
+                version_range: Range::new(Position::new(0, 20), Position::new(0, 25)),
+                name_range,
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
             blocked: vec![BlockedRegistryOccurrence {
-                range: name_range.into(),
+                range: name_range,
                 class: HostClass::CloudMetadata,
                 raw_value: "https://index.mycorp.dev/api?api_key=SECRET".to_string(),
                 declaration_key: "https://index.mycorp.dev/api?api_key=SECRET".to_string(),
@@ -2226,7 +2190,7 @@ mod tests {
     fn test_generate_diagnostics_from_cache_blocked_registry_message_redacts_query_string_credential_in_declaration_key_without_scheme_slashes()
      {
         use crate::net_policy::HostClass;
-        use tower_lsp_server::ls_types::{Position, Range};
+        use crate::position::{Position, Range};
 
         struct BlockedRegistryParseResult {
             deps: Vec<MockDep>,
@@ -2259,12 +2223,12 @@ mod tests {
             deps: vec![MockDep {
                 name: "internal-crate".into(),
                 version_req: "1.0.0".into(),
-                version_range: Range::new(Position::new(0, 20), Position::new(0, 25)).into(),
-                name_range: name_range.into(),
+                version_range: Range::new(Position::new(0, 20), Position::new(0, 25)),
+                name_range,
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
             blocked: vec![BlockedRegistryOccurrence {
-                range: name_range.into(),
+                range: name_range,
                 class: HostClass::CloudMetadata,
                 raw_value: slash_less.clone(),
                 declaration_key: slash_less,
@@ -2307,7 +2271,7 @@ mod tests {
     fn test_generate_diagnostics_from_cache_blocked_registry_message_redacts_userinfo_in_declaration_key_without_scheme_slashes()
      {
         use crate::net_policy::HostClass;
-        use tower_lsp_server::ls_types::{Position, Range};
+        use crate::position::{Position, Range};
 
         struct BlockedRegistryParseResult {
             deps: Vec<MockDep>,
@@ -2340,12 +2304,12 @@ mod tests {
             deps: vec![MockDep {
                 name: "internal-crate".into(),
                 version_req: "1.0.0".into(),
-                version_range: Range::new(Position::new(0, 20), Position::new(0, 25)).into(),
-                name_range: name_range.into(),
+                version_range: Range::new(Position::new(0, 20), Position::new(0, 25)),
+                name_range,
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
             blocked: vec![BlockedRegistryOccurrence {
-                range: name_range.into(),
+                range: name_range,
                 class: HostClass::CloudMetadata,
                 raw_value: slash_less_credential.clone(),
                 declaration_key: slash_less_credential,
@@ -2388,7 +2352,7 @@ mod tests {
     fn test_generate_diagnostics_from_cache_blocked_registry_message_does_not_mangle_opaque_declaration_keys()
      {
         use crate::net_policy::HostClass;
-        use tower_lsp_server::ls_types::{Position, Range};
+        use crate::position::{Position, Range};
 
         struct BlockedRegistryParseResult {
             deps: Vec<MockDep>,
@@ -2430,12 +2394,12 @@ mod tests {
                 deps: vec![MockDep {
                     name: "internal-crate".into(),
                     version_req: "1.0.0".into(),
-                    version_range: Range::new(Position::new(0, 20), Position::new(0, 25)).into(),
-                    name_range: name_range.into(),
+                    version_range: Range::new(Position::new(0, 20), Position::new(0, 25)),
+                    name_range,
                 }],
                 uri: crate::test_util::test_uri("/test/Cargo.toml"),
                 blocked: vec![BlockedRegistryOccurrence {
-                    range: name_range.into(),
+                    range: name_range,
                     class: HostClass::CloudMetadata,
                     raw_value: "https://169.254.169.254/index".to_string(),
                     declaration_key: opaque_key.to_string(),
@@ -2479,7 +2443,7 @@ mod tests {
     fn test_generate_diagnostics_from_cache_blocked_registry_message_still_redacts_opaque_label_prefixed_url_in_declaration_key()
      {
         use crate::net_policy::HostClass;
-        use tower_lsp_server::ls_types::{Position, Range};
+        use crate::position::{Position, Range};
 
         struct BlockedRegistryParseResult {
             deps: Vec<MockDep>,
@@ -2512,12 +2476,12 @@ mod tests {
             deps: vec![MockDep {
                 name: "internal-crate".into(),
                 version_req: "1.0.0".into(),
-                version_range: Range::new(Position::new(0, 20), Position::new(0, 25)).into(),
-                name_range: name_range.into(),
+                version_range: Range::new(Position::new(0, 20), Position::new(0, 25)),
+                name_range,
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
             blocked: vec![BlockedRegistryOccurrence {
-                range: name_range.into(),
+                range: name_range,
                 class: HostClass::CloudMetadata,
                 raw_value: "https://10.0.0.1/v3/index.json".to_string(),
                 declaration_key: opaque_prefixed_url,
@@ -2563,7 +2527,7 @@ mod tests {
     #[test]
     fn test_generate_diagnostics_from_cache_dedups_by_declaration_key_not_by_value() {
         use crate::net_policy::HostClass;
-        use tower_lsp_server::ls_types::{Position, Range};
+        use crate::position::{Position, Range};
 
         struct BlockedRegistryParseResult {
             deps: Vec<MockDep>,
@@ -2598,20 +2562,20 @@ mod tests {
                 MockDep {
                     name: "first-crate".into(),
                     version_req: "1.0.0".into(),
-                    version_range: Range::new(Position::new(0, 20), Position::new(0, 25)).into(),
-                    name_range: first_range.into(),
+                    version_range: Range::new(Position::new(0, 20), Position::new(0, 25)),
+                    name_range: first_range,
                 },
                 MockDep {
                     name: "second-crate".into(),
                     version_req: "1.0.0".into(),
-                    version_range: Range::new(Position::new(1, 20), Position::new(1, 25)).into(),
-                    name_range: second_range.into(),
+                    version_range: Range::new(Position::new(1, 20), Position::new(1, 25)),
+                    name_range: second_range,
                 },
                 MockDep {
                     name: "third-crate".into(),
                     version_req: "1.0.0".into(),
-                    version_range: Range::new(Position::new(2, 20), Position::new(2, 25)).into(),
-                    name_range: third_range.into(),
+                    version_range: Range::new(Position::new(2, 20), Position::new(2, 25)),
+                    name_range: third_range,
                 },
             ],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
@@ -2619,13 +2583,13 @@ mod tests {
                 // Same declaration ("top-level"), same value — genuinely the same config-wide
                 // block, referenced by two dependencies. Must collapse to one diagnostic.
                 BlockedRegistryOccurrence {
-                    range: first_range.into(),
+                    range: first_range,
                     class: HostClass::CloudMetadata,
                     raw_value: "https://169.254.169.254/index".to_string(),
                     declaration_key: "top-level".to_string(),
                 },
                 BlockedRegistryOccurrence {
-                    range: second_range.into(),
+                    range: second_range,
                     class: HostClass::CloudMetadata,
                     raw_value: "https://169.254.169.254/index".to_string(),
                     declaration_key: "top-level".to_string(),
@@ -2633,7 +2597,7 @@ mod tests {
                 // A different declaration ("scope:@myorg") that happens to share the exact
                 // same (class, raw_value) — must NOT be swallowed by the dedup above.
                 BlockedRegistryOccurrence {
-                    range: third_range.into(),
+                    range: third_range,
                     class: HostClass::CloudMetadata,
                     raw_value: "https://169.254.169.254/index".to_string(),
                     declaration_key: "scope:@myorg".to_string(),
@@ -2686,7 +2650,7 @@ mod tests {
             .as_ref()
             .expect("anchor diagnostic must carry related_information for the collapsed sibling");
         assert_eq!(related.len(), 1);
-        assert_eq!(related[0].location.range, second_range);
+        assert_eq!(related[0].range, second_range);
         assert!(
             related[0].message.contains("second-crate"),
             "related_information message must name the collapsed sibling dependency, got: {:?}",
@@ -2720,7 +2684,7 @@ mod tests {
     #[test]
     fn test_generate_diagnostics_from_cache_blocked_registry_related_info_capped_and_folded() {
         use crate::net_policy::HostClass;
-        use tower_lsp_server::ls_types::{Position, Range};
+        use crate::position::{Position, Range};
 
         struct BlockedRegistryParseResult {
             deps: Vec<MockDep>,
@@ -2759,15 +2723,14 @@ mod tests {
                 version_range: Range::new(
                     Position::new(range.start.line, 20),
                     Position::new(range.start.line, 25),
-                )
-                .into(),
-                name_range: range.into(),
+                ),
+                name_range: range,
             })
             .collect();
         let blocked: Vec<BlockedRegistryOccurrence> = ranges
             .iter()
             .map(|&range| BlockedRegistryOccurrence {
-                range: range.into(),
+                range,
                 class: HostClass::CloudMetadata,
                 raw_value: "https://169.254.169.254/index".to_string(),
                 declaration_key: "top-level".to_string(),
@@ -2824,7 +2787,7 @@ mod tests {
             fold_entry.message
         );
         assert_eq!(
-            fold_entry.location.range, blocked_diagnostics[0].range,
+            fold_entry.range, blocked_diagnostics[0].range,
             "the fold entry must be anchored at the anchor diagnostic's own range"
         );
     }
@@ -2858,7 +2821,7 @@ mod tests {
     #[test]
     fn test_generate_diagnostics_from_cache_blocked_registry_message_caps_long_raw_value() {
         use crate::net_policy::HostClass;
-        use tower_lsp_server::ls_types::{Position, Range};
+        use crate::position::{Position, Range};
 
         struct BlockedRegistryParseResult {
             deps: Vec<MockDep>,
@@ -2891,12 +2854,12 @@ mod tests {
             deps: vec![MockDep {
                 name: "internal-crate".into(),
                 version_req: "1.0.0".into(),
-                version_range: Range::new(Position::new(0, 20), Position::new(0, 25)).into(),
-                name_range: name_range.into(),
+                version_range: Range::new(Position::new(0, 20), Position::new(0, 25)),
+                name_range,
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
             blocked: vec![BlockedRegistryOccurrence {
-                range: name_range.into(),
+                range: name_range,
                 class: HostClass::InternalName,
                 raw_value: long_alias.clone(),
                 declaration_key: long_alias.clone(),
@@ -2929,8 +2892,8 @@ mod tests {
 
     #[test]
     fn test_generate_diagnostics_from_cache_fetch_failed_not_reported_as_unknown() {
+        use crate::position::{Position, Range};
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range};
 
         // A package missing from `cached` because its registry fetch errored
         // or timed out (#267) must not be reported as "Unknown package" — the
@@ -2942,8 +2905,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "flaky-pkg".into(),
                 version_req: "1.0.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 11)).into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 11)),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -2975,8 +2938,8 @@ mod tests {
     /// dependency — the same noise argument that justified suppressing the failure toast.
     #[test]
     fn test_generate_diagnostics_from_cache_offline_suppresses_per_dependency_warning() {
+        use crate::position::{Position, Range};
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range};
 
         let formatter = MockFormatter;
 
@@ -2985,14 +2948,14 @@ mod tests {
                 MockDep {
                     name: "flaky-pkg-a".into(),
                     version_req: "1.0.0".into(),
-                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                    name_range: Range::new(Position::new(0, 0), Position::new(0, 11)).into(),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 11)),
                 },
                 MockDep {
                     name: "flaky-pkg-b".into(),
                     version_req: "1.0.0".into(),
-                    version_range: Range::new(Position::new(1, 10), Position::new(1, 20)).into(),
-                    name_range: Range::new(Position::new(1, 0), Position::new(1, 11)).into(),
+                    version_range: Range::new(Position::new(1, 10), Position::new(1, 20)),
+                    name_range: Range::new(Position::new(1, 0), Position::new(1, 11)),
                 },
             ],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
@@ -3024,7 +2987,7 @@ mod tests {
         );
         let offline_diagnostics: Vec<_> = diagnostics
             .iter()
-            .filter(|d| d.severity == Some(DiagnosticSeverity::INFORMATION))
+            .filter(|d| d.severity == Some(Severity::Information))
             .filter(|d| d.message.to_lowercase().contains("offline"))
             .collect();
         assert_eq!(
@@ -3041,8 +3004,8 @@ mod tests {
     /// independent of whether any individual dependency's lookup happened to fail.
     #[test]
     fn test_generate_diagnostics_from_cache_offline_signal_present_even_with_no_fetch_failures() {
+        use crate::position::{Position, Range};
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range};
 
         let formatter = MockFormatter;
 
@@ -3050,8 +3013,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "serde".into(),
                 version_req: "=1.0.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -3073,7 +3036,7 @@ mod tests {
         assert!(
             diagnostics
                 .iter()
-                .any(|d| d.severity == Some(DiagnosticSeverity::INFORMATION)
+                .any(|d| d.severity == Some(Severity::Information)
                     && d.message.to_lowercase().contains("offline")),
             "expected a file-level offline diagnostic even with zero fetch failures; \
              got: {diagnostics:?}"
@@ -3082,8 +3045,8 @@ mod tests {
 
     #[test]
     fn test_generate_diagnostics_from_cache_fetch_failed_actionable_shows_hint() {
+        use crate::position::{Position, Range};
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range};
 
         // #478: an `Actionable` fetch failure must surface its pre-vetted hint
         // text in the diagnostic, not the generic fallback.
@@ -3093,8 +3056,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "rate-limited-pkg".into(),
                 version_req: "1.0.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 16)).into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 16)),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -3128,8 +3091,8 @@ mod tests {
 
     #[test]
     fn test_generate_diagnostics_from_cache_multiple_fetch_failed_collapse_into_one_diagnostic() {
+        use crate::position::{Position, Range};
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range};
 
         // #479: a registry-wide condition (e.g. a rate limit tripped by one dependency)
         // can fail every remaining dependency identically. N near-duplicate
@@ -3147,20 +3110,20 @@ mod tests {
                 MockDep {
                     name: "flaky-1".into(),
                     version_req: "1.0.0".into(),
-                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                    name_range: name_range_1.into(),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                    name_range: name_range_1,
                 },
                 MockDep {
                     name: "flaky-2".into(),
                     version_req: "1.0.0".into(),
-                    version_range: Range::new(Position::new(1, 10), Position::new(1, 20)).into(),
-                    name_range: name_range_2.into(),
+                    version_range: Range::new(Position::new(1, 10), Position::new(1, 20)),
+                    name_range: name_range_2,
                 },
                 MockDep {
                     name: "flaky-3".into(),
                     version_req: "1.0.0".into(),
-                    version_range: Range::new(Position::new(2, 10), Position::new(2, 20)).into(),
-                    name_range: name_range_3.into(),
+                    version_range: Range::new(Position::new(2, 10), Position::new(2, 20)),
+                    name_range: name_range_3,
                 },
             ],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
@@ -3210,24 +3173,18 @@ mod tests {
             2,
             "expected one related_information entry per additional failing dependency (n - 1)"
         );
-        assert_eq!(related_information[0].location.range, name_range_2);
-        assert_eq!(
-            related_information[0].location.uri,
-            crate::lsp_helpers::to_ls_uri(parse_result.uri())
-        );
+        assert_eq!(related_information[0].range, name_range_2);
+        assert_eq!(related_information[0].uri, parse_result.uri().clone());
         assert!(related_information[0].message.contains("flaky-2"));
-        assert_eq!(related_information[1].location.range, name_range_3);
-        assert_eq!(
-            related_information[1].location.uri,
-            crate::lsp_helpers::to_ls_uri(parse_result.uri())
-        );
+        assert_eq!(related_information[1].range, name_range_3);
+        assert_eq!(related_information[1].uri, parse_result.uri().clone());
         assert!(related_information[1].message.contains("flaky-3"));
     }
 
     #[test]
     fn test_generate_diagnostics_from_cache_two_fetch_failed_collapse_boundary() {
+        use crate::position::{Position, Range};
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range};
 
         // n==2 is the lowest n that collapses at all (n==1 stays a plain per-dependency
         // diagnostic — see `test_generate_diagnostics_from_cache_fetch_failed_not_reported_as_unknown`
@@ -3243,14 +3200,14 @@ mod tests {
                 MockDep {
                     name: "flaky-1".into(),
                     version_req: "1.0.0".into(),
-                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                    name_range: name_range_1.into(),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                    name_range: name_range_1,
                 },
                 MockDep {
                     name: "flaky-2".into(),
                     version_req: "1.0.0".into(),
-                    version_range: Range::new(Position::new(1, 10), Position::new(1, 20)).into(),
-                    name_range: name_range_2.into(),
+                    version_range: Range::new(Position::new(1, 10), Position::new(1, 20)),
+                    name_range: name_range_2,
                 },
             ],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
@@ -3291,18 +3248,15 @@ mod tests {
             1,
             "n==2 collapse must carry exactly one related_information entry (n - 1)"
         );
-        assert_eq!(related_information[0].location.range, name_range_2);
-        assert_eq!(
-            related_information[0].location.uri,
-            crate::lsp_helpers::to_ls_uri(parse_result.uri())
-        );
+        assert_eq!(related_information[0].range, name_range_2);
+        assert_eq!(related_information[0].uri, parse_result.uri().clone());
         assert!(related_information[0].message.contains("flaky-2"));
     }
 
     #[test]
     fn test_generate_diagnostics_from_cache_multiple_fetch_failed_shared_actionable_hint() {
+        use crate::position::{Position, Range};
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range};
 
         // #478/#485 + #479: the motivating scenario for both — a rate-limit gate trips
         // and fails every remaining dependency with the SAME `Actionable` hint. The
@@ -3319,20 +3273,20 @@ mod tests {
                 MockDep {
                     name: "flaky-1".into(),
                     version_req: "1.0.0".into(),
-                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                    name_range: name_range_1.into(),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                    name_range: name_range_1,
                 },
                 MockDep {
                     name: "flaky-2".into(),
                     version_req: "1.0.0".into(),
-                    version_range: Range::new(Position::new(1, 10), Position::new(1, 20)).into(),
-                    name_range: name_range_2.into(),
+                    version_range: Range::new(Position::new(1, 10), Position::new(1, 20)),
+                    name_range: name_range_2,
                 },
                 MockDep {
                     name: "flaky-3".into(),
                     version_req: "1.0.0".into(),
-                    version_range: Range::new(Position::new(2, 10), Position::new(2, 20)).into(),
-                    name_range: name_range_3.into(),
+                    version_range: Range::new(Position::new(2, 10), Position::new(2, 20)),
+                    name_range: name_range_3,
                 },
             ],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
@@ -3385,8 +3339,8 @@ mod tests {
 
     #[test]
     fn test_generate_diagnostics_from_cache_fetch_failed_transient_shows_generic_message() {
+        use crate::position::{Position, Range};
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range};
 
         // A `Transient` fetch failure has no safe detail to show, so it must
         // fall back to the generic "package status could not be determined"
@@ -3397,8 +3351,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "transient-pkg".into(),
                 version_req: "1.0.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 13)).into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 13)),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -3429,8 +3383,8 @@ mod tests {
 
     #[test]
     fn test_generate_diagnostics_from_cache_fetch_failed_not_attempted_shows_generic_message() {
+        use crate::position::{Position, Range};
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range};
 
         // #478 fix (impl-critic S1): `NotAttempted` (a source-collided
         // dependency that was deliberately never queried) must render the
@@ -3442,8 +3396,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "collided-pkg".into(),
                 version_req: "1.0.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 12)).into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 12)),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -3474,8 +3428,8 @@ mod tests {
 
     #[test]
     fn test_generate_diagnostics_from_cache_fetch_failed_does_not_mask_invalid_name() {
+        use crate::position::{Position, Range};
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range};
 
         // A syntactically invalid name is a local, name-only check independent
         // of any registry round trip — it must win over a fetch-failure
@@ -3486,8 +3440,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "bad name".into(),
                 version_req: "1.0.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 11)).into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 11)),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -3513,8 +3467,8 @@ mod tests {
 
     #[test]
     fn test_generate_diagnostics_from_cache_invalid_package_name() {
+        use crate::position::{Position, Range};
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range};
 
         // A formatter that rejects every name must produce exactly one
         // "Invalid package name" diagnostic per unresolved dependency, never
@@ -3525,8 +3479,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "bad-pkg".into(),
                 version_req: "1.0.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 7)).into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 7)),
             }],
             uri: crate::test_util::test_uri("/test/package.json"),
         };
@@ -3545,15 +3499,15 @@ mod tests {
         );
 
         assert_eq!(diagnostics.len(), 1);
-        assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
+        assert_eq!(diagnostics[0].severity, Some(Severity::Warning));
         assert!(diagnostics[0].message.starts_with("Invalid package name"));
         assert!(!diagnostics[0].message.contains("Unknown package"));
     }
 
     #[test]
     fn test_generate_diagnostics_from_cache_outdated_version() {
+        use crate::position::{Position, Range};
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range};
 
         let formatter = MockFormatter;
 
@@ -3561,8 +3515,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "serde".into(),
                 version_req: "1.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -3583,7 +3537,7 @@ mod tests {
         );
 
         assert_eq!(diagnostics.len(), 1);
-        assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::HINT));
+        assert_eq!(diagnostics[0].severity, Some(Severity::Hint));
         assert!(diagnostics[0].message.contains("Newer version available"));
         assert!(diagnostics[0].message.contains("2.0.0"));
     }
@@ -3592,8 +3546,8 @@ mod tests {
     /// configured cooldown window gets the extra context appended, severity unchanged.
     #[test]
     fn test_generate_diagnostics_from_cache_outdated_within_cooldown_appends_context() {
+        use crate::position::{Position, Range};
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range};
 
         let formatter = MockFormatter;
 
@@ -3601,8 +3555,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "serde".into(),
                 version_req: "1.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -3633,7 +3587,7 @@ mod tests {
         );
 
         assert_eq!(diagnostics.len(), 1);
-        assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::HINT));
+        assert_eq!(diagnostics[0].severity, Some(Severity::Hint));
         assert_eq!(
             diagnostics[0].message,
             "Newer version available: 2.0.0 (published 1 hour ago — still within the release cooldown window)"
@@ -3647,8 +3601,8 @@ mod tests {
     /// message must stay exactly the pre-feature text.
     #[test]
     fn test_generate_diagnostics_from_cache_outdated_outside_cooldown_plain_message() {
+        use crate::position::{Position, Range};
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range};
 
         let formatter = MockFormatter;
 
@@ -3656,8 +3610,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "serde".into(),
                 version_req: "1.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -3695,8 +3649,8 @@ mod tests {
     /// publish age would otherwise qualify.
     #[test]
     fn test_generate_diagnostics_from_cache_outdated_freshness_disabled_plain_message() {
+        use crate::position::{Position, Range};
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range};
 
         let formatter = MockFormatter;
 
@@ -3704,8 +3658,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "serde".into(),
                 version_req: "1.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -3747,8 +3701,8 @@ mod tests {
     /// exactly must NOT be within cooldown — the bound is exclusive (`age < cooldown`).
     #[test]
     fn test_generate_diagnostics_from_cache_outdated_cooldown_boundary_is_exclusive() {
+        use crate::position::{Position, Range};
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range};
 
         const COOLDOWN_SECS: u64 = 100;
         let now = PublishTime::from_unix_secs(10_000);
@@ -3760,8 +3714,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "serde".into(),
                 version_req: "1.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -3801,8 +3755,8 @@ mod tests {
     /// Same fixture, one second younger — must flip to the within-cooldown message.
     #[test]
     fn test_generate_diagnostics_from_cache_outdated_cooldown_boundary_one_second_inside() {
+        use crate::position::{Position, Range};
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range};
 
         const COOLDOWN_SECS: u64 = 100;
         let now = PublishTime::from_unix_secs(10_000);
@@ -3814,8 +3768,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "serde".into(),
                 version_req: "1.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -3855,8 +3809,8 @@ mod tests {
 
     #[test]
     fn test_generate_diagnostics_from_cache_up_to_date() {
+        use crate::position::{Position, Range};
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range};
 
         let formatter = MockFormatter;
 
@@ -3864,8 +3818,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "serde".into(),
                 version_req: "^1.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -3893,8 +3847,8 @@ mod tests {
 
     #[test]
     fn test_generate_diagnostics_from_cache_multiple_deps() {
+        use crate::position::{Position, Range};
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range};
 
         let formatter = MockFormatter;
 
@@ -3903,20 +3857,20 @@ mod tests {
                 MockDep {
                     name: "serde".into(),
                     version_req: "^1.0".into(),
-                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
                 },
                 MockDep {
                     name: "tokio".into(),
                     version_req: "1.0".into(),
-                    version_range: Range::new(Position::new(1, 10), Position::new(1, 20)).into(),
-                    name_range: Range::new(Position::new(1, 0), Position::new(1, 5)).into(),
+                    version_range: Range::new(Position::new(1, 10), Position::new(1, 20)),
+                    name_range: Range::new(Position::new(1, 0), Position::new(1, 5)),
                 },
                 MockDep {
                     name: "unknown".into(),
                     version_req: "1.0".into(),
-                    version_range: Range::new(Position::new(2, 10), Position::new(2, 20)).into(),
-                    name_range: Range::new(Position::new(2, 0), Position::new(2, 7)).into(),
+                    version_range: Range::new(Position::new(2, 10), Position::new(2, 20)),
+                    name_range: Range::new(Position::new(2, 0), Position::new(2, 7)),
                 },
             ],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
@@ -3951,8 +3905,8 @@ mod tests {
 
     #[test]
     fn test_generate_diagnostics_from_cache_unresolved_emits_no_diagnostic() {
+        use crate::position::{Position, Range};
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range};
 
         let formatter = MockUnresolvedFormatter;
 
@@ -3960,8 +3914,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "spring-boot-starter".into(),
                 version_req: "$missing".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
             }],
             uri: crate::test_util::test_uri("/test/libs.versions.toml"),
         };
@@ -3992,8 +3946,8 @@ mod tests {
 
     #[test]
     fn test_generate_diagnostics_from_cache_yanked_uses_configured_severity() {
+        use crate::position::{Position, Range};
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range};
 
         let formatter = MockFormatter;
 
@@ -4001,8 +3955,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "serde".into(),
                 version_req: "1.0.5".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -4013,7 +3967,7 @@ mod tests {
             DependencyOutcomes::new().with_yanked("serde", ("1.0.5".into(), RemovalStatus::Yanked));
 
         let severities = DiagnosticSeverities {
-            yanked: DiagnosticSeverity::ERROR,
+            yanked: Severity::Error,
             ..DiagnosticSeverities::default()
         };
 
@@ -4031,14 +3985,14 @@ mod tests {
             .iter()
             .find(|d| d.message.starts_with(formatter.yanked_message()))
             .expect("expected a yanked diagnostic");
-        assert_eq!(yanked_diag.severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(yanked_diag.severity, Some(Severity::Error));
         assert!(yanked_diag.message.contains("1.0.5"));
     }
 
     #[test]
     fn test_generate_diagnostics_from_cache_yanked_default_severity_unchanged() {
+        use crate::position::{Position, Range};
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range};
 
         let formatter = MockFormatter;
 
@@ -4046,8 +4000,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "serde".into(),
                 version_req: "1.0.5".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -4071,13 +4025,13 @@ mod tests {
             .iter()
             .find(|d| d.message.starts_with(formatter.yanked_message()))
             .expect("expected a yanked diagnostic");
-        assert_eq!(yanked_diag.severity, Some(DiagnosticSeverity::WARNING));
+        assert_eq!(yanked_diag.severity, Some(Severity::Warning));
     }
 
     #[test]
     fn test_generate_diagnostics_from_cache_no_yanked_map_emits_no_yanked_diagnostic() {
+        use crate::position::{Position, Range};
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range};
 
         // Regression guard for the four handlers (hover, completion, code_lens,
         // inlay_hints) that keep calling `VersionData::new` without
@@ -4088,8 +4042,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "serde".into(),
                 version_req: "1.0.5".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -4118,8 +4072,8 @@ mod tests {
 
     #[test]
     fn test_generate_diagnostics_from_cache_yanked_and_outdated_both_emitted() {
+        use crate::position::{Position, Range};
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range};
 
         // Proves the yanked push sits before the early-`continue`s, so a dep
         // that is both yanked (in-use version) and outdated (vs. latest)
@@ -4130,8 +4084,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "serde".into(),
                 version_req: "1.0.5".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
             }],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
@@ -4177,16 +4131,16 @@ mod tests {
     #[test]
     fn test_generate_diagnostics_from_cache_deprecation_suppresses_advisory_deprecated_yanked_finding()
      {
+        use crate::position::{Position, Range};
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range};
 
         let formatter = MockFormatter;
         let parse_result = MockParseResult {
             deps: vec![MockDep {
                 name: "left-pad".into(),
                 version_req: "1.3.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
             }],
             uri: crate::test_util::test_uri("/test/package.json"),
         };
@@ -4236,16 +4190,16 @@ mod tests {
     /// package-level deprecation finding on the same dependency. Both diagnostics fire.
     #[test]
     fn test_generate_diagnostics_from_cache_deprecation_never_suppresses_real_yanked_finding() {
+        use crate::position::{Position, Range};
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range};
 
         let formatter = MockFormatter;
         let parse_result = MockParseResult {
             deps: vec![MockDep {
                 name: "pkg".into(),
                 version_req: "1.0.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
             }],
             uri: crate::test_util::test_uri("/test/pyproject.toml"),
         };
@@ -4285,10 +4239,7 @@ mod tests {
             diagnostics[0].message,
             format!("{}: project archived", formatter.deprecated_message())
         );
-        assert_eq!(
-            diagnostics[0].code,
-            Some(NumberOrString::String(DEPRECATED_DIAGNOSTIC_CODE.into()))
-        );
+        assert_eq!(diagnostics[0].code, Some(DEPRECATED_DIAGNOSTIC_CODE.into()));
         assert_eq!(
             diagnostics[1].message,
             format!("{} (1.0.0)", formatter.yanked_message())
@@ -4303,16 +4254,16 @@ mod tests {
     /// is not an input to the suppression decision at all.
     #[test]
     fn test_generate_diagnostics_from_cache_deprecation_suppression_is_severity_independent() {
+        use crate::position::{Position, Range};
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range};
 
         let formatter = MockFormatter;
         let parse_result = MockParseResult {
             deps: vec![MockDep {
                 name: "left-pad".into(),
                 version_req: "1.3.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
             }],
             uri: crate::test_util::test_uri("/test/package.json"),
         };
@@ -4337,8 +4288,8 @@ mod tests {
 
         let default_severities = DiagnosticSeverities::default();
         let inverted_severities = DiagnosticSeverities {
-            deprecated: DiagnosticSeverity::HINT,
-            yanked: DiagnosticSeverity::ERROR,
+            deprecated: Severity::Hint,
+            yanked: Severity::Error,
             ..DiagnosticSeverities::default()
         };
 
@@ -4445,8 +4396,8 @@ mod tests {
 
     #[test]
     fn test_generate_diagnostics_from_cache_yanked_no_version_range_uses_name_range() {
+        use crate::position::{Position, Range};
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range};
 
         let formatter = MockFormatter;
         let name_range = Range::new(Position::new(0, 0), Position::new(0, 5));
@@ -4454,7 +4405,7 @@ mod tests {
         let parse_result = MockMarkedParseResult {
             dep: MockMarkedDep {
                 name: "serde".into(),
-                name_range: name_range.into(),
+                name_range,
                 markers: None,
             },
             uri: crate::test_util::test_uri("/test/pyproject.toml"),
@@ -4484,8 +4435,8 @@ mod tests {
 
     #[test]
     fn test_generate_diagnostics_from_cache_yanked_normalized_name_keying() {
+        use crate::position::{Position, Range};
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range};
 
         /// Mirrors a Composer/NuGet/Swift-shaped formatter whose normalized
         /// name differs from the manifest-declared raw name.
@@ -4522,8 +4473,8 @@ mod tests {
             deps: vec![MockDep {
                 name: "Newtonsoft.Json".into(),
                 version_req: "13.0.1".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
             }],
             uri: crate::test_util::test_uri("/test/project.csproj"),
         };
@@ -4560,8 +4511,8 @@ mod tests {
         // recording only "0.1.43" — the occurrence pinned to "0.1.44" must
         // NOT also render "yanked (0.1.43)" just because it shares the name;
         // that version string doesn't even appear on its line.
+        use crate::position::{Position, Range};
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range};
 
         let formatter = MockFormatter;
 
@@ -4570,14 +4521,14 @@ mod tests {
                 MockDep {
                     name: "time".into(),
                     version_req: "=0.1.43".into(),
-                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
                 },
                 MockDep {
                     name: "time".into(),
                     version_req: "=0.1.44".into(),
-                    version_range: Range::new(Position::new(3, 10), Position::new(3, 20)).into(),
-                    name_range: Range::new(Position::new(3, 0), Position::new(3, 5)).into(),
+                    version_range: Range::new(Position::new(3, 10), Position::new(3, 20)),
+                    name_range: Range::new(Position::new(3, 0), Position::new(3, 5)),
                 },
             ],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
@@ -4623,8 +4574,8 @@ mod tests {
         // occurrences render the shared name-keyed finding — the exact
         // pre-#394 behavior, preserved deliberately for backward
         // compatibility rather than silently tightened.
+        use crate::position::{Position, Range};
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range};
 
         let formatter = MockFormatter;
 
@@ -4633,14 +4584,14 @@ mod tests {
                 MockDep {
                     name: "time".into(),
                     version_req: "=0.1.43".into(),
-                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
                 },
                 MockDep {
                     name: "time".into(),
                     version_req: "=0.1.44".into(),
-                    version_range: Range::new(Position::new(3, 10), Position::new(3, 20)).into(),
-                    name_range: Range::new(Position::new(3, 0), Position::new(3, 5)).into(),
+                    version_range: Range::new(Position::new(3, 10), Position::new(3, 20)),
+                    name_range: Range::new(Position::new(3, 0), Position::new(3, 5)),
                 },
             ],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
@@ -5039,11 +4990,8 @@ mod tests {
             .iter()
             .find(|d| d.message.contains("RUSTSEC-2020-0071"))
             .expect("vulnerability diagnostic must be emitted even without registry data");
-        assert_eq!(vuln_diag.severity, Some(DiagnosticSeverity::WARNING));
-        assert_eq!(
-            vuln_diag.code,
-            Some(NumberOrString::String("RUSTSEC-2020-0071".to_string()))
-        );
+        assert_eq!(vuln_diag.severity, Some(Severity::Warning));
+        assert_eq!(vuln_diag.code, Some("RUSTSEC-2020-0071".to_string()));
     }
 
     #[test]
@@ -5160,11 +5108,8 @@ mod tests {
 
         assert_ne!(informational_diag.message, unknown_diag.message);
         assert_ne!(informational_diag.severity, unknown_diag.severity);
-        assert_eq!(
-            informational_diag.severity,
-            Some(DiagnosticSeverity::INFORMATION)
-        );
-        assert_eq!(unknown_diag.severity, Some(DiagnosticSeverity::WARNING));
+        assert_eq!(informational_diag.severity, Some(Severity::Information));
+        assert_eq!(unknown_diag.severity, Some(Severity::Warning));
         assert!(informational_diag.message.contains("[INFORMATIONAL]"));
         assert!(!unknown_diag.message.contains("[INFORMATIONAL]"));
     }
@@ -5298,21 +5243,21 @@ mod tests {
             Capped, DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity,
             VulnerabilityMap, vulnerability_keys,
         };
-        use tower_lsp_server::ls_types::{Position, Range};
+        use crate::position::{Position, Range};
 
         let formatter = MockFormatter;
 
         let vulnerable_dep = MockDep {
             name: "pkg".into(),
             version_req: "=1.0.0".into(),
-            version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-            name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+            version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
         };
         let patched_dep = MockDep {
             name: "pkg".into(),
             version_req: "=2.0.0".into(),
-            version_range: Range::new(Position::new(3, 10), Position::new(3, 20)).into(),
-            name_range: Range::new(Position::new(3, 0), Position::new(3, 5)).into(),
+            version_range: Range::new(Position::new(3, 10), Position::new(3, 20)),
+            name_range: Range::new(Position::new(3, 0), Position::new(3, 5)),
         };
         let parse_result = MockParseResult {
             deps: vec![vulnerable_dep, patched_dep],
@@ -5393,21 +5338,21 @@ mod tests {
             Capped, DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity,
             VulnerabilityMap, vulnerability_keys,
         };
-        use tower_lsp_server::ls_types::{Position, Range};
+        use crate::position::{Position, Range};
 
         let formatter = MockFormatter;
 
         let current_major = MockDep {
             name: "serde".into(),
             version_req: "1.0".into(),
-            version_range: Range::new(Position::new(0, 8), Position::new(0, 13)).into(),
-            name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+            version_range: Range::new(Position::new(0, 8), Position::new(0, 13)),
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
         };
         let renamed_old_major = MockDep {
             name: "serde".into(),
             version_req: "0.9".into(),
-            version_range: Range::new(Position::new(1, 8), Position::new(1, 13)).into(),
-            name_range: Range::new(Position::new(1, 0), Position::new(1, 9)).into(),
+            version_range: Range::new(Position::new(1, 8), Position::new(1, 13)),
+            name_range: Range::new(Position::new(1, 0), Position::new(1, 9)),
         };
         let parse_result = MockParseResult {
             deps: vec![current_major, renamed_old_major],
@@ -6232,8 +6177,8 @@ mod tests {
                 deps: vec![MockDep {
                     name: "serde".into(),
                     version_req: "modelled".into(),
-                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
                 }],
                 uri: crate::test_util::test_uri("/test/Cargo.toml"),
             };
@@ -6261,7 +6206,7 @@ mod tests {
             );
 
             assert_eq!(diagnostics.len(), 1, "expected exactly one diagnostic");
-            assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
+            assert_eq!(diagnostics[0].severity, Some(Severity::Warning));
             assert_eq!(
                 diagnostics[0].message,
                 format!("{}; latest is 2.0.0", formatter.yanked_message())
@@ -6286,8 +6231,8 @@ mod tests {
                 deps: vec![MockDep {
                     name: "serde".into(),
                     version_req: "modelled".into(),
-                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
                 }],
                 uri: crate::test_util::test_uri("/test/Cargo.toml"),
             };
@@ -6339,10 +6284,7 @@ mod tests {
                 format!("{}: archived", formatter.deprecated_message()),
                 "a genuine Yanked #247 match must still fire, without a #263 entry: {diagnostics:?}"
             );
-            assert_eq!(
-                diagnostics[0].code,
-                Some(NumberOrString::String(DEPRECATED_DIAGNOSTIC_CODE.into()))
-            );
+            assert_eq!(diagnostics[0].code, Some(DEPRECATED_DIAGNOSTIC_CODE.into()));
             assert_eq!(
                 diagnostics[1].message,
                 format!("{}; latest is 2.0.0", formatter.yanked_message())
@@ -6363,8 +6305,8 @@ mod tests {
                 deps: vec![MockDep {
                     name: "serde".into(),
                     version_req: "modelled".into(),
-                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
                 }],
                 uri: crate::test_util::test_uri("/test/Cargo.toml"),
             };
@@ -6434,8 +6376,8 @@ mod tests {
                 deps: vec![MockDep {
                     name: "serde".into(),
                     version_req: "modelled".into(),
-                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
                 }],
                 uri: crate::test_util::test_uri("/test/Cargo.toml"),
             };
@@ -6490,10 +6432,7 @@ mod tests {
                 format!("{}: archived", formatter.deprecated_message()),
                 "the package-level deprecation finding must still fire: {diagnostics:?}"
             );
-            assert_eq!(
-                diagnostics[0].code,
-                Some(NumberOrString::String(DEPRECATED_DIAGNOSTIC_CODE.into()))
-            );
+            assert_eq!(diagnostics[0].code, Some(DEPRECATED_DIAGNOSTIC_CODE.into()));
             assert_eq!(
                 diagnostics[1].message,
                 format!("{}; latest is 2.0.0", formatter.yanked_message()),
@@ -6516,8 +6455,8 @@ mod tests {
                 deps: vec![MockDep {
                     name: "serde".into(),
                     version_req: "modelled".into(),
-                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
                 }],
                 uri: crate::test_util::test_uri("/test/Cargo.toml"),
             };
@@ -6587,8 +6526,8 @@ mod tests {
                 deps: vec![MockDep {
                     name: "serde".into(),
                     version_req: "modelled".into(),
-                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
                 }],
                 uri: crate::test_util::test_uri("/test/Cargo.toml"),
             };
@@ -6606,7 +6545,7 @@ mod tests {
             let resolved_versions = HashMap::new();
 
             let severities = DiagnosticSeverities {
-                yanked: DiagnosticSeverity::ERROR,
+                yanked: Severity::Error,
                 ..DiagnosticSeverities::default()
             };
 
@@ -6621,7 +6560,7 @@ mod tests {
             );
 
             assert_eq!(diagnostics.len(), 1);
-            assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
+            assert_eq!(diagnostics[0].severity, Some(Severity::Error));
         }
 
         /// When a non-yanked version also satisfies the requirement, no yanked diagnostic
@@ -6635,8 +6574,8 @@ mod tests {
                 deps: vec![MockDep {
                     name: "serde".into(),
                     version_req: "modelled".into(),
-                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
                 }],
                 uri: crate::test_util::test_uri("/test/Cargo.toml"),
             };
@@ -6753,8 +6692,8 @@ mod tests {
             let dep = MockDep {
                 name: "dep".into(),
                 version_req: "modelled".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 3)).into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 3)),
             };
             let parse_result = SingleDepParseResult {
                 dep: NonRegistryDep(
@@ -6795,8 +6734,8 @@ mod tests {
                 deps: vec![MockDep {
                     name: "serde".into(),
                     version_req: "modelled".into(),
-                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
                 }],
                 uri: crate::test_util::test_uri("/test/Cargo.toml"),
             };
@@ -6836,15 +6775,15 @@ mod tests {
     mod license_policy_tests {
         use super::*;
         use crate::LicensePolicy;
-        use tower_lsp_server::ls_types::{Position, Range};
+        use crate::position::{Position, Range};
 
         fn single_dep_parse_result() -> MockParseResult {
             MockParseResult {
                 deps: vec![MockDep {
                     name: "serde".into(),
                     version_req: "1.0.0".into(),
-                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
                 }],
                 uri: crate::test_util::test_uri("/test/Cargo.toml"),
             }
@@ -6936,13 +6875,11 @@ mod tests {
             );
 
             assert_eq!(diagnostics.len(), 1);
-            assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
+            assert_eq!(diagnostics[0].severity, Some(Severity::Error));
             assert_eq!(diagnostics[0].message, "serde: GPL-3.0 denied by policy");
             assert_eq!(
                 diagnostics[0].code,
-                Some(NumberOrString::String(
-                    LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE.into()
-                ))
+                Some(LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE.to_string())
             );
             assert_eq!(
                 diagnostics[0].range,
@@ -6977,7 +6914,7 @@ mod tests {
             );
 
             assert_eq!(diagnostics.len(), 1);
-            assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
+            assert_eq!(diagnostics[0].severity, Some(Severity::Warning));
             assert_eq!(
                 diagnostics[0].message,
                 "serde: ISC not on the allowed license list"

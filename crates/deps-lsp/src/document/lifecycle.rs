@@ -1723,7 +1723,7 @@ mod tests {
         use std::path::Path;
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use tokio::sync::Barrier;
-        use tower_lsp_server::ls_types::{CodeLens, Diagnostic, InlayHint, Position};
+        use tower_lsp_server::ls_types::{CodeLens, InlayHint, Position};
 
         struct NoopFormatter;
         impl PackageNaming for NoopFormatter {}
@@ -1889,7 +1889,7 @@ mod tests {
                 _uri: &'a url::Url,
                 _freshness: FreshnessSettings,
                 _severities: DiagnosticSeverities,
-            ) -> BoxFuture<'a, Vec<Diagnostic>> {
+            ) -> BoxFuture<'a, Vec<deps_core::diagnostic::Diagnostic>> {
                 Box::pin(async move { vec![] })
             }
             fn generate_code_lenses<'a>(

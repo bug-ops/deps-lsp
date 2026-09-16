@@ -249,7 +249,7 @@ pub(crate) async fn generate_diagnostics_internal(
         .with_license_policy(&policy)
         .with_license_prefetch(&licenses);
 
-    let mut diagnostics = ecosystem
+    let domain_diagnostics = ecosystem
         .generate_diagnostics(
             parse_result.as_ref(),
             version_data,
@@ -258,6 +258,10 @@ pub(crate) async fn generate_diagnostics_internal(
             severities,
         )
         .await;
+    let mut diagnostics: Vec<Diagnostic> = domain_diagnostics
+        .into_iter()
+        .map(crate::lsp_types_interop::to_lsp_diagnostic)
+        .collect();
     rekey_related_information_to_original_uri(&mut diagnostics, uri);
     diagnostics
 }
@@ -488,6 +492,7 @@ mod tests {
     mod severity_wiring_tests {
         use super::*;
         use crate::document::DocumentState;
+        use deps_core::diagnostic::Severity;
         use std::collections::HashMap;
         use tower_lsp_server::ls_types::DiagnosticSeverity;
 
@@ -500,7 +505,7 @@ mod tests {
             let state = Arc::new(ServerState::new());
             let url = deps_core::test_util::test_uri("/test/Cargo.toml");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
-            let config = DiagnosticsConfig::new().with_unknown_severity(DiagnosticSeverity::ERROR);
+            let config = DiagnosticsConfig::new().with_unknown_severity(Severity::Error);
 
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
             let content = r#"[dependencies]
@@ -560,7 +565,7 @@ serde = "1.0.0"
             let state = Arc::new(ServerState::new());
             let url = deps_core::test_util::test_uri("/test/Cargo.toml");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
-            let config = DiagnosticsConfig::new().with_outdated_severity(DiagnosticSeverity::ERROR);
+            let config = DiagnosticsConfig::new().with_outdated_severity(Severity::Error);
 
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
             let content = r#"[dependencies]
@@ -645,8 +650,7 @@ serde = "1.0.0"
             let state = Arc::new(ServerState::new());
             let url = deps_core::test_util::test_uri("/test/Cargo.toml");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
-            let config =
-                DiagnosticsConfig::new().with_unsatisfiable_severity(DiagnosticSeverity::ERROR);
+            let config = DiagnosticsConfig::new().with_unsatisfiable_severity(Severity::Error);
 
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
             let content = "[dependencies]\nserde = \"99\"\n".to_string();

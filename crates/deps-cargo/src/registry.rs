@@ -24,7 +24,7 @@
 //! }
 //! ```
 
-#[cfg(test)]
+#[cfg(all(test, feature = "lsp-responses"))]
 use crate::config::IndexTrust;
 use crate::config::{AuthToken, RegistryIndex};
 use crate::sparse::SparseIndexClient;
@@ -102,6 +102,7 @@ impl CratesIoRegistry {
     /// redundant. `test-util` itself stays feature-gated because, unlike this function, it
     /// is a crate-level opt-in any downstream `Cargo.toml` could enable (`publish = true`).
     #[cfg(test)]
+    #[cfg(feature = "lsp-responses")]
     #[must_use]
     pub(crate) fn with_base_for_test(cache: Arc<HttpCache>, base: &str) -> Self {
         let policy = deps_core::net_policy::RegistryAccessPolicy::default();
@@ -419,6 +420,7 @@ impl CargoRegistry {
     /// [`CratesIoRegistry::with_base_for_test`] pointed at a mock server) instead of building
     /// a live-registry one (#1045).
     #[cfg(test)]
+    #[cfg(feature = "lsp-responses")]
     #[must_use]
     pub(crate) fn with_crates_io_for_test(
         cache: Arc<HttpCache>,

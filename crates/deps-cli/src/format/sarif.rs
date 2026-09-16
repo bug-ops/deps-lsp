@@ -1,7 +1,7 @@
 //! SARIF 2.1.0 output (FR-008, US-002) for GitHub code scanning and other SARIF consumers.
 //!
 //! Each distinct SARIF rule id becomes one `tool.driver.rules` entry, and each
-//! [`CheckFinding`] becomes one `run.results` entry with its LSP [`Range`] translated to a
+//! [`CheckFinding`] becomes one `run.results` entry with its [`Range`] translated to a
 //! SARIF physical location region. A rule id is [`CheckFinding::code`] when the finding is
 //! [`Category::Vulnerable`] *and* `code` passes [`deps_core::osv::is_valid_osv_id`]
 //! (`is_advisory_finding`), falling back to its [`Category`] wire token otherwise (issue
@@ -46,7 +46,9 @@
 //! expects it to follow.
 
 use crate::report::{Category, CheckFinding, CheckReport};
+use deps_core::diagnostic::Severity;
 use deps_core::osv::{VulnSeverity, is_valid_osv_id, validated_osv_url};
+use deps_core::position::Range;
 use serde_sarif::sarif::{
     ArtifactLocation, Location, MultiformatMessageString, PhysicalLocation, PropertyBag, Region,
     ReportingDescriptor, Result as SarifResult, ResultLevel, Run, RunAutomationDetails, SCHEMA_URL,
@@ -54,7 +56,6 @@ use serde_sarif::sarif::{
 };
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Component, Path};
-use tower_lsp_server::ls_types::{DiagnosticSeverity, Range};
 
 /// Builds the [`Sarif`] document for `report`.
 ///
@@ -458,7 +459,7 @@ fn manifest_uri(path: &Path) -> String {
         .join("/")
 }
 
-/// Translates an LSP [`Range`] (zero-based line/character) into a SARIF [`Region`]
+/// Translates a [`Range`] (zero-based line/character) into a SARIF [`Region`]
 /// (one-based line/column, per the SARIF 2.1.0 spec).
 fn to_sarif_region(range: Range) -> Region {
     Region::builder()
@@ -469,13 +470,12 @@ fn to_sarif_region(range: Range) -> Region {
         .build()
 }
 
-/// Maps an LSP [`DiagnosticSeverity`] to the closest SARIF [`ResultLevel`].
-fn to_result_level(severity: DiagnosticSeverity) -> ResultLevel {
+/// Maps a [`Severity`] to the closest SARIF [`ResultLevel`].
+fn to_result_level(severity: Severity) -> ResultLevel {
     match severity {
-        DiagnosticSeverity::ERROR => ResultLevel::Error,
-        DiagnosticSeverity::WARNING => ResultLevel::Warning,
-        DiagnosticSeverity::INFORMATION | DiagnosticSeverity::HINT => ResultLevel::Note,
-        _ => ResultLevel::None,
+        Severity::Error => ResultLevel::Error,
+        Severity::Warning => ResultLevel::Warning,
+        Severity::Information | Severity::Hint => ResultLevel::Note,
     }
 }
 
@@ -493,10 +493,10 @@ pub fn render(report: &CheckReport) -> Result<String, serde_json::Error> {
 mod tests {
     use super::*;
     use deps_core::EcosystemId;
+    use deps_core::position::Position;
     use std::path::PathBuf;
-    use tower_lsp_server::ls_types::Position;
 
-    fn finding(category: Category, severity: DiagnosticSeverity) -> CheckFinding {
+    fn finding(category: Category, severity: Severity) -> CheckFinding {
         CheckFinding {
             ecosystem: EcosystemId::Cargo,
             manifest_path: PathBuf::from("Cargo.toml"),
@@ -516,7 +516,7 @@ mod tests {
         CheckFinding {
             code: Some(code.to_string()),
             message: message.to_string(),
-            ..finding(category, DiagnosticSeverity::WARNING)
+            ..finding(category, Severity::Warning)
         }
     }
 
@@ -537,7 +537,7 @@ mod tests {
     #[test]
     fn test_to_sarif_rule_id_matches_category_token() {
         let report = CheckReport {
-            findings: vec![finding(Category::Outdated, DiagnosticSeverity::HINT)],
+            findings: vec![finding(Category::Outdated, Severity::Hint)],
         };
         let sarif = to_sarif(&report);
         let rules = sarif.runs[0].tool.driver.rules.as_ref().unwrap();
@@ -553,9 +553,9 @@ mod tests {
     fn test_to_sarif_deduplicates_rules_across_findings() {
         let report = CheckReport {
             findings: vec![
-                finding(Category::Outdated, DiagnosticSeverity::HINT),
-                finding(Category::Outdated, DiagnosticSeverity::HINT),
-                finding(Category::Vulnerable, DiagnosticSeverity::ERROR),
+                finding(Category::Outdated, Severity::Hint),
+                finding(Category::Outdated, Severity::Hint),
+                finding(Category::Vulnerable, Severity::Error),
             ],
         };
         let sarif = to_sarif(&report);
@@ -566,7 +566,7 @@ mod tests {
     #[test]
     fn test_to_sarif_translates_range_to_one_based_region() {
         let report = CheckReport {
-            findings: vec![finding(Category::Outdated, DiagnosticSeverity::HINT)],
+            findings: vec![finding(Category::Outdated, Severity::Hint)],
         };
         let sarif = to_sarif(&report);
         let locations = sarif.runs[0].results.as_ref().unwrap()[0]
@@ -589,7 +589,7 @@ mod tests {
     #[test]
     fn test_to_sarif_artifact_uri_matches_manifest_path() {
         let report = CheckReport {
-            findings: vec![finding(Category::Outdated, DiagnosticSeverity::HINT)],
+            findings: vec![finding(Category::Outdated, Severity::Hint)],
         };
         let sarif = to_sarif(&report);
         let locations = sarif.runs[0].results.as_ref().unwrap()[0]
@@ -667,7 +667,7 @@ mod tests {
 
     #[test]
     fn test_to_sarif_artifact_uri_of_nested_path_has_no_fragment_character() {
-        let mut finding = finding(Category::Outdated, DiagnosticSeverity::HINT);
+        let mut finding = finding(Category::Outdated, Severity::Hint);
         finding.manifest_path = Path::new("a b#c").join("Cargo.toml");
         let report = CheckReport {
             findings: vec![finding],
@@ -695,9 +695,9 @@ mod tests {
     fn test_to_sarif_severity_level_mapping() {
         let report = CheckReport {
             findings: vec![
-                finding(Category::Vulnerable, DiagnosticSeverity::ERROR),
-                finding(Category::License, DiagnosticSeverity::WARNING),
-                finding(Category::Deprecated, DiagnosticSeverity::HINT),
+                finding(Category::Vulnerable, Severity::Error),
+                finding(Category::License, Severity::Warning),
+                finding(Category::Deprecated, Severity::Hint),
             ],
         };
         let sarif = to_sarif(&report);
@@ -710,7 +710,7 @@ mod tests {
     #[test]
     fn test_render_round_trips_through_serde_json() {
         let report = CheckReport {
-            findings: vec![finding(Category::Outdated, DiagnosticSeverity::HINT)],
+            findings: vec![finding(Category::Outdated, Severity::Hint)],
         };
         let rendered = render(&report).expect("render must succeed");
         let parsed: Sarif = serde_json::from_str(&rendered).expect("must round-trip");
@@ -728,8 +728,8 @@ mod tests {
     fn test_to_sarif_multi_category_snapshot() {
         let report = CheckReport {
             findings: vec![
-                finding(Category::Outdated, DiagnosticSeverity::HINT),
-                finding(Category::Vulnerable, DiagnosticSeverity::ERROR),
+                finding(Category::Outdated, Severity::Hint),
+                finding(Category::Vulnerable, Severity::Error),
             ],
         };
         insta::assert_json_snapshot!(to_sarif(&report), {
@@ -778,10 +778,7 @@ mod tests {
         // diagnostic code (`push_vulnerability_diagnostics` in `deps-core`), so it must still
         // fall back to the category-token rule rather than panicking or producing an empty id.
         let report = CheckReport {
-            findings: vec![finding(
-                Category::Vulnerable,
-                DiagnosticSeverity::INFORMATION,
-            )],
+            findings: vec![finding(Category::Vulnerable, Severity::Information)],
         };
         let sarif = to_sarif(&report);
         let rules = sarif.runs[0].tool.driver.rules.as_ref().unwrap();
@@ -870,7 +867,7 @@ mod tests {
     #[test]
     fn test_build_rule_descriptor_category_only_rule_has_no_help_uri_or_full_description() {
         let report = CheckReport {
-            findings: vec![finding(Category::Outdated, DiagnosticSeverity::HINT)],
+            findings: vec![finding(Category::Outdated, Severity::Hint)],
         };
         let sarif = to_sarif(&report);
         let rule = &sarif.runs[0].tool.driver.rules.as_ref().unwrap()[0];
@@ -1026,10 +1023,10 @@ mod tests {
 
     #[test]
     fn test_to_sarif_partial_fingerprint_is_stable_across_a_line_shift() {
-        let mut moved = finding(Category::Outdated, DiagnosticSeverity::HINT);
+        let mut moved = finding(Category::Outdated, Severity::Hint);
         moved.range = Range::new(Position::new(40, 0), Position::new(40, 10));
         let report_before = CheckReport {
-            findings: vec![finding(Category::Outdated, DiagnosticSeverity::HINT)],
+            findings: vec![finding(Category::Outdated, Severity::Hint)],
         };
         let report_after = CheckReport {
             findings: vec![moved],
@@ -1046,10 +1043,10 @@ mod tests {
     #[test]
     fn test_to_sarif_partial_fingerprint_differs_across_dependency_and_category() {
         let base = sarif_fingerprint(&CheckReport {
-            findings: vec![finding(Category::Outdated, DiagnosticSeverity::HINT)],
+            findings: vec![finding(Category::Outdated, Severity::Hint)],
         });
 
-        let mut other_dependency = finding(Category::Outdated, DiagnosticSeverity::HINT);
+        let mut other_dependency = finding(Category::Outdated, Severity::Hint);
         other_dependency.dependency_name = Some("tokio".to_string());
         let other_dependency_fp = sarif_fingerprint(&CheckReport {
             findings: vec![other_dependency],
@@ -1057,7 +1054,7 @@ mod tests {
         assert_ne!(base, other_dependency_fp);
 
         let other_category_fp = sarif_fingerprint(&CheckReport {
-            findings: vec![finding(Category::Vulnerable, DiagnosticSeverity::ERROR)],
+            findings: vec![finding(Category::Vulnerable, Severity::Error)],
         });
         assert_ne!(base, other_category_fp);
     }
@@ -1070,8 +1067,8 @@ mod tests {
     fn test_to_sarif_partial_fingerprint_disambiguates_duplicate_occurrences_by_ordinal() {
         let report = CheckReport {
             findings: vec![
-                finding(Category::Outdated, DiagnosticSeverity::HINT),
-                finding(Category::Outdated, DiagnosticSeverity::HINT),
+                finding(Category::Outdated, Severity::Hint),
+                finding(Category::Outdated, Severity::Hint),
             ],
         };
         let sarif = to_sarif(&report);
@@ -1089,9 +1086,9 @@ mod tests {
     /// onto one fingerprint either.
     #[test]
     fn test_to_sarif_partial_fingerprint_disambiguates_two_document_level_other_notices() {
-        let mut first = finding(Category::Other, DiagnosticSeverity::INFORMATION);
+        let mut first = finding(Category::Other, Severity::Information);
         first.dependency_name = None;
-        let mut second = finding(Category::Other, DiagnosticSeverity::INFORMATION);
+        let mut second = finding(Category::Other, Severity::Information);
         second.dependency_name = None;
         let report = CheckReport {
             findings: vec![first, second],
@@ -1109,7 +1106,7 @@ mod tests {
     /// different (dependency, rule) pair.
     #[test]
     fn test_to_sarif_partial_fingerprint_percent_encodes_a_pipe_in_the_dependency_name() {
-        let mut finding = finding(Category::Outdated, DiagnosticSeverity::HINT);
+        let mut finding = finding(Category::Outdated, Severity::Hint);
         finding.dependency_name = Some("serde|outdated".to_string());
         let report = CheckReport {
             findings: vec![finding],
@@ -1125,7 +1122,7 @@ mod tests {
 
     #[test]
     fn test_to_sarif_partial_fingerprint_handles_missing_dependency_name() {
-        let mut finding = finding(Category::Other, DiagnosticSeverity::INFORMATION);
+        let mut finding = finding(Category::Other, Severity::Information);
         finding.dependency_name = None;
         let report = CheckReport {
             findings: vec![finding],
