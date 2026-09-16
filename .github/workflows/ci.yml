@@ -674,6 +674,19 @@ jobs:
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
+      - name: Resolve deps-cli release version
+        # Authenticated (5000/hr) resolution outside the Docker build: the Dockerfile's own
+        # unauthenticated fallback (60/hr, cached in the `fetch` layer) rate-limits and goes
+        # stale under `cache-from: type=gha` (#1141). Passed explicitly below so the layer
+        # cache busts whenever a new release actually ships.
+        id: deps-cli-version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version="$(gh api repos/bug-ops/deps-lsp/releases/latest --jq .tag_name)"
+          [ -n "${version}" ] || { echo "failed to resolve latest deps-lsp release tag" >&2; exit 1; }
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
       - name: Build image for self-test
         # `action.yml`'s `image:` is a `docker://ghcr.io/...` reference (required so real
         # consumers pull a pre-built image instead of compiling on every run) — GitHub Actions
@@ -689,6 +702,8 @@ jobs:
           load: true
           push: false
           tags: deps-lsp-github-action:selftest
+          build-args: |
+            DEPS_CLI_VERSION=${{ steps.deps-cli-version.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -762,6 +777,16 @@ jobs:
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
+      - name: Resolve deps-cli release version
+        # See deps-lsp-check's identically named step above for the rationale (#1141).
+        id: deps-cli-version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version="$(gh api repos/bug-ops/deps-lsp/releases/latest --jq .tag_name)"
+          [ -n "${version}" ] || { echo "failed to resolve latest deps-lsp release tag" >&2; exit 1; }
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
       - name: Build Docker image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -769,6 +794,8 @@ jobs:
           load: true
           tags: deps-lsp-github-action:local
           push: false
+          build-args: |
+            DEPS_CLI_VERSION=${{ steps.deps-cli-version.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
