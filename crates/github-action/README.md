@@ -1,10 +1,20 @@
 # deps-lsp check (GitHub Action)
 
-A thin composite action wrapping [`deps-cli check --format sarif`](../deps-cli/README.md).
-It installs `deps-cli`, runs the check, and writes a SARIF 2.1.0 file — it does **not**
-upload that file to GitHub code scanning itself (spec 062 FR-018); wire
-[`github/codeql-action/upload-sarif`](https://github.com/github/codeql-action) after it in
-your own workflow.
+A Docker-based action wrapping [`deps-cli check --format sarif`](../deps-cli/README.md). The
+published image (`ghcr.io/bug-ops/deps-lsp-github-action`) already bundles a `deps-cli`
+binary — no toolchain setup or `cargo install` step required. It runs the check and writes a
+SARIF 2.1.0 file — it does **not** upload that file to GitHub code scanning itself (spec 062
+FR-018); wire [`github/codeql-action/upload-sarif`](https://github.com/github/codeql-action)
+after it in your own workflow.
+
+> [!IMPORTANT]
+> **Breaking change (Docker packaging):** this action now runs `using: docker` instead of
+> `using: composite`. Docker-based actions only run on Linux runners
+> (`runs-on: ubuntu-latest` or similar) — `macos-latest` and `windows-latest` are no longer
+> supported, unlike the previous composite version. If your workflow ran this action on a
+> non-Linux runner, move it to a Linux job. The `version` input has also been removed: the
+> `deps-cli` version is now baked into the image at build time — pin a specific version via
+> the image tag instead (see below).
 
 ## Usage
 
@@ -25,7 +35,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
       - uses: bug-ops/deps-lsp/crates/github-action@main
         id: deps-check
         with:
@@ -37,6 +46,18 @@ jobs:
         if: steps.deps-check.outputs.exit-code == '1'
         run: exit 1
 ```
+
+## Image tags
+
+The action's `image:` pins `ghcr.io/bug-ops/deps-lsp-github-action:1`, a rolling major-version
+tag that tracks the latest `deps-cli` release published under `1.x.y`. It is rebuilt whenever a
+new `deps-lsp`/`deps-cli` release is tagged (`.github/workflows/release.yml`). More specific
+tags are also published for each release: `X`, `X.Y`, `X.Y.Z`, and `latest`.
+
+Every image is scanned with [Trivy](https://github.com/aquasecurity/trivy) for CRITICAL/HIGH
+vulnerabilities before it's pushed — a finding blocks the publish and is reported to this
+repository's Security tab. Every pull request touching `crates/github-action/` is scanned the
+same way, without publishing.
 
 Per FR-018, this action only fails the job itself on `exit-code` `2` (an execution error —
 `sarif-file` is left unset in that case, since the file may be missing or truncated, so the
@@ -54,7 +75,6 @@ policy violation.
 | `fail-on` | Comma-separated categories that exit 1 (`outdated,yanked,vulnerable,unsatisfiable,mutable-ref,license,deprecated`) | `vulnerable,yanked,unsatisfiable` |
 | `cooldown` | Overrides `freshness.cooldown_secs` (e.g. `3d`) | unset |
 | `config` | Path to a **fully-trusted** `deps.toml` config file — see warning below | unset (`deps-cli`'s own hardened auto-discovery of `./deps.toml`) |
-| `version` | `deps-cli` version to install from crates.io | latest |
 
 > [!WARNING]
 > `deps-cli` treats an *explicit* `--config` path as fully trusted — unlike an

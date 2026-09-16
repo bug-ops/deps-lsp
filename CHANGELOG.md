@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Breaking**: `crates/github-action` now packaged as a Docker-based action (`ghcr.io/bug-ops/deps-lsp-github-action`), Trivy-scanned on every PR and before each publish, with a pre-built `deps-cli` instead of a composite `cargo install` wrapper — requires a Linux runner and drops the `version` input (#1126, resolves #1123)
+
+### Added
+- **ci**: `crates/github-action` wired into this repo's own `ci.yml` as a SARIF gate, uploading results to Code Scanning and failing the build on a `vulnerable`/`yanked`/`unsatisfiable` policy violation (#1126, resolves #1122)
+
 ## [1.0.1] - 2026-09-16
 
 ### Added
