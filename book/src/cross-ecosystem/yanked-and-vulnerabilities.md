@@ -1,5 +1,35 @@
 # Yanked Versions & Vulnerabilities
 
+## Informational Advisories (issue #1043)
+
+Not every OSV record is a graded vulnerability. `deps-lsp` classifies an OSV advisory as
+`Informational` — instead of `Critical`/`High`/`Medium`/`Low`/`Unknown` — when its
+`database_specific.informational` field is `"unmaintained"` on an entry that genuinely
+describes the queried package (not a stranger sharing the same advisory id). This is an
+**allowlist of exactly one value**: RUSTSEC's `"unsound"` (a real memory-safety/UB finding)
+and `"notice"` (which can still describe a real defect) are deliberately *not* treated as
+informational — an unrecognized or missing value falls through to the existing `Unknown`/
+WARNING treatment rather than being silently downgraded to the less-visible informational
+bucket.
+
+An informational advisory renders distinctly rather than being hidden or conflated with a
+real vulnerability:
+
+- **Hover** labels it `maintenance-status notice, not a vulnerability` instead of a
+  severity word, and a candidate version's "still vulnerable" line is suppressed only when
+  *every* remaining advisory for it is known-informational — a mix of one informational and
+  one graded advisory still shows the warning line.
+- **Diagnostics** render at `INFORMATION` severity (not `WARNING`) and the message is
+  prefixed `[INFORMATIONAL]`, so it is visually and severity-distinct from a graded
+  advisory's diagnostic in the editor's Problems panel.
+- A confirmed-malicious-package record (OSV's `MAL-` id prefix, e.g. via `aliases`) always
+  takes precedence over an `informational` classification, even if the same record also
+  carries `database_specific.informational: "unmaintained"`.
+
+`deps-cli check`'s `vulnerable` category maps 1:1 to the same OSV scan `deps-lsp` runs, so
+an informational-only advisory is reported the same way there — visible in the output, but
+distinguishable from a graded finding via its severity field.
+
 ## Yanked-Version Diagnostics
 
 `diagnostics.yanked_severity` flags a dependency pinned to a version the registry

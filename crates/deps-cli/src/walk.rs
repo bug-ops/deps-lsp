@@ -90,11 +90,70 @@ fn is_not_pruned_directory(entry: &ignore::DirEntry) -> bool {
             .is_some_and(|name| PRUNED_DIRECTORIES.contains(&name))
 }
 
+/// Returns `false` for a directory entry [`ignore::WalkBuilder::filter_entry`] should prune
+/// *before descending into it* — its canonicalized real path falls outside `canonical_root`
+/// under `follow_symlinks: true`. Never prunes depth 0 (the walk root itself; already
+/// containment-checked by its own caller — see [`walk_with_limit`]'s sub-root check) or a
+/// non-directory entry (the per-file [`canonicalize_within_root`] check in [`walk_directory`]'s
+/// match loop already covers those).
+///
+/// Background code-review finding #2: without this, `follow_links(true)` lets `ignore` descend
+/// into a symlinked directory that resolves entirely outside the walked root (e.g.
+/// `evil -> /some/huge/external/tree`) before the per-file check rejects each descendant
+/// individually — on a large enough external tree this can exhaust [`MAX_WALKED_FILES`] on
+/// content outside the walked root, silently truncating the walk and dropping legitimate
+/// manifests elsewhere in the real tree, reintroducing #1112's own fail-open class through this
+/// fix's own new flag. Pruning at the directory level (mirroring [`is_not_pruned_directory`]'s
+/// existing prune-before-descend pattern) bounds the cost to one `canonicalize` call per
+/// directory rather than one per descendant file — deliberately *not* extended into the
+/// existing pruned-directory one-level-deep manifest peek
+/// ([`warn_on_pruned_directory_manifest`]), since that helper's `read_dir` is only safe because
+/// a *pruned* directory is still inside the trusted walked root; an *escaping* one is not, and
+/// must not have its contents listed at all.
+///
+/// Additive to, not a replacement for, the per-file [`canonicalize_within_root`] check: a leaf
+/// file symlink that individually escapes the root without its parent directory itself being a
+/// symlink is not a directory-level escape, so this check does not fire for it and the per-file
+/// check remains the only guard for that case.
+fn is_not_escaping_directory(
+    entry: &ignore::DirEntry,
+    follow_symlinks: bool,
+    canonical_root: Option<&Path>,
+) -> bool {
+    if !follow_symlinks || entry.depth() == 0 {
+        return true;
+    }
+    if !entry
+        .file_type()
+        .is_some_and(|file_type| file_type.is_dir())
+    {
+        return true;
+    }
+    let Some(canonical_root) = canonical_root else {
+        return false;
+    };
+    let Ok(canonical_path) = std::fs::canonicalize(entry.path()) else {
+        return false;
+    };
+    canonical_path.starts_with(canonical_root)
+}
+
 /// One manifest discovered by [`walk`], already routed to its owning ecosystem.
 pub struct DiscoveredManifest {
     /// Absolute (or walk-root-relative, when the walked root itself was relative)
-    /// filesystem path to the manifest.
+    /// filesystem path to read the manifest's content from — for a symlinked manifest under
+    /// `--follow-symlinks`, this is the resolved, canonicalized real path (FR-007), never the
+    /// symlink itself.
     pub path: PathBuf,
+    /// Absolute filesystem path used to derive the manifest's URI for parsing and lockfile/
+    /// in-use-version discovery (review finding M2). This must stay the manifest's *encountered*
+    /// path — the symlink's own location, not its resolved target's — because lockfile lookup
+    /// searches ancestor directories starting from this URI: a manifest symlinked into
+    /// directory A, whose target lives in directory B, must find `A`'s adjacent lockfile, not
+    /// `B`'s (or `B`'s absence of one), matching US-002's own shared-manifest scenario. Identical
+    /// to [`path`](Self::path) for every non-symlinked (or `--follow-symlinks`-disabled)
+    /// manifest.
+    pub uri_path: PathBuf,
     /// The manifest path as it should be displayed/reported — relative to the walked root
     /// when possible, matching [`crate::report::CheckFinding::manifest_path`].
     pub display_path: PathBuf,
@@ -173,13 +232,41 @@ pub struct WalkOutcome {
 /// `respect_gitignore`), so such a suppression is silent beyond [`WalkOutcome::manifests`]
 /// coming back emptier than expected — acceptable because both sources are
 /// operator-, not attacker-, controlled (see above).
+///
+/// **`follow_symlinks` (issue #1112)**: a directory entry that is itself a symlink to a
+/// manifest-shaped file is always detected, regardless of this flag — its path is reported via
+/// [`WalkOutcome::ignored_manifests`], the same sink a pruned or `.gitignore`-excluded manifest
+/// already uses, so a symlinked manifest can never silently vanish from the report. Detection
+/// alone never reads the target's content. When `follow_symlinks` is `true`, such a symlink is
+/// additionally resolved and routed like any other manifest (appearing in
+/// [`WalkOutcome::manifests`] instead, with [`DiscoveredManifest::path`] set to the resolved
+/// real path used for reading and [`DiscoveredManifest::display_path`] kept as the symlink's
+/// own encountered path). Every routed entry under `follow_symlinks: true` — not only ones
+/// where the leaf itself is a symlink, since an entry reached by descending into a followed
+/// symlinked *directory* is otherwise indistinguishable from an ordinary one — is canonicalized
+/// and checked against the walked root's own canonicalized absolute path; an entry that
+/// resolves outside the root is never routed, and is reported via `ignored_manifests` only when
+/// it is itself manifest-shaped (an arbitrary out-of-root symlink to a non-manifest file is
+/// silently skipped, matching detection's own never-warn-on-non-manifests invariant). This
+/// containment check applies to every registered ecosystem's own dot-directory sub-root (e.g.
+/// `.github`) too, and — because `ignore`/`walkdir` always follows a walk's own *root* symlink
+/// regardless of `follow_links` — that sub-root containment check runs in every mode, not only
+/// under `follow_symlinks`. A symlink loop is detected by the underlying `ignore` crate and
+/// surfaced via [`WalkOutcome::walk_errors`].
 #[must_use]
 pub fn walk(
     roots: &[PathBuf],
     registry: &EcosystemRegistry,
     respect_gitignore: bool,
+    follow_symlinks: bool,
 ) -> WalkOutcome {
-    walk_with_limit(roots, registry, MAX_WALKED_FILES, respect_gitignore)
+    walk_with_limit(
+        roots,
+        registry,
+        MAX_WALKED_FILES,
+        respect_gitignore,
+        follow_symlinks,
+    )
 }
 
 /// [`walk`]'s implementation, parameterized over the walked-entry cap so a test can exercise
@@ -199,6 +286,7 @@ fn walk_with_limit(
     registry: &EcosystemRegistry,
     limit: usize,
     respect_gitignore: bool,
+    follow_symlinks: bool,
 ) -> WalkOutcome {
     let mut ctx = WalkCtx {
         registry,
@@ -236,12 +324,30 @@ fn walk_with_limit(
             }
             ctx.entries_walked += 1;
             let matched_before = ctx.outcome.manifests.len();
-            route_file(&absolute_root, root, registry, &mut ctx.outcome);
+            route_file(
+                &absolute_root,
+                &absolute_root,
+                root,
+                registry,
+                &mut ctx.outcome,
+            );
             if ctx.outcome.manifests.len() == matched_before {
                 ctx.outcome.unrecognized_explicit_paths.push(root.clone());
             }
             continue;
         }
+
+        // FR-004: the escape-prevention baseline, canonicalized once per root (not per entry).
+        // Computed unconditionally, not only when `follow_symlinks` is set (critic finding S1):
+        // `ignore`/`walkdir` always follows a *root* symlink when starting a walk, regardless
+        // of `follow_links`, so a symlinked hidden-ecosystem sub-root (e.g. a repository's own
+        // `.github` replaced by a symlink) can escape the walked root in every mode, not only
+        // under `--follow-symlinks` — this baseline is reused below to close that gap too.
+        // `canonicalize` failing here (a root that itself cannot be resolved) is not fatal to
+        // the walk: it just means containment can never be proven for anything under this root,
+        // so every symlink target falls back to `ignored_manifests` (or the sub-root is simply
+        // not walked) rather than being routed.
+        let canonical_root = std::fs::canonicalize(&absolute_root).ok();
 
         // Always hidden-filtered: `hidden(true)` filters entries by their own basename as the
         // walk descends, so `walk_root` itself is never excluded even if its name starts with
@@ -251,6 +357,8 @@ fn walk_with_limit(
             &absolute_root,
             true,
             respect_gitignore,
+            follow_symlinks,
+            canonical_root.as_deref(),
             &mut ctx,
         ) {
             break 'roots;
@@ -261,11 +369,26 @@ fn walk_with_limit(
             if !sub_root.is_dir() {
                 continue;
             }
+            // S1: `sub_root` (e.g. `<root>/.github`) may itself be a symlink escaping the
+            // walked root — `ignore`/`walkdir` always follows a walk's own root symlink, so
+            // this containment check applies regardless of `follow_symlinks`. A root that
+            // could not be canonicalized above means containment can never be proven, so the
+            // sub-root is skipped entirely rather than walked unchecked.
+            match (
+                canonical_root.as_deref(),
+                std::fs::canonicalize(&sub_root).ok(),
+            ) {
+                (Some(canonical_root), Some(canonical_sub_root))
+                    if canonical_sub_root.starts_with(canonical_root) => {}
+                _ => continue,
+            }
             if !walk_directory(
                 &sub_root,
                 &absolute_root,
                 false,
                 respect_gitignore,
+                follow_symlinks,
+                canonical_root.as_deref(),
                 &mut ctx,
             ) {
                 break 'roots;
@@ -296,6 +419,8 @@ fn walk_directory(
     display_root: &Path,
     hidden: bool,
     respect_gitignore: bool,
+    follow_symlinks: bool,
+    canonical_root: Option<&Path>,
     ctx: &mut WalkCtx<'_>,
 ) -> bool {
     // `.gitignore`/`.ignore` toggle by `respect_gitignore` (issue #1109) — both are
@@ -310,19 +435,20 @@ fn walk_directory(
         .ignore(respect_gitignore)
         .git_ignore(respect_gitignore)
         .git_global(true)
-        .git_exclude(true);
+        .git_exclude(true)
+        .follow_links(follow_symlinks);
     {
         let pruned_dirs = Arc::clone(&pruned_dirs);
+        let canonical_root_owned = canonical_root.map(Path::to_path_buf);
         builder.filter_entry(move |entry| {
-            if is_not_pruned_directory(entry) {
-                true
-            } else {
+            if !is_not_pruned_directory(entry) {
                 pruned_dirs
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .push(entry.path().to_path_buf());
-                false
+                return false;
             }
+            is_not_escaping_directory(entry, follow_symlinks, canonical_root_owned.as_deref())
         });
     }
 
@@ -347,9 +473,63 @@ fn walk_directory(
                 if respect_gitignore {
                     visited.insert(display.clone());
                 }
-                route_file(path, &display, ctx.registry, &mut ctx.outcome);
+                if follow_symlinks {
+                    // FR-004/FR-007 (critic finding C1): every entry is canonicalized and
+                    // containment-checked here, not only ones where the leaf itself is a
+                    // symlink — see `canonicalize_within_root`'s doc for why a leaf-only check
+                    // misses an entry reached through a followed symlinked *directory*. The
+                    // resolved path doubles as the real path routed for reading (FR-007).
+                    match canonicalize_within_root(path, canonical_root) {
+                        Some(canonical_path) => {
+                            // Routing (basename/pattern matching) still goes through `path`
+                            // (the encountered, possibly-symlinked path) — only the content
+                            // read later uses the resolved `canonical_path` (FR-007).
+                            route_file(
+                                path,
+                                &canonical_path,
+                                &display,
+                                ctx.registry,
+                                &mut ctx.outcome,
+                            );
+                        }
+                        None => {
+                            // S4: only report as an excluded manifest when the escaping/
+                            // unresolvable path is itself manifest-shaped — an arbitrary
+                            // out-of-root symlink (e.g. `notes.txt -> /etc/hosts`) must not
+                            // produce a false "looks like a manifest" warning.
+                            if symlink_is_manifest_shaped(path, ctx.registry) {
+                                ctx.outcome.ignored_manifests.push(display);
+                            }
+                        }
+                    }
+                } else {
+                    route_file(path, path, &display, ctx.registry, &mut ctx.outcome);
+                }
             }
-            Ok(_) => {}
+            Ok(entry) => {
+                // Issue #1112: `file_type()` reports the symlink's own type, not its target's,
+                // so a manifest reachable only through a symlink otherwise falls through here
+                // silently. Detection alone (this arm) is always on; actually resolving and
+                // scanning the target is opt-in via `follow_symlinks` (handled by `ignore`'s
+                // own `WalkBuilder::follow_links`, wired above).
+                if entry.path_is_symlink() && symlink_is_manifest_shaped(entry.path(), ctx.registry)
+                {
+                    let path = entry.path();
+                    let display = path
+                        .strip_prefix(display_root)
+                        .unwrap_or(path)
+                        .to_path_buf();
+                    // Background code-review finding #1: must mirror the `is_file()` arm's
+                    // `visited` insert above — otherwise `detect_ignored_manifests`' separate
+                    // unfiltered walk (run when `respect_gitignore` is true) finds this same
+                    // symlink again, sees it missing from `visited`, and pushes a second,
+                    // duplicate `ignored_manifests` entry for it.
+                    if respect_gitignore {
+                        visited.insert(display.clone());
+                    }
+                    ctx.outcome.ignored_manifests.push(display);
+                }
+            }
             Err(error) => ctx.outcome.walk_errors.push(error.to_string()),
         }
     }
@@ -393,20 +573,15 @@ fn warn_on_pruned_directory_manifest(
         return;
     };
     for entry in read_dir.flatten() {
-        if !entry.file_type().is_ok_and(|file_type| file_type.is_file()) {
+        let path = entry.path();
+        if !symlink_is_manifest_shaped(&path, ctx.registry) {
             continue;
         }
-        let path = entry.path();
         let display = path
             .strip_prefix(display_root)
             .unwrap_or(&path)
             .to_path_buf();
-        let Ok(uri) = url::Url::from_file_path(&path) else {
-            continue;
-        };
-        if ctx.registry.for_uri(&uri).is_some() {
-            ctx.outcome.ignored_manifests.push(display);
-        }
+        ctx.outcome.ignored_manifests.push(display);
     }
 }
 
@@ -464,6 +639,22 @@ fn detect_ignored_manifests(
             }
         };
         if !entry.file_type().is_some_and(|t| t.is_file()) {
+            // #1112/M5: a symlinked manifest excluded by `.gitignore`/`.ignore` never appears
+            // in the primary (filtered) walk at all — `ignore` skips a gitignored entry before
+            // yielding it, so it also never lands in `visited`. This unfiltered pass is the
+            // only place that still sees it; without this branch it silently vanished from
+            // both `manifests` and `ignored_manifests` under `--respect-gitignore`, the same
+            // fail-open class `--respect-gitignore` closes for ordinary files.
+            let path = entry.path();
+            if entry.path_is_symlink() && symlink_is_manifest_shaped(path, ctx.registry) {
+                let display = path
+                    .strip_prefix(display_root)
+                    .unwrap_or(path)
+                    .to_path_buf();
+                if !visited.contains(&display) {
+                    ctx.outcome.ignored_manifests.push(display);
+                }
+            }
             continue;
         }
         let path = entry.path();
@@ -514,21 +705,76 @@ fn hidden_ecosystem_directories(registry: &EcosystemRegistry) -> BTreeSet<String
     dirs
 }
 
+/// FR-004/FR-007: resolves `path` to its canonicalized real path and returns it only when that
+/// path is contained within `canonical_root`. `canonical_root` being `None` (symlink-following
+/// disabled, or the root itself failed to canonicalize) always yields `None` — a safe default,
+/// never routing an entry whose containment cannot be proven. A `canonicalize` failure on `path`
+/// itself (e.g. a race between the walk's stat and this check) is likewise treated as "outside
+/// root", never as "inside".
+///
+/// Called for **every** routed file entry under `follow_symlinks: true`, not only ones where
+/// the leaf itself is a symlink (critic finding C1): `ignore`/`walkdir` only sets
+/// `DirEntry::path_is_symlink()` on the entry actually named as a symlink, so an entry reached
+/// by *descending into* a followed symlinked directory reports `path_is_symlink() == false` for
+/// its own leaf while still resolving to a real path outside the walked root — canonicalizing
+/// unconditionally (rather than gating on `path_is_symlink()`) closes that gap for both leaf
+/// symlinks and symlinked ancestors alike.
+///
+/// The returned path also satisfies FR-007: it is the resolved real path
+/// [`DiscoveredManifest::path`] must use for reading, computed once here rather than a second
+/// time at read-time, which would otherwise leave a TOCTOU window between this containment
+/// check and the actual read.
+fn canonicalize_within_root(path: &Path, canonical_root: Option<&Path>) -> Option<PathBuf> {
+    let canonical_root = canonical_root?;
+    let canonical_path = std::fs::canonicalize(path).ok()?;
+    canonical_path
+        .starts_with(canonical_root)
+        .then_some(canonical_path)
+}
+
+/// Resolves `path` (which failed the regular `is_file()` check) as a possible symlink to a
+/// manifest-shaped file, without reading its content. Returns `false` for anything that isn't
+/// a symlink resolving to a manifest-shaped regular file — a broken symlink, a symlink to a
+/// directory, or a target no ecosystem's `for_uri` claims (issue #1112, FR-001).
+fn symlink_is_manifest_shaped(path: &Path, registry: &EcosystemRegistry) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    let Ok(uri) = url::Url::from_file_path(path) else {
+        return false;
+    };
+    registry.for_uri(&uri).is_some()
+}
+
 /// Routes one already-discovered file through `registry.for_uri`, pushing a
 /// [`DiscoveredManifest`] onto `outcome` when an ecosystem claims it.
 ///
-/// `path` is expected to already be absolute (every caller absolutizes its walk root first —
-/// see [`walk_with_limit`]) so `url::Url::from_file_path` should never fail in practice; if it
-/// somehow does (issue #1108), that is recorded as a warning rather than silently dropping the
-/// file, so a future regression in the absolutization degrades loudly instead of quietly
-/// reintroducing the "walk finds zero manifests" bug.
+/// `route_path` and `read_path` are the same path for every caller except the
+/// `follow_symlinks: true` branch of `walk_directory` (FR-007): ecosystem routing is a
+/// basename/pattern match (`manifest_filenames`, `manifest_patterns`, ...), so it must always
+/// go through the *encountered* path — a symlink named `Cargo.toml` routes as `Cargo.toml`
+/// regardless of what its target is named — while [`DiscoveredManifest::path`] (used later to
+/// read the manifest's content) must be the resolved real path a symlink was already
+/// containment-checked against, not the symlink itself. `route_path` is also stored as
+/// [`DiscoveredManifest::uri_path`] (review finding M2): lockfile/in-use-version discovery
+/// must anchor its ancestor-directory search at the symlink's own location, not its target's.
+///
+/// `route_path` is expected to already be absolute (every caller absolutizes its walk root
+/// first — see [`walk_with_limit`]) so `url::Url::from_file_path` should never fail in
+/// practice; if it somehow does (issue #1108), that is recorded as a warning rather than
+/// silently dropping the file, so a future regression in the absolutization degrades loudly
+/// instead of quietly reintroducing the "walk finds zero manifests" bug.
 fn route_file(
-    path: &Path,
+    route_path: &Path,
+    read_path: &Path,
     display_path: &Path,
     registry: &EcosystemRegistry,
     outcome: &mut WalkOutcome,
 ) {
-    let Ok(uri) = url::Url::from_file_path(path) else {
+    let Ok(uri) = url::Url::from_file_path(route_path) else {
         outcome.walk_errors.push(format!(
             "could not convert to a file URI, skipping: {}",
             display_path.display()
@@ -537,7 +783,8 @@ fn route_file(
     };
     if let Some(ecosystem) = registry.for_uri(&uri) {
         outcome.manifests.push(DiscoveredManifest {
-            path: path.to_path_buf(),
+            path: read_path.to_path_buf(),
+            uri_path: route_path.to_path_buf(),
             display_path: display_path.to_path_buf(),
             ecosystem,
         });
@@ -598,7 +845,7 @@ mod tests {
     #[test]
     fn test_walk_empty_directory_finds_nothing() {
         let dir = tempfile::tempdir().expect("create temp dir");
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false);
+        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
         assert!(outcome.manifests.is_empty());
         assert!(!outcome.truncated);
     }
@@ -608,7 +855,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("create temp dir");
         fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n")
             .expect("write manifest");
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false);
+        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
         assert_eq!(outcome.manifests.len(), 1);
         assert_eq!(
             outcome.manifests[0].display_path,
@@ -630,7 +877,7 @@ mod tests {
         fs::create_dir(dir.path().join("ignored")).expect("mkdir");
         fs::write(dir.path().join("ignored").join("Cargo.toml"), "[package]\n")
             .expect("write manifest");
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), true);
+        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), true, false);
         assert!(outcome.manifests.is_empty());
         assert_eq!(
             outcome.ignored_manifests,
@@ -647,7 +894,7 @@ mod tests {
         fs::create_dir(dir.path().join(".git")).expect("create .git marker");
         fs::write(dir.path().join(".gitignore"), "Cargo.toml\n").expect("write gitignore");
         fs::write(dir.path().join("Cargo.toml"), "[package]\n").expect("write manifest");
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false);
+        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
         assert_eq!(outcome.manifests.len(), 1);
         assert!(outcome.ignored_manifests.is_empty());
     }
@@ -663,7 +910,7 @@ mod tests {
             .expect("write nested gitignore");
         fs::write(dir.path().join("sub").join("Cargo.toml"), "[package]\n")
             .expect("write manifest");
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false);
+        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
         assert_eq!(outcome.manifests.len(), 1);
     }
 
@@ -674,7 +921,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("create temp dir");
         fs::write(dir.path().join(".ignore"), "Cargo.toml\n").expect("write .ignore");
         fs::write(dir.path().join("Cargo.toml"), "[package]\n").expect("write manifest");
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false);
+        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
         assert_eq!(outcome.manifests.len(), 1);
     }
 
@@ -696,7 +943,7 @@ mod tests {
         )
         .expect("write vendored manifest");
 
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false);
+        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
 
         assert_eq!(outcome.manifests.len(), 1);
         assert_eq!(
@@ -717,7 +964,7 @@ mod tests {
         fs::write(dir.path().join("vendor").join("Cargo.toml"), "[package]\n")
             .expect("write manifest directly under pruned dir");
 
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false);
+        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
 
         assert!(
             outcome.manifests.is_empty(),
@@ -743,7 +990,7 @@ mod tests {
         )
         .expect("write nested manifest");
 
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false);
+        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
 
         assert!(outcome.manifests.is_empty());
         assert!(outcome.ignored_manifests.is_empty());
@@ -770,7 +1017,13 @@ mod tests {
         // Comfortably covers the primary walk (root + .gitignore + Cargo.toml == 3 entries,
         // `noise/` itself is `.gitignore`-excluded there) but not the diagnostic pass, which
         // ignores `.gitignore` and must descend into `noise/`'s 20 files.
-        let outcome = walk_with_limit(&[dir.path().to_path_buf()], &test_registry(), 5, true);
+        let outcome = walk_with_limit(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            5,
+            true,
+            false,
+        );
 
         assert!(
             !outcome.truncated,
@@ -803,7 +1056,7 @@ mod tests {
         )
         .expect("write vendored manifest");
 
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), true);
+        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), true, false);
 
         assert!(outcome.ignored_manifests.is_empty());
     }
@@ -823,7 +1076,7 @@ mod tests {
         .expect("write git info/exclude");
         fs::write(dir.path().join("Cargo.toml"), "[package]\n").expect("write manifest");
 
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), true);
+        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), true, false);
 
         assert!(outcome.manifests.is_empty());
         assert!(
@@ -838,7 +1091,7 @@ mod tests {
         fs::write(dir.path().join(".gitignore"), "Cargo.toml\n").expect("write gitignore");
         let manifest = dir.path().join("Cargo.toml");
         fs::write(&manifest, "[package]\n").expect("write manifest");
-        let outcome = walk(&[manifest], &test_registry(), true);
+        let outcome = walk(&[manifest], &test_registry(), true, false);
         assert_eq!(outcome.manifests.len(), 1);
     }
 
@@ -856,7 +1109,7 @@ mod tests {
         fs::write(dir.path().join("Cargo.toml"), "[package]\n").expect("write manifest");
         let _guard = CwdGuard::chdir(dir.path());
 
-        let outcome = walk(&[PathBuf::from(".")], &test_registry(), false);
+        let outcome = walk(&[PathBuf::from(".")], &test_registry(), false, false);
 
         assert_eq!(outcome.manifests.len(), 1);
         assert!(outcome.walk_errors.is_empty());
@@ -875,7 +1128,12 @@ mod tests {
         fs::write(dir.path().join("Cargo.toml"), "[package]\n").expect("write manifest");
         let _guard = CwdGuard::chdir(dir.path());
 
-        let outcome = walk(&[PathBuf::from("Cargo.toml")], &test_registry(), false);
+        let outcome = walk(
+            &[PathBuf::from("Cargo.toml")],
+            &test_registry(),
+            false,
+            false,
+        );
 
         assert_eq!(outcome.manifests.len(), 1);
         assert!(outcome.unrecognized_explicit_paths.is_empty());
@@ -892,7 +1150,13 @@ mod tests {
         }
         fs::write(dir.path().join("Cargo.toml"), "[package]\n").expect("write manifest");
 
-        let outcome = walk_with_limit(&[dir.path().to_path_buf()], &test_registry(), 2, false);
+        let outcome = walk_with_limit(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            2,
+            false,
+            false,
+        );
         assert!(
             outcome.truncated,
             "a 2-entry limit against a 6-entry tree must truncate"
@@ -903,7 +1167,13 @@ mod tests {
     fn test_walk_with_limit_does_not_truncate_when_under_the_cap() {
         let dir = tempfile::tempdir().expect("create temp dir");
         fs::write(dir.path().join("Cargo.toml"), "[package]\n").expect("write manifest");
-        let outcome = walk_with_limit(&[dir.path().to_path_buf()], &test_registry(), 100, false);
+        let outcome = walk_with_limit(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            100,
+            false,
+            false,
+        );
         assert!(!outcome.truncated);
         assert_eq!(outcome.manifests.len(), 1);
     }
@@ -915,7 +1185,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("create temp dir");
         let unknown = dir.path().join("notes.txt");
         fs::write(&unknown, "not a manifest").expect("write file");
-        let outcome = walk(std::slice::from_ref(&unknown), &test_registry(), false);
+        let outcome = walk(
+            std::slice::from_ref(&unknown),
+            &test_registry(),
+            false,
+            false,
+        );
         assert!(outcome.manifests.is_empty());
         assert_eq!(outcome.unrecognized_explicit_paths, vec![unknown]);
     }
@@ -927,7 +1202,7 @@ mod tests {
     fn test_walk_unrecognized_file_found_during_directory_walk_is_not_reported() {
         let dir = tempfile::tempdir().expect("create temp dir");
         fs::write(dir.path().join("notes.txt"), "not a manifest").expect("write file");
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false);
+        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
         assert!(outcome.unrecognized_explicit_paths.is_empty());
     }
 
@@ -936,7 +1211,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("create temp dir");
         fs::write(dir.path().join("Cargo.toml"), "[package]\n").expect("write cargo manifest");
         fs::write(dir.path().join("package.json"), "{}").expect("write npm manifest");
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false);
+        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
         assert_eq!(outcome.manifests.len(), 2);
     }
 
@@ -966,7 +1241,13 @@ mod tests {
         }
         fs::write(dir.path().join("Cargo.toml"), "[package]\n").expect("write manifest");
 
-        let outcome = walk_with_limit(&[dir.path().to_path_buf()], &test_registry(), 3, false);
+        let outcome = walk_with_limit(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            3,
+            false,
+            false,
+        );
         assert!(
             !outcome.truncated,
             ".git's 100 dummy files must never be walked, so a limit of 3 must suffice"
@@ -992,7 +1273,7 @@ mod tests {
         )
         .expect("write workflow");
 
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false);
+        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
         assert_eq!(outcome.manifests.len(), 1);
         assert_eq!(
             outcome.manifests[0].display_path,
@@ -1019,11 +1300,465 @@ mod tests {
             })
             .collect();
 
-        let outcome = walk_with_limit(&paths, &test_registry(), 2, false);
+        let outcome = walk_with_limit(&paths, &test_registry(), 2, false, false);
         assert!(
             outcome.truncated,
             "a 2-entry limit against 5 explicit paths must truncate"
         );
         assert_eq!(outcome.manifests.len(), 2);
+    }
+
+    /// Issue #1112, US-001: a symlinked manifest must never silently vanish from the scan
+    /// under the default (`follow_symlinks: false`) mode — it is reported via
+    /// `ignored_manifests`, not `manifests`.
+    #[cfg(unix)]
+    #[test]
+    fn test_walk_default_detects_symlinked_manifest_without_following() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let real = dir.path().join("real").join("manifest-data");
+        fs::create_dir(dir.path().join("real")).expect("mkdir real");
+        fs::write(&real, "[package]\n").expect("write real manifest");
+        std::os::unix::fs::symlink(&real, dir.path().join("Cargo.toml")).expect("create symlink");
+
+        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
+
+        assert!(outcome.manifests.is_empty());
+        assert_eq!(outcome.ignored_manifests, vec![PathBuf::from("Cargo.toml")]);
+    }
+
+    /// A broken symlink is not manifest-shaped by definition — no `ignored_manifests` entry.
+    #[cfg(unix)]
+    #[test]
+    fn test_walk_broken_symlink_is_not_reported_as_manifest() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        std::os::unix::fs::symlink(
+            dir.path().join("does-not-exist"),
+            dir.path().join("Cargo.toml"),
+        )
+        .expect("create broken symlink");
+
+        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
+
+        assert!(outcome.manifests.is_empty());
+        assert!(outcome.ignored_manifests.is_empty());
+    }
+
+    /// A symlink to a directory is not manifest-shaped either.
+    #[cfg(unix)]
+    #[test]
+    fn test_walk_symlink_to_directory_is_not_reported_as_manifest() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        fs::create_dir(dir.path().join("real_dir")).expect("mkdir real_dir");
+        std::os::unix::fs::symlink(dir.path().join("real_dir"), dir.path().join("link_dir"))
+            .expect("create symlink to directory");
+
+        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
+
+        assert!(outcome.manifests.is_empty());
+        assert!(outcome.ignored_manifests.is_empty());
+    }
+
+    /// Spec §6 edge case: a symlink to a manifest-shaped file sitting directly at a
+    /// `PRUNED_DIRECTORIES`-excluded directory's own root is reported via `ignored_manifests`,
+    /// mirroring the existing regular-file case
+    /// (`test_walk_default_warns_on_manifest_directly_inside_pruned_directory`).
+    #[cfg(unix)]
+    #[test]
+    fn test_walk_pruned_directory_symlinked_manifest_is_still_warned() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let real = dir.path().join("real-cargo.toml");
+        fs::write(&real, "[package]\n").expect("write real manifest");
+        fs::create_dir(dir.path().join("vendor")).expect("mkdir vendor");
+        std::os::unix::fs::symlink(&real, dir.path().join("vendor").join("Cargo.toml"))
+            .expect("create symlink inside pruned directory");
+
+        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
+
+        assert!(
+            outcome.manifests.is_empty(),
+            "still pruned from the primary scan"
+        );
+        assert_eq!(
+            outcome.ignored_manifests,
+            vec![PathBuf::from("vendor").join("Cargo.toml")]
+        );
+    }
+
+    /// Issue #1112, US-002 (FR-003): with `follow_symlinks: true`, a symlinked manifest inside
+    /// the walked root is resolved and routed, appearing in `manifests` rather than only
+    /// `ignored_manifests`.
+    #[cfg(unix)]
+    #[test]
+    fn test_walk_follow_symlinks_resolves_and_routes_manifest() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let real = dir.path().join("real").join("manifest-data");
+        fs::create_dir(dir.path().join("real")).expect("mkdir real");
+        fs::write(&real, "[package]\n").expect("write real manifest");
+        std::os::unix::fs::symlink(&real, dir.path().join("Cargo.toml")).expect("create symlink");
+
+        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, true);
+
+        assert_eq!(outcome.manifests.len(), 1);
+        assert!(outcome.ignored_manifests.is_empty());
+        assert_eq!(outcome.manifests[0].ecosystem.id(), "cargo");
+        // S3/FR-007: `path` (used for reading) is the resolved real path, not the symlink.
+        assert_eq!(
+            outcome.manifests[0]
+                .path
+                .canonicalize()
+                .expect("canonicalize actual path"),
+            real.canonicalize()
+                .expect("canonicalize expected real path")
+        );
+        // Review finding M3: canonicalizing both sides above can't actually distinguish
+        // "symlink path" from "real path" on its own (both would resolve to the same real
+        // file) — assert the *raw*, non-canonicalized paths differ too, proving `path` is
+        // genuinely the resolved target, not the symlink verbatim.
+        assert_ne!(
+            outcome.manifests[0].path,
+            dir.path().join("Cargo.toml"),
+            "path must be the resolved real path, not the symlink's own raw path"
+        );
+    }
+
+    /// FR-002/US-001: the same symlinked-manifest fixture behaves oppositely depending on the
+    /// flag — `follow_symlinks: false` never reads the target (empty `manifests`, populated
+    /// `ignored_manifests`), `follow_symlinks: true` resolves and routes it (populated
+    /// `manifests`, empty `ignored_manifests`) — proving the flag actually gates reading, not
+    /// just two independently-plausible outcomes.
+    #[cfg(unix)]
+    #[test]
+    fn test_walk_follow_symlinks_toggles_between_ignored_and_routed() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let real = dir.path().join("real").join("manifest-data");
+        fs::create_dir(dir.path().join("real")).expect("mkdir real");
+        fs::write(&real, "[package]\n").expect("write real manifest");
+        std::os::unix::fs::symlink(&real, dir.path().join("Cargo.toml")).expect("create symlink");
+
+        let disabled = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
+        assert!(disabled.manifests.is_empty());
+        assert_eq!(
+            disabled.ignored_manifests,
+            vec![PathBuf::from("Cargo.toml")]
+        );
+
+        let enabled = walk(&[dir.path().to_path_buf()], &test_registry(), false, true);
+        assert_eq!(enabled.manifests.len(), 1);
+        assert!(enabled.ignored_manifests.is_empty());
+    }
+
+    /// FR-007: `display_path` reflects the symlink's own encountered path, not the resolved
+    /// target's real path.
+    #[cfg(unix)]
+    #[test]
+    fn test_walk_follow_symlinks_display_path_is_symlink_path_not_target() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let real = dir.path().join("real").join("manifest-data");
+        fs::create_dir(dir.path().join("real")).expect("mkdir real");
+        fs::write(&real, "[package]\n").expect("write real manifest");
+        std::os::unix::fs::symlink(&real, dir.path().join("Cargo.toml")).expect("create symlink");
+
+        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, true);
+
+        assert_eq!(outcome.manifests.len(), 1);
+        assert_eq!(
+            outcome.manifests[0].display_path,
+            PathBuf::from("Cargo.toml")
+        );
+    }
+
+    /// FR-006: `follow_symlinks: true` does not defeat `PRUNED_DIRECTORIES` pruning, even when
+    /// the manifest inside the pruned directory is itself reachable through a symlink.
+    #[cfg(unix)]
+    #[test]
+    fn test_walk_follow_symlinks_still_prunes_node_modules() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        fs::write(dir.path().join("Cargo.toml"), "[package]\n").expect("write manifest");
+        let real_vendored = dir.path().join("real-vendored-manifest");
+        fs::write(&real_vendored, "{}").expect("write real vendored manifest");
+        fs::create_dir_all(dir.path().join("node_modules").join("left-pad"))
+            .expect("mkdir node_modules/left-pad");
+        std::os::unix::fs::symlink(
+            &real_vendored,
+            dir.path()
+                .join("node_modules")
+                .join("left-pad")
+                .join("package.json"),
+        )
+        .expect("symlink vendored manifest inside pruned directory");
+
+        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, true);
+
+        assert_eq!(
+            outcome.manifests.len(),
+            1,
+            "a symlinked manifest inside a pruned directory must still be pruned, not routed"
+        );
+        assert_eq!(
+            outcome.manifests[0].display_path,
+            PathBuf::from("Cargo.toml")
+        );
+    }
+
+    /// FR-006: `follow_symlinks: true` still respects `walk_with_limit`'s cap when a symlinked
+    /// directory inflates the number of entries the walk must visit.
+    #[cfg(unix)]
+    #[test]
+    fn test_walk_follow_symlinks_still_enforces_max_walked_files() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        // Review finding M4: the noise source is a *hidden* (dot-prefixed) directory, so the
+        // default `hidden(true)` filter excludes it from ever being walked directly by its own
+        // name — the only way to reach its 5 files is by following `noise-link`, making the
+        // symlink genuinely load-bearing for this test. `limit` is chosen to comfortably cover
+        // the baseline tree (walk root + `Cargo.toml` + the `noise-link` entry itself = 3
+        // entries, `.noise-source` never yielded at all) but not baseline-plus-5-noise-files —
+        // with `follow_symlinks: false` this same fixture and limit does *not* truncate,
+        // proving the symlink (not just the raw entry count) is what pushes the walk over.
+        let noise_target = dir.path().join(".noise-source");
+        fs::create_dir(&noise_target).expect("mkdir .noise-source");
+        for i in 0..5 {
+            fs::write(noise_target.join(format!("noise-{i}.txt")), "").expect("write noise file");
+        }
+        std::os::unix::fs::symlink(&noise_target, dir.path().join("noise-link"))
+            .expect("symlink noise directory");
+        fs::write(dir.path().join("Cargo.toml"), "[package]\n").expect("write manifest");
+
+        let outcome = walk_with_limit(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            4,
+            false,
+            true,
+        );
+        assert!(
+            outcome.truncated,
+            "a 4-entry limit against a tree inflated by a symlinked directory must truncate"
+        );
+    }
+
+    /// FR-004, US-003: a symlink inside the walked root pointing to a manifest-shaped file
+    /// *outside* the walked root is never routed, even with `follow_symlinks: true`.
+    #[cfg(unix)]
+    #[test]
+    fn test_walk_follow_symlinks_rejects_target_outside_root() {
+        let outside = tempfile::tempdir().expect("create outside temp dir");
+        let outside_manifest = outside.path().join("Cargo.toml");
+        fs::write(&outside_manifest, "[package]\n").expect("write outside manifest");
+
+        let root = tempfile::tempdir().expect("create walked root");
+        std::os::unix::fs::symlink(&outside_manifest, root.path().join("Cargo.toml"))
+            .expect("create symlink escaping the walked root");
+
+        let outcome = walk(&[root.path().to_path_buf()], &test_registry(), false, true);
+
+        assert!(
+            outcome.manifests.is_empty(),
+            "must never route a symlink target outside the walked root"
+        );
+        assert_eq!(outcome.ignored_manifests, vec![PathBuf::from("Cargo.toml")]);
+    }
+
+    /// FR-005, US-003: a symlink loop must not hang or crash the walk; it is reported via
+    /// `walk_errors` and the run's other manifests are still found.
+    #[cfg(unix)]
+    #[test]
+    fn test_walk_follow_symlinks_reports_symlink_loop_via_walk_errors() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        fs::create_dir_all(dir.path().join("a")).expect("mkdir a");
+        fs::create_dir_all(dir.path().join("b")).expect("mkdir b");
+        std::os::unix::fs::symlink(dir.path().join("b"), dir.path().join("a").join("loop"))
+            .expect("create a/loop -> b");
+        std::os::unix::fs::symlink(dir.path().join("a"), dir.path().join("b").join("loop"))
+            .expect("create b/loop -> a");
+        fs::write(dir.path().join("Cargo.toml"), "[package]\n").expect("write manifest");
+
+        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, true);
+
+        assert!(
+            outcome
+                .walk_errors
+                .iter()
+                .any(|error| error.to_lowercase().contains("loop")),
+            "a symlink loop must be reported via walk_errors naming the loop, not just any \
+             error, and must not hang or crash: {:?}",
+            outcome.walk_errors
+        );
+        assert!(
+            outcome
+                .manifests
+                .iter()
+                .any(|m| m.display_path == Path::new("Cargo.toml")),
+            "other manifests in the same tree must still be found"
+        );
+    }
+
+    /// Spec §6 edge case: `--follow-symlinks` and `--respect-gitignore` are independent flags —
+    /// a symlinked manifest excluded by `.gitignore` is still reported via the existing
+    /// `.gitignore`-suppression path once resolved, exactly as a non-symlinked manifest would
+    /// be, rather than `follow_symlinks` bypassing the ignore rule.
+    #[cfg(unix)]
+    #[test]
+    fn test_walk_follow_symlinks_and_respect_gitignore_together_still_honors_gitignore() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        fs::create_dir(dir.path().join(".git")).expect("create .git marker");
+        fs::write(dir.path().join(".gitignore"), "Cargo.toml\n").expect("write gitignore");
+        let real = dir.path().join("real").join("manifest-data");
+        fs::create_dir(dir.path().join("real")).expect("mkdir real");
+        fs::write(&real, "[package]\n").expect("write real manifest");
+        std::os::unix::fs::symlink(&real, dir.path().join("Cargo.toml")).expect("create symlink");
+
+        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), true, true);
+
+        assert!(
+            outcome.manifests.is_empty(),
+            "a .gitignore-excluded symlinked manifest must not be routed even under \
+             --follow-symlinks"
+        );
+        assert_eq!(outcome.ignored_manifests, vec![PathBuf::from("Cargo.toml")]);
+    }
+
+    /// Critic finding C1 regression: a symlinked *directory* (not a symlinked leaf file) must
+    /// not let `--follow-symlinks` escape the walked root — the leaf entry inside it
+    /// (`evil/Cargo.toml`) is not itself a symlink, so a containment check keyed only on
+    /// `path_is_symlink()` would miss it.
+    #[cfg(unix)]
+    #[test]
+    fn test_walk_follow_symlinks_rejects_directory_symlink_escaping_root() {
+        let outside = tempfile::tempdir().expect("create outside temp dir");
+        fs::write(outside.path().join("Cargo.toml"), "[package]\n")
+            .expect("write outside manifest");
+
+        let root = tempfile::tempdir().expect("create walked root");
+        fs::write(root.path().join("Cargo.toml"), "[package]\n").expect("write root manifest");
+        std::os::unix::fs::symlink(outside.path(), root.path().join("evil"))
+            .expect("symlink a directory escaping the walked root");
+
+        let outcome = walk(&[root.path().to_path_buf()], &test_registry(), false, true);
+
+        assert!(
+            outcome
+                .manifests
+                .iter()
+                .all(|m| m.display_path != PathBuf::from("evil").join("Cargo.toml")),
+            "a manifest reached only by descending into a symlinked directory outside the \
+             walked root must never be routed: {:?}",
+            outcome
+                .manifests
+                .iter()
+                .map(|m| &m.display_path)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            outcome.manifests.len(),
+            1,
+            "the root's own, non-escaping Cargo.toml must still be found"
+        );
+    }
+
+    /// Background code-review finding #2: an escaping symlinked directory must be pruned
+    /// *before* `ignore`/`walkdir` descends into it, not walked entry-by-entry and rejected
+    /// individually — otherwise a large external tree behind the symlink can exhaust
+    /// `MAX_WALKED_FILES` on content outside the walked root, silently truncating the walk and
+    /// dropping legitimate manifests elsewhere in the real tree (the exact #1112 fail-open
+    /// class, reopened through this fix's own flag). Proven by pointing the escaping symlink at
+    /// a directory with far more entries than a deliberately tiny `limit`, and asserting the
+    /// walk still finds the root's own manifest without truncating.
+    #[cfg(unix)]
+    #[test]
+    fn test_walk_follow_symlinks_escaping_directory_does_not_exhaust_the_budget() {
+        let outside = tempfile::tempdir().expect("create outside temp dir");
+        for i in 0..50 {
+            fs::write(outside.path().join(format!("noise-{i}.txt")), "")
+                .expect("write outside noise file");
+        }
+
+        let root = tempfile::tempdir().expect("create walked root");
+        fs::write(root.path().join("Cargo.toml"), "[package]\n").expect("write root manifest");
+        std::os::unix::fs::symlink(outside.path(), root.path().join("evil"))
+            .expect("symlink a directory escaping the walked root");
+
+        // Comfortably covers the walked root's own 2 entries (root dir + Cargo.toml) plus the
+        // pruned `evil` entry itself, but is far smaller than the 50 files behind it — if the
+        // escaping directory were walked instead of pruned, this would truncate long before
+        // `Cargo.toml` is guaranteed to be counted.
+        let outcome = walk_with_limit(
+            &[root.path().to_path_buf()],
+            &test_registry(),
+            5,
+            false,
+            true,
+        );
+
+        assert!(
+            !outcome.truncated,
+            "pruning the escaping directory before descent must keep the walk well under the \
+             budget, not exhaust it on external content"
+        );
+        assert_eq!(
+            outcome.manifests.len(),
+            1,
+            "the root's own manifest must still be found"
+        );
+    }
+
+    /// Background code-review finding #1: a symlinked manifest that is not itself
+    /// `.gitignore`-excluded must be reported exactly once in `ignored_manifests`, not twice.
+    /// Root cause was the primary walk's symlink-detection arm never inserting into `visited`
+    /// (only the `is_file()` arm did), so `detect_ignored_manifests`'s separate unfiltered walk
+    /// (run because `respect_gitignore` is true) found the same symlink again and double-counted
+    /// it.
+    #[cfg(unix)]
+    #[test]
+    fn test_walk_respect_gitignore_does_not_duplicate_symlinked_manifest_warning() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        fs::create_dir(dir.path().join(".git")).expect("create .git marker");
+        // Present but irrelevant to this symlink — proves the duplication wasn't specific to
+        // an empty .gitignore file being absent.
+        fs::write(dir.path().join(".gitignore"), "*.log\n").expect("write gitignore");
+        let real = dir.path().join("real").join("manifest-data");
+        fs::create_dir(dir.path().join("real")).expect("mkdir real");
+        fs::write(&real, "[package]\n").expect("write real manifest");
+        std::os::unix::fs::symlink(&real, dir.path().join("Cargo.toml")).expect("create symlink");
+
+        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), true, false);
+
+        assert_eq!(
+            outcome.ignored_manifests,
+            vec![PathBuf::from("Cargo.toml")],
+            "a non-gitignored symlinked manifest must be reported exactly once"
+        );
+    }
+
+    /// Critic finding S1 regression: a registered ecosystem's own hidden dot-directory (e.g.
+    /// `.github`) escaping the walked root via a symlink must not be scanned, regardless of
+    /// `follow_symlinks` — `ignore`/`walkdir` always follows a walk's own root symlink, so this
+    /// containment check must apply in the default mode too.
+    #[cfg(unix)]
+    #[test]
+    fn test_walk_default_rejects_symlinked_hidden_ecosystem_directory_escaping_root() {
+        let outside = tempfile::tempdir().expect("create outside temp dir");
+        fs::create_dir_all(outside.path().join("workflows")).expect("mkdir workflows");
+        fs::write(
+            outside.path().join("workflows").join("ci.yml"),
+            "on: push\njobs:\n  x:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n",
+        )
+        .expect("write workflow");
+
+        let root = tempfile::tempdir().expect("create walked root");
+        std::os::unix::fs::symlink(outside.path(), root.path().join(".github"))
+            .expect("symlink .github escaping the walked root");
+
+        let outcome = walk(&[root.path().to_path_buf()], &test_registry(), false, false);
+
+        assert!(
+            outcome.manifests.is_empty(),
+            "a symlinked .github escaping the walked root must never be scanned, even in the \
+             default mode: {:?}",
+            outcome
+                .manifests
+                .iter()
+                .map(|m| &m.display_path)
+                .collect::<Vec<_>>()
+        );
     }
 }

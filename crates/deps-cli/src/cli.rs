@@ -93,6 +93,15 @@ pub struct CheckArgs {
     /// flag only when scanning a target you trust as much as your own `deps.toml`.
     #[arg(long)]
     pub respect_gitignore: bool,
+
+    /// Follow symlinks during the directory walk and resolve a symlinked manifest's target for
+    /// scanning (issue #1112). A symlink whose resolved, canonicalized target falls outside the
+    /// walked root is never followed regardless of this flag — see [`crate::walk::walk`]'s doc.
+    /// When this flag is not passed (the default), a symlink to a manifest-shaped file is still
+    /// detected and reported via a warning (non-zero exit code), it is simply not resolved and
+    /// scanned.
+    #[arg(long)]
+    pub follow_symlinks: bool,
 }
 
 impl CheckArgs {
