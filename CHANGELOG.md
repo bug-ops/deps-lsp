@@ -43,11 +43,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-engine, deps-lsp, ci**: closed `deps-lsp`'s last direct dependency on `deps-gitlab-ci` via a new `deps_engine::setup::validate_gitlab_instance_host`, and added a CI guard asserting no ecosystem crate is a *direct* non-dev dependency of `deps-lsp`/`deps-cli` (resolves #1073) (#1079)
 - **docs**: mdBook now publishes to the GitHub Pages site root (`https://bug-ops.github.io/deps-lsp/`) instead of `/book/`; `mdbook.yml`'s now-dead `workflow_run` trigger for the removed `Documentation` workflow is also dropped (#1098)
 - **CI**: `mdbook.yml` now deploys via the native GitHub Actions Pages flow (`actions/configure-pages`, `actions/upload-pages-artifact`, `actions/deploy-pages`) instead of `peaceiris/actions-gh-pages` pushing to a `gh-pages` branch, matching the repo's Pages source now being set to "GitHub Actions"
-- removed redundant in-code `//` comments that merely restated adjacent code across every crate; issue-referenced and invariant-documenting comments are untouched (no functional change)
+- removed redundant in-code `//` comments that merely restated adjacent code across every crate; issue-referenced and invariant-documenting comments are untouched (no functional change) (#1102)
 
 ### Removed
 - **CI**: removed the legacy `Documentation` workflow (`.github/workflows/docs.yml`), which deployed `cargo doc` output to the `gh-pages` root with `force_orphan: true` on every Rust-touching push, wiping the mdBook site published by `mdbook.yml` (#1096) each time it ran
-- **CI**: removed the `wasm` job — it built `crates/deps-zed`'s WASM target, but `deps-zed` is a separate git submodule with its own repository and CI; verifying it here duplicated work that belongs there
+- **CI**: removed the `wasm` job — it built `crates/deps-zed`'s WASM target, but `deps-zed` is a separate git submodule with its own repository and CI; verifying it here duplicated work that belongs there (#1102)
 
 ### Fixed
 - **deps-cargo, deps-nuget, deps-pypi, deps-lsp, deps-npm, deps-gradle**: client-supplied manifest/document URIs with a non-`file:` scheme or remote host no longer resolve against the real filesystem, including a Windows-only bypass where a `file:` URI's host was silently stripped by URL parsing when the path looked like a drive letter (resolves #1090) (#1091)
