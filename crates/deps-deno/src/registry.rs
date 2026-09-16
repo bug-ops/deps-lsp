@@ -455,6 +455,7 @@ impl DenoRegistry {
     /// version-endpoint bases pointed at a mock server (#1038), mirroring
     /// `deps_npm::NpmRegistry::with_public_base_for_test`.
     #[cfg(test)]
+    #[cfg(feature = "lsp-responses")]
     #[must_use]
     pub(crate) fn with_bases_for_test(
         cache: Arc<HttpCache>,

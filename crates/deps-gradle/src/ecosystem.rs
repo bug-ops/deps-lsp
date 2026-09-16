@@ -2,12 +2,16 @@
 
 use std::any::Any;
 use std::sync::Arc;
+#[cfg(feature = "lsp-responses")]
 use tower_lsp_server::ls_types::{CompletionItem, Position, Range};
 use url::Url;
 
+#[cfg(feature = "lsp-responses")]
+use deps_core::completion::Completions;
+#[cfg(feature = "lsp-responses")]
+use deps_core::position_in_range;
 use deps_core::{
-    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, completion::Completions,
-    lsp_helpers::EcosystemFormatter, position_in_range,
+    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, lsp_helpers::EcosystemFormatter,
 };
 use deps_maven::MavenCentralRegistry;
 
@@ -30,6 +34,7 @@ use crate::formatter::GradleFormatter;
 /// `test_generate_completions_version_context_no_dependency_at_position_returns_empty`
 /// below), whereas [`deps_core::completion::detect_completion_context`] derives its context
 /// from parsed-AST dependency ranges (see that method's default-impl doc).
+#[cfg(feature = "lsp-responses")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GradleCompletionContext {
     /// Cursor is inside a dependency coordinate's version segment.
@@ -65,6 +70,7 @@ impl GradleEcosystem {
         }
     }
 
+    #[cfg(feature = "lsp-responses")]
     async fn complete_package_names(&self, prefix: &str, range: Range) -> Vec<CompletionItem> {
         deps_core::completion::complete_package_names_generic(
             self.registry.as_ref(),
@@ -75,6 +81,7 @@ impl GradleEcosystem {
         .await
     }
 
+    #[cfg(feature = "lsp-responses")]
     async fn complete_versions(
         &self,
         package_name: &deps_core::PackageName,
@@ -110,6 +117,7 @@ impl GradleEcosystem {
     /// back to UTF-16 units via [`deps_core::completion::byte_to_utf16_offset`].
     // `col_idx` comes from `utf16_to_byte_offset` (char_indices-based), so it is always a
     // char boundary.
+    #[cfg(feature = "lsp-responses")]
     #[allow(clippy::string_slice)]
     fn detect_completion_context<'a>(
         content: &'a str,
@@ -140,6 +148,7 @@ impl GradleEcosystem {
 /// Builds an LSP [`Range`] on `line_idx` from a pair of byte offsets into `line`,
 /// converting each to a UTF-16 code unit offset via
 /// [`deps_core::completion::byte_to_utf16_offset`].
+#[cfg(feature = "lsp-responses")]
 fn byte_range(line: &str, line_idx: u32, start_byte: usize, end_byte: usize) -> Range {
     Range::new(
         Position::new(
@@ -172,6 +181,7 @@ fn byte_range(line: &str, line_idx: u32, start_byte: usize, end_byte: usize) -> 
 // as those helpers (see `count_real_quotes`'s doc comment) so the two can't disagree on
 // a line containing `\"` (#738 follow-up); a future change to that rule must be mirrored
 // here too.
+#[cfg(feature = "lsp-responses")]
 fn current_field_start(before_cursor: &str) -> usize {
     let mut in_string = false;
     let mut backslash_run = 0usize;
@@ -203,6 +213,7 @@ fn current_field_start(before_cursor: &str) -> usize {
 // Every offset below (`field_start`, `rel_eq_pos`, `quote_start`, `value_start`/`value_end`)
 // derives from `char_indices()` or `find`/`rfind` of an ASCII token (`"`, `=`, `version`,
 // `module`), so every slice bound is always a char boundary.
+#[cfg(feature = "lsp-responses")]
 #[allow(clippy::string_slice)]
 fn detect_catalog_context<'a>(
     before_cursor: &str,
@@ -309,6 +320,7 @@ fn detect_catalog_context<'a>(
 // Every offset below (`open_pos`, `end_rel`, `version_start`) derives from `rfind`/`find` of
 // an ASCII `'"'`/`'\''`/`':'` token or `char_indices()`, so every slice bound is always a
 // char boundary.
+#[cfg(feature = "lsp-responses")]
 #[allow(clippy::string_slice)]
 fn detect_dsl_context<'a>(
     before_cursor: &str,
@@ -440,6 +452,7 @@ impl Ecosystem for GradleEcosystem {
     /// concept — is the actual reason this crate can't reuse the shared dispatch). Opting
     /// out of it means this ecosystem takes on #793's wildcard-match obligation itself; see
     /// `deps_core::Ecosystem::generate_completions`'s doc.
+    #[cfg(feature = "lsp-responses")]
     fn generate_completions<'a>(
         &'a self,
         parse_result: &'a dyn ParseResultTrait,
@@ -457,7 +470,7 @@ impl Ecosystem for GradleEcosystem {
                 GradleCompletionContext::Version => {
                     let dep = parse_result.dependencies().into_iter().find(|d| {
                         d.version_range()
-                            .is_some_and(|r| position_in_range(position, r.into()))
+                            .is_some_and(|r| position_in_range(position.into(), r))
                             || d.name_range().start.line == position.line
                     });
                     // #919: `detect_completion_context` only checks that the cursor sits
@@ -470,7 +483,9 @@ impl Ecosystem for GradleEcosystem {
                     match dep {
                         Some(dep)
                             if deps_core::lsp_helpers::dependency_version_range_is_literal(
-                                dep, content, range,
+                                dep,
+                                content,
+                                range.into(),
                             ) =>
                         {
                             let request = deps_core::completion::CompletionRequest::new(
@@ -496,6 +511,7 @@ impl Ecosystem for GradleEcosystem {
     /// [`Self::generate_completions`] override (Gradle does not use the shared default
     /// dispatch — see that method's doc), for the `GradleCompletionContext::Version`
     /// DSL/catalog context.
+    #[cfg(feature = "lsp-responses")]
     fn complete_version<'a>(
         &'a self,
         request: deps_core::completion::CompletionRequest<'a>,
@@ -600,6 +616,7 @@ mod tests {
     // (`deps_core::completion::complete_package_names_generic`), replacing
     // test_complete_package_names_short_prefix — also closes the missing max-length case
     // (issue #758 named deps-gradle as missing this).
+    #[cfg(feature = "lsp-responses")]
     deps_core::completion_guard_conformance! {
         mod gradle_completion_guard_conformance;
         complete: |registry: &dyn deps_core::Registry, prefix: String| -> std::pin::Pin<
@@ -629,6 +646,7 @@ mod tests {
         assert_eq!(result.dependencies().len(), 1);
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_detect_catalog_context_version_cursor_at_start() {
         // version = "|1.0.0"
@@ -647,6 +665,7 @@ mod tests {
         assert_eq!(&line[11..16], "1.0.0");
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_detect_catalog_context_version_cursor_mid() {
         // version = "1.0|.0"
@@ -664,6 +683,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_detect_catalog_context_version_cursor_at_end() {
         // version = "1.0.0|"
@@ -680,6 +700,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_detect_catalog_context_module_prefix() {
         // module = "com.ex|ample:lib"
@@ -698,6 +719,7 @@ mod tests {
         assert_eq!(&line[10..25], "com.example:lib");
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_detect_catalog_context_version_closed_value_with_escaped_quote_stays_closed() {
         // version = "a\"b" | — cursor past a properly closed value that contains an
@@ -714,6 +736,7 @@ mod tests {
         assert_eq!(range, Range::default());
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_detect_catalog_context_module_escaped_quote_does_not_close_string() {
         // module = "com.example\"extra:lib — an escaped quote inside the still-open
@@ -736,6 +759,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_detect_dsl_context_package_cursor_mid() {
         // implementation("junit|:junit:4.13.2")
@@ -756,6 +780,7 @@ mod tests {
         assert_eq!(&line[16..27], "junit:junit");
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_detect_dsl_context_package_no_version_yet() {
         // implementation("junit|") — no colon typed yet, string not closed by a version
@@ -772,6 +797,7 @@ mod tests {
         assert_eq!(&line[16..21], "junit");
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_detect_dsl_context_escaped_quote_in_earlier_group_does_not_block_completion() {
         // implementation "a\"b", "com.foo:ba — the escaped quote inside the first,
@@ -787,6 +813,7 @@ mod tests {
         assert_eq!(v, "com.foo:ba");
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_detect_dsl_context_apostrophe_inside_double_quoted_package_name() {
         // implementation "com.o'reilly:li — an apostrophe inside a double-quoted
@@ -799,6 +826,7 @@ mod tests {
         assert_eq!(v, "com.o'reilly:li");
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_detect_dsl_context_mixed_quote_types_on_one_line_no_completion() {
         // exclude module: "x"; implementation 'com.baz:qu — a completed double-quoted
@@ -817,6 +845,7 @@ mod tests {
         assert_eq!(range, Range::default());
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_detect_completion_context_catalog_multibyte_module_value() {
         // module = "café:lib" — 'é' is 2 bytes in UTF-8 but 1 UTF-16 code unit, so byte
@@ -837,6 +866,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_detect_completion_context_catalog_inline_table_multibyte_does_not_consume_closing_quote()
      {
@@ -864,6 +894,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_detect_completion_context_dsl_multibyte_package_value() {
         // implementation("café:junit") — same multi-byte concern as above, in the
@@ -881,6 +912,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_detect_catalog_context_cursor_past_closing_quote_not_matched() {
         // module = "com.example:lib"|  — cursor placed after the closing quote (e.g. in
@@ -895,6 +927,7 @@ mod tests {
         assert_eq!(range, Range::default());
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_detect_catalog_context_module_unterminated_falls_back_to_cursor() {
         // module = "com.example:lib   (no closing quote on the line) — the range must
@@ -911,6 +944,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_detect_catalog_context_inline_table_does_not_leak_across_fields() {
         // lib = { version = "1.0", module = "com.exa|  — cursor is inside the *module*
@@ -931,6 +965,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_detect_catalog_context_inline_table_version_field_after_module() {
         // lib = { module = "com.example:lib", version = "1.0|  — the reverse ordering:
@@ -953,6 +988,7 @@ mod tests {
         assert_eq!(&line[47..col], "1.0");
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_detect_catalog_context_version_ref_keeps_placeholder_range() {
         // lib = { module = "com.example:lib", version.ref = "guavaVersion|" — `version.ref`
@@ -971,6 +1007,7 @@ mod tests {
         assert_eq!(range, Range::default());
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_detect_catalog_context_version_ref_with_toml_whitespace_keeps_placeholder_range() {
         // lib = { module = "com.example:lib", version . ref = "guavaVersion|" — TOML's
@@ -988,6 +1025,7 @@ mod tests {
         assert_eq!(range, Range::default());
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_detect_dsl_context_unterminated_falls_back_to_cursor() {
         // implementation("junit:junit   (no closing quote/paren on the line) — the range
@@ -1004,6 +1042,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_detect_dsl_context_version_cursor_mid() {
         // implementation("junit:junit:4.1|3.2")
@@ -1024,6 +1063,7 @@ mod tests {
         assert_eq!(&line[28..34], "4.13.2");
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_detect_dsl_context_version_cursor_at_start() {
         // implementation("junit:junit:|4.13.2")
@@ -1040,6 +1080,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_detect_dsl_context_version_unterminated_falls_back_to_cursor() {
         // implementation("junit:junit:4.13.2 — no closing quote/paren on the line; the
@@ -1070,11 +1111,12 @@ mod tests {
     /// Gradle spans five manifest formats (TOML version catalog, Groovy DSL, Kotlin
     /// DSL) with no raw-text section marker shared across all of them — no override,
     /// unreachable in practice.
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_fallback_completion_prefix_default_none() {
         let eco = GradleEcosystem::new(make_cache());
         assert!(
-            eco.fallback_completion_prefix("anything at all\n", Position::new(0, 0))
+            eco.fallback_completion_prefix("anything at all\n", Position::new(0, 0).into())
                 .is_none()
         );
     }
@@ -1129,6 +1171,7 @@ mod tests {
     /// GradleCompletionContext::Version` while `parse_result.dependencies()` stays empty,
     /// and the arm must fail closed to `Completions::default()` without ever calling the
     /// registry.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_completions_version_context_no_dependency_at_position_returns_empty() {
         // See the comment in `test_parse_manifest_kts` on why this guard is needed here.
@@ -1159,6 +1202,7 @@ mod tests {
     /// `Completions::default()` either way); the actual #819 guarantee is compile-time (a
     /// new `GradleCompletionContext` variant is a compile error at the match in
     /// `generate_completions`), which no runtime test can exercise.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_completions_none_context_returns_empty() {
         // See the comment in `test_parse_manifest_kts` on why this guard is needed here.
@@ -1190,6 +1234,7 @@ mod tests {
     /// `detect_completion_context`'s raw-text DSL scanner only checks the coordinate's
     /// shape, so without the literal-span guard this would previously offer the full
     /// version list and, on accept, splice a version string into `$libVersion`.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_completions_version_context_withheld_for_unresolved_variable() {
         // See the comment in `test_parse_manifest_kts` on why this guard is needed here.
@@ -1217,7 +1262,7 @@ mod tests {
             !deps_core::lsp_helpers::dependency_version_range_is_literal(
                 *dep,
                 content,
-                dep.version_range().unwrap().into(),
+                dep.version_range().unwrap(),
             )
         );
 
@@ -1232,6 +1277,7 @@ mod tests {
     /// span of the version segment instead of `Range::default()` — the guard's content
     /// slice previously never matched the declared version, rejecting every such
     /// completion.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_dsl_context_range_admits_plain_literal_compact_coordinate() {
         // See the comment in `test_parse_manifest_kts` on why this guard is needed here.
@@ -1246,13 +1292,16 @@ mod tests {
         let (ctx, _, range) = GradleEcosystem::detect_completion_context(content, position, &uri);
         assert_eq!(ctx, GradleCompletionContext::Version);
         assert!(deps_core::lsp_helpers::dependency_version_range_is_literal(
-            *dep, content, range,
+            *dep,
+            content,
+            range.into(),
         ));
     }
 
     /// #931 regression: a plain literal `version = "..."` catalog value must be admitted
     /// by the #922 guard now that `detect_catalog_context`'s `version` arm returns the
     /// real span of the value instead of `Range::default()`.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_catalog_context_range_admits_plain_literal_version() {
         // See the comment in `test_parse_manifest_kts` on why this guard is needed here.
@@ -1267,13 +1316,16 @@ mod tests {
         let (ctx, _, range) = GradleEcosystem::detect_completion_context(content, position, &uri);
         assert_eq!(ctx, GradleCompletionContext::Version);
         assert!(deps_core::lsp_helpers::dependency_version_range_is_literal(
-            *dep, content, range,
+            *dep,
+            content,
+            range.into(),
         ));
     }
 
     // `complete_versions` has no offline guard for an already-well-formed package name, so
     // the "happy path" needs live Maven Central access, mirroring `deps_maven`'s equivalent
     // characterization test.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     #[ignore] // Requires network access
     async fn test_generate_completions_version_arm_dispatches_by_position() {

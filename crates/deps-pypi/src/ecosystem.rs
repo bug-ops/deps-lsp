@@ -7,12 +7,14 @@
 
 use std::any::Any;
 use std::sync::Arc;
+#[cfg(feature = "lsp-responses")]
 use tower_lsp_server::ls_types::{CompletionItem, DocumentLink, Position, Range, Uri};
 use url::Url;
 
+#[cfg(feature = "lsp-responses")]
+use deps_core::completion::Completions;
 use deps_core::{
-    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, completion::Completions,
-    lsp_helpers::EcosystemFormatter,
+    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, lsp_helpers::EcosystemFormatter,
 };
 
 use crate::formatter::PypiFormatter;
@@ -98,6 +100,7 @@ impl PypiEcosystem {
         }
     }
 
+    #[cfg(feature = "lsp-responses")]
     async fn complete_package_names(&self, prefix: &str, range: Range) -> Vec<CompletionItem> {
         let mut items = deps_core::completion::complete_package_names_generic(
             self.registry.as_ref(),
@@ -169,6 +172,7 @@ impl PypiEcosystem {
     /// against `pypi.org` — the shared helper's gate is what keeps `Registry::get_versions_from`'s
     /// permissive routing of an unrecognized source to the default public client (matching
     /// hover/diagnostics/code-actions' identical gate) from leaking one for completions too.
+    #[cfg(feature = "lsp-responses")]
     async fn complete_versions(
         &self,
         parse_result: &dyn ParseResultTrait,
@@ -293,6 +297,7 @@ impl Ecosystem for PypiEcosystem {
     /// than filter its existing (possibly cold-start-empty) list — so this is the one
     /// context that reports `is_incomplete: true`, regardless of whether it currently has
     /// any items (#427).
+    #[cfg(feature = "lsp-responses")]
     fn complete_package_name<'a>(
         &'a self,
         _request: deps_core::completion::CompletionRequest<'a>,
@@ -305,6 +310,7 @@ impl Ecosystem for PypiEcosystem {
         })
     }
 
+    #[cfg(feature = "lsp-responses")]
     fn complete_version<'a>(
         &'a self,
         request: deps_core::completion::CompletionRequest<'a>,
@@ -331,6 +337,7 @@ impl Ecosystem for PypiEcosystem {
         true
     }
 
+    #[cfg(feature = "lsp-responses")]
     fn generate_document_links(
         &self,
         parse_result: &dyn ParseResultTrait,
@@ -428,7 +435,7 @@ impl Ecosystem for PypiEcosystem {
                 // path — always resolve through the URI to keep them in sync.
                 let tooltip = target_uri.to_file_path()?.display().to_string();
                 Some(DocumentLink {
-                    range: link.range,
+                    range: link.range.into(),
                     target: Some(target_uri),
                     // Resolved absolute path, shown on hover — a bidi/format-character
                     // trick in the rendered line (rejected above) or a merely confusing
@@ -444,7 +451,7 @@ impl Ecosystem for PypiEcosystem {
     fn fallback_completion_prefix<'a>(
         &self,
         content: &'a str,
-        position: Position,
+        position: deps_core::position::Position,
     ) -> Option<&'a str> {
         let line = deps_core::fallback_completion::line_at(content, position)?;
         if !is_in_dependencies_section(content, position.line as usize) {
@@ -453,7 +460,11 @@ impl Ecosystem for PypiEcosystem {
         Some(extract_prefix(line, position.character))
     }
 
-    fn fallback_completion_is_bare(&self, content: &str, position: Position) -> bool {
+    fn fallback_completion_is_bare(
+        &self,
+        content: &str,
+        position: deps_core::position::Position,
+    ) -> bool {
         // A genuinely still-open quoted string — an odd, escape-aware real-quote count
         // via `open_quoted_tail` (the same primitive `extract_prefix` uses below, so
         // the two methods always agree on the same `content`/`position`) — means the
@@ -630,6 +641,7 @@ fn extract_prefix(line: &str, character: u32) -> &str {
 /// as an innocuous `.txt` file) while the link actually opens `.evil` —
 /// link-target spoofing, not merely a cosmetic issue, since the resolved URI
 /// is exactly what the user's click opens.
+#[cfg(feature = "lsp-responses")]
 fn is_safe_document_link_target(target: &str) -> bool {
     !target.is_empty()
         && target.chars().all(|c| {
@@ -663,6 +675,7 @@ fn is_safe_document_link_target(target: &str) -> bool {
 /// segment (`Path::new("/project").join("C:x") == "/project/C:x"`) — but this function has
 /// no way to know which platform authored the requirements file, so it rejects the shape
 /// uniformly rather than trusting the host OS's own `Path::join` semantics.
+#[cfg(feature = "lsp-responses")]
 fn is_absolute_document_link_target(target: &str) -> bool {
     target.starts_with('/')
         || target.starts_with('\\')
@@ -686,6 +699,7 @@ fn is_absolute_document_link_target(target: &str) -> bool {
 /// "has_root"), which would silently skip containment for exactly that shape on Windows. A
 /// relative `path` isn't rejected here either way, it just won't clamp to a meaningful
 /// root.
+#[cfg(feature = "lsp-responses")]
 fn lexically_normalize(path: &std::path::Path) -> std::path::PathBuf {
     let mut result = std::path::PathBuf::new();
     for component in path.components() {
@@ -703,7 +717,9 @@ fn lexically_normalize(path: &std::path::Path) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deps_core::{EcosystemConfig, VersionData, parser::DependencySource};
+    #[cfg(feature = "lsp-responses")]
+    use deps_core::EcosystemConfig;
+    use deps_core::{VersionData, parser::DependencySource};
     use std::assert_matches;
     use std::collections::HashMap;
 
@@ -729,6 +745,7 @@ mod tests {
     // #758: the shared completion-prefix-length guard
     // (`deps_core::completion::complete_package_names_generic`), replacing
     // test_complete_package_names_minimum_prefix/test_complete_package_names_max_length.
+    #[cfg(feature = "lsp-responses")]
     deps_core::completion_guard_conformance! {
         mod pypi_completion_guard_conformance;
         complete: |registry: &dyn deps_core::Registry, prefix: String| -> std::pin::Pin<
@@ -817,6 +834,7 @@ mod tests {
         assert_eq!(result.dependencies().len(), 2);
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_document_links_resolves_relative_target() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -842,6 +860,7 @@ mod tests {
     /// document-link target against a real local directory — same guard gap class as
     /// #1084/#1089's lock file fix, applied here to `generate_document_links`' base
     /// directory resolution.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_document_links_rejects_malicious_uri() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -879,6 +898,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_document_links_rejects_absolute_target() {
         // #937: an absolute `-r`/`-c` target silently discards `base_dir` on
@@ -897,6 +917,7 @@ mod tests {
         assert!(links.is_empty());
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_document_links_rejects_windows_style_absolute_target() {
         // #937: a Windows drive-letter prefix must be rejected even when
@@ -915,6 +936,7 @@ mod tests {
         assert!(links.is_empty());
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_document_links_allows_parent_dir_without_workspace_root() {
         // `-r ../requirements-base.txt` is a standard, legitimate multi-directory pip
@@ -949,6 +971,7 @@ mod tests {
     /// same prefix — otherwise it and the `base_dir` derived from a `test_uri`
     /// document (which *does* carry the drive) never share a common root, and the
     /// containment check spuriously rejects every target on Windows.
+    #[cfg(feature = "lsp-responses")]
     fn test_workspace_root(unix_path: &str) -> std::path::PathBuf {
         #[cfg(windows)]
         {
@@ -963,18 +986,19 @@ mod tests {
     /// A single-document-link `ParseResult` with an explicit `workspace_root`, used to
     /// exercise the containment check directly (`parse_manifest` never produces a
     /// non-`None` `workspace_root` for pypi today — see the field's own doc).
+    #[cfg(feature = "lsp-responses")]
     fn parse_result_with_document_link(
         uri: Url,
         workspace_root: Option<std::path::PathBuf>,
         target: &str,
     ) -> crate::parser::ParseResult {
-        use tower_lsp_server::ls_types::Range;
+        use deps_core::position::{Position as DomainPosition, Range as DomainRange};
         crate::parser::ParseResult {
             dependencies: Vec::new(),
             workspace_root,
             uri,
             document_links: vec![crate::parser::RequirementRef {
-                range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+                range: DomainRange::new(DomainPosition::new(0, 0), DomainPosition::new(0, 0)),
                 target: target.to_string(),
             }],
             resolved_chains: Vec::new(),
@@ -983,6 +1007,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_generate_document_links_rejects_escape_past_workspace_root() {
         // #937: once a workspace root is known, a relative target with enough `../`
@@ -1002,6 +1027,7 @@ mod tests {
         assert!(links.is_empty());
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_generate_document_links_accepts_path_that_climbs_to_root_then_reenters() {
         // #937 (impl-critic C2/second pass): discriminates `lexically_normalize`'s
@@ -1029,6 +1055,7 @@ mod tests {
         assert!(target.path().as_str().ends_with("/project/x.txt"));
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_generate_document_links_allows_parent_dir_with_workspace_root_set() {
         // #937 (impl-critic C4): a legitimate `../` include that stays inside the
@@ -1051,6 +1078,7 @@ mod tests {
         assert!(target.path().as_str().ends_with("/project/shared/req.txt"));
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_document_links_rejects_bidi_override_target() {
         // #452 S2 (security): a bidi override in the target text could make the
@@ -1069,6 +1097,7 @@ mod tests {
         assert!(links.is_empty());
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_is_safe_document_link_target_rejects_invisible_unicode() {
         for bad in [
@@ -1085,6 +1114,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_is_safe_document_link_target_accepts_normal_paths() {
         for good in [
@@ -1096,6 +1126,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_is_absolute_document_link_target_detects_every_absolute_form() {
         // #937 (impl-critic C1/C4): `C:evil.txt` and bare `C:` are Windows
@@ -1118,6 +1149,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_is_absolute_document_link_target_accepts_relative_paths() {
         for good in [
@@ -1177,6 +1209,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_package_name_completion_context_has_real_range() {
         // Regression test for #232: the textEdit range for a package-name completion
@@ -1213,6 +1246,7 @@ mod tests {
     /// `test_package_name_completion_context_has_real_range`, but calling
     /// `generate_completions` directly (not `detect_completion_context`) so a
     /// reversed condition or wrong-arm bug in the real dispatch would be caught.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_completions_package_name_context_is_incomplete() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1242,6 +1276,7 @@ mod tests {
     /// Builds a `PypiEcosystem` whose registry's search index is pointed at a
     /// mock server rather than the real `pypi.org/simple/`, so package-name
     /// completion (issue #419) can be exercised network-free.
+    #[cfg(feature = "lsp-responses")]
     fn ecosystem_with_index_url(
         cache: Arc<deps_core::HttpCache>,
         index_url: String,
@@ -1257,6 +1292,7 @@ mod tests {
     /// Polls `probe` until it returns a non-empty result or `attempts` polls have
     /// elapsed, returning the last (possibly still empty) result. Used to wait out
     /// the background index build without a flaky fixed sleep.
+    #[cfg(feature = "lsp-responses")]
     async fn poll_until_nonempty<F, Fut>(mut probe: F, attempts: u32) -> Vec<CompletionItem>
     where
         F: FnMut() -> Fut,
@@ -1277,6 +1313,7 @@ mod tests {
     /// network-free against a mocked Simple API index: the first call is a cold
     /// start (empty, index not built yet) and a later call — once the background
     /// build finishes — finds `requests`.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_complete_package_names_uses_index() {
         let mut server = mockito::Server::new_async().await;
@@ -1315,6 +1352,7 @@ mod tests {
     /// normalized `label`/`insert_text` — otherwise an LSP client's local
     /// re-filtering (`zope.int` is not a subsequence of `zope-interface`) would
     /// silently drop a result the server correctly matched.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_complete_package_names_filter_text_matches_raw_typed_prefix() {
         let mut server = mockito::Server::new_async().await;
@@ -1352,6 +1390,7 @@ mod tests {
     /// `PypiEcosystem::generate_completions` calls `warm_search_index` before
     /// dispatching on completion context — and repeated requests must still
     /// produce exactly one index-build fetch (single-flight + build-once).
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_version_completion_triggers_exactly_one_index_build_attempt() {
         let mut server = mockito::Server::new_async().await;
@@ -1423,6 +1462,7 @@ mod tests {
         mock.assert_async().await;
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     #[ignore] // Requires network access
     async fn test_complete_versions_real() {
@@ -1442,6 +1482,7 @@ mod tests {
         assert!(results.iter().all(|r| r.label.starts_with("2.")));
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     #[ignore] // Requires network access
     async fn test_complete_versions_with_operator() {
@@ -1464,6 +1505,7 @@ mod tests {
     /// Sentinel package name for a package that does not exist in the registry (#1038): every
     /// "unknown package" completion test below shares it, resolved against a mockito 404 via
     /// [`mock_unknown_package_ecosystem`] rather than the live `pypi.org`.
+    #[cfg(feature = "lsp-responses")]
     const UNKNOWN_PACKAGE: &str = "this-package-does-not-exist-12345";
 
     /// Builds a [`PypiEcosystem`] wired to a mockito server that 404s `name` (#1038), plus the
@@ -1472,6 +1514,7 @@ mod tests {
     /// live-registry-avoiding wiring per test. A regression that makes zero requests (and so
     /// also produces an empty result) can no longer pass vacuously, since
     /// `mock.assert_async()` requires the request to actually have been made.
+    #[cfg(feature = "lsp-responses")]
     async fn mock_unknown_package_ecosystem(
         name: &str,
     ) -> (mockito::ServerGuard, mockito::Mock, PypiEcosystem) {
@@ -1493,6 +1536,7 @@ mod tests {
         (server, mock, ecosystem)
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_complete_versions_unknown_package() {
         let (_server, mock, ecosystem) = mock_unknown_package_ecosystem(UNKNOWN_PACKAGE).await;
@@ -1515,6 +1559,7 @@ mod tests {
     /// The single dependency `parse_result_with_dependency` constructs always has its
     /// `version_range` start here — every call site below passes this as `complete_versions`'
     /// `position` argument so the position-based lookup finds it.
+    #[cfg(feature = "lsp-responses")]
     const DEP_POSITION: Position = Position {
         line: 0,
         character: 0,
@@ -1523,6 +1568,7 @@ mod tests {
     /// A minimal single-dependency `ParseResult`, used to exercise `complete_versions`'
     /// per-source routing (issue #593) — the dependency's `version_range` starts at
     /// [`DEP_POSITION`].
+    #[cfg(feature = "lsp-responses")]
     fn parse_result_with_dependency(
         name: &str,
         source: DependencySource,
@@ -1554,6 +1600,7 @@ mod tests {
     /// an `AlternateRegistry`-sourced dependency must route through the resolved chain, never
     /// through the root `Public`-tier client — fetching from the root would send the
     /// dependency's name to `pypi.org` on every keystroke.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_complete_versions_alternate_registry_routes_through_chain() {
         let mut alt_server = mockito::Server::new_async().await;
@@ -1612,6 +1659,7 @@ mod tests {
     /// explicit index, US-005) must offer no version completions at all — never falling back
     /// to `pypi.org`, matching hover/diagnostics' existing fail-closed behavior for it
     /// (SC-004).
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_complete_versions_custom_registry_offers_nothing() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1636,6 +1684,7 @@ mod tests {
     /// Validator finding #1: an `AlternateRegistry` source whose chain was never registered
     /// (or whose registration is now stale) offers nothing rather than falling back to the
     /// root client.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_complete_versions_unregistered_alternate_offers_nothing() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1662,6 +1711,7 @@ mod tests {
     /// sources no longer collapse into the old name-based "offer nothing for either" result
     /// — cursor position now identifies exactly one dependency, so each occurrence routes
     /// independently through its own source.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_complete_versions_same_name_different_sources_routes_by_position() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1732,6 +1782,7 @@ mod tests {
     /// `test_complete_package_names_uses_index`: a mocked index proves the cold start is
     /// genuinely empty (not just "empty for the wrong reason"), then `poll_until_nonempty` +
     /// `mock.assert_async()` + a concrete label prove the index actually works once built.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_complete_package_names_special_characters() {
         // #1055: was a live, unmocked search index build that asserted the tautology
@@ -1773,6 +1824,7 @@ mod tests {
     /// the actual display cap (`MAX_COMPLETION_VERSIONS`, `deps-core`) is 5, not 20, so it
     /// passed vacuously (even for 0 results) and could never catch a cap regression. Mocks 8
     /// matching versions and asserts the count is exactly the real cap.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_complete_versions_capped_at_max_completion_versions() {
         let mut server = mockito::Server::new_async().await;
@@ -1868,6 +1920,7 @@ dependencies = []
         assert!(provider.is_some());
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_inlay_hints_empty_dependencies() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1895,6 +1948,7 @@ dependencies = []
         assert!(hints.is_empty());
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_completions_no_context() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1924,6 +1978,7 @@ name = "test"
         assert!(!completions.is_incomplete);
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_completions_package_name_context_returns_matches() {
         // #1055: position (1, 20) lands inside the bare `requests` entry (no version
@@ -1989,6 +2044,7 @@ dependencies = ["requests"]
         assert!(completions.iter().any(|r| r.label == "requests"));
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_hover_no_dependency_at_position() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -2019,6 +2075,7 @@ name = "test"
         assert!(hover.is_none());
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_code_actions_no_actions() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -2081,6 +2138,7 @@ dependencies = []
     /// under a dead network, since a regression that made zero requests would produce the
     /// same empty result. Now mocked, with `mock.assert_async()` requiring the request to
     /// actually have been made.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_complete_versions_empty_prefix() {
         let (_server, mock, ecosystem) =
@@ -2103,6 +2161,7 @@ dependencies = []
     }
 
     /// #1038: see [`test_complete_versions_empty_prefix`]'s doc for why this is now mocked.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_complete_versions_with_tilde_operator() {
         let (_server, mock, ecosystem) = mock_unknown_package_ecosystem("nonexistent-pkg").await;
@@ -2123,6 +2182,7 @@ dependencies = []
     }
 
     /// #1038: see [`test_complete_versions_empty_prefix`]'s doc for why this is now mocked.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_complete_versions_with_not_equal_operator() {
         let (_server, mock, ecosystem) = mock_unknown_package_ecosystem("nonexistent-pkg").await;
@@ -2149,17 +2209,23 @@ dependencies = []
     /// table-key path takes the name verbatim from the TOML key — this is
     /// the actual bug #212 fixes.
     mod poetry_lockfile_regression_tests {
+        #[cfg(feature = "lsp-responses")]
         use super::*;
+        #[cfg(feature = "lsp-responses")]
         use crate::lockfile::PypiLockParser;
+        #[cfg(feature = "lsp-responses")]
         use deps_core::PackageName;
+        #[cfg(feature = "lsp-responses")]
         use deps_core::lockfile::LockFileProvider;
 
         /// A registry mock returning an empty (but `Ok`) version list —
         /// `generate_hover` requires a successful registry call before it
         /// reaches the `versions.resolved`-driven "Current" line, but the
         /// content of that call is irrelevant to this regression.
+        #[cfg(feature = "lsp-responses")]
         struct EmptyOkRegistry;
 
+        #[cfg(feature = "lsp-responses")]
         impl deps_core::Registry for EmptyOkRegistry {
             fn get_versions<'a>(
                 &'a self,
@@ -2198,6 +2264,7 @@ dependencies = []
             }
         }
 
+        #[cfg(feature = "lsp-responses")]
         #[tokio::test]
         async fn test_poetry_table_key_dotted_name_resolves_against_lockfile() {
             let toml = "[tool.poetry.dependencies]\n\"zope.interface\" = \"^5.0\"\n";
@@ -2380,6 +2447,7 @@ dependencies = []
     /// compose correctly through the real trait method on realistic multi-line
     /// `pyproject.toml` content — the primitives were each individually correct in
     /// isolation but their composition was the actual #390 bug.
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_fallback_completion_prefix_multi_line_composition_project_array() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -2388,13 +2456,14 @@ dependencies = []
         let line = content.lines().nth(5).unwrap();
         let position = Position::new(5, line.chars().count() as u32);
         assert_eq!(
-            eco.fallback_completion_prefix(content, position),
+            eco.fallback_completion_prefix(content, position.into()),
             Some("flas")
         );
     }
 
     /// Same composition, `[project.optional-dependencies]`'s real section-header
     /// shape rather than the headerless primary `dependencies = [...]` array.
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_fallback_completion_prefix_multi_line_composition_optional_dependencies() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -2403,7 +2472,7 @@ dependencies = []
         let line = content.lines().nth(3).unwrap();
         let position = Position::new(3, line.chars().count() as u32);
         assert_eq!(
-            eco.fallback_completion_prefix(content, position),
+            eco.fallback_completion_prefix(content, position.into()),
             Some("flas")
         );
     }
@@ -2593,6 +2662,7 @@ dependencies = []
     /// #737: zero quotes typed at all (`req` alone on its own line under
     /// `dependencies = [...]`) must not be reported as bare — otherwise the fallback
     /// path bare-inserts the unquoted name straight into the TOML array.
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_fallback_completion_is_bare_false_with_no_quote_typed() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -2600,11 +2670,12 @@ dependencies = []
         let content = "[project]\ndependencies = [\n    \"pytest\",\n    req\n]\n";
         let line = content.lines().nth(3).unwrap();
         let position = Position::new(3, line.chars().count() as u32);
-        assert!(!eco.fallback_completion_is_bare(content, position));
+        assert!(!eco.fallback_completion_is_bare(content, position.into()));
     }
 
     /// An already-open quote (`"req`, mid-typing) must still route to the bare insert
     /// — this is the pre-#737 behavior and must not regress.
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_fallback_completion_is_bare_true_with_open_quote() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -2612,12 +2683,13 @@ dependencies = []
         let content = "[project]\ndependencies = [\n    \"req";
         let line = content.lines().nth(2).unwrap();
         let position = Position::new(2, line.chars().count() as u32);
-        assert!(eco.fallback_completion_is_bare(content, position));
+        assert!(eco.fallback_completion_is_bare(content, position.into()));
     }
 
     /// Same two states as the primary PEP 621 `dependencies = [...]` array, exercised
     /// against `[project.optional-dependencies]` instead — coverage gap flagged in
     /// #737 validation: only the primary array branch was previously tested.
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_fallback_completion_is_bare_false_with_no_quote_typed_optional_dependencies() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -2625,9 +2697,10 @@ dependencies = []
         let content = "[project.optional-dependencies]\ndev = [\n    \"pytest\",\n    req\n]\n";
         let line = content.lines().nth(3).unwrap();
         let position = Position::new(3, line.chars().count() as u32);
-        assert!(!eco.fallback_completion_is_bare(content, position));
+        assert!(!eco.fallback_completion_is_bare(content, position.into()));
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_fallback_completion_is_bare_true_with_open_quote_optional_dependencies() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -2635,7 +2708,7 @@ dependencies = []
         let content = "[project.optional-dependencies]\ndev = [\n    \"req";
         let line = content.lines().nth(2).unwrap();
         let position = Position::new(2, line.chars().count() as u32);
-        assert!(eco.fallback_completion_is_bare(content, position));
+        assert!(eco.fallback_completion_is_bare(content, position.into()));
     }
 
     /// #737 critic S1: a `\"` preceded by an odd backslash run is an *escaped* quote,
@@ -2643,6 +2716,7 @@ dependencies = []
     /// real quotes here, so this must still route through `completion_insert_text`
     /// (quoted insert), not the bare path. A naive `.contains('"')` check would
     /// wrongly report `true` since the literal `"` character is present in the text.
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_fallback_completion_is_bare_false_with_only_escaped_quote() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -2650,7 +2724,7 @@ dependencies = []
         let content = "[project]\ndependencies = [\n    \\\"req";
         let line = content.lines().nth(2).unwrap();
         let position = Position::new(2, line.chars().count() as u32);
-        assert!(!eco.fallback_completion_is_bare(content, position));
+        assert!(!eco.fallback_completion_is_bare(content, position.into()));
     }
 
     /// #737 validation gap: multiple entries on one line, cursor after a bare trailing
@@ -2661,6 +2735,7 @@ dependencies = []
     /// in a different manifest shape. `open_quoted_tail`'s escape-aware parity check
     /// correctly reports `false` (an even, non-zero quote count means no string is
     /// currently open).
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_fallback_completion_is_bare_false_with_multiple_deps_same_line() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -2668,11 +2743,12 @@ dependencies = []
         let content = "[project]\ndependencies = [\"pytest\", req]\n";
         let cursor = "dependencies = [\"pytest\", req";
         let position = Position::new(1, cursor.chars().count() as u32);
-        assert!(!eco.fallback_completion_is_bare(content, position));
+        assert!(!eco.fallback_completion_is_bare(content, position.into()));
     }
 
     /// Same shape, with an escaped quote inside the prior closed entry — must not
     /// misclassify the escape as a still-open string either.
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_fallback_completion_is_bare_false_with_escaped_quote_in_prior_closed_entry_same_line() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -2680,7 +2756,7 @@ dependencies = []
         let content = "[project]\ndependencies = [\"a\\\"b\", req]\n";
         let cursor = "dependencies = [\"a\\\"b\", req";
         let position = Position::new(1, cursor.chars().count() as u32);
-        assert!(!eco.fallback_completion_is_bare(content, position));
+        assert!(!eco.fallback_completion_is_bare(content, position.into()));
     }
 
     /// #737 critic S2: pins the trait default `fallback_bare_insert_text` (bare

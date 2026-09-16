@@ -2,14 +2,16 @@
 
 use std::any::Any;
 use std::sync::Arc;
-#[cfg(test)]
+#[cfg(all(test, feature = "lsp-responses"))]
 use tower_lsp_server::ls_types::Position;
+#[cfg(feature = "lsp-responses")]
 use tower_lsp_server::ls_types::{CompletionItem, Range};
 use url::Url;
 
+#[cfg(feature = "lsp-responses")]
+use deps_core::completion::Completions;
 use deps_core::{
-    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, completion::Completions,
-    lsp_helpers::EcosystemFormatter,
+    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, lsp_helpers::EcosystemFormatter,
 };
 
 use crate::formatter::BundlerFormatter;
@@ -42,6 +44,7 @@ impl BundlerEcosystem {
     /// [`RubyGemsRegistry::with_base_for_test`](crate::registry::RubyGemsRegistry::with_base_for_test)
     /// pointed at a mock server) instead of building a live-registry one (#1038).
     #[cfg(test)]
+    #[cfg(feature = "lsp-responses")]
     #[must_use]
     pub(crate) fn with_registry_for_test(registry: RubyGemsRegistry) -> Self {
         Self {
@@ -50,6 +53,7 @@ impl BundlerEcosystem {
         }
     }
 
+    #[cfg(feature = "lsp-responses")]
     async fn complete_package_names(&self, prefix: &str, range: Range) -> Vec<CompletionItem> {
         deps_core::completion::complete_package_names_generic(
             self.registry.as_ref(),
@@ -60,6 +64,7 @@ impl BundlerEcosystem {
         .await
     }
 
+    #[cfg(feature = "lsp-responses")]
     async fn complete_versions(
         &self,
         package_name: &deps_core::PackageName,
@@ -119,6 +124,7 @@ impl Ecosystem for BundlerEcosystem {
         &self.formatter
     }
 
+    #[cfg(feature = "lsp-responses")]
     fn complete_package_name<'a>(
         &'a self,
         _request: deps_core::completion::CompletionRequest<'a>,
@@ -128,6 +134,7 @@ impl Ecosystem for BundlerEcosystem {
         Box::pin(async move { self.complete_package_names(&prefix, range).await.into() })
     }
 
+    #[cfg(feature = "lsp-responses")]
     fn complete_version<'a>(
         &'a self,
         request: deps_core::completion::CompletionRequest<'a>,
@@ -172,6 +179,7 @@ mod tests {
     // #758: the shared completion-prefix-length guard
     // (`deps_core::completion::complete_package_names_generic`), replacing
     // test_complete_package_names_minimum_prefix/test_complete_package_names_max_length.
+    #[cfg(feature = "lsp-responses")]
     deps_core::completion_guard_conformance! {
         mod bundler_completion_guard_conformance;
         complete: |registry: &dyn deps_core::Registry, prefix: String| -> std::pin::Pin<
@@ -189,6 +197,7 @@ mod tests {
         };
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_package_name_completion_context_has_real_range() {
         // Regression test for #232: the textEdit range for a package-name completion
@@ -250,7 +259,10 @@ gem 'rails', '~> 7.0'";
         let ecosystem = BundlerEcosystem::new(cache);
         assert!(
             ecosystem
-                .fallback_completion_prefix("anything at all\n", Position::new(0, 0))
+                .fallback_completion_prefix(
+                    "anything at all\n",
+                    deps_core::position::Position::new(0, 0)
+                )
                 .is_none()
         );
     }
@@ -296,6 +308,7 @@ gem 'rails', '~> 7.0'";
     // --- #793 characterization: `generate_completions` dispatch, pinned before the
     // wildcard-match refactor.
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_completions_package_name_context_below_length_guard_is_empty() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -323,6 +336,7 @@ gem 'rails', '~> 7.0'";
         assert!(direct.is_empty());
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_completions_none_context_returns_empty() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -355,6 +369,7 @@ gem 'rails', '~> 7.0'";
     /// `DepsError::HttpStatus`, never stored) — so exactly 2 requests reach the mock on the
     /// unregressed path. A regression that dropped the `generate_completions` dispatch would
     /// leave the mock at 1 hit, which `.expect_at_least(1)` alone would not catch.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_completions_version_context_unknown_package_is_empty() {
         let mut server = mockito::Server::new_async().await;
@@ -405,6 +420,7 @@ gem 'rails', '~> 7.0'";
     /// has no offline test seam here), mirroring this codebase's existing convention for
     /// completion tests that need a genuine registry round-trip (e.g.
     /// `deps_cargo::ecosystem::tests::test_complete_versions_real`).
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     #[ignore] // Requires network access
     async fn test_generate_completions_version_context_dispatches_to_registry() {

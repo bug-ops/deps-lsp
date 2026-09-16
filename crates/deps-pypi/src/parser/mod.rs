@@ -379,7 +379,7 @@ fn looks_like_valid_pep508_name(name: &str) -> bool {
 #[derive(Debug, Clone)]
 pub struct RequirementRef {
     /// Source range of the referenced path text on the option line.
-    pub range: tower_lsp_server::ls_types::Range,
+    pub range: Range,
     /// The target as written in the file (e.g. `"constraints.txt"`), not yet
     /// resolved to an absolute URI — resolution happens against the
     /// containing document's URI in `PypiEcosystem`'s
@@ -744,9 +744,7 @@ impl Default for PypiParser {
 /// toml-span string spans exclude surrounding quotes, so the span start
 /// points directly to the first character of the string content.
 fn span_start(content: &str, line_table: &LineOffsetTable, span: toml_span::Span) -> Position {
-    line_table
-        .byte_offset_to_position(content, span.start)
-        .into()
+    line_table.byte_offset_to_position(content, span.start)
 }
 
 /// Adapts a `toml_span::Span` to [`deps_core::lsp_helpers::byte_span_to_range`].

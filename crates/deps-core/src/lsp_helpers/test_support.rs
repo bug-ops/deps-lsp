@@ -8,10 +8,12 @@
 
 use super::*;
 use crate::{
-    ConcreteVersion, Dependency, InvalidPackageName, PackageName, ParseResult, PublishTime,
-    RemovalStatus, VersionReq,
+    ConcreteVersion, Dependency, InvalidPackageName, PackageName, ParseResult, VersionReq,
 };
+#[cfg(feature = "lsp-responses")]
+use crate::{PublishTime, RemovalStatus};
 use std::any::Any;
+#[cfg(feature = "lsp-responses")]
 use tower_lsp_server::ls_types::{CodeAction, CodeActionKind};
 
 pub(crate) fn pkg(s: &str) -> PackageName {
@@ -79,10 +81,13 @@ impl OsvNaming for MockUnresolvedFormatter {}
 /// Formatter stub mirroring `GoFormatter`'s override: reports the manifest
 /// version-requirement line (go.mod's `require`) as itself the resolved
 /// version, since it is already the exact MVS-selected version (#235).
+#[cfg(feature = "lsp-responses")]
 pub(crate) struct MockGoFormatter;
 
+#[cfg(feature = "lsp-responses")]
 impl PackageNaming for MockGoFormatter {}
 
+#[cfg(feature = "lsp-responses")]
 impl PackageRendering for MockGoFormatter {
     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
         version.to_string()
@@ -93,18 +98,23 @@ impl PackageRendering for MockGoFormatter {
     }
 }
 
+#[cfg(feature = "lsp-responses")]
 impl RequirementResolution for MockGoFormatter {
     fn manifest_requirement_is_resolved_version(&self, _dep: &dyn Dependency) -> bool {
         true
     }
 }
 
+#[cfg(feature = "lsp-responses")]
 impl DiagnosticMessages for MockGoFormatter {}
 
+#[cfg(feature = "lsp-responses")]
 impl DiagnosticPolicy for MockGoFormatter {}
 
+#[cfg(feature = "lsp-responses")]
 impl SourcePolicy for MockGoFormatter {}
 
+#[cfg(feature = "lsp-responses")]
 impl OsvNaming for MockGoFormatter {}
 
 /// Formatter stub mirroring `deps-cargo`'s `CargoFormatter`: widens
@@ -115,10 +125,13 @@ impl OsvNaming for MockGoFormatter {}
 /// resolvable without its content being safe to treat as a public
 /// registry's (e.g. for the deps.dev trust-signal gate, which must use the
 /// latter, never the former).
+#[cfg(feature = "lsp-responses")]
 pub(crate) struct MockWidenedResolveFormatter;
 
+#[cfg(feature = "lsp-responses")]
 impl PackageNaming for MockWidenedResolveFormatter {}
 
+#[cfg(feature = "lsp-responses")]
 impl PackageRendering for MockWidenedResolveFormatter {
     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
         version.to_string()
@@ -129,12 +142,16 @@ impl PackageRendering for MockWidenedResolveFormatter {
     }
 }
 
+#[cfg(feature = "lsp-responses")]
 impl RequirementResolution for MockWidenedResolveFormatter {}
 
+#[cfg(feature = "lsp-responses")]
 impl DiagnosticMessages for MockWidenedResolveFormatter {}
 
+#[cfg(feature = "lsp-responses")]
 impl DiagnosticPolicy for MockWidenedResolveFormatter {}
 
+#[cfg(feature = "lsp-responses")]
 impl SourcePolicy for MockWidenedResolveFormatter {
     fn can_resolve_source(&self, source: &crate::parser::DependencySource) -> bool {
         matches!(
@@ -145,6 +162,7 @@ impl SourcePolicy for MockWidenedResolveFormatter {
     }
 }
 
+#[cfg(feature = "lsp-responses")]
 impl OsvNaming for MockWidenedResolveFormatter {}
 
 /// A formatter whose `validate_package_name` always rejects, for exercising
@@ -333,8 +351,10 @@ impl ParseResult for MockMarkedParseResult {
     }
 }
 
+#[cfg(feature = "lsp-responses")]
 pub(crate) struct MockRegistry;
 
+#[cfg(feature = "lsp-responses")]
 impl crate::Registry for MockRegistry {
     fn get_versions<'a>(
         &'a self,
@@ -367,8 +387,10 @@ impl crate::Registry for MockRegistry {
 
 /// A registry whose `get_versions` always errs, for exercising a fetch-failure code
 /// path (e.g. `generate_hover`'s degrade-to-basic-card behavior on a failed fetch).
+#[cfg(feature = "lsp-responses")]
 pub(crate) struct ErrorRegistry;
 
+#[cfg(feature = "lsp-responses")]
 impl crate::Registry for ErrorRegistry {
     fn get_versions<'a>(
         &'a self,
@@ -407,8 +429,10 @@ impl crate::Registry for ErrorRegistry {
 /// exercising a "package genuinely doesn't exist" code path — distinct from
 /// [`ErrorRegistry`], whose `CacheError` stands in for a transient/unanswerable
 /// failure instead.
+#[cfg(feature = "lsp-responses")]
 pub(crate) struct NotFoundRegistry;
 
+#[cfg(feature = "lsp-responses")]
 impl crate::Registry for NotFoundRegistry {
     fn get_versions<'a>(
         &'a self,
@@ -446,12 +470,14 @@ impl crate::Registry for NotFoundRegistry {
 
 /// A version with a configurable yanked flag and publish time, used for the
 /// "Recent versions" hover freshness tests below.
+#[cfg(feature = "lsp-responses")]
 pub(crate) struct MockVersionWithAge {
     pub(crate) version: ConcreteVersion,
     pub(crate) yanked: bool,
     pub(crate) published_at: Option<PublishTime>,
 }
 
+#[cfg(feature = "lsp-responses")]
 impl crate::Version for MockVersionWithAge {
     fn version_string(&self) -> &ConcreteVersion {
         &self.version
@@ -470,11 +496,13 @@ impl crate::Version for MockVersionWithAge {
     }
 }
 
+#[cfg(feature = "lsp-responses")]
 pub(crate) struct TestVersion {
     pub(crate) version: ConcreteVersion,
     pub(crate) yanked: bool,
 }
 
+#[cfg(feature = "lsp-responses")]
 impl crate::Version for TestVersion {
     fn version_string(&self) -> &ConcreteVersion {
         &self.version
@@ -492,10 +520,12 @@ impl crate::Version for TestVersion {
 /// A registry whose `get_versions` returns a fixed, caller-supplied version list —
 /// used to exercise hover's "Recent versions" rendering, which `MockRegistry`
 /// above (always empty) cannot.
+#[cfg(feature = "lsp-responses")]
 pub(crate) struct MockRegistryWithVersions {
     pub(crate) versions: Vec<MockVersionWithAge>,
 }
 
+#[cfg(feature = "lsp-responses")]
 impl crate::Registry for MockRegistryWithVersions {
     fn get_versions<'a>(
         &'a self,
@@ -554,11 +584,13 @@ impl crate::Registry for MockRegistryWithVersions {
 /// A version carrying an SPDX `license` list (issue #204), used by hover tests that
 /// exercise `push_license_hover_section`'s native-version-list path without touching
 /// every existing [`MockVersionWithAge`] call site.
+#[cfg(feature = "lsp-responses")]
 pub(crate) struct MockVersionWithLicense {
     pub(crate) version: ConcreteVersion,
     pub(crate) license: Vec<String>,
 }
 
+#[cfg(feature = "lsp-responses")]
 impl crate::Version for MockVersionWithLicense {
     fn version_string(&self) -> &ConcreteVersion {
         &self.version
@@ -575,10 +607,12 @@ impl crate::Version for MockVersionWithLicense {
 
 /// Registry stub serving [`MockVersionWithLicense`] entries — the license-hover
 /// counterpart of [`MockRegistryWithVersions`].
+#[cfg(feature = "lsp-responses")]
 pub(crate) struct MockRegistryWithLicensedVersions {
     pub(crate) versions: Vec<MockVersionWithLicense>,
 }
 
+#[cfg(feature = "lsp-responses")]
 impl crate::Registry for MockRegistryWithLicensedVersions {
     fn get_versions<'a>(
         &'a self,
@@ -630,11 +664,13 @@ impl crate::Registry for MockRegistryWithLicensedVersions {
 /// A version carrying an explicit [`RemovalStatus`], used where a test needs
 /// `AdvisoryDeprecated` specifically — `MockVersionWithAge`'s `bool` field can only
 /// express `Available`/`Yanked` via [`RemovalStatus::from_yanked`].
+#[cfg(feature = "lsp-responses")]
 pub(crate) struct MockVersionWithStatus {
     pub(crate) version: ConcreteVersion,
     pub(crate) status: RemovalStatus,
 }
 
+#[cfg(feature = "lsp-responses")]
 impl crate::Version for MockVersionWithStatus {
     fn version_string(&self) -> &ConcreteVersion {
         &self.version
@@ -657,10 +693,12 @@ impl crate::Version for MockVersionWithStatus {
 /// pick that disagrees with it — including rung 3 (newest overall, unconditionally), which
 /// is what lets an all-yanked/all-prerelease package still resolve a "latest" instead of
 /// `None`.
+#[cfg(feature = "lsp-responses")]
 pub(crate) struct MockRegistryPreferringUnflagged {
     pub(crate) versions: Vec<MockVersionWithStatus>,
 }
 
+#[cfg(feature = "lsp-responses")]
 impl crate::Registry for MockRegistryPreferringUnflagged {
     fn get_versions<'a>(
         &'a self,
@@ -718,6 +756,7 @@ impl crate::Registry for MockRegistryPreferringUnflagged {
 /// counts invocations so a test can assert the fallback is NOT reached on the happy
 /// path (a list-based pick that already succeeds), guarding against a future regression
 /// that would make every hover pay for a second network round trip.
+#[cfg(feature = "lsp-responses")]
 pub(crate) struct MockRegistryListFailsLatestFallbackSucceeds {
     pub(crate) versions: Vec<MockVersionWithAge>,
     pub(crate) fallback_latest: MockVersionWithAge,
@@ -729,6 +768,7 @@ pub(crate) struct MockRegistryListFailsLatestFallbackSucceeds {
     pub(crate) get_latest_matching_calls: std::sync::atomic::AtomicUsize,
 }
 
+#[cfg(feature = "lsp-responses")]
 impl crate::Registry for MockRegistryListFailsLatestFallbackSucceeds {
     fn get_versions<'a>(
         &'a self,
@@ -788,10 +828,12 @@ impl crate::Registry for MockRegistryListFailsLatestFallbackSucceeds {
 /// A registry returning a fixed, caller-supplied version list — used to
 /// exercise the yank check and display-item dedup in
 /// [`generate_code_actions`].
+#[cfg(feature = "lsp-responses")]
 pub(crate) struct FixedVersionRegistry {
     pub(crate) versions: Vec<(&'static str, bool)>,
 }
 
+#[cfg(feature = "lsp-responses")]
 impl crate::Registry for FixedVersionRegistry {
     fn get_versions<'a>(
         &'a self,
@@ -846,13 +888,14 @@ impl crate::Registry for FixedVersionRegistry {
 
 /// Builds a single-dependency parse result for the freshness hover tests, cursor
 /// positioned on the dependency name.
+#[cfg(feature = "lsp-responses")]
 pub(crate) fn freshness_test_parse_result(name: &str) -> MockParseResult {
     MockParseResult {
         deps: vec![MockDep {
             name: name.into(),
             version_req: "1.0.0".into(),
-            version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-            name_range: Range::new(Position::new(0, 0), Position::new(0, name.len() as u32)).into(),
+            version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+            name_range: Range::new(Position::new(0, 0), Position::new(0, name.len() as u32)),
         }],
         uri: crate::test_util::test_uri("/test/Cargo.toml"),
     }
@@ -861,10 +904,13 @@ pub(crate) fn freshness_test_parse_result(name: &str) -> MockParseResult {
 /// A formatter whose `format_version_for_text_edit` is the identity —
 /// unlike [`MockFormatter`], which wraps the version in quotes and would
 /// otherwise confound the N1 no-op-edit guard's own test.
+#[cfg(feature = "lsp-responses")]
 pub(crate) struct IdentityFormatter;
 
+#[cfg(feature = "lsp-responses")]
 impl PackageNaming for IdentityFormatter {}
 
+#[cfg(feature = "lsp-responses")]
 impl PackageRendering for IdentityFormatter {
     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
         version.to_string()
@@ -875,24 +921,32 @@ impl PackageRendering for IdentityFormatter {
     }
 }
 
+#[cfg(feature = "lsp-responses")]
 impl RequirementResolution for IdentityFormatter {}
 
+#[cfg(feature = "lsp-responses")]
 impl DiagnosticMessages for IdentityFormatter {}
 
+#[cfg(feature = "lsp-responses")]
 impl DiagnosticPolicy for IdentityFormatter {}
 
+#[cfg(feature = "lsp-responses")]
 impl SourcePolicy for IdentityFormatter {}
 
+#[cfg(feature = "lsp-responses")]
 impl OsvNaming for IdentityFormatter {}
 
 /// A formatter mimicking `deps-dart`'s non-identity
 /// `format_version_for_text_edit` (wraps the version in a caret
 /// constraint) — used to prove the N1 guard compares the *formatted*
 /// text actually written, not the bare version (critic S3).
+#[cfg(feature = "lsp-responses")]
 pub(crate) struct CaretWrappingFormatter;
 
+#[cfg(feature = "lsp-responses")]
 impl PackageNaming for CaretWrappingFormatter {}
 
+#[cfg(feature = "lsp-responses")]
 impl PackageRendering for CaretWrappingFormatter {
     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
         format!("^{version}")
@@ -903,14 +957,19 @@ impl PackageRendering for CaretWrappingFormatter {
     }
 }
 
+#[cfg(feature = "lsp-responses")]
 impl RequirementResolution for CaretWrappingFormatter {}
 
+#[cfg(feature = "lsp-responses")]
 impl DiagnosticMessages for CaretWrappingFormatter {}
 
+#[cfg(feature = "lsp-responses")]
 impl DiagnosticPolicy for CaretWrappingFormatter {}
 
+#[cfg(feature = "lsp-responses")]
 impl SourcePolicy for CaretWrappingFormatter {}
 
+#[cfg(feature = "lsp-responses")]
 impl OsvNaming for CaretWrappingFormatter {}
 
 /// A formatter mimicking `deps-pypi`'s non-identity
@@ -918,10 +977,13 @@ impl OsvNaming for CaretWrappingFormatter {}
 /// falling back to `format_version_for_text_edit`) — used to prove the
 /// vulnerability-fix action's `TextEdit` goes through the override, not
 /// the default delegation (critic S3).
+#[cfg(feature = "lsp-responses")]
 pub(crate) struct PinPreservingFormatter;
 
+#[cfg(feature = "lsp-responses")]
 impl PackageNaming for PinPreservingFormatter {}
 
+#[cfg(feature = "lsp-responses")]
 impl PackageRendering for PinPreservingFormatter {
     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
         format!(">={version}")
@@ -940,19 +1002,25 @@ impl PackageRendering for PinPreservingFormatter {
     }
 }
 
+#[cfg(feature = "lsp-responses")]
 impl RequirementResolution for PinPreservingFormatter {}
 
+#[cfg(feature = "lsp-responses")]
 impl DiagnosticMessages for PinPreservingFormatter {}
 
+#[cfg(feature = "lsp-responses")]
 impl DiagnosticPolicy for PinPreservingFormatter {}
 
+#[cfg(feature = "lsp-responses")]
 impl SourcePolicy for PinPreservingFormatter {}
 
+#[cfg(feature = "lsp-responses")]
 impl OsvNaming for PinPreservingFormatter {}
 
 /// Builds a `pkg = "<version_req>"`-shaped fixture: a dependency whose
 /// `version_range` slices `content` to exactly `version_req` (so the
 /// literal-span guard in `generate_code_actions` never rejects it).
+#[cfg(feature = "lsp-responses")]
 pub(crate) fn vulnerable_dep(
     version_req: &str,
 ) -> (MockDep, tower_lsp_server::ls_types::Range, String) {
@@ -974,6 +1042,7 @@ pub(crate) fn vulnerable_dep(
     )
 }
 
+#[cfg(feature = "lsp-responses")]
 pub(crate) fn quickfix_titles(actions: &[CodeAction]) -> Vec<&str> {
     actions
         .iter()
@@ -982,6 +1051,7 @@ pub(crate) fn quickfix_titles(actions: &[CodeAction]) -> Vec<&str> {
         .collect()
 }
 
+#[cfg(feature = "lsp-responses")]
 pub(crate) fn refactor_titles(actions: &[CodeAction]) -> Vec<&str> {
     actions
         .iter()
@@ -993,10 +1063,13 @@ pub(crate) fn refactor_titles(actions: &[CodeAction]) -> Vec<&str> {
 /// A formatter whose formatted edit text differs from the bare version only in
 /// whitespace (a trailing space) — used to prove the REFACTOR-loop no-op guard
 /// compares whitespace-insensitively rather than by raw string equality.
+#[cfg(feature = "lsp-responses")]
 pub(crate) struct TrailingSpaceFormatter;
 
+#[cfg(feature = "lsp-responses")]
 impl PackageNaming for TrailingSpaceFormatter {}
 
+#[cfg(feature = "lsp-responses")]
 impl PackageRendering for TrailingSpaceFormatter {
     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
         format!("{version} ")
@@ -1007,14 +1080,19 @@ impl PackageRendering for TrailingSpaceFormatter {
     }
 }
 
+#[cfg(feature = "lsp-responses")]
 impl RequirementResolution for TrailingSpaceFormatter {}
 
+#[cfg(feature = "lsp-responses")]
 impl DiagnosticMessages for TrailingSpaceFormatter {}
 
+#[cfg(feature = "lsp-responses")]
 impl DiagnosticPolicy for TrailingSpaceFormatter {}
 
+#[cfg(feature = "lsp-responses")]
 impl SourcePolicy for TrailingSpaceFormatter {}
 
+#[cfg(feature = "lsp-responses")]
 impl OsvNaming for TrailingSpaceFormatter {}
 
 /// A formatter that truncates every version to `==<major>.<minor>`, mirroring
@@ -1023,10 +1101,13 @@ impl OsvNaming for TrailingSpaceFormatter {}
 /// same rewritten text — used to prove issue #242's two dedup gaps: an item
 /// matching the fix action's text under a different raw version, and two
 /// items matching each other's text.
+#[cfg(feature = "lsp-responses")]
 pub(crate) struct TruncatingFormatter;
 
+#[cfg(feature = "lsp-responses")]
 impl PackageNaming for TruncatingFormatter {}
 
+#[cfg(feature = "lsp-responses")]
 impl PackageRendering for TruncatingFormatter {
     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
         version.to_string()
@@ -1044,14 +1125,19 @@ impl PackageRendering for TruncatingFormatter {
     }
 }
 
+#[cfg(feature = "lsp-responses")]
 impl RequirementResolution for TruncatingFormatter {}
 
+#[cfg(feature = "lsp-responses")]
 impl DiagnosticMessages for TruncatingFormatter {}
 
+#[cfg(feature = "lsp-responses")]
 impl DiagnosticPolicy for TruncatingFormatter {}
 
+#[cfg(feature = "lsp-responses")]
 impl SourcePolicy for TruncatingFormatter {}
 
+#[cfg(feature = "lsp-responses")]
 impl OsvNaming for TruncatingFormatter {}
 
 pub(crate) fn sample_advisory(
@@ -1074,8 +1160,8 @@ pub(crate) fn dep_at(name: &str) -> MockDep {
     MockDep {
         name: PackageName::new(name),
         version_req: VersionReq::new("1.0.0"),
-        version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-        name_range: Range::new(Position::new(0, 0), Position::new(0, name.len() as u32)).into(),
+        version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+        name_range: Range::new(Position::new(0, 0), Position::new(0, name.len() as u32)),
     }
 }
 

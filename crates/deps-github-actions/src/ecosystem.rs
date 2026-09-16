@@ -3,16 +3,20 @@
 use dashmap::DashMap;
 use std::any::Any;
 use std::sync::Arc;
+#[cfg(feature = "lsp-responses")]
 use tower_lsp_server::ls_types::{
-    CodeAction, CodeActionKind, Diagnostic, Hover, HoverContents, NumberOrString, Position,
-    TextEdit, WorkspaceEdit,
+    CodeAction, CodeActionKind, Hover, HoverContents, Position, TextEdit, WorkspaceEdit,
 };
 use url::Url;
 
+#[cfg(feature = "lsp-responses")]
+use deps_core::completion::Completions;
+#[cfg(feature = "lsp-responses")]
+use deps_core::lsp_helpers::{PackageRendering, markdown_code_span};
 use deps_core::{
     Ecosystem, PackageName, ParseResult as ParseResultTrait, Registry, Result,
-    completion::Completions,
-    lsp_helpers::{EcosystemFormatter, PackageRendering, markdown_code_span},
+    diagnostic::{Diagnostic, Severity},
+    lsp_helpers::EcosystemFormatter,
 };
 
 use crate::MUTABLE_REF_PIN_DIAGNOSTIC_CODE;
@@ -146,6 +150,7 @@ impl Ecosystem for GithubActionsEcosystem {
     // endpoint (a workflow only ever references an already-known `owner/repo` action), so
     // the inherited default (`Completions::default()`) is correct — see M3 (#793).
 
+    #[cfg(feature = "lsp-responses")]
     fn complete_version<'a>(
         &'a self,
         request: deps_core::completion::CompletionRequest<'a>,
@@ -205,6 +210,7 @@ impl Ecosystem for GithubActionsEcosystem {
     /// Appends the "Pin to commit SHA" quickfix (issue #473) to the shared default's
     /// output when the position's dependency is a `PinStyle::Tag` step with a resolvable
     /// `TagIndex` entry.
+    #[cfg(feature = "lsp-responses")]
     fn generate_code_actions<'a>(
         &'a self,
         parse_result: &'a dyn ParseResultTrait,
@@ -253,6 +259,7 @@ impl Ecosystem for GithubActionsEcosystem {
     /// dependency (a reusable-workflow call, `./local`, `docker://…`) still matches the
     /// shared helper's own hover-target predicate and must not have a `**Resolved**` line
     /// spliced onto it.
+    #[cfg(feature = "lsp-responses")]
     fn generate_hover<'a>(
         &'a self,
         parse_result: &'a dyn ParseResultTrait,
@@ -275,9 +282,9 @@ impl Ecosystem for GithubActionsEcosystem {
             let mut hover = base_hover?;
 
             let dep = parse_result.dependencies().into_iter().find(|d| {
-                deps_core::position_in_range(position, d.name_range().into())
+                deps_core::position_in_range(position.into(), d.name_range())
                     || d.version_range()
-                        .is_some_and(|r| deps_core::position_in_range(position, r.into()))
+                        .is_some_and(|r| deps_core::position_in_range(position.into(), r))
             });
             let Some(dep) = dep else {
                 return Some(hover);
@@ -362,7 +369,7 @@ impl Ecosystem for GithubActionsEcosystem {
     fn fallback_completion_prefix<'a>(
         &self,
         content: &'a str,
-        position: Position,
+        position: deps_core::position::Position,
     ) -> Option<&'a str> {
         let line = deps_core::fallback_completion::line_at(content, position)?;
         if !is_in_dependencies_section(content, position.line as usize) {
@@ -403,6 +410,7 @@ impl Ecosystem for GithubActionsEcosystem {
     /// SHA via this ecosystem's own `TagIndex`-backed formatter (issue #633) — `versions`
     /// is unused: a GHA SHA pin's replacement comes entirely from the shared `TagIndex`,
     /// with no dependency on the caller's fetched version data.
+    #[cfg(feature = "lsp-responses")]
     fn collect_pin_all_to_sha_edits(
         &self,
         parse_result: &dyn ParseResultTrait,
@@ -411,6 +419,7 @@ impl Ecosystem for GithubActionsEcosystem {
         collect_pin_all_to_sha_edits(parse_result, &self.formatter)
     }
 
+    #[cfg(feature = "lsp-responses")]
     fn pin_all_to_sha_noun(&self) -> deps_core::lsp_helpers::PinNoun {
         deps_core::lsp_helpers::PinNoun {
             singular: "action",
@@ -447,6 +456,7 @@ fn extract_prefix(line: &str, character: u32) -> &str {
 // `pos`/`rel_end`/`insert_at` come from `find` of ASCII anchors (`"**Current**: "`,
 // `"\n\n"`), so all are always char boundaries.
 #[allow(clippy::string_slice)]
+#[cfg(feature = "lsp-responses")]
 fn splice_resolved_line(markdown: &str, resolved_tag: &str, sha: &str) -> String {
     // `sha` is expected to be a validated, pure-ASCII full hex SHA by the time it
     // reaches here (`TagIndex` entries are filtered in `populate_tag_index`, security
@@ -491,7 +501,7 @@ const MAX_MUTABLE_REF_PIN_MESSAGE_VALUE_CHARS: usize = 128;
 
 fn mutable_ref_pin_diagnostics(
     parse_result: &dyn ParseResultTrait,
-    severity: tower_lsp_server::ls_types::DiagnosticSeverity,
+    severity: Severity,
     tag_index: &DashMap<PackageName, Arc<TagIndex>>,
 ) -> Vec<Diagnostic> {
     parse_result
@@ -535,16 +545,11 @@ fn mutable_ref_pin_diagnostics(
                      available for this ref)"
                 )
             };
-            Some(Diagnostic {
-                range: range.into(),
-                severity: Some(severity),
-                message,
-                code: Some(NumberOrString::String(
-                    MUTABLE_REF_PIN_DIAGNOSTIC_CODE.into(),
-                )),
-                source: Some("deps-lsp".into()),
-                ..Default::default()
-            })
+            Some(
+                Diagnostic::new(range, message)
+                    .with_severity(severity)
+                    .with_code(MUTABLE_REF_PIN_DIAGNOSTIC_CODE),
+            )
         })
         .collect()
 }
@@ -567,6 +572,7 @@ fn mutable_ref_pin_diagnostics(
 /// ref actually resolves to at run time. A diagnostic's advisory text carries no such
 /// risk (pinning to *some* SHA is safer than a moving ref either way), but this
 /// destructive edit keeps the stricter, pre-#551 guard.
+#[cfg(feature = "lsp-responses")]
 fn build_sha_pin_action(
     parse_result: &dyn ParseResultTrait,
     position: Position,
@@ -580,7 +586,7 @@ fn build_sha_pin_action(
     let dep = parse_result
         .dependencies()
         .into_iter()
-        .find(|d| formatter.is_position_on_dependency(*d, position))?;
+        .find(|d| formatter.is_position_on_dependency(*d, position.into()))?;
 
     let gha_dep = dep.as_any().downcast_ref::<GithubActionsDependency>()?;
     let text_edit = sha_pin_text_edit_for(dep, formatter)?;
@@ -611,6 +617,7 @@ fn build_sha_pin_action(
 /// `None` for anything but a plain-scalar `PinStyle::Tag` step with a resolvable
 /// `TagIndex` entry — the same withholding guards `build_sha_pin_action`'s doc comment
 /// describes (FR-010's quoted-scalar guard, and a `TagIndex` cache miss).
+#[cfg(feature = "lsp-responses")]
 fn sha_pin_text_edit_for(
     dep: &dyn deps_core::Dependency,
     formatter: &GithubActionsFormatter,
@@ -650,6 +657,7 @@ fn sha_pin_text_edit_for(
 /// [`build_sha_pin_action`]'s single-step quickfix (issue #633). A step with no
 /// resolvable `TagIndex` entry (cache miss) is silently skipped, exactly like that
 /// quickfix's own withholding behavior — never blocking on, or triggering, a fetch.
+#[cfg(feature = "lsp-responses")]
 fn collect_pin_all_to_sha_edits(
     parse_result: &dyn ParseResultTrait,
     formatter: &GithubActionsFormatter,
@@ -666,12 +674,11 @@ fn collect_pin_all_to_sha_edits(
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use tower_lsp_server::ls_types::DiagnosticSeverity;
 
     // --- issue #473: mutable-ref-pin diagnostic + "Pin to commit SHA" code action ---
 
-    fn mutable_ref_pin_code() -> NumberOrString {
-        NumberOrString::String(MUTABLE_REF_PIN_DIAGNOSTIC_CODE.into())
+    fn mutable_ref_pin_code() -> String {
+        MUTABLE_REF_PIN_DIAGNOSTIC_CODE.into()
     }
 
     async fn diagnostics_for(content: &str) -> Vec<Diagnostic> {
@@ -723,7 +730,7 @@ mod tests {
             .iter()
             .find(|d| d.code == Some(mutable_ref_pin_code()))
             .expect("expected a mutable-ref-pin diagnostic for a tag pin");
-        assert_eq!(found.severity, Some(DiagnosticSeverity::HINT));
+        assert_eq!(found.severity, Some(Severity::Hint));
         assert!(found.message.contains("actions/checkout"));
     }
 
@@ -940,7 +947,7 @@ mod tests {
         let cached = HashMap::new();
         let resolved = HashMap::new();
         let severities = deps_core::lsp_helpers::DiagnosticSeverities::new()
-            .with_mutable_ref_pin(DiagnosticSeverity::ERROR);
+            .with_mutable_ref_pin(Severity::Error);
 
         let diagnostics = eco
             .generate_diagnostics(
@@ -956,7 +963,7 @@ mod tests {
             .iter()
             .find(|d| d.code == Some(mutable_ref_pin_code()))
             .expect("expected a mutable-ref-pin diagnostic");
-        assert_eq!(found.severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(found.severity, Some(Severity::Error));
     }
 
     /// FR-009 (corrected): `mutable_ref_pin_enabled: false` must suppress the diagnostic
@@ -996,6 +1003,7 @@ mod tests {
     /// delegates to first drives a *live* registry fetch (to list "Update to X" actions),
     /// which would overwrite a hand-seeded `TagIndex` fixture with real GitHub data before
     /// this function ever runs.
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_build_sha_pin_action_offers_quickfix_on_tag_index_hit() {
         let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
@@ -1036,6 +1044,7 @@ mod tests {
     /// convention (`version_range` only, GHA does not override it) rather than a
     /// hand-rolled check that also matched `name_range` — a cursor on the action *name*
     /// must not offer this quickfix, matching every other deps-lsp code action's UX.
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_build_sha_pin_action_cursor_on_name_range_offers_nothing() {
         let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
@@ -1061,6 +1070,7 @@ mod tests {
     }
 
     /// FR-005: a `TagIndex` cache miss must never offer a destructive/no-op edit.
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_build_sha_pin_action_no_quickfix_on_tag_index_miss() {
         let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
@@ -1082,6 +1092,7 @@ mod tests {
 
     /// FR-005/plan §11: a `PinStyle::Branch` step must never get the SHA-pin quickfix,
     /// even if a `TagIndex` entry happens to exist for its literal ref text.
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_build_sha_pin_action_no_quickfix_for_branch_pin() {
         let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
@@ -1110,6 +1121,7 @@ mod tests {
     /// FR-010 (security audit finding): a quoted `uses:` scalar must never get the
     /// SHA-pin quickfix, even on a `TagIndex` hit — writing `{sha} # {tag}` inside the
     /// quotes would corrupt the value and make it re-parse as `PinStyle::Branch`.
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_build_sha_pin_action_no_quickfix_for_quoted_scalar() {
         let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
@@ -1144,6 +1156,7 @@ mod tests {
     /// quickfix must withhold itself even on a `TagIndex` hit, since appending `# v4`
     /// would comment out the rest of the flow mapping and produce invalid, unterminated
     /// YAML (reproduced live by the security audit against a real `yaml_rust2` re-parse).
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_build_sha_pin_action_no_quickfix_for_flow_mapping_step() {
         let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
@@ -1247,6 +1260,7 @@ mod tests {
         assert_eq!(result.dependencies().len(), 1);
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_splice_resolved_line_after_requirement() {
         let markdown = "# actions/checkout\n\n**Requirement**: `v4.2.0`\n\n**Latest**: `v4.3.0`\n";
@@ -1259,6 +1273,7 @@ mod tests {
         assert!(spliced.contains("aaaaaaa…"));
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_splice_resolved_line_after_current_when_present() {
         let markdown = "# actions/checkout\n\n**Current**: `v4.2.0`\n\n**Requirement**: `v4`\n";
@@ -1270,6 +1285,7 @@ mod tests {
         assert!(resolved_pos < requirement_pos);
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_splice_resolved_line_falls_back_to_append_when_no_anchor() {
         let markdown = "# actions/checkout\n\nno anchors here\n";
@@ -1286,6 +1302,7 @@ mod tests {
     /// touching the network (mirroring `HttpCache`'s real offline-cold behavior), so
     /// `VersionData` carries no signal of its own and only the post-hoc restore can produce
     /// the footer.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_hover_restores_footer_offline_for_tag_pin_with_warm_tag_index() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1330,6 +1347,7 @@ mod tests {
 
     /// A `PinStyle::Tag` step with no `TagIndex` entry (true cold start, nothing ever
     /// resolved) must not have the footer restored — there is no quickfix to advertise.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_hover_footer_stays_omitted_offline_for_tag_pin_without_tag_index() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1374,6 +1392,7 @@ mod tests {
     /// still genuinely available here. Unlike the offline-only sibling test above, this
     /// drives a real (mocked) network fetch through the actual `GithubActionsRegistry` to
     /// prove the restore now fires **online** too, not just offline.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_hover_restores_footer_online_for_bare_major_tag_with_empty_live_list() {
         let sha = "a".repeat(40);
@@ -1440,6 +1459,7 @@ mod tests {
     /// inside the quotes and editing it there would corrupt the value. The footer
     /// restoration must withhold itself the same way `build_sha_pin_action` does, not just
     /// check `pin`/`TagIndex` resolvability.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_hover_footer_not_restored_offline_for_quoted_tag_pin() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1483,6 +1503,7 @@ mod tests {
 
     // --- issue #633/#640: bulk "Pin all to SHA" collector + lens ---
 
+    #[cfg(feature = "lsp-responses")]
     fn seed_tag(eco: &GithubActionsEcosystem, name: &str, tag: &str, sha: &str) {
         let mut index = crate::registry::TagIndex::default();
         index.tag_to_sha.insert(tag.to_string(), sha.to_string());
@@ -1504,6 +1525,7 @@ mod tests {
     /// `collect_pin_all_to_sha_edits`'s count, the same call `deps-lsp`'s
     /// `handlers::code_lens` makes, rather than going through the (now-deleted)
     /// `generate_code_lenses` override.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_build_pin_all_to_sha_lens_title_and_command_id() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1536,6 +1558,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_collect_pin_all_to_sha_edits_singular_count_for_one_step() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1558,6 +1581,7 @@ mod tests {
     /// tag (`TagIndex.sha_to_tag`) is `v4.0.0`, genuinely behind `latest` `v4.3.1`, even
     /// though the human-written comment (`# v4`) matches at major-only precision — the
     /// lens must count and edit it as outdated, not silently exclude it.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_collect_update_all_edits_counts_sha_pin_outdated_via_tag_index_ground_truth() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1605,6 +1629,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_collect_pin_all_to_sha_edits_empty_when_no_tag_pins() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1623,6 +1648,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_collect_pin_all_to_sha_edits_empty_when_tag_index_miss() {
         // No `seed_tag` call: the TagIndex has no entry, so the one Tag-pinned step is a
@@ -1644,6 +1670,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_collect_pin_all_to_sha_edits_skips_unresolvable_step_but_counts_others() {
         // A mix of one resolvable Tag pin and one cache-miss Tag pin: the collector must
@@ -1669,6 +1696,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_collect_pin_all_to_sha_edits_produces_correct_workspace_edit_for_multiple_steps()
     {
@@ -1715,6 +1743,7 @@ mod tests {
         assert_eq!(setup_node_edit.range, setup_node_range.into());
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_collect_pin_all_to_sha_edits_empty_for_branch_and_quoted_scalar() {
         // A `PinStyle::Branch` step and a quoted-scalar `PinStyle::Tag` step must both be
@@ -1743,6 +1772,7 @@ mod tests {
     /// Security audit finding (issue #633): the bulk aggregator must skip a flow-mapping
     /// `uses:` step the same way the per-step quickfix does — a click on "Pin N actions
     /// to commit SHA" must never turn a real click into workflow-wide YAML corruption.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_collect_pin_all_to_sha_edits_empty_for_flow_mapping_step() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1802,6 +1832,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_hover_for_composite_action_yml_dependency() {
         // Offline (mirrors `test_generate_hover_restores_footer_offline_for_tag_pin_with_warm_tag_index`):
@@ -1868,6 +1899,7 @@ mod tests {
     /// Composition regression guard (#390/#282 bug class): proves `line_at` +
     /// the `uses:` step-key detection compose correctly through the real trait
     /// method on realistic multi-line workflow content.
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_fallback_completion_prefix_multi_line_composition() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1878,7 +1910,7 @@ mod tests {
         // Raw trim only, no manifest-syntax stripping — matches this ecosystem's
         // "no override" prefix shape (see `extract_prefix`'s doc).
         assert_eq!(
-            eco.fallback_completion_prefix(content, position),
+            eco.fallback_completion_prefix(content, position.into()),
             Some("- uses: actions/check")
         );
     }
@@ -1950,6 +1982,7 @@ mod tests {
     // wildcard-match refactor. GitHub Actions serves only `Version` (no package-name
     // search); `PackageName`/`Feature`/`None` must all return an untouched `Completions::default()`.
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_completions_package_name_context_returns_empty_non_incomplete() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1975,6 +2008,7 @@ mod tests {
     /// `for_test` setup, so this proves `generate_completions`'s `Version` arm actually
     /// threads the resolved `package_name`/`prefix` through to
     /// `complete_versions_generic` rather than just checking an empty degenerate case.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_completions_version_context_dispatches_to_registry() {
         let mut server = mockito::Server::new_async().await;

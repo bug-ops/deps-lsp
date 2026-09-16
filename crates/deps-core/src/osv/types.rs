@@ -93,7 +93,7 @@ impl ScanTarget {
 ///
 /// See `architecture.md` §6 for the precedence rules used to derive this
 /// from a raw record, and [`crate::osv::diagnostic_severity_for`] for the mapping to
-/// [`tower_lsp_server::ls_types::DiagnosticSeverity`].
+/// [`crate::diagnostic::Severity`].
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VulnSeverity {
@@ -1605,8 +1605,8 @@ mod informational_record_tests {
 mod vulnerability_keys_candidates_tests {
     use super::*;
     use crate::lsp_helpers::test_support::{MockDep, MockFormatter};
+    use crate::position::{Position, Range};
     use crate::{ConcreteVersion, EcosystemId, PackageName, ParseResult, VersionReq};
-    use tower_lsp_server::ls_types::{Position, Range};
 
     #[test]
     fn distinct_signatures_for_two_occurrences_resolving_to_different_candidates() {
@@ -1616,14 +1616,14 @@ mod vulnerability_keys_candidates_tests {
         let current_major = MockDep {
             name: PackageName::new("serde"),
             version_req: VersionReq::new("1.0"),
-            version_range: Range::new(Position::new(0, 0), Position::new(0, 4)).into(),
-            name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+            version_range: Range::new(Position::new(0, 0), Position::new(0, 4)),
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
         };
         let renamed_old_major = MockDep {
             name: PackageName::new("serde"),
             version_req: VersionReq::new("0.9"),
-            version_range: Range::new(Position::new(1, 0), Position::new(1, 4)).into(),
-            name_range: Range::new(Position::new(1, 0), Position::new(1, 9)).into(),
+            version_range: Range::new(Position::new(1, 0), Position::new(1, 4)),
+            name_range: Range::new(Position::new(1, 0), Position::new(1, 9)),
         };
 
         struct TwoOccurrenceParseResult {
@@ -1708,8 +1708,8 @@ mod vulnerability_keys_candidates_tests {
                 Box::new(MockDep {
                     name: PackageName::new("real-pkg"),
                     version_req: VersionReq::new("1.0.0"),
-                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
-                    name_range: Range::new(Position::new(0, 0), Position::new(0, 8)).into(),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 8)),
                 }),
             ],
             uri: crate::test_util::test_uri("/test/pubspec.yaml"),

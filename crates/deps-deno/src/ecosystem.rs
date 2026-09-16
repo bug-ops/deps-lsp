@@ -7,11 +7,13 @@
 
 use std::any::Any;
 use std::sync::Arc;
-use tower_lsp_server::ls_types::{CompletionItem, Position, Range};
+#[cfg(feature = "lsp-responses")]
+use tower_lsp_server::ls_types::{CompletionItem, Range};
 
+#[cfg(feature = "lsp-responses")]
+use deps_core::completion::Completions;
 use deps_core::{
-    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, completion::Completions,
-    lsp_helpers::EcosystemFormatter,
+    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, lsp_helpers::EcosystemFormatter,
 };
 
 use crate::formatter::DenoFormatter;
@@ -70,6 +72,7 @@ impl DenoEcosystem {
     /// [`DenoRegistry::with_bases_for_test`](crate::registry::DenoRegistry::with_bases_for_test)
     /// pointed at a mock server) instead of building a live-registry one (#1038).
     #[cfg(test)]
+    #[cfg(feature = "lsp-responses")]
     #[must_use]
     pub(crate) fn with_registry_for_test(registry: DenoRegistry) -> Self {
         Self {
@@ -80,6 +83,7 @@ impl DenoEcosystem {
 
     /// Completes package names by searching whichever registry the typed scheme prefix
     /// (`jsr:`/`npm:`) selects.
+    #[cfg(feature = "lsp-responses")]
     async fn complete_package_names(&self, prefix: &str, range: Range) -> Vec<CompletionItem> {
         deps_core::completion::complete_package_names_generic(
             self.registry.as_ref(),
@@ -90,6 +94,7 @@ impl DenoEcosystem {
         .await
     }
 
+    #[cfg(feature = "lsp-responses")]
     async fn complete_versions(
         &self,
         package_name: &deps_core::PackageName,
@@ -141,6 +146,7 @@ impl Ecosystem for DenoEcosystem {
         &self.formatter
     }
 
+    #[cfg(feature = "lsp-responses")]
     fn complete_package_name<'a>(
         &'a self,
         _request: deps_core::completion::CompletionRequest<'a>,
@@ -150,6 +156,7 @@ impl Ecosystem for DenoEcosystem {
         Box::pin(async move { self.complete_package_names(&prefix, range).await.into() })
     }
 
+    #[cfg(feature = "lsp-responses")]
     fn complete_version<'a>(
         &'a self,
         request: deps_core::completion::CompletionRequest<'a>,
@@ -166,7 +173,7 @@ impl Ecosystem for DenoEcosystem {
     fn fallback_completion_prefix<'a>(
         &self,
         content: &'a str,
-        position: Position,
+        position: deps_core::position::Position,
     ) -> Option<&'a str> {
         let line = deps_core::fallback_completion::line_at(content, position)?;
         if !is_in_dependencies_section(content, position.line as usize) {
@@ -250,6 +257,8 @@ fn extract_prefix(line: &str, character: u32) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "lsp-responses")]
+    use tower_lsp_server::ls_types::Position;
 
     // #758: exact-value `Ecosystem` conformance, replacing test_ecosystem_id/
     // test_ecosystem_display_name/test_ecosystem_manifest_filenames/test_as_any.
@@ -269,6 +278,7 @@ mod tests {
 
     // #758: the shared completion-prefix-length guard, replacing
     // test_complete_package_names_minimum_prefix (which only checked a 1-character prefix).
+    #[cfg(feature = "lsp-responses")]
     deps_core::completion_guard_conformance! {
         mod deno_completion_guard_conformance;
         complete: |registry: &dyn deps_core::Registry, prefix: String| -> std::pin::Pin<
@@ -309,6 +319,7 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_completions_no_context() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -334,6 +345,7 @@ mod tests {
     /// #1038: uses a mockito 404 instead of the live `jsr.io`, so a regression that makes
     /// zero requests (and so also produces an empty result) can no longer pass vacuously —
     /// `mock.assert_async()` requires the request to actually have been made.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_complete_versions_unknown_package() {
         let mut server = mockito::Server::new_async().await;
@@ -374,6 +386,7 @@ mod tests {
     /// `is_in_json_dependencies` compose correctly through the real trait method on
     /// realistic multi-line content — no quote strip, unlike npm/Composer (see
     /// `DenoEcosystem::fallback_completion_prefix`'s doc for why).
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_fallback_completion_prefix_multi_line_composition() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -382,7 +395,7 @@ mod tests {
         let line = content.lines().nth(3).unwrap();
         let position = Position::new(3, line.chars().count() as u32);
         assert_eq!(
-            ecosystem.fallback_completion_prefix(content, position),
+            ecosystem.fallback_completion_prefix(content, position.into()),
             Some("\"@std/fs\": \"jsr:@std/f")
         );
     }

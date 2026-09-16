@@ -397,8 +397,10 @@ mod tests {
     /// A registry mock whose `get_versions` always succeeds with an empty list — a real
     /// GitHub repository whose only tags don't parse as full semver
     /// (`dtolnay/rust-toolchain`'s sole tag `v1`, issue #550), not a fetch failure.
+    #[cfg(feature = "lsp-responses")]
     struct EmptyRegistry;
 
+    #[cfg(feature = "lsp-responses")]
     impl deps_core::Registry for EmptyRegistry {
         fn get_versions<'a>(
             &'a self,
@@ -453,6 +455,7 @@ mod tests {
     /// `GithubActionsFormatter`, mirroring the fixtures already used by `crate::parser`'s
     /// own unit tests (`./local-action`, `docker://alpine:3.18`,
     /// `octo-org/repo/.github/workflows/x.yml@v1`, `actions/checkout@v4`).
+    #[cfg(feature = "lsp-responses")]
     async fn hover_markdown_for(content: &str) -> String {
         use deps_core::freshness::FreshnessSettings;
         use deps_core::lsp_helpers::generate_hover;
@@ -495,10 +498,12 @@ mod tests {
     /// `deps_core::lsp_helpers::escape_markdown`, which backslash-escapes all ASCII
     /// punctuation — building the expected heading through the same function keeps these
     /// assertions from hardcoding that escaping rather than testing it.
+    #[cfg(feature = "lsp-responses")]
     fn escaped(name: &str) -> String {
         deps_core::lsp_helpers::escape_markdown(name)
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_hover_local_path_action_has_plain_header_and_no_footer() {
         let markdown = hover_markdown_for("steps:\n  - uses: ./local-action\n").await;
@@ -513,6 +518,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_hover_docker_ref_has_plain_header_and_no_footer() {
         let markdown = hover_markdown_for("steps:\n  - uses: docker://alpine:3.18\n").await;
@@ -527,6 +533,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_hover_reusable_workflow_keeps_real_link_and_no_footer() {
         let markdown = hover_markdown_for(
@@ -553,6 +560,7 @@ mod tests {
     /// must keep its link but must NOT show the update footer — there's nothing to
     /// update to, so advertising `Cmd+.` would be misleading. Supersedes this test's
     /// pre-#550 name and assertion, which locked in exactly that bug.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_hover_registry_action_keeps_link_no_footer_when_versions_empty() {
         let markdown = hover_markdown_for("steps:\n  - uses: actions/checkout@v4\n").await;
@@ -577,6 +585,7 @@ mod tests {
     /// Non-regression companion to the above (#474's original contract): a resolvable
     /// Registry source whose live fetch returns real version data must still show the
     /// update footer.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_hover_registry_action_keeps_footer_when_versions_present() {
         use deps_core::freshness::FreshnessSettings;
@@ -702,6 +711,7 @@ mod tests {
     /// a full `major.minor.patch` comment, so this exact real-world shape degraded to an
     /// unresolvable bare-SHA requirement and `generate_inlay_hints` emitted no hint at all
     /// (`RequirementStatus::Unresolved`).
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_inlay_hint_sha_pin_with_major_only_comment_tag_shows_outdated() {
         use deps_core::{EcosystemConfig, VersionData};
@@ -745,6 +755,7 @@ mod tests {
     /// Companion to the major-only case above at major.minor precision (`# v2.9`) — the
     /// other real-world precision `is_partial_semver_shaped` accepts, through the full
     /// `generate_inlay_hints` pipeline rather than only the parser level.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_inlay_hint_sha_pin_with_major_minor_comment_tag_shows_outdated() {
         use deps_core::{EcosystemConfig, VersionData};

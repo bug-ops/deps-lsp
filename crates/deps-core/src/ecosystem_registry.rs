@@ -603,11 +603,13 @@ pub fn manifest_pattern_matches(filename: &str, pattern: &str) -> bool {
 mod tests {
     use super::*;
     use std::any::Any;
+    #[cfg(feature = "lsp-responses")]
     use tower_lsp_server::ls_types::Position;
 
+    #[cfg(feature = "lsp-responses")]
+    use crate::completion::Completions;
     use crate::{
         ConcreteVersion, PackageName, ParseResult, Registry,
-        completion::Completions,
         lsp_helpers::{
             DiagnosticMessages, DiagnosticPolicy, EcosystemFormatter, OsvNaming, PackageNaming,
             PackageRendering, RequirementResolution, SourcePolicy,
@@ -692,6 +694,7 @@ mod tests {
             &MockFormatter
         }
 
+        #[cfg(feature = "lsp-responses")]
         fn generate_completions<'a>(
             &'a self,
             _parse_result: &'a dyn ParseResult,
@@ -702,6 +705,7 @@ mod tests {
             Box::pin(async move { Completions::default() })
         }
 
+        #[cfg(feature = "lsp-responses")]
         fn complete_version<'a>(
             &'a self,
             _request: crate::completion::CompletionRequest<'a>,
@@ -766,6 +770,7 @@ mod tests {
             &MockFormatter
         }
 
+        #[cfg(feature = "lsp-responses")]
         fn generate_completions<'a>(
             &'a self,
             _parse_result: &'a dyn ParseResult,
@@ -776,6 +781,7 @@ mod tests {
             Box::pin(async move { Completions::default() })
         }
 
+        #[cfg(feature = "lsp-responses")]
         fn complete_version<'a>(
             &'a self,
             _request: crate::completion::CompletionRequest<'a>,
@@ -847,6 +853,7 @@ mod tests {
             &MockFormatter
         }
 
+        #[cfg(feature = "lsp-responses")]
         fn generate_completions<'a>(
             &'a self,
             _parse_result: &'a dyn ParseResult,
@@ -857,6 +864,7 @@ mod tests {
             Box::pin(async move { Completions::default() })
         }
 
+        #[cfg(feature = "lsp-responses")]
         fn complete_version<'a>(
             &'a self,
             _request: crate::completion::CompletionRequest<'a>,

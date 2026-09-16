@@ -446,8 +446,8 @@ pub fn byte_span_to_range(
     end: usize,
 ) -> Range {
     Range::new(
-        table.byte_offset_to_position(content, start).into(),
-        table.byte_offset_to_position(content, end).into(),
+        table.byte_offset_to_position(content, start),
+        table.byte_offset_to_position(content, end),
     )
 }
 

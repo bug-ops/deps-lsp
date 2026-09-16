@@ -2,28 +2,35 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use tower_lsp_server::ls_types::{Position, Range, TextEdit, Uri};
+use std::time::Duration;
 
 use crate::error::DepsError;
 use crate::licenses::LicensePolicy;
 use crate::osv::VulnerabilityMap;
+use crate::position::{Position, Range};
 use crate::{
     ConcreteVersion, Dependency, Deprecation, DepsDevClient, EcosystemId, FetchFailure,
     LicenseSource, PackageName, RemovalStatus,
 };
 
+#[cfg(feature = "lsp-responses")]
 mod code_actions;
+#[cfg(feature = "lsp-responses")]
 mod code_lenses;
 mod diagnostics;
 mod formatter;
 mod git_ref;
+#[cfg(feature = "lsp-responses")]
 mod hover;
 mod in_use_version;
+#[cfg(feature = "lsp-responses")]
 mod inlay_hints;
 #[cfg(test)]
 pub(crate) mod test_support;
 
+#[cfg(feature = "lsp-responses")]
 pub use code_actions::generate_code_actions;
+#[cfg(feature = "lsp-responses")]
 pub use code_lenses::{
     PIN_ALL_TO_SHA_COMMAND_ID, PinNoun, build_pin_all_to_sha_lens, collect_update_all_edits,
     dedup_overlapping_edits, generate_code_lenses,
@@ -42,8 +49,10 @@ pub use git_ref::{
     is_partial_semver_shaped, is_plain_null, is_tag_shaped, locate_value_span, marker_byte_offset,
     match_v_prefix_style,
 };
+#[cfg(feature = "lsp-responses")]
 pub use hover::{CMD_DOT_FOOTER, generate_hover};
 pub use in_use_version::{concrete_pin_version, is_full_semver_shape, resolve_in_use_version};
+#[cfg(feature = "lsp-responses")]
 pub use inlay_hints::generate_inlay_hints;
 
 /// Maximum number of recent versions hover's "Recent versions" section renders.
@@ -826,6 +835,118 @@ impl<'a> VersionData<'a> {
     }
 }
 
+/// Wall-clock budget `deps-lsp`'s completion handler gives an ecosystem's
+/// `generate_completions` before treating it as a timeout.
+///
+/// Past this, the handler skips the fallback search rather than treating a
+/// fast-but-empty result as "genuinely no results"
+/// (`crates/deps-lsp/src/handlers/completion.rs`).
+///
+/// A registry-backed completion path that retries internally on failure (e.g.
+/// `deps-maven`'s `search`, #274) must size its own total retry budget to
+/// exceed this constant: finishing sooner with an empty/error result is
+/// indistinguishable, at the call site, from a query that legitimately has no
+/// matches, and triggers a wasted (and, for a struggling registry, likely to also
+/// fail) fallback search rather than the handler's existing skip-on-timeout path.
+///
+/// Lives here (ungated), not in [`crate::completion`] (`#[cfg(feature =
+/// "lsp-responses")]`), and is re-exported from there for that feature's consumers:
+/// a registry-backed completion path's own retry-budget constant (e.g. `deps-maven`'s
+/// `RECENT_FAILURE_TTL`) is genuine `Registry::search` behavior, not LSP-response-shaped,
+/// and must stay available under `--no-default-features` too (issue #1083 critic M1) —
+/// one definition, not a hand-copied duplicate per feature state.
+pub const COMPLETION_SEARCH_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Converts UTF-16 offset to byte offset in a string.
+///
+/// LSP uses UTF-16 code units for character positions (for compatibility with
+/// JavaScript and other languages). This function converts from UTF-16 offset
+/// to byte offset for Rust string indexing.
+///
+/// # Arguments
+///
+/// * `s` - The string to index into
+/// * `utf16_offset` - UTF-16 code unit offset (from LSP Position.character)
+///
+/// # Returns
+///
+/// Byte offset if valid, `None` if the UTF-16 offset is out of bounds.
+///
+/// # Examples
+///
+/// ```
+/// # use deps_core::lsp_helpers::utf16_to_byte_offset;
+/// // ASCII: UTF-16 offset equals byte offset
+/// assert_eq!(utf16_to_byte_offset("hello", 2), Some(2));
+///
+/// // Unicode: "日本語" - each char is 3 bytes but 1 UTF-16 code unit
+/// assert_eq!(utf16_to_byte_offset("日本語", 0), Some(0));
+/// assert_eq!(utf16_to_byte_offset("日本語", 1), Some(3));
+/// assert_eq!(utf16_to_byte_offset("日本語", 2), Some(6));
+///
+/// // Emoji: "😀" is 4 bytes but 2 UTF-16 code units (surrogate pair)
+/// assert_eq!(utf16_to_byte_offset("😀test", 2), Some(4));
+/// ```
+pub fn utf16_to_byte_offset(s: &str, utf16_offset: u32) -> Option<usize> {
+    let mut utf16_count = 0u32;
+    for (byte_idx, ch) in s.char_indices() {
+        if utf16_count >= utf16_offset {
+            return Some(byte_idx);
+        }
+        // `char::len_utf16` always returns 1 or 2, so this cast never truncates.
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            utf16_count += ch.len_utf16() as u32;
+        }
+    }
+    if utf16_count == utf16_offset {
+        return Some(s.len());
+    }
+    None
+}
+
+/// Converts a byte offset within `s` to a UTF-16 code unit offset (LSP `Position.character`).
+///
+/// `byte_offset` may be an arbitrary caller-supplied value: it is clamped to `s.len()` and
+/// floored down to the nearest UTF-8 char boundary before use, so this never panics.
+///
+/// # Examples
+///
+/// ```
+/// # use deps_core::lsp_helpers::byte_to_utf16_offset;
+/// // ASCII: byte offset equals UTF-16 offset
+/// assert_eq!(byte_to_utf16_offset("hello", 2), 2);
+///
+/// // Unicode: "日本語" - each char is 3 bytes but 1 UTF-16 code unit
+/// assert_eq!(byte_to_utf16_offset("日本語", 0), 0);
+/// assert_eq!(byte_to_utf16_offset("日本語", 3), 1);
+/// assert_eq!(byte_to_utf16_offset("日本語", 6), 2);
+///
+/// // Emoji: "😀" is 4 bytes but 2 UTF-16 code units (surrogate pair)
+/// assert_eq!(byte_to_utf16_offset("😀test", 4), 2);
+///
+/// // Never panics: an offset landing mid-character floors down to the start of that
+/// // character, and an offset past the end saturates to the string's length.
+/// assert_eq!(byte_to_utf16_offset("日本語", 1), 0); // inside the first character
+/// assert_eq!(byte_to_utf16_offset("日本語", 999), 3); // past the end
+/// ```
+// `end` is floor_char_boundary-clamped just above, mirroring the already-hardened
+// `LineOffsetTable::byte_offset_to_position` (lsp_helpers/mod.rs).
+#[allow(clippy::string_slice)]
+pub fn byte_to_utf16_offset(s: &str, byte_offset: usize) -> u32 {
+    // Saturate rather than silently wrap: an LSP `Position.character` past `u32::MAX` UTF-16
+    // units is already meaningless, but a wrapped value would be a wrong-but-plausible one
+    // (#673 — the exact offset-math bug class #244 shipped).
+    //
+    // `byte_offset` is not guaranteed to be in bounds or on a char boundary (a caller-supplied
+    // offset can be past `s.len()` or land mid-character); `floor_char_boundary` clamps both
+    // — past-the-end saturates to `s.len()` and any other in-bounds index floors to the
+    // nearest char boundary — mirroring `LineOffsetTable::byte_offset_to_position`
+    // (lsp_helpers/mod.rs).
+    let end = s.floor_char_boundary(byte_offset);
+    u32::try_from(s[..end].encode_utf16().count()).unwrap_or(u32::MAX)
+}
+
 /// Checks whether a cursor position falls within an LSP range (inclusive on both ends).
 pub fn position_in_range(pos: Position, range: Range) -> bool {
     if pos.line < range.start.line || pos.line > range.end.line {
@@ -1100,7 +1221,7 @@ impl LineOffsetTable {
             .copied()
             .unwrap_or(content.len());
         let line = &content[line_start..line_end];
-        crate::completion::utf16_to_byte_offset(line, position.character)
+        utf16_to_byte_offset(line, position.character)
             .map_or(line_end, |offset| line_start + offset)
             .min(content.len())
     }
@@ -1307,7 +1428,7 @@ pub fn is_dot_segment(segment: &str) -> bool {
     segment == "." || segment == ".."
 }
 
-/// Whether `version` is safe to embed in a manifest [`TextEdit`] or completion item.
+/// Whether `version` is safe to embed in a manifest `TextEdit` or completion item.
 ///
 /// Guards every call into
 /// [`formatter::PackageRendering::format_version_replacing`]/[`formatter::PackageRendering::format_version_for_text_edit`]
@@ -1352,7 +1473,7 @@ pub fn is_safe_version_string(version: &str) -> bool {
 }
 
 /// Whether `segment` is safe to embed as a Maven `groupId`/`artifactId` value in a
-/// pom.xml [`TextEdit`] or completion item.
+/// pom.xml `TextEdit` or completion item.
 ///
 /// Guards Maven's group/artifact completion producer, which builds a completion item's
 /// `insert_text`/`text_edit` from one field of a Maven Central search result — a value
@@ -1436,7 +1557,7 @@ pub fn maven_coordinate_path(group_id: &str, artifact_id: &str) -> Option<String
 }
 
 /// Whether `url` is safe to embed as a Swift Package Manager repository URL in a
-/// Package.swift [`TextEdit`] or completion item.
+/// Package.swift `TextEdit` or completion item.
 ///
 /// Guards Swift's URL-completion producer, which builds a `.package(url: "...")`
 /// string-literal replacement from a package registry search result's URL — a value
@@ -1496,7 +1617,7 @@ pub fn is_safe_registry_url(url: &str) -> bool {
         })
 }
 
-/// Whether `name` is safe to embed as a package name in a manifest [`TextEdit`] or
+/// Whether `name` is safe to embed as a package name in a manifest `TextEdit` or
 /// completion item.
 ///
 /// Guards every arm of `create_package_completion_item`
@@ -1637,7 +1758,7 @@ pub fn dot_segment_rejection_error(
 ///
 /// # Panics
 ///
-/// Panics if `url`'s string form does not round-trip into an [`Uri`]. In practice this
+/// Panics if `url`'s string form does not round-trip into an `Uri`. In practice this
 /// never happens: every `url::Url` reaching `lsp_helpers` originates from a real
 /// editor-opened document (an `ls_types::Uri` converted to `Url` at the `deps-lsp`
 /// boundary), so failing to convert it back indicates upstream corruption, not
@@ -1653,8 +1774,9 @@ pub fn dot_segment_rejection_error(
 /// let uri = to_ls_uri(&url);
 /// assert_eq!(uri.as_str(), "file:///tmp/Cargo.toml");
 /// ```
+#[cfg(feature = "lsp-responses")]
 #[must_use]
-pub fn to_ls_uri(url: &url::Url) -> Uri {
+pub fn to_ls_uri(url: &url::Url) -> tower_lsp_server::ls_types::Uri {
     url.as_str()
         .parse()
         .unwrap_or_else(|e| panic!("document URL {url} did not round-trip to an LSP Uri: {e}"))
@@ -1679,7 +1801,7 @@ pub fn to_ls_uri(url: &url::Url) -> Uri {
 ///
 /// ```
 /// use deps_core::single_file_edit;
-/// use tower_lsp_server::ls_types::{Position, Range};
+/// use deps_core::position::{Position, Range};
 /// use url::Url;
 ///
 /// let url = Url::parse("file:///tmp/Cargo.toml").unwrap();
@@ -1688,14 +1810,21 @@ pub fn to_ls_uri(url: &url::Url) -> Uri {
 ///
 /// assert_eq!(edits.len(), 1);
 /// ```
+#[cfg(feature = "lsp-responses")]
 #[must_use]
 pub fn single_file_edit(
     uri: &url::Url,
     range: Range,
     new_text: String,
-) -> HashMap<Uri, Vec<TextEdit>> {
+) -> HashMap<tower_lsp_server::ls_types::Uri, Vec<tower_lsp_server::ls_types::TextEdit>> {
     let mut edits = HashMap::new();
-    edits.insert(to_ls_uri(uri), vec![TextEdit { range, new_text }]);
+    edits.insert(
+        to_ls_uri(uri),
+        vec![tower_lsp_server::ls_types::TextEdit {
+            range: range.into(),
+            new_text,
+        }],
+    );
     edits
 }
 
@@ -1890,14 +2019,14 @@ mod tests {
         let dep = MockDep {
             name: PackageName::new("serde"),
             version_req: VersionReq::new("1.0.0"),
-            version_range: Range::new(Position::new(0, 9), Position::new(0, 14)).into(),
-            name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+            version_range: Range::new(Position::new(0, 9), Position::new(0, 14)),
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
         };
 
         assert!(dependency_version_range_is_literal(
             &dep,
             content,
-            dep.version_range.into(),
+            dep.version_range,
         ));
     }
 
@@ -1911,14 +2040,14 @@ mod tests {
         let dep = MockDep {
             name: PackageName::new("slf4j-api"),
             version_req: VersionReq::new("2.0.16"), // resolved property value
-            version_range: Range::new(Position::new(0, 9), Position::new(0, 25)).into(), // "${slf4j.version}"
-            name_range: Range::new(Position::new(0, 0), Position::new(0, 0)).into(),
+            version_range: Range::new(Position::new(0, 9), Position::new(0, 25)), // "${slf4j.version}"
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 0)),
         };
 
         assert!(!dependency_version_range_is_literal(
             &dep,
             content,
-            dep.version_range.into(),
+            dep.version_range,
         ));
     }
 
@@ -1931,14 +2060,14 @@ mod tests {
         let dep = MockDep {
             name: PackageName::new("job"),
             version_req: VersionReq::new("1.0.0"),
-            version_range: Range::new(Position::new(0, 5), Position::new(0, 9)).into(), // "*pin"
-            name_range: Range::new(Position::new(0, 0), Position::new(0, 0)).into(),
+            version_range: Range::new(Position::new(0, 5), Position::new(0, 9)), // "*pin"
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 0)),
         };
 
         assert!(!dependency_version_range_is_literal(
             &dep,
             content,
-            dep.version_range.into(),
+            dep.version_range,
         ));
     }
 
@@ -1953,14 +2082,14 @@ mod tests {
         let dep = MockDep {
             name: PackageName::new("serde"),
             version_req: VersionReq::new(""),
-            version_range: Range::new(Position::new(0, 9), Position::new(0, 9)).into(),
-            name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+            version_range: Range::new(Position::new(0, 9), Position::new(0, 9)),
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
         };
 
         assert!(dependency_version_range_is_literal(
             &dep,
             content,
-            dep.version_range.into(),
+            dep.version_range,
         ));
     }
 
@@ -1974,14 +2103,14 @@ mod tests {
         let dep = MockDep {
             name: PackageName::new("x"),
             version_req: VersionReq::new(""),
-            version_range: Range::new(Position::new(0, 5), Position::new(0, 8)).into(), // "1.0"
-            name_range: Range::new(Position::new(0, 0), Position::new(0, 1)).into(),
+            version_range: Range::new(Position::new(0, 5), Position::new(0, 8)), // "1.0"
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 1)),
         };
 
         assert!(!dependency_version_range_is_literal(
             &dep,
             content,
-            dep.version_range.into(),
+            dep.version_range,
         ));
     }
 
@@ -1996,14 +2125,14 @@ mod tests {
         let dep = MockDep {
             name: PackageName::new("slf4j-api"),
             version_req: VersionReq::new("${slf4j.version}"), // left unresolved by the parser
-            version_range: Range::new(Position::new(0, 9), Position::new(0, 25)).into(), // "${slf4j.version}"
-            name_range: Range::new(Position::new(0, 0), Position::new(0, 0)).into(),
+            version_range: Range::new(Position::new(0, 9), Position::new(0, 25)), // "${slf4j.version}"
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 0)),
         };
 
         assert!(!dependency_version_range_is_literal(
             &dep,
             content,
-            dep.version_range.into(),
+            dep.version_range,
         ));
     }
 
@@ -2016,14 +2145,14 @@ mod tests {
         let dep = MockDep {
             name: PackageName::new("com.example:lib"),
             version_req: VersionReq::new("$libVersion"), // left unresolved by the parser
-            version_range: Range::new(Position::new(0, 32), Position::new(0, 43)).into(), // "$libVersion"
-            name_range: Range::new(Position::new(0, 0), Position::new(0, 0)).into(),
+            version_range: Range::new(Position::new(0, 32), Position::new(0, 43)), // "$libVersion"
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 0)),
         };
 
         assert!(!dependency_version_range_is_literal(
             &dep,
             content,
-            dep.version_range.into(),
+            dep.version_range,
         ));
     }
 
@@ -2036,14 +2165,14 @@ mod tests {
         let dep = MockDep {
             name: PackageName::new("x"),
             version_req: VersionReq::new("1.0-${suffix}"),
-            version_range: Range::new(Position::new(0, 5), Position::new(0, 18)).into(), // "1.0-${suffix}"
-            name_range: Range::new(Position::new(0, 0), Position::new(0, 1)).into(),
+            version_range: Range::new(Position::new(0, 5), Position::new(0, 18)), // "1.0-${suffix}"
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 1)),
         };
 
         assert!(!dependency_version_range_is_literal(
             &dep,
             content,
-            dep.version_range.into(),
+            dep.version_range,
         ));
     }
 
@@ -2058,14 +2187,14 @@ mod tests {
         let dep = MockDep {
             name: PackageName::new("x"),
             version_req: VersionReq::new("*"),
-            version_range: Range::new(Position::new(0, 5), Position::new(0, 6)).into(), // "*"
-            name_range: Range::new(Position::new(0, 0), Position::new(0, 1)).into(),
+            version_range: Range::new(Position::new(0, 5), Position::new(0, 6)), // "*"
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 1)),
         };
 
         assert!(dependency_version_range_is_literal(
             &dep,
             content,
-            dep.version_range.into(),
+            dep.version_range,
         ));
     }
 
@@ -2079,14 +2208,14 @@ mod tests {
         let dep = MockDep {
             name: PackageName::new("job"),
             version_req: VersionReq::new("1.0.0"),
-            version_range: Range::new(Position::new(0, 5), Position::new(0, 19)).into(), // "*pinned-anchor"
-            name_range: Range::new(Position::new(0, 0), Position::new(0, 0)).into(),
+            version_range: Range::new(Position::new(0, 5), Position::new(0, 19)), // "*pinned-anchor"
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 0)),
         };
 
         assert!(!dependency_version_range_is_literal(
             &dep,
             content,
-            dep.version_range.into(),
+            dep.version_range,
         ));
     }
 
@@ -2101,14 +2230,14 @@ mod tests {
         let dep = MockDep {
             name: PackageName::new("com.example:lib"),
             version_req: VersionReq::new("1.0.$patch"), // left unresolved by the parser
-            version_range: Range::new(Position::new(0, 32), Position::new(0, 42)).into(), // "1.0.$patch"
-            name_range: Range::new(Position::new(0, 0), Position::new(0, 0)).into(),
+            version_range: Range::new(Position::new(0, 32), Position::new(0, 42)), // "1.0.$patch"
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 0)),
         };
 
         assert!(!dependency_version_range_is_literal(
             &dep,
             content,
-            dep.version_range.into(),
+            dep.version_range,
         ));
     }
 
@@ -2849,8 +2978,8 @@ mod tests {
         let dep = MockDep {
             name: pkg("test-pkg"),
             version_req: VersionReq::new("1.0.0"),
-            version_range: Range::default().into(),
-            name_range: Range::default().into(),
+            version_range: Range::default(),
+            name_range: Range::default(),
         };
         assert_eq!(
             formatter.format_version_replacing_for(&dep, &ConcreteVersion::new("1.2.3"), "1.0.0"),

@@ -99,7 +99,7 @@ const SEARCH_CACHE_ROWS: usize = 50;
 /// failure here, is cancelled before it can run. That's fine: the hang case is already
 /// handled by the caller's existing skip-fallback path, so no second call happens for
 /// this memo to prevent.
-const RECENT_FAILURE_TTL: Duration = deps_core::completion::COMPLETION_SEARCH_TIMEOUT;
+const RECENT_FAILURE_TTL: Duration = deps_core::lsp_helpers::COMPLETION_SEARCH_TIMEOUT;
 
 const GOOGLE_PREFIXES: &[&str] = &[
     "androidx.",
@@ -1465,6 +1465,7 @@ mod tests {
     /// own timeout fires first and takes its existing skip-fallback path, rather than
     /// `search` finishing fast with an empty/error result the caller cannot
     /// distinguish from "genuinely no results" (see [`SEARCH_ATTEMPT_TIMEOUTS`]'s doc).
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_search_attempt_budget_exceeds_completion_search_timeout() {
         let attempts_total: Duration = SEARCH_ATTEMPT_TIMEOUTS.iter().sum();
@@ -1482,6 +1483,7 @@ mod tests {
     /// actually apply (see [`SEARCH_ATTEMPT_TIMEOUTS`]'s doc). This test exercises the
     /// actual hang-mode behavior instead: a total-failure `search_with_retry` call (no
     /// stale cache) must not resolve before `COMPLETION_SEARCH_TIMEOUT` elapses.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test(start_paused = true)]
     async fn test_search_with_retry_total_failure_outlasts_completion_search_timeout() {
         let start = tokio::time::Instant::now();

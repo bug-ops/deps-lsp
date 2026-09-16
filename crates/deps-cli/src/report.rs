@@ -10,13 +10,14 @@
 //! stays in this crate rather than `deps_core` per `specs/062-cli-check-mode/plan.md`'s
 //! `[NEEDS CLARIFICATION: O-4]` marker — see that doc before moving it.
 
+use deps_core::diagnostic::{Diagnostic, Severity};
 use deps_core::lsp_helpers::{
     DEPRECATED_DIAGNOSTIC_CODE, DependencyOutcomes, LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE,
     UNSATISFIABLE_DIAGNOSTIC_CODE,
 };
 use deps_core::osv::{OsvClient, ScanOutcome, VulnSeverity, VulnerabilityMap};
 use deps_core::policy_config::PolicyConfig;
-use deps_core::position::Range as DomainRange;
+use deps_core::position::Range;
 use deps_core::{Dependency, Ecosystem, EcosystemId, HttpCache, PackageName, VersionData};
 use deps_engine::classify::diff::{
     merge_deprecations_after_fetch, merge_no_comparable_versions_after_fetch,
@@ -31,7 +32,6 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Range};
 
 /// Every non-`deps-core` diagnostic code constant in the workspace, mirrored here as
 /// literals rather than importing `deps-github-actions`/`deps-gitlab-ci` directly (both are
@@ -200,14 +200,14 @@ pub struct CheckFinding {
     /// The OSV-derived severity bucket for [`Self::code`], when it names an advisory this
     /// manifest's OSV scan actually fetched (issue #1077 C2) — looked up by advisory id from
     /// the same scan results `generate_diagnostics` consumed, not re-derived from
-    /// [`Self::severity`] (the three-bucket LSP [`DiagnosticSeverity`] `code` already
-    /// collapsed into is too coarse to recover a CVSS-style grade from). `None` for every
-    /// non-advisory finding, and for an advisory `code` this run's scan did not itself fetch
-    /// (e.g. a stale `code` from a formatter that does not source it from a live scan).
+    /// [`Self::severity`] (the three-bucket [`Severity`] `code` already collapsed into is too
+    /// coarse to recover a CVSS-style grade from). `None` for every non-advisory finding, and
+    /// for an advisory `code` this run's scan did not itself fetch (e.g. a stale `code` from a
+    /// formatter that does not source it from a live scan).
     pub advisory_severity: Option<VulnSeverity>,
     /// The diagnostic's severity.
-    pub severity: DiagnosticSeverity,
-    /// The diagnostic's LSP range within the manifest.
+    pub severity: Severity,
+    /// The diagnostic's range within the manifest.
     pub range: Range,
     /// The diagnostic's human-readable message.
     pub message: String,
@@ -229,8 +229,9 @@ impl CheckReport {
     /// ```
     /// use deps_cli::report::{Category, CheckFinding, CheckReport};
     /// use deps_core::EcosystemId;
+    /// use deps_core::diagnostic::Severity;
+    /// use deps_core::position::Range;
     /// use std::path::PathBuf;
-    /// use tower_lsp_server::ls_types::{DiagnosticSeverity, Range};
     ///
     /// let report = CheckReport {
     ///     findings: vec![CheckFinding {
@@ -242,7 +243,7 @@ impl CheckReport {
     ///         code: None,
     ///         advisory_url: None,
     ///         advisory_severity: None,
-    ///         severity: DiagnosticSeverity::HINT,
+    ///         severity: Severity::Hint,
     ///         range: Range::default(),
     ///         message: "Newer version available: 1.1".to_string(),
     ///     }],
@@ -563,10 +564,10 @@ impl<'a> DependencyIndex<'a> {
         let mut by_version_range = HashMap::new();
         for dep in parse_result.dependencies() {
             if !dep.name_range_is_synthetic() {
-                by_name_range.insert(dep.name_range().into(), dep);
+                by_name_range.insert(dep.name_range(), dep);
             }
             if let Some(version_range) = dep.version_range() {
-                by_version_range.insert(version_range.into(), dep);
+                by_version_range.insert(version_range, dep);
             }
         }
         Self {
@@ -589,8 +590,8 @@ impl<'a> DependencyIndex<'a> {
 /// Indexes every advisory this manifest's OSV scan fetched, keyed by (the [`VulnerabilityMap`]
 /// key identifying the specific dependency occurrence, advisory id) rather than by advisory id
 /// alone (issue #1077 review #4), so [`to_finding`] can attach a
-/// [`CheckFinding::advisory_severity`] without re-deriving a grade from the coarser LSP
-/// [`DiagnosticSeverity`] a `Diagnostic` carries.
+/// [`CheckFinding::advisory_severity`] without re-deriving a grade from the coarser
+/// [`Severity`] a `Diagnostic` carries.
 ///
 /// A bare `HashMap<String, VulnSeverity>` keyed only by advisory id would let one dependency's
 /// severity silently overwrite another's (unspecified `HashMap` iteration order) whenever two
@@ -635,14 +636,11 @@ fn to_finding(
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
     diagnostic: Diagnostic,
     advisory_severities: &HashMap<(String, String), VulnSeverity>,
-    vuln_keys: &HashMap<DomainRange, String>,
+    vuln_keys: &HashMap<Range, String>,
 ) -> CheckFinding {
     let category = classify(&diagnostic, formatter);
     let dep = dep_index.lookup(diagnostic.range);
-    let code = match &diagnostic.code {
-        Some(NumberOrString::String(code)) => Some(code.clone()),
-        Some(NumberOrString::Number(_)) | None => None,
-    };
+    let code = diagnostic.code.clone();
     let advisory_url = diagnostic
         .code_description
         .as_ref()
@@ -664,7 +662,7 @@ fn to_finding(
         code,
         advisory_url,
         advisory_severity,
-        severity: diagnostic.severity.unwrap_or(DiagnosticSeverity::WARNING),
+        severity: diagnostic.severity.unwrap_or(Severity::Warning),
         range: diagnostic.range,
         message: diagnostic.message,
     }
@@ -690,7 +688,7 @@ fn classify(
     diagnostic: &Diagnostic,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
 ) -> Category {
-    if let Some(NumberOrString::String(code)) = &diagnostic.code {
+    if let Some(code) = &diagnostic.code {
         return match code.as_str() {
             UNSATISFIABLE_DIAGNOSTIC_CODE => Category::Unsatisfiable,
             LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE => Category::License,
@@ -739,7 +737,6 @@ fn path_to_uri(path: &Path) -> Option<url::Url> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tower_lsp_server::ls_types::Uri;
 
     fn finding(category: Category) -> CheckFinding {
         CheckFinding {
@@ -751,7 +748,7 @@ mod tests {
             code: None,
             advisory_url: None,
             advisory_severity: None,
-            severity: DiagnosticSeverity::WARNING,
+            severity: Severity::Warning,
             range: Range::default(),
             message: "test".to_string(),
         }
@@ -832,13 +829,11 @@ mod tests {
     impl deps_core::lsp_helpers::OsvNaming for StubFormatter {}
 
     fn diagnostic_with(code: Option<&str>, message: &str) -> Diagnostic {
-        Diagnostic {
-            range: Range::default(),
-            severity: Some(DiagnosticSeverity::WARNING),
-            message: message.to_string(),
-            code: code.map(|c| NumberOrString::String(c.to_string())),
-            source: Some("deps-lsp".into()),
-            ..Default::default()
+        let diagnostic =
+            Diagnostic::new(Range::default(), message).with_severity(Severity::Warning);
+        match code {
+            Some(code) => diagnostic.with_code(code),
+            None => diagnostic,
         }
     }
 
@@ -916,13 +911,11 @@ mod tests {
     }
 
     /// A single-dependency parse result whose one dependency ("dep-0") sits at
-    /// `DomainRange::default()` (`deps_core::test_util::StubDependency::name_range` always
-    /// returns it) — numerically matching `diagnostic_with`'s own hardcoded
-    /// `range: Range::default()` (the LSP-facing `tower_lsp_server::ls_types::Range`
-    /// `DependencyIndex` is keyed on), so `DependencyIndex::lookup` resolves it for tests
-    /// that need a real, non-`None` dependency occurrence. These are two distinct `Range`
-    /// types that happen to share the same zero-valued default — see `DomainRange`'s import
-    /// and `vuln_keys`' type for the domain-range side of this file's lookups.
+    /// `Range::default()` (`deps_core::test_util::StubDependency::name_range` always
+    /// returns it) — matching `diagnostic_with`'s own hardcoded `range: Range::default()`
+    /// (both the same `deps_core::position::Range` `DependencyIndex` is keyed on), so
+    /// `DependencyIndex::lookup` resolves it for tests that need a real, non-`None`
+    /// dependency occurrence.
     fn dep_index_with_one_dependency() -> Box<dyn deps_core::ParseResult> {
         deps_core::test_util::stub_parse_result_with_dependencies(1)
     }
@@ -972,13 +965,11 @@ mod tests {
     fn test_to_finding_extracts_advisory_url_from_code_description() {
         let parse_result = empty_dep_index();
         let dep_index = DependencyIndex::build(parse_result.as_ref());
-        let href: Uri = "https://osv.dev/vulnerability/RUSTSEC-2024-0001"
+        let href: url::Url = "https://osv.dev/vulnerability/RUSTSEC-2024-0001"
             .parse()
-            .expect("valid URI");
-        let diagnostic = Diagnostic {
-            code_description: Some(tower_lsp_server::ls_types::CodeDescription { href }),
-            ..diagnostic_with(Some("RUSTSEC-2024-0001"), "advisory summary")
-        };
+            .expect("valid URL");
+        let diagnostic = diagnostic_with(Some("RUSTSEC-2024-0001"), "advisory summary")
+            .with_code_description(deps_core::diagnostic::CodeDescription::new(href));
         let finding = to_finding(
             EcosystemId::Cargo,
             Path::new("Cargo.toml"),
@@ -1018,7 +1009,7 @@ mod tests {
         let diagnostic = diagnostic_with(Some("RUSTSEC-2024-0001"), "advisory summary");
 
         let mut vuln_keys = HashMap::new();
-        vuln_keys.insert(DomainRange::default(), "dep-0".to_string());
+        vuln_keys.insert(Range::default(), "dep-0".to_string());
         let mut severities = HashMap::new();
         severities.insert(
             ("dep-0".to_string(), "RUSTSEC-2024-0001".to_string()),
@@ -1043,7 +1034,7 @@ mod tests {
         let dep_index = DependencyIndex::build(parse_result.as_ref());
         let diagnostic = diagnostic_with(Some("RUSTSEC-2024-0001"), "advisory summary");
         let mut vuln_keys = HashMap::new();
-        vuln_keys.insert(DomainRange::default(), "dep-0".to_string());
+        vuln_keys.insert(Range::default(), "dep-0".to_string());
 
         let finding = to_finding(
             EcosystemId::Cargo,

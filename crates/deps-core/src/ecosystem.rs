@@ -1,13 +1,16 @@
 use std::any::Any;
 use std::pin::Pin;
 use std::sync::Arc;
+#[cfg(feature = "lsp-responses")]
 use tower_lsp_server::ls_types::{
-    CodeAction, CodeLens, Diagnostic, DocumentLink, Hover, InlayHint, Position, TextEdit,
+    CodeAction, CodeLens, DocumentLink, Hover, InlayHint, Position, TextEdit,
 };
 
+#[cfg(feature = "lsp-responses")]
+use crate::completion::Completions;
 use crate::{
     Registry,
-    completion::Completions,
+    diagnostic::Diagnostic,
     lsp_helpers::{EcosystemFormatter, VersionData},
     position::Range,
     registry::Metadata,
@@ -980,6 +983,7 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     ///
     /// Default implementation delegates to `lsp_helpers::generate_inlay_hints`
     /// using `self.formatter()`. Override only if custom behavior is needed.
+    #[cfg(feature = "lsp-responses")]
     fn generate_inlay_hints<'a>(
         &'a self,
         parse_result: &'a dyn ParseResult,
@@ -1006,6 +1010,7 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     /// `VersionData` construction site every path funnels through, override or not
     /// (issue #688 critic M1: attaching it in this default only would silently drop it
     /// for the ecosystems that override `generate_hover` instead of using this default).
+    #[cfg(feature = "lsp-responses")]
     fn generate_hover<'a>(
         &'a self,
         parse_result: &'a dyn ParseResult,
@@ -1038,6 +1043,7 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     /// manifest source, needed to guard against rewriting a `version_range`
     /// that no longer slices to its declared requirement text (see
     /// `lsp_helpers::literal_span_matches`).
+    #[cfg(feature = "lsp-responses")]
     fn generate_code_actions<'a>(
         &'a self,
         parse_result: &'a dyn ParseResult,
@@ -1097,6 +1103,7 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     /// so unlike the other `generate_*` methods this is synchronous rather
     /// than a [`BoxFuture`]. Empty by default: most ecosystems' manifest
     /// formats have no such intra-file-graph references.
+    #[cfg(feature = "lsp-responses")]
     fn generate_document_links(
         &self,
         _parse_result: &dyn ParseResult,
@@ -1116,6 +1123,7 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     ///
     /// Default implementation delegates to `lsp_helpers::generate_code_lenses` using
     /// `self.formatter()`. Override only if custom behavior is needed.
+    #[cfg(feature = "lsp-responses")]
     fn generate_code_lenses<'a>(
         &'a self,
         parse_result: &'a dyn ParseResult,
@@ -1174,6 +1182,7 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     /// truncated index should report `true`, while a version completion or any
     /// other exhaustive context in the same manifest must report `false`, even for
     /// an ecosystem where some contexts are incomplete and others are not.
+    #[cfg(feature = "lsp-responses")]
     fn generate_completions<'a>(
         &'a self,
         parse_result: &'a dyn ParseResult,
@@ -1219,6 +1228,7 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     /// (`deps-maven`, `deps-gradle`) and so never calls this hook at all — both actually do
     /// serve package-name completion (`groupId`/`artifactId`, a Gradle coordinate), just not
     /// through this method.
+    #[cfg(feature = "lsp-responses")]
     fn complete_package_name<'a>(
         &'a self,
         _request: crate::completion::CompletionRequest<'a>,
@@ -1239,6 +1249,7 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     /// `request.position` from `request.parse_result` (cursor-position-based routing, issue
     /// #593) — deliberate divergence between ecosystems, not a mistake to unify, since the
     /// two lookups can disagree (see `deps-cargo`'s position-based migration history).
+    #[cfg(feature = "lsp-responses")]
     fn complete_version<'a>(
         &'a self,
         request: crate::completion::CompletionRequest<'a>,
@@ -1252,6 +1263,7 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     /// Default: no feature completion (`Completions::default()`) — correct for every
     /// ecosystem without a feature-flag concept. Overridden today by `deps-cargo` and
     /// `deps-go`.
+    #[cfg(feature = "lsp-responses")]
     fn complete_feature<'a>(
         &'a self,
         _request: crate::completion::CompletionRequest<'a>,
@@ -1291,7 +1303,7 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     fn fallback_completion_prefix<'a>(
         &self,
         _content: &'a str,
-        _position: Position,
+        _position: crate::position::Position,
     ) -> Option<&'a str> {
         None
     }
@@ -1348,7 +1360,11 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     /// a missing override only means a future markup-shaped ecosystem always gets the
     /// full-snippet insert, a feature gap rather than #118's "silently wrong syntax"
     /// failure mode.
-    fn fallback_completion_is_bare(&self, _content: &str, _position: Position) -> bool {
+    fn fallback_completion_is_bare(
+        &self,
+        _content: &str,
+        _position: crate::position::Position,
+    ) -> bool {
         false
     }
 
@@ -1452,6 +1468,7 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     /// pin concept at all. The lens/command wiring itself lives in `deps-lsp`'s
     /// `handlers::code_lens` (not a trait default here), so no override of
     /// [`Self::generate_code_lenses`] can accidentally suppress it.
+    #[cfg(feature = "lsp-responses")]
     fn collect_pin_all_to_sha_edits(
         &self,
         _parse_result: &dyn ParseResult,
@@ -1465,6 +1482,7 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     /// consulted only when [`Self::collect_pin_all_to_sha_edits`] returns at least one
     /// edit. Default `{ "ref", "refs" }` is a generic fallback; override to match the
     /// ecosystem's own vocabulary.
+    #[cfg(feature = "lsp-responses")]
     fn pin_all_to_sha_noun(&self) -> crate::lsp_helpers::PinNoun {
         crate::lsp_helpers::PinNoun {
             singular: "ref",
@@ -1715,6 +1733,7 @@ mod tests {
             unimplemented!()
         }
 
+        #[cfg(feature = "lsp-responses")]
         fn generate_completions<'a>(
             &'a self,
             _parse_result: &'a dyn ParseResult,
@@ -1725,6 +1744,7 @@ mod tests {
             unimplemented!()
         }
 
+        #[cfg(feature = "lsp-responses")]
         fn complete_version<'a>(
             &'a self,
             _request: crate::completion::CompletionRequest<'a>,

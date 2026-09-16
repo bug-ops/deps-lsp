@@ -5,11 +5,13 @@
 
 use std::any::Any;
 use std::sync::Arc;
-use tower_lsp_server::ls_types::{CompletionItem, Position, Range};
+#[cfg(feature = "lsp-responses")]
+use tower_lsp_server::ls_types::{CompletionItem, Range};
 
+#[cfg(feature = "lsp-responses")]
+use deps_core::completion::Completions;
 use deps_core::{
-    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, completion::Completions,
-    lsp_helpers::EcosystemFormatter,
+    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, lsp_helpers::EcosystemFormatter,
 };
 
 use crate::formatter::ComposerFormatter;
@@ -38,6 +40,7 @@ impl ComposerEcosystem {
         }
     }
 
+    #[cfg(feature = "lsp-responses")]
     async fn complete_package_names(&self, prefix: &str, range: Range) -> Vec<CompletionItem> {
         deps_core::completion::complete_package_names_generic(
             self.registry.as_ref(),
@@ -48,6 +51,7 @@ impl ComposerEcosystem {
         .await
     }
 
+    #[cfg(feature = "lsp-responses")]
     async fn complete_versions(
         &self,
         package_name: &deps_core::PackageName,
@@ -107,6 +111,7 @@ impl Ecosystem for ComposerEcosystem {
         &self.formatter
     }
 
+    #[cfg(feature = "lsp-responses")]
     fn complete_package_name<'a>(
         &'a self,
         _request: deps_core::completion::CompletionRequest<'a>,
@@ -116,6 +121,7 @@ impl Ecosystem for ComposerEcosystem {
         Box::pin(async move { self.complete_package_names(&prefix, range).await.into() })
     }
 
+    #[cfg(feature = "lsp-responses")]
     fn complete_version<'a>(
         &'a self,
         request: deps_core::completion::CompletionRequest<'a>,
@@ -132,7 +138,7 @@ impl Ecosystem for ComposerEcosystem {
     fn fallback_completion_prefix<'a>(
         &self,
         content: &'a str,
-        position: Position,
+        position: deps_core::position::Position,
     ) -> Option<&'a str> {
         let line = deps_core::fallback_completion::line_at(content, position)?;
         if !is_in_dependencies_section(content, position.line as usize) {
@@ -150,7 +156,11 @@ impl Ecosystem for ComposerEcosystem {
         Some(prefix)
     }
 
-    fn fallback_completion_is_bare(&self, content: &str, position: Position) -> bool {
+    fn fallback_completion_is_bare(
+        &self,
+        content: &str,
+        position: deps_core::position::Position,
+    ) -> bool {
         let Some(line) = deps_core::fallback_completion::line_at(content, position) else {
             return false;
         };
@@ -202,8 +212,12 @@ fn extract_prefix(line: &str, character: u32) -> (&str, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "lsp-responses")]
     use deps_core::{EcosystemConfig, VersionData};
+    #[cfg(feature = "lsp-responses")]
     use std::collections::HashMap;
+    #[cfg(feature = "lsp-responses")]
+    use tower_lsp_server::ls_types::Position;
 
     // #758: exact-value `Ecosystem` conformance, replacing test_ecosystem_id,
     // test_ecosystem_manifest_filenames, and test_ecosystem_lockfile_filenames. Also closes
@@ -221,6 +235,7 @@ mod tests {
     // #758: the shared completion-prefix-length guard
     // (`deps_core::completion::complete_package_names_generic`), replacing
     // test_complete_package_names_short_prefix — also closes the missing max-length case.
+    #[cfg(feature = "lsp-responses")]
     deps_core::completion_guard_conformance! {
         mod composer_completion_guard_conformance;
         complete: |registry: &dyn deps_core::Registry, prefix: String| -> std::pin::Pin<
@@ -269,6 +284,7 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_package_name_completion_context_has_real_range() {
         // Regression test for #232: the textEdit range for a package-name completion
@@ -297,6 +313,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_inlay_hints_empty() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -318,6 +335,7 @@ mod tests {
         assert!(hints.is_empty());
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_completions_no_context() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -345,6 +363,7 @@ mod tests {
     /// Composition regression guard (#390/#282 bug class): proves `line_at` +
     /// `is_in_json_dependencies` + quote-stripping compose correctly through the real
     /// trait method on realistic multi-line content.
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_fallback_completion_prefix_multi_line_composition() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -353,7 +372,7 @@ mod tests {
         let line = content.lines().nth(2).unwrap();
         let position = Position::new(2, line.chars().count() as u32);
         assert_eq!(
-            ecosystem.fallback_completion_prefix(content, position),
+            ecosystem.fallback_completion_prefix(content, position.into()),
             Some("monolog/mono")
         );
     }
@@ -387,6 +406,7 @@ mod tests {
     /// suppress the completion entirely — the same "no safe text to offer" outcome as
     /// Maven's non-`artifactId` open tag — which this trait method achieves by
     /// returning `None`, same as "no completable position at all".
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_fallback_completion_prefix_closed_key_is_suppressed() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -394,9 +414,13 @@ mod tests {
         let content = "{\n  \"require\": {\n    \"monolog/monolog\"";
         let line = content.lines().nth(2).unwrap();
         let position = Position::new(2, line.chars().count() as u32);
-        assert_eq!(eco.fallback_completion_prefix(content, position), None);
+        assert_eq!(
+            eco.fallback_completion_prefix(content, position.into()),
+            None
+        );
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_fallback_completion_is_bare_inside_open_key() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -404,9 +428,10 @@ mod tests {
         let content = "{\n  \"require\": {\n    \"monolog/mono";
         let line = content.lines().nth(2).unwrap();
         let position = Position::new(2, line.chars().count() as u32);
-        assert!(eco.fallback_completion_is_bare(content, position));
+        assert!(eco.fallback_completion_is_bare(content, position.into()));
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_fallback_completion_is_bare_false_with_no_open_key() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -414,7 +439,7 @@ mod tests {
         let content = "{\n  \"require\": {\n    monolog";
         let line = content.lines().nth(2).unwrap();
         let position = Position::new(2, line.chars().count() as u32);
-        assert!(!eco.fallback_completion_is_bare(content, position));
+        assert!(!eco.fallback_completion_is_bare(content, position.into()));
     }
 
     /// #729: `ComposerEcosystem` has no `fallback_bare_insert_text` override — the

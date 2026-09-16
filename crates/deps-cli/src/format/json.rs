@@ -129,8 +129,9 @@ mod tests {
     use super::*;
     use crate::report::{Category, CheckFinding};
     use deps_core::EcosystemId;
+    use deps_core::diagnostic::Severity;
+    use deps_core::position::{Position, Range};
     use std::path::PathBuf;
-    use tower_lsp_server::ls_types::{DiagnosticSeverity, Position, Range};
 
     fn finding() -> CheckFinding {
         CheckFinding {
@@ -142,7 +143,7 @@ mod tests {
             code: None,
             advisory_url: None,
             advisory_severity: None,
-            severity: DiagnosticSeverity::HINT,
+            severity: Severity::Hint,
             range: Range::new(Position::new(4, 0), Position::new(4, 10)),
             message: "Newer version available: 1.1.0".to_string(),
         }
@@ -196,7 +197,7 @@ mod tests {
     fn test_to_document_snapshot() {
         let mut other = finding();
         other.category = Category::Vulnerable;
-        other.severity = DiagnosticSeverity::ERROR;
+        other.severity = Severity::Error;
         other.manifest_path = PathBuf::from("package.json");
         other.dependency_name = None;
         other.requirement = None;

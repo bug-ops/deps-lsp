@@ -9,7 +9,6 @@ use deps_core::lsp_helpers::{
 };
 use pep440_rs::{Version, VersionSpecifiers};
 use std::str::FromStr;
-use tower_lsp_server::ls_types::Position;
 
 /// Precise PEP 440 specifier-set matcher, compiled once per dependency by
 /// [`PypiFormatter::compile_requirement`].
@@ -127,7 +126,11 @@ impl PackageRendering for PypiFormatter {
         crate::registry::package_url(name.as_str())
     }
 
-    fn is_position_on_dependency(&self, dep: &dyn Dependency, position: Position) -> bool {
+    fn is_position_on_dependency(
+        &self,
+        dep: &dyn Dependency,
+        position: deps_core::position::Position,
+    ) -> bool {
         let name_range = dep.name_range();
 
         if position.line != name_range.start.line {
@@ -562,11 +565,13 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "lsp-responses")]
     mod is_position_on_dependency_tests {
         use super::*;
         use deps_core::parser::DependencySource;
         use deps_core::position::{Position as DomainPosition, Range};
         use std::any::Any;
+        use tower_lsp_server::ls_types::Position;
 
         struct MockDep {
             name_range: Range,
@@ -609,7 +614,7 @@ mod tests {
                 )),
             };
             // Position on package name
-            assert!(formatter.is_position_on_dependency(&dep, Position::new(5, 15)));
+            assert!(formatter.is_position_on_dependency(&dep, Position::new(5, 15).into()));
         }
 
         #[test]
@@ -623,7 +628,7 @@ mod tests {
                 )),
             };
             // Position in padding before name (character - 2)
-            assert!(formatter.is_position_on_dependency(&dep, Position::new(5, 8)));
+            assert!(formatter.is_position_on_dependency(&dep, Position::new(5, 8).into()));
         }
 
         #[test]
@@ -637,7 +642,7 @@ mod tests {
                 )),
             };
             // Position after version range (character + 2)
-            assert!(formatter.is_position_on_dependency(&dep, Position::new(5, 37)));
+            assert!(formatter.is_position_on_dependency(&dep, Position::new(5, 37).into()));
         }
 
         #[test]
@@ -651,7 +656,7 @@ mod tests {
                 )),
             };
             // Position too far before (outside padding)
-            assert!(!formatter.is_position_on_dependency(&dep, Position::new(5, 5)));
+            assert!(!formatter.is_position_on_dependency(&dep, Position::new(5, 5).into()));
         }
 
         #[test]
@@ -665,7 +670,7 @@ mod tests {
                 )),
             };
             // Position too far after (outside padding)
-            assert!(!formatter.is_position_on_dependency(&dep, Position::new(5, 40)));
+            assert!(!formatter.is_position_on_dependency(&dep, Position::new(5, 40).into()));
         }
 
         #[test]
@@ -679,8 +684,8 @@ mod tests {
                 )),
             };
             // Different line
-            assert!(!formatter.is_position_on_dependency(&dep, Position::new(4, 15)));
-            assert!(!formatter.is_position_on_dependency(&dep, Position::new(6, 15)));
+            assert!(!formatter.is_position_on_dependency(&dep, Position::new(4, 15).into()));
+            assert!(!formatter.is_position_on_dependency(&dep, Position::new(6, 15).into()));
         }
 
         #[test]
@@ -691,8 +696,8 @@ mod tests {
                 version_range: None,
             };
             // Should use name_range.end for calculation
-            assert!(formatter.is_position_on_dependency(&dep, Position::new(5, 22)));
-            assert!(!formatter.is_position_on_dependency(&dep, Position::new(5, 25)));
+            assert!(formatter.is_position_on_dependency(&dep, Position::new(5, 22).into()));
+            assert!(!formatter.is_position_on_dependency(&dep, Position::new(5, 25).into()));
         }
 
         #[test]
@@ -704,7 +709,7 @@ mod tests {
                 version_range: None,
             };
             // saturating_sub(2) should give 0, not underflow
-            assert!(formatter.is_position_on_dependency(&dep, Position::new(5, 0)));
+            assert!(formatter.is_position_on_dependency(&dep, Position::new(5, 0).into()));
         }
     }
 }

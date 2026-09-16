@@ -42,6 +42,7 @@ impl GitlabCiFormatter {
     /// Looks up `pin`'s commit SHA for `name` under `endpoint` in the shared tag index,
     /// mirroring `deps_github_actions::GithubActionsFormatter::sha_pin_replacement_for`'s
     /// lookup shape (used by hover's `**Resolved**` splice, `crate::ecosystem`).
+    #[cfg(feature = "lsp-responses")]
     #[must_use]
     pub(crate) fn resolved_tag_for_sha(
         &self,

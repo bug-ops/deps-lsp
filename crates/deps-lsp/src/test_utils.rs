@@ -57,7 +57,7 @@ pub(crate) mod blocking_ecosystem {
     use std::path::Path;
     use std::sync::Arc;
     use tokio::sync::Barrier;
-    use tower_lsp_server::ls_types::{CodeLens, Diagnostic, InlayHint, Position};
+    use tower_lsp_server::ls_types::{CodeLens, InlayHint, Position};
 
     pub(crate) struct NoopRegistry;
     impl Registry for NoopRegistry {
@@ -188,7 +188,7 @@ pub(crate) mod blocking_ecosystem {
             _uri: &'a url::Url,
             _freshness: FreshnessSettings,
             _severities: DiagnosticSeverities,
-        ) -> BoxFuture<'a, Vec<Diagnostic>> {
+        ) -> BoxFuture<'a, Vec<deps_core::diagnostic::Diagnostic>> {
             Box::pin(async move {
                 if matches!(self.hook, BlockingHook::Diagnostics) {
                     self.started.wait().await;

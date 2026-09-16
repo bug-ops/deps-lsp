@@ -261,7 +261,7 @@ async fn fallback_completion(
     // section" log lines into one — both are now internal to the ecosystem's own
     // `fallback_completion_prefix`, which has no completable position to report either
     // way.
-    let Some(prefix) = ecosystem.fallback_completion_prefix(content, position) else {
+    let Some(prefix) = ecosystem.fallback_completion_prefix(content, position.into()) else {
         tracing::info!("fallback_completion: no completable prefix at this position");
         return vec![];
     };
@@ -283,7 +283,7 @@ async fn fallback_completion(
     // around the cursor (#724/#728). Decided once per call, from the same
     // `content`/`position` `fallback_completion_prefix` used, and applied to every
     // result.
-    let bare = ecosystem.fallback_completion_is_bare(content, position);
+    let bare = ecosystem.fallback_completion_is_bare(content, position.into());
 
     tracing::info!(
         "fallback_completion: prefix = {:?}, bare = {}",
@@ -505,7 +505,7 @@ mod tests {
         fn fallback_completion_prefix<'a>(
             &self,
             _content: &'a str,
-            _position: tower_lsp_server::ls_types::Position,
+            _position: deps_core::position::Position,
         ) -> Option<&'a str> {
             self.fallback_prefix
         }
@@ -515,7 +515,7 @@ mod tests {
         fn fallback_completion_is_bare(
             &self,
             _content: &str,
-            _position: tower_lsp_server::ls_types::Position,
+            _position: deps_core::position::Position,
         ) -> bool {
             self.is_bare
         }

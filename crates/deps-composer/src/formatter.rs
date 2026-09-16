@@ -8,7 +8,6 @@ use deps_core::lsp_helpers::{
     RequirementMatcher, RequirementResolution, SourcePolicy, compile_requirement_unless,
 };
 use deps_core::normalize_operator_spacing;
-use tower_lsp_server::ls_types::Position;
 
 /// Whether `segment` matches Packagist's vendor/package name-segment charset: starts and ends
 /// with an ASCII alphanumeric character, with only `.`, `_`, `-` allowed in between (Composer's
@@ -115,15 +114,19 @@ impl PackageRendering for ComposerFormatter {
     /// narrower to the rename alone: a single shared boolean gate has no per-action-kind
     /// dial, and a cursor on the name is exactly where a user reading "this package is
     /// abandoned" is likely to click for *any* fix, not just the rename.
-    fn is_position_on_dependency(&self, dep: &dyn Dependency, position: Position) -> bool {
+    fn is_position_on_dependency(
+        &self,
+        dep: &dyn Dependency,
+        position: deps_core::position::Position,
+    ) -> bool {
         let name_range = dep.name_range();
         if name_range.start != name_range.end
-            && deps_core::lsp_helpers::position_in_range(position, name_range.into())
+            && deps_core::lsp_helpers::position_in_range(position, name_range)
         {
             return true;
         }
         dep.version_range()
-            .is_some_and(|r| deps_core::lsp_helpers::position_in_range(position, r.into()))
+            .is_some_and(|r| deps_core::lsp_helpers::position_in_range(position, r))
     }
 }
 
@@ -326,6 +329,7 @@ impl OsvNaming for ComposerFormatter {
     /// This is the mirror image of NuGet: there, lowercasing kills the
     /// ecosystem; here, *not* lowercasing does (OSV is case-sensitive for
     /// every ecosystem except PyPI).
+    #[cfg(feature = "lsp-responses")]
     fn osv_package_name(&self, dep: &dyn Dependency) -> Option<String> {
         Some(self.normalize_package_name(dep.name()))
     }
@@ -577,7 +581,10 @@ mod tests {
     use super::*;
     use crate::types::{ComposerDependency, ComposerSection};
     use deps_core::position::{Position as DomainPosition, Range};
+    #[cfg(feature = "lsp-responses")]
     use std::collections::HashMap;
+    #[cfg(feature = "lsp-responses")]
+    use tower_lsp_server::ls_types::Position;
 
     #[test]
     fn test_normalize_package_name() {
@@ -1135,11 +1142,11 @@ mod tests {
 
         let f = ComposerFormatter;
         assert!(
-            !f.is_position_on_dependency(&dep, Position::new(0, 0)),
+            !f.is_position_on_dependency(&dep, DomainPosition::new(0, 0)),
             "a degenerate name_range must never be selectable, even at its own (0,0) span"
         );
         // The version range still works normally.
-        assert!(f.is_position_on_dependency(&dep, Position::new(1, 22)));
+        assert!(f.is_position_on_dependency(&dep, DomainPosition::new(1, 22)));
     }
 
     /// The override still widens discoverability for a real (non-degenerate) name
@@ -1158,7 +1165,7 @@ mod tests {
         };
 
         let f = ComposerFormatter;
-        assert!(f.is_position_on_dependency(&dep, Position::new(1, 10)));
+        assert!(f.is_position_on_dependency(&dep, DomainPosition::new(1, 10)));
     }
 
     /// T1 (D7(a)/C2): a Composer manifest with a legal escaped-solidus `"vendor\/package"`
@@ -1179,6 +1186,7 @@ mod tests {
     /// and directly against `name_literal_guard`-shaped input (`version_range: Some(..)`,
     /// `name_range: Range::default()`) so the test still catches a regression if a future
     /// parser change ever reintroduces a degenerate `name_range`.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_code_actions_escaped_solidus_name_offers_no_rename_action() {
         let json = r#"{"require": {"vendor\/package": "^1.0"}}"#;
@@ -1262,6 +1270,7 @@ mod tests {
 
     /// Positive path (D7): a well-formed manifest with a real replacement name offers
     /// the "Replace with X" rename quickfix, targeting `name_range` with `replacement`.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_code_actions_offers_rename_action_for_well_formed_manifest() {
         let json = r#"{"require": {"vendor/package": "^1.0"}}"#;
@@ -1312,8 +1321,10 @@ mod tests {
     /// No-op [`deps_core::Registry`] so #205 code-action tests never hit the network —
     /// `generate_code_actions` calls `registry.get_versions` unconditionally after the
     /// registry-independent fix/rename actions are built.
+    #[cfg(feature = "lsp-responses")]
     struct NoNetworkRegistry;
 
+    #[cfg(feature = "lsp-responses")]
     impl deps_core::Registry for NoNetworkRegistry {
         fn get_versions<'a>(
             &'a self,

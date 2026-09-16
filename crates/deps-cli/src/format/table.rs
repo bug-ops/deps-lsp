@@ -2,9 +2,9 @@
 
 use super::severity_str;
 use crate::report::CheckReport;
+use deps_core::diagnostic::Severity;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use tower_lsp_server::ls_types::DiagnosticSeverity;
 
 /// Renders `report` as a table grouped by manifest path, then by severity
 /// (error > warning > information > hint) within each file.
@@ -69,13 +69,12 @@ pub fn render(report: &CheckReport) -> String {
 }
 
 /// Sort key for severity within one file's findings — error first, hint last.
-fn severity_rank(severity: DiagnosticSeverity) -> u8 {
+fn severity_rank(severity: Severity) -> u8 {
     match severity {
-        DiagnosticSeverity::ERROR => 0,
-        DiagnosticSeverity::WARNING => 1,
-        DiagnosticSeverity::INFORMATION => 2,
-        DiagnosticSeverity::HINT => 3,
-        _ => 4,
+        Severity::Error => 0,
+        Severity::Warning => 1,
+        Severity::Information => 2,
+        Severity::Hint => 3,
     }
 }
 
@@ -84,10 +83,10 @@ mod tests {
     use super::*;
     use crate::report::{Category, CheckFinding};
     use deps_core::EcosystemId;
+    use deps_core::position::{Position, Range};
     use std::path::PathBuf;
-    use tower_lsp_server::ls_types::{Position, Range};
 
-    fn finding(path: &str, category: Category, severity: DiagnosticSeverity) -> CheckFinding {
+    fn finding(path: &str, category: Category, severity: Severity) -> CheckFinding {
         CheckFinding {
             ecosystem: EcosystemId::Cargo,
             manifest_path: PathBuf::from(path),
@@ -111,11 +110,7 @@ mod tests {
     #[test]
     fn test_render_single_finding_includes_path_and_message() {
         let report = CheckReport {
-            findings: vec![finding(
-                "Cargo.toml",
-                Category::Outdated,
-                DiagnosticSeverity::HINT,
-            )],
+            findings: vec![finding("Cargo.toml", Category::Outdated, Severity::Hint)],
         };
         let table = render(&report);
         assert!(table.contains("Cargo.toml"));
@@ -130,12 +125,8 @@ mod tests {
     fn test_render_groups_findings_by_file() {
         let report = CheckReport {
             findings: vec![
-                finding("Cargo.toml", Category::Outdated, DiagnosticSeverity::HINT),
-                finding(
-                    "package.json",
-                    Category::Vulnerable,
-                    DiagnosticSeverity::ERROR,
-                ),
+                finding("Cargo.toml", Category::Outdated, Severity::Hint),
+                finding("package.json", Category::Vulnerable, Severity::Error),
             ],
         };
         let table = render(&report);
@@ -151,12 +142,8 @@ mod tests {
     fn test_render_sorts_by_severity_within_a_file() {
         let report = CheckReport {
             findings: vec![
-                finding("Cargo.toml", Category::Outdated, DiagnosticSeverity::HINT),
-                finding(
-                    "Cargo.toml",
-                    Category::Vulnerable,
-                    DiagnosticSeverity::ERROR,
-                ),
+                finding("Cargo.toml", Category::Outdated, Severity::Hint),
+                finding("Cargo.toml", Category::Vulnerable, Severity::Error),
             ],
         };
         let table = render(&report);
@@ -171,23 +158,15 @@ mod tests {
     /// snapshot diff instead of silently passing a `.contains()`-only assertion.
     #[test]
     fn test_render_multi_category_snapshot() {
-        let mut vulnerable = finding(
-            "Cargo.toml",
-            Category::Vulnerable,
-            DiagnosticSeverity::ERROR,
-        );
+        let mut vulnerable = finding("Cargo.toml", Category::Vulnerable, Severity::Error);
         vulnerable.message = "GHSA-xxxx-yyyy-zzzz: example advisory".to_string();
-        let mut license = finding(
-            "package.json",
-            Category::License,
-            DiagnosticSeverity::WARNING,
-        );
+        let mut license = finding("package.json", Category::License, Severity::Warning);
         license.dependency_name = Some("left-pad".to_string());
         license.message = "left-pad: GPL-3.0 denied".to_string();
 
         let report = CheckReport {
             findings: vec![
-                finding("Cargo.toml", Category::Outdated, DiagnosticSeverity::HINT),
+                finding("Cargo.toml", Category::Outdated, Severity::Hint),
                 vulnerable,
                 license,
             ],

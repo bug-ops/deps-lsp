@@ -350,7 +350,7 @@ mod tests {
         let config = load(None, dir.path()).expect("deps.toml in default_dir must be found");
         assert_eq!(
             config.policy.diagnostics.outdated_severity,
-            tower_lsp_server::ls_types::DiagnosticSeverity::ERROR
+            deps_core::diagnostic::Severity::Error
         );
     }
 
@@ -469,7 +469,7 @@ mod tests {
         let config = load(None, dir.path()).expect("auto-discovered file must still load");
         assert_eq!(
             config.policy.diagnostics.yanked_severity,
-            tower_lsp_server::ls_types::DiagnosticSeverity::HINT
+            deps_core::diagnostic::Severity::Hint
         );
     }
 

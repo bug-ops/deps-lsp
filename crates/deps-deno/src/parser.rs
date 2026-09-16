@@ -563,6 +563,7 @@ mod tests {
         assert!(result.dependencies.is_empty());
     }
 
+    #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_partial_specifier_end_to_end_completion_context_fires() {
         use deps_core::completion::{CompletionContext, detect_completion_context};

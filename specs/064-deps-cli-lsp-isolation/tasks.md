@@ -187,57 +187,132 @@ orphan-rule-constrained conversion.
 
 ---
 
-### T005: `tower-lsp-server` optional in `deps-core` (`lsp-responses` feature)
+### T005: `tower-lsp-server` optional in `deps-core` and every ecosystem crate (`lsp-responses` feature)
 
-**Context**: Part B of the plan. `hover.rs`/`code_actions.rs`/`code_lenses.rs`/
-`inlay_hints.rs`/`generate_document_links` are `deps-cli`-unused and stay
-`ls_types`-typed, but must compile conditionally so `tower-lsp-server` can
-become optional for a `deps-cli`-shaped build.
+**Context**: Part B of the plan, larger than originally scoped. Gating only
+`deps-core`'s `hover.rs`/`code_actions.rs`/`code_lenses.rs`/`inlay_hints.rs`/
+`generate_document_links` (the original T005 scope) does not satisfy
+FR-001/SC-001: `Ecosystem::complete_version`/`complete_package_name`/
+`complete_feature` (required, no default) return `Completions`, which wraps
+`Vec<tower_lsp_server::ls_types::CompletionItem>` regardless of whether
+`deps-cli` calls `generate_completions` — and each of the 14 ecosystem
+crates has its own **direct**, unconditional `tower-lsp-server` Cargo.toml
+dependency, not routed through `deps-core`'s re-export. The feature gate
+must extend through `deps-core`'s `completion` module and every ecosystem
+crate's own Cargo.toml/`ecosystem.rs`.
 **Spec reference**: [[spec#FR-001]], [[plan#1. Architecture]] (Part B)
 **Acceptance criteria**:
 - [ ] `deps-core/Cargo.toml`: `tower-lsp-server = { workspace = true,
       optional = true }`; new feature `lsp-responses = ["dep:tower-lsp-server"]`;
-      new `default = ["lsp-responses"]` list (today `deps-core` has none)
+      **not** added to `default` (Cargo does not allow a `workspace = true`
+      dependency edge to turn off a feature the workspace-inherited crate
+      defaults on — confirmed empirically when `deps-engine`'s
+      `deps-cargo = { workspace = true, optional = true }`-shaped edges hit
+      exactly this restriction; see plan's Key Design Decisions)
 - [ ] `lsp_helpers/mod.rs`'s `hover`/`code_actions`/`code_lenses`/`inlay_hints`
-      module declarations gated `#[cfg(feature = "lsp-responses")]`
+      module declarations gated `#[cfg(feature = "lsp-responses")]`;
+      `position_in_range`/`LineOffsetTable`/`byte_span_to_range` retyped to
+      domain `position::Position`/`position::Range` and stay ungated (needed
+      unconditionally by parsing infrastructure); `to_ls_uri`/
+      `single_file_edit` gated
 - [ ] `Ecosystem`'s `generate_hover`/`generate_code_actions`/
-      `generate_code_lenses`/`generate_inlay_hints`/`generate_document_links`
-      default methods gated the same way in `ecosystem.rs`
+      `generate_code_lenses`/`generate_inlay_hints`/`generate_document_links`/
+      `generate_completions`/`complete_version`/`complete_package_name`/
+      `complete_feature`/`collect_pin_all_to_sha_edits`/`pin_all_to_sha_noun`
+      default methods (or, for the ones with no default, the trait method
+      declaration itself) gated the same way in `ecosystem.rs`;
+      `fallback_completion_prefix`/`fallback_completion_is_bare` retyped to
+      domain `Position` and stay ungated
+- [ ] `lib.rs`'s `completion` module declaration gated; `position.rs`'s
+      `ls_types` `From` impls and their roundtrip tests gated
+      (`Position`/`Range` themselves stay ungated)
+- [ ] `ecosystem_registry.rs`'s test-module mock `Ecosystem` impls and
+      `conformance.rs`'s `assert_completion_guard`/`AlwaysHasResultsRegistry`/
+      `completion_guard_conformance!` macro gated to match the trait
+- [ ] `lsp_helpers/test_support.rs`'s fixtures used only by `hover.rs`/
+      `code_actions.rs` (e.g. `MockGoFormatter`, `vulnerable_dep`,
+      `quickfix_titles`) gated; fixtures shared with `diagnostics.rs` stay
+      ungated
+- [ ] Each of the 14 `deps-<ecosystem>` crates (`bundler`, `cargo`,
+      `composer`, `dart`, `deno`, `github-actions`, `gitlab-ci`, `go`,
+      `gradle`, `maven`, `npm`, `nuget`, `pypi`, `swift`) gets its own
+      Cargo.toml `lsp-responses = ["dep:tower-lsp-server",
+      "deps-core/lsp-responses"]` feature (not in `default`, same Cargo
+      restriction as above), its own `tower-lsp-server` dependency made
+      `optional = true`; `deps-deno`/`deps-gradle` additionally forward
+      `deps-npm/lsp-responses`/`deps-maven/lsp-responses` (real,
+      non-optional dependencies, not routed through `deps-engine`)
+- [ ] Each of the 14 crates' `generate_completions`/`complete_version`/
+      `complete_package_name` override (every crate has one — either via
+      the shared dispatch or, for `deps-maven`/`deps-gradle`, a full
+      override) gated `#[cfg(feature = "lsp-responses")]`;
+      `deps-npm`/`deps-github-actions`/`deps-gitlab-ci` additionally gate
+      their `generate_hover`/`generate_code_actions`/`generate_code_lenses`
+      overrides and any free-function helpers used only by them (e.g.
+      `deps-github-actions`'s `build_sha_pin_action`/`splice_resolved_line`,
+      `deps-gitlab-ci`'s equivalents); `deps-nuget` also overrides
+      `generate_hover` and gets the same treatment
 - [ ] `cargo build -p deps-core --no-default-features` compiles (only
       `diagnostic.rs`/`diagnostics.rs`/`generate_diagnostics` remain active)
 - [ ] `cargo build -p deps-core --all-features` (i.e. with `lsp-responses`)
       compiles identically to before this task
-- [ ] `cargo tree -p deps-core --no-default-features -e features,no-dev`
-      does not contain `tower-lsp-server`
+- [ ] `cargo clippy -p deps-core --all-targets --no-default-features -- -D
+      warnings` is clean (stricter than a bare `--no-default-features`
+      check — catches dead-code fallout from gating, e.g. helpers whose
+      only caller became gated)
+- [ ] `cargo clippy -p <each ecosystem crate> --no-default-features -- -D
+      warnings` is clean for all 14 (mirrors CI's
+      `cargo hack clippy --workspace --each-feature --no-dev-deps` step,
+      which has no `--all-targets` — only the lib target needs to compile
+      under `--no-default-features`, not `#[cfg(test)]` code)
 **Dependencies**: T001
-**Files**: `crates/deps-core/Cargo.toml`, `crates/deps-core/src/lsp_helpers/mod.rs`, `crates/deps-core/src/ecosystem.rs`
-**Complexity**: medium
+**Files**: `crates/deps-core/{Cargo.toml,src/lib.rs,src/completion.rs,src/ecosystem.rs,src/position.rs,src/ecosystem_registry.rs,src/conformance.rs,src/lsp_helpers/{mod.rs,test_support.rs,formatter.rs,in_use_version.rs},src/deps_dev/mod.rs}`, `crates/deps-{bundler,cargo,composer,dart,deno,github-actions,gitlab-ci,go,gradle,maven,npm,nuget,pypi,swift}/{Cargo.toml,src/ecosystem.rs}` (plus `deps-gitlab-ci/src/formatter.rs`, `deps-nuget/src/ecosystem.rs`, `deps-pypi/src/parser/mod.rs` for scattered `RequirementRef`/`resolved_tag_for_sha` retypes)
+**Complexity**: high
 
 ---
 
 ### T006: `deps-engine`/`deps-lsp` Cargo.toml feature forwarding
 
 **Context**: `deps-engine` already forwards every per-ecosystem feature
-explicitly with no `default` list (issue #1058's documented pattern) —
-`lsp-responses` follows the same shape. `deps-lsp` must explicitly opt back
-in since it still needs hover/code-actions/code-lenses/inlay-hints.
+explicitly with no `default` list (issue #1058's documented pattern);
+`lsp-responses` cannot follow the same `default-features = false` shape the
+plan originally described (Cargo disallows it — see T005), so it uses
+weak-dependency-feature syntax instead. `deps-lsp` must explicitly opt back
+in since it still needs hover/code-actions/code-lenses/inlay-hints/
+completions, including on its own unconditional dev-dependencies.
 **Spec reference**: [[spec#FR-001]], [[plan#1. Architecture]] (Part B)
 **Acceptance criteria**:
-- [ ] `deps-engine/Cargo.toml`: new `lsp-responses = ["deps-core/lsp-responses"]`
-      feature; its `deps-core` dependency switched to `default-features =
-      false` (forwarding everything explicitly, matching its existing
-      ecosystem-feature philosophy)
+- [ ] `deps-engine/Cargo.toml`: new `lsp-responses` feature using
+      weak-dependency-feature syntax — `["deps-core/lsp-responses",
+      "deps-bundler?/lsp-responses", "deps-cargo?/lsp-responses", ...]` for
+      all 14 optional ecosystem dependencies — so it only forwards to an
+      ecosystem crate already enabled via that ecosystem's own
+      `cargo = ["dep:deps-cargo"]`-shaped feature; its `deps-core`/ecosystem
+      dependency edges are **not** changed to `default-features = false`
+      (disallowed by Cargo for a `workspace = true` edge — see T005)
 - [ ] `deps-lsp/Cargo.toml`: `deps-core`/`deps-engine` dependency lines
-      updated to add `features = ["lsp-responses"]`
+      updated to add `features = ["lsp-responses"]` unconditionally (not
+      tied to any `deps-lsp` feature toggle, since `deps-lsp` always needs
+      the full surface); `[dev-dependencies]` on `deps-npm`/`deps-deno`/
+      `deps-github-actions`/`deps-gitlab-ci` also get
+      `features = ["lsp-responses"]` explicitly — they're compiled for
+      every `cargo-hack --each-feature --all-targets` slice regardless of
+      which ecosystem feature `deps-lsp` itself has selected, so
+      `deps-engine`'s weak-dependency forwarding (which only covers
+      ecosystems `deps-engine` itself optionally enables) doesn't reach them
 - [ ] `deps-cli/Cargo.toml`: no change yet (still has its own direct
       `ls_types` usage — fixed in T007)
 - [ ] `cargo build -p deps-lsp --all-features` compiles unchanged
 - [ ] `cargo build -p deps-engine --no-default-features --features
       cargo,npm,pypi,go,bundler,dart,maven,gradle,swift,composer,nuget,deno,github-actions,gitlab-ci`
       (i.e. `deps-cli`'s exact feature set, no `lsp-responses`) compiles
+- [ ] `cargo hack clippy -p deps-lsp --each-feature --all-targets
+      --keep-going -- -D warnings` and `cargo hack clippy -p deps-engine
+      --each-feature --all-targets --keep-going -- -D warnings` (CI's own
+      checks) are both clean across every slice
 **Dependencies**: T005
 **Files**: `crates/deps-engine/Cargo.toml`, `crates/deps-lsp/Cargo.toml`
-**Complexity**: low
+**Complexity**: medium
 
 ---
 
@@ -261,12 +336,19 @@ all currently import `ls_types` types directly, independent of whatever
       `format/sarif.rs` retyped the same way; `severity_str` and any
       `Display`/formatting logic preserved verbatim (only the input type
       changes)
-- [ ] `deps-cli/Cargo.toml`: `deps-core` dependency switched to
-      `default-features = false`; direct `tower-lsp-server` dependency line
-      removed once no source file under `crates/deps-cli/src/` references
+- [ ] `deps-cli/Cargo.toml`: **no** `default-features = false` needed on its
+      `deps-core`/`deps-engine` dependency lines — neither crate defaults to
+      `lsp-responses` after T005/T006, so a bare `{ workspace = true }` is
+      already clean; direct `tower-lsp-server` dependency line removed once
+      no source file under `crates/deps-cli/src/` references
       `tower_lsp_server`/`ls_types` (grep confirms zero matches)
 - [ ] `cargo tree -p deps-cli -e features,no-dev` does not contain
-      `tower-lsp-server` (spec SC-001)
+      `tower-lsp-server` (spec SC-001) — verified against the *actual*
+      resolved dependency tree, not assumed from the Cargo.toml shape alone
+      (an earlier, `deps-core`-only-gated version of this change looked
+      correct on paper but still leaked `tower-lsp-server` transitively
+      through each ecosystem crate's own unconditional dependency until
+      T005 closed that gap too)
 - [ ] **Every existing `deps-cli` table/JSON/SARIF fixture test (insta +
       jsonschema) passes unchanged** — spec SC-003, do not accept a fixture
       diff here; a changed fixture means the retype introduced a real
