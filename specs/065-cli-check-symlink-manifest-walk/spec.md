@@ -89,6 +89,66 @@ escape the walked root onto arbitrary filesystem paths.
   deliberately out of scope here rather than expanding this already
   multi-round security fix further — tracked as a follow-up issue (see
   §10).
+
+  **Addendum (issue #1124, implemented)**: the above gap is now closed.
+  `walk.rs` classifies a symlink whose target could not be resolved at all,
+  *or* resolved to something that can never be a manifest regardless of
+  `--follow-symlinks` (a directory, fifo, socket, or other non-regular-file
+  target) — `SymlinkClassification::Broken` in the new `classify_symlink`
+  — by its own filename, not its target, via a new `is_manifest_shaped_by_name`
+  helper factored out of this spec's original routing check. A match is
+  reported via a new, distinct `WalkOutcome::broken_manifest_symlinks` sink
+  rather than reusing `ignored_manifests`. The two are kept separate
+  deliberately: an `ignored_manifests` entry means "a real manifest file
+  existed and we chose not to read it" (an unfollowed symlink, a
+  `.gitignore` rule, a pruned directory), while a `broken_manifest_symlinks`
+  entry means the manifest-shaped path produced no manifest at all — for a
+  manifest a git history shows was previously present, that is stronger
+  evidence of tampering than of legitimate exclusion, so `deps-cli`'s
+  stderr warning for it uses its own wording rather than the generic
+  "excluded from the scan" message.
+
+  **This spec's original text (just above) treated a symlink resolving to
+  a directory as out of scope, reasoning it "can never satisfy any
+  ecosystem's manifest parsing" — that conflated *parseability* with
+  *detectability* and was corrected during adversarial review (impl-critic
+  finding S1) before this addendum's first draft shipped: an attacker
+  substituting the real manifest for a symlink to an *existing* directory
+  is a zero-cost variant of substituting it for a dangling symlink, and
+  #1124 exists precisely because that prior "can't be parsed, so it's
+  fine" reasoning was the bug. `Broken` therefore also requires the entry
+  to actually be a symlink (an `is_symlink`/`symlink_metadata` lstat guard,
+  impl-critic finding S2) — without it, an ordinary, non-symlink directory
+  or unreadable file that merely happens to share a manifest's name (e.g.
+  a permission-denied directory named `app.csproj`) would be misreported
+  as tampering, which is a distinct failure mode from S1's under-detection.
+
+  Reporting is unconditional across every mode: default, `--follow-symlinks`
+  (where `ignore`/`walkdir` instead yields an `Err` for the unresolvable
+  entry — `walk_directory`'s `Err` arm additionally classifies that error's
+  path, gated on both `is_io()` — so a structurally different error sharing
+  the same path-carrying variant, e.g. a symlink loop, isn't conflated with
+  this — and the same `is_symlink` check), and `--respect-gitignore`
+  (detected via the same unfiltered diff pass `ignored_manifests`' own
+  gitignored-symlink case already uses). A broken hop partway through a
+  symlink chain is covered for free by `std::fs::metadata` resolving the
+  whole chain in one call. An *explicitly*-given single-manifest root that
+  is itself a broken symlink (`deps-cli check some/Cargo.toml`, the
+  natural single-manifest CI-gate invocation) needed its own check in
+  `walk_with_limit`'s `root.is_file()` branch (impl-critic finding S3):
+  `is_file()` follows symlinks and so is `false` for a broken one, which
+  otherwise fell into the directory-walk branch with the root treated as
+  its own display root, producing an empty reported path once
+  `strip_prefix` trivially succeeded against itself. That explicit-root
+  check now routes through `classify_symlink` directly (rather than a
+  hand-rolled duplicate) after background code review found the original,
+  narrower check let a manifest-shaped symlink-to-directory root both be
+  walked *and* independently re-flagged as `Broken` at the same time — a
+  self-contradictory report; and the `Err`-arm classification no longer
+  also emits a redundant generic `walk_errors` line once the specific
+  `broken_manifest_symlinks` one already fired. See
+  `crates/deps-cli/src/walk.rs`'s `classify_symlink`/`SymlinkClassification`
+  and the corresponding tests.
 - `respect_gitignore`'s existing `.gitignore`/`.ignore`/pruned-directory
   behavior (#1109) — unrelated axis, unchanged by this spec.
 
@@ -237,7 +297,7 @@ one place" constitution principle.
 - [[constitution]] — project principles, especially principle 1 (one fix, one place)
 - [[MOC-specs]] — all specifications
 - Issue #1112 (this spec's source), #1109/#1108 (same fail-open class, closed by #1111)
-- Issue #1124 (follow-up: a manifest replaced by a broken symlink is still silently skipped — narrower variant of this spec's Out of Scope section, filed after implementation review)
+- Issue #1124 (follow-up: a manifest replaced by a broken symlink is still silently skipped — narrower variant of this spec's Out of Scope section, filed after implementation review; implemented, see the addendum above)
 - `crates/deps-cli/src/walk.rs` (`walk_directory`, `route_file`, `warn_on_pruned_directory_manifest`, `WalkOutcome`)
 - `crates/deps-cli/src/cli.rs` (`CheckArgs::respect_gitignore` — the flag pattern this spec's `follow_symlinks` mirrors)
 - `crates/deps-cli/src/main.rs` (`run_check` — where `WalkOutcome::ignored_manifests`/`walk_errors` already drive `had_execution_error`)

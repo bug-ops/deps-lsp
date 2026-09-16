@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **deps-cli**: `check` now reports a manifest replaced by an unresolvable or non-file symlink instead of silently skipping it (#1139, resolves #1124)
+
 ## [1.1.0] - 2026-09-16
 
 ### Changed

@@ -419,6 +419,84 @@ fn test_default_mode_ignores_gitignore_through_the_real_binary_and_exits_clean()
     );
 }
 
+/// Issue #1124's own repro, exercised through the real binary (mirroring reviewer follow-up
+/// #5's rationale above for `--respect-gitignore`): a manifest replaced by a broken symlink
+/// must not be silently dropped from the scan, and the warning must distinguish this case
+/// (possible tampering) from an ordinary excluded manifest.
+#[cfg(unix)]
+#[test]
+fn test_broken_symlink_manifest_reaches_the_real_exit_code_wiring() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    // M1 (critic follow-up): a second *recognized* manifest, so `manifests.is_empty()` isn't
+    // an independent, overlapping reason for a non-zero exit — the broken symlink must be the
+    // only thing driving `had_execution_error` here. `--fail-on vulnerable` matches the
+    // issue's own literal repro command.
+    std::fs::write(
+        dir.path().join("package.json"),
+        "{\"name\": \"fixture\", \"version\": \"0.1.0\"}\n",
+    )
+    .expect("write a second, recognized manifest");
+    std::os::unix::fs::symlink(
+        dir.path().join("does-not-exist.toml"),
+        dir.path().join("Cargo.toml"),
+    )
+    .expect("create broken symlink replacing Cargo.toml");
+
+    let exe = env!("CARGO_BIN_EXE_deps-cli");
+    let output = std::process::Command::new(exe)
+        .args(["check", "--offline", "--fail-on", "vulnerable"])
+        .arg(dir.path())
+        .output()
+        .expect("run the real deps-cli binary");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a manifest replaced by a broken symlink must exit 2 (execution error), not 0, even \
+         though a second manifest was found and scanned cleanly — stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("could not be resolved"),
+        "must warn with the broken-symlink-specific message, not the generic excluded-manifest \
+         one, stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("no manifests were discovered"),
+        "the second manifest must have been found — this exit code must come from the broken \
+         symlink alone, stderr: {stderr}"
+    );
+}
+
+/// Companion to the above: the same fixture under `--follow-symlinks` must still report the
+/// broken symlink (resolving it is impossible by definition), not treat the flag as silencing
+/// the warning.
+#[cfg(unix)]
+#[test]
+fn test_broken_symlink_manifest_still_reported_under_follow_symlinks() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    std::os::unix::fs::symlink(
+        dir.path().join("does-not-exist.toml"),
+        dir.path().join("Cargo.toml"),
+    )
+    .expect("create broken symlink replacing Cargo.toml");
+
+    let exe = env!("CARGO_BIN_EXE_deps-cli");
+    let output = std::process::Command::new(exe)
+        .args(["check", "--offline", "--follow-symlinks"])
+        .arg(dir.path())
+        .output()
+        .expect("run the real deps-cli binary");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "--follow-symlinks must not turn a broken symlink into a clean exit — stderr: {stderr}"
+    );
+    assert!(stderr.contains("could not be resolved"), "stderr: {stderr}");
+}
+
 /// Review finding M2: a manifest symlinked from directory A (which has its own `Cargo.lock`)
 /// to a target manifest in directory B (which has none) must find A's lockfile during
 /// `check_manifest`'s lockfile/in-use-version discovery, not B's absence of one — matching
