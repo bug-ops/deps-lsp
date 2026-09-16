@@ -84,6 +84,15 @@ pub struct CheckArgs {
     /// built-in defaults otherwise.
     #[arg(long)]
     pub config: Option<PathBuf>,
+
+    /// Restore `.gitignore`/`.ignore` awareness during the walk (`git`'s own default
+    /// behavior). `check` does not respect either by default (issue #1109): as a CI
+    /// security gate (`git checkout && deps-cli check .` against an untrusted fork PR), both
+    /// files are attacker-controlled input, and a one-line addition to either would otherwise
+    /// silently remove a manifest from the scan with no warning and exit code 0. Pass this
+    /// flag only when scanning a target you trust as much as your own `deps.toml`.
+    #[arg(long)]
+    pub respect_gitignore: bool,
 }
 
 impl CheckArgs {

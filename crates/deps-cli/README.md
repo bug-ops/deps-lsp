@@ -22,10 +22,17 @@ a table, as JSON, or as SARIF 2.1.0, with a CI-friendly exit code.
 
 ## Features
 
-- **`.gitignore`-aware workspace walk** — routes every discovered file through the same
+- **Security-hardened workspace walk** — routes every discovered file through the same
   `EcosystemRegistry` the LSP server uses, across all 14 supported ecosystems (Cargo, npm,
   PyPI, Go, Bundler, Dart, Maven, Gradle, Swift, Composer, NuGet, Deno, GitHub Actions,
-  GitLab CI/CD)
+  GitLab CI/CD). `check` does **not** honor `.gitignore`/`.ignore` by default, because in a CI
+  gate (`git checkout && deps-cli check .` against an untrusted fork PR) both files are
+  attacker-controlled input — a one-line addition to either would otherwise silently remove a
+  manifest from the scan with no warning and exit code `0`. A compiled-in denylist
+  (`node_modules`, `target`, `vendor`, `.venv`, and other common dependency/build/VCS
+  directories) still keeps the scan fast and on-signal without depending on either file. Pass
+  `--respect-gitignore` to restore standard `.gitignore`/`.ignore` awareness when scanning a
+  target you trust as much as your own `deps.toml`.
 - **Table, JSON, or SARIF output** — a human-readable table (default) grouped by file and
   severity, a versioned JSON document for machine consumption, or a SARIF 2.1.0 document for
   `github/codeql-action/upload-sarif` and other SARIF consumers
@@ -127,6 +134,9 @@ deps-cli check --cooldown 3d
 
 # Use an explicit, fully-trusted config file
 deps-cli check --config ./ci/deps-strict.toml
+
+# Restore .gitignore/.ignore awareness (only for a fully-trusted scan target — see Features)
+deps-cli check --respect-gitignore
 ```
 
 ### Exit codes

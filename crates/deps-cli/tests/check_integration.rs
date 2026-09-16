@@ -71,7 +71,7 @@ fn offline_context() -> (EcosystemRegistry, CheckContext) {
 /// report plus whether any manifest's registry fetch was reported unreachable.
 async fn run_pipeline(dir: &std::path::Path) -> (CheckReport, bool) {
     let (registry, ctx) = offline_context();
-    let outcome = walk::walk(&[dir.to_path_buf()], &registry);
+    let outcome = walk::walk(&[dir.to_path_buf()], &registry, false);
     assert!(!outcome.truncated);
 
     let mut findings = Vec::new();
@@ -262,7 +262,7 @@ async fn test_walk_paths_default_to_current_directory_semantics_via_single_file(
     std::fs::write(&manifest, "[package]\nname = \"fixture\"\n").expect("write fixture manifest");
 
     let (registry, ctx) = offline_context();
-    let outcome = walk::walk(std::slice::from_ref(&manifest), &registry);
+    let outcome = walk::walk(std::slice::from_ref(&manifest), &registry, false);
     assert_eq!(outcome.manifests.len(), 1);
 
     let content = deps_core::fs_probe::read_to_string_capped(&manifest, 10_000_000)
@@ -299,7 +299,7 @@ async fn test_sarif_formatter_relativizes_an_absolute_single_file_path() {
     .expect("write fixture manifest");
 
     let (registry, ctx) = offline_context();
-    let outcome = walk::walk(std::slice::from_ref(&manifest), &registry);
+    let outcome = walk::walk(std::slice::from_ref(&manifest), &registry, false);
     assert_eq!(outcome.manifests.len(), 1);
     assert!(
         outcome.manifests[0].display_path.is_absolute(),
@@ -351,4 +351,68 @@ async fn test_sarif_formatter_relativizes_an_absolute_single_file_path() {
              document meant to be uploaded to GitHub code scanning"
         );
     }
+}
+
+/// Reviewer follow-up #5: exercises the *real* wiring in `main.rs` (warnings →
+/// `had_execution_error` → `exit_code`) via the actual built binary, not `run_pipeline`'s
+/// simplified reimplementation above — `run_pipeline` hardcodes `walk::walk(..., false)` and
+/// never touches `main.rs::run_check`'s own warning/exit-code logic, so a regression there
+/// could pass every other test in this file while silently reopening a fail-open gap.
+#[test]
+fn test_respect_gitignore_flag_reaches_the_real_exit_code_wiring() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    std::fs::create_dir(dir.path().join(".git")).expect("create .git marker");
+    std::fs::write(dir.path().join(".gitignore"), "Cargo.toml\n").expect("write gitignore");
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("write fixture manifest");
+
+    let exe = env!("CARGO_BIN_EXE_deps-cli");
+    let output = std::process::Command::new(exe)
+        .args(["check", "--offline", "--respect-gitignore"])
+        .arg(dir.path())
+        .output()
+        .expect("run the real deps-cli binary");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a manifest excluded by --respect-gitignore must exit 2 (execution error), not 0 — \
+         stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("excluded from the scan"),
+        "must warn about the excluded manifest, stderr: {stderr}"
+    );
+}
+
+/// Companion to the above: the same fixture under the default (`respect_gitignore: false`)
+/// mode must find the manifest and exit clean through the real binary too.
+#[test]
+fn test_default_mode_ignores_gitignore_through_the_real_binary_and_exits_clean() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    std::fs::create_dir(dir.path().join(".git")).expect("create .git marker");
+    std::fs::write(dir.path().join(".gitignore"), "Cargo.toml\n").expect("write gitignore");
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("write fixture manifest");
+
+    let exe = env!("CARGO_BIN_EXE_deps-cli");
+    let output = std::process::Command::new(exe)
+        .args(["check", "--offline"])
+        .arg(dir.path())
+        .output()
+        .expect("run the real deps-cli binary");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
