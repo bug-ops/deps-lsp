@@ -206,10 +206,11 @@ impl<T> MtimeFileCache<T> {
     }
 }
 
-// #673: fixed test-fixture constants cast to `usize` never approach truncation range; not
-// the request-path cast concern the crate-level `warn` targets.
 #[cfg(test)]
-#[allow(clippy::cast_possible_truncation)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "#673: fixed test-fixture constants cast to usize never approach truncation range"
+)]
 mod tests {
     use super::*;
 

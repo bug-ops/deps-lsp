@@ -1,7 +1,12 @@
-// Fixture/helper infrastructure exercised only from test binaries (see the module gate
-// below), matching `test_util.rs`'s identical allow: every `.unwrap()`/`.expect()` here is
-// on a fixture filesystem/temp-dir operation that cannot fail in a single-threaded test.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+// No `.unwrap()` call in this module actually triggers `unwrap_used`; kept as a plain
+// `#[allow]` rather than `#[expect]`.
+#![allow(clippy::unwrap_used)]
+#![expect(
+    clippy::expect_used,
+    reason = "fixture/helper infrastructure exercised only from test binaries (see the module \
+              gate below): every .expect() here is on a fixture filesystem/temp-dir operation \
+              that cannot fail in a single-threaded test"
+)]
 
 //! Shared conformance-test scaffolding for ecosystem crates (#758).
 //!

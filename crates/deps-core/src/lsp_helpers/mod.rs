@@ -893,8 +893,10 @@ pub fn utf16_to_byte_offset(s: &str, utf16_offset: u32) -> Option<usize> {
         if utf16_count >= utf16_offset {
             return Some(byte_idx);
         }
-        // `char::len_utf16` always returns 1 or 2, so this cast never truncates.
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "char::len_utf16 always returns 1 or 2, so this cast never truncates"
+        )]
         {
             utf16_count += ch.len_utf16() as u32;
         }
@@ -930,9 +932,11 @@ pub fn utf16_to_byte_offset(s: &str, utf16_offset: u32) -> Option<usize> {
 /// assert_eq!(byte_to_utf16_offset("日本語", 1), 0); // inside the first character
 /// assert_eq!(byte_to_utf16_offset("日本語", 999), 3); // past the end
 /// ```
-// `end` is floor_char_boundary-clamped just above, mirroring the already-hardened
-// `LineOffsetTable::byte_offset_to_position` (lsp_helpers/mod.rs).
-#[allow(clippy::string_slice)]
+#[expect(
+    clippy::string_slice,
+    reason = "end is floor_char_boundary-clamped just above, mirroring the already-hardened \
+              LineOffsetTable::byte_offset_to_position (lsp_helpers/mod.rs)"
+)]
 pub fn byte_to_utf16_offset(s: &str, byte_offset: usize) -> u32 {
     // Saturate rather than silently wrap: an LSP `Position.character` past `u32::MAX` UTF-16
     // units is already meaningless, but a wrapped value would be a wrong-but-plausible one
@@ -1069,9 +1073,11 @@ impl LineOffsetTable {
     ///
     /// Takes a closure rather than returning a `Ref` so the `RefCell` borrow never outlives one
     /// call — a caller cannot accidentally hold it open across an unrelated later borrow.
-    // `borrow_mut()` is dropped before `borrow()` runs, and the inserted entry is never
-    // removed, so the lookup below always succeeds.
-    #[allow(clippy::expect_used)]
+    #[expect(
+        clippy::expect_used,
+        reason = "borrow_mut() is dropped before borrow() runs, and the inserted entry is \
+                  never removed, so the lookup below always succeeds"
+    )]
     fn with_non_ascii_line_index<R>(
         &self,
         line0: usize,
@@ -1152,8 +1158,6 @@ impl LineOffsetTable {
     }
 
     /// Converts a byte offset into an LSP `Position`.
-    // `offset` is floor_char_boundary-clamped just below before slicing `content`.
-    #[allow(clippy::string_slice)]
     pub fn byte_offset_to_position(&self, content: &str, offset: usize) -> Position {
         let offset = offset.min(content.len());
         // The requirements.txt line parser derives offsets via hand-rolled byte arithmetic,
@@ -1164,9 +1168,11 @@ impl LineOffsetTable {
             .line_starts
             .partition_point(|&start| start <= offset)
             .saturating_sub(1);
-        // `line_starts` always has at least one element (`vec![0]` at construction), so
-        // `partition_point().saturating_sub(1)` is always a valid index into it.
-        #[allow(clippy::indexing_slicing)]
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "line_starts always has at least one element (vec![0] at construction), \
+                      so partition_point().saturating_sub(1) is always a valid index into it"
+        )]
         let line_start = self.line_starts[line];
         // #673 M1: `line`/`character` aren't bounded by any size cap for editor-sent
         // full-document-sync text, so this saturates rather than assuming an upstream cap
@@ -1194,9 +1200,11 @@ impl LineOffsetTable {
     /// [`byte_offset_to_position`](Self::byte_offset_to_position). Out-of-range lines or
     /// UTF-16 characters clamp to `content.len()` rather than panicking, matching the
     /// forward conversion's `.min(content.len())` guard.
-    // `line_start`/`line_end` come from `line_starts` (post-newline offsets, always char
-    // boundaries) or `content.len()`.
-    #[allow(clippy::string_slice)]
+    #[expect(
+        clippy::string_slice,
+        reason = "line_start/line_end come from line_starts (post-newline offsets, always \
+                  char boundaries) or content.len()"
+    )]
     pub fn position_to_byte_offset(&self, content: &str, position: Position) -> usize {
         let Some(&line_start) = self.line_starts.get(position.line as usize) else {
             return content.len();
@@ -1989,8 +1997,10 @@ pub fn dependency_version_range_is_literal(
 }
 
 #[cfg(test)]
-// Fixtures are single-line ASCII literals with hand-computed byte offsets.
-#[allow(clippy::string_slice)]
+#[expect(
+    clippy::string_slice,
+    reason = "fixtures are single-line ASCII literals with hand-computed byte offsets"
+)]
 mod tests {
     use super::*;
     use crate::lsp_helpers::test_support::*;

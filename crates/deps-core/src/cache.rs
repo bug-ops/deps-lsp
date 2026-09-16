@@ -561,9 +561,11 @@ fn build_client_inner(
     redirect: reqwest::redirect::Policy,
     resolver: BlockedAddrResolver,
 ) -> Client {
-    // Fixed, hardcoded client configuration — no attacker-influenced input; can only
-    // fail on a genuinely broken TLS backend, which is unrecoverable anyway.
-    #[allow(clippy::expect_used)]
+    #[expect(
+        clippy::expect_used,
+        reason = "fixed, hardcoded client configuration — no attacker-influenced input; can \
+                  only fail on a genuinely broken TLS backend, which is unrecoverable anyway"
+    )]
     Client::builder()
         .user_agent(format!("deps-lsp/{}", env!("CARGO_PKG_VERSION")))
         .timeout(std::time::Duration::from_secs(HTTP_TIMEOUT_SECS))
@@ -1369,9 +1371,11 @@ impl HttpCache {
         url: &str,
         extra_headers: &[(header::HeaderName, &str)],
     ) -> Result<Bytes> {
-        // Poisoned only if another thread already panicked holding the lock — propagate via
-        // panic, matching `RwLock`'s poisoning contract.
-        #[allow(clippy::expect_used)]
+        #[expect(
+            clippy::expect_used,
+            reason = "poisoned only if another thread already panicked holding the lock — \
+                      propagate via panic, matching RwLock's poisoning contract"
+        )]
         let transport = self
             .workspace
             .read()
@@ -1408,9 +1412,11 @@ impl HttpCache {
         }
         self.policy.set(value);
         let rebuilt = Transport::workspace(&self.policy);
-        // Poisoned only if another thread panicked while holding the lock — see the
-        // matching justification on `get_cached_workspace_with_headers` above.
-        #[allow(clippy::expect_used)]
+        #[expect(
+            clippy::expect_used,
+            reason = "poisoned only if another thread panicked while holding the lock — see \
+                      the matching justification on get_cached_workspace_with_headers above"
+        )]
         {
             *self
                 .workspace

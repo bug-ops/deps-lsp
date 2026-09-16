@@ -1,8 +1,13 @@
-// #673: this entire module is test-only fixture/helper infrastructure (most of it gated
-// behind the `test-util` feature), not the request-path parsers the restriction lints
-// target — every `.unwrap()`/`.expect()` here is on a fixture `Mutex`/UTF-8 conversion
-// that cannot fail in a single-threaded test harness.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+// `unwrap_used` only fires inside this module's own `#[cfg(all(test, feature = "test-util"))]
+// mod tests`, which isn't compiled in a plain `--lib` build, so `#[expect]` would be
+// unfulfilled there; kept as a plain `#[allow]`.
+#![allow(clippy::unwrap_used)]
+#![expect(
+    clippy::expect_used,
+    reason = "this entire module is test-only fixture/helper infrastructure (most of it gated \
+              behind the test-util feature); every .expect() here is on a fixture Mutex/UTF-8 \
+              conversion that cannot fail in a single-threaded test harness"
+)]
 
 //! Test fixtures and helpers shared across ecosystem crates.
 //!

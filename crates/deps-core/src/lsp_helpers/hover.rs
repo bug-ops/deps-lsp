@@ -975,8 +975,11 @@ const MAX_LICENSE_ID_CHARS: usize = 128;
 /// registry-reported data, not validated or bounded upstream.
 fn format_license_list(licenses: &[String]) -> String {
     let shown = licenses.len().min(MAX_LICENSE_ENTRIES_RENDERED);
-    // `shown` is `min(licenses.len(), MAX_LICENSE_ENTRIES_RENDERED)`, always `<= licenses.len()`.
-    #[allow(clippy::indexing_slicing)]
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "shown is min(licenses.len(), MAX_LICENSE_ENTRIES_RENDERED), always <= \
+                  licenses.len()"
+    )]
     let mut rendered: Vec<String> = licenses[..shown]
         .iter()
         .map(|l| markdown_code_span(&super::truncate_for_diagnostic(l, MAX_LICENSE_ID_CHARS)))
@@ -1064,10 +1067,12 @@ fn push_license_hover_section(
     markdown.push_str("\n\n");
 }
 
-// #673: fixed test-fixture lengths cast to `u32` for `Position` fixtures never approach
-// truncation range; not the request-path cast concern the crate-level `warn` targets.
 #[cfg(test)]
-#[allow(clippy::cast_possible_truncation)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "#673: fixed test-fixture lengths cast to u32 for Position fixtures never approach \
+              truncation range"
+)]
 mod tests {
     use super::*;
     use crate::RemovalStatus;

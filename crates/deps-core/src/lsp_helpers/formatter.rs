@@ -196,8 +196,10 @@ pub trait RequirementResolution: Send + Sync {
                 return true;
             }
 
-            // For ^0.Y, must have same minor (length checked on the same line).
-            #[allow(clippy::indexing_slicing)]
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "for ^0.Y, must have same minor (length checked on the same line)"
+            )]
             if req_parts.len() >= 2 && ver_parts.len() >= 2 {
                 return req_parts[1] == ver_parts[1];
             }

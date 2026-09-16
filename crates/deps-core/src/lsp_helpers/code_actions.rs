@@ -682,9 +682,12 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
 
     // Single post-pass resolving `isPreferred`, priority order vuln fix -> unsat fix -> latest
     // REFACTOR item, run unconditionally (including the registry-outage path) so an outage
-    // never drops `isPreferred` from an already-built fix action. Each `*_idx` was captured as
-    // `actions.len()` immediately before its matching `push`, so it stays a valid index here.
-    #[allow(clippy::indexing_slicing)]
+    // never drops `isPreferred` from an already-built fix action.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "each *_idx was captured as actions.len() immediately before its matching \
+                  push, so it stays a valid index here"
+    )]
     if let Some(i) = vuln_idx.or(unsat_idx).or(latest_refactor_idx) {
         actions[i].is_preferred = Some(true);
     }
@@ -692,11 +695,12 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
     actions
 }
 
-// #673: fixed test-fixture lengths cast to `u32` for `Position`/`Range` fixtures never
-// approach truncation range; not the request-path cast concern the crate-level `warn`
-// targets.
 #[cfg(test)]
-#[allow(clippy::cast_possible_truncation)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "#673: fixed test-fixture lengths cast to u32 for Position/Range fixtures never \
+              approach truncation range"
+)]
 mod tests {
     use super::*;
     use crate::lsp_helpers::test_support::*;

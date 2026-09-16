@@ -205,9 +205,11 @@ fn is_valid_project_key(key: &str) -> bool {
     {
         return false;
     }
-    // `split_first` cannot return `None`: the length check above already guarantees
-    // `segments` has at least 2 entries.
-    #[allow(clippy::expect_used)]
+    #[expect(
+        clippy::expect_used,
+        reason = "split_first cannot return None: the length check above already guarantees \
+                  segments has at least 2 entries"
+    )]
     let (host, rest) = segments
         .split_first()
         .expect("segments has at least 2 entries");

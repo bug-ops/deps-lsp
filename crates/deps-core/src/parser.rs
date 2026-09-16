@@ -87,10 +87,12 @@ pub const MAX_TOML_NESTING_DEPTH: usize = 64;
 /// let deep_dotted_key = format!("a{} = 1", ".a".repeat(10));
 /// assert_eq!(check_toml_nesting_depth(&deep_dotted_key, 4), Err(5));
 /// ```
-// Every `bytes[i]` below is preceded by an `i < len` bounds check (loop
-// condition or `if` guard); `dot_frames[0]` stays valid because it is the
-// permanent first element of `vec![0]` and only ever popped while `len() > 1`.
-#[allow(clippy::indexing_slicing)]
+#[expect(
+    clippy::indexing_slicing,
+    reason = "every bytes[i] below is preceded by an i < len bounds check (loop condition or \
+              if guard); dot_frames[0] stays valid because it is the permanent first element \
+              of vec![0] and only ever popped while len() > 1"
+)]
 pub fn check_toml_nesting_depth(content: &str, max_depth: usize) -> std::result::Result<(), usize> {
     let bytes = content.as_bytes();
     let len = bytes.len();
@@ -202,8 +204,10 @@ pub fn check_toml_nesting_depth(content: &str, max_depth: usize) -> std::result:
 /// the index just past its closing quote (or `bytes.len()` if unterminated —
 /// `toml_span` reports the real syntax error in that case, so it is safe for
 /// the rest of the file to be treated as string content here).
-// Every `bytes[i]` below is preceded by an `i < len` bounds check.
-#[allow(clippy::indexing_slicing)]
+#[expect(
+    clippy::indexing_slicing,
+    reason = "every bytes[i] below is preceded by an i < len bounds check"
+)]
 fn skip_single_line_string(bytes: &[u8], mut i: usize, quote: u8) -> usize {
     let len = bytes.len();
     while i < len {
@@ -229,8 +233,10 @@ fn skip_single_line_string(bytes: &[u8], mut i: usize, quote: u8) -> usize {
 /// the closing delimiter, regardless of how many of those quotes are "extra"
 /// literal content versus the delimiter itself — the distinction does not
 /// matter here since the whole run is consumed either way.
-// Every `bytes[i]` below is preceded by an `i < len` bounds check.
-#[allow(clippy::indexing_slicing)]
+#[expect(
+    clippy::indexing_slicing,
+    reason = "every bytes[i] below is preceded by an i < len bounds check"
+)]
 fn skip_multiline_string(bytes: &[u8], mut i: usize, quote: u8) -> usize {
     let len = bytes.len();
     while i < len {
@@ -340,9 +346,11 @@ pub const MAX_YAML_NESTING_DEPTH: usize = 64;
 /// let content = format!("a: it doesn't panic\n{}1", "- ".repeat(10));
 /// assert!(check_yaml_nesting_depth(&content, 4).is_err());
 /// ```
-// Every `bytes[i]` below is preceded by an `i < len` bounds check (loop
-// condition or `if` guard); single-pass byte scanner, see doc comment above.
-#[allow(clippy::indexing_slicing)]
+#[expect(
+    clippy::indexing_slicing,
+    reason = "every bytes[i] below is preceded by an i < len bounds check (loop condition or \
+              if guard); single-pass byte scanner, see doc comment above"
+)]
 pub fn check_yaml_nesting_depth(content: &str, max_depth: usize) -> std::result::Result<(), usize> {
     let bytes = content.as_bytes();
     let len = bytes.len();
@@ -444,8 +452,10 @@ pub fn check_yaml_nesting_depth(content: &str, max_depth: usize) -> std::result:
 
 /// Advances past the rest of the current line (used for blank and comment
 /// lines), returning the index of the `\n` or `bytes.len()`.
-// Every `bytes[i]` below is preceded by an `i < len` bounds check.
-#[allow(clippy::indexing_slicing)]
+#[expect(
+    clippy::indexing_slicing,
+    reason = "every bytes[i] below is preceded by an i < len bounds check"
+)]
 fn skip_to_eol(bytes: &[u8], mut i: usize) -> usize {
     let len = bytes.len();
     while i < len && bytes[i] != b'\n' {
@@ -466,8 +476,10 @@ fn skip_to_eol(bytes: &[u8], mut i: usize) -> usize {
 /// (impl-critic C1). `yaml-rust2` reports the real syntax error for content
 /// this treats as unterminated. Handles double-quote backslash escapes and
 /// single-quote `''` escapes.
-// Every `bytes[i]` below is preceded by an `i < len` bounds check.
-#[allow(clippy::indexing_slicing)]
+#[expect(
+    clippy::indexing_slicing,
+    reason = "every bytes[i] below is preceded by an i < len bounds check"
+)]
 fn skip_yaml_string(bytes: &[u8], mut i: usize, quote: u8) -> usize {
     let len = bytes.len();
     while i < len && bytes[i] != b'\n' {
@@ -1160,10 +1172,11 @@ pub enum LoadingState {
     Failed,
 }
 
-// #673: fixed test-fixture constants cast to `usize` never approach truncation range; not
-// the request-path cast concern the crate-level `warn` targets.
 #[cfg(test)]
-#[allow(clippy::cast_possible_truncation)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "#673: fixed test-fixture constants cast to usize never approach truncation range"
+)]
 mod tests {
     use super::*;
 

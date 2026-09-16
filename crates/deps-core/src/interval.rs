@@ -131,9 +131,11 @@ fn parse_bound_side<V>(s: &str, parse_bound: &impl Fn(&str) -> Option<V>) -> Par
 /// assert_eq!(parse_interval::<String>("[1.0,2.0,3.0]", BracketStyle::Standard, |b| Some(b.to_string())), None);
 /// assert_eq!(parse_interval::<String>("(1.0)", BracketStyle::Standard, |b| Some(b.to_string())), None);
 /// ```
-// `first`/`last` are `chars()` ends sliced at `len_utf8`, and the explicit length guard
-// above prevents `start > end`, so the slice bound is always a char boundary.
-#[allow(clippy::string_slice)]
+#[expect(
+    clippy::string_slice,
+    reason = "first/last are chars() ends sliced at len_utf8, and the explicit length guard \
+              above prevents start > end, so the slice bound is always a char boundary"
+)]
 pub fn parse_interval<V>(
     s: &str,
     style: BracketStyle,
