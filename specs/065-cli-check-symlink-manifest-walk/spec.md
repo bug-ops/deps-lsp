@@ -76,11 +76,19 @@ escape the walked root onto arbitrary filesystem paths.
 - Changing the explicit single-file invocation path
   (`deps-cli check evil/Cargo.toml`) — it already follows symlinks
   correctly via `Path::is_file()` and is unaffected by this spec.
-- A symlink whose target is unreadable, broken, or points outside the
-  filesystem entirely — already surfaced today via `ignore`'s own
-  `Err(error)` walk-entry variant into `WalkOutcome::walk_errors`; this
-  spec only adds handling for the previously-unhandled "valid symlink,
-  target looks like a manifest" case.
+- A symlink whose target is unreadable or broken (does not exist). This is
+  **not** actually surfaced via `WalkOutcome::walk_errors` today — that
+  claim in an earlier draft of this spec was wrong (confirmed empirically
+  during implementation review, impl-critic finding S2): `ignore`'s
+  default (non-`follow_links`) walk reports a broken symlink as an
+  ordinary `Ok(entry)` with a symlink file type, not an `Err`, so it is
+  silently skipped with no warning at all, matching this project's
+  existing (pre-#1112-fix) behavior for any non-regular-file entry. A
+  manifest deliberately replaced by a broken symlink is therefore a
+  variant of the same fail-open class #1112 itself reports, left
+  deliberately out of scope here rather than expanding this already
+  multi-round security fix further — tracked as a follow-up issue (see
+  §10).
 - `respect_gitignore`'s existing `.gitignore`/`.ignore`/pruned-directory
   behavior (#1109) — unrelated axis, unchanged by this spec.
 
@@ -166,7 +174,7 @@ THEN the target is not read or routed to any ecosystem, and the path is
 | ID | Category | Requirement |
 |----|----------|-------------|
 | NFR-001 | Security | Symlink resolution under `--follow-symlinks` never escapes the walked root's canonicalized absolute path (FR-004) and never loops indefinitely (FR-005) — see US-003 |
-| NFR-002 | Performance | FR-001's detection (`std::fs::metadata` on a symlink entry that already failed `is_file()`) adds at most one extra stat syscall per symlink entry encountered; it must not measurably regress `walk`'s existing `MAX_WALKED_FILES`-bounded cost for a tree with few or no symlinks |
+| NFR-002 | Performance | FR-001's detection (`std::fs::metadata` on a symlink entry that already failed `is_file()`) adds at most one extra stat syscall per symlink entry encountered under the default mode; it must not measurably regress `walk`'s existing `MAX_WALKED_FILES`-bounded cost for a tree with few or no symlinks. Revised during implementation (see [[plan#1. Architecture\|plan.md §1]], impl-critic finding C1/S1): under `--follow-symlinks`, containment (FR-004) is checked via one canonicalize call per *file* entry, not only per symlink entry — a deliberate widening from the original per-symlink-only design, needed to close a directory-symlink escape a leaf-only check missed |
 | NFR-003 | Compatibility | Default (no-flag) `check` behavior for every existing non-symlink fixture/snapshot stays unchanged — this is an additive detection, not a change to already-passing paths |
 | NFR-004 | Test coverage | Each of US-001/US-002/US-003's acceptance criteria has a corresponding `walk.rs` unit test, following the existing `#[cfg(test)] mod tests` pattern and `tempfile::TempDir` fixture convention already used throughout that file (including `#[cfg(unix)]`/platform gating for `std::os::unix::fs::symlink` construction, since the test fixtures create real symlinks) |
 
@@ -229,6 +237,7 @@ one place" constitution principle.
 - [[constitution]] — project principles, especially principle 1 (one fix, one place)
 - [[MOC-specs]] — all specifications
 - Issue #1112 (this spec's source), #1109/#1108 (same fail-open class, closed by #1111)
+- Issue #1124 (follow-up: a manifest replaced by a broken symlink is still silently skipped — narrower variant of this spec's Out of Scope section, filed after implementation review)
 - `crates/deps-cli/src/walk.rs` (`walk_directory`, `route_file`, `warn_on_pruned_directory_manifest`, `WalkOutcome`)
 - `crates/deps-cli/src/cli.rs` (`CheckArgs::respect_gitignore` — the flag pattern this spec's `follow_symlinks` mirrors)
 - `crates/deps-cli/src/main.rs` (`run_check` — where `WalkOutcome::ignored_manifests`/`walk_errors` already drive `had_execution_error`)

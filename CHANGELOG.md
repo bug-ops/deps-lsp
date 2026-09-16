@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **deps-cli**: `check`'s directory walk no longer silently skips a manifest reachable only through a symlink; it is now reported via a warning by default, or resolved and scanned with the new opt-in `--follow-symlinks` flag (resolves #1112)
 - **ci**: `release.yml` now builds `deps-lsp` and `deps-cli` in separate cargo/cross invocations, preventing cargo's feature-unification from linking `tower-lsp-server` into the released `deps-cli` binary (#1110, resolves #1103)
 
 ### Changed

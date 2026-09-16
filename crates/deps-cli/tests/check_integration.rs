@@ -71,7 +71,7 @@ fn offline_context() -> (EcosystemRegistry, CheckContext) {
 /// report plus whether any manifest's registry fetch was reported unreachable.
 async fn run_pipeline(dir: &std::path::Path) -> (CheckReport, bool) {
     let (registry, ctx) = offline_context();
-    let outcome = walk::walk(&[dir.to_path_buf()], &registry, false);
+    let outcome = walk::walk(&[dir.to_path_buf()], &registry, false, false);
     assert!(!outcome.truncated);
 
     let mut findings = Vec::new();
@@ -80,9 +80,11 @@ async fn run_pipeline(dir: &std::path::Path) -> (CheckReport, bool) {
         let content = deps_core::fs_probe::read_to_string_capped(&manifest.path, 10_000_000)
             .expect("read fixture manifest")
             .expect("fixture manifest under size cap");
+        // Review finding M2: mirrors main.rs's fix — `uri_path` (not `path`) drives lockfile
+        // lookup, so this harness exercises the same correct wiring `check` itself uses.
         let result = check_manifest(
             &manifest.ecosystem,
-            &manifest.path,
+            &manifest.uri_path,
             &manifest.display_path,
             &content,
             &ctx,
@@ -262,7 +264,7 @@ async fn test_walk_paths_default_to_current_directory_semantics_via_single_file(
     std::fs::write(&manifest, "[package]\nname = \"fixture\"\n").expect("write fixture manifest");
 
     let (registry, ctx) = offline_context();
-    let outcome = walk::walk(std::slice::from_ref(&manifest), &registry, false);
+    let outcome = walk::walk(std::slice::from_ref(&manifest), &registry, false, false);
     assert_eq!(outcome.manifests.len(), 1);
 
     let content = deps_core::fs_probe::read_to_string_capped(&manifest, 10_000_000)
@@ -299,7 +301,7 @@ async fn test_sarif_formatter_relativizes_an_absolute_single_file_path() {
     .expect("write fixture manifest");
 
     let (registry, ctx) = offline_context();
-    let outcome = walk::walk(std::slice::from_ref(&manifest), &registry, false);
+    let outcome = walk::walk(std::slice::from_ref(&manifest), &registry, false, false);
     assert_eq!(outcome.manifests.len(), 1);
     assert!(
         outcome.manifests[0].display_path.is_absolute(),
@@ -414,5 +416,132 @@ fn test_default_mode_ignores_gitignore_through_the_real_binary_and_exits_clean()
         Some(0),
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Review finding M2: a manifest symlinked from directory A (which has its own `Cargo.lock`)
+/// to a target manifest in directory B (which has none) must find A's lockfile during
+/// `check_manifest`'s lockfile/in-use-version discovery, not B's absence of one — matching
+/// US-002's own shared-manifest-symlinked-into-multiple-package-directories scenario, where
+/// each symlinked location has its own adjacent lockfile.
+///
+/// Exercises the exact mechanism `check_manifest` -> `load_resolved_versions` relies on
+/// (`Ecosystem::lockfile_provider().locate_lockfile`) directly against the URIs
+/// [`DiscoveredManifest::uri_path`]/[`DiscoveredManifest::path`] actually produce, rather than
+/// observing an indirect effect through findings (which would need a populated/mocked registry
+/// to show a version difference).
+#[cfg(unix)]
+#[tokio::test]
+async fn test_follow_symlinks_lockfile_lookup_uses_symlinks_directory_not_targets() {
+    // A and B are both subdirectories of one walked root — the symlink's target must stay
+    // inside the walked root (FR-004) for `--follow-symlinks` to resolve and route it at all;
+    // A/B being two independent, unrelated temp directories would make the target a root
+    // escape instead, an unrelated scenario this test isn't exercising.
+    let root = tempfile::tempdir().expect("create walked root");
+    let dir_a = root.path().join("a");
+    let dir_b = root.path().join("b");
+    std::fs::create_dir(&dir_a).expect("mkdir a");
+    std::fs::create_dir(&dir_b).expect("mkdir b");
+
+    std::fs::write(
+        dir_b.join("manifest-data"),
+        "[package]\nname = \"x\"\nversion = \"0.1.0\"\n\n[dependencies]\nonce_cell = \"1\"\n",
+    )
+    .expect("write target manifest in B");
+    std::fs::write(
+        dir_a.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"once_cell\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n",
+    )
+    .expect("write A's Cargo.lock");
+    std::os::unix::fs::symlink(dir_b.join("manifest-data"), dir_a.join("Cargo.toml"))
+        .expect("symlink A/Cargo.toml -> B/Cargo.toml");
+
+    let (registry, ctx) = offline_context();
+    let outcome = walk::walk(&[root.path().to_path_buf()], &registry, false, true);
+    assert_eq!(
+        outcome.manifests.len(),
+        1,
+        "ignored_manifests: {:?}, walk_errors: {:?}",
+        outcome.ignored_manifests,
+        outcome.walk_errors
+    );
+    let manifest = &outcome.manifests[0];
+
+    // Sanity check on the fields M2's fix relies on: `path` (content read, canonicalized by
+    // the C1/S3 containment check) resolves to B's real file; `uri_path` (lockfile lookup)
+    // stays A's encountered symlink path, not canonicalized — matching `route_path`'s
+    // semantics (see `route_file`'s doc).
+    assert_eq!(
+        manifest.path.canonicalize().expect("canonicalize path"),
+        dir_b
+            .join("manifest-data")
+            .canonicalize()
+            .expect("canonicalize B/Cargo.toml")
+    );
+    assert_eq!(manifest.uri_path, dir_a.join("Cargo.toml"));
+
+    let lockfile_provider = manifest
+        .ecosystem
+        .lockfile_provider()
+        .expect("cargo ecosystem must have a lock file provider");
+
+    let uri_path_uri = url::Url::from_file_path(&manifest.uri_path).expect("uri_path to file uri");
+    let path_uri = url::Url::from_file_path(&manifest.path).expect("path to file uri");
+
+    assert_eq!(
+        lockfile_provider.locate_lockfile(&uri_path_uri),
+        Some(dir_a.join("Cargo.lock")),
+        "lockfile lookup driven by uri_path must find A's Cargo.lock"
+    );
+    assert_eq!(
+        lockfile_provider.locate_lockfile(&path_uri),
+        None,
+        "lockfile lookup driven by the resolved target path (B) must find nothing — B has no \
+         Cargo.lock; if this were Some, check_manifest would silently anchor lockfile lookup \
+         at the wrong directory"
+    );
+
+    // End-to-end: exercise the exact call `main.rs` makes (`manifest.uri_path`, per M2's fix)
+    // and confirm A's lockfile actually gets parsed into the cache — the load-bearing
+    // assertion that would catch a regression reverting `main.rs`'s argument choice, not just
+    // the underlying `locate_lockfile` mechanism checked above.
+    let content = std::fs::read_to_string(&manifest.path).expect("read manifest content");
+    check_manifest(
+        &manifest.ecosystem,
+        &manifest.uri_path,
+        &manifest.display_path,
+        &content,
+        &ctx,
+    )
+    .await
+    .expect("check_manifest must succeed with the correct (uri_path) wiring");
+    assert_eq!(
+        ctx.lockfile_cache.len(),
+        1,
+        "check_manifest called with uri_path must have found and cached A's Cargo.lock"
+    );
+
+    // Simulates the M2 bug (passing the resolved target path instead of uri_path) against a
+    // fresh cache — must find and cache nothing, since B has no Cargo.lock.
+    let buggy_ctx = CheckContext {
+        cache: Arc::clone(&ctx.cache),
+        osv: Arc::clone(&ctx.osv),
+        lockfile_cache: Arc::new(deps_core::lockfile::LockFileCache::new()),
+        policy: ctx.policy.clone(),
+    };
+    check_manifest(
+        &manifest.ecosystem,
+        &manifest.path,
+        &manifest.display_path,
+        &content,
+        &buggy_ctx,
+    )
+    .await
+    .expect("check_manifest must still succeed (absence of a lock file is not an error)");
+    assert_eq!(
+        buggy_ctx.lockfile_cache.len(),
+        0,
+        "check_manifest called with the resolved target path (the bug M2 fixes) must find no \
+         lockfile at all, proving the two wirings genuinely diverge"
     );
 }

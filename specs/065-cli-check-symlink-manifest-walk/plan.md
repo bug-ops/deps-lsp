@@ -52,17 +52,31 @@ is already threaded today):
    arm already handles with zero new code (FR-005 is satisfied by wiring
    `follow_links(true)` alone). What `ignore` does *not* do is bound a
    resolved symlink target to the walked root, so FR-004's escape check is
-   added explicitly: when `follow_symlinks` is `true` and the entry
-   satisfies `path_is_symlink()`, canonicalize the entry's path
-   (`std::fs::canonicalize`, which resolves through the symlink to the real
-   target) and compare it against the walk's own canonicalized absolute
-   root (already computed once per root in `walk_with_limit` as
-   `absolute_root` — canonicalizing that once per root, not per entry, is
-   the comparison baseline). If the canonicalized target does not start
-   with the canonicalized root, skip routing and push onto
-   `ignored_manifests` instead (same sink as detection, so a
-   root-escaping symlink is reported identically to an unresolved one —
-   consistent operator-facing signal).
+   added explicitly. **Revised during implementation** (impl-critic finding
+   C1): checking only entries where the *leaf* `path_is_symlink()` is true
+   is insufficient — `ignore`/`walkdir` reports `path_is_symlink() == false`
+   for an entry reached by following a symlinked *directory*, so a
+   symlinked directory anywhere in the walked path let a resolved target
+   escape the walked root undetected. The actual, shipped check instead
+   canonicalizes *every* routed file entry's path when `follow_symlinks` is
+   `true` (not gated on `path_is_symlink()`) and compares it against the
+   walk's own canonicalized absolute root (`absolute_root`, still computed
+   once per root, not per entry). The same generalized check is also
+   applied to each hidden-ecosystem sub-root (e.g. `.github`) before it is
+   walked, in *every* mode — `ignore`/`walkdir` always follows a walk's own
+   root symlink regardless of `follow_links`, so an unguarded symlinked
+   `.github` escaped containment even without `--follow-symlinks` (impl-critic
+   finding S1, same root cause as C1). If the canonicalized target does not
+   start with the canonicalized root, skip routing and push onto
+   `ignored_manifests` instead — but only when the target is itself
+   manifest-shaped (impl-critic finding S4: an out-of-root symlink to a
+   non-manifest file, e.g. `notes.txt -> /etc/hosts`, must not produce a
+   false "looks like a manifest" warning). This supersedes NFR-002's
+   original "one extra stat only for symlink entries" framing: the shipped
+   design costs one canonicalize per *file* entry under `--follow-symlinks`
+   (not just symlink entries), an accepted, documented trade-off for
+   closing C1/S1 with one general mechanism instead of two narrower,
+   harder-to-verify ones (constitution principle 1).
 
 Detection and resolution share one small helper
 (`symlink_is_manifest_shaped`, see §3) so the "does this path look like a
