@@ -156,8 +156,10 @@ pub fn is_in_xml_tag_section(content: &str, line_number: usize, tag: &str) -> bo
 /// Counts real `<{open_prefix}...>` tag occurrences on `line`, i.e. `open_prefix`
 /// followed by `>` or whitespace (an attribute) rather than more tag-name characters
 /// (so `<dependencies` doesn't also match a longer, unrelated tag name).
-// `search_from` only ever advances to `idx + open_prefix.len()`, always a char boundary.
-#[allow(clippy::string_slice)]
+#[expect(
+    clippy::string_slice,
+    reason = "search_from only ever advances to idx + open_prefix.len(), always a char boundary"
+)]
 fn count_open_tags(line: &str, open_prefix: &str) -> usize {
     let mut count = 0;
     let mut search_from = 0;
@@ -198,8 +200,11 @@ fn count_open_tags(line: &str, open_prefix: &str) -> usize {
 /// [`strip_open_xml_attribute_value`]'s own element extraction).
 #[must_use]
 pub fn strip_leading_xml_tag(prefix: &str) -> (&str, Option<&str>) {
-    // `>`/`<` are single-byte ASCII chars, so `gt + 1`/`lt + 1` are always valid char boundaries.
-    #[allow(clippy::string_slice)]
+    #[expect(
+        clippy::string_slice,
+        reason = ">/< are single-byte ASCII chars, so gt + 1/lt + 1 are always valid char \
+                  boundaries"
+    )]
     {
         let Some(gt) = prefix.rfind('>') else {
             return (prefix, None);
@@ -266,8 +271,10 @@ pub fn strip_open_xml_attribute_value<'a>(
             // Reset here too (not just on a closing quote), so `before_quote` below never
             // spans back across a *previous* element's tail.
             segment_start = idx + ch.len_utf8();
-            // char-boundary safe: `idx + ch.len_utf8()` always lands on one.
-            #[allow(clippy::string_slice)]
+            #[expect(
+                clippy::string_slice,
+                reason = "char-boundary safe: idx + ch.len_utf8() always lands on one"
+            )]
             let rest = &prefix[segment_start..];
             element = rest
                 .split(|c: char| c == '>' || c == '/' || c.is_whitespace())
@@ -276,8 +283,10 @@ pub fn strip_open_xml_attribute_value<'a>(
             continue;
         }
         if ch == '"' || ch == '\'' {
-            // char-boundary safe: `idx` comes from `char_indices`.
-            #[allow(clippy::string_slice)]
+            #[expect(
+                clippy::string_slice,
+                reason = "char-boundary safe: idx comes from char_indices"
+            )]
             let before_quote = prefix[segment_start..idx].trim_end();
             let name = before_quote
                 .strip_suffix('=')
@@ -292,8 +301,11 @@ pub fn strip_open_xml_attribute_value<'a>(
     }
 
     if quote.is_some() && in_target_attr {
-        // char-boundary safe: `value_start` is `idx + ch.len_utf8()` for the opening quote.
-        #[allow(clippy::string_slice)]
+        #[expect(
+            clippy::string_slice,
+            reason = "char-boundary safe: value_start is idx + ch.len_utf8() for the opening \
+                      quote"
+        )]
         let value = &prefix[value_start..];
         // The scan above only closes `quote` on the *matching* delimiter, so an opposite-type
         // quote could otherwise survive into the value; stop at the first quote of either kind.
@@ -463,8 +475,11 @@ pub fn strip_open_json_key(prefix: &str) -> (&str, bool) {
     let Some(last_quote) = last_quote else {
         return ("", false);
     };
-    // char-boundary safe: `"` is single-byte ASCII, so `last_quote + 1` always lands on one.
-    #[allow(clippy::string_slice)]
+    #[expect(
+        clippy::string_slice,
+        reason = "char-boundary safe: \" is single-byte ASCII, so last_quote + 1 always lands \
+                  on one"
+    )]
     let (before_quote, after_quote) = (&prefix[..last_quote], &prefix[last_quote + 1..]);
     if before_quote.trim_end().ends_with(':') {
         ("", false)
@@ -506,8 +521,11 @@ pub fn open_quoted_tail(segment: &str) -> Option<&str> {
     if count.is_multiple_of(2) {
         return None;
     }
-    // char-boundary safe: `"` is single-byte ASCII, so `last_quote + 1` always lands on one.
-    #[allow(clippy::string_slice)]
+    #[expect(
+        clippy::string_slice,
+        reason = "char-boundary safe: \" is single-byte ASCII, so last_quote + 1 always lands \
+                  on one"
+    )]
     last_quote.map(|pos| &segment[pos + 1..])
 }
 
@@ -524,7 +542,10 @@ mod tests {
 
     /// Sums a line's UTF-16 code unit length. `len_utf16()` is always 1 or 2, so a
     /// short test line can never overflow `u32`.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "len_utf16() is always 1 or 2, so a short test line can never overflow u32"
+    )]
     fn utf16_len(line: &str) -> u32 {
         line.chars().map(char::len_utf16).sum::<usize>() as u32
     }

@@ -1,34 +1,31 @@
 //! Conversions between `deps-core`'s protocol-agnostic domain types
-//! (`url::Url`, [`deps_core::position::Position`], [`deps_core::position::Range`],
-//! [`deps_core::diagnostic::Diagnostic`] and its nested types) and `tower_lsp_server::ls_types`.
+//! (`url::Url`, [`deps_core::position::Range`], [`deps_core::diagnostic::Diagnostic`] and its
+//! nested types) and `tower_lsp_server::ls_types`.
 //!
 //! `deps-core`/`deps-engine` never construct or consume an `ls_types` type for their own
 //! domain data; every `deps-lsp` handler converts at the edge, right before building an LSP
-//! response or right after reading one from a request. This module is where the `url::Url`
-//! ⇄ `ls_types::Uri` conversion for a *request/response boundary* URI is meant to happen —
-//! but it is not, in practice, the only place a `url::Url`/`ls_types::Uri` conversion exists
-//! in the workspace: `deps_core::lsp_helpers::to_ls_uri` performs an identical one-way
-//! `Url -> Uri` conversion, called directly by `deps-github-actions`/`deps-composer`/
-//! `deps-gitlab-ci` for edits they build themselves (`WorkspaceEdit` changes, hover links) —
-//! a pre-existing duplication this module's introduction did not create and does not resolve
-//! (tracked as a follow-up, not fixed here). Likewise,
-//! [`crate::lsp_types_interop::from_lsp_position`]/
-//! [`crate::lsp_types_interop::to_lsp_position`]/[`crate::lsp_types_interop::from_lsp_range`]
-//! below are unused outside this module's own unit tests — real call sites (e.g.
-//! `handlers::completion`) convert via the bare `.into()`
+//! response or right after reading one from a request. `Position`/`Range` conversions in the
+//! other direction (LSP-protocol to domain) go through the bare `.into()`
 //! [`deps_core::position::Position`]/[`deps_core::position::Range`] already provide (see
-//! [`deps_core::position`]'s module doc for those `From` impls), not through these wrappers.
-//! [`crate::lsp_types_interop::to_lsp_uri`], [`crate::lsp_types_interop::to_lsp_diagnostic`],
-//! and the other `to_lsp_*`/`from_lsp_uri` functions genuinely are each's single
-//! implementation within `deps-lsp` itself.
+//! [`deps_core::position`]'s module doc for those `From` impls) — real call sites (e.g.
+//! `handlers::completion`) use that, not a wrapper here, so this module only keeps
+//! [`crate::lsp_types_interop::to_lsp_range`] for the domain-to-LSP direction, plus the
+//! `Uri`/`Diagnostic` conversions that have no `From`-impl option (see below).
+//!
+//! [`crate::lsp_types_interop::to_lsp_uri`] wraps [`deps_core::to_ls_uri`] rather than
+//! reimplementing the `url::Url -> Uri` conversion: `deps-core` is the shared crate ecosystem
+//! crates (`deps-github-actions`, `deps-composer`, `deps-gitlab-ci`) can depend on for edits
+//! they build themselves (`WorkspaceEdit` changes, hover links), while this binary crate
+//! cannot be a dependency of any of them — so [`deps_core::to_ls_uri`] is the one underlying
+//! implementation, and this module's [`crate::lsp_types_interop::to_lsp_uri`] is `deps-lsp`'s
+//! thin wrapper over it, not a second, independent copy.
 //!
 //! The `Uri`/`Diagnostic`-shaped conversions here are plain free functions, not
 //! [`From`]/[`Into`] trait impls: neither `url::Url` nor `tower_lsp_server::ls_types::Uri` (nor
 //! `ls_types::Diagnostic` and friends) is local to this crate, so a `From` impl in either
 //! direction would violate Rust's orphan rules. [`deps_core::position::Position`]/
 //! [`deps_core::position::Range`] do not have this problem (they're local to `deps-core`, so
-//! `deps-core` itself defines `From` impls for those) but the free-function pair here is kept
-//! for symmetry with the `Uri`/`Diagnostic` conversions that have no other option.
+//! `deps-core` itself defines `From` impls for those).
 
 use tower_lsp_server::ls_types;
 
@@ -70,36 +67,16 @@ pub fn from_lsp_uri(uri: &ls_types::Uri) -> Option<url::Url> {
 /// Converts a domain `url::Url` back into the `tower_lsp_server::ls_types::Uri` an LSP
 /// response object (`Location`, `WorkspaceEdit`, ...) requires.
 ///
+/// Thin wrapper over [`deps_core::to_ls_uri`] — see the module doc for why the conversion
+/// itself lives in `deps-core` rather than being reimplemented here.
+///
 /// # Panics
 ///
-/// Panics if `url` does not round-trip into an `ls_types::Uri`. In practice this never
-/// happens: every `url::Url` reaching this function either came from [`from_lsp_uri`] moments
-/// earlier in the same request, or was constructed by a `deps-core`/`deps-engine` ecosystem
-/// parser directly from that same round-tripped value.
+/// Panics if `url` does not round-trip into an `ls_types::Uri` — see [`deps_core::to_ls_uri`]'s
+/// own `# Panics` section.
 #[must_use]
 pub fn to_lsp_uri(url: &url::Url) -> ls_types::Uri {
-    url.as_str()
-        .parse()
-        .unwrap_or_else(|e| panic!("Url {url} did not round-trip to an LSP Uri: {e}"))
-}
-
-/// Converts an LSP-protocol `Position` into the domain [`deps_core::position::Position`].
-#[must_use]
-pub fn from_lsp_position(position: ls_types::Position) -> deps_core::position::Position {
-    position.into()
-}
-
-/// Converts a domain [`deps_core::position::Position`] into the LSP-protocol `Position` a
-/// response object requires.
-#[must_use]
-pub fn to_lsp_position(position: deps_core::position::Position) -> ls_types::Position {
-    position.into()
-}
-
-/// Converts an LSP-protocol `Range` into the domain [`deps_core::position::Range`].
-#[must_use]
-pub fn from_lsp_range(range: ls_types::Range) -> deps_core::position::Range {
-    range.into()
+    deps_core::to_ls_uri(url)
 }
 
 /// Converts a domain [`deps_core::position::Range`] into the LSP-protocol `Range` a response
@@ -323,21 +300,12 @@ mod tests {
     }
 
     #[test]
-    fn test_position_roundtrips() {
-        let ls_position = ls_types::Position::new(12, 34);
-        let domain = from_lsp_position(ls_position);
-        assert_eq!(domain.line, 12);
-        assert_eq!(domain.character, 34);
-        assert_eq!(to_lsp_position(domain), ls_position);
-    }
+    fn test_to_lsp_range_converts_domain_range() {
+        use deps_core::position::{Position, Range};
 
-    #[test]
-    fn test_range_roundtrips() {
+        let domain = Range::new(Position::new(0, 0), Position::new(2, 5));
         let ls_range =
             ls_types::Range::new(ls_types::Position::new(0, 0), ls_types::Position::new(2, 5));
-        let domain = from_lsp_range(ls_range);
-        assert_eq!(domain.start.line, 0);
-        assert_eq!(domain.end.line, 2);
         assert_eq!(to_lsp_range(domain), ls_range);
     }
 

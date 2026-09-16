@@ -343,9 +343,11 @@ pub use crate::lsp_helpers::utf16_to_byte_offset;
 /// let prefix = extract_prefix(content, position, range);
 /// assert_eq!(prefix, "1.");
 /// ```
-// `start_byte`/`cursor_byte` come from `utf16_to_byte_offset` (char_indices-based) and are
-// bounds/ordering-checked above, so both are verified char boundaries.
-#[allow(clippy::string_slice)]
+#[expect(
+    clippy::string_slice,
+    reason = "start_byte/cursor_byte come from utf16_to_byte_offset (char_indices-based) and \
+              are bounds/ordering-checked above, so both are verified char boundaries"
+)]
 pub fn extract_prefix(content: &str, position: Position, range: Range) -> String {
     let line = match content.lines().nth(position.line as usize) {
         Some(l) => l,
@@ -403,9 +405,11 @@ pub fn extract_prefix(content: &str, position: Position, range: Range) -> String
 /// let prefix = extract_feature_prefix(content, pos);
 /// assert_eq!(prefix, "ser");
 /// ```
-// `cursor_byte` comes from `utf16_to_byte_offset` (char_indices-based) and is clamped to
-// `line.len()`; `segment_start` is an ASCII-char (`[`) index.
-#[allow(clippy::string_slice)]
+#[expect(
+    clippy::string_slice,
+    reason = "cursor_byte comes from utf16_to_byte_offset (char_indices-based) and is clamped \
+              to line.len(); segment_start is an ASCII-char ([) index"
+)]
 pub fn extract_feature_prefix(content: &str, position: Position) -> String {
     let line = match content.lines().nth(position.line as usize) {
         Some(l) => l,
@@ -461,8 +465,10 @@ pub fn extract_feature_prefix(content: &str, position: Position) -> String {
 /// assert_eq!(item.label, metadata.name().as_str());
 /// # }
 /// ```
-// `end` is floor_char_boundary-clamped just below before slicing `desc`.
-#[allow(clippy::string_slice)]
+#[expect(
+    clippy::string_slice,
+    reason = "end is floor_char_boundary-clamped just below before slicing desc"
+)]
 pub fn build_package_completion(
     metadata: &dyn Metadata,
     insert_range: Range,
@@ -4380,8 +4386,10 @@ mod tests {
     /// A naive count sees two `"` characters (even, wrongly "closed") and would
     /// collapse the prefix to empty; the escape-aware check must still find the
     /// string open with the correct tail.
-    // A short ASCII test line can never overflow `u32`.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a short ASCII test line can never overflow u32"
+    )]
     #[test]
     fn test_extract_feature_prefix_skips_escaped_quote() {
         let content = r#"features = ["a\"b"#;

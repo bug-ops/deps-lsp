@@ -434,8 +434,10 @@ pub fn requirement_is_unsatisfiable(
 /// strict-SemVer ecosystems (see
 /// [`crate::lsp_helpers::DiagnosticPolicy::strict_semver_prerelease_exclusion`]), whose registries only
 /// publish spec-conformant version strings.
-// `dash` comes from `str::find('-')`, an ASCII byte, so it is always a char boundary.
-#[allow(clippy::string_slice)]
+#[expect(
+    clippy::string_slice,
+    reason = "dash comes from str::find('-'), an ASCII byte, so it is always a char boundary"
+)]
 fn semver_prerelease_base(version: &str) -> Option<&str> {
     let core = version.split('+').next().unwrap_or(version);
     core.find('-').map(|dash| &core[..dash])
@@ -450,8 +452,10 @@ fn semver_prerelease_base(version: &str) -> Option<&str> {
 /// rejected by ordinary version *ordering* against that explicit floor, not by SemVer's
 /// default pre-release exclusion — enriching the message in that case would misattribute the
 /// cause.
-// `i > 0` and `i + 1 < bytes.len()` guard `bytes[i - 1]`/`bytes[i + 1]` respectively.
-#[allow(clippy::indexing_slicing)]
+#[expect(
+    clippy::indexing_slicing,
+    reason = "i > 0 and i + 1 < bytes.len() guard bytes[i - 1]/bytes[i + 1] respectively"
+)]
 fn requirement_names_prerelease(requirement: &str) -> bool {
     let bytes = requirement.as_bytes();
     bytes.iter().enumerate().any(|(i, &b)| {
@@ -987,9 +991,11 @@ fn push_collapsed_blocked_registries(
     uri: &url::Url,
     dependency_names: &HashMap<Range, &str>,
 ) {
-    // The `0`/`1` arms are matched separately, so this arm only runs with `len() >= 2`,
-    // making both `entries[0]` and the `entries[1..]` slice below valid.
-    #[allow(clippy::indexing_slicing)]
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "the 0/1 arms are matched separately, so this arm only runs with len() >= 2, \
+                  making both entries[0] and the entries[1..] slice below valid"
+    )]
     match entries.len() {
         0 => {}
         1 => diagnostics.extend(entries.iter().map(build_blocked_registry_diagnostic)),
@@ -997,7 +1003,11 @@ fn push_collapsed_blocked_registries(
             let diagnostic = build_blocked_registry_diagnostic(&entries[0]);
             let siblings = &entries[1..];
             let shown = siblings.len().min(MAX_BLOCKED_REGISTRY_RELATED_INFO);
-            #[allow(clippy::indexing_slicing)]
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "shown is siblings.len().min(...), so siblings[..shown] is always \
+                          in bounds"
+            )]
             let mut related_information: Vec<RelatedInformation> = siblings[..shown]
                 .iter()
                 .map(|occurrence| {
@@ -1613,9 +1623,11 @@ fn push_collapsed_fetch_failures(
     fetch_failed: Vec<FetchFailureEntry>,
     uri: &url::Url,
 ) {
-    // The `0`/`1` arms are matched separately, so this arm only runs with `len() >= 2`,
-    // making both `fetch_failed[0]` and the `fetch_failed[1..]` slice below valid.
-    #[allow(clippy::indexing_slicing)]
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "the 0/1 arms are matched separately, so this arm only runs with len() >= 2, \
+                  making both fetch_failed[0] and the fetch_failed[1..] slice below valid"
+    )]
     match fetch_failed.len() {
         0 => {}
         1 => diagnostics.extend(fetch_failed.into_iter().map(|entry| entry.diagnostic)),

@@ -769,10 +769,12 @@ pub fn read_string_literal(text: &str, at: usize, syntax: ScanSyntax) -> Option<
 /// );
 /// assert_eq!(strip_line_comment("no comment here", ScanSyntax::Ruby), "no comment here");
 /// ```
-// `span.range.start` is always a char boundary: every span built by `scan_spans` starts
-// either at 0, at a `char_indices()` offset from `find_next_marker`, or just past a prior
-// span's end (itself always a char boundary by the same argument).
-#[allow(clippy::string_slice)]
+#[expect(
+    clippy::string_slice,
+    reason = "span.range.start is always a char boundary: every span built by scan_spans \
+              starts either at 0, at a char_indices() offset from find_next_marker, or just \
+              past a prior span's end (itself always a char boundary by the same argument)"
+)]
 #[must_use]
 pub fn strip_line_comment(line: &str, syntax: ScanSyntax) -> &str {
     scan_spans(line, syntax)
@@ -799,9 +801,11 @@ pub fn strip_line_comment(line: &str, syntax: ScanSyntax) -> &str {
 /// let blanked = blank_comments("let x = 1 // comment\nlet y = 2", ScanSyntax::Swift);
 /// assert_eq!(blanked, "let x = 1           \nlet y = 2");
 /// ```
-// Every `span.range` returned by `scan_spans` is a sub-range of `0..content.len()`, so
-// indexing `bytes` (the same length as `content.as_bytes()`) with it never panics.
-#[allow(clippy::indexing_slicing)]
+#[expect(
+    clippy::indexing_slicing,
+    reason = "every span.range returned by scan_spans is a sub-range of 0..content.len(), so \
+              indexing bytes (the same length as content.as_bytes()) with it never panics"
+)]
 #[must_use]
 pub fn blank_comments(content: &str, syntax: ScanSyntax) -> String {
     let mut bytes = content.as_bytes().to_vec();
@@ -920,9 +924,11 @@ impl<'a> CodeSpans<'a> {
 }
 
 #[cfg(test)]
-// Every `literal.content` indexed below comes from `read_string_literal`, whose bounds
-// are always char boundaries (see `strip_line_comment`'s justification above).
-#[allow(clippy::string_slice)]
+#[expect(
+    clippy::string_slice,
+    reason = "every literal.content indexed below comes from read_string_literal, whose \
+              bounds are always char boundaries (see strip_line_comment's justification above)"
+)]
 mod tests {
     use super::*;
 

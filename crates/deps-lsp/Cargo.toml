@@ -74,7 +74,10 @@ deps-npm = { workspace = true, features = ["lsp-responses"] }
 insta = { workspace = true, features = ["json"] }
 mockito = { workspace = true }
 tempfile = { workspace = true }
-tokio-test = { workspace = true }
+# `test-util` is what `#[tokio::test(start_paused = true)]` needs (`Builder::start_paused`);
+# previously reached transitively through the now-removed `tokio-test` dev-dependency, which
+# had no other, directly-used API in this crate — made explicit here instead.
+tokio = { workspace = true, features = ["test-util"] }
 
 [[bench]]
 name = "lsp_handlers"

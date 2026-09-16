@@ -141,8 +141,10 @@ impl PublishTime {
         // `saturating_sub` only guards i64 overflow; the diff can still be negative
         // (a future `self`), so clamp to 0 before the `as u64` cast.
         let diff = now.0.saturating_sub(self.0);
-        // `diff >= 0` guaranteed by the `else` branch check on the same line.
-        #[allow(clippy::cast_sign_loss)]
+        #[expect(
+            clippy::cast_sign_loss,
+            reason = "diff >= 0 guaranteed by the else branch check on the same line"
+        )]
         if diff < 0 { 0 } else { diff as u64 }
     }
 }

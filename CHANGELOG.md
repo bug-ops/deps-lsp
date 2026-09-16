@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **ci**: `release.yml` now builds `deps-lsp` and `deps-cli` in separate cargo/cross invocations, preventing cargo's feature-unification from linking `tower-lsp-server` into the released `deps-cli` binary (#1110, resolves #1103)
 
 ### Changed
+- **Breaking (public API)**: **deps-lsp**: `lsp_types_interop` no longer exposes `from_lsp_position`/`to_lsp_position`/`from_lsp_range` (unused outside its own tests), and `to_lsp_uri` now delegates to `deps_core::to_ls_uri` instead of reimplementing the conversion (#TBD)
+- **deps-core**: migrated restriction-lint `#[allow(...)]` attributes to `#[expect(..., reason = "...")]`, and removed unused dev-dependencies across 8 crates (7 ecosystem crates plus `deps-lsp`) (#TBD)
 - **docs**: root `README.md` shrunk from a full reference manual back to a pitch-and-getting-started page; editor setup, the configuration option reference, performance benchmarks, project structure, and the `deps-core` versioning policy moved into new/expanded mdBook pages (`book/src/editor-setup.md`, `book/src/configuration.md`, and additions to `book/src/architecture.md`) (#1100)
 
 ### Added

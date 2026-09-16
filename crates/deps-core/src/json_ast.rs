@@ -227,11 +227,12 @@ fn quoted_lsp_range(
     byte_span_to_range(content, table, range.start + 1, range.end.saturating_sub(1))
 }
 
-// #673: fixed test-fixture lengths cast to `u32` for `Position`/`Range` assertions never
-// approach truncation range; not the request-path cast concern the crate-level `warn`
-// targets.
 #[cfg(test)]
-#[allow(clippy::cast_possible_truncation)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "#673: fixed test-fixture lengths cast to u32 for Position/Range assertions never \
+              approach truncation range"
+)]
 mod tests {
     use super::*;
 

@@ -84,9 +84,11 @@ pub fn is_tag_shaped(s: &str) -> bool {
 /// assert!(!is_partial_semver_shaped("2024-01-15"));
 /// assert!(!is_partial_semver_shaped("main"));
 /// ```
-// `idx` comes from `str::find(['-', '+'])`, both ASCII bytes, so it is always a char
-// boundary; `strip_prefix(['v', 'V'])` likewise only ever removes a single ASCII byte.
-#[allow(clippy::string_slice)]
+#[expect(
+    clippy::string_slice,
+    reason = "idx comes from str::find(['-', '+']), both ASCII bytes, so it is always a char \
+              boundary; strip_prefix(['v', 'V']) likewise only ever removes a single ASCII byte"
+)]
 #[must_use]
 pub fn is_partial_semver_shaped(s: &str) -> bool {
     let has_v_prefix = s.starts_with(['v', 'V']);
@@ -118,9 +120,11 @@ pub fn is_partial_semver_shaped(s: &str) -> bool {
 /// assert_eq!(match_v_prefix_style("v4", "5.0.0"), "v5.0.0");
 /// assert_eq!(match_v_prefix_style("4", "v5.0.0"), "5.0.0");
 /// ```
-// `tag[1..]` only runs when `tag_has_v` (an ASCII 'v'/'V' prefix check), so index 1 is
-// always a char boundary.
-#[allow(clippy::string_slice)]
+#[expect(
+    clippy::string_slice,
+    reason = "tag[1..] only runs when tag_has_v (an ASCII 'v'/'V' prefix check), so index 1 \
+              is always a char boundary"
+)]
 #[must_use]
 pub fn match_v_prefix_style(current: &str, tag: &str) -> String {
     let current_has_v = current.starts_with(['v', 'V']);
@@ -355,9 +359,11 @@ pub fn locate_value_span(content: &str, search_from: usize, value: &str) -> Opti
     if value.is_empty() {
         return Some((search_from, search_from));
     }
-    // Every slice/index from here on is bounds-checked by the `search_from <= bytes.len()`
-    // guard above combined with each expression's own `<=`/`.min(...)` clamp.
-    #[allow(clippy::indexing_slicing)]
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "every slice/index in this block is bounds-checked by the search_from <= \
+                  bytes.len() guard above combined with each expression's own <=/.min(...) clamp"
+    )]
     {
         if search_from + value.len() <= bytes.len()
             && &bytes[search_from..search_from + value.len()] == value.as_bytes()
@@ -368,16 +374,23 @@ pub fn locate_value_span(content: &str, search_from: usize, value: &str) -> Opti
     // #885: bound the window *before* searching for '\n', not after — searching the whole
     // remainder first reintroduces O(remaining-document-length) cost on one huge line even
     // though the resulting scan_end value is the same either way (min is order-independent).
-    #[allow(clippy::indexing_slicing)]
     let window_end = bytes
         .len()
         .min(search_from.saturating_add(MAX_FALLBACK_SCAN_BYTES));
-    #[allow(clippy::indexing_slicing)]
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "window_end = bytes.len().min(...), and search_from <= bytes.len() from the \
+                  guard above, so bytes[search_from..window_end] is always in bounds"
+    )]
     let scan_end = bytes[search_from..window_end]
         .iter()
         .position(|&b| b == b'\n')
         .map_or(window_end, |p| search_from + p);
-    #[allow(clippy::indexing_slicing)]
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "scan_end is derived from window_end or a position found within \
+                  bytes[search_from..window_end], so it stays within [search_from, window_end]"
+    )]
     let haystack = &bytes[search_from..scan_end];
     let needle = value.as_bytes();
     let found = haystack
@@ -603,8 +616,10 @@ impl MarkedScalar {
 }
 
 #[cfg(test)]
-// Fixtures are single-line ASCII literals with hand-computed byte offsets.
-#[allow(clippy::string_slice)]
+#[expect(
+    clippy::string_slice,
+    reason = "fixtures are single-line ASCII literals with hand-computed byte offsets"
+)]
 mod tests {
     use super::*;
 

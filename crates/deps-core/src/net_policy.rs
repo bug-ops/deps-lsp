@@ -577,9 +577,11 @@ pub enum PolicyGate<'a> {
 /// );
 /// assert_eq!(redact_userinfo("c:/user:hunter2@evil"), "c:***@evil");
 /// ```
-// #901: `authority_start` (from `find(':')` + `scheme_separator_end`) is an ASCII-byte scan,
-// so it always lands on a char boundary.
-#[allow(clippy::string_slice)]
+#[expect(
+    clippy::string_slice,
+    reason = "#901: authority_start (from find(':') + scheme_separator_end) is an ASCII-byte \
+              scan, so it always lands on a char boundary"
+)]
 #[must_use]
 pub fn redact_userinfo(raw: &str) -> String {
     let Ok(mut url) = url::Url::parse(raw) else {
@@ -654,9 +656,11 @@ pub fn redact_userinfo(raw: &str) -> String {
 /// Accepted for the same reason the rest of this file accepts it: the output only ever feeds a
 /// `tracing` line or error string, and over-redacting a non-credential is always safer than
 /// leaking a real one.
-// `serialized.find("***@")` locates an ASCII marker, so `tail_start` always lands on a char
-// boundary.
-#[allow(clippy::string_slice)]
+#[expect(
+    clippy::string_slice,
+    reason = "serialized.find(\"***@\") locates an ASCII marker, so tail_start always lands \
+              on a char boundary"
+)]
 fn redact_authority_url_tail(serialized: &str) -> String {
     let Some(marker_at) = serialized.find("***@") else {
         return redact_secondary_colon_credential(serialized);
@@ -690,9 +694,11 @@ fn redact_authority_url_tail(serialized: &str) -> String {
 /// approach) is what closes #826's password-containing-`/` gap: a password containing `/`
 /// (`user:pa/ss@evil`) still has its `:` in the *same* since-last-`@` segment as the `@` that
 /// follows it, however many `/`s sit between them.
-// `at` comes from `match_indices('@')` on ASCII '@' bytes, so every slice bound is always a
-// char boundary.
-#[allow(clippy::string_slice)]
+#[expect(
+    clippy::string_slice,
+    reason = "at comes from match_indices('@') on ASCII '@' bytes, so every slice bound is \
+              always a char boundary"
+)]
 fn find_credential_at(region: &str) -> Option<usize> {
     let mut prev_at = 0;
     let mut found = None;
@@ -792,9 +798,11 @@ const TOKEN_PREFIXES: &[&str] = &[
 /// directions only ever widen what gets redacted — but is undocumented anywhere else, so a future
 /// "unify the boundary sets" cleanup should know it would change behavior for `c:\ghp_X@evil`
 /// before doing so.
-// `i`/`seg_start` come from `enumerate()` over `region.bytes()` and ASCII byte-literal matches
-// against '@'/'/'/'?'/'#'/'\\', so every slice bound stays a char boundary.
-#[allow(clippy::string_slice)]
+#[expect(
+    clippy::string_slice,
+    reason = "i/seg_start come from enumerate() over region.bytes() and ASCII byte-literal \
+              matches against '@'/'/'/'?'/'#'/'\\\\', so every slice bound stays a char boundary"
+)]
 fn find_token_prefix_at(region: &str) -> Option<usize> {
     let mut seg_start = 0;
     let mut found = None;
@@ -843,9 +851,11 @@ fn find_token_prefix_at(region: &str) -> Option<usize> {
 /// `\`-separated Windows-path-shaped tail extending into the masked span is accepted as an
 /// over-redaction trade-off, not a leak, consistent with this file's existing
 /// over-redaction/false-positive trade-offs (see [`redact_colon_credential`]'s own doc comment).
-// `at`/`next` come from `find('@')` on ASCII '@' bytes, so every slice bound is always a char
-// boundary.
-#[allow(clippy::string_slice)]
+#[expect(
+    clippy::string_slice,
+    reason = "at/next come from find('@') on ASCII '@' bytes, so every slice bound is always \
+              a char boundary"
+)]
 fn extend_credential_at(region: &str, at: usize) -> usize {
     let mut at = at;
     loop {
@@ -896,9 +906,11 @@ fn extend_credential_at(region: &str, at: usize) -> usize {
 /// byte-for-byte equivalent to the pre-fix scan via `redact_userinfo`, over all 271,452 strings of
 /// length 1-5 drawn from the 12-character alphabet `[ ] : / ? # \ c a 0 x @` (not committed as a
 /// permanent test; see #896's own tracked follow-up for a durable equivalence harness).
-// `bracket`/`colon` come from `find`/`starts_with` of ASCII `[`/`]`/`:` bytes, so every slice
-// bound is always a char boundary.
-#[allow(clippy::string_slice)]
+#[expect(
+    clippy::string_slice,
+    reason = "bracket/colon come from find/starts_with of ASCII [/]/: bytes, so every slice \
+              bound is always a char boundary"
+)]
 fn segment_has_credential_colon(segment: &str) -> bool {
     let mut cursor = 0;
     let mut bracket_adjacent = false;
@@ -1103,9 +1115,12 @@ fn is_port_like(value: &str) -> bool {
 /// returning early — distinct from [`segment_has_credential_colon`]'s "return `false`" on the
 /// same case, since this function's contract is "does `bounded` contain a credential-shaped
 /// colon at all", not "identify a specific one".
-// `bracket_host_shape_end`'s return and `colon` (from `rfind` of an ASCII `:` byte) are always
-// char-boundary-safe byte offsets, so every slice bound below is always a char boundary.
-#[allow(clippy::string_slice)]
+#[expect(
+    clippy::string_slice,
+    reason = "bracket_host_shape_end's return and colon (from rfind of an ASCII : byte) are \
+              always char-boundary-safe byte offsets, so every slice bound below is always a \
+              char boundary"
+)]
 fn bounded_has_credential_colon(bounded: &str) -> bool {
     let bounded = if bounded.starts_with('[') {
         &bounded[bracket_host_shape_end(bounded, 0)..]
@@ -1263,10 +1278,12 @@ fn host_boundary_scheme_aware(region: &str) -> usize {
 ///   [`redact_colon_credential`] unconditionally, which itself keeps scanning past a masked
 ///   value for a further `@`-shaped credential rather than stopping at its first match (#862,
 ///   see that function's own doc comment).
-// `start` is an ASCII byte offset (`find("://")`/`find(':')` on `raw`), so `region` always
-// starts on a char boundary; every further offset comes from `find`/`rfind` of ASCII tokens on
-// `region`, so every slice bound stays a char boundary throughout.
-#[allow(clippy::string_slice)]
+#[expect(
+    clippy::string_slice,
+    reason = "start is an ASCII byte offset (find(\"://\")/find(':') on raw), so region \
+              always starts on a char boundary; every further offset comes from find/rfind of \
+              ASCII tokens on region, so every slice bound stays a char boundary throughout"
+)]
 fn redact_credential(raw: &str, start: usize, kind: RegionKind) -> String {
     let region = &raw[start..];
 
@@ -1425,7 +1442,11 @@ fn redact_credential(raw: &str, start: usize, kind: RegionKind) -> String {
 /// This doc comment has overclaimed completeness in earlier rounds; treat the step-by-step
 /// description above as bounded by this one documented, tracked exception, not as a
 /// completeness guarantee.
-#[allow(clippy::string_slice)]
+#[expect(
+    clippy::string_slice,
+    reason = "every slice bound is derived from find/rfind of ASCII tokens ('@', ':', '/', ...) \
+              or host_boundary_scheme_aware's own char-boundary-safe byte offsets"
+)]
 fn redact_authority_suffix(region: &str) -> String {
     // Gates whether a window with neither an `@` nor colon evidence of its own is worth looking
     // past at all (#862, impl-critic C1's own follow-up finding): continuing unconditionally
@@ -1733,10 +1754,13 @@ fn colon_credential_match(
 /// single call over the whole region would have reached (#886). Still threads `next_bracket` as
 /// a bare `Option<usize>` offset rather than a whole-tail rescan, so seeding costs nothing extra
 /// asymptotically.
-// All indices come from `find` of ASCII tokens (`:`, `]`, `/`, `?`, `#`) or byte-level ASCII
-// checks, so every slice bound is always a char boundary. `cursor` only ever advances (every
-// branch below adds at least 1 to it before looping), so the scan is guaranteed to terminate.
-#[allow(clippy::string_slice)]
+// `cursor` only ever advances (every branch below adds at least 1 to it before looping), so
+// the scan is guaranteed to terminate.
+#[expect(
+    clippy::string_slice,
+    reason = "all indices come from find of ASCII tokens (:, ], /, ?, #) or byte-level ASCII \
+              checks, so every slice bound is always a char boundary"
+)]
 fn colon_credential_match_seeded(
     authority: &str,
     next_bracket: Option<usize>,
@@ -1865,9 +1889,11 @@ fn redact_colon_credential(raw: &str, authority_start: usize, authority: &str) -
 /// [`redact_colon_credential`], but with `bracket_seen`'s initial value taken from the caller
 /// instead of always starting `false` — see [`colon_credential_match_seeded`], which this
 /// delegates to.
-// `authority_start` is always caller-derived from `find`/`rfind` of ASCII tokens, so it always
-// lands on a char boundary.
-#[allow(clippy::string_slice)]
+#[expect(
+    clippy::string_slice,
+    reason = "authority_start is always caller-derived from find/rfind of ASCII tokens, so it \
+              always lands on a char boundary"
+)]
 fn redact_colon_credential_seeded(
     raw: &str,
     authority_start: usize,
@@ -1983,7 +2009,7 @@ fn redact_span_colon_credential(span: &str, bracket_seen: bool) -> Cow<'_, str> 
 ///   alphabet that lets either span cross one of those three bytes would break this invariant and
 ///   must re-examine this latch, since silently getting it wrong here is an under-redaction (a
 ///   leak), not just a missed optimization.
-#[allow(
+#[expect(
     clippy::string_slice,
     reason = "`at` comes from `extend_credential_at`, itself derived from `match_indices('@')` \
               on an ASCII byte, so it always lands on a char boundary"
@@ -2106,9 +2132,11 @@ fn redact_further_credential(tail: &str, next_bracket: Option<usize>) -> String 
 /// reaches) has no authority-vs-credential distinction to anchor against. See
 /// [`redact_credential`]'s own doc comment for the full carve-out list and its per-`RegionKind`
 /// coverage table.
-// `authority_start` comes from `find('@')` followed by `find("://")` on ASCII bytes, so it
-// always lands on a char boundary.
-#[allow(clippy::string_slice)]
+#[expect(
+    clippy::string_slice,
+    reason = "authority_start comes from find('@') followed by find(\"://\") on ASCII bytes, \
+              so it always lands on a char boundary"
+)]
 fn redact_userinfo_unparseable(raw: &str) -> String {
     let authority_start = match raw.find('@') {
         Some(at) => raw[..at]
@@ -2205,7 +2233,7 @@ fn redact_userinfo_opaque_path(raw: &str) -> String {
 /// );
 /// ```
 #[must_use]
-#[allow(
+#[expect(
     clippy::string_slice,
     reason = "`end` comes from `find` of ASCII '?'/'#' bytes on the raw input string, so it \
               always lands on a valid char boundary"

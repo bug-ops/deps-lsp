@@ -109,8 +109,10 @@ where
     }
 
     let mut page = 2u32;
-    // `CONCURRENCY` is a small hardcoded constant (5), never close to `u32::MAX`.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "CONCURRENCY is a small hardcoded constant (5), never close to u32::MAX"
+    )]
     'batches: while page <= max_pages {
         let batch_end = (page + CONCURRENCY as u32 - 1).min(max_pages);
         let mut stream = stream::iter(page..=batch_end)
@@ -141,10 +143,11 @@ where
     Ok(items)
 }
 
-// #673: fixed test-fixture lengths cast to `u32` never approach truncation range; not
-// the request-path cast concern the crate-level `warn` targets.
 #[cfg(test)]
-#[allow(clippy::cast_possible_truncation)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "#673: fixed test-fixture lengths cast to u32 never approach truncation range"
+)]
 mod tests {
     use super::*;
     #[cfg(feature = "test-util")]
