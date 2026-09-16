@@ -6,6 +6,7 @@
 
 - [Editor Setup](editor-setup.md)
 - [Configuration](configuration.md)
+- [deps-cli](cli.md)
 - [Architecture Overview](architecture.md)
 - [API Documentation](api-docs.md)
 
