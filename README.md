@@ -2,6 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/deps-lsp)](https://crates.io/crates/deps-lsp)
 [![CI](https://github.com/bug-ops/deps-lsp/actions/workflows/ci.yml/badge.svg)](https://github.com/bug-ops/deps-lsp/actions)
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/bug-ops/deps-lsp/badge)](https://scorecard.dev/viewer/?uri=github.com/bug-ops/deps-lsp)
 [![codecov](https://codecov.io/gh/bug-ops/deps-lsp/graph/badge.svg?token=S71PTINTGQ)](https://codecov.io/gh/bug-ops/deps-lsp)
 [![Tests](https://img.shields.io/badge/tests-5891%20passed-brightgreen)](https://github.com/bug-ops/deps-lsp/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
