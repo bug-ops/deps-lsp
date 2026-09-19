@@ -1298,4 +1298,83 @@ mod tests {
             .await;
         assert_eq!(via_dispatch.items, direct);
     }
+
+    // #1146: cursor just before dep-two's version_range on a real two-dep line resolves dep-two via pass 2, not dep-one.
+    #[cfg(feature = "lsp-responses")]
+    #[tokio::test]
+    async fn test_literal_version_dependency_resolves_second_dependency_from_real_parser_output() {
+        // See the comment in `test_parse_manifest_kts` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let eco = GradleEcosystem::new(make_cache());
+        let content = "dependencies {\n    implementation(\"com.example:foo:1.0.0\"); implementation(\"com.example:bar:2.0.0\")\n}\n";
+        let uri = deps_core::test_util::test_uri("/project/build.gradle");
+        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+        let deps = parse_result.dependencies();
+        assert_eq!(
+            deps.len(),
+            2,
+            "fixture must parse both same-line dependencies: {content}"
+        );
+        let dep_one_name = deps[0].name().clone();
+        let dep_two = deps[1];
+        let dep_two_version_range: Range = dep_two.version_range().unwrap().into();
+        let position = Position {
+            line: dep_two_version_range.start.line,
+            character: dep_two_version_range.start.character - 1,
+        };
+
+        let resolved = deps_core::completion::literal_version_dependency(
+            parse_result.as_ref(),
+            position,
+            content,
+            dep_two_version_range,
+        )
+        .expect("dep-two's own version_range must resolve it");
+
+        assert_eq!(
+            resolved.name(),
+            dep_two.name(),
+            "must resolve the second dependency, not the first"
+        );
+        assert_ne!(resolved.name().as_str(), dep_one_name.as_str());
+    }
+
+    // #1146 review follow-up: `version` written before `module` in a catalog entry must still resolve via the fallback.
+    #[cfg(feature = "lsp-responses")]
+    #[tokio::test]
+    async fn test_literal_version_dependency_resolves_catalog_entry_with_version_before_module() {
+        // See the comment in `test_parse_manifest_kts` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let eco = GradleEcosystem::new(make_cache());
+        let content =
+            "[libraries]\nfoo-bar = { version = \"1.0.0\", module = \"com.example:foo\" }\n";
+        let uri = deps_core::test_util::test_uri("/project/gradle/libs.versions.toml");
+        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+        let deps = parse_result.dependencies();
+        assert_eq!(
+            deps.len(),
+            1,
+            "fixture must parse one dependency: {content}"
+        );
+        let dep = deps[0];
+        let version_range: Range = dep.version_range().unwrap().into();
+        assert!(
+            dep.name_range().start.character > version_range.start.character,
+            "fixture must keep `version` before `module` in source order: {content}"
+        );
+        let position = Position {
+            line: version_range.start.line,
+            character: version_range.start.character - 1,
+        };
+
+        let resolved = deps_core::completion::literal_version_dependency(
+            parse_result.as_ref(),
+            position,
+            content,
+            version_range,
+        )
+        .expect("must resolve despite name_range starting after version_range");
+
+        assert_eq!(resolved.name(), dep.name());
+    }
 }

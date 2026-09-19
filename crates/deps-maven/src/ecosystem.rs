@@ -1469,4 +1469,44 @@ mod tests {
             .await;
         assert_eq!(via_dispatch.items, direct);
     }
+
+    // #1146: cursor just before dep-two's version_range on a real two-dep-per-line pom.xml resolves dep-two via pass 2, not dep-one.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_literal_version_dependency_resolves_second_dependency_from_real_parser_output() {
+        let xml = "<project><dependencies>\
+<dependency><groupId>com.example</groupId><artifactId>foo</artifactId><version>1.0.0</version></dependency>\
+<dependency><groupId>com.example</groupId><artifactId>bar</artifactId><version>2.0.0</version></dependency>\
+</dependencies></project>";
+        let uri = deps_core::test_util::test_uri("/test/pom.xml");
+        let result = crate::parser::parse_pom_xml(xml, &uri).unwrap();
+        let deps = result.dependencies();
+        assert_eq!(
+            deps.len(),
+            2,
+            "fixture must parse both same-line dependencies: {xml}"
+        );
+        let dep_one_name = deps[0].name().clone();
+        let dep_two = deps[1];
+        let dep_two_version_range: LspRange = dep_two.version_range().unwrap().into();
+        let position = Position {
+            line: dep_two_version_range.start.line,
+            character: dep_two_version_range.start.character - 1,
+        };
+
+        let resolved = deps_core::completion::literal_version_dependency(
+            &result,
+            position,
+            xml,
+            dep_two_version_range,
+        )
+        .expect("dep-two's own version_range must resolve it");
+
+        assert_eq!(
+            resolved.name(),
+            dep_two.name(),
+            "must resolve the second dependency, not the first"
+        );
+        assert_ne!(resolved.name().as_str(), dep_one_name.as_str());
+    }
 }

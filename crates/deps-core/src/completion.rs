@@ -295,11 +295,20 @@ pub fn detect_completion_context(
 ///
 /// # Lookup
 ///
-/// Finds the first dependency in `parse_result.dependencies()` whose `version_range` contains
-/// `position`, or — since a raw-text scanner's own detected span can diverge slightly from
-/// the AST's `version_range()` — whose `name_range` starts on the same line as `position`.
-/// This lenient fallback preserves `deps-gradle`/`deps-maven`'s pre-existing lookup
-/// unchanged; it is not applied to [`detect_completion_context`]'s own stricter check.
+/// Finds the dependency in `parse_result.dependencies()` whose `version_range` contains
+/// `position`. If none does — since a raw-text scanner's own detected span can diverge
+/// slightly from the AST's `version_range()`, landing just outside it — falls back to the
+/// dependency, among those on the same line as `position`, whose own `version_range` is
+/// nearest to `position` (a dependency with no `version_range` sorts last). Distance, not
+/// `name_range` position, is deliberately the tiebreak: a Gradle version-catalog entry's
+/// `name_range`/`version_range` come from independent TOML keys (`module`/`version`) and can
+/// appear in either order in the source text, so a `name_range`-relative tiebreak would
+/// misfire whenever `version` is written before `module`. On a line shared by multiple
+/// dependencies (e.g. a minified Gradle/Maven manifest with several coordinates on one line,
+/// #1146) this picks the dependency the cursor is actually sitting closest to rather than
+/// always the first one on the line. This preserves `deps-gradle`/`deps-maven`'s pre-existing
+/// same-line lookup for the single-dependency-per-line case unchanged; it is not applied to
+/// [`detect_completion_context`]'s own stricter check.
 ///
 /// `value_range` is the raw-text scanner's own detected span of the version token (not
 /// necessarily identical to the found dependency's `version_range()`), checked against
@@ -329,14 +338,41 @@ pub fn literal_version_dependency<'a>(
     content: &str,
     value_range: Range,
 ) -> Option<&'a dyn crate::ecosystem::Dependency> {
-    let dep = parse_result.dependencies().into_iter().find(|d| {
-        d.version_range()
-            .is_some_and(|r| crate::lsp_helpers::position_in_range(position.into(), r))
-            || d.name_range().start.line == position.line
-    })?;
+    let deps = parse_result.dependencies();
+
+    // Pass 1 uses `find` (first match); `version_range`s can only tie at one shared character.
+    let dep = deps
+        .iter()
+        .copied()
+        .find(|d| {
+            d.version_range()
+                .is_some_and(|r| crate::lsp_helpers::position_in_range(position.into(), r))
+        })
+        .or_else(|| {
+            deps.iter()
+                .copied()
+                .filter(|d| {
+                    d.version_range().map_or_else(
+                        || d.name_range().start.line == position.line,
+                        |r| r.start.line == position.line,
+                    )
+                })
+                .min_by_key(|d| version_range_distance(d.version_range(), position.character))
+        })?;
 
     crate::lsp_helpers::dependency_version_range_is_literal(dep, content, value_range.into())
         .then_some(dep)
+}
+
+/// Distance in UTF-16 code units from `character` to the nearer end of `range`, or
+/// [`u32::MAX`] when `range` is absent — used by [`literal_version_dependency`]'s same-line
+/// fallback to rank candidates without a `version_range` last.
+fn version_range_distance(range: Option<crate::position::Range>, character: u32) -> u32 {
+    range.map_or(u32::MAX, |r| {
+        character
+            .abs_diff(r.start.character)
+            .min(character.abs_diff(r.end.character))
+    })
 }
 
 /// Checks if a position is within or at the end of a range.
@@ -1221,6 +1257,13 @@ mod tests {
             self.name_range
         }
 
+        /// Deliberately independent of `version_range` (unlike a real parser's dependency
+        /// type, where the two are derived from the same optional field): this mock is
+        /// shared by many tests that construct `version_range: None` fixtures to exercise
+        /// package-name/feature completion paths that never consult
+        /// `version_requirement()`. A test that needs the two to agree (e.g. a
+        /// literal-version-match check) must set `version_range` accordingly and use a
+        /// `value_range` whose content slice is `"1.0"`.
         fn version_requirement(&self) -> Option<&crate::VersionReq> {
             static VERSION_REQ: std::sync::LazyLock<crate::VersionReq> =
                 std::sync::LazyLock::new(|| crate::VersionReq::new("1.0"));
@@ -1726,6 +1769,200 @@ mod tests {
         );
 
         assert_matches!(context, CompletionContext::None);
+    }
+
+    /// Builds a [`Range`] on `line` from a pair of `u32` character offsets — shared by the
+    /// `literal_version_dependency` tests below to cut down on `Range { start: Position {...},
+    /// end: Position {...} }` struct-literal repetition.
+    fn char_range(line: u32, start: u32, end: u32) -> Range {
+        Range {
+            start: Position {
+                line,
+                character: start,
+            },
+            end: Position {
+                line,
+                character: end,
+            },
+        }
+    }
+
+    /// Builds a [`MockDependency`] on line 0 from `name`/`version` character offsets — see
+    /// [`char_range`].
+    fn make_dep_with_version_range(
+        name: &str,
+        name_start: u32,
+        name_end: u32,
+        version_start: u32,
+        version_end: u32,
+    ) -> MockDependency {
+        MockDependency {
+            name: name.into(),
+            name_range: char_range(0, name_start, name_end).into(),
+            version_range: Some(char_range(0, version_start, version_end).into()),
+            features_range: None,
+        }
+    }
+
+    /// #1146: two dependencies sharing one manifest line (a minified Gradle/Maven line) must
+    /// not let the same-line fallback pick the FIRST one when the cursor actually falls
+    /// inside the SECOND one's `version_range` — the `version_range` check must take
+    /// priority over the same-line fallback for every dependency, not just the first one
+    /// `find` happens to see.
+    #[test]
+    fn test_literal_version_dependency_prefers_version_range_match_over_earlier_same_line_dependency()
+     {
+        let content = "dep-one:1.0 dep-two:1.0\n";
+        let dep_one = make_dep_with_version_range("dep-one", 0, 7, 8, 11);
+        let dep_two_version_range = char_range(0, 20, 23);
+        let dep_two = make_dep_with_version_range("dep-two", 12, 19, 20, 23);
+        let parse_result = MockParseResult {
+            dependencies: vec![dep_one, dep_two],
+        };
+
+        // Cursor sits inside dep-two's version, not dep-one's — dep-one only matches via the
+        // same-line fallback, which must lose to dep-two's real `version_range` match.
+        let position = Position {
+            line: 0,
+            character: 21,
+        };
+
+        let dep =
+            literal_version_dependency(&parse_result, position, content, dep_two_version_range)
+                .expect("dep-two's literal version must be found");
+
+        assert_eq!(dep.name().as_str(), "dep-two");
+    }
+
+    /// #1146 S1 (critic follow-up): the original count-based fallback ("exactly one dependency
+    /// on the line, else `None`") turned #1146's *wrong* answer into *no* answer at
+    /// `version_range` boundaries on a minified line — including for the dependency the old
+    /// code got RIGHT. The fallback must instead disambiguate by position: among same-line
+    /// dependencies, prefer the one whose own `version_range` is nearest to the cursor (not
+    /// `name_range` position — see [`literal_version_dependency`]'s doc for why). This
+    /// exercises both boundary-rescue directions on one two-dependency line: a cursor just
+    /// before dep-one's own `version_range` resolves to dep-one (nearest), and a cursor just
+    /// before dep-two's `version_range` resolves to dep-two (nearest), not dep-one — the
+    /// #1146 regression.
+    #[test]
+    fn test_literal_version_dependency_same_line_fallback_prefers_nearest_version_range_on_minified_line()
+     {
+        // Both versions are literally "1.0" — `MockDependency::version_requirement` always
+        // reports "1.0" (see its doc), so the literal-match check needs the sliced text of
+        // whichever `version_range` is passed as `value_range` to actually read "1.0".
+        let content = "dep-one:1.0 dep-two:1.0\n";
+        let dep_one_version_range = char_range(0, 8, 11);
+        let dep_two_version_range = char_range(0, 20, 23);
+        let dep_one = make_dep_with_version_range("dep-one", 0, 7, 8, 11);
+        let dep_two = make_dep_with_version_range("dep-two", 12, 19, 20, 23);
+        let parse_result = MockParseResult {
+            dependencies: vec![dep_one, dep_two],
+        };
+
+        let before_dep_one_vr = Position {
+            line: 0,
+            character: 7,
+        };
+        let dep = literal_version_dependency(
+            &parse_result,
+            before_dep_one_vr,
+            content,
+            dep_one_version_range,
+        )
+        .expect("dep-one must be rescued at its own version_range boundary");
+        assert_eq!(dep.name().as_str(), "dep-one");
+
+        let before_dep_two_vr = Position {
+            line: 0,
+            character: 19,
+        };
+        let dep = literal_version_dependency(
+            &parse_result,
+            before_dep_two_vr,
+            content,
+            dep_two_version_range,
+        )
+        .expect("dep-two must be rescued at its own version_range boundary");
+        assert_eq!(dep.name().as_str(), "dep-two");
+    }
+
+    /// #1146 (review follow-up): a Gradle version-catalog entry's `name_range`/`version_range`
+    /// come from independent TOML keys (`module`/`version`), so `name_range` can start AFTER
+    /// `version_range` when `version` is written first in the source — the fallback must not
+    /// depend on `name_range` position. `deps_gradle::ecosystem`'s own
+    /// `test_literal_version_dependency_resolves_catalog_entry_with_version_before_module`
+    /// pins the same invariant against real parser output; this pins it directly here.
+    #[test]
+    fn test_literal_version_dependency_same_line_fallback_ignores_name_range_order() {
+        let content = "v:1.0 n:dep-one\n";
+        // `name_range` (8..15) starts well after `version_range` (2..5) — the inverse of every
+        // other fixture in this module, where the name always precedes its version. Under the
+        // old `name_range`-position tiebreak this single dependency was wrongly excluded
+        // (`name_range.start.character(8) <= position.character(1)` is false).
+        let dep_one = make_dep_with_version_range("dep-one", 8, 15, 2, 5);
+        let parse_result = MockParseResult {
+            dependencies: vec![dep_one],
+        };
+        let value_range = char_range(0, 2, 5);
+        let just_before_vr = Position {
+            line: 0,
+            character: 1,
+        };
+
+        let dep = literal_version_dependency(&parse_result, just_before_vr, content, value_range)
+            .expect("must resolve despite name_range starting after version_range");
+        assert_eq!(dep.name().as_str(), "dep-one");
+    }
+
+    /// #1146: when no dependency is declared on the cursor's line at all, there is nothing to
+    /// prefer — the fallback must fail closed to `None` rather than reaching across lines.
+    #[test]
+    fn test_literal_version_dependency_same_line_fallback_returns_none_without_same_line_dependency()
+     {
+        let content = "dep-one:1.0\n\n";
+        let dep_one = make_dep_with_version_range("dep-one", 0, 7, 8, 11);
+        let parse_result = MockParseResult {
+            dependencies: vec![dep_one],
+        };
+        // Line 1 has no dependency at all.
+        let position = Position {
+            line: 1,
+            character: 0,
+        };
+        let value_range = char_range(1, 0, 0);
+
+        assert!(
+            literal_version_dependency(&parse_result, position, content, value_range).is_none()
+        );
+    }
+
+    /// #1146 S2 (critic follow-up): the "legitimate fallback" case is a single dependency
+    /// whose declared `version_range` doesn't quite cover the cursor — not a dependency with
+    /// no `version_range` at all (both parsers derive `version_requirement` and
+    /// `version_range` from the same optional field, so a real dependency with no version
+    /// never reaches [`crate::lsp_helpers::dependency_version_range_is_literal`] regardless of
+    /// the fallback — see `MockDependency::version_requirement`'s doc). This is the actual
+    /// divergence case the fallback exists for: the raw-text scanner's detected span landed
+    /// one character short of the AST's `version_range`.
+    #[test]
+    fn test_literal_version_dependency_same_line_fallback_rescues_single_dependency_at_version_range_boundary()
+     {
+        let content = "dep-one:1.0\n";
+        let dep_one = make_dep_with_version_range("dep-one", 0, 7, 8, 11);
+        let parse_result = MockParseResult {
+            dependencies: vec![dep_one],
+        };
+        // The sliced text of `value_range` must actually read "1.0" for the literal-match
+        // check to admit it — see `MockDependency::version_requirement`'s doc.
+        let value_range = char_range(0, 8, 11);
+
+        let just_before_vr = Position {
+            line: 0,
+            character: 7,
+        };
+        let dep = literal_version_dependency(&parse_result, just_before_vr, content, value_range)
+            .expect("must be rescued just before version_range start");
+        assert_eq!(dep.name().as_str(), "dep-one");
     }
 
     #[test]
