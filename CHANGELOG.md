@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: `locate_value_span`'s empty-value short-circuit now applies the same opening-quote correction as the non-empty path, fixing a one-column-early `version_range` anchor for quoted empty values in deps-dart and deps-gitlab-ci (resolves #1180) (#1185)
 - **ci**: `scorecard.yml` and `release.yml` pin `github/codeql-action/upload-sarif` to the current `v4.38.1` digest, resolving stale-dependency code-scanning findings
 - **deps-go**: fix trailing directive comment (`// indirect`) on a require line with a deleted version being misparsed as the version requirement (resolves #1179) (#1183)
+- **deps-gradle**: version-catalog completion now scans single- and double-quoted values as independent delimiters instead of a `"`-only parity check, fixing a wrong context on a mixed-quote-style line and an inline-table field mis-split at a comma inside another field's single-quoted value (resolves #1175) (#1186)
 - **ci**: `auto-merge.yml` scopes `contents`/`pull-requests` write permissions to the job instead of the whole workflow, and `SECURITY.md` links the GitHub Security Advisories reporting channel, resolving OpenSSF Scorecard code-scanning findings (#1172)
 - **deps-gradle**: DSL scanner's quote-delimiter selection is now scoped to the literal containing the cursor instead of picked line-wide, fixing withheld completion on mixed-quote-style joined lines, a quoted Groovy map key evading the map-notation guard, and a forward-scan range corruption when a trailing comment contains a quote character (resolves #1168) (#1173)
 - **deps-gradle**: DSL version completion no longer overspans into a semicolon- or space-joined earlier dependency on the same line (resolves #1160) (#1166)
@@ -39,6 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **ci**: `deps-lsp-check` and `docker-build-and-scan` now block `ci-success` (#1130, #1140)
 
 ### Changed
+- **deps-core, deps-gradle**: Gradle's quote/comment scanning migrated onto a shared `deps-core::quote_scan::ScanSyntax::Groovy` scanner instead of a crate-local implementation (resolves #1174) (#1186)
 - **ci**: `crates/github-action`'s Alpine base image pinned by digest, tracked by Dependabot for security-patch bumps (resolves #1155) (#1169)
 - **deps-gradle, deps-maven**: version-completion dependency lookup deduplicated into a shared `deps-core` helper (resolves #1134)
 - **ci**: `release.yml`'s top-level GITHUB_TOKEN permissions scoped to a read-only default, with `contents: write` granted per-job only where needed (resolves #1151) (#1163)
