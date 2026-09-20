@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **deps-maven**: version completion now offers items inside a self-closing `<version/>` tag, replacing the whole tag with `<version>X</version>` via an explicit text edit instead of relying on a cursor-position insert (resolves #1167)
+- **deps-maven**: version completion now offers items inside a self-closing `<version/>` tag, replacing the whole tag with `<version>X</version>` via an explicit text edit instead of relying on a cursor-position insert (resolves #1167) (#1189)
 - **ci**: release workflow publishes a CycloneDX SBOM (JSON) for `deps-lsp` and `deps-cli` alongside each release's binaries (resolves #1154) (#1169)
 - **ci**: weekly + push-to-main OpenSSF Scorecard workflow, uploading results to the Security tab (#1158)
 - **ci**: CodeQL SAST scanning for Rust source and GitHub Actions workflow files, on push/PR/weekly schedule (resolves #1152) (#1163)
