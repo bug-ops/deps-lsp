@@ -232,7 +232,10 @@ impl Ecosystem for GithubActionsEcosystem {
                     prefix,
                 } => {
                     if position_past_sha_pin_own_ref(parse_result, position) {
-                        return Completions::default();
+                        // #1184 Gap 2: this cursor position is a confirmed `Version`
+                        // context, not a package-name one — never fall through to
+                        // `deps-lsp`'s raw-text package-name search.
+                        return Completions::default().with_suppress_fallback(true);
                     }
                     self.complete_version(request, package_name, prefix).await
                 }
@@ -533,6 +536,33 @@ fn extract_prefix(line: &str, character: u32) -> &str {
 /// every `publishDiagnostics`.
 const MAX_MUTABLE_REF_PIN_MESSAGE_VALUE_CHARS: usize = 128;
 
+/// Whether `gha_dep` is structurally eligible for GitHub Actions' static "pin to commit
+/// SHA" resolution — `PinStyle::Tag` plus the two shape guards
+/// [`deps_core::lsp_helpers::ShaPinning::resolve_static_sha_pin`] enforces before it ever
+/// consults the `TagIndex` cache: `is_plain_scalar` (FR-010, a quoted scalar's
+/// `version_range` sits inside the quotes) and `is_last_on_line` (#633, a flow-style
+/// step has real YAML after the ref).
+///
+/// Deliberately **not** feature-gated behind `lsp-responses` (unlike `ShaPinning`/
+/// `resolve_static_sha_pin` themselves, which need the `TagIndex`-backed formatter) and
+/// deliberately **not** dependent on a live `TagIndex` cache hit — this is the single
+/// source of truth [`mutable_ref_pin_diagnostics`]'s message-branch selection uses
+/// (issue #1188), and both properties matter there: the message must render identically
+/// in a `deps-cli` build with `lsp-responses` disabled (critic S1 — `deps-cli` never
+/// enables that feature, per `Cargo.toml`, but `generate_diagnostics` still runs there),
+/// and it must not flip between "automated fix available" and "manual edit" as the cache
+/// warms or goes cold across a session (critic S2 — mirrors `deps-gitlab-ci`'s
+/// `sha_pin_quickfix_kind`/`ecosystem.rs`, whose own doc comment rules the identical
+/// question the same way: a diagnostic's advisory text needs no live cache hit the way
+/// an actual destructive edit does).
+///
+/// Not the same predicate [`GithubActionsEcosystem::generate_hover`]'s footer guard
+/// checks: that guard still hand-rolls its own, narrower check (missing
+/// `is_last_on_line`) pending PR #1187, so no parity claim is made with it here.
+pub(crate) fn is_sha_pinnable_tag(gha_dep: &GithubActionsDependency) -> bool {
+    gha_dep.pin == Some(PinStyle::Tag) && gha_dep.is_plain_scalar && gha_dep.is_last_on_line
+}
+
 fn mutable_ref_pin_diagnostics(
     parse_result: &dyn ParseResultTrait,
     severity: Severity,
@@ -561,8 +591,10 @@ fn mutable_ref_pin_diagnostics(
             );
             // Critic C2 (#551): a registry-confirmed `PinStyle::Branch` has no automated fix
             // (`build_sha_pin_action` stays restricted to `PinStyle::Tag`, FR-005) — the
-            // message must say so, not imply one exists.
-            let message = if gha_dep.pin == Some(PinStyle::Tag) {
+            // message must say so, not imply one exists. Gated on `is_sha_pinnable_tag`
+            // (#1188), not raw `PinStyle::Tag` alone, so a quoted-scalar/flow-style tag pin
+            // (quickfix withheld) doesn't claim one.
+            let message = if is_sha_pinnable_tag(gha_dep) {
                 format!(
                     "{name} is pinned to the mutable tag ref `{tag}`; pin to a full commit \
                      SHA to guard against tag mutation"
@@ -859,6 +891,98 @@ mod tests {
             !v2_message.contains("no automated fix available"),
             "a statically-classified tag DOES have the SHA-pin quickfix, so the message \
              must not claim otherwise; got: {v2_message}"
+        );
+    }
+
+    /// #1188 regression: a quoted-scalar tag pin is still diagnosable (`PinStyle::Tag`)
+    /// but not SHA-pin-quickfixable (`is_plain_scalar` is `false`, FR-010) — the message
+    /// must say so, not claim an automated fix that `resolve_static_sha_pin`/
+    /// `build_sha_pin_action` actually withhold. Mirrors
+    /// `test_build_sha_pin_action_no_quickfix_for_quoted_scalar`'s fixture.
+    #[tokio::test]
+    async fn test_generate_diagnostics_mutable_ref_pin_no_automated_fix_for_quoted_scalar() {
+        let diagnostics = diagnostics_for("steps:\n  - uses: \"actions/checkout@v4\"\n").await;
+        let found = diagnostics
+            .iter()
+            .find(|d| d.code == Some(mutable_ref_pin_code()))
+            .expect("expected a mutable-ref-pin diagnostic for a quoted tag pin");
+        assert!(
+            found.message.contains("no automated fix available"),
+            "a quoted scalar withholds the SHA-pin quickfix (FR-010), so the message \
+             must say so; got: {}",
+            found.message
+        );
+    }
+
+    /// #1188 regression: a flow-style tag pin (`!is_last_on_line`, #633) is still
+    /// diagnosable but not quickfixable — the message must say so. Mirrors
+    /// `test_build_sha_pin_action_no_quickfix_for_flow_mapping_step`'s fixture.
+    #[tokio::test]
+    async fn test_generate_diagnostics_mutable_ref_pin_no_automated_fix_for_flow_mapping_step() {
+        let diagnostics =
+            diagnostics_for("steps:\n  - {uses: actions/checkout@v4, with: {node: 20}}\n").await;
+        let found = diagnostics
+            .iter()
+            .find(|d| d.code == Some(mutable_ref_pin_code()))
+            .expect("expected a mutable-ref-pin diagnostic for a flow-style tag pin");
+        assert!(
+            found.message.contains("no automated fix available"),
+            "a flow-style step withholds the SHA-pin quickfix (#633), so the message \
+             must say so; got: {}",
+            found.message
+        );
+    }
+
+    /// #1188 critic S2: the message must not depend on a live `TagIndex` cache hit — a
+    /// plain, un-quoted tag pin gets the "automated fix available" phrasing (no suffix)
+    /// both cold (no fetch has happened yet) and warm (`TagIndex` populated for the same
+    /// content), never flipping between document-open and the post-fetch republish.
+    #[tokio::test]
+    async fn test_generate_diagnostics_mutable_ref_pin_message_does_not_depend_on_cache_state() {
+        let content = "steps:\n  - uses: actions/checkout@v4\n";
+
+        let cold = diagnostics_for(content).await;
+        let cold_message = cold
+            .iter()
+            .find(|d| d.code == Some(mutable_ref_pin_code()))
+            .expect("expected a diagnostic on cold cache")
+            .message
+            .clone();
+        assert!(
+            !cold_message.contains("no automated fix available"),
+            "a cold TagIndex must not force the manual-edit wording; got: {cold_message}"
+        );
+
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = GithubActionsEcosystem::new(cache);
+        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+        let mut index = crate::registry::TagIndex::default();
+        index.tag_to_sha.insert("v4".to_string(), "a".repeat(40));
+        eco.formatter.tag_index.insert(
+            deps_core::PackageName::new("actions/checkout"),
+            Arc::new(index),
+        );
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+        let warm = eco
+            .generate_diagnostics(
+                parse_result.as_ref(),
+                deps_core::VersionData::new(&cached, &resolved),
+                &uri,
+                deps_core::FreshnessSettings::default(),
+                deps_core::lsp_helpers::DiagnosticSeverities::default(),
+            )
+            .await;
+        let warm_message = warm
+            .iter()
+            .find(|d| d.code == Some(mutable_ref_pin_code()))
+            .expect("expected a diagnostic on warm cache")
+            .message
+            .clone();
+        assert_eq!(
+            cold_message, warm_message,
+            "the diagnostic message must not flip as the TagIndex cache warms (critic S2)"
         );
     }
 
@@ -2161,8 +2285,9 @@ mod tests {
                 .await;
             assert_eq!(
                 withheld,
-                Completions::default(),
-                "expected no completion at character {character} (sha_end = {sha_end})"
+                Completions::default().with_suppress_fallback(true),
+                "expected no completion (and no fallback) at character {character} \
+                 (sha_end = {sha_end})"
             );
         }
     }
