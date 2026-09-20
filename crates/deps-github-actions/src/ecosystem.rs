@@ -9,6 +9,8 @@ use url::Url;
 
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
+#[cfg(feature = "lsp-responses")]
+use deps_core::lsp_helpers::ShaPinning;
 use deps_core::{
     Ecosystem, PackageName, ParseResult as ParseResultTrait, Registry, Result,
     diagnostic::{Diagnostic, Severity},
@@ -399,21 +401,9 @@ impl Ecosystem for GithubActionsEcosystem {
             // #501/#550: the shared footer gate only sees `VersionData`, not `tag_index` —
             // so a `PinStyle::Tag` step with a warm `TagIndex` entry can have a real "Pin to
             // commit SHA" quickfix even when the shared gate suppressed the footer for lack
-            // of `VersionData`. Restored post-hoc via `CMD_DOT_FOOTER`, idempotently.
-            // `is_plain_scalar` mirrors `build_sha_pin_action`'s guard (FR-010): a quoted
-            // scalar withholds its quickfix, so the footer must too. Keyed on raw
-            // `PinStyle::Tag`, not `is_registry_confirmed_tag` (#551), since this footer only
-            // ever advertises `build_sha_pin_action`'s stricter pre-#551 guard.
-            if gha_dep.pin == Some(PinStyle::Tag)
-                && gha_dep.is_plain_scalar
-                && let Some(tag) = gha_dep
-                    .version_req
-                    .as_ref()
-                    .map(deps_core::VersionReq::as_str)
-                && self
-                    .formatter
-                    .sha_pin_replacement_for(&gha_dep.name, tag)
-                    .is_some()
+            // of `VersionData`. Restored post-hoc via `CMD_DOT_FOOTER`, idempotently, using
+            // the same centralized eligibility check the quickfix/code-lens build on (#1177).
+            if self.formatter.resolve_static_sha_pin(dep).is_some()
                 && let HoverContents::Markup(content) = &mut hover.contents
                 && !content
                     .value
@@ -1480,6 +1470,62 @@ mod tests {
             !content.value.contains("Press `Cmd+.` to update version"),
             "a quoted uses: scalar offers no SHA-pin quickfix even on a TagIndex hit, so the \
              footer must not be restored; got: {}",
+            content.value
+        );
+    }
+
+    /// Regression for #1178: a flow-style `uses:` step (issue #633's
+    /// `is_last_on_line == false` scenario — `, with: {...}}` follows the ref on the same
+    /// line) must not have the footer restored, even on a `TagIndex` hit. Before #1178 the
+    /// hand-rolled eligibility check omitted this `is_last_on_line` condition entirely, so
+    /// the footer was wrongly restored for a step whose quickfix `build_sha_pin_action`
+    /// itself withholds (see `test_build_sha_pin_action_no_quickfix_for_flow_mapping_step`).
+    #[cfg(feature = "lsp-responses")]
+    #[tokio::test]
+    async fn test_generate_hover_footer_not_restored_offline_for_flow_mapping_tag_pin() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        cache.set_offline(true);
+        let eco = GithubActionsEcosystem::new(cache);
+        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+        let content = "steps:\n  - {uses: actions/checkout@v4, with: {node: 20}}\n";
+        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+        let gha_dep = parse_result.dependencies()[0]
+            .as_any()
+            .downcast_ref::<GithubActionsDependency>()
+            .unwrap();
+        assert!(!gha_dep.is_last_on_line);
+
+        let mut index = crate::registry::TagIndex::default();
+        index.tag_to_sha.insert("v4".to_string(), "a".repeat(40));
+        eco.formatter.tag_index.insert(
+            deps_core::PackageName::new("actions/checkout"),
+            Arc::new(index),
+        );
+
+        let position = parse_result.dependencies()[0].name_range().start.into();
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+
+        let hover = eco
+            .generate_hover(
+                parse_result.as_ref(),
+                position,
+                deps_core::VersionData::new(&cached, &resolved).with_offline(true),
+                deps_core::FreshnessSettings::default(),
+            )
+            .await
+            .expect("hover should be generated for the dependency on this line");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            !content
+                .value
+                .contains(deps_core::lsp_helpers::CMD_DOT_FOOTER),
+            "a flow-style uses: step is not the last token on its line, so appending a SHA \
+             pin comment would produce invalid YAML; the footer must not be restored even \
+             on a TagIndex hit; got: {}",
             content.value
         );
     }
