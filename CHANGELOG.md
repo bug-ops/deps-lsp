@@ -18,7 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **ci**: `scorecard.yml` and `release.yml` pin `github/codeql-action/upload-sarif` to the current `v4.38.1` digest, resolving stale-dependency code-scanning findings
-- **deps-go**: fix trailing directive comment (`// indirect`) on a require line with a deleted version being misparsed as the version requirement (resolves #1179)
+- **deps-go**: fix trailing directive comment (`// indirect`) on a require line with a deleted version being misparsed as the version requirement (resolves #1179) (#1183)
 - **ci**: `auto-merge.yml` scopes `contents`/`pull-requests` write permissions to the job instead of the whole workflow, and `SECURITY.md` links the GitHub Security Advisories reporting channel, resolving OpenSSF Scorecard code-scanning findings (#1172)
 - **deps-gradle**: DSL scanner's quote-delimiter selection is now scoped to the literal containing the cursor instead of picked line-wide, fixing withheld completion on mixed-quote-style joined lines, a quoted Groovy map key evading the map-notation guard, and a forward-scan range corruption when a trailing comment contains a quote character (resolves #1168) (#1173)
 - **deps-gradle**: DSL version completion no longer overspans into a semicolon- or space-joined earlier dependency on the same line (resolves #1160) (#1166)
