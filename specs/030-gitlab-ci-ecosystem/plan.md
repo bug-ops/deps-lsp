@@ -511,7 +511,7 @@ Two bounds, at the two places the growth actually happens:
    precedent) and its dependency is emitted with `HostRef::Unresolved` — i.e. it takes the
    §3.2 skip path and never reaches the transport at all. This is the bound that matters for
    the `didOpen` burst, and no process-wide cap can provide it.
-2. **Process-wide, at registration:** `MAX_GITLAB_ROUTES: usize = 256` entries in
+2. **Process-wide, at registration:** `deps_core::registry::MAX_ALTERNATE_REGISTRIES: usize = 256` entries in
    `GitlabCiRegistry::routes`, mirroring `MAX_ALTERNATE_REGISTRIES` exactly, including its
    core semantics — at capacity a *new* route is simply never registered, and a dependency
    is **never** fetched against some other host as a consequence. Existing routes stay

@@ -1,18 +1,18 @@
 //! `GitlabCiRegistry` — the `deps_core::Registry` implementation for GitLab CI.
 //!
 //! Routes every dependency against its `(host, endpoint)` route (spec §7a), a process-wide
-//! route table capped at [`MAX_GITLAB_ROUTES`] (spec §4.6), and a per-host rate-limit gate
-//! (spec §9.3).
+//! route table capped at [`deps_core::registry::MAX_ALTERNATE_REGISTRIES`] (spec §4.6), and
+//! a per-host rate-limit gate (spec §9.3).
 
 use dashmap::DashMap;
 use deps_core::error::{DepsError, Result};
 use deps_core::github::normalize_tag;
+use deps_core::rate_limit::RateLimitGate;
+use deps_core::registry::{CapResult, KeyShape, register_capped};
 use deps_core::{PackageName, PublishTime};
 use std::any::Any;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::client::{
     GitlabApiClient, GitlabRelease, GitlabTag, MAX_GITLAB_PAGES, gitlab_rate_limit_error,
@@ -24,44 +24,9 @@ use crate::types::{EndpointKind, GitlabCiVersion, GitlabRoute, PinStyle};
 /// Display name for the registry backing GitLab CI version lookups.
 pub const REGISTRY: &str = "GitLab";
 
-/// Upper bound on [`GitlabCiRegistry::routes`]' entry count.
-///
-/// Mirrors `deps_go::registry::MAX_ALTERNATE_REGISTRIES` exactly, including its core
-/// semantics: at capacity a *new* route is simply never registered. Since a route is
-/// `(origin, endpoint)`, this bounds distinct origins at 256 too — the same ceiling
-/// `deps-nuget` already imposes on `HttpCache::trusted_clients` growth.
-pub const MAX_GITLAB_ROUTES: usize = 256;
-
 /// How long [`RateLimitGate`] keeps a host's fetches short-circuiting locally after a
 /// rate-limited/untokened-auth-failure response, before allowing another live request.
 const RATE_LIMIT_COOLDOWN_SECS: u64 = 300;
-
-fn now_epoch_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-}
-
-/// Per-host (not process-wide, spec §9.3) gate: one self-hosted instance rate-limiting must
-/// not disable lookups against `gitlab.com` or any other host.
-#[derive(Debug, Default)]
-struct RateLimitGate {
-    reset_at: AtomicU64,
-}
-
-impl RateLimitGate {
-    fn is_tripped(&self) -> bool {
-        let reset_at = self.reset_at.load(Ordering::Relaxed);
-        reset_at != 0 && now_epoch_secs() < reset_at
-    }
-
-    fn trip(&self) {
-        self.reset_at.store(
-            now_epoch_secs() + RATE_LIMIT_COOLDOWN_SECS,
-            Ordering::Relaxed,
-        );
-    }
-}
 
 /// Per-`(endpoint, name)` tag/release-name -> commit-SHA cross-reference.
 ///
@@ -224,6 +189,8 @@ fn project_path_from_name(name: &str, host_bare: &str, endpoint: EndpointKind) -
 pub struct GitlabCiRegistry {
     client: Arc<GitlabApiClient>,
     routes: Arc<DashMap<String, GitlabRoute>>,
+    /// Per-host (not process-wide, spec §9.3) gate: one self-hosted instance rate-limiting
+    /// must not disable lookups against `gitlab.com` or any other host.
     rate_limits: Arc<DashMap<String, Arc<RateLimitGate>>>,
     tag_index: Arc<DashMap<(EndpointKind, PackageName), Arc<TagIndex>>>,
 }
@@ -255,29 +222,30 @@ impl GitlabCiRegistry {
     }
 
     /// Registers every `(route_key, route)` pair in `routes` (idempotent per key), capacity-
-    /// capped at [`MAX_GITLAB_ROUTES`], and returns the set of `route_key`s that were
-    /// refused because the cap was already reached (spec §3.2/§4.6's downgrade pass —
-    /// `GitlabCiEcosystem::parse_manifest` rewrites every dependency carrying a refused key
-    /// to `CustomRegistry` + `HostRef::Unresolved` before returning the parse result).
+    /// capped at [`deps_core::registry::MAX_ALTERNATE_REGISTRIES`], and returns the set of
+    /// `route_key`s that were refused because the cap was already reached (spec §3.2/§4.6's
+    /// downgrade pass — `GitlabCiEcosystem::parse_manifest` rewrites every dependency
+    /// carrying a refused key to `CustomRegistry` + `HostRef::Unresolved` before returning
+    /// the parse result).
+    ///
+    /// Logs one cap-reached warning per refused route key, via the shared
+    /// [`register_capped`] helper, rather than one per batch — a change from this crate's
+    /// prior local implementation (#1205). Worst case per reparse is bounded by
+    /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT`, since refused routes stay refused and are
+    /// re-registered (and re-warned) on every reparse.
     pub fn register_alternate(&self, routes: &[(String, GitlabRoute)]) -> HashSet<String> {
         let mut refused = HashSet::new();
-        let mut warned_once = false;
         for (key, route) in routes {
-            if self.routes.contains_key(key) {
-                continue;
-            }
-            if self.routes.len() >= MAX_GITLAB_ROUTES {
-                if !warned_once {
-                    tracing::warn!(
-                        cap = MAX_GITLAB_ROUTES,
-                        "GitLab CI route cap reached; not registering further routes"
-                    );
-                    warned_once = true;
-                }
+            if register_capped(
+                &self.routes,
+                key.clone(),
+                "GitLab CI",
+                KeyShape::Opaque,
+                || route.clone(),
+            ) == CapResult::RefusedAtCapacity
+            {
                 refused.insert(key.clone());
-                continue;
             }
-            self.routes.insert(key.clone(), route.clone());
         }
         refused
     }
@@ -289,7 +257,7 @@ impl GitlabCiRegistry {
         Arc::clone(
             self.rate_limits
                 .entry(origin.to_string())
-                .or_insert_with(|| Arc::new(RateLimitGate::default()))
+                .or_insert_with(|| Arc::new(RateLimitGate::new(RATE_LIMIT_COOLDOWN_SECS)))
                 .value(),
         )
     }
@@ -656,12 +624,14 @@ mod tests {
         }
     }
 
-    // --- register_alternate: MAX_GITLAB_ROUTES cap refusal ---
+    // --- register_alternate: MAX_ALTERNATE_REGISTRIES cap refusal ---
 
     #[test]
     fn test_register_alternate_refuses_route_257() {
+        use deps_core::registry::MAX_ALTERNATE_REGISTRIES;
+
         let registry = GitlabCiRegistry::new(test_client());
-        let routes: Vec<(String, GitlabRoute)> = (0..=MAX_GITLAB_ROUTES)
+        let routes: Vec<(String, GitlabRoute)> = (0..=MAX_ALTERNATE_REGISTRIES)
             .map(|i| {
                 (
                     format!("gitlab:route{i}"),
@@ -669,19 +639,21 @@ mod tests {
                 )
             })
             .collect();
-        assert_eq!(routes.len(), MAX_GITLAB_ROUTES + 1);
+        assert_eq!(routes.len(), MAX_ALTERNATE_REGISTRIES + 1);
 
         let refused = registry.register_alternate(&routes);
 
         assert_eq!(refused.len(), 1);
-        assert!(refused.contains(&format!("gitlab:route{MAX_GITLAB_ROUTES}")));
-        assert_eq!(registry.routes.len(), MAX_GITLAB_ROUTES);
+        assert!(refused.contains(&format!("gitlab:route{MAX_ALTERNATE_REGISTRIES}")));
+        assert_eq!(registry.routes.len(), MAX_ALTERNATE_REGISTRIES);
     }
 
     #[test]
     fn test_register_alternate_under_cap_refuses_nothing() {
+        use deps_core::registry::MAX_ALTERNATE_REGISTRIES;
+
         let registry = GitlabCiRegistry::new(test_client());
-        let routes: Vec<(String, GitlabRoute)> = (0..MAX_GITLAB_ROUTES)
+        let routes: Vec<(String, GitlabRoute)> = (0..MAX_ALTERNATE_REGISTRIES)
             .map(|i| {
                 (
                     format!("gitlab:route{i}"),
@@ -691,7 +663,25 @@ mod tests {
             .collect();
         let refused = registry.register_alternate(&routes);
         assert!(refused.is_empty());
-        assert_eq!(registry.routes.len(), MAX_GITLAB_ROUTES);
+        assert_eq!(registry.routes.len(), MAX_ALTERNATE_REGISTRIES);
+    }
+
+    /// Migration guard (#1205 item 3): the shared `register_capped` helper's `AlreadyPresent`
+    /// outcome must not be folded into `RefusedAtCapacity` in `register_alternate`'s return
+    /// value. This is not a regression test for a prior bug — `contains_key -> continue`
+    /// already kept an already-registered key out of `refused` before this migration; it
+    /// only guards that the enum-based rewrite preserves that same behavior.
+    #[test]
+    fn test_register_alternate_already_present_key_is_not_refused() {
+        let registry = GitlabCiRegistry::new(test_client());
+        let routes = vec![(
+            "gitlab:route0".to_string(),
+            route("https://host0.example.com", EndpointKind::Tags),
+        )];
+        assert!(registry.register_alternate(&routes).is_empty());
+
+        let refused = registry.register_alternate(&routes);
+        assert!(refused.is_empty());
     }
 
     // --- endpoint dispatch: a Releases route calls /releases, never /repository/tags ---

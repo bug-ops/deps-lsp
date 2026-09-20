@@ -171,6 +171,10 @@ pub mod position;
 /// `deps-pypi`, and `deps-gradle` instead of each hand-rolling its own scanner (#1022,
 /// #1174).
 pub mod quote_scan;
+/// Local, process-lifetime rate-limit short-circuiting.
+///
+/// [`rate_limit::RateLimitGate`] is shared by `deps-github-actions` and `deps-gitlab-ci`.
+pub mod rate_limit;
 /// The [`registry::Registry`] trait: version lookup and search that every
 /// ecosystem's registry client implements.
 pub mod registry;

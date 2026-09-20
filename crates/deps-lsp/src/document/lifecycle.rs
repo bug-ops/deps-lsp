@@ -867,6 +867,12 @@ struct ChangeTaskConfig {
     refetch: RefetchPolicy,
 }
 
+/// Debounce window before [`run_document_change_task`] starts its fetch work. This is a
+/// *debounce*, not a plain delay: a newer `did_change` for the same URI aborts the prior
+/// task (see [`crate::document::ServerState::spawn_background_task`]) while it is still
+/// parked in this sleep, so a keystroke burst costs one fetch round instead of one per edit.
+pub(crate) const DID_CHANGE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Background task spawned by [`handle_document_change`] once the new document state has
 /// been committed: reloads lock-file-resolved versions, then runs the OSV rescan
 /// concurrently with any registry fetch the diff calls for, and finally publishes the
@@ -881,7 +887,7 @@ async fn run_document_change_task(
     needs_osv_rescan: bool,
     deps_to_fetch: Vec<PackageName>,
 ) {
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    tokio::time::sleep(DID_CHANGE_DEBOUNCE).await;
 
     // `handle_document_change_guarded` already validated this exact `uri` converts
     // successfully before spawning this task, so `None` here is unreachable in

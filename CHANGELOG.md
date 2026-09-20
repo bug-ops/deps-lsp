@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **deps-core**: new `rate_limit` module with a `RateLimitGate` mechanism shared by deps-github-actions and deps-gitlab-ci (#1218)
 - **fuzz**: `redact_declaration_key` fuzz target, covering the client-visible declaration-key redaction gate for blocked-registry diagnostics (resolves #1207) (#1213)
 - **deps-maven**: version completion now offers items inside a self-closing `<version/>` tag, replacing the whole tag with `<version>X</version>` via an explicit text edit instead of relying on a cursor-position insert (resolves #1167) (#1189)
 - **deps-composer**: `PackagistRegistry` gained a mockable test constructor and an end-to-end completion test proving the real `VERSION_OPERATOR_CHARS` operator-stripping fix from #1137, not just a `deps-core`-side copy of it (resolves #1171) (#1193)
@@ -17,12 +18,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **ci**: release archives signed with Sigstore/cosign keyless signing alongside existing SHA256 checksums (resolves #1153) (#1163)
 
 ### Breaking
+- **deps-core**: `registry::register_capped`/`register_capped_with_occupied` return `CapResult` instead of `bool` (#1218)
+- **deps-gitlab-ci**: removed `pub const MAX_GITLAB_ROUTES`; the cap is now `deps_core::registry::MAX_ALTERNATE_REGISTRIES` (#1218)
 - **deps-core**: `lsp_helpers::git_ref::locate_value_span` gains a 4th `is_quoted: bool` parameter; new `MarkedScalar::is_quoted()` replaces the marker-byte-based quote inference the empty-value correction previously relied on (#1194)
 - **deps-core**: removed `completion::complete_versions_generic`; `completion::complete_versions_generic_from` now requires an additional `formatter: &dyn lsp_helpers::SourcePolicy` parameter (resolves #1136)
 
 ### Fixed
 - **deps-core, deps-npm, deps-composer, deps-go, deps-maven, deps-deno**: closes the `can_resolve_source` privacy gate's structural inertness for npm (git/tarball/local-path/workspace specifiers), Composer (`repositories` package/artifact/wildcard-filtered entries, `packagist.org: false`), Go (`replace`-to-local-path propagated to its `require` entry), Maven (`scope: system`/`systemPath`), and Deno (npm-scope via `.npmrc`), preventing a private/local dependency's name from being sent to a public registry; adds a mandatory per-ecosystem conformance check so a future ecosystem cannot silently skip it (#1202) (#1211)
 - **deps-core**: unifies `SourcePolicy::can_resolve_source`/`PackageRendering::suppress_package_url` behind a single `resolves_alternate_registry()` hook and fixes their default polarity, so an ecosystem that never overrides them now safely suppresses a misleading public-registry hover link for a non-registry dependency instead of showing one by default (resolves #1203) (#1211)
+- **deps-lsp**: a panic in the `didChangeConfiguration` reparse worker is now logged instead of silently leaving open documents un-reparsed (#1218)
 - **deps-core, deps-engine, and all 14 ecosystem crates**: package/module names are now redacted before reaching logs, error messages, or LSP client-visible diagnostics, closing a workspace-wide credential-shaped-name leak in the fetch/classify path and its error types (resolves #1209) (#1214)
 - **deps-core**: hover and code-action registry version fetches now respect a 10s deadline instead of blocking indefinitely, preventing a slow or sequential-fallback registry lookup from stalling an interactive LSP request (resolves #1204) (#1210)
 - **deps-core, deps-swift, deps-maven, deps-lsp**: completion no longer forwards a credential-bearing search prefix to the registry or logs it unredacted (resolves #1206) (#1208)
@@ -58,6 +62,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **ci**: `deps-lsp-check` and `docker-build-and-scan` now block `ci-success` (#1130, #1140)
 
 ### Changed
+- **deps-gitlab-ci**: `register_alternate` now logs one cap-reached warning per refused route key instead of one per batch (#1218)
 - **deps-core, deps-gradle**: Gradle's quote/comment scanning migrated onto a shared `deps-core::quote_scan::ScanSyntax::Groovy` scanner instead of a crate-local implementation (resolves #1174) (#1186)
 - **ci**: `crates/github-action`'s Alpine base image pinned by digest, tracked by Dependabot for security-patch bumps (resolves #1155) (#1169)
 - **deps-gradle, deps-maven**: version-completion dependency lookup deduplicated into a shared `deps-core` helper (resolves #1134)
