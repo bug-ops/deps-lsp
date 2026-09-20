@@ -257,13 +257,12 @@ pub fn detect_completion_context(
         }
 
         let name_range: Range = dep.name_range().into();
-        // Unlike `position_in_range`'s one-past-end tolerance, this needs *strict* containment:
-        // the text right after a name is often structurally significant (closing quote, space
-        // before `=`), and widening the range to reach it would consume that char on edit.
-        if position_in_range(position, name_range)
-            && (name_range.end.line != position.line
-                || position.character <= name_range.end.character)
-        {
+        // Strict containment (unlike this module's own `position_in_range`, which tolerates one
+        // past `range.end`): the text right after a name is often structurally significant
+        // (closing quote, space before `=`), and widening the range to reach it would consume
+        // that char on edit. `lsp_helpers::position_in_range` is already strict at `range.end`,
+        // so no extra cancelling guard is needed on top of it (#1147).
+        if crate::lsp_helpers::position_in_range(position.into(), dep.name_range()) {
             let prefix = extract_prefix(content, position, name_range);
             return CompletionContext::PackageName {
                 prefix,
@@ -304,8 +303,34 @@ pub fn detect_completion_context(
     CompletionContext::None
 }
 
+/// How tightly [`literal_version_dependency_in_scope`]'s same-line fallback (pass 2) is
+/// restricted to one specific declaration sharing the cursor's line.
+///
+/// Decided by the caller's own raw-text scan of the manifest (e.g. `deps-gradle`'s
+/// `dsl_declaration_scope`). Only pass 2 (the same-line ranking fallback) is affected by
+/// this; pass 1 (strict `version_range` containment) behaves identically regardless of
+/// `scope`. Introduced for issue #1191: without it, a same-line non-dependency literal
+/// (`println("at 12:30:00")` beside a real dependency) or a still-unparsed second
+/// declaration (`implementation("org.other:bar:` mid-typing) could be misattributed to an
+/// unrelated, already-parsed dependency sharing the line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeclarationScope {
+    /// No restriction: pass 2 considers every same-line dependency, exactly as
+    /// [`literal_version_dependency`] (the unscoped wrapper) has always behaved. Used by a
+    /// caller, like `deps-maven`, with no raw-text declaration scan of its own.
+    Unchecked,
+    /// The cursor's literal is not inside any recognized dependency-declaration call — pass 2
+    /// is skipped entirely, so only pass 1 can still produce a match.
+    Outside,
+    /// The cursor's literal sits inside the declaration spanning this range. A same-line pass
+    /// 2 candidate is only considered when its own anchor (`version_range().start`, falling
+    /// back to `name_range().start`) also falls inside it.
+    Within(crate::position::Range),
+}
+
 /// Finds the dependency at `position` whose version field is a literal token, not an
-/// interpolated/variable reference (issue #1134).
+/// interpolated/variable reference (issue #1134), restricting the same-line fallback to
+/// `scope` (issue #1191).
 ///
 /// For a raw-text-based completion context detector that has already established, from its
 /// own scan, that the cursor sits in a version-shaped position (`deps-gradle`'s
@@ -327,17 +352,31 @@ pub fn detect_completion_context(
 /// Finds the dependency in `parse_result.dependencies()` whose `version_range` contains
 /// `position`. If none does — since a raw-text scanner's own detected span can diverge
 /// slightly from the AST's `version_range()`, landing just outside it — falls back to the
-/// dependency, among those on the same line as `position`, whose own `version_range` is
-/// nearest to `position` (a dependency with no `version_range` sorts last). Distance, not
-/// `name_range` position, is deliberately the tiebreak: a Gradle version-catalog entry's
-/// `name_range`/`version_range` come from independent TOML keys (`module`/`version`) and can
-/// appear in either order in the source text, so a `name_range`-relative tiebreak would
-/// misfire whenever `version` is written before `module`. On a line shared by multiple
-/// dependencies (e.g. a minified Gradle/Maven manifest with several coordinates on one line,
-/// #1146) this picks the dependency the cursor is actually sitting closest to rather than
-/// always the first one on the line. This preserves `deps-gradle`/`deps-maven`'s pre-existing
-/// same-line lookup for the single-dependency-per-line case unchanged; it is not applied to
+/// dependency, among those on the same line as `position` **and admitted by `scope`** (see
+/// below), whose own `version_range` is nearest to `position` (a dependency with no
+/// `version_range` sorts last). Distance, not `name_range` position, is deliberately the
+/// tiebreak: a Gradle version-catalog entry's `name_range`/`version_range` come from
+/// independent TOML keys (`module`/`version`) and can appear in either order in the source
+/// text, so a `name_range`-relative tiebreak would misfire whenever `version` is written
+/// before `module`. On a line shared by multiple dependencies (e.g. a minified Gradle/Maven
+/// manifest with several coordinates on one line, #1146) this picks the dependency the
+/// cursor is actually sitting closest to rather than always the first one on the line. This
+/// preserves `deps-gradle`/`deps-maven`'s pre-existing same-line lookup for the
+/// single-dependency-per-line case unchanged; it is not applied to
 /// [`detect_completion_context`]'s own stricter check.
+///
+/// # Scope
+///
+/// [`DeclarationScope::Outside`] skips the same-line fallback entirely — the caller's own
+/// scan already established the cursor's literal is not a dependency declaration at all, so
+/// no same-line candidate should be attributed to it. [`DeclarationScope::Within`] admits a
+/// same-line candidate only when its anchor (`version_range().start`, else
+/// `name_range().start`) falls inside the given span, via
+/// [`crate::lsp_helpers::position_in_range`] — excluding a same-line dependency that belongs
+/// to a *different* declaration than the one the cursor is actually inside.
+/// [`DeclarationScope::Unchecked`] admits every same-line candidate, unchanged from this
+/// function's pre-#1191 behavior — see [`literal_version_dependency`], which always passes
+/// this variant.
 ///
 /// `value_range` is the raw-text scanner's own detected span of the version token (not
 /// necessarily identical to the found dependency's `version_range()`), checked against
@@ -345,6 +384,79 @@ pub fn detect_completion_context(
 ///
 /// Returns `None` if no dependency matches at `position`, or if the matched dependency's
 /// version field is not a literal.
+///
+/// # Examples
+///
+/// ```no_run
+/// use deps_core::completion::{literal_version_dependency_in_scope, DeclarationScope};
+/// use tower_lsp_server::ls_types::{Position, Range};
+///
+/// # fn example(parse_result: &dyn deps_core::ParseResult, content: &str, value_range: Range) {
+/// let position = Position { line: 3, character: 12 };
+/// if let Some(dep) = literal_version_dependency_in_scope(
+///     parse_result,
+///     position,
+///     content,
+///     value_range,
+///     DeclarationScope::Unchecked,
+/// ) {
+///     // dep.name() / dep.source() are now safe to complete a version for.
+///     let _ = dep.name();
+/// }
+/// # }
+/// ```
+#[must_use]
+pub fn literal_version_dependency_in_scope<'a>(
+    parse_result: &'a dyn ParseResult,
+    position: Position,
+    content: &str,
+    value_range: Range,
+    scope: DeclarationScope,
+) -> Option<&'a dyn crate::ecosystem::Dependency> {
+    let deps = parse_result.dependencies();
+
+    // Pass 1 uses `find` (first match); `version_range`s can only tie at one shared character.
+    // Never affected by `scope` — only pass 2 (the `or_else` fallback below) is.
+    let dep = deps
+        .iter()
+        .copied()
+        .find(|d| {
+            d.version_range()
+                .is_some_and(|r| crate::lsp_helpers::position_in_range(position.into(), r))
+        })
+        .or_else(|| {
+            if matches!(scope, DeclarationScope::Outside) {
+                return None;
+            }
+            deps.iter()
+                .copied()
+                .filter(|d| {
+                    d.version_range().map_or_else(
+                        || d.name_range().start.line == position.line,
+                        |r| r.start.line == position.line,
+                    )
+                })
+                .filter(|d| {
+                    let DeclarationScope::Within(span) = scope else {
+                        return true;
+                    };
+                    let anchor = d
+                        .version_range()
+                        .map_or_else(|| d.name_range().start, |r| r.start);
+                    crate::lsp_helpers::position_in_range(anchor, span)
+                })
+                .min_by_key(|d| version_range_distance(d.version_range(), position.character))
+        })?;
+
+    crate::lsp_helpers::dependency_version_range_is_literal(dep, content, value_range.into())
+        .then_some(dep)
+}
+
+/// Thin wrapper over [`literal_version_dependency_in_scope`] with `scope:
+/// DeclarationScope::Unchecked`.
+///
+/// The unrestricted same-line fallback every existing caller has always used. See that
+/// function's doc for the full lookup contract.
 ///
 /// # Examples
 ///
@@ -367,30 +479,13 @@ pub fn literal_version_dependency<'a>(
     content: &str,
     value_range: Range,
 ) -> Option<&'a dyn crate::ecosystem::Dependency> {
-    let deps = parse_result.dependencies();
-
-    // Pass 1 uses `find` (first match); `version_range`s can only tie at one shared character.
-    let dep = deps
-        .iter()
-        .copied()
-        .find(|d| {
-            d.version_range()
-                .is_some_and(|r| crate::lsp_helpers::position_in_range(position.into(), r))
-        })
-        .or_else(|| {
-            deps.iter()
-                .copied()
-                .filter(|d| {
-                    d.version_range().map_or_else(
-                        || d.name_range().start.line == position.line,
-                        |r| r.start.line == position.line,
-                    )
-                })
-                .min_by_key(|d| version_range_distance(d.version_range(), position.character))
-        })?;
-
-    crate::lsp_helpers::dependency_version_range_is_literal(dep, content, value_range.into())
-        .then_some(dep)
+    literal_version_dependency_in_scope(
+        parse_result,
+        position,
+        content,
+        value_range,
+        DeclarationScope::Unchecked,
+    )
 }
 
 /// Distance in UTF-16 code units from `character` to the nearer end of `range`, or
@@ -2154,6 +2249,97 @@ mod tests {
         let dep = literal_version_dependency(&parse_result, just_before_vr, content, value_range)
             .expect("must be rescued just before version_range start");
         assert_eq!(dep.name().as_str(), "dep-one");
+    }
+
+    /// #1191: [`DeclarationScope::Outside`] must never affect pass 1 (strict `version_range`
+    /// containment) — only pass 2, the same-line fallback.
+    #[test]
+    fn test_literal_version_dependency_in_scope_outside_does_not_affect_pass_one() {
+        let content = "dep-one:1.0\n";
+        let dep_one = make_dep_with_version_range("dep-one", 0, 7, 8, 11);
+        let parse_result = MockParseResult {
+            dependencies: vec![dep_one],
+        };
+        let value_range = char_range(0, 8, 11);
+        let inside_version_range = Position {
+            line: 0,
+            character: 9,
+        };
+
+        let dep = literal_version_dependency_in_scope(
+            &parse_result,
+            inside_version_range,
+            content,
+            value_range,
+            DeclarationScope::Outside,
+        )
+        .expect("pass 1 must resolve regardless of DeclarationScope::Outside");
+        assert_eq!(dep.name().as_str(), "dep-one");
+    }
+
+    /// #1191: [`DeclarationScope::Outside`] skips pass 2 (the same-line fallback) entirely —
+    /// the same boundary position the sibling `..._rescues_single_dependency_at_version_range_boundary`
+    /// test proves pass 2 resolves under `Unchecked` must resolve to `None` here instead.
+    #[test]
+    fn test_literal_version_dependency_in_scope_outside_suppresses_pass_two() {
+        let content = "dep-one:1.0\n";
+        let dep_one = make_dep_with_version_range("dep-one", 0, 7, 8, 11);
+        let parse_result = MockParseResult {
+            dependencies: vec![dep_one],
+        };
+        let value_range = char_range(0, 8, 11);
+        let just_before_vr = Position {
+            line: 0,
+            character: 7,
+        };
+
+        assert!(
+            literal_version_dependency_in_scope(
+                &parse_result,
+                just_before_vr,
+                content,
+                value_range,
+                DeclarationScope::Outside,
+            )
+            .is_none(),
+            "DeclarationScope::Outside must skip pass 2's same-line fallback entirely"
+        );
+    }
+
+    /// #1191: [`DeclarationScope::Within`] excludes a same-line pass-2 candidate whose own
+    /// anchor (`version_range().start`) falls outside the given span, even when that candidate
+    /// would otherwise be the nearest one by distance (the same fixture and cursor position as
+    /// `..._prefers_nearest_version_range_on_minified_line`, where `Unchecked` picks dep-one).
+    #[test]
+    fn test_literal_version_dependency_in_scope_within_excludes_anchor_outside_span() {
+        let content = "dep-one:1.0 dep-two:1.0\n";
+        let dep_one_version_range = char_range(0, 8, 11);
+        let dep_two_version_range = char_range(0, 20, 23);
+        let dep_one = make_dep_with_version_range("dep-one", 0, 7, 8, 11);
+        let dep_two = make_dep_with_version_range("dep-two", 12, 19, 20, 23);
+        let parse_result = MockParseResult {
+            dependencies: vec![dep_one, dep_two],
+        };
+
+        let before_dep_one_vr = Position {
+            line: 0,
+            character: 7,
+        };
+        let dep_two_scope = DeclarationScope::Within(dep_two_version_range.into());
+
+        let dep = literal_version_dependency_in_scope(
+            &parse_result,
+            before_dep_one_vr,
+            content,
+            dep_one_version_range,
+            dep_two_scope,
+        );
+
+        assert_eq!(
+            dep.map(|d| d.name().as_str()),
+            Some("dep-two"),
+            "dep-one is nearer by distance but its anchor falls outside dep-two's span"
+        );
     }
 
     #[test]
