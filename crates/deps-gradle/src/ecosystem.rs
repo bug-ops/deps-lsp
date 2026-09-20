@@ -8,6 +8,8 @@ use url::Url;
 
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
+#[cfg(feature = "lsp-responses")]
+use deps_core::quote_scan::{self, CodeSpans, ScanSyntax};
 use deps_core::{
     Ecosystem, ParseResult as ParseResultTrait, Registry, Result, lsp_helpers::EcosystemFormatter,
 };
@@ -183,32 +185,20 @@ fn byte_range(line: &str, line_idx: u32, start_byte: usize, end_byte: usize) -> 
 /// (e.g. treating a cursor inside `module`'s still-open value as "version" context,
 /// because "version" appears earlier on the line and the combined quote count happens
 /// to be odd).
-// Own escape-aware loop, not the shared count_real_quotes/find_closing_quote helpers: needs an
-// in_string toggle interleaved with comma-boundary tracking in one forward pass, which those
-// whole-segment helpers don't expose mid-scan. Mirrors their backslash-run escape rule (#738
-// follow-up) — keep in sync if that rule ever changes.
+///
+/// Built on [`deps_core::quote_scan::CodeSpans`] under [`ScanSyntax::Toml`] (#1175), which
+/// tracks `'...'` and `"..."` as independent delimiters instead of assuming one quote style
+/// for the whole `before_cursor` — the earlier per-`"`-only toggle mis-split a mixed-style
+/// entry like `{ module = "a:b", version = '[1.0,2.0` at the comma inside `version`'s
+/// still-open single-quoted range value, since the old toggle never opened a string for
+/// that `'` at all — and, as a side effect, correctly ignores a comma inside a `#` comment.
 #[cfg(feature = "lsp-responses")]
 fn current_field_start(before_cursor: &str) -> usize {
-    let mut in_string = false;
-    let mut backslash_run = 0usize;
-    let mut field_start = 0;
-    for (i, c) in before_cursor.char_indices() {
-        match c {
-            '\\' => backslash_run += 1,
-            '"' => {
-                if backslash_run.is_multiple_of(2) {
-                    in_string = !in_string;
-                }
-                backslash_run = 0;
-            }
-            ',' if !in_string => {
-                field_start = i + 1;
-                backslash_run = 0;
-            }
-            _ => backslash_run = 0,
-        }
-    }
-    field_start
+    let code = CodeSpans::new(before_cursor, ScanSyntax::Toml);
+    before_cursor
+        .char_indices()
+        .rfind(|&(i, c)| c == ',' && code.is_code_byte(i))
+        .map_or(0, |(i, _)| i + 1)
 }
 
 /// Detects completion context in version catalog files.
@@ -232,15 +222,15 @@ fn detect_catalog_context<'a>(
     let field_start = current_field_start(before_cursor);
     let field = &before_cursor[field_start..];
 
-    // version = "..." or version.ref = "..."
+    // version = "..." or version.ref = "..." — also '...' (#1175): a single-`"`-parity check
+    // disagrees with itself once both quote styles are legal on the same line (`version =
+    // "1.0-o'brien` has both an odd `'` count and an odd `"` count), so this scans left to
+    // right toggling between the two styles as alternatives instead of picking one.
     if let Some(rel_eq_pos) = field.rfind("version")
         && let after = &field[rel_eq_pos..]
         && after.contains('=')
-        // Odd escape-aware quote count means the cursor is inside an unclosed string opened by
-        // the last real quote; even means it's past this `version = "..."` entirely.
-        && let (quote_count, Some(quote_start)) =
-            deps_core::fallback_completion::count_real_quotes(after)
-        && !quote_count.is_multiple_of(2)
+        && let Some(literal) =
+            quote_scan::last_string_literal(after, ScanSyntax::Toml).filter(|l| l.close.is_none())
     {
         // `version.ref = "alias"` names a `[versions]` table alias, not a registry version
         // literal — computing a real range for it would let `dependency_version_range_is_literal`
@@ -252,18 +242,23 @@ fn detect_catalog_context<'a>(
         let is_version_ref = after
             .get("version".len()..)
             .is_some_and(|rest| rest.trim_start().starts_with('.'));
-        let value_start = field_start + rel_eq_pos + quote_start + 1;
+        let value_start = field_start + rel_eq_pos + literal.open + 1;
         if value_start <= cursor {
             let range = if is_version_ref {
                 Range::default()
             } else {
                 // Bound by the cursor, not end-of-line, so an unterminated value doesn't swallow
                 // trailing line content (#931 fix; this arm previously always returned
-                // `Range::default()`, rejecting every completion here).
-                let value_end =
-                    deps_core::fallback_completion::find_closing_quote(&line[value_start..], '"')
-                        .map_or(cursor, |rel| value_start + rel)
-                        .max(cursor);
+                // `Range::default()`, rejecting every completion here). Comment-aware (#1175,
+                // same defect class #1168 fixed on the DSL side): `version = "1.0   # a "quoted"
+                // note` must not overspan the completion range into the trailing comment.
+                let value_end = quote_scan::find_closing_quote_before_comment(
+                    &line[value_start..],
+                    literal.quote,
+                    ScanSyntax::Toml,
+                )
+                .map_or(cursor, |rel| value_start + rel)
+                .max(cursor);
                 byte_range(line, line_idx, value_start, value_end)
             };
             return (
@@ -274,22 +269,24 @@ fn detect_catalog_context<'a>(
         }
     }
 
-    // module = "..."
+    // module = "..." or '...' (#1175, same fix as the version arm above)
     if let Some(rel_eq_pos) = field.rfind("module")
         && let after = &field[rel_eq_pos..]
         && after.contains('=')
-        && let (quote_count, Some(quote_start)) =
-            deps_core::fallback_completion::count_real_quotes(after)
-        && !quote_count.is_multiple_of(2)
+        && let Some(literal) =
+            quote_scan::last_string_literal(after, ScanSyntax::Toml).filter(|l| l.close.is_none())
     {
-        let value_start = field_start + rel_eq_pos + quote_start + 1;
+        let value_start = field_start + rel_eq_pos + literal.open + 1;
         if value_start <= cursor {
             // Fall back to the cursor, not end-of-line, when unterminated (mirrors
             // `MavenEcosystem::detect_xml_context`'s no-closing-tag fallback).
-            let value_end =
-                deps_core::fallback_completion::find_closing_quote(&line[value_start..], '"')
-                    .map_or(cursor, |rel| value_start + rel)
-                    .max(cursor);
+            let value_end = quote_scan::find_closing_quote_before_comment(
+                &line[value_start..],
+                literal.quote,
+                ScanSyntax::Toml,
+            )
+            .map_or(cursor, |rel| value_start + rel)
+            .max(cursor);
             let range = byte_range(line, line_idx, value_start, value_end);
             return (
                 GradleCompletionContext::Package,
@@ -300,145 +297,6 @@ fn detect_catalog_context<'a>(
     }
 
     (GradleCompletionContext::None, "", Range::default())
-}
-
-/// One Groovy/Kotlin `'...'`/`"..."` string literal found while scanning left to right,
-/// toggling between the two quote characters as independent delimiters instead of
-/// assuming one quote style for the whole text (#1168) — so a line mixing both styles
-/// (`"a:b:1.0"; implementation 'c:d:2.0`) doesn't have an unrelated `"` earlier on the
-/// line desync which character actually closes the `'...'` the cursor is in.
-///
-/// `close` is the byte offset just past the closing delimiter, or `None` when `text` ends
-/// inside this literal (i.e. it's still open at the cursor).
-#[cfg(feature = "lsp-responses")]
-struct QuoteLiteral {
-    quote: char,
-    open: usize,
-    close: Option<usize>,
-}
-
-/// Scans `text` and returns its *last* string literal, open or closed — the one whose
-/// delimiter the cursor (at the end of `text`) would be inside, if any, or (when `text`
-/// ends outside any string) the last one that closed.
-///
-/// Escape-aware per [`deps_core::fallback_completion::count_real_quotes_with`]'s rule: an
-/// odd run of `\` immediately before a quote escapes it. A quote of the *other* style
-/// encountered while inside an open literal is just content, not a delimiter — mirrors
-/// how a single-quote-char scan already treats the other quote character as content.
-///
-/// A `//` or `/* ... */` comment outside any open literal is skipped rather than scanned:
-/// otherwise a quote character inside comment text (e.g. an apostrophe in `// don't bump`)
-/// is misread as opening a phantom literal (critic finding S1 on #1168's PR — `"` picked
-/// line-wide happened to make this parity-even and harmless before that fix; scoping the
-/// scan per-literal removed that accident). A `/`/`*` inside an *open* literal is just
-/// content (the `open.is_none()` guard below), matching e.g. `"http://example.com"`. An
-/// unterminated block comment (no closing `*/` before the end of `text`) is treated like a
-/// line comment — nothing after it can be code.
-#[cfg(feature = "lsp-responses")]
-fn last_quote_literal(text: &str) -> Option<QuoteLiteral> {
-    let mut open: Option<(char, usize)> = None;
-    let mut last = None;
-    let mut backslash_run = 0usize;
-    let mut chars = text.char_indices().peekable();
-    while let Some((idx, ch)) = chars.next() {
-        match ch {
-            '\\' => backslash_run += 1,
-            '/' if open.is_none() => match chars.peek().copied() {
-                Some((_, '/')) => break,
-                Some((star_idx, '*')) => {
-                    chars.next();
-                    let Some(body_len) = text.get(star_idx + 1..).and_then(|s| s.find("*/")) else {
-                        break;
-                    };
-                    let resume_at = star_idx + 1 + body_len + "*/".len();
-                    while chars.peek().is_some_and(|&(i, _)| i < resume_at) {
-                        chars.next();
-                    }
-                }
-                _ => backslash_run = 0,
-            },
-            '\'' | '"' => {
-                let is_real = backslash_run.is_multiple_of(2);
-                backslash_run = 0;
-                if !is_real {
-                    continue;
-                }
-                match open {
-                    Some((q, start)) if q == ch => {
-                        last = Some(QuoteLiteral {
-                            quote: q,
-                            open: start,
-                            close: Some(idx + ch.len_utf8()),
-                        });
-                        open = None;
-                    }
-                    Some(_) => {}
-                    None => open = Some((ch, idx)),
-                }
-            }
-            _ => backslash_run = 0,
-        }
-    }
-    if let Some((quote, start)) = open {
-        last = Some(QuoteLiteral {
-            quote,
-            open: start,
-            close: None,
-        });
-    }
-    last
-}
-
-/// Forward search for the byte offset of `rest`'s real closing `quote` character, bailing
-/// out (returning `None`, same as "no closing quote on this line") as soon as a `//` line
-/// comment or an unterminated `/*` block comment is reached, and skipping over a *closed*
-/// `/* ... */` block comment rather than scanning its content for a coincidental match.
-///
-/// `rest` is the tail of the current line starting inside an already-open literal (from
-/// [`detect_dsl_context`]'s `open_pos`/`version_start`), and it can extend past the cursor
-/// into not-yet-confirmed content — including a trailing comment the user already typed
-/// while still mid-editing the coordinate. Without this guard, a quote character inside
-/// that comment (e.g. the apostrophe in `// don't forget`, or a quote inside `/* "x" */`)
-/// is indistinguishable from the literal's real closing delimiter to a plain
-/// escape-aware scan, corrupting the completion range and risking deletion of real
-/// comment text on accept (#1168 code review).
-///
-/// Unlike [`last_quote_literal`]'s backward scan — which must still let `/` stand as
-/// ordinary content inside some *other*, unrelated open string (e.g. `"http://..."`) —
-/// this function always treats `//`/`/*` as comment syntax, without an `open.is_none()`
-/// gate: a Maven coordinate segment (group/artifact/version) never legitimately contains
-/// `//`, so there is no real string content this could misclassify here.
-#[cfg(feature = "lsp-responses")]
-fn find_closing_quote_skip_comments(rest: &str, quote: char) -> Option<usize> {
-    let mut backslash_run = 0usize;
-    let mut chars = rest.char_indices().peekable();
-    while let Some((idx, ch)) = chars.next() {
-        match ch {
-            '\\' => backslash_run += 1,
-            '/' => match chars.peek().copied() {
-                Some((_, '/')) => return None,
-                Some((star_idx, '*')) => {
-                    chars.next();
-                    let body_len = rest.get(star_idx + 1..).and_then(|s| s.find("*/"))?;
-                    let resume_at = star_idx + 1 + body_len + "*/".len();
-                    while chars.peek().is_some_and(|&(i, _)| i < resume_at) {
-                        chars.next();
-                    }
-                    backslash_run = 0;
-                }
-                _ => backslash_run = 0,
-            },
-            _ if ch == quote => {
-                let is_real = backslash_run.is_multiple_of(2);
-                backslash_run = 0;
-                if is_real {
-                    return Some(idx);
-                }
-            }
-            _ => backslash_run = 0,
-        }
-    }
-    None
 }
 
 /// Whether `before_colon` (the text up to, but excluding, a trailing `:` immediately
@@ -459,13 +317,13 @@ fn find_closing_quote_skip_comments(rest: &str, quote: char) -> Option<usize> {
 #[cfg(feature = "lsp-responses")]
 #[allow(clippy::string_slice)]
 fn quoted_key_precedes_colon(before_colon: &str) -> bool {
-    let Some(span) = last_quote_literal(before_colon) else {
+    let Some(literal) = quote_scan::last_string_literal(before_colon, ScanSyntax::Groovy) else {
         return false;
     };
-    if span.close != Some(before_colon.len()) {
+    if literal.close != Some(before_colon.len()) {
         return false;
     }
-    let before_key = before_colon[..span.open].trim_end();
+    let before_key = before_colon[..literal.open].trim_end();
     before_key.is_empty()
         || before_key
             .ends_with(|c: char| c.is_alphanumeric() || matches!(c, '_' | ',' | '(' | '[' | '{'))
@@ -492,7 +350,9 @@ fn detect_dsl_context<'a>(
     // the string containing the cursor, found by scanning forward and toggling between
     // `'`/`"` as independent delimiters, rather than picking one quote character for the
     // whole line and checking its parity.
-    let Some(open) = last_quote_literal(before_cursor).filter(|span| span.close.is_none()) else {
+    let Some(open) = quote_scan::last_string_literal(before_cursor, ScanSyntax::Groovy)
+        .filter(|span| span.close.is_none())
+    else {
         return (GradleCompletionContext::None, "", Range::default());
     };
     let quote_char = open.quote;
@@ -535,7 +395,8 @@ fn detect_dsl_context<'a>(
             // already-typed version) if any, else the closing quote; bounded by the cursor when
             // unterminated (mirrors `MavenEcosystem::detect_xml_context`'s fallback).
             let rest = &line[open_pos + 1..];
-            let closing_quote_rel = find_closing_quote_skip_comments(rest, quote_char);
+            let closing_quote_rel =
+                quote_scan::find_closing_quote_before_comment(rest, quote_char, ScanSyntax::Groovy);
             let scan_limit_rel = closing_quote_rel.unwrap_or(cursor - (open_pos + 1));
             let end_rel = rest[..scan_limit_rel]
                 .char_indices()
@@ -561,7 +422,8 @@ fn detect_dsl_context<'a>(
             // this arm previously returned `Range::default()`, rejecting every compact-coordinate
             // completion here).
             let rest = &line[version_start..];
-            let closing_quote_rel = find_closing_quote_skip_comments(rest, quote_char);
+            let closing_quote_rel =
+                quote_scan::find_closing_quote_before_comment(rest, quote_char, ScanSyntax::Groovy);
             let value_end = closing_quote_rel
                 .map_or(cursor, |rel| version_start + rel)
                 .max(cursor);
@@ -1491,6 +1353,167 @@ mod tests {
         assert_eq!(t, GradleCompletionContext::Version);
         assert_eq!(v, "guavaVersion");
         assert_eq!(range, Range::default());
+    }
+
+    // #1175: single-quote catalog values, cross-quote-style non-desync, and the
+    // inline-table comma-split fix.
+
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_catalog_context_version_single_quoted() {
+        let line = "version = '1.0";
+        let col = line.len();
+        let before = &line[..col];
+        let (t, v, _range) = detect_catalog_context(before, line, col, 0);
+        assert_eq!(t, GradleCompletionContext::Version);
+        assert_eq!(v, "1.0");
+    }
+
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_catalog_context_module_single_quoted() {
+        let line = "module = 'com.a:b";
+        let col = line.len();
+        let before = &line[..col];
+        let (t, v, _range) = detect_catalog_context(before, line, col, 0);
+        assert_eq!(t, GradleCompletionContext::Package);
+        assert_eq!(v, "com.a:b");
+    }
+
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_catalog_context_version_ref_single_quoted_keeps_placeholder_range() {
+        let line = "version.ref = 'junit";
+        let col = line.len();
+        let before = &line[..col];
+        let (t, v, range) = detect_catalog_context(before, line, col, 0);
+        assert_eq!(t, GradleCompletionContext::Version);
+        assert_eq!(v, "junit");
+        assert_eq!(range, Range::default());
+    }
+
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_catalog_context_version_double_quoted_apostrophe_content_no_desync() {
+        // Both the `'` count and the `"` count in `after` are odd here — a per-quote-char
+        // parity check cannot disambiguate which delimiter is actually open (#1175). The
+        // shared left-to-right scan resolves it: the open literal is delimited by `"`.
+        let line = "version = \"1.0-o'brien";
+        let col = line.len();
+        let before = &line[..col];
+        let (t, v, _range) = detect_catalog_context(before, line, col, 0);
+        assert_eq!(t, GradleCompletionContext::Version);
+        assert_eq!(v, "1.0-o'brien");
+    }
+
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_catalog_context_module_single_quoted_double_quote_content_no_desync() {
+        let line = "module = 'a\"b";
+        let col = line.len();
+        let before = &line[..col];
+        let (t, v, _range) = detect_catalog_context(before, line, col, 0);
+        assert_eq!(t, GradleCompletionContext::Package);
+        assert_eq!(v, "a\"b");
+    }
+
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_catalog_context_inline_table_module_single_version_double_no_comma_desync() {
+        // module = 'a,b', version = "1.0| — the comma inside `module`'s single-quoted value
+        // must not be mistaken for the inline-table field separator. Positive coverage, not
+        // a regression discriminator: impl-critic C1 found the pre-#1175 `"`-only
+        // `in_string` toggle also lands on the correct field here (a later real
+        // `"`-delimited comma overwrites `field_start` to the same position regardless), so
+        // this input alone does not distinguish old from new behavior — see
+        // `test_detect_catalog_context_inline_table_comma_split_regression_c1` below for an
+        // input that does.
+        let line = r#"{ module = 'a,b', version = "1.0"#;
+        let col = line.len();
+        let before = &line[..col];
+        let (t, v, _range) = detect_catalog_context(before, line, col, 0);
+        assert_eq!(t, GradleCompletionContext::Version);
+        assert_eq!(v, "1.0");
+    }
+
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_catalog_context_inline_table_module_double_version_single_no_quote_style_desync()
+    {
+        // module = "a,b", version = '1.0| — this variant fails under the pre-#1175 code, but
+        // (impl-critic C1) because of the `"`-only quote-parity gate #1175 replaces, not
+        // because of a comma-split bug; it overlaps with the dedicated quote-style coverage
+        // in `test_detect_catalog_context_version_double_quoted_apostrophe_content_no_desync`/
+        // `test_detect_catalog_context_module_single_quoted_double_quote_content_no_desync`.
+        let line = r#"{ module = "a,b", version = '1.0"#;
+        let col = line.len();
+        let before = &line[..col];
+        let (t, v, _range) = detect_catalog_context(before, line, col, 0);
+        assert_eq!(t, GradleCompletionContext::Version);
+        assert_eq!(v, "1.0");
+    }
+
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_catalog_context_inline_table_comma_split_regression_c1() {
+        // Genuinely discriminating comma-split input (impl-critic C1): `version`'s value is
+        // a single-quoted TOML range literal containing a comma, which the pre-#1175
+        // `"`-only `in_string` toggle never recognized as an open string, misreading the
+        // comma as the inline-table field separator and desyncing `current_field_start`.
+        let line = r#"{ module = "a:b", version = '[1.0,2.0"#;
+        let col = line.len();
+        let before = &line[..col];
+        let (t, v, _range) = detect_catalog_context(before, line, col, 0);
+        assert_eq!(t, GradleCompletionContext::Version);
+        assert_eq!(v, "[1.0,2.0");
+    }
+
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_catalog_context_version_trailing_comment_cursor_at_line_end_is_none() {
+        let line = r#"version = "1.0" # don't bump"#;
+        let col = line.len();
+        let before = &line[..col];
+        let (t, v, range) = detect_catalog_context(before, line, col, 0);
+        assert_eq!(t, GradleCompletionContext::None);
+        assert_eq!(v, "");
+        assert_eq!(range, Range::default());
+    }
+
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_current_field_start_regression_c1_discriminates_old_scanner_bug_version_range() {
+        // impl-critic C1: `{ module = 'a,b', version = "1.0` does NOT discriminate the old
+        // `"`-only `in_string` toggle from the new scan — the old scanner also lands on the
+        // real comma here (a later real `"`-delimited comma would just overwrite
+        // `field_start` to the same position either way), so a test on that input alone
+        // passes unedited against the pre-#1175 code and guards nothing. This input does
+        // discriminate: `version`'s value is a single-quoted TOML range literal, which the
+        // old `"`-only toggle never recognized as an open string at all, so its comma was
+        // misread as a field separator there.
+        let before_cursor = "{ module = \"a:b\", version = '[1.0,2.0";
+        let field_start = current_field_start(before_cursor);
+        assert_eq!(&before_cursor[field_start..], " version = '[1.0,2.0");
+    }
+
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_current_field_start_regression_c1_discriminates_old_scanner_bug_single_quoted_only() {
+        // Second discriminating input (impl-critic C1): a bare single-quoted field with a
+        // comma inside it. The old `"`-only toggle never opened a string for the `'`, so it
+        // read the comma inside `'a,b` as a field separator; the new `CodeSpans`-based scan
+        // correctly keeps it inside the still-open literal.
+        let before_cursor = "{ module = 'a,b";
+        let field_start = current_field_start(before_cursor);
+        assert_eq!(field_start, 0);
+    }
+
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_current_field_start_comma_inside_comment_is_not_a_field_boundary() {
+        let before_cursor = "module = \"a\", version = \"1.0\" # a, b";
+        let field_start = current_field_start(before_cursor);
+        assert_eq!(&before_cursor[field_start..], " version = \"1.0\" # a, b");
     }
 
     #[cfg(feature = "lsp-responses")]

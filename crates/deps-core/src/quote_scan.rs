@@ -1,26 +1,36 @@
 //! Shared escape-aware string-literal and comment scanning for manifest raw-text parsers.
 //!
-//! Three ecosystem parsers scan manifest source text byte-by-byte, skipping over string
+//! Four ecosystem parsers scan manifest source text byte-by-byte, skipping over string
 //! literals and comments to find or classify code: `deps-bundler`'s Gemfile option
-//! extraction, `deps-swift`'s Package.swift comment stripping, and `deps-pypi`'s TOML
-//! comment stripping. Before this module each did so with its own hand-rolled scanner —
-//! one of which (`deps-pypi`'s) did not track backslash escapes at all, truncating a
-//! quoted value early at an escaped `"`. This module centralizes that skip-scan behind a
-//! `syntax`-parameterized surface ([`crate::quote_scan::ScanSyntax`]), implemented as a
-//! single skip loop that advances past whichever comes first: a string literal (read via
+//! extraction, `deps-swift`'s Package.swift comment stripping, `deps-pypi`'s TOML comment
+//! stripping, and `deps-gradle`'s DSL/version-catalog completion-context detection. Before
+//! this module each did so with its own hand-rolled scanner — one of which (`deps-pypi`'s)
+//! did not track backslash escapes at all, truncating a quoted value early at an escaped
+//! `"`. This module centralizes that skip-scan behind a `syntax`-parameterized surface
+//! ([`crate::quote_scan::ScanSyntax`]), implemented as a single skip loop that advances past
+//! whichever comes first: a string literal (read via
 //! [`crate::quote_scan::read_string_literal`]) or a comment.
 //!
 //! The skip-scan delegates all escape-aware closing-quote search to
 //! [`crate::fallback_completion::find_closing_quote`] rather than re-implementing it, so
-//! there is exactly one escape rule in the workspace, with one exception: a
+//! there is exactly one escape rule in the workspace, with two exceptions. First, a
 //! [`crate::quote_scan::ScanSyntax::Ruby`] `"..."` literal is scanned via a dedicated `#{...}`
 //! interpolation-aware helper instead, since Ruby interpolation can nest a string literal using
 //! the same quote type as the outer literal — see [`crate::quote_scan::read_string_literal`]'s
 //! doc for the full contract and [`crate::quote_scan::ScanSyntax::Ruby`]'s doc for which
-//! literals this applies to. **Use `find_closing_quote` directly** when a string is already
+//! literals this applies to. Second,
+//! [`crate::quote_scan::find_closing_quote_before_comment`] inlines its own copy of the same
+//! `backslash_run`/parity check rather than delegating to `find_closing_quote`, since it needs
+//! to interleave escape-tracking with comment-marker detection in a single forward pass —
+//! a structural requirement `find_closing_quote` itself has no comment awareness to serve, not
+//! an accidental duplication. **Use `find_closing_quote` directly** when a string is already
 //! known to be open and only its closing quote is needed (e.g. completing inside a string the
 //! cursor sits in). **Use this module** when comments are also in play, or when the string's
-//! start position is not already known and must be found by scanning.
+//! start position is not already known and must be found by scanning — including via
+//! [`crate::quote_scan::last_string_literal`], which finds the *last* literal in a text (open
+//! or closed) rather than reading one from an already-known position, and
+//! [`crate::quote_scan::find_closing_quote_before_comment`], a comment-aware variant of
+//! `find_closing_quote` for scanning a partially-typed line.
 
 use crate::fallback_completion::{count_real_quotes_with, find_closing_quote};
 use std::ops::Range;
@@ -59,6 +69,31 @@ pub enum ScanSyntax {
     /// not escaped at all (a `\` inside one is just a literal backslash). `#` starts a
     /// line comment.
     Toml,
+    /// Groovy/Kotlin DSL syntax (Gradle build scripts): `"` and `'` string literals, both
+    /// backslash-escaped ([`ScanSyntax::Ruby`]'s quote handling); `//` starts a line comment
+    /// and `/* ... */` a block comment ([`ScanSyntax::Swift`]'s comment handling). Unlike
+    /// Ruby, `?"`/`?'` is not a distinct token, so the `?`-predecessor char-literal check is
+    /// never consulted for this variant.
+    ///
+    /// Known, documented approximations (all pre-existing in this crate's Gradle-specific
+    /// scanners this variant replaces, not new regressions):
+    /// - Groovy GString interpolation (`"${...}"`) nesting a same-type quote
+    ///   (`"${p.get("x")}"`) is not tracked — the Groovy analogue of the Ruby `#{}` problem
+    ///   [`read_string_literal`]'s interpolation-aware path solves; a literal reads as
+    ///   closing at the inner `"` instead.
+    /// - Triple-quoted strings (`'''...'''`, `"""..."""`) are not tokenized; each `'`/`"`
+    ///   inside one is read as an ordinary delimiter.
+    /// - A Kotlin `'a'` `Char` literal is scanned as a one-character string literal, which is
+    ///   harmless for skip-scanning (the content is opaque either way).
+    /// - Known, intentional divergence from the crate-local scanner this variant replaces
+    ///   (#1174 impl-critic C2): the old scanner tracked one `backslash_run` across the
+    ///   *entire* input, so a stray `\` in code position (outside any string) suppressed
+    ///   the very next quote as a delimiter (e.g. `impl \"a:b:1.0` read as no open string at
+    ///   all); this scanner's escape tracking is scoped to inside a literal, so the same
+    ///   input opens a `"` literal there instead. Unreachable from valid Groovy/Kotlin
+    ///   syntax (a bare `\` is not valid outside a string literal), and the new answer is
+    ///   arguably the more correct one, so this is not treated as a regression.
+    Groovy,
 }
 
 /// A string literal read from source text: its raw content span, the position just past
@@ -79,16 +114,169 @@ pub struct StringLiteral {
     pub quote: char,
 }
 
+/// The *last* string literal found while scanning `text` left to right, open or closed —
+/// the result of [`last_string_literal`].
+///
+/// Unlike [`StringLiteral`] (returned by [`read_string_literal`] for a literal whose
+/// opening position is already known), this describes a literal found by scanning `text`
+/// from its start, and distinguishes a literal that is still open at the end of `text`
+/// (`close: None`) from one that closed exactly at `text`'s end (`close: Some(text.len())`)
+/// — the distinction a completion handler needs to tell "cursor is inside an unterminated
+/// literal" from "cursor sits right after a literal that just closed".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScannedLiteral {
+    /// The delimiter character (`"` or `'`) that opened this literal.
+    pub quote: char,
+    /// Byte offset of the opening delimiter.
+    pub open: usize,
+    /// Byte offset just past the closing delimiter, or `None` if the literal runs
+    /// unterminated to the end of the scanned text.
+    pub close: Option<usize>,
+}
+
+/// Scans `text` left to right (per `syntax`) and returns its last string literal, open or
+/// closed.
+///
+/// This is the one a cursor at the end of `text` would be inside, if any, or (when `text`
+/// ends outside any string) the last one that closed.
+///
+/// A quote of the *other* style encountered while inside an open literal is content, not a
+/// delimiter — toggling between `'`/`"` as independent alternatives rather than assuming one
+/// quote style for the whole text, so a line mixing both styles doesn't have an unrelated
+/// quote desync which delimiter actually closes the literal a cursor sits in. A comment (per
+/// `syntax`) outside any open literal is skipped, not scanned, so a quote character inside
+/// comment text is never mistaken for a literal opener.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::quote_scan::{ScanSyntax, last_string_literal};
+///
+/// // Still open at the end of `text` — the cursor sits inside it.
+/// let open = last_string_literal(r#"implementation("a:b:1.0"); implementation("c:d:2"#, ScanSyntax::Groovy).unwrap();
+/// assert!(open.close.is_none());
+///
+/// // Closed exactly at `text`'s end.
+/// let closed = last_string_literal(r#"version = "1.0""#, ScanSyntax::Toml).unwrap();
+/// assert_eq!(closed.close, Some(r#"version = "1.0""#.len()));
+/// ```
+#[must_use]
+pub fn last_string_literal(text: &str, syntax: ScanSyntax) -> Option<ScannedLiteral> {
+    scan_spans(text, syntax)
+        .into_iter()
+        .rev()
+        .find_map(|span| match span.kind {
+            SpanKind::Str { quote, terminated } => Some(ScannedLiteral {
+                quote,
+                open: span.range.start,
+                close: terminated.then_some(span.range.end),
+            }),
+            _ => None,
+        })
+}
+
+/// Forward search for the byte offset of `rest`'s real closing `quote` character.
+///
+/// Follows `syntax`'s escaping rule, bailing out (returning `None`, same as "no closing
+/// quote on this line") as soon as a comment marker (per `syntax`: `//`/`/* */` for
+/// [`ScanSyntax::Groovy`]/[`ScanSyntax::Swift`], `#` for [`ScanSyntax::Ruby`] or
+/// [`ScanSyntax::Toml`] with `quote == '"'`) is reached, and skipping over a *closed* block
+/// comment rather than scanning its content for a coincidental match. A `#` is deliberately
+/// **not** a bail marker for [`ScanSyntax::Toml`] with `quote == '\''`: a TOML `'...'`
+/// literal string has no escaping at all and permits `#` as ordinary content (unlike a
+/// `"..."` basic string, where this heuristic still applies), so bailing there would
+/// truncate a legitimately `#`-containing value like `version = '1.0-build#5'`.
+///
+/// `rest` is the tail of a **partially typed** line already known to sit inside an open
+/// literal delimited by `quote` (e.g. from [`last_string_literal`] filtered to `close.is_none()`).
+/// A comment marker found there is a hard stop because the trailing text is mid-edit — not
+/// because a comment can legitimately appear inside a string (it cannot; a real comment
+/// marker inside a closed string is just string content, already handled by
+/// [`read_string_literal`]/[`last_string_literal`], which this function is not used for).
+/// Callers must only use this where the value being completed cannot legitimately contain
+/// the comment marker itself under the bail rule above — a Maven coordinate segment or a
+/// double-quoted TOML catalog version literal contains neither `//` nor `#`; a single-quoted
+/// TOML literal string is exempted from the `#` rule for the reason above instead of being
+/// excluded from this function's use entirely.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::quote_scan::{ScanSyntax, find_closing_quote_before_comment};
+///
+/// assert_eq!(
+///     find_closing_quote_before_comment(r#"1.0" // trailing"#, '"', ScanSyntax::Groovy),
+///     Some(3),
+/// );
+/// assert_eq!(
+///     find_closing_quote_before_comment(r#"1.0 // still typing"#, '"', ScanSyntax::Groovy),
+///     None,
+/// );
+/// ```
+#[must_use]
+pub fn find_closing_quote_before_comment(
+    rest: &str,
+    quote: char,
+    syntax: ScanSyntax,
+) -> Option<usize> {
+    let escaped = is_escaped(syntax, quote);
+    let mut backslash_run = 0usize;
+    let mut chars = rest.char_indices().peekable();
+    while let Some((idx, ch)) = chars.next() {
+        match ch {
+            '\\' if escaped => backslash_run += 1,
+            '#' if syntax == ScanSyntax::Ruby || (syntax == ScanSyntax::Toml && quote != '\'') => {
+                return None;
+            }
+            '/' if matches!(syntax, ScanSyntax::Groovy | ScanSyntax::Swift) => {
+                match chars.peek().copied() {
+                    Some((_, '/')) => return None,
+                    Some((star_idx, '*')) => {
+                        chars.next();
+                        // `?`-bail distinguishes "closed" from "unterminated" (the latter
+                        // must return `None`, same as any other unresolved comment marker);
+                        // `block_comment_end` alone can't make that distinction, so it's
+                        // only called below, once a close is already confirmed, to compute
+                        // the resume offset instead of re-deriving the same arithmetic here.
+                        rest.get(star_idx + 1..).and_then(|s| s.find("*/"))?;
+                        let resume_at = block_comment_end(rest, idx);
+                        while chars.peek().is_some_and(|&(i, _)| i < resume_at) {
+                            chars.next();
+                        }
+                        backslash_run = 0;
+                    }
+                    _ => backslash_run = 0,
+                }
+            }
+            _ if ch == quote => {
+                let is_real = !escaped || backslash_run.is_multiple_of(2);
+                backslash_run = 0;
+                if is_real {
+                    return Some(idx);
+                }
+            }
+            _ => backslash_run = 0,
+        }
+    }
+    None
+}
+
 /// Byte-range classification produced by the internal skip-scan.
 #[derive(Debug, Clone, Copy)]
 enum SpanKind {
     /// Plain source text, outside any string literal or comment.
     Code,
     /// A string literal, delimiters included.
-    Str,
+    Str {
+        /// The delimiter character (`"` or `'`) that opened this literal.
+        quote: char,
+        /// Whether the literal closed before `text` ended — `false` when it runs
+        /// unterminated to the end of the scanned text.
+        terminated: bool,
+    },
     /// A `#`/`//`-style line comment, excluding a trailing newline, if any.
     LineComment,
-    /// A Swift `/* ... */` block comment, delimiters included.
+    /// A Swift/Groovy `/* ... */` block comment, delimiters included.
     BlockComment,
 }
 
@@ -113,7 +301,7 @@ enum Marker {
 /// Whether `ch` opens a string literal under `syntax`.
 fn is_delimiter(ch: char, syntax: ScanSyntax) -> bool {
     match syntax {
-        ScanSyntax::Ruby | ScanSyntax::Toml => ch == '"' || ch == '\'',
+        ScanSyntax::Ruby | ScanSyntax::Toml | ScanSyntax::Groovy => ch == '"' || ch == '\'',
         ScanSyntax::Swift => ch == '"',
     }
 }
@@ -123,7 +311,7 @@ fn is_delimiter(ch: char, syntax: ScanSyntax) -> bool {
 /// verbatim.
 fn is_escaped(syntax: ScanSyntax, quote: char) -> bool {
     match syntax {
-        ScanSyntax::Ruby | ScanSyntax::Swift => true,
+        ScanSyntax::Ruby | ScanSyntax::Swift | ScanSyntax::Groovy => true,
         ScanSyntax::Toml => quote == '"',
     }
 }
@@ -223,7 +411,7 @@ fn find_next_marker(text: &str, from: usize, syntax: ScanSyntax) -> Option<(usiz
                     return Some((from + offset, Marker::LineComment));
                 }
             }
-            ScanSyntax::Swift => {
+            ScanSyntax::Swift | ScanSyntax::Groovy => {
                 if ch == '/' {
                     match rest.as_bytes().get(offset + 1) {
                         Some(b'/') => return Some((from + offset, Marker::LineComment)),
@@ -284,11 +472,22 @@ fn scan_spans(text: &str, syntax: ScanSyntax) -> Vec<Span> {
             });
         }
         let (end, kind) = match marker {
-            Marker::Delim => (
-                read_string_literal(text, marker_at, syntax)
-                    .map_or(text.len(), |literal| literal.end),
-                SpanKind::Str,
-            ),
+            Marker::Delim => {
+                let literal = read_string_literal(text, marker_at, syntax);
+                let terminated = literal.is_some();
+                // `literal.quote` is reused on the closed path; the unterminated path (no
+                // `StringLiteral` to read it from) falls back to the same lookup directly.
+                let quote = literal.as_ref().map_or_else(
+                    || {
+                        text.get(marker_at..)
+                            .and_then(|s| s.chars().next())
+                            .unwrap_or('"')
+                    },
+                    |l| l.quote,
+                );
+                let end = literal.map_or(text.len(), |literal| literal.end);
+                (end, SpanKind::Str { quote, terminated })
+            }
             Marker::LineComment => (line_comment_end(text, marker_at), SpanKind::LineComment),
             Marker::BlockComment => (block_comment_end(text, marker_at), SpanKind::BlockComment),
         };
@@ -917,7 +1116,7 @@ impl<'a> CodeSpans<'a> {
             .partition_point(|span| span.range.end <= byte_idx);
         self.spans.get(idx).is_some_and(|span| match span.kind {
             SpanKind::Code => true,
-            SpanKind::Str => byte_idx == span.range.start,
+            SpanKind::Str { .. } => byte_idx == span.range.start,
             SpanKind::LineComment | SpanKind::BlockComment => false,
         })
     }
@@ -1595,5 +1794,229 @@ mod tests {
         let url_quote = url_start - 1;
         let literal = read_string_literal(line, url_quote, ScanSyntax::Ruby).unwrap();
         assert_eq!(&line[literal.content], "https://evil.example.com");
+    }
+
+    // #1174: `ScanSyntax::Groovy` and `last_string_literal`/`find_closing_quote_before_comment`.
+
+    #[test]
+    fn last_string_literal_closed_at_text_end() {
+        let text = r#"version = "1.0""#;
+        let literal = last_string_literal(text, ScanSyntax::Toml).unwrap();
+        assert_eq!(literal.quote, '"');
+        assert_eq!(literal.close, Some(text.len()));
+    }
+
+    #[test]
+    fn last_string_literal_unterminated_is_open() {
+        let text = r#"version = "1.0"#;
+        let literal = last_string_literal(text, ScanSyntax::Toml).unwrap();
+        assert_eq!(literal.quote, '"');
+        assert_eq!(literal.open, text.find('"').unwrap());
+        assert_eq!(literal.close, None);
+    }
+
+    #[test]
+    fn last_string_literal_groovy_single_quote_open() {
+        let text = "implementation 'com.example:lib:1.0";
+        let literal = last_string_literal(text, ScanSyntax::Groovy).unwrap();
+        assert_eq!(literal.quote, '\'');
+        assert_eq!(literal.close, None);
+    }
+
+    #[test]
+    fn last_string_literal_groovy_double_quote_open() {
+        let text = r#"implementation "com.example:lib:1.0"#;
+        let literal = last_string_literal(text, ScanSyntax::Groovy).unwrap();
+        assert_eq!(literal.quote, '"');
+        assert_eq!(literal.close, None);
+    }
+
+    #[test]
+    fn last_string_literal_toml_single_quote_no_escape() {
+        let text = r"version = 'C:\Users\x";
+        let literal = last_string_literal(text, ScanSyntax::Toml).unwrap();
+        assert_eq!(literal.quote, '\'');
+        assert_eq!(literal.close, None);
+    }
+
+    #[test]
+    fn last_string_literal_escaped_closing_quote_stays_open() {
+        let text = r#"description = "a\""#;
+        let literal = last_string_literal(text, ScanSyntax::Toml).unwrap();
+        assert_eq!(literal.close, None);
+    }
+
+    #[test]
+    fn last_string_literal_quote_inside_comment_is_not_a_phantom_literal() {
+        // The `'` inside the Groovy `//` comment must not be read as opening a literal.
+        let text = "implementation(\"a:b:1.0\") // don't bump";
+        let literal = last_string_literal(text, ScanSyntax::Groovy).unwrap();
+        assert_eq!(literal.quote, '"');
+        assert_eq!(literal.close, Some(text.find(')').unwrap()));
+    }
+
+    #[test]
+    fn last_string_literal_toml_hash_comment_not_a_phantom_literal() {
+        let text = "version = \"1.0\" # a 'note'";
+        let literal = last_string_literal(text, ScanSyntax::Toml).unwrap();
+        assert_eq!(literal.quote, '"');
+        assert_eq!(literal.close, Some(text.find(" #").unwrap()));
+    }
+
+    #[test]
+    fn last_string_literal_closed_block_comment_is_skipped() {
+        let text = r#"implementation("a" /* "x" */ + "b"#;
+        let literal = last_string_literal(text, ScanSyntax::Groovy).unwrap();
+        assert_eq!(literal.close, None);
+        assert_eq!(literal.open, text.rfind('"').unwrap());
+    }
+
+    #[test]
+    fn last_string_literal_unterminated_block_comment_ends_scan() {
+        // An unterminated `/*` absorbs the rest of the text; no literal after it is found.
+        let text = r#""a" /* unterminated"#;
+        let literal = last_string_literal(text, ScanSyntax::Groovy).unwrap();
+        assert_eq!(literal.close, Some(3));
+    }
+
+    #[test]
+    fn last_string_literal_empty_text_is_none() {
+        assert!(last_string_literal("", ScanSyntax::Groovy).is_none());
+    }
+
+    #[test]
+    fn last_string_literal_no_literal_is_none() {
+        assert!(last_string_literal("no strings here", ScanSyntax::Groovy).is_none());
+    }
+
+    #[test]
+    fn groovy_hash_is_not_a_comment() {
+        // `#` has no comment meaning in Groovy — must stay code, unlike Ruby/TOML.
+        let line = "implementation(\"a:b:1.0\") # not a comment";
+        let code = CodeSpans::new(line, ScanSyntax::Groovy);
+        let hash = line.find('#').unwrap();
+        assert!(code.is_code_byte(hash));
+    }
+
+    #[test]
+    fn groovy_double_slash_inside_string_is_not_a_comment() {
+        let line = r#"implementation("http://example.com:1.0")"#;
+        let code = CodeSpans::new(line, ScanSyntax::Groovy);
+        let slash = line.find("//").unwrap();
+        // Inside the open string, so it stays non-code content, not a comment start.
+        assert!(!code.is_code_byte(slash));
+        assert_eq!(strip_line_comment(line, ScanSyntax::Groovy), line);
+    }
+
+    #[test]
+    fn groovy_line_comment_stripped() {
+        let line = r#"implementation("a:b:1.0") // don't bump"#;
+        assert_eq!(
+            strip_line_comment(line, ScanSyntax::Groovy),
+            r#"implementation("a:b:1.0") "#,
+        );
+    }
+
+    #[test]
+    fn groovy_block_comment_blanked() {
+        let content = "val x = 1 /* multi\nline */ val y = 2";
+        let blanked = blank_comments(content, ScanSyntax::Groovy);
+        assert_eq!(blanked.len(), content.len());
+        assert!(blanked.contains('\n'));
+        assert!(!blanked.contains("multi"));
+    }
+
+    #[test]
+    fn groovy_both_quote_styles_open_a_literal() {
+        let single = last_string_literal("val a = 'x", ScanSyntax::Groovy).unwrap();
+        assert_eq!(single.quote, '\'');
+        let double = last_string_literal("val a = \"x", ScanSyntax::Groovy).unwrap();
+        assert_eq!(double.quote, '"');
+    }
+
+    #[test]
+    fn find_closing_quote_before_comment_found() {
+        assert_eq!(
+            find_closing_quote_before_comment(r#"1.0" tail"#, '"', ScanSyntax::Groovy),
+            Some(3),
+        );
+    }
+
+    #[test]
+    fn find_closing_quote_before_comment_line_comment_bails() {
+        assert_eq!(
+            find_closing_quote_before_comment("1.0 // still typing", '"', ScanSyntax::Groovy),
+            None,
+        );
+    }
+
+    #[test]
+    fn find_closing_quote_before_comment_hash_bails_under_toml() {
+        assert_eq!(
+            find_closing_quote_before_comment("1.0 # still typing", '"', ScanSyntax::Toml),
+            None,
+        );
+    }
+
+    #[test]
+    fn find_closing_quote_before_comment_hash_is_not_a_comment_under_groovy() {
+        // `#` has no comment meaning in Groovy, so it doesn't bail — it's just content, and the
+        // scan continues past it to the real closing quote.
+        assert_eq!(
+            find_closing_quote_before_comment(
+                "1.0 # not-a-comment\" tail",
+                '"',
+                ScanSyntax::Groovy
+            ),
+            Some(19),
+        );
+    }
+
+    #[test]
+    fn find_closing_quote_before_comment_closed_block_comment_skipped() {
+        let rest = r#"1.0" /* "x" */"#;
+        assert_eq!(
+            find_closing_quote_before_comment(rest, '"', ScanSyntax::Groovy),
+            Some(3),
+        );
+    }
+
+    #[test]
+    fn find_closing_quote_before_comment_unterminated_block_comment_bails() {
+        assert_eq!(
+            find_closing_quote_before_comment("1.0 /* unterminated", '"', ScanSyntax::Groovy),
+            None,
+        );
+    }
+
+    #[test]
+    fn find_closing_quote_before_comment_escaped_quote_not_taken() {
+        let rest = r#"a\" real" tail"#;
+        assert_eq!(
+            find_closing_quote_before_comment(rest, '"', ScanSyntax::Groovy),
+            Some(8),
+        );
+    }
+
+    #[test]
+    fn find_closing_quote_before_comment_toml_literal_string_has_no_escapes() {
+        let rest = r"C:\Users' tail";
+        assert_eq!(
+            find_closing_quote_before_comment(rest, '\'', ScanSyntax::Toml),
+            Some(8),
+        );
+    }
+
+    /// Code-review finding (#1174/#1175 review round): a TOML `'...'` literal string has no
+    /// escaping at all and permits `#` as ordinary content — unlike a `"..."` basic string,
+    /// where `#` still bails as a mid-edit comment marker — so a legitimately `#`-containing
+    /// single-quoted catalog value (e.g. a build-metadata suffix) must not be truncated.
+    #[test]
+    fn find_closing_quote_before_comment_toml_single_quoted_hash_is_content_not_comment() {
+        let rest = r"1.0-build#5' tail";
+        assert_eq!(
+            find_closing_quote_before_comment(rest, '\'', ScanSyntax::Toml),
+            Some(11),
+        );
     }
 }
