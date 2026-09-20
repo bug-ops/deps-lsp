@@ -1,5 +1,9 @@
 //! Maven ecosystem implementation for deps-lsp.
 
+#[cfg(feature = "lsp-responses")]
+use quick_xml::Reader;
+#[cfg(feature = "lsp-responses")]
+use quick_xml::events::Event;
 use std::any::Any;
 use std::sync::Arc;
 #[cfg(feature = "lsp-responses")]
@@ -521,20 +525,16 @@ impl MavenEcosystem {
 /// just nearest on the cursor's physical line.
 ///
 /// Comments (`<!--...-->`), CDATA sections (`<![CDATA[...]]>`), processing instructions
-/// (`<?...?>`) and other `<!...>` declarations are skipped as opaque spans (searched for
-/// their own close marker) so a commented-out `<dependency>` block can't be mistaken for
-/// a live one — the generic `<!...>` span stops at the first `>`, which in principle
-/// mishandles a DOCTYPE's internal subset (`<!DOCTYPE p [<!ENTITY x "y">]>`); harmless in
-/// practice since pom.xml never declares one. Tag names are also compared with a possible
-/// `<!--`/`<?`/DOCTYPE marker stripped, but the tag-end search itself is a bare `find('>')`
-/// with no attribute-quoting awareness — an unescaped `>` inside a quoted attribute value
-/// (`<foo bar="a>b">`) would desync the scan; low real risk since `dependency`/`plugin`/
-/// `version` elements never carry attributes in a pom.xml. This is a raw-text
-/// approximation, not a full XML parser — same tradeoff `detect_xml_context` itself already
-/// makes — but it only ever runs against content that `deps-maven::parser::parse_pom_xml`
-/// has already accepted as well-formed XML (completion is only reachable with a
-/// successfully parsed `ParseResult`), so tags close in strict LIFO order and a plain
-/// pop-without-name-check on every close tag is sound.
+/// (`<?...?>`) and other `<!...>` declarations (including a DOCTYPE's internal subset) are
+/// all skipped by `quick_xml`'s own tokenizer, so a commented-out `<dependency>` block can't
+/// be mistaken for a live one and an unescaped `>` inside a quoted attribute value never
+/// desyncs the scan. This only ever runs against content that
+/// `deps-maven::parser::parse_pom_xml` has already accepted as well-formed XML (completion is
+/// only reachable with a successfully parsed `ParseResult`), so tags close in strict LIFO
+/// order and a plain pop-without-name-check on every close tag is sound. Should that
+/// precondition ever stop holding, a `quick_xml` parse error mid-scan truncates the ancestry
+/// to whatever was pushed before the error, rather than degrading gracefully like the old
+/// hand-rolled scanner did.
 ///
 /// Being opaque cuts both ways: a comment is never *entered*, so `offset` values that fall
 /// *inside* one are never distinguished from each other — if the comment itself sits inside a
@@ -556,75 +556,48 @@ impl MavenEcosystem {
 /// declares) can still resolve to a minified-line neighbor. Out of scope here — same
 /// territory as #1147 — do not read this function as a complete fix for the fallback's
 /// same-line ranking.
-// `lt`/`gt_rel`/`name_end` all come from `find`/`strip_prefix` on ASCII tokens (`<`, `>`,
-// `<!--`, `-->`, whitespace), so every slice bound below is always a char boundary.
 #[cfg(feature = "lsp-responses")]
-#[allow(clippy::string_slice)]
 fn innermost_open_element(content: &str, offset: usize) -> Option<&str> {
-    // Order matters: `<!--` (comment) must be tried before the generic `<!` (DOCTYPE/other
-    // declaration) fallback, since every comment also matches that generic prefix.
-    const OPAQUE_SPANS: &[(&str, &str)] = &[
-        ("<!--", "-->"),
-        ("<![CDATA[", "]]>"),
-        ("<?", "?>"),
-        ("<!", ">"),
-    ];
-
+    let mut reader = Reader::from_str(content);
     let mut stack: Vec<&str> = Vec::new();
-    let mut pos = 0usize;
+    // quick-xml's `remove_utf8_bom` drops a leading BOM from its input slice without advancing
+    // `buffer_position()`, so every position it reports on BOM'd content is short by the BOM's
+    // byte length while `offset` (derived from `content` itself) still counts it — add it back.
+    let base = if content.starts_with('\u{feff}') {
+        '\u{feff}'.len_utf8()
+    } else {
+        0
+    };
 
-    while let Some(rel) = content[pos..].find('<') {
-        let lt = pos + rel;
-        if lt >= offset {
+    while let Ok(pos) = usize::try_from(reader.buffer_position()) {
+        let pos = pos + base;
+        if pos >= offset {
             break;
         }
 
-        if let Some(end) = OPAQUE_SPANS
-            .iter()
-            .find_map(|&(open, close)| skip_opaque_xml_span(&content[lt..], open, close))
-        {
-            pos = lt + end;
-            continue;
-        }
-
-        let Some(gt_rel) = content[lt..].find('>') else {
-            break;
-        };
-        let inner = &content[lt + 1..lt + gt_rel];
-        pos = lt + gt_rel + 1;
-
-        if inner.starts_with('/') {
-            stack.pop();
-        } else if !inner.ends_with('/') {
-            let name_end = inner.find(char::is_whitespace).unwrap_or(inner.len());
-            let name = &inner[..name_end];
-            // Strip a namespace prefix (`m:dependency` -> `dependency`) so a
-            // namespace-prefixed pom.xml compares the same way `parse_pom_xml` already
-            // does via quick-xml's `local_name()` (`parser.rs`) — without this, a prefixed
-            // document would keep parsing into real `Dependency`s (hover/diagnostics/code
-            // actions unaffected) while completion alone silently stopped triggering,
-            // since the qualified name never equals `"dependency"`/`"plugin"` (#1181 critic
-            // S1).
-            let local_name = name.rsplit(':').next().unwrap_or(name);
-            stack.push(local_name);
+        match reader.read_event() {
+            Ok(Event::Start(e)) => {
+                // Strip a namespace prefix (`m:dependency` -> `dependency`) so a
+                // namespace-prefixed pom.xml compares the same way `parse_pom_xml` already
+                // does via quick-xml's `local_name()` (`parser.rs`) — without this, a
+                // prefixed document would keep parsing into real `Dependency`s (hover/
+                // diagnostics/code actions unaffected) while completion alone silently
+                // stopped triggering, since the qualified name never equals
+                // `"dependency"`/`"plugin"` (#1181 critic S1).
+                let qname = content
+                    .get(pos + 1..pos + 1 + e.name().as_ref().len())
+                    .unwrap_or_default();
+                stack.push(qname.rsplit(':').next().unwrap_or(qname));
+            }
+            Ok(Event::End(_)) => {
+                stack.pop();
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            Ok(_) => {}
         }
     }
 
     stack.last().copied()
-}
-
-/// If `text` starts with `open`, returns the byte offset (relative to `text`) right after
-/// the first `close` marker that follows — or the end of `text` if `close` never appears
-/// (a truncated/malformed span), so the scan fails closed by consuming the rest of the
-/// document rather than looping forever. Returns `None` if `text` doesn't start with
-/// `open` at all.
-#[cfg(feature = "lsp-responses")]
-fn skip_opaque_xml_span(text: &str, open: &str, close: &str) -> Option<usize> {
-    let rest = text.strip_prefix(open)?;
-    Some(
-        rest.find(close)
-            .map_or(text.len(), |i| open.len() + i + close.len()),
-    )
 }
 
 impl deps_core::ecosystem::private::Sealed for MavenEcosystem {}
@@ -1233,6 +1206,58 @@ mod tests {
         let content = "<m:project><m:dependencies><m:dependency><m:version>1.0.0</m:version>\
                         </m:dependency></m:dependencies></m:project>";
         let offset = content.rfind("<m:version>").unwrap();
+        assert_eq!(innermost_open_element(content, offset), Some("dependency"));
+    }
+
+    /// #1192 regression: the old hand-rolled `find('>')` scanner stops inside the quoted
+    /// attribute value `"a/>b"`, misreads the truncated `<exclusions ...` as self-closing, and
+    /// never pushes it — so its real `</exclusions>` then pops the genuine `<dependency>` off
+    /// the stack, leaving `<version>` misattributed to `project` instead of `dependency`.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_innermost_open_element_handles_unescaped_gt_in_attribute_value() {
+        let content = r#"<project><dependency><exclusions d="a/>b"></exclusions><version>1</version></dependency></project>"#;
+        let offset = content.rfind("<version>").unwrap();
+        assert_eq!(innermost_open_element(content, offset), Some("dependency"));
+    }
+
+    /// #1192 regression: same desync class as above, reached through an arbitrary
+    /// `<plugin><configuration>` subtree rather than `<exclusions>` — not purely theoretical
+    /// since plugin configuration is free-form user XML.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_innermost_open_element_handles_unescaped_gt_in_plugin_configuration() {
+        let content = r#"<project><plugin><configuration><f p="x/>y"></f></configuration><version>1</version></plugin></project>"#;
+        let offset = content.rfind("<version>").unwrap();
+        assert_eq!(innermost_open_element(content, offset), Some("plugin"));
+    }
+
+    /// #1192: a DOCTYPE with an internal subset is now handled by `quick_xml`'s own DTD state
+    /// machine instead of the old generic `<!...>` span (which stopped at the first `>`, inside
+    /// the subset). Not user-visible before this fix — the DOCTYPE sits in the prolog where the
+    /// ancestor stack is empty — but locks the fix in for any future caller that scans earlier
+    /// in the document.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_innermost_open_element_handles_doctype_internal_subset() {
+        let content = concat!(
+            r#"<!DOCTYPE project [<!ENTITY x "><parent>">]>"#,
+            "<project><dependency><version>1</version></dependency></project>"
+        );
+        let offset = content.rfind("<version>").unwrap();
+        assert_eq!(innermost_open_element(content, offset), Some("dependency"));
+    }
+
+    /// #1192 critic S1 (blocking): `quick_xml`'s `remove_utf8_bom` strips a leading UTF-8 BOM
+    /// from its input slice without advancing `buffer_position()`, so every reported position on
+    /// BOM'd content is 3 bytes short of `offset` (which is derived from `content` itself and
+    /// does count the BOM) — without correcting for it, this returns garbage ancestry and
+    /// silently disables version completion for the whole file.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_innermost_open_element_handles_utf8_bom() {
+        let content = "\u{feff}<project><dependency><version>1</version></dependency></project>";
+        let offset = content.rfind("<version>").unwrap();
         assert_eq!(innermost_open_element(content, offset), Some("dependency"));
     }
 
