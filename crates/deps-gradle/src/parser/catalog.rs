@@ -102,6 +102,7 @@ fn parse_library_entry(
         version_req: version_req.map(Into::into),
         version_range,
         configuration: String::new(),
+        source: deps_core::parser::DependencySource::Registry,
     })
 }
 

@@ -133,6 +133,7 @@ pub fn parse_settings(content: &str, uri: &Url) -> Result<GradleParseResult> {
                 version_req: Some(version.into()),
                 version_range: Some(version_range),
                 configuration: "plugin".to_string(),
+                source: deps_core::parser::DependencySource::Registry,
             });
         }
     }

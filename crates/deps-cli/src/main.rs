@@ -97,7 +97,13 @@ async fn run_check(
     follow_symlinks: bool,
 ) -> (CheckReport, bool) {
     let policy = cli_config.policy;
-    let ecosystem_runtime = EcosystemRuntime::from_policy(&policy);
+    // Shared with `ecosystem_runtime` below (impl-critic #4 follow-up to #1212's S3 fix) so
+    // Composer's classification-time `composer.lock` read and this run's own in-use-version
+    // resolution hit the same mtime-keyed cache instance, instead of each parsing the lock
+    // file independently — the same double-parse `deps-lsp`'s `ServerState` avoids.
+    let lockfile_cache = Arc::new(deps_core::lockfile::LockFileCache::new());
+    let ecosystem_runtime =
+        EcosystemRuntime::from_policy(&policy).with_lockfile_cache(Arc::clone(&lockfile_cache));
     let cache = Arc::new(HttpCache::with_policy(Arc::clone(
         &ecosystem_runtime.policy,
     )));
@@ -111,7 +117,7 @@ async fn run_check(
     let ctx = CheckContext {
         cache: Arc::clone(&cache),
         osv: Arc::new(OsvClient::new(Arc::clone(&cache))),
-        lockfile_cache: Arc::new(deps_core::lockfile::LockFileCache::new()),
+        lockfile_cache,
         policy,
     };
 

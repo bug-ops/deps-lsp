@@ -15,6 +15,7 @@ use crate::specifier::parse_specifier;
 use crate::types::{DenoDependency, DenoDependencySection};
 use deps_core::json_ast::find_last_prop;
 use deps_core::lsp_helpers::{LineOffsetTable, byte_span_to_range};
+use deps_core::net_policy::RegistryAccessPolicy;
 use deps_core::{
     DepsError, MAX_JSON_NESTING_DEPTH, PackageName, Result, VersionReq, json_depth_error_message,
 };
@@ -22,7 +23,90 @@ use jsonc_parser::ast::{Object, StringLit, Value};
 use jsonc_parser::{CollectOptions, ParseOptions, parse_to_ast};
 use std::borrow::Cow;
 use std::collections::HashSet;
+use std::sync::Arc;
 use url::Url;
+
+/// `.npmrc`-resolution context for [`parse_deno_json_with_context`]'s `npm:`-scheme
+/// classification (#1212).
+///
+/// Mirrors the subset of `deps_npm::config::NpmParseContext` this crate actually needs — no
+/// `PnpmWorkspaceCache` equivalent, since Deno has no pnpm-catalog concept.
+///
+/// `deps_engine::setup::register_ecosystems` constructs one of these sharing the exact same
+/// `Arc<RegistryAccessPolicy>`/`Arc<NpmConfigCache>` handles it hands to `NpmEcosystem`'s own
+/// [`deps_npm::config::NpmParseContext`], so a `.npmrc` file ancestor-walked once for a
+/// `package.json` parse is reused, not re-read from disk, for a `deno.json` in the same
+/// workspace (and vice versa).
+#[non_exhaustive]
+#[derive(Debug, Clone, Default)]
+pub struct DenoParseContext {
+    /// Gates every workspace-declared alternate registry this parse's `.npmrc` resolution
+    /// constructs.
+    pub policy: Arc<RegistryAccessPolicy>,
+    /// Memoizes each distinct `.npmrc` file's raw, unvalidated contents across every parse
+    /// that reads it — shared with `deps-npm`'s own cache instance in production (see this
+    /// type's own doc).
+    pub config_cache: Arc<deps_npm::config::NpmConfigCache>,
+}
+
+impl DenoParseContext {
+    /// Constructs a `DenoParseContext` from its two required fields.
+    ///
+    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
+    /// this crate, so every other crate must go through this constructor instead.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::net_policy::RegistryAccessPolicy;
+    /// use deps_deno::parser::DenoParseContext;
+    /// use deps_npm::config::NpmConfigCache;
+    /// use std::sync::Arc;
+    ///
+    /// let ctx = DenoParseContext::new(
+    ///     Arc::new(RegistryAccessPolicy::default()),
+    ///     Arc::new(NpmConfigCache::new()),
+    /// );
+    /// assert!(Arc::strong_count(&ctx.policy) >= 1);
+    /// ```
+    #[must_use]
+    pub const fn new(
+        policy: Arc<RegistryAccessPolicy>,
+        config_cache: Arc<deps_npm::config::NpmConfigCache>,
+    ) -> Self {
+        Self {
+            policy,
+            config_cache,
+        }
+    }
+
+    /// Constructs a context sharing `policy` with a fresh, private `.npmrc` memoization cache
+    /// (impl-critic #1 follow-up to #1212's S5 fix).
+    ///
+    /// For a caller that needs to thread a live policy through without itself depending on
+    /// `deps-npm` — `deps_engine::setup::register_ecosystems`'s deno-without-npm build
+    /// configuration (`#[cfg(all(feature = "deno", not(feature = "npm")))]`) cannot name
+    /// `deps_npm::config::NpmConfigCache` directly there, since `deps-engine`'s own `deps-npm`
+    /// dependency is optional and gated behind its *own* `npm` feature, which is off in that
+    /// configuration — `deps-deno` itself always depends on `deps-npm` unconditionally
+    /// (`DenoRegistry` delegates `npm:` specifiers to it), so this constructor can build the
+    /// cache internally where the type is always nameable.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::net_policy::RegistryAccessPolicy;
+    /// use deps_deno::parser::DenoParseContext;
+    /// use std::sync::Arc;
+    ///
+    /// let ctx = DenoParseContext::with_policy(Arc::new(RegistryAccessPolicy::default()));
+    /// assert!(Arc::strong_count(&ctx.policy) >= 1);
+    /// ```
+    #[must_use]
+    pub fn with_policy(policy: Arc<RegistryAccessPolicy>) -> Self {
+        Self::new(policy, Arc::new(deps_npm::config::NpmConfigCache::new()))
+    }
+}
 
 /// Result of parsing a `deno.json`/`deno.jsonc` file.
 #[non_exhaustive]
@@ -75,6 +159,44 @@ deps_core::impl_parse_result!(
 /// assert_eq!(result.dependencies[0].name, "jsr:@std/fs");
 /// ```
 pub fn parse_deno_json(content: &str, uri: &Url) -> Result<DenoParseResult> {
+    parse_deno_json_with_context(content, uri, &DenoParseContext::default())
+}
+
+/// Parses a `deno.json`/`deno.jsonc` file using `ctx`'s cached `.npmrc` resolution (#1212).
+///
+/// Classifies `npm:`-scheme imports against `ctx`'s cache instead of [`parse_deno_json`]'s
+/// fresh, non-persistent one — the production path, used by
+/// [`crate::ecosystem::DenoEcosystem::with_context`] so a `.npmrc` walked once for this
+/// workspace is reused across every reparse, and shared with `deps-npm`'s own cache instance
+/// when `deps_engine::setup::register_ecosystems` wires both up.
+///
+/// # Errors
+///
+/// Same as [`parse_deno_json`].
+///
+/// # Examples
+///
+/// ```no_run
+/// use deps_deno::parser::{DenoParseContext, parse_deno_json_with_context};
+/// use url::Url;
+///
+/// let json = r#"{
+///   "imports": {
+///     "@std/fs": "jsr:@std/fs@^1.0"
+///   }
+/// }"#;
+/// let uri = Url::from_file_path("/project/deno.json").unwrap();
+/// let ctx = DenoParseContext::default();
+///
+/// let result = parse_deno_json_with_context(json, &uri, &ctx).unwrap();
+/// assert_eq!(result.dependencies.len(), 1);
+/// assert_eq!(result.dependencies[0].name, "jsr:@std/fs");
+/// ```
+pub fn parse_deno_json_with_context(
+    content: &str,
+    uri: &Url,
+    ctx: &DenoParseContext,
+) -> Result<DenoParseResult> {
     let ast = parse_to_ast(
         content,
         &CollectOptions::default(),
@@ -111,7 +233,7 @@ pub fn parse_deno_json(content: &str, uri: &Url) -> Result<DenoParseResult> {
         );
     }
 
-    classify_npm_imports(&mut dependencies, uri);
+    classify_npm_imports(&mut dependencies, uri, ctx);
 
     Ok(DenoParseResult {
         dependencies,
@@ -177,19 +299,13 @@ fn check_ast_nesting_depth(root: &Value<'_>, max_depth: usize) -> std::result::R
 /// shared `npm:` name grammar (issue #654 S3), and this is the same SSRF-gated, fail-closed
 /// resolution path `deps-npm`'s own parser uses, not a lighter reimplementation of it.
 ///
-/// TODO(follow-up to #1202, critic S6): a fresh, non-persistent
-/// [`deps_npm::config::NpmConfigCache`] plus a hardcoded default (public-only)
-/// [`deps_core::net_policy::RegistryAccessPolicy`] is used on every call — no context is
-/// threaded through `DenoEcosystem`, unlike `NpmEcosystem`'s own `context: NpmParseContext`
-/// field. Two consequences, both scoped out of this PR (needs `DenoEcosystem::with_context` +
-/// `deps_engine::setup::register_ecosystems` wiring, the same real architecture work
-/// `NpmEcosystem` already has): (1) every reparse re-walks and re-reads `.npmrc` from disk
-/// with no cache; (2) a workspace whose real server-side policy allows workspace registries
-/// still gets Deno's own hardcoded fail-closed default, so the *same* `.npmrc` scope entry
-/// can resolve to a fetchable `AlternateRegistry` via `package.json` but a fail-closed
-/// `CustomRegistry` via `deno.json` in that one workspace — an inconsistency, not just a
-/// perf gap.
-fn classify_npm_imports(dependencies: &mut [DenoDependency], uri: &Url) {
+/// `ctx`'s policy/config-cache handles are threaded through from [`DenoParseContext`] (#1212)
+/// rather than constructed fresh here — in production, `deps_engine::setup::register_ecosystems`
+/// shares the exact same handles `NpmEcosystem` reads, so a `.npmrc` walked once for this
+/// workspace is reused across every reparse and both ecosystems, and a real server-side
+/// policy that allows workspace registries applies identically whether the `npm:` scope entry
+/// is read from a `package.json` or a `deno.json`.
+fn classify_npm_imports(dependencies: &mut [DenoDependency], uri: &Url, ctx: &DenoParseContext) {
     let Some(manifest_dir) = deps_core::lockfile::resolve_manifest_file_path(uri)
         .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
     else {
@@ -204,9 +320,7 @@ fn classify_npm_imports(dependencies: &mut [DenoDependency], uri: &Url) {
         return;
     }
 
-    let config_cache = deps_npm::config::NpmConfigCache::new();
-    let policy = deps_core::net_policy::RegistryAccessPolicy::default();
-    let npm_config = deps_npm::config::resolve(&manifest_dir, &config_cache, &policy);
+    let npm_config = deps_npm::config::resolve(&manifest_dir, &ctx.config_cache, &ctx.policy);
 
     for dep in dependencies {
         let Some((crate::specifier::Scheme::Npm, bare_name)) =
@@ -757,6 +871,104 @@ mod tests {
         assert!(
             formatter.suppress_package_url(&source),
             "a fail-closed CustomRegistry source must suppress the public-registry hover link"
+        );
+    }
+
+    /// #1212: `parse_deno_json_with_context` must resolve against `ctx`'s own policy, not a
+    /// hardcoded [`deps_core::net_policy::RegistryAccessPolicy::default`] — a
+    /// `WorkspaceRegistryAccess::All` policy (the real server-side config a workspace can set)
+    /// must resolve the same `.internal` scope entry [`test_npm_scoped_import_resolves_via_npmrc`]
+    /// fails closed under the default policy, this time to a fetchable `AlternateRegistry`.
+    /// Before this fix, `classify_npm_imports` always constructed its own default (public-only)
+    /// policy internally, so this workspace-level permission never reached `deno.json` parsing
+    /// at all, even though the identical `.npmrc` entry would resolve for a sibling
+    /// `package.json` once `NpmEcosystem`'s own policy handle allowed it.
+    #[test]
+    fn test_parse_deno_json_with_context_uses_injected_policy_not_hardcoded_default() {
+        use deps_core::net_policy::{RegistryAccessPolicy, WorkspaceRegistryAccess};
+
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join(".npmrc"),
+            "@acme-corp:registry=https://npm.acme.internal\n",
+        )
+        .unwrap();
+        let manifest_path = root.path().join("deno.json");
+        let uri = Url::from_file_path(&manifest_path).unwrap();
+        let json = r#"{"imports": {"secret": "npm:@acme-corp/secretpkg@^1.0.0"}}"#;
+
+        let ctx = DenoParseContext::new(
+            Arc::new(RegistryAccessPolicy::new(WorkspaceRegistryAccess::All)),
+            Arc::new(deps_npm::config::NpmConfigCache::new()),
+        );
+        let result = parse_deno_json_with_context(json, &uri, &ctx).unwrap();
+
+        assert_eq!(
+            result.dependencies[0].source,
+            deps_core::parser::DependencySource::AlternateRegistry {
+                index: "https://npm.acme.internal".to_string(),
+                mirrors_crates_io: false,
+            },
+            "an injected All-access policy must resolve the .internal scope entry, proving \
+             ctx's own policy — not a hardcoded default — drives classification"
+        );
+    }
+
+    /// #1212: two parses sharing the same [`DenoParseContext`] (thus the same
+    /// `Arc<NpmConfigCache>`) must both classify correctly off one underlying `.npmrc` read —
+    /// proving the shared cache is actually threaded through, not merely accepted and ignored.
+    /// Test-coverage gap (tester follow-up to #1212): the earlier version of this test only
+    /// re-read an *unchanged* `.npmrc` twice, which would pass identically even with a no-op
+    /// cache (a correctness check, not a caching check). Proves genuine cache reuse instead by
+    /// diffing `deps_core::fs_probe`'s process-global read counter (the same technique
+    /// `deps-core`'s own `MtimeFileCache` cache-hit tests use): the first call must read
+    /// `.npmrc` from disk once (priming the cache), and a second call sharing the same
+    /// `DenoParseContext` must do zero additional reads — proving `ctx.config_cache` is
+    /// genuinely threaded through `classify_npm_imports`, not accepted and silently ignored.
+    #[test]
+    fn test_parse_deno_json_with_context_shares_config_cache_across_calls() {
+        use deps_core::net_policy::RegistryAccessPolicy;
+
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join(".npmrc"),
+            "@acme-corp:registry=https://npm.acme.internal\n",
+        )
+        .unwrap();
+        let manifest_path = root.path().join("deno.json");
+        let uri = Url::from_file_path(&manifest_path).unwrap();
+        let json = r#"{"imports": {"secret": "npm:@acme-corp/secretpkg@^1.0.0"}}"#;
+
+        let ctx = DenoParseContext::new(
+            Arc::new(RegistryAccessPolicy::default()),
+            Arc::new(deps_npm::config::NpmConfigCache::new()),
+        );
+
+        // Prime the cache — this first call must read `.npmrc` from disk.
+        let first = parse_deno_json_with_context(json, &uri, &ctx).unwrap();
+        assert_eq!(
+            first.dependencies[0].source,
+            deps_core::parser::DependencySource::CustomRegistry {
+                url: "https://npm.acme.internal".to_string(),
+            }
+        );
+
+        let (_, reads_before) = deps_core::fs_probe::snapshot();
+        let second = parse_deno_json_with_context(json, &uri, &ctx).unwrap();
+        let (_, reads_after) = deps_core::fs_probe::snapshot();
+
+        assert_eq!(
+            reads_after, reads_before,
+            "a second parse sharing the same DenoParseContext must do zero additional file \
+             reads — the cache must be genuinely threaded through, not accepted and ignored"
+        );
+        assert_eq!(
+            second.dependencies[0].source,
+            deps_core::parser::DependencySource::CustomRegistry {
+                url: "https://npm.acme.internal".to_string(),
+            }
         );
     }
 

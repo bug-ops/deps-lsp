@@ -719,6 +719,11 @@ impl ServerState {
         let lockfile_cache = Arc::new(LockFileCache::new());
         let ecosystem_registry = Arc::new(EcosystemRegistry::new());
 
+        // Shares this server's one long-lived `lockfile_cache` with `ComposerEcosystem`'s own
+        // classification-time `composer.lock` read (#1212 impl-critic follow-up), so it hits
+        // the same mtime-keyed cache `load_resolved_versions` already reads instead of parsing
+        // the file independently on every reparse.
+        let runtime = runtime.with_lockfile_cache(Arc::clone(&lockfile_cache));
         let workspace_registry_ecosystems =
             crate::register_ecosystems(&ecosystem_registry, Arc::clone(&cache), &runtime);
 

@@ -35,14 +35,25 @@ dependency resolved this way is never sent to Packagist, drops its public-regist
 link, and is excluded from OSV vulnerability scanning against the public package name
 (resolves #1202).
 
-**Known limitation**: a bare `vcs`/`path`/`artifact` repository with no `only` filter is
-*not* classified — an earlier vendor-substring URL heuristic covered this case but produced
-false positives that silently disabled OSV scanning for unrelated public packages sharing a
-GitHub org with a private repository's URL (e.g. one `vcs` entry for
-`github.com/acme/internal` incorrectly reclassifying an unrelated public `acme/`-scoped
-package too). The heuristic was removed rather than fixed; this case is tracked as a
-follow-up, likely via `composer.lock`'s already-parsed per-package `source.type` mapping
-for the common case where a lockfile is present.
+A bare `vcs`/`path`/`artifact` repository entry with no `only` filter has no static
+per-package name binding in `composer.json` itself (Composer tries every declared
+repository, in order, for any required package) — an earlier vendor-substring URL heuristic
+covered this case but produced false positives that silently disabled OSV scanning for
+unrelated public packages sharing a GitHub org with a private repository's URL (e.g. one
+`vcs` entry for `github.com/acme/internal` incorrectly reclassifying an unrelated public
+`acme/`-scoped package too). The heuristic was removed rather than fixed. Instead, when a
+bare repository of this kind is declared, an ancestor `composer.lock` (once `composer
+install` has run) is cross-checked for the affected dependency's own recorded
+`source.type`, and only `"path"` is trusted as a non-registry signal — never `"git"`, since
+`composer.lock` records a `"git"` source for essentially every ordinary Packagist-resolved
+package too (Packagist itself mirrors GitHub/GitLab/Bitbucket-hosted packages), so it cannot
+distinguish a genuinely private package from an ordinary public one (resolves #1212).
+
+**Known limitation**: the `vcs`-repository case from #1202's original report (a private
+git-hosted package, no lockfile equivalent to Path's unambiguous signal) remains an accepted
+gap, as does a lockless manifest (no `composer.lock` present) and the `artifact` repository
+type (Composer's lock records an `artifact`-sourced package under `dist`, not `source`, so
+this repository kind can never trigger the override).
 
 ## Deprecation & Abandoned Packages
 

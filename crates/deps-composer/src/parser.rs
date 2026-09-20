@@ -112,6 +112,93 @@ pub fn is_platform_package(name: &str) -> bool {
 /// assert_eq!(result.dependencies[0].name, "symfony/console");
 /// ```
 pub fn parse_composer_json(content: &str, uri: &Url) -> Result<ComposerParseResult> {
+    parse_composer_json_inner(content, uri).map(|(result, _)| result)
+}
+
+/// Parses a composer.json file, then cross-checks against `composer.lock` when needed (#1212).
+///
+/// When the manifest declares a bare (no `only` filter) `vcs`/`path`/`artifact` repository,
+/// every dependency left `Registry`-classified is cross-checked against an ancestor
+/// `composer.lock`'s own per-package `source.type` field.
+///
+/// A bare repository entry has no static per-package name binding in the Composer manifest
+/// format at all (Composer tries every declared repository, in order, for any required
+/// package), so [`parse_composer_json`] deliberately leaves every such dependency `Registry`
+/// (see `ComposerRepository::only`'s doc). `composer.lock`, once `composer install` has run,
+/// is the one place that records which source actually resolved a given package — this
+/// consults only that explicit, per-package field, never a URL/vendor substring heuristic (the
+/// kind #1211 removed for false positives). Falls back to [`parse_composer_json`]'s behavior
+/// verbatim when no bare repository is declared, or when no lock file is present/parseable.
+///
+/// Only overrides to [`deps_core::parser::DependencySource::Path`], never `Git` — see
+/// `apply_lockfile_classification`'s doc for why a lock entry's `source.type == "git"` is not
+/// a trustworthy non-registry signal on its own.
+///
+/// Known limitation (impl-critic minor, documented not fixed): the ancestor lockfile lookup
+/// (`LockFileProvider::locate_lockfile`, shared with every other lockfile-aware ecosystem) can
+/// walk up to 5 directory levels, so a manifest with no `composer.lock` of its own in an
+/// unconventional monorepo layout could adopt an unrelated parent directory's lock file. This
+/// is the same pre-existing ancestor-walk behavior `deps-lsp`'s in-use-version resolution
+/// already relies on for every ecosystem, not a new risk this fix introduces.
+///
+/// `lockfile_cache` is read through, never bypassed with a fresh read (impl-critic follow-up):
+/// `composer.lock` can be large and this runs on every reparse, so a raw
+/// `LockFileProvider::parse_lockfile` call here would re-stat, re-read, and re-parse it on
+/// every keystroke, and a second time relative to whatever else in this process already caches
+/// it by mtime (e.g. `deps-lsp`'s own in-use-version resolution) — [`crate::ecosystem::ComposerEcosystem::with_context`]
+/// shares one cache instance between both.
+///
+/// # Errors
+///
+/// Returns an error if JSON parsing fails. A missing or unparseable `composer.lock` is not an
+/// error — classification simply falls back to `Registry` for the affected dependencies.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use deps_composer::parser::parse_composer_json_with_lockfile;
+/// # use deps_core::lockfile::LockFileCache;
+/// # use url::Url;
+/// # #[tokio::main]
+/// # async fn main() {
+/// let json = r#"{
+///   "require": {
+///     "symfony/console": "^6.0"
+///   }
+/// }"#;
+/// let uri = Url::from_file_path("/project/composer.json").unwrap();
+/// let lockfile_cache = LockFileCache::new();
+///
+/// let result = parse_composer_json_with_lockfile(json, &uri, &lockfile_cache)
+///     .await
+///     .unwrap();
+/// assert_eq!(result.dependencies.len(), 1);
+/// assert_eq!(result.dependencies[0].name, "symfony/console");
+/// # }
+/// ```
+pub async fn parse_composer_json_with_lockfile(
+    content: &str,
+    uri: &Url,
+    lockfile_cache: &deps_core::lockfile::LockFileCache,
+) -> Result<ComposerParseResult> {
+    let (mut result, has_bare_repo) = parse_composer_json_inner(content, uri)?;
+    if has_bare_repo {
+        use deps_core::lockfile::LockFileProvider;
+        let provider = crate::lockfile::ComposerLockParser;
+        if let Some(lock_path) = provider.locate_lockfile(uri)
+            && let Ok(resolved) = lockfile_cache.get_or_parse(&provider, &lock_path).await
+        {
+            apply_lockfile_classification(&mut result.dependencies, &resolved);
+        }
+    }
+    Ok(result)
+}
+
+/// Shared parsing body for [`parse_composer_json`]/[`parse_composer_json_with_lockfile`],
+/// additionally reporting whether the manifest declares a bare (no `only`) `vcs`/`path`/
+/// `artifact` repository (see [`has_bare_non_registry_repository`]) so the async wrapper knows
+/// whether consulting `composer.lock` is even worth the I/O.
+fn parse_composer_json_inner(content: &str, uri: &Url) -> Result<(ComposerParseResult, bool)> {
     let root: Value = deps_core::parse_json_checked(content.as_bytes())?;
 
     let line_table = LineOffsetTable::new(content);
@@ -152,6 +239,7 @@ pub fn parse_composer_json(content: &str, uri: &Url) -> Result<ComposerParseResu
     }
 
     let (repositories, packagist_disabled) = parse_repositories(&root);
+    let has_bare_repo = has_bare_non_registry_repository(&repositories);
     if !repositories.is_empty() || packagist_disabled {
         classify_repositories(&mut dependencies, &repositories, packagist_disabled);
     }
@@ -161,12 +249,15 @@ pub fn parse_composer_json(content: &str, uri: &Url) -> Result<ComposerParseResu
         .and_then(|v| v.as_str())
         .map(str::to_string);
 
-    Ok(ComposerParseResult {
-        dependencies,
-        uri: uri.clone(),
-        minimum_stability,
-        dependency_truncation: budget.truncation(),
-    })
+    Ok((
+        ComposerParseResult {
+            dependencies,
+            uri: uri.clone(),
+            minimum_stability,
+            dependency_truncation: budget.truncation(),
+        },
+        has_bare_repo,
+    ))
 }
 
 /// Parses a single dependency section and extracts positions, filtering platform packages.
@@ -408,6 +499,63 @@ fn classify_repositories(
     }
 }
 
+/// Returns true if any declared repository is a bare `vcs`/`path`/`artifact` entry — one with
+/// no `only` filter at all (#1212). This is the trigger [`parse_composer_json_with_lockfile`]
+/// uses to decide whether consulting `composer.lock` is worthwhile: a `Package`-kind entry
+/// already carries an exact name and never needs this, and a `vcs`/`path`/`artifact` entry
+/// *with* an `only` filter was already classified by [`classify_repositories`] above.
+///
+/// Known limitation (impl-critic minor, documented not fixed): a bare `artifact` repository
+/// triggers this the same as `vcs`/`path`, but [`crate::lockfile::parse_composer_lock`] only
+/// maps a lock entry's `source.type` of `"git"`/`"path"` — an artifact-sourced package's lock
+/// entry has no `source` block at all (only `dist`), so [`apply_lockfile_classification`] can
+/// never actually reclassify one. Harmless (a wasted lockfile read, never a wrong answer), so
+/// left as-is rather than special-cased out of this trigger.
+fn has_bare_non_registry_repository(repositories: &[ComposerRepository]) -> bool {
+    repositories.iter().any(|repo| {
+        repo.only.is_none()
+            && matches!(
+                repo.kind,
+                ComposerRepositoryKind::Vcs
+                    | ComposerRepositoryKind::Path
+                    | ComposerRepositoryKind::Artifact
+            )
+    })
+}
+
+/// Overrides a still-`Registry`-classified dependency's source using `composer.lock`'s own
+/// per-package `source.type` (#1212, see [`parse_composer_json_with_lockfile`]).
+///
+/// Only `ResolvedSource::Path` is treated as a signal here — deliberately *not*
+/// `ResolvedSource::Git`, even though [`crate::lockfile::parse_composer_lock`] does map a
+/// lock entry's `"git"` `source.type` to it. `composer.lock` records a real git checkout's
+/// `source` block for essentially every ordinary Packagist-resolved package too (Packagist
+/// itself mirrors GitHub/GitLab/Bitbucket-hosted packages), so `source.type == "git"` alone
+/// cannot distinguish a genuinely private/non-registry package from `symfony/console`. Since
+/// this function scans *every* still-`Registry` dependency once triggered (not only the one
+/// named by the bare repository), trusting that ambiguous signal would reclassify ordinary
+/// public packages present in the same lock file — the exact false-positive class #1211
+/// removed the URL-substring heuristic for. `source.type == "path"` has no such ambiguity: no
+/// Packagist-resolved package is ever recorded that way, only a genuine local-path repository
+/// entry. (Impl-critic follow-up to the original #1212 direction, which specified both
+/// mappings — narrowed after review; see `test_lockfile_never_reclassifies_unrelated_git_sourced_registry_package`.)
+fn apply_lockfile_classification(
+    dependencies: &mut [ComposerDependency],
+    resolved: &deps_core::lockfile::ResolvedPackages,
+) {
+    for dep in dependencies {
+        if !matches!(dep.source, deps_core::parser::DependencySource::Registry) {
+            continue;
+        }
+        let Some(pkg) = resolved.get(&dep.name.as_str().to_lowercase()) else {
+            continue;
+        };
+        if let deps_core::lockfile::ResolvedSource::Path { path } = &pkg.source {
+            dep.source = deps_core::parser::DependencySource::Path { path: path.clone() };
+        }
+    }
+}
+
 /// Matches `name` against a Composer `only` entry, which may contain `*` wildcards
 /// (Composer's own documented glob syntax, e.g. `"acme/*"` — critic S2) matching any run of
 /// characters. No other glob metacharacter (`?`, `[...]`) is part of Composer's own syntax,
@@ -504,6 +652,299 @@ mod tests {
                 dep.name.as_str()
             );
         }
+    }
+
+    /// Impl-critic follow-up to #1212: a bare `vcs` repository's lock entry alone must never
+    /// reclassify a dependency to `Git` — `composer.lock`'s `source.type == "git"` is recorded
+    /// for essentially every ordinary Packagist-resolved package too (Packagist mirrors
+    /// GitHub/GitLab/Bitbucket), so it cannot distinguish `acme/secretpkg` (genuinely private,
+    /// resolved only via the bare `vcs` repo) from an ordinary public package. This stays the
+    /// already-accepted `Registry` gap the original #1202 fix documented — see
+    /// [`apply_lockfile_classification`]'s doc.
+    #[tokio::test]
+    async fn test_lockfile_never_reclassifies_via_bare_vcs_repo_git_source() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manifest_path = temp_dir.path().join("composer.json");
+        let json = r#"{
+  "repositories": [
+    { "type": "vcs", "url": "ssh://git@git.acme.internal/private.git" }
+  ],
+  "require": {
+    "acme/secretpkg": "^1.0"
+  }
+}"#;
+        tokio::fs::write(&manifest_path, json).await.unwrap();
+        let lock_json = r#"{
+  "packages": [
+    {
+      "name": "acme/secretpkg",
+      "version": "1.0.0",
+      "source": {
+        "type": "git",
+        "url": "ssh://git@git.acme.internal/private.git",
+        "reference": "deadbeef"
+      }
+    }
+  ],
+  "packages-dev": []
+}"#;
+        tokio::fs::write(temp_dir.path().join("composer.lock"), lock_json)
+            .await
+            .unwrap();
+
+        let uri = Url::from_file_path(&manifest_path).unwrap();
+        let lockfile_cache = deps_core::lockfile::LockFileCache::new();
+        let result = parse_composer_json_with_lockfile(json, &uri, &lockfile_cache)
+            .await
+            .unwrap();
+        assert_eq!(
+            result.dependencies[0].source,
+            deps_core::parser::DependencySource::Registry,
+            "a lock entry's source.type == \"git\" alone must never override classification, \
+             even for the exact package a bare vcs repository was declared for"
+        );
+    }
+
+    /// Impl-critic follow-up to #1212 (the regression the team lead's review flagged): a bare
+    /// `path` repository triggering the lockfile check must not sweep in an *unrelated*,
+    /// ordinary Packagist package that merely happens to share the same `composer.lock` and
+    /// have a `source.type: "git"` entry (true for essentially every real public package) —
+    /// the same false-positive bug class #1211 removed the URL-substring heuristic for.
+    #[tokio::test]
+    async fn test_lockfile_never_reclassifies_unrelated_git_sourced_registry_package() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manifest_path = temp_dir.path().join("composer.json");
+        let json = r#"{
+  "repositories": [
+    { "type": "path", "url": "../acme-local" }
+  ],
+  "require": {
+    "acme/localpkg": "^1.0",
+    "symfony/console": "^6.0"
+  }
+}"#;
+        tokio::fs::write(&manifest_path, json).await.unwrap();
+        let lock_json = r#"{
+  "packages": [
+    {
+      "name": "acme/localpkg",
+      "version": "1.0.0",
+      "source": {
+        "type": "path",
+        "url": "../acme-local"
+      }
+    },
+    {
+      "name": "symfony/console",
+      "version": "6.0.0",
+      "source": {
+        "type": "git",
+        "url": "https://github.com/symfony/console.git",
+        "reference": "abc123"
+      }
+    }
+  ],
+  "packages-dev": []
+}"#;
+        tokio::fs::write(temp_dir.path().join("composer.lock"), lock_json)
+            .await
+            .unwrap();
+
+        let uri = Url::from_file_path(&manifest_path).unwrap();
+        let lockfile_cache = deps_core::lockfile::LockFileCache::new();
+        let result = parse_composer_json_with_lockfile(json, &uri, &lockfile_cache)
+            .await
+            .unwrap();
+        let local = result
+            .dependencies
+            .iter()
+            .find(|d| d.name == "acme/localpkg")
+            .unwrap();
+        let console = result
+            .dependencies
+            .iter()
+            .find(|d| d.name == "symfony/console")
+            .unwrap();
+
+        assert_eq!(
+            local.source,
+            deps_core::parser::DependencySource::Path {
+                path: "../acme-local".into(),
+            },
+            "the genuinely path-sourced package must still be reclassified"
+        );
+        assert_eq!(
+            console.source,
+            deps_core::parser::DependencySource::Registry,
+            "an unrelated, ordinary git-hosted Packagist package must never be swept in just \
+             because a bare path repository elsewhere in the manifest triggered the lockfile \
+             check"
+        );
+    }
+
+    /// #1212: same as above, for a `path` repository/lock source.
+    #[tokio::test]
+    async fn test_lockfile_overrides_bare_repo_path_source() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manifest_path = temp_dir.path().join("composer.json");
+        let json = r#"{
+  "repositories": [
+    { "type": "path", "url": "../acme-local" }
+  ],
+  "require": {
+    "acme/localpkg": "^1.0"
+  }
+}"#;
+        tokio::fs::write(&manifest_path, json).await.unwrap();
+        let lock_json = r#"{
+  "packages": [
+    {
+      "name": "acme/localpkg",
+      "version": "1.0.0",
+      "source": {
+        "type": "path",
+        "url": "../acme-local"
+      }
+    }
+  ],
+  "packages-dev": []
+}"#;
+        tokio::fs::write(temp_dir.path().join("composer.lock"), lock_json)
+            .await
+            .unwrap();
+
+        let uri = Url::from_file_path(&manifest_path).unwrap();
+        let lockfile_cache = deps_core::lockfile::LockFileCache::new();
+        let result = parse_composer_json_with_lockfile(json, &uri, &lockfile_cache)
+            .await
+            .unwrap();
+        assert_eq!(
+            result.dependencies[0].source,
+            deps_core::parser::DependencySource::Path {
+                path: "../acme-local".into(),
+            }
+        );
+    }
+
+    /// #1212: a lockless manifest (no `composer.lock` on disk) is an accepted gap — a bare
+    /// repository with no lock file to consult must stay `Registry`, never guess.
+    #[tokio::test]
+    async fn test_lockless_manifest_with_bare_repo_stays_registry() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manifest_path = temp_dir.path().join("composer.json");
+        let json = r#"{
+  "repositories": [
+    { "type": "vcs", "url": "ssh://git@git.acme.internal/private.git" }
+  ],
+  "require": {
+    "acme/secretpkg": "^1.0"
+  }
+}"#;
+        tokio::fs::write(&manifest_path, json).await.unwrap();
+
+        let uri = Url::from_file_path(&manifest_path).unwrap();
+        let lockfile_cache = deps_core::lockfile::LockFileCache::new();
+        let result = parse_composer_json_with_lockfile(json, &uri, &lockfile_cache)
+            .await
+            .unwrap();
+        assert_eq!(
+            result.dependencies[0].source,
+            deps_core::parser::DependencySource::Registry
+        );
+    }
+
+    /// Test-coverage gap (tester follow-up to #1212): a bare repository is declared and
+    /// `composer.lock` is present, but this exact dependency has no entry in it at all (e.g. a
+    /// stale lock file from before the dependency was added) — `resolved.get(...)` must return
+    /// `None` and the dependency must stay `Registry`, not panic or misclassify.
+    #[tokio::test]
+    async fn test_bare_repo_with_lockfile_present_but_dependency_absent_from_lock() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manifest_path = temp_dir.path().join("composer.json");
+        let json = r#"{
+  "repositories": [
+    { "type": "path", "url": "../acme-local" }
+  ],
+  "require": {
+    "acme/notinlock": "^1.0"
+  }
+}"#;
+        tokio::fs::write(&manifest_path, json).await.unwrap();
+        // composer.lock exists (proving the lockfile IS consulted) but has no entry for
+        // acme/notinlock at all.
+        let lock_json = r#"{
+  "packages": [
+    {
+      "name": "symfony/console",
+      "version": "6.0.0",
+      "source": { "type": "git", "url": "https://github.com/symfony/console.git", "reference": "abc123" }
+    }
+  ],
+  "packages-dev": []
+}"#;
+        tokio::fs::write(temp_dir.path().join("composer.lock"), lock_json)
+            .await
+            .unwrap();
+
+        let uri = Url::from_file_path(&manifest_path).unwrap();
+        let lockfile_cache = deps_core::lockfile::LockFileCache::new();
+        let result = parse_composer_json_with_lockfile(json, &uri, &lockfile_cache)
+            .await
+            .unwrap();
+        assert_eq!(
+            result.dependencies[0].source,
+            deps_core::parser::DependencySource::Registry,
+            "a dependency absent from an otherwise-present composer.lock must stay Registry, \
+             not panic or guess"
+        );
+    }
+
+    /// #1212: the lockfile override only fires when a bare non-registry repository is
+    /// declared — a manifest with no `repositories` at all must never consult `composer.lock`,
+    /// even when the lock file's `source.type` for an ordinary registry package happens to be
+    /// `"git"` (true for virtually every Packagist package, since Packagist mirrors GitHub).
+    /// Consulting it unconditionally would silently disable OSV scanning for every dependency,
+    /// the same false-positive bug class #1211 removed the URL-substring heuristic for.
+    #[tokio::test]
+    async fn test_lockfile_not_consulted_without_bare_repository() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manifest_path = temp_dir.path().join("composer.json");
+        let json = r#"{
+  "require": {
+    "symfony/console": "^6.0"
+  }
+}"#;
+        tokio::fs::write(&manifest_path, json).await.unwrap();
+        let lock_json = r#"{
+  "packages": [
+    {
+      "name": "symfony/console",
+      "version": "6.0.0",
+      "source": {
+        "type": "git",
+        "url": "https://github.com/symfony/console.git",
+        "reference": "abc123"
+      }
+    }
+  ],
+  "packages-dev": []
+}"#;
+        tokio::fs::write(temp_dir.path().join("composer.lock"), lock_json)
+            .await
+            .unwrap();
+
+        let uri = Url::from_file_path(&manifest_path).unwrap();
+        let lockfile_cache = deps_core::lockfile::LockFileCache::new();
+        let result = parse_composer_json_with_lockfile(json, &uri, &lockfile_cache)
+            .await
+            .unwrap();
+        assert_eq!(
+            result.dependencies[0].source,
+            deps_core::parser::DependencySource::Registry,
+            "no bare repository is declared, so composer.lock must never be consulted for \
+             classification — every Packagist package's lock entry also has source.type \
+             \"git\", which would otherwise misclassify it"
+        );
     }
 
     /// Critic S2: `only` supports Composer's own `*` wildcard glob syntax.
