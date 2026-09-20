@@ -202,3 +202,10 @@ path = "fuzz_targets/redact_userinfo.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "redact_declaration_key"
+path = "fuzz_targets/redact_declaration_key.rs"
+test = false
+doc = false
+bench = false
