@@ -2,7 +2,7 @@
 
 # Fetches the pre-built deps-cli release binary for the target architecture and verifies it
 # against its published SHA256 checksum, mirroring scripts/install-deps-cli.sh's approach.
-FROM alpine:3.22 AS fetch
+FROM alpine:3.22@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8 AS fetch
 
 # apk upgrade first: the alpine:3.22 layer can be stale relative to its own repo snapshot,
 # shipping an already-patched CVE otherwise (e.g. CVE-2026-14456 in libssl3/libcrypto3).
@@ -38,7 +38,7 @@ RUN set -eu; \
 	tar -xzf "${archive}" deps-cli; \
 	chmod +x deps-cli
 
-FROM alpine:3.22
+FROM alpine:3.22@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8
 
 RUN apk upgrade --no-cache && apk add --no-cache bash ca-certificates
 

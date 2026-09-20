@@ -176,6 +176,47 @@ jobs:
             deps-lsp-${{ matrix.target }}.*
             deps-cli-${{ matrix.target }}.*
 
+  generate-sbom:
+    name: Generate SBOM
+    needs: create-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3  # v1
+        with:
+          cache: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install cargo-cyclonedx
+        uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
+        with:
+          tool: cargo-cyclonedx
+
+      - name: Generate CycloneDX SBOM for release binaries
+        # `--describe binaries`: model the released deps-lsp/deps-cli binaries as actually
+        # built by build-binaries (default features), not every workspace crate. Output
+        # filename is `<crate>_bin.cdx.json` (cargo-cyclonedx 0.5.9's fixed naming for a
+        # `[[bin]]` target under --describe binaries), verified locally before relying on it.
+        run: |
+          cargo cyclonedx --format json --spec-version 1.5 --describe binaries --manifest-path crates/deps-lsp/Cargo.toml
+          cargo cyclonedx --format json --spec-version 1.5 --describe binaries --manifest-path crates/deps-cli/Cargo.toml
+          mv crates/deps-lsp/deps-lsp_bin.cdx.json deps-lsp.cdx.json
+          mv crates/deps-cli/deps-cli_bin.cdx.json deps-cli.cdx.json
+          shasum -a 256 deps-lsp.cdx.json > deps-lsp.cdx.json.sha256
+          shasum -a 256 deps-cli.cdx.json > deps-cli.cdx.json.sha256
+
+      - name: Upload SBOM to release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          files: |
+            deps-lsp.cdx.json*
+            deps-cli.cdx.json*
+
   scan-github-action-image:
     name: Scan GitHub Action Image
     needs: [create-release, build-binaries]
