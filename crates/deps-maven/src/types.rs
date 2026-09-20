@@ -5,7 +5,7 @@ use std::any::Any;
 
 /// A single `<dependency>` declaration parsed from a `pom.xml`.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct MavenDependency {
     /// Maven `groupId`.
     pub group_id: String,
@@ -24,6 +24,30 @@ pub struct MavenDependency {
     /// Resolved source (#1202): `Path` for a `scope: system` dependency's `<systemPath>`
     /// (an explicit, per-dependency local-jar binding), `Registry` otherwise.
     pub source: deps_core::parser::DependencySource,
+}
+
+impl std::fmt::Debug for MavenDependency {
+    /// Manual, not derived: `group_id`/`artifact_id` are raw coordinate segments that can carry
+    /// a credential via property interpolation (`group:artifact:secret@host`) — the same leak
+    /// class `PackageName`'s own `Debug` already redacts for `name` (#1220, mirrors #1217/#1219).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MavenDependency")
+            .field(
+                "group_id",
+                &deps_core::net_policy::redact_declaration_key(&self.group_id),
+            )
+            .field(
+                "artifact_id",
+                &deps_core::net_policy::redact_declaration_key(&self.artifact_id),
+            )
+            .field("name", &self.name)
+            .field("name_range", &self.name_range)
+            .field("version_req", &self.version_req)
+            .field("version_range", &self.version_range)
+            .field("scope", &self.scope)
+            .field("source", &self.source)
+            .finish()
+    }
 }
 
 // TODO(follow-up to #1202): `pom.xml`'s `<repositories>`/`<repository><url>file://...</url>`
@@ -123,7 +147,7 @@ impl MavenVersion {
 
 /// Artifact metadata as returned by Maven Central's search API.
 #[non_exhaustive]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ArtifactInfo {
     /// Maven `groupId`.
     pub group_id: String,
@@ -137,6 +161,28 @@ pub struct ArtifactInfo {
     pub latest_version: deps_core::ConcreteVersion,
     /// Source repository URL, if known.
     pub repository: Option<String>,
+}
+
+impl std::fmt::Debug for ArtifactInfo {
+    /// Manual, not derived: same `group_id`/`artifact_id` leak class as
+    /// [`MavenDependency`]'s manual `Debug` impl (#1220) — this struct sits next to a
+    /// redacted `name` too.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ArtifactInfo")
+            .field(
+                "group_id",
+                &deps_core::net_policy::redact_declaration_key(&self.group_id),
+            )
+            .field(
+                "artifact_id",
+                &deps_core::net_policy::redact_declaration_key(&self.artifact_id),
+            )
+            .field("name", &self.name)
+            .field("description", &self.description)
+            .field("latest_version", &self.latest_version)
+            .field("repository", &self.repository)
+            .finish()
+    }
 }
 
 impl ArtifactInfo {
@@ -399,5 +445,41 @@ mod tests {
         assert!(info.repository().is_none());
         assert!(info.documentation().is_none());
         assert!(info.as_any().is::<ArtifactInfo>());
+    }
+
+    #[test]
+    fn test_maven_dependency_debug_redacts_credential_shaped_group_id() {
+        let dep = MavenDependency {
+            group_id: "org.example:secretA@hostA.internal".into(),
+            artifact_id: "artifact:secretB@hostB.internal".into(),
+            name: "org.example:artifact".into(),
+            name_range: Range::default(),
+            version_req: None,
+            version_range: None,
+            scope: MavenScope::Compile,
+            source: deps_core::parser::DependencySource::Registry,
+        };
+        let rendered = format!("{dep:?}");
+        assert!(!rendered.contains("secretA"));
+        assert!(!rendered.contains("secretB"));
+        assert!(rendered.contains(r#"group_id: "***@hostA.internal""#));
+        assert!(rendered.contains(r#"artifact_id: "***@hostB.internal""#));
+    }
+
+    #[test]
+    fn test_artifact_info_debug_redacts_credential_shaped_group_id() {
+        let info = ArtifactInfo {
+            group_id: "org.example:secretA@hostA.internal".into(),
+            artifact_id: "artifact:secretB@hostB.internal".into(),
+            name: deps_core::PackageName::new("org.example:artifact"),
+            description: None,
+            latest_version: "1.0.0".into(),
+            repository: None,
+        };
+        let rendered = format!("{info:?}");
+        assert!(!rendered.contains("secretA"));
+        assert!(!rendered.contains("secretB"));
+        assert!(rendered.contains(r#"group_id: "***@hostA.internal""#));
+        assert!(rendered.contains(r#"artifact_id: "***@hostB.internal""#));
     }
 }

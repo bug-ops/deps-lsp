@@ -6,7 +6,7 @@ pub use deps_maven::MavenVersion as GradleVersion;
 
 /// A single dependency declaration parsed from a Gradle build script.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct GradleDependency {
     /// Maven `groupId`.
     pub group_id: String,
@@ -29,6 +29,29 @@ pub struct GradleDependency {
     /// { }` evaluation (an arbitrary repo with no content filter) has no static per-package
     /// binding in the Gradle DSL at all, so those stay `Registry`.
     pub source: deps_core::parser::DependencySource,
+}
+
+impl std::fmt::Debug for GradleDependency {
+    /// Manual, not derived: same `group_id`/`artifact_id` leak class as
+    /// `deps_maven::MavenDependency`'s manual `Debug` impl (#1220).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GradleDependency")
+            .field(
+                "group_id",
+                &deps_core::net_policy::redact_declaration_key(&self.group_id),
+            )
+            .field(
+                "artifact_id",
+                &deps_core::net_policy::redact_declaration_key(&self.artifact_id),
+            )
+            .field("name", &self.name)
+            .field("name_range", &self.name_range)
+            .field("version_req", &self.version_req)
+            .field("version_range", &self.version_range)
+            .field("configuration", &self.configuration)
+            .field("source", &self.source)
+            .finish()
+    }
 }
 
 deps_core::impl_dependency!(GradleDependency {
@@ -114,5 +137,24 @@ mod tests {
         let version = GradleVersion::new("3.2.0".into()).with_published_at(published);
 
         assert_eq!(version.published_at(), Some(published));
+    }
+
+    #[test]
+    fn test_gradle_dependency_debug_redacts_credential_shaped_group_id() {
+        let dep = GradleDependency {
+            group_id: "org.example:secretA@hostA.internal".into(),
+            artifact_id: "artifact:secretB@hostB.internal".into(),
+            name: "org.example:artifact".into(),
+            name_range: Range::default(),
+            version_req: None,
+            version_range: None,
+            configuration: "implementation".into(),
+            source: deps_core::parser::DependencySource::Registry,
+        };
+        let rendered = format!("{dep:?}");
+        assert!(!rendered.contains("secretA"));
+        assert!(!rendered.contains("secretB"));
+        assert!(rendered.contains(r#"group_id: "***@hostA.internal""#));
+        assert!(rendered.contains(r#"artifact_id: "***@hostB.internal""#));
     }
 }
