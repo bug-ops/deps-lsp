@@ -8,12 +8,11 @@ use deps_core::github::{
     GithubTag, GithubTagsClient, ReleaseDatesCache, normalize_tag, paginate_tags,
     validate_owner_repo,
 };
+use deps_core::rate_limit::RateLimitGate;
 use deps_core::{DepsError, HttpCache, PackageName, PublishTime, Result};
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::types::GithubActionsVersion;
 
@@ -39,44 +38,6 @@ const MAX_IN_FLIGHT_ENTRIES: usize = 256;
 /// (critic C1) — long enough to meaningfully stop hammering a workspace with many unique
 /// actions, short enough to recover without a restart.
 const RATE_LIMIT_COOLDOWN_SECS: u64 = 300;
-
-fn now_epoch_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-}
-
-/// Local, process-lifetime gate that short-circuits further GitHub API requests once a
-/// 403-without-token response has been seen, instead of letting every remaining unique
-/// repository in a workspace fire (and lose) its own doomed request (critic C1).
-///
-/// `HttpCache::get_cached_with_headers_via` stores nothing on a failed fetch, so without
-/// this gate, per-repository in-flight coalescing alone does not help: each waiter still
-/// finds an empty cache and issues its own request once the first one fails.
-#[derive(Debug, Default)]
-struct RateLimitGate {
-    /// Unix-epoch seconds at which the gate clears; `0` means "not tripped".
-    reset_at: AtomicU64,
-}
-
-impl RateLimitGate {
-    fn is_tripped(&self) -> bool {
-        let reset_at = self.reset_at.load(Ordering::Relaxed);
-        reset_at != 0 && now_epoch_secs() < reset_at
-    }
-
-    fn trip(&self) {
-        self.reset_at.store(
-            now_epoch_secs() + RATE_LIMIT_COOLDOWN_SECS,
-            Ordering::Relaxed,
-        );
-    }
-
-    #[cfg(test)]
-    fn trip_until_epoch_secs(&self, reset_at: u64) {
-        self.reset_at.store(reset_at, Ordering::Relaxed);
-    }
-}
 
 /// Per-repository tag/SHA cross-reference.
 ///
@@ -134,6 +95,10 @@ pub struct GithubActionsRegistry {
     github: GithubTagsClient,
     tag_index: Arc<DashMap<PackageName, Arc<TagIndex>>>,
     in_flight: Arc<DashMap<PackageName, Arc<tokio::sync::Mutex<()>>>>,
+    /// `in_flight` only coalesces concurrent waiters on the *same* repository; it stores
+    /// nothing on a failed fetch, so each `get_versions` call for a different repository
+    /// still issues its own live request. This gate stops all of them from re-hitting a
+    /// 403'd GitHub endpoint at once.
     rate_limit: Arc<RateLimitGate>,
     /// Per-repository memoized GitHub Release publish times (#486, mirroring
     /// `deps-swift`'s identical need — see [`ReleaseDatesCache`]). `Arc` because
@@ -155,7 +120,7 @@ impl GithubActionsRegistry {
             github: GithubTagsClient::new(cache),
             tag_index: Arc::new(DashMap::new()),
             in_flight: Arc::new(DashMap::new()),
-            rate_limit: Arc::new(RateLimitGate::default()),
+            rate_limit: Arc::new(RateLimitGate::new(RATE_LIMIT_COOLDOWN_SECS)),
             release_dates: Arc::new(ReleaseDatesCache::new()),
         }
     }
@@ -177,7 +142,7 @@ impl GithubActionsRegistry {
             github: GithubTagsClient::for_test(cache, api_base, has_token),
             tag_index: Arc::new(DashMap::new()),
             in_flight: Arc::new(DashMap::new()),
-            rate_limit: Arc::new(RateLimitGate::default()),
+            rate_limit: Arc::new(RateLimitGate::new(RATE_LIMIT_COOLDOWN_SECS)),
             release_dates: Arc::new(ReleaseDatesCache::new()),
         }
     }
@@ -625,27 +590,7 @@ mod tests {
     // Pagination/validation helpers are now shared with `deps-swift` via
     // `deps_core::github` (#472); their unit tests moved there.
 
-    // --- RateLimitGate ---
-
-    #[test]
-    fn test_rate_limit_gate_starts_untripped() {
-        let gate = RateLimitGate::default();
-        assert!(!gate.is_tripped());
-    }
-
-    #[test]
-    fn test_rate_limit_gate_trips_and_stays_tripped_within_cooldown() {
-        let gate = RateLimitGate::default();
-        gate.trip();
-        assert!(gate.is_tripped());
-    }
-
-    #[test]
-    fn test_rate_limit_gate_clears_after_reset_time_passes() {
-        let gate = RateLimitGate::default();
-        gate.trip_until_epoch_secs(1); // far in the past
-        assert!(!gate.is_tripped());
-    }
+    // `RateLimitGate` mechanism tests moved to `deps_core::rate_limit` (#1205).
 
     fn mock_registry(base: &str, has_token: bool) -> GithubActionsRegistry {
         GithubActionsRegistry::for_test(Arc::new(HttpCache::new()), base, has_token)

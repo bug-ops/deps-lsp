@@ -16,11 +16,11 @@ use tracing::Instrument;
 
 /// Debounce window for coalescing a burst of `workspace/didChangeConfiguration`
 /// notifications (issue #592) into a single reparse — a settings-file save can emit
-/// several notifications in quick succession. Independent of the 100ms lifecycle debounce
-/// in `document::lifecycle::run_document_change_task`: `Loading` is only ever set inside
-/// the fetch window itself (see `fetch_registry_versions_for_change`), so this value only
-/// affects how many separate reparse rounds a burst produces, never a
-/// diagnostics-suppression window.
+/// several notifications in quick succession. Independent of
+/// [`super::lifecycle::DID_CHANGE_DEBOUNCE`] in `document::lifecycle::run_document_change_task`:
+/// `Loading` is only ever set inside the fetch window itself (see
+/// `fetch_registry_versions_for_change`), so this value only affects how many separate
+/// reparse rounds a burst produces, never a diagnostics-suppression window.
 pub(crate) const RECONFIGURE_DEBOUNCE: Duration = Duration::from_millis(250);
 
 /// Upper bound on how long a coalesced config-change reparse may be deferred by a

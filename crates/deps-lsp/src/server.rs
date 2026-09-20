@@ -752,7 +752,7 @@ impl LanguageServer for Backend {
                 let state = Arc::clone(&self.state);
                 let client = self.client.clone();
                 let config = Arc::clone(&self.config);
-                tokio::spawn(async move {
+                let worker = tokio::spawn(async move {
                     tokio::time::sleep(crate::document::reparse::RECONFIGURE_DEBOUNCE).await;
                     let superseded = state.config_generation() != generation;
                     // Security M3: a superseded worker normally defers to the newer one, but
@@ -777,6 +777,14 @@ impl LanguageServer for Backend {
                         config,
                     )
                     .await;
+                });
+                tokio::spawn(async move {
+                    if let Err(e) = worker.await {
+                        tracing::error!(
+                            "workspace/didChangeConfiguration reparse worker panicked ({e}); \
+                             open documents were not reparsed"
+                        );
+                    }
                 });
             }
             None => {

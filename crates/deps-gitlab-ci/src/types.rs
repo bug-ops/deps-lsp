@@ -73,10 +73,11 @@ pub enum HostRef {
     Unresolved(String),
     /// A host that validated successfully but whose route/admission was refused purely by a
     /// capacity limit (spec §4.6's per-document host cap, or the registry's process-wide
-    /// `MAX_GITLAB_ROUTES` cap) — carries the host's normalized origin. Deliberately distinct
-    /// from [`Self::Unresolved`] (#466 review M-a): the host genuinely *is* determinable, so
-    /// the diagnostic this produces must never suggest `registries.gitlab_instance_host` as
-    /// the fix — a capacity refusal needs fewer distinct hosts/includes, not that setting.
+    /// `deps_core::registry::MAX_ALTERNATE_REGISTRIES` cap) — carries the host's normalized
+    /// origin. Deliberately distinct from [`Self::Unresolved`] (#466 review M-a): the host
+    /// genuinely *is* determinable, so the diagnostic this produces must never suggest
+    /// `registries.gitlab_instance_host` as the fix — a capacity refusal needs fewer
+    /// distinct hosts/includes, not that setting.
     CapacityRefused(String),
     /// A host that would otherwise resolve, but whose class is blocked by the current
     /// `registries.workspace_registries` reachability policy. Deliberately distinct from

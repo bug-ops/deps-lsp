@@ -1025,6 +1025,18 @@ pub enum KeyShape {
     Opaque,
 }
 
+/// Outcome of a [`register_capped`]/[`register_capped_with_occupied`] call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapResult {
+    /// `make()` ran and its value was inserted (the `Vacant`, under-capacity arm).
+    Inserted,
+    /// `key` was already registered; the existing value stuck (`on_occupied` ran, if any).
+    AlreadyPresent,
+    /// `key` was absent but the map was at [`MAX_ALTERNATE_REGISTRIES`]; nothing was
+    /// inserted and a cap-reached `warn!` was emitted.
+    RefusedAtCapacity,
+}
+
 /// Registers `key` in a capacity-bounded alternate-client map, refusing (never evicting)
 /// once full.
 ///
@@ -1039,18 +1051,25 @@ pub enum KeyShape {
 /// `ecosystem` names the caller in the cap-reached log line (e.g. `"npm"`, `"PyPI"`).
 /// `key_shape` picks how `key` is rendered in that same line — see [`KeyShape`].
 ///
-/// Returns `true` when `make()` was inserted, `false` when `key` was already occupied or the
-/// map was at capacity.
+/// Returns [`CapResult::Inserted`] when `make()` was inserted, [`CapResult::AlreadyPresent`]
+/// when `key` was already occupied, or [`CapResult::RefusedAtCapacity`] when the map was at
+/// capacity.
 ///
 /// # Examples
 ///
 /// ```
 /// use dashmap::DashMap;
-/// use deps_core::registry::{KeyShape, register_capped};
+/// use deps_core::registry::{CapResult, KeyShape, register_capped};
 ///
 /// let map: DashMap<String, u32> = DashMap::new();
-/// assert!(register_capped(&map, "a".to_string(), "test", KeyShape::Opaque, || 1));
-/// assert!(!register_capped(&map, "a".to_string(), "test", KeyShape::Opaque, || 2));
+/// assert_eq!(
+///     register_capped(&map, "a".to_string(), "test", KeyShape::Opaque, || 1),
+///     CapResult::Inserted
+/// );
+/// assert_eq!(
+///     register_capped(&map, "a".to_string(), "test", KeyShape::Opaque, || 2),
+///     CapResult::AlreadyPresent
+/// );
 /// assert_eq!(*map.get("a").unwrap(), 1);
 /// ```
 pub fn register_capped<K, V>(
@@ -1059,7 +1078,7 @@ pub fn register_capped<K, V>(
     ecosystem: &'static str,
     key_shape: KeyShape,
     make: impl FnOnce() -> V,
-) -> bool
+) -> CapResult
 where
     K: Eq + Hash + AsRef<str>,
 {
@@ -1076,7 +1095,8 @@ where
 /// so gating it would strand a legitimate in-place update (e.g. a rotated credential) once
 /// the cap is hit for unrelated keys.
 ///
-/// Returns `true` when `make()` was inserted (the `Vacant` arm), `false` otherwise —
+/// Returns [`CapResult::Inserted`] when `make()` was inserted (the `Vacant` arm),
+/// [`CapResult::AlreadyPresent`] or [`CapResult::RefusedAtCapacity`] otherwise —
 /// `on_occupied` signals its own outcome (e.g. via `tracing::warn!`) rather than through this
 /// return value.
 ///
@@ -1084,11 +1104,11 @@ where
 ///
 /// ```
 /// use dashmap::DashMap;
-/// use deps_core::registry::{KeyShape, register_capped_with_occupied};
+/// use deps_core::registry::{CapResult, KeyShape, register_capped_with_occupied};
 ///
 /// let map: DashMap<String, u32> = DashMap::new();
 /// register_capped_with_occupied(&map, "a".to_string(), "test", KeyShape::Opaque, || 1, |_| {});
-/// register_capped_with_occupied(
+/// let outcome = register_capped_with_occupied(
 ///     &map,
 ///     "a".to_string(),
 ///     "test",
@@ -1096,6 +1116,7 @@ where
 ///     || 1,
 ///     |v| *v += 10,
 /// );
+/// assert_eq!(outcome, CapResult::AlreadyPresent);
 /// assert_eq!(*map.get("a").unwrap(), 11);
 /// ```
 pub fn register_capped_with_occupied<K, V>(
@@ -1105,7 +1126,7 @@ pub fn register_capped_with_occupied<K, V>(
     key_shape: KeyShape,
     make: impl FnOnce() -> V,
     on_occupied: impl FnOnce(&mut V),
-) -> bool
+) -> CapResult
 where
     K: Eq + Hash + AsRef<str>,
 {
@@ -1114,7 +1135,7 @@ where
     match map.entry(key) {
         Entry::Occupied(mut slot) => {
             on_occupied(slot.get_mut());
-            false
+            CapResult::AlreadyPresent
         }
         Entry::Vacant(slot) => {
             if at_capacity {
@@ -1132,10 +1153,10 @@ where
                     cap = MAX_ALTERNATE_REGISTRIES,
                     "{ecosystem} alternate registry cap reached; not registering a new entry"
                 );
-                return false;
+                return CapResult::RefusedAtCapacity;
             }
             slot.insert(make());
-            true
+            CapResult::Inserted
         }
     }
 }
@@ -1601,13 +1622,16 @@ mod tests {
     fn test_register_capped_url_shape_redacts_credential_on_cap_reached() {
         let map: DashMap<String, usize> = DashMap::new();
         for i in 0..MAX_ALTERNATE_REGISTRIES {
-            assert!(register_capped(
-                &map,
-                format!("https://index{i}.example"),
-                "test",
-                KeyShape::Url,
-                || i,
-            ));
+            assert_eq!(
+                register_capped(
+                    &map,
+                    format!("https://index{i}.example"),
+                    "test",
+                    KeyShape::Url,
+                    || i,
+                ),
+                CapResult::Inserted
+            );
         }
 
         let log = crate::test_util::capture_tracing_output(|| {
@@ -1639,7 +1663,10 @@ mod tests {
         let map: DashMap<String, usize> = DashMap::new();
         for i in 0..MAX_ALTERNATE_REGISTRIES {
             let key = hash_routing_key("test-chain", std::iter::once(i.to_string().as_str()));
-            assert!(register_capped(&map, key, "test", KeyShape::Opaque, || i));
+            assert_eq!(
+                register_capped(&map, key, "test", KeyShape::Opaque, || i),
+                CapResult::Inserted
+            );
         }
 
         let overflow_key = hash_routing_key("test-chain", std::iter::once("overflow"));
