@@ -9,7 +9,6 @@ use url::Url;
 
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
-#[cfg(feature = "lsp-responses")]
 use deps_core::{
     Ecosystem, PackageName, ParseResult as ParseResultTrait, Registry, Result,
     diagnostic::{Diagnostic, Severity},
