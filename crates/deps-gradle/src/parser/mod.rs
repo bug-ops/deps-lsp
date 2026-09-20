@@ -11,8 +11,9 @@ pub mod settings;
 use crate::types::GradleDependency;
 use deps_core::Result;
 use deps_core::position::{Position, Range};
-use regex::Captures;
+use regex::{Captures, Regex};
 use std::collections::HashMap;
+use std::sync::LazyLock;
 use url::Url;
 
 pub use deps_core::lsp_helpers::LineOffsetTable;
@@ -128,6 +129,7 @@ pub(crate) fn build_dependency(
         version_req,
         version_range,
         configuration: config.to_string(),
+        source: deps_core::parser::DependencySource::Registry,
     }
 }
 
@@ -198,18 +200,27 @@ pub fn parse_gradle(content: &str, uri: &Url) -> Result<GradleParseResult> {
         });
     };
 
-    // Directory derived via `resolve_manifest_file_path` (#1090), not the raw `uri.path()`
-    // string used for dispatch above: that string has no scheme/host check, so joining it
-    // straight onto `load_gradle_properties` would let a non-file:/remote-host URI read a real
-    // gradle.properties from this process's local filesystem.
-    if (path.ends_with("build.gradle.kts") || path.ends_with("build.gradle"))
-        && let Some(dir) = deps_core::lockfile::resolve_manifest_file_path(uri)
+    if path.ends_with("build.gradle.kts") || path.ends_with("build.gradle") {
+        // Directory derived via `resolve_manifest_file_path` (#1090), not the raw `uri.path()`
+        // string used for dispatch above: that string has no scheme/host check, so joining it
+        // straight onto `load_gradle_properties` would let a non-file:/remote-host URI read a
+        // real gradle.properties from this process's local filesystem.
+        if let Some(dir) = deps_core::lockfile::resolve_manifest_file_path(uri)
             .as_deref()
             .and_then(std::path::Path::parent)
-    {
-        let props = properties::load_gradle_properties(dir);
-        if !props.is_empty() {
-            resolve_variables(&mut result.dependencies, &props);
+        {
+            let props = properties::load_gradle_properties(dir);
+            if !props.is_empty() {
+                resolve_variables(&mut result.dependencies, &props);
+            }
+        }
+
+        // #1212: `content { includeGroup(...) }`-restricted `repositories { }` entries are a
+        // real static per-group binding, unlike general-purpose `repositories { }` DSL
+        // evaluation — pure text analysis, no filesystem access needed.
+        let restrictions = parse_repository_content_restrictions(content);
+        if !restrictions.is_empty() {
+            apply_repository_content_restrictions(&mut result.dependencies, &restrictions);
         }
     }
 
@@ -224,6 +235,414 @@ deps_core::impl_parse_result!(
         dependency_truncation: dependency_truncation,
     }
 );
+
+/// One `content { includeGroup(...) }`-style restriction read from a `repositories { }` block
+/// (#1212), naming the repository's own declared `url` (empty when the block declares none,
+/// e.g. a named repository resolved by a plugin).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RepositoryContentRestriction {
+    /// The bound coordinate: a bare group id (`includeGroup`/`includeGroupByRegex`), or a
+    /// `"group:module"` pair (`includeModule`) matched against the dependency's exact
+    /// `group:artifact`.
+    pattern: String,
+    /// `true` when `pattern` is an `includeGroupByRegex` regular expression rather than an
+    /// exact `includeGroup`/`includeModule` match.
+    is_regex: bool,
+    /// The repository's own declared `url`, becoming `CustomRegistry`'s `url` field for a
+    /// matching dependency.
+    repository_url: String,
+}
+
+// Compile-time-constant patterns; a malformed literal is a build-visible programmer error,
+// not attacker-influenceable input.
+#[allow(clippy::expect_used)]
+static RE_INCLUDE_GROUP: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"includeGroup\s*\(\s*["']([^"']+)["']\s*\)"#).expect("RE_INCLUDE_GROUP")
+});
+// Same guarantee as RE_INCLUDE_GROUP above.
+#[allow(clippy::expect_used)]
+static RE_INCLUDE_GROUP_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"includeGroupByRegex\s*\(\s*["']([^"']+)["']\s*\)"#)
+        .expect("RE_INCLUDE_GROUP_REGEX")
+});
+// Same guarantee as RE_INCLUDE_GROUP above.
+#[allow(clippy::expect_used)]
+static RE_INCLUDE_MODULE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"includeModule\s*\(\s*["']([^"']+)["']\s*,\s*["']([^"']+)["']\s*\)"#)
+        .expect("RE_INCLUDE_MODULE")
+});
+/// Matches a repository's own `url` declaration inside its body: Kotlin's `url = uri("...")`/
+/// `url = "..."`, or Groovy's `url '...'`/`url "..."`/`url = '...'` — both DSLs tolerated. Also
+/// matches `setUrl("...")` and the Gradle 7/8 lazy-property idiom `url.set("...")`/
+/// `url.set(uri("..."))` (impl-critic #3 follow-up to #1212).
+// Same guarantee as RE_INCLUDE_GROUP above.
+#[allow(clippy::expect_used)]
+static RE_REPOSITORY_URL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?:\burl\s*=?\s*(?:uri\()?|\bsetUrl\s*\(\s*|\burl\.set\s*\(\s*(?:uri\()?)["']([^"']+)["']\)?"#,
+    )
+    .expect("RE_REPOSITORY_URL")
+});
+/// Matches a repository call's own parenthesized URL argument, positional
+/// (`maven("https://...")`) or named (`maven(url = "https://...")`) — G1 (impl-critic): the
+/// idiomatic Kotlin DSL form for a repo declared with a `content { }` filter, e.g. `maven(
+/// "https://...") { content { includeGroup("...") } }`. Anchored to the *whole* call-args text
+/// (via [`extract_call_paren_url`]'s own extraction, not this pattern) so an unexpected extra
+/// argument fails closed (no url) rather than guessing.
+// Same guarantee as RE_INCLUDE_GROUP above.
+#[allow(clippy::expect_used)]
+static RE_REPO_CALL_URL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^\s*(?:url\s*=\s*)?["']([^"']+)["']\s*$"#).expect("RE_REPO_CALL_URL")
+});
+
+/// Returns the byte index of the `}` matching the `{` at `open` (which must be a `{` byte),
+/// tracking brace depth only — no string/comment awareness, the same fidelity as the rest of
+/// this parser's line-scanning (a full Groovy/Kotlin lexer is out of scope, see
+/// [`GradleDependency`]'s `source` doc). `None` if the file has no matching close.
+///
+/// Known limitation (impl-critic minor, documented not fixed): a `{`/`}` character inside a
+/// `//` line comment or `/* */` block comment is counted as real nesting, desyncing the
+/// remaining scan for the rest of the file. Not fixed by comment-stripping here because a
+/// naive stripper would itself corrupt a `url = "https://..."` literal (`//` inside a URL is
+/// not a comment) — a correct fix needs quote-aware scanning, out of scope for this pass.
+fn find_matching_brace(text: &str, open: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    for (i, b) in text.as_bytes().iter().enumerate().skip(open) {
+        match b {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Byte ranges of every `buildscript { }` block found anywhere in `content` (#1212 impl-critic
+/// S1, regardless of nesting depth — this is a linear text scan, not a depth-aware walk): a
+/// `content { }` restriction declared inside `buildscript { repositories { ... } }` scopes
+/// *plugin* resolution, not the project's own `dependencies { }` — [`parse_repository_content_restrictions`]
+/// must never let it reclassify an unrelated project dependency.
+// Every slice bound comes from `str::find` of the ASCII literal "buildscript"/"{" or from
+// `find_matching_brace`'s brace byte position — always a char boundary.
+#[allow(clippy::string_slice)]
+fn find_buildscript_spans(content: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut search_from = 0usize;
+
+    while let Some(rel) = content[search_from..].find("buildscript") {
+        let kw_start = search_from + rel;
+        let after_kw = kw_start + "buildscript".len();
+
+        let preceded_by_ident_char = content
+            .as_bytes()
+            .get(kw_start.wrapping_sub(1))
+            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_');
+        if kw_start > 0 && preceded_by_ident_char {
+            search_from = after_kw;
+            continue;
+        }
+
+        let rest = &content[after_kw..];
+        let trimmed = rest.trim_start();
+        if !trimmed.starts_with('{') {
+            search_from = after_kw;
+            continue;
+        }
+        let open = after_kw + (rest.len() - trimmed.len());
+        let Some(close) = find_matching_brace(content, open) else {
+            break;
+        };
+
+        spans.push((kw_start, close));
+        search_from = close + 1;
+    }
+
+    spans
+}
+
+/// Scans `content` for every `repositories { }` block and, within each, every nested
+/// repository entry (`maven { ... }`, `ivy { ... }`, etc.) that declares a `content { }`
+/// restriction, returning one [`RepositoryContentRestriction`] per `includeGroup`/
+/// `includeGroupByRegex`/`includeModule` call found.
+///
+/// Skips any `repositories { }` block nested inside a `buildscript { }` block (#1212
+/// impl-critic S1, see [`find_buildscript_spans`]) — that scopes plugin resolution, not the
+/// project's own dependencies.
+///
+/// Known limitations (impl-critic minor, documented not fixed): only `includeGroup`/
+/// `includeGroupByRegex`/`includeModule` are read — Gradle's `exclusiveContent { }` wrapper and
+/// `includeGroupAndSubgroups` are not, narrower than the full `content { }` DSL surface. See
+/// also [`find_matching_brace`]'s doc for the comment-blindness limitation.
+// Every slice bound here comes from `str::find` of an ASCII literal ("repositories", "{") or
+// from `find_matching_brace`'s brace byte position — always a char boundary.
+#[allow(clippy::string_slice)]
+pub(crate) fn parse_repository_content_restrictions(
+    content: &str,
+) -> Vec<RepositoryContentRestriction> {
+    let mut restrictions = Vec::new();
+    let buildscript_spans = find_buildscript_spans(content);
+    let mut search_from = 0usize;
+
+    while let Some(rel) = content[search_from..].find("repositories") {
+        let kw_start = search_from + rel;
+        let after_kw = kw_start + "repositories".len();
+
+        // Skip a longer identifier merely containing "repositories" (e.g. a hypothetical
+        // "myRepositories" call) — never a real Gradle block.
+        let preceded_by_ident_char = content
+            .as_bytes()
+            .get(kw_start.wrapping_sub(1))
+            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_');
+        if kw_start > 0 && preceded_by_ident_char {
+            search_from = after_kw;
+            continue;
+        }
+
+        // S1: a `repositories { }` inside `buildscript { }` configures plugin resolution —
+        // skip straight past the whole enclosing `buildscript { }` block.
+        if let Some(&(_, span_end)) = buildscript_spans
+            .iter()
+            .find(|&&(start, end)| kw_start >= start && kw_start <= end)
+        {
+            search_from = span_end + 1;
+            continue;
+        }
+
+        let rest = &content[after_kw..];
+        let trimmed = rest.trim_start();
+        if !trimmed.starts_with('{') {
+            search_from = after_kw;
+            continue;
+        }
+        let open = after_kw + (rest.len() - trimmed.len());
+        let Some(close) = find_matching_brace(content, open) else {
+            break;
+        };
+
+        extract_repository_entries(&content[open + 1..close], &mut restrictions);
+        search_from = close + 1;
+    }
+
+    restrictions
+}
+
+/// Extracts a URL argument from the repository call's own parens immediately preceding `open`
+/// (only whitespace allowed between the call's closing `)` and the `{` at `open`) — G1
+/// (impl-critic): `maven("https://...") { }`/`maven(url = "https://...") { }`. `None` (not a
+/// guess) if no call parens immediately precede `open` at all (a bare `maven { }`/`google { }`
+/// shorthand), the parens are unbalanced, or the call-args text doesn't match a single url
+/// argument.
+///
+/// Known limitation (impl-critic #5, documented not fixed): the backward paren-scan below has
+/// no string-literal awareness — a URL containing a literal `)` (e.g.
+/// `maven("https://example.com/api(v2)") { }`) desyncs the scan, and the restriction is
+/// silently discarded via the caller's empty-url guard even though a real URL was declared.
+/// Not fixed here for the same reason [`find_matching_brace`]'s comment-blindness isn't: a
+/// correct fix needs quote-aware scanning, out of scope for this narrow pattern.
+fn extract_call_paren_url(body: &str, open: usize) -> Option<String> {
+    let before = body.get(..open)?;
+    let trimmed = before.trim_end();
+    if !trimmed.ends_with(')') {
+        return None;
+    }
+
+    let mut depth = 0i32;
+    let mut open_paren = None;
+    for (i, &b) in trimmed.as_bytes().iter().enumerate().rev() {
+        match b {
+            b')' => depth += 1,
+            b'(' => {
+                depth -= 1;
+                if depth == 0 {
+                    open_paren = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let open_paren = open_paren?;
+
+    let call_args = trimmed.get(open_paren + 1..trimmed.len() - 1)?;
+    RE_REPO_CALL_URL
+        .captures(call_args)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().to_string())
+}
+
+/// Splits a `repositories { }` block's body into its individual `name { ... }` entries (via
+/// [`find_matching_brace`]) and extracts each entry's content restrictions, if any.
+// Every slice bound comes from `str::find('{')` or `find_matching_brace`'s brace byte
+// position — always a char boundary.
+#[allow(clippy::string_slice)]
+fn extract_repository_entries(body: &str, out: &mut Vec<RepositoryContentRestriction>) {
+    let mut pos = 0usize;
+    while let Some(rel) = body[pos..].find('{') {
+        let open = pos + rel;
+        let Some(close) = find_matching_brace(body, open) else {
+            break;
+        };
+        let entry = &body[open..=close];
+
+        if let Some(content_body) = find_content_block(entry) {
+            let url = RE_REPOSITORY_URL
+                .captures(entry)
+                .and_then(|c| c.get(1))
+                .map(|m| m.as_str().to_string())
+                .or_else(|| extract_call_paren_url(body, open))
+                .unwrap_or_default();
+
+            // C1 (impl-critic): a shorthand repo call with no explicit `url = ...` literal —
+            // `google()`/`mavenCentral()`/`gradlePluginPortal()`/`mavenLocal()` being the
+            // canonical real-world cases (all commonly used with a `content { }` block to
+            // restrict what they serve, e.g. Android's `google { content { includeGroupByRegex(
+            // "androidx.*") } }`) — must never classify a matching dependency as
+            // `CustomRegistry` with an empty url. These are registry-shaped repositories
+            // (public or local-cache), not a non-registry signal; treat the whole entry as if
+            // it declared no `content { }` restriction at all.
+            if !url.is_empty() {
+                for caps in RE_INCLUDE_GROUP.captures_iter(content_body) {
+                    if let Some(group) = caps.get(1) {
+                        out.push(RepositoryContentRestriction {
+                            pattern: group.as_str().to_string(),
+                            is_regex: false,
+                            repository_url: url.clone(),
+                        });
+                    }
+                }
+                for caps in RE_INCLUDE_GROUP_REGEX.captures_iter(content_body) {
+                    if let Some(group) = caps.get(1) {
+                        out.push(RepositoryContentRestriction {
+                            pattern: group.as_str().to_string(),
+                            is_regex: true,
+                            repository_url: url.clone(),
+                        });
+                    }
+                }
+                for caps in RE_INCLUDE_MODULE.captures_iter(content_body) {
+                    if let (Some(group), Some(module)) = (caps.get(1), caps.get(2)) {
+                        out.push(RepositoryContentRestriction {
+                            pattern: format!("{}:{}", group.as_str(), module.as_str()),
+                            is_regex: false,
+                            repository_url: url.clone(),
+                        });
+                    }
+                }
+            }
+        }
+
+        // #2 (impl-critic, CRITICAL — caught before merge): multiple repository declarations
+        // can be grouped inside a shared wrapper brace, e.g. `if (cond) { maven { ... } maven {
+        // ... } }` — without this, `entry` above is the *whole* wrapper block, and
+        // `find_content_block` only ever finds the first `content { }` in it, silently
+        // dropping every sibling repository's own restriction (a privacy leak: that sibling's
+        // dependency stays `Registry` and its name is sent to the public registry). Recursing
+        // into this entry's own inner body finds any nested repo declaration alongside the
+        // first one. Harmless when `entry` is itself a single ordinary repo call: recursing
+        // into its own `content { }`/`credentials { }` sub-blocks finds no further nested
+        // `content` keyword there, so no extra restriction is produced. Known minor byproduct:
+        // when `entry` *is* a wrapper, the wrapper's own (over-broad) pass already pushed one
+        // restriction for its first nested repo — recursion pushes that same restriction again,
+        // correctly re-scoped, alongside every sibling's own. A harmless duplicate (`Vec`
+        // entries, not classification behavior — `apply_repository_content_restrictions` is
+        // idempotent per dependency), not a second bug — see
+        // `test_multiple_maven_blocks_under_shared_wrapper_brace_all_collected`.
+        if let Some(inner) = entry.get(1..entry.len().saturating_sub(1)) {
+            extract_repository_entries(inner, out);
+        }
+
+        pos = close + 1;
+    }
+}
+
+/// Finds a nested `content { }` block's own body within a single repository entry's text
+/// (which itself already includes its outer `{`/`}` pair).
+// Every slice bound comes from `str::find` of the ASCII literal "content"/"{" or from
+// `find_matching_brace`'s brace byte position — always a char boundary.
+#[allow(clippy::string_slice)]
+fn find_content_block(entry: &str) -> Option<&str> {
+    let rel = entry.find("content")?;
+    let after = rel + "content".len();
+    let preceded_by_ident_char = entry
+        .as_bytes()
+        .get(rel.wrapping_sub(1))
+        .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_');
+    if rel > 0 && preceded_by_ident_char {
+        return None;
+    }
+    let rest = &entry[after..];
+    let trimmed = rest.trim_start();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    let open = after + (rest.len() - trimmed.len());
+    let close = find_matching_brace(entry, open)?;
+    Some(&entry[open + 1..close])
+}
+
+/// Compiles an `includeGroupByRegex` pattern (captured verbatim from Gradle Kotlin/Groovy
+/// source) into a [`Regex`] matching Gradle's own whole-group-match semantics (#1212
+/// impl-critic C2).
+///
+/// Two corrections vs. compiling the captured source text directly:
+/// - Un-escapes a doubled backslash: `\\.` as written in a Kotlin/Groovy string literal means
+///   a single `\.` after that language's own string-literal parsing, but this parser captures
+///   the raw source text — compiling `\\.` directly means "a literal backslash then any
+///   character", not "a literal dot", so the near-universal real-world spelling
+///   (`includeGroupByRegex("com\\.acme.*")`) never matches anything.
+/// - Anchors the pattern (`^(?:...)$`): Gradle's own implementation requires the *whole*
+///   group id to match, not a substring — an unanchored `androidx.*` would also match an
+///   unrelated group like `com.myandroidxtra.lib`.
+fn compile_group_regex(pattern: &str) -> Option<Regex> {
+    let unescaped = pattern.replace("\\\\", "\\");
+    Regex::new(&format!("^(?:{unescaped})$")).ok()
+}
+
+/// Applies every [`RepositoryContentRestriction`] to `dependencies`, reclassifying a matching
+/// dependency's `source` to [`deps_core::parser::DependencySource::CustomRegistry`] (#1212).
+/// First matching restriction wins, mirroring Composer's own declaration-order classification
+/// (`deps_composer::parser::classify_repositories`) — achieved here by iterating restrictions
+/// in the outer loop and skipping a dependency once it is no longer `Registry`, rather than the
+/// reverse nesting, so each restriction's regex compiles at most once per parse instead of once
+/// per (dependency × restriction) pair (#1212 impl-critic S2 perf finding). An
+/// `includeGroupByRegex` pattern that fails to compile matches nothing (fails closed).
+pub(crate) fn apply_repository_content_restrictions(
+    dependencies: &mut [GradleDependency],
+    restrictions: &[RepositoryContentRestriction],
+) {
+    for restriction in restrictions {
+        let compiled_regex = restriction
+            .is_regex
+            .then(|| compile_group_regex(&restriction.pattern));
+
+        for dep in dependencies.iter_mut() {
+            if !matches!(dep.source, deps_core::parser::DependencySource::Registry) {
+                continue;
+            }
+
+            let is_match = if let Some((group, module)) = restriction.pattern.split_once(':') {
+                dep.group_id == group && dep.artifact_id == module
+            } else if let Some(maybe_re) = &compiled_regex {
+                maybe_re
+                    .as_ref()
+                    .is_some_and(|re| re.is_match(&dep.group_id))
+            } else {
+                dep.group_id == restriction.pattern
+            };
+
+            if is_match {
+                dep.source = deps_core::parser::DependencySource::CustomRegistry {
+                    url: restriction.repository_url.clone(),
+                };
+            }
+        }
+    }
+}
 
 /// Returns the number of UTF-16 code units in `s`.
 pub(crate) fn utf16_len(s: &str) -> usize {
@@ -375,6 +794,7 @@ mod tests {
             version_req: Some("${kotlinVersion}".into()),
             version_range: None,
             configuration: "implementation".into(),
+            source: deps_core::parser::DependencySource::Registry,
         }];
         resolve_variables(&mut deps, &props);
         assert_eq!(deps[0].version_req, Some("2.1.10".into()));
@@ -392,6 +812,7 @@ mod tests {
             version_req: Some("$springVersion".into()),
             version_range: None,
             configuration: "implementation".into(),
+            source: deps_core::parser::DependencySource::Registry,
         }];
         resolve_variables(&mut deps, &props);
         assert_eq!(deps[0].version_req, Some("3.2.0".into()));
@@ -408,6 +829,7 @@ mod tests {
             version_req: Some("$unknownVar".into()),
             version_range: None,
             configuration: "implementation".into(),
+            source: deps_core::parser::DependencySource::Registry,
         }];
         resolve_variables(&mut deps, &props);
         assert_eq!(deps[0].version_req, Some("$unknownVar".into()));
@@ -424,6 +846,7 @@ mod tests {
             version_req: Some("1.2.3".into()),
             version_range: None,
             configuration: "implementation".into(),
+            source: deps_core::parser::DependencySource::Registry,
         }];
         resolve_variables(&mut deps, &props);
         assert_eq!(deps[0].version_req, Some("1.2.3".into()));
@@ -598,5 +1021,843 @@ mod tests {
     #[test]
     fn test_utf16_len_ascii() {
         assert_eq!(utf16_len("hello"), 5);
+    }
+
+    /// #1212: `includeGroup` inside a repository's `content { }` block is a real static
+    /// per-group binding — a dependency in that group must classify as `CustomRegistry`.
+    #[test]
+    fn test_repository_content_include_group_classifies_matching_dependency() {
+        let content = r#"
+repositories {
+    maven {
+        url = "https://repo.acme.internal/maven"
+        content {
+            includeGroup("com.acme")
+        }
+    }
+}
+"#;
+        let restrictions = parse_repository_content_restrictions(content);
+        assert_eq!(restrictions.len(), 1);
+        assert_eq!(restrictions[0].pattern, "com.acme");
+        assert!(!restrictions[0].is_regex);
+        assert_eq!(
+            restrictions[0].repository_url,
+            "https://repo.acme.internal/maven"
+        );
+
+        let mut deps = vec![
+            GradleDependency {
+                group_id: "com.acme".into(),
+                artifact_id: "secretlib".into(),
+                name: "com.acme:secretlib".into(),
+                name_range: Range::default(),
+                version_req: Some("1.0.0".into()),
+                version_range: None,
+                configuration: "implementation".into(),
+                source: deps_core::parser::DependencySource::Registry,
+            },
+            GradleDependency {
+                group_id: "org.springframework.boot".into(),
+                artifact_id: "spring-boot-starter".into(),
+                name: "org.springframework.boot:spring-boot-starter".into(),
+                name_range: Range::default(),
+                version_req: Some("3.2.0".into()),
+                version_range: None,
+                configuration: "implementation".into(),
+                source: deps_core::parser::DependencySource::Registry,
+            },
+        ];
+        apply_repository_content_restrictions(&mut deps, &restrictions);
+
+        assert_eq!(
+            deps[0].source,
+            deps_core::parser::DependencySource::CustomRegistry {
+                url: "https://repo.acme.internal/maven".into(),
+            }
+        );
+        assert_eq!(
+            deps[1].source,
+            deps_core::parser::DependencySource::Registry,
+            "an unrelated group must never be swept in by another repository's content filter"
+        );
+    }
+
+    /// #1212: Groovy DSL uses `url '...'` (no `=`), single-quoted — must be tolerated too.
+    #[test]
+    fn test_repository_content_groovy_style_url_and_quotes() {
+        let content = r"
+repositories {
+    maven {
+        url 'https://repo.acme.internal/maven'
+        content {
+            includeGroup 'com.acme'
+        }
+    }
+}
+";
+        // Groovy also allows bare-word method calls without parens; the restriction regexes
+        // require parens, matching Composer's own explicit-syntax-only policy (no heuristics
+        // beyond the documented DSL shape) — so `includeGroup 'com.acme'` (no parens) is not
+        // matched, only `url` without `=` is exercised here.
+        let restrictions = parse_repository_content_restrictions(content);
+        assert!(restrictions.is_empty());
+    }
+
+    /// G1 (impl-critic follow-up to #1212): the idiomatic Kotlin DSL form passes the
+    /// repository's URL as a call argument (`maven("https://...")`), not a brace-body `url =
+    /// ...` property — the most common real-world spelling for exactly this feature's target
+    /// use case (a private repo scoped by `content { }`). Both positional and named-argument
+    /// forms must be read.
+    #[test]
+    fn test_repository_content_call_paren_url_positional_and_named() {
+        let positional = r#"
+repositories {
+    maven("https://repo.acme.internal/maven") {
+        content {
+            includeGroup("com.acme")
+        }
+    }
+}
+"#;
+        let restrictions = parse_repository_content_restrictions(positional);
+        assert_eq!(restrictions.len(), 1);
+        assert_eq!(
+            restrictions[0].repository_url,
+            "https://repo.acme.internal/maven"
+        );
+
+        let named = r#"
+repositories {
+    maven(url = "https://repo.acme.internal/maven") {
+        content {
+            includeGroup("com.acme")
+        }
+    }
+}
+"#;
+        let restrictions = parse_repository_content_restrictions(named);
+        assert_eq!(restrictions.len(), 1);
+        assert_eq!(
+            restrictions[0].repository_url,
+            "https://repo.acme.internal/maven"
+        );
+
+        let mut deps = vec![GradleDependency {
+            group_id: "com.acme".into(),
+            artifact_id: "secretlib".into(),
+            name: "com.acme:secretlib".into(),
+            name_range: Range::default(),
+            version_req: Some("1.0.0".into()),
+            version_range: None,
+            configuration: "implementation".into(),
+            source: deps_core::parser::DependencySource::Registry,
+        }];
+        apply_repository_content_restrictions(&mut deps, &restrictions);
+        assert_eq!(
+            deps[0].source,
+            deps_core::parser::DependencySource::CustomRegistry {
+                url: "https://repo.acme.internal/maven".into(),
+            }
+        );
+    }
+
+    /// G1: a bare shorthand repo (`google { }`, no call parens at all) must still classify as
+    /// having no url — [`extract_call_paren_url`] must not misread an unrelated preceding
+    /// statement's parens as this entry's own call arguments.
+    #[test]
+    fn test_call_paren_url_absent_for_bare_shorthand_repo() {
+        let content = r#"
+repositories {
+    google {
+        content {
+            includeGroup("com.acme")
+        }
+    }
+}
+"#;
+        let restrictions = parse_repository_content_restrictions(content);
+        assert!(
+            restrictions.is_empty(),
+            "a bare `google {{ }}` with no call parens must never acquire a url from thin air: \
+             {restrictions:?}"
+        );
+    }
+
+    /// #1212: `includeGroupByRegex` restrictions are matched as a regex against the group id.
+    #[test]
+    fn test_repository_content_include_group_by_regex() {
+        let content = r#"
+repositories {
+    maven {
+        url = "https://repo.acme.internal/maven"
+        content {
+            includeGroupByRegex("com\.acme\..*")
+        }
+    }
+}
+"#;
+        let restrictions = parse_repository_content_restrictions(content);
+        assert_eq!(restrictions.len(), 1);
+        assert!(restrictions[0].is_regex);
+
+        let mut deps = vec![GradleDependency {
+            group_id: "com.acme.internal".into(),
+            artifact_id: "lib".into(),
+            name: "com.acme.internal:lib".into(),
+            name_range: Range::default(),
+            version_req: Some("1.0.0".into()),
+            version_range: None,
+            configuration: "implementation".into(),
+            source: deps_core::parser::DependencySource::Registry,
+        }];
+        apply_repository_content_restrictions(&mut deps, &restrictions);
+        assert_eq!(
+            deps[0].source,
+            deps_core::parser::DependencySource::CustomRegistry {
+                url: "https://repo.acme.internal/maven".into(),
+            }
+        );
+    }
+
+    /// #1212: `includeModule` binds an exact `group:module` coordinate.
+    #[test]
+    fn test_repository_content_include_module() {
+        let content = r#"
+repositories {
+    maven {
+        url = "https://repo.acme.internal/maven"
+        content {
+            includeModule("com.acme", "secretlib")
+        }
+    }
+}
+"#;
+        let restrictions = parse_repository_content_restrictions(content);
+        assert_eq!(restrictions.len(), 1);
+        assert_eq!(restrictions[0].pattern, "com.acme:secretlib");
+
+        let mut deps = vec![
+            GradleDependency {
+                group_id: "com.acme".into(),
+                artifact_id: "secretlib".into(),
+                name: "com.acme:secretlib".into(),
+                name_range: Range::default(),
+                version_req: Some("1.0.0".into()),
+                version_range: None,
+                configuration: "implementation".into(),
+                source: deps_core::parser::DependencySource::Registry,
+            },
+            GradleDependency {
+                group_id: "com.acme".into(),
+                artifact_id: "otherlib".into(),
+                name: "com.acme:otherlib".into(),
+                name_range: Range::default(),
+                version_req: Some("1.0.0".into()),
+                version_range: None,
+                configuration: "implementation".into(),
+                source: deps_core::parser::DependencySource::Registry,
+            },
+        ];
+        apply_repository_content_restrictions(&mut deps, &restrictions);
+        assert_eq!(
+            deps[0].source,
+            deps_core::parser::DependencySource::CustomRegistry {
+                url: "https://repo.acme.internal/maven".into(),
+            }
+        );
+        assert_eq!(
+            deps[1].source,
+            deps_core::parser::DependencySource::Registry,
+            "includeModule binds only the exact module, not the whole group"
+        );
+    }
+
+    /// #1212: a `repositories { }` block with no `content { }` restriction at all (the
+    /// general, unbound case) must never classify anything — same accepted-gap policy as
+    /// Composer's bare `vcs`/`path`/`artifact` repository.
+    #[test]
+    fn test_repository_without_content_block_never_classifies() {
+        let content = r#"
+repositories {
+    mavenCentral()
+    maven {
+        url = "https://repo.acme.internal/maven"
+    }
+}
+"#;
+        let restrictions = parse_repository_content_restrictions(content);
+        assert!(restrictions.is_empty());
+    }
+
+    /// C1 (impl-critic, #1212): the canonical Android template — `google { content {
+    /// includeGroupByRegex("androidx.*") } }`, `google()`/`mavenCentral()`/etc. have no literal
+    /// `url = ...` — must never classify a matching dependency as `CustomRegistry` with an
+    /// empty url. Doing so silently disables OSV scanning/hover/completion for every dependency
+    /// in that group, in a shape that's near-universal in real Android `build.gradle.kts`
+    /// files — the exact false-positive/silent-disable class #1211 removed a heuristic for.
+    #[test]
+    fn test_google_shorthand_repo_with_no_literal_url_never_classifies() {
+        let content = r#"
+repositories {
+    google {
+        content {
+            includeGroupByRegex("androidx.*")
+            includeGroupByRegex("com\\.android.*")
+        }
+    }
+    mavenCentral()
+}
+"#;
+        let restrictions = parse_repository_content_restrictions(content);
+        assert!(
+            restrictions.is_empty(),
+            "a shorthand repo with no literal url must produce zero restrictions, not a \
+             CustomRegistry-with-empty-url restriction: {restrictions:?}"
+        );
+
+        let mut deps = vec![GradleDependency {
+            group_id: "androidx.core".into(),
+            artifact_id: "core-ktx".into(),
+            name: "androidx.core:core-ktx".into(),
+            name_range: Range::default(),
+            version_req: Some("1.12.0".into()),
+            version_range: None,
+            configuration: "implementation".into(),
+            source: deps_core::parser::DependencySource::Registry,
+        }];
+        apply_repository_content_restrictions(&mut deps, &restrictions);
+        assert_eq!(
+            deps[0].source,
+            deps_core::parser::DependencySource::Registry,
+            "androidx.core:core-ktx must stay Registry — google() is a real public registry, \
+             not a non-registry source, and there is no url to route it to anyway"
+        );
+    }
+
+    /// #3 (impl-critic follow-up to #1212): `url.set(uri("..."))` (and `url.set("...")`) is the
+    /// Gradle 7/8 lazy-property idiom for setting a repository's url in Kotlin DSL — must not
+    /// trip the C1 empty-url guard and silently discard the `content { }` restriction.
+    #[test]
+    fn test_url_set_lazy_property_idiom_is_recognized() {
+        let with_uri = r#"
+repositories {
+    maven {
+        url.set(uri("https://repo.acme.internal/maven"))
+        content {
+            includeGroup("com.acme")
+        }
+    }
+}
+"#;
+        let restrictions = parse_repository_content_restrictions(with_uri);
+        assert_eq!(restrictions.len(), 1);
+        assert_eq!(
+            restrictions[0].repository_url,
+            "https://repo.acme.internal/maven"
+        );
+
+        let bare = r#"
+repositories {
+    maven {
+        url.set("https://repo.acme.internal/maven")
+        content {
+            includeGroup("com.acme")
+        }
+    }
+}
+"#;
+        let restrictions = parse_repository_content_restrictions(bare);
+        assert_eq!(restrictions.len(), 1);
+        assert_eq!(
+            restrictions[0].repository_url,
+            "https://repo.acme.internal/maven"
+        );
+
+        let mut deps = vec![GradleDependency {
+            group_id: "com.acme".into(),
+            artifact_id: "secretlib".into(),
+            name: "com.acme:secretlib".into(),
+            name_range: Range::default(),
+            version_req: Some("1.0.0".into()),
+            version_range: None,
+            configuration: "implementation".into(),
+            source: deps_core::parser::DependencySource::Registry,
+        }];
+        apply_repository_content_restrictions(&mut deps, &restrictions);
+        assert_eq!(
+            deps[0].source,
+            deps_core::parser::DependencySource::CustomRegistry {
+                url: "https://repo.acme.internal/maven".into(),
+            }
+        );
+    }
+
+    /// C2 (impl-critic, #1212): `includeGroupByRegex("com\\.acme.*")` — the real-world spelling
+    /// with a doubled backslash, as Kotlin/Groovy string-literal escaping requires for a
+    /// literal-dot regex — must actually match, and the match must be anchored to the whole
+    /// group id, not an unanchored substring search.
+    #[test]
+    fn test_include_group_by_regex_unescapes_backslash_and_anchors_whole_match() {
+        let content = r#"
+repositories {
+    maven {
+        url = "https://repo.acme.internal/maven"
+        content {
+            includeGroupByRegex("com\\.acme.*")
+        }
+    }
+}
+"#;
+        let restrictions = parse_repository_content_restrictions(content);
+        assert_eq!(restrictions.len(), 1);
+
+        let mut deps = vec![
+            GradleDependency {
+                group_id: "com.acme".into(),
+                artifact_id: "secretlib".into(),
+                name: "com.acme:secretlib".into(),
+                name_range: Range::default(),
+                version_req: Some("1.0.0".into()),
+                version_range: None,
+                configuration: "implementation".into(),
+                source: deps_core::parser::DependencySource::Registry,
+            },
+            GradleDependency {
+                group_id: "com.acme.internal".into(),
+                artifact_id: "lib".into(),
+                name: "com.acme.internal:lib".into(),
+                name_range: Range::default(),
+                version_req: Some("1.0.0".into()),
+                version_range: None,
+                configuration: "implementation".into(),
+                source: deps_core::parser::DependencySource::Registry,
+            },
+            GradleDependency {
+                group_id: "com.notacme.other".into(),
+                artifact_id: "lib".into(),
+                name: "com.notacme.other:lib".into(),
+                name_range: Range::default(),
+                version_req: Some("1.0.0".into()),
+                version_range: None,
+                configuration: "implementation".into(),
+                source: deps_core::parser::DependencySource::Registry,
+            },
+            // G2 (impl-critic follow-up): unlike `com.notacme.other` (which `com\.acme.*`
+            // never matches even unanchored, since "acme" alone isn't "com.acme"), this group
+            // genuinely contains the substring "com.acme" starting at byte 1 — an *unanchored*
+            // `is_match` would incorrectly accept it, so this is the case that actually
+            // discriminates the anchoring fix from a no-op.
+            GradleDependency {
+                group_id: "xcom.acme".into(),
+                artifact_id: "lib".into(),
+                name: "xcom.acme:lib".into(),
+                name_range: Range::default(),
+                version_req: Some("1.0.0".into()),
+                version_range: None,
+                configuration: "implementation".into(),
+                source: deps_core::parser::DependencySource::Registry,
+            },
+        ];
+        apply_repository_content_restrictions(&mut deps, &restrictions);
+
+        assert_eq!(
+            deps[0].source,
+            deps_core::parser::DependencySource::CustomRegistry {
+                url: "https://repo.acme.internal/maven".into(),
+            },
+            "the escaped-dot regex must actually match a real com.acme group (C2a: escaping)"
+        );
+        assert_eq!(
+            deps[1].source,
+            deps_core::parser::DependencySource::CustomRegistry {
+                url: "https://repo.acme.internal/maven".into(),
+            },
+            "com.acme.internal must also match — com\\.acme.* covers any subgroup"
+        );
+        assert_eq!(
+            deps[2].source,
+            deps_core::parser::DependencySource::Registry,
+            "com.notacme.other must NOT match merely because it contains 'acme' as a substring"
+        );
+        assert_eq!(
+            deps[3].source,
+            deps_core::parser::DependencySource::Registry,
+            "xcom.acme must NOT match — it contains \"com.acme\" as a substring starting at \
+             byte 1, which an unanchored is_match would incorrectly accept (C2b: the match \
+             must be anchored to the whole group id, not merely contain the pattern)"
+        );
+    }
+
+    /// S1 (impl-critic, #1212): a `content { }` restriction declared inside `buildscript {
+    /// repositories { } }` (plugin resolution) must never reclassify an unrelated dependency in
+    /// the project's own `dependencies { }` block.
+    #[test]
+    fn test_buildscript_repositories_do_not_leak_into_project_classification() {
+        let content = r#"
+buildscript {
+    repositories {
+        maven {
+            url = "https://plugins.acme.internal/maven"
+            content {
+                includeGroup("com.acme")
+            }
+        }
+    }
+    dependencies {
+        classpath("com.acme:some-plugin:1.0.0")
+    }
+}
+
+dependencies {
+    implementation("com.acme:runtime-lib:1.0.0")
+}
+"#;
+        let restrictions = parse_repository_content_restrictions(content);
+        assert!(
+            restrictions.is_empty(),
+            "a content{{}} restriction scoped to buildscript's own repositories{{}} must never \
+             surface as a project-wide restriction: {restrictions:?}"
+        );
+
+        let mut deps = vec![GradleDependency {
+            group_id: "com.acme".into(),
+            artifact_id: "runtime-lib".into(),
+            name: "com.acme:runtime-lib".into(),
+            name_range: Range::default(),
+            version_req: Some("1.0.0".into()),
+            version_range: None,
+            configuration: "implementation".into(),
+            source: deps_core::parser::DependencySource::Registry,
+        }];
+        apply_repository_content_restrictions(&mut deps, &restrictions);
+        assert_eq!(
+            deps[0].source,
+            deps_core::parser::DependencySource::Registry,
+            "com.acme:runtime-lib is a project dependency, unrelated to buildscript's own \
+             plugin-resolution repository — must stay Registry"
+        );
+    }
+
+    /// Test-coverage gap (tester follow-up to #1212): multiple `repositories { }` blocks (a
+    /// real Gradle shape — e.g. one per source-set-specific configuration block) and multiple
+    /// `content { }`-restricted entries within the same file must all be collected, each
+    /// independently classifying only its own matching group.
+    #[test]
+    fn test_multiple_repositories_blocks_and_restricted_entries_all_collected() {
+        let content = r#"
+repositories {
+    maven {
+        url = "https://repo.acme.internal/maven"
+        content {
+            includeGroup("com.acme")
+        }
+    }
+}
+repositories {
+    maven {
+        url = "https://repo.other.internal/maven"
+        content {
+            includeGroup("com.other")
+        }
+    }
+    maven {
+        url = "https://repo.third.internal/maven"
+        content {
+            includeGroup("com.third")
+        }
+    }
+}
+"#;
+        let restrictions = parse_repository_content_restrictions(content);
+        assert_eq!(
+            restrictions.len(),
+            3,
+            "all 3 restrictions across both repositories{{}} blocks must be collected: {restrictions:?}"
+        );
+
+        let mut deps = vec![
+            GradleDependency {
+                group_id: "com.acme".into(),
+                artifact_id: "lib".into(),
+                name: "com.acme:lib".into(),
+                name_range: Range::default(),
+                version_req: Some("1.0.0".into()),
+                version_range: None,
+                configuration: "implementation".into(),
+                source: deps_core::parser::DependencySource::Registry,
+            },
+            GradleDependency {
+                group_id: "com.other".into(),
+                artifact_id: "lib".into(),
+                name: "com.other:lib".into(),
+                name_range: Range::default(),
+                version_req: Some("1.0.0".into()),
+                version_range: None,
+                configuration: "implementation".into(),
+                source: deps_core::parser::DependencySource::Registry,
+            },
+            GradleDependency {
+                group_id: "com.third".into(),
+                artifact_id: "lib".into(),
+                name: "com.third:lib".into(),
+                name_range: Range::default(),
+                version_req: Some("1.0.0".into()),
+                version_range: None,
+                configuration: "implementation".into(),
+                source: deps_core::parser::DependencySource::Registry,
+            },
+        ];
+        apply_repository_content_restrictions(&mut deps, &restrictions);
+
+        assert_eq!(
+            deps[0].source,
+            deps_core::parser::DependencySource::CustomRegistry {
+                url: "https://repo.acme.internal/maven".into(),
+            }
+        );
+        assert_eq!(
+            deps[1].source,
+            deps_core::parser::DependencySource::CustomRegistry {
+                url: "https://repo.other.internal/maven".into(),
+            }
+        );
+        assert_eq!(
+            deps[2].source,
+            deps_core::parser::DependencySource::CustomRegistry {
+                url: "https://repo.third.internal/maven".into(),
+            }
+        );
+    }
+
+    /// Impl-critic #2 (CRITICAL, caught before merge): multiple repository declarations
+    /// grouped inside a shared wrapper brace (e.g. a conditional block) must all be collected,
+    /// not just the first — a real privacy-leak class: before this fix, `com.b`'s dependency
+    /// would have stayed `Registry` and its name would have been sent to the public registry.
+    #[test]
+    fn test_multiple_maven_blocks_under_shared_wrapper_brace_all_collected() {
+        let content = r#"
+repositories {
+    if (true) {
+        maven {
+            url = "https://a.internal/maven"
+            content {
+                includeGroup("com.a")
+            }
+        }
+        maven {
+            url = "https://b.internal/maven"
+            content {
+                includeGroup("com.b")
+            }
+        }
+    }
+}
+"#;
+        let restrictions = parse_repository_content_restrictions(content);
+        // >= 2, not == 2: the recursive fix for this bug can push a harmless duplicate
+        // restriction for the wrapper's first nested repo (see the doc comment on the
+        // recursive call in `extract_repository_entries`) — classification *outcome* below is
+        // the property that actually matters, not the exact restriction count.
+        assert!(
+            restrictions.len() >= 2,
+            "both maven {{ }} blocks under the shared `if` wrapper must be collected: \
+             {restrictions:?}"
+        );
+        assert!(
+            restrictions
+                .iter()
+                .any(|r| r.pattern == "com.a" && r.repository_url == "https://a.internal/maven"),
+            "com.a's restriction must be present: {restrictions:?}"
+        );
+        assert!(
+            restrictions
+                .iter()
+                .any(|r| r.pattern == "com.b" && r.repository_url == "https://b.internal/maven"),
+            "com.b's restriction must be present: {restrictions:?}"
+        );
+
+        let mut deps = vec![
+            GradleDependency {
+                group_id: "com.a".into(),
+                artifact_id: "lib".into(),
+                name: "com.a:lib".into(),
+                name_range: Range::default(),
+                version_req: Some("1.0.0".into()),
+                version_range: None,
+                configuration: "implementation".into(),
+                source: deps_core::parser::DependencySource::Registry,
+            },
+            GradleDependency {
+                group_id: "com.b".into(),
+                artifact_id: "lib".into(),
+                name: "com.b:lib".into(),
+                name_range: Range::default(),
+                version_req: Some("1.0.0".into()),
+                version_range: None,
+                configuration: "implementation".into(),
+                source: deps_core::parser::DependencySource::Registry,
+            },
+        ];
+        apply_repository_content_restrictions(&mut deps, &restrictions);
+
+        assert_eq!(
+            deps[0].source,
+            deps_core::parser::DependencySource::CustomRegistry {
+                url: "https://a.internal/maven".into(),
+            }
+        );
+        assert_eq!(
+            deps[1].source,
+            deps_core::parser::DependencySource::CustomRegistry {
+                url: "https://b.internal/maven".into(),
+            },
+            "com.b must not stay Registry just because it shares a wrapper brace with com.a's \
+             repository declaration"
+        );
+    }
+
+    /// Reviewer follow-up to impl-critic #2: the fix was manually traced to generalize to N
+    /// siblings under one wrapper brace, not just 2 — this makes that explicit rather than
+    /// relying on the trace. Three `maven { }` blocks share one wrapper; all three must
+    /// classify.
+    #[test]
+    fn test_three_maven_blocks_under_shared_wrapper_brace_all_collected() {
+        let content = r#"
+repositories {
+    if (true) {
+        maven {
+            url = "https://a.internal/maven"
+            content {
+                includeGroup("com.a")
+            }
+        }
+        maven {
+            url = "https://b.internal/maven"
+            content {
+                includeGroup("com.b")
+            }
+        }
+        maven {
+            url = "https://c.internal/maven"
+            content {
+                includeGroup("com.c")
+            }
+        }
+    }
+}
+"#;
+        let restrictions = parse_repository_content_restrictions(content);
+        for (group, url) in [
+            ("com.a", "https://a.internal/maven"),
+            ("com.b", "https://b.internal/maven"),
+            ("com.c", "https://c.internal/maven"),
+        ] {
+            assert!(
+                restrictions
+                    .iter()
+                    .any(|r| r.pattern == group && r.repository_url == url),
+                "{group}'s restriction must be present: {restrictions:?}"
+            );
+        }
+
+        let mut deps = vec![
+            GradleDependency {
+                group_id: "com.a".into(),
+                artifact_id: "lib".into(),
+                name: "com.a:lib".into(),
+                name_range: Range::default(),
+                version_req: Some("1.0.0".into()),
+                version_range: None,
+                configuration: "implementation".into(),
+                source: deps_core::parser::DependencySource::Registry,
+            },
+            GradleDependency {
+                group_id: "com.b".into(),
+                artifact_id: "lib".into(),
+                name: "com.b:lib".into(),
+                name_range: Range::default(),
+                version_req: Some("1.0.0".into()),
+                version_range: None,
+                configuration: "implementation".into(),
+                source: deps_core::parser::DependencySource::Registry,
+            },
+            GradleDependency {
+                group_id: "com.c".into(),
+                artifact_id: "lib".into(),
+                name: "com.c:lib".into(),
+                name_range: Range::default(),
+                version_req: Some("1.0.0".into()),
+                version_range: None,
+                configuration: "implementation".into(),
+                source: deps_core::parser::DependencySource::Registry,
+            },
+        ];
+        apply_repository_content_restrictions(&mut deps, &restrictions);
+
+        assert_eq!(
+            deps[0].source,
+            deps_core::parser::DependencySource::CustomRegistry {
+                url: "https://a.internal/maven".into(),
+            }
+        );
+        assert_eq!(
+            deps[1].source,
+            deps_core::parser::DependencySource::CustomRegistry {
+                url: "https://b.internal/maven".into(),
+            }
+        );
+        assert_eq!(
+            deps[2].source,
+            deps_core::parser::DependencySource::CustomRegistry {
+                url: "https://c.internal/maven".into(),
+            },
+            "com.c (the third sibling) must not stay Registry — the fix must generalize past 2 \
+             siblings under one wrapper brace"
+        );
+    }
+
+    /// #1212 end-to-end: `parse_gradle` on a real `build.gradle.kts` wires the restriction
+    /// parsing and application together.
+    #[test]
+    fn test_parse_gradle_applies_repository_content_restriction_end_to_end() {
+        // See the comment in `test_dispatch_kotlin` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let content = r#"
+repositories {
+    maven {
+        url = "https://repo.acme.internal/maven"
+        content {
+            includeGroup("com.acme")
+        }
+    }
+}
+dependencies {
+    implementation("com.acme:secretlib:1.0.0")
+    implementation("org.springframework.boot:spring-boot-starter:3.2.0")
+}
+"#;
+        let uri = make_uri("/project/build.gradle.kts");
+        let result = parse_gradle(content, &uri).unwrap();
+        assert_eq!(result.dependencies.len(), 2);
+
+        let secret = result
+            .dependencies
+            .iter()
+            .find(|d| d.group_id == "com.acme")
+            .unwrap();
+        let spring = result
+            .dependencies
+            .iter()
+            .find(|d| d.group_id == "org.springframework.boot")
+            .unwrap();
+
+        assert_eq!(
+            secret.source,
+            deps_core::parser::DependencySource::CustomRegistry {
+                url: "https://repo.acme.internal/maven".into(),
+            }
+        );
+        assert_eq!(spring.source, deps_core::parser::DependencySource::Registry);
     }
 }

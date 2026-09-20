@@ -37,14 +37,40 @@ const VERSION_OPERATOR_CHARS: &[char] = &['^', '~', '=', '<', '>', '*', '!'];
 pub struct ComposerEcosystem {
     registry: Arc<PackagistRegistry>,
     formatter: ComposerFormatter,
+    /// `composer.lock` memoization cache (#1212 impl-critic follow-up) every `parse_manifest`
+    /// call threads through to [`crate::parser::parse_composer_json_with_lockfile`]. Defaulted
+    /// by [`Self::new`] to a private instance; set explicitly by [`Self::with_context`] so
+    /// `deps_engine::setup::register_ecosystems` can share the same handle `deps-lsp`'s own
+    /// in-use-version resolution reads, instead of each parsing `composer.lock` independently.
+    lockfile_cache: Arc<deps_core::lockfile::LockFileCache>,
 }
 
 impl ComposerEcosystem {
-    /// Creates a new Composer ecosystem with the given HTTP cache.
+    /// Creates a new Composer ecosystem with the given HTTP cache, using a fresh, private
+    /// `composer.lock` memoization cache. Production use goes through [`Self::with_context`]
+    /// instead.
     pub fn new(cache: Arc<deps_core::HttpCache>) -> Self {
         Self {
             registry: Arc::new(PackagistRegistry::new(cache)),
             formatter: ComposerFormatter,
+            lockfile_cache: Arc::new(deps_core::lockfile::LockFileCache::new()),
+        }
+    }
+
+    /// Creates a new Composer ecosystem sharing `lockfile_cache` (#1212 impl-critic follow-up)
+    /// — the production constructor, used by `deps_engine::setup::register_ecosystems` so a
+    /// `composer.lock` read for classification and a `composer.lock` read for in-use-version
+    /// resolution hit the same mtime-keyed cache instance instead of each parsing it
+    /// independently on every reparse.
+    #[must_use]
+    pub fn with_context(
+        cache: Arc<deps_core::HttpCache>,
+        lockfile_cache: Arc<deps_core::lockfile::LockFileCache>,
+    ) -> Self {
+        Self {
+            registry: Arc::new(PackagistRegistry::new(cache)),
+            formatter: ComposerFormatter,
+            lockfile_cache,
         }
     }
 
@@ -108,7 +134,12 @@ impl Ecosystem for ComposerEcosystem {
         uri: &'a url::Url,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Box<dyn ParseResultTrait>>> {
         Box::pin(async move {
-            let result = crate::parser::parse_composer_json(content, uri)?;
+            let result = crate::parser::parse_composer_json_with_lockfile(
+                content,
+                uri,
+                &self.lockfile_cache,
+            )
+            .await?;
             Ok(Box::new(result) as Box<dyn ParseResultTrait>)
         })
     }
@@ -420,6 +451,7 @@ mod tests {
                 base,
             )),
             formatter: ComposerFormatter,
+            lockfile_cache: Arc::new(deps_core::lockfile::LockFileCache::new()),
         };
         let uri = deps_core::test_util::test_uri("/test/composer.json");
         let content = r#"{"require": {"monolog/monolog": "!=2.0"}}"#;

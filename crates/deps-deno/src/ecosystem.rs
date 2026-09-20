@@ -40,10 +40,20 @@ const VERSION_OPERATOR_CHARS: &[char] = &['^', '~', '=', '<', '>', '*'];
 pub struct DenoEcosystem {
     registry: Arc<DenoRegistry>,
     formatter: DenoFormatter,
+    /// The `.npmrc` reachability policy and memoization cache (#1212) every `parse_manifest`
+    /// call threads through to [`crate::parser::parse_deno_json_with_context`]. Defaulted by
+    /// [`Self::new`]/[`Self::with_npm`]; set explicitly by [`Self::with_context`] so
+    /// `deps_engine::setup::register_ecosystems` can share the same handles it hands
+    /// `NpmEcosystem` (mirrors `deps_npm::ecosystem::NpmEcosystem`'s identical `context`
+    /// field).
+    context: crate::parser::DenoParseContext,
 }
 
 impl DenoEcosystem {
-    /// Creates a new Deno ecosystem with the given HTTP cache.
+    /// Creates a new Deno ecosystem with the given HTTP cache, using a fresh, default
+    /// [`crate::parser::DenoParseContext`] — an all-`PublicOnly`-policy, empty-cache context
+    /// private to this ecosystem instance. Production use goes through [`Self::with_context`]
+    /// instead.
     ///
     /// The same cache backs both halves of the registry facade (M1), deduping plain
     /// cached GETs between `package.json` and `deno.json` for the same npm package. This
@@ -55,22 +65,67 @@ impl DenoEcosystem {
         Self {
             registry: Arc::new(DenoRegistry::new(cache)),
             formatter: DenoFormatter,
+            context: crate::parser::DenoParseContext::default(),
         }
     }
 
     /// Creates a new Deno ecosystem sharing an existing [`NpmRegistry`] instance for its
-    /// `npm:`-scheme half, instead of building a private one (N4/#312).
+    /// `npm:`-scheme half, instead of building a private one (N4/#312), using a fresh,
+    /// default [`crate::parser::DenoParseContext`].
     ///
-    /// `deps-lsp`'s ecosystem registration uses this when both the `npm` and `deno`
-    /// features are enabled, so a package appearing in both `package.json` and
-    /// `deno.json` shares one freshness-path publish-time cache. See
-    /// [`DenoRegistry::with_npm`](crate::registry::DenoRegistry::with_npm) for what this
-    /// dedupes.
+    /// Used by tests and by `deps-lsp`'s registration when only the `deno` feature (not
+    /// `npm`) is enabled; production registration with both features goes through
+    /// [`Self::with_context`] instead. See [`DenoRegistry::with_npm`](crate::registry::DenoRegistry::with_npm)
+    /// for what sharing the registry itself dedupes.
     #[must_use]
     pub fn with_npm(cache: Arc<deps_core::HttpCache>, npm: NpmRegistry) -> Self {
         Self {
             registry: Arc::new(DenoRegistry::with_npm(cache, npm)),
             formatter: DenoFormatter,
+            context: crate::parser::DenoParseContext::default(),
+        }
+    }
+
+    /// Creates a new Deno ecosystem sharing an existing [`NpmRegistry`] instance and `ctx`'s
+    /// `.npmrc` reachability policy and memoization cache (#1212) — the production
+    /// constructor, used by `deps_engine::setup::register_ecosystems` so a `.npmrc` file
+    /// ancestor-walked once for this workspace is cached and reused across every reparse,
+    /// and shared with `NpmEcosystem`'s own identical handles rather than re-read from disk
+    /// independently per ecosystem.
+    #[must_use]
+    pub fn with_context(
+        cache: Arc<deps_core::HttpCache>,
+        npm: NpmRegistry,
+        ctx: crate::parser::DenoParseContext,
+    ) -> Self {
+        Self {
+            registry: Arc::new(DenoRegistry::with_npm(cache, npm)),
+            formatter: DenoFormatter,
+            context: ctx,
+        }
+    }
+
+    /// Creates a new Deno ecosystem with `ctx`'s `.npmrc` reachability policy and memoization
+    /// cache, building its own private [`NpmRegistry`] from `cache` instead of taking one
+    /// (impl-critic #1 follow-up to #1212's S5 fix).
+    ///
+    /// For a caller that needs to thread a live context through but cannot construct an
+    /// [`NpmRegistry`] value itself — `deps_engine::setup::register_ecosystems`'s
+    /// deno-without-npm build configuration (`#[cfg(all(feature = "deno", not(feature =
+    /// "npm")))]`), whose own `deps-npm` dependency is optional and gated behind its *own*
+    /// `npm` feature (off in that configuration), so `deps_npm::NpmRegistry` is not nameable
+    /// from that crate at all in that build. `deps-deno` itself always depends on `deps-npm`
+    /// unconditionally, so this constructor can build the registry internally where the type
+    /// is always nameable (mirrors [`Self::new`]'s identical "build our own" pattern).
+    #[must_use]
+    pub fn with_context_standalone(
+        cache: Arc<deps_core::HttpCache>,
+        ctx: crate::parser::DenoParseContext,
+    ) -> Self {
+        Self {
+            registry: Arc::new(DenoRegistry::new(cache)),
+            formatter: DenoFormatter,
+            context: ctx,
         }
     }
 
@@ -84,6 +139,7 @@ impl DenoEcosystem {
         Self {
             registry: Arc::new(registry),
             formatter: DenoFormatter,
+            context: crate::parser::DenoParseContext::default(),
         }
     }
 
@@ -100,7 +156,9 @@ impl DenoEcosystem {
         .await
     }
 
-    // Position-based, gated (#593, #1136) — currently inert here since `DenoDependency::source()` is hardcoded `Registry`; see the TODO on that type.
+    // Position-based, gated (#593, #1136) via `SourcePolicy::can_resolve_source` — an
+    // `npm:`-scheme import classified non-`Registry` (#1212, see `parser::classify_npm_imports`)
+    // now correctly yields zero completions here.
     #[cfg(feature = "lsp-responses")]
     async fn complete_versions(
         &self,
@@ -143,7 +201,7 @@ impl Ecosystem for DenoEcosystem {
         uri: &'a url::Url,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Box<dyn ParseResultTrait>>> {
         Box::pin(async move {
-            let result = crate::parser::parse_deno_json(content, uri)?;
+            let result = crate::parser::parse_deno_json_with_context(content, uri, &self.context)?;
             Ok(Box::new(result) as Box<dyn ParseResultTrait>)
         })
     }

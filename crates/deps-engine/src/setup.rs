@@ -35,6 +35,14 @@ pub struct EcosystemRuntime {
     /// un-`cfg`'d — see `deps_gitlab_ci::host::GitlabInstanceHost`'s docs for why host
     /// validation lives in that crate instead, applied on read.
     pub gitlab_instance_host: Arc<std::sync::RwLock<Option<String>>>,
+    /// `composer.lock` memoization cache (#1212 impl-critic follow-up) `register_ecosystems`
+    /// hands `ComposerEcosystem::with_context` — unlike the three fields above, this has a
+    /// sensible default (a fresh, private cache), so it is not a [`Self::new`] parameter; set
+    /// explicitly via [`Self::with_lockfile_cache`] so an adapter with its own long-lived
+    /// cache (e.g. `deps-lsp`'s `ServerState::lockfile_cache`, also read by its own
+    /// in-use-version resolution) can share that exact instance instead of Composer
+    /// classification parsing the same `composer.lock` independently.
+    pub lockfile_cache: Arc<deps_core::lockfile::LockFileCache>,
 }
 
 impl EcosystemRuntime {
@@ -73,7 +81,34 @@ impl EcosystemRuntime {
             policy,
             nuget_user_profile_sources,
             gitlab_instance_host,
+            lockfile_cache: Arc::new(deps_core::lockfile::LockFileCache::new()),
         }
+    }
+
+    /// Overrides [`Self::lockfile_cache`]'s default (a fresh, private cache) with an existing
+    /// instance — see that field's own doc for why an adapter with its own long-lived cache
+    /// wants to do this.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lockfile::LockFileCache;
+    /// use deps_core::policy_config::PolicyConfig;
+    /// use deps_engine::setup::EcosystemRuntime;
+    /// use std::sync::Arc;
+    ///
+    /// let shared = Arc::new(LockFileCache::new());
+    /// let runtime =
+    ///     EcosystemRuntime::from_policy(&PolicyConfig::default()).with_lockfile_cache(Arc::clone(&shared));
+    /// assert!(Arc::ptr_eq(&runtime.lockfile_cache, &shared));
+    /// ```
+    #[must_use]
+    pub fn with_lockfile_cache(
+        mut self,
+        lockfile_cache: Arc<deps_core::lockfile::LockFileCache>,
+    ) -> Self {
+        self.lockfile_cache = lockfile_cache;
+        self
     }
 
     /// Builds the runtime's three live-updatable handles from a [`PolicyConfig`] snapshot.
@@ -477,24 +512,36 @@ pub fn register_ecosystems(
 
     #[cfg(all(feature = "npm", feature = "deno"))]
     {
+        // Shared with `deno_context` below (#1212) so a `.npmrc` file ancestor-walked once
+        // for this workspace is cached and reused across both ecosystems, not re-read from
+        // disk independently per manifest kind.
+        let npm_config_cache = Arc::new(deps_npm::config::NpmConfigCache::new());
         let npm_context = deps_npm::config::NpmParseContext::new(
             Arc::clone(&policy),
-            Arc::new(deps_npm::config::NpmConfigCache::new()),
+            Arc::clone(&npm_config_cache),
             Arc::new(deps_npm::catalog::PnpmWorkspaceCache::new()),
         );
+        let deno_context =
+            deps_deno::parser::DenoParseContext::new(Arc::clone(&policy), npm_config_cache);
         let npm_registry = Arc::new(NpmRegistry::new(Arc::clone(&cache)));
         registry.register(Arc::new(NpmEcosystem::with_context(
             Arc::clone(&npm_registry),
             npm_context,
         )));
         workspace_registry_ecosystems.push("npm");
-        // `DenoEcosystem::with_npm` shares the registry above but is never handed `policy`
-        // itself (its own `.npmrc`-style workspace registry concept doesn't exist yet), so
-        // "deno" deliberately never joins this list.
-        registry.register(Arc::new(DenoEcosystem::with_npm(
+        // `DenoEcosystem::with_context` shares the registry, policy, and `.npmrc` cache above.
+        // "deno" joins `workspace_registry_ecosystems` too (#1212 S4 impl-critic fix): since
+        // `DenoParseContext.policy` now flows into real classification (`npm:`-scope
+        // resolution), a live `registries.workspace_registries` update must reach an
+        // already-open `deno.json` the same way it reaches `package.json` — omitting it here
+        // would reproduce the #592 stale-classification failure pattern
+        // `deps_lsp::config::reparse_scope`'s own doc warns against.
+        registry.register(Arc::new(DenoEcosystem::with_context(
             Arc::clone(&cache),
             npm_registry.as_ref().clone(),
+            deno_context,
         )));
+        workspace_registry_ecosystems.push("deno");
     }
     // npm is explicit, not via `register!` (spec 032, S3): the macro's default
     // `NpmParseContext` would never see a live `initialize`/`didChangeConfiguration` update.
@@ -511,8 +558,25 @@ pub fn register_ecosystems(
         )));
         workspace_registry_ecosystems.push("npm");
     }
+    // deno-without-npm is explicit too, not via `register!` (#1212 S5 impl-critic fix): the
+    // macro's default `DenoParseContext` would never see a live
+    // `initialize`/`did_change_configuration` policy update either, even with no `NpmEcosystem`
+    // present to share a `.npmrc` cache instance with. Uses `DenoParseContext::with_policy` and
+    // `DenoEcosystem::with_context_standalone` (impl-critic #1 follow-up), not `::new`/
+    // `with_context`, because this arm compiles with `deps-engine`'s own `deps-npm` dependency
+    // absent (it is optional, gated behind `deps-engine`'s *own* `npm` feature, which is off
+    // here) — neither `deps_npm::config::NpmConfigCache` nor `NpmRegistry` is nameable from
+    // this crate in this build configuration at all; both helpers build what they need
+    // internally inside `deps-deno`, which always depends on `deps-npm` unconditionally.
     #[cfg(all(feature = "deno", not(feature = "npm")))]
-    register!("deno", DenoEcosystem, registry, &cache);
+    {
+        let deno_context = deps_deno::parser::DenoParseContext::with_policy(Arc::clone(&policy));
+        registry.register(Arc::new(DenoEcosystem::with_context_standalone(
+            Arc::clone(&cache),
+            deno_context,
+        )));
+        workspace_registry_ecosystems.push("deno");
+    }
 
     // pypi is explicit, not via `register!` (spec 033, mirrors npm's spec 032 S3): the
     // macro's default `RegistryAccessPolicy` would never see a live config update.
@@ -545,7 +609,15 @@ pub fn register_ecosystems(
     register!("maven", MavenEcosystem, registry, &cache);
     register!("gradle", GradleEcosystem, registry, &cache);
     register!("swift", SwiftEcosystem, registry, &cache);
-    register!("composer", ComposerEcosystem, registry, &cache);
+
+    // composer is explicit, not via `register!` (#1212 impl-critic follow-up): shares
+    // `runtime.lockfile_cache` with whatever else in this process reads `composer.lock` by the
+    // same mtime-keyed cache instance, instead of parsing it independently on every reparse.
+    #[cfg(feature = "composer")]
+    registry.register(Arc::new(ComposerEcosystem::with_context(
+        Arc::clone(&cache),
+        Arc::clone(&runtime.lockfile_cache),
+    )));
 
     // nuget is explicit, not via `register!` (#523, mirrors npm's/pypi's precedent): the
     // macro's default `RegistryAccessPolicy` would never see a live config update.
@@ -693,6 +765,8 @@ mod tests {
         expected.push("cargo");
         #[cfg(feature = "npm")]
         expected.push("npm");
+        #[cfg(feature = "deno")]
+        expected.push("deno");
         #[cfg(feature = "pypi")]
         expected.push("pypi");
         #[cfg(feature = "go")]

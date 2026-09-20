@@ -732,7 +732,23 @@ mod tests {
             "settings.gradle",
         ];
         no_lockfile_support: true;
-        no_non_registry_fixture: "Gradle's repositories { } block (mavenLocal(), a custom maven { url = ... }/flatDir { dirs ... }) is a programmatic Groovy/Kotlin DSL, not a static declaration — determining which dependency a given repository block serves would need real DSL evaluation, far beyond this crate's regex/text-based parser. Tracked as a follow-up to #1202 (see the TODO in types.rs); Gradle 6+ content { includeGroup(...) } filters are a real static-binding counterexample worth revisiting when this is picked up.";
+        // #1212: closes the follow-up noted in the previous `no_non_registry_fixture` reason —
+        // Gradle 6+'s `content { includeGroup(...) }` restriction is a real static per-group
+        // binding (see `parser::parse_repository_content_restrictions`), unlike the general
+        // `repositories { }` DSL (still unclassifiable without real Groovy/Kotlin evaluation).
+        non_registry_fixture: "build.gradle.kts" => r#"
+repositories {
+    maven {
+        url = "https://repo.acme.internal/maven"
+        content {
+            includeGroup("com.acme")
+        }
+    }
+}
+dependencies {
+    implementation("com.acme:secretlib:1.0.0")
+}
+"#;
     }
 
     // #784: `build_arc:` against the real `Ecosystem::registry()` wiring, not a `build:` fixture

@@ -652,6 +652,15 @@ pub struct LockFileCache {
     capacity: usize,
 }
 
+impl std::fmt::Debug for LockFileCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LockFileCache")
+            .field("capacity", &self.capacity)
+            .field("len", &self.entries.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl LockFileCache {
     /// Creates a new empty lock file cache, capped at [`DEFAULT_MAX_CACHED_LOCKFILES`]
     /// entries.

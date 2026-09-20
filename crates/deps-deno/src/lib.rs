@@ -21,6 +21,8 @@ pub mod types;
 
 pub use ecosystem::DenoEcosystem;
 pub use formatter::DenoFormatter;
-pub use parser::{DenoParseResult, parse_deno_json};
+pub use parser::{
+    DenoParseContext, DenoParseResult, parse_deno_json, parse_deno_json_with_context,
+};
 pub use registry::{DenoRegistry, JsrRegistry};
 pub use types::{DenoDependency, DenoDependencySection, DenoMetadata, JsrPackage, JsrVersion};

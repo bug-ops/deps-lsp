@@ -22,16 +22,21 @@ pub struct GradleDependency {
     pub version_range: Option<Range>,
     /// Gradle configuration (e.g. "implementation", "api", "testImplementation")
     pub configuration: String,
+    /// Resolved source (#1212): `Registry` unless a `repositories { }` block declares a
+    /// repository whose `content { includeGroup(...) }` (or `includeGroupByRegex`/
+    /// `includeModule`) restriction statically binds this dependency's group/module to it
+    /// (see `parser::parse_repository_content_restrictions`). General-purpose `repositories
+    /// { }` evaluation (an arbitrary repo with no content filter) has no static per-package
+    /// binding in the Gradle DSL at all, so those stay `Registry`.
+    pub source: deps_core::parser::DependencySource,
 }
 
-// TODO(follow-up to #1202): `repositories { }` needs real Groovy/Kotlin DSL evaluation to bind
-// a package to a repo, so every dependency stays `DependencySource::Registry` here; Gradle 6+'s
-// `content { includeGroup(...) }` filter is a real static binding worth a narrower look first.
 deps_core::impl_dependency!(GradleDependency {
     name: name,
     name_range: name_range,
     version: version_req,
     version_range: version_range,
+    source: source,
 });
 
 #[cfg(test)]
@@ -49,6 +54,7 @@ mod tests {
             version_req: Some("3.2.0".into()),
             version_range: Some(Range::new(Position::new(5, 35), Position::new(5, 40))),
             configuration: "implementation".into(),
+            source: deps_core::parser::DependencySource::Registry,
         }
     }
 
@@ -89,6 +95,7 @@ mod tests {
             version_req: None,
             version_range: None,
             configuration: "api".into(),
+            source: deps_core::parser::DependencySource::Registry,
         };
         assert!(dep.version_requirement().is_none());
         assert!(dep.version_range().is_none());
