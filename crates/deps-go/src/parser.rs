@@ -149,7 +149,13 @@ pub fn parse_go_mod_with_context(
         }
 
         if (in_require_block || REQUIRE_SINGLE.is_match(line_trimmed))
-            && let Some(dep) = parse_require_line(line, line_offset, content, &line_table)
+            && let Some(dep) = parse_require_line(
+                line_without_comment,
+                line.contains("// indirect"),
+                line_offset,
+                content,
+                &line_table,
+            )
             && budget.allow()
         {
             dependencies.push(dep);
@@ -158,9 +164,14 @@ pub fn parse_go_mod_with_context(
         if let Some(caps) = REPLACE_PATTERN.captures(line_trimmed) {
             let module = &caps[1];
             let version = caps.get(2).map(|m| m.as_str());
-            if let Some(dep) =
-                parse_replace_line(line, line_offset, module, version, content, &line_table)
-                && budget.allow()
+            if let Some(dep) = parse_replace_line(
+                line_without_comment,
+                line_offset,
+                module,
+                version,
+                content,
+                &line_table,
+            ) && budget.allow()
             {
                 dependencies.push(dep);
             }
@@ -169,9 +180,14 @@ pub fn parse_go_mod_with_context(
         if let Some(caps) = EXCLUDE_PATTERN.captures(line_trimmed) {
             let module = &caps[1];
             let version = &caps[2];
-            if let Some(dep) =
-                parse_exclude_line(line, line_offset, module, version, content, &line_table)
-                && budget.allow()
+            if let Some(dep) = parse_exclude_line(
+                line_without_comment,
+                line_offset,
+                module,
+                version,
+                content,
+                &line_table,
+            ) && budget.allow()
             {
                 dependencies.push(dep);
             }
@@ -254,8 +270,16 @@ fn strip_line_comment(line: &str) -> &str {
 }
 
 /// Parses a single require line.
+///
+/// `line` must already have any trailing `//` comment stripped (see
+/// [`strip_line_comment`]) — otherwise a comment-only directive on a line whose version was
+/// deleted (e.g. `github.com/foo/bar // indirect`) can be misparsed as `[module, "//", ..]`,
+/// setting `version` to the comment token itself (#1179). `indirect` is derived from the raw
+/// (unstripped) line by the caller, since the `// indirect` marker lives in the comment this
+/// function no longer sees.
 fn parse_require_line(
     line: &str,
+    indirect: bool,
     line_start_offset: usize,
     content: &str,
     line_table: &LineOffsetTable,
@@ -267,8 +291,6 @@ fn parse_require_line(
         [module, version, ..] => (*module, *version),
         _ => return None,
     };
-
-    let indirect = line.contains("// indirect");
 
     let module_start = line.find(module_path)?;
     let module_offset = line_start_offset + module_start;
@@ -619,6 +641,48 @@ exclude github.com/bad/module v0.1.0
             Some("v0.1.0")
         );
         assert_eq!(exclude.directive, GoDirective::Exclude);
+    }
+
+    /// #1179: a require-block line whose version was deleted but a directive comment remains
+    /// must not have the comment's `//` token misparsed as the version. Also covers the more
+    /// common real-world case (impl-critic M1) of a fully commented-out require entry, where the
+    /// old behavior misparsed `module_path = "//"` / `version` from the comment body itself.
+    #[test]
+    fn test_require_block_line_missing_version_with_comment_yields_no_dependency() {
+        let content = "require (\n\tgithub.com/foo/bar // indirect\n\t// github.com/foo/bar v1.0.0\n\t// TODO check this\n)\n";
+        let result = parse_go_mod(content, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 0);
+    }
+
+    /// #1179 follow-up: a `replace` directive followed by a trailing comment must still parse
+    /// the correct module/version, exercising the same `line_without_comment` call site as the
+    /// require-block fix.
+    #[test]
+    fn test_parse_replace_directive_with_trailing_comment() {
+        let content = "replace github.com/old/module => github.com/new/module v1.2.3 // pinned\n";
+        let result = parse_go_mod(content, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].directive, GoDirective::Replace);
+        assert_eq!(result.dependencies[0].module_path, "github.com/old/module");
+    }
+
+    /// #1179 follow-up: an `exclude` directive followed by a trailing comment must still parse
+    /// the correct module/version, exercising the same `line_without_comment` call site as the
+    /// require-block fix.
+    #[test]
+    fn test_parse_exclude_directive_with_trailing_comment() {
+        let content = "exclude github.com/bad/module v0.1.0 // known vulnerability\n";
+        let result = parse_go_mod(content, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].directive, GoDirective::Exclude);
+        assert_eq!(result.dependencies[0].module_path, "github.com/bad/module");
+        assert_eq!(
+            result.dependencies[0]
+                .version
+                .as_ref()
+                .map(deps_core::VersionReq::as_str),
+            Some("v0.1.0")
+        );
     }
 
     #[test]
