@@ -4,10 +4,11 @@
 
 A `deno.json`/`deno.jsonc` `imports` entry resolved to a private npm scope via `.npmrc` is
 classified as a non-registry dependency instead of defaulting to `registry.npmjs.org`
-(resolves #1202). **Known limitation**: unlike npm's own `.npmrc` handling, Deno's `.npmrc`
-resolution is not yet wired into this project's shared ancestor-config-file cache — it
-re-reads `.npmrc` from disk on every parse rather than reusing the cached lookup npm's
-`NpmEcosystem::with_context` already benefits from; tracked as a follow-up.
+(resolves #1202). This `.npmrc` resolution now shares npm's cached ancestor-config lookup
+and live `RegistryAccessPolicy` instead of re-reading `.npmrc` from disk with a
+hardcoded policy on every parse, and participates in the same live-config reparse scope as
+npm — a `registries.workspace_registries` change reaches an already-open `deno.json` the
+same way it reaches `package.json` (resolves #1212).
 
 ## Release-Freshness Coverage
 

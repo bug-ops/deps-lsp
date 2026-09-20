@@ -16,11 +16,24 @@ system-scope dependency with a missing or empty `<systemPath>` still falls back 
 Central-resolvable, since scope alone isn't a locally-provided binding without a path.
 
 **Gradle**: Gradle has no per-dependency local-source syntax analogous to Maven's
-`systemPath` today (`project(":core")`/`files()`/`fileTree()` dependencies are deliberately
-not surfaced as version-checkable dependencies at all, so no Gradle dependency currently
-carries a local source through this pipeline) — tracked as a follow-up, since Gradle 6+'s
-`content { includeGroup(...) }` repository filtering is a static per-group binding this
-project doesn't yet read.
+`systemPath` (`project(":core")`/`files()`/`fileTree()` dependencies are deliberately not
+surfaced as version-checkable dependencies at all, so no Gradle dependency ever carries a
+local source through this pipeline that way). Instead, a `repositories { <repo> { content {
+includeGroup(...)/includeGroupByRegex(...)/includeModule(...) } } }` restriction (Gradle 6+,
+Groovy and Kotlin DSL, including `maven("url") { }`/`url.set(uri("..."))` call-site
+spellings) is read as a per-dependency non-registry classification signal: a dependency
+whose group matches a `content {}` restriction scoped to a repository with an explicit URL
+is classified as a custom-registry source the same way Maven's `systemPath` is (resolves
+#1212). An explicit repository URL is required — the common shorthand repos
+`google()`/`mavenCentral()`/`gradlePluginPortal()`/`mavenLocal()` (which frequently carry
+their own `content {}` filter, e.g. Android's canonical `google { content {
+includeGroupByRegex("androidx.*") } }`) are never reclassified this way, since they are
+themselves registry-shaped. A `content {}` restriction declared inside a `buildscript {}`
+block (plugin resolution) never affects the project's own `dependencies {}` classification.
+
+**Known limitation**: `exclusiveContent {}` and `includeGroupAndSubgroups(...)` are not yet
+parsed — only `includeGroup`/`includeGroupByRegex`/`includeModule` inside an ordinary
+`content {}` block.
 
 ## Version Comparison
 
