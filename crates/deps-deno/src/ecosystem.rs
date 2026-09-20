@@ -202,6 +202,10 @@ impl Ecosystem for DenoEcosystem {
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Box<dyn ParseResultTrait>>> {
         Box::pin(async move {
             let result = crate::parser::parse_deno_json_with_context(content, uri, &self.context)?;
+            // Registers `.npmrc`-resolved alternate indices (#1227), mirroring `NpmEcosystem`.
+            for index in result.resolved_registries.clone() {
+                self.registry.register_alternate_npm(index);
+            }
             Ok(Box::new(result) as Box<dyn ParseResultTrait>)
         })
     }
@@ -385,6 +389,80 @@ mod tests {
         let result = ecosystem.parse_manifest(content, &uri).await;
         assert!(result.is_ok());
         assert!(!result.unwrap().dependencies().is_empty());
+    }
+
+    /// S2 (task #11): proves `DenoEcosystem::parse_manifest`'s own registration loop
+    /// (`ecosystem.rs:205-210`) — not a manually-called `register_alternate_npm` — is what
+    /// wires an `.npmrc`-resolved alternate registry into the shared router. No test called
+    /// `register_alternate_npm` from `parse_manifest` before this: deleting that loop left
+    /// the whole suite green, since every other alternate-registry test registered the index
+    /// by hand. Here the index is registered purely as a side effect of `parse_manifest`.
+    #[tokio::test]
+    async fn test_parse_manifest_registers_resolved_alternate_registries_1227() {
+        use deps_core::net_policy::{RegistryAccessPolicy, WorkspaceRegistryAccess};
+
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let root = tempfile::tempdir().unwrap();
+
+        let mut alt_server = mockito::Server::new_async().await;
+        let alt_mock = alt_server
+            .mock("GET", "/@acme-corp/secretpkg")
+            .with_status(200)
+            .with_body(r#"{"versions": {"1.0.0": {}}}"#)
+            .create_async()
+            .await;
+        std::fs::write(
+            root.path().join(".npmrc"),
+            format!("@acme-corp:registry={}\n", alt_server.url()),
+        )
+        .unwrap();
+
+        let mut public_server = mockito::Server::new_async().await;
+        let public_mock = public_server
+            .mock("GET", mockito::Matcher::Any)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let manifest_path = root.path().join("deno.json");
+        let uri = url::Url::from_file_path(&manifest_path).unwrap();
+        let content = r#"{"imports": {"secret": "npm:@acme-corp/secretpkg@^1.0.0"}}"#;
+
+        let cache = Arc::new(deps_core::HttpCache::new());
+        cache.set_registry_policy(WorkspaceRegistryAccess::All);
+        let npm = NpmRegistry::with_public_base_for_test(Arc::clone(&cache), public_server.url());
+        let ctx = crate::parser::DenoParseContext::new(
+            Arc::new(RegistryAccessPolicy::new(WorkspaceRegistryAccess::All)),
+            Arc::new(deps_npm::config::NpmConfigCache::new()),
+        );
+        let ecosystem = DenoEcosystem::with_context(Arc::clone(&cache), npm, ctx);
+
+        // No manual `register_alternate_npm` call — the registration under test must come
+        // solely from `parse_manifest`'s own loop.
+        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+        let deps = parse_result.dependencies();
+        let dep = deps.first().expect("one npm: dependency");
+        let source = dep.source();
+        assert!(
+            matches!(
+                source,
+                deps_core::parser::DependencySource::AlternateRegistry { .. }
+            ),
+            "expected AlternateRegistry classification, got {source:?}"
+        );
+
+        let versions = Registry::get_versions_from(
+            ecosystem.registry.as_ref(),
+            dep.name(),
+            &source,
+            deps_core::FreshnessSettings::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(versions.len(), 1);
+
+        alt_mock.assert_async().await;
+        public_mock.assert_async().await;
     }
 
     #[tokio::test]

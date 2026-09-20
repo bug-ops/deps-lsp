@@ -10,6 +10,11 @@ hardcoded policy on every parse, and participates in the same live-config repars
 npm — a `registries.workspace_registries` change reaches an already-open `deno.json` the
 same way it reaches `package.json` (resolves #1212).
 
+A scope-overridden `npm:` import is fully fetchable, not just correctly classified: hover,
+diagnostics, completion, and inlay hints query the resolved alternate registry — the same
+`deps-npm` registry client and fail-closed routing `package.json` uses for the identical
+`.npmrc` entry — instead of silently behaving as an unresolved dependency (resolves #1227).
+
 ## Release-Freshness Coverage
 
 `jsr:` specifiers get full freshness coverage at **zero extra request cost** — better than
