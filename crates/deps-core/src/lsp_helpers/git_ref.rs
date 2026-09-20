@@ -364,7 +364,15 @@ pub fn locate_value_span(content: &str, search_from: usize, value: &str) -> Opti
         return None;
     }
     if value.is_empty() {
-        return Some((search_from, search_from));
+        // Mirrors the non-empty path's opening-quote correction below: a quoted empty
+        // scalar (`""`/`''`) has no content bytes for a fallback scan to anchor on, so the
+        // marker's own opening-quote-or-not shape is the only signal available — advance
+        // past the quote when the raw marker lands on one.
+        let corrected = match bytes.get(search_from) {
+            Some(b'"' | b'\'') => search_from + 1,
+            _ => search_from,
+        };
+        return Some((corrected, corrected));
     }
     #[expect(
         clippy::indexing_slicing,
@@ -906,6 +914,74 @@ mod tests {
         let content = "short";
         assert_eq!(locate_value_span(content, usize::MAX, ""), None);
         assert_eq!(locate_value_span(content, content.len() + 1, ""), None);
+    }
+
+    #[test]
+    fn test_locate_value_span_empty_value_corrects_past_opening_double_quote() {
+        // #1180: the raw marker for `pkg: ""` lands on the opening `"`, one byte before the
+        // actual (empty) value slot between the quotes.
+        let content = r#"pkg: """#;
+        let quote_offset = content.find('"').unwrap();
+        let (start, end) = locate_value_span(content, quote_offset, "").unwrap();
+        assert_eq!(start, quote_offset + 1);
+        assert_eq!(end, quote_offset + 1);
+    }
+
+    #[test]
+    fn test_locate_value_span_empty_value_corrects_past_opening_single_quote() {
+        let content = "ref: ''";
+        let quote_offset = content.find('\'').unwrap();
+        let (start, end) = locate_value_span(content, quote_offset, "").unwrap();
+        assert_eq!(start, quote_offset + 1);
+        assert_eq!(end, quote_offset + 1);
+    }
+
+    #[test]
+    fn test_locate_value_span_empty_value_at_non_quote_position_is_unchanged() {
+        // A plain (unquoted) empty value has no opening quote to correct past — the marker
+        // already points at the right (empty) slot, e.g. `ref:` with nothing after it.
+        let content = "ref: ";
+        let end_offset = content.len();
+        let (start, end) = locate_value_span(content, end_offset, "").unwrap();
+        assert_eq!(start, end_offset);
+        assert_eq!(end, end_offset);
+    }
+
+    #[test]
+    fn test_marked_scalar_span_quoted_empty_value_anchors_after_opening_quote() {
+        // End-to-end regression for #1180: `MarkedScalar::span` (via `locate_value_span`)
+        // must anchor a quoted empty scalar's span at the actual value slot, not the
+        // opening quote one column early — reproduces deps-dart's `pkg: ""` and
+        // deps-gitlab-ci's `ref: ""`.
+        use yaml_rust2::parser::{Event, MarkedEventReceiver, Parser};
+
+        struct Scalars(Vec<(String, TScalarStyle, Marker)>);
+        impl MarkedEventReceiver for Scalars {
+            fn on_event(&mut self, event: Event, marker: Marker) {
+                if let Event::Scalar(value, style, ..) = event {
+                    self.0.push((value, style, marker));
+                }
+            }
+        }
+
+        let content = "pkg: \"\"\n";
+        let mut receiver = Scalars(Vec::new());
+        Parser::new_from_str(content)
+            .load(&mut receiver, false)
+            .unwrap();
+        // receiver.0[0] is the key scalar ("pkg"), receiver.0[1] is the value.
+        let (value, style, marker) = receiver.0[1].clone();
+        assert_eq!(value, "");
+        let scalar = MarkedScalar::new(value, style, &marker);
+        let table = LineOffsetTable::new(content);
+        let (start, end) = scalar.span(content, &table).unwrap();
+        let quote_offset = content.find("\"\"").unwrap();
+        assert_eq!(
+            (start, end),
+            (quote_offset + 1, quote_offset + 1),
+            "expected the empty value's span to anchor between the quotes, not on the \
+             opening quote"
+        );
     }
 
     #[test]

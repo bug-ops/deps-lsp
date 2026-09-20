@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **deps-github-actions**: hover's "Press Cmd+. to update version" footer now uses the same centralized SHA-pin eligibility check as the quickfix/code-lens, no longer advertising the action for a flow-style step where the quickfix is withheld (resolves #1178) (#1187)
+- **deps-github-actions**: version completion is now withheld once the cursor moves past a full-SHA pin's own ref text, instead of remaining offered inside the trailing tag comment (resolves #1182) (#1185)
+- **deps-core**: `locate_value_span`'s empty-value short-circuit now applies the same opening-quote correction as the non-empty path, fixing a one-column-early `version_range` anchor for quoted empty values in deps-dart and deps-gitlab-ci (resolves #1180) (#1185)
 - **ci**: `scorecard.yml` and `release.yml` pin `github/codeql-action/upload-sarif` to the current `v4.38.1` digest, resolving stale-dependency code-scanning findings
 - **deps-go**: fix trailing directive comment (`// indirect`) on a require line with a deleted version being misparsed as the version requirement (resolves #1179) (#1183)
 - **ci**: `auto-merge.yml` scopes `contents`/`pull-requests` write permissions to the job instead of the whole workflow, and `SECURITY.md` links the GitHub Security Advisories reporting channel, resolving OpenSSF Scorecard code-scanning findings (#1172)
