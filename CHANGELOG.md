@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: removed `completion::complete_versions_generic`; `completion::complete_versions_generic_from` now requires an additional `formatter: &dyn lsp_helpers::SourcePolicy` parameter (resolves #1136)
 
 ### Fixed
+- **ci**: `auto-merge.yml` scopes `contents`/`pull-requests` write permissions to the job instead of the whole workflow, and `SECURITY.md` links the GitHub Security Advisories reporting channel, resolving OpenSSF Scorecard code-scanning findings
 - **deps-gradle**: DSL version completion no longer overspans into a semicolon- or space-joined earlier dependency on the same line (resolves #1160) (#1166)
 - **deps-maven**: version completion now triggers inside an empty `<version></version>` tag instead of being silently withheld (resolves #1161) (#1166)
 - **deps-pypi, deps-cargo, deps-composer, deps-maven, deps-gradle, deps-nuget**: version-completion's leading-operator stripping fixed for Poetry caret constraints, Cargo `*`, Composer `!=`, and Maven/Gradle/NuGet bracket-range syntax, each ecosystem's operator set now covered by a conformance test (resolves #1137) (#1170)
