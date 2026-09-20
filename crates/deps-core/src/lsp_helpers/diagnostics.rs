@@ -14,6 +14,7 @@ use crate::{
 
 use super::{
     EcosystemFormatter, PackageVersions, RequirementMatcher, RequirementStatus, VersionData,
+    version_range_is_synthetic_empty,
 };
 
 /// Stable [`Diagnostic::code`] set on the unsatisfiable-requirement diagnostic.
@@ -1234,7 +1235,7 @@ fn apply_deprecation_rule(diagnostics: &mut Vec<Diagnostic>, ctx: &RuleContext<'
 /// `ctx.versions.ecosystem` being set (production always sets it; the check is
 /// skipped, matching pre-#394 behavior, for the test fixtures that do not) via
 /// `is_none_or`.
-/// Emits: 1 yanked diagnostic on `version_range().unwrap_or(name_range())`. Message is
+/// Emits: 1 yanked diagnostic on [`version_anchor_range`]. Message is
 /// deliberately `"{yanked_message()} ({version})"` — do not "harmonize" it with R6b's
 /// message (`"{yanked_message()}; latest is {latest}"`), which differs on purpose.
 /// Suppressed by: D5 above. Not gated on `can_resolve_source`.
@@ -1276,10 +1277,7 @@ fn apply_in_use_yanked_rule(
         })
     {
         diagnostics.push(Diagnostic {
-            range: ctx
-                .dep
-                .version_range()
-                .unwrap_or_else(|| ctx.dep.name_range()),
+            range: version_anchor_range(ctx.dep),
             severity: Some(ctx.severities.yanked),
             message: format!("{} ({})", ctx.formatter.yanked_message(), yanked_version),
             ..Default::default()
@@ -1668,12 +1666,35 @@ fn push_collapsed_fetch_failures(
     }
 }
 
+/// The anchor range for a package-level diagnostic (deprecation, vulnerability) that isn't
+/// itself about the declared version requirement: `dep.version_range()` when it is a real,
+/// non-degenerate position, falling back to `dep.name_range()` otherwise — the same range D4
+/// requires so the client's lightbulb gesture lands where `generate_code_actions`'s quickfixes
+/// already work (see `EcosystemFormatter::is_position_on_dependency`'s default).
+///
+/// The `version_range_is_synthetic_empty` gate (#1161 M1 follow-up) is deliberate, not
+/// redundant with `version_range()`'s own `Option`: Maven's `<version></version>` gives
+/// `version_range()` a real, zero-width position purely so completion can locate the
+/// dependency there, but there is no requirement text to visibly anchor a diagnostic against
+/// — anchoring there anyway would move a vulnerability/deprecation squiggle off the visible
+/// `<artifactId>` text onto an invisible empty span between two tags, contrary to this
+/// function's whole purpose of picking a *visible* fallback. A bare `version_requirement().is_some()`
+/// check (the M1 fix's first attempt) over-corrected this: Gradle's version-catalog
+/// `version.ref` pointing at a dangling/rich-version alias legitimately has a REAL, non-empty
+/// `version_range()` (the alias-reference text) with `version_requirement()` still `None` —
+/// anchoring diagnostics there worked before #1161 and must keep working (code-review
+/// follow-up, second round).
+fn version_anchor_range(dep: &dyn Dependency) -> Range {
+    if version_range_is_synthetic_empty(dep) {
+        dep.name_range()
+    } else {
+        dep.version_range().unwrap_or_else(|| dep.name_range())
+    }
+}
+
 /// Pushes the package-level deprecation [`Diagnostic`] for `dep` (issue #205).
 ///
-/// Modeled on `push_vulnerability_diagnostics`: anchored on `dep.version_range()`,
-/// falling back to `dep.name_range()` — the same range D4 requires so the client's
-/// lightbulb gesture lands where `generate_code_actions`' quickfixes already work (see
-/// `EcosystemFormatter::is_position_on_dependency`'s default).
+/// Modeled on `push_vulnerability_diagnostics`: anchored via [`version_anchor_range`].
 fn push_deprecation_diagnostic(
     diagnostics: &mut Vec<Diagnostic>,
     dep: &dyn Dependency,
@@ -1683,7 +1704,7 @@ fn push_deprecation_diagnostic(
 ) {
     use std::fmt::Write as _;
 
-    let range: Range = dep.version_range().unwrap_or_else(|| dep.name_range());
+    let range: Range = version_anchor_range(dep);
 
     let mut message = formatter.deprecated_message().to_string();
     if let Some(reason) = deprecation.reason.as_deref().filter(|r| !r.is_empty()) {
@@ -1732,7 +1753,7 @@ fn push_vulnerability_diagnostics(
     dep: &dyn Dependency,
     dv: &crate::osv::DependencyVulnerabilities,
 ) {
-    let range: Range = dep.version_range().unwrap_or_else(|| dep.name_range());
+    let range: Range = version_anchor_range(dep);
 
     for advisory in dv.advisories.items() {
         let code_description = advisory
@@ -1788,6 +1809,57 @@ mod tests {
 
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    /// #1161 M1 (critic follow-up): a dependency with a real `version_range()` but no
+    /// `version_requirement()` — Maven's `<version></version>`, whose zero-width
+    /// `version_range()` exists purely so completion can locate the dependency — must anchor
+    /// package-level diagnostics (deprecation, vulnerability, in-use-yanked) at the visible
+    /// `name_range()`, not the invisible empty span, matching what happens for a manifest
+    /// with no `<version>` tag at all (`version_range() == None`).
+    #[test]
+    fn test_version_anchor_range_falls_back_to_name_range_with_no_requirement() {
+        let name_range = Range::new(Position::new(4, 18), Position::new(4, 21));
+        let dep = MockNoRequirementDep {
+            name: PackageName::new("com.example:foo"),
+            name_range,
+            version_range: Range::new(Position::new(5, 15), Position::new(5, 15)),
+        };
+
+        assert_eq!(version_anchor_range(&dep), name_range);
+    }
+
+    /// Counterpart to the above: when `version_requirement()` IS present, the real
+    /// `version_range()` is used, unaffected by the #1161 M1 fallback.
+    #[test]
+    fn test_version_anchor_range_uses_version_range_when_requirement_present() {
+        let version_range = Range::new(Position::new(0, 9), Position::new(0, 14));
+        let dep = MockDep {
+            name: PackageName::new("serde"),
+            version_req: VersionReq::new("1.0.0"),
+            version_range,
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+        };
+
+        assert_eq!(version_anchor_range(&dep), version_range);
+    }
+
+    /// #1161 M1 code-review follow-up (second round): a REAL, non-empty `version_range()`
+    /// with no `version_requirement()` — Gradle's version-catalog `version.ref` pointing at a
+    /// dangling/rich-version alias — must still anchor diagnostics at that real position, not
+    /// fall back to `name_range()`. This worked before #1161 (`version_range().unwrap_or_else`
+    /// alone gated it, with no requirement check), and a bare `version_requirement().is_some()`
+    /// gate (the M1 fix's first attempt) would have silently broken it.
+    #[test]
+    fn test_version_anchor_range_uses_non_empty_version_range_with_no_requirement() {
+        let version_range = Range::new(Position::new(4, 40), Position::new(4, 45));
+        let dep = MockNoRequirementDep {
+            name: PackageName::new("com.example:guava"),
+            name_range: Range::new(Position::new(4, 18), Position::new(4, 21)),
+            version_range,
+        };
+
+        assert_eq!(version_anchor_range(&dep), version_range);
+    }
 
     #[test]
     fn test_generate_diagnostics_from_cache_unknown_package() {

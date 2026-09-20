@@ -84,9 +84,18 @@ pub async fn generate_hover<R: Registry + ?Sized>(
         // sentinel) would match whichever synthetic-range dependency lists first.
         let on_name =
             !d.name_range_is_synthetic() && position_in_range(position.into(), d.name_range());
-        let on_version = d
-            .version_range()
-            .is_some_and(|r| position_in_range(position.into(), r));
+        // `!version_range_is_synthetic_empty` gate (#1161 M1 code-review follow-up, second
+        // round): Maven's empty `<version></version>` gives `version_range()` a real,
+        // zero-width position purely so completion can locate the dependency there, with no
+        // requirement text to hover over — that degenerate case must not match here. A blanket
+        // `version_requirement().is_some()` gate over-corrected this: Gradle's version-catalog
+        // `version.ref` pointing at a dangling/rich-version alias legitimately has a REAL,
+        // non-empty `version_range()` (the alias-reference text) with `version_requirement()`
+        // still `None`, and hovering it worked before #1161 — the zero-width check keeps that
+        // working while still suppressing Maven's genuinely degenerate position.
+        let on_version = !super::version_range_is_synthetic_empty(*d)
+            && d.version_range()
+                .is_some_and(|r| position_in_range(position.into(), r));
         on_name || on_version
     })?;
 
@@ -1304,6 +1313,81 @@ mod tests {
             hover.is_none(),
             "position (0,0) must not match the synthetic-range dependency's \
              Range::default() sentinel"
+        );
+    }
+
+    /// #1161 M1 (critic follow-up): a dependency whose `version_range()` is `Some` but which
+    /// has no `version_requirement()` at all — e.g. Maven's `<version></version>`, whose
+    /// zero-width `version_range()` exists purely so completion can locate the dependency —
+    /// must not match on `version_range()` alone. Without the `version_requirement().is_some()`
+    /// gate, hovering exactly at that position would fire a registry fetch for a dependency
+    /// that every other consumer (diagnostics, inlay hints) treats as having no version range.
+    #[tokio::test]
+    async fn test_generate_hover_does_not_match_version_range_with_no_requirement() {
+        use std::collections::HashMap;
+
+        let version_range = Range::new(Position::new(5, 15), Position::new(5, 15));
+        let parse_result = MockMixedParseResult {
+            deps: vec![Box::new(MockNoRequirementDep {
+                name: "com.example:foo".into(),
+                name_range: Range::new(Position::new(4, 18), Position::new(4, 21)),
+                version_range,
+            })],
+            uri: crate::test_util::test_uri("/test/pom.xml"),
+        };
+
+        let hover = generate_hover(
+            &parse_result,
+            version_range.start.into(),
+            VersionData::new(&HashMap::new(), &HashMap::new()),
+            &MockRegistry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await;
+
+        assert!(
+            hover.is_none(),
+            "must not match a version_range with no version_requirement behind it"
+        );
+    }
+
+    /// #1161 M1 code-review follow-up (second round): a REAL, non-empty `version_range()`
+    /// with no `version_requirement()` — Gradle's version-catalog `version.ref` pointing at a
+    /// dangling or rich-version `[versions]` alias, whose `version_range()` spans the real
+    /// alias-reference text (`crates/deps-gradle/src/parser/catalog.rs`'s `extract_version`)
+    /// — is a genuinely different shape from Maven's zero-width degenerate position, and must
+    /// still match here: hovering it worked before #1161, and a blanket
+    /// `version_requirement().is_some()` gate would have silently broken it.
+    #[tokio::test]
+    async fn test_generate_hover_matches_non_empty_version_range_with_no_requirement() {
+        use std::collections::HashMap;
+
+        let version_range = Range::new(Position::new(4, 40), Position::new(4, 45));
+        let parse_result = MockMixedParseResult {
+            deps: vec![Box::new(MockNoRequirementDep {
+                name: "com.example:guava".into(),
+                name_range: Range::new(Position::new(4, 18), Position::new(4, 21)),
+                version_range,
+            })],
+            uri: crate::test_util::test_uri("/test/libs.versions.toml"),
+        };
+
+        let hover = generate_hover(
+            &parse_result,
+            version_range.start.into(),
+            VersionData::new(&HashMap::new(), &HashMap::new()),
+            &MockRegistry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await;
+
+        assert!(
+            hover.is_some(),
+            "must match a real, non-empty version_range even with no version_requirement"
         );
     }
 

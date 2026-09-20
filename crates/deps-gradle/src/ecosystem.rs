@@ -325,7 +325,34 @@ fn detect_dsl_context<'a>(
         return (GradleCompletionContext::None, "", Range::default());
     };
 
-    let colon_count = before_cursor.chars().filter(|&c| c == ':').count();
+    // Groovy's named-argument ("map notation") dependency form
+    // (`group: 'x', name: 'y', version: 'z'`) puts each field's value in its own standalone
+    // quoted literal, with the field name and colon OUTSIDE the quotes — a shape
+    // `crate::parser::groovy` doesn't parse into a `Dependency` at all, so its colon-free field
+    // values must not be misread as a Package/Version segment of a compact coordinate.
+    // Requires the colon to be immediately preceded (after whitespace) by an identifier
+    // character, not just any trailing `:` — a Groovy ternary's or Elvis operator's colon
+    // (`cond ? "a:b:1.0" : "c:d:2.0`, `value ?: "a:b:1.0"`) also leaves a trailing `:` before a
+    // legitimate compact-coordinate string, but is preceded by `"`/`?`, never an identifier.
+    if let Some(before_colon) = before_cursor[..open_pos].trim_end().strip_suffix(':')
+        && before_colon
+            .trim_end()
+            .ends_with(|c: char| c.is_alphanumeric() || c == '_')
+    {
+        return (GradleCompletionContext::None, "", Range::default());
+    }
+
+    // Scoped to the currently open string literal (from `open_pos` to the cursor), not the
+    // whole line: a semicolon- or space-joined multi-dependency statement
+    // (`implementation("a:b:1.0"); implementation("c:d:2.0")`) would otherwise let an earlier,
+    // already-closed dependency's colons leak into this one's colon count and `version_start`
+    // computation, causing both a wrong context (Package vs Version) and, in the Version arm,
+    // a `value_range` that overspans back into the earlier dependency's text (#1160).
+    let in_string_before_cursor = &before_cursor[open_pos + 1..];
+    let colon_count = in_string_before_cursor
+        .chars()
+        .filter(|&c| c == ':')
+        .count();
 
     match colon_count {
         0 | 1 => {
@@ -350,11 +377,11 @@ fn detect_dsl_context<'a>(
             )
         }
         _ => {
-            let version_start = before_cursor
+            let version_start = in_string_before_cursor
                 .char_indices()
                 .filter(|(_, c)| *c == ':')
                 .nth(1)
-                .map(|(i, _)| i + 1)
+                .map(|(i, _)| open_pos + 1 + i + 1)
                 .unwrap_or(before_cursor.len());
             // Same unterminated-string fallback as the `colon_count 0 | 1` arm above (#931 —
             // this arm previously returned `Range::default()`, rejecting every compact-coordinate
@@ -796,6 +823,94 @@ mod tests {
         assert_eq!(t, GradleCompletionContext::None);
         assert_eq!(v, "");
         assert_eq!(range, Range::default());
+    }
+
+    // #1160 S2 (critic follow-up): Groovy's named-argument ("map notation") dependency form
+    // is not parsed by `crate::parser::groovy` into a `Dependency` at all, and scoping
+    // colon-count to the open string literal (#1160's own fix) now sees zero colons inside
+    // the version value's own quoted text and misreads it as a Package-name prefix instead
+    // of correctly withholding completion — regression this test pins closed.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_dsl_context_groovy_map_notation_version_value_withholds_completion() {
+        // implementation group: 'com.example', name: 'foo', version: '1.0|
+        let line = r"implementation group: 'com.example', name: 'foo', version: '1.0";
+        let col = line.len();
+        let before = &line[..col];
+        let (t, v, range) = detect_dsl_context(before, line, col, 0);
+        assert_eq!(t, GradleCompletionContext::None);
+        assert_eq!(v, "");
+        assert_eq!(range, Range::default());
+    }
+
+    // #1160 S2 follow-up: the same map-notation shape must also withhold completion for the
+    // `group`/`name` fields, not just `version`, confirming the fix isn't accidentally
+    // keyed to the word "version".
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_dsl_context_groovy_map_notation_group_value_withholds_completion() {
+        // implementation group: 'com.exam|
+        let line = "implementation group: 'com.exam";
+        let col = line.len();
+        let before = &line[..col];
+        let (t, v, range) = detect_dsl_context(before, line, col, 0);
+        assert_eq!(t, GradleCompletionContext::None);
+        assert_eq!(v, "");
+        assert_eq!(range, Range::default());
+    }
+
+    // #1160 S2 code-review follow-up: a Groovy ternary's second colon
+    // (`cond ? "a:b:1.0" : "c:d:2.0`) leaves the same trailing `:` before an open quote as
+    // map-notation's `version: '...'`, but the character immediately before it (after
+    // whitespace) is `"` — a closing quote, not an identifier — so this must still resolve
+    // to Version, not be withheld.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_dsl_context_ternary_colon_before_string_still_resolves_version() {
+        // implementation(cond ? "a:b:1.0" : "c:d:2.0|
+        let line = r#"implementation(cond ? "a:b:1.0" : "c:d:2.0"#;
+        let col = line.len();
+        let before = &line[..col];
+        let (t, v, range) = detect_dsl_context(before, line, col, 0);
+        assert_eq!(t, GradleCompletionContext::Version);
+        assert_eq!(v, "2.0");
+        let expected_start = line.rfind("2.0").unwrap();
+        assert_eq!(
+            range,
+            Range::new(
+                Position::new(0, expected_start as u32),
+                Position::new(0, col as u32)
+            )
+        );
+    }
+
+    // #1160 S2 code-review follow-up: the same ternary shape, cursor in the second string's
+    // still-untyped package segment, must resolve to Package.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_dsl_context_ternary_colon_before_string_still_resolves_package() {
+        // implementation(cond ? "a:b:1.0" : "com.exam|
+        let line = r#"implementation(cond ? "a:b:1.0" : "com.exam"#;
+        let col = line.len();
+        let before = &line[..col];
+        let (t, v, _range) = detect_dsl_context(before, line, col, 0);
+        assert_eq!(t, GradleCompletionContext::Package);
+        assert_eq!(v, "com.exam");
+    }
+
+    // #1160 S2 code-review follow-up: an Elvis operator (`value ?: "a:b:1.0"`) leaves a
+    // trailing `?:` before the open quote — the character immediately before the colon is
+    // `?`, never an identifier, so this must not be withheld either.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_dsl_context_elvis_operator_colon_before_string_still_resolves_version() {
+        // implementation(value ?: "com.example:foo:1.0|
+        let line = r#"implementation(value ?: "com.example:foo:1.0"#;
+        let col = line.len();
+        let before = &line[..col];
+        let (t, v, _range) = detect_dsl_context(before, line, col, 0);
+        assert_eq!(t, GradleCompletionContext::Version);
+        assert_eq!(v, "1.0");
     }
 
     #[cfg(feature = "lsp-responses")]
@@ -1275,6 +1390,84 @@ mod tests {
         ));
     }
 
+    // Critic follow-up (C1) to #1161: end-to-end pin, through the real parser and
+    // `generate_completions` dispatch, of the exact #931 worst case — an alias whose
+    // resolved value is textually identical to its own name — proving
+    // `dependency_version_range_is_literal`'s empty-slice relaxation for #1161 did not
+    // invert `detect_catalog_context`'s deliberate `Range::default()` always-reject
+    // sentinel into an always-accept.
+    #[cfg(feature = "lsp-responses")]
+    #[tokio::test]
+    async fn test_generate_completions_version_ref_alias_withheld_even_when_resolved_value_matches_alias_name()
+     {
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let eco = GradleEcosystem::new(make_cache());
+        let content = "[versions]\nguavaVersion = \"guavaVersion\"\n\n[libraries]\nguava = { module = \"com.google.guava:guava\", version.ref = \"guavaVersion\" }\n";
+        let uri = deps_core::test_util::test_uri("/project/gradle/libs.versions.toml");
+        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+        let dep = &parse_result.dependencies()[0];
+        assert_eq!(
+            dep.version_requirement().map(deps_core::VersionReq::as_str),
+            Some("guavaVersion"),
+            "fixture must resolve the alias to a value textually identical to its own name: {content}"
+        );
+        let position: Position = dep.version_range().unwrap().start.into();
+
+        let result = eco
+            .generate_completions(
+                parse_result.as_ref(),
+                position,
+                content,
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
+        assert_eq!(
+            result,
+            Completions::default(),
+            "a version.ref alias must never be offered completions, even when its \
+             resolved value happens to equal its own alias name"
+        );
+    }
+
+    // Critic follow-up (C1, second round) to #1161: the ORDINARY interactive state while
+    // typing a `version.ref` alias — every prefix short of the real key, so
+    // `version_requirement()` is `None` on every keystroke, not just for a permanently
+    // dangling reference — must never fall through to the unfiltered full version list.
+    // Exercises several partial-typing states end-to-end through the real parser + dispatch.
+    #[cfg(feature = "lsp-responses")]
+    #[tokio::test]
+    async fn test_generate_completions_version_ref_alias_withheld_while_still_being_typed() {
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let eco = GradleEcosystem::new(make_cache());
+        for partial in ["g", "gu", "gua", "guavaVersio"] {
+            let content = format!(
+                "[versions]\nguavaVersion = \"32.0.1\"\n\n[libraries]\nguava = {{ module = \"com.google.guava:guava\", version.ref = \"{partial}\" }}\n"
+            );
+            let uri = deps_core::test_util::test_uri("/project/gradle/libs.versions.toml");
+            let parse_result = eco.parse_manifest(&content, &uri).await.unwrap();
+            let dep = &parse_result.dependencies()[0];
+            assert!(
+                dep.version_requirement().is_none(),
+                "{partial:?} must not resolve against \"guavaVersion\": {content}"
+            );
+            let position: Position = dep.version_range().unwrap().start.into();
+
+            let result = eco
+                .generate_completions(
+                    parse_result.as_ref(),
+                    position,
+                    &content,
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            assert_eq!(
+                result,
+                Completions::default(),
+                "partial alias {partial:?} must not offer the unfiltered version list: {content}"
+            );
+        }
+    }
+
     // `complete_versions` has no offline guard for an already-well-formed package name, so
     // the "happy path" needs live Maven Central access, mirroring `deps_maven`'s equivalent
     // characterization test.
@@ -1297,6 +1490,127 @@ mod tests {
             .generate_completions(parse_result.as_ref(), position, content, freshness)
             .await;
         assert_eq!(via_dispatch.items, direct);
+    }
+
+    // #1160: `detect_dsl_context`'s colon-counting/`version_start` must be scoped to the
+    // current dependency call, not the whole line, so a semicolon-joined second dependency's
+    // version resolves to its own literal text instead of overspanning back into the first
+    // dependency's already-closed coordinate.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_dsl_context_semicolon_joined_line_scopes_version_to_second_dependency() {
+        // implementation("com.example:foo:1.0.0"); implementation("com.example:bar:2.0|.0")
+        let line =
+            r#"implementation("com.example:foo:1.0.0"); implementation("com.example:bar:2.0.0")"#;
+        let col = line.find("2.0").unwrap() + 3; // cursor right after "2.0" in the second dep
+        let before = &line[..col];
+        let (t, v, range) = detect_dsl_context(before, line, col, 0);
+        assert_eq!(t, GradleCompletionContext::Version);
+        assert_eq!(v, "2.0");
+        let expected_start = line.rfind("2.0.0").unwrap();
+        assert_eq!(
+            range,
+            Range::new(
+                Position::new(0, expected_start as u32),
+                Position::new(0, (expected_start + "2.0.0".len()) as u32)
+            )
+        );
+    }
+
+    // #1160 M2 (tester follow-up): the same scoping fix must also generalize to a
+    // space-joined (not just semicolon-joined) pair of dependencies, since `detect_dsl_context`
+    // doesn't special-case the joining delimiter — only `open_pos` (the last odd-parity quote)
+    // matters.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_dsl_context_space_joined_line_scopes_version_to_second_dependency() {
+        // implementation("com.example:foo:1.0.0") implementation("com.example:bar:2.0|.0")
+        let line =
+            r#"implementation("com.example:foo:1.0.0") implementation("com.example:bar:2.0.0")"#;
+        let col = line.find("2.0").unwrap() + 3;
+        let before = &line[..col];
+        let (t, v, range) = detect_dsl_context(before, line, col, 0);
+        assert_eq!(t, GradleCompletionContext::Version);
+        assert_eq!(v, "2.0");
+        let expected_start = line.rfind("2.0.0").unwrap();
+        assert_eq!(
+            range,
+            Range::new(
+                Position::new(0, expected_start as u32),
+                Position::new(0, (expected_start + "2.0.0".len()) as u32)
+            )
+        );
+    }
+
+    // #1160 M2 (tester follow-up): a 3-dependency-per-line statement must scope correctly to
+    // the LAST dependency, proving the fix isn't a special case for exactly two dependencies.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_dsl_context_three_dependencies_semicolon_joined_scopes_to_third() {
+        // implementation("a:b:1.0"); implementation("c:d:2.0"); implementation("e:f:3.0|.0")
+        let line =
+            r#"implementation("a:b:1.0"); implementation("c:d:2.0"); implementation("e:f:3.0.0")"#;
+        let col = line.find("3.0").unwrap() + 3;
+        let before = &line[..col];
+        let (t, v, range) = detect_dsl_context(before, line, col, 0);
+        assert_eq!(t, GradleCompletionContext::Version);
+        assert_eq!(v, "3.0");
+        let expected_start = line.rfind("3.0.0").unwrap();
+        assert_eq!(
+            range,
+            Range::new(
+                Position::new(0, expected_start as u32),
+                Position::new(0, (expected_start + "3.0.0".len()) as u32)
+            )
+        );
+    }
+
+    // #1160 follow-up: the same unscoped colon-count bug also misclassified a second,
+    // not-yet-colon-typed dependency's package name as a Version context, since the first
+    // dependency's own two colons were counted against it.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_dsl_context_semicolon_joined_line_scopes_package_to_second_dependency() {
+        // implementation("com.example:foo:1.0.0"); implementation("ba|
+        let line = r#"implementation("com.example:foo:1.0.0"); implementation("ba"#;
+        let col = line.len();
+        let before = &line[..col];
+        let (t, v, _range) = detect_dsl_context(before, line, col, 0);
+        assert_eq!(t, GradleCompletionContext::Package);
+        assert_eq!(v, "ba");
+    }
+
+    // #1160: end-to-end through `generate_completions`'s real parser + dispatch, on the exact
+    // semicolon-joined fixture from the issue, proving completion is no longer withheld for
+    // the second dependency's version.
+    #[cfg(feature = "lsp-responses")]
+    #[tokio::test]
+    async fn test_dsl_context_semicolon_joined_line_admits_second_dependency_version() {
+        // See the comment in `test_parse_manifest_kts` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let eco = GradleEcosystem::new(make_cache());
+        let content = "dependencies {\n    implementation(\"com.example:foo:1.0.0\"); implementation(\"com.example:bar:2.0.0\")\n}\n";
+        let uri = deps_core::test_util::test_uri("/project/build.gradle");
+        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+        let deps = parse_result.dependencies();
+        assert_eq!(
+            deps.len(),
+            2,
+            "fixture must parse both dependencies: {content}"
+        );
+        let dep_two = deps[1];
+        let position: Position = dep_two.version_range().unwrap().start.into();
+
+        let (ctx, _, range) = GradleEcosystem::detect_completion_context(content, position, &uri);
+        assert_eq!(ctx, GradleCompletionContext::Version);
+        assert!(
+            deps_core::lsp_helpers::dependency_version_range_is_literal(
+                dep_two,
+                content,
+                range.into(),
+            ),
+            "second dependency's version must be admitted as a literal, editable span"
+        );
     }
 
     // #1146: cursor just before dep-two's version_range on a real two-dep line resolves dep-two via pass 2, not dep-one.
