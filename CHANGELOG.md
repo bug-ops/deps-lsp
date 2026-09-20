@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **deps-core**: new `rate_limit` module with a `RateLimitGate` mechanism shared by deps-github-actions and deps-gitlab-ci (#1218)
+- **fuzz**: `redact_declaration_key` fuzz target, covering the client-visible declaration-key redaction gate for blocked-registry diagnostics (resolves #1207) (#1213)
 - **deps-maven**: version completion now offers items inside a self-closing `<version/>` tag, replacing the whole tag with `<version>X</version>` via an explicit text edit instead of relying on a cursor-position insert (resolves #1167) (#1189)
 - **deps-composer**: `PackagistRegistry` gained a mockable test constructor and an end-to-end completion test proving the real `VERSION_OPERATOR_CHARS` operator-stripping fix from #1137, not just a `deps-core`-side copy of it (resolves #1171) (#1193)
 - **ci**: release workflow publishes a CycloneDX SBOM (JSON) for `deps-lsp` and `deps-cli` alongside each release's binaries (resolves #1154) (#1169)
