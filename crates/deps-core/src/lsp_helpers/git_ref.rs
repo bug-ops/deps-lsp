@@ -334,6 +334,9 @@ pub const MAX_FALLBACK_SCAN_BYTES: usize = 1024;
 /// [`MAX_FALLBACK_SCAN_BYTES`]), which is exact for the unescaped ASCII text most manifest
 /// values are.
 ///
+/// `is_quoted` disambiguates the empty-value case (see below) — pass
+/// [`MarkedScalar::is_quoted`], or the equivalent for a hand-rolled scanner receiver.
+///
 /// Returns `None` if `search_from` is past the end of `content` (checked first, before the
 /// `value.is_empty()` short-circuit below — #673 M2) or `value` cannot be located within
 /// the bounded fallback scan — logged at `debug` (value length only, never the value text
@@ -347,11 +350,16 @@ pub const MAX_FALLBACK_SCAN_BYTES: usize = 1024;
 /// use deps_core::lsp_helpers::locate_value_span;
 ///
 /// let content = "prefix xxxxx actions/checkout@v4 suffix";
-/// let (start, end) = locate_value_span(content, 0, "actions/checkout@v4").unwrap();
+/// let (start, end) = locate_value_span(content, 0, "actions/checkout@v4", false).unwrap();
 /// assert_eq!(&content[start..end], "actions/checkout@v4");
 /// ```
 #[must_use]
-pub fn locate_value_span(content: &str, search_from: usize, value: &str) -> Option<(usize, usize)> {
+pub fn locate_value_span(
+    content: &str,
+    search_from: usize,
+    value: &str,
+    is_quoted: bool,
+) -> Option<(usize, usize)> {
     let bytes = content.as_bytes();
     // #673: reject an out-of-bounds search_from before the value.is_empty() check below
     // (#673 M2: otherwise an empty value would return Some((search_from, search_from))).
@@ -364,13 +372,23 @@ pub fn locate_value_span(content: &str, search_from: usize, value: &str) -> Opti
         return None;
     }
     if value.is_empty() {
-        // Mirrors the non-empty path's opening-quote correction below: a quoted empty
-        // scalar (`""`/`''`) has no content bytes for a fallback scan to anchor on, so the
-        // marker's own opening-quote-or-not shape is the only signal available — advance
-        // past the quote when the raw marker lands on one.
-        let corrected = match bytes.get(search_from) {
-            Some(b'"' | b'\'') => search_from + 1,
-            _ => search_from,
+        // #1184: a quoted empty scalar (`""`/`''`) has no content bytes for a fallback
+        // scan to anchor on, so the marker's own opening-quote-or-not shape is the only
+        // signal available — advance past the quote when the raw marker lands on one.
+        // Gated on `is_quoted` (a non-heuristic discriminator from the scanner's own
+        // reported style — true only for `SingleQuoted`/`DoubleQuoted`, critic M2), not on
+        // the marker byte alone and not on `!is_plain`: a `Plain` empty scalar's marker
+        // points at the *next token*, not the value itself, and a `Literal`/`Folded`
+        // block scalar's empty body is neither plain nor quoted — both cases have an
+        // unrelated next token that can itself happen to be a quote byte, which
+        // inferring "quoted" from `!is_plain` alone would incorrectly shift into.
+        let corrected = if is_quoted {
+            match bytes.get(search_from) {
+                Some(b'"' | b'\'') => search_from + 1,
+                _ => search_from,
+            }
+        } else {
+            search_from
         };
         return Some((corrected, corrected));
     }
@@ -556,6 +574,22 @@ impl MarkedScalar {
         self.style == TScalarStyle::Plain
     }
 
+    /// Whether the scalar was written with an explicit quote style
+    /// (`SingleQuoted`/`DoubleQuoted`).
+    ///
+    /// Deliberately not `!is_plain()` (critic M2 on #1184): a `Literal`/`Folded` block
+    /// scalar (`ref: |`/`ref: >`) is neither plain nor quoted, and its marker has the
+    /// same "points at the next token, not the value" shape as a `Plain` scalar's — so
+    /// [`Self::span`]'s empty-value quote-correction must key on this method, not on the
+    /// negation of [`Self::is_plain`].
+    #[must_use]
+    pub fn is_quoted(&self) -> bool {
+        matches!(
+            self.style,
+            TScalarStyle::SingleQuoted | TScalarStyle::DoubleQuoted
+        )
+    }
+
     /// The scanner marker's 1-indexed line.
     #[must_use]
     pub const fn line(&self) -> usize {
@@ -617,7 +651,7 @@ impl MarkedScalar {
     #[must_use]
     pub fn span(&self, content: &str, table: &LineOffsetTable) -> Option<(usize, usize)> {
         let start = marker_byte_offset(content, table, self.line, self.col);
-        locate_value_span(content, start, &self.text)
+        locate_value_span(content, start, &self.text, self.is_quoted())
     }
 
     /// Resolves this scalar's raw span (see [`MarkedScalar::span`]) into an LSP
@@ -903,7 +937,7 @@ mod tests {
     fn test_locate_value_span_finds_value_within_fallback_bound() {
         let content = "prefix xxxxx actions/checkout@v4 suffix";
         let value = "actions/checkout@v4";
-        let (start, end) = locate_value_span(content, 0, value).unwrap();
+        let (start, end) = locate_value_span(content, 0, value, false).unwrap();
         assert_eq!(&content[start..end], value);
     }
 
@@ -912,8 +946,11 @@ mod tests {
         // #673 M2: the `search_from > bytes.len()` guard must run before the
         // `value.is_empty()` early return, or this returned `Some((usize::MAX, usize::MAX))`.
         let content = "short";
-        assert_eq!(locate_value_span(content, usize::MAX, ""), None);
-        assert_eq!(locate_value_span(content, content.len() + 1, ""), None);
+        assert_eq!(locate_value_span(content, usize::MAX, "", false), None);
+        assert_eq!(
+            locate_value_span(content, content.len() + 1, "", false),
+            None
+        );
     }
 
     #[test]
@@ -922,7 +959,7 @@ mod tests {
         // actual (empty) value slot between the quotes.
         let content = r#"pkg: """#;
         let quote_offset = content.find('"').unwrap();
-        let (start, end) = locate_value_span(content, quote_offset, "").unwrap();
+        let (start, end) = locate_value_span(content, quote_offset, "", true).unwrap();
         assert_eq!(start, quote_offset + 1);
         assert_eq!(end, quote_offset + 1);
     }
@@ -931,7 +968,7 @@ mod tests {
     fn test_locate_value_span_empty_value_corrects_past_opening_single_quote() {
         let content = "ref: ''";
         let quote_offset = content.find('\'').unwrap();
-        let (start, end) = locate_value_span(content, quote_offset, "").unwrap();
+        let (start, end) = locate_value_span(content, quote_offset, "", true).unwrap();
         assert_eq!(start, quote_offset + 1);
         assert_eq!(end, quote_offset + 1);
     }
@@ -942,9 +979,37 @@ mod tests {
         // already points at the right (empty) slot, e.g. `ref:` with nothing after it.
         let content = "ref: ";
         let end_offset = content.len();
-        let (start, end) = locate_value_span(content, end_offset, "").unwrap();
+        let (start, end) = locate_value_span(content, end_offset, "", false).unwrap();
         assert_eq!(start, end_offset);
         assert_eq!(end, end_offset);
+    }
+
+    #[test]
+    fn test_locate_value_span_plain_empty_value_never_shifts_past_a_next_token_quote() {
+        // #1184 Gap 1: for a Plain empty scalar the marker points at the *next token*,
+        // not the value itself — if that next token happens to start with a quote byte,
+        // `is_quoted: false` must still suppress the quote-correction, unlike the quoted
+        // case above where the byte-at-marker really is the value's own opening quote.
+        let content = "ref: \n\"next-token\"";
+        let marker_offset = content.find('\n').unwrap() + 1;
+        assert_eq!(content.as_bytes()[marker_offset], b'"');
+        let (start, end) = locate_value_span(content, marker_offset, "", false).unwrap();
+        assert_eq!(start, marker_offset);
+        assert_eq!(end, marker_offset);
+    }
+
+    #[test]
+    fn test_locate_value_span_literal_style_empty_value_never_shifts_past_a_next_token_quote() {
+        // #1184 critic M2: a `Literal`/`Folded` block scalar's empty body is neither
+        // `Plain` nor quoted — the old `!is_plain` gate would have wrongly performed the
+        // quote-correction here (`is_plain()` is `false` for `Literal` too). `is_quoted`
+        // must be keyed on the actual quote styles, not the negation of `is_plain`.
+        let content = "ref: |\n\"next-token\"";
+        let marker_offset = content.find('\n').unwrap() + 1;
+        assert_eq!(content.as_bytes()[marker_offset], b'"');
+        let (start, end) = locate_value_span(content, marker_offset, "", false).unwrap();
+        assert_eq!(start, marker_offset);
+        assert_eq!(end, marker_offset);
     }
 
     #[test]
@@ -985,11 +1050,41 @@ mod tests {
     }
 
     #[test]
+    fn test_marked_scalar_is_quoted_distinguishes_literal_from_plain_and_quoted() {
+        // #1184 critic M2: `is_quoted()` must be `false` for `Literal`/`Folded`, same as
+        // `Plain` — not the negation of `is_plain()`, which was `true` for `Literal` too.
+        use yaml_rust2::parser::{Event, MarkedEventReceiver, Parser};
+
+        struct Scalars(Vec<(String, TScalarStyle, Marker)>);
+        impl MarkedEventReceiver for Scalars {
+            fn on_event(&mut self, event: Event, marker: Marker) {
+                if let Event::Scalar(value, style, ..) = event {
+                    self.0.push((value, style, marker));
+                }
+            }
+        }
+
+        let content = "ref: |\n";
+        let mut receiver = Scalars(Vec::new());
+        Parser::new_from_str(content)
+            .load(&mut receiver, false)
+            .unwrap();
+        let (value, style, marker) = receiver.0[1].clone();
+        assert_eq!(style, TScalarStyle::Literal);
+        let scalar = MarkedScalar::new(value, style, &marker);
+        assert!(!scalar.is_plain());
+        assert!(
+            !scalar.is_quoted(),
+            "a Literal block scalar is neither plain nor quoted"
+        );
+    }
+
+    #[test]
     fn test_locate_value_span_gives_up_beyond_fallback_bound_instead_of_hanging() {
         let filler = "x".repeat(MAX_FALLBACK_SCAN_BYTES + 100);
         let value = "actions/checkout@v4";
         let content = format!("{filler}{value}");
-        assert_eq!(locate_value_span(&content, 0, value), None);
+        assert_eq!(locate_value_span(&content, 0, value, false), None);
     }
 
     #[test]
@@ -1000,7 +1095,7 @@ mod tests {
         let value = "not-present-in-filler@v4";
         let content = format!("{filler}\n");
         let start = std::time::Instant::now();
-        let result = locate_value_span(&content, 0, value);
+        let result = locate_value_span(&content, 0, value, false);
         assert!(
             start.elapsed() < std::time::Duration::from_secs(1),
             "locate_value_span took {:?}, expected a bounded scan to finish in well under 1s",
@@ -1026,7 +1121,7 @@ mod tests {
 
         let start = std::time::Instant::now();
         for &offset in &offsets {
-            let _ = locate_value_span(&content, offset, value);
+            let _ = locate_value_span(&content, offset, value, false);
         }
         let elapsed = start.elapsed();
         assert!(

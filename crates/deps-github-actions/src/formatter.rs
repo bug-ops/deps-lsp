@@ -114,17 +114,11 @@ impl deps_core::lsp_helpers::ShaPinning for GithubActionsFormatter {
         dep: &dyn Dependency,
     ) -> Option<deps_core::lsp_helpers::ResolvedShaPin> {
         let gha_dep = dep.as_any().downcast_ref::<GithubActionsDependency>()?;
-        if gha_dep.pin != Some(PinStyle::Tag) {
-            return None;
-        }
-        // FR-010: a quoted scalar's version_range sits inside the quotes, so `{sha} #
-        // {tag}` would corrupt the string instead of adding a YAML comment.
-        if !gha_dep.is_plain_scalar {
-            return None;
-        }
-        // #633: a flow-style step has real YAML after the ref; appending `# <tag>` would
-        // comment that out too, producing invalid YAML.
-        if !gha_dep.is_last_on_line {
+        // Shared with `mutable_ref_pin_diagnostics`'s message-branch selection (#1188
+        // critic S1/S2): the structural shape gate (`PinStyle::Tag`, `is_plain_scalar`/
+        // FR-010, `is_last_on_line`/#633) lives in one ungated place so a diagnostic and
+        // this quickfix can never independently drift on eligibility.
+        if !crate::ecosystem::is_sha_pinnable_tag(gha_dep) {
             return None;
         }
         let version_range = gha_dep.version_range?;

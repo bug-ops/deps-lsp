@@ -16,10 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **ci**: release archives signed with Sigstore/cosign keyless signing alongside existing SHA256 checksums (resolves #1153) (#1163)
 
 ### Breaking
+- **deps-core**: `lsp_helpers::git_ref::locate_value_span` gains a 4th `is_quoted: bool` parameter; new `MarkedScalar::is_quoted()` replaces the marker-byte-based quote inference the empty-value correction previously relied on (#1194)
 - **deps-core**: removed `completion::complete_versions_generic`; `completion::complete_versions_generic_from` now requires an additional `formatter: &dyn lsp_helpers::SourcePolicy` parameter (resolves #1136)
 
 ### Fixed
 - **deps-github-actions**: hover's "Press Cmd+. to update version" footer now uses the same centralized SHA-pin eligibility check as the quickfix/code-lens, no longer advertising the action for a flow-style step where the quickfix is withheld (resolves #1178) (#1187)
+- **deps-github-actions**: mutable-tag-ref diagnostic's message branch now uses the same structural eligibility check as the SHA-pin quickfix, instead of claiming an automated fix is available for a quoted-scalar or flow-style tag pin where it is actually withheld (resolves #1188) (#1194)
+- **deps-core**: `locate_value_span`'s empty-value quote correction now keys on the scalar's actual quote style instead of inferring it from the marker byte, fixing a false correction when a Plain/Literal/Folded empty scalar's next token happens to be a quote character; `deps-lsp`'s SHA-pin-comment completion withholding no longer falls through to a package-name registry search (resolves #1184) (#1194)
 - **deps-github-actions**: version completion is now withheld once the cursor moves past a full-SHA pin's own ref text, instead of remaining offered inside the trailing tag comment (resolves #1182) (#1185)
 - **deps-core**: `locate_value_span`'s empty-value short-circuit now applies the same opening-quote correction as the non-empty path, fixing a one-column-early `version_range` anchor for quoted empty values in deps-dart and deps-gitlab-ci (resolves #1180) (#1185)
 - **ci**: `scorecard.yml` and `release.yml` pin `github/codeql-action/upload-sarif` to the current `v4.38.1` digest, resolving stale-dependency code-scanning findings
