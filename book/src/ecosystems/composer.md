@@ -24,6 +24,26 @@ reopened.
 See [Dart](dart.md#version-comparison) for the equivalent fix in that ecosystem, which shares
 the same underlying `compare_versions` bug class and was corrected in the same change.
 
+## Non-Registry Dependency Sources
+
+A `require` entry bound to a non-`vcs`-heuristic `repositories` entry is classified as
+non-registry instead of defaulting to Packagist: a `package`-type repository (matched by
+its embedded `package.name`), an `artifact`-type repository, and an `only`/`exclude`
+wildcard-filtered `vcs`/`path` entry (Composer's `*` glob syntax, not just exact names). A
+top-level `{"packagist.org": false}` entry disables the default registry outright. A
+dependency resolved this way is never sent to Packagist, drops its public-registry hover
+link, and is excluded from OSV vulnerability scanning against the public package name
+(resolves #1202).
+
+**Known limitation**: a bare `vcs`/`path`/`artifact` repository with no `only` filter is
+*not* classified — an earlier vendor-substring URL heuristic covered this case but produced
+false positives that silently disabled OSV scanning for unrelated public packages sharing a
+GitHub org with a private repository's URL (e.g. one `vcs` entry for
+`github.com/acme/internal` incorrectly reclassifying an unrelated public `acme/`-scoped
+package too). The heuristic was removed rather than fixed; this case is tracked as a
+follow-up, likely via `composer.lock`'s already-parsed per-package `source.type` mapping
+for the common case where a lockfile is present.
+
 ## Deprecation & Abandoned Packages
 
 Composer's `abandoned` field powers two cross-ecosystem features rather than a

@@ -380,6 +380,7 @@ mod tests {
         display_name: "Go Modules";
         manifest_filenames: &["go.mod"];
         lockfile_filenames: &["go.sum"];
+        non_registry_fixture: "go.mod" => "module example.com/myapp\n\nrequire github.com/acme/secretmod v1.0.0\n\nreplace github.com/acme/secretmod => ./local/secretmod\n";
     }
 
     // #794: no `completion_guard_conformance!` for this crate — `complete_package_names`

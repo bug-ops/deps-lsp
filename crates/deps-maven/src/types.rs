@@ -21,7 +21,21 @@ pub struct MavenDependency {
     pub version_range: Option<Range>,
     /// Maven dependency scope (`compile`, `test`, `runtime`, etc.).
     pub scope: MavenScope,
+    /// Resolved source (#1202): `Path` for a `scope: system` dependency's `<systemPath>`
+    /// (an explicit, per-dependency local-jar binding), `Registry` otherwise.
+    pub source: deps_core::parser::DependencySource,
 }
+
+// TODO(follow-up to #1202): `pom.xml`'s `<repositories>`/`<repository><url>file://...</url>`
+// declarations are still not parsed at all (distinct from `scope: system`'s `<systemPath>`,
+// which now classifies as `Path` — see `parser::finalize_dep`), so a dependency resolved from
+// a local/custom *repository* still classifies as `DependencySource::Registry` and the
+// #1136/#1203 gate stays inert for that specific case. Unlike Composer's `vcs`/`path`
+// repositories, Maven's `<repository>` has no per-package binding to exploit even
+// heuristically — every declared repository is simply tried, in order, for any dependency —
+// so closing this properly needs either an explicit-mapping heuristic (none exists in the POM
+// format) or accepting a coarser "any repository present" classification; scoped out of this
+// PR pending a decision, tracked as a follow-up to #1202.
 
 /// Maven dependency scope (the `<scope>` element).
 #[non_exhaustive]
@@ -186,6 +200,7 @@ deps_core::impl_dependency!(MavenDependency {
     name_range: name_range,
     version: version_req,
     version_range: version_range,
+    source: source,
 });
 
 impl deps_core::Version for MavenVersion {
@@ -253,6 +268,7 @@ mod tests {
             version_req: Some("3.14.0".into()),
             version_range: Some(Range::new(Position::new(7, 13), Position::new(7, 19))),
             scope: MavenScope::Compile,
+            source: deps_core::parser::DependencySource::Registry,
         }
     }
 
@@ -323,6 +339,7 @@ mod tests {
             version_req: None,
             version_range: None,
             scope: MavenScope::Compile,
+            source: deps_core::parser::DependencySource::Registry,
         };
         assert!(dep.version_requirement().is_none());
         assert!(dep.version_range().is_none());

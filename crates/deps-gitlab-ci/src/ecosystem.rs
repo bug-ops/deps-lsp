@@ -1055,6 +1055,7 @@ mod tests {
         display_name: "GitLab CI/CD";
         manifest_filenames: &[".gitlab-ci.yml"];
         no_lockfile_support: true;
+        non_registry_fixture: ".gitlab-ci.yml" => "include:\n  - project: org/proj\n    ref: v1.0.0\n";
     }
 
     // #1137: regression guard, not independent parser verification (see

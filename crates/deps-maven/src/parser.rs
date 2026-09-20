@@ -63,6 +63,9 @@ struct DepAccum {
     /// when no `Text` event set `version` — see `version_open_pos`.
     version_close_pos: Option<u64>,
     scope: Option<String>,
+    /// `<systemPath>` text, present only for a `scope: system` dependency (#1202, Maven fix)
+    /// — the explicit, already-per-dependency local-jar binding `MavenScope::System` names.
+    system_path: Option<String>,
 }
 
 /// Parses a `pom.xml` document into a [`MavenParseResult`].
@@ -177,6 +180,9 @@ pub fn parse_pom_xml(content: &str, doc_uri: &Url) -> Result<MavenParseResult> {
                             }
                             "scope" => {
                                 dep.scope = Some(text.clone());
+                            }
+                            "systemPath" => {
+                                dep.system_path = Some(text.clone());
                             }
                             _ => {}
                         }
@@ -309,6 +315,23 @@ fn finalize_dep(
         .parse::<MavenScope>()
         .unwrap_or_default();
 
+    // #1202 (critic Maven fix): `scope: system` is an explicit, per-dependency local-jar
+    // binding via `<systemPath>` — unlike the unbound `<repositories>` gap (see the
+    // `types.rs` TODO), this one is already a real per-dependency field this parser reads,
+    // so classifying it needs no heuristic at all. Falls back to `Registry` only if a
+    // malformed manifest declares `scope: system` with no `systemPath` at all (never crashes
+    // on it, but there is nothing to classify against either).
+    let source = if scope == MavenScope::System {
+        dep.system_path
+            .as_deref()
+            .map(|path| deps_core::parser::DependencySource::Path {
+                path: resolve_properties(path, properties),
+            })
+            .unwrap_or(deps_core::parser::DependencySource::Registry)
+    } else {
+        deps_core::parser::DependencySource::Registry
+    };
+
     let version_req = dep.version.map(|v| resolve_properties(&v, properties));
 
     Some(MavenDependency {
@@ -319,6 +342,7 @@ fn finalize_dep(
         version_req: version_req.map(Into::into),
         version_range,
         scope,
+        source,
     })
 }
 
@@ -450,6 +474,74 @@ mod tests {
         assert_eq!(result.dependencies[0].name, "com.google.guava:guava");
         assert_eq!(result.dependencies[1].name, "junit:junit");
         assert_matches!(result.dependencies[1].scope, MavenScope::Test);
+    }
+
+    /// #1202 (critic Maven fix): a `scope: system` dependency's `<systemPath>` classifies as
+    /// `Path` — never sent to repo1.maven.org/OSV, and its hover link is suppressed.
+    #[test]
+    fn test_system_scope_dependency_classifies_as_path() {
+        let xml = r"<project>
+  <dependencies>
+    <dependency>
+      <groupId>com.acme</groupId>
+      <artifactId>internal-jar</artifactId>
+      <version>1.0.0</version>
+      <scope>system</scope>
+      <systemPath>/opt/lib/internal-jar-1.0.0.jar</systemPath>
+    </dependency>
+  </dependencies>
+</project>";
+
+        let result = parse_pom_xml(xml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_matches!(result.dependencies[0].scope, MavenScope::System);
+        assert_eq!(
+            result.dependencies[0].source,
+            deps_core::parser::DependencySource::Path {
+                path: "/opt/lib/internal-jar-1.0.0.jar".into(),
+            }
+        );
+    }
+
+    /// A regular (non-`system`) dependency keeps resolving through the registry, even when
+    /// other dependencies in the same manifest are `system`-scoped.
+    #[test]
+    fn test_non_system_scope_stays_registry_alongside_system_scope() {
+        let xml = r"<project>
+  <dependencies>
+    <dependency>
+      <groupId>com.acme</groupId>
+      <artifactId>internal-jar</artifactId>
+      <version>1.0.0</version>
+      <scope>system</scope>
+      <systemPath>/opt/lib/internal-jar-1.0.0.jar</systemPath>
+    </dependency>
+    <dependency>
+      <groupId>com.google.guava</groupId>
+      <artifactId>guava</artifactId>
+      <version>33.0.0-jre</version>
+    </dependency>
+  </dependencies>
+</project>";
+
+        let result = parse_pom_xml(xml, &test_uri()).unwrap();
+        let system = result
+            .dependencies
+            .iter()
+            .find(|d| d.artifact_id == "internal-jar")
+            .unwrap();
+        let guava = result
+            .dependencies
+            .iter()
+            .find(|d| d.artifact_id == "guava")
+            .unwrap();
+        assert_eq!(
+            system.source,
+            deps_core::parser::DependencySource::Path {
+                path: "/opt/lib/internal-jar-1.0.0.jar".into(),
+            }
+        );
+        assert_eq!(guava.source, deps_core::parser::DependencySource::Registry);
     }
 
     #[test]

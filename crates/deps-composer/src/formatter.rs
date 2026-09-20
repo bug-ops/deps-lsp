@@ -829,6 +829,7 @@ mod tests {
             version_req: Some("^4.4".into()),
             version_range: None,
             section: ComposerSection::Require,
+            source: deps_core::parser::DependencySource::Registry,
         };
 
         assert_eq!(
@@ -1133,6 +1134,7 @@ mod tests {
                 DomainPosition::new(1, 25),
             )),
             section: ComposerSection::Require,
+            source: deps_core::parser::DependencySource::Registry,
         };
 
         let f = ComposerFormatter;
@@ -1157,6 +1159,7 @@ mod tests {
                 DomainPosition::new(1, 28),
             )),
             section: ComposerSection::Require,
+            source: deps_core::parser::DependencySource::Registry,
         };
 
         let f = ComposerFormatter;
@@ -1239,6 +1242,7 @@ mod tests {
                 DomainPosition::new(0, 37),
             )),
             section: ComposerSection::Require,
+            source: deps_core::parser::DependencySource::Registry,
         };
         let corrupted_result = crate::parser::ComposerParseResult {
             dependencies: vec![corrupted_dep],

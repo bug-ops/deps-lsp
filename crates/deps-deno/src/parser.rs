@@ -111,6 +111,8 @@ pub fn parse_deno_json(content: &str, uri: &Url) -> Result<DenoParseResult> {
         );
     }
 
+    classify_npm_imports(&mut dependencies, uri);
+
     Ok(DenoParseResult {
         dependencies,
         uri: uri.clone(),
@@ -162,6 +164,61 @@ fn check_ast_nesting_depth(root: &Value<'_>, max_depth: usize) -> std::result::R
         }
     }
     Ok(())
+}
+
+/// Reclassifies every `npm:`-scheme dependency whose scope resolves, through the same
+/// `.npmrc` hierarchy `deps-npm` reads, to something other than the default public registry
+/// (#1202) — Deno reads `.npmrc` for `npm:` specifier registry configuration exactly like
+/// Node/npm do, so a manifest declaring `@corp:registry=https://npm.corp.internal` for a
+/// `npm:@corp/pkg` import must not send that private package's name to npmjs.com.
+///
+/// Reuses `deps_npm::config::resolve`/`NpmConfig::resolve_source_for` directly rather than
+/// re-implementing `.npmrc` parsing here — `deps-deno` already depends on `deps-npm` for the
+/// shared `npm:` name grammar (issue #654 S3), and this is the same SSRF-gated, fail-closed
+/// resolution path `deps-npm`'s own parser uses, not a lighter reimplementation of it.
+///
+/// TODO(follow-up to #1202, critic S6): a fresh, non-persistent
+/// [`deps_npm::config::NpmConfigCache`] plus a hardcoded default (public-only)
+/// [`deps_core::net_policy::RegistryAccessPolicy`] is used on every call — no context is
+/// threaded through `DenoEcosystem`, unlike `NpmEcosystem`'s own `context: NpmParseContext`
+/// field. Two consequences, both scoped out of this PR (needs `DenoEcosystem::with_context` +
+/// `deps_engine::setup::register_ecosystems` wiring, the same real architecture work
+/// `NpmEcosystem` already has): (1) every reparse re-walks and re-reads `.npmrc` from disk
+/// with no cache; (2) a workspace whose real server-side policy allows workspace registries
+/// still gets Deno's own hardcoded fail-closed default, so the *same* `.npmrc` scope entry
+/// can resolve to a fetchable `AlternateRegistry` via `package.json` but a fail-closed
+/// `CustomRegistry` via `deno.json` in that one workspace — an inconsistency, not just a
+/// perf gap.
+fn classify_npm_imports(dependencies: &mut [DenoDependency], uri: &Url) {
+    let Some(manifest_dir) = deps_core::lockfile::resolve_manifest_file_path(uri)
+        .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+    else {
+        return;
+    };
+    if !dependencies.iter().any(|dep| {
+        matches!(
+            crate::specifier::split_scheme(dep.name.as_str()),
+            Some((crate::specifier::Scheme::Npm, _))
+        )
+    }) {
+        return;
+    }
+
+    let config_cache = deps_npm::config::NpmConfigCache::new();
+    let policy = deps_core::net_policy::RegistryAccessPolicy::default();
+    let npm_config = deps_npm::config::resolve(&manifest_dir, &config_cache, &policy);
+
+    for dep in dependencies {
+        let Some((crate::specifier::Scheme::Npm, bare_name)) =
+            crate::specifier::split_scheme(dep.name.as_str())
+        else {
+            continue;
+        };
+        let source = npm_config.resolve_source_for(&PackageName::new(bare_name));
+        if !matches!(source, deps_core::parser::DependencySource::Registry) {
+            dep.source = source;
+        }
+    }
 }
 
 /// Builds a [`DenoDependency`] for every entry in the `imports` object, applying
@@ -236,6 +293,7 @@ fn build_dependency(
             version_req: parsed.version_req.map(VersionReq::new),
             version_range: None,
             section: DenoDependencySection::Imports,
+            source: deps_core::parser::DependencySource::Registry,
         });
     }
 
@@ -264,6 +322,7 @@ fn build_dependency(
             version_req: parsed.version_req.map(VersionReq::new),
             version_range,
             section: DenoDependencySection::Imports,
+            source: deps_core::parser::DependencySource::Registry,
         });
     }
 
@@ -289,6 +348,7 @@ fn build_dependency(
         version_req: None,
         version_range: None,
         section: DenoDependencySection::Imports,
+        source: deps_core::parser::DependencySource::Registry,
     })
 }
 
@@ -646,5 +706,78 @@ mod tests {
 }"#;
         let result = parse_deno_json(jsonc, &test_uri());
         assert!(result.is_err());
+    }
+
+    /// #1202: an `npm:` scoped import whose scope resolves, via `.npmrc`, to a non-default
+    /// registry must classify as non-`Registry` — never sent to npmjs.com. Classifies as the
+    /// fail-closed `CustomRegistry` (not the fetchable `AlternateRegistry`) because this call
+    /// site resolves under the default [`deps_core::net_policy::RegistryAccessPolicy`]
+    /// (public-only) — the same safe-by-default behavior `deps-npm` itself has when no
+    /// workspace-registry-enabling policy is threaded in, so `DenoFormatter::can_resolve_source`
+    /// (never overridden) correctly answers `false` and no outbound request is made at all.
+    #[test]
+    fn test_npm_scoped_import_resolves_via_npmrc() {
+        use deps_core::lsp_helpers::{PackageRendering, SourcePolicy};
+
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join(".npmrc"),
+            "@acme-corp:registry=https://npm.acme.internal\n",
+        )
+        .unwrap();
+        let manifest_path = root.path().join("deno.json");
+        let uri = Url::from_file_path(&manifest_path).unwrap();
+
+        let json = r#"{"imports": {"secret": "npm:@acme-corp/secretpkg@^1.0.0"}}"#;
+        let result = parse_deno_json(json, &uri).unwrap();
+
+        let source = result.dependencies[0].source.clone();
+        assert_eq!(
+            source,
+            deps_core::parser::DependencySource::CustomRegistry {
+                url: "https://npm.acme.internal".to_string(),
+            }
+        );
+
+        // M10 (critic): the opt-out reason on `ecosystem_conformance!`'s
+        // `no_non_registry_fixture` field for this crate claims this test asserts the same
+        // gate properties `assert_non_registry_source_yields_no_fetch` would — actually
+        // calling the gates here (not just checking the raw `source` value) is what makes
+        // that claim true rather than an overclaim.
+        let formatter = crate::formatter::DenoFormatter;
+        assert!(
+            !formatter.can_resolve_source(&source),
+            "a fail-closed CustomRegistry source must not be resolvable"
+        );
+        assert!(
+            !formatter.source_is_public_registry_content(&source),
+            "a fail-closed CustomRegistry source must never be public-registry content"
+        );
+        assert!(
+            formatter.suppress_package_url(&source),
+            "a fail-closed CustomRegistry source must suppress the public-registry hover link"
+        );
+    }
+
+    /// A `jsr:` import never has an alternate-registry concept, and an `npm:` import with no
+    /// matching `.npmrc` scope entry must stay `Registry` (NFR-005-equivalent: zero
+    /// regression for the common case).
+    #[test]
+    fn test_no_npmrc_and_jsr_scheme_stay_registry() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let root = tempfile::tempdir().unwrap();
+        let manifest_path = root.path().join("deno.json");
+        let uri = Url::from_file_path(&manifest_path).unwrap();
+
+        let json = r#"{"imports": {
+            "@std/fs": "jsr:@std/fs@^1.0",
+            "react": "npm:react@^18"
+        }}"#;
+        let result = parse_deno_json(json, &uri).unwrap();
+
+        for dep in &result.dependencies {
+            assert_eq!(dep.source, deps_core::parser::DependencySource::Registry);
+        }
     }
 }

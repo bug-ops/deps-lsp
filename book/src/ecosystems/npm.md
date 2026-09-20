@@ -56,6 +56,19 @@ there is no tier that is "the user's own configuration" in the way
   standard `.npmrc` present in the workspace is still honored either way.
   pnpm's own `pnpm-workspace.yaml` catalog extension *is* read — see below.
 
+## Non-Registry Dependency Sources
+
+A dependency declared against a git repository, a local filesystem path, or a workspace
+sibling is classified as such instead of defaulting to `registry.npmjs.org` — this covers
+`git+ssh://`/`git+https://`/`git://` URLs, a bare HTTPS URL to a known git host
+(GitHub/GitLab/Bitbucket) ending in `.git`, `github:`/`gitlab:`/`bitbucket:`/`gist:`
+shorthand (`owner/repo[#ref]`), a direct tarball URL, `file:`/`link:`/`portal:`-prefixed and
+bare local paths (`./`, `../`, `~/`, or a Windows drive letter), and `workspace:` protocol
+dependencies. A dependency resolved this way is never sent to the registry, drops its
+public-registry hover link, and is excluded from OSV vulnerability scanning against the
+public package name — matching the treatment Cargo already gives a `git =`/`path =`
+dependency (resolves #1202).
+
 ## `npm:` Alias Resolution
 
 npm/pnpm/yarn let a `package.json` dependency install under a different local

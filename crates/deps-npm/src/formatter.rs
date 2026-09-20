@@ -134,16 +134,6 @@ impl PackageRendering for NpmFormatter {
     fn package_url(&self, name: &PackageName) -> String {
         crate::registry::package_url(name.as_str())
     }
-
-    /// FR-015: suppresses the hover heading's npmjs.com link for anything but the plain
-    /// public registry — a private package's hover showing a `npmjs.com` link once live data
-    /// from the real (alternate) registry renders alongside it would read as false
-    /// confirmation the link is real. Reuses `source_is_public_registry_content`'s default
-    /// (`Registry` only, not overridden — npm has no crates.io-style verified-mirror concept
-    /// for `AlternateRegistry` to except).
-    fn suppress_package_url(&self, source: &deps_core::DependencySource) -> bool {
-        !self.source_is_public_registry_content(source)
-    }
 }
 
 impl RequirementResolution for NpmFormatter {
@@ -201,16 +191,13 @@ impl DiagnosticPolicy for NpmFormatter {
 }
 
 impl SourcePolicy for NpmFormatter {
-    /// FR-009: a `.npmrc`-resolved `AlternateRegistry` is resolvable, alongside the default
-    /// public `Registry` — gates hover/diagnostics/code-actions onto the router's per-source
-    /// dispatch (`NpmRegistry::get_versions_from`) instead of the source-blind path.
-    /// `CustomRegistry` (FR-006's fail-closed state) keeps the trait default's `false`.
-    fn can_resolve_source(&self, source: &deps_core::DependencySource) -> bool {
-        matches!(
-            source,
-            deps_core::DependencySource::Registry
-                | deps_core::DependencySource::AlternateRegistry { .. }
-        )
+    /// FR-009: widens [`SourcePolicy::can_resolve_source`] so a `.npmrc`-resolved
+    /// `AlternateRegistry` is resolvable alongside the default public `Registry` — gates
+    /// hover/diagnostics/code-actions onto the router's per-source dispatch
+    /// (`NpmRegistry::get_versions_from`) instead of the source-blind path. `CustomRegistry`
+    /// (FR-006's fail-closed state) keeps the default's `false`.
+    fn resolves_alternate_registry(&self) -> bool {
+        true
     }
 }
 

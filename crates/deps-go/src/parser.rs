@@ -112,8 +112,12 @@ pub fn parse_go_mod_with_context(
         std::sync::LazyLock::new(|| Regex::new(r"^\s*require\s*\(").unwrap());
     // Same guarantee as MODULE_PATTERN above.
     #[allow(clippy::unwrap_used)]
+    // Trailing `(?:\s+(\S+))?` (group 4, the replacement's own version) is optional: a
+    // filesystem replacement (`replace X => ./local/path`) carries no version at all (#1202)
+    // — a mandatory version there previously made the whole line fail to match, silently
+    // dropping the directive instead of classifying it as `Path`.
     static REPLACE_PATTERN: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
-        Regex::new(r"^\s*replace\s+(\S+)\s+(?:(\S+)\s+)?=>\s+(\S+)\s+(\S+)").unwrap()
+        Regex::new(r"^\s*replace\s+(\S+)\s+(?:(\S+)\s+)?=>\s+(\S+)(?:\s+(\S+))?").unwrap()
     });
     // Same guarantee as MODULE_PATTERN above.
     #[allow(clippy::unwrap_used)]
@@ -164,11 +168,13 @@ pub fn parse_go_mod_with_context(
         if let Some(caps) = REPLACE_PATTERN.captures(line_trimmed) {
             let module = &caps[1];
             let version = caps.get(2).map(|m| m.as_str());
+            let target = &caps[3];
             if let Some(dep) = parse_replace_line(
                 line_without_comment,
                 line_offset,
                 module,
                 version,
+                target,
                 content,
                 &line_table,
             ) && budget.allow()
@@ -214,8 +220,29 @@ pub fn parse_go_mod_with_context(
     // vary across dependencies — computed once rather than once per dependency (up to
     // `MAX_DEPENDENCIES_PER_DOCUMENT`).
     let blocked_class = go_config.blocked_class();
+
+    // C1 (#1202): a filesystem `replace` target's `Path` classification must propagate to
+    // every directive sharing its module path, not just the `Replace` entry's own dependency.
+    // A malformed go.mod with two `replace` directives for the same module silently keeps
+    // whichever this `HashMap` collects last, with no diagnostic — accepted edge case.
+    let path_replacements: std::collections::HashMap<String, deps_core::parser::DependencySource> =
+        dependencies
+            .iter()
+            .filter(|dep| dep.directive == GoDirective::Replace)
+            .filter_map(|dep| match &dep.source {
+                deps_core::parser::DependencySource::Path { .. } => {
+                    Some((dep.module_path.as_str().to_string(), dep.source.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+
     let mut blocked_registries = Vec::new();
     for dep in &mut dependencies {
+        if let Some(path_source) = path_replacements.get(dep.module_path.as_str()) {
+            dep.source = path_source.clone();
+            continue;
+        }
         dep.source = go_config.resolve_source_for(dep.module_path.as_str());
         // Only a dependency that actually fell back to `CustomRegistry` was affected by the
         // blocked chain — a `GOPRIVATE`-matched module bypasses `GOPROXY` entirely and keeps
@@ -321,12 +348,16 @@ fn parse_require_line(
     })
 }
 
-/// Parses a replace directive line.
+/// Parses a replace directive line. `target` is the right-hand side of `=>` (a module path or
+/// a filesystem path) — used only to classify [`GoDependency::source`] (#1202), never stored
+/// as this entry's own `module_path`/`version` (those stay the *replaced* module's identity,
+/// matching this function's pre-existing behavior).
 fn parse_replace_line(
     line: &str,
     line_start_offset: usize,
     module: &str,
     version: Option<&str>,
+    target: &str,
     content: &str,
     line_table: &LineOffsetTable,
 ) -> Option<GoDependency> {
@@ -353,6 +384,14 @@ fn parse_replace_line(
         (None, None)
     };
 
+    let source = if is_filesystem_replace_target(target) {
+        deps_core::parser::DependencySource::Path {
+            path: target.to_string(),
+        }
+    } else {
+        deps_core::parser::DependencySource::Registry
+    };
+
     Some(GoDependency {
         module_path: module.into(),
         module_path_range,
@@ -360,8 +399,21 @@ fn parse_replace_line(
         version_range,
         directive: GoDirective::Replace,
         indirect: false,
-        source: deps_core::parser::DependencySource::Registry,
+        source,
     })
+}
+
+/// Whether a `replace` directive's right-hand side names a local filesystem directory rather
+/// than a module path — Go's own rule (`go help mod#Set`): a relative path beginning with
+/// `./`/`../`, or an absolute path. Everything else is a module path, still resolved through
+/// the normal proxy/registry chain. Delegates to the shared
+/// [`deps_core::parser::looks_like_filesystem_path`] (code review #1202: this was previously
+/// duplicated near-verbatim between `deps-go` and `deps-npm`) — that helper additionally
+/// matches `~/`, wider than Go's own documented rule, but the wider match is still the safe
+/// direction here: worst case a `replace` target Go itself would reject as invalid classifies
+/// as `Path` (no network call) rather than `Registry` (a leak).
+fn is_filesystem_replace_target(target: &str) -> bool {
+    deps_core::parser::looks_like_filesystem_path(target)
 }
 
 /// Parses an exclude directive line.
@@ -477,6 +529,82 @@ require github.com/gin-gonic/gin v1.9.1
         assert_eq!(result.dependencies.len(), 1);
         assert_eq!(result.dependencies[0].directive, GoDirective::Replace);
         assert_eq!(result.dependencies[0].module_path, "github.com/old/module");
+    }
+
+    /// #1202: a filesystem `replace` target (no version, relative `./` path) must classify
+    /// as `Path`, and must survive the `GOPROXY`/`GOPRIVATE` resolution pass unchanged — a
+    /// local module must never be sent to a registry.
+    #[test]
+    fn test_parse_replace_directive_to_local_path() {
+        let content = "replace github.com/acme/secretmod => ./local/secretmod\n";
+        let result = parse_go_mod(content, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].directive, GoDirective::Replace);
+        assert_eq!(
+            result.dependencies[0].module_path,
+            "github.com/acme/secretmod"
+        );
+        assert_eq!(
+            result.dependencies[0].source,
+            deps_core::parser::DependencySource::Path {
+                path: "./local/secretmod".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_replace_directive_to_absolute_path() {
+        let content = "replace github.com/acme/secretmod => /abs/local/secretmod\n";
+        let result = parse_go_mod(content, &test_uri()).unwrap();
+        assert_eq!(
+            result.dependencies[0].source,
+            deps_core::parser::DependencySource::Path {
+                path: "/abs/local/secretmod".into(),
+            }
+        );
+    }
+
+    /// C1 (critic, #1202): the issue's own primary repro — a `require` line for a module
+    /// that a filesystem `replace` directive also targets. Both the `Require` and the
+    /// `Replace` entries share `module_path`, and both must classify as `Path`; without the
+    /// cross-directive propagation, the `Require` entry stayed `Registry` and still leaked to
+    /// `proxy.golang.org`/OSV/a public pkg.go.dev hover link.
+    #[test]
+    fn test_replace_to_local_path_also_reclassifies_the_require_entry() {
+        let content = "module example.com/myapp\n\nrequire github.com/acme/secretmod v1.0.0\n\nreplace github.com/acme/secretmod => ./local/secretmod\n";
+        let result = parse_go_mod(content, &test_uri()).unwrap();
+
+        let require = result
+            .dependencies
+            .iter()
+            .find(|dep| dep.directive == GoDirective::Require)
+            .expect("fixture must contain a require entry");
+        let replace = result
+            .dependencies
+            .iter()
+            .find(|dep| dep.directive == GoDirective::Replace)
+            .expect("fixture must contain a replace entry");
+
+        let expected = deps_core::parser::DependencySource::Path {
+            path: "./local/secretmod".into(),
+        };
+        assert_eq!(
+            require.source, expected,
+            "the require entry sharing the replaced module path must also classify as Path"
+        );
+        assert_eq!(replace.source, expected);
+    }
+
+    /// A module->module replace (no local path involved) must keep resolving through the
+    /// normal registry chain — only the filesystem form is exempt.
+    #[test]
+    fn test_parse_replace_directive_to_module_stays_registry() {
+        let content = "replace github.com/old/module => github.com/new/module v1.2.3\n";
+        let result = parse_go_mod(content, &test_uri()).unwrap();
+        assert_eq!(
+            result.dependencies[0].source,
+            deps_core::parser::DependencySource::Registry
+        );
     }
 
     #[test]

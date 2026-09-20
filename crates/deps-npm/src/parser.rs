@@ -166,6 +166,20 @@ pub fn parse_package_json_with_context(
 
     let mut blocked_registries = Vec::new();
     for dep in &mut dependencies {
+        // #1202: a `git+`/`file:`/`link:`/`portal:`/`github:`/`workspace:` specifier is not a
+        // registry reference at all — `.npmrc` scope/registry resolution has no meaning for
+        // it, and applying it anyway would silently reclassify a non-registry dependency back
+        // to `Registry`/`AlternateRegistry`, sending its name to a registry over the network.
+        let version_req = dep
+            .version_req
+            .as_ref()
+            .map(deps_core::VersionReq::as_str)
+            .unwrap_or_default();
+        if let Some(source) = classify_non_registry_specifier(version_req) {
+            dep.source = source;
+            continue;
+        }
+
         // Route by the real registry name, not the manifest alias (#654 S2): a `.npmrc`
         // scope entry matches the package actually installed, not the local alias.
         let name = deps_core::Dependency::name(dep).clone();
@@ -244,6 +258,150 @@ fn parse_dependency_section(
     }
 
     result
+}
+
+/// Classifies an npm dependency specifier that names a non-registry source directly (#1202) —
+/// `git+`/`git://`, `github:`/`gitlab:`/`bitbucket:`/`gist:`, bare GitHub shorthand
+/// (`owner/repo`), `file:`/`link:`/`portal:`, a bare relative/absolute local path, a direct
+/// tarball URL, and `workspace:` all bypass the registry entirely, so `.npmrc` scope/registry
+/// resolution must never run for them (see the call site in
+/// [`parse_package_json_with_context`]).
+///
+/// Returns `None` for anything else (a plain semver range, an `npm:` alias, a dist-tag, ...),
+/// meaning the caller falls through to ordinary `.npmrc` resolution.
+fn classify_non_registry_specifier(value: &str) -> Option<deps_core::parser::DependencySource> {
+    let value = value.trim();
+
+    if let Some(rest) = value.strip_prefix("git+") {
+        let (url, rev) = split_committish(rest);
+        return Some(deps_core::parser::DependencySource::Git {
+            url: url.to_string(),
+            rev,
+        });
+    }
+    if value.starts_with("git://") {
+        let (url, rev) = split_committish(value);
+        return Some(deps_core::parser::DependencySource::Git {
+            url: url.to_string(),
+            rev,
+        });
+    }
+    // Code review #1202: an empty remainder (a bare "github:"/"gitlab:"/"bitbucket:"/"gist:"
+    // with nothing after the colon) is not a valid reference at all — `.filter` falls
+    // through to the checks below instead of building a malformed `.../.git` URL.
+    if let Some(rest) = value.strip_prefix("github:").filter(|r| !r.is_empty()) {
+        return Some(git_shorthand("github.com", rest));
+    }
+    if let Some(rest) = value.strip_prefix("gitlab:").filter(|r| !r.is_empty()) {
+        return Some(git_shorthand("gitlab.com", rest));
+    }
+    if let Some(rest) = value.strip_prefix("bitbucket:").filter(|r| !r.is_empty()) {
+        return Some(git_shorthand("bitbucket.org", rest));
+    }
+    if let Some(rest) = value.strip_prefix("gist:").filter(|r| !r.is_empty()) {
+        let (id, rev) = split_committish(rest);
+        return Some(deps_core::parser::DependencySource::Git {
+            url: format!("https://gist.github.com/{id}.git"),
+            rev,
+        });
+    }
+    if let Some(rest) = value
+        .strip_prefix("file:")
+        .or_else(|| value.strip_prefix("link:"))
+        .or_else(|| value.strip_prefix("portal:"))
+    {
+        return Some(deps_core::parser::DependencySource::Path {
+            path: rest.to_string(),
+        });
+    }
+    if value.starts_with("workspace:") {
+        return Some(deps_core::parser::DependencySource::Workspace);
+    }
+    if value.starts_with("http://") || value.starts_with("https://") {
+        // Code review #1202: a bare (no `git+` prefix) URL to a known git-hosting service
+        // ending in `.git` is still a git reference, consistent with this crate's own
+        // lockfile-side detection (`lockfile::parse_npm_source`) — checked before the
+        // generic tarball-URL fallback below, splitting off any `#<committish>` into `rev`
+        // instead of baking it into the stored URL.
+        if is_bare_git_host_url(value) {
+            let (url, rev) = split_committish(value);
+            return Some(deps_core::parser::DependencySource::Git {
+                url: url.to_string(),
+                rev,
+            });
+        }
+        // A direct tarball reference (S1, critic): npm accepts a bare `http(s)://` URL as a
+        // dependency specifier with no other scheme prefix — never a semver range/tag/alias,
+        // which never contain `://`.
+        return Some(deps_core::parser::DependencySource::Url {
+            url: value.to_string(),
+        });
+    }
+    // A bare local path (S1, critic): npm accepts `./`/`../`/an absolute path (`/`, `~/`, or
+    // a Windows drive letter) with no `file:` prefix at all — distinct from the
+    // explicit-prefix case above.
+    if deps_core::parser::looks_like_filesystem_path(value) {
+        return Some(deps_core::parser::DependencySource::Path {
+            path: value.to_string(),
+        });
+    }
+    // Bare GitHub shorthand (S1, critic): `"owner/repo"`/`"owner/repo#ref"` with no scheme
+    // prefix at all — checked last since every scheme above also structurally contains `/`
+    // and must be ruled out first.
+    if is_github_shorthand(value) {
+        return Some(git_shorthand("github.com", value));
+    }
+
+    None
+}
+
+/// Whether `value` (already known to start with `http://`/`https://`) is a bare URL to a
+/// known git-hosting service ending in `.git` — e.g. `https://github.com/acme/pkg.git`.
+/// Consistent with this crate's own lockfile-side git-URL detection
+/// (`lockfile::parse_npm_source`), which recognizes this exact shape.
+fn is_bare_git_host_url(value: &str) -> bool {
+    let (base, _) = split_committish(value);
+    base.ends_with(".git")
+        && ["github.com/", "gitlab.com/", "bitbucket.org/"]
+            .iter()
+            .any(|host| base.contains(host))
+}
+
+/// Builds a [`DependencySource::Git`](deps_core::parser::DependencySource::Git) for an
+/// `owner/repo`-shaped `rest` (optionally `#<committish>`-suffixed) against `host`.
+fn git_shorthand(host: &str, rest: &str) -> deps_core::parser::DependencySource {
+    let (repo, rev) = split_committish(rest);
+    deps_core::parser::DependencySource::Git {
+        url: format!("https://{host}/{repo}.git"),
+        rev,
+    }
+}
+
+/// Whether `value` is npm's bare GitHub-shorthand specifier form: exactly one `/`-separated
+/// `owner/repo` pair (each an npm-package-arg-shaped token: alphanumeric plus `-`/`_`/`.`),
+/// optionally followed by `#<committish>`. Deliberately excludes anything already recognized
+/// by an explicit prefix above (a scoped package alias value never reaches this function in
+/// specifier position, and a tarball URL/absolute path has already returned by this point).
+fn is_github_shorthand(value: &str) -> bool {
+    let (candidate, _) = split_committish(value);
+    let Some((owner, repo)) = candidate.split_once('/') else {
+        return false;
+    };
+    let is_token = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    };
+    is_token(owner) && !repo.contains('/') && is_token(repo)
+}
+
+/// Splits off an npm git specifier's optional trailing `#<committish>` — returns
+/// `(base, Some(committish))` when present and non-empty, else `(value, None)`.
+fn split_committish(value: &str) -> (&str, Option<String>) {
+    match value.rsplit_once('#') {
+        Some((base, rev)) if !rev.is_empty() => (base, Some(rev.to_string())),
+        _ => (value, None),
+    }
 }
 
 /// The real registry package name and version requirement parsed out of an `npm:` alias value.
@@ -622,6 +780,51 @@ mod tests {
             result.dependencies[0].version_req,
             Some("git+https://github.com/user/repo.git".into())
         );
+        assert_eq!(
+            result.dependencies[0].source,
+            deps_core::parser::DependencySource::Git {
+                url: "https://github.com/user/repo.git".into(),
+                rev: None,
+            },
+            "#1202: a git+ specifier must classify as Git, never fall through to Registry"
+        );
+    }
+
+    #[test]
+    fn test_dependency_with_git_url_committish() {
+        let json = r#"{
+  "dependencies": {
+    "my-lib": "git+https://github.com/user/repo.git#v1.2.3"
+  }
+}"#;
+
+        let result = parse_package_json(json, &test_uri()).unwrap();
+        assert_eq!(
+            result.dependencies[0].source,
+            deps_core::parser::DependencySource::Git {
+                url: "https://github.com/user/repo.git".into(),
+                rev: Some("v1.2.3".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn test_dependency_with_github_shorthand() {
+        let json = r#"{
+  "dependencies": {
+    "acme-internal-secret": "github:acme/internal-secret#main"
+  }
+}"#;
+
+        let result = parse_package_json(json, &test_uri()).unwrap();
+        assert_eq!(
+            result.dependencies[0].source,
+            deps_core::parser::DependencySource::Git {
+                url: "https://github.com/acme/internal-secret.git".into(),
+                rev: Some("main".into()),
+            },
+            "#1202: a private acme-internal-secret repo must never be sent to a public registry"
+        );
     }
 
     #[test]
@@ -639,6 +842,304 @@ mod tests {
             result.dependencies[0].version_req,
             Some("file:../local-package".into())
         );
+        assert_eq!(
+            result.dependencies[0].source,
+            deps_core::parser::DependencySource::Path {
+                path: "../local-package".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_dependency_with_link_and_portal_protocols() {
+        let json = r#"{
+  "dependencies": {
+    "linked-pkg": "link:../linked-package",
+    "portal-pkg": "portal:../portal-package"
+  }
+}"#;
+
+        let result = parse_package_json(json, &test_uri()).unwrap();
+        let linked = result
+            .dependencies
+            .iter()
+            .find(|d| d.name == "linked-pkg")
+            .unwrap();
+        let portal = result
+            .dependencies
+            .iter()
+            .find(|d| d.name == "portal-pkg")
+            .unwrap();
+        assert_eq!(
+            linked.source,
+            deps_core::parser::DependencySource::Path {
+                path: "../linked-package".into(),
+            }
+        );
+        assert_eq!(
+            portal.source,
+            deps_core::parser::DependencySource::Path {
+                path: "../portal-package".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_dependency_with_workspace_protocol() {
+        let json = r#"{
+  "dependencies": {
+    "sibling-pkg": "workspace:*"
+  }
+}"#;
+
+        let result = parse_package_json(json, &test_uri()).unwrap();
+        assert_eq!(
+            result.dependencies[0].source,
+            deps_core::parser::DependencySource::Workspace
+        );
+    }
+
+    /// S1 (critic, #1202): bare GitHub shorthand, with and without a committish.
+    #[test]
+    fn test_dependency_with_bare_github_shorthand() {
+        let json = r#"{
+  "dependencies": {
+    "acme-internal-secret": "acme/internal-secret",
+    "acme-pinned": "acme/internal-secret#main"
+  }
+}"#;
+
+        let result = parse_package_json(json, &test_uri()).unwrap();
+        let bare = result
+            .dependencies
+            .iter()
+            .find(|d| d.name == "acme-internal-secret")
+            .unwrap();
+        let pinned = result
+            .dependencies
+            .iter()
+            .find(|d| d.name == "acme-pinned")
+            .unwrap();
+        assert_eq!(
+            bare.source,
+            deps_core::parser::DependencySource::Git {
+                url: "https://github.com/acme/internal-secret.git".into(),
+                rev: None,
+            }
+        );
+        assert_eq!(
+            pinned.source,
+            deps_core::parser::DependencySource::Git {
+                url: "https://github.com/acme/internal-secret.git".into(),
+                rev: Some("main".into()),
+            }
+        );
+    }
+
+    /// S1 (critic, #1202): `gitlab:`/`bitbucket:`/`gist:` protocols.
+    #[test]
+    fn test_dependency_with_gitlab_bitbucket_and_gist_protocols() {
+        let json = r#"{
+  "dependencies": {
+    "gl-pkg": "gitlab:acme/secret",
+    "bb-pkg": "bitbucket:acme/secret",
+    "gist-pkg": "gist:abcdef1234567890"
+  }
+}"#;
+
+        let result = parse_package_json(json, &test_uri()).unwrap();
+        let gl = result
+            .dependencies
+            .iter()
+            .find(|d| d.name == "gl-pkg")
+            .unwrap();
+        let bb = result
+            .dependencies
+            .iter()
+            .find(|d| d.name == "bb-pkg")
+            .unwrap();
+        let gist = result
+            .dependencies
+            .iter()
+            .find(|d| d.name == "gist-pkg")
+            .unwrap();
+        assert_eq!(
+            gl.source,
+            deps_core::parser::DependencySource::Git {
+                url: "https://gitlab.com/acme/secret.git".into(),
+                rev: None,
+            }
+        );
+        assert_eq!(
+            bb.source,
+            deps_core::parser::DependencySource::Git {
+                url: "https://bitbucket.org/acme/secret.git".into(),
+                rev: None,
+            }
+        );
+        assert_eq!(
+            gist.source,
+            deps_core::parser::DependencySource::Git {
+                url: "https://gist.github.com/abcdef1234567890.git".into(),
+                rev: None,
+            }
+        );
+    }
+
+    /// Code review #1202: a bare (no `git+` prefix) specifier of exactly `"github:"` (or
+    /// `"gitlab:"`/`"bitbucket:"`/`"gist:"`) has no owner/repo after the colon at all — must
+    /// not build a malformed `.../.git` URL, and must fall back to ordinary registry
+    /// resolution.
+    #[test]
+    fn test_empty_remainder_after_git_shorthand_prefix_falls_back_to_registry() {
+        let json = r#"{
+  "dependencies": {
+    "gh-empty": "github:",
+    "gl-empty": "gitlab:",
+    "bb-empty": "bitbucket:",
+    "gist-empty": "gist:"
+  }
+}"#;
+
+        let result = parse_package_json(json, &test_uri()).unwrap();
+        for dep in &result.dependencies {
+            assert_eq!(
+                dep.source,
+                deps_core::parser::DependencySource::Registry,
+                "{} must fall back to Registry, not build a malformed .git URL",
+                dep.name
+            );
+        }
+    }
+
+    /// Code review #1202: a bare `https://` URL to a known git-hosting service ending in
+    /// `.git` is still a git reference (consistent with this crate's own lockfile-side
+    /// detection), and any trailing `#<committish>` must split into `rev`, not stay baked
+    /// into the stored URL.
+    #[test]
+    fn test_bare_https_git_host_url_classifies_as_git_with_split_committish() {
+        let json = r#"{
+  "dependencies": {
+    "secretpkg": "https://github.com/acme/secretpkg.git#v1.0.0"
+  }
+}"#;
+
+        let result = parse_package_json(json, &test_uri()).unwrap();
+        assert_eq!(
+            result.dependencies[0].source,
+            deps_core::parser::DependencySource::Git {
+                url: "https://github.com/acme/secretpkg.git".into(),
+                rev: Some("v1.0.0".into()),
+            }
+        );
+    }
+
+    /// A bare `https://` URL that is NOT a known git host (or has no `.git` suffix) still
+    /// classifies as a plain tarball `Url` reference, unaffected by the new git-host check.
+    #[test]
+    fn test_bare_https_non_git_host_url_still_classifies_as_url() {
+        let json = r#"{
+  "dependencies": {
+    "not-git-host": "https://example.com/acme-secretpkg-1.0.0.tgz",
+    "github_no_dot_git": "https://github.com/acme/secretpkg"
+  }
+}"#;
+
+        let result = parse_package_json(json, &test_uri()).unwrap();
+        for name in ["not-git-host", "github_no_dot_git"] {
+            let dep = result.dependencies.iter().find(|d| d.name == name).unwrap();
+            assert_matches!(dep.source, deps_core::parser::DependencySource::Url { .. });
+        }
+    }
+
+    /// S1 (critic, #1202): a direct tarball URL and a bare local relative path with no
+    /// `file:` prefix at all.
+    #[test]
+    fn test_dependency_with_tarball_url_and_bare_local_path() {
+        let json = r#"{
+  "dependencies": {
+    "tarball-pkg": "https://example.com/acme-secretpkg-1.0.0.tgz",
+    "bare-local": "../local-sibling"
+  }
+}"#;
+
+        let result = parse_package_json(json, &test_uri()).unwrap();
+        let tarball = result
+            .dependencies
+            .iter()
+            .find(|d| d.name == "tarball-pkg")
+            .unwrap();
+        let bare_local = result
+            .dependencies
+            .iter()
+            .find(|d| d.name == "bare-local")
+            .unwrap();
+        assert_eq!(
+            tarball.source,
+            deps_core::parser::DependencySource::Url {
+                url: "https://example.com/acme-secretpkg-1.0.0.tgz".into(),
+            }
+        );
+        assert_eq!(
+            bare_local.source,
+            deps_core::parser::DependencySource::Path {
+                path: "../local-sibling".into(),
+            }
+        );
+    }
+
+    /// M8 (critic, #1202): npm also accepts `~/`-relative and Windows drive-letter paths
+    /// with no `file:` prefix.
+    #[test]
+    fn test_dependency_with_home_relative_and_windows_drive_paths() {
+        let json = r#"{
+  "dependencies": {
+    "home-relative": "~/local/sibling",
+    "windows-drive": "C:/local/sibling"
+  }
+}"#;
+
+        let result = parse_package_json(json, &test_uri()).unwrap();
+        let home_relative = result
+            .dependencies
+            .iter()
+            .find(|d| d.name == "home-relative")
+            .unwrap();
+        let windows_drive = result
+            .dependencies
+            .iter()
+            .find(|d| d.name == "windows-drive")
+            .unwrap();
+        assert_eq!(
+            home_relative.source,
+            deps_core::parser::DependencySource::Path {
+                path: "~/local/sibling".into(),
+            }
+        );
+        assert_eq!(
+            windows_drive.source,
+            deps_core::parser::DependencySource::Path {
+                path: "C:/local/sibling".into(),
+            }
+        );
+    }
+
+    /// A plain semver range/tag never contains a `/`, so the bare-GitHub-shorthand detector
+    /// must never misfire on it.
+    #[test]
+    fn test_ordinary_semver_specifiers_are_not_misclassified() {
+        let json = r#"{
+  "dependencies": {
+    "express": "^4.18.2",
+    "lodash": "~4.17",
+    "tagged": "latest"
+  }
+}"#;
+
+        let result = parse_package_json(json, &test_uri()).unwrap();
+        for dep in &result.dependencies {
+            assert_eq!(dep.source, deps_core::parser::DependencySource::Registry);
+        }
     }
 
     #[test]

@@ -151,6 +151,11 @@ pub fn parse_composer_json(content: &str, uri: &Url) -> Result<ComposerParseResu
         }
     }
 
+    let (repositories, packagist_disabled) = parse_repositories(&root);
+    if !repositories.is_empty() || packagist_disabled {
+        classify_repositories(&mut dependencies, &repositories, packagist_disabled);
+    }
+
     let minimum_stability = root
         .get("minimum-stability")
         .and_then(|v| v.as_str())
@@ -202,10 +207,237 @@ fn parse_section(
             version_req: Some(version_req.into()),
             version_range,
             section,
+            source: deps_core::parser::DependencySource::Registry,
         });
     }
 
     result
+}
+
+/// One `repositories` entry classifying `vcs`/`path`/`artifact`/`package` sources (#1202) —
+/// every other declared type (`composer`, `pear`, ...) is still registry-shaped and ignored.
+struct ComposerRepository {
+    kind: ComposerRepositoryKind,
+    url: String,
+    /// Explicit `"only": ["vendor/pkg", "vendor/*", ...]` filter — Composer's own documented
+    /// way to bind a `vcs`/`path`/`artifact` repository to specific package names, with `*`
+    /// as a wildcard (see [`composer_pattern_matches`]). This is the *only* binding this
+    /// parser trusts for those three types (critic S4): a bare repository declaration with
+    /// no `only` has no static name association at all in the Composer manifest format
+    /// (every declared repository is simply tried, in order, for any required package), and
+    /// a substring-of-the-URL heuristic previously used here mis-classified unrelated public
+    /// packages that merely shared an org/vendor token with the URL (e.g. one `vcs` repo for
+    /// `github.com/symfony/monolog-bundle` silently reclassified `symfony/console`,
+    /// `symfony/http-kernel`, and even unrelated `monolog/monolog` as non-`Registry`,
+    /// silently disabling their OSV scan). Team-lead policy call: an occasional false
+    /// negative (a private package with no `only` filter staying `Registry`, the
+    /// pre-existing status quo this issue is fixing) is preferable to that false-positive.
+    only: Option<Vec<String>>,
+}
+
+enum ComposerRepositoryKind {
+    Vcs,
+    Path,
+    Artifact,
+    /// `{"type": "package", "package": {"name": "...", ...}}` — unlike the other three
+    /// variants, this one carries an exact, manifest-declared package name (critic S3), so
+    /// it needs no `only` filter or heuristic at all.
+    Package {
+        name: String,
+        is_git: bool,
+    },
+}
+
+impl ComposerRepositoryKind {
+    fn classify(&self, url: &str) -> deps_core::parser::DependencySource {
+        match self {
+            Self::Vcs => deps_core::parser::DependencySource::Git {
+                url: url.to_string(),
+                rev: None,
+            },
+            Self::Path => deps_core::parser::DependencySource::Path {
+                path: url.to_string(),
+            },
+            Self::Artifact => deps_core::parser::DependencySource::Url {
+                url: url.to_string(),
+            },
+            Self::Package { is_git, .. } => {
+                if *is_git {
+                    deps_core::parser::DependencySource::Git {
+                        url: url.to_string(),
+                        rev: None,
+                    }
+                } else {
+                    deps_core::parser::DependencySource::Url {
+                        url: url.to_string(),
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Parses the manifest-level `repositories` declaration (array or Composer 2's
+/// object-map-by-label form — both carry the same per-entry shape) into the repositories
+/// this parser can classify against, plus whether any entry disables the implicit
+/// `packagist.org` fallback (`{"packagist.org": false}`, critic S3) — Composer's documented
+/// way to opt every otherwise-unmatched dependency out of the public registry entirely.
+fn parse_repositories(root: &Value) -> (Vec<ComposerRepository>, bool) {
+    let Some(repositories) = root.get("repositories") else {
+        return (Vec::new(), false);
+    };
+    let entries: Vec<&Value> = match repositories {
+        Value::Array(entries) => entries.iter().collect(),
+        Value::Object(entries) => entries.values().collect(),
+        _ => return (Vec::new(), false),
+    };
+    let packagist_disabled = entries.iter().any(|entry| {
+        entry
+            .as_object()
+            .and_then(|obj| obj.get("packagist.org"))
+            .and_then(Value::as_bool)
+            == Some(false)
+    });
+    let repos = entries
+        .into_iter()
+        .filter_map(parse_repository_entry)
+        .collect();
+    (repos, packagist_disabled)
+}
+
+fn parse_repository_entry(entry: &Value) -> Option<ComposerRepository> {
+    let obj = entry.as_object()?;
+    match obj.get("type").and_then(Value::as_str)? {
+        "package" => parse_package_repository_entry(obj),
+        kind_str => {
+            let kind = match kind_str {
+                "vcs" | "github" | "gitlab" | "bitbucket" | "git" | "hg" | "fossil"
+                | "perforce" | "svn" => ComposerRepositoryKind::Vcs,
+                "path" => ComposerRepositoryKind::Path,
+                "artifact" => ComposerRepositoryKind::Artifact,
+                _ => return None,
+            };
+            let url = obj.get("url").and_then(Value::as_str)?.to_string();
+            let only = obj.get("only").and_then(Value::as_array).map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(String::from)
+                    .collect()
+            });
+            Some(ComposerRepository { kind, url, only })
+        }
+    }
+}
+
+/// `{"type": "package", "package": {"name", "source"|"dist"}}` — the exact-binding form
+/// (critic S3). `source.url` (a real VCS checkout) is preferred over `dist.url` (a
+/// pre-built artifact) when both are present, matching Composer's own installation
+/// preference order.
+fn parse_package_repository_entry(
+    obj: &serde_json::Map<String, Value>,
+) -> Option<ComposerRepository> {
+    let package = obj.get("package")?.as_object()?;
+    let name = package.get("name").and_then(Value::as_str)?.to_string();
+    let source = package.get("source").and_then(Value::as_object);
+    if let Some(url) = source.and_then(|s| s.get("url")).and_then(Value::as_str) {
+        let is_git = source.and_then(|s| s.get("type")).and_then(Value::as_str) == Some("git");
+        return Some(ComposerRepository {
+            kind: ComposerRepositoryKind::Package { name, is_git },
+            url: url.to_string(),
+            only: None,
+        });
+    }
+    let dist_url = package
+        .get("dist")
+        .and_then(Value::as_object)
+        .and_then(|d| d.get("url"))
+        .and_then(Value::as_str)?;
+    Some(ComposerRepository {
+        kind: ComposerRepositoryKind::Package {
+            name,
+            is_git: false,
+        },
+        url: dist_url.to_string(),
+        only: None,
+    })
+}
+
+/// Classifies each `Registry`-defaulted dependency against `repositories`, in manifest
+/// declaration order (first matching repository wins, mirroring Composer's own resolution
+/// order), then applies `packagist_disabled` (critic S3) to whatever is still unmatched.
+fn classify_repositories(
+    dependencies: &mut [ComposerDependency],
+    repositories: &[ComposerRepository],
+    packagist_disabled: bool,
+) {
+    for repo in repositories {
+        for dep in &mut *dependencies {
+            if !matches!(dep.source, deps_core::parser::DependencySource::Registry) {
+                continue;
+            }
+            let name = dep.name.as_str();
+            let is_match = match &repo.kind {
+                ComposerRepositoryKind::Package {
+                    name: bound_name, ..
+                } => bound_name == name,
+                ComposerRepositoryKind::Vcs
+                | ComposerRepositoryKind::Path
+                | ComposerRepositoryKind::Artifact => repo.only.as_ref().is_some_and(|only| {
+                    only.iter()
+                        .any(|pattern| composer_pattern_matches(pattern, name))
+                }),
+            };
+            if is_match {
+                dep.source = repo.kind.classify(&repo.url);
+            }
+        }
+    }
+
+    if packagist_disabled {
+        for dep in &mut *dependencies {
+            if matches!(dep.source, deps_core::parser::DependencySource::Registry) {
+                // `url` normally names a real index this LSP has (or could) resolve against;
+                // there is none here — `packagist.org` is disabled outright, not pointed
+                // elsewhere — so this is the host name being disabled, not a resolvable URL.
+                dep.source = deps_core::parser::DependencySource::CustomRegistry {
+                    url: "packagist.org".to_string(),
+                };
+            }
+        }
+    }
+}
+
+/// Matches `name` against a Composer `only` entry, which may contain `*` wildcards
+/// (Composer's own documented glob syntax, e.g. `"acme/*"` — critic S2) matching any run of
+/// characters. No other glob metacharacter (`?`, `[...]`) is part of Composer's own syntax,
+/// so none is supported here either.
+// `idx` and `idx + segment.len()` both come from `str::find`'s match bounds, always char
+// boundaries.
+#[allow(clippy::string_slice)]
+fn composer_pattern_matches(pattern: &str, name: &str) -> bool {
+    if !pattern.contains('*') {
+        return pattern == name;
+    }
+    let mut segments = pattern.split('*');
+    // `split('*')` on a pattern containing at least one `*` always yields >= 2 items, so the
+    // first `next()` never falls through to the default.
+    let Some(rest) = name.strip_prefix(segments.next().unwrap_or_default()) else {
+        return false;
+    };
+    let mut rest = rest;
+    let mut middle: Vec<&str> = segments.collect();
+    let last = middle.pop();
+    for segment in &middle {
+        if segment.is_empty() {
+            continue;
+        }
+        let Some(idx) = rest.find(segment) else {
+            return false;
+        };
+        rest = &rest[idx + segment.len()..];
+    }
+    last.is_none_or(|last_segment| rest.ends_with(last_segment))
 }
 
 #[cfg(test)]
@@ -217,6 +449,317 @@ mod tests {
 
     fn test_uri() -> Url {
         deps_core::test_util::test_uri("/test/composer.json")
+    }
+
+    /// #1202 repro: a `vcs` repository with an exact `only` filter must classify the matching
+    /// `require` entry as `Git` rather than leave it `Registry` (which would send
+    /// `acme/secretpkg`'s name to Packagist).
+    #[test]
+    fn test_vcs_repository_with_only_classifies_matching_dependency() {
+        let json = r#"{
+  "repositories": [
+    { "type": "vcs", "url": "ssh://git@git.acme.internal/private.git", "only": ["acme/secretpkg"] }
+  ],
+  "require": {
+    "acme/secretpkg": "^1.0"
+  }
+}"#;
+
+        let result = parse_composer_json(json, &test_uri()).unwrap();
+        assert_eq!(
+            result.dependencies[0].source,
+            deps_core::parser::DependencySource::Git {
+                url: "ssh://git@git.acme.internal/private.git".into(),
+                rev: None,
+            }
+        );
+    }
+
+    /// Critic S4: a `vcs`/`path`/`artifact` repository with no `only` filter has no static
+    /// name binding in the Composer manifest format at all — this parser now deliberately
+    /// stays `Registry` for every dependency in that case, accepting a false negative (the
+    /// pre-existing status-quo bug) rather than the substring-heuristic's false positive
+    /// (silently disabling OSV scanning for unrelated public packages that merely share an
+    /// org/vendor token with the repository's URL).
+    #[test]
+    fn test_vcs_repository_without_only_never_reclassifies_anything() {
+        let json = r#"{
+  "repositories": [
+    { "type": "vcs", "url": "https://github.com/symfony/monolog-bundle.git" }
+  ],
+  "require": {
+    "symfony/console": "^6.0",
+    "symfony/http-kernel": "^6.0",
+    "monolog/monolog": "^3.0"
+  }
+}"#;
+
+        let result = parse_composer_json(json, &test_uri()).unwrap();
+        for dep in &result.dependencies {
+            assert_eq!(
+                dep.source,
+                deps_core::parser::DependencySource::Registry,
+                "{} must stay Registry — a bare vcs repo with no `only` must never sweep in \
+                 unrelated packages that merely share a vendor/org token with its URL",
+                dep.name
+            );
+        }
+    }
+
+    /// Critic S2: `only` supports Composer's own `*` wildcard glob syntax.
+    #[test]
+    fn test_repository_only_filter_supports_wildcard() {
+        let json = r#"{
+  "repositories": [
+    { "type": "vcs", "url": "ssh://git@git.acme.internal/private.git", "only": ["acme/*"] }
+  ],
+  "require": {
+    "acme/secretpkg": "^1.0",
+    "other/pkg": "^1.0"
+  }
+}"#;
+
+        let result = parse_composer_json(json, &test_uri()).unwrap();
+        let secret = result
+            .dependencies
+            .iter()
+            .find(|d| d.name == "acme/secretpkg")
+            .unwrap();
+        let other = result
+            .dependencies
+            .iter()
+            .find(|d| d.name == "other/pkg")
+            .unwrap();
+        assert_eq!(
+            secret.source,
+            deps_core::parser::DependencySource::Git {
+                url: "ssh://git@git.acme.internal/private.git".into(),
+                rev: None,
+            }
+        );
+        assert_eq!(other.source, deps_core::parser::DependencySource::Registry);
+    }
+
+    /// Critic S3: a `package`-type repository carries an exact, manifest-declared package
+    /// name — no `only` filter or heuristic needed.
+    #[test]
+    fn test_package_type_repository_classifies_exact_name() {
+        let json = r#"{
+  "repositories": [
+    {
+      "type": "package",
+      "package": {
+        "name": "acme/secretpkg",
+        "version": "1.0.0",
+        "source": { "type": "git", "url": "ssh://git@git.acme.internal/private.git", "reference": "main" }
+      }
+    }
+  ],
+  "require": {
+    "acme/secretpkg": "^1.0",
+    "symfony/console": "^6.0"
+  }
+}"#;
+
+        let result = parse_composer_json(json, &test_uri()).unwrap();
+        let secret = result
+            .dependencies
+            .iter()
+            .find(|d| d.name == "acme/secretpkg")
+            .unwrap();
+        let console = result
+            .dependencies
+            .iter()
+            .find(|d| d.name == "symfony/console")
+            .unwrap();
+        assert_eq!(
+            secret.source,
+            deps_core::parser::DependencySource::Git {
+                url: "ssh://git@git.acme.internal/private.git".into(),
+                rev: None,
+            }
+        );
+        assert_eq!(
+            console.source,
+            deps_core::parser::DependencySource::Registry
+        );
+    }
+
+    /// Critic S3: `{"packagist.org": false}` disables the implicit public-registry fallback
+    /// for every otherwise-unmatched dependency.
+    #[test]
+    fn test_packagist_org_disabled_fails_closed_for_unmatched_dependencies() {
+        let json = r#"{
+  "repositories": [
+    { "packagist.org": false },
+    { "type": "vcs", "url": "ssh://git@git.acme.internal/private.git", "only": ["acme/secretpkg"] }
+  ],
+  "require": {
+    "acme/secretpkg": "^1.0",
+    "symfony/console": "^6.0"
+  }
+}"#;
+
+        let result = parse_composer_json(json, &test_uri()).unwrap();
+        let secret = result
+            .dependencies
+            .iter()
+            .find(|d| d.name == "acme/secretpkg")
+            .unwrap();
+        let console = result
+            .dependencies
+            .iter()
+            .find(|d| d.name == "symfony/console")
+            .unwrap();
+        assert_eq!(
+            secret.source,
+            deps_core::parser::DependencySource::Git {
+                url: "ssh://git@git.acme.internal/private.git".into(),
+                rev: None,
+            },
+            "the only-matched dependency keeps its explicit classification"
+        );
+        assert_eq!(
+            console.source,
+            deps_core::parser::DependencySource::CustomRegistry {
+                url: "packagist.org".into(),
+            },
+            "an unmatched dependency must fail closed, never fall back to Registry, once \
+             packagist.org itself is disabled"
+        );
+    }
+
+    /// Team-lead follow-up: the `artifact` repository kind (a pre-built package archive,
+    /// e.g. a local/network directory of zip files) had no test at all — classifies as `Url`,
+    /// distinct from `vcs`'s `Git` and `path`'s `Path`.
+    #[test]
+    fn test_artifact_repository_classifies_as_url() {
+        let json = r#"{
+  "repositories": [
+    { "type": "artifact", "url": "file:///opt/composer-artifacts", "only": ["acme/secretpkg"] }
+  ],
+  "require": {
+    "acme/secretpkg": "^1.0"
+  }
+}"#;
+
+        let result = parse_composer_json(json, &test_uri()).unwrap();
+        assert_eq!(
+            result.dependencies[0].source,
+            deps_core::parser::DependencySource::Url {
+                url: "file:///opt/composer-artifacts".into(),
+            }
+        );
+    }
+
+    /// Team-lead follow-up: every one of Composer's 8 documented `vcs`-equivalent `type`
+    /// aliases must classify identically to plain `"vcs"` — previously only implicitly
+    /// exercised via one alias in the vendor-heuristic test that was since removed (S4).
+    #[test]
+    fn test_all_vcs_type_aliases_classify_as_git() {
+        for alias in [
+            "vcs",
+            "github",
+            "gitlab",
+            "bitbucket",
+            "git",
+            "hg",
+            "fossil",
+            "perforce",
+            "svn",
+        ] {
+            let json = format!(
+                r#"{{
+  "repositories": [
+    {{ "type": "{alias}", "url": "ssh://git@git.acme.internal/private.git", "only": ["acme/secretpkg"] }}
+  ],
+  "require": {{
+    "acme/secretpkg": "^1.0"
+  }}
+}}"#
+            );
+
+            let result = parse_composer_json(&json, &test_uri()).unwrap();
+            assert_eq!(
+                result.dependencies[0].source,
+                deps_core::parser::DependencySource::Git {
+                    url: "ssh://git@git.acme.internal/private.git".into(),
+                    rev: None,
+                },
+                "type: \"{alias}\" must classify identically to type: \"vcs\""
+            );
+        }
+    }
+
+    /// Team-lead follow-up: Composer 2's object-map form of `repositories` (keyed by an
+    /// arbitrary label instead of a bare array) must classify identically to the array form —
+    /// previously only the array form had any test coverage.
+    #[test]
+    fn test_repositories_object_map_form_classifies_same_as_array_form() {
+        let json = r#"{
+  "repositories": {
+    "acme-private": { "type": "vcs", "url": "ssh://git@git.acme.internal/private.git", "only": ["acme/secretpkg"] }
+  },
+  "require": {
+    "acme/secretpkg": "^1.0"
+  }
+}"#;
+
+        let result = parse_composer_json(json, &test_uri()).unwrap();
+        assert_eq!(
+            result.dependencies[0].source,
+            deps_core::parser::DependencySource::Git {
+                url: "ssh://git@git.acme.internal/private.git".into(),
+                rev: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_repository_only_filter_is_exact() {
+        let json = r#"{
+  "repositories": [
+    { "type": "path", "url": "../local-packages/*", "only": ["acme/local-pkg"] }
+  ],
+  "require": {
+    "acme/local-pkg": "*",
+    "symfony/console": "^6.0"
+  }
+}"#;
+
+        let result = parse_composer_json(json, &test_uri()).unwrap();
+        let local = result
+            .dependencies
+            .iter()
+            .find(|d| d.name == "acme/local-pkg")
+            .unwrap();
+        let console = result
+            .dependencies
+            .iter()
+            .find(|d| d.name == "symfony/console")
+            .unwrap();
+
+        assert_eq!(
+            local.source,
+            deps_core::parser::DependencySource::Path {
+                path: "../local-packages/*".into(),
+            }
+        );
+        assert_eq!(
+            console.source,
+            deps_core::parser::DependencySource::Registry,
+            "an `only`-filtered repository must not affect packages outside its list"
+        );
+    }
+
+    #[test]
+    fn test_no_repositories_stays_registry() {
+        let json = r#"{ "require": { "symfony/console": "^6.0" } }"#;
+        let result = parse_composer_json(json, &test_uri()).unwrap();
+        assert_eq!(
+            result.dependencies[0].source,
+            deps_core::parser::DependencySource::Registry
+        );
     }
 
     #[test]

@@ -187,6 +187,7 @@ mod tests {
         display_name: "Bundler (Ruby)";
         manifest_filenames: &["Gemfile"];
         lockfile_filenames: &["Gemfile.lock"];
+        non_registry_fixture: "Gemfile" => "source 'https://rubygems.org'\ngem 'local_gem', path: '../local_gem'\n";
     }
 
     // #758: the shared completion-prefix-length guard

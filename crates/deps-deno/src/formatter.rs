@@ -333,6 +333,7 @@ mod tests {
             version_req: Some(VersionReq::new(requirement)),
             version_range: None,
             section: crate::types::DenoDependencySection::Imports,
+            source: deps_core::parser::DependencySource::Registry,
         }
     }
 

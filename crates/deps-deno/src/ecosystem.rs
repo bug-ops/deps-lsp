@@ -281,6 +281,7 @@ mod tests {
         display_name: "Deno (JSR/npm)";
         manifest_filenames: &["deno.json", "deno.jsonc"];
         no_lockfile_support: true;
+        no_non_registry_fixture: "Deno's non-Registry classification (parser::classify_npm_imports) only fires once a real .npmrc file resolves from disk for an npm: import's scope — the shared macro's fixture has no filesystem backing to supply one. Covered instead by parser::tests::test_npm_scoped_import_resolves_via_npmrc, which builds a real tempfile::tempdir() with a .npmrc and asserts the same gate properties end-to-end.";
     }
 
     // #758: the shared completion-prefix-length guard, replacing

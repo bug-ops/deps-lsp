@@ -35,16 +35,19 @@ pub struct DenoDependency {
     pub version_range: Option<Range>,
     /// Which section of the manifest this import was declared in.
     pub section: DenoDependencySection,
+    /// Resolved source (#1202): `Registry` unless an `npm:` import's scope resolves, via the
+    /// same `.npmrc` hierarchy `deps-npm` reads, to a non-default registry (see
+    /// `parser::classify_npm_imports`). `jsr:` imports always stay `Registry` — JSR has no
+    /// alternate-registry concept.
+    pub source: deps_core::parser::DependencySource,
 }
 
-// TODO(critic): classify a private `npm:@corp/*`-scope import (or any other non-public
-// source) as a non-Registry DependencySource so the #1136 gate is not inert here (follow-up
-// to #1136).
 deps_core::impl_dependency!(DenoDependency {
     name: name,
     name_range: name_range,
     version: version_req,
     version_range: version_range,
+    source: source,
 });
 
 /// Section of a `deno.json` manifest a dependency was declared in.
@@ -289,6 +292,7 @@ mod tests {
             version_req: Some("^1.0".into()),
             version_range: Some(Range::new(Position::new(0, 13), Position::new(0, 17))),
             section: DenoDependencySection::Imports,
+            source: deps_core::parser::DependencySource::Registry,
         };
 
         assert_eq!(dep.name, "jsr:@std/fs");

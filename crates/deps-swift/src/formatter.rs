@@ -209,6 +209,24 @@ mod tests {
         );
     }
 
+    /// #1203 side effect (critic note): `SwiftFormatter` never overrode
+    /// `suppress_package_url`, so a `.branch(...)`/`.revision(...)`/`.package(path: ...)`
+    /// dependency's hover previously still rendered a github.com heading link even though
+    /// `can_resolve_source` already correctly refused to fetch its version data — flipping
+    /// `PackageRendering::suppress_package_url`'s default polarity fixes this for Swift with
+    /// no crate-local change. Pinned here since it was previously untested.
+    #[test]
+    fn test_suppress_package_url_true_for_git_source() {
+        use deps_core::parser::DependencySource;
+
+        let fmt = SwiftFormatter;
+        assert!(fmt.suppress_package_url(&DependencySource::Git {
+            url: "https://github.com/dev/tool".into(),
+            rev: Some("main".into()),
+        }));
+        assert!(!fmt.suppress_package_url(&DependencySource::Registry));
+    }
+
     // #758: exact-value `EcosystemFormatter` conformance, replacing test_package_url,
     // test_package_url_invalid_returns_empty, test_package_url_rejects_dot_segment,
     // test_validate_package_name_accepts_owner_repo,

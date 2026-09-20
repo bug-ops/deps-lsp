@@ -889,6 +889,7 @@ mod tests {
         display_name: "Maven (JVM)";
         manifest_filenames: &["pom.xml"];
         no_lockfile_support: true;
+        non_registry_fixture: "pom.xml" => "<project><dependencies><dependency><groupId>com.acme</groupId><artifactId>internal-jar</artifactId><version>1.0.0</version><scope>system</scope><systemPath>/opt/lib/internal-jar-1.0.0.jar</systemPath></dependency></dependencies></project>";
     }
 
     // #794: `complete_package_names_for_field` (defined above in `impl MavenEcosystem`)

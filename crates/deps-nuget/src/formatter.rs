@@ -102,17 +102,6 @@ impl PackageRendering for NuGetFormatter {
     fn package_url(&self, name: &PackageName) -> String {
         crate::registry::package_url(name.as_str())
     }
-
-    /// FR-011 (issue #523, M1): an `AlternateRegistry` dependency (resolved against a private
-    /// `NuGet.Config`-declared feed) must not render nuget.org's package-page link alongside
-    /// live private-feed data — a nuget.org link next to that would read as confirmation the
-    /// link is real, which is worse than showing no link at all. Delegates to
-    /// [`SourcePolicy::source_is_public_registry_content`], which is `true` only for plain
-    /// `Registry` (the default) — so this suppresses the link for exactly the sources
-    /// [`Self::can_resolve_source`] newly opts into resolving.
-    fn suppress_package_url(&self, source: &deps_core::parser::DependencySource) -> bool {
-        !self.source_is_public_registry_content(source)
-    }
 }
 
 impl RequirementResolution for NuGetFormatter {
@@ -206,20 +195,14 @@ impl DiagnosticPolicy for NuGetFormatter {}
 
 impl SourcePolicy for NuGetFormatter {
     /// FR-011 (issue #523): a NuGet dependency resolved against a private `NuGet.Config`
-    /// feed is version-resolvable through `NuGetRegistry`'s alternate-feed chain, not just
-    /// the default `Registry`/`AlternateRegistry`-excluding set
-    /// [`deps_core::parser::DependencySource::is_version_resolvable`] would otherwise answer.
-    /// `source_is_public_registry_content` stays at its default (`Registry` only) — an
-    /// `AlternateRegistry` dependency is resolvable but is never treated as public-registry
-    /// content for OSV/deps.dev/hover-trust-signal purposes (M3: deliberate privacy
-    /// protection, since those signals would otherwise send a private package's name to a
-    /// public service by default).
-    fn can_resolve_source(&self, source: &deps_core::parser::DependencySource) -> bool {
-        matches!(
-            source,
-            deps_core::parser::DependencySource::Registry
-                | deps_core::parser::DependencySource::AlternateRegistry { .. }
-        )
+    /// feed is version-resolvable through `NuGetRegistry`'s alternate-feed chain, so widens
+    /// [`SourcePolicy::can_resolve_source`] accordingly. `source_is_public_registry_content`
+    /// stays at its default (`Registry` only) — an `AlternateRegistry` dependency is
+    /// resolvable but is never treated as public-registry content for OSV/deps.dev/hover-
+    /// trust-signal purposes (M3: deliberate privacy protection, since those signals would
+    /// otherwise send a private package's name to a public service by default).
+    fn resolves_alternate_registry(&self) -> bool {
+        true
     }
 }
 
