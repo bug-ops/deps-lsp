@@ -583,7 +583,7 @@ impl NpmRegistry {
     /// assert!(!results.is_empty());
     /// # }
     /// ```
-    #[tracing::instrument(skip_all, fields(query = ?query), level = "debug")]
+    #[tracing::instrument(skip_all, fields(query = %deps_core::net_policy::url_for_tracing(query)), level = "debug")]
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<NpmPackage>> {
         // N-M3: an alternate registry never performs a package-*name* search. Nothing else
         // enforces that today, and this method's request goes through the **ungated**
@@ -809,7 +809,7 @@ impl deps_core::Registry for NpmRegistry {
                                 .await
                         }
                         None => Err(DepsError::PackageNotFound {
-                            package: name.to_string().into(),
+                            package: name.as_str().into(),
                             registry: "alternate registry (not registered)",
                         }),
                     }
@@ -853,7 +853,7 @@ impl deps_core::Registry for NpmRegistry {
                             Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
                         }
                         None => Err(DepsError::PackageNotFound {
-                            package: name.to_string().into(),
+                            package: name.as_str().into(),
                             registry: "alternate registry (not registered)",
                         }),
                     }
@@ -868,7 +868,7 @@ impl deps_core::Registry for NpmRegistry {
         })
     }
 
-    fn search<'a>(
+    fn search_raw<'a>(
         &'a self,
         query: &'a str,
         limit: usize,

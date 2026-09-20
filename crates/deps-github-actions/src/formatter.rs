@@ -125,7 +125,7 @@ impl deps_core::lsp_helpers::ShaPinning for GithubActionsFormatter {
         let tag = gha_dep.version_req.as_ref().map(VersionReq::as_str)?;
         let new_text = self.sha_pin_replacement_for(&gha_dep.name, tag)?;
         Some(deps_core::lsp_helpers::ResolvedShaPin {
-            display_name: gha_dep.name.to_string(),
+            display_name: gha_dep.name.as_str().to_string(),
             version_range,
             replacement: new_text,
         })
@@ -224,7 +224,7 @@ impl PackageRendering for GithubActionsFormatter {
 
     fn package_url(&self, name: &PackageName) -> String {
         if crate::is_valid_github_identity(name.as_str()) {
-            format!("https://github.com/{name}")
+            format!("https://github.com/{}", name.as_str())
         } else {
             warn_rejected_value(
                 "is_valid_github_identity",
@@ -448,7 +448,7 @@ mod tests {
             Box::pin(async move { Ok(None) })
         }
 
-        fn search<'a>(
+        fn search_raw<'a>(
             &'a self,
             _query: &'a str,
             _limit: usize,
@@ -649,7 +649,7 @@ mod tests {
                 Box::pin(async move { Ok(None) })
             }
 
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,

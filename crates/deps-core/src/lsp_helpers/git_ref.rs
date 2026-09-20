@@ -742,7 +742,7 @@ pub trait ShaPinning: Send + Sync {
     /// impl ShaPinning for MockPinning {
     ///     fn resolve_static_sha_pin(&self, dep: &dyn Dependency) -> Option<ResolvedShaPin> {
     ///         Some(ResolvedShaPin {
-    ///             display_name: dep.name().to_string(),
+    ///             display_name: dep.name().as_str().to_string(),
     ///             version_range: dep.version_range()?,
     ///             replacement: "a".repeat(40),
     ///         })
@@ -1363,7 +1363,7 @@ mod tests {
                 return None;
             }
             Some(ResolvedShaPin {
-                display_name: dep.name().to_string(),
+                display_name: dep.name().as_str().to_string(),
                 version_range: dep.version_range()?,
                 replacement: "a".repeat(40),
             })

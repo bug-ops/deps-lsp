@@ -154,7 +154,7 @@ impl TierThreeLicenseFetch {
 ///         version.to_string()
 ///     }
 ///     fn package_url(&self, name: &PackageName) -> String {
-///         name.to_string()
+///         name.as_str().to_string()
 ///     }
 /// }
 /// impl RequirementResolution for SimpleFormatter {}
@@ -413,7 +413,7 @@ mod tests {
             version.to_string()
         }
         fn package_url(&self, name: &PackageName) -> String {
-            format!("https://example.com/{name}")
+            format!("https://example.com/{}", name.as_str())
         }
     }
     impl RequirementResolution for MockFormatter {}

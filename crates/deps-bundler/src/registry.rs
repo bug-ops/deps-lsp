@@ -114,7 +114,7 @@ impl RubyGemsRegistry {
     ///
     /// Returns an error if the HTTP request fails or the response body is not valid JSON
     /// matching rubygems.org's `search.json` shape.
-    #[tracing::instrument(skip_all, fields(query = ?query), level = "debug")]
+    #[tracing::instrument(skip_all, fields(query = %deps_core::net_policy::url_for_tracing(query)), level = "debug")]
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<GemInfo>> {
         let url = format!(
             "{}/search.json?query={}",
@@ -326,7 +326,7 @@ impl deps_core::Registry for RubyGemsRegistry {
         })
     }
 
-    fn search<'a>(
+    fn search_raw<'a>(
         &'a self,
         query: &'a str,
         limit: usize,

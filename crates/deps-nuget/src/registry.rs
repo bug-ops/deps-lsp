@@ -986,7 +986,7 @@ impl NuGetRegistry {
     /// # Errors
     ///
     /// Returns an error if the service index cannot be resolved or the search request fails.
-    #[tracing::instrument(skip_all, fields(query = ?query), level = "debug")]
+    #[tracing::instrument(skip_all, fields(query = %deps_core::net_policy::url_for_tracing(query)), level = "debug")]
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<PackageInfo>> {
         let index = self.service_index().await?;
         // FR-016 (spec 035): a feed may omit `SearchQueryService` entirely (e.g. GitHub
@@ -1230,7 +1230,7 @@ impl deps_core::Registry for NuGetRegistry {
                                 .collect())
                         }
                         None => Err(DepsError::PackageNotFound {
-                            package: name.to_string().into(),
+                            package: name.as_str().into(),
                             registry: "alternate registry (not registered)",
                         }),
                     }
@@ -1267,7 +1267,7 @@ impl deps_core::Registry for NuGetRegistry {
                             Ok(idx.and_then(|i| versions.into_iter().nth(i)))
                         }
                         None => Err(DepsError::PackageNotFound {
-                            package: name.to_string().into(),
+                            package: name.as_str().into(),
                             registry: "alternate registry (not registered)",
                         }),
                     }
@@ -1282,7 +1282,7 @@ impl deps_core::Registry for NuGetRegistry {
         })
     }
 
-    fn search<'a>(
+    fn search_raw<'a>(
         &'a self,
         query: &'a str,
         limit: usize,

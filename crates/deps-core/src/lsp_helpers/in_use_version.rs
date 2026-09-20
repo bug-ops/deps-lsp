@@ -460,7 +460,7 @@ pub(crate) fn resolve_occurrence_version<'a>(
 ///         version.to_string()
 ///     }
 ///     fn package_url(&self, name: &PackageName) -> String {
-///         name.to_string()
+///         name.as_str().to_string()
 ///     }
 /// }
 /// impl RequirementResolution for SimpleFormatter {}
@@ -540,7 +540,7 @@ mod tests {
             version.to_string()
         }
         fn package_url(&self, name: &PackageName) -> String {
-            name.to_string()
+            name.as_str().to_string()
         }
     }
     impl crate::lsp_helpers::RequirementResolution for CaretFormatter {

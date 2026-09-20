@@ -152,7 +152,7 @@ impl deps_core::lsp_helpers::ShaPinning for GitlabCiFormatter {
             .map(deps_core::VersionReq::as_str)?;
         let new_text = self.sha_pin_replacement_for(gl_dep.kind.endpoint(), &gl_dep.name, tag)?;
         Some(deps_core::lsp_helpers::ResolvedShaPin {
-            display_name: gl_dep.name.to_string(),
+            display_name: gl_dep.name.as_str().to_string(),
             version_range,
             replacement: new_text,
         })
@@ -563,9 +563,9 @@ impl Ecosystem for GitlabCiEcosystem {
         // `component:` `name@ref`), so there is no single insertable snippet shape —
         // this mirrors GitHub Actions' bare `name`/`name@version` fallback.
         if latest.is_empty() {
-            Some(name.to_string())
+            Some(name.as_str().to_string())
         } else {
-            Some(format!("{name}@{latest}"))
+            Some(format!("{}@{latest}", name.as_str()))
         }
     }
 
@@ -860,7 +860,7 @@ async fn build_dynamic_component_pin_action(
     let changes = deps_core::single_file_edit(uri, version_range, resolved.sha);
 
     Some(CodeAction {
-        title: format!("Pin {} to commit SHA", gl_dep.name),
+        title: format!("Pin {} to commit SHA", gl_dep.name.as_str()),
         kind: Some(CodeActionKind::QUICKFIX),
         edit: Some(WorkspaceEdit {
             changes: Some(changes),

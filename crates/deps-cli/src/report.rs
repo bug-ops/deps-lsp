@@ -723,7 +723,7 @@ fn to_finding(
     CheckFinding {
         ecosystem,
         manifest_path: display_path.to_path_buf(),
-        dependency_name: dep.map(|d| d.name().to_string()),
+        dependency_name: dep.map(|d| d.name().as_str().to_string()),
         requirement: dep
             .and_then(Dependency::version_requirement)
             .map(ToString::to_string),
@@ -886,7 +886,7 @@ mod tests {
             version.to_string()
         }
         fn package_url(&self, name: &PackageName) -> String {
-            name.to_string()
+            name.as_str().to_string()
         }
     }
     impl deps_core::lsp_helpers::RequirementResolution for StubFormatter {}

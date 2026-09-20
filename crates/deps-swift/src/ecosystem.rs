@@ -53,7 +53,7 @@ fn build_url_completion(
     let url = package
         .repository
         .clone()
-        .unwrap_or_else(|| format!("https://github.com/{}", package.name));
+        .unwrap_or_else(|| format!("https://github.com/{}", package.name.as_str()));
 
     if !is_safe_registry_url(&url) {
         warn_rejected_value("is_safe_registry_url", "swift url completion", &url);
@@ -249,9 +249,10 @@ impl Ecosystem for SwiftEcosystem {
     fn completion_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
         let name = metadata.name();
         let latest = metadata.latest_version().as_str();
-        let url = metadata
-            .repository()
-            .map_or_else(|| format!("https://github.com/{name}"), str::to_string);
+        let url = metadata.repository().map_or_else(
+            || format!("https://github.com/{}", name.as_str()),
+            str::to_string,
+        );
         if !is_safe_registry_url(&url) {
             warn_rejected_value(
                 "is_safe_registry_url",

@@ -27,6 +27,11 @@ use std::fmt;
 /// `EcosystemFormatter`, not this type — do not add validation rules here,
 /// as it would silently break those ecosystems.
 ///
+/// This type has no [`Display`](fmt::Display) impl, and its [`Debug`](fmt::Debug) impl
+/// redacts via [`crate::net_policy::redact_declaration_key`] rather than deriving (#1217) —
+/// see [`Self::for_tracing`] for why, and use [`Self::as_str`]/[`Self::as_ref`]/
+/// [`Self::into_string`] for the raw value.
+///
 /// # Examples
 ///
 /// ```
@@ -36,7 +41,7 @@ use std::fmt;
 /// assert_eq!(name.as_str(), "serde");
 /// assert_eq!(name, "serde");
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct PackageName(String);
 
 impl PackageName {
@@ -93,11 +98,13 @@ impl PackageName {
     ///
     /// A manifest can hold a credential in a name-shaped field (e.g. a Maven
     /// `group:artifact:secret@host` coordinate produced by property
-    /// interpolation), and this type's own [`Display`](fmt::Display) writes the string
-    /// verbatim — so any
-    /// `tracing` field or span built from a `PackageName` must go through this method instead
-    /// of `%name`/`?name`. An ordinary package name (including scoped ones like
-    /// `@types/node` or `com.google.guava:guava`) passes through unchanged.
+    /// interpolation), and this type's raw accessors ([`Self::as_str`], [`Self::as_ref`],
+    /// [`Self::into_string`]) return the string verbatim — so any `tracing` field or span
+    /// built from a `PackageName` must go through this method instead. (`?name` and
+    /// `Debug`-derived output are already safe — see [`Self`]'s `Debug` impl — but `%name`,
+    /// which requires `Display`, does not compile at all, since `PackageName` has none.) An
+    /// ordinary package name (including scoped ones like `@types/node` or
+    /// `com.google.guava:guava`) passes through unchanged.
     ///
     /// # Examples
     ///
@@ -116,9 +123,14 @@ impl PackageName {
     }
 }
 
-impl fmt::Display for PackageName {
+impl fmt::Debug for PackageName {
+    /// Forwards to the redacted text's own `Debug` (a quoted string), not a struct-wrapper
+    /// rendering — mirrors [`crate::net_policy::RedactedName`]'s `Debug` impl. This makes
+    /// `?name`, and any `#[derive(Debug)]` struct/enum that embeds a `PackageName`, safe by
+    /// construction against the credential-in-a-name-shaped-field case [`Self::for_tracing`]
+    /// documents (#1217).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        fmt::Debug::fmt(&crate::net_policy::redact_declaration_key(&self.0), f)
     }
 }
 
@@ -508,6 +520,18 @@ mod tests {
         let original = String::from("tokio");
         let name = PackageName::new(original.clone());
         assert_eq!(name.into_string(), original);
+    }
+
+    #[test]
+    fn package_name_debug_redacts_credential_shape() {
+        let name = PackageName::new("com.google.guava:deploy:TOKEN@git.internal.corp");
+        assert_eq!(format!("{name:?}"), "\"***@git.internal.corp\"");
+    }
+
+    #[test]
+    fn package_name_debug_leaves_ordinary_name_untouched() {
+        let name = PackageName::new("com.google.guava:guava");
+        assert_eq!(format!("{name:?}"), "\"com.google.guava:guava\"");
     }
 
     #[test]

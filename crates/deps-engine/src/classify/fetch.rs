@@ -75,7 +75,7 @@ pub type DepSources = Vec<(PackageName, deps_core::parser::DependencySource)>;
 ///         version.to_string()
 ///     }
 ///     fn package_url(&self, name: &PackageName) -> String {
-///         name.to_string()
+///         name.as_str().to_string()
 ///     }
 /// }
 /// impl RequirementResolution for SimpleFormatter {}
@@ -372,7 +372,7 @@ impl FetchResult {
 ///         })
 ///     }
 ///
-///     fn search<'a>(
+///     fn search_raw<'a>(
 ///         &'a self,
 ///         _query: &'a str,
 ///         _limit: usize,
@@ -871,7 +871,7 @@ async fn fetch_and_classify_package(
 ///         version.to_string()
 ///     }
 ///     fn package_url(&self, name: &PackageName) -> String {
-///         name.to_string()
+///         name.as_str().to_string()
 ///     }
 /// }
 /// impl RequirementResolution for SimpleFormatter {}
@@ -1037,7 +1037,7 @@ mod tests {
             }
 
             fn package_url(&self, name: &PackageName) -> String {
-                format!("https://example.com/{name}")
+                format!("https://example.com/{}", name.as_str())
             }
         }
 
@@ -1275,7 +1275,7 @@ mod tests {
                 })
             }
 
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,
@@ -1351,7 +1351,7 @@ mod tests {
                 })
             }
 
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,
@@ -1445,7 +1445,7 @@ mod tests {
                 })
             }
 
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,
@@ -1522,7 +1522,7 @@ mod tests {
                 Box::pin(async move { Ok(None) })
             }
 
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,
@@ -1636,7 +1636,7 @@ mod tests {
                 })
             }
 
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,
@@ -1761,7 +1761,7 @@ mod tests {
                 Box::pin(async move { Ok(None) })
             }
 
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,
@@ -1892,7 +1892,7 @@ mod tests {
                 Box::pin(async move { Ok(None) })
             }
 
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,
@@ -2005,7 +2005,7 @@ mod tests {
                 Box::pin(async move { Ok(None) })
             }
 
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,
@@ -2129,7 +2129,7 @@ mod tests {
                 Box::pin(async move { Ok(None) })
             }
 
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,
@@ -2232,7 +2232,7 @@ mod tests {
                 Box::pin(async move { Ok(None) })
             }
 
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,
@@ -2362,7 +2362,7 @@ mod tests {
                 })
             }
 
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,
@@ -2461,7 +2461,7 @@ mod tests {
                 })
             }
 
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,
@@ -2516,7 +2516,7 @@ mod tests {
                 Box::pin(async move {
                     Err(deps_core::error::DepsError::CacheError(format!(
                         "Failed to fetch package: {}",
-                        name
+                        name.as_str()
                     )))
                 })
             }
@@ -2530,12 +2530,12 @@ mod tests {
                 Box::pin(async move {
                     Err(deps_core::error::DepsError::CacheError(format!(
                         "Failed to fetch package: {}",
-                        name
+                        name.as_str()
                     )))
                 })
             }
 
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,
@@ -2648,7 +2648,7 @@ mod tests {
                 })
             }
 
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,
@@ -2725,7 +2725,7 @@ mod tests {
             {
                 Box::pin(async move {
                     Err(deps_core::error::DepsError::PackageNotFound {
-                        package: name.to_string().into(),
+                        package: name.as_str().into(),
                         registry: "mock",
                     })
                 })
@@ -2739,13 +2739,13 @@ mod tests {
             {
                 Box::pin(async move {
                     Err(deps_core::error::DepsError::PackageNotFound {
-                        package: name.to_string().into(),
+                        package: name.as_str().into(),
                         registry: "mock",
                     })
                 })
             }
 
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,
@@ -2815,7 +2815,7 @@ mod tests {
                 Box::pin(async move { Ok(None) })
             }
 
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,
@@ -2881,7 +2881,7 @@ mod tests {
             {
                 Box::pin(async move {
                     Err(deps_core::error::DepsError::HttpStatus {
-                        url: format!("https://example.com/{name}").into(),
+                        url: format!("https://example.com/{}", name.as_str()).into(),
                         status: 404,
                     })
                 })
@@ -2895,13 +2895,13 @@ mod tests {
             {
                 Box::pin(async move {
                     Err(deps_core::error::DepsError::HttpStatus {
-                        url: format!("https://example.com/{name}").into(),
+                        url: format!("https://example.com/{}", name.as_str()).into(),
                         status: 404,
                     })
                 })
             }
 
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,
@@ -2969,7 +2969,7 @@ mod tests {
                 Box::pin(async move {
                     if name.as_str() == "not-found" {
                         Err(deps_core::error::DepsError::PackageNotFound {
-                            package: name.to_string().into(),
+                            package: name.as_str().into(),
                             registry: "mock",
                         })
                     } else {
@@ -2980,7 +2980,7 @@ mod tests {
                 })
             }
 
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,
@@ -3054,7 +3054,7 @@ mod tests {
                 })
             }
 
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,
@@ -3112,7 +3112,7 @@ mod tests {
                 Box::pin(async move {
                     if name.as_str() == "typo-pkg" {
                         Err(deps_core::error::DepsError::PackageNotFound {
-                            package: name.to_string().into(),
+                            package: name.as_str().into(),
                             registry: "mock",
                         })
                     } else {
@@ -3133,7 +3133,7 @@ mod tests {
                 Box::pin(async move { Ok(None) })
             }
 
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,
@@ -3198,7 +3198,7 @@ mod tests {
             {
                 Box::pin(async move {
                     Err(deps_core::error::DepsError::PackageNotFound {
-                        package: name.to_string().into(),
+                        package: name.as_str().into(),
                         registry: "mock",
                     })
                 })
@@ -3213,7 +3213,7 @@ mod tests {
                 Box::pin(async move { Ok(None) })
             }
 
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,
@@ -3291,7 +3291,7 @@ mod tests {
                 })
             }
 
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,
@@ -3510,7 +3510,7 @@ mod tests {
                 })
             }
 
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,
@@ -4017,7 +4017,7 @@ mod tests {
                 Box::pin(async move { Ok(None) })
             }
 
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,

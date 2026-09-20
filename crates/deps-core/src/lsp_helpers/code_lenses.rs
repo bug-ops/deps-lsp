@@ -79,7 +79,7 @@ pub struct PinNoun {
 ///         version.to_string()
 ///     }
 ///     fn package_url(&self, name: &PackageName) -> String {
-///         format!("https://example.com/{name}")
+///         format!("https://example.com/{}", name.as_str())
 ///     }
 /// }
 /// impl RequirementResolution for MockFormatter {}
@@ -282,7 +282,7 @@ pub fn dedup_overlapping_edits(mut edits: Vec<TextEdit>, caller: &str) -> Vec<Te
 ///         version.to_string()
 ///     }
 ///     fn package_url(&self, name: &PackageName) -> String {
-///         format!("https://example.com/{name}")
+///         format!("https://example.com/{}", name.as_str())
 ///     }
 /// }
 /// impl RequirementResolution for MockFormatter {}
@@ -493,7 +493,7 @@ mod tests {
             }
 
             fn package_url(&self, name: &PackageName) -> String {
-                format!("https://example.com/{name}")
+                format!("https://example.com/{}", name.as_str())
             }
         }
 
@@ -777,7 +777,7 @@ mod tests {
                 }
 
                 fn package_url(&self, name: &PackageName) -> String {
-                    format!("https://example.com/{name}")
+                    format!("https://example.com/{}", name.as_str())
                 }
 
                 fn format_version_replacing(

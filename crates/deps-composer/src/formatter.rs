@@ -1344,7 +1344,7 @@ mod tests {
             Box::pin(async move { Ok(None) })
         }
 
-        fn search<'a>(
+        fn search_raw<'a>(
             &'a self,
             _query: &'a str,
             _limit: usize,

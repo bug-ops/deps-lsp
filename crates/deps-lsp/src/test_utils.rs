@@ -74,7 +74,7 @@ pub(crate) mod blocking_ecosystem {
         ) -> BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>> {
             Box::pin(async move { Ok(None) })
         }
-        fn search<'a>(
+        fn search_raw<'a>(
             &'a self,
             _query: &'a str,
             _limit: usize,
@@ -95,7 +95,7 @@ pub(crate) mod blocking_ecosystem {
         }
 
         fn package_url(&self, name: &deps_core::PackageName) -> String {
-            format!("https://example.com/{name}")
+            format!("https://example.com/{}", name.as_str())
         }
     }
 

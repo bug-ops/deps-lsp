@@ -175,7 +175,7 @@ impl Ecosystem for DartEcosystem {
         // The key is quoted: an unquoted YAML plain scalar can't start with `@`
         // (allowed by `is_safe_package_name` for npm/Deno-shaped names), which would
         // otherwise emit invalid YAML instead of a dependency entry.
-        Some(format!("\"{name}\": ^{latest}"))
+        Some(format!("\"{}\": ^{latest}", name.as_str()))
     }
 
     fn as_any(&self) -> &dyn Any {

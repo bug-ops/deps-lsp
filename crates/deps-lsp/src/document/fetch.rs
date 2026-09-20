@@ -338,7 +338,7 @@ mod tests {
                 Box::pin(async move {
                     if name.as_str() == "not-found" {
                         Err(deps_core::error::DepsError::PackageNotFound {
-                            package: name.to_string().into(),
+                            package: name.as_str().into(),
                             registry: "mock",
                         })
                     } else {
@@ -349,7 +349,7 @@ mod tests {
                 })
             }
 
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,
@@ -520,7 +520,7 @@ dependencies = ["requests>=2.0.0"]
                 Box::pin(async move { Ok(Some(latest)) })
             }
 
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,
@@ -568,7 +568,7 @@ dependencies = ["requests>=2.0.0"]
                 parse_result
                     .dependencies()
                     .iter()
-                    .map(|d| d.name().to_string())
+                    .map(|d| d.name().as_str().to_string())
                     .collect::<Vec<_>>(),
                 vec![raw_name.to_string()],
                 "Poetry table-key parsing must keep the manifest-declared name as-is"

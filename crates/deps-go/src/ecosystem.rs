@@ -237,7 +237,7 @@ impl Ecosystem for GoEcosystem {
     fn completion_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
         let name = metadata.name();
         let latest = metadata.latest_version().as_str();
-        Some(format!("{name} {latest}"))
+        Some(format!("{} {latest}", name.as_str()))
     }
 
     fn as_any(&self) -> &dyn Any {

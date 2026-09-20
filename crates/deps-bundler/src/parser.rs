@@ -2044,7 +2044,10 @@ end"#;
                 DependencySource::CustomRegistry { url } => {
                     assert_eq!(url, "https://gems.corp");
                 }
-                other => panic!("expected CustomRegistry for {}, got {other:?}", dep.name),
+                other => panic!(
+                    "expected CustomRegistry for {}, got {other:?}",
+                    dep.name.as_str()
+                ),
             }
         }
     }
@@ -2069,7 +2072,10 @@ end"#;
                 DependencySource::CustomRegistry { url } => {
                     assert_eq!(url, "https://gems.corp");
                 }
-                other => panic!("expected CustomRegistry for {}, got {other:?}", dep.name),
+                other => panic!(
+                    "expected CustomRegistry for {}, got {other:?}",
+                    dep.name.as_str()
+                ),
             }
         }
     }
@@ -2234,7 +2240,10 @@ end"#;
                 DependencySource::CustomRegistry { url } => {
                     assert_eq!(url, "https://gems.corp");
                 }
-                other => panic!("expected CustomRegistry for {}, got {other:?}", dep.name),
+                other => panic!(
+                    "expected CustomRegistry for {}, got {other:?}",
+                    dep.name.as_str()
+                ),
             }
         }
     }
@@ -2264,7 +2273,10 @@ end"#;
                 DependencySource::CustomRegistry { url } => {
                     assert_eq!(url, "https://gems.corp");
                 }
-                other => panic!("expected CustomRegistry for {}, got {other:?}", dep.name),
+                other => panic!(
+                    "expected CustomRegistry for {}, got {other:?}",
+                    dep.name.as_str()
+                ),
             }
         }
     }
@@ -2290,7 +2302,10 @@ gem "rails""#;
                 DependencySource::CustomRegistry { url } => {
                     assert_eq!(url, "https://gems.corp");
                 }
-                other => panic!("expected CustomRegistry for {}, got {other:?}", dep.name),
+                other => panic!(
+                    "expected CustomRegistry for {}, got {other:?}",
+                    dep.name.as_str()
+                ),
             }
         }
         assert_eq!(result.dependencies[2].name, "rails");

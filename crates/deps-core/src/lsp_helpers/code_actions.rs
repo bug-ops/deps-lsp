@@ -2616,7 +2616,7 @@ mod tests {
                 Box::pin(async move { Ok(None) })
             }
 
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,
@@ -2895,7 +2895,7 @@ mod tests {
             }
 
             fn package_url(&self, name: &PackageName) -> String {
-                format!("https://example.com/{name}")
+                format!("https://example.com/{}", name.as_str())
             }
 
             fn format_version_replacing(
@@ -2941,7 +2941,7 @@ mod tests {
             }
 
             fn package_url(&self, name: &PackageName) -> String {
-                format!("https://example.com/{name}")
+                format!("https://example.com/{}", name.as_str())
             }
 
             fn format_version_replacing(
@@ -2976,7 +2976,7 @@ mod tests {
 
         impl PackageNaming for NormalizingExactFormatter {
             fn normalize_package_name(&self, name: &PackageName) -> String {
-                format!("normalized-{name}")
+                format!("normalized-{}", name.as_str())
             }
         }
 
@@ -2986,7 +2986,7 @@ mod tests {
             }
 
             fn package_url(&self, name: &PackageName) -> String {
-                format!("https://example.com/{name}")
+                format!("https://example.com/{}", name.as_str())
             }
         }
 

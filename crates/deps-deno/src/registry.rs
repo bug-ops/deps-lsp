@@ -121,7 +121,7 @@ fn not_found_or(err: DepsError, full_name: &str) -> DepsError {
 /// into a GET against the bare npm registry base URL.
 fn unroutable(name: &PackageName) -> DepsError {
     DepsError::PackageNotFound {
-        package: name.to_string().into(),
+        package: name.as_str().into(),
         registry: "deno",
     }
 }
@@ -327,7 +327,7 @@ impl JsrRegistry {
     /// assert!(!results.is_empty());
     /// # }
     /// ```
-    #[tracing::instrument(skip_all, fields(query = ?query), level = "debug")]
+    #[tracing::instrument(skip_all, fields(query = %deps_core::net_policy::url_for_tracing(query)), level = "debug")]
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<JsrPackage>> {
         let Some((scope, pkg_prefix)) = split_scope_query(query) else {
             return self.fetch_search(query, limit).await;
@@ -358,7 +358,7 @@ impl JsrRegistry {
     /// Issues the raw `api.jsr.io/packages?query=` request with no scope-aware
     /// post-processing. Used directly for an unscoped query, and as the underlying fetch
     /// for [`Self::search`]'s scope-qualified path.
-    #[tracing::instrument(skip_all, fields(query = ?query), level = "debug")]
+    #[tracing::instrument(skip_all, fields(query = %deps_core::net_policy::url_for_tracing(query)), level = "debug")]
     async fn fetch_search(&self, query: &str, limit: usize) -> Result<Vec<JsrPackage>> {
         let url = format!(
             "{}/packages?query={}&limit={}",
@@ -592,7 +592,7 @@ impl Registry for DenoRegistry {
         })
     }
 
-    fn search<'a>(
+    fn search_raw<'a>(
         &'a self,
         query: &'a str,
         limit: usize,
@@ -607,12 +607,15 @@ impl Registry for DenoRegistry {
                         .collect())
                 }
                 Some((Scheme::Npm, rest)) => {
-                    let results = Registry::search(&self.npm, rest, limit).await?;
+                    // Inherent `search`, mirroring the JSR branch above — not the trait's
+                    // `search_raw` — the query already passed the caller-side gate once, and
+                    // scheme-prefix stripping only shrinks `query`, never adds content back.
+                    let results = self.npm.search(rest, limit).await?;
                     Ok(results
                         .into_iter()
                         .map(|m| {
-                            let prefixed = PackageName::new(format!("npm:{}", m.name()));
-                            Box::new(DenoMetadata::new(prefixed, m)) as Box<dyn Metadata>
+                            let prefixed = PackageName::new(format!("npm:{}", m.name().as_str()));
+                            Box::new(DenoMetadata::new(prefixed, Box::new(m))) as Box<dyn Metadata>
                         })
                         .collect())
                 }

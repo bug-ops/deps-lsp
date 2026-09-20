@@ -437,9 +437,9 @@ impl Ecosystem for GithubActionsEcosystem {
             return None;
         }
         if latest.is_empty() {
-            Some(name.to_string())
+            Some(name.as_str().to_string())
         } else {
-            Some(format!("{name}@{latest}"))
+            Some(format!("{}@{latest}", name.as_str()))
         }
     }
 
