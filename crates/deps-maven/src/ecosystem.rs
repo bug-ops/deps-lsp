@@ -58,10 +58,15 @@ enum MavenNameField {
 /// crate keeps its own full override rather than the shared dispatch isn't a missing
 /// concept, it's the detection *source*: `detect_xml_context` scans the manifest's raw text
 /// for `<version>`/`<artifactId>`/`<groupId>` tags directly, independent of
-/// `parse_result.dependencies()` (deliberately dependency-blind, see
+/// `parse_result.dependencies()` (deliberately blind to the *parsed* dependency list — see
 /// `test_generate_completions_version_context_no_dependency_at_position_returns_empty`
 /// below), whereas [`deps_core::completion::detect_completion_context`] derives its context
-/// from parsed-AST dependency ranges. `ArtifactId`/`GroupId` genuinely have no counterpart —
+/// from parsed-AST dependency ranges. A matched `<version>` is, since #1181, still checked
+/// against the raw-text XML *structure* around it (is it actually nested inside a
+/// `<dependency>`/`<plugin>` element, not just textually nearest) — this is a raw-text
+/// ancestry check, not a lookup into `parse_result.dependencies()`, so the "dependency-blind"
+/// characterization above still holds for the parsed list, just not for XML nesting anymore.
+/// `ArtifactId`/`GroupId` genuinely have no counterpart —
 /// a pom.xml coordinate splits `groupId`/`artifactId` across two separate tags, unlike
 /// `CompletionContext::PackageName`'s single combined name (see that method's default-impl
 /// doc).
@@ -110,10 +115,14 @@ const VERSION_OPEN_TAG_UTF16_LEN: u32 = 8;
 /// between them), the earlier tag wins, since it is checked first and its inclusive `tag_end`
 /// already contains that column.
 ///
-/// Like [`detect_xml_context`], this is a raw-text scan with no XML-comment or element-
-/// ancestry awareness — `<!-- <version/> -->` still triggers, the same pre-existing blind
-/// spot every other tag branch here already has (tracked with the ancestry follow-up, since
-/// both need the same kind of surrounding-structure awareness this scanner doesn't have).
+/// Like [`detect_xml_context`]'s own `<tag>...</tag>` loop, this scanner itself has no
+/// XML-comment or element-ancestry awareness and would match `<!-- <version/> -->` on its
+/// own — but [`detect_xml_context`] now runs the same [`innermost_open_element`] ancestry
+/// check on every match this function returns (#1181 follow-up): a `<version/>` inside a
+/// comment with no real `<dependency>`/`<plugin>` ancestor of its own is correctly rejected.
+/// See [`innermost_open_element`]'s own doc for the one case this does not cover — a comment
+/// nested *inside* a real `<dependency>`/`<plugin>` — which applies equally to this arm and
+/// the `<version>...</version>` arm below, not something introduced here.
 // Every bound is an ASCII-token-length offset from an already-valid boundary, same invariant as `detect_xml_context`'s own `#[allow(clippy::string_slice)]`.
 #[cfg(feature = "lsp-responses")]
 #[allow(clippy::string_slice)]
@@ -393,6 +402,31 @@ impl MavenEcosystem {
         // loop to find anyway). `generate_completions` replaces the whole `tag_span`
         // wholesale via `VersionReplacement` rather than inserting at the cursor.
         if let Some((tag_start, tag_end)) = find_self_closing_version_tag(line, col_idx) {
+            // #1181 follow-up: the same ancestry requirement as the `<version>...</version>`
+            // arm below — a self-closing `<version/>` must also be nested inside
+            // `<dependency>`/`<plugin>`, or a minified pom.xml's `<project>`/`<parent>` own
+            // `<version/>` can misattribute to a nearby `<dependency>` via
+            // `literal_version_dependency`'s same-line fallback, the same bug class as #1181
+            // just for the self-closing tag shape. A self-closing tag never contains the
+            // literal `<version>` substring the loop below searches for (it has `/>`, not
+            // `>`, right after the tag name), so there is no *`Version`* candidate to fall
+            // through to for this cursor position. There CAN still be an unrelated
+            // `artifactId`/`groupId` open-tag match at this same cursor position (e.g.
+            // `<groupId>org.foo<version/></groupId>`, cursor inside the self-closing tag) —
+            // `return`ing `None` directly discards that too, unlike the loop's own `continue`
+            // below, which only disqualifies the `Version` candidate and still lets a later
+            // iteration try `artifactId`/`groupId` independently. Pre-existing gap, not a
+            // regression: before #1189 a self-closing tag always resolved to `None` outright,
+            // so no candidate — `Version` or otherwise — was ever reachable there; `None` is
+            // still the safer of the two choices, so left as-is here.
+            let tag_offset = content.substr_range(line).map(|r| r.start + tag_start);
+            if !matches!(
+                tag_offset.and_then(|offset| innermost_open_element(content, offset)),
+                Some("dependency" | "plugin")
+            ) {
+                return (MavenXmlContext::None, "", LspRange::default());
+            }
+
             let tag_span = LspRange {
                 start: Position {
                     line: position.line,
@@ -422,6 +456,35 @@ impl MavenEcosystem {
                 if !between.contains("</") {
                     // Check if cursor is on a dependency line (use parse_result for context)
                     let _ = parse_result;
+
+                    // #1181: a `<version>` match is only a real completion trigger when it is
+                    // structurally nested inside `<dependency>`/`<plugin>` — not merely the
+                    // nearest `<version>` tag on the cursor's line. Without this, a minified
+                    // pom.xml where `<project>`'s own top-level `<version>` shares a physical
+                    // line with unrelated dependency coordinates lets
+                    // `literal_version_dependency`'s same-line fallback (#1146) misattribute
+                    // the project's own version to a nearby dependency, and an accepted
+                    // completion would then edit the wrong element. `artifactId`/`groupId`
+                    // don't need this: they complete in place from the tag's own text with no
+                    // cross-element attribution step, so there is nothing to misattribute.
+                    // `line` is a subslice of `content` from `content.lines()`, so
+                    // `substr_range` recovers its absolute offset without re-scanning
+                    // `content` for it.
+                    let tag_offset = content.substr_range(line).map(|r| r.start + start);
+                    if ctx == MavenXmlContext::Version
+                        && !matches!(
+                            tag_offset.and_then(|offset| innermost_open_element(content, offset)),
+                            Some("dependency" | "plugin")
+                        )
+                    {
+                        // `continue`, not `return`: this only disqualifies THIS `<version>`
+                        // match (e.g. one found inside a comment on a minified line) — a
+                        // later iteration's `artifactId`/`groupId` pattern can still validly
+                        // match the same `before_cursor` independently, and must still get
+                        // the chance to.
+                        continue;
+                    }
+
                     let value = &line[value_start..col_idx];
                     let value_end = line[value_start..]
                         .find("</")
@@ -447,6 +510,121 @@ impl MavenEcosystem {
 
         (MavenXmlContext::None, "", LspRange::default())
     }
+}
+
+/// Tag name of the innermost XML element open at `offset` (an absolute byte offset into
+/// `content`), found via a single forward scan from the document start that pushes on
+/// every opening tag and pops on every closing one, stopping once `offset` is reached —
+/// used by [`MavenEcosystem::detect_xml_context`]'s `Version` arm (#1181) and its
+/// self-closing `<version/>` arm (#1181 follow-up) alike, to verify a matched `<version>`
+/// (open/close or self-closing) is actually nested inside a `<dependency>`/`<plugin>`, not
+/// just nearest on the cursor's physical line.
+///
+/// Comments (`<!--...-->`), CDATA sections (`<![CDATA[...]]>`), processing instructions
+/// (`<?...?>`) and other `<!...>` declarations are skipped as opaque spans (searched for
+/// their own close marker) so a commented-out `<dependency>` block can't be mistaken for
+/// a live one — the generic `<!...>` span stops at the first `>`, which in principle
+/// mishandles a DOCTYPE's internal subset (`<!DOCTYPE p [<!ENTITY x "y">]>`); harmless in
+/// practice since pom.xml never declares one. Tag names are also compared with a possible
+/// `<!--`/`<?`/DOCTYPE marker stripped, but the tag-end search itself is a bare `find('>')`
+/// with no attribute-quoting awareness — an unescaped `>` inside a quoted attribute value
+/// (`<foo bar="a>b">`) would desync the scan; low real risk since `dependency`/`plugin`/
+/// `version` elements never carry attributes in a pom.xml. This is a raw-text
+/// approximation, not a full XML parser — same tradeoff `detect_xml_context` itself already
+/// makes — but it only ever runs against content that `deps-maven::parser::parse_pom_xml`
+/// has already accepted as well-formed XML (completion is only reachable with a
+/// successfully parsed `ParseResult`), so tags close in strict LIFO order and a plain
+/// pop-without-name-check on every close tag is sound.
+///
+/// Being opaque cuts both ways: a comment is never *entered*, so `offset` values that fall
+/// *inside* one are never distinguished from each other — if the comment itself sits inside a
+/// real `<dependency>`/`<plugin>`, every `offset` inside it (including one from a `<version>`
+/// or `<version/>` match a caller's raw-text scanner found on the commented-out text) still
+/// resolves to that real ancestor, e.g. `<dependency><!-- <version/> --></dependency>` reports
+/// `Some("dependency")` for an `offset` inside the comment, same as if the comment weren't
+/// there at all. This narrows the #1181 misattribution class without closing every instance of
+/// it; a comment with no real ancestor of its own is still correctly rejected (see
+/// `test_detect_xml_context_failed_version_ancestry_does_not_suppress_artifact_id`), only a
+/// comment nested inside one is not.
+///
+/// Proving `<version>` sits inside *a* `<dependency>`/`<plugin>` narrows the #1181
+/// misattribution class, it does not close it: [`deps_core::completion::literal_version_dependency`]'s
+/// pass-2 same-line fallback still ranks purely by same-line distance among *parsed*
+/// `Dependency`s, so a `<version>` whose own element never became a `Dependency` (e.g. a
+/// `<dependency>` still missing `<groupId>` mid-typing, dropped by `finalize_dep`; or a
+/// `<plugin>` whose accumulator got overwritten by a nested `<dependencies>` block it
+/// declares) can still resolve to a minified-line neighbor. Out of scope here — same
+/// territory as #1147 — do not read this function as a complete fix for the fallback's
+/// same-line ranking.
+// `lt`/`gt_rel`/`name_end` all come from `find`/`strip_prefix` on ASCII tokens (`<`, `>`,
+// `<!--`, `-->`, whitespace), so every slice bound below is always a char boundary.
+#[cfg(feature = "lsp-responses")]
+#[allow(clippy::string_slice)]
+fn innermost_open_element(content: &str, offset: usize) -> Option<&str> {
+    // Order matters: `<!--` (comment) must be tried before the generic `<!` (DOCTYPE/other
+    // declaration) fallback, since every comment also matches that generic prefix.
+    const OPAQUE_SPANS: &[(&str, &str)] = &[
+        ("<!--", "-->"),
+        ("<![CDATA[", "]]>"),
+        ("<?", "?>"),
+        ("<!", ">"),
+    ];
+
+    let mut stack: Vec<&str> = Vec::new();
+    let mut pos = 0usize;
+
+    while let Some(rel) = content[pos..].find('<') {
+        let lt = pos + rel;
+        if lt >= offset {
+            break;
+        }
+
+        if let Some(end) = OPAQUE_SPANS
+            .iter()
+            .find_map(|&(open, close)| skip_opaque_xml_span(&content[lt..], open, close))
+        {
+            pos = lt + end;
+            continue;
+        }
+
+        let Some(gt_rel) = content[lt..].find('>') else {
+            break;
+        };
+        let inner = &content[lt + 1..lt + gt_rel];
+        pos = lt + gt_rel + 1;
+
+        if inner.starts_with('/') {
+            stack.pop();
+        } else if !inner.ends_with('/') {
+            let name_end = inner.find(char::is_whitespace).unwrap_or(inner.len());
+            let name = &inner[..name_end];
+            // Strip a namespace prefix (`m:dependency` -> `dependency`) so a
+            // namespace-prefixed pom.xml compares the same way `parse_pom_xml` already
+            // does via quick-xml's `local_name()` (`parser.rs`) — without this, a prefixed
+            // document would keep parsing into real `Dependency`s (hover/diagnostics/code
+            // actions unaffected) while completion alone silently stopped triggering,
+            // since the qualified name never equals `"dependency"`/`"plugin"` (#1181 critic
+            // S1).
+            let local_name = name.rsplit(':').next().unwrap_or(name);
+            stack.push(local_name);
+        }
+    }
+
+    stack.last().copied()
+}
+
+/// If `text` starts with `open`, returns the byte offset (relative to `text`) right after
+/// the first `close` marker that follows — or the end of `text` if `close` never appears
+/// (a truncated/malformed span), so the scan fails closed by consuming the rest of the
+/// document rather than looping forever. Returns `None` if `text` doesn't start with
+/// `open` at all.
+#[cfg(feature = "lsp-responses")]
+fn skip_opaque_xml_span(text: &str, open: &str, close: &str) -> Option<usize> {
+    let rest = text.strip_prefix(open)?;
+    Some(
+        rest.find(close)
+            .map_or(text.len(), |i| open.len() + i + close.len()),
+    )
 }
 
 impl deps_core::ecosystem::private::Sealed for MavenEcosystem {}
@@ -807,13 +985,41 @@ mod tests {
         (t, v.to_owned(), range)
     }
 
+    /// Same fixture shape as [`xml_context_with_range`], but `line_content` sits on line 1
+    /// of a `<dependency>...</dependency>`-wrapped document instead of standing alone on
+    /// line 0 — required for a `<version>` match to satisfy #1181's ancestry check (a bare
+    /// `<version>` with no enclosing `<dependency>`/`<plugin>` now correctly yields
+    /// `MavenXmlContext::None`, see `test_detect_xml_context_version_without_dependency_
+    /// ancestor_yields_no_context`). The 4-space indent and column math are unchanged from
+    /// `xml_context_with_range`; only the line index shifts from 0 to 1.
+    #[cfg(feature = "lsp-responses")]
+    fn xml_context_with_range_in_dependency(
+        line_content: &str,
+        col: u32,
+    ) -> (MavenXmlContext, String, LspRange) {
+        let content = format!("<dependency>\n    {line_content}\n</dependency>\n");
+        let col_in_content = col + 4; // 4 spaces indent
+        let (t, v, range) = MavenEcosystem::detect_xml_context(
+            &content,
+            make_position(1, col_in_content),
+            &NoopParseResult,
+        );
+        (t, v.to_owned(), range)
+    }
+
+    #[cfg(feature = "lsp-responses")]
+    fn xml_context_in_dependency(line_content: &str, col: u32) -> (MavenXmlContext, String) {
+        let (t, v, _range) = xml_context_with_range_in_dependency(line_content, col);
+        (t, v)
+    }
+
     #[cfg(feature = "lsp-responses")]
     #[test]
     fn test_detect_xml_context_version_cursor_at_start() {
         // <version>|4.13.2</version> — cursor right after '>'
         let line = "<version>4.13.2</version>";
         // col 0..8 is "<version", col 9 is '4'
-        let (t, v) = xml_context(line, 9); // col at value_start
+        let (t, v) = xml_context_in_dependency(line, 9); // col at value_start
         assert_eq!(t, MavenXmlContext::Version);
         assert_eq!(v, "");
     }
@@ -823,7 +1029,7 @@ mod tests {
     fn test_detect_xml_context_version_cursor_mid() {
         // <version>4.1|3.2</version>
         let line = "<version>4.13.2</version>";
-        let (t, v) = xml_context(line, 12); // "4.1" = 3 chars after value_start (9)
+        let (t, v) = xml_context_in_dependency(line, 12); // "4.1" = 3 chars after value_start (9)
         assert_eq!(t, MavenXmlContext::Version);
         assert_eq!(v, "4.1");
     }
@@ -833,7 +1039,7 @@ mod tests {
     fn test_detect_xml_context_version_cursor_at_end() {
         // <version>4.13.2|</version>
         let line = "<version>4.13.2</version>";
-        let (t, v) = xml_context(line, 15); // value_start=9, end=15
+        let (t, v) = xml_context_in_dependency(line, 15); // value_start=9, end=15
         assert_eq!(t, MavenXmlContext::Version);
         assert_eq!(v, "4.13.2");
     }
@@ -843,7 +1049,7 @@ mod tests {
     fn test_detect_xml_context_version_empty_value() {
         // <version>|</version>
         let line = "<version></version>";
-        let (t, v) = xml_context(line, 9);
+        let (t, v) = xml_context_in_dependency(line, 9);
         assert_eq!(t, MavenXmlContext::Version);
         assert_eq!(v, "");
     }
@@ -861,10 +1067,10 @@ mod tests {
     fn test_detect_xml_context_self_closing_version_tag_is_a_completion_trigger() {
         for line in ["<version/>", "<version />", "<version  />"] {
             let cursor = u32::try_from(line.len()).unwrap();
-            let (t, v, range) = xml_context_with_range(line, cursor);
+            let (t, v, range) = xml_context_with_range_in_dependency(line, cursor);
             let expected_span = LspRange {
-                start: Position::new(0, 4),
-                end: Position::new(0, 4 + cursor),
+                start: Position::new(1, 4),
+                end: Position::new(1, 4 + cursor),
             };
             assert_eq!(
                 t,
@@ -878,6 +1084,20 @@ mod tests {
         }
     }
 
+    /// #1181: a `<version>` tag with no enclosing `<dependency>`/`<plugin>` at all (e.g. a
+    /// standalone fixture, or the project's own top-level `<version>`) must not trigger
+    /// completion, even though the raw-text scanner alone would still find an open
+    /// `<version>` tag with the cursor inside it.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_xml_context_version_without_dependency_ancestor_yields_no_context() {
+        let line = "<version>4.13.2</version>";
+        let (t, v, range) = xml_context_with_range(line, 9);
+        assert_eq!(t, MavenXmlContext::None);
+        assert_eq!(v, "");
+        assert_eq!(range, LspRange::default());
+    }
+
     /// LSP 3.17 requires `textEdit.range` to contain the completion position — proven here
     /// for the tag-start, mid-tag, and tag-end cursor positions inside a single
     /// self-closing `<version/>` tag.
@@ -887,11 +1107,11 @@ mod tests {
         let line = "<version/>";
         let tag_len = u32::try_from(line.len()).unwrap();
         for cursor in [0, tag_len / 2, tag_len] {
-            let (t, _v, range) = xml_context_with_range(line, cursor);
+            let (t, _v, range) = xml_context_with_range_in_dependency(line, cursor);
             let MavenXmlContext::SelfClosingVersion { tag_span } = t else {
                 panic!("must trigger at cursor {cursor} for {line:?}, got {t:?}");
             };
-            let indented_cursor = Position::new(0, cursor + 4);
+            let indented_cursor = Position::new(1, cursor + 4);
             assert!(
                 range.start <= indented_cursor && indented_cursor <= range.end,
                 "range {range:?} must contain cursor {indented_cursor:?}"
@@ -905,8 +1125,37 @@ mod tests {
     #[test]
     fn test_detect_xml_context_version_range_self_closing_tag_is_not_a_trigger() {
         let line = "<versionRange/>";
-        let (t, v, range) = xml_context_with_range(line, u32::try_from(line.len()).unwrap());
+        let (t, v, range) =
+            xml_context_with_range_in_dependency(line, u32::try_from(line.len()).unwrap());
         assert_eq!(t, MavenXmlContext::None, "must not trigger for {line:?}");
+        assert_eq!(v, "");
+        assert_eq!(range, LspRange::default());
+    }
+
+    /// #1181: `<plugin>` is as valid an ancestor as `<dependency>` — the ancestry check
+    /// must not narrow the trigger to `<dependency>` alone.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_xml_context_version_inside_plugin_is_a_completion_trigger() {
+        let content = "<plugin>\n    <version>1.0.0</version>\n</plugin>\n";
+        let position = Position::new(1, 4 + "<version>".len() as u32);
+        let (t, v, _range) =
+            MavenEcosystem::detect_xml_context(content, position, &NoopParseResult);
+        assert_eq!(t, MavenXmlContext::Version);
+        assert_eq!(v, "");
+    }
+
+    /// #1181: a `<parent>` block's `<version>` (the parent POM reference, not a regular
+    /// dependency) must not trigger completion either — `<parent>` is neither `<dependency>`
+    /// nor `<plugin>`, and `deps-maven::parser::parse_pom_xml` never turns it into a
+    /// `Dependency`, so a completion there would have nothing valid to resolve against.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_xml_context_version_inside_parent_yields_no_context() {
+        let content = "<parent>\n    <version>1.0.0</version>\n</parent>\n";
+        let position = Position::new(1, 4 + "<version>".len() as u32);
+        let (t, v, range) = MavenEcosystem::detect_xml_context(content, position, &NoopParseResult);
+        assert_eq!(t, MavenXmlContext::None);
         assert_eq!(v, "");
         assert_eq!(range, LspRange::default());
     }
@@ -915,8 +1164,148 @@ mod tests {
     #[test]
     fn test_detect_xml_context_optional_self_closing_tag_is_not_a_trigger() {
         let line = "<optional/>";
-        let (t, v, range) = xml_context_with_range(line, u32::try_from(line.len()).unwrap());
+        let (t, v, range) =
+            xml_context_with_range_in_dependency(line, u32::try_from(line.len()).unwrap());
         assert_eq!(t, MavenXmlContext::None, "must not trigger for {line:?}");
+        assert_eq!(v, "");
+        assert_eq!(range, LspRange::default());
+    }
+
+    /// #1181 follow-up: the same ancestry gap as
+    /// `test_detect_xml_context_version_without_dependency_ancestor_yields_no_context`, but
+    /// for the self-closing tag shape — a minified pom.xml where `<project>`'s own
+    /// self-closing `<version/>` shares physical structure with a real `<dependency>` must
+    /// not trigger completion via the self-closing path either.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_xml_context_self_closing_version_without_dependency_ancestor_yields_no_context()
+    {
+        let content =
+            "<project><version/><dependency><artifactId>foo</artifactId></dependency></project>\n";
+        let cursor = u32::try_from(content.find("<version/>").unwrap() + 4).unwrap();
+        let (t, v, range) =
+            MavenEcosystem::detect_xml_context(content, Position::new(0, cursor), &NoopParseResult);
+        assert_eq!(t, MavenXmlContext::None);
+        assert_eq!(v, "");
+        assert_eq!(range, LspRange::default());
+    }
+
+    /// Positive counterpart: a self-closing `<version/>` correctly nested inside
+    /// `<dependency>` still triggers `SelfClosingVersion` after the #1181 follow-up ancestry
+    /// check — proves the fix withholds completion only for the misattributed case, not for
+    /// every self-closing tag.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_xml_context_self_closing_version_inside_dependency_is_a_completion_trigger() {
+        let content = "<dependency><version/></dependency>\n";
+        let cursor = u32::try_from(content.find("<version/>").unwrap() + 4).unwrap();
+        let (t, v, _range) =
+            MavenEcosystem::detect_xml_context(content, Position::new(0, cursor), &NoopParseResult);
+        assert!(
+            matches!(t, MavenXmlContext::SelfClosingVersion { .. }),
+            "expected SelfClosingVersion, got {t:?}"
+        );
+        assert_eq!(v, "<version/>");
+    }
+
+    /// #1181: a commented-out `<dependency>` block must not be mistaken for a live one by
+    /// `innermost_open_element`'s ancestry scan — the `<version>` right after the comment
+    /// closes must resolve to the real, uncommented enclosing element, not "dependency"
+    /// leaked from inside the comment text.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_innermost_open_element_skips_commented_out_dependency() {
+        let content = "<project><!-- <dependency><version>0.0.0</version></dependency> \
+                        --><parent><version>1.0.0</version></parent></project>";
+        let offset = content.rfind("<version>").unwrap();
+        assert_eq!(innermost_open_element(content, offset), Some("parent"));
+    }
+
+    /// #1181 critic S1 (regression): `innermost_open_element` must compare on the XML local
+    /// name, stripping a `prefix:` the same way `parse_pom_xml`'s quick-xml reader already
+    /// does via `local_name()` — otherwise a namespace-prefixed `<m:dependency>` never
+    /// equals `"dependency"`, and a document that `parse_pom_xml` parses into real
+    /// dependencies just fine would silently lose version completion while hover/
+    /// diagnostics/code-actions kept working.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_innermost_open_element_strips_namespace_prefix() {
+        let content = "<m:project><m:dependencies><m:dependency><m:version>1.0.0</m:version>\
+                        </m:dependency></m:dependencies></m:project>";
+        let offset = content.rfind("<m:version>").unwrap();
+        assert_eq!(innermost_open_element(content, offset), Some("dependency"));
+    }
+
+    /// #1181 critic S1: the same fix through the real parser + `detect_xml_context`. The
+    /// `<version>` tag itself is deliberately left unprefixed (`detect_xml_context`'s raw-text
+    /// search for the literal token `<version>` is a separate, pre-existing limitation that
+    /// does not understand namespace prefixes at all — out of scope here) while its
+    /// `<m:dependency>` ancestor is prefixed, isolating exactly the ancestry-comparison bug
+    /// this fix addresses: `parse_pom_xml` already parses this into a real `Dependency` via
+    /// quick-xml's `local_name()`, so completion must trigger too.
+    #[cfg(feature = "lsp-responses")]
+    #[tokio::test]
+    async fn test_generate_completions_version_context_namespaced_dependency_still_triggers() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = MavenEcosystem::new(cache);
+        let xml = r"<m:project xmlns:m='http://maven.apache.org/POM/4.0.0'>
+  <m:dependencies>
+    <m:dependency>
+      <m:groupId>com.example</m:groupId>
+      <m:artifactId>foo</m:artifactId>
+      <version>1.0.0</version>
+    </m:dependency>
+  </m:dependencies>
+</m:project>";
+        let uri = deps_core::test_util::test_uri("/test/pom.xml");
+        let parse_result = eco.parse_manifest(xml, &uri).await.unwrap();
+        let dep = &parse_result.dependencies()[0];
+        let position: Position = dep.version_range().unwrap().start.into();
+
+        let (ctx, _, _) = MavenEcosystem::detect_xml_context(xml, position, parse_result.as_ref());
+        assert_eq!(
+            ctx,
+            MavenXmlContext::Version,
+            "a <version> nested inside a namespace-prefixed <m:dependency> must still trigger \
+             completion"
+        );
+    }
+
+    /// #1181 critic M1: a failed ancestry check must only withhold the `Version` context,
+    /// not bail out of the whole tag-detection loop — an unrelated `<artifactId>` match at
+    /// the same cursor position must still resolve independently.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_xml_context_failed_version_ancestry_does_not_suppress_artifact_id() {
+        // A `<version>` substring inside a comment (no real `<dependency>`/`<plugin>`
+        // ancestor) precedes a genuinely open `<artifactId>` tag on the same line — the
+        // version match must be rejected without aborting the loop before it can find the
+        // artifactId match that follows.
+        let line = "<!-- <version>x --><artifactId>jun";
+        let (t, v) = xml_context(line, u32::try_from(line.len()).unwrap());
+        assert_eq!(t, MavenXmlContext::ArtifactId);
+        assert_eq!(v, "jun");
+    }
+
+    /// M2 (impl-critic follow-up): unlike the tag-loop's `continue` above, a failed ancestry
+    /// check on the self-closing arm returns `None` directly and so DOES suppress an unrelated
+    /// `groupId`/`artifactId` candidate at the same cursor position — pinning the current,
+    /// intentionally-not-fixed behavior (see the `return (MavenXmlContext::None, ...)` comment
+    /// in `detect_xml_context`'s self-closing arm) rather than leaving it undocumented.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_xml_context_self_closing_failed_version_ancestry_suppresses_group_id() {
+        let content = "<dependency><groupId>org.foo<version/></groupId></dependency>\n";
+        let cursor = u32::try_from(content.find("<version/>").unwrap() + 4).unwrap();
+        let (t, v, range) =
+            MavenEcosystem::detect_xml_context(content, Position::new(0, cursor), &NoopParseResult);
+        assert_eq!(
+            t,
+            MavenXmlContext::None,
+            "the self-closing arm's ancestry rejection (innermost element is groupId, not \
+             dependency/plugin) returns None directly, discarding the groupId match the loop \
+             below would otherwise have found"
+        );
         assert_eq!(v, "");
         assert_eq!(range, LspRange::default());
     }
@@ -929,13 +1318,13 @@ mod tests {
         let line = "<version/><version/>";
         let second_tag_start = u32::try_from(line.rfind("<version/>").unwrap()).unwrap();
         let cursor = second_tag_start + 3; // inside the second tag
-        let (t, v, range) = xml_context_with_range(line, cursor);
+        let (t, v, range) = xml_context_with_range_in_dependency(line, cursor);
         let MavenXmlContext::SelfClosingVersion { tag_span } = t else {
             panic!("must trigger, got {t:?}");
         };
         assert_eq!(v, "<version/>");
         assert_eq!(tag_span, range);
-        assert_eq!(range.start, Position::new(0, second_tag_start + 4)); // +4 for indent
+        assert_eq!(range.start, Position::new(1, second_tag_start + 4)); // +4 for indent
     }
 
     /// M2 (critic follow-up): when the cursor sits exactly on the shared boundary between two
@@ -946,7 +1335,7 @@ mod tests {
     fn test_detect_xml_context_two_self_closing_version_tags_boundary_picks_first() {
         let line = "<version/><version/>";
         let boundary = u32::try_from("<version/>".len()).unwrap(); // end of tag 1 == start of tag 2
-        let (t, v, range) = xml_context_with_range(line, boundary);
+        let (t, v, range) = xml_context_with_range_in_dependency(line, boundary);
         let MavenXmlContext::SelfClosingVersion { tag_span } = t else {
             panic!("must trigger, got {t:?}");
         };
@@ -954,10 +1343,10 @@ mod tests {
         assert_eq!(tag_span, range);
         assert_eq!(
             range.start,
-            Position::new(0, 4),
+            Position::new(1, 4),
             "the first tag must win the tie"
         );
-        assert_eq!(range.end, Position::new(0, 4 + boundary));
+        assert_eq!(range.end, Position::new(1, 4 + boundary));
     }
 
     /// Architect's test plan item (not covered by `test_detect_xml_context_multibyte_value_
@@ -973,10 +1362,10 @@ mod tests {
         let cursor_byte = tag_byte_start + 1; // one byte into the tag
         let cursor_char = deps_core::completion::byte_to_utf16_offset(line, cursor_byte);
 
-        let content = format!("{line}\n");
+        let content = format!("<dependency>\n{line}\n</dependency>\n");
         let (ctx, value, range) = MavenEcosystem::detect_xml_context(
             &content,
-            Position::new(0, cursor_char),
+            Position::new(1, cursor_char),
             &NoopParseResult,
         );
 
@@ -1295,11 +1684,11 @@ mod tests {
         // <version>|</version> — empty existing value produces a zero-width range at the
         // value's start.
         let line = "<version></version>";
-        let (t, v, range) = xml_context_with_range(line, 9);
+        let (t, v, range) = xml_context_with_range_in_dependency(line, 9);
         assert_eq!(t, MavenXmlContext::Version);
         assert_eq!(v, "");
         assert_eq!(range.start, range.end);
-        assert_eq!(range.start, Position::new(0, 13)); // 4 (indent) + "<version>".len()
+        assert_eq!(range.start, Position::new(1, 13)); // 4 (indent) + "<version>".len()
     }
 
     #[cfg(feature = "lsp-responses")]
@@ -1308,11 +1697,11 @@ mod tests {
         // <version>|4.13.2</version> — range must span the full existing value even
         // though the typed prefix is empty.
         let line = "<version>4.13.2</version>";
-        let (t, v, range) = xml_context_with_range(line, 9);
+        let (t, v, range) = xml_context_with_range_in_dependency(line, 9);
         assert_eq!(t, MavenXmlContext::Version);
         assert_eq!(v, "");
-        assert_eq!(range.start, Position::new(0, 13)); // 4 (indent) + "<version>".len()
-        assert_eq!(range.end, Position::new(0, 19)); // 13 + "4.13.2".len()
+        assert_eq!(range.start, Position::new(1, 13)); // 4 (indent) + "<version>".len()
+        assert_eq!(range.end, Position::new(1, 19)); // 13 + "4.13.2".len()
     }
 
     #[cfg(feature = "lsp-responses")]
@@ -1834,10 +2223,21 @@ mod tests {
     // `complete_version` hook. This pins the arm's observable output before that move.
 
     /// Deterministic, CI-enforced counterpart to the network-gated test below: a
-    /// `<version>` tag with no enclosing `<dependency>` still resolves to a
-    /// [`MavenXmlContext::Version`] context (`detect_xml_context` is dependency-blind), but
-    /// no parsed dependency's name/version range covers this position — the arm must fail
-    /// closed to `Completions::default()` without ever calling the registry.
+    /// `<version>` tag with no enclosing `<dependency>`/`<plugin>` — the project's own
+    /// top-level `<version>` here — is rejected by `detect_xml_context`'s own ancestry
+    /// check (#1181) *before* `MavenXmlContext::Version` is ever returned, so
+    /// `generate_completions`'s `None` arm fires without ever calling
+    /// `literal_version_dependency` or the registry. Before #1181, `detect_xml_context`
+    /// returned `Version` unconditionally for any open `<version>` tag (`detect_xml_context`
+    /// remains blind to the *parsed* dependency list — `parse_result.dependencies()` is
+    /// still unused by it — but is no longer blind to the raw-text XML structure around the
+    /// tag) and this exact scenario was instead rejected one layer up, by
+    /// `literal_version_dependency` finding no dependency whose range covers the position.
+    /// This test pins the ancestry check's own `ctx` boundary directly, not just the final
+    /// `Completions::default()` output it happens to still produce either way — so a future
+    /// regression that makes `detect_xml_context` wrongly permissive again (while
+    /// `literal_version_dependency` still happens to fail closed) would be caught here
+    /// instead of passing silently.
     #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_completions_version_context_no_dependency_at_position_returns_empty() {
@@ -1847,6 +2247,15 @@ mod tests {
         let uri = deps_core::test_util::test_uri("/test/pom.xml");
         let parse_result = eco.parse_manifest(xml, &uri).await.unwrap();
         assert!(parse_result.dependencies().is_empty());
+
+        let (ctx, _, _) =
+            MavenEcosystem::detect_xml_context(xml, Position::new(1, 13), parse_result.as_ref());
+        assert_eq!(
+            ctx,
+            MavenXmlContext::None,
+            "detect_xml_context's own ancestry check must reject this before \
+             literal_version_dependency is ever reached"
+        );
 
         let result = eco
             .generate_completions(
@@ -2191,21 +2600,18 @@ mod tests {
         assert!(edit.new_text.ends_with("</version>"));
     }
 
-    /// #1167 S1 (critic follow-up): `detect_xml_context`/`literal_version_dependency` have no
-    /// `<dependency>`/`<plugin>` ancestry check — the *underlying* gap (pass 2's same-line
-    /// fallback, #1146) is pre-existing and shared with `<version></version>`, not something
-    /// this fix introduces. But this *specific instance* is newly reachable: before this fix,
-    /// a self-closing `<version/>` unconditionally resolved to `MavenXmlContext::None`, so no
-    /// completion — misattributed or otherwise — could ever fire there at all. On a minified
-    /// pom where the project's own self-closing `<version/>` shares a line with a dependency
-    /// that *also* has an empty version, pass 2's same-line fallback now misattributes the
-    /// project's version tag to that dependency. This pins the actual (imperfect) current
-    /// behavior so a future change to the same-line fallback doesn't silently regress further
-    /// without a test catching it — see #1167's follow-up issue for the ancestry-tracking fix,
-    /// out of this PR's scope.
+    /// #1181 follow-up: on a minified pom.xml, `<project>`'s own top-level self-closing
+    /// `<version/>` can share a physical line with an unrelated `<dependency>`'s coordinates.
+    /// Before this fix, a self-closing `<version/>` had no ancestry check at all, so
+    /// `literal_version_dependency`'s same-line fallback (#1146) misattributed the project's
+    /// own version tag to the nearby dependency — the same #1181 misattribution class the
+    /// `<version>...</version>` arm was already closed for. The extended ancestry check in
+    /// `detect_xml_context` must now suppress the trigger before `literal_version_dependency`
+    /// is ever reached, mirroring
+    /// `test_generate_completions_withholds_completion_for_project_own_version_on_minified_line`.
     #[cfg(feature = "lsp-responses")]
     #[test]
-    fn test_literal_version_dependency_minified_pom_misattributes_project_version_to_dependency() {
+    fn test_detect_xml_context_self_closing_project_version_on_minified_line_yields_no_context() {
         let xml = "<project><version/><dependencies>\
 <dependency><groupId>com.example</groupId><artifactId>foo</artifactId><version/></dependency>\
 </dependencies></project>";
@@ -2218,22 +2624,60 @@ mod tests {
         let project_version_col = u32::try_from(xml.find("<version/>").unwrap() + 5).unwrap();
         let position = Position::new(0, project_version_col);
 
-        let (ctx, _, tag_span) = MavenEcosystem::detect_xml_context(xml, position, &result);
-        assert!(
-            matches!(ctx, MavenXmlContext::SelfClosingVersion { .. }),
-            "expected SelfClosingVersion, got {ctx:?}"
-        );
-        let probe_range = self_closing_version_probe_range(tag_span);
-
-        let resolved =
-            deps_core::completion::literal_version_dependency(&result, position, xml, probe_range);
-
+        let (ctx, _, _) = MavenEcosystem::detect_xml_context(xml, position, &result);
         assert_eq!(
-            resolved.map(|d| d.name().clone()),
-            Some(deps[0].name().clone()),
-            "known limitation: same-line fallback has no ancestry check, so the project's own \
-             version tag resolves to the nearby dependency instead of nothing"
+            ctx,
+            MavenXmlContext::None,
+            "a self-closing <version/> with no enclosing <dependency>/<plugin> must not trigger \
+             completion, even when a real dependency's version shares the same minified line"
         );
+    }
+
+    /// #1181: on a minified pom.xml, `<project>`'s own top-level `<version>` can share a
+    /// physical line with an unrelated `<dependency>`'s coordinates. Before the ancestry
+    /// check, `literal_version_dependency`'s same-line fallback (#1146) would resolve the
+    /// cursor position — sitting inside the project's own version — to the nearby real
+    /// dependency instead, so an accepted completion would have edited `foo`'s version, not
+    /// the project's own. The ancestry check in `detect_xml_context` must suppress the
+    /// trigger before `literal_version_dependency` is ever reached.
+    #[cfg(feature = "lsp-responses")]
+    #[tokio::test]
+    async fn test_generate_completions_withholds_completion_for_project_own_version_on_minified_line()
+     {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = MavenEcosystem::new(cache);
+        let xml = "<project><version>9.9.9</version><dependencies><dependency>\
+                    <groupId>com.example</groupId><artifactId>foo</artifactId>\
+                    <version>1.0.0</version></dependency></dependencies></project>";
+        let uri = deps_core::test_util::test_uri("/test/pom.xml");
+        let parse_result = eco.parse_manifest(xml, &uri).await.unwrap();
+        assert_eq!(
+            parse_result.dependencies().len(),
+            1,
+            "fixture must parse exactly the real dependency, not the project's own version: {xml}"
+        );
+
+        // Cursor inside the project's own <version>9.9.9</version>, not the dependency's.
+        let project_version_value_start = xml.find("<version>9.9.9").unwrap() + "<version>".len();
+        let position = Position::new(0, u32::try_from(project_version_value_start + 2).unwrap());
+
+        let (ctx, _, _) = MavenEcosystem::detect_xml_context(xml, position, parse_result.as_ref());
+        assert_eq!(
+            ctx,
+            MavenXmlContext::None,
+            "a <version> with no enclosing <dependency>/<plugin> must not trigger completion, \
+             even when a real dependency's version shares the same minified line"
+        );
+
+        let result = eco
+            .generate_completions(
+                parse_result.as_ref(),
+                position,
+                xml,
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
+        assert_eq!(result, Completions::default());
     }
 
     // #1146: cursor just before dep-two's version_range on a real two-dep-per-line pom.xml resolves dep-two via pass 2, not dep-one.
