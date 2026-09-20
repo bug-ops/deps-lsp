@@ -15,7 +15,7 @@ use deps_core::PackageName;
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
 #[cfg(feature = "lsp-responses")]
-use deps_core::lsp_helpers::{PackageNaming, PackageRendering, markdown_code_span};
+use deps_core::lsp_helpers::{PackageNaming, PackageRendering};
 use deps_core::net_policy::RegistryAccessPolicy;
 use deps_core::{
     Ecosystem, HttpCache, ParseResult as ParseResultTrait, Registry, Result,
@@ -123,6 +123,39 @@ fn sha_pin_quickfix_kind(
                 .then_some(ShaPinQuickfixKind::DynamicComponentPin)
         }
         _ => None,
+    }
+}
+
+/// Implements `deps-core`'s shared "pin to commit SHA" resolution (issue #1138) for the
+/// `ShaPinQuickfixKind::StaticTagIndex` path only: a `component:` include's
+/// `Latest`/`Partial` pin (`ShaPinQuickfixKind::DynamicComponentPin`) needs a live fetch
+/// and a [`GitlabCiRegistry`] handle this trait has no room for, so it stays local to
+/// `build_dynamic_component_pin_action` — the one genuinely GitLab-specific quickfix arm
+/// this ecosystem keeps outside the shared abstraction.
+#[cfg(feature = "lsp-responses")]
+impl deps_core::lsp_helpers::ShaPinning for GitlabCiFormatter {
+    fn resolve_static_sha_pin(
+        &self,
+        dep: &dyn deps_core::Dependency,
+    ) -> Option<deps_core::lsp_helpers::ResolvedShaPin> {
+        let gl_dep = dep.as_any().downcast_ref::<GitlabCiDependency>()?;
+        if !matches!(
+            sha_pin_quickfix_kind(dep, gl_dep, self),
+            Some(ShaPinQuickfixKind::StaticTagIndex)
+        ) {
+            return None;
+        }
+        let version_range = gl_dep.version_range?;
+        let tag = gl_dep
+            .version_req
+            .as_ref()
+            .map(deps_core::VersionReq::as_str)?;
+        let new_text = self.sha_pin_replacement_for(gl_dep.kind.endpoint(), &gl_dep.name, tag)?;
+        Some(deps_core::lsp_helpers::ResolvedShaPin {
+            display_name: gl_dep.name.to_string(),
+            version_range,
+            replacement: new_text,
+        })
     }
 }
 
@@ -469,7 +502,11 @@ impl Ecosystem for GitlabCiEcosystem {
                         .resolved_tag_for_sha(gl_dep.kind.endpoint(), dep.name(), sha)
                 && let HoverContents::Markup(content) = &mut hover.contents
             {
-                content.value = splice_resolved_line(&content.value, &resolved_tag, sha);
+                content.value = deps_core::lsp_helpers::splice_resolved_line(
+                    &content.value,
+                    &resolved_tag,
+                    sha,
+                );
             }
 
             // FR-007 (H1, #466 review): a `component:` `Latest`/`Partial` pin names no
@@ -495,7 +532,7 @@ impl Ecosystem for GitlabCiEcosystem {
                 match outcome {
                     Ok(Ok(Some(resolved))) => {
                         if let HoverContents::Markup(content) = &mut hover.contents {
-                            content.value = splice_resolved_line(
+                            content.value = deps_core::lsp_helpers::splice_resolved_line(
                                 &content.value,
                                 resolved.version.as_str(),
                                 &resolved.sha,
@@ -732,6 +769,10 @@ fn mutable_ref_pin_diagnostics(
 /// *automated edit* that silently pins to the tag's commit could pin to a different commit
 /// than the ref actually resolves to at run time. A diagnostic's advisory text carries no
 /// such risk, but this destructive edit keeps the stricter guard.
+///
+/// Delegates entirely to [`deps_core::lsp_helpers::build_sha_pin_action`] (issue #1138) via
+/// [`GitlabCiFormatter`]'s [`deps_core::lsp_helpers::ShaPinning`] impl, which carries this
+/// guard (restricted to [`ShaPinQuickfixKind::StaticTagIndex`]).
 #[cfg(feature = "lsp-responses")]
 fn build_sha_pin_action(
     parse_result: &dyn ParseResultTrait,
@@ -739,42 +780,13 @@ fn build_sha_pin_action(
     uri: &Url,
     formatter: &GitlabCiFormatter,
 ) -> Option<CodeAction> {
-    // Same lookup convention every other deps-lsp code action goes through (critic S2) —
-    // not a hand-rolled position check.
-    let dep = parse_result
-        .dependencies()
-        .into_iter()
-        .find(|d| formatter.is_position_on_dependency(*d, position.into()))?;
-
-    let gl_dep = dep.as_any().downcast_ref::<GitlabCiDependency>()?;
-    if !matches!(
-        sha_pin_quickfix_kind(dep, gl_dep, formatter),
-        Some(ShaPinQuickfixKind::StaticTagIndex)
-    ) {
-        return None;
-    }
-    let version_range = gl_dep.version_range?;
-    let tag = gl_dep
-        .version_req
-        .as_ref()
-        .map(deps_core::VersionReq::as_str)?;
-    let new_text = formatter.sha_pin_replacement_for(gl_dep.kind.endpoint(), &gl_dep.name, tag)?;
-
-    let changes = deps_core::single_file_edit(uri, version_range, new_text);
-
-    Some(CodeAction {
-        title: format!("Pin {} to commit SHA", gl_dep.name),
-        kind: Some(CodeActionKind::QUICKFIX),
-        edit: Some(WorkspaceEdit {
-            changes: Some(changes),
-            ..Default::default()
-        }),
-        data: Some(serde_json::json!({
-            "diagnostic_codes": [MUTABLE_REF_PIN_DIAGNOSTIC_CODE],
-            "diagnostic_range": tower_lsp_server::ls_types::Range::from(version_range),
-        })),
-        ..Default::default()
-    })
+    deps_core::lsp_helpers::build_sha_pin_action(
+        parse_result,
+        position,
+        uri,
+        formatter,
+        MUTABLE_REF_PIN_DIAGNOSTIC_CODE,
+    )
 }
 
 /// Builds the "Pin `{name}` to commit SHA" quickfix (validation follow-up C2/S2) for a
@@ -905,16 +917,7 @@ fn bulk_sha_pin_text_edit_for(
 
     match sha_pin_quickfix_kind(dep, gl_dep, formatter)? {
         ShaPinQuickfixKind::StaticTagIndex => {
-            let tag = gl_dep
-                .version_req
-                .as_ref()
-                .map(deps_core::VersionReq::as_str)?;
-            let new_text =
-                formatter.sha_pin_replacement_for(gl_dep.kind.endpoint(), &gl_dep.name, tag)?;
-            Some(TextEdit {
-                range: version_range.into(),
-                new_text,
-            })
+            deps_core::lsp_helpers::sha_pin_text_edit(formatter, dep)
         }
         ShaPinQuickfixKind::DynamicComponentPin => {
             let pin = gl_dep.pin.as_ref()?;
@@ -1019,35 +1022,6 @@ fn splice_project_line(markdown: &str, url: &str) -> String {
     }
 }
 
-/// Inserts a `**Resolved**: `tag` (`sha…`)` line immediately after the shared hover's
-/// `**Current**`/`**Requirement**` line, mirroring
-/// `deps_github_actions::ecosystem::splice_resolved_line` exactly.
-// `pos`/`rel_end`/`insert_at` come from `find` of ASCII anchors (`"**Current**: "`,
-// `"\n\n"`), so all are always char boundaries.
-#[allow(clippy::string_slice)]
-#[cfg(feature = "lsp-responses")]
-fn splice_resolved_line(markdown: &str, resolved_tag: &str, sha: &str) -> String {
-    let short_sha = sha.get(..7).unwrap_or(sha);
-    let line = format!(
-        "**Resolved**: {} ({})\n\n",
-        markdown_code_span(resolved_tag),
-        markdown_code_span(&format!("{short_sha}…"))
-    );
-    for anchor in ["**Current**: ", "**Requirement**: "] {
-        if let Some(pos) = markdown.find(anchor)
-            && let Some(rel_end) = markdown[pos..].find("\n\n")
-        {
-            let insert_at = pos + rel_end + 2;
-            let mut out = String::with_capacity(markdown.len() + line.len());
-            out.push_str(&markdown[..insert_at]);
-            out.push_str(&line);
-            out.push_str(&markdown[insert_at..]);
-            return out;
-        }
-    }
-    format!("{markdown}{line}")
-}
-
 #[cfg(test)]
 // Fixtures are single-line ASCII literals with hand-computed byte offsets.
 #[allow(clippy::string_slice)]
@@ -1057,6 +1031,8 @@ mod tests {
     use crate::registry::TagIndex;
     use crate::types::EndpointKind;
     use dashmap::DashMap;
+    #[cfg(feature = "lsp-responses")]
+    use deps_core::lsp_helpers::splice_resolved_line;
 
     // #758: exact-value `Ecosystem` conformance, replacing test_ecosystem_id_and_display_name
     // and test_as_any. `lockfile_filenames()` is omitted — GitLab CI pipelines have no lock

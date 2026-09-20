@@ -102,6 +102,42 @@ impl GithubActionsFormatter {
     }
 }
 
+/// Implements `deps-core`'s shared "pin to commit SHA" resolution (issue #1138) for a
+/// `PinStyle::Tag` step: the same eligibility guards `build_sha_pin_action`/
+/// `sha_pin_text_edit_for` used to re-derive locally (FR-010's quoted-scalar withholding,
+/// #633's flow-style-line withholding), now the single source of truth both the
+/// per-position quickfix and the bulk "pin all to SHA" code lens build on.
+#[cfg(feature = "lsp-responses")]
+impl deps_core::lsp_helpers::ShaPinning for GithubActionsFormatter {
+    fn resolve_static_sha_pin(
+        &self,
+        dep: &dyn Dependency,
+    ) -> Option<deps_core::lsp_helpers::ResolvedShaPin> {
+        let gha_dep = dep.as_any().downcast_ref::<GithubActionsDependency>()?;
+        if gha_dep.pin != Some(PinStyle::Tag) {
+            return None;
+        }
+        // FR-010: a quoted scalar's version_range sits inside the quotes, so `{sha} #
+        // {tag}` would corrupt the string instead of adding a YAML comment.
+        if !gha_dep.is_plain_scalar {
+            return None;
+        }
+        // #633: a flow-style step has real YAML after the ref; appending `# <tag>` would
+        // comment that out too, producing invalid YAML.
+        if !gha_dep.is_last_on_line {
+            return None;
+        }
+        let version_range = gha_dep.version_range?;
+        let tag = gha_dep.version_req.as_ref().map(VersionReq::as_str)?;
+        let new_text = self.sha_pin_replacement_for(&gha_dep.name, tag)?;
+        Some(deps_core::lsp_helpers::ResolvedShaPin {
+            display_name: gha_dep.name.to_string(),
+            version_range,
+            replacement: new_text,
+        })
+    }
+}
+
 impl PackageNaming for GithubActionsFormatter {
     fn normalize_package_name(&self, name: &PackageName) -> String {
         name.as_str().to_lowercase()

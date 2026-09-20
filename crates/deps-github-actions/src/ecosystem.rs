@@ -4,15 +4,12 @@ use dashmap::DashMap;
 use std::any::Any;
 use std::sync::Arc;
 #[cfg(feature = "lsp-responses")]
-use tower_lsp_server::ls_types::{
-    CodeAction, CodeActionKind, Hover, HoverContents, Position, TextEdit, WorkspaceEdit,
-};
+use tower_lsp_server::ls_types::{CodeAction, Hover, HoverContents, Position, TextEdit};
 use url::Url;
 
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
 #[cfg(feature = "lsp-responses")]
-use deps_core::lsp_helpers::{PackageRendering, markdown_code_span};
 use deps_core::{
     Ecosystem, PackageName, ParseResult as ParseResultTrait, Registry, Result,
     diagnostic::{Diagnostic, Severity},
@@ -346,7 +343,11 @@ impl Ecosystem for GithubActionsEcosystem {
             };
 
             if let HoverContents::Markup(content) = &mut hover.contents {
-                content.value = splice_resolved_line(&content.value, &resolved_tag, sha);
+                content.value = deps_core::lsp_helpers::splice_resolved_line(
+                    &content.value,
+                    &resolved_tag,
+                    sha,
+                );
             }
 
             Some(hover)
@@ -433,39 +434,6 @@ fn extract_prefix(line: &str, character: u32) -> &str {
     deps_core::fallback_completion::raw_prefix(line, character)
 }
 
-/// Inserts a `**Resolved**: `tag` (`sha…`)` line immediately after the shared hover's
-/// `**Current**`/`**Requirement**` line (whichever is present), falling back to append
-/// only if neither anchor is found.
-// `pos`/`rel_end`/`insert_at` come from `find` of ASCII anchors (`"**Current**: "`,
-// `"\n\n"`), so all are always char boundaries.
-#[allow(clippy::string_slice)]
-#[cfg(feature = "lsp-responses")]
-fn splice_resolved_line(markdown: &str, resolved_tag: &str, sha: &str) -> String {
-    // `sha` should already be a validated, pure-ASCII full hex SHA (security S-3), so a
-    // byte slice is normally safe; `get(..7)` is a belt-and-braces char-boundary guard
-    // instead of a raw index (security S-4), falling back to the whole string.
-    let short_sha = sha.get(..7).unwrap_or(sha);
-    let line = format!(
-        "**Resolved**: {} ({})\n\n",
-        markdown_code_span(resolved_tag),
-        markdown_code_span(&format!("{short_sha}…"))
-    );
-
-    for anchor in ["**Current**: ", "**Requirement**: "] {
-        if let Some(pos) = markdown.find(anchor)
-            && let Some(rel_end) = markdown[pos..].find("\n\n")
-        {
-            let insert_at = pos + rel_end + 2;
-            let mut out = String::with_capacity(markdown.len() + line.len());
-            out.push_str(&markdown[..insert_at]);
-            out.push_str(&line);
-            out.push_str(&markdown[insert_at..]);
-            return out;
-        }
-    }
-    format!("{markdown}{line}")
-}
-
 /// Builds one mutable-ref-pin [`Diagnostic`] (issue #473) per diagnosable-as-tag step in
 /// `parse_result` — every `PinStyle::Tag` step, plus a `PinStyle::Branch` step
 /// `tag_index` confirms is actually a real tag (issue #551, e.g.
@@ -548,6 +516,10 @@ fn mutable_ref_pin_diagnostics(
 /// ref actually resolves to at run time. A diagnostic's advisory text carries no such
 /// risk (pinning to *some* SHA is safer than a moving ref either way), but this
 /// destructive edit keeps the stricter, pre-#551 guard.
+///
+/// Delegates entirely to [`deps_core::lsp_helpers::build_sha_pin_action`] (issue #1138) via
+/// [`GithubActionsFormatter`]'s [`deps_core::lsp_helpers::ShaPinning`] impl, which carries
+/// this guard.
 #[cfg(feature = "lsp-responses")]
 fn build_sha_pin_action(
     parse_result: &dyn ParseResultTrait,
@@ -555,71 +527,13 @@ fn build_sha_pin_action(
     uri: &Url,
     formatter: &GithubActionsFormatter,
 ) -> Option<CodeAction> {
-    // Same lookup convention every other deps-lsp code action uses (critic S2), not a
-    // hand-rolled position check — both the diagnostic and the edit anchor on `version_range`.
-    let dep = parse_result
-        .dependencies()
-        .into_iter()
-        .find(|d| formatter.is_position_on_dependency(*d, position.into()))?;
-
-    let gha_dep = dep.as_any().downcast_ref::<GithubActionsDependency>()?;
-    let text_edit = sha_pin_text_edit_for(dep, formatter)?;
-    let diagnostic_range = text_edit.range;
-
-    let mut changes = std::collections::HashMap::new();
-    changes.insert(deps_core::to_ls_uri(uri), vec![text_edit]);
-
-    Some(CodeAction {
-        title: format!("Pin {} to commit SHA", gha_dep.name),
-        kind: Some(CodeActionKind::QUICKFIX),
-        edit: Some(WorkspaceEdit {
-            changes: Some(changes),
-            ..Default::default()
-        }),
-        data: Some(serde_json::json!({
-            "diagnostic_codes": [MUTABLE_REF_PIN_DIAGNOSTIC_CODE],
-            "diagnostic_range": diagnostic_range,
-        })),
-        ..Default::default()
-    })
-}
-
-/// Builds the `{sha} # {tag}` [`TextEdit`] for a single `PinStyle::Tag` step, shared by
-/// [`build_sha_pin_action`] (wraps it into a per-position quickfix) and
-/// [`collect_pin_all_to_sha_edits`] (the bulk "Pin all to SHA" code lens, issue #633).
-///
-/// `None` for anything but a plain-scalar `PinStyle::Tag` step with a resolvable
-/// `TagIndex` entry — the same withholding guards `build_sha_pin_action`'s doc comment
-/// describes (FR-010's quoted-scalar guard, and a `TagIndex` cache miss).
-#[cfg(feature = "lsp-responses")]
-fn sha_pin_text_edit_for(
-    dep: &dyn deps_core::Dependency,
-    formatter: &GithubActionsFormatter,
-) -> Option<TextEdit> {
-    let gha_dep = dep.as_any().downcast_ref::<GithubActionsDependency>()?;
-    if gha_dep.pin != Some(PinStyle::Tag) {
-        return None;
-    }
-    // FR-010: a quoted scalar's version_range sits inside the quotes, so `{sha} # {tag}`
-    // would corrupt the string instead of adding a YAML comment. Withhold rather than risk it.
-    if !gha_dep.is_plain_scalar {
-        return None;
-    }
-    // #633: a flow-style step has real YAML after the ref; appending `# <tag>` would
-    // comment that out too, producing invalid YAML. Withhold rather than risk it.
-    if !gha_dep.is_last_on_line {
-        return None;
-    }
-    let version_range = gha_dep.version_range?;
-    let tag = gha_dep
-        .version_req
-        .as_ref()
-        .map(deps_core::VersionReq::as_str)?;
-    let new_text = formatter.sha_pin_replacement_for(&gha_dep.name, tag)?;
-    Some(TextEdit {
-        range: version_range.into(),
-        new_text,
-    })
+    deps_core::lsp_helpers::build_sha_pin_action(
+        parse_result,
+        position,
+        uri,
+        formatter,
+        MUTABLE_REF_PIN_DIAGNOSTIC_CODE,
+    )
 }
 
 /// Builds one [`TextEdit`] per `PinStyle::Tag` step in `parse_result` resolvable to a
@@ -635,7 +549,7 @@ fn collect_pin_all_to_sha_edits(
     let edits: Vec<TextEdit> = parse_result
         .dependencies()
         .into_iter()
-        .filter_map(|dep| sha_pin_text_edit_for(dep, formatter))
+        .filter_map(|dep| deps_core::lsp_helpers::sha_pin_text_edit(formatter, dep))
         .collect();
     deps_core::lsp_helpers::dedup_overlapping_edits(edits, "collect_pin_all_to_sha_edits")
 }
@@ -643,6 +557,8 @@ fn collect_pin_all_to_sha_edits(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "lsp-responses")]
+    use deps_core::lsp_helpers::splice_resolved_line;
     use std::collections::HashMap;
 
     // --- issue #473: mutable-ref-pin diagnostic + "Pin to commit SHA" code action ---

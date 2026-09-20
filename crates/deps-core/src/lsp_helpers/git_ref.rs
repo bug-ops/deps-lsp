@@ -9,6 +9,13 @@ use crate::position::Range;
 use yaml_rust2::parser::Tag;
 use yaml_rust2::scanner::{Marker, TScalarStyle};
 
+#[cfg(feature = "lsp-responses")]
+use super::{EcosystemFormatter, markdown_code_span, single_file_edit};
+#[cfg(feature = "lsp-responses")]
+use crate::{Dependency, ParseResult};
+#[cfg(feature = "lsp-responses")]
+use tower_lsp_server::ls_types::{CodeAction, CodeActionKind, Position, TextEdit, WorkspaceEdit};
+
 /// Length of a full, lowercase-or-not hex commit SHA (git's SHA-1 object id).
 const SHA_LEN: usize = 40;
 
@@ -615,6 +622,207 @@ impl MarkedScalar {
     }
 }
 
+/// A successful static "pin to commit SHA" resolution: the dependency's display name, the
+/// span of its current ref, and the commit-SHA replacement text for that span.
+///
+/// A named struct rather than a same-typed `(String, Range, String)` tuple (review finding
+/// M3, #1138): `display_name` and `replacement` are both `String`, and a tuple return lets a
+/// future [`ShaPinning`] implementor transpose them silently.
+#[cfg(feature = "lsp-responses")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedShaPin {
+    /// The dependency's human-readable name, for the quickfix title ("Pin `{display_name}`
+    /// to commit SHA").
+    pub display_name: String,
+    /// The span of the dependency's current ref — what the edit replaces.
+    pub version_range: Range,
+    /// The commit-SHA text (plus any ecosystem-specific trailing comment, e.g. GitHub
+    /// Actions' `{sha} # {tag}`) to splice into `version_range`.
+    pub replacement: String,
+}
+
+/// Resolves the *static* — warm-`TagIndex`-only, no live fetch — "pin a mutable ref to an
+/// immutable commit SHA" quickfix shape.
+///
+/// Shared by every git-tags-datasource ecosystem (`deps-github-actions`'s `owner/repo@ref`,
+/// `deps-gitlab-ci`'s `PinStyle::Tag` include) — see deps-lsp issue #1138. A resolution that
+/// needs a live fetch instead of a warm tag index (e.g. GitLab's `component:`
+/// `Latest`/`Partial` pin, resolved against a project's published releases) is out of this
+/// trait's scope and stays ecosystem-specific.
+#[cfg(feature = "lsp-responses")]
+pub trait ShaPinning: Send + Sync {
+    /// Attempts the static "pin to commit SHA" resolution for `dep`.
+    ///
+    /// Runs the eligibility check and `TagIndex` lookup in one step, since neither is
+    /// meaningful without the other to this trait's callers.
+    ///
+    /// Returns a [`ResolvedShaPin`] on success. `None` if `dep` is not this ecosystem's own
+    /// dependency type, is not a statically-pinnable occurrence (e.g. a mutable branch/SHA
+    /// ref, or a non-editable alias token), has no ref span to anchor an edit on, or the
+    /// `TagIndex` lookup misses (a registry fetch still in flight).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::{ResolvedShaPin, ShaPinning};
+    /// use deps_core::parser::DependencySource;
+    /// use deps_core::position::Range;
+    /// use deps_core::{Dependency, PackageName, VersionReq};
+    /// use std::any::Any;
+    ///
+    /// struct MockDep {
+    ///     name: PackageName,
+    /// }
+    ///
+    /// impl Dependency for MockDep {
+    ///     fn name(&self) -> &PackageName {
+    ///         &self.name
+    ///     }
+    ///     fn name_range(&self) -> Range {
+    ///         Range::default()
+    ///     }
+    ///     fn version_requirement(&self) -> Option<&VersionReq> {
+    ///         None
+    ///     }
+    ///     fn version_range(&self) -> Option<Range> {
+    ///         Some(Range::default())
+    ///     }
+    ///     fn source(&self) -> DependencySource {
+    ///         DependencySource::Registry
+    ///     }
+    ///     fn as_any(&self) -> &dyn Any {
+    ///         self
+    ///     }
+    /// }
+    ///
+    /// struct MockPinning;
+    ///
+    /// impl ShaPinning for MockPinning {
+    ///     fn resolve_static_sha_pin(&self, dep: &dyn Dependency) -> Option<ResolvedShaPin> {
+    ///         Some(ResolvedShaPin {
+    ///             display_name: dep.name().to_string(),
+    ///             version_range: dep.version_range()?,
+    ///             replacement: "a".repeat(40),
+    ///         })
+    ///     }
+    /// }
+    ///
+    /// let dep = MockDep { name: PackageName::new("owner/repo") };
+    /// let resolved = MockPinning.resolve_static_sha_pin(&dep).unwrap();
+    /// assert_eq!(resolved.display_name, "owner/repo");
+    /// assert_eq!(resolved.replacement.len(), 40);
+    /// ```
+    fn resolve_static_sha_pin(&self, dep: &dyn Dependency) -> Option<ResolvedShaPin>;
+}
+
+/// Builds the "Pin `{name}` to commit SHA" [`CodeAction`] for the dependency at `position`.
+///
+/// The boilerplate `deps-github-actions`'s and `deps-gitlab-ci`'s own `build_sha_pin_action`
+/// functions each re-derived byte-for-byte before deps-lsp#1138 moved it here: locate the
+/// dependency at `position` through `formatter`'s shared
+/// [`PackageRendering::is_position_on_dependency`](super::PackageRendering::is_position_on_dependency)
+/// lookup, resolve it via [`ShaPinning::resolve_static_sha_pin`], and wrap the resulting edit
+/// into a `WorkspaceEdit`-carrying quickfix tagged with `diagnostic_code` so a client can
+/// later associate this action back to its diagnostic.
+///
+/// Takes a single `formatter: &F` bound by both [`EcosystemFormatter`] and [`ShaPinning`]
+/// (review finding M4, #1138) rather than two separate parameters for the same value — every
+/// real implementor is one type that implements both traits, and a two-parameter signature
+/// let a caller pass mismatched formatters at the two call sites with no compile error.
+#[cfg(feature = "lsp-responses")]
+#[must_use]
+pub fn build_sha_pin_action<F: EcosystemFormatter + ShaPinning>(
+    parse_result: &dyn ParseResult,
+    position: Position,
+    uri: &url::Url,
+    formatter: &F,
+    diagnostic_code: &'static str,
+) -> Option<CodeAction> {
+    let dep = parse_result
+        .dependencies()
+        .into_iter()
+        .find(|d| formatter.is_position_on_dependency(*d, position.into()))?;
+    let resolved = formatter.resolve_static_sha_pin(dep)?;
+    let changes = single_file_edit(uri, resolved.version_range, resolved.replacement);
+    Some(CodeAction {
+        title: format!("Pin {} to commit SHA", resolved.display_name),
+        kind: Some(CodeActionKind::QUICKFIX),
+        edit: Some(WorkspaceEdit {
+            changes: Some(changes),
+            ..Default::default()
+        }),
+        data: Some(serde_json::json!({
+            "diagnostic_codes": [diagnostic_code],
+            "diagnostic_range": tower_lsp_server::ls_types::Range::from(resolved.version_range),
+        })),
+        ..Default::default()
+    })
+}
+
+/// Builds the [`TextEdit`] for `dep` via [`ShaPinning::resolve_static_sha_pin`].
+///
+/// The single-dependency step `deps-github-actions`'s and `deps-gitlab-ci`'s own bulk "pin
+/// all to SHA" collectors both build on, one dependency at a time, before their own
+/// `dedup_overlapping_edits` pass.
+#[cfg(feature = "lsp-responses")]
+#[must_use]
+pub fn sha_pin_text_edit(pinning: &impl ShaPinning, dep: &dyn Dependency) -> Option<TextEdit> {
+    let resolved = pinning.resolve_static_sha_pin(dep)?;
+    Some(TextEdit {
+        range: resolved.version_range.into(),
+        new_text: resolved.replacement,
+    })
+}
+
+/// Inserts a `**Resolved**: `tag` (`sha…`)` line immediately after the shared hover's
+/// `**Current**`/`**Requirement**` line (whichever is present), falling back to append.
+///
+/// Falls back to appending only if neither anchor is found — the byte-for-byte-identical
+/// helper `deps-github-actions` and `deps-gitlab-ci` each defined locally, before
+/// deps-lsp#1138 moved it here.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::splice_resolved_line;
+///
+/// let markdown = "**Current**: `v3`\n\nSome body.";
+/// let sha = "a".repeat(40);
+/// let out = splice_resolved_line(markdown, "v3.0.0", &sha);
+/// assert!(out.contains("**Resolved**: `v3.0.0`"));
+/// ```
+// `pos`/`rel_end`/`insert_at` come from `find` of ASCII anchors (`"**Current**: "`,
+// `"\n\n"`), so all are always char boundaries.
+#[cfg(feature = "lsp-responses")]
+#[expect(
+    clippy::string_slice,
+    reason = "sha.get(..7) already guards non-ASCII input; pos/rel_end/insert_at derive only \
+              from find() of ASCII anchors, so every slice below is a char boundary"
+)]
+#[must_use]
+pub fn splice_resolved_line(markdown: &str, resolved_tag: &str, sha: &str) -> String {
+    let short_sha = sha.get(..7).unwrap_or(sha);
+    let line = format!(
+        "**Resolved**: {} ({})\n\n",
+        markdown_code_span(resolved_tag),
+        markdown_code_span(&format!("{short_sha}…"))
+    );
+
+    for anchor in ["**Current**: ", "**Requirement**: "] {
+        if let Some(pos) = markdown.find(anchor)
+            && let Some(rel_end) = markdown[pos..].find("\n\n")
+        {
+            let insert_at = pos + rel_end + 2;
+            let mut out = String::with_capacity(markdown.len() + line.len());
+            out.push_str(&markdown[..insert_at]);
+            out.push_str(&line);
+            out.push_str(&markdown[insert_at..]);
+            return out;
+        }
+    }
+    format!("{markdown}{line}")
+}
+
 #[cfg(test)]
 #[expect(
     clippy::string_slice,
@@ -961,5 +1169,154 @@ mod tests {
         // yaml-rust2 would report line 5 for the `uses:` value here; only line 1 exists in
         // the table since it never splits on a lone `\r`.
         assert_eq!(marker_byte_offset(content, &table, 5, 14), content.len());
+    }
+
+    // --- #1138 review M5: direct coverage for `build_sha_pin_action`/`sha_pin_text_edit`,
+    // which previously had only indirect coverage via ecosystem-crate wrapper tests.
+
+    #[cfg(feature = "lsp-responses")]
+    use crate::lsp_helpers::test_support::MockFormatter;
+    #[cfg(feature = "lsp-responses")]
+    use crate::position::Position as CorePosition;
+    #[cfg(feature = "lsp-responses")]
+    use crate::{PackageName, VersionReq};
+
+    /// Resolves a dependency named `"resolvable"` to a fixed SHA; declines everything else
+    /// — the minimal [`ShaPinning`] fixture these tests need, layered onto the shared
+    /// [`MockFormatter`] fixture (already implements every [`EcosystemFormatter`] sub-trait)
+    /// rather than hand-rolling a second formatter mock.
+    #[cfg(feature = "lsp-responses")]
+    impl ShaPinning for MockFormatter {
+        fn resolve_static_sha_pin(&self, dep: &dyn Dependency) -> Option<ResolvedShaPin> {
+            if dep.name().as_str() != "resolvable" {
+                return None;
+            }
+            Some(ResolvedShaPin {
+                display_name: dep.name().to_string(),
+                version_range: dep.version_range()?,
+                replacement: "a".repeat(40),
+            })
+        }
+    }
+
+    #[cfg(feature = "lsp-responses")]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "fixed short ASCII test-fixture names never approach u32::MAX"
+    )]
+    fn sha_pin_test_dep(name: &str) -> crate::lsp_helpers::test_support::MockDep {
+        let range = Range::new(
+            CorePosition::new(0, 6),
+            CorePosition::new(0, 6 + name.len() as u32),
+        );
+        crate::lsp_helpers::test_support::MockDep {
+            name: PackageName::new(name),
+            version_req: VersionReq::new("v1"),
+            version_range: range,
+            name_range: range,
+        }
+    }
+
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_build_sha_pin_action_resolves_at_position() {
+        let dep = sha_pin_test_dep("resolvable");
+        let uri = crate::test_util::test_uri("/repo/manifest.yml");
+        let parse_result = crate::lsp_helpers::test_support::MockParseResult {
+            deps: vec![dep],
+            uri: uri.clone(),
+        };
+        let position = Position {
+            line: 0,
+            character: 7,
+        };
+
+        let action = build_sha_pin_action(
+            &parse_result,
+            position,
+            &uri,
+            &MockFormatter,
+            "TEST_DIAGNOSTIC_CODE",
+        )
+        .expect("resolvable dependency at position must produce a quickfix");
+
+        assert_eq!(action.title, "Pin resolvable to commit SHA");
+        let edits = action
+            .edit
+            .expect("quickfix must carry a WorkspaceEdit")
+            .changes
+            .expect("WorkspaceEdit must carry changes");
+        let text_edits = edits.values().next().expect("one file's edits");
+        assert_eq!(text_edits.len(), 1);
+        assert_eq!(text_edits[0].new_text, "a".repeat(40));
+    }
+
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_build_sha_pin_action_none_when_pinning_declines() {
+        let dep = sha_pin_test_dep("not-resolvable");
+        let uri = crate::test_util::test_uri("/repo/manifest.yml");
+        let parse_result = crate::lsp_helpers::test_support::MockParseResult {
+            deps: vec![dep],
+            uri: uri.clone(),
+        };
+        let position = Position {
+            line: 0,
+            character: 7,
+        };
+
+        assert!(
+            build_sha_pin_action(
+                &parse_result,
+                position,
+                &uri,
+                &MockFormatter,
+                "TEST_DIAGNOSTIC_CODE",
+            )
+            .is_none()
+        );
+    }
+
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_build_sha_pin_action_none_when_position_off_dependency() {
+        let dep = sha_pin_test_dep("resolvable");
+        let uri = crate::test_util::test_uri("/repo/manifest.yml");
+        let parse_result = crate::lsp_helpers::test_support::MockParseResult {
+            deps: vec![dep],
+            uri: uri.clone(),
+        };
+        let position = Position {
+            line: 5,
+            character: 0,
+        };
+
+        assert!(
+            build_sha_pin_action(
+                &parse_result,
+                position,
+                &uri,
+                &MockFormatter,
+                "TEST_DIAGNOSTIC_CODE",
+            )
+            .is_none()
+        );
+    }
+
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_sha_pin_text_edit_resolves() {
+        let dep = sha_pin_test_dep("resolvable");
+        let edit =
+            sha_pin_text_edit(&MockFormatter, &dep).expect("resolvable dependency must resolve");
+        assert_eq!(edit.new_text, "a".repeat(40));
+        assert_eq!(edit.range, dep.version_range.into());
+    }
+
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_sha_pin_text_edit_none_when_pinning_declines() {
+        let dep = sha_pin_test_dep("not-resolvable");
+        assert!(sha_pin_text_edit(&MockFormatter, &dep).is_none());
     }
 }
