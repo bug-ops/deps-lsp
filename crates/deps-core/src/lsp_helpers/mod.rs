@@ -889,6 +889,7 @@ pub const REGISTRY_FETCH_BUDGET: Duration = Duration::from_secs(10);
 /// failure and a fetch timeout must not be treated the same way (impl-critic S1: a
 /// timeout is not a verified "not yanked" answer, so it must not fail open the way a
 /// genuine registry outage does).
+#[cfg(feature = "lsp-responses")]
 async fn await_versions_fetch<T, E>(
     fetch: impl std::future::Future<Output = Result<T, E>>,
     package: impl std::fmt::Display,
