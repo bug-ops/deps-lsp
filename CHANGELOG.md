@@ -22,7 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - **deps-gradle**: version-completion same-line fallback no longer misattributes a non-dependency or still-unparsed literal on a shared manifest line to a nearby real dependency (resolves #1191) (#1196)
 - **deps-core**: `detect_completion_context`'s hand-inlined strict-containment check (package-name completion) now reuses `lsp_helpers::position_in_range` instead of re-deriving it (resolves #1147) (#1196)
-- **deps-maven**: `<version>` ancestry resolution now uses `quick_xml`'s event-based parser instead of a hand-rolled scanner, fixing ancestry misattribution when a quoted attribute value contains an unescaped `>` (resolves #1192)
+- **deps-maven**: `<version>` ancestry resolution now uses `quick_xml`'s event-based parser instead of a hand-rolled scanner, fixing ancestry misattribution when a quoted attribute value contains an unescaped `>` (resolves #1192) (#1197)
 - **deps-maven**: version completion no longer misattributes a `<version>` or self-closing `<version/>` tag to a nearby `<dependency>`/`<plugin>` on a minified pom.xml unless it is structurally nested inside one (resolves #1181) (#1190)
 - **deps-github-actions**: hover's "Press Cmd+. to update version" footer now uses the same centralized SHA-pin eligibility check as the quickfix/code-lens, no longer advertising the action for a flow-style step where the quickfix is withheld (resolves #1178) (#1187)
 - **deps-github-actions**: mutable-tag-ref diagnostic's message branch now uses the same structural eligibility check as the SHA-pin quickfix, instead of claiming an automated fix is available for a quoted-scalar or flow-style tag pin where it is actually withheld (resolves #1188) (#1194)
