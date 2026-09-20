@@ -385,6 +385,58 @@ mod tests {
         assert!(completions.items.is_empty());
     }
 
+    /// #1171: end-to-end counterpart of `deps_core::completion`'s
+    /// `test_complete_versions_generic_operator_stripping_composer_not_equal` — that test
+    /// proves the shared helper strips a `!=` prefix against a hard-coded *copy* of
+    /// Composer's operator array (`deps-core` cannot depend on `deps-composer` to reference
+    /// the real one). This drives the same scenario through the real
+    /// `ComposerEcosystem::generate_completions` against a mocked Packagist response,
+    /// proving the actual shipped `VERSION_OPERATOR_CHARS` constant above.
+    #[cfg(feature = "lsp-responses")]
+    #[tokio::test]
+    async fn test_generate_completions_strips_not_equal_operator_against_real_registry() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        server
+            .mock("GET", "/p2/monolog/monolog.json")
+            .with_status(200)
+            .with_body(
+                r#"{"packages": {"monolog/monolog": [
+                    {"version": "2.0.0", "version_normalized": "2.0.0.0", "abandoned": null},
+                    {"version": "1.0.0", "version_normalized": "1.0.0.0"}
+                ]}}"#,
+                // "1.0.0" doesn't match the "!=2.0"-stripped "2.0" prefix — its presence
+                // proves the assertion below reflects filtering, not just an unfiltered list.
+            )
+            .create_async()
+            .await;
+
+        let ecosystem = ComposerEcosystem {
+            registry: Arc::new(PackagistRegistry::with_base(
+                Arc::new(deps_core::HttpCache::new()),
+                base,
+            )),
+            formatter: ComposerFormatter,
+        };
+        let uri = deps_core::test_util::test_uri("/test/composer.json");
+        let content = r#"{"require": {"monolog/monolog": "!=2.0"}}"#;
+        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+        let dep = &parse_result.dependencies()[0];
+        let position = dep.version_range().unwrap().end.into();
+
+        let completions = ecosystem
+            .generate_completions(
+                parse_result.as_ref(),
+                position,
+                content,
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
+
+        assert_eq!(completions.items.len(), 1);
+        assert_eq!(completions.items[0].label, "2.0.0 (latest)");
+    }
+
     /// Composition regression guard (#390/#282 bug class): proves `line_at` +
     /// `is_in_json_dependencies` + quote-stripping compose correctly through the real
     /// trait method on realistic multi-line content.

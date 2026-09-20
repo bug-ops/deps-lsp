@@ -4067,10 +4067,12 @@ mod tests {
     /// from `deps_composer::ecosystem::VERSION_OPERATOR_CHARS` before the fix — without it, a
     /// `!=2.0` prefix isn't stripped at all (its first char `!` doesn't match), so it falls
     /// through to the unfiltered fallback list, same failure mode as #1137's reported PyPI
-    /// caret bug. `deps-composer` has no test-only mockable registry constructor to exercise
-    /// this through `ComposerEcosystem` itself (unlike `deps-pypi`/`deps-cargo`), so this pins
-    /// composer's exact real array against the shared helper instead — see this crate's
-    /// handoff for the flagged follow-up to add one.
+    /// caret bug. This pins the shared helper's stripping logic against a literal copy of
+    /// Composer's operator array — `deps-core` cannot depend on `deps-composer` to reference
+    /// the real constant directly. #1171:
+    /// `deps_composer::ecosystem::tests::test_generate_completions_strips_not_equal_operator_against_real_registry`
+    /// drives the same scenario through the real `ComposerEcosystem::generate_completions`
+    /// and the real `VERSION_OPERATOR_CHARS`, closing that gap.
     #[tokio::test]
     async fn test_complete_versions_generic_operator_stripping_composer_not_equal() {
         let registry = MockRegistry {

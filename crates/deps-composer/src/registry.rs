@@ -227,8 +227,10 @@ impl PackagistRegistry {
     /// server URL in tests. Unlike `deps-npm` (which splits this into a production
     /// `with_base` and a separate test-only `with_public_base_for_test`), Composer's own
     /// constructor serves both roles — there is no alternate-registry concept here that
-    /// needs a distinct tier.
-    fn with_base(cache: Arc<HttpCache>, base: String) -> Self {
+    /// needs a distinct tier. `pub(crate)` (not module-private) so tests elsewhere in this
+    /// crate (e.g. `crate::ecosystem`'s completion tests, #1171) can also point a
+    /// `PackagistRegistry` at a mock server, not just this module's own `tests` submodule.
+    pub(crate) fn with_base(cache: Arc<HttpCache>, base: String) -> Self {
         Self { cache, base }
     }
 
