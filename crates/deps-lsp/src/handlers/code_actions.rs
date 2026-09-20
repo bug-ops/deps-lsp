@@ -89,7 +89,6 @@ pub async fn handle_code_actions(
         )
         .await;
 
-    rekey_edits_to_original_uri(&mut actions, uri);
     bind_diagnostics(&mut actions, &params.context.diagnostics);
 
     let actions = match params.context.only.as_deref() {
@@ -101,63 +100,6 @@ pub async fn handle_code_actions(
         .into_iter()
         .map(CodeActionOrCommand::CodeAction)
         .collect()
-}
-
-/// Re-keys every action's single-file `WorkspaceEdit.changes` entry onto `original_uri`,
-/// the exact `Uri` the client sent in this request.
-///
-/// `deps_core::lsp_helpers::generate_code_actions` builds each edit's map key via
-/// [`crate::lsp_types_interop::from_lsp_uri`] followed by `deps_core::to_ls_uri` (through
-/// `single_file_edit`) — a round trip through `url::Url` that can normalize a
-/// non-canonical URI spelling into a different string (e.g. `file://localhost/x` becomes
-/// `file:///x`, `FILE:///x` is lowercased, `.`/`..` segments collapse). Every such edit is
-/// scoped to this single document (`single_file_edit`'s own contract — never a foreign
-/// file), so overwriting its one key with the client's original `Uri` is always correct,
-/// and is required: an editor keys its open documents by the exact string the client
-/// itself sent, so a normalized key lands on a document the client doesn't have open and
-/// the edit is silently dropped (issue #1071 S3).
-///
-/// Silently no-ops (does not re-key) for an empty or absent `changes` map — nothing to
-/// re-key — but a `changes` map with more than one entry, or `document_changes` set
-/// instead of `changes`, are both currently unreachable by construction (every one of
-/// this codebase's 7 `WorkspaceEdit`-building call sites goes through
-/// `deps_core::single_file_edit`, directly or via a hand-rolled equivalent, which always
-/// builds exactly one `changes` entry and never sets `document_changes`), asserted in
-/// debug builds below so a future change to that invariant is caught by tests instead of
-/// silently leaking a normalized URI onto the wire again.
-fn rekey_edits_to_original_uri(
-    actions: &mut [CodeAction],
-    original_uri: &tower_lsp_server::ls_types::Uri,
-) {
-    for action in actions.iter_mut() {
-        let Some(edit) = action.edit.as_mut() else {
-            continue;
-        };
-        debug_assert!(
-            edit.document_changes.is_none(),
-            "no code-action builder in this codebase sets WorkspaceEdit::document_changes \
-             today (only `changes`) — if one starts to, this function must be extended to \
-             re-key it too"
-        );
-        let Some(changes) = edit.changes.as_mut() else {
-            continue;
-        };
-        debug_assert!(
-            changes.len() <= 1,
-            "every code-action builder in this codebase produces a single-file edit \
-             (single_file_edit's own contract) — a multi-entry `changes` map means that \
-             invariant broke, and this function's single-key rekey is no longer correct \
-             for it: {changes:?}"
-        );
-        if changes.len() != 1 {
-            continue;
-        }
-        let Some(edits) = changes.values().next().cloned() else {
-            continue;
-        };
-        changes.clear();
-        changes.insert(original_uri.clone(), edits);
-    }
 }
 
 /// Binds a code action to the client-supplied diagnostics it resolves, so editors can
@@ -352,82 +294,6 @@ mod tests {
         let filtered = filter_by_requested_kinds(actions, &[CodeActionKind::QUICKFIX]);
 
         assert!(filtered.is_empty());
-    }
-
-    /// S3 (issue #1071): `rekey_edits_to_original_uri` is ecosystem-agnostic — it
-    /// operates structurally on any `CodeAction.edit.changes` single-entry map, never
-    /// downcasting to an ecosystem-specific type. This proves its contract directly
-    /// against a hand-built `CodeAction` shaped exactly like every one of the 7
-    /// `WorkspaceEdit`-building call sites in this codebase (the shared
-    /// `deps_core::lsp_helpers::generate_code_actions`'s 4 sites, and the 3 hand-rolled
-    /// ones in `deps-github-actions`/`deps-gitlab-ci`, all of which build a single-entry
-    /// `changes` map via `deps_core::single_file_edit`/`to_ls_uri`) — so the
-    /// `cargo_tests`-only end-to-end coverage below does not need to be duplicated per
-    /// ecosystem for this function's own correctness to be established.
-    #[test]
-    fn test_rekey_edits_to_original_uri_replaces_single_entry_key() {
-        let normalized_uri: tower_lsp_server::ls_types::Uri =
-            "file:///normalized/x.toml".parse().unwrap();
-        let original_uri: tower_lsp_server::ls_types::Uri =
-            "file://localhost/normalized/x.toml".parse().unwrap();
-        let text_edits = vec![tower_lsp_server::ls_types::TextEdit {
-            range: Range::new(Position::new(0, 0), Position::new(0, 1)),
-            new_text: "x".to_string(),
-        }];
-        let mut changes = std::collections::HashMap::new();
-        changes.insert(normalized_uri.clone(), text_edits.clone());
-        let mut actions = vec![CodeAction {
-            title: "test".to_string(),
-            edit: Some(tower_lsp_server::ls_types::WorkspaceEdit {
-                changes: Some(changes),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }];
-
-        rekey_edits_to_original_uri(&mut actions, &original_uri);
-
-        let changes = actions[0].edit.as_ref().unwrap().changes.as_ref().unwrap();
-        assert_eq!(changes.len(), 1);
-        assert!(!changes.contains_key(&normalized_uri));
-        assert_eq!(changes.get(&original_uri), Some(&text_edits));
-    }
-
-    /// Guards against a future edit-shape change (e.g. a real multi-file
-    /// `WorkspaceEdit`) silently corrupting an edit this function does not understand:
-    /// anything other than exactly one `changes` entry is left untouched rather than
-    /// guessed at.
-    #[test]
-    fn test_rekey_edits_to_original_uri_leaves_non_single_entry_edits_untouched() {
-        let original_uri: tower_lsp_server::ls_types::Uri = "file:///x.toml".parse().unwrap();
-        let mut actions = vec![
-            CodeAction {
-                title: "no edit at all".to_string(),
-                ..Default::default()
-            },
-            CodeAction {
-                title: "empty changes map".to_string(),
-                edit: Some(tower_lsp_server::ls_types::WorkspaceEdit {
-                    changes: Some(std::collections::HashMap::new()),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-        ];
-
-        rekey_edits_to_original_uri(&mut actions, &original_uri);
-
-        assert!(actions[0].edit.is_none());
-        assert!(
-            actions[1]
-                .edit
-                .as_ref()
-                .unwrap()
-                .changes
-                .as_ref()
-                .unwrap()
-                .is_empty()
-        );
     }
 
     fn vuln_diagnostic(source: Option<&str>, code: Option<&str>) -> Diagnostic {
@@ -768,26 +634,28 @@ serde = "1.0.0"
             assert!(result.is_empty());
         }
 
-        /// S3 regression (issue #1071): a client can hold a document open under any of
-        /// several raw URI spellings `url::Url::parse` normalizes to a different string
-        /// — the returned `WorkspaceEdit.changes` key must match the exact `Uri` the
-        /// client sent, not the round-tripped-through-`Url` form, or the editor
-        /// silently drops the edit. Covers the four forms empirically confirmed to
-        /// diverge (critic evidence): an explicit `localhost` authority, an uppercase
-        /// scheme, a `.`/`..`-segment path, and a four-slash UNC-like authority. Each
-        /// case is built from a raw client-style string (not
+        /// Canonical-in/canonical-out regression (issue #1086, replaces #1071's
+        /// `rekey_edits_to_original_uri`): with `canonicalize_uri` applied once at the
+        /// `server.rs` boundary before a document is ever stored or looked up, a
+        /// `WorkspaceEdit.changes` key built via `single_file_edit`/`to_ls_uri`'s
+        /// `url::Url` round trip already equals the canonical `Uri` the document is
+        /// keyed by — no per-handler rekey is needed. Covers the four forms empirically
+        /// confirmed to diverge from their canonical form: an explicit `localhost`
+        /// authority, an uppercase scheme, a `.`/`..`-segment path, and a four-slash
+        /// UNC-like authority. Each case starts from a raw client-style string (not
         /// `ls_types::Uri::from_file_path`, which is always already canonical and so
-        /// cannot exercise this divergence).
+        /// cannot exercise this divergence), canonicalized exactly as `server.rs`'s
+        /// `code_action` trait method would before calling this handler.
         ///
         /// Unix-only: every fixture path here is drive-letter-less, so
         /// `url::Url::to_file_path` (which `parse_manifest`'s workspace-root discovery
         /// calls internally) always fails on Windows regardless of the URI's spelling —
-        /// this is a fixture-portability limit, not a difference in the rekey mechanism
-        /// under test, which the cross-platform `lsp_types_interop` round-trip tests
-        /// already cover on Windows.
+        /// this is a fixture-portability limit, not a difference in the canonicalization
+        /// mechanism under test, which the cross-platform `lsp_types_interop` round-trip
+        /// tests already cover on Windows.
         #[tokio::test]
         #[cfg(not(windows))]
-        async fn test_handle_code_actions_rekeys_edit_to_original_non_canonical_uri() {
+        async fn test_handle_code_actions_keys_edit_by_canonical_uri_for_non_canonical_input() {
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let raw_uris = [
                 "file://localhost/test/Cargo.toml",
@@ -798,17 +666,20 @@ serde = "1.0.0"
 
             for raw in raw_uris {
                 let state = Arc::new(ServerState::new());
-                let uri: tower_lsp_server::ls_types::Uri = raw
+                let raw_uri: tower_lsp_server::ls_types::Uri = raw
                     .parse()
                     .unwrap_or_else(|e| panic!("{raw:?} must parse as an ls_types::Uri: {e}"));
+                // Mirrors the canonicalization `server.rs`'s `code_action` trait method
+                // performs before this handler ever sees a `Uri`.
+                let uri = crate::lsp_types_interop::canonicalize_uri(&raw_uri);
                 let url = crate::lsp_types_interop::from_lsp_uri(&uri)
-                    .unwrap_or_else(|| panic!("{raw:?} must parse as a url::Url"));
-                // Sanity: each of these is exactly a shape `url::Url` normalizes away,
+                    .unwrap_or_else(|| panic!("{raw:?} must canonicalize to a valid url::Url"));
+                // Sanity: each of these is exactly a shape `canonicalize_uri` normalizes,
                 // otherwise this case would pass vacuously.
                 assert_ne!(
-                    url.as_str(),
                     uri.as_str(),
-                    "expected {raw:?} to be normalized by url::Url::parse"
+                    raw_uri.as_str(),
+                    "expected {raw:?} to be normalized by canonicalize_uri"
                 );
 
                 let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
@@ -846,8 +717,7 @@ serde = "1.0.0"
                 assert!(
                     has_correctly_keyed_edit,
                     "for input {raw:?}: expected at least one action whose edit is keyed \
-                     by the client's original URI, not a url::Url-normalized one: \
-                     {result:?}"
+                     by the canonical Uri: {result:?}"
                 );
             }
         }

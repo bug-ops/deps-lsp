@@ -578,7 +578,11 @@ impl DocumentState {
 /// assert_eq!(state.document_count(), 0);
 /// ```
 pub struct ServerState {
-    /// Open documents by URI
+    /// Open documents keyed by canonical `Uri` (issue #1086): every `server.rs`
+    /// `LanguageServer` trait method runs [`crate::lsp_types_interop::canonicalize_uri`]
+    /// on a request's `textDocument.uri` before it ever reaches this map, so two requests
+    /// spelling the same document differently (`file://localhost/x` vs `file:///x`) always
+    /// resolve to the same entry.
     pub documents: DashMap<Uri, DocumentState>,
     /// HTTP cache for registry requests
     pub cache: Arc<HttpCache>,

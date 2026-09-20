@@ -21,11 +21,24 @@ related:
 
 ## Progress
 
-- [ ] T001: Add `canonicalize_uri` helper
-- [ ] T002: Wire canonicalization into every `server.rs` LSP entry point
-- [ ] T003: Delete the three #1071 per-handler rekey fixups and their tests
-- [ ] T004: Cross-handler dedup regression tests (US-001)
-- [ ] T005: Live-client verification (NFR-002) + docs/regression catalog update
+- [x] T001: Add `canonicalize_uri` helper
+- [x] T002: Wire canonicalization into every `server.rs` LSP entry point
+- [x] T003: Delete the three #1071 per-handler rekey fixups and their tests (the third
+      fixup, `rekey_related_information_to_original_uri`, was found in
+      `crates/deps-lsp/src/handlers/diagnostics.rs` rather than `deps-core` as the plan
+      assumed — see `.local/testing/regressions.md`'s correction note)
+- [x] T004: Cross-handler dedup regression tests (US-001) — plus a chokepoint boundary
+      test (`test_canonicalize_uri_chokepoint_covers_every_document_reading_entry_point`)
+      added during review to close a gap where deleting a `canonicalize_uri` call from a
+      handler would have failed zero tests
+- [x] T005: Live verification (NFR-002) + docs/regression catalog update — verified via
+      this project's real-protocol LSP test harness (`.local/testing/lsp_test_uri_canon.py`)
+      against the real `deps-lsp` binary in both didOpen/follow-up URI-spelling orderings,
+      not a GUI editor client; matches how this project's other playbooks define "live"
+      testing. One disclosed, accepted gap: the two `executeCommand` arms
+      (`updateAllOutdated`/`pinAllToSha`) are not covered by the chokepoint test — no
+      message-capture test infra exists in this project to observe their effect; low risk
+      since their URIs are server-produced and already canonical.
 
 ---
 

@@ -246,40 +246,10 @@ pub(crate) async fn generate_diagnostics_internal(
             severities,
         )
         .await;
-    let mut diagnostics: Vec<Diagnostic> = domain_diagnostics
+    domain_diagnostics
         .into_iter()
         .map(crate::lsp_types_interop::to_lsp_diagnostic)
-        .collect();
-    rekey_related_information_to_original_uri(&mut diagnostics, uri);
-    diagnostics
-}
-
-/// Re-keys every diagnostic's `related_information[].location.uri` onto `original_uri`,
-/// the exact `Uri` the client sent in this request.
-///
-/// `deps_core::lsp_helpers::diagnostics`' collapsed-batch builders
-/// (`push_collapsed_blocked_registries`/`push_collapsed_fetch_failures`) build each
-/// related-info `Location.uri` via `to_ls_uri` from the normalized `url::Url` — a round
-/// trip that can normalize a non-canonical URI spelling into a different string (see
-/// `crate::lsp_types_interop::from_lsp_uri`'s doc). There are exactly 3 non-test
-/// `DiagnosticRelatedInformation` construction sites in this codebase, all in
-/// `deps-core/src/lsp_helpers/diagnostics.rs`: `push_collapsed_blocked_registries`'s
-/// per-sibling entries (`:1053`) and its trailing "and N more" entry (`:1068`), and
-/// `push_collapsed_fetch_failures`'s per-entry "also failed" location (`:1709`). All 3
-/// anchor back into the *same* document being diagnosed, never a different file (each
-/// reuses one `ls_uri` local built from the same `uri: &url::Url` this function's own
-/// document is diagnosed under), so overwriting every entry's URI unconditionally is
-/// always correct (issue #1071 S3, round 2: the "jump to related occurrence" affordance
-/// could otherwise target a URI the client doesn't have open).
-fn rekey_related_information_to_original_uri(diagnostics: &mut [Diagnostic], original_uri: &Uri) {
-    for diagnostic in diagnostics.iter_mut() {
-        let Some(related_information) = diagnostic.related_information.as_mut() else {
-            continue;
-        };
-        for related in related_information.iter_mut() {
-            related.location.uri = original_uri.clone();
-        }
-    }
+        .collect()
 }
 
 #[cfg(test)]
@@ -345,53 +315,6 @@ mod tests {
         let (client, full_config) = create_test_client_and_config();
         let result = handle_diagnostics(state, &uri, &config, client, full_config).await;
         assert!(result.is_empty());
-    }
-
-    /// S3 (issue #1071), round 2: `rekey_related_information_to_original_uri` is
-    /// ecosystem-agnostic — it only inspects each diagnostic's
-    /// `related_information[].location.uri` structurally. This proves its contract
-    /// directly against a hand-built diagnostic shaped exactly like
-    /// `push_collapsed_blocked_registries`/`push_collapsed_fetch_failures`'s output,
-    /// without needing to orchestrate the 2+-occurrence collapse those functions require
-    /// to produce `related_information` at all.
-    #[test]
-    fn test_rekey_related_information_to_original_uri_replaces_all_locations() {
-        let normalized_uri: Uri = "file:///normalized/x.toml".parse().unwrap();
-        let original_uri: Uri = "file://localhost/normalized/x.toml".parse().unwrap();
-        let mut diagnostics = vec![Diagnostic {
-            related_information: Some(vec![
-                tower_lsp_server::ls_types::DiagnosticRelatedInformation {
-                    location: tower_lsp_server::ls_types::Location {
-                        uri: normalized_uri.clone(),
-                        range: tower_lsp_server::ls_types::Range::new(
-                            tower_lsp_server::ls_types::Position::new(0, 0),
-                            tower_lsp_server::ls_types::Position::new(0, 1),
-                        ),
-                    },
-                    message: "also blocked".to_string(),
-                },
-            ]),
-            ..Default::default()
-        }];
-
-        rekey_related_information_to_original_uri(&mut diagnostics, &original_uri);
-
-        let related = diagnostics[0].related_information.as_ref().unwrap();
-        assert_eq!(related[0].location.uri, original_uri);
-        assert_ne!(related[0].location.uri, normalized_uri);
-    }
-
-    /// Guards against a future diagnostic without `related_information` silently
-    /// panicking instead of being left untouched.
-    #[test]
-    fn test_rekey_related_information_to_original_uri_leaves_diagnostics_without_related_info_untouched()
-     {
-        let uri: Uri = "file:///x.toml".parse().unwrap();
-        let mut diagnostics = vec![Diagnostic::default()];
-
-        rekey_related_information_to_original_uri(&mut diagnostics, &uri);
-
-        assert!(diagnostics[0].related_information.is_none());
     }
 
     /// #333 liveness regression: `handle_diagnostics` must release the DashMap shard
