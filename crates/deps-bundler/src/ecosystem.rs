@@ -15,6 +15,12 @@ use deps_core::{
 use crate::formatter::BundlerFormatter;
 use crate::registry::RubyGemsRegistry;
 
+/// Leading version-constraint operators stripped from a completion prefix before matching
+/// it against registry versions: Ruby/Bundler's pessimistic `~>`, comparisons `>=`/`<=`/`>`/
+/// `<`/`=`, and `!=`. No `^` — Ruby gem constraints have no caret syntax (#1137).
+#[cfg(feature = "lsp-responses")]
+const VERSION_OPERATOR_CHARS: &[char] = &['~', '>', '<', '=', '!'];
+
 /// Bundler ecosystem implementation.
 ///
 /// Provides LSP functionality for Gemfile files, including:
@@ -77,7 +83,7 @@ impl BundlerEcosystem {
             parse_result,
             position,
             prefix,
-            &['~', '>', '<', '=', '!'],
+            VERSION_OPERATOR_CHARS,
             freshness,
         )
         .await
@@ -202,6 +208,18 @@ mod tests {
                 .await
             })
         };
+    }
+
+    // #1137: regression guard, not independent parser verification (see
+    // `operator_chars_conformance!`'s doc) — `required` mirrors `VERSION_OPERATOR_CHARS`'s
+    // own doc comment (Bundler's `~>`/comparison/`!=` grammar), so an edit to one without
+    // the other fails loudly instead of silently degrading completion.
+    #[cfg(feature = "lsp-responses")]
+    deps_core::operator_chars_conformance! {
+        mod bundler_operator_chars_conformance;
+        ecosystem: "bundler";
+        operator_chars: VERSION_OPERATOR_CHARS;
+        required: &['~', '>', '<', '=', '!'];
     }
 
     // #1136: a gem pinned to a per-gem inline `source:` must yield zero version completions

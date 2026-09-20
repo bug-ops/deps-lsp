@@ -25,6 +25,12 @@ use crate::formatter::GithubActionsFormatter;
 use crate::registry::{GithubActionsRegistry, TagIndex};
 use crate::types::{GithubActionsDependency, PinStyle};
 
+/// Leading version-constraint operators stripped from a completion prefix before matching
+/// it against registry versions. Empty: a `uses:` ref is a bare tag/branch/SHA, with no
+/// comparison/caret/tilde operator syntax (#1137).
+#[cfg(feature = "lsp-responses")]
+const VERSION_OPERATOR_CHARS: &[char] = &[];
+
 /// Whether `gha_dep`'s ref is diagnosable as a tag — either because
 /// [`crate::parser::classify_uses_value`] already classified it as [`PinStyle::Tag`] from
 /// its text shape, or because `tag_index`'s live `/tags` fetch confirms the ref is a
@@ -164,7 +170,7 @@ impl Ecosystem for GithubActionsEcosystem {
                 request.parse_result,
                 request.position,
                 &prefix,
-                &[],
+                VERSION_OPERATOR_CHARS,
                 request.freshness,
             )
             .await
@@ -1163,6 +1169,18 @@ mod tests {
         no_lockfile_support: true;
     }
 
+    // #1137: regression guard, not independent parser verification (see
+    // `operator_chars_conformance!`'s doc) — `required` mirrors `VERSION_OPERATOR_CHARS`'s
+    // own doc comment (a `uses:` ref has no operator syntax), so an edit to one without the
+    // other fails loudly instead of silently degrading completion.
+    #[cfg(feature = "lsp-responses")]
+    deps_core::operator_chars_conformance! {
+        mod github_actions_operator_chars_conformance;
+        ecosystem: "github-actions";
+        operator_chars: VERSION_OPERATOR_CHARS;
+        required: &[];
+    }
+
     #[test]
     fn test_manifest_routing_filenames_and_directory_patterns() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -2001,7 +2019,7 @@ mod tests {
             parse_result.as_ref(),
             position,
             &prefix,
-            &[],
+            VERSION_OPERATOR_CHARS,
             freshness,
         )
         .await;

@@ -23,6 +23,14 @@ use crate::formatter::CargoFormatter;
 use crate::parser::CargoParseContext;
 use crate::registry::CargoRegistry;
 
+/// Leading version-constraint operators `semver::VersionReq` (Cargo's own requirement
+/// grammar) accepts, stripped from a completion prefix before matching it against
+/// registry versions. Includes the bare wildcard `*` (`VersionReq::new("*")` is a valid,
+/// tested requirement — see `registry.rs`'s tests) alongside the comparison and
+/// caret/tilde operators (#1137).
+#[cfg(feature = "lsp-responses")]
+const VERSION_OPERATOR_CHARS: &[char] = &['^', '~', '=', '<', '>', '*'];
+
 /// Cargo ecosystem implementation.
 ///
 /// Provides LSP functionality for Cargo.toml files, including:
@@ -170,7 +178,7 @@ impl CargoEcosystem {
             parse_result,
             position,
             prefix,
-            &['^', '~', '=', '<', '>'],
+            VERSION_OPERATOR_CHARS,
             freshness,
         )
         .await
@@ -413,6 +421,18 @@ mod tests {
                 .await
             })
         };
+    }
+
+    // #1137: regression guard, not independent parser verification (see
+    // `operator_chars_conformance!`'s doc) — `required` mirrors `VERSION_OPERATOR_CHARS`'s
+    // own doc comment (`semver::VersionReq`'s operator set), so an edit to one without the
+    // other fails loudly instead of silently degrading completion.
+    #[cfg(feature = "lsp-responses")]
+    deps_core::operator_chars_conformance! {
+        mod cargo_operator_chars_conformance;
+        ecosystem: "cargo";
+        operator_chars: VERSION_OPERATOR_CHARS;
+        required: &['^', '~', '=', '<', '>', '*'];
     }
 
     // #1136: a dependency whose source is an unregistered custom registry must yield zero

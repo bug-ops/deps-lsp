@@ -39,6 +39,16 @@ use crate::lockfile::NuGetLockParser;
 use crate::parser::NuGetParseResult;
 use crate::registry::NuGetRegistry;
 
+/// Leading version-constraint operators stripped from a completion prefix before matching
+/// it against registry versions: the two range delimiters `version::parse_range` accepts
+/// (`[1.0,2.0)`) — `deps_core::interval::BracketStyle::Standard`, no reversed-bracket form
+/// (NuGet spec §2). A bare version (no leading bracket, including `1.0.*` floating
+/// versions) is a floor, not a range, and has no operator to strip. Originally left empty,
+/// which meant a completion prefix like `"[2.2"` was never stripped down to `"2.2"` and so
+/// never prefix-matched any real version (#1137 critic S1).
+#[cfg(feature = "lsp-responses")]
+const VERSION_OPERATOR_CHARS: &[char] = &['[', '('];
+
 /// Bounds `NuGetEcosystem::generate_hover`'s `unlisted_versions` fetch (S4, #451
 /// follow-up) — mirrors `deps_core::lsp_helpers::hover`'s own private `HOVER_FALLBACK_TIMEOUT`
 /// for its analogous fallback fetch: hover responses must return quickly, and without this
@@ -129,7 +139,7 @@ impl NuGetEcosystem {
             parse_result,
             position,
             prefix,
-            &[],
+            VERSION_OPERATOR_CHARS,
             freshness,
         )
         .await
@@ -534,6 +544,18 @@ mod tests {
                 .await
             })
         };
+    }
+
+    // #1137: regression guard, not independent parser verification (see
+    // `operator_chars_conformance!`'s doc) — `required` mirrors `VERSION_OPERATOR_CHARS`'s
+    // own doc comment (`version::parse_range`'s range-delimiter set), so an edit to one
+    // without the other fails loudly instead of silently degrading completion.
+    #[cfg(feature = "lsp-responses")]
+    deps_core::operator_chars_conformance! {
+        mod nuget_operator_chars_conformance;
+        ecosystem: "nuget";
+        operator_chars: VERSION_OPERATOR_CHARS;
+        required: &['[', '('];
     }
 
     #[test]

@@ -21,6 +21,14 @@ use crate::formatter::PypiFormatter;
 use crate::parser::PypiParser;
 use crate::registry::PypiRegistry;
 
+/// Leading version-constraint operators stripped from a completion prefix before matching
+/// it against registry versions: PEP 508's `==`, `!=`, `<=`, `>=`, `<`, `>`, `~=` plus
+/// Poetry's caret (`^2.28`, `[tool.poetry.dependencies]`) — `^` was missing here despite
+/// `parser::pyproject::parse_poetry_dependencies` accepting caret constraints, so a Poetry
+/// manifest's completion silently fell back to an unfiltered list (#1137).
+#[cfg(feature = "lsp-responses")]
+const VERSION_OPERATOR_CHARS: &[char] = &['>', '<', '=', '~', '!', '^'];
+
 /// Which manifest shape a URI's basename identifies, so `parse_manifest` can
 /// dispatch to the right parser method and report the right `file_type` on
 /// error.
@@ -186,7 +194,7 @@ impl PypiEcosystem {
             parse_result,
             position,
             prefix,
-            &['>', '<', '=', '~', '!'],
+            VERSION_OPERATOR_CHARS,
             freshness,
         )
         .await
@@ -761,6 +769,18 @@ mod tests {
                 .await
             })
         };
+    }
+
+    // #1137: regression guard, not independent parser verification (see
+    // `operator_chars_conformance!`'s doc) — `required` mirrors `VERSION_OPERATOR_CHARS`'s
+    // own doc comment (PEP 508 plus Poetry's caret), so an edit to one without the other
+    // fails loudly instead of silently degrading completion.
+    #[cfg(feature = "lsp-responses")]
+    deps_core::operator_chars_conformance! {
+        mod pypi_operator_chars_conformance;
+        ecosystem: "pypi";
+        operator_chars: VERSION_OPERATOR_CHARS;
+        required: &['>', '<', '=', '~', '!', '^'];
     }
 
     // #1136: a dependency whose only registry source is blocked by the default reachability
@@ -1882,6 +1902,57 @@ mod tests {
             .await;
         mock.assert_async().await;
         assert_eq!(results.len(), 5);
+    }
+
+    /// End-to-end regression for #1137: a Poetry-style caret prefix (`^2.28`) must filter
+    /// completions to matching versions, not fall through `VERSION_OPERATOR_CHARS`'s strip
+    /// (which was previously missing `^`) into the unfiltered top-N fallback the issue
+    /// reported. `operator_chars_conformance!` above only proves the array *contains* `^`; it
+    /// does not exercise `complete_versions`/`complete_versions_generic_from` with a real
+    /// prefix, which is what actually reproduces the reported symptom.
+    #[cfg(feature = "lsp-responses")]
+    #[tokio::test]
+    async fn test_complete_versions_with_poetry_caret_operator_filters_matching_versions() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/simple/requests/")
+            .with_status(200)
+            .with_body(
+                r#"{"versions": ["1.0.0", "2.27.0", "2.28.0", "2.28.1", "2.29.0"], "files": []}"#,
+            )
+            .create_async()
+            .await;
+
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let registry = PypiRegistry::with_public_base_for_test(
+            Arc::clone(&cache),
+            format!("{}/simple", server.url()),
+        );
+        let ecosystem = PypiEcosystem::with_policy(
+            Arc::new(registry),
+            Arc::new(deps_core::net_policy::RegistryAccessPolicy::default()),
+        );
+
+        let parse_result = parse_result_with_dependency("requests", DependencySource::Registry);
+        let results = ecosystem
+            .complete_versions(
+                &parse_result,
+                DEP_POSITION,
+                "^2.28",
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
+        mock.assert_async().await;
+
+        assert_eq!(
+            results.len(),
+            2,
+            "expected only the two 2.28.x versions, got: {results:?}"
+        );
+        assert!(
+            results.iter().all(|r| r.label.starts_with("2.28")),
+            "a stripped `^` prefix must filter out 1.0.0/2.27.0/2.29.0, got: {results:?}"
+        );
     }
 
     #[tokio::test]

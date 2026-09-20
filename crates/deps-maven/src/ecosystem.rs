@@ -20,6 +20,16 @@ use crate::registry::MavenCentralRegistry;
 #[cfg(feature = "lsp-responses")]
 use crate::types::ArtifactInfo;
 
+/// Leading version-constraint operators stripped from a completion prefix before matching
+/// it against registry versions: the two range delimiters `crate::range::is_range` accepts
+/// (`[1.0,2.0)`, `(,2.0]`) — `deps_core::interval::BracketStyle::Standard`, unlike Gradle's
+/// `AllowReversed`, has no reversed-bracket leading `]` form. A bare `<version>` (no leading
+/// bracket) is a "soft" recommended version, not a range, and has no operator to strip.
+/// Originally left empty, which meant a completion prefix like `"[2.2"` was never stripped
+/// down to `"2.2"` and so never prefix-matched any real version (#1137 critic S1).
+#[cfg(feature = "lsp-responses")]
+const VERSION_OPERATOR_CHARS: &[char] = &['[', '('];
+
 /// [`Ecosystem`] implementation for Maven (`pom.xml`).
 pub struct MavenEcosystem {
     registry: Arc<MavenCentralRegistry>,
@@ -192,7 +202,7 @@ impl MavenEcosystem {
             package_name,
             &deps_core::parser::DependencySource::Registry,
             prefix,
-            &[],
+            VERSION_OPERATOR_CHARS,
             freshness,
         )
         .await
@@ -364,7 +374,7 @@ impl Ecosystem for MavenEcosystem {
                                 dep.name(),
                                 &dep.source(),
                                 value,
-                                &[],
+                                VERSION_OPERATOR_CHARS,
                                 freshness,
                             )
                             .await
@@ -579,6 +589,17 @@ mod tests {
                 .await
             })
         };
+    }
+
+    // #1137: regression guard — `required` mirrors `VERSION_OPERATOR_CHARS`'s own doc
+    // comment (`[`/`(`, `crate::range::is_range`'s leading delimiters), so an edit to one
+    // without the other fails loudly instead of silently degrading completion.
+    #[cfg(feature = "lsp-responses")]
+    deps_core::operator_chars_conformance! {
+        mod maven_operator_chars_conformance;
+        ecosystem: "maven";
+        operator_chars: VERSION_OPERATOR_CHARS;
+        required: &['[', '('];
     }
 
     #[cfg(feature = "lsp-responses")]
