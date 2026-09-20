@@ -1,6 +1,7 @@
 //! Command-line argument surface for the `deps-cli` binary.
 
 use crate::report::Category;
+use crate::walk::{GitignorePolicy, SymlinkPolicy};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
@@ -124,6 +125,28 @@ impl CheckArgs {
             vec![PathBuf::from(".")]
         } else {
             self.paths.clone()
+        }
+    }
+
+    /// [`Self::respect_gitignore`] translated to [`GitignorePolicy`] — the transposition-proof
+    /// type `walk::walk` and `run_check` take, so a `bool` never has to travel past this point.
+    #[must_use]
+    pub fn gitignore_policy(&self) -> GitignorePolicy {
+        if self.respect_gitignore {
+            GitignorePolicy::Respect
+        } else {
+            GitignorePolicy::Ignore
+        }
+    }
+
+    /// [`Self::follow_symlinks`] translated to [`SymlinkPolicy`] — the transposition-proof
+    /// type `walk::walk` and `run_check` take, so a `bool` never has to travel past this point.
+    #[must_use]
+    pub fn symlink_policy(&self) -> SymlinkPolicy {
+        if self.follow_symlinks {
+            SymlinkPolicy::Follow
+        } else {
+            SymlinkPolicy::Skip
         }
     }
 }

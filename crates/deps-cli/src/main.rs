@@ -60,8 +60,8 @@ fn main() -> ExitCode {
     let (report, had_execution_error) = runtime.block_on(run_check(
         walk_paths,
         cli_config,
-        args.respect_gitignore,
-        args.follow_symlinks,
+        args.gitignore_policy(),
+        args.symlink_policy(),
     ));
 
     let rendered = match args.format {
@@ -93,8 +93,8 @@ fn main() -> ExitCode {
 async fn run_check(
     paths: Vec<PathBuf>,
     cli_config: CliConfig,
-    respect_gitignore: bool,
-    follow_symlinks: bool,
+    gitignore_policy: walk::GitignorePolicy,
+    symlink_policy: walk::SymlinkPolicy,
 ) -> (CheckReport, bool) {
     let policy = cli_config.policy;
     // Shared with `ecosystem_runtime` below (impl-critic #4 follow-up to #1212's S3 fix) so
@@ -124,8 +124,8 @@ async fn run_check(
     let walk_outcome = walk::walk(
         &paths,
         &ecosystem_registry,
-        respect_gitignore,
-        follow_symlinks,
+        gitignore_policy,
+        symlink_policy,
     );
     let mut had_execution_error = false;
     for error in &walk_outcome.walk_errors {
