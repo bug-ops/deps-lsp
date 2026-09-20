@@ -59,6 +59,51 @@ fn is_registry_confirmed_tag(
     }
 }
 
+/// Whether `position` sits strictly past a comment-annotated SHA pin's own ref text —
+/// see [`GithubActionsEcosystem::generate_completions`]'s doc for why this check exists
+/// (issue #1182) and why it cannot be a check on the extracted completion prefix.
+///
+/// Finds the dependency whose (deliberately widened) `version_range` contains
+/// `position` and, only when it is a [`PinStyle::Sha`] with a `comment_tag` (the one
+/// form where `version_range` extends past the ref's own text), compares `position`
+/// against the SHA's own end column — [`crate::types::sha_pin_raw_sha`]'s length, added
+/// to the range's start — rather than the range's own (widened) end. A position exactly
+/// at that column (cursor immediately after the last SHA character, still typing it) is
+/// deliberately *not* past it, so a commentless SHA pin's ordinary end-of-ref position is
+/// unaffected; a [`PinStyle::Sha`] with no `comment_tag` has no widened tail at all
+/// (`sha_pin_raw_sha` still resolves it, but its `version_range` already ends exactly at
+/// the SHA's own end, so this predicate can never fire for it).
+#[cfg(feature = "lsp-responses")]
+fn position_past_sha_pin_own_ref(parse_result: &dyn ParseResultTrait, position: Position) -> bool {
+    let position: deps_core::position::Position = position.into();
+    parse_result.dependencies().into_iter().any(|dep| {
+        let Some(range) = dep.version_range() else {
+            return false;
+        };
+        if !deps_core::position_in_range(position, range) {
+            return false;
+        }
+        let Some(gha_dep) = dep.as_any().downcast_ref::<GithubActionsDependency>() else {
+            return false;
+        };
+        if !matches!(
+            gha_dep.pin,
+            Some(PinStyle::Sha {
+                comment_tag: Some(_)
+            })
+        ) {
+            return false;
+        }
+        let Some(sha) = crate::types::sha_pin_raw_sha(gha_dep) else {
+            return false;
+        };
+        let Ok(sha_len) = u32::try_from(sha.len()) else {
+            return false;
+        };
+        position.character > range.start.character.saturating_add(sha_len)
+    })
+}
+
 /// GitHub Actions ecosystem implementation.
 ///
 /// Provides LSP functionality for `.github/workflows/*.yml`/`*.yaml` workflow files and
@@ -150,6 +195,57 @@ impl Ecosystem for GithubActionsEcosystem {
 
     // No `complete_package_name` override: GHA has no package-name search endpoint, so
     // the inherited `Completions::default()` is correct (M3, #793).
+
+    /// Overrides the shared dispatch (#793) to withhold a `Version` completion when the
+    /// cursor sits past a comment-annotated SHA pin's own ref text — in the whitespace
+    /// padding before its trailing `# vX.Y.Z` comment, on the `#` itself, or inside the
+    /// comment (issue #1182). That pin's `version_range` intentionally extends through
+    /// the comment — `crate::formatter::GithubActionsFormatter::format_version_replacing_for`'s
+    /// edit range and [`Self::generate_hover`]'s `**Resolved**` splice both depend on it
+    /// spanning the full `<sha> # <tag>` text — so `detect_completion_context` still
+    /// reports a `Version` context there. `position_past_sha_pin_own_ref` checks the
+    /// cursor position directly against the SHA's own end column rather than scanning
+    /// the extracted prefix: `extract_prefix` trims trailing whitespace, so a cursor
+    /// sitting in the padding gap or exactly on `#` yields a bare-SHA prefix with no
+    /// whitespace left for a prefix-content check to catch.
+    #[cfg(feature = "lsp-responses")]
+    fn generate_completions<'a>(
+        &'a self,
+        parse_result: &'a dyn ParseResultTrait,
+        position: Position,
+        content: &'a str,
+        freshness: deps_core::FreshnessSettings,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
+        Box::pin(async move {
+            self.prepare_completions();
+            let request =
+                deps_core::completion::CompletionRequest::new(parse_result, position, freshness);
+            match deps_core::completion::detect_completion_context(parse_result, position, content)
+            {
+                deps_core::completion::CompletionContext::PackageName { prefix, range } => {
+                    self.complete_package_name(request, prefix, range).await
+                }
+                deps_core::completion::CompletionContext::Version {
+                    package_name,
+                    prefix,
+                } => {
+                    if position_past_sha_pin_own_ref(parse_result, position) {
+                        return Completions::default();
+                    }
+                    self.complete_version(request, package_name, prefix).await
+                }
+                deps_core::completion::CompletionContext::Feature {
+                    package_name,
+                    prefix,
+                } => self.complete_feature(request, package_name, prefix).await,
+                // `CompletionContext` is `#[non_exhaustive]` from outside the crate that
+                // defines it, so a catch-all arm is required here (unlike the exhaustive
+                // match in the shared default this override replaces, per that default's
+                // own doc comment); covers `None` and any future variant with no completion.
+                _ => Completions::default(),
+            }
+        })
+    }
 
     // Position-based, gated: see complete_versions_at_position's own doc (#593, #1136).
     #[cfg(feature = "lsp-responses")]
@@ -1943,5 +2039,131 @@ mod tests {
             .await;
         assert_eq!(via_dispatch.items, direct);
         assert!(!direct.is_empty());
+    }
+
+    /// Regression test for issue #1182. A comment-annotated SHA pin's `version_range`
+    /// intentionally spans through the trailing `# vX.Y.Z` comment — see
+    /// `crate::parser::tests::test_sha_with_comment_tag` — because
+    /// `GithubActionsFormatter::format_version_replacing_for`'s edit range and
+    /// `generate_hover`'s `**Resolved**` splice both depend on it covering the full
+    /// `<sha> # <tag>` text. That means `detect_completion_context` still reports a
+    /// `Version` context for a cursor anywhere in that span; `generate_completions`
+    /// must withhold a completion once the cursor is past the SHA's own end column —
+    /// including the whitespace padding before `#` and `#` itself, not just once the
+    /// cursor is past `#` (the gap an earlier, prefix-based guard missed, since
+    /// `extract_prefix` trims a padding-only or bare-`#` slice back to a bare SHA with
+    /// no whitespace left to detect) — while a cursor on or immediately after the SHA
+    /// itself still gets one.
+    ///
+    /// Two spaces separate the SHA from `#` so the padding-gap and immediately-before-`#`
+    /// positions below land on distinct columns.
+    #[cfg(feature = "lsp-responses")]
+    #[tokio::test]
+    async fn test_generate_completions_withholds_only_past_sha_pins_own_ref_end() {
+        let sha = "a".repeat(40);
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/repos/actions/checkout/tags")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(format!(
+                r#"[{{"name": "v4.2.0", "commit": {{"sha": "{sha}"}}}}]"#
+            ))
+            .create_async()
+            .await;
+
+        let registry = crate::registry::GithubActionsRegistry::for_test(
+            Arc::new(deps_core::HttpCache::new()),
+            server.url(),
+            false,
+        );
+        let formatter = GithubActionsFormatter::new(registry.tag_index());
+        let eco = GithubActionsEcosystem {
+            registry: Arc::new(registry),
+            formatter,
+        };
+
+        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+        let content = format!("steps:\n  - uses: actions/checkout@{sha}  # v4.2.0\n");
+        let parse_result = eco.parse_manifest(&content, &uri).await.unwrap();
+        let version_range = parse_result.dependencies()[0].version_range().unwrap();
+        let sha_end = version_range.start.character + u32::try_from(sha.len()).unwrap();
+        let line = version_range.start.line;
+        let freshness = deps_core::FreshnessSettings::default();
+
+        // Right after the SHA's own last character: still typing the ref, must complete.
+        let allowed = eco
+            .generate_completions(
+                parse_result.as_ref(),
+                deps_core::position::Position::new(line, sha_end).into(),
+                &content,
+                freshness,
+            )
+            .await;
+        assert!(!allowed.items.is_empty());
+
+        // Past the SHA's own end: in the padding gap, immediately before `#`, and
+        // inside the comment past `#` — all three must withhold.
+        for character in [sha_end + 1, sha_end + 2, sha_end + 3] {
+            let withheld = eco
+                .generate_completions(
+                    parse_result.as_ref(),
+                    deps_core::position::Position::new(line, character).into(),
+                    &content,
+                    freshness,
+                )
+                .await;
+            assert_eq!(
+                withheld,
+                Completions::default(),
+                "expected no completion at character {character} (sha_end = {sha_end})"
+            );
+        }
+    }
+
+    /// A commentless SHA pin's `version_range` already ends exactly at the SHA's own end
+    /// (never widened) — `position_past_sha_pin_own_ref`'s guard must never fire for it,
+    /// so completion at the ref's end column is unaffected by issue #1182's fix.
+    #[cfg(feature = "lsp-responses")]
+    #[tokio::test]
+    async fn test_generate_completions_unaffected_for_commentless_sha_pin() {
+        let sha = "a".repeat(40);
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/repos/actions/checkout/tags")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(format!(
+                r#"[{{"name": "v4.2.0", "commit": {{"sha": "{sha}"}}}}]"#
+            ))
+            .create_async()
+            .await;
+
+        let registry = crate::registry::GithubActionsRegistry::for_test(
+            Arc::new(deps_core::HttpCache::new()),
+            server.url(),
+            false,
+        );
+        let formatter = GithubActionsFormatter::new(registry.tag_index());
+        let eco = GithubActionsEcosystem {
+            registry: Arc::new(registry),
+            formatter,
+        };
+
+        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+        let content = format!("steps:\n  - uses: actions/checkout@{sha}\n");
+        let parse_result = eco.parse_manifest(&content, &uri).await.unwrap();
+        let version_range = parse_result.dependencies()[0].version_range().unwrap();
+        let freshness = deps_core::FreshnessSettings::default();
+
+        let result = eco
+            .generate_completions(
+                parse_result.as_ref(),
+                version_range.end.into(),
+                &content,
+                freshness,
+            )
+            .await;
+        assert!(!result.items.is_empty());
     }
 }
