@@ -136,24 +136,46 @@ impl GradleEcosystem {
         content: &'a str,
         position: Position,
         uri: &Url,
-    ) -> (GradleCompletionContext, &'a str, Range) {
+    ) -> (
+        GradleCompletionContext,
+        &'a str,
+        Range,
+        deps_core::completion::DeclarationScope,
+    ) {
         let path = uri.path().to_string();
         let lines: Vec<&str> = content.lines().collect();
         let line_idx = position.line as usize;
 
         let Some(&line) = lines.get(line_idx) else {
-            return (GradleCompletionContext::None, "", Range::default());
+            return (
+                GradleCompletionContext::None,
+                "",
+                Range::default(),
+                deps_core::completion::DeclarationScope::Unchecked,
+            );
         };
         let col_idx = deps_core::completion::utf16_to_byte_offset(line, position.character)
             .unwrap_or(line.len());
         let before_cursor = &line[..col_idx];
 
         if path.ends_with("libs.versions.toml") {
-            detect_catalog_context(before_cursor, line, col_idx, position.line)
+            let (ctx, value, range) =
+                detect_catalog_context(before_cursor, line, col_idx, position.line);
+            (
+                ctx,
+                value,
+                range,
+                deps_core::completion::DeclarationScope::Unchecked,
+            )
         } else if path.ends_with(".gradle.kts") || path.ends_with(".gradle") {
             detect_dsl_context(before_cursor, line, col_idx, position.line)
         } else {
-            (GradleCompletionContext::None, "", Range::default())
+            (
+                GradleCompletionContext::None,
+                "",
+                Range::default(),
+                deps_core::completion::DeclarationScope::Unchecked,
+            )
         }
     }
 }
@@ -173,6 +195,80 @@ fn byte_range(line: &str, line_idx: u32, start_byte: usize, end_byte: usize) -> 
             deps_core::completion::byte_to_utf16_offset(line, end_byte),
         ),
     )
+}
+
+/// Determines whether the string literal opening at byte offset `open_pos` on `line` sits
+/// inside a recognized Gradle dependency-configuration call (`implementation(...)`,
+/// `api(...)`, `implementation(platform(...))`, `compile platform('...')`, ...), by walking
+/// backward from `open_pos` over the call syntax `crate::parser::groovy`/`crate::parser::kotlin`'s
+/// own regexes accept (issue #1191).
+///
+/// The walk strips, in order and repeating whitespace at every step: an optional `(`, an
+/// optional `platform`/`enforcedPlatform` keyword, and another optional `(` — covering both
+/// the direct-call (`implementation("g:a:v")`) and platform-wrapped
+/// (`implementation(platform("g:a:v"))`, or the without-parens Groovy form
+/// `implementation platform('g:a:v')`) shapes. What remains is checked as the trailing
+/// `[A-Za-z0-9_]+` configuration word — but only when at least one whitespace-or-`(`
+/// separator was actually consumed before it, so a literal with nothing call-shaped before it
+/// (e.g. line-start indentation only) is never mistaken for a bare configuration word.
+///
+/// Returns [`DeclarationScope::Outside`] when no separator was consumed, no word is found, or
+/// the word is not [`crate::parser::is_dependency_configuration`] — e.g. `println("...")` or
+/// an unrecognized call. Otherwise returns [`DeclarationScope::Within`] spanning from the
+/// configuration word's start to `value_end` (the same end-of-literal-or-cursor bound the
+/// `Version` arm of [`detect_dsl_context`] already computes).
+///
+/// The word scan is ASCII-only (`[A-Za-z0-9_]`), unlike the parsers' Unicode `\w+`: a
+/// non-ASCII custom source-set name (e.g. `kaptDébug`) degrades to pre-#1191 behavior for
+/// that one call — `Outside` instead of `Within` — losing the pass-2 rescue but never
+/// misattributing to an unrelated dependency.
+#[cfg(feature = "lsp-responses")]
+#[allow(clippy::string_slice)]
+fn dsl_declaration_scope(
+    line: &str,
+    line_idx: u32,
+    open_pos: usize,
+    value_end: usize,
+) -> deps_core::completion::DeclarationScope {
+    use deps_core::completion::DeclarationScope;
+
+    let mut rest = line[..open_pos].trim_end();
+    let mut consumed_separator = rest.len() != line[..open_pos].len();
+
+    if let Some(stripped) = rest.strip_suffix('(') {
+        consumed_separator = true;
+        rest = stripped.trim_end();
+    }
+
+    if let Some(stripped) = rest
+        .strip_suffix("platform")
+        .or_else(|| rest.strip_suffix("enforcedPlatform"))
+    {
+        consumed_separator = true;
+        rest = stripped.trim_end();
+
+        if let Some(stripped) = rest.strip_suffix('(') {
+            consumed_separator = true;
+            rest = stripped.trim_end();
+        }
+    }
+
+    if !consumed_separator {
+        return DeclarationScope::Outside;
+    }
+
+    let word_start = rest
+        .char_indices()
+        .rev()
+        .find(|&(_, c)| !(c.is_ascii_alphanumeric() || c == '_'))
+        .map_or(0, |(i, c)| i + c.len_utf8());
+    let word = &rest[word_start..];
+
+    if word.is_empty() || !crate::parser::is_dependency_configuration(word) {
+        return DeclarationScope::Outside;
+    }
+
+    DeclarationScope::Within(byte_range(line, line_idx, word_start, value_end).into())
 }
 
 /// Finds the byte offset (relative to `before_cursor`) where the current inline-table
@@ -344,7 +440,12 @@ fn detect_dsl_context<'a>(
     line: &'a str,
     col_idx: usize,
     line_idx: u32,
-) -> (GradleCompletionContext, &'a str, Range) {
+) -> (
+    GradleCompletionContext,
+    &'a str,
+    Range,
+    deps_core::completion::DeclarationScope,
+) {
     let cursor = col_idx.min(line.len());
     // Scoped per-literal (#1168), not line-wide: `quote_char` is whatever delimiter opens
     // the string containing the cursor, found by scanning forward and toggling between
@@ -353,7 +454,12 @@ fn detect_dsl_context<'a>(
     let Some(open) = quote_scan::last_string_literal(before_cursor, ScanSyntax::Groovy)
         .filter(|span| span.close.is_none())
     else {
-        return (GradleCompletionContext::None, "", Range::default());
+        return (
+            GradleCompletionContext::None,
+            "",
+            Range::default(),
+            deps_core::completion::DeclarationScope::Unchecked,
+        );
     };
     let quote_char = open.quote;
     let open_pos = open.open;
@@ -373,7 +479,12 @@ fn detect_dsl_context<'a>(
         let is_map_key = before_colon.ends_with(|c: char| c.is_alphanumeric() || c == '_')
             || quoted_key_precedes_colon(before_colon);
         if is_map_key {
-            return (GradleCompletionContext::None, "", Range::default());
+            return (
+                GradleCompletionContext::None,
+                "",
+                Range::default(),
+                deps_core::completion::DeclarationScope::Unchecked,
+            );
         }
     }
 
@@ -409,6 +520,7 @@ fn detect_dsl_context<'a>(
                 GradleCompletionContext::Package,
                 &line[open_pos + 1..cursor],
                 range,
+                deps_core::completion::DeclarationScope::Unchecked,
             )
         }
         _ => {
@@ -428,10 +540,12 @@ fn detect_dsl_context<'a>(
                 .map_or(cursor, |rel| version_start + rel)
                 .max(cursor);
             let range = byte_range(line, line_idx, version_start, value_end);
+            let scope = dsl_declaration_scope(line, line_idx, open_pos, value_end);
             (
                 GradleCompletionContext::Version,
                 &line[version_start..cursor],
                 range,
+                scope,
             )
         }
     }
@@ -499,17 +613,19 @@ impl Ecosystem for GradleEcosystem {
     ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
         Box::pin(async move {
             let uri = parse_result.uri();
-            let (ctx_type, value, range) = Self::detect_completion_context(content, position, uri);
+            let (ctx_type, value, range, scope) =
+                Self::detect_completion_context(content, position, uri);
 
             // Exhaustive on purpose (#819, same bug class as #793): no wildcard arm.
             match ctx_type {
                 GradleCompletionContext::Version => {
-                    // #1134: finds+literal-checks the dependency; #1136: complete_versions_generic_from's own gate rejects a non-registry `dep.source()`.
-                    match deps_core::completion::literal_version_dependency(
+                    // #1134: finds+literal-checks the dependency; #1136: complete_versions_generic_from's own gate rejects a non-registry `dep.source()`; #1191: `scope` restricts the same-line fallback to this literal's own declaration.
+                    match deps_core::completion::literal_version_dependency_in_scope(
                         parse_result,
                         position,
                         content,
                         range,
+                        scope,
                     ) {
                         Some(dep) => {
                             deps_core::completion::complete_versions_generic_from(
@@ -796,7 +912,7 @@ mod tests {
         // before_cursor = `implementation("junit`
         let col = 21;
         let before = &line[..col];
-        let (t, v, range) = detect_dsl_context(before, line, col, 0);
+        let (t, v, range, _scope) = detect_dsl_context(before, line, col, 0);
         assert_eq!(t, GradleCompletionContext::Package);
         assert_eq!(v, "junit");
         // range replaces the whole "group:artifact" coordinate ("junit:junit"),
@@ -815,7 +931,7 @@ mod tests {
         let line = r#"implementation("junit")"#;
         let col = 21; // right after "junit"
         let before = &line[..col];
-        let (t, v, range) = detect_dsl_context(before, line, col, 0);
+        let (t, v, range, _scope) = detect_dsl_context(before, line, col, 0);
         assert_eq!(t, GradleCompletionContext::Package);
         assert_eq!(v, "junit");
         assert_eq!(
@@ -836,7 +952,7 @@ mod tests {
         let line = "implementation \"a\\\"b\", \"com.foo:ba";
         let col = line.len();
         let before = &line[..col];
-        let (t, v, _range) = detect_dsl_context(before, line, col, 0);
+        let (t, v, _range, _scope) = detect_dsl_context(before, line, col, 0);
         assert_eq!(t, GradleCompletionContext::Package);
         assert_eq!(v, "com.foo:ba");
     }
@@ -849,7 +965,7 @@ mod tests {
         let line = r#"implementation "com.o'reilly:li"#;
         let col = line.len();
         let before = &line[..col];
-        let (t, v, _range) = detect_dsl_context(before, line, col, 0);
+        let (t, v, _range, _scope) = detect_dsl_context(before, line, col, 0);
         assert_eq!(t, GradleCompletionContext::Package);
         assert_eq!(v, "com.o'reilly:li");
     }
@@ -867,7 +983,7 @@ mod tests {
         let line = r#"exclude module: "x"; implementation 'com.baz:qu"#;
         let col = line.len();
         let before = &line[..col];
-        let (t, v, _range) = detect_dsl_context(before, line, col, 0);
+        let (t, v, _range, _scope) = detect_dsl_context(before, line, col, 0);
         assert_eq!(t, GradleCompletionContext::Package);
         assert_eq!(v, "com.baz:qu");
     }
@@ -883,7 +999,7 @@ mod tests {
         let line = r#"implementation "a:b:1.0"; implementation 'c:d:2.0"#;
         let col = line.len();
         let before = &line[..col];
-        let (t, v, range) = detect_dsl_context(before, line, col, 0);
+        let (t, v, range, _scope) = detect_dsl_context(before, line, col, 0);
         assert_eq!(t, GradleCompletionContext::Version);
         assert_eq!(v, "2.0");
         let expected_start = line.rfind("2.0").unwrap();
@@ -907,7 +1023,7 @@ mod tests {
         let line = r"implementation 'group': 'com.example', 'version': '1.0";
         let col = line.len();
         let before = &line[..col];
-        let (t, v, range) = detect_dsl_context(before, line, col, 0);
+        let (t, v, range, _scope) = detect_dsl_context(before, line, col, 0);
         assert_eq!(t, GradleCompletionContext::None);
         assert_eq!(v, "");
         assert_eq!(range, Range::default());
@@ -922,7 +1038,7 @@ mod tests {
         let line = "implementation 'group': 'com.exam";
         let col = line.len();
         let before = &line[..col];
-        let (t, v, range) = detect_dsl_context(before, line, col, 0);
+        let (t, v, range, _scope) = detect_dsl_context(before, line, col, 0);
         assert_eq!(t, GradleCompletionContext::None);
         assert_eq!(v, "");
         assert_eq!(range, Range::default());
@@ -938,7 +1054,7 @@ mod tests {
         let line = r#"implementation "a:b:1.0" // don't bump"#;
         let col = line.len();
         let before = &line[..col];
-        let (t, v, range) = detect_dsl_context(before, line, col, 0);
+        let (t, v, range, _scope) = detect_dsl_context(before, line, col, 0);
         assert_eq!(t, GradleCompletionContext::None);
         assert_eq!(v, "");
         assert_eq!(range, Range::default());
@@ -954,7 +1070,7 @@ mod tests {
         let line = "implementation 'a:b:1.0' // don't bump";
         let col = line.len();
         let before = &line[..col];
-        let (t, v, range) = detect_dsl_context(before, line, col, 0);
+        let (t, v, range, _scope) = detect_dsl_context(before, line, col, 0);
         assert_eq!(t, GradleCompletionContext::None);
         assert_eq!(v, "");
         assert_eq!(range, Range::default());
@@ -970,7 +1086,7 @@ mod tests {
         let line = "implementation /* don't */ \"com.exam";
         let col = line.len();
         let before = &line[..col];
-        let (t, v, _range) = detect_dsl_context(before, line, col, 0);
+        let (t, v, _range, _scope) = detect_dsl_context(before, line, col, 0);
         assert_eq!(t, GradleCompletionContext::Package);
         assert_eq!(v, "com.exam");
     }
@@ -986,7 +1102,7 @@ mod tests {
         let line = r#"implementation(x = c ? p + "a" : "g:a:1.0"#;
         let col = line.len();
         let before = &line[..col];
-        let (t, v, _range) = detect_dsl_context(before, line, col, 0);
+        let (t, v, _range, _scope) = detect_dsl_context(before, line, col, 0);
         assert_eq!(t, GradleCompletionContext::Version);
         assert_eq!(v, "1.0");
     }
@@ -1004,7 +1120,7 @@ mod tests {
         let expected_start = line.find("1.0").unwrap();
         let col = expected_start + 3;
         let before = &line[..col];
-        let (t, v, range) = detect_dsl_context(before, line, col, 0);
+        let (t, v, range, _scope) = detect_dsl_context(before, line, col, 0);
         assert_eq!(t, GradleCompletionContext::Version);
         assert_eq!(v, "1.0");
         assert_eq!(
@@ -1026,7 +1142,7 @@ mod tests {
         let expected_start = line.find('"').unwrap() + 1;
         let col = line.find(":fo").unwrap() + 3;
         let before = &line[..col];
-        let (t, v, range) = detect_dsl_context(before, line, col, 0);
+        let (t, v, range, _scope) = detect_dsl_context(before, line, col, 0);
         assert_eq!(t, GradleCompletionContext::Package);
         assert_eq!(v, "com.example:fo");
         assert_eq!(
@@ -1050,7 +1166,7 @@ mod tests {
         let expected_start = line.find("1.0").unwrap();
         let col = expected_start + 3;
         let before = &line[..col];
-        let (t, v, range) = detect_dsl_context(before, line, col, 0);
+        let (t, v, range, _scope) = detect_dsl_context(before, line, col, 0);
         assert_eq!(t, GradleCompletionContext::Version);
         assert_eq!(v, "1.0");
         assert_eq!(
@@ -1075,7 +1191,7 @@ mod tests {
         let expected_start = line.find("1.0").unwrap();
         let col = expected_start + 3;
         let before = &line[..col];
-        let (t, v, range) = detect_dsl_context(before, line, col, 0);
+        let (t, v, range, _scope) = detect_dsl_context(before, line, col, 0);
         assert_eq!(t, GradleCompletionContext::Version);
         assert_eq!(v, "1.0");
         assert_eq!(
@@ -1099,7 +1215,7 @@ mod tests {
         let line = r"implementation group: 'com.example', name: 'foo', version: '1.0";
         let col = line.len();
         let before = &line[..col];
-        let (t, v, range) = detect_dsl_context(before, line, col, 0);
+        let (t, v, range, _scope) = detect_dsl_context(before, line, col, 0);
         assert_eq!(t, GradleCompletionContext::None);
         assert_eq!(v, "");
         assert_eq!(range, Range::default());
@@ -1115,7 +1231,7 @@ mod tests {
         let line = "implementation group: 'com.exam";
         let col = line.len();
         let before = &line[..col];
-        let (t, v, range) = detect_dsl_context(before, line, col, 0);
+        let (t, v, range, _scope) = detect_dsl_context(before, line, col, 0);
         assert_eq!(t, GradleCompletionContext::None);
         assert_eq!(v, "");
         assert_eq!(range, Range::default());
@@ -1133,7 +1249,7 @@ mod tests {
         let line = r#"implementation(cond ? "a:b:1.0" : "c:d:2.0"#;
         let col = line.len();
         let before = &line[..col];
-        let (t, v, range) = detect_dsl_context(before, line, col, 0);
+        let (t, v, range, _scope) = detect_dsl_context(before, line, col, 0);
         assert_eq!(t, GradleCompletionContext::Version);
         assert_eq!(v, "2.0");
         let expected_start = line.rfind("2.0").unwrap();
@@ -1155,7 +1271,7 @@ mod tests {
         let line = r#"implementation(cond ? "a:b:1.0" : "com.exam"#;
         let col = line.len();
         let before = &line[..col];
-        let (t, v, _range) = detect_dsl_context(before, line, col, 0);
+        let (t, v, _range, _scope) = detect_dsl_context(before, line, col, 0);
         assert_eq!(t, GradleCompletionContext::Package);
         assert_eq!(v, "com.exam");
     }
@@ -1170,7 +1286,7 @@ mod tests {
         let line = r#"implementation(value ?: "com.example:foo:1.0"#;
         let col = line.len();
         let before = &line[..col];
-        let (t, v, _range) = detect_dsl_context(before, line, col, 0);
+        let (t, v, _range, _scope) = detect_dsl_context(before, line, col, 0);
         assert_eq!(t, GradleCompletionContext::Version);
         assert_eq!(v, "1.0");
     }
@@ -1187,7 +1303,8 @@ mod tests {
         let uri = deps_core::test_util::test_uri("/test/libs.versions.toml");
         let position = Position::new(0, 14); // cursor right after "café" (UTF-16 units)
 
-        let (t, v, range) = GradleEcosystem::detect_completion_context(content, position, &uri);
+        let (t, v, range, _scope) =
+            GradleEcosystem::detect_completion_context(content, position, &uri);
         assert_eq!(t, GradleCompletionContext::Package);
         assert_eq!(v, "café");
         assert_eq!(
@@ -1213,7 +1330,8 @@ mod tests {
         let uri = deps_core::test_util::test_uri("/test/libs.versions.toml");
         let position = Position::new(0, 33); // cursor right after "lib" (UTF-16 units)
 
-        let (t, v, range) = GradleEcosystem::detect_completion_context(content, position, &uri);
+        let (t, v, range, _scope) =
+            GradleEcosystem::detect_completion_context(content, position, &uri);
         assert_eq!(t, GradleCompletionContext::Package);
         assert_eq!(v, "com.exämple:lib");
         // Range must end at UTF-16 33 (right before the closing quote), not 34 (which
@@ -1233,7 +1351,8 @@ mod tests {
         let uri = deps_core::test_util::test_uri("/project/build.gradle.kts");
         let position = Position::new(0, 20); // cursor right after "café" (UTF-16 units)
 
-        let (t, v, range) = GradleEcosystem::detect_completion_context(content, position, &uri);
+        let (t, v, range, _scope) =
+            GradleEcosystem::detect_completion_context(content, position, &uri);
         assert_eq!(t, GradleCompletionContext::Package);
         assert_eq!(v, "café");
         assert_eq!(
@@ -1524,7 +1643,7 @@ mod tests {
         let line = r#"implementation("junit:junit"#;
         let col = line.len();
         let before = &line[..col];
-        let (t, v, range) = detect_dsl_context(before, line, col, 0);
+        let (t, v, range, _scope) = detect_dsl_context(before, line, col, 0);
         assert_eq!(t, GradleCompletionContext::Package);
         assert_eq!(v, "junit:junit");
         assert_eq!(
@@ -1541,7 +1660,7 @@ mod tests {
         // second ':' at index 27; version_start=28, "4.1"=3 chars, cursor at 31
         let col = 31;
         let before = &line[..col];
-        let (t, v, range) = detect_dsl_context(before, line, col, 0);
+        let (t, v, range, _scope) = detect_dsl_context(before, line, col, 0);
         assert_eq!(t, GradleCompletionContext::Version);
         assert_eq!(v, "4.1");
         // #931: range must span the whole literal version segment ("4.13.2"), not
@@ -1562,7 +1681,7 @@ mod tests {
         // second ':' at index 27, cursor at 28 (right after it)
         let col = 28;
         let before = &line[..col];
-        let (t, v, range) = detect_dsl_context(before, line, col, 0);
+        let (t, v, range, _scope) = detect_dsl_context(before, line, col, 0);
         assert_eq!(t, GradleCompletionContext::Version);
         assert_eq!(v, "");
         assert_eq!(
@@ -1579,7 +1698,7 @@ mod tests {
         let line = r#"implementation("junit:junit:4.13.2"#;
         let col = line.len();
         let before = &line[..col];
-        let (t, v, range) = detect_dsl_context(before, line, col, 0);
+        let (t, v, range, _scope) = detect_dsl_context(before, line, col, 0);
         assert_eq!(t, GradleCompletionContext::Version);
         assert_eq!(v, "4.13.2");
         assert_eq!(
@@ -1703,7 +1822,7 @@ mod tests {
         let uri = deps_core::test_util::test_uri("/project/build.gradle.kts");
         let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
 
-        let (ctx, _, _) =
+        let (ctx, _, _, _) =
             GradleEcosystem::detect_completion_context(content, Position::new(0, 5), &uri);
         assert_eq!(ctx, GradleCompletionContext::None);
 
@@ -1780,7 +1899,8 @@ mod tests {
         let dep = &parse_result.dependencies()[0];
         let position: Position = dep.version_range().unwrap().start.into();
 
-        let (ctx, _, range) = GradleEcosystem::detect_completion_context(content, position, &uri);
+        let (ctx, _, range, _scope) =
+            GradleEcosystem::detect_completion_context(content, position, &uri);
         assert_eq!(ctx, GradleCompletionContext::Version);
         assert!(deps_core::lsp_helpers::dependency_version_range_is_literal(
             *dep,
@@ -1804,7 +1924,8 @@ mod tests {
         let dep = &parse_result.dependencies()[0];
         let position: Position = dep.version_range().unwrap().start.into();
 
-        let (ctx, _, range) = GradleEcosystem::detect_completion_context(content, position, &uri);
+        let (ctx, _, range, _scope) =
+            GradleEcosystem::detect_completion_context(content, position, &uri);
         assert_eq!(ctx, GradleCompletionContext::Version);
         assert!(deps_core::lsp_helpers::dependency_version_range_is_literal(
             *dep,
@@ -1927,7 +2048,7 @@ mod tests {
             r#"implementation("com.example:foo:1.0.0"); implementation("com.example:bar:2.0.0")"#;
         let col = line.find("2.0").unwrap() + 3; // cursor right after "2.0" in the second dep
         let before = &line[..col];
-        let (t, v, range) = detect_dsl_context(before, line, col, 0);
+        let (t, v, range, _scope) = detect_dsl_context(before, line, col, 0);
         assert_eq!(t, GradleCompletionContext::Version);
         assert_eq!(v, "2.0");
         let expected_start = line.rfind("2.0.0").unwrap();
@@ -1952,7 +2073,7 @@ mod tests {
             r#"implementation("com.example:foo:1.0.0") implementation("com.example:bar:2.0.0")"#;
         let col = line.find("2.0").unwrap() + 3;
         let before = &line[..col];
-        let (t, v, range) = detect_dsl_context(before, line, col, 0);
+        let (t, v, range, _scope) = detect_dsl_context(before, line, col, 0);
         assert_eq!(t, GradleCompletionContext::Version);
         assert_eq!(v, "2.0");
         let expected_start = line.rfind("2.0.0").unwrap();
@@ -1975,7 +2096,7 @@ mod tests {
             r#"implementation("a:b:1.0"); implementation("c:d:2.0"); implementation("e:f:3.0.0")"#;
         let col = line.find("3.0").unwrap() + 3;
         let before = &line[..col];
-        let (t, v, range) = detect_dsl_context(before, line, col, 0);
+        let (t, v, range, _scope) = detect_dsl_context(before, line, col, 0);
         assert_eq!(t, GradleCompletionContext::Version);
         assert_eq!(v, "3.0");
         let expected_start = line.rfind("3.0.0").unwrap();
@@ -1998,7 +2119,7 @@ mod tests {
         let line = r#"implementation("com.example:foo:1.0.0"); implementation("ba"#;
         let col = line.len();
         let before = &line[..col];
-        let (t, v, _range) = detect_dsl_context(before, line, col, 0);
+        let (t, v, _range, _scope) = detect_dsl_context(before, line, col, 0);
         assert_eq!(t, GradleCompletionContext::Package);
         assert_eq!(v, "ba");
     }
@@ -2024,7 +2145,8 @@ mod tests {
         let dep_two = deps[1];
         let position: Position = dep_two.version_range().unwrap().start.into();
 
-        let (ctx, _, range) = GradleEcosystem::detect_completion_context(content, position, &uri);
+        let (ctx, _, range, _scope) =
+            GradleEcosystem::detect_completion_context(content, position, &uri);
         assert_eq!(ctx, GradleCompletionContext::Version);
         assert!(
             deps_core::lsp_helpers::dependency_version_range_is_literal(
@@ -2113,5 +2235,197 @@ mod tests {
         .expect("must resolve despite name_range starting after version_range");
 
         assert_eq!(resolved.name(), dep.name());
+    }
+
+    /// #1191: a same-line, non-dependency literal that happens to look version-shaped
+    /// (`println("a:b:1.0.0")` beside a real `com.example:foo:1.0.0` dependency) must not be
+    /// misattributed to that dependency. Pins exactly what `dsl_declaration_scope` prevents:
+    /// under the real computed scope (`Outside`, since `println` is not a recognized
+    /// configuration) the result is `None`, but under `DeclarationScope::Unchecked` — the
+    /// pre-#1191 behavior — the same-line fallback wrongly resolves `foo`.
+    #[cfg(feature = "lsp-responses")]
+    #[tokio::test]
+    async fn test_literal_version_dependency_minified_dsl_non_dependency_literal_is_not_attributed()
+    {
+        let eco = GradleEcosystem::new(make_cache());
+        let content =
+            "dependencies { implementation(\"com.example:foo:1.0.0\"); println(\"a:b:1.0.0\") }\n";
+        let uri = deps_core::test_util::test_uri("/project/build.gradle");
+        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+        assert_eq!(
+            parse_result.dependencies().len(),
+            1,
+            "println(...) must not parse as a dependency: {content}"
+        );
+
+        let line = content.lines().next().unwrap();
+        let literal_start = line.find("\"a:b:1.0.0\"").unwrap() + 1;
+        let col = literal_start + "a:b:1.0.0".len();
+        let before = &line[..col];
+        let (ctx, _, range, scope) = detect_dsl_context(before, line, col, 0);
+        assert_eq!(ctx, GradleCompletionContext::Version);
+        assert_eq!(scope, deps_core::completion::DeclarationScope::Outside);
+
+        let position = Position::new(0, col as u32);
+
+        assert!(
+            deps_core::completion::literal_version_dependency_in_scope(
+                parse_result.as_ref(),
+                position,
+                content,
+                range,
+                scope,
+            )
+            .is_none(),
+            "the real computed scope must reject println's non-dependency literal"
+        );
+        assert_eq!(
+            deps_core::completion::literal_version_dependency_in_scope(
+                parse_result.as_ref(),
+                position,
+                content,
+                range,
+                deps_core::completion::DeclarationScope::Unchecked,
+            )
+            .map(|d| d.name().to_string()),
+            Some("com.example:foo".to_string()),
+            "Unchecked pins exactly what the scope prevents: same-line misattribution to foo"
+        );
+    }
+
+    /// #1191: a still-unparsed second declaration mid-typing on the same line as a real
+    /// dependency (`implementation("org.other:bar:1.0.0`, no closing quote/paren yet — so
+    /// `crate::parser::groovy` never captures it as a `Dependency`) must not be misattributed
+    /// to the first, already-parsed dependency, even when its typed-so-far text happens to
+    /// coincide with the first dependency's own version (the scenario `Unchecked`'s same-line
+    /// fallback would wrongly resolve).
+    #[cfg(feature = "lsp-responses")]
+    #[tokio::test]
+    async fn test_literal_version_dependency_minified_dsl_unparsed_second_declaration_is_not_attributed()
+     {
+        let eco = GradleEcosystem::new(make_cache());
+        let content = "dependencies { implementation(\"com.example:foo:1.0.0\"); implementation(\"org.other:bar:1.0.0";
+        let uri = deps_core::test_util::test_uri("/project/build.gradle");
+        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+        assert_eq!(
+            parse_result.dependencies().len(),
+            1,
+            "the unterminated second declaration must not parse: {content}"
+        );
+
+        let line = content.lines().next().unwrap();
+        let col = line.len();
+        let before = &line[..col];
+        let (ctx, _, range, scope) = detect_dsl_context(before, line, col, 0);
+        assert_eq!(ctx, GradleCompletionContext::Version);
+
+        let position = Position::new(0, col as u32);
+
+        assert_eq!(
+            deps_core::completion::literal_version_dependency_in_scope(
+                parse_result.as_ref(),
+                position,
+                content,
+                range,
+                deps_core::completion::DeclarationScope::Unchecked,
+            )
+            .map(|d| d.name().to_string()),
+            Some("com.example:foo".to_string()),
+            "Unchecked pins the misattribution this test's real scope must prevent"
+        );
+        assert!(
+            deps_core::completion::literal_version_dependency_in_scope(
+                parse_result.as_ref(),
+                position,
+                content,
+                range,
+                scope,
+            )
+            .is_none(),
+            "the real computed scope must not misattribute to the first dependency"
+        );
+    }
+
+    /// #1191: a raw-text scanner's own detected version span can diverge from the AST's
+    /// `version_range` by exactly one character (here, a space after the colon —
+    /// `find_version_range`, `crates/deps-gradle/src/parser/mod.rs`, finds the *trimmed*
+    /// version text and so skips the space, while `detect_dsl_context`'s own colon-counted
+    /// `version_start` does not) — pass 1 must miss at that boundary, and pass 2's same-line
+    /// fallback, restricted to this dependency's own `Within` scope, must still rescue it.
+    #[cfg(feature = "lsp-responses")]
+    #[tokio::test]
+    async fn test_literal_version_dependency_same_line_boundary_rescue_still_resolves() {
+        let eco = GradleEcosystem::new(make_cache());
+        let content = "dependencies { implementation(\"com.example:foo: 1.0.0\") }\n";
+        let uri = deps_core::test_util::test_uri("/project/build.gradle");
+        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+        let deps = parse_result.dependencies();
+        assert_eq!(
+            deps.len(),
+            1,
+            "fixture must parse one dependency: {content}"
+        );
+        let dep = deps[0];
+        let version_range: Range = dep.version_range().unwrap().into();
+
+        let line = content.lines().next().unwrap();
+        let col = line.find("foo:").unwrap() + "foo:".len();
+        let before = &line[..col];
+        let (ctx, _, range, scope) = detect_dsl_context(before, line, col, 0);
+        assert_eq!(ctx, GradleCompletionContext::Version);
+
+        let position = Position::new(0, col as u32);
+        assert!(
+            position.character < version_range.start.character,
+            "cursor must sit outside the AST's own version_range, so pass 1 misses and pass 2 \
+             is what resolves this: {version_range:?} vs cursor {position:?}"
+        );
+
+        let resolved = deps_core::completion::literal_version_dependency_in_scope(
+            parse_result.as_ref(),
+            position,
+            content,
+            range,
+            scope,
+        )
+        .expect("pass 2, restricted to this dependency's own Within scope, must rescue it");
+        assert_eq!(resolved.name(), dep.name());
+    }
+
+    /// #1191: [`dsl_declaration_scope`] must recognize every call shape
+    /// `crate::parser::groovy`/`crate::parser::kotlin`'s own regexes accept (direct,
+    /// with/without parens, platform-wrapped, prefix-convention configurations like `kapt*`)
+    /// as `Within`, and reject an unrecognized call or a literal with nothing call-shaped
+    /// before it as `Outside`. Each fixture ends in the literal's opening quote, so
+    /// `open_pos` is always its last byte.
+    #[test]
+    fn test_dsl_declaration_scope_recognizes_configuration_calls() {
+        let within_cases: &[&str] = &[
+            "implementation(\"",
+            "implementation (\"",
+            "implementation '",
+            "implementation(platform(\"",
+            "compile platform('",
+            "kaptTest '",
+        ];
+        for line in within_cases {
+            let open_pos = line.len() - 1;
+            let scope = dsl_declaration_scope(line, 0, open_pos, line.len());
+            assert!(
+                matches!(scope, deps_core::completion::DeclarationScope::Within(_)),
+                "{line:?} must resolve to Within, got {scope:?}"
+            );
+        }
+
+        let outside_cases: &[&str] = &["println(\"", "unknown '", "    \""];
+        for line in outside_cases {
+            let open_pos = line.len() - 1;
+            let scope = dsl_declaration_scope(line, 0, open_pos, line.len());
+            assert_eq!(
+                scope,
+                deps_core::completion::DeclarationScope::Outside,
+                "{line:?} must resolve to Outside"
+            );
+        }
     }
 }

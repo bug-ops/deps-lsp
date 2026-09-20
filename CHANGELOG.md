@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: removed `completion::complete_versions_generic`; `completion::complete_versions_generic_from` now requires an additional `formatter: &dyn lsp_helpers::SourcePolicy` parameter (resolves #1136)
 
 ### Fixed
+- **deps-gradle**: version-completion same-line fallback no longer misattributes a non-dependency or still-unparsed literal on a shared manifest line to a nearby real dependency (resolves #1191)
+- **deps-core**: `detect_completion_context`'s hand-inlined strict-containment check (package-name completion) now reuses `lsp_helpers::position_in_range` instead of re-deriving it (resolves #1147)
 - **deps-github-actions**: hover's "Press Cmd+. to update version" footer now uses the same centralized SHA-pin eligibility check as the quickfix/code-lens, no longer advertising the action for a flow-style step where the quickfix is withheld (resolves #1178) (#1187)
 - **deps-github-actions**: mutable-tag-ref diagnostic's message branch now uses the same structural eligibility check as the SHA-pin quickfix, instead of claiming an automated fix is available for a quoted-scalar or flow-style tag pin where it is actually withheld (resolves #1188) (#1194)
 - **deps-core**: `locate_value_span`'s empty-value quote correction now keys on the scalar's actual quote style instead of inferring it from the marker byte, fixing a false correction when a Plain/Literal/Folded empty scalar's next token happens to be a quote character; `deps-lsp`'s SHA-pin-comment completion withholding no longer falls through to a package-name registry search (resolves #1184) (#1194)
