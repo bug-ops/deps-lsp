@@ -328,11 +328,22 @@ impl MavenEcosystem {
         if !deps_core::completion::is_valid_completion_prefix_len(prefix) {
             return vec![];
         }
+        // #1206 S1: this bespoke path doesn't route through `complete_package_names_generic`, so it needs its own gate.
+        if let Some(rejected) = deps_core::completion::reject_credential_bearing_value(
+            prefix,
+            "maven package-name completion",
+        ) {
+            return rejected;
+        }
 
         let results = match self.registry.search(prefix, 20).await {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!("Maven registry search failed for '{}': {}", prefix, e);
+                tracing::warn!(
+                    "Maven registry search failed for '{}': {}",
+                    deps_core::net_policy::url_for_tracing(prefix),
+                    e
+                );
                 return vec![];
             }
         };
@@ -911,6 +922,28 @@ mod tests {
                 .await
             })
         };
+    }
+
+    /// #1206 S1: `complete_package_names_for_field` doesn't route through
+    /// `complete_package_names_generic` (see the conformance block above for why), so it needs
+    /// its own direct test that a credential-shaped prefix is rejected — no mock/network setup
+    /// needed: if the gate works, `self.registry.search` is never called at all.
+    #[cfg(feature = "lsp-responses")]
+    #[tokio::test]
+    async fn test_complete_package_names_for_field_rejects_credential_bearing_prefix() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = MavenEcosystem::new(cache);
+        let prefix = "deploy:AUDITSENTINEL0000@git.internal.corp/team/x";
+
+        let items = eco
+            .complete_package_names_for_field(
+                prefix,
+                MavenNameField::ArtifactId,
+                tower_lsp_server::ls_types::Range::default(),
+            )
+            .await;
+
+        assert!(items.is_empty());
     }
 
     // #1137: regression guard — `required` mirrors `VERSION_OPERATOR_CHARS`'s own doc

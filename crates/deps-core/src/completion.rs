@@ -1249,11 +1249,50 @@ pub fn is_valid_completion_prefix_len(prefix: &str) -> bool {
     (2..=200).contains(&prefix.chars().count())
 }
 
+/// The shared reject-before-search gate for a completion value that might carry a credential
+/// or an untrusted query/fragment component (issue #1206).
+///
+/// Every call site that is about to forward a raw completion prefix/query to a registry
+/// `search` call (or even log it) needs the identical check-then-reject-then-warn sequence —
+/// this is that sequence, extracted to one place in `deps-core` (per the project's
+/// cross-ecosystem-consistency rule) instead of being copy-pasted at each of the 5 call sites
+/// that need it (`complete_package_names_generic` below, `deps-lsp`'s `fallback_completion`/
+/// `search_packages`, `deps-swift`'s `complete_package_urls`, `deps-maven`'s
+/// `complete_package_names_for_field`).
+///
+/// Returns `Some(vec![])` — an empty completions list the caller should return immediately —
+/// when `value` is rejected; `None` when the caller should proceed. `context` is a short
+/// human-readable label for the [`warn_rejected_value`] log field (e.g. `"maven package-name
+/// completion"`), not logged alongside `value` itself — see that function's own doc for why.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::completion::reject_credential_bearing_value;
+///
+/// assert!(
+///     reject_credential_bearing_value("https://user:pass@evil.example", "test").is_some()
+/// );
+/// assert!(reject_credential_bearing_value("serde", "test").is_none());
+/// ```
+#[must_use]
+pub fn reject_credential_bearing_value(value: &str, context: &str) -> Option<Vec<CompletionItem>> {
+    if crate::net_policy::is_credential_or_query_bearing(value) {
+        warn_rejected_value("credential_bearing", context, value);
+        return Some(vec![]);
+    }
+    None
+}
+
 /// Generic package name completion using any `Registry` implementation.
 ///
 /// Searches the registry for packages matching `prefix` and returns up to `limit`
 /// completion items, each with its `textEdit` set to replace `insert_range`. Returns
-/// empty vec if `prefix` is shorter than 2 characters or longer than 200 characters.
+/// empty vec if `prefix` is shorter than 2 characters or longer than 200 characters, or if
+/// `prefix` is rejected by [`reject_credential_bearing_value`] (issue #1206) — a credential
+/// embedded in a completion prefix (e.g. a `.package(url: "https://user:pass@host/...")`
+/// literal) must never reach `registry.search` as an outbound query, and a redacted value is
+/// not a useful search term, so the request is dropped rather than redacted-and-sent.
 /// A result whose name fails [`build_package_completion`]'s [`crate::is_safe_package_name`]
 /// gate is silently dropped rather than surfaced as an error, matching the fallback-search
 /// completion builder's convention (`create_package_completion_item` in `deps-lsp`).
@@ -1266,11 +1305,20 @@ pub async fn complete_package_names_generic(
     if !is_valid_completion_prefix_len(prefix) {
         return vec![];
     }
+    if let Some(rejected) =
+        reject_credential_bearing_value(prefix, "package-name completion prefix")
+    {
+        return rejected;
+    }
 
     let results = match registry.search(prefix, limit).await {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!("Registry search failed for '{}': {}", prefix, e);
+            tracing::warn!(
+                "Registry search failed for '{}': {}",
+                crate::net_policy::url_for_tracing(prefix),
+                e
+            );
             return vec![];
         }
     };
