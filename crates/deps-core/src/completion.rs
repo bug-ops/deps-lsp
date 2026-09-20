@@ -52,11 +52,23 @@ pub struct Completions {
     pub items: Vec<CompletionItem>,
     /// Whether `items` is a possibly-truncated view of a larger candidate set.
     pub is_incomplete: bool,
+    /// Whether an empty [`Self::items`] means "no completion here, and the raw-text
+    /// package-name fallback should not run either" rather than "context detection found
+    /// nothing, try the fallback" (issue #1184 Gap 2).
+    ///
+    /// `deps-lsp`'s completion handler treats empty `items` from a resolved
+    /// [`crate::completion::CompletionContext`] the same as a parse failure — both fall
+    /// back to raw-text package-name search — which is wrong for a context an ecosystem
+    /// positively identified (e.g. a `Version` context) but withheld the item for
+    /// (e.g. GitHub Actions' `position_past_sha_pin_own_ref`, issue #1182): the cursor is
+    /// not a package-name position, so no fallback search should ever run there.
+    pub suppress_fallback: bool,
 }
 
 impl Completions {
-    /// Constructs a `Completions` from its items, with [`Self::is_incomplete`] left `false` —
-    /// chain [`Self::with_incomplete`] to mark it truncated.
+    /// Constructs a `Completions` from its items, with [`Self::is_incomplete`] and
+    /// [`Self::suppress_fallback`] left `false` — chain [`Self::with_incomplete`]/
+    /// [`Self::with_suppress_fallback`] to override either.
     ///
     /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
     /// this crate, so every other crate must go through this constructor instead.
@@ -74,6 +86,7 @@ impl Completions {
         Self {
             items,
             is_incomplete: false,
+            suppress_fallback: false,
         }
     }
 
@@ -81,6 +94,22 @@ impl Completions {
     #[must_use]
     pub const fn with_incomplete(mut self, is_incomplete: bool) -> Self {
         self.is_incomplete = is_incomplete;
+        self
+    }
+
+    /// Overrides [`Self::suppress_fallback`]. See [`Self::new`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::completion::Completions;
+    ///
+    /// let completions = Completions::default().with_suppress_fallback(true);
+    /// assert!(completions.suppress_fallback);
+    /// ```
+    #[must_use]
+    pub const fn with_suppress_fallback(mut self, suppress_fallback: bool) -> Self {
+        self.suppress_fallback = suppress_fallback;
         self
     }
 }
